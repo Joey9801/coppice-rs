@@ -32,6 +32,7 @@ coppice-api = { path = "crates/coppice-api" }
 # Common third-party dependencies. Versions are pinned centrally so every
 # crate in the workspace stays in lockstep.
 anyhow = "1"
+proptest = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

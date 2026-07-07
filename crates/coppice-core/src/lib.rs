@@ -15,6 +15,7 @@ pub mod attempt;
 pub mod id;
 pub mod job;
 pub mod node;
+pub mod quota;
 pub mod resource;
 
 /// Monotonic fencing token used to reject stale leaders and commands.

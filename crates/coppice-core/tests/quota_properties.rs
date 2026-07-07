@@ -1,0 +1,182 @@
+//! Property tests for the deterministic quota arithmetic (ADR 0019).
+//!
+//! The exact composition invariant is the load-bearing one: lazy decay means
+//! replicated usage is brought forward in however many hops the command
+//! stream happens to produce, and bracketing must never change the result.
+//! It holds by construction today (decay is literally the iterated per-tick
+//! step); these tests exist to catch any future "fast path" that breaks it.
+
+use coppice_core::quota::{
+    job_cost, penalty, true_up, ChargeRecord, CostUnits, CostWeights, DecayPolicy,
+    PriorityMultiplier, UsageState,
+};
+use coppice_core::resource::Resources;
+use proptest::prelude::*;
+
+/// Any policy that passes validation.
+fn valid_policy() -> impl Strategy<Value = DecayPolicy> {
+    (1i64..=3_600_000_000, 0u64..=DecayPolicy::MAX_DECAY_PER_TICK)
+        .prop_map(|(tick_us, decay_per_tick)| DecayPolicy { tick_us, decay_per_tick })
+}
+
+/// Timestamps within a realistic window (± a few months around 2026) so
+/// elapsed tick counts stay in the tens of thousands.
+const TS_BASE: i64 = 1_760_000_000_000_000;
+const TS_SPAN: i64 = 1_000_000_000_000; // ~11.6 days
+
+proptest! {
+    /// The composition invariant, at tick granularity, for arbitrary valid
+    /// policies: decaying n1 then n2 ticks equals decaying n1 + n2 ticks,
+    /// exactly.
+    #[test]
+    fn decay_composes_exactly_over_tick_splits(
+        u in any::<u64>(),
+        policy in valid_policy(),
+        n1 in 0u64..=4096,
+        n2 in 0u64..=4096,
+    ) {
+        let u = CostUnits(u);
+        let split = policy.decay_ticks(policy.decay_ticks(u, n1), n2);
+        let joined = policy.decay_ticks(u, n1 + n2);
+        prop_assert_eq!(split, joined);
+    }
+
+    /// The composition invariant at timestamp granularity: an intermediate
+    /// touch at any b with a ≤ b ≤ c is invisible. Absolute tick indices are
+    /// what make the two elapsed-tick counts sum exactly.
+    #[test]
+    fn touch_composes_exactly_over_timestamp_splits(
+        u in any::<u64>(),
+        start in TS_BASE..TS_BASE + TS_SPAN,
+        d1 in 0i64..TS_SPAN,
+        d2 in 0i64..TS_SPAN,
+    ) {
+        let policy = DecayPolicy::DEFAULT;
+        let (a, b, c) = (start, start + d1, start + d1 + d2);
+
+        let mut stepped = UsageState { usage: CostUnits(u), last_update_us: a };
+        stepped.touch(b, &policy);
+        stepped.touch(c, &policy);
+
+        let mut direct = UsageState { usage: CostUnits(u), last_update_us: a };
+        direct.touch(c, &policy);
+
+        prop_assert_eq!(stepped, direct);
+
+        // Same statement for the raw decay function.
+        let split = policy.decay_between(policy.decay_between(CostUnits(u), a, b), b, c);
+        prop_assert_eq!(split, policy.decay_between(CostUnits(u), a, c));
+    }
+
+    /// Clock-skew rule: a command timestamp at or before the stored one is a
+    /// complete no-op — no decay, no rewind — so a decay interval can never
+    /// be applied twice across leader changes.
+    #[test]
+    fn regressed_timestamps_are_no_ops(
+        u in any::<u64>(),
+        policy in valid_policy(),
+        last in TS_BASE..TS_BASE + TS_SPAN,
+        skew in 0i64..TS_SPAN,
+    ) {
+        let mut state = UsageState { usage: CostUnits(u), last_update_us: last };
+        let before = state;
+        state.touch(last - skew, &policy);
+        prop_assert_eq!(state, before);
+    }
+
+    /// Decay never increases usage, is monotone in elapsed ticks, and is
+    /// monotone in the starting value.
+    #[test]
+    fn decay_is_monotone(
+        u1 in any::<u64>(),
+        u2 in any::<u64>(),
+        policy in valid_policy(),
+        n in 0u64..=4096,
+        extra in 0u64..=4096,
+    ) {
+        let (lo, hi) = (CostUnits(u1.min(u2)), CostUnits(u1.max(u2)));
+        prop_assert!(policy.decay_ticks(hi, n) <= hi);
+        prop_assert!(policy.decay_ticks(hi, n + extra) <= policy.decay_ticks(hi, n));
+        prop_assert!(policy.decay_ticks(lo, n) <= policy.decay_ticks(hi, n));
+    }
+
+    /// Saturating arithmetic end to end: no input to cost computation,
+    /// charging, refunding, or true-up can panic or wrap, however extreme.
+    #[test]
+    fn extreme_inputs_never_panic(
+        cpu in any::<u64>(),
+        memory in any::<u64>(),
+        disk in any::<u64>(),
+        w_cpu in any::<u64>(),
+        w_mem in any::<u64>(),
+        w_disk in any::<u64>(),
+        runtime_s in any::<u64>(),
+        multiplier in any::<u64>(),
+        policy in valid_policy(),
+        ts in TS_BASE..TS_BASE + TS_SPAN,
+        charge2 in any::<u64>(),
+    ) {
+        let requests = Resources { cpu_millis: cpu, memory_bytes: memory, disk_bytes: disk };
+        let weights = CostWeights {
+            per_cpu_milli_second: w_cpu,
+            per_memory_byte_second: w_mem,
+            per_disk_byte_second: w_disk,
+        };
+        let cost = job_cost(&requests, &weights, runtime_s, PriorityMultiplier(multiplier));
+
+        let mut state = UsageState::new(ts - 1_000_000);
+        state.charge(cost, ts, &policy);
+        state.charge(CostUnits(charge2), ts, &policy);
+        prop_assert!(state.usage <= CostUnits::MAX);
+
+        let record = ChargeRecord { amount: cost, charged_at_us: ts };
+        let adjustment = true_up(&record, CostUnits(charge2), ts + 1, &policy);
+        state.settle(adjustment, ts + 1, &policy);
+        // Refunds saturate at zero: usage can never underflow.
+        state.refund(CostUnits::MAX, ts + 2, &policy);
+        prop_assert_eq!(state.usage, CostUnits::ZERO);
+    }
+
+    /// Penalty is 1 within quota, ≥ 1 always, and monotone in the ratio.
+    #[test]
+    fn penalty_is_monotone_and_anchored(
+        x1 in 0.0f64..1e12,
+        x2 in 0.0f64..1e12,
+        exponent_milli in 1000u32..=4000,
+    ) {
+        let (lo, hi) = (x1.min(x2), x1.max(x2));
+        if hi <= 1.0 {
+            prop_assert_eq!(penalty(hi, exponent_milli), 1.0);
+        }
+        prop_assert!(penalty(lo, exponent_milli) >= 1.0);
+        prop_assert!(penalty(lo, exponent_milli) <= penalty(hi, exponent_milli));
+    }
+
+    /// The fixed-point decay tracks the real exponential u·λⁿ. The f64
+    /// version is the *reference documenting intent*; the fixed-point one is
+    /// authoritative. Floor rounding loses < 1 µCU per tick and the loss
+    /// itself decays, bounding the drift by min(n, 1/(1−λ)); on top of that
+    /// we allow for f64's own rounding when computing the reference.
+    #[test]
+    fn fixed_point_decay_tracks_f64_reference(
+        u in any::<u64>(),
+        policy in valid_policy(),
+        n in 0u64..=4096,
+    ) {
+        let lambda = policy.decay_per_tick as f64 / 2f64.powi(64);
+        let reference = u as f64 * lambda.powi(n as i32);
+        let fixed = policy.decay_ticks(CostUnits(u), n).0 as f64;
+
+        // f64 slack: relative error of the reference product chain.
+        let slack = reference * (n + 1) as f64 * 1e-15 + 2.0;
+        let floor_drift = if lambda < 1.0 {
+            (n as f64).min(1.0 / (1.0 - lambda))
+        } else {
+            n as f64
+        };
+        prop_assert!(fixed <= reference + slack,
+            "fixed {fixed} exceeds reference {reference} beyond slack {slack}");
+        prop_assert!(reference - fixed <= floor_drift + slack,
+            "fixed {fixed} lags reference {reference} beyond drift {floor_drift} + slack {slack}");
+    }
+}
