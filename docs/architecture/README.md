@@ -7,6 +7,8 @@ it correct under failure and change.
 - [state-model.md](state-model.md) — desired vs. observed vs. derived state.
 - [high-availability.md](high-availability.md) — the Raft-based HA model and
   determinism requirements.
+- [command-catalog.md](command-catalog.md) — every replicated command and the
+  apply contract (rejections, funding, ingestion boundary).
 - [versioning.md](versioning.md) — evolving the replicated state model safely.
 - [data-storage-boundaries.md](data-storage-boundaries.md) — which store owns
   what.
