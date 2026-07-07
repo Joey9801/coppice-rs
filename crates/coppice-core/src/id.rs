@@ -16,6 +16,10 @@ macro_rules! typed_id {
 
         impl $name {
             /// Generate a fresh random identifier.
+            ///
+            /// Deliberately no `Default`: a defaulted id is always a bug, and
+            /// `..Default::default()` struct updates must not mint one silently.
+            #[allow(clippy::new_without_default)]
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
