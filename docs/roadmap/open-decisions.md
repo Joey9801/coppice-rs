@@ -327,3 +327,38 @@ depend on it.
 - Whether accruing allocations subsume time-based reservations entirely.
 - What the gang-scheduling seam is (a group-scoped readiness barrier) and what
   is deliberately deferred (funded-allocation wait policy for slow peers).
+
+## OD-13: Base score and the exact job-costing formula
+
+**Open** (raised 2026-07-07, while deciding
+[ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md)).
+
+**Question.** What exactly is `base(job)` in
+`effective_score = base(job) / Π penalty(usage_a / quota_a)`, and does the
+job-costing formula need refinement alongside it?
+
+**Why it matters.** The quota arithmetic (ADR 0019) fixed the replicated
+bookkeeping but not the scoring numerator. Within one quota entity the
+ancestor-penalty product is a shared factor that cancels, so relative order
+among a user's own queued jobs is decided entirely by `base(job)` and the
+FIFO tie-break. The expected behaviour — a later-submitted high-priority job
+outranks the same user's earlier low-priority jobs (the "Friday evening
+backlog" scenario) — therefore holds only if `base` is monotone in the
+requested priority. ADR 0005 defines priority's effect on *cost* (burn
+budget faster) but is silent on its effect on *rank*.
+
+**Considerations.**
+- `base` presumably a monotone function of the priority multiplier, FIFO
+  within a priority level; state and property-test the within-entity
+  ordering guarantee next to the quota arithmetic in `coppice-core`.
+- Whether `base` should also reflect job size/cost (cheap-job bias for
+  backfill already comes from ADR 0006; avoid double-counting).
+- Whether the placement-time charge of the full `max_runtime` cost needs
+  smoothing for very long jobs (a whale's charge lands as one lump), or
+  whether true-up plus decay is sufficient.
+- Scheduler data structure: per-entity penalty products with per-entity
+  queues ordered by `base`, so rescoring is O(entities touched), not O(jobs).
+
+**Related:** [ADR 0005](../decisions/0005-cost-based-soft-quotas.md),
+[ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md),
+[scheduling/quotas-and-priorities.md](../scheduling/quotas-and-priorities.md).
