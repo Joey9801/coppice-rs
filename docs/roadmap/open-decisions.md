@@ -1,19 +1,241 @@
-# Important Open Design Decisions
+# Open Design Decisions
 
-Several areas require further design before implementation. Each of these should
-eventually be resolved by an [Architecture Decision Record](../decisions/).
+This is the register of significant design questions that are **not yet
+settled**. It exists so that a human or agent picking up Coppice can quickly see
+what is undecided, why it matters, and what the trade-offs are — without
+re-deriving it from the whole design.
 
-- The exact Raft library and persistence layer need to be selected.
-- The command and snapshot schema versioning strategy needs to be defined.
-- The job lifecycle state machine needs to be formalized.
-- The scheduler's quota and priority policy needs a precise specification.
-- The reservation and backfilling model for large jobs needs more detailed
-  design.
-- The consistency model for reads from followers needs to be decided.
-- The event subscription delivery guarantees need to be specified.
-- The agent fencing and reconciliation protocol needs to be defined.
-- The image-cache policy needs to distinguish between local agent autonomy and
-  central scheduling hints.
-- The security model for container execution needs clear boundaries.
-- The data retention policy for events, metrics, logs, and job history needs to
-  be chosen.
+## How to use this register
+
+- Each entry has an ID (`OD-N`), a status, the question, why it matters, and the
+  main options or considerations.
+- When a question is **resolved**, write an [ADR](../decisions/) capturing the
+  decision and its rationale, change the entry's status to _Resolved_, and link
+  the ADR. Do not delete the entry — the register should show what has been
+  decided as well as what remains.
+- Keep the design docs (the rest of `docs/`) describing the _current intended_
+  design; keep the _reasoning_ in ADRs; keep the _list of what's still undecided_
+  here.
+- Add new questions as `OD-N` with the next free number.
+
+## Status at a glance
+
+| ID | Question | Blocking? | Status |
+| --- | --- | --- | --- |
+| [OD-1](#od-1-raft-library-and-persistence-layer) | Raft library & persistence layer | Yes — foundational | Open |
+| [OD-2](#od-2-command-and-snapshot-schema-versioning) | Command & snapshot schema versioning | Yes — hard to change later | Open |
+| [OD-3](#od-3-job-lifecycle-state-machine) | Job lifecycle state machine | Yes — touches everything | Open |
+| [OD-4](#od-4-quota-and-priority-policy) | Quota & priority policy | High | Open |
+| [OD-5](#od-5-reservation-and-backfilling-model) | Reservation & backfilling for large jobs | Medium | Open |
+| [OD-6](#od-6-follower-read-consistency-model) | Follower read consistency | Medium | Open |
+| [OD-7](#od-7-event-subscription-delivery-guarantees) | Event subscription delivery guarantees | Medium | Open |
+| [OD-8](#od-8-agent-fencing-and-reconciliation-protocol) | Agent fencing & reconciliation | High | Open |
+| [OD-9](#od-9-image-cache-autonomy-vs-central-hints) | Image-cache autonomy vs. central hints | Low | Open |
+| [OD-10](#od-10-container-execution-security-model) | Container execution security model | High | Open |
+| [OD-11](#od-11-data-retention-policy) | Data retention policy | Low | Open |
+
+"Blocking?" is a rough judgement of how much other work is gated on the answer.
+
+---
+
+## OD-1: Raft library and persistence layer
+
+**Question.** Which Raft implementation and durable log/snapshot storage does the
+coordinator build on?
+
+**Why it matters.** This is the most foundational choice: it shapes the
+`coppice-consensus` API, the snapshotting model, the apply loop, and the
+operational story (backup, disaster recovery). It is expensive to change once
+built against.
+
+**Considerations.**
+- Build on an existing Rust Raft crate (e.g. an `openraft`-style library) vs. a
+  more manual integration over a lower-level log.
+- Persistence: embedded key-value store for the log and snapshots vs. custom
+  segment files.
+- Must support snapshotting so recovering coordinators don't replay an unbounded
+  log (see [high-availability](../architecture/high-availability.md)).
+- The library's determinism and threading model must let expensive scheduling
+  stay off the apply path.
+
+**Related:** [architecture/high-availability.md](../architecture/high-availability.md),
+`coppice-consensus`.
+
+## OD-2: Command and snapshot schema versioning
+
+**Question.** How are command formats, snapshot formats, and durable state
+schemas versioned and evolved?
+
+**Why it matters.** Old log entries and snapshots may be read by newer binaries,
+and rolling upgrades run mixed versions briefly. A wrong choice here can make
+rollback impossible or corrupt state during upgrade.
+
+**Considerations.**
+- Serialization format and its evolution rules (additive-only fields, explicit
+  version tags, feature gates bumped through Raft).
+- The upgrade choreography in [versioning](../architecture/versioning.md)
+  (read-new/write-old, then flip) needs a concrete mechanism.
+- How downgrade limits are expressed and enforced.
+
+**Related:** [architecture/versioning.md](../architecture/versioning.md),
+`coppice-state`.
+
+## OD-3: Job lifecycle state machine
+
+**Question.** What is the formal set of job states, the legal transitions between
+them, and the owner of each transition?
+
+**Why it matters.** The lifecycle is referenced by the API, scheduler, agent,
+reconciler, and events. Ambiguity here causes correctness bugs and inconsistent
+UI/observability.
+
+**Considerations.**
+- The `JobState` enum in `coppice-core` lists the states; the **transition
+  table** (which edges are legal, who commits each) is what's missing.
+- Where retries create new attempts vs. reuse identity.
+- How cancellation interleaves with in-flight assignment/dispatch.
+
+**Related:** [lifecycle/job-lifecycle.md](../lifecycle/job-lifecycle.md),
+`coppice-core::job`.
+
+## OD-4: Quota and priority policy
+
+**Question.** What is the precise admission-control, queue-ordering, priority,
+and fair-share specification?
+
+**Why it matters.** Determines who gets capacity under contention. Must be
+replicated where it affects decisions so failover doesn't produce inconsistent
+outcomes.
+
+**Considerations.**
+- Ownership levels (user, project, org, queue, service account) and how they
+  compose.
+- Separation of admission control, queue ordering, scheduling priority,
+  fair-share, hard limits, burst allowances, and (later) preemption.
+- Which accounting state is authoritative/replicated vs. derived.
+
+**Related:** [scheduling/quotas-and-priorities.md](../scheduling/quotas-and-priorities.md),
+`coppice-scheduler`.
+
+## OD-5: Reservation and backfilling model
+
+**Question.** How are large ("whale") jobs given earmarked future capacity, and
+how is smaller work safely backfilled around those reservations?
+
+**Why it matters.** Without it, large jobs starve or block throughput. With a
+naive version, reservations leak capacity or backfill violates them.
+
+**Considerations.**
+- Representation of a reservation in replicated state and its expiry/renewal.
+- Backfill safety: guaranteeing backfilled jobs finish before (or don't delay)
+  the reserved job.
+- Interaction with runtime estimates, which are advisory and uncertain.
+
+**Related:** [scheduling/scheduling-model.md](../scheduling/scheduling-model.md).
+
+## OD-6: Follower read consistency model
+
+**Question.** Which reads may be served by followers, and with what freshness
+guarantee?
+
+**Why it matters.** Affects API scalability and correctness of what clients see.
+Serving stale data from followers is cheap but can mislead; strong reads cost a
+round-trip to the leader.
+
+**Considerations.**
+- Categories from [high-availability](../architecture/high-availability.md):
+  strong (read-index/leader-confirmed), stale-tolerant follower reads, and
+  eventually-consistent reads from derived stores.
+- Which API endpoints fall into which category, and how staleness is surfaced to
+  callers.
+
+**Related:** [architecture/high-availability.md](../architecture/high-availability.md),
+`coppice-api`.
+
+## OD-7: Event subscription delivery guarantees
+
+**Question.** What ordering, gap, and reconnection guarantees does the
+event/subscription system provide?
+
+**Why it matters.** Clients (UI, integrations) rely on updates but must be able
+to recover from missed events by re-querying authoritative state.
+
+**Considerations.**
+- Cursor/sequence semantics and how a client detects it has fallen too far
+  behind (gap indication → resync via query).
+- Whether the event log is bounded and derived vs. tied to the Raft log.
+- Per-scope ordering guarantees (per job, per queue).
+
+**Related:** [architecture/components.md](../architecture/components.md) (Event
+and Subscription System).
+
+## OD-8: Agent fencing and reconciliation protocol
+
+**Question.** What is the concrete protocol by which agents reject stale-leader
+commands and reconcile running containers with coordinator intent?
+
+**Why it matters.** This is the safety boundary against split-brain and
+duplicate execution. Getting fencing wrong means jobs run twice or stale leaders
+cause harm.
+
+**Considerations.**
+- Which epoch/term/fencing token travels on each message, and the exact reject
+  rules (see [agent-coordinator](../protocols/agent-coordinator.md)).
+- Reconciliation on agent restart: inspect local durable state, report actual
+  running set, let the coordinator decide accept/cancel/retry/lost.
+- Idempotency keys (job/allocation/attempt/command ids) and dedup windows.
+
+**Related:** [protocols/agent-coordinator.md](../protocols/agent-coordinator.md),
+[operations/failure-handling.md](../operations/failure-handling.md),
+`coppice-proto::agent`.
+
+## OD-9: Image-cache autonomy vs. central hints
+
+**Question.** Where is the line between local agent cache autonomy and central
+scheduling hints/policy?
+
+**Why it matters.** Local disk safety must win, but central hints improve
+startup latency and registry load. The boundary decides who evicts and how much
+cache state enters replicated state.
+
+**Considerations.**
+- Agents own eviction under disk pressure; coordinator provides hints/policy.
+- Only cache metadata affecting durable scheduling decisions enters replicated
+  state; detailed inventory stays observed.
+- Optional future features (prefetch, warming, eviction scoring).
+
+**Related:** [scheduling/image-cache.md](../scheduling/image-cache.md).
+
+## OD-10: Container execution security model
+
+**Question.** What are the security boundaries for executing user containers?
+
+**Why it matters.** User workloads are untrusted code running on shared nodes.
+Unclear boundaries are a direct path to node/cluster compromise.
+
+**Considerations.**
+- Posture around privileged containers, host mounts, network access, and user
+  identity/isolation.
+- Secret handling: integration with a secret manager; never exposing secrets in
+  logs, events, snapshots, or UI.
+- Node identity and mutual authentication between coordinator and agents.
+
+**Related:** [operations/security.md](../operations/security.md).
+
+## OD-11: Data retention policy
+
+**Question.** How long are events, metrics, logs, and job history retained, and
+where?
+
+**Why it matters.** Drives storage cost, debuggability, and compliance. Needs to
+respect the [storage boundaries](../architecture/data-storage-boundaries.md) so
+retention choices don't leak high-volume data into replicated state.
+
+**Considerations.**
+- Separate retention per store (metrics TSDB, log store, event log, job-history
+  store).
+- What summarized job history is kept in/near authoritative state vs. an
+  analytical store.
+
+**Related:** [architecture/data-storage-boundaries.md](../architecture/data-storage-boundaries.md),
+[operations/observability.md](../operations/observability.md).
