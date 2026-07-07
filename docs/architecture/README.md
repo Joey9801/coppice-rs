@@ -9,6 +9,9 @@ it correct under failure and change.
   determinism requirements.
 - [command-catalog.md](command-catalog.md) — every replicated command and the
   apply contract (rejections, funding, ingestion boundary).
+- [coordinator-runtime.md](coordinator-runtime.md) — the coordinator's task
+  topology: state ownership, every channel and its bound, proposal lifecycle,
+  and leader transitions.
 - [versioning.md](versioning.md) — evolving the replicated state model safely.
 - [schema-style.md](schema-style.md) — the protobuf schema corpus (`proto/`)
   and its evolution rules: tag discipline, representation rules, and the
