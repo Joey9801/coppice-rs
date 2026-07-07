@@ -18,6 +18,13 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# coppice-testkit dev-depends back on this crate; Cargo permits the cycle
+# because dev-dependencies sit outside the library's own build graph.
+coppice-proto.workspace = true
+coppice-testkit.workspace = true
+crc32c.workspace = true
+criterion.workspace = true
+prost.workspace = true
 tempfile.workspace = true
 
 [features]
@@ -29,3 +36,18 @@ storage-compliance = []
 
 [lints]
 workspace = true
+
+# ADR 0018 storage benchmark suite (docs/architecture/storage-testing.md,
+# "The benchmark suite"). criterion drives all three; harness = false hands
+# `main` to criterion's own runner instead of the default `#[bench]` harness.
+[[bench]]
+name = "append_commit"
+harness = false
+
+[[bench]]
+name = "snapshot_codec"
+harness = false
+
+[[bench]]
+name = "recovery_replay"
+harness = false
