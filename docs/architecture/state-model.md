@@ -4,7 +4,8 @@ The system should be explicit about desired state, observed state, and derived
 state.
 
 **Desired state** is what the control plane intends to happen. Examples include
-submitted jobs, cancellations, assignments, reservations, node drain requests,
+submitted jobs, abort requests, assignments, accruing allocations, node drain
+requests,
 and policy configuration.
 
 **Observed state** is what agents and monitoring systems report. Examples include

@@ -7,8 +7,8 @@ decisions.
 
 It should not directly mutate authoritative state. Instead, it should operate on
 a consistent snapshot or versioned view of the cluster state, compute a batch of
-proposed assignments or reservations, and submit those proposals back to the
-coordinator leader for validation and commitment.
+proposed assignments, accruing allocations, and revocations, and submit those
+proposals back to the coordinator leader for validation and commitment.
 
 The scheduler must handle:
 
@@ -38,14 +38,15 @@ A useful model is:
 3. Classify jobs into ordinary jobs, constrained jobs, and large jobs where
    useful.
 4. Compute feasible placements against a snapshot of cluster state.
-5. Use reservations or earmarked future capacity for large jobs that cannot run
-   immediately but must not be starved.
-6. Backfill around reservations when safe.
-7. Submit a batch of proposed placements and reservations for atomic validation.
+5. Commit accruing allocations for large jobs that cannot run immediately but
+   must not be starved, so they accumulate capacity as it frees.
+6. Backfill around accruing allocations when provably safe.
+7. Submit a batch of proposed placements, accruals, and revocations for atomic
+   validation.
 8. Recompute when the proposal conflicts with newer committed state.
 
 The scheduler should expect proposals to fail validation due to concurrent
-changes, node loss, job cancellation, quota updates, or leader changes. Failed
+changes, node loss, job abort, quota updates, or leader changes. Failed
 proposals are normal and should trigger recomputation, not exceptional control
 flow.
 
@@ -87,16 +88,54 @@ Bin packing should be heuristic. Full optimal packing is not practical at the
 target scale. The scheduler should use a combination of candidate pruning,
 scoring, batching, and incremental recomputation.
 
-## Large jobs, reservations, and backfilling
+## Large jobs, accrual, and backfilling
 
 Large jobs require special care. A strict single-job-at-a-time admission loop
 can allow a large unschedulable job to block throughput. Conversely, ignoring
 the large job allows smaller jobs to continuously consume capacity and starve
-it. The design should support reservations or earmarked future capacity so that
-large jobs can make progress while safe backfilling continues around them.
+it.
 
-The detailed reservation and backfilling model is an
-[open design decision](../roadmap/open-decisions.md).
+The model, decided in
+[ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md), is
+**accruing allocations** plus strict (EASY) backfill — there is no standalone
+reservation object.
+
+The trigger rule matters and is easy to get wrong: **an accruing allocation is
+the license to backfill past a job, not a placement optimization.** "Whale" is
+shorthand for "blocked at the head of the effective-score order while others
+are backfilled past it" — not a size classification, and there is no
+user-declared whale flag.
+
+- The default state of a queued job is *unpinned*, even on a saturated
+  cluster with a deep queue. It is seated by ordinary score-order placement
+  the moment any node frees enough capacity, wherever that is; no guess about
+  which node frees first is ever committed for it.
+- An accruing allocation is created only when the scheduler wants to hand
+  freed capacity to a job *behind* a blocked higher-score job and must prove
+  the blocked job is not starved. The blocked job then gets allocations on
+  specific nodes in the `Accruing` state; freed capacity on those nodes is
+  pledged to accruing allocations in commit order, deterministically, until
+  they are `Funded` and the attempt passes the `Ready` barrier (see
+  [../lifecycle/job-lifecycle.md](../lifecycle/job-lifecycle.md)).
+- At most K jobs hold accruing allocations at once (replicated config,
+  default 4). K bounds simultaneous *guarantees*, not throughput: jobs beyond
+  the top-K are seated normally whenever they fit, and quota decay keeps
+  effective scores moving so the protected window rotates rather than being
+  camped on.
+- An accrual is a hold, not a destination commitment. The scheduler re-plans
+  every pass; if the job's slot appears on a different node first it is
+  seated there and the accrual is revoked.
+- Accruing allocations are revocable by scheduler command for re-planning
+  (attempt outcome `Revoked`, requeued free of retry budget) — the
+  anti-deadlock and anti-leak story for overlapping half-funded whales.
+- A job may **backfill** into pledged capacity only if it has an *enforced*
+  `max_runtime` and `now + max_runtime ≤ projected_ready(A)` for every
+  accruing allocation A it would touch, where `projected_ready` is the
+  worst-case funding time computed from the enforced `max_runtime`s of the
+  jobs currently holding A's remainder. Jobs without a `max_runtime` never
+  touch pledged capacity, so accrual is never delayed by backfill.
+- Advisory runtime estimates may inform heuristics but never the backfill
+  safety check.
 
 ## Runtime estimates
 
@@ -112,7 +151,8 @@ Runtime estimates may come from several sources:
 
 Runtime estimates are advisory unless tied to explicit policy such as maximum
 runtime enforcement. Persist only the estimates and progress signals that affect
-durable scheduling decisions, fairness, reservations, or user-visible semantics.
+durable scheduling decisions, fairness, accrual projections, or user-visible
+semantics.
 
 ## Related
 

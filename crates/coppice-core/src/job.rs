@@ -1,9 +1,11 @@
 //! Job definition and lifecycle.
 //!
 //! The lifecycle enum below mirrors the states documented in
-//! `docs/lifecycle/job-lifecycle.md`. Every transition has a clear owner
-//! (user command, scheduler, coordinator, agent, or reconciler); the concrete
-//! transition table is still being formalised.
+//! `docs/lifecycle/job-lifecycle.md`, whose transition table (decided in
+//! `docs/decisions/0004-job-lifecycle-and-attempts.md`) defines the legal
+//! edges and their owners. Attempts are first-class: retries mint a new
+//! `AttemptId` and return the job to `Queued`; cancellation is a
+//! `cancel_requested` flag on the job, not a distinct state.
 
 use serde::{Deserialize, Serialize};
 

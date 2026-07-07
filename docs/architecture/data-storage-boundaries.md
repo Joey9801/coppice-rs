@@ -16,4 +16,6 @@ clear is what keeps the replicated state machine small, deterministic, and fast.
 See [state-model.md](state-model.md) for the desired/observed/derived
 distinction that drives these boundaries, and
 [../operations/observability.md](../operations/observability.md) for what flows
-into the metrics and logging systems.
+into the metrics and logging systems. Retention per store — including eviction
+of terminal jobs from replicated state into a 90-day SQL job-history store —
+was decided in [ADR 0012](../decisions/0012-data-retention.md).

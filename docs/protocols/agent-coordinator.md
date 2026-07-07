@@ -48,6 +48,23 @@ coordinator should not assume that a sent command was executed until the agent
 reports observed state. The agent should not assume a command is current unless
 it passes epoch and identity checks.
 
-The concrete fencing and reconciliation protocol is an
-[open design decision](../roadmap/open-decisions.md). The message enums in
-`coppice-proto` (`agent` module) are the code-side anchor for this document.
+## Fencing and reconciliation
+
+Decided in [ADR 0009](../decisions/0009-fencing-and-reconciliation.md):
+
+- The fencing token is **`(leader_term, node_epoch)`**; `node_epoch` is
+  replicated per node and bumped on (re)registration or when the node is
+  declared lost. Every coordinator→agent command carries the token plus a
+  per-node `command_seq`. Agents durably track the highest accepted token and
+  reject lower terms, mismatched epochs, and already-seen sequence numbers.
+- `StartJob` is idempotent on `AllocationId`; status reports are idempotent on
+  `(AttemptId, attempt_state)` because the attempt state machine is monotonic.
+- Agents journal `(allocation_id, attempt_id, job_id, epoch)` durably before
+  starting a container, and label containers with allocation/attempt IDs. On
+  restart the agent rebuilds its actual set from journal + runtime, registers
+  (receiving a fresh `node_epoch`), and reports the full **ObservedSet**; the
+  coordinator diffs it against replicated intent and commits adopt / stop /
+  lost per allocation. The same diff runs periodically against heartbeats.
+
+The message enums in `coppice-proto` (`agent` module) are the code-side anchor
+for this document.

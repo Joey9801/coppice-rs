@@ -1,6 +1,8 @@
 # High Availability Model
 
-The coordinator control plane should use Raft.
+The coordinator control plane should use Raft. The implementation — openraft
+over a custom segment-file storage layer — was decided in
+[ADR 0002](../decisions/0002-openraft-with-custom-segment-storage.md).
 
 Raft provides a replicated log, leader election, and a deterministic replicated
 state machine. The system should be designed around that model.
@@ -16,6 +18,10 @@ Read paths can be divided into categories:
 - Stale-tolerant reads served from followers.
 - UI or observability reads from derived stores where eventual consistency is
   acceptable.
+
+Which endpoints default to which category, the client override, and how
+staleness is surfaced were decided in
+[ADR 0007](../decisions/0007-per-endpoint-read-consistency.md).
 
 ## Determinism requirements
 

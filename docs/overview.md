@@ -32,7 +32,8 @@ It accepts job submissions from users and services, validates them, records them
 durably, and exposes their lifecycle state.
 
 It maintains an authoritative view of cluster state, including jobs, nodes,
-allocations, resource reservations, quotas, and relevant scheduling metadata.
+allocations (including accruing allocations that earmark future capacity),
+quotas, and relevant scheduling metadata.
 
 It makes placement decisions using a scheduler that understands resource
 availability, hard constraints, soft preferences, quotas, priorities, affinity,

@@ -1,6 +1,9 @@
 # State-Machine Evolution and Versioning
 
-The replicated state model must be designed for evolution.
+The replicated state model must be designed for evolution. The concrete
+mechanism — protobuf with additive-only evolution rules and a Raft-replicated
+`ClusterVersion` gating semantic changes — was decided in
+[ADR 0003](../decisions/0003-protobuf-serialization-and-cluster-version-gates.md).
 
 Old log entries may be replayed by newer binaries. Snapshots may be read by
 newer binaries. During rolling upgrades, different coordinator replicas may
@@ -21,7 +24,8 @@ adding derived indexes.
 
 Riskier changes require migration planning. Examples include changing command
 semantics, changing scheduler policy in a way that affects existing
-reservations, changing quota accounting, or changing job lifecycle meaning.
+accruing allocations, changing quota accounting, or changing job lifecycle
+meaning.
 
 ## Upgrade strategy
 
@@ -43,6 +47,6 @@ changes until it is intentionally committed to them.
 
 Bad scheduler behavior is easier to roll back than bad state-machine format
 changes if placement policy is kept outside the deterministic application path.
-However, any committed placements, reservations, or quota changes remain part of
+However, any committed placements, allocations, or quota changes remain part of
 history and must be corrected through new commands rather than by rewriting the
 log.

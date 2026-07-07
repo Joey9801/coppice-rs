@@ -24,17 +24,19 @@ minority coordinators must reject them using epoch checks.
 
 ## Job execution failure
 
-Job execution failure should be classified. Examples include image pull failure,
-container start failure, runtime nonzero exit, resource exhaustion, node loss,
-timeout, cancellation, and internal scheduler or agent error. Retry policy
-should be explicit and should avoid retry storms.
+Job execution failure is classified through the attempt outcome taxonomy
+(`Exited`, `OomKilled`, `MaxRuntimeExceeded`, `Aborted`, `Revoked`,
+`PullFailed`, `StartFailed`, `NodeLost`, `AgentError` — see
+[ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md)), each
+classified as success, user error, user request, or platform failure. Retry
+policy keys off that classification and should avoid retry storms.
 
 ## Node restart
 
 Node restart should trigger local reconciliation. The agent should inspect
 existing containers and local durable state, then report what is actually
-running. The coordinator decides whether to accept, cancel, retry, or mark jobs
-lost.
+running. The coordinator diffs that report against replicated intent and
+commits adopt, stop, or lost per allocation.
 
 See [../architecture/high-availability.md](../architecture/high-availability.md)
 for the consensus and fencing mechanics these recovery paths rely on.

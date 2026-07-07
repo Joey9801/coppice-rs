@@ -7,9 +7,10 @@
 //! applies committed entries, manages terms/epochs for fencing, and persists
 //! snapshots so recovering coordinators need not replay an unbounded log.
 //!
-//! The concrete Raft library and persistence layer are not yet chosen; see
-//! `docs/roadmap/open-decisions.md`. The traits here define the seam so that
-//! decision can be deferred without blocking the rest of the workspace.
+//! The concrete choice — openraft over a custom append-only segment-file
+//! storage layer — is recorded in
+//! `docs/decisions/0002-openraft-with-custom-segment-storage.md`. The traits
+//! here are the seam that implementation will fill in.
 
 use coppice_state::Command;
 

@@ -5,7 +5,7 @@ The initial version should aim for a small but structurally correct system.
 A reasonable first cut includes:
 
 - Coordinator cluster using Raft.
-- Job submission and cancellation.
+- Job submission and abort.
 - Basic job lifecycle.
 - Node agent registration and heartbeat.
 - Docker container execution.

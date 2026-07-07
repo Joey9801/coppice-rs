@@ -6,7 +6,7 @@ The system should be designed to explain its decisions.
 
 For each pending job, it should be possible to determine why it is not running.
 Reasons may include insufficient resources, hard constraint mismatch, quota
-exhaustion, priority ordering, reservation behavior, image availability, node
+exhaustion, priority ordering, allocation accrual, image availability, node
 health, or scheduler backoff.
 
 For each placed job, it should be possible to determine why the selected node
@@ -55,7 +55,7 @@ observations, such as:
 - Final status.
 - Peak resource summaries, if needed.
 - Runtime estimate updates used by scheduling.
-- Progress milestones used for reservation decisions.
+- Progress milestones used for accrual and funding projections.
 
 ## Metrics
 
@@ -75,7 +75,7 @@ Important metric categories include:
 - API latency and error rates.
 - Event subscription counts and lag.
 - Image pull latency and cache hit rate.
-- Job success, failure, retry, and cancellation rates.
+- Job success, failure, retry, and abort rates.
 
 See [../architecture/data-storage-boundaries.md](../architecture/data-storage-boundaries.md)
 for where these outputs are stored.

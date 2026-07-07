@@ -23,10 +23,13 @@ For intelligent caching, the system may later add:
 - Eviction scoring based on recency, frequency, size, and expected demand.
 - Registry rate-limit awareness.
 
-Only cache metadata that affects durable scheduling or policy decisions needs to
-enter the replicated state. Detailed cache contents can be reported periodically
-and treated as observed state (see
-[../architecture/state-model.md](../architecture/state-model.md)).
-
-The boundary between local agent autonomy and central scheduling hints is an
-[open design decision](../roadmap/open-decisions.md).
+The autonomy boundary was decided in
+[ADR 0010](../decisions/0010-image-cache-boundary.md): agents own eviction
+absolutely (LRU in v1, with images pinned while an assigned or running
+allocation references them); cache inventory is reported periodically and
+treated as observed state used for soft scoring only (see
+[../architecture/state-model.md](../architecture/state-model.md)); central
+`PrepareCache`/`EvictHint` messages are advisory and may be ignored. Nothing
+cache-related enters replicated state in v1 — any future feature that makes
+durable decisions depend on cache state must define exactly which facts become
+replicated.

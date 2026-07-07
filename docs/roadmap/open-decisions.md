@@ -22,23 +22,31 @@ re-deriving it from the whole design.
 
 | ID | Question | Blocking? | Status |
 | --- | --- | --- | --- |
-| [OD-1](#od-1-raft-library-and-persistence-layer) | Raft library & persistence layer | Yes — foundational | Open |
-| [OD-2](#od-2-command-and-snapshot-schema-versioning) | Command & snapshot schema versioning | Yes — hard to change later | Open |
-| [OD-3](#od-3-job-lifecycle-state-machine) | Job lifecycle state machine | Yes — touches everything | Open |
-| [OD-4](#od-4-quota-and-priority-policy) | Quota & priority policy | High | Open |
-| [OD-5](#od-5-reservation-and-backfilling-model) | Reservation & backfilling for large jobs | Medium | Open |
-| [OD-6](#od-6-follower-read-consistency-model) | Follower read consistency | Medium | Open |
-| [OD-7](#od-7-event-subscription-delivery-guarantees) | Event subscription delivery guarantees | Medium | Open |
-| [OD-8](#od-8-agent-fencing-and-reconciliation-protocol) | Agent fencing & reconciliation | High | Open |
-| [OD-9](#od-9-image-cache-autonomy-vs-central-hints) | Image-cache autonomy vs. central hints | Low | Open |
-| [OD-10](#od-10-container-execution-security-model) | Container execution security model | High | Open |
-| [OD-11](#od-11-data-retention-policy) | Data retention policy | Low | Open |
+| [OD-1](#od-1-raft-library-and-persistence-layer) | Raft library & persistence layer | Yes — foundational | Resolved — [ADR 0002](../decisions/0002-openraft-with-custom-segment-storage.md) |
+| [OD-2](#od-2-command-and-snapshot-schema-versioning) | Command & snapshot schema versioning | Yes — hard to change later | Resolved — [ADR 0003](../decisions/0003-protobuf-serialization-and-cluster-version-gates.md) |
+| [OD-3](#od-3-job-lifecycle-state-machine) | Job lifecycle state machine | Yes — touches everything | Resolved — [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md) (superseding [ADR 0004](../decisions/0004-job-lifecycle-and-attempts.md)) |
+| [OD-4](#od-4-quota-and-priority-policy) | Quota & priority policy | High | Resolved — [ADR 0005](../decisions/0005-cost-based-soft-quotas.md) |
+| [OD-5](#od-5-reservation-and-backfilling-model) | Reservation & backfilling for large jobs | Medium | Resolved — [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) (superseding [ADR 0006](../decisions/0006-reservations-and-strict-backfill.md)) |
+| [OD-6](#od-6-follower-read-consistency-model) | Follower read consistency | Medium | Resolved — [ADR 0007](../decisions/0007-per-endpoint-read-consistency.md) |
+| [OD-7](#od-7-event-subscription-delivery-guarantees) | Event subscription delivery guarantees | Medium | Resolved — [ADR 0008](../decisions/0008-event-delivery-guarantees.md) |
+| [OD-8](#od-8-agent-fencing-and-reconciliation-protocol) | Agent fencing & reconciliation | High | Resolved — [ADR 0009](../decisions/0009-fencing-and-reconciliation.md) |
+| [OD-9](#od-9-image-cache-autonomy-vs-central-hints) | Image-cache autonomy vs. central hints | Low | Resolved — [ADR 0010](../decisions/0010-image-cache-boundary.md) |
+| [OD-10](#od-10-container-execution-security-model) | Container execution security model | High | Resolved — [ADR 0011](../decisions/0011-container-security-posture.md) |
+| [OD-11](#od-11-data-retention-policy) | Data retention policy | Low | Resolved — [ADR 0012](../decisions/0012-data-retention.md) |
+| [OD-12](#od-12-abort-semantics-partial-scheduling-and-job-groups) | Abort semantics, partial scheduling & job groups | High | Resolved — [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md), [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) |
+
+All eleven initial questions were resolved on 2026-07-07; the ADRs linked above
+carry the decisions and rationale. New questions get the next free `OD-N`.
 
 "Blocking?" is a rough judgement of how much other work is gated on the answer.
 
 ---
 
 ## OD-1: Raft library and persistence layer
+
+**Resolved** (2026-07-07): openraft, over a custom append-only segment-file
+storage layer for log, vote metadata, and snapshots —
+[ADR 0002](../decisions/0002-openraft-with-custom-segment-storage.md).
 
 **Question.** Which Raft implementation and durable log/snapshot storage does the
 coordinator build on?
@@ -63,6 +71,11 @@ built against.
 
 ## OD-2: Command and snapshot schema versioning
 
+**Resolved** (2026-07-07): protobuf via prost for all durable and wire formats,
+with additive-only evolution and a Raft-replicated `ClusterVersion` gating
+semantic changes —
+[ADR 0003](../decisions/0003-protobuf-serialization-and-cluster-version-gates.md).
+
 **Question.** How are command formats, snapshot formats, and durable state
 schemas versioned and evolved?
 
@@ -82,6 +95,13 @@ rollback impossible or corrupt state during upgrade.
 
 ## OD-3: Job lifecycle state machine
 
+**Resolved** (2026-07-07): initially by
+[ADR 0004](../decisions/0004-job-lifecycle-and-attempts.md); refined the same
+day by [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md)
+(see OD-12) — coarse user-visible job machine, detailed attempt machine with a
+`Ready` funding barrier, per-node allocation machine, and explicit abort
+semantics with a terminal outcome taxonomy.
+
 **Question.** What is the formal set of job states, the legal transitions between
 them, and the owner of each transition?
 
@@ -99,6 +119,11 @@ UI/observability.
 `coppice-core::job`.
 
 ## OD-4: Quota and priority policy
+
+**Resolved** (2026-07-07): no hard limits; a generic tree of quota entities
+with soft quotas, a single scalar cost per job, exponentially decayed usage,
+and quota breaches penalizing effective priority —
+[ADR 0005](../decisions/0005-cost-based-soft-quotas.md).
 
 **Question.** What is the precise admission-control, queue-ordering, priority,
 and fair-share specification?
@@ -119,6 +144,14 @@ outcomes.
 
 ## OD-5: Reservation and backfilling model
 
+**Resolved** (2026-07-07): initially by
+[ADR 0006](../decisions/0006-reservations-and-strict-backfill.md); superseded
+the same day by
+[ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md)
+(see OD-12) — accruing allocations *are* the reservations; the strict
+enforced-`max_runtime` backfill rule carries over against projected funding
+time.
+
 **Question.** How are large ("whale") jobs given earmarked future capacity, and
 how is smaller work safely backfilled around those reservations?
 
@@ -134,6 +167,11 @@ naive version, reservations leak capacity or backfill violates them.
 **Related:** [scheduling/scheduling-model.md](../scheduling/scheduling-model.md).
 
 ## OD-6: Follower read consistency model
+
+**Resolved** (2026-07-07): per-endpoint consistency defaults
+(strong / bounded-stale / eventual) with an explicit client override and
+staleness surfaced in response metadata —
+[ADR 0007](../decisions/0007-per-endpoint-read-consistency.md).
 
 **Question.** Which reads may be served by followers, and with what freshness
 guarantee?
@@ -154,6 +192,11 @@ round-trip to the leader.
 
 ## OD-7: Event subscription delivery guarantees
 
+**Resolved** (2026-07-07): events derived at apply time with the Raft apply
+index as cursor; per-scope total order, at-least-once delivery, bounded
+reconnection buffer, gap indication → resync via query —
+[ADR 0008](../decisions/0008-event-delivery-guarantees.md).
+
 **Question.** What ordering, gap, and reconnection guarantees does the
 event/subscription system provide?
 
@@ -170,6 +213,11 @@ to recover from missed events by re-querying authoritative state.
 and Subscription System).
 
 ## OD-8: Agent fencing and reconciliation protocol
+
+**Resolved** (2026-07-07): fencing token `(leader_term, node_epoch)` plus
+per-node command sequence; allocation/attempt-scoped idempotency; agent journal
+and full ObservedSet diff on restart —
+[ADR 0009](../decisions/0009-fencing-and-reconciliation.md).
 
 **Question.** What is the concrete protocol by which agents reject stale-leader
 commands and reconcile running containers with coordinator intent?
@@ -191,6 +239,11 @@ cause harm.
 
 ## OD-9: Image-cache autonomy vs. central hints
 
+**Resolved** (2026-07-07): agents own eviction absolutely; cache inventory is
+observed state used for soft scoring only; central hints are advisory; nothing
+cache-related is replicated in v1 —
+[ADR 0010](../decisions/0010-image-cache-boundary.md).
+
 **Question.** Where is the line between local agent cache autonomy and central
 scheduling hints/policy?
 
@@ -208,6 +261,11 @@ cache state enters replicated state.
 
 ## OD-10: Container execution security model
 
+**Resolved** (2026-07-07): default-deny posture (no privileged, no host
+mounts/network, non-root) with admin-allowlisted exceptions per queue or node
+pool; mTLS node identity from day one; secrets deferred —
+[ADR 0011](../decisions/0011-container-security-posture.md).
+
 **Question.** What are the security boundaries for executing user containers?
 
 **Why it matters.** User workloads are untrusted code running on shared nodes.
@@ -224,6 +282,11 @@ Unclear boundaries are a direct path to node/cluster compromise.
 
 ## OD-11: Data retention policy
 
+**Resolved** (2026-07-07): per-store retention with terminal jobs evicted from
+replicated state 72 h after completion via commanded cleanup, and a 90-day SQL
+job-history store as a sink —
+[ADR 0012](../decisions/0012-data-retention.md).
+
 **Question.** How long are events, metrics, logs, and job history retained, and
 where?
 
@@ -239,3 +302,28 @@ retention choices don't leak high-volume data into replicated state.
 
 **Related:** [architecture/data-storage-boundaries.md](../architecture/data-storage-boundaries.md),
 [operations/observability.md](../operations/observability.md).
+
+## OD-12: Abort semantics, partial scheduling, and job groups
+
+**Resolved** (2026-07-07): three linked state machines (job / attempt /
+allocation) joined at a `Ready` funding barrier —
+[ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md) and
+[ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md),
+superseding ADRs 0004 and 0006.
+
+**Question.** How does the lifecycle support (a) aborting a job at any stage
+with an explicit, honest terminal record distinguishing abort from OOM,
+`max_runtime` breach, or natural exit; (b) whale jobs partially scheduled on
+nodes that don't yet have space; and (c) future gang scheduling of job groups?
+
+**Why it matters.** These three pressures determine whether the job state
+machine survives contact with real features or needs redesign after clients
+depend on it.
+
+**Considerations.**
+- Job enum coarse (detail on attempts) vs. mirroring attempt phases.
+- Abort race: does the recorded terminal state report what actually stopped
+  the job, or does an abort request override the true outcome?
+- Whether accruing allocations subsume time-based reservations entirely.
+- What the gang-scheduling seam is (a group-scoped readiness barrier) and what
+  is deliberately deferred (funded-allocation wait policy for slow peers).

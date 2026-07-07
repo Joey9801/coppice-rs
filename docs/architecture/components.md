@@ -3,7 +3,7 @@
 ## External API Layer
 
 The external API is the user-facing entry point for job submission, job
-cancellation, status queries, event subscriptions, administrative actions, and
+abort, status queries, event subscriptions, administrative actions, and
 UI support.
 
 It should support authentication through SSO for user-facing access.
@@ -18,7 +18,7 @@ forwarded to it.
 The API should expose operations such as:
 
 - Submit job.
-- Cancel job.
+- Abort job.
 - Retry job.
 - Query job status.
 - Query node status.
@@ -28,7 +28,7 @@ The API should expose operations such as:
 - Administer nodes, queues, projects, users, and policy configuration.
 
 The API should be designed around durable state transitions rather than direct
-imperative manipulation of workers. For example, cancelling a job should commit
+imperative manipulation of workers. For example, aborting a job should commit
 a desired state transition; agents then observe and enforce the updated desired
 state.
 
@@ -76,13 +76,14 @@ Examples of state that should be replicated:
 - Queue membership.
 - Priority and quota accounting state.
 - Node membership and schedulability state.
-- Allocations and reservations.
+- Allocations, including accruing allocations (the reservation mechanism —
+  see [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md)).
 - Placement decisions.
 - Assignment epochs or fencing tokens.
 - Durable policy configuration.
 - Durable image-cache metadata if it affects scheduling decisions.
 - Important progress or runtime estimates when they influence scheduling
-  fairness or reservations.
+  fairness or allocation funding.
 
 Examples of state that generally should not be replicated directly:
 
@@ -107,8 +108,8 @@ decisions.
 
 It should not directly mutate authoritative state. Instead, it should operate on
 a consistent snapshot or versioned view of the cluster state, compute a batch of
-proposed assignments or reservations, and submit those proposals back to the
-coordinator leader for validation and commitment.
+proposed assignments, accruing allocations, and revocations, and submit those
+proposals back to the coordinator leader for validation and commitment.
 
 Its detailed responsibilities and operating model are described in
 [../scheduling/scheduling-model.md](../scheduling/scheduling-model.md).
@@ -173,6 +174,11 @@ derived event store, or pub/sub layer.
 The API should distinguish between authoritative state and notification
 delivery. Lost streaming updates must be recoverable by re-querying current
 state.
+
+The concrete guarantees — Raft apply index as the cursor, per-scope total
+order, at-least-once delivery, a bounded reconnection buffer, and
+gap-indication → resync — were decided in
+[ADR 0008](../decisions/0008-event-delivery-guarantees.md).
 
 ## Web UI
 

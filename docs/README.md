@@ -19,7 +19,7 @@ documents so that each concern can grow independently.
 | [scheduling/](scheduling/) | Scheduling model, quotas and priorities, image-cache policy. |
 | [protocols/](protocols/) | The agent–coordinator protocol. |
 | [operations/](operations/) | Observability, failure handling, and security. |
-| [roadmap/](roadmap/) | Initial scope and open design decisions. |
+| [roadmap/](roadmap/) | Initial scope and the design-decision register. |
 | [decisions/](decisions/) | Architecture Decision Records (ADRs). |
 | [design-principles.md](design-principles.md) | The principles that guide the whole design. |
 
