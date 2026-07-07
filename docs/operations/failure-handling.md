@@ -9,6 +9,15 @@ reconstructs authoritative state from the replicated log and snapshot, resumes
 communication with agents, fences stale leaders using terms or epochs, and
 reconciles desired state against observed agent reports.
 
+## Coordinator disk loss
+
+A coordinator that loses its durable state is replaced, never repaired: the
+machine rejoins with a fresh node ID as a non-voting learner, catches up via
+snapshot and log replay, and is promoted while the departed identity is
+removed. Rejoining with an empty disk under an existing voter ID is refused at
+startup — see
+[ADR 0016](../decisions/0016-coordinator-rebuild-learner-join.md).
+
 ## Agent failure
 
 Agent failure should cause the node to become unhealthy after missed heartbeats.

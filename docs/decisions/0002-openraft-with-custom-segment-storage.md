@@ -3,6 +3,11 @@
 - **Status:** Accepted
 - **Date:** 2026-07-07
 - **Resolves:** [OD-1](../roadmap/open-decisions.md#od-1-raft-library-and-persistence-layer)
+- **Amended by:** [ADR 0017](0017-log-manifest-truncation-and-purge.md)
+  (sealed segments are *logically* truncatable on Raft conflict); extended by
+  [ADR 0015](0015-durable-format-versioning.md),
+  [ADR 0016](0016-coordinator-rebuild-learner-join.md), and
+  [ADR 0018](0018-protobuf-records-in-parallel-containers.md)
 
 ## Context
 

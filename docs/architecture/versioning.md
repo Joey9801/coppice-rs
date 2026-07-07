@@ -4,6 +4,10 @@ The replicated state model must be designed for evolution. The concrete
 mechanism — protobuf with additive-only evolution rules and a Raft-replicated
 `ClusterVersion` gating semantic changes — was decided in
 [ADR 0003](../decisions/0003-protobuf-serialization-and-cluster-version-gates.md).
+The *container* formats around those payloads (segment files, vote file,
+manifest, snapshot files) are versioned separately, under the same
+`ClusterVersion` gate — see
+[ADR 0015](../decisions/0015-durable-format-versioning.md).
 
 Old log entries may be replayed by newer binaries. Snapshots may be read by
 newer binaries. During rolling upgrades, different coordinator replicas may
