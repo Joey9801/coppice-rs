@@ -18,7 +18,7 @@ documents so that each concern can grow independently.
 | [lifecycle/](lifecycle/) | The job lifecycle state machine. |
 | [scheduling/](scheduling/) | Scheduling model, quotas and priorities, image-cache policy. |
 | [protocols/](protocols/) | The agent–coordinator protocol. |
-| [operations/](operations/) | Observability, failure handling, and security. |
+| [operations/](operations/) | Configuration, observability, failure handling, and security. |
 | [roadmap/](roadmap/) | Initial scope and the design-decision register. |
 | [decisions/](decisions/) | Architecture Decision Records (ADRs). |
 | [design-principles.md](design-principles.md) | The principles that guide the whole design. |

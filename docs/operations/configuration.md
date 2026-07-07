@@ -1,0 +1,120 @@
+# Configuration
+
+Coppice is configured through two mechanisms with a bright line between them,
+decided in [ADR 0020](../decisions/0020-node-config-vs-replicated-policy.md):
+
+1. **A node configuration file** — one TOML file per process, read once at
+   startup. Holds everything that is legitimately per-node: addresses, paths,
+   tuning, telemetry.
+2. **Replicated cluster policy** — held in the Raft state machine, changed
+   via `coppice-cli policy …` commands, identical on every replica by
+   construction. Holds everything that replicas must agree on.
+
+The litmus test for any new knob: *would replicated state, scheduling, or
+fencing diverge if two replicas disagreed on it?* → policy. *Could a canary
+node want a different value than its peers?* → config file.
+
+## Which mechanism owns what
+
+| Setting | Where |
+| --- | --- |
+| Listen/advertise addresses, ports | config file |
+| Data directory, `node_id` | config file (cross-checked against the disk stamp, [ADR 0016](../decisions/0016-coordinator-rebuild-learner-join.md)) |
+| TLS cert/key/CA paths, enrollment token path | config file |
+| SSO issuer, client id, client-secret path | config file |
+| Log level/format, OTLP endpoint, metrics address | config file |
+| Raft election timeout, Raft heartbeat interval, snapshot thresholds | config file (liveness-only; safe to vary per node) |
+| Quota-entity tree, soft quotas, cost weights | replicated policy |
+| Decay policy (tick, λ — the "half-life"), penalty exponent | replicated policy ([ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md)) |
+| Priority-multiplier table | replicated policy |
+| Data-retention windows | replicated policy ([ADR 0012](../decisions/0012-data-retention.md)) |
+| Agent-liveness / allocation-lost deadlines (fencing inputs) | replicated policy |
+| SSO role/group → authorization mappings | replicated policy |
+
+If a setting seems to belong to both, it probably splits the way SSO does:
+the *connection* parameters are node config, the *meaning* (who is an admin)
+is policy.
+
+## The config file
+
+One file per binary, passed explicitly:
+
+```
+coppice-coordinator --config /etc/coppice/coordinator.toml
+coppice-agent       --config /etc/coppice/agent.toml
+```
+
+Conventions (all from ADR 0020):
+
+- **Unknown keys are startup errors.** A typo fail-stops with the key named.
+- **Durations and sizes are strings** — `"1500ms"`, `"24h"`, `"512MiB"`.
+  Unlabelled numbers for durations are rejected.
+- **No inline secrets, ever** — the file holds *paths* to key material, so
+  the file itself is safe to commit to config management, diff, and attach
+  to support bundles.
+- **Precedence:** CLI flags > file > built-in defaults. The only flags are
+  `--config` and the startup-intent flags `--bootstrap` / `--join`.
+  There is no environment-variable layer.
+- **No hot reload.** Changes take effect on restart; coordinator restarts
+  are designed to be cheap (rolling restart with learner catch-up).
+- The effective configuration is logged in full at startup.
+
+### Annotated coordinator example
+
+```toml
+# /etc/coppice/coordinator.toml
+#
+# Node-local configuration only. Cluster-wide behaviour — quotas, decay,
+# retention, authorization — is replicated policy: see `coppice-cli policy`.
+
+node_id = 3                     # must match the data directory's stamp
+data_dir = "/var/lib/coppice"
+
+[listen]
+client_addr = "0.0.0.0:7070"    # user/CLI API
+raft_addr   = "0.0.0.0:7071"    # coordinator peer traffic
+agent_addr  = "0.0.0.0:7072"    # agent heartbeats and reports
+advertise_host = "coord-3.batch.example.com"   # what peers and agents dial
+
+[raft]
+# Liveness tuning only — never affects safety. The defaults are right for
+# ordinary datacenter networks; you almost certainly should not touch this.
+election_timeout   = "1500ms"
+heartbeat_interval = "300ms"
+snapshot_log_entries = 50_000
+
+[tls]
+cert_path = "/etc/coppice/pki/node.crt"
+key_path  = "/etc/coppice/pki/node.key"
+ca_path   = "/etc/coppice/pki/ca.crt"
+
+[sso]
+issuer = "https://sso.example.com/oidc"
+client_id = "coppice"
+client_secret_path = "/etc/coppice/oidc-secret"
+
+[observability]
+log_level  = "info"
+log_format = "json"
+otlp_endpoint = "https://otel-collector.example.com:4317"
+metrics_addr  = "127.0.0.1:9090"
+```
+
+The agent's file follows the same conventions with its own schema
+(coordinator endpoints, enrollment token path, image-cache and workdir
+paths, resource-advertisement overrides).
+
+## Replicated policy
+
+Policy is inspected and changed through the CLI, which converts
+human-friendly forms into the exact replicated representations:
+
+- `coppice-cli cluster init --policy policy.toml` — supplies *initial*
+  policy exactly once, at cluster creation. The node config file never seeds
+  policy, even on first boot.
+- `coppice-cli policy …` — reads and updates policy at runtime; every change
+  is a committed Raft command, ordered in the log and applied identically on
+  every replica.
+- Conversions like decay half-life → Q0.64 per-tick factor and quota rate →
+  quota stock happen here, in tooling — never inside the state machine
+  ([ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md)).
