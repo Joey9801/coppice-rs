@@ -10,6 +10,7 @@ members = [
     "crates/coppice-coordinator",
     "crates/coppice-agent",
     "crates/coppice-cli",
+    "crates/coppice-testkit",
 ]
 
 [workspace.package]
@@ -28,10 +29,20 @@ coppice-state = { path = "crates/coppice-state" }
 coppice-consensus = { path = "crates/coppice-consensus" }
 coppice-scheduler = { path = "crates/coppice-scheduler" }
 coppice-api = { path = "crates/coppice-api" }
+# Test and bench infrastructure only — always a dev-dependency, never shipped.
+coppice-testkit = { path = "crates/coppice-testkit" }
 
 # Common third-party dependencies. Versions are pinned centrally so every
 # crate in the workspace stays in lockstep.
 anyhow = "1"
+# CRC32C (Castagnoli) — the per-entry / per-section checksum mandated by
+# ADR 0002 and ADR 0018.
+crc32c = "0.6"
+# Benchmark harness for the ADR 0018 storage benchmark suite.
+criterion = "0.5"
+# Advisory file locking for the storage LOCK file (ADR 0017); std gains
+# File::lock only after our 1.79 MSRV.
+fs2 = "0.4"
 # openraft drives election, replication, and membership; the app data types
 # (`Command`, `Applied`, `RejectionReason`) do not implement serde, so the
 # "serde" feature is deliberately left off (ADR 0002). Default features cover
@@ -45,6 +56,7 @@ protox = "0.7"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

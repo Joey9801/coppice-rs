@@ -11,10 +11,14 @@ authors.workspace = true
 [dependencies]
 coppice-core.workspace = true
 coppice-state.workspace = true
+fs2.workspace = true
 openraft.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

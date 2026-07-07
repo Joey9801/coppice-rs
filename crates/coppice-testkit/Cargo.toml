@@ -1,0 +1,18 @@
+[package]
+name = "coppice-testkit"
+description = "Test and bench infrastructure: SimFs fault injection, the crash harness, and synthetic state generation. Dev-dependency only; never shipped."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+coppice-consensus.workspace = true
+coppice-core.workspace = true
+coppice-state.workspace = true
+crc32c.workspace = true
+
+[lints]
+workspace = true

@@ -27,6 +27,7 @@ use coppice_state::Command;
 mod adapter;
 mod error;
 mod events;
+pub mod fs;
 mod view;
 
 pub use adapter::{
