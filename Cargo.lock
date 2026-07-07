@@ -411,6 +411,7 @@ dependencies = [
  "coppice-core",
  "coppice-state",
  "crc32c",
+ "uuid",
 ]
 
 [[package]]
