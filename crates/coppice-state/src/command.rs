@@ -87,14 +87,17 @@ pub struct CommitPlacements {
     pub proposed_at_us: i64,
 }
 
-/// One job seated on one node. The proto field is repeated allocations;
-/// v1 writers emit exactly one and set `group` to the job's id.
+/// One job seated on one or more nodes. `allocations` is plural for the
+/// gang-scheduling seam; v1 writers emit exactly one and set `group` to the
+/// job's id, and apply rejects other shapes (`UnsupportedPlacementShape`) —
+/// a committed multi-allocation placement must be representable so every
+/// replica computes the identical rejection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {
     pub job: JobId,
     pub attempt: AttemptId,
     pub group: GroupId,
-    pub allocation: AllocationSpec,
+    pub allocations: Vec<AllocationSpec>,
 }
 
 /// The allocation a placement creates. Whether it starts `Funded` or

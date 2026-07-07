@@ -107,7 +107,10 @@ impl StateMachine {
         if let Some(r) = self.jobs.get_mut(&c.job) {
             // A repeated abort is an accepted no-op: the first request wins.
             if r.spec.abort_requested.is_none() {
-                r.spec.abort_requested = Some(AbortRequest { reason: c.reason.clone() });
+                r.spec.abort_requested = Some(AbortRequest {
+                    reason: c.reason.clone(),
+                    requested_at_us: c.requested_at_us,
+                });
             }
         }
         match state {
@@ -184,7 +187,10 @@ impl StateMachine {
                 None => {
                     seen_jobs.insert(p.job);
                     seen_attempts.insert(p.attempt);
-                    seen_allocs.insert(p.allocation.id);
+                    // Validation guarantees exactly one allocation (v1 shape).
+                    if let Some(spec) = p.allocations.first() {
+                        seen_allocs.insert(spec.id);
+                    }
                 }
             }
             idx += 1;
@@ -213,6 +219,8 @@ impl StateMachine {
             }
         }
         for p in &c.placements {
+            // Validation guarantees exactly one allocation (v1 shape).
+            let Some(spec) = p.allocations.first() else { continue };
             let Some((entity, multiplier, runtime_s, requests)) =
                 self.jobs.get(&p.job).map(|j| {
                     (
@@ -235,20 +243,20 @@ impl StateMachine {
             // standing pledge passes is capacity the accrual queue does not
             // want, so pledging it to a new allocation cannot starve the
             // queue.
-            let free = self.free_capacity(&p.allocation.node);
-            let funded = free.component_min(&p.allocation.requested);
-            let fully = funded == p.allocation.requested;
+            let free = self.free_capacity(&spec.node);
+            let funded = free.component_min(&spec.requested);
+            let fully = funded == spec.requested;
             let alloc_state =
                 if fully { AllocationState::Funded } else { AllocationState::Accruing };
             self.allocations.insert(
-                p.allocation.id,
+                spec.id,
                 AllocationRecord {
                     allocation: Allocation {
-                        id: p.allocation.id,
+                        id: spec.id,
                         job: p.job,
                         attempt: p.attempt,
-                        node: p.allocation.node,
-                        requested: p.allocation.requested,
+                        node: spec.node,
+                        requested: spec.requested,
                         funded,
                         state: alloc_state,
                     },
@@ -256,7 +264,7 @@ impl StateMachine {
                 },
             );
             if !fully {
-                self.accrual_queue.insert((p.allocation.node, seq), p.allocation.id);
+                self.accrual_queue.insert((spec.node, seq), spec.id);
             }
             // Accruing is skipped entirely when capacity is immediately
             // available (the common case).
@@ -269,8 +277,8 @@ impl StateMachine {
                     attempt: Attempt {
                         id: p.attempt,
                         job: p.job,
-                        allocation: p.allocation.id,
-                        node: p.allocation.node,
+                        allocation: spec.id,
+                        node: spec.node,
                         state: attempt_state.clone(),
                     },
                     group: p.group,
@@ -282,7 +290,7 @@ impl StateMachine {
             );
             events.push(Event::AttemptStateChanged { attempt: p.attempt, state: attempt_state });
             if fully {
-                events.push(Event::AllocationFunded { allocation: p.allocation.id });
+                events.push(Event::AllocationFunded { allocation: spec.id });
             }
             if let Some(j) = self.jobs.get_mut(&p.job) {
                 j.current_attempt = Some(p.attempt);
@@ -319,25 +327,27 @@ impl StateMachine {
         if (job.state != JobState::Queued && !reseat) || seen_jobs.contains(&p.job) {
             return Some(RejectionReason::JobNotQueued(p.job));
         }
-        // v1 shape gate: singleton groups keyed by the job id.
-        if p.group.0 != p.job.0 {
+        // v1 shape gate: exactly one allocation, singleton groups keyed by
+        // the job id. The plural field is the gang-scheduling seam; until
+        // that ADR, other shapes are committed-but-rejected.
+        if p.group.0 != p.job.0 || p.allocations.len() != 1 {
             return Some(RejectionReason::UnsupportedPlacementShape);
         }
+        let spec = &p.allocations[0];
         if self.attempts.contains_key(&p.attempt) || seen_attempts.contains(&p.attempt) {
             return Some(RejectionReason::DuplicateAttempt(p.attempt));
         }
-        if self.allocations.contains_key(&p.allocation.id) || seen_allocs.contains(&p.allocation.id)
-        {
-            return Some(RejectionReason::DuplicateAllocation(p.allocation.id));
+        if self.allocations.contains_key(&spec.id) || seen_allocs.contains(&spec.id) {
+            return Some(RejectionReason::DuplicateAllocation(spec.id));
         }
-        let Some(node) = self.nodes.get(&p.allocation.node) else {
-            return Some(RejectionReason::UnknownNode(p.allocation.node));
+        let Some(node) = self.nodes.get(&spec.node) else {
+            return Some(RejectionReason::UnknownNode(spec.node));
         };
         if !node.node.schedulable {
-            return Some(RejectionReason::NodeNotSchedulable(p.allocation.node));
+            return Some(RejectionReason::NodeNotSchedulable(spec.node));
         }
-        if !p.allocation.requested.fits_within(&node.node.capacity) {
-            return Some(RejectionReason::RequestExceedsNodeCapacity(p.allocation.id));
+        if !spec.requested.fits_within(&node.node.capacity) {
+            return Some(RejectionReason::RequestExceedsNodeCapacity(spec.id));
         }
         if !self.quota_entities.contains_key(&job.spec.quota_entity) {
             return Some(RejectionReason::UnknownQuotaEntity(job.spec.quota_entity));
@@ -373,7 +383,9 @@ impl StateMachine {
             }
         }
         for p in &c.placements {
-            touched.insert(p.allocation.node);
+            for spec in &p.allocations {
+                touched.insert(spec.node);
+            }
         }
         let mut sim_free: BTreeMap<NodeId, Resources> = BTreeMap::new();
         for node in &touched {
@@ -405,10 +417,12 @@ impl StateMachine {
             sim_free.insert(*node, free);
         }
         for p in &c.placements {
-            let Some(free) = sim_free.get_mut(&p.allocation.node) else { continue };
-            let pledge = free.component_min(&p.allocation.requested);
+            // Item validation already pinned the v1 single-allocation shape.
+            let Some(spec) = p.allocations.first() else { continue };
+            let Some(free) = sim_free.get_mut(&spec.node) else { continue };
+            let pledge = free.component_min(&spec.requested);
             *free = free.saturating_sub(&pledge);
-            if pledge != p.allocation.requested {
+            if pledge != spec.requested {
                 accruing_jobs.insert(p.job);
             }
         }

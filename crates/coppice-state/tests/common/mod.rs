@@ -107,7 +107,7 @@ pub fn placement(job: JobId, attempt: AttemptId, alloc: AllocationId, node: Node
         job,
         attempt,
         group: GroupId(job.0),
-        allocation: AllocationSpec { id: alloc, node, requested },
+        allocations: vec![AllocationSpec { id: alloc, node, requested }],
     }
 }
 

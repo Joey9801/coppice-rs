@@ -66,8 +66,10 @@ impl Default for RetryPolicy {
 pub struct AbortRequest {
     /// Optional user-supplied reason, surfaced in job history and events.
     pub reason: Option<String>,
-    // Requester identity and request timestamp are added with the protobuf
-    // migration (ADR 0003), which also carries the identity model.
+    /// When the abort was committed (proposer-stamped, Unix µs).
+    pub requested_at_us: i64,
+    // Requester identity arrives with the identity ADR; its wire tag is
+    // already earmarked in coppice.core.v1.AbortRequest.
 }
 
 /// The lifecycle state of a job. Authoritative, Raft-replicated state.
