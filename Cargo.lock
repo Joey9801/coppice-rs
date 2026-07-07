@@ -141,6 +141,7 @@ dependencies = [
  "coppice-state",
  "prost",
  "prost-build",
+ "prost-types",
  "protox",
  "thiserror",
  "uuid",

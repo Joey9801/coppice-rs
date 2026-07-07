@@ -15,6 +15,9 @@ prost.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+prost-types.workspace = true
+
 [build-dependencies]
 prost.workspace = true
 prost-build.workspace = true

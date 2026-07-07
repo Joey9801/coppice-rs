@@ -4,7 +4,9 @@ This document is the authoritative catalog of every command in the Raft log
 and the precise contract under which `StateMachine::apply` executes them. The
 protobuf schema (ADR
 [0003](../decisions/0003-protobuf-serialization-and-cluster-version-gates.md))
-is frozen from this catalog; the code-side anchor is
+is frozen from this catalog as `coppice.command.v1`
+(`proto/coppice/command/v1/command.proto`, evolved per
+[schema-style](schema-style.md)); the code-side anchor is
 `crates/coppice-state/src/command.rs` and `apply.rs`.
 
 Settled inputs, not re-decided here: the three state machines and abort
@@ -405,7 +407,7 @@ cluster-version 1.
 | | |
 | --- | --- |
 | Proposer | Admin API / CLI. The CLI converts human-facing forms (half-life → Q0.64 λ, rates → stocks) so no transcendental math ever runs in a replica (ADR 0019/0020). |
-| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers: map<i32, PriorityMultiplier>`, `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `terminal_retention_us: i64` (72 h default), `abort_grace_us: i64` (30 s default); plus `updated_at_us` |
+| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `terminal_retention_us: i64` (72 h default), `abort_grace_us: i64` (30 s default); plus `updated_at_us` |
 | Validation | `decay.validate()` (positive tick, λ within the iteration bound); a full-replacement payload is otherwise self-consistent by construction |
 | Apply effects | Replace the replicated policy. In-flight charge records keep their recorded rate/multiplier (no retroactive repricing); decay re-times from each entity's next touch; quota-stock rescaling on half-life change is owned by the tooling that authored the command. |
 | Rejections | `InvalidPolicy` |

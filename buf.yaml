@@ -1,0 +1,17 @@
+# buf configuration for the schema corpus in proto/ (ADR 0003).
+#
+# buf is optional tooling here: the gate of record is the vendored
+# descriptor-set diff (crates/coppice-proto/tests/breaking.rs, run by
+# scripts/proto-check.sh). When buf is installed, the script also runs
+#   buf lint
+#   buf breaking --against ".git#branch=main"
+# for stricter style checks and a second opinion on wire compatibility.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - WIRE_JSON

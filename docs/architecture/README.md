@@ -10,6 +10,9 @@ it correct under failure and change.
 - [command-catalog.md](command-catalog.md) — every replicated command and the
   apply contract (rejections, funding, ingestion boundary).
 - [versioning.md](versioning.md) — evolving the replicated state model safely.
+- [schema-style.md](schema-style.md) — the protobuf schema corpus (`proto/`)
+  and its evolution rules: tag discipline, representation rules, and the
+  breaking-change gate.
 - [data-storage-boundaries.md](data-storage-boundaries.md) — which store owns
   what.
 
@@ -20,7 +23,7 @@ The subsystems described here map onto the workspace crates roughly as follows:
 | Subsystem | Crate(s) |
 | --- | --- |
 | Shared domain model | `coppice-core` |
-| Wire protocol (API + agent) | `coppice-proto` |
+| Serialization boundary (generated protobuf + conversions) | `coppice-proto` |
 | Replicated state machine | `coppice-state` |
 | Raft consensus | `coppice-consensus` |
 | Scheduler engine | `coppice-scheduler` |

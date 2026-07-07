@@ -9,6 +9,13 @@ manifest, snapshot files) are versioned separately, under the same
 `ClusterVersion` gate — see
 [ADR 0015](../decisions/0015-durable-format-versioning.md).
 
+The schemas themselves live in the `proto/` tree at the workspace root
+(compiled into `coppice_proto::pb`); the day-to-day evolution rules — tag
+discipline, enum policy, representation rules, and the mechanical
+breaking-change gate (`scripts/proto-check.sh`, backed by the committed
+descriptor baseline `proto/baseline.binpb`) — are in
+[schema-style.md](schema-style.md).
+
 Old log entries may be replayed by newer binaries. Snapshots may be read by
 newer binaries. During rolling upgrades, different coordinator replicas may
 briefly run different versions.

@@ -66,5 +66,10 @@ Decided in [ADR 0009](../decisions/0009-fencing-and-reconciliation.md):
   coordinator diffs it against replicated intent and commits adopt / stop /
   lost per allocation. The same diff runs periodically against heartbeats.
 
-The message enums in `coppice-proto` (`agent` module) are the code-side anchor
-for this document.
+The wire schema is `coppice.agent.v1`
+(`proto/coppice/agent/v1/agent.proto`): `AgentCommand` carries the fencing
+token and `command_seq` in one common `CommandHeader` on every
+coordinator→agent command, and `AgentReport` covers registration,
+heartbeats (capacity, running set, image-cache inventory), attempt status,
+and the ObservedSet. That file is the code-side anchor for this document;
+evolution follows [schema-style](../architecture/schema-style.md).
