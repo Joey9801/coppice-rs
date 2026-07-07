@@ -1,0 +1,565 @@
+//! Scripted lifecycle tests: every command in the catalog exercised through
+//! realistic sequences, asserting the apply contract of
+//! `docs/architecture/command-catalog.md` — resolution rules, funding order,
+//! rejection-as-deterministic-no-op, and quota charging.
+
+mod common;
+
+use common::*;
+use coppice_core::allocation::AllocationState;
+use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::id::GroupId;
+use coppice_core::job::{JobState, RetryPolicy};
+use coppice_state::command::{
+    BumpClusterVersion, CommitPlacements, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
+    ReconcileNode, SetNodeSchedulable,
+};
+use coppice_state::{Command, Event, RejectionReason};
+
+#[test]
+fn happy_path_submit_to_eviction() {
+    let mut sm = setup();
+    let (job, attempt, alloc) = (jid(1), aid(11), alid(111));
+
+    apply_ok(&mut sm, submit_cmd(job, cpu(4_000), Some(3_600), RetryPolicy::default()));
+    assert_eq!(sm.jobs[&job].state, JobState::Queued);
+
+    let usage_before = sm.quota_entities[&ROOT].usage.usage;
+    apply_ok(&mut sm, place_cmd(placement(job, attempt, alloc, nid(1), cpu(4_000)), TS));
+    // Capacity was immediately available: accrual skipped, charge landed.
+    assert_eq!(sm.jobs[&job].state, JobState::Preparing);
+    assert_eq!(sm.attempts[&attempt].attempt.state, AttemptState::Ready);
+    assert_eq!(sm.allocations[&alloc].allocation.state, AllocationState::Funded);
+    let usage_charged = sm.quota_entities[&ROOT].usage.usage;
+    assert!(usage_charged > usage_before, "placement must charge the quota entity");
+
+    apply_ok(&mut sm, dispatch_cmd(attempt, TS + 1));
+    assert_eq!(sm.attempts[&attempt].attempt.state, AttemptState::Dispatching);
+
+    apply_ok(&mut sm, started_cmd(attempt, TS + 2));
+    assert_eq!(sm.jobs[&job].state, JobState::Running);
+    assert_eq!(sm.allocations[&alloc].allocation.state, AllocationState::Active);
+
+    apply_ok(&mut sm, exited_cmd(attempt, TS + 60_000_000));
+    assert_eq!(sm.jobs[&job].state, JobState::Finalizing);
+
+    apply_ok(&mut sm, outcome_cmd(attempt, AttemptOutcome::Exited { code: 0 }, 60, TS + 60_000_000));
+    assert_eq!(sm.jobs[&job].state, JobState::Succeeded);
+    assert_eq!(sm.allocations[&alloc].allocation.state, AllocationState::Released);
+    // Ran 60 s of the declared 3600: true-up refunds the unused charge.
+    assert!(sm.quota_entities[&ROOT].usage.usage < usage_charged);
+
+    apply_ok(
+        &mut sm,
+        Command::EvictTerminalJobs(EvictTerminalJobs { jobs: vec![job], evicted_at_us: TS + 1_000 }),
+    );
+    assert!(sm.jobs.is_empty() && sm.attempts.is_empty() && sm.allocations.is_empty());
+}
+
+#[test]
+fn whale_accrues_then_funds_when_capacity_frees() {
+    let mut sm = setup();
+    // Filler occupies 8 of 10 cores and runs.
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(8_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(8_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+
+    // The whale needs the whole node: partial funding, attempt accrues.
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(10_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)), TS));
+    assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Accruing);
+    assert_eq!(sm.allocations[&alid(222)].allocation.funded, cpu(2_000));
+    assert_eq!(sm.accrual_queue.len(), 1);
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Preparing);
+
+    // Filler finishes: freed capacity pledges to the whale, Ready flips.
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::Exited { code: 0 }, 60, TS + 1));
+    assert_eq!(sm.allocations[&alid(222)].allocation.state, AllocationState::Funded);
+    assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Ready);
+    assert!(sm.accrual_queue.is_empty());
+}
+
+#[test]
+fn funding_follows_commit_order_not_id_order() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(10_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(10_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+
+    // First-committed whale gets a *larger* AllocationId than the second, so
+    // id-ordered funding would fund the wrong one.
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(6_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(0xFF), nid(1), cpu(6_000)), TS));
+    apply_ok(&mut sm, submit_cmd(jid(3), cpu(6_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(3), aid(33), alid(0x01), nid(1), cpu(6_000)), TS));
+
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::Exited { code: 0 }, 60, TS + 1));
+    // 10 cores freed: first-committed (seq order) fully funds, the later one
+    // takes the remainder.
+    assert_eq!(sm.allocations[&alid(0xFF)].allocation.state, AllocationState::Funded);
+    assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Ready);
+    assert_eq!(sm.allocations[&alid(0x01)].allocation.state, AllocationState::Accruing);
+    assert_eq!(sm.allocations[&alid(0x01)].allocation.funded, cpu(4_000));
+}
+
+#[test]
+fn abort_with_no_live_attempt_is_immediate() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()));
+    apply_ok(&mut sm, abort_cmd(jid(1), TS));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Aborted);
+    assert!(sm.jobs[&jid(1)].spec.abort_requested.is_some());
+}
+
+#[test]
+fn abort_while_accruing_releases_and_refunds() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(8_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(8_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    let usage_before_whale = sm.quota_entities[&ROOT].usage.usage;
+
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(10_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)), TS));
+    apply_ok(&mut sm, abort_cmd(jid(2), TS));
+
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Aborted);
+    assert_eq!(
+        sm.attempts[&aid(22)].attempt.state,
+        AttemptState::Terminal(AttemptOutcome::Aborted)
+    );
+    assert_eq!(sm.allocations[&alid(222)].allocation.state, AllocationState::Released);
+    assert!(sm.accrual_queue.is_empty());
+    // Same-tick charge and full refund: usage lands exactly where it was.
+    assert_eq!(sm.quota_entities[&ROOT].usage.usage, usage_before_whale);
+}
+
+#[test]
+fn abort_while_running_signals_stop_and_truth_wins() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+
+    let applied = apply_ok(&mut sm, abort_cmd(jid(1), TS + 1));
+    assert!(applied
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::StopRequested { allocation, .. } if *allocation == alid(111))));
+    // The attempt is in the agent's hands; state is unchanged until the
+    // outcome arrives.
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Running);
+
+    // The container exited naturally before the stop landed: truth wins.
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::Exited { code: 0 }, 30, TS + 2));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Succeeded);
+    assert!(sm.jobs[&jid(1)].spec.abort_requested.is_some());
+}
+
+#[test]
+fn abort_wins_over_retry() {
+    let mut sm = setup();
+    // Platform failures normally retry; a pending abort must block that.
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    apply_ok(&mut sm, abort_cmd(jid(1), TS + 1));
+
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::AgentError, 30, TS + 2));
+    // Not requeued (abort wins over retry) and not Aborted (the abort
+    // mechanism didn't stop it — the agent failure did).
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Failed);
+}
+
+#[test]
+fn abort_confirmed_by_agent_ends_aborted() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    apply_ok(&mut sm, abort_cmd(jid(1), TS + 1));
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::Aborted, 30, TS + 2));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Aborted);
+}
+
+#[test]
+fn platform_failures_retry_until_budget_exhausted() {
+    let mut sm = setup();
+    let retry = RetryPolicy { max_retries: 1, retry_user_errors: false };
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(3_600), retry));
+
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::StartFailed { user_error: false }, 0, TS));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Queued);
+    assert_eq!(sm.jobs[&jid(1)].retries_used, 1);
+
+    // Retry mints a fresh attempt via a new placement.
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(12), alid(112), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(12), TS));
+    apply_ok(&mut sm, outcome_cmd(aid(12), AttemptOutcome::StartFailed { user_error: false }, 0, TS));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Failed);
+}
+
+#[test]
+fn user_errors_do_not_retry_unless_opted_in() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::Exited { code: 1 }, 30, TS));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Failed);
+
+    let opt_in = RetryPolicy { max_retries: 3, retry_user_errors: true };
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(1_000), Some(3_600), opt_in));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(222), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(22), TS));
+    apply_ok(&mut sm, started_cmd(aid(22), TS));
+    apply_ok(&mut sm, outcome_cmd(aid(22), AttemptOutcome::OomKilled, 30, TS));
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Queued);
+}
+
+#[test]
+fn max_runtime_exceeded_never_retries() {
+    let mut sm = setup();
+    // Even with user-error retries opted in: deterministic recurrence.
+    let opt_in = RetryPolicy { max_retries: 3, retry_user_errors: true };
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(60), opt_in));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::MaxRuntimeExceeded, 90, TS));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Failed);
+}
+
+#[test]
+fn revocation_requeues_free_of_retry_budget() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(8_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(8_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    let usage_before = sm.quota_entities[&ROOT].usage.usage;
+
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(10_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)), TS));
+
+    apply_ok(
+        &mut sm,
+        Command::CommitPlacements(CommitPlacements {
+            expected_version: 0,
+            revocations: vec![alid(222)],
+            placements: vec![],
+            proposed_at_us: TS,
+        }),
+    );
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Queued);
+    assert_eq!(sm.jobs[&jid(2)].retries_used, 0, "revocation must not consume retry budget");
+    assert_eq!(
+        sm.attempts[&aid(22)].attempt.state,
+        AttemptState::Terminal(AttemptOutcome::Revoked)
+    );
+    // Same-tick full refund: requeue is free.
+    assert_eq!(sm.quota_entities[&ROOT].usage.usage, usage_before);
+}
+
+#[test]
+fn revoke_and_reseat_in_one_batch() {
+    let mut sm = setup();
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(16_000), TS));
+    // Whale accrues on the full node 1.
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(8_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(8_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(10_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)), TS));
+    assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Accruing);
+
+    // The re-plan: node 2 freed up first — revoke the accrual and seat the
+    // whale there, atomically.
+    apply_ok(
+        &mut sm,
+        Command::CommitPlacements(CommitPlacements {
+            expected_version: 0,
+            revocations: vec![alid(222)],
+            placements: vec![placement(jid(2), aid(23), alid(223), nid(2), cpu(10_000))],
+            proposed_at_us: TS + 1,
+        }),
+    );
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Preparing);
+    assert_eq!(sm.attempts[&aid(23)].attempt.state, AttemptState::Ready);
+    assert!(sm.accrual_queue.is_empty());
+}
+
+#[test]
+fn accrual_limit_bounds_concurrent_whales() {
+    let mut sm = setup();
+    apply_ok(&mut sm, update_policy_cmd(test_policy(1)));
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(9_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(9_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(10_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)), TS));
+    assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Accruing);
+
+    apply_ok(&mut sm, submit_cmd(jid(3), cpu(10_000), Some(3_600), RetryPolicy::default()));
+    let rejection = sm
+        .apply(&place_cmd(placement(jid(3), aid(33), alid(333), nid(1), cpu(10_000)), TS))
+        .unwrap_err();
+    assert_eq!(rejection, RejectionReason::AccrualLimitExceeded { limit: 1 });
+    assert_eq!(sm.jobs[&jid(3)].state, JobState::Queued, "rejected batch must have no effects");
+}
+
+#[test]
+fn reconcile_adopts_and_declares_lost() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(222), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(22), TS));
+
+    // A stale-epoch set is worthless and rejected whole.
+    let stale = sm
+        .apply(&Command::ReconcileNode(ReconcileNode {
+            node: nid(1),
+            node_epoch: 99,
+            adopted: vec![aid(11)],
+            lost: vec![],
+            observed_at_us: TS + 1,
+        }))
+        .unwrap_err();
+    assert!(matches!(stale, RejectionReason::StaleNodeEpoch { .. }));
+
+    let epoch = sm.nodes[&nid(1)].epoch;
+    apply_ok(
+        &mut sm,
+        Command::ReconcileNode(ReconcileNode {
+            node: nid(1),
+            node_epoch: epoch,
+            adopted: vec![aid(11)],
+            lost: vec![LostAttempt {
+                attempt: aid(22),
+                outcome: AttemptOutcome::AgentError,
+                actual_runtime_us: 0,
+            }],
+            observed_at_us: TS + 1,
+        }),
+    );
+    // Adopted: the missed started report is folded in.
+    assert_eq!(sm.attempts[&aid(11)].attempt.state, AttemptState::Running);
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Running);
+    // Lost: platform failure, retry policy applies.
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Queued);
+    assert_eq!(sm.jobs[&jid(2)].retries_used, 1);
+}
+
+#[test]
+fn node_lost_fails_attempts_and_fences() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    let epoch_before = sm.nodes[&nid(1)].epoch;
+
+    apply_ok(&mut sm, Command::DeclareNodeLost(DeclareNodeLost { node: nid(1), declared_at_us: TS + 60_000_000 }));
+    assert_eq!(sm.nodes[&nid(1)].epoch, epoch_before + 1);
+    assert!(!sm.nodes[&nid(1)].node.schedulable);
+    assert_eq!(
+        sm.attempts[&aid(11)].attempt.state,
+        AttemptState::Terminal(AttemptOutcome::NodeLost)
+    );
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Queued);
+    assert!(sm.accrual_queue.is_empty());
+}
+
+#[test]
+fn reregistration_bumps_epoch_and_preserves_drain() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        Command::SetNodeSchedulable(SetNodeSchedulable {
+            node: nid(1),
+            schedulable: false,
+            updated_at_us: TS,
+        }),
+    );
+    let epoch_before = sm.nodes[&nid(1)].epoch;
+    apply_ok(&mut sm, register_node_cmd(nid(1), cpu(20_000), TS + 1));
+    assert_eq!(sm.nodes[&nid(1)].epoch, epoch_before + 1);
+    assert_eq!(sm.nodes[&nid(1)].node.capacity, cpu(20_000));
+    assert!(!sm.nodes[&nid(1)].node.schedulable, "an agent restart must not undo a drain");
+}
+
+#[test]
+fn drained_node_rejects_placements_but_keeps_funding() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(8_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(8_000)), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(10_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)), TS));
+
+    apply_ok(
+        &mut sm,
+        Command::SetNodeSchedulable(SetNodeSchedulable {
+            node: nid(1),
+            schedulable: false,
+            updated_at_us: TS,
+        }),
+    );
+    apply_ok(&mut sm, submit_cmd(jid(3), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    let rejection = sm
+        .apply(&place_cmd(placement(jid(3), aid(33), alid(333), nid(1), cpu(1_000)), TS))
+        .unwrap_err();
+    assert_eq!(
+        rejection,
+        RejectionReason::InvalidBatch(vec![(0, RejectionReason::NodeNotSchedulable(nid(1)))])
+    );
+
+    // Existing accrual keeps funding on the drained node.
+    apply_ok(&mut sm, outcome_cmd(aid(11), AttemptOutcome::Exited { code: 0 }, 30, TS + 1));
+    assert_eq!(sm.allocations[&alid(222)].allocation.state, AllocationState::Funded);
+}
+
+#[test]
+fn eviction_rejects_live_jobs_and_skips_missing() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()));
+    let rejection = sm
+        .apply(&Command::EvictTerminalJobs(EvictTerminalJobs {
+            jobs: vec![jid(1)],
+            evicted_at_us: TS,
+        }))
+        .unwrap_err();
+    assert_eq!(
+        rejection,
+        RejectionReason::InvalidBatch(vec![(0, RejectionReason::JobNotTerminal(jid(1)))])
+    );
+
+    // Missing ids skip silently: duplicate eviction proposals are idempotent.
+    apply_ok(&mut sm, abort_cmd(jid(1), TS));
+    let evict = Command::EvictTerminalJobs(EvictTerminalJobs {
+        jobs: vec![jid(1), jid(999)],
+        evicted_at_us: TS,
+    });
+    apply_ok(&mut sm, evict.clone());
+    apply_ok(&mut sm, evict);
+    assert!(sm.jobs.is_empty());
+}
+
+#[test]
+fn quota_entity_updates_preserve_usage_and_reject_cycles() {
+    let mut sm = setup();
+    apply_ok(&mut sm, configure_entity_cmd(qid(2), Some(ROOT)));
+    apply_ok(&mut sm, configure_entity_cmd(qid(3), Some(qid(2))));
+    // Re-parenting the root under its grandchild would cycle.
+    let rejection = sm.apply(&configure_entity_cmd(ROOT, Some(qid(3)))).unwrap_err();
+    assert_eq!(rejection, RejectionReason::QuotaEntityCycle(ROOT));
+
+    // Updates keep the accumulator: reconfiguration is not an amnesty.
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(4_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(4_000)), TS));
+    let usage = sm.quota_entities[&ROOT].usage;
+    apply_ok(&mut sm, configure_entity_cmd(ROOT, None));
+    assert_eq!(sm.quota_entities[&ROOT].usage, usage);
+}
+
+#[test]
+fn charges_propagate_to_ancestors() {
+    let mut sm = setup();
+    apply_ok(&mut sm, configure_entity_cmd(qid(2), Some(ROOT)));
+    let mut cmd = submit_cmd(jid(1), cpu(4_000), Some(3_600), RetryPolicy::default());
+    if let Command::SubmitJob(ref mut s) = cmd {
+        s.job.quota_entity = qid(2);
+    }
+    apply_ok(&mut sm, cmd);
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(4_000)), TS));
+    let leaf = sm.quota_entities[&qid(2)].usage.usage;
+    let root = sm.quota_entities[&ROOT].usage.usage;
+    assert!(!leaf.is_zero());
+    assert_eq!(leaf, root, "every ancestor on the path is charged the same cost");
+}
+
+#[test]
+fn cluster_version_bumps_are_monotonic() {
+    let mut sm = setup();
+    apply_ok(&mut sm, Command::BumpClusterVersion(BumpClusterVersion { to: 2, bumped_at_us: TS }));
+    assert_eq!(sm.cluster_version, 2);
+    let rejection = sm
+        .apply(&Command::BumpClusterVersion(BumpClusterVersion { to: 2, bumped_at_us: TS }))
+        .unwrap_err();
+    assert_eq!(rejection, RejectionReason::ClusterVersionNotMonotonic { current: 2, requested: 2 });
+}
+
+#[test]
+fn rejection_is_a_deterministic_no_op_that_bumps_version() {
+    let mut sm = setup();
+    let mut expected = sm.clone();
+    let rejection = sm.apply(&abort_cmd(jid(404), TS)).unwrap_err();
+    assert_eq!(rejection, RejectionReason::UnknownJob(jid(404)));
+    // A rejected command is an applied (no-op) log entry: only version moves.
+    expected.version += 1;
+    assert_eq!(sm, expected);
+}
+
+#[test]
+fn stale_and_duplicate_reports_reject_monotonically() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()));
+    apply_ok(&mut sm, place_cmd(placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)), TS));
+
+    // Dispatch of a non-Ready attempt, started before dispatch, duplicate
+    // started: all deterministic StaleAttemptState rejections.
+    assert_eq!(
+        sm.apply(&started_cmd(aid(11), TS)).unwrap_err(),
+        RejectionReason::StaleAttemptState(aid(11))
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    assert_eq!(
+        sm.apply(&dispatch_cmd(aid(11), TS)).unwrap_err(),
+        RejectionReason::StaleAttemptState(aid(11))
+    );
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    assert_eq!(
+        sm.apply(&started_cmd(aid(11), TS)).unwrap_err(),
+        RejectionReason::StaleAttemptState(aid(11))
+    );
+}
+
+#[test]
+fn submit_validates_identity_and_entity() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()));
+    assert_eq!(
+        sm.apply(&submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default())).unwrap_err(),
+        RejectionReason::DuplicateJob(jid(1))
+    );
+    let mut cmd = submit_cmd(jid(2), cpu(1_000), None, RetryPolicy::default());
+    if let Command::SubmitJob(ref mut s) = cmd {
+        s.job.quota_entity = qid(404);
+    }
+    assert_eq!(sm.apply(&cmd).unwrap_err(), RejectionReason::UnknownQuotaEntity(qid(404)));
+}
+
+#[test]
+fn v1_placement_shape_is_enforced() {
+    let mut sm = setup();
+    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()));
+    let mut p = placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000));
+    p.group = GroupId(jid(999).0);
+    assert_eq!(
+        sm.apply(&place_cmd(p, TS)).unwrap_err(),
+        RejectionReason::InvalidBatch(vec![(0, RejectionReason::UnsupportedPlacementShape)])
+    );
+}
