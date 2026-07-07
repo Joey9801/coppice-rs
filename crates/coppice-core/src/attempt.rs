@@ -6,8 +6,6 @@
 //! monotonic). Decided in
 //! `docs/decisions/0013-job-attempt-allocation-state-machines.md`.
 
-use serde::{Deserialize, Serialize};
-
 use crate::id::{AllocationId, AttemptId, JobId, NodeId};
 
 /// One execution of a job. Authoritative, Raft-replicated state.
@@ -15,7 +13,7 @@ use crate::id::{AllocationId, AttemptId, JobId, NodeId};
 /// v1 attempts hold exactly one allocation; gang scheduling later spans a
 /// placement group of attempts behind the same [`AttemptState::Ready`]
 /// barrier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attempt {
     pub id: AttemptId,
     pub job: JobId,
@@ -29,7 +27,7 @@ pub struct Attempt {
 /// `Accruing → Ready → Dispatching → Running → Finalizing → Terminal`, plus a
 /// direct edge from every non-terminal state to `Terminal` for early endings
 /// (abort before start, revocation, pull/start failure, node lost).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptState {
     /// Allocations committed but not all funded. Skipped when capacity is
     /// immediately available (the common case).
@@ -71,7 +69,7 @@ impl AttemptState {
 
 /// Why an attempt ended. Recorded on every terminal attempt so that "what
 /// stopped this job" is always answerable from state, never inferred.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptOutcome {
     /// The container exited on its own with this code.
     Exited { code: i32 },
@@ -98,7 +96,7 @@ pub enum AttemptOutcome {
 /// Who or what an outcome is attributed to. Drives default retry policy:
 /// platform failures retry, user errors don't (job policy may opt in),
 /// user requests never do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutcomeClass {
     Success,
     UserError,

@@ -6,13 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
 use crate::id::NodeId;
 use crate::resource::Resources;
 
 /// Authoritative record of a node's membership and schedulability.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub id: NodeId,
     /// Total advertised capacity.

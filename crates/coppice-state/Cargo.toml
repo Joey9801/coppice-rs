@@ -10,12 +10,14 @@ authors.workspace = true
 
 [dependencies]
 coppice-core.workspace = true
-serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# Dev-only cycle: the determinism harness roundtrips snapshots through the
+# real proto record path.
+coppice-proto.workspace = true
 proptest.workspace = true
-serde_json.workspace = true
+prost.workspace = true
 uuid.workspace = true
 
 [lints]

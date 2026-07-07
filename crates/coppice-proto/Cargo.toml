@@ -10,8 +10,10 @@ authors.workspace = true
 
 [dependencies]
 coppice-core.workspace = true
+coppice-state.workspace = true
 prost.workspace = true
-serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
 
 [build-dependencies]
 prost.workspace = true

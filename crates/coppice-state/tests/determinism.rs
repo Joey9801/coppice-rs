@@ -8,7 +8,7 @@
 //! - **Replica equivalence**: the same sequence into two `StateMachine`s
 //!   yields identical apply results and identical final state.
 //! - **Snapshot equivalence**: apply k commands, roundtrip the state through
-//!   the serde path (the snapshot path for now, per ADR 0003), apply the
+//!   encoded proto snapshot records (the ADR 0018 payload path), apply the
 //!   rest — indistinguishable from applying everything on the original.
 //!
 //! Rejections are as much a part of the contract as acceptances: a rejected
@@ -24,6 +24,7 @@ use coppice_core::attempt::AttemptOutcome;
 use coppice_core::job::RetryPolicy;
 use coppice_core::quota::CostUnits;
 use coppice_core::resource::Resources;
+use coppice_proto::convert::{state_from_records, state_to_records, StateRecords};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
     ReconcileNode, RegisterNode, SetNodeSchedulable,
@@ -160,6 +161,37 @@ fn arb_global() -> impl Strategy<Value = Command> {
     ]
 }
 
+/// Roundtrip state through *encoded* proto snapshot records — flatten,
+/// encode each record length-delimited, decode, rebuild — so the property
+/// covers the bytes, not just the in-memory conversion.
+fn snapshot_roundtrip(state: &StateMachine) -> StateMachine {
+    fn recode<M: prost::Message + Default>(records: Vec<M>) -> Vec<M> {
+        let mut buf = Vec::new();
+        for record in &records {
+            record.encode_length_delimited(&mut buf).expect("record must encode");
+        }
+        let mut slice = buf.as_slice();
+        let mut out = Vec::new();
+        while !slice.is_empty() {
+            out.push(M::decode_length_delimited(&mut slice).expect("record must decode"));
+        }
+        out
+    }
+    let records = state_to_records(state);
+    state_from_records(StateRecords {
+        jobs: recode(records.jobs),
+        attempts: recode(records.attempts),
+        allocations: recode(records.allocations),
+        nodes: recode(records.nodes),
+        quota_entities: recode(records.quota_entities),
+        cluster: records.cluster.map(|c| {
+            let mut recoded = recode(vec![c]);
+            recoded.pop().expect("one cluster record")
+        }),
+    })
+    .expect("snapshot records must rebuild")
+}
+
 /// Merge chains preserving intra-chain order; the pick sequence chooses
 /// which chain advances next.
 fn interleave(chains: Vec<Vec<Command>>, picks: Vec<prop::sample::Index>) -> Vec<Command> {
@@ -243,8 +275,9 @@ proptest! {
 
     /// Snapshot-then-replay: serializing mid-stream and continuing on the
     /// restored copy is indistinguishable from never snapshotting. Exercises
-    /// the serde path standing in for the proto snapshot (ADR 0003); `split`
-    /// ranges over the whole sequence including the ends.
+    /// the real snapshot payload path — length-delimited proto records per
+    /// entity type (ADR 0018) — via `coppice_proto::convert`; `split` ranges
+    /// over the whole sequence including the ends.
     #[test]
     fn snapshot_roundtrip_is_transparent(scenario in arb_scenario()) {
         let mut direct = StateMachine::default();
@@ -256,9 +289,7 @@ proptest! {
         for cmd in &scenario.commands[..scenario.split] {
             let _ = prefix.apply(cmd);
         }
-        let snapshot = serde_json::to_vec(&prefix).expect("state must serialize");
-        let mut restored: StateMachine =
-            serde_json::from_slice(&snapshot).expect("snapshot must deserialize");
+        let mut restored = snapshot_roundtrip(&prefix);
         prop_assert_eq!(&restored, &prefix, "roundtrip must be lossless");
 
         let mut resumed_results = Vec::new();

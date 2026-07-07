@@ -9,13 +9,11 @@
 //! `docs/decisions/0013-job-attempt-allocation-state-machines.md`; the
 //! transition table lives in `docs/lifecycle/job-lifecycle.md`.
 
-use serde::{Deserialize, Serialize};
-
 use crate::id::{JobId, QuotaEntityId};
 use crate::resource::Resources;
 
 /// A job as submitted by a user, plus the metadata needed to schedule it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub id: JobId,
     /// Container image reference to execute.
@@ -47,7 +45,7 @@ pub struct Job {
 
 /// Per-job retry policy. Bounds attempts beyond the first; `Revoked` outcomes
 /// never consume this budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub max_retries: u32,
     /// Opt-in to retrying user-error outcomes (nonzero exit, OOM). Never
@@ -62,7 +60,7 @@ impl Default for RetryPolicy {
 }
 
 /// A committed user request to abort a job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbortRequest {
     /// Optional user-supplied reason, surfaced in job history and events.
     pub reason: Option<String>,
@@ -77,7 +75,7 @@ pub struct AbortRequest {
 /// Coarse by design: it stays stable while the attempt machine evolves
 /// (accrual now, gang barriers later). UIs join this with the live attempt's
 /// state for detail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     /// Recorded durably; awaiting admission evaluation.
     Submitted,

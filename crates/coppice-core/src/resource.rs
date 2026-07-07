@@ -5,14 +5,12 @@
 //! accelerators, licenses, NUMA-local devices) without reworking callers. See
 //! `docs/scheduling/scheduling-model.md`.
 
-use serde::{Deserialize, Serialize};
-
 /// A vector of resource quantities requested by a job or offered by a node.
 ///
 /// This is intentionally a coarse placeholder. The extensible-dimension design
 /// (a map keyed by resource kind) is an open item in
 /// `docs/roadmap/open-decisions.md`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Resources {
     /// Milli-CPU units (1000 = one core).
     pub cpu_millis: u64,

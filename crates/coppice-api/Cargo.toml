@@ -12,7 +12,6 @@ authors.workspace = true
 coppice-core.workspace = true
 coppice-proto.workspace = true
 coppice-state.workspace = true
-serde.workspace = true
 tracing.workspace = true
 
 [lints]

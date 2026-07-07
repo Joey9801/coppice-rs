@@ -8,15 +8,13 @@
 //! in commit order. Decided in
 //! `docs/decisions/0014-accruing-allocations-replace-reservations.md`.
 
-use serde::{Deserialize, Serialize};
-
 use crate::id::{AllocationId, AttemptId, JobId, NodeId};
 use crate::resource::Resources;
 
 /// A claim on one node's resources. Authoritative, Raft-replicated state —
 /// including `funded`, which must survive failover because accrual progress
 /// is exactly what a reservation is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allocation {
     pub id: AllocationId,
     pub job: JobId,
@@ -33,7 +31,7 @@ pub struct Allocation {
 /// with early release from `Accruing` (revocation, abort) and `Funded`
 /// (abort). Revocation is legal only while accruing; funded allocations are
 /// stable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocationState {
     /// Committed but not fully funded; holds capacity as it frees. Revocable
     /// by scheduler command at no cost to the job.

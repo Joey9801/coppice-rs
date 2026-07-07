@@ -10,7 +10,7 @@
 //! durable state transitions, not imperative worker control. See
 //! `docs/architecture/components.md` and `docs/operations/security.md`.
 
-use coppice_proto::api::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
+use coppice_proto::pb::api::v1::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
 
 /// Errors surfaced to API callers.
 #[derive(Debug)]

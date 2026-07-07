@@ -25,8 +25,6 @@
 //! single per-tick step — and the property tests in
 //! `tests/quota_properties.rs` guard that any future fast path preserves it.
 
-use serde::{Deserialize, Serialize};
-
 use crate::resource::Resources;
 
 /// Micro-cost-units per cost unit: [`CostUnits`] counts µCU.
@@ -38,7 +36,7 @@ pub const MICRO_PER_COST_UNIT: u64 = 1_000_000;
 /// hence maximal penalty) rather than wrapping or panicking. See ADR 0019 for
 /// the overflow-horizon analysis behind the µCU scale.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
 pub struct CostUnits(pub u64);
 
@@ -75,7 +73,7 @@ pub enum PolicyError {
 /// policy-authoring time — `decay_per_tick = round(2^64 · 2^(-tick/half_life))`
 /// — so no transcendental function ever runs in the state machine; replicas
 /// only need to agree on these two integers, which replication guarantees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecayPolicy {
     /// Tick length in microseconds. Must be positive.
     pub tick_us: i64,
@@ -163,7 +161,7 @@ impl DecayPolicy {
 /// clock read during apply). Every mutation first brings the accumulator
 /// forward to the command's tick ([`UsageState::touch`]), so decay is lazy
 /// but exact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageState {
     pub usage: CostUnits,
     pub last_update_us: i64,
@@ -213,7 +211,7 @@ impl UsageState {
 /// (GPUs, licenses) are priced by adding weight fields, not by changing the
 /// representation. Q32.32 spans ~2.3×10⁻¹⁰ µCU (per-byte rates) to ~4×10⁹
 /// µCU per unit-second.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CostWeights {
     /// µCU per (milli-CPU × second), Q32.32.
     pub per_cpu_milli_second: u64,
@@ -226,7 +224,7 @@ pub struct CostWeights {
 /// Replicated priority multiplier, Q32.32. The user-facing `priority: i32` is
 /// mapped to a multiplier by a policy table outside this module; arithmetic
 /// only ever sees the resolved fixed-point value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PriorityMultiplier(pub u64);
 
 impl PriorityMultiplier {
@@ -285,7 +283,7 @@ pub fn job_cost(
 
 /// The replicated record of a placement charge, kept on the attempt so its
 /// terminal resolution can true up against what was actually consumed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChargeRecord {
     /// The full job cost charged to every ancestor at placement.
     pub amount: CostUnits,

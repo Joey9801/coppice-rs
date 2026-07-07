@@ -27,7 +27,6 @@ use coppice_core::quota::{
     DEFAULT_PENALTY_EXPONENT_MILLI,
 };
 use coppice_core::allocation::Allocation;
-use serde::{Deserialize, Serialize};
 
 mod apply;
 pub mod command;
@@ -41,7 +40,7 @@ pub use command::Command;
 /// `BTreeMap` is used throughout to keep iteration deterministic, and every
 /// field is `PartialEq` so the determinism harness can assert replica
 /// equivalence structurally.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateMachine {
     pub jobs: BTreeMap<JobId, JobRecord>,
     pub attempts: BTreeMap<AttemptId, AttemptRecord>,
@@ -54,10 +53,9 @@ pub struct StateMachine {
     /// range scan yields one node's accruing allocations in commit order —
     /// the funding order of ADR 0014. Never iterate accruals by
     /// `AllocationId`: UUID order is meaningless across histories.
-    /// Serialized as an entry list: tuple map keys don't survive
-    /// human-readable formats, and the serde encoding stands in for the
-    /// snapshot until the proto migration (ADR 0003).
-    #[serde(with = "accrual_queue_serde")]
+    /// Derived from the allocation map, so it is not snapshotted: the proto
+    /// snapshot path (`coppice_proto::convert`) rebuilds it from the
+    /// Accruing `AllocationRecord`s at load.
     pub accrual_queue: BTreeMap<(NodeId, u64), AllocationId>,
     /// Commit-order sequence for allocations. Part of replicated state so it
     /// is a pure function of the command history.
@@ -72,32 +70,9 @@ pub struct StateMachine {
     pub version: u64,
 }
 
-mod accrual_queue_serde {
-    use std::collections::BTreeMap;
-
-    use coppice_core::id::{AllocationId, NodeId};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        map: &BTreeMap<(NodeId, u64), AllocationId>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let entries: Vec<(&NodeId, &u64, &AllocationId)> =
-            map.iter().map(|((node, seq), id)| (node, seq, id)).collect();
-        entries.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<BTreeMap<(NodeId, u64), AllocationId>, D::Error> {
-        let entries: Vec<(NodeId, u64, AllocationId)> = Vec::deserialize(deserializer)?;
-        Ok(entries.into_iter().map(|(node, seq, id)| ((node, seq), id)).collect())
-    }
-}
-
 /// A job's replicated record: the submitted spec plus lifecycle bookkeeping
 /// owned by the apply loop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRecord {
     pub spec: Job,
     pub state: JobState,
@@ -114,7 +89,7 @@ pub struct JobRecord {
 
 /// An attempt's replicated record: the attempt itself plus the charge that
 /// placement committed, kept for true-up at terminal resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptRecord {
     pub attempt: Attempt,
     /// The placement group sharing the `Ready` barrier. v1: the job's id.
@@ -130,7 +105,7 @@ pub struct AttemptRecord {
 }
 
 /// An allocation's replicated record plus its commit-order sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationRecord {
     pub allocation: Allocation,
     /// Commit order: assigned from `next_allocation_seq` at creation.
@@ -139,7 +114,7 @@ pub struct AllocationRecord {
 }
 
 /// A node's replicated record: descriptor plus its fencing epoch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRecord {
     pub node: Node,
     /// Bumped on (re)registration and on loss declaration; invalidates all
@@ -148,7 +123,7 @@ pub struct NodeRecord {
 }
 
 /// One node of the quota-entity tree.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaEntity {
     pub parent: Option<QuotaEntityId>,
     pub name: String,
@@ -165,7 +140,7 @@ pub const QUOTA_TREE_DEPTH_CAP: u32 = 32;
 /// Replicated cluster policy (ADR 0020). Everything here would diverge
 /// scheduling or accounting if replicas disagreed, so none of it may appear
 /// in a node config file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyConfig {
     pub cost_weights: CostWeights,
     pub decay: DecayPolicy,
@@ -205,7 +180,7 @@ impl Default for PolicyConfig {
 /// state changes only by the `version` bump, and the proposer observes it
 /// through the leader's apply result. See the taxonomy table in
 /// `docs/architecture/command-catalog.md`.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RejectionReason {
     #[error("job {0} not found")]
     UnknownJob(JobId),
@@ -260,7 +235,7 @@ pub enum RejectionReason {
 /// Change events produced by an accepted command — derived output for the
 /// event fanout (ADR 0008) and the coordinator runtime, never read back by
 /// apply.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     JobSubmitted { job: JobId },
     JobStateChanged { job: JobId, from: JobState, to: JobState },

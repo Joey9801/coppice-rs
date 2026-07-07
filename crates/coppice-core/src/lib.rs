@@ -18,10 +18,7 @@ pub mod node;
 pub mod quota;
 pub mod resource;
 
-/// Monotonic fencing token used to reject stale leaders and commands.
-///
-/// Epochs are attached to coordinator-issued commands so that agents can ignore
-/// instructions from a leader that has since been superseded. See
-/// `docs/architecture/high-availability.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
-pub struct Epoch(pub u64);
+// The old single-value `Epoch` placeholder is gone: ADR 0009 settled the
+// fencing token as the (leader_term, node_epoch) pair, defined on the wire
+// as `coppice.agent.v1.FencingToken` and carried in every coordinator→agent
+// command header.

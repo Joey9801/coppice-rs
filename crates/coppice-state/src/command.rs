@@ -5,9 +5,10 @@
 //! proposer-minted ids, proposer-stamped timestamps (`*_at_us`, Unix µs), and
 //! decisions rather than computations. The catalog — proposer, payload,
 //! validation, apply effects, and rejections per command — lives in
-//! `docs/architecture/command-catalog.md`; the protobuf schema (ADR 0003) is
-//! frozen from that document, and these serde types mirror it field for
-//! field.
+//! `docs/architecture/command-catalog.md`; the protobuf schema
+//! (`coppice.command.v1`, ADR 0003) is frozen from that document, and these
+//! domain types mirror it field for field — `coppice_proto::convert` maps
+//! between the two at the wire boundary.
 
 use std::collections::BTreeMap;
 
@@ -16,13 +17,12 @@ use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEnt
 use coppice_core::job::Job;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
-use serde::{Deserialize, Serialize};
 
 use crate::PolicyConfig;
 
 /// A committed mutation to the authoritative state. One arm of the versioned
 /// proto envelope; every command here is cluster-version 1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     // API-proposed.
     SubmitJob(SubmitJob),
@@ -50,7 +50,7 @@ pub enum Command {
 /// Record a newly submitted job. Admission is synchronous in v1, so one
 /// apply walks `Submitted → Accepted → Queued`. No quota charge here — cost
 /// is charged at placement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitJob {
     pub job: Job,
     /// Resolved by the API from the replicated multiplier table; apply never
@@ -62,7 +62,7 @@ pub struct SubmitJob {
 /// Request an abort: sets `abort_requested`, terminates immediately when no
 /// agent interaction is needed, otherwise emits `StopRequested` and lets the
 /// outcome arrive through ingestion. Legal in every non-terminal state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbortJob {
     pub job: JobId,
     pub reason: Option<String>,
@@ -72,7 +72,7 @@ pub struct AbortJob {
 /// One scheduler pass's atomic batch of placements and revocations.
 /// All-or-nothing: any invalid item rejects the whole batch with per-item
 /// diagnostics, and the scheduler recomputes — failed proposals are normal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitPlacements {
     /// The state version the scheduler's snapshot was taken at. Audit
     /// record: semantic re-validation of each item is what actually gates
@@ -92,7 +92,7 @@ pub struct CommitPlacements {
 /// job's id, and apply rejects other shapes (`UnsupportedPlacementShape`) —
 /// a committed multi-allocation placement must be representable so every
 /// replica computes the identical rejection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     pub job: JobId,
     pub attempt: AttemptId,
@@ -103,7 +103,7 @@ pub struct Placement {
 /// The allocation a placement creates. Whether it starts `Funded` or
 /// `Accruing` is decided by apply from actual free capacity, not by the
 /// proposer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationSpec {
     pub id: AllocationId,
     pub node: NodeId,
@@ -114,14 +114,14 @@ pub struct AllocationSpec {
 /// replicated dispatching/running set is the "intended" side of the
 /// ObservedSet diff, so a crash between commit and send reconciles as lost,
 /// never as an untracked container.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchAttempt {
     pub attempt: AttemptId,
     pub dispatched_at_us: i64,
 }
 
 /// Container observed running.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAttemptStarted {
     pub attempt: AttemptId,
     pub observed_at_us: i64,
@@ -129,7 +129,7 @@ pub struct RecordAttemptStarted {
 
 /// Exit observed; agent-side finalization still in flight. Skippable — the
 /// terminal edge exists from every non-terminal state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAttemptExited {
     pub attempt: AttemptId,
     pub observed_at_us: i64,
@@ -138,7 +138,7 @@ pub struct RecordAttemptExited {
 /// Terminal outcome for an attempt. Runs the full terminal path: release +
 /// funding cascade, quota true-up, and job resolution (retry policy,
 /// abort-wins-over-retry, truth-wins-the-race) in one apply.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAttemptOutcome {
     pub attempt: AttemptId,
     /// Any outcome except `Revoked`, which only `CommitPlacements` produces.
@@ -152,7 +152,7 @@ pub struct RecordAttemptOutcome {
 /// Verdicts from the leader's ObservedSet diff (ADR 0009). "Stop" verdicts
 /// never appear: an unknown running container has nothing in state to
 /// mutate; the leader sends `StopJob` directly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileNode {
     pub node: NodeId,
     /// The epoch the set was observed under; must match the node's current
@@ -165,7 +165,7 @@ pub struct ReconcileNode {
     pub observed_at_us: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LostAttempt {
     pub attempt: AttemptId,
     /// Normalizer-picked, typically `AgentError`; never `Revoked`.
@@ -176,7 +176,7 @@ pub struct LostAttempt {
 /// Node (re)registration. Re-registration bumps the node epoch, fencing all
 /// commands issued under earlier epochs; the drain flag survives (an agent
 /// restart must not undo an admin's drain).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterNode {
     pub node: NodeId,
     pub capacity: Resources,
@@ -187,7 +187,7 @@ pub struct RegisterNode {
 /// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,
 /// and every live attempt on it terminates `NodeLost` (platform outcome —
 /// retry policy applies).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclareNodeLost {
     pub node: NodeId,
     pub declared_at_us: i64,
@@ -195,7 +195,7 @@ pub struct DeclareNodeLost {
 
 /// Admin drain / undrain. Drain blocks new placements only: running work and
 /// existing accrual funding continue.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetNodeSchedulable {
     pub node: NodeId,
     pub schedulable: bool,
@@ -206,7 +206,7 @@ pub struct SetNodeSchedulable {
 /// housekeeping **only after** the history-store write is durable; the apply
 /// itself just deletes. Missing ids are skipped (duplicate proposals across
 /// leader changes must be idempotent); a live listed job rejects the batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictTerminalJobs {
     pub jobs: Vec<JobId>,
     pub evicted_at_us: i64,
@@ -214,7 +214,7 @@ pub struct EvictTerminalJobs {
 
 /// Create or update one quota entity. Updates preserve accumulated usage —
 /// reconfiguration is not an amnesty. No delete in v1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigureQuotaEntity {
     pub entity: QuotaEntityId,
     pub parent: Option<QuotaEntityId>,
@@ -227,7 +227,7 @@ pub struct ConfigureQuotaEntity {
 /// Full replacement of the replicated policy. Human-facing forms (half-life,
 /// rates) are converted by tooling before proposal; in-flight charge records
 /// keep their recorded rate and multiplier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePolicy {
     pub policy: PolicyConfig,
     pub updated_at_us: i64,
@@ -236,7 +236,7 @@ pub struct UpdatePolicy {
 /// Bump the semantic feature gate (ADR 0003). The leader refuses to propose
 /// past the minimum version supported by voting members; apply enforces
 /// monotonicity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BumpClusterVersion {
     pub to: u32,
     pub bumped_at_us: i64,

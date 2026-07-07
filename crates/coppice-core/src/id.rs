@@ -5,13 +5,12 @@
 //! appear on the agent protocol (job, allocation, attempt) exist so retries are
 //! safe; see `docs/protocols/agent-coordinator.md`.
 
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 macro_rules! typed_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub Uuid);
 
         impl $name {
