@@ -256,19 +256,31 @@ pub fn runtime_seconds_ceil(runtime_us: u64) -> u64 {
     runtime_us.div_ceil(MICRO_PER_COST_UNIT)
 }
 
+/// Cost from an already-computed rate:
+/// `cost = rate × runtime_seconds × priority_multiplier`, computed in `u128`
+/// with a single `>> 32` for the Q32.32 multiplier, saturating. True-up uses
+/// this with the rate stored in the [`ChargeRecord`]'s attempt, so a policy
+/// edit mid-flight never reprices an in-flight charge (ADR 0019).
+pub fn cost_from_rate(
+    rate_ucu_per_second: u64,
+    runtime_seconds: u64,
+    multiplier: PriorityMultiplier,
+) -> CostUnits {
+    let scaled = (rate_ucu_per_second as u128)
+        .saturating_mul(runtime_seconds as u128)
+        .saturating_mul(multiplier.0 as u128);
+    CostUnits(u64::try_from(scaled >> 32).unwrap_or(u64::MAX))
+}
+
 /// A job's scalar cost (ADR 0005):
-/// `cost = resource_rate × runtime_seconds × priority_multiplier`, computed
-/// in `u128` with a single `>> 32` for the Q32.32 multiplier, saturating.
+/// `cost = resource_rate × runtime_seconds × priority_multiplier`.
 pub fn job_cost(
     requests: &Resources,
     weights: &CostWeights,
     runtime_seconds: u64,
     multiplier: PriorityMultiplier,
 ) -> CostUnits {
-    let scaled = (resource_rate(requests, weights) as u128)
-        .saturating_mul(runtime_seconds as u128)
-        .saturating_mul(multiplier.0 as u128);
-    CostUnits(u64::try_from(scaled >> 32).unwrap_or(u64::MAX))
+    cost_from_rate(resource_rate(requests, weights), runtime_seconds, multiplier)
 }
 
 /// The replicated record of a placement charge, kept on the attempt so its

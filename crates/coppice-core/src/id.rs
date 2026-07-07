@@ -54,3 +54,8 @@ typed_id!(
     /// (gang scheduling). v1 groups are singletons: one job, one group.
     GroupId
 );
+typed_id!(
+    /// Identifies a node in the quota-entity tree (ADR 0005). Levels carry no
+    /// built-in meaning; every job is submitted under exactly one leaf.
+    QuotaEntityId
+);

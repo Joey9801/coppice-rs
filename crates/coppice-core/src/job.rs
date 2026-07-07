@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::JobId;
+use crate::id::{JobId, QuotaEntityId};
 use crate::resource::Resources;
 
 /// A job as submitted by a user, plus the metadata needed to schedule it.
@@ -26,12 +26,39 @@ pub struct Job {
     /// burning budget faster pushes this job forward. See
     /// `docs/decisions/0005-cost-based-soft-quotas.md`.
     pub priority: i32,
+    /// Enforced runtime bound in microseconds. Part of the job's price
+    /// (ADR 0005) and the license to backfill (ADR 0014); jobs without one
+    /// never touch pledged capacity and are charged a policy default runtime.
+    pub max_runtime_us: Option<u64>,
+    /// The quota-entity leaf this job charges (every ancestor on its path is
+    /// charged too).
+    pub quota_entity: QuotaEntityId,
+    /// Retry policy resolved at finalization (ADR 0013): platform failures
+    /// retry within budget, user errors only if opted in, `Revoked` requeues
+    /// free, aborts and `MaxRuntimeExceeded` never retry.
+    pub retry: RetryPolicy,
     /// Set when the user has requested an abort. Legal in every non-terminal
     /// state; once set, finalization never resolves to a retry. The job only
     /// terminates as [`JobState::Aborted`] if the abort mechanism actually
     /// stopped it — a natural exit that wins the race keeps its real outcome,
     /// with this flag still visible in history.
     pub abort_requested: Option<AbortRequest>,
+}
+
+/// Per-job retry policy. Bounds attempts beyond the first; `Revoked` outcomes
+/// never consume this budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    /// Opt-in to retrying user-error outcomes (nonzero exit, OOM). Never
+    /// applies to `MaxRuntimeExceeded` (deterministic recurrence) or aborts.
+    pub retry_user_errors: bool,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy { max_retries: 3, retry_user_errors: false }
+    }
 }
 
 /// A committed user request to abort a job.
