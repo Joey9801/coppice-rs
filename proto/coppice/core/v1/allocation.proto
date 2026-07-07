@@ -1,0 +1,40 @@
+// Allocations: an attempt's claim on one node's resources (mirrors
+// `coppice_core::allocation`). Accruing allocations are Coppice's
+// reservation mechanism (ADR 0014); `funded` is replicated because accrual
+// progress is exactly what a reservation is.
+
+syntax = "proto3";
+
+package coppice.core.v1;
+
+import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/resource.proto";
+
+// A claim on one node's resources. Authoritative, Raft-replicated state.
+message Allocation {
+  AllocationId id = 1;
+  JobId job = 2;
+  AttemptId attempt = 3;
+  NodeId node = 4;
+  // The full request this allocation must reach before it is funded.
+  Resources requested = 5;
+  // How much has been pledged so far. Equals `requested` once funded.
+  Resources funded = 6;
+  AllocationState state = 7;
+}
+
+// `Accruing → Funded → Active → Released`, with early release from Accruing
+// (revocation, abort) and Funded (abort). Revocation is legal only while
+// accruing; funded allocations are stable.
+enum AllocationState {
+  ALLOCATION_STATE_UNSPECIFIED = 0;
+  // Committed but not fully funded; holds capacity as it frees.
+  ALLOCATION_STATE_ACCRUING = 1;
+  // Fully funded and stable; the attempt's Ready barrier watches this.
+  ALLOCATION_STATE_FUNDED = 2;
+  // The container is consuming the resources.
+  ALLOCATION_STATE_ACTIVE = 3;
+  // Terminal: capacity returned to the node and pledged onward in commit
+  // order.
+  ALLOCATION_STATE_RELEASED = 4;
+}

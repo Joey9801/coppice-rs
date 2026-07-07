@@ -1,0 +1,43 @@
+// Public API request/response types.
+//
+// The HTTP surface is JSON at the edge mapped onto these same messages
+// (ADR 0003, proto3 JSON mapping) — endpoints are durable state
+// transitions, not imperative worker control. Field names here are part of
+// the JSON contract; see docs/architecture/schema-style.md.
+
+syntax = "proto3";
+
+package coppice.api.v1;
+
+import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/job.proto";
+import "coppice/core/v1/resource.proto";
+
+// Submit a new job. The API mints the JobId, resolves `priority` through
+// the replicated multiplier table, and proposes SubmitJob.
+message SubmitJobRequest {
+  string image = 1;
+  coppice.core.v1.Resources requests = 2;
+  sint32 priority = 3;
+  // Enforced runtime bound; part of the job's price and its license to
+  // backfill. Absent = charged the policy default runtime.
+  optional uint64 max_runtime_us = 4;
+  // The quota-entity leaf to charge.
+  coppice.core.v1.QuotaEntityId quota_entity = 5;
+  coppice.core.v1.RetryPolicy retry = 6;
+}
+
+message SubmitJobResponse {
+  coppice.core.v1.JobId job = 1;
+}
+
+// Abort a job: commits a desired-state transition; it does not
+// synchronously stop the container. Legal in any non-terminal state; the
+// job terminates Aborted only if this mechanism actually stopped it.
+message AbortJobRequest {
+  coppice.core.v1.JobId job = 1;
+  // Optional reason, recorded in job history and events.
+  optional string reason = 2;
+}
+
+message AbortJobResponse {}

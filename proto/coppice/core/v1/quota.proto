@@ -1,0 +1,88 @@
+// Deterministic fixed-point quota vocabulary (mirrors `coppice_core::quota`
+// and the ADR 0019 representation decisions).
+//
+// Nothing here is ever a float: cost and usage are u64 micro-cost-units
+// (µCU), weights and multipliers are u64 Q32.32 fixed point, the decay
+// factor is u64 Q0.64. Replicas must agree on these values bit-for-bit, and
+// floating point cannot promise that across platforms and binary versions.
+// Field names carry the unit and representation (`*_ucu`, `*_q32_32`,
+// `*_q0_64`) so a reader can never mistake the encoding.
+
+syntax = "proto3";
+
+package coppice.core.v1;
+
+import "coppice/core/v1/resource.proto";
+
+// µCU per (resource unit × second) for one dimension, Q32.32.
+message CostWeight {
+  ResourceKind kind = 1;
+  uint64 weight_q32_32 = 2;
+}
+
+// Replicated cost weights. New resource dimensions are priced by adding
+// entries, not by changing the representation. Canonical form: ascending
+// kind, unique kinds, zero weights omitted.
+message CostWeights {
+  repeated CostWeight weights = 1;
+}
+
+// Replicated decay policy: tick length and per-tick retention factor λ as
+// Q0.64 (`decay_per_tick / 2^64`). λ is derived from the human-facing
+// half-life by config tooling at policy-authoring time, so no
+// transcendental function ever runs in a replica.
+message DecayPolicy {
+  // Tick length in microseconds. Must be positive.
+  int64 tick_us = 1;
+  // Per-tick retention factor λ, Q0.64. Bounded above by ADR 0019's
+  // iteration limit (λ ≤ 1 − 2⁻¹⁶).
+  uint64 decay_per_tick_q0_64 = 2;
+}
+
+// A quota entity's usage accumulator: the (accumulated usage, last update)
+// pair of ADR 0005. Decay is lazy but exact (integer iterated per-tick
+// step); timestamps are proposer-stamped command times, never wall clock.
+message UsageState {
+  uint64 usage_ucu = 1;
+  int64 last_update_us = 2;
+}
+
+// The replicated record of a placement charge, kept on the attempt so its
+// terminal resolution can true up against what was actually consumed.
+message ChargeRecord {
+  // The full job cost charged to every ancestor at placement, µCU.
+  uint64 amount_ucu = 1;
+  // Timestamp of the placement command that charged it (Unix µs).
+  int64 charged_at_us = 2;
+}
+
+// Maps one user-facing priority to its Q32.32 cost multiplier. Part of the
+// replicated policy; repeated sorted entries, never a proto map. Canonical
+// form: ascending priority, unique priorities.
+message PriorityMultiplierEntry {
+  sint32 priority = 1;
+  uint64 multiplier_q32_32 = 2;
+}
+
+// Replicated cluster policy (ADR 0020: never in a node config file —
+// everything here would diverge scheduling or accounting if replicas
+// disagreed). Human-facing forms (half-lives, rates) are converted by
+// tooling before proposal.
+message PolicyConfig {
+  CostWeights cost_weights = 1;
+  DecayPolicy decay = 2;
+  // Penalty exponent in milli (2000 = quadratic), applied to the
+  // over-quota ratio in *derived* scheduler state only.
+  uint32 penalty_exponent_milli = 3;
+  // Canonical form: ascending priority, unique priorities.
+  repeated PriorityMultiplierEntry priority_multipliers = 4;
+  // K: at most this many jobs hold accruing allocations at once (ADR 0014).
+  uint32 accrual_limit = 5;
+  // Charge-time runtime for jobs with no enforced max_runtime, seconds.
+  uint64 default_charge_runtime_s = 6;
+  // Terminal jobs are eligible for eviction this long after terminal state
+  // (ADR 0012). Consulted by the proposer, never by apply.
+  int64 terminal_retention_us = 7;
+  // Default SIGTERM→SIGKILL grace for aborts, microseconds.
+  int64 abort_grace_us = 8;
+}

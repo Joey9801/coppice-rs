@@ -1,0 +1,64 @@
+// The log manifest (ADR 0017): the single durable home of every structural
+// fact about a coordinator's log, updated by atomic write-new + fsync +
+// rename only on rare structural events.
+//
+// Container/payload split (ADR 0015): this message is the *payload* inside
+// the manifest file's fixed-layout binary header (magic, container version,
+// CRC). The header is what tells a reader this protobuf is here at all; it
+// is versioned separately and is not part of this schema.
+
+syntax = "proto3";
+
+package coppice.storage.v1;
+
+import "coppice/raft/v1/raft.proto";
+
+// Everything the manifest claims about the log. Ordered-first in truncation
+// and purge, so it is always the pessimistic truth: it may claim less log
+// than physically exists, never more.
+message Manifest {
+  // Identity stamps (ADR 0016). Mismatches fail-stop at startup: wrong
+  // volume, cross-cluster mixup, or a volume attached to the wrong
+  // instance.
+  //
+  // Generated once at `coppice-cli cluster init`; identical on every
+  // replica. 16 raw UUID bytes.
+  bytes cluster_uuid = 1;
+  // This instance's Raft identity (allocate-once integer, ADR 0016).
+  uint64 node_id = 2;
+  // Generated at directory initialization; distinguishes "same node id,
+  // different life" in logs and forensics. 16 raw UUID bytes.
+  bytes instance_uuid = 3;
+
+  // The segments this manifest claims, ascending by start_index; startup
+  // deletes any file the manifest does not claim. Segments are named by the
+  // index of their first entry (`log/<start-index>.seg`).
+  repeated Segment segments = 4;
+
+  // The purge floor: the last purged log id. The log logically starts just
+  // above it.
+  coppice.raft.v1.LogId purge_floor = 5;
+
+  // Set after a suffix truncation: the last live entry, overriding the
+  // physical tail of the segment that contains it. Cleared (absent) once
+  // rotation opens a fresh segment.
+  coppice.raft.v1.LogId logical_end = 6;
+
+  // The current snapshot, if one exists.
+  SnapshotPointer snapshot = 7;
+
+  // Best-effort committed index, recorded at rotation, snapshot, and clean
+  // shutdown. Recovery may replay past it; correctness never depends on it.
+  optional uint64 committed_index = 8;
+}
+
+// One claimed log segment.
+message Segment {
+  // Index of the segment's first entry; also its file name.
+  uint64 start_index = 1;
+}
+
+// Pointer to the current snapshot file (`snap/<snapshot-id>.snap`).
+message SnapshotPointer {
+  string snapshot_id = 1;
+}

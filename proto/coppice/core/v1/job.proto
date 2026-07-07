@@ -1,0 +1,79 @@
+// Job definition and lifecycle state (mirrors `coppice_core::job`).
+//
+// The job machine is deliberately coarse and user-visible (ADR 0013); all
+// execution detail lives on the attempt. JobState is a flat enum — no
+// variant carries data — while everything data-bearing (the abort request,
+// outcomes) is a message or oneof.
+
+syntax = "proto3";
+
+package coppice.core.v1;
+
+import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/resource.proto";
+
+// A job as submitted by a user, plus the metadata needed to schedule it.
+message Job {
+  JobId id = 1;
+  // Container image reference to execute.
+  string image = 2;
+  // Resources requested for scheduling and isolation.
+  Resources requests = 3;
+  // User-chosen priority. A multiplier on the job's cost, not a free lane
+  // (ADR 0005). The API resolves it through the replicated multiplier table
+  // at proposal time; apply never sees this raw value in arithmetic.
+  sint32 priority = 4;
+  // Enforced runtime bound in microseconds. Part of the job's price and the
+  // license to backfill (ADR 0014); absent means the job never touches
+  // pledged capacity and is charged a policy default runtime.
+  optional uint64 max_runtime_us = 5;
+  // The quota-entity leaf this job charges (every ancestor on its path too).
+  QuotaEntityId quota_entity = 6;
+  RetryPolicy retry = 7;
+  // Present iff the user has requested an abort (ADR 0013). Legal in every
+  // non-terminal state; once set, finalization never resolves to a retry.
+  AbortRequest abort_requested = 8;
+}
+
+// Per-job retry policy. Bounds attempts beyond the first; `Revoked` outcomes
+// never consume this budget.
+message RetryPolicy {
+  uint32 max_retries = 1;
+  // Opt-in to retrying user-error outcomes (nonzero exit, OOM). Never
+  // applies to MaxRuntimeExceeded (deterministic recurrence) or aborts.
+  bool retry_user_errors = 2;
+}
+
+// A committed user request to abort a job. The job only terminates ABORTED
+// if the abort mechanism actually stopped it — a natural exit that wins the
+// race keeps its real outcome, with this record still visible in history.
+message AbortRequest {
+  // Optional user-supplied reason, surfaced in job history and events.
+  optional string reason = 1;
+  // When the abort was committed (proposer-stamped, Unix µs).
+  int64 requested_at_us = 2;
+  // Tag 3 is earmarked for requester identity, pending the identity ADR.
+}
+
+// The lifecycle state of a job. Authoritative, Raft-replicated.
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  // Recorded durably; awaiting admission evaluation.
+  JOB_STATE_SUBMITTED = 1;
+  // Passed admission (synchronous in v1; distinct for observability).
+  JOB_STATE_ACCEPTED = 2;
+  // Waiting, unpinned. Ordered by effective score, not arrival.
+  JOB_STATE_QUEUED = 3;
+  // An attempt exists but is not yet running.
+  JOB_STATE_PREPARING = 4;
+  // The attempt's container is running.
+  JOB_STATE_RUNNING = 5;
+  // The attempt ended or its exit was observed; resolution pending.
+  JOB_STATE_FINALIZING = 6;
+  // Terminal: the final attempt exited successfully.
+  JOB_STATE_SUCCEEDED = 7;
+  // Terminal: failed and retries are exhausted or inapplicable.
+  JOB_STATE_FAILED = 8;
+  // Terminal: stopped by the abort mechanism (and only then).
+  JOB_STATE_ABORTED = 9;
+}

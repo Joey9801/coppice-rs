@@ -1,0 +1,239 @@
+// The Raft log command set: the versioned envelope of ADR 0003 and one
+// message per command in `docs/architecture/command-catalog.md` (the
+// authoritative catalog — proposer, validation, apply effects, and
+// rejections per command live there, not here).
+//
+// Commands commit *decisions, not computations*: every timestamp is
+// proposer-stamped (`*_at_us`, Unix µs), every id is proposer-minted, and
+// anything judgement-shaped is resolved before the log. These bytes are the
+// highest lock-in surface in the project — they are replicated over the
+// wire, fsynced into log segments, and replayed for years.
+
+syntax = "proto3";
+
+package coppice.command.v1;
+
+import "coppice/core/v1/attempt.proto";
+import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/job.proto";
+import "coppice/core/v1/node.proto";
+import "coppice/core/v1/quota.proto";
+import "coppice/core/v1/resource.proto";
+
+// A committed mutation to the authoritative state, in the versioned
+// envelope of ADR 0003.
+//
+// Body tag allocation (headroom is deliberate — the catalog will grow for
+// years; gang scheduling is an anticipated seam):
+//
+//   1–7     envelope metadata (only `version` today)
+//   8–15    API-proposed
+//   16–29   scheduler-proposed
+//   30–49   agent ingestion (leader-normalized observed facts)
+//   50–59   node lifecycle
+//   60–69   housekeeping
+//   70–89   admin / policy
+//   90+     unallocated
+//
+// New arms take the next tag in their range; a full range spills into 90+.
+message Command {
+  // The ClusterVersion the proposer wrote this command under. All commands
+  // in this file are cluster-version 1; version-gated arms may be *read* by
+  // any supporting binary but are not *written* until the gate is bumped.
+  uint32 version = 1;
+
+  oneof body {
+    SubmitJob submit_job = 8;
+    AbortJob abort_job = 9;
+
+    CommitPlacements commit_placements = 16;
+    DispatchAttempt dispatch_attempt = 17;
+
+    RecordAttemptStarted record_attempt_started = 30;
+    RecordAttemptExited record_attempt_exited = 31;
+    RecordAttemptOutcome record_attempt_outcome = 32;
+    ReconcileNode reconcile_node = 33;
+
+    RegisterNode register_node = 50;
+    DeclareNodeLost declare_node_lost = 51;
+    SetNodeSchedulable set_node_schedulable = 52;
+
+    EvictTerminalJobs evict_terminal_jobs = 60;
+
+    ConfigureQuotaEntity configure_quota_entity = 70;
+    UpdatePolicy update_policy = 71;
+    BumpClusterVersion bump_cluster_version = 72;
+  }
+}
+
+// Record a newly submitted job. Admission is synchronous in v1, so one
+// apply walks Submitted → Accepted → Queued. No quota charge here — cost is
+// charged at placement.
+message SubmitJob {
+  coppice.core.v1.Job job = 1;
+  // Resolved by the API from the replicated multiplier table at proposal
+  // time; apply never sees the raw priority in arithmetic (ADR 0019).
+  uint64 multiplier_q32_32 = 2;
+  int64 submitted_at_us = 3;
+}
+
+// Request an abort: sets the job's abort record, terminates immediately
+// when no agent interaction is needed, otherwise the outcome arrives
+// through ingestion. Legal in every non-terminal state.
+message AbortJob {
+  coppice.core.v1.JobId job = 1;
+  optional string reason = 2;
+  int64 requested_at_us = 3;
+}
+
+// One scheduler pass's atomic batch of placements and revocations.
+// All-or-nothing: any invalid item rejects the whole batch with per-item
+// diagnostics, and the scheduler recomputes.
+message CommitPlacements {
+  // The state version the scheduler's snapshot was taken at. Audit record:
+  // semantic re-validation of each item is what actually gates the batch.
+  uint64 expected_version = 1;
+  // Accruing allocations to revoke, applied before placements so freed
+  // capacity pledges onward in commit order first.
+  repeated coppice.core.v1.AllocationId revocations = 2;
+  repeated Placement placements = 3;
+  // Charge timestamp for the batch's quota charges and refunds.
+  int64 proposed_at_us = 4;
+}
+
+// One job seated on one or more nodes. `allocations` is repeated for the
+// gang-scheduling seam; v1 writers emit exactly one allocation and set
+// `group` to the job's id, and apply rejects other shapes
+// (UnsupportedPlacementShape) until the gang-scheduling ADR.
+message Placement {
+  coppice.core.v1.JobId job = 1;
+  coppice.core.v1.AttemptId attempt = 2;
+  coppice.core.v1.GroupId group = 3;
+  repeated AllocationSpec allocations = 4;
+}
+
+// The allocation a placement creates. Whether it starts Funded or Accruing
+// is decided by apply from actual free capacity, not by the proposer.
+message AllocationSpec {
+  coppice.core.v1.AllocationId id = 1;
+  coppice.core.v1.NodeId node = 2;
+  coppice.core.v1.Resources requested = 3;
+}
+
+// Commit Ready → Dispatching *before* StartJob is sent: the replicated
+// dispatching/running set is the "intended" side of the ObservedSet diff
+// (ADR 0009), so a crash between commit and send reconciles as lost, never
+// as an untracked container.
+message DispatchAttempt {
+  coppice.core.v1.AttemptId attempt = 1;
+  int64 dispatched_at_us = 2;
+}
+
+// Container observed running.
+message RecordAttemptStarted {
+  coppice.core.v1.AttemptId attempt = 1;
+  int64 observed_at_us = 2;
+}
+
+// Exit observed; agent-side finalization still in flight. Skippable — the
+// terminal edge exists from every non-terminal state.
+message RecordAttemptExited {
+  coppice.core.v1.AttemptId attempt = 1;
+  int64 observed_at_us = 2;
+}
+
+// Terminal outcome for an attempt: release + funding cascade, quota
+// true-up, and job resolution in one apply.
+message RecordAttemptOutcome {
+  coppice.core.v1.AttemptId attempt = 1;
+  // Any outcome except Revoked, which only CommitPlacements produces.
+  coppice.core.v1.AttemptOutcome outcome = 2;
+  // Normalizer-computed; ignored for true-up when the attempt never reached
+  // Running (actual cost is zero by rule).
+  uint64 actual_runtime_us = 3;
+  int64 observed_at_us = 4;
+}
+
+// Verdicts from the leader's ObservedSet diff (ADR 0009). "Stop" verdicts
+// never appear: an unknown running container has nothing in state to
+// mutate; the leader sends StopJob directly.
+message ReconcileNode {
+  coppice.core.v1.NodeId node = 1;
+  // The epoch the set was observed under; must match the node's current
+  // epoch or the whole set predates a re-registration.
+  uint64 node_epoch = 2;
+  // Intended and running: confirm Running.
+  repeated coppice.core.v1.AttemptId adopted = 3;
+  // Intended but absent: attempt failure, retry policy applies.
+  repeated LostAttempt lost = 4;
+  int64 observed_at_us = 5;
+}
+
+message LostAttempt {
+  coppice.core.v1.AttemptId attempt = 1;
+  // Normalizer-picked, typically AgentError; never Revoked.
+  coppice.core.v1.AttemptOutcome outcome = 2;
+  uint64 actual_runtime_us = 3;
+}
+
+// Node (re)registration. Re-registration bumps the node epoch, fencing all
+// commands issued under earlier epochs; the drain flag survives. The
+// catalog's `node: Node` payload is realized as the id/capacity/labels
+// triple — `schedulable` is admin-owned desired state, not registration
+// input.
+message RegisterNode {
+  coppice.core.v1.NodeId node = 1;
+  coppice.core.v1.Resources capacity = 2;
+  // Canonical form: ascending key, unique keys.
+  repeated coppice.core.v1.Label labels = 3;
+  int64 registered_at_us = 4;
+}
+
+// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,
+// and every live attempt on it terminates NodeLost in commit order.
+message DeclareNodeLost {
+  coppice.core.v1.NodeId node = 1;
+  int64 declared_at_us = 2;
+}
+
+// Admin drain / undrain. Drain blocks new placements only.
+message SetNodeSchedulable {
+  coppice.core.v1.NodeId node = 1;
+  bool schedulable = 2;
+  int64 updated_at_us = 3;
+}
+
+// Remove terminal jobs from replicated state (ADR 0012). Proposed only
+// after the history-store write is durable; missing ids are skipped so
+// duplicate proposals across leader changes stay idempotent.
+message EvictTerminalJobs {
+  repeated coppice.core.v1.JobId jobs = 1;
+  int64 evicted_at_us = 2;
+}
+
+// Create or update one quota entity. Updates preserve accumulated usage —
+// reconfiguration is not an amnesty. No delete in v1.
+message ConfigureQuotaEntity {
+  coppice.core.v1.QuotaEntityId entity = 1;
+  coppice.core.v1.QuotaEntityId parent = 2;
+  string name = 3;
+  // The soft quota as a *stock* in µCU; the CLI converts human rates
+  // (ADR 0019).
+  uint64 quota_ucu = 4;
+  int64 updated_at_us = 5;
+}
+
+// Full replacement of the replicated policy. In-flight charge records keep
+// their recorded rate and multiplier (no retroactive repricing).
+message UpdatePolicy {
+  coppice.core.v1.PolicyConfig policy = 1;
+  int64 updated_at_us = 2;
+}
+
+// Bump the semantic feature gate (ADR 0003). The leader refuses to propose
+// past the minimum version supported by voting members; apply enforces
+// monotonicity.
+message BumpClusterVersion {
+  uint32 to = 1;
+  int64 bumped_at_us = 2;
+}

@@ -1,0 +1,162 @@
+// Snapshot payload messages (ADR 0018): the header metadata, the footer's
+// section index, and one record message per entity type.
+//
+// A snapshot is *not one message*. Sections are independent streams of
+// length-delimited records, decoded record-at-a-time in parallel shards —
+// so every record here is individually decodable and carries its own key;
+// none requires sibling context. The state machine's rebuild must not
+// depend on iteration order across sections.
+//
+// Container/payload split (ADR 0015): file magic, container version, CRCs,
+// and section framing are fixed-layout binary owned by the storage layer;
+// these messages are the payloads inside that frame.
+//
+// Derived state is not snapshotted: the accrual queue is exactly the
+// Accruing allocations keyed (node, seq), so it is rebuilt from
+// AllocationRecords at load. Snapshotting it too would create a second copy
+// that could disagree.
+
+syntax = "proto3";
+
+package coppice.storage.v1;
+
+import "coppice/core/v1/allocation.proto";
+import "coppice/core/v1/attempt.proto";
+import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/job.proto";
+import "coppice/core/v1/node.proto";
+import "coppice/core/v1/quota.proto";
+import "coppice/raft/v1/raft.proto";
+
+// Header payload: what this snapshot covers.
+message SnapshotMeta {
+  // Identity stamp (ADR 0016), 16 raw UUID bytes — snapshots cross node
+  // boundaries via install-snapshot, and a receiver must be able to refuse
+  // another cluster's state.
+  bytes cluster_uuid = 1;
+  string snapshot_id = 2;
+  coppice.raft.v1.LogId last_applied = 3;
+  coppice.raft.v1.StoredMembership membership = 4;
+  // The ClusterVersion at last_applied.
+  uint32 cluster_version = 5;
+  // Hash-shards per entity type. Shard assignment is a writer choice;
+  // readers never depend on which shard holds a record.
+  uint32 shard_count = 6;
+}
+
+// Footer payload: where every section lives. Written last, so a truncated
+// snapshot is detectable by construction; readers locate sections here,
+// giving per-section random access without decoding the world.
+message SectionIndex {
+  repeated SectionEntry sections = 1;
+}
+
+// One section: an independent stream of length-delimited records for one
+// (entity type, shard) pair.
+message SectionEntry {
+  SectionKind kind = 1;
+  uint32 shard = 2;
+  // Byte offset and length of the section within the snapshot file.
+  uint64 offset = 3;
+  uint64 length = 4;
+  uint64 record_count = 5;
+  // The ADR 0018 escape hatch: today always "protobuf-ld". A hot section
+  // type may move to a denser encoding behind a ClusterVersion gate.
+  string encoding = 6;
+  Compression compression = 7;
+  // CRC32C of the section's bytes as stored.
+  fixed32 crc32c = 8;
+}
+
+enum SectionKind {
+  SECTION_KIND_UNSPECIFIED = 0;
+  SECTION_KIND_JOB = 1;
+  SECTION_KIND_ATTEMPT = 2;
+  SECTION_KIND_ALLOCATION = 3;
+  SECTION_KIND_NODE = 4;
+  SECTION_KIND_QUOTA_ENTITY = 5;
+  // Exactly one record (ClusterStateRecord) in exactly one shard.
+  SECTION_KIND_CLUSTER_STATE = 6;
+}
+
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE = 1;
+  COMPRESSION_ZSTD = 2;
+}
+
+// ---- Records, one message per entity type ----
+// Each mirrors the corresponding replicated record in `coppice_state`.
+
+// A job's replicated record: the submitted spec plus lifecycle bookkeeping
+// owned by the apply loop. Keyed by spec.id.
+message JobRecord {
+  coppice.core.v1.Job spec = 1;
+  coppice.core.v1.JobState state = 2;
+  // The Q32.32 priority multiplier resolved by the API at proposal time.
+  uint64 multiplier_q32_32 = 3;
+  int64 submitted_at_us = 4;
+  // Retries consumed. Revoked outcomes requeue without touching this.
+  uint32 retries_used = 5;
+  coppice.core.v1.AttemptId current_attempt = 6;
+  // Every attempt this job has had, in creation order.
+  repeated coppice.core.v1.AttemptId attempts = 7;
+}
+
+// An attempt's replicated record: the attempt plus the charge that
+// placement committed, kept for true-up at terminal resolution. Keyed by
+// attempt.id.
+message AttemptRecord {
+  coppice.core.v1.Attempt attempt = 1;
+  // The placement group sharing the Ready barrier. v1: the job's id.
+  coppice.core.v1.GroupId group = 2;
+  coppice.core.v1.ChargeRecord charge = 3;
+  // Rate and multiplier the charge used, so true-up is never repriced by a
+  // later policy edit (ADR 0019).
+  uint64 rate_ucu_per_second = 4;
+  uint64 multiplier_q32_32 = 5;
+  // Set when the attempt is observed Running; an attempt that never started
+  // has actual cost zero at true-up.
+  optional int64 started_at_us = 6;
+}
+
+// An allocation's replicated record plus its commit-order sequence. Keyed
+// by allocation.id.
+message AllocationRecord {
+  coppice.core.v1.Allocation allocation = 1;
+  // Commit order: assigned from next_allocation_seq at creation. Funding
+  // iterates ascending seq, never id order.
+  uint64 seq = 2;
+}
+
+// A node's replicated record: descriptor plus its fencing epoch. Keyed by
+// node.id.
+message NodeRecord {
+  coppice.core.v1.Node node = 1;
+  // Bumped on (re)registration and on loss declaration (ADR 0009).
+  uint64 epoch = 2;
+}
+
+// One node of the quota-entity tree, keyed by `entity` (the map key made
+// explicit so the record decodes alone).
+message QuotaEntityRecord {
+  coppice.core.v1.QuotaEntityId entity = 1;
+  coppice.core.v1.QuotaEntityId parent = 2;
+  string name = 3;
+  // The soft quota as a stock in µCU (ADR 0019).
+  uint64 quota_ucu = 4;
+  coppice.core.v1.UsageState usage = 5;
+}
+
+// The state machine's scalar fields: replicated policy, feature gate, and
+// counters. Exactly one per snapshot.
+message ClusterStateRecord {
+  coppice.core.v1.PolicyConfig policy = 1;
+  // Semantic feature gate (ADR 0003).
+  uint32 cluster_version = 2;
+  // Count of applied log entries, accepted or rejected.
+  uint64 version = 3;
+  // Commit-order sequence for allocations; replicated so it is a pure
+  // function of the command history.
+  uint64 next_allocation_seq = 4;
+}

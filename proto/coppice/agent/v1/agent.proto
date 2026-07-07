@@ -1,0 +1,179 @@
+// The agent↔coordinator protocol (ADR 0009,
+// docs/protocols/agent-coordinator.md).
+//
+// Coordinator→agent messages express *desired* state; agent→coordinator
+// messages report *observed* state. The protocol tolerates duplicate,
+// delayed, and reordered delivery: every command carries the fencing token
+// and a per-node sequence number in one common header, and every report
+// carries identifiers that make retries safe.
+//
+// Raw agent reports are never Raft commands. The leader's ingestion layer
+// fences, dedupes, timestamps, and normalizes them into
+// coppice.command.v1 facts (see the command catalog's ingestion boundary).
+
+syntax = "proto3";
+
+package coppice.agent.v1;
+
+import "coppice/core/v1/attempt.proto";
+import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/node.proto";
+import "coppice/core/v1/resource.proto";
+
+// The fencing token (ADR 0009). Agents durably track the highest accepted
+// token and reject lower terms and mismatched epochs.
+message FencingToken {
+  // Raft term of the coordinator leader sending the command.
+  uint64 leader_term = 1;
+  // Replicated per node; bumped on (re)registration and loss declaration. A
+  // bump invalidates all commands issued under earlier epochs.
+  uint64 node_epoch = 2;
+}
+
+// Common header on *every* coordinator→agent command — defined once here,
+// never copy-pasted into bodies.
+message CommandHeader {
+  FencingToken token = 1;
+  // Per-node, monotonically increasing. An already-processed seq is
+  // acknowledged without acting (idempotent re-delivery).
+  uint64 command_seq = 2;
+}
+
+// A command from the coordinator to a node agent.
+// Body tags: 1–7 header/metadata headroom, 8+ command arms.
+message AgentCommand {
+  CommandHeader header = 1;
+
+  oneof body {
+    StartJob start_job = 8;
+    StopJob stop_job = 9;
+    Drain drain = 10;
+    PrepareCache prepare_cache = 11;
+    EvictImageHint evict_image_hint = 12;
+  }
+}
+
+// Start the given job under an allocation. Idempotent on `allocation`: an
+// agent that has already journaled it acknowledges without acting. The
+// agent journals (allocation, attempt, job, epoch) durably *before*
+// starting the container, and labels the container with allocation and
+// attempt ids.
+message StartJob {
+  coppice.core.v1.AllocationId allocation = 1;
+  coppice.core.v1.AttemptId attempt = 2;
+  coppice.core.v1.JobId job = 3;
+  // Container image reference.
+  string image = 4;
+  // Resource limits to enforce (the allocation's requested vector).
+  coppice.core.v1.Resources limits = 5;
+  // Enforced runtime bound; the agent kills the container past it
+  // (outcome MaxRuntimeExceeded). Absent = unbounded.
+  optional uint64 max_runtime_us = 6;
+}
+
+// Stop the work under an allocation (SIGTERM, grace, SIGKILL). Idempotent,
+// and valid even if the allocation is unknown: the agent journals a
+// tombstone so a racing StartJob for it is refused (ADR 0013).
+message StopJob {
+  coppice.core.v1.AllocationId allocation = 1;
+  // SIGTERM→SIGKILL grace in microseconds (from replicated policy).
+  int64 grace_us = 2;
+}
+
+// Ask the node to stop accepting new work. Advisory mirror of the
+// replicated drain flag; placement enforcement lives in apply.
+message Drain {}
+
+// Advisory prefetch hint (ADR 0010): agents may ignore it freely, and no
+// scheduling decision depends on it having been honored.
+message PrepareCache {
+  string image = 1;
+}
+
+// Advisory eviction hint (ADR 0010). Agents own eviction absolutely; images
+// pinned by assigned or running allocations are never evicted.
+message EvictImageHint {
+  string image_digest = 1;
+}
+
+// A report from a node agent to the coordinator.
+// Body tags: 1–7 identity/metadata headroom, 8+ report arms.
+message AgentReport {
+  coppice.core.v1.NodeId node = 1;
+  // The epoch the report was observed under; zero before the agent has
+  // (re)registered. Stale-epoch reports are demoted to reconciliation
+  // input, never attempt progress (ADR 0009).
+  uint64 node_epoch = 2;
+
+  oneof body {
+    Register register = 8;
+    Heartbeat heartbeat = 9;
+    AttemptStatus attempt_status = 10;
+    ObservedSet observed_set = 11;
+  }
+}
+
+// (Re)registration: advertises capacity and labels. The leader proposes
+// RegisterNode from this, bumping the node's epoch; the full ObservedSet
+// report follows.
+message Register {
+  coppice.core.v1.Resources capacity = 1;
+  // Canonical form: ascending key, unique keys.
+  repeated coppice.core.v1.Label labels = 2;
+}
+
+// Periodic liveness, inventory, and running-set signal. The coordinator
+// diffs `running` against replicated intent as a background invariant
+// check — the same diff as restart reconciliation.
+message Heartbeat {
+  coppice.core.v1.Resources capacity = 1;
+  repeated coppice.core.v1.AllocationId running = 2;
+  // Summarized cache inventory (ADR 0010): observed state for soft scoring
+  // only, never replicated.
+  ImageCacheInventory image_cache = 3;
+}
+
+// An observed attempt transition. Attempt-scoped and idempotent: the
+// attempt machine is monotonic, so duplicate or stale reports are dropped
+// deterministically at apply.
+message AttemptStatus {
+  coppice.core.v1.AllocationId allocation = 1;
+  coppice.core.v1.AttemptId attempt = 2;
+  coppice.core.v1.JobId job = 3;
+  // The observed state, carrying the outcome when terminal. The agent
+  // reports what it saw; classification and retry are resolved centrally.
+  coppice.core.v1.AttemptState observed = 4;
+  // Observed runtime, reported with terminal states; the leader's
+  // normalizer computes the authoritative actual_runtime_us.
+  uint64 runtime_us = 5;
+}
+
+// The full observed set, sent after (re)registration: everything the agent
+// found in its journal and container runtime. The coordinator diffs it
+// against replicated intent and commits adopt / lost verdicts
+// (ReconcileNode); "stop" is sent directly and never enters the log.
+message ObservedSet {
+  repeated ObservedAllocation allocations = 1;
+}
+
+message ObservedAllocation {
+  coppice.core.v1.AllocationId allocation = 1;
+  coppice.core.v1.AttemptId attempt = 2;
+  coppice.core.v1.JobId job = 3;
+  // True if the container is running; false if it exited and `outcome`
+  // records how.
+  bool running = 4;
+  coppice.core.v1.AttemptOutcome outcome = 5;
+  uint64 runtime_us = 6;
+}
+
+// Summarized image-cache inventory (ADR 0010).
+message ImageCacheInventory {
+  repeated CachedImage images = 1;
+}
+
+message CachedImage {
+  string digest = 1;
+  uint64 size_bytes = 2;
+  int64 last_used_at_us = 3;
+}

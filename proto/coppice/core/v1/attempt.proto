@@ -1,0 +1,94 @@
+// Attempts: one execution of a job (mirrors `coppice_core::attempt`).
+//
+// AttemptOutcome is the ADR 0013 taxonomy as a oneof: variants carry data
+// (exit code, user-error attribution), so a flat enum cannot represent them.
+// The outcome *classification* (success / user error / user request /
+// platform) is derived from the outcome by ADR 0013's table and is
+// deliberately absent from the schema — encoding it as a settable field
+// would let the two disagree.
+
+syntax = "proto3";
+
+package coppice.core.v1;
+
+import "coppice/core/v1/ids.proto";
+
+// One execution of a job. Authoritative, Raft-replicated state.
+message Attempt {
+  AttemptId id = 1;
+  JobId job = 2;
+  AllocationId allocation = 3;
+  NodeId node = 4;
+  AttemptState state = 5;
+}
+
+// The attempt machine's position: the forward chain
+// `Accruing → Ready → Dispatching → Running → Finalizing → Terminal`, plus
+// a direct edge from every non-terminal phase to Terminal for early endings.
+message AttemptState {
+  AttemptPhase phase = 1;
+  // Set iff phase == ATTEMPT_PHASE_TERMINAL.
+  AttemptOutcome outcome = 2;
+}
+
+enum AttemptPhase {
+  ATTEMPT_PHASE_UNSPECIFIED = 0;
+  // Allocations committed but not all funded. Skipped when capacity is
+  // immediately available (the common case).
+  ATTEMPT_PHASE_ACCRUING = 1;
+  // The barrier: all allocations funded, dispatch may begin. Defined over a
+  // placement group; v1 groups are singletons.
+  ATTEMPT_PHASE_READY = 2;
+  // StartJob sent to the agent.
+  ATTEMPT_PHASE_DISPATCHING = 3;
+  // Container observed running.
+  ATTEMPT_PHASE_RUNNING = 4;
+  // Exit observed; agent-side finalization (log flush, usage summary).
+  ATTEMPT_PHASE_FINALIZING = 5;
+  // Terminal, with the recorded outcome.
+  ATTEMPT_PHASE_TERMINAL = 6;
+}
+
+// Why an attempt ended. Recorded on every terminal attempt so that "what
+// stopped this job" is always answerable from state, never inferred.
+message AttemptOutcome {
+  // The container exited on its own with this code.
+  message Exited {
+    sint32 code = 1;
+  }
+  // Killed by the kernel for exceeding its memory limit.
+  message OomKilled {}
+  // Killed by the agent for exceeding its enforced max_runtime.
+  message MaxRuntimeExceeded {}
+  // Terminated by the abort mechanism.
+  message Aborted {}
+  // Revoked by the scheduler while accruing, to re-plan. Requeued without
+  // consuming retry budget. Only CommitPlacements may produce this.
+  message Revoked {}
+  // The image could not be pulled. `user_error` distinguishes a bad image
+  // reference from registry/platform trouble; the leader's ingestion layer
+  // resolves it from error detail before proposing (never the agent).
+  message PullFailed {
+    bool user_error = 1;
+  }
+  // The container could not be started.
+  message StartFailed {
+    bool user_error = 1;
+  }
+  // The node was declared lost while the attempt was live.
+  message NodeLost {}
+  // The agent failed in a way not attributable to the workload.
+  message AgentError {}
+
+  oneof outcome {
+    Exited exited = 1;
+    OomKilled oom_killed = 2;
+    MaxRuntimeExceeded max_runtime_exceeded = 3;
+    Aborted aborted = 4;
+    Revoked revoked = 5;
+    PullFailed pull_failed = 6;
+    StartFailed start_failed = 7;
+    NodeLost node_lost = 8;
+    AgentError agent_error = 9;
+  }
+}

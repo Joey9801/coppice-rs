@@ -1,0 +1,82 @@
+// Our durable representations of the openraft-level types: the log-entry
+// envelope with its three payload kinds, and our own messages for Vote,
+// LogId, and membership.
+//
+// ADR 0018 forbids persisting openraft's serde representations — these
+// messages exist precisely so an openraft upgrade cannot silently change
+// our durable format. `coppice-consensus` converts at the trait boundary;
+// what openraft calls the types is its business, what lands on disk is
+// ours.
+//
+// Coordinator node ids are allocate-once u64 integers recorded in
+// membership (ADR 0016) — instance identities, never reused slots. They are
+// unrelated to coppice.core.v1.NodeId, which identifies a compute node.
+
+syntax = "proto3";
+
+package coppice.raft.v1;
+
+import "coppice/command/v1/command.proto";
+
+// Identifies a leader: the pair (term, coordinator node id).
+message LeaderId {
+  uint64 term = 1;
+  uint64 node_id = 2;
+}
+
+// Raft vote state. Durability rule (ADR 0002): written atomically and
+// fsynced before any response — correctness depends on votes never rolling
+// back.
+message Vote {
+  LeaderId leader_id = 1;
+  // Whether this leader has been committed (openraft's vote-commit flag).
+  bool committed = 2;
+}
+
+// Identifies one log entry: the leader that proposed it and its index.
+message LogId {
+  LeaderId leader_id = 1;
+  uint64 index = 2;
+}
+
+// One coordinator in the membership, with the address peers dial.
+message RaftMember {
+  uint64 node_id = 1;
+  string address = 2;
+}
+
+// A voting configuration: one set of voter node ids.
+// Canonical form: ascending node_id, unique.
+message VoterConfig {
+  repeated uint64 voters = 1;
+}
+
+// Cluster membership. Two configs during a joint-consensus transition, one
+// otherwise. `members` covers voters and learners.
+// Canonical form: members ascending by node_id, unique.
+message Membership {
+  repeated VoterConfig configs = 1;
+  repeated RaftMember members = 2;
+}
+
+// Membership plus the log id it was committed at (openraft's
+// StoredMembership).
+message StoredMembership {
+  LogId log_id = 1;
+  Membership membership = 2;
+}
+
+// A blank (no-op) entry, appended by a new leader to commit its term.
+message Blank {}
+
+// One Raft log entry: the payload layer inside ADR 0002's length-delimited,
+// CRC-framed segment records. Covers all three openraft payload kinds.
+message LogEntry {
+  LogId log_id = 1;
+
+  oneof payload {
+    coppice.command.v1.Command normal = 2;
+    Membership membership = 3;
+    Blank blank = 4;
+  }
+}

@@ -33,6 +33,10 @@ coppice-api = { path = "crates/coppice-api" }
 # crate in the workspace stays in lockstep.
 anyhow = "1"
 proptest = "1"
+prost = "0.13"
+prost-build = "0.13"
+prost-types = "0.13"
+protox = "0.7"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,0 +1,30 @@
+// Compute node model (mirrors `coppice_core::node`).
+
+syntax = "proto3";
+
+package coppice.core.v1;
+
+import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/resource.proto";
+
+// One label used for hard/soft placement constraints.
+//
+// Label sets are repeated entries, never a proto map: map serialization
+// order is unspecified, and labels ride in replicated payloads. Canonical
+// form: ascending byte-order by key, unique keys.
+message Label {
+  string key = 1;
+  string value = 2;
+}
+
+// Authoritative record of a node's membership and schedulability.
+message Node {
+  NodeId id = 1;
+  // Total advertised capacity.
+  Resources capacity = 2;
+  // Canonical form: ascending key, unique keys.
+  repeated Label labels = 3;
+  // Whether the scheduler may place new work here. Desired state owned by
+  // the admin — an agent restart must not undo a drain (ADR 0009).
+  bool schedulable = 4;
+}

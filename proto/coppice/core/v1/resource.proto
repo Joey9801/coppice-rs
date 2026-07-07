@@ -1,0 +1,39 @@
+// Multi-dimensional resource model (mirrors `coppice_core::resource`).
+//
+// A resource vector is a repeated list of (kind, amount) entries rather than
+// named fields, so future dimensions (GPUs, licenses) are new enum values —
+// gated by ClusterVersion per ADR 0003 — not schema surgery. Cost weights
+// (coppice.core.v1.CostWeight) price dimensions the same way.
+//
+// Canonical form, required wherever the message is replicated or hashed:
+// entries sorted ascending by kind number, at most one entry per kind,
+// zero amounts omitted. Readers reject duplicate kinds and unknown kinds
+// (an unknown kind in a committed payload means the ClusterVersion write
+// gate was violated — fail loud, never silently drop a priced dimension).
+
+syntax = "proto3";
+
+package coppice.core.v1;
+
+// A priced, schedulable resource dimension.
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  // Milli-CPU units (1000 = one core).
+  RESOURCE_KIND_CPU_MILLIS = 1;
+  // Memory in bytes.
+  RESOURCE_KIND_MEMORY_BYTES = 2;
+  // Disk in bytes.
+  RESOURCE_KIND_DISK_BYTES = 3;
+}
+
+// One dimension of a resource vector.
+message ResourceQuantity {
+  ResourceKind kind = 1;
+  uint64 amount = 2;
+}
+
+// A vector of resource quantities requested by a job or offered by a node.
+message Resources {
+  // Canonical form: ascending kind, unique kinds, zeros omitted.
+  repeated ResourceQuantity quantities = 1;
+}
