@@ -13,6 +13,9 @@ coppice-consensus.workspace = true
 coppice-core.workspace = true
 coppice-state.workspace = true
 crc32c.workspace = true
+# For building typed ids deterministically from the testkit Rng — never
+# `Uuid::new_v4` in the generator, or seeds stop reproducing.
+uuid.workspace = true
 
 [lints]
 workspace = true

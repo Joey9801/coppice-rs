@@ -110,6 +110,9 @@ pub trait Fs: Send + Sync + 'static {
 
 /// An open file. Only the access patterns the formats need: append at the
 /// tail, positioned reads, truncate (torn-tail repair only), and data fsync.
+// `len` here is a fallible size query, not a collection length; an
+// `is_empty` counterpart would be noise.
+#[allow(clippy::len_without_is_empty)]
 pub trait FsFile: Send + 'static {
     /// Write `data` at the current end of file. Visible to all handles
     /// immediately; durable only after [`FsFile::sync_data`].
