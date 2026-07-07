@@ -32,6 +32,11 @@ coppice-api = { path = "crates/coppice-api" }
 # Common third-party dependencies. Versions are pinned centrally so every
 # crate in the workspace stays in lockstep.
 anyhow = "1"
+# openraft drives election, replication, and membership; the app data types
+# (`Command`, `Applied`, `RejectionReason`) do not implement serde, so the
+# "serde" feature is deliberately left off (ADR 0002). Default features cover
+# the tokio runtime support the adapter needs.
+openraft = "0.9"
 proptest = "1"
 prost = "0.13"
 prost-build = "0.13"

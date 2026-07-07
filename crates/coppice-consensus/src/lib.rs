@@ -1,32 +1,128 @@
 //! # coppice-consensus
 //!
-//! Raft integration for the coordinator control plane.
+//! The async seam between the coordinator control plane and openraft.
 //!
-//! This crate wraps a Raft implementation and drives the deterministic
-//! [`coppice_state::StateMachine`]: it proposes commands, replicates the log,
-//! applies committed entries, manages terms/epochs for fencing, and persists
-//! snapshots so recovering coordinators need not replay an unbounded log.
+//! This crate is a **thin adapter over openraft 0.9** (ADR 0002), not an
+//! abstraction meant to swap Raft libraries. openraft owns election,
+//! replication, and membership-change correctness; the seam converts at that
+//! boundary so openraft's types never appear in any other crate's signatures.
+//! Everything downstream consumes the openraft-free surface defined here:
+//! [`Consensus`] for proposals and reads, [`StateView`]/[`StateViews`] for
+//! applied state, [`EventTap`] for the derived event stream, and
+//! [`ConsensusError`] for failures.
 //!
-//! The concrete choice — openraft over a custom append-only segment-file
-//! storage layer — is recorded in
-//! `docs/decisions/0002-openraft-with-custom-segment-storage.md`. The traits
-//! here are the seam that implementation will fill in.
+//! The runtime that wires these together — the single-writer apply task that
+//! owns the mutable [`coppice_state::StateMachine`], the view publisher, the
+//! event tap, and the openraft node — is documented in
+//! `docs/architecture/coordinator-runtime.md`. Two coordinates run through the
+//! whole design and must not be conflated: the Raft applied **log index** (the
+//! read/event cursor of ADR 0007/0008) and [`coppice_state::StateMachine::version`]
+//! (the applied-command count the scheduler uses for `expected_version`).
+//! [`StateView`] exposes both.
+
+use std::future::Future;
 
 use coppice_state::Command;
 
-/// Proposes commands to the replicated log and reports leadership.
+mod adapter;
+mod error;
+mod events;
+mod view;
+
+pub use adapter::{
+    ApplyRequest, ApplyResult, OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY,
+    MAX_INFLIGHT_PROPOSALS,
+};
+pub use error::{ConsensusError, ProposeError};
+pub use events::{EventBatch, EventTap, EventTapReceiver, TapItem};
+pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
+
+/// Raft identity of one coordinator replica — an instance identity, never a
+/// reusable slot (ADR 0016). Distinct from [`coppice_core::id::NodeId`], which
+/// identifies compute nodes.
+pub type CoordinatorId = u64;
+
+/// This replica's current view of cluster leadership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Role {
+    /// This replica is the leader for `term`.
+    Leader { term: u64 },
+    /// This replica is a follower; `leader` is the current leader when known.
+    Follower { leader: Option<CoordinatorId> },
+    /// Election in progress, or metrics not yet observed.
+    Unknown,
+}
+
+impl Role {
+    /// Whether this replica currently believes it is the leader.
+    pub fn is_leader(&self) -> bool {
+        matches!(self, Role::Leader { .. })
+    }
+}
+
+/// A snapshot of this replica's leadership and progress, published through
+/// [`Consensus::status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsensusStatus {
+    /// This replica's Raft identity.
+    pub id: CoordinatorId,
+    /// Current leadership role.
+    pub role: Role,
+    /// Log index of the last entry applied locally (the ADR 0007/0008 cursor).
+    pub last_applied: u64,
+    /// Highest committed index this replica knows of; `known_committed - last_applied`
+    /// is the surfaced staleness bound for follower reads (ADR 0007).
+    pub known_committed: u64,
+}
+
+/// The resolved result of a proposal: committed, applied, outcome observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// Raft log index at which the command applied.
+    pub log_index: u64,
+    /// The deterministic apply outcome. `Err` is a *rejection* — committed as a
+    /// no-op on every replica with the reason recorded (command-catalog.md);
+    /// normal control flow for racing proposers, not a failure of `propose`.
+    pub outcome: Result<coppice_state::Applied, coppice_state::RejectionReason>,
+}
+
+/// The proposal, read-barrier, membership, and observation surface of the
+/// replicated control plane.
 ///
-/// Only the leader may accept authoritative writes; followers redirect, proxy,
-/// or reject with leader information. See
-/// `docs/architecture/high-availability.md`.
-pub trait Consensus {
-    type Error;
+/// The leader accepts authoritative writes; followers redirect via
+/// [`ConsensusError::NotLeader`]. Implementations are a thin adapter over
+/// openraft (ADR 0002); see [`OpenraftConsensus`].
+pub trait Consensus: Send + Sync + 'static {
+    /// Propose a command. Resolves only once the command is committed AND
+    /// applied, carrying the apply outcome. Backpressured by a bounded
+    /// in-flight budget. On [`ConsensusError::Timeout`] the outcome is UNKNOWN —
+    /// the command may still commit; proposers rely on the catalog's
+    /// idempotency rules, never blind resubmission of non-idempotent intents.
+    fn propose(&self, command: Command) -> impl Future<Output = Result<Applied, ConsensusError>> + Send;
 
-    /// Propose a command for replication. Resolves once the command is
-    /// committed and applied, or fails if this node is not the leader or the
-    /// proposal loses to a concurrent commit.
-    fn propose(&self, command: Command) -> Result<(), Self::Error>;
+    /// Linearizable read barrier (leader only): returns an index N such that
+    /// reading any view with `applied_index >= N` is a strong read (ADR 0007).
+    /// Pair with [`StateViews::at_least`].
+    fn read_index(&self) -> impl Future<Output = Result<u64, ConsensusError>> + Send;
 
-    /// Whether this node currently believes it is the leader.
-    fn is_leader(&self) -> bool;
+    /// Leadership + progress watch. Latest-value semantics; cheap to clone.
+    fn status(&self) -> tokio::sync::watch::Receiver<ConsensusStatus>;
+
+    /// Handle to published read views of applied state.
+    fn views(&self) -> StateViews;
+
+    /// Add a fresh node as a non-voting learner (ADR 0016 step 2). `addr` is
+    /// the network endpoint the Raft transport dials.
+    fn add_learner(&self, node: CoordinatorId, addr: String) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// Promote a caught-up learner to voter, optionally removing a departed
+    /// voter in the same joint-consensus change (ADR 0016 step 3).
+    fn promote_voter(&self, promote: CoordinatorId, remove: Option<CoordinatorId>) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// Remove a node from membership.
+    fn remove_node(&self, node: CoordinatorId) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// Ask consensus to build a snapshot now (housekeeping trigger; sealed
+    /// segments become deletable once covered — ADR 0002/0017).
+    fn trigger_snapshot(&self) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 }
