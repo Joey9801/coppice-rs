@@ -15,12 +15,16 @@ use serde::{Deserialize, Serialize};
 pub enum Command {
     /// Record a newly submitted job.
     SubmitJob { job: Job },
-    /// Request cancellation of a job (a desired-state transition).
-    CancelJob { job: JobId },
+    /// Request an abort (a desired-state transition: sets `abort_requested`).
+    /// With no live attempt the job terminates as `Aborted` in the same
+    /// apply; otherwise the attempt is stopped and resolution happens in
+    /// `Finalizing`.
+    AbortJob { job: JobId, reason: Option<String> },
     /// Commit a batch of scheduler placement decisions, valid only against the
     /// expected state version.
     CommitPlacements {
         expected_version: u64,
-        // Placeholder for the assignment batch produced by the scheduler.
+        // Placeholder for the placements, accruals, and revocations produced
+        // by the scheduler.
     },
 }

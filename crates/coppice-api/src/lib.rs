@@ -1,7 +1,7 @@
 //! # coppice-api
 //!
 //! The external API layer — the user-facing entry point for job submission,
-//! cancellation, status queries, event subscriptions, and administrative
+//! abort, status queries, event subscriptions, and administrative
 //! actions. The web UI and CLI are both built on this same surface.
 //!
 //! The API runs on every coordinator replica. Read-only requests may be served
@@ -10,7 +10,7 @@
 //! durable state transitions, not imperative worker control. See
 //! `docs/architecture/components.md` and `docs/operations/security.md`.
 
-use coppice_proto::api::{CancelJobRequest, SubmitJobRequest, SubmitJobResponse};
+use coppice_proto::api::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
 
 /// Errors surfaced to API callers.
 #[derive(Debug)]
@@ -26,5 +26,5 @@ pub enum ApiError {
 /// which owns access to consensus and state.
 pub trait ControlPlane {
     fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError>;
-    fn cancel_job(&self, req: CancelJobRequest) -> Result<(), ApiError>;
+    fn abort_job(&self, req: AbortJobRequest) -> Result<(), ApiError>;
 }

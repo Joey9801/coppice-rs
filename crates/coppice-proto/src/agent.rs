@@ -19,7 +19,9 @@ pub enum CoordinatorToAgent {
         allocation: AllocationId,
         attempt: AttemptId,
     },
-    /// Stop a running job.
+    /// Stop the work under an allocation (SIGTERM, grace period, SIGKILL).
+    /// Idempotent, and valid even if the allocation is unknown: the agent
+    /// journals a tombstone so a racing `StartJob` for it is refused.
     StopJob {
         epoch: Epoch,
         allocation: AllocationId,
@@ -33,11 +35,15 @@ pub enum CoordinatorToAgent {
 pub enum AgentToCoordinator {
     /// Periodic liveness and capacity signal.
     Heartbeat { node: NodeId, epoch: Epoch },
-    /// Report an observed job lifecycle transition.
-    JobStatus {
+    /// Report an observed attempt transition. Attempt-scoped and idempotent:
+    /// the attempt state machine is monotonic, so the coordinator's apply
+    /// naturally drops duplicate or stale reports (ADR 0009).
+    AttemptStatus {
         node: NodeId,
         allocation: AllocationId,
-        // Placeholder: the observed status payload is defined alongside the
-        // job lifecycle formalisation.
+        attempt: AttemptId,
+        /// The observed attempt state, carrying the outcome when terminal
+        /// (`coppice_core::attempt::AttemptState`).
+        observed: coppice_core::attempt::AttemptState,
     },
 }

@@ -10,6 +10,8 @@
 //!
 //! See `docs/architecture/state-model.md` and `docs/lifecycle/job-lifecycle.md`.
 
+pub mod allocation;
+pub mod attempt;
 pub mod id;
 pub mod job;
 pub mod node;

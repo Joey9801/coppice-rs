@@ -45,3 +45,8 @@ typed_id!(
     /// Identifies one execution attempt of a job (retries produce new attempts).
     AttemptId
 );
+typed_id!(
+    /// Identifies a placement group whose attempts share the `Ready` barrier
+    /// (gang scheduling). v1 groups are singletons: one job, one group.
+    GroupId
+);
