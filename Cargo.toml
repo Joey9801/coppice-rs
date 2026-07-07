@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/coppice-core",
+    "crates/coppice-proto",
+    "crates/coppice-state",
+    "crates/coppice-consensus",
+    "crates/coppice-scheduler",
+    "crates/coppice-api",
+    "crates/coppice-coordinator",
+    "crates/coppice-agent",
+    "crates/coppice-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.79"
+license = "Apache-2.0"
+repository = "https://github.com/josephroberts/coppice"
+authors = ["The Coppice Authors"]
+
+[workspace.dependencies]
+# Internal crates
+coppice-core = { path = "crates/coppice-core" }
+coppice-proto = { path = "crates/coppice-proto" }
+coppice-state = { path = "crates/coppice-state" }
+coppice-consensus = { path = "crates/coppice-consensus" }
+coppice-scheduler = { path = "crates/coppice-scheduler" }
+coppice-api = { path = "crates/coppice-api" }
+
+# Common third-party dependencies. Versions are pinned centrally so every
+# crate in the workspace stays in lockstep.
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

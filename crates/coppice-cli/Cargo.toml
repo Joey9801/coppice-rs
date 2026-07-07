@@ -1,0 +1,21 @@
+[package]
+name = "coppice-cli"
+description = "Command-line client for Coppice: submit, cancel, and query jobs against the public API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "coppice"
+path = "src/main.rs"
+
+[dependencies]
+coppice-core.workspace = true
+coppice-proto.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

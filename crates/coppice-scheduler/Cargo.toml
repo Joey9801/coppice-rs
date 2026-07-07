@@ -1,0 +1,16 @@
+[package]
+name = "coppice-scheduler"
+description = "Asynchronous scheduler engine: bin packing, constraints, quotas, and reservations."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+coppice-core.workspace = true
+coppice-state.workspace = true
+
+[lints]
+workspace = true

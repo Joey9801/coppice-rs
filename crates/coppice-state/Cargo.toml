@@ -1,0 +1,17 @@
+[package]
+name = "coppice-state"
+description = "Deterministic replicated state machine for the Coppice control plane."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+coppice-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

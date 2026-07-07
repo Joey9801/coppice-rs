@@ -1,0 +1,28 @@
+[package]
+name = "coppice-coordinator"
+description = "Coordinator daemon: the replicated control plane binding consensus, scheduling, and the API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "coppice-coordinator"
+path = "src/main.rs"
+
+[dependencies]
+coppice-core.workspace = true
+coppice-proto.workspace = true
+coppice-state.workspace = true
+coppice-consensus.workspace = true
+coppice-scheduler.workspace = true
+coppice-api.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

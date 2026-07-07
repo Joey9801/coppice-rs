@@ -1,0 +1,18 @@
+[package]
+name = "coppice-consensus"
+description = "Raft consensus integration: log replication, leader election, and snapshots."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+coppice-core.workspace = true
+coppice-state.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
