@@ -16,7 +16,7 @@ documents so that each concern can grow independently.
 | [overview.md](overview.md) | Purpose, target scale, and core responsibilities. |
 | [architecture/](architecture/) | Components, state model, high availability, versioning, and storage boundaries. |
 | [lifecycle/](lifecycle/) | The job lifecycle state machine. |
-| [scheduling/](scheduling/) | Scheduling model, quotas and priorities, image-cache policy. |
+| [scheduling/](scheduling/) | Scheduling model, the v1 scheduler algorithm, quotas and priorities, image-cache policy. |
 | [protocols/](protocols/) | The agent–coordinator protocol. |
 | [operations/](operations/) | Configuration, observability, failure handling, and security. |
 | [roadmap/](roadmap/) | Initial scope and the design-decision register. |

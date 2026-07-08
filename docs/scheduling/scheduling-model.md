@@ -156,6 +156,9 @@ semantics.
 
 ## Related
 
+- [scheduler-v1.md](scheduler-v1.md) — the implemented v1 algorithm: scoring,
+  node filtering, best-fit packing, and the accrual/backfill mechanics
+  described above, as built.
 - [quotas-and-priorities.md](quotas-and-priorities.md) — the fairness and
   admission policy the scheduler enforces.
 - [image-cache.md](image-cache.md) — how image locality feeds soft scoring.

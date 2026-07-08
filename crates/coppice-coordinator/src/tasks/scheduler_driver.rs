@@ -6,16 +6,27 @@
 //! driver"), propose `CommitPlacements`, await the outcome. At most one
 //! proposal is in flight by construction: this loop's body is
 //! straight-line sequential code, never spawned concurrently.
+//!
+//! Every completed proposal — accepted or rejected — changes what the next
+//! pass must see: an acceptance changes state directly, and a rejection
+//! (`docs/architecture/command-catalog.md`'s all-or-nothing batch outcome)
+//! still means *some* concurrent command landed first (that is what caused
+//! the rejection), and only a fresh view can tell the difference from
+//! re-proposing the same jobs into the same rejection. So after any
+//! completed proposal the driver waits for `views` to catch up to the
+//! commit's log index before scheduling again (see the `at_least` call
+//! below) — otherwise the next pass reads a stale snapshot and hot-loops on
+//! the same rejection.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
-use coppice_consensus::{Applied, Consensus, ConsensusStatus, StateViews};
-use coppice_scheduler::{PlacementProposal, Scheduler};
-use coppice_state::command::CommitPlacements;
-use coppice_state::{Command, StateMachine};
+use coppice_consensus::{Consensus, ConsensusStatus, StateViews};
+use coppice_core::id::{AllocationId, AttemptId};
+use coppice_scheduler::Scheduler;
+use coppice_state::Command;
 
 use crate::leadership;
 
@@ -26,20 +37,6 @@ use crate::leadership;
 /// target index), so a short poll is the available alternative to a true
 /// view-change wait.
 const EMPTY_PASS_BACKOFF: Duration = Duration::from_millis(200);
-
-/// Placeholder `Scheduler` until a real engine lands in `coppice-scheduler`.
-///
-/// Today `coppice-scheduler` defines only the trait and an empty `PlacementProposal`.
-/// Keeps the task topology wired and exercised; every pass is a no-op.
-pub struct NoopScheduler;
-
-impl Scheduler for NoopScheduler {
-    fn schedule(&self, snapshot: &StateMachine) -> PlacementProposal {
-        PlacementProposal {
-            against_version: snapshot.version,
-        }
-    }
-}
 
 /// Run the scheduler driver loop until shutdown.
 pub async fn run<C, S>(
@@ -60,9 +57,10 @@ pub async fn run<C, S>(
 
         loop {
             let view = views.latest();
+            let now = now_us();
             let pass_scheduler = Arc::clone(&scheduler);
             let proposal = match tokio::task::spawn_blocking(move || {
-                pass_scheduler.schedule(view.state())
+                pass_scheduler.schedule(view.state(), now)
             })
             .await
             {
@@ -73,7 +71,7 @@ pub async fn run<C, S>(
                 }
             };
 
-            if proposal_is_empty(&proposal) {
+            if proposal.is_empty() {
                 tokio::select! {
                     biased;
                     _ = leadership::until_leadership_lost(&mut status, term, &mut shutdown) => break,
@@ -82,20 +80,11 @@ pub async fn run<C, S>(
                 continue;
             }
 
-            let command = Command::CommitPlacements(commit_placements_from_proposal(proposal));
-            match consensus.propose(command).await {
-                Ok(Applied { outcome: Ok(_), .. }) => {
-                    // Placed; loop straight back around for the next pass.
-                }
-                Ok(Applied {
-                    outcome: Err(reason),
-                    ..
-                }) => {
-                    tracing::debug!(
-                        ?reason,
-                        "scheduler driver: CommitPlacements rejected, recomputing (scheduling-model.md)"
-                    );
-                }
+            let command = Command::CommitPlacements(
+                proposal.to_commit_placements(&mut || (AttemptId::new(), AllocationId::new())),
+            );
+            let applied = match consensus.propose(command).await {
+                Ok(applied) => applied,
                 Err(e) if e.is_retryable() => {
                     tracing::info!(
                         error = %e,
@@ -107,26 +96,44 @@ pub async fn run<C, S>(
                     tracing::error!(error = %e, "scheduler driver: fatal propose error");
                     return;
                 }
+            };
+
+            match &applied.outcome {
+                Ok(_) => {
+                    // Placed; the freshness gate below still applies before
+                    // the next pass.
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        ?reason,
+                        "scheduler driver: CommitPlacements rejected, recomputing (scheduling-model.md)"
+                    );
+                }
+            }
+
+            // Freshness gate: every completed proposal, accepted or
+            // rejected, changed what the next pass must see (an acceptance
+            // changes state; a rejection means something else did). Wait for
+            // `views` to reflect this commit's log index before scheduling
+            // again, or the next pass reads a stale snapshot and re-proposes
+            // into the same rejection. Races against leadership loss the
+            // same way the empty-pass sleep does.
+            tokio::select! {
+                biased;
+                _ = leadership::until_leadership_lost(&mut status, term, &mut shutdown) => break,
+                result = views.at_least(applied.log_index) => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
             }
         }
     }
 }
 
-/// `PlacementProposal` doesn't yet carry placement/revocation data.
-///
-/// `coppice-scheduler` ships only the trait and an audit-only proposal today —
-/// until it does, every pass is trivially empty.
-fn proposal_is_empty(_proposal: &PlacementProposal) -> bool {
-    true
-}
-
-/// Deferred: convert `PlacementProposal` -> `CommitPlacements`.
-///
-/// Waits for `coppice-scheduler` to carry real placement/revocation data.
-fn commit_placements_from_proposal(proposal: PlacementProposal) -> CommitPlacements {
-    todo!(
-        "PlacementProposal -> CommitPlacements conversion once coppice-scheduler \
-         carries placement data (against_version={})",
-        proposal.against_version
-    )
+fn now_us() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }

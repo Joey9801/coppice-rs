@@ -12,5 +12,12 @@ authors.workspace = true
 coppice-core.workspace = true
 coppice-state.workspace = true
 
+[dev-dependencies]
+# Property tests for the ADR 0021 score formula and the zero-rejection
+# scheduler↔apply contract; synthetic states drive the throughput test.
+proptest.workspace = true
+coppice-testkit.workspace = true
+uuid.workspace = true
+
 [lints]
 workspace = true

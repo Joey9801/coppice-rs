@@ -550,6 +550,9 @@ version = "0.0.1"
 dependencies = [
  "coppice-core",
  "coppice-state",
+ "coppice-testkit",
+ "proptest",
+ "uuid",
 ]
 
 [[package]]

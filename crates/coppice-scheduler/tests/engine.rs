@@ -1,0 +1,401 @@
+//! Behavioural tests for the `HeuristicScheduler` against real apply-built
+//! states: resource-fit filtering, best-fit choice, the accrual cap K,
+//! per-cycle work caps, emitted command shape, and the strict-backfill
+//! boundary (ADR 0014).
+
+mod common;
+
+use common::*;
+
+use coppice_core::allocation::AllocationState;
+use coppice_core::attempt::AttemptState;
+use coppice_core::job::JobState;
+use coppice_core::quota::PriorityMultiplier;
+use coppice_scheduler::{HeuristicScheduler, PlacementProposal, Scheduler, SchedulerConfig};
+use coppice_state::StateMachine;
+
+fn schedule(sm: &StateMachine, now_us: i64) -> PlacementProposal {
+    HeuristicScheduler::default().schedule(sm, now_us)
+}
+
+fn schedule_with(sm: &StateMachine, cfg: SchedulerConfig, now_us: i64) -> PlacementProposal {
+    HeuristicScheduler::new(cfg).schedule(sm, now_us)
+}
+
+/// Submit a job whose enforced `max_runtime` is given in microseconds (the
+/// second-granularity helper cannot express a sub-second boundary).
+fn submit_runtime_us(
+    sm: &mut StateMachine,
+    job: coppice_core::id::JobId,
+    requests: coppice_core::resource::Resources,
+    max_runtime_us: u64,
+) {
+    let spec = coppice_core::job::Job {
+        id: job,
+        image: "img".into(),
+        requests,
+        priority: 0,
+        max_runtime_us: Some(max_runtime_us),
+        quota_entity: ROOT,
+        retry: coppice_core::job::RetryPolicy::default(),
+        abort_requested: None,
+    };
+    apply_ok(
+        sm,
+        coppice_state::Command::SubmitJob(coppice_state::command::SubmitJob {
+            job: spec,
+            multiplier: PriorityMultiplier::ONE,
+            submitted_at_us: TS,
+        }),
+    );
+}
+
+/// Apply a proposal through real commands and return the applied result, plus
+/// the ids that were minted for each placement (in order).
+fn commit(
+    sm: &mut StateMachine,
+    proposal: &PlacementProposal,
+) -> Result<Vec<coppice_core::id::AllocationId>, coppice_state::RejectionReason> {
+    let mut minted = Vec::new();
+    let mut mint = minter();
+    let cmd = proposal.to_commit_placements(&mut || {
+        let ids = mint();
+        minted.push(ids.1);
+        ids
+    });
+    sm.apply(&coppice_state::Command::CommitPlacements(cmd))?;
+    Ok(minted)
+}
+
+#[test]
+fn seats_a_fitting_job_and_emits_the_v1_shape() {
+    let mut sm = setup(cpu(10_000), 4);
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(4_000), Some(600), PriorityMultiplier::ONE, TS),
+    );
+
+    let proposal = schedule(&sm, TS + 1);
+    assert_eq!(proposal.placements.len(), 1);
+    assert!(proposal.revocations.is_empty());
+    let p = &proposal.placements[0];
+    assert_eq!(p.job, jid(1));
+    assert_eq!(p.node, nid(1));
+    assert!(p.expect_funded, "a 4-core job on a free 10-core node funds");
+
+    // The command carries the v1 shape apply demands: singleton group == job
+    // id, exactly one allocation.
+    let cmd = proposal.to_commit_placements(&mut minter());
+    assert_eq!(cmd.placements.len(), 1);
+    assert_eq!(cmd.placements[0].group.0, jid(1).0);
+    assert_eq!(cmd.placements[0].allocations.len(), 1);
+    assert_eq!(cmd.expected_version, proposal.against_version);
+    assert_eq!(cmd.proposed_at_us, proposal.now_us);
+
+    let allocs = commit(&mut sm, &proposal).expect("batch applies");
+    assert_eq!(
+        sm.allocations[&allocs[0]].allocation.state,
+        AllocationState::Funded
+    );
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Preparing);
+}
+
+#[test]
+fn rejects_a_job_that_exceeds_every_node_on_one_dimension() {
+    // Node has plenty of CPU and disk but little memory; a memory-heavy job
+    // fits no node and is never placed.
+    let mut sm = setup(res(32_000, 8 << 30, 1 << 40), 4);
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(1),
+            res(1_000, 64 << 30, 0),
+            Some(600),
+            PriorityMultiplier::ONE,
+            TS,
+        ),
+    );
+    let proposal = schedule(&sm, TS + 1);
+    assert!(proposal.is_empty(), "an unplaceable job yields no proposal");
+}
+
+#[test]
+fn best_fit_prefers_the_snugger_node() {
+    // Two nodes: a roomy 64-core and a snug 8-core. A 6-core job packs onto the
+    // snug node, leaving the roomy one for bigger work.
+    let mut sm = StateMachine::default();
+    apply_ok(&mut sm, configure_entity_cmd(ROOT, None));
+    apply_ok(&mut sm, update_policy_cmd(test_policy(4)));
+    apply_ok(&mut sm, register_node_cmd(nid(1), cpu(64_000), TS));
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(8_000), TS));
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(6_000), Some(600), PriorityMultiplier::ONE, TS),
+    );
+
+    let proposal = schedule(&sm, TS + 1);
+    assert_eq!(proposal.placements.len(), 1);
+    assert_eq!(
+        proposal.placements[0].node,
+        nid(2),
+        "best-fit picks the snug node"
+    );
+}
+
+#[test]
+fn honours_the_effective_score_order_and_the_candidate_cap() {
+    // Three queued jobs, one node with room for one. With max_candidates == 1
+    // only the top-scored job is even considered.
+    let mut sm = setup(cpu(10_000), 4);
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(9_000), Some(600), PriorityMultiplier::ONE, TS),
+    );
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(2),
+            cpu(9_000),
+            Some(600),
+            PriorityMultiplier::from_integer(5),
+            TS,
+        ),
+    );
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(3), cpu(9_000), Some(600), PriorityMultiplier::ONE, TS),
+    );
+
+    let cfg = SchedulerConfig {
+        max_candidates: 1,
+        ..SchedulerConfig::default()
+    };
+    let proposal = schedule_with(&sm, cfg, TS + 1);
+    assert_eq!(proposal.placements.len(), 1);
+    // jid(2) has the 5× multiplier ⇒ top of the score order ⇒ the sole
+    // candidate seated.
+    assert_eq!(proposal.placements[0].job, jid(2));
+}
+
+#[test]
+fn honours_the_placement_cap() {
+    // Many fitting jobs, but the per-cycle placement cap bounds the batch.
+    let mut sm = setup(res(1_000_000, 0, 0), 4);
+    for i in 1..=10u128 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(jid(i), cpu(1_000), Some(600), PriorityMultiplier::ONE, TS),
+        );
+    }
+    let cfg = SchedulerConfig {
+        max_placements_per_cycle: 3,
+        ..SchedulerConfig::default()
+    };
+    let proposal = schedule_with(&sm, cfg, TS + 1);
+    assert_eq!(
+        proposal.placements.len(),
+        3,
+        "the placement cap bounds emissions"
+    );
+}
+
+#[test]
+fn accrual_opening_respects_the_cap_k() {
+    // A node whose free capacity is already partly consumed, and three whales
+    // that each need the whole node — they fit total capacity (so apply admits
+    // them) but not free capacity, so each seating is an accrual open. With
+    // K = 2 only two may hold accruing allocations at once.
+    let mut sm = setup(cpu(8_000), 2);
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(10), cpu(2_000), Some(600), PriorityMultiplier::ONE, TS),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(10), aid(10), alid(10), nid(1), cpu(2_000)),
+            TS,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(10), TS));
+    apply_ok(&mut sm, started_cmd(aid(10), TS));
+    for i in 1..=3u128 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(jid(i), cpu(8_000), None, PriorityMultiplier::ONE, TS),
+        );
+    }
+    let proposal = schedule(&sm, TS + 1);
+    // No whale free-fits (8 > 6 free) and none can backfill (no max_runtime),
+    // so each seating is an accrual open — capped at K = 2.
+    assert_eq!(
+        proposal.placements.len(),
+        2,
+        "at most K accruing jobs opened"
+    );
+    assert!(proposal.placements.iter().all(|p| !p.expect_funded));
+
+    let allocs = commit(&mut sm, &proposal).expect("K-respecting batch applies");
+    assert_eq!(allocs.len(), 2);
+    for a in &allocs {
+        assert_eq!(
+            sm.allocations[a].allocation.state,
+            AllocationState::Accruing
+        );
+    }
+    // A second pass adds nothing: the cap is already reached.
+    let again = schedule(&sm, TS + 2);
+    assert!(again.is_empty(), "no third accrual past K");
+}
+
+#[test]
+fn fixpoint_reached_after_placing_everything_placeable() {
+    let mut sm = setup(cpu(10_000), 4);
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(3_000), Some(600), PriorityMultiplier::ONE, TS),
+    );
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(2), cpu(3_000), Some(600), PriorityMultiplier::ONE, TS),
+    );
+
+    let proposal = schedule(&sm, TS + 1);
+    assert_eq!(proposal.placements.len(), 2);
+    commit(&mut sm, &proposal).expect("applies");
+    // Immediately re-running on the applied state must be empty (the driver's
+    // backoff depends on it).
+    assert!(schedule(&sm, TS + 2).is_empty());
+}
+
+/// Drive a running job onto the node so its capacity is consumed and it carries
+/// a guaranteed release event, then queue a whale that can only accrue.
+fn state_with_running_and_accruing_whale(
+    runtime_r_s: u64,
+) -> (StateMachine, coppice_core::id::AllocationId) {
+    let mut sm = setup(cpu(32_000), 4);
+    // Running job R: 16 cpu, enforced max_runtime, started at TS.
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(1),
+            cpu(16_000),
+            Some(runtime_r_s),
+            PriorityMultiplier::ONE,
+            TS,
+        ),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(placement(jid(1), aid(1), alid(1), nid(1), cpu(16_000)), TS),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(1), TS));
+    apply_ok(&mut sm, started_cmd(aid(1), TS));
+    // Whale W: needs the whole 32 cpu, no max_runtime ⇒ it just accrues.
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(2), cpu(32_000), None, PriorityMultiplier::ONE, TS),
+    );
+
+    let proposal = schedule(&sm, TS + 50);
+    assert_eq!(proposal.placements.len(), 1);
+    assert_eq!(proposal.placements[0].job, jid(2));
+    assert!(!proposal.placements[0].expect_funded, "the whale accrues");
+    let mut minted = Vec::new();
+    // A low base disjoint from the test's own later minting into this state.
+    let mut mint = minter_from(1000);
+    let cmd = proposal.to_commit_placements(&mut || {
+        let ids = mint();
+        minted.push(ids.1);
+        ids
+    });
+    sm.apply(&coppice_state::Command::CommitPlacements(cmd))
+        .expect("accrual opens");
+    let whale_alloc = minted[0];
+    assert_eq!(
+        sm.allocations[&whale_alloc].allocation.state,
+        AllocationState::Accruing
+    );
+    // The whale is funded to the 16 cpu currently free.
+    assert_eq!(sm.allocations[&whale_alloc].allocation.funded, cpu(16_000));
+    (sm, whale_alloc)
+}
+
+#[test]
+fn strict_backfill_lends_exactly_at_the_boundary() {
+    // R runs for 3600 s from TS ⇒ its 16 cpu is guaranteed free at
+    // projected_ready = TS + 3_600_000_000, which is when the whale W would
+    // become ready. A small job S that finishes exactly then may lend.
+    let runtime_r_s = 3600u64;
+    let projected_ready = TS + (runtime_r_s as i64) * 1_000_000;
+    let (mut sm, whale_alloc) = state_with_running_and_accruing_whale(runtime_r_s);
+
+    // S needs 8 cpu with an enforced runtime chosen so now + S.max_runtime
+    // lands exactly on projected_ready (microsecond precision).
+    let now = TS + 100;
+    let s_runtime_us = (projected_ready - now) as u64;
+    submit_runtime_us(&mut sm, jid(3), cpu(8_000), s_runtime_us);
+
+    let proposal = schedule(&sm, now);
+    // A lend: revoke the whale, seat S, reseat the whale after it.
+    assert_eq!(
+        proposal.revocations,
+        vec![whale_alloc],
+        "the lend revokes the whale"
+    );
+    assert!(proposal
+        .placements
+        .iter()
+        .any(|p| p.job == jid(3) && p.expect_funded));
+    assert!(
+        proposal.placements.iter().any(|p| p.job == jid(2)),
+        "the whale is reseated"
+    );
+    // Funding order: S is seated before the whale it borrows from.
+    let s_idx = proposal
+        .placements
+        .iter()
+        .position(|p| p.job == jid(3))
+        .unwrap();
+    let w_idx = proposal
+        .placements
+        .iter()
+        .position(|p| p.job == jid(2))
+        .unwrap();
+    assert!(s_idx < w_idx, "the backfilled job funds before the reseat");
+
+    // The whole batch applies with zero rejections.
+    let mut mint = minter();
+    let cmd = proposal.to_commit_placements(&mut mint);
+    sm.apply(&coppice_state::Command::CommitPlacements(cmd))
+        .expect("the lend applies cleanly");
+}
+
+#[test]
+fn strict_backfill_declines_one_microsecond_past_the_boundary() {
+    let runtime_r_s = 3600u64;
+    let projected_ready = TS + (runtime_r_s as i64) * 1_000_000;
+    let (mut sm, _whale_alloc) = state_with_running_and_accruing_whale(runtime_r_s);
+
+    // S would finish one microsecond after the whale's projected_ready — the
+    // strict rule forbids the lend.
+    let now = TS + 100;
+    let s_runtime_us = (projected_ready - now) as u64 + 1;
+    submit_runtime_us(&mut sm, jid(3), cpu(8_000), s_runtime_us);
+
+    let proposal = schedule(&sm, now);
+    // No lend: the whale keeps its pledge. S opens its own accrual instead (the
+    // node has no free capacity), so no revocation is proposed.
+    assert!(proposal.revocations.is_empty(), "no lend past the boundary");
+    let mut mint = minter();
+    let cmd = proposal.to_commit_placements(&mut mint);
+    sm.apply(&coppice_state::Command::CommitPlacements(cmd))
+        .expect("applies without a lend");
+    // The whale's accrual survives untouched.
+    assert!(
+        sm.attempts
+            .values()
+            .any(|a| a.attempt.state == AttemptState::Accruing),
+        "the whale is still accruing"
+    );
+}

@@ -9,11 +9,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
 use coppice_consensus::{Consensus, EventTapReceiver, StateViews};
+use coppice_scheduler::HeuristicScheduler;
 
 use crate::limits::AGENT_INBOUND_CAPACITY;
 use crate::tasks::api_server::{self, CoordinatorControlPlane};
 use crate::tasks::housekeeping::StubHistoryStore;
-use crate::tasks::scheduler_driver::NoopScheduler;
 use crate::tasks::{
     agent_gateway, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver,
 };
@@ -76,7 +76,7 @@ where
     let scheduler_join = tokio::spawn(scheduler_driver::run(
         Arc::clone(&consensus),
         views.clone(),
-        Arc::new(NoopScheduler),
+        Arc::new(HeuristicScheduler::default()),
         status.clone(),
         shutdown_rx.clone(),
     ));
