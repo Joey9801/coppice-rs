@@ -1,140 +1,233 @@
 //! ADR 0018 storage benchmark suite, family 3/3: cold-recovery replay
-//! floor.
+//! against the real engine.
 //!
 //! Mandate ([ADR 0018](../../../docs/decisions/0018-protobuf-records-in-parallel-containers.md)):
 //! recovery replay is pipelined — segment read-ahead and entry decode run
 //! ahead of the serial apply loop — so apply, not parsing, must be the
-//! limiter. This bench measures the scan+verify half of that pipeline
-//! (sequential read + frame-split + CRC32C) through the `Fs`/`FsFile` seam
-//! on a real segment file, giving the entries/s floor recovery can promise
-//! before a single applied command exists to bound it from the other side.
+//! limiter. This bench builds a 100k-entry data directory once (real
+//! `RegisterNode` commands, real `LogEntry` protobuf framing, real
+//! `StorageCore::append_batch`), then measures the three legs of the
+//! pipeline through the `Fs`/`FsFile` seam on `RealFs`:
+//!
+//! - `open/recovery`: `StorageCore::open` cold — manifest read, orphan
+//!   sweep, and the full tail-segment scan + CRC32C verify of every entry
+//!   (ADR 0017 recovery step 4). This is what a replica pays once, before
+//!   anything is replayed.
+//! - `scan_decode/entries`: `read_payloads` over the whole live range, then
+//!   protobuf-decoding each payload back to a `LogEntry` and converting its
+//!   `Command`. The scan+decode half of the pipeline.
+//! - `apply/entries`: applying the already-decoded commands to a fresh
+//!   `StateMachine`, one `sm.apply` per entry. The serial half of the
+//!   pipeline — the one ADR 0018 says must be the bottleneck.
 //!
 //! Regressions here gate storage merges exactly like the crash suite
 //! (see docs/architecture/storage-testing.md, "The benchmark suite").
-//!
-// TODO(storage-engine): once the engine exists, extend this bench to
-// decode each entry's `Command` protobuf and feed it to the apply loop's
-// input side, then compare directly against the apply loop's own rate.
-// ADR 0018's thesis is only checked once that comparison exists: replay
-// scan+decode must exceed the serial apply loop's rate, or recovery becomes
-// the bottleneck ADR 0018 promises it isn't.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::hint::black_box;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use prost::Message;
 
 use coppice_consensus::fs::{Fs, FsFile, RealFs};
+use coppice_consensus::storage::{EncodedEntry, FrameLogId, StorageCore, StorageOptions};
+use coppice_core::id::NodeId;
+use coppice_core::resource::Resources;
+use coppice_proto::convert::{command_from_pb, command_to_pb};
+use coppice_proto::pb::raft::v1 as pbraft;
+use coppice_state::command::RegisterNode;
+use coppice_state::{Command, StateMachine};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
-/// Representative log entry payload size, matching `append_commit`'s.
-const ENTRY_PAYLOAD_LEN: usize = 256;
+const CLUSTER_UUID: [u8; 16] = *b"replay-bench-clu";
+const INSTANCE_UUID: [u8; 16] = [0x77; 16];
+const NODE_ID: u64 = 1;
 
-/// Entry count in the replay-floor segment. Large enough that read-ahead
-/// and per-chunk overhead average out.
+/// Entry count in the replay-floor fixture. Large enough that read-ahead
+/// and per-chunk overhead average out, small enough that `--quick` runs
+/// finish in seconds.
 const ENTRY_COUNT: usize = 100_000;
 
-/// 1 MiB sequential read-ahead buffer for the scan.
-const READ_CHUNK: usize = 1 << 20;
+/// Batch size the fixture is appended in (matches a realistic group-commit
+/// size, not a single-entry-per-fsync fixture build).
+const APPEND_BATCH: usize = 1024;
 
-/// Frame one entry as length-delimited + CRC32C'd — the same shape
-/// `append_commit` writes, matching the real ADR 0002/0018 segment framing.
-fn frame_entry(payload: &[u8], out: &mut Vec<u8>) {
-    let len = payload.len() as u32;
-    let crc = crc32c::crc32c(payload);
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(payload);
+/// One realistic small command: register a distinct compute node. Cheap to
+/// construct, decodes through the real `Command::RegisterNode` apply path
+/// (unconditional accept, ADR 0009 epoch bump), so `apply/entries` never
+/// spends its measured time on rejection bookkeeping.
+fn register_node_command() -> Command {
+    Command::RegisterNode(RegisterNode {
+        node: NodeId::new(),
+        capacity: Resources {
+            cpu_millis: 4_000,
+            memory_bytes: 8 << 30,
+            disk_bytes: 100 << 30,
+        },
+        labels: BTreeMap::new(),
+        registered_at_us: 1_700_000_000_000_000,
+    })
 }
 
-/// Build the fixed replay-floor segment once, through the seam, and return
-/// an open read handle plus its length. Not timed: this is the "cold
-/// recovery finds this segment on disk" precondition, not the replay
-/// itself.
-fn build_segment(fs: &RealFs) -> (<RealFs as Fs>::File, u64) {
-    let payload = vec![0xEFu8; ENTRY_PAYLOAD_LEN];
-    let mut buf = Vec::with_capacity(ENTRY_COUNT * (8 + ENTRY_PAYLOAD_LEN));
-    for _ in 0..ENTRY_COUNT {
-        frame_entry(&payload, &mut buf);
+/// Encode one fixture entry as the real durable `coppice.raft.v1.LogEntry`
+/// payload (the same bytes `SegmentLogStorage::append` produces), wrapped in
+/// its frame-level log id.
+fn encode_fixture_entry(index: u64) -> EncodedEntry {
+    let command = register_node_command();
+    let entry = pbraft::LogEntry {
+        log_id: Some(pbraft::LogId {
+            leader_id: Some(pbraft::LeaderId {
+                term: 1,
+                node_id: NODE_ID,
+            }),
+            index,
+        }),
+        payload: Some(pbraft::log_entry::Payload::Normal(command_to_pb(
+            &command, 1,
+        ))),
+    };
+    EncodedEntry {
+        id: FrameLogId {
+            index,
+            term: 1,
+            node_id: NODE_ID,
+        },
+        payload: entry.encode_to_vec(),
     }
-
-    let path = Path::new("replay.seg");
-    {
-        let mut file = fs.create_new(path).expect("create segment");
-        file.append(&buf).expect("append");
-        file.sync_data().expect("sync_data");
-    }
-    let file = fs.open_read(path).expect("open_read");
-    let len = file.len().expect("len");
-    (file, len)
 }
 
-/// Sequential scan: chunked read-ahead, frame-split, CRC-verify every
-/// entry. Returns (entries verified, bytes verified) so the caller can
-/// report both throughput axes. A carry buffer holds any partial frame
-/// spanning a chunk boundary — reading a fixed-size window can split a
-/// frame anywhere.
-fn replay_scan<F: FsFile>(file: &F, file_len: u64) -> (u64, u64) {
-    let mut chunk = vec![0u8; READ_CHUNK];
-    let mut carry: Vec<u8> = Vec::new();
-    let mut offset = 0u64;
-    let mut entries = 0u64;
-    let mut bytes_verified = 0u64;
-
-    while offset < file_len {
-        let want = READ_CHUNK.min((file_len - offset) as usize);
-        let n = file.read_at(offset, &mut chunk[..want]).expect("read_at");
-        assert!(n > 0, "short read before expected end of segment");
-        offset += n as u64;
-        carry.extend_from_slice(&chunk[..n]);
-
-        let mut pos = 0usize;
-        loop {
-            if carry.len() - pos < 8 {
-                break;
-            }
-            let len = u32::from_le_bytes(carry[pos..pos + 4].try_into().unwrap()) as usize;
-            if carry.len() - pos < 8 + len {
-                break;
-            }
-            let crc_expected = u32::from_le_bytes(carry[pos + 4..pos + 8].try_into().unwrap());
-            let payload = &carry[pos + 8..pos + 8 + len];
-            let crc_actual = crc32c::crc32c(payload);
-            assert_eq!(crc_actual, crc_expected, "corrupt entry during replay scan");
-            entries += 1;
-            bytes_verified += (8 + len) as u64;
-            pos += 8 + len;
-        }
-        carry.drain(..pos);
-    }
-
-    (entries, bytes_verified)
+/// Decode one fixture payload back to its domain `Command` — the
+/// `scan_decode` half of the pipeline this module measures.
+fn decode_fixture_entry(bytes: &[u8]) -> Command {
+    let entry = pbraft::LogEntry::decode(bytes).expect("decode LogEntry");
+    let Some(pbraft::log_entry::Payload::Normal(pb_command)) = entry.payload else {
+        panic!("recovery_replay fixture only ever writes Command::Normal entries");
+    };
+    command_from_pb(pb_command).expect("command_from_pb").1
 }
 
-/// The replay-rate floor: entries/s a cold-recovery scan can sustain before
-/// any apply-side decode is added. Read-only against a fixed segment, so no
-/// `iter_batched` setup is needed per iteration.
+/// Build the fixture directory once, through the seam, appending
+/// `ENTRY_COUNT` real `RegisterNode` entries in `APPEND_BATCH`-sized group
+/// commits. Not timed: this is the "cold recovery finds this on disk"
+/// precondition, not the replay itself. The engine is dropped at the end of
+/// this function, releasing the data directory's `LOCK` for the benches.
+fn build_fixture(fs_root: &Path, options: &StorageOptions) {
+    let fs = RealFs::new(fs_root);
+    StorageCore::init(&fs, options, INSTANCE_UUID).expect("init");
+    let mut core = StorageCore::open(fs, options.clone()).expect("open");
+
+    let mut index = 0u64;
+    while (index as usize) < ENTRY_COUNT {
+        let batch_len = APPEND_BATCH.min(ENTRY_COUNT - index as usize) as u64;
+        let batch: Vec<EncodedEntry> = (index..index + batch_len)
+            .map(encode_fixture_entry)
+            .collect();
+        core.append_batch(&batch).expect("append_batch");
+        index += batch_len;
+    }
+}
+
 fn bench_recovery_replay(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let fs = RealFs::new(dir.path());
-    let (file, file_len) = build_segment(&fs);
+    let fs_root: PathBuf = dir.path().to_path_buf();
+    let options = StorageOptions::new(CLUSTER_UUID, NODE_ID);
+
+    build_fixture(&fs_root, &options);
+
+    // 100k small RegisterNode entries stay well under the 64 MiB default
+    // rotation threshold, so every entry lands in the one segment starting
+    // at index 0 — this is the byte count `open/recovery` scans and
+    // CRC-verifies in full.
+    let segment_bytes = {
+        let fs = RealFs::new(&fs_root);
+        let file = fs.open_read(Path::new("log/0.seg")).expect("open segment");
+        file.len().expect("len")
+    };
 
     let mut group = c.benchmark_group("recovery_replay");
 
-    group.throughput(Throughput::Elements(ENTRY_COUNT as u64));
-    group.bench_function("scan_and_verify/entries", |b| {
+    // (a) The cold-open cost: manifest + orphan sweep + full tail-segment
+    // scan/CRC-verify of all 100k entries (ADR 0017 recovery step 4). Every
+    // iteration opens a fresh `StorageCore` and drops it (releasing `LOCK`)
+    // before the next.
+    group.throughput(Throughput::Bytes(segment_bytes));
+    group.bench_function("open/recovery", |b| {
         b.iter(|| {
-            let (entries, bytes) = replay_scan(&file, file_len);
-            std::hint::black_box((entries, bytes));
+            let core = StorageCore::open(RealFs::new(&fs_root), options.clone()).expect("open");
+            black_box(&core);
         });
     });
 
-    group.throughput(Throughput::Bytes(file_len));
-    group.bench_function("scan_and_verify/bytes", |b| {
+    // One core, held open for both remaining groups.
+    let mut core = StorageCore::open(RealFs::new(&fs_root), options.clone()).expect("open");
+
+    // (b) scan_decode/entries: read_payloads over the whole live range, then
+    // decode every payload's LogEntry + Command. Freshly re-reads and
+    // re-decodes every sample, matching what a real recovery's scan+decode
+    // stage does once per cold start.
+    group.throughput(Throughput::Elements(ENTRY_COUNT as u64));
+    group.bench_function("scan_decode/entries", |b| {
         b.iter(|| {
-            let (entries, bytes) = replay_scan(&file, file_len);
-            std::hint::black_box((entries, bytes));
+            let payloads = core.read_payloads(0, u64::MAX).expect("read_payloads");
+            for (_, bytes) in &payloads {
+                black_box(decode_fixture_entry(bytes));
+            }
+        });
+    });
+
+    // Pre-decode once, outside the timed apply loop — apply/entries
+    // measures only `sm.apply`, not the decode that feeds it. This pass
+    // also doubles as the untimed data source for the eprintln comparison
+    // below.
+    let scan_decode_start = Instant::now();
+    let payloads = core.read_payloads(0, u64::MAX).expect("read_payloads");
+    let commands: Vec<Command> = payloads
+        .iter()
+        .map(|(_, bytes)| decode_fixture_entry(bytes))
+        .collect();
+    let scan_decode_elapsed = scan_decode_start.elapsed();
+    assert_eq!(
+        commands.len(),
+        ENTRY_COUNT,
+        "fixture must hold exactly ENTRY_COUNT live entries"
+    );
+
+    // (c) apply/entries: the serial apply loop ADR 0018 says must be the
+    // bottleneck. A fresh StateMachine per iteration so state size stays
+    // constant across samples.
+    group.throughput(Throughput::Elements(ENTRY_COUNT as u64));
+    group.bench_function("apply/entries", |b| {
+        b.iter(|| {
+            let mut sm = StateMachine::default();
+            for command in &commands {
+                black_box(sm.apply(command).ok());
+            }
+            black_box(sm);
         });
     });
 
     group.finish();
+
+    // A one-shot, unstatistical comparison (like snapshot_codec's eprintln)
+    // of the two pipeline legs ADR 0018's thesis is about: scan+decode must
+    // clear the apply rate, or recovery replay becomes bound by parsing
+    // instead of application.
+    let apply_start = Instant::now();
+    let mut sm = StateMachine::default();
+    for command in &commands {
+        let _ = sm.apply(command);
+    }
+    let apply_elapsed = apply_start.elapsed();
+
+    let scan_decode_rate = ENTRY_COUNT as f64 / scan_decode_elapsed.as_secs_f64();
+    let apply_rate = ENTRY_COUNT as f64 / apply_elapsed.as_secs_f64();
+    eprintln!(
+        "recovery_replay: scan+decode {scan_decode_rate:.0} entries/s vs apply {apply_rate:.0} \
+         entries/s (ratio {:.2}x; ADR 0018 requires scan+decode to clear apply so replay \
+         pipelines ahead of it)",
+        scan_decode_rate / apply_rate
+    );
 }
 
 criterion_group!(benches, bench_recovery_replay);

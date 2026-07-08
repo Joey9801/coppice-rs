@@ -19,22 +19,27 @@
 //! uses a longer measurement window).
 
 use std::env;
+use std::path::Path;
 use std::time::Duration;
 
+use coppice_consensus::storage::raw::{decode_state, encode_state};
 use coppice_proto::convert::{state_from_records, state_to_records, StateRecords};
 use coppice_proto::pb::storage::v1 as pb;
 use coppice_testkit::synth::{synth_state, SynthConfig};
 use criterion::measurement::WallTime;
-use criterion::{criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+};
 use prost::Message;
 
 /// One buffer per snapshot section (ADR 0018: jobs / attempts / allocations
 /// / nodes / quota entities / cluster, each an independent length-delimited
 /// protobuf stream). Sharding those streams across cores, optional zstd,
-/// and the per-section CRC32C are the storage engine's job.
-// TODO(storage-engine): wire real sections (sharding + compression + CRC)
-// around this payload path and re-measure end to end; this bench isolates
-// exactly the part that does not change when that lands.
+/// and the per-section CRC32C are the storage engine's job — measured
+/// end to end below by `bench_container_encode`/`bench_container_decode`
+/// against `storage::raw::{encode_state, decode_state}`; this payload-only
+/// path isolates exactly the part that does not change when the container
+/// layer wraps it.
 #[derive(Default)]
 struct SectionBuffers {
     jobs: Vec<u8>,
@@ -51,7 +56,9 @@ struct SectionBuffers {
 fn encode_section<M: Message>(records: &[M], buf: &mut Vec<u8>) {
     buf.clear();
     for record in records {
-        record.encode_length_delimited(buf).expect("encode_length_delimited");
+        record
+            .encode_length_delimited(buf)
+            .expect("encode_length_delimited");
     }
 }
 
@@ -65,7 +72,9 @@ fn encode_all(records: &StateRecords, bufs: &mut SectionBuffers) -> u64 {
     encode_section(&records.quota_entities, &mut bufs.quota_entities);
     bufs.cluster.clear();
     if let Some(cluster) = &records.cluster {
-        cluster.encode_length_delimited(&mut bufs.cluster).expect("encode_length_delimited");
+        cluster
+            .encode_length_delimited(&mut bufs.cluster)
+            .expect("encode_length_delimited");
     }
     (bufs.jobs.len()
         + bufs.attempts.len()
@@ -181,5 +190,93 @@ fn bench_decode(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_encode, bench_decode);
+/// Shard counts swept for the container-level benches: 1 (no parallelism)
+/// and 4 (`StorageOptions::new`'s default `snapshot_shards`), so the sweep
+/// shows both the unsharded floor and the shape a real cluster runs with.
+const SHARD_COUNTS: [u32; 2] = [1, 4];
+
+/// A minimal but valid `SnapshotMeta` for the container benches: the fields
+/// that matter to `encode_state`/`decode_state` are `shard_count` (which
+/// must match the `shards` argument) and enough of the rest to satisfy
+/// `validate_container`/`decode_state`'s shape checks. `last_applied` and
+/// `membership` are legitimately absent on a from-scratch snapshot.
+fn container_meta(shards: u32) -> pb::SnapshotMeta {
+    pb::SnapshotMeta {
+        cluster_uuid: vec![0u8; 16],
+        snapshot_id: "bench".into(),
+        last_applied: None,
+        membership: None,
+        cluster_version: 1,
+        shard_count: shards,
+    }
+}
+
+/// The full ADR 0018 container encode a real snapshot production pays:
+/// per-section sharding, framing (header, per-section CRC32C, footer), and
+/// assembly — `bench_encode` above isolates only the per-section payload
+/// slice of this.
+fn bench_container_encode(c: &mut Criterion) {
+    for jobs in scales() {
+        let state = synth_state(&SynthConfig::with_jobs(jobs));
+        let records = state_to_records(&state);
+
+        let mut group = group_for(c, "snapshot_codec/container_encode", jobs);
+        for shards in SHARD_COUNTS {
+            let meta = container_meta(shards);
+            group.throughput(Throughput::Elements(jobs as u64));
+            group.bench_with_input(
+                BenchmarkId::new(format!("shards{shards}"), jobs),
+                &jobs,
+                |b, _| {
+                    b.iter(|| {
+                        let bytes = encode_state(&meta, &records, shards);
+                        std::hint::black_box(bytes);
+                    });
+                },
+            );
+        }
+        group.finish();
+    }
+}
+
+/// The full ADR 0018 container decode a learner-join rebuild pays:
+/// `decode_state` (container validation + parallel per-section decode) plus
+/// `state_from_records`, the same reassembly step `super::open` runs on a
+/// real snapshot. Container bytes are pre-encoded outside the timed loop.
+fn bench_container_decode(c: &mut Criterion) {
+    for jobs in scales() {
+        let state = synth_state(&SynthConfig::with_jobs(jobs));
+        let records = state_to_records(&state);
+
+        let mut group = group_for(c, "snapshot_codec/container_decode", jobs);
+        for shards in SHARD_COUNTS {
+            let meta = container_meta(shards);
+            let bytes = encode_state(&meta, &records, shards);
+
+            group.throughput(Throughput::Elements(jobs as u64));
+            group.bench_with_input(
+                BenchmarkId::new(format!("shards{shards}"), jobs),
+                &jobs,
+                |b, _| {
+                    b.iter(|| {
+                        let (_meta, records) =
+                            decode_state(Path::new("snapshot_codec-bench.snap"), &bytes)
+                                .expect("decode_state");
+                        let state = state_from_records(records).expect("state_from_records");
+                        std::hint::black_box(state);
+                    });
+                },
+            );
+        }
+        group.finish();
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_encode,
+    bench_decode,
+    bench_container_encode,
+    bench_container_decode
+);
 criterion_main!(benches);
