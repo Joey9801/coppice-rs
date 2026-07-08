@@ -30,9 +30,20 @@ pub async fn run<C: Consensus>(
         let Some(term) = leadership::wait_for_leadership(&mut status, &mut shutdown).await else {
             return;
         };
-        tracing::info!(term, "ingestion: gained leadership, draining inbound reports");
+        tracing::info!(
+            term,
+            "ingestion: gained leadership, draining inbound reports"
+        );
 
-        let lost_leadership = drain(&consensus, &views, &mut inbound, &mut status, term, &mut shutdown).await;
+        let lost_leadership = drain(
+            &consensus,
+            &views,
+            &mut inbound,
+            &mut status,
+            term,
+            &mut shutdown,
+        )
+        .await;
         if !lost_leadership {
             // The inbound sender side is gone (agent gateway shut down)
             // rather than leadership having moved; nothing left to ingest.

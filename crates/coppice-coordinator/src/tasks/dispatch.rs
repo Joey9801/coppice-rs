@@ -84,7 +84,10 @@ async fn handle_event<C: Consensus>(
     event: &Event,
 ) {
     match event {
-        Event::AttemptStateChanged { attempt, state: AttemptState::Ready } => {
+        Event::AttemptStateChanged {
+            attempt,
+            state: AttemptState::Ready,
+        } => {
             dispatch_ready_attempt(consensus, views, router, *attempt).await;
         }
         Event::StopRequested { node, allocation } => {
@@ -121,7 +124,10 @@ async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &R
         .filter_map(|job| job.current_attempt)
         .filter_map(|attempt_id| view.state().attempts.get(&attempt_id))
         .filter(|record| {
-            matches!(record.attempt.state, AttemptState::Dispatching | AttemptState::Running)
+            matches!(
+                record.attempt.state,
+                AttemptState::Dispatching | AttemptState::Running
+            )
         })
         .map(|record| (record.attempt.node, record.attempt.allocation))
         .collect();
@@ -140,21 +146,36 @@ async fn dispatch_ready_attempt<C: Consensus>(
     router: &RouterHandle,
     attempt: AttemptId,
 ) {
-    let command = Command::DispatchAttempt(DispatchAttempt { attempt, dispatched_at_us: now_us() });
+    let command = Command::DispatchAttempt(DispatchAttempt {
+        attempt,
+        dispatched_at_us: now_us(),
+    });
     match consensus.propose(command).await {
         Ok(Applied { outcome: Ok(_), .. }) => {
             let view = views.latest();
-            let Some(record) = view.state().attempts.get(&attempt) else { return };
+            let Some(record) = view.state().attempts.get(&attempt) else {
+                return;
+            };
             let Some(allocation) = view.state().allocations.get(&record.attempt.allocation) else {
                 return;
             };
             let node = record.attempt.node;
             let agent_command = start_job_command(record, allocation);
-            if router.send(RouteCommand { node, command: agent_command }).await.is_err() {
+            if router
+                .send(RouteCommand {
+                    node,
+                    command: agent_command,
+                })
+                .await
+                .is_err()
+            {
                 tracing::warn!(?attempt, "dispatch: router channel closed");
             }
         }
-        Ok(Applied { outcome: Err(reason), .. }) => {
+        Ok(Applied {
+            outcome: Err(reason),
+            ..
+        }) => {
             tracing::debug!(?attempt, ?reason, "dispatch: DispatchAttempt rejected");
         }
         Err(e) if e.is_retryable() => {
@@ -192,5 +213,8 @@ fn stop_job_command(_allocation: AllocationId) -> AgentCommand {
 
 fn now_us() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }

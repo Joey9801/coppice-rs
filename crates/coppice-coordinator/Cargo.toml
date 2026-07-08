@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "coppice_coordinator"
+path = "src/lib.rs"
+
 [[bin]]
 name = "coppice-coordinator"
 path = "src/main.rs"
@@ -15,14 +19,33 @@ path = "src/main.rs"
 [dependencies]
 coppice-core.workspace = true
 coppice-proto.workspace = true
+coppice-raft-net.workspace = true
 coppice-state.workspace = true
 coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
 coppice-api.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+# `json` (not in the workspace default feature set) backs the config's
+# `log_format = "json"` structured-logging option; mirrors the `uuid` pattern
+# below of enabling a feature purely from this crate.
+tracing-subscriber = { workspace = true, features = ["json"] }
+serde.workspace = true
+toml.workspace = true
+humantime-serde.workspace = true
+# `Uuid` needs the "serde" feature (not part of the workspace default) to
+# deserialize `cluster_id` from the config file's hyphenated string form.
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+# Test-only self-signed CA + per-node leaf certs for the mTLS Raft/admin mesh
+# the multi-node integration test drives (ADR 0011). Dev-only: production nodes
+# read PEM material from disk (config `[tls]`), never mint it.
+rcgen.workspace = true
 
 [lints]
 workspace = true

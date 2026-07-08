@@ -85,7 +85,11 @@ impl FanoutHandle {
     ) -> Result<Subscription, FanoutClosed> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(SubscribeRequest { filter, cursor, reply: reply_tx })
+            .send(SubscribeRequest {
+                filter,
+                cursor,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| FanoutClosed)?;
         reply_rx.await.map_err(|_| FanoutClosed)?
@@ -102,7 +106,10 @@ struct Ring {
 
 impl Ring {
     fn new() -> Self {
-        Ring { entries: VecDeque::new(), event_count: 0 }
+        Ring {
+            entries: VecDeque::new(),
+            event_count: 0,
+        }
     }
 
     fn push(&mut self, batch: EventBatch) {
@@ -113,12 +120,16 @@ impl Ring {
 
     fn evict(&mut self) {
         while self.event_count > FANOUT_RING_MAX_EVENTS {
-            let Some((_, evicted)) = self.entries.pop_front() else { break };
+            let Some((_, evicted)) = self.entries.pop_front() else {
+                break;
+            };
             self.event_count -= evicted.events.len();
         }
         if let Some(cutoff) = Instant::now().checked_sub(FANOUT_RING_MAX_AGE) {
             while matches!(self.entries.front(), Some((seen_at, _)) if *seen_at < cutoff) {
-                let Some((_, evicted)) = self.entries.pop_front() else { break };
+                let Some((_, evicted)) = self.entries.pop_front() else {
+                    break;
+                };
                 self.event_count -= evicted.events.len();
             }
         }
@@ -128,7 +139,10 @@ impl Ring {
     ///
     /// An empty ring retains everything from the start.
     fn earliest_index(&self) -> u64 {
-        self.entries.front().map(|(_, batch)| batch.applied_index).unwrap_or(0)
+        self.entries
+            .front()
+            .map(|(_, batch)| batch.applied_index)
+            .unwrap_or(0)
     }
 
     fn iter(&self) -> impl Iterator<Item = &EventBatch> {
@@ -218,11 +232,19 @@ fn filter_events(filter: &EventFilter, batch: &EventBatch) -> Option<EventBatch>
     if matches!(filter, EventFilter::All) {
         return Some(batch.clone());
     }
-    let events: Vec<Event> = batch.events.iter().filter(|e| event_matches(filter, e)).cloned().collect();
+    let events: Vec<Event> = batch
+        .events
+        .iter()
+        .filter(|e| event_matches(filter, e))
+        .cloned()
+        .collect();
     if events.is_empty() {
         None
     } else {
-        Some(EventBatch { applied_index: batch.applied_index, events })
+        Some(EventBatch {
+            applied_index: batch.applied_index,
+            events,
+        })
     }
 }
 
@@ -249,13 +271,17 @@ fn event_matches(filter: &EventFilter, event: &Event) -> bool {
 /// Applies the gap recovery and full-queue policy of the "per-subscriber queue" channel row.
 fn deliver(sub: &mut SubscriberState, batch: &EventBatch, ring_earliest: u64) {
     if sub.gapped {
-        let gap = SubscriptionItem::Gap { earliest_available: ring_earliest };
+        let gap = SubscriptionItem::Gap {
+            earliest_available: ring_earliest,
+        };
         match sub.tx.try_send(gap) {
             Ok(()) => sub.gapped = false,
             Err(_) => return, // still backed up; try again on the next batch
         }
     }
-    let Some(filtered) = filter_events(&sub.filter, batch) else { return };
+    let Some(filtered) = filter_events(&sub.filter, batch) else {
+        return;
+    };
     if sub.tx.try_send(SubscriptionItem::Events(filtered)).is_err() {
         sub.gapped = true;
     }
@@ -292,10 +318,19 @@ fn handle_subscribe(
         None => {}
     }
     if gapped {
-        let _ = tx.try_send(SubscriptionItem::Gap { earliest_available: ring.earliest_index() });
+        let _ = tx.try_send(SubscriptionItem::Gap {
+            earliest_available: ring.earliest_index(),
+        });
     }
 
-    subscribers.insert(id, SubscriberState { filter: req.filter, tx, gapped: false });
+    subscribers.insert(
+        id,
+        SubscriberState {
+            filter: req.filter,
+            tx,
+            gapped: false,
+        },
+    );
     // The receiver may be gone already (an impatient caller); nothing to do
     // either way.
     let _ = req.reply.send(Ok(Subscription { items: rx }));
@@ -311,7 +346,10 @@ mod tests {
 
     #[test]
     fn all_filter_admits_everything() {
-        let batch = EventBatch { applied_index: 1, events: vec![job_event(JobId::new())] };
+        let batch = EventBatch {
+            applied_index: 1,
+            events: vec![job_event(JobId::new())],
+        };
         assert!(filter_events(&EventFilter::All, &batch).is_some());
     }
 
@@ -319,7 +357,10 @@ mod tests {
     fn job_filter_only_admits_its_own_job() {
         let job = JobId::new();
         let other = JobId::new();
-        let batch = EventBatch { applied_index: 1, events: vec![job_event(job)] };
+        let batch = EventBatch {
+            applied_index: 1,
+            events: vec![job_event(job)],
+        };
         assert!(filter_events(&EventFilter::Job(job), &batch).is_some());
         assert!(filter_events(&EventFilter::Job(other), &batch).is_none());
     }
@@ -329,7 +370,10 @@ mod tests {
         let node = NodeId::new();
         let other = NodeId::new();
         let event = Event::NodeEpochBumped { node, epoch: 1 };
-        let batch = EventBatch { applied_index: 1, events: vec![event] };
+        let batch = EventBatch {
+            applied_index: 1,
+            events: vec![event],
+        };
         assert!(filter_events(&EventFilter::Node(node), &batch).is_some());
         assert!(filter_events(&EventFilter::Node(other), &batch).is_none());
     }
@@ -337,11 +381,24 @@ mod tests {
     #[tokio::test]
     async fn subscriber_gaps_when_its_queue_overflows_then_recovers() {
         let (tx, mut rx) = mpsc::channel(2);
-        let mut sub = SubscriberState { filter: EventFilter::All, tx, gapped: false };
+        let mut sub = SubscriberState {
+            filter: EventFilter::All,
+            tx,
+            gapped: false,
+        };
 
-        let b1 = EventBatch { applied_index: 1, events: vec![job_event(JobId::new())] };
-        let b2 = EventBatch { applied_index: 2, events: vec![job_event(JobId::new())] };
-        let b3 = EventBatch { applied_index: 3, events: vec![job_event(JobId::new())] };
+        let b1 = EventBatch {
+            applied_index: 1,
+            events: vec![job_event(JobId::new())],
+        };
+        let b2 = EventBatch {
+            applied_index: 2,
+            events: vec![job_event(JobId::new())],
+        };
+        let b3 = EventBatch {
+            applied_index: 3,
+            events: vec![job_event(JobId::new())],
+        };
 
         deliver(&mut sub, &b1, 0); // 1/2
         deliver(&mut sub, &b2, 0); // 2/2, still not full
@@ -359,7 +416,10 @@ mod tests {
 
         // Queue is empty again; the next delivery clears the gap and gets
         // its own batch through in the same call.
-        let b4 = EventBatch { applied_index: 4, events: vec![job_event(JobId::new())] };
+        let b4 = EventBatch {
+            applied_index: 4,
+            events: vec![job_event(JobId::new())],
+        };
         deliver(&mut sub, &b4, 2);
         assert!(!sub.gapped);
 

@@ -87,7 +87,12 @@ mod tests {
     use std::time::Duration;
 
     fn status(role: Role) -> ConsensusStatus {
-        ConsensusStatus { id: 1, role, last_applied: 0, known_committed: 0 }
+        ConsensusStatus {
+            id: 1,
+            role,
+            last_applied: 0,
+            known_committed: 0,
+        }
     }
 
     #[tokio::test]
@@ -96,7 +101,9 @@ mod tests {
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let waiter =
-            tokio::spawn(async move { wait_for_leadership(&mut status_rx, &mut shutdown_rx).await });
+            tokio::spawn(
+                async move { wait_for_leadership(&mut status_rx, &mut shutdown_rx).await },
+            );
 
         tokio::task::yield_now().await;
         status_tx.send(status(Role::Leader { term: 3 })).unwrap();
@@ -111,7 +118,9 @@ mod tests {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let waiter =
-            tokio::spawn(async move { wait_for_leadership(&mut status_rx, &mut shutdown_rx).await });
+            tokio::spawn(
+                async move { wait_for_leadership(&mut status_rx, &mut shutdown_rx).await },
+            );
 
         tokio::task::yield_now().await;
         shutdown_tx.send(true).unwrap();
@@ -130,9 +139,14 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        status_tx.send(status(Role::Follower { leader: Some(9) })).unwrap();
+        status_tx
+            .send(status(Role::Follower { leader: Some(9) }))
+            .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), waiter).await.expect("timed out").expect("join");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("timed out")
+            .expect("join");
     }
 
     #[tokio::test]
@@ -149,6 +163,9 @@ mod tests {
         // watching for still counts as "lost" for the caller's purposes.
         status_tx.send(status(Role::Leader { term: 6 })).unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), waiter).await.expect("timed out").expect("join");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("timed out")
+            .expect("join");
     }
 }

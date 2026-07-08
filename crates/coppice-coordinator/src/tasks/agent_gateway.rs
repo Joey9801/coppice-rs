@@ -207,8 +207,14 @@ mod tests {
         // No session is registered for this node (no transport yet), so
         // routing to it is dropped rather than panicking or blocking.
         let node = NodeId::new();
-        let command = AgentCommand { header: None, body: None };
-        router.send(RouteCommand { node, command }).await.expect("router accepts the send");
+        let command = AgentCommand {
+            header: None,
+            body: None,
+        };
+        router
+            .send(RouteCommand { node, command })
+            .await
+            .expect("router accepts the send");
 
         let _ = shutdown_tx.send(true);
         let _ = status_tx; // keep the sender alive until shutdown is observed

@@ -14,12 +14,18 @@ use crate::limits::AGENT_INBOUND_CAPACITY;
 use crate::tasks::api_server::{self, CoordinatorControlPlane};
 use crate::tasks::housekeeping::StubHistoryStore;
 use crate::tasks::scheduler_driver::NoopScheduler;
-use crate::tasks::{agent_gateway, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver};
+use crate::tasks::{
+    agent_gateway, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver,
+};
 
 /// Wire up and run every coordinator task.
 ///
 /// Returns once shutdown has fully drained.
-pub async fn run<C>(consensus: C, views: StateViews, event_tap: EventTapReceiver) -> anyhow::Result<()>
+pub async fn run<C>(
+    consensus: C,
+    views: StateViews,
+    event_tap: EventTapReceiver,
+) -> anyhow::Result<()>
 where
     C: Consensus,
 {
@@ -34,12 +40,18 @@ where
     let (fanout, fanout_join) = event_fanout::spawn(event_tap, shutdown_rx.clone());
     tracing::info!("runtime: event fanout up");
 
-    let (router, router_join) = agent_gateway::spawn(inbound_tx, status.clone(), shutdown_rx.clone());
+    let (router, router_join) =
+        agent_gateway::spawn(inbound_tx, status.clone(), shutdown_rx.clone());
     tracing::info!("runtime: agent gateway up");
 
-    let control_plane =
-        Arc::new(CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone()));
-    let api_join = tokio::spawn(api_server::run_placeholder(control_plane, shutdown_rx.clone()));
+    let control_plane = Arc::new(CoordinatorControlPlane::new(
+        Arc::clone(&consensus),
+        views.clone(),
+    ));
+    let api_join = tokio::spawn(api_server::run_placeholder(
+        control_plane,
+        shutdown_rx.clone(),
+    ));
     tracing::info!("runtime: api server up");
 
     // ---- Leader-only tasks (every replica runs the loop; each self-gates
@@ -79,10 +91,38 @@ where
     tracing::info!("runtime: ingestion, dispatch, scheduler driver, housekeeping spawned");
 
     // ---- Shutdown trigger ----
+    // Both interactive (ctrl-c / SIGINT) and orchestrated (SIGTERM, e.g. a
+    // `kill` or a container stop) shutdowns flip the same watch; whichever
+    // fires first wins the race and the other arm is dropped.
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("runtime: ctrl-c received, shutting down");
-            let _ = shutdown_tx.send(true);
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "runtime: failed to install SIGTERM handler");
+                    return;
+                }
+            };
+            let reason = tokio::select! {
+                res = tokio::signal::ctrl_c() => res.map(|()| "ctrl-c").ok(),
+                _ = sigterm.recv() => Some("SIGTERM"),
+            };
+            if let Some(reason) = reason {
+                tracing::info!(
+                    signal = reason,
+                    "runtime: shutdown signal received, shutting down"
+                );
+                let _ = shutdown_tx.send(true);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("runtime: ctrl-c received, shutting down");
+                let _ = shutdown_tx.send(true);
+            }
         }
     });
 

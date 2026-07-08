@@ -61,7 +61,10 @@ pub struct StubHistoryStore;
 
 impl HistoryStore for StubHistoryStore {
     async fn write_terminal_jobs(&self, jobs: Vec<TerminalJobRecord>) -> anyhow::Result<()> {
-        tracing::info!(count = jobs.len(), "housekeeping: (stub) wrote terminal jobs to history");
+        tracing::info!(
+            count = jobs.len(),
+            "housekeeping: (stub) wrote terminal jobs to history"
+        );
         Ok(())
     }
 }
@@ -140,7 +143,10 @@ async fn run_pass<C: Consensus, H: HistoryStore>(
     });
     match consensus.propose(command).await {
         Ok(Applied { outcome: Ok(_), .. }) => {}
-        Ok(Applied { outcome: Err(reason), .. }) => {
+        Ok(Applied {
+            outcome: Err(reason),
+            ..
+        }) => {
             tracing::debug!(?reason, "housekeeping: EvictTerminalJobs rejected");
         }
         Err(e) if e.is_retryable() => {
@@ -173,5 +179,8 @@ fn snapshot_due() -> bool {
 }
 
 fn now_us() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }

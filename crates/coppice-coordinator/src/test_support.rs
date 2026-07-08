@@ -57,10 +57,14 @@ impl Consensus for FakeConsensus {
         let log_index = *next_log_index;
         *next_log_index += 1;
         match &*self.outcome.lock().unwrap() {
-            ProposeOutcome::Accepted => {
-                Ok(Applied { log_index, outcome: Ok(coppice_state::Applied::default()) })
-            }
-            ProposeOutcome::Rejected(reason) => Ok(Applied { log_index, outcome: Err(reason.clone()) }),
+            ProposeOutcome::Accepted => Ok(Applied {
+                log_index,
+                outcome: Ok(coppice_state::Applied::default()),
+            }),
+            ProposeOutcome::Rejected(reason) => Ok(Applied {
+                log_index,
+                outcome: Err(reason.clone()),
+            }),
             ProposeOutcome::NotLeader(leader) => Err(ConsensusError::NotLeader { leader: *leader }),
         }
     }

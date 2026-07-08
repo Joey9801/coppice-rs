@@ -58,9 +58,17 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         // arithmetic) — this is the "synchronous validation" that needs
         // `self.views` rather than being purely shape-level.
         let view = self.views.latest();
-        let multiplier = *view.state().policy.priority_multipliers.get(&req.priority).ok_or_else(|| {
-            ApiError::Invalid(format!("no multiplier configured for priority {}", req.priority))
-        })?;
+        let multiplier = *view
+            .state()
+            .policy
+            .priority_multipliers
+            .get(&req.priority)
+            .ok_or_else(|| {
+                ApiError::Invalid(format!(
+                    "no multiplier configured for priority {}",
+                    req.priority
+                ))
+            })?;
 
         let job = JobId::new();
         let command = Command::SubmitJob(SubmitJob {
@@ -83,8 +91,13 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             // commit-index field yet for ADR 0007 read-your-writes (see the
             // `ControlPlane` trait doc) — a future proto revision would ride
             // `log_index` here.
-            Ok(Applied { outcome: Ok(_), .. }) => Ok(SubmitJobResponse { job: Some(job.into()) }),
-            Ok(Applied { outcome: Err(rejection), .. }) => Err(ApiError::Rejected(rejection)),
+            Ok(Applied { outcome: Ok(_), .. }) => Ok(SubmitJobResponse {
+                job: Some(job.into()),
+            }),
+            Ok(Applied {
+                outcome: Err(rejection),
+                ..
+            }) => Err(ApiError::Rejected(rejection)),
             Err(e) => Err(map_consensus_error(e)),
         }
     }
@@ -96,12 +109,18 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             .try_into()
             .map_err(invalid)?;
 
-        let command =
-            Command::AbortJob(AbortJob { job, reason: req.reason, requested_at_us: now_us() });
+        let command = Command::AbortJob(AbortJob {
+            job,
+            reason: req.reason,
+            requested_at_us: now_us(),
+        });
 
         match self.consensus.propose(command).await {
             Ok(Applied { outcome: Ok(_), .. }) => Ok(()),
-            Ok(Applied { outcome: Err(rejection), .. }) => Err(ApiError::Rejected(rejection)),
+            Ok(Applied {
+                outcome: Err(rejection),
+                ..
+            }) => Err(ApiError::Rejected(rejection)),
             Err(e) => Err(map_consensus_error(e)),
         }
     }
@@ -120,15 +139,18 @@ fn invalid(e: ConvertError) -> ApiError {
 /// caller's side.
 fn map_consensus_error(e: ConsensusError) -> ApiError {
     match e {
-        ConsensusError::NotLeader { leader } => {
-            ApiError::NotLeader { leader_hint: leader.map(|l| l.to_string()) }
-        }
+        ConsensusError::NotLeader { leader } => ApiError::NotLeader {
+            leader_hint: leader.map(|l| l.to_string()),
+        },
         other => ApiError::Unavailable(other.to_string()),
     }
 }
 
 fn now_us() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 /// Placeholder for the HTTP/gRPC listener that will host [`ControlPlane`].
@@ -161,7 +183,10 @@ mod tests {
         policy
             .priority_multipliers
             .insert(0, coppice_core::quota::PriorityMultiplier::ONE);
-        let state = coppice_state::StateMachine { policy, ..coppice_state::StateMachine::default() };
+        let state = coppice_state::StateMachine {
+            policy,
+            ..coppice_state::StateMachine::default()
+        };
         publisher.publish_now(&state, 1);
 
         let views = consensus.views();
@@ -198,13 +223,18 @@ mod tests {
     async fn not_leader_submit_maps_to_not_leader() {
         let cp = control_plane(ProposeOutcome::NotLeader(Some(7)));
         let result = cp.submit_job(submit_request()).await;
-        assert!(matches!(result, Err(ApiError::NotLeader { leader_hint: Some(hint) }) if hint == "7"));
+        assert!(
+            matches!(result, Err(ApiError::NotLeader { leader_hint: Some(hint) }) if hint == "7")
+        );
     }
 
     #[tokio::test]
     async fn accepted_abort_returns_ok() {
         let cp = control_plane(ProposeOutcome::Accepted);
-        let req = AbortJobRequest { job: Some(JobId::new().into()), reason: None };
+        let req = AbortJobRequest {
+            job: Some(JobId::new().into()),
+            reason: None,
+        };
         assert!(cp.abort_job(req).await.is_ok());
     }
 }

@@ -35,7 +35,9 @@ pub struct NoopScheduler;
 
 impl Scheduler for NoopScheduler {
     fn schedule(&self, snapshot: &StateMachine) -> PlacementProposal {
-        PlacementProposal { against_version: snapshot.version }
+        PlacementProposal {
+            against_version: snapshot.version,
+        }
     }
 }
 
@@ -59,8 +61,10 @@ pub async fn run<C, S>(
         loop {
             let view = views.latest();
             let pass_scheduler = Arc::clone(&scheduler);
-            let proposal = match tokio::task::spawn_blocking(move || pass_scheduler.schedule(view.state()))
-                .await
+            let proposal = match tokio::task::spawn_blocking(move || {
+                pass_scheduler.schedule(view.state())
+            })
+            .await
             {
                 Ok(proposal) => proposal,
                 Err(join_error) => {
@@ -83,7 +87,10 @@ pub async fn run<C, S>(
                 Ok(Applied { outcome: Ok(_), .. }) => {
                     // Placed; loop straight back around for the next pass.
                 }
-                Ok(Applied { outcome: Err(reason), .. }) => {
+                Ok(Applied {
+                    outcome: Err(reason),
+                    ..
+                }) => {
                     tracing::debug!(
                         ?reason,
                         "scheduler driver: CommitPlacements rejected, recomputing (scheduling-model.md)"
