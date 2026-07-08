@@ -43,7 +43,7 @@
 mod container;
 mod engine;
 mod log;
-mod raftpb;
+pub(crate) mod raftpb;
 mod sm;
 mod snapshot;
 

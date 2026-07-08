@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{LogId, RaftLogReader, StorageError, StorageIOError, Vote};
+use tokio::sync::watch;
 
 use crate::adapter::TypeConfig;
 use crate::fs::{Fs, RealFs};
@@ -53,6 +54,13 @@ async fn blocking<F: Fs, T: Send + 'static>(
 /// home of both the segment list and the snapshot pointer.
 pub struct SegmentLogStorage<F: Fs = RealFs> {
     core: Arc<Mutex<StorageCore<F>>>,
+    /// Publishes the committed index openraft reports through `save_committed`.
+    /// The coordinator runtime's status task folds this into
+    /// [`ConsensusStatus::known_committed`](crate::ConsensusStatus): openraft's
+    /// `save_committed` can briefly lead the applied index (the commit is known
+    /// before the entry is applied), which is precisely the follower-read
+    /// staleness bound of ADR 0007.
+    committed_tx: watch::Sender<u64>,
 }
 
 /// Read-only handle handed to openraft's replication tasks.
@@ -62,7 +70,26 @@ pub struct SegmentLogReader<F: Fs = RealFs> {
 
 impl<F: Fs> SegmentLogStorage<F> {
     pub(super) fn new(core: Arc<Mutex<StorageCore<F>>>) -> Self {
-        SegmentLogStorage { core }
+        // Seed the watch with the best-effort committed index recovered from
+        // the manifest (ADR 0017), so a status reader observes a correct value
+        // before openraft's first `save_committed`.
+        let initial = core
+            .lock()
+            .expect("storage engine poisoned")
+            .committed()
+            .map(|id| id.index)
+            .unwrap_or(0);
+        let (committed_tx, _) = watch::channel(initial);
+        SegmentLogStorage { core, committed_tx }
+    }
+
+    /// A latest-value watch of the committed index openraft reports.
+    ///
+    /// Taken by the coordinator runtime *before* the store moves into
+    /// `Raft::new`; the sender lives inside the store for the process lifetime,
+    /// so the receiver stays live for the status task.
+    pub fn committed_watch(&self) -> watch::Receiver<u64> {
+        self.committed_tx.subscribe()
     }
 }
 
@@ -170,12 +197,16 @@ impl<F: Fs> RaftLogStorage<TypeConfig> for SegmentLogStorage<F> {
         // In memory now; persisted opportunistically with the next structural
         // manifest write (rotation, snapshot) — never its own fsync, the
         // committed index is best-effort by design (ADR 0017).
+        let index = committed.as_ref().map(|id| id.index).unwrap_or(0);
         let committed = committed.as_ref().map(raftpb::log_id_to_pb);
         self.core
             .lock()
             .expect("storage engine poisoned")
             .set_committed(committed)
-            .map_err(|e| storage_err(&e))
+            .map_err(|e| storage_err(&e))?;
+        // Publish for the status task; overwrite semantics, never blocks apply.
+        self.committed_tx.send_replace(index);
+        Ok(())
     }
 
     async fn read_committed(

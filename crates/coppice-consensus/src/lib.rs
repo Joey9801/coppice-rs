@@ -25,19 +25,35 @@ use std::future::Future;
 use coppice_state::Command;
 
 mod adapter;
+mod apply_loop;
 mod error;
 mod events;
 pub mod fs;
+mod net;
+mod node;
+mod status;
 pub mod storage;
 mod view;
 
 pub use adapter::{
     ApplyRequest, ApplyResult, OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY,
-    MAX_INFLIGHT_PROPOSALS,
+    MAX_INFLIGHT_PROPOSALS, PROMOTION_LAG_MAX,
 };
 pub use error::{ConsensusError, ProposeError};
 pub use events::{EventBatch, EventTap, EventTapReceiver, TapItem};
+pub use node::{
+    start, ClusterSummary, MemberSummary, NodeHandle, NodeOptions, NodeStartError, NodeTls,
+    StartIntent, StartedNode,
+};
 pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
+
+/// The Raft transport service type the coordinator mounts on its mTLS server.
+///
+/// Re-exported so the coordinator names the concrete tonic service without
+/// depending on the `net` module's internals.
+pub use coppice_raft_net::transport::Server as RaftTransportServer;
+/// The handler the transport server wraps (built by [`start`]).
+pub use net::RaftTransportHandler;
 
 /// Raft identity of one coordinator replica — an instance identity, never a
 /// reusable slot (ADR 0016). Distinct from [`coppice_core::id::NodeId`], which

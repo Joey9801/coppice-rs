@@ -1,5 +1,5 @@
-//! Conversions between openraft's in-memory types and our durable protobuf
-//! shapes (`coppice.raft.v1`, ADR 0018).
+//! Conversions between openraft's in-memory types and our protobuf shapes
+//! (`coppice.raft.v1`, ADR 0018).
 //!
 //! ADR 0018 forbids persisting openraft's serde representations: what lands on
 //! disk is our schema, converted here at the storage boundary, so an openraft
@@ -7,6 +7,15 @@
 //! pb→domain is fallible and every failure is a fail-stop `io::Error` — a log
 //! entry or vote that does not decode is corruption of possibly-committed
 //! state, never something to skip (ADR 0017).
+//!
+//! These same converters back **both** durable formats (the segment log and
+//! snapshot meta here) **and** the wire transport (the [`net`](crate::net)
+//! module's gRPC Raft RPCs). That sharing is deliberate: ADR 0018 mandates one
+//! set of *our own* representations for a Raft value — never openraft's serde
+//! forms — regardless of whether the value is going to disk or over the wire.
+//! The pb-struct-level [`entry_to_pb`]/[`entry_from_pb`] exist so the net
+//! module reuses the exact log-entry conversion the log store persists, rather
+//! than growing a second, drift-prone copy.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -149,8 +158,11 @@ pub fn stored_membership_from_pb(
     ))
 }
 
-/// Encode one log entry as the durable `coppice.raft.v1.LogEntry` payload.
-pub fn entry_to_bytes(entry: &openraft::Entry<TypeConfig>) -> Vec<u8> {
+/// Convert one openraft log entry into its `coppice.raft.v1.LogEntry` pb form.
+///
+/// Total (Domain→pb). Shared by the durable log store and the wire transport
+/// (module docs): both encode an entry exactly this way.
+pub fn entry_to_pb(entry: &openraft::Entry<TypeConfig>) -> pb::LogEntry {
     use openraft::EntryPayload;
     let payload = match &entry.payload {
         EntryPayload::Blank => pb::log_entry::Payload::Blank(pb::Blank {}),
@@ -165,20 +177,20 @@ pub fn entry_to_bytes(entry: &openraft::Entry<TypeConfig>) -> Vec<u8> {
         log_id: Some(log_id_to_pb(&entry.log_id)),
         payload: Some(payload),
     }
-    .encode_to_vec()
 }
 
-/// Decode a durable log-entry payload back into an openraft entry.
+/// Convert a `coppice.raft.v1.LogEntry` pb back into an openraft entry.
 ///
-/// `path` and `index` name the source for fail-stop errors.
-pub fn entry_from_bytes(
+/// Fallible (pb→Domain): `path` and `index` name the source for fail-stop
+/// errors, and the entry's own `log_id.index` must equal `index` — on the
+/// durable path `index` is the framing position; on the wire path it is the
+/// entry's claimed index, so the check is the caller's contiguity assertion.
+pub fn entry_from_pb(
     path: &Path,
     index: u64,
-    bytes: &[u8],
+    entry: pb::LogEntry,
 ) -> io::Result<openraft::Entry<TypeConfig>> {
     use openraft::EntryPayload;
-    let entry = pb::LogEntry::decode(bytes)
-        .map_err(|e| fail_stop(path, 0, format!("log entry {index} does not decode: {e}")))?;
     let log_id = entry
         .log_id
         .as_ref()
@@ -218,6 +230,28 @@ pub fn entry_from_bytes(
         }
     };
     Ok(openraft::Entry { log_id, payload })
+}
+
+/// Encode one log entry as the durable `coppice.raft.v1.LogEntry` payload.
+///
+/// The durable log store's entry point; delegates to [`entry_to_pb`] so the
+/// wire and disk representations can never drift apart.
+pub fn entry_to_bytes(entry: &openraft::Entry<TypeConfig>) -> Vec<u8> {
+    entry_to_pb(entry).encode_to_vec()
+}
+
+/// Decode a durable log-entry payload back into an openraft entry.
+///
+/// `path` and `index` name the source for fail-stop errors; delegates the
+/// pb→domain conversion to [`entry_from_pb`].
+pub fn entry_from_bytes(
+    path: &Path,
+    index: u64,
+    bytes: &[u8],
+) -> io::Result<openraft::Entry<TypeConfig>> {
+    let entry = pb::LogEntry::decode(bytes)
+        .map_err(|e| fail_stop(path, 0, format!("log entry {index} does not decode: {e}")))?;
+    entry_from_pb(path, index, entry)
 }
 
 #[cfg(test)]

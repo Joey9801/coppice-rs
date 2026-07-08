@@ -96,6 +96,16 @@ pub const APPLY_CHANNEL_CAPACITY: usize = 64;
 /// instead of piling into openraft's queues.
 pub const MAX_INFLIGHT_PROPOSALS: usize = 4096;
 
+/// The maximum log-index lag a learner may carry and still be promoted to
+/// voter (ADR 0016 "caught up within a threshold").
+///
+/// Promotion adds the node to the quorum; a learner still far behind would
+/// stall commit until it catches up, so [`Consensus::promote_voter`] refuses
+/// the joint change while the learner's `leader_last_log − matched` exceeds
+/// this, returning the retryable [`ConsensusError::LearnerNotCaughtUp`] so the
+/// admin caller polls until it passes.
+pub const PROMOTION_LAG_MAX: u64 = 256;
+
 /// The openraft-backed [`Consensus`] implementation.
 pub struct OpenraftConsensus {
     raft: Raft<TypeConfig>,
@@ -184,6 +194,31 @@ impl Consensus for OpenraftConsensus {
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
     ) -> Result<(), ConsensusError> {
+        // ADR 0016 catch-up gate: refuse to raise a learner into the quorum
+        // until its replication lag is within the threshold. The check is
+        // best-effort — it needs leader replication metrics; if this node is
+        // not leader (no replication metrics) or the learner is not yet tracked
+        // the promotion is refused as not-caught-up, and a racing step-down
+        // still surfaces `NotLeader` from `change_membership` below.
+        {
+            let metrics = self.raft.metrics();
+            let metrics = metrics.borrow();
+            let leader_last = metrics.last_log_index.unwrap_or(0);
+            let matched = metrics
+                .replication
+                .as_ref()
+                .and_then(|repl| repl.get(&promote).copied());
+            let lag = match matched {
+                Some(entry) => leader_last.saturating_sub(entry.map(|id| id.index).unwrap_or(0)),
+                None => {
+                    return Err(ConsensusError::LearnerNotCaughtUp { lag: leader_last });
+                }
+            };
+            if lag > PROMOTION_LAG_MAX {
+                return Err(ConsensusError::LearnerNotCaughtUp { lag });
+            }
+        }
+
         let changes = match remove {
             // Pure promotion: raise one learner to voter, leaving the rest of
             // the voter set untouched.
