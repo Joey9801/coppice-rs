@@ -16,7 +16,8 @@ machine rejoins with a fresh node ID as a non-voting learner, catches up via
 snapshot and log replay, and is promoted while the departed identity is
 removed. Rejoining with an empty disk under an existing voter ID is refused at
 startup — see
-[ADR 0016](../decisions/0016-coordinator-rebuild-learner-join.md).
+[ADR 0016](../decisions/0016-coordinator-rebuild-learner-join.md), and
+[cluster-lifecycle](cluster-lifecycle.md) for the exact replace commands.
 
 ## Agent failure
 
