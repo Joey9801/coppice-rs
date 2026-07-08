@@ -49,7 +49,9 @@ use super::container::{
 use super::snapshot;
 
 /// Node-local configuration of the engine plus the identity the directory
-/// must carry (ADR 0016). Identity mismatches fail-stop at open.
+/// must carry (ADR 0016).
+///
+/// Identity mismatches fail-stop at open.
 #[derive(Debug, Clone)]
 pub struct StorageOptions {
     /// The cluster this replica belongs to; stamped at `cluster init`.
@@ -75,7 +77,9 @@ impl StorageOptions {
 }
 
 /// One log entry already encoded as its durable `LogEntry` payload, plus the
-/// frame-level log id. The core never decodes payloads (ADR 0018).
+/// frame-level log id.
+///
+/// The core never decodes payloads (ADR 0018).
 #[derive(Debug, Clone)]
 pub struct EncodedEntry {
     pub id: FrameLogId,
@@ -113,8 +117,10 @@ struct ActiveSegment<File> {
     len: u64,
 }
 
-/// The engine. One per data directory; the `LOCK` file is held for its
-/// lifetime, so a second opener is refused (ADR 0017).
+/// The engine.
+///
+/// One per data directory; the `LOCK` file is held for its lifetime, so a
+/// second opener is refused (ADR 0017).
 pub struct StorageCore<F: Fs> {
     fs: F,
     options: StorageOptions,
@@ -242,9 +248,10 @@ impl ManifestState {
 
 impl<F: Fs> StorageCore<F> {
     /// Initialize an empty data directory: `log/`, `snap/`, and an
-    /// identity-stamped manifest claiming nothing (ADR 0016 / 0017). Refuses
-    /// a directory that already has a manifest. Not crash-armed by the crash
-    /// suite (initialization precedes any acknowledged state).
+    /// identity-stamped manifest claiming nothing (ADR 0016 / 0017).
+    ///
+    /// Refuses a directory that already has a manifest. Not crash-armed by
+    /// the crash suite (initialization precedes any acknowledged state).
     pub fn init(fs: &F, options: &StorageOptions, instance_uuid: [u8; 16]) -> io::Result<()> {
         if fs.exists(Path::new("manifest"))? {
             return Err(io::Error::new(
@@ -448,9 +455,11 @@ impl<F: Fs> StorageCore<F> {
         self.committed.map(lid_to_pb)
     }
 
-    /// Record the committed index in memory. Persisted opportunistically at
-    /// the next structural manifest write (rotation, snapshot) per ADR 0017 —
-    /// never on its own, the append path stays manifest-free.
+    /// Record the committed index in memory.
+    ///
+    /// Persisted opportunistically at the next structural manifest write
+    /// (rotation, snapshot) per ADR 0017 — never on its own, the append path
+    /// stays manifest-free.
     pub fn set_committed(&mut self, committed: Option<pbraft::LogId>) -> io::Result<()> {
         self.committed = committed
             .as_ref()
@@ -660,8 +669,9 @@ impl<F: Fs> StorageCore<F> {
         Ok(())
     }
 
-    /// Drop every log claim (manifest first), keeping the purge floor. Used
-    /// only for openraft's gap-append overwrite semantics.
+    /// Drop every log claim (manifest first), keeping the purge floor.
+    ///
+    /// Used only for openraft's gap-append overwrite semantics.
     fn clear_log(&mut self) -> io::Result<()> {
         let dropped = std::mem::take(&mut self.manifest.segments);
         self.manifest.logical_end = None;
@@ -679,8 +689,10 @@ impl<F: Fs> StorageCore<F> {
     }
 
     /// Seal the active segment; the next append opens a fresh one (and takes
-    /// the structural manifest write with it). A never-written active segment
-    /// is left alone so rotation cannot mint two segments at one index.
+    /// the structural manifest write with it).
+    ///
+    /// A never-written active segment is left alone so rotation cannot mint
+    /// two segments at one index.
     pub fn rotate(&mut self) -> io::Result<()> {
         if let Some(active) = &self.active {
             let has_entries = self
@@ -695,8 +707,10 @@ impl<F: Fs> StorageCore<F> {
 
     /// Create, make durable, and *then* claim `log/<start>.seg` (ADR 0017:
     /// recovery either sees an orphan or a claimed segment, never an
-    /// acknowledged entry in an unclaimed file). This is the structural event
-    /// that clears a logical end and records the best-effort committed index.
+    /// acknowledged entry in an unclaimed file).
+    ///
+    /// This is the structural event that clears a logical end and records
+    /// the best-effort committed index.
     fn open_fresh_segment(&mut self, start: u64) -> io::Result<()> {
         let path = seg_path(start);
         // A leftover file here is always unclaimed (truncation deletes claim
@@ -744,9 +758,11 @@ impl<F: Fs> StorageCore<F> {
     // ---- structural transitions -----------------------------------------
 
     /// Suffix truncation (ADR 0017): everything at and above `from` is
-    /// discarded. Manifest first (logical end + dropped claims, fsynced),
-    /// physical deletion strictly after; sealed bytes are never rewritten,
-    /// and the next append opens a fresh segment.
+    /// discarded.
+    ///
+    /// Manifest first (logical end + dropped claims, fsynced), physical
+    /// deletion strictly after; sealed bytes are never rewritten, and the
+    /// next append opens a fresh segment.
     pub fn truncate(&mut self, from: u64) -> io::Result<()> {
         let Some(last) = self.last_log_id else {
             return Ok(());
@@ -816,8 +832,10 @@ impl<F: Fs> StorageCore<F> {
     }
 
     /// The segments whose every live entry is at or below `upto` — the set a
-    /// purge (or a floor-advancing snapshot install) may delete. A segment
-    /// straddling the floor stays: it still holds live entries above it.
+    /// purge (or a floor-advancing snapshot install) may delete.
+    ///
+    /// A segment straddling the floor stays: it still holds live entries
+    /// above it.
     fn covered_segments(&self, upto: u64, purges_everything: bool) -> Vec<u64> {
         if purges_everything {
             return self.manifest.segments.clone();
@@ -894,9 +912,11 @@ impl<F: Fs> StorageCore<F> {
     /// Adopt a complete snapshot container: validate it, make the file
     /// durable, then atomically flip the manifest pointer (the commit point);
     /// the previous snapshot is retained until the flip is durable and
-    /// deleted after (ADR 0002/0018). With `advance_floor` (the ADR 0016
-    /// learner-rebuild install path) the same manifest write advances the
-    /// purge floor past everything the snapshot covers.
+    /// deleted after (ADR 0002/0018).
+    ///
+    /// With `advance_floor` (the ADR 0016 learner-rebuild install path) the
+    /// same manifest write advances the purge floor past everything the
+    /// snapshot covers.
     pub fn install_snapshot(
         &mut self,
         container: &[u8],
@@ -980,8 +1000,10 @@ impl<F: Fs> StorageCore<F> {
     }
 
     /// Read and fully validate the current snapshot, if the manifest points
-    /// at one. The manifest only ever points at a durably renamed file, so
-    /// any damage here is fail-stop corruption, never a torn write.
+    /// at one.
+    ///
+    /// The manifest only ever points at a durably renamed file, so any
+    /// damage here is fail-stop corruption, never a torn write.
     pub fn current_snapshot(&self) -> io::Result<Option<(pbstorage::SnapshotMeta, Vec<u8>)>> {
         let Some(id) = &self.manifest.snapshot_id else {
             return Ok(None);
@@ -995,12 +1017,13 @@ impl<F: Fs> StorageCore<F> {
 
     // ---- recovery internals ---------------------------------------------
 
-    /// Scan the tail segment per recovery step 4. Frames at or below the
-    /// manifest's claims (the logical end, when set) fail-stop on any
-    /// damage; a torn or short frame past the claims is the un-acknowledged
-    /// tail and is physically truncated (the one place sealed-bytes-never-
-    /// rewritten does not apply, because these bytes were never
-    /// acknowledged).
+    /// Scan the tail segment per recovery step 4.
+    ///
+    /// Frames at or below the manifest's claims (the logical end, when set)
+    /// fail-stop on any damage; a torn or short frame past the claims is the
+    /// un-acknowledged tail and is physically truncated (the one place
+    /// sealed-bytes-never-rewritten does not apply, because these bytes were
+    /// never acknowledged).
     fn scan_tail(&mut self, start: u64) -> io::Result<(OffsetTable, Option<FrameLogId>)> {
         let path = seg_path(start);
         let bytes = read_to_vec(&self.fs, &path)?;
@@ -1119,8 +1142,9 @@ impl<F: Fs> StorageCore<F> {
 }
 
 /// One atomic manifest swap: encode, then `write_atomic` (write-new + fsync +
-/// rename + parent fsync). Every structural fact changes through here and
-/// nowhere else (ADR 0017).
+/// rename + parent fsync).
+///
+/// Every structural fact changes through here and nowhere else (ADR 0017).
 fn write_manifest<F: Fs>(fs: &F, manifest: &ManifestState) -> io::Result<()> {
     let mut bytes = header(MANIFEST_MAGIC).to_vec();
     frame_record(&manifest.to_pb().encode_to_vec(), &mut bytes);
@@ -1128,8 +1152,9 @@ fn write_manifest<F: Fs>(fs: &F, manifest: &ManifestState) -> io::Result<()> {
 }
 
 /// Recovery's orphan sweep over one directory: delete everything `keep`
-/// rejects, syncing the directory if anything died. Idempotent by
-/// construction.
+/// rejects, syncing the directory if anything died.
+///
+/// Idempotent by construction.
 fn sweep_dir<F: Fs>(fs: &F, dir: &Path, keep: impl Fn(&str) -> bool) -> io::Result<()> {
     let mut deleted = false;
     for name in fs.list_dir(dir)? {

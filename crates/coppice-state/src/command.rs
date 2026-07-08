@@ -47,9 +47,11 @@ pub enum Command {
     BumpClusterVersion(BumpClusterVersion),
 }
 
-/// Record a newly submitted job. Admission is synchronous in v1, so one
-/// apply walks `Submitted → Accepted → Queued`. No quota charge here — cost
-/// is charged at placement.
+/// Record a newly submitted job.
+///
+/// Admission is synchronous in v1, so one apply walks
+/// `Submitted → Accepted → Queued`. No quota charge here — cost is charged
+/// at placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitJob {
     pub job: Job,
@@ -61,7 +63,9 @@ pub struct SubmitJob {
 
 /// Request an abort: sets `abort_requested`, terminates immediately when no
 /// agent interaction is needed, otherwise emits `StopRequested` and lets the
-/// outcome arrive through ingestion. Legal in every non-terminal state.
+/// outcome arrive through ingestion.
+///
+/// Legal in every non-terminal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbortJob {
     pub job: JobId,
@@ -70,28 +74,34 @@ pub struct AbortJob {
 }
 
 /// One scheduler pass's atomic batch of placements and revocations.
+///
 /// All-or-nothing: any invalid item rejects the whole batch with per-item
 /// diagnostics, and the scheduler recomputes — failed proposals are normal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitPlacements {
-    /// The state version the scheduler's snapshot was taken at. Audit
-    /// record: semantic re-validation of each item is what actually gates
-    /// the batch (see the apply contract).
+    /// The state version the scheduler's snapshot was taken at.
+    ///
+    /// Audit record: semantic re-validation of each item is what actually
+    /// gates the batch (see the apply contract).
     pub expected_version: u64,
     /// Accruing allocations to revoke (attempt outcome `Revoked`, requeued
-    /// free of retry budget). Applied before placements so freed capacity
-    /// pledges onward in commit order first.
+    /// free of retry budget).
+    ///
+    /// Applied before placements so freed capacity pledges onward in commit
+    /// order first.
     pub revocations: Vec<AllocationId>,
     pub placements: Vec<Placement>,
     /// Charge timestamp for the batch's quota charges and refunds.
     pub proposed_at_us: i64,
 }
 
-/// One job seated on one or more nodes. `allocations` is plural for the
-/// gang-scheduling seam; v1 writers emit exactly one and set `group` to the
-/// job's id, and apply rejects other shapes (`UnsupportedPlacementShape`) —
-/// a committed multi-allocation placement must be representable so every
-/// replica computes the identical rejection.
+/// One job seated on one or more nodes.
+///
+/// `allocations` is plural for the gang-scheduling seam; v1 writers emit
+/// exactly one and set `group` to the job's id, and apply rejects other
+/// shapes (`UnsupportedPlacementShape`) — a committed multi-allocation
+/// placement must be representable so every replica computes the identical
+/// rejection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     pub job: JobId,
@@ -100,9 +110,10 @@ pub struct Placement {
     pub allocations: Vec<AllocationSpec>,
 }
 
-/// The allocation a placement creates. Whether it starts `Funded` or
-/// `Accruing` is decided by apply from actual free capacity, not by the
-/// proposer.
+/// The allocation a placement creates.
+///
+/// Whether it starts `Funded` or `Accruing` is decided by apply from actual
+/// free capacity, not by the proposer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationSpec {
     pub id: AllocationId,
@@ -127,17 +138,20 @@ pub struct RecordAttemptStarted {
     pub observed_at_us: i64,
 }
 
-/// Exit observed; agent-side finalization still in flight. Skippable — the
-/// terminal edge exists from every non-terminal state.
+/// Exit observed; agent-side finalization still in flight.
+///
+/// Skippable — the terminal edge exists from every non-terminal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAttemptExited {
     pub attempt: AttemptId,
     pub observed_at_us: i64,
 }
 
-/// Terminal outcome for an attempt. Runs the full terminal path: release +
-/// funding cascade, quota true-up, and job resolution (retry policy,
-/// abort-wins-over-retry, truth-wins-the-race) in one apply.
+/// Terminal outcome for an attempt.
+///
+/// Runs the full terminal path: release + funding cascade, quota true-up,
+/// and job resolution (retry policy, abort-wins-over-retry,
+/// truth-wins-the-race) in one apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAttemptOutcome {
     pub attempt: AttemptId,
@@ -149,9 +163,10 @@ pub struct RecordAttemptOutcome {
     pub observed_at_us: i64,
 }
 
-/// Verdicts from the leader's ObservedSet diff (ADR 0009). "Stop" verdicts
-/// never appear: an unknown running container has nothing in state to
-/// mutate; the leader sends `StopJob` directly.
+/// Verdicts from the leader's ObservedSet diff (ADR 0009).
+///
+/// "Stop" verdicts never appear: an unknown running container has nothing
+/// in state to mutate; the leader sends `StopJob` directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileNode {
     pub node: NodeId,
@@ -173,9 +188,11 @@ pub struct LostAttempt {
     pub actual_runtime_us: u64,
 }
 
-/// Node (re)registration. Re-registration bumps the node epoch, fencing all
-/// commands issued under earlier epochs; the drain flag survives (an agent
-/// restart must not undo an admin's drain).
+/// Node (re)registration.
+///
+/// Re-registration bumps the node epoch, fencing all commands issued under
+/// earlier epochs; the drain flag survives (an agent restart must not undo
+/// an admin's drain).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterNode {
     pub node: NodeId,
@@ -193,8 +210,10 @@ pub struct DeclareNodeLost {
     pub declared_at_us: i64,
 }
 
-/// Admin drain / undrain. Drain blocks new placements only: running work and
-/// existing accrual funding continue.
+/// Admin drain / undrain.
+///
+/// Drain blocks new placements only: running work and existing accrual
+/// funding continue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetNodeSchedulable {
     pub node: NodeId,
@@ -202,18 +221,22 @@ pub struct SetNodeSchedulable {
     pub updated_at_us: i64,
 }
 
-/// Remove terminal jobs from replicated state (ADR 0012). Proposed by leader
-/// housekeeping **only after** the history-store write is durable; the apply
-/// itself just deletes. Missing ids are skipped (duplicate proposals across
-/// leader changes must be idempotent); a live listed job rejects the batch.
+/// Remove terminal jobs from replicated state (ADR 0012).
+///
+/// Proposed by leader housekeeping **only after** the history-store write
+/// is durable; the apply itself just deletes. Missing ids are skipped
+/// (duplicate proposals across leader changes must be idempotent); a live
+/// listed job rejects the batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictTerminalJobs {
     pub jobs: Vec<JobId>,
     pub evicted_at_us: i64,
 }
 
-/// Create or update one quota entity. Updates preserve accumulated usage —
-/// reconfiguration is not an amnesty. No delete in v1.
+/// Create or update one quota entity.
+///
+/// Updates preserve accumulated usage — reconfiguration is not an amnesty.
+/// No delete in v1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigureQuotaEntity {
     pub entity: QuotaEntityId,
@@ -224,18 +247,21 @@ pub struct ConfigureQuotaEntity {
     pub updated_at_us: i64,
 }
 
-/// Full replacement of the replicated policy. Human-facing forms (half-life,
-/// rates) are converted by tooling before proposal; in-flight charge records
-/// keep their recorded rate and multiplier.
+/// Full replacement of the replicated policy.
+///
+/// Human-facing forms (half-life, rates) are converted by tooling before
+/// proposal; in-flight charge records keep their recorded rate and
+/// multiplier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePolicy {
     pub policy: PolicyConfig,
     pub updated_at_us: i64,
 }
 
-/// Bump the semantic feature gate (ADR 0003). The leader refuses to propose
-/// past the minimum version supported by voting members; apply enforces
-/// monotonicity.
+/// Bump the semantic feature gate (ADR 0003).
+///
+/// The leader refuses to propose past the minimum version supported by
+/// voting members; apply enforces monotonicity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BumpClusterVersion {
     pub to: u32,

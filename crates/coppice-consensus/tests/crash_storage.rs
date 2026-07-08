@@ -27,10 +27,11 @@ const CLUSTER_UUID: [u8; 16] = *b"crash-suite-clst";
 const INSTANCE_UUID: [u8; 16] = [0x42; 16];
 const NODE_ID: u64 = 1;
 
-/// The real engine as a harness subject. Entry payloads stay opaque bytes:
-/// the container layer frames them without protobuf (by design, ADR 0018),
-/// so the harness's byte-equality checks exercise exactly what the engine
-/// persists.
+/// The real engine as a harness subject.
+///
+/// Entry payloads stay opaque bytes: the container layer frames them
+/// without protobuf (by design, ADR 0018), so the harness's byte-equality
+/// checks exercise exactly what the engine persists.
 struct RealEngine {
     segment_max_bytes: u64,
 }

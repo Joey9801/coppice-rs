@@ -111,11 +111,12 @@ fn invalid(e: ConvertError) -> ApiError {
     ApiError::Invalid(e.to_string())
 }
 
-/// Every non-`NotLeader` consensus failure — retryable (`Timeout`,
-/// `MembershipInProgress`, `LearnerNotCaughtUp`) or fatal (`Shutdown`,
-/// `Fatal`) — surfaces to API callers as `Unavailable`: retryable ones are
-/// literally "try again"; fatal ones still mean "this replica cannot serve
-/// the write right now," which is the same actionable advice from the
+/// Map every non-`NotLeader` consensus failure to an API error.
+///
+/// Retryable failures (`Timeout`, `MembershipInProgress`, `LearnerNotCaughtUp`)
+/// or fatal ones (`Shutdown`, `Fatal`) both surface as `Unavailable`: retryable
+/// ones are literally "try again"; fatal ones still mean "this replica cannot
+/// serve the write right now," which is the same actionable advice from the
 /// caller's side.
 fn map_consensus_error(e: ConsensusError) -> ApiError {
     match e {
@@ -130,8 +131,9 @@ fn now_us() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
 }
 
-/// Placeholder for the HTTP/gRPC listener that will host [`ControlPlane`]
-/// (no transport dependency added yet — see the module doc). Holds the real
+/// Placeholder for the HTTP/gRPC listener that will host [`ControlPlane`].
+///
+/// No transport dependency added yet — see the module doc. Holds the real
 /// `CoordinatorControlPlane` so it is constructed by production code, and
 /// simply parks until shutdown.
 pub async fn run_placeholder<C: Consensus>(

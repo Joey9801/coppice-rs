@@ -22,8 +22,9 @@
 
 use coppice_state::StateMachine;
 
-/// A batch of proposed placements, accruals, and revocations, valid against a
-/// specific state version. The coordinator commits or rejects it atomically.
+/// A batch of proposed placements, accruals, and revocations, valid against a specific state version.
+///
+/// The coordinator commits or rejects it atomically.
 #[derive(Debug, Default)]
 pub struct PlacementProposal {
     /// The state version this proposal was computed against.

@@ -41,8 +41,9 @@ pub async fn run<C: Consensus>(
     }
 }
 
-/// Drain inbound reports until leadership is lost or shutdown. Returns
-/// `true` when it stopped because leadership was lost (the caller should
+/// Drain inbound reports until leadership is lost or shutdown.
+///
+/// Returns `true` when it stopped because leadership was lost (the caller should
 /// re-gate), `false` when the inbound channel closed for good.
 async fn drain<C: Consensus>(
     consensus: &Arc<C>,
@@ -86,9 +87,10 @@ async fn drain<C: Consensus>(
     }
 }
 
-/// Normalize one agent report into zero or more commands: fencing check
-/// against `view`'s node epoch, dedupe, timestamping, and the ObservedSet
-/// diff (`docs/architecture/command-catalog.md#the-agent-report-ingestion-boundary`).
+/// Normalize one agent report into zero or more commands.
+///
+/// Fencing check against `view`'s node epoch, dedupe, timestamping, and the
+/// ObservedSet diff. See `docs/architecture/command-catalog.md#the-agent-report-ingestion-boundary`.
 /// Deferred: this is real domain logic, not wiring.
 fn normalize(_view: &StateView, _report: InboundReport) -> Vec<Command> {
     todo!("agent-report normalization: fencing, dedupe, timestamping, ObservedSet diff")

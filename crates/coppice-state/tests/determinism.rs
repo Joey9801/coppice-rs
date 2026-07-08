@@ -274,10 +274,11 @@ proptest! {
     }
 
     /// Snapshot-then-replay: serializing mid-stream and continuing on the
-    /// restored copy is indistinguishable from never snapshotting. Exercises
-    /// the real snapshot payload path — length-delimited proto records per
-    /// entity type (ADR 0018) — via `coppice_proto::convert`; `split` ranges
-    /// over the whole sequence including the ends.
+    /// restored copy is indistinguishable from never snapshotting.
+    ///
+    /// Exercises the real snapshot payload path — length-delimited proto
+    /// records per entity type (ADR 0018) — via `coppice_proto::convert`;
+    /// `split` ranges over the whole sequence including the ends.
     #[test]
     fn snapshot_roundtrip_is_transparent(scenario in arb_scenario()) {
         let mut direct = StateMachine::default();
@@ -304,8 +305,10 @@ proptest! {
     }
 
     /// Applying any generated sequence never panics — bad input is a
-    /// rejection, not a crash. (Implicit in the other properties; explicit
-    /// here so a future shrink points straight at the offending command.)
+    /// rejection, not a crash.
+    ///
+    /// (Implicit in the other properties; explicit here so a future shrink
+    /// points straight at the offending command.)
     #[test]
     fn apply_never_panics(scenario in arb_scenario()) {
         let mut sm = StateMachine::default();

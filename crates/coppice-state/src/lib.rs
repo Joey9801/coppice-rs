@@ -51,22 +51,26 @@ pub struct StateMachine {
     pub quota_entities: BTreeMap<QuotaEntityId, QuotaEntity>,
     /// Exactly the allocations in state `Accruing`, keyed `(node, seq)` so a
     /// range scan yields one node's accruing allocations in commit order —
-    /// the funding order of ADR 0014. Never iterate accruals by
-    /// `AllocationId`: UUID order is meaningless across histories.
-    /// Derived from the allocation map, so it is not snapshotted: the proto
-    /// snapshot path (`coppice_proto::convert`) rebuilds it from the
-    /// Accruing `AllocationRecord`s at load.
+    /// the funding order of ADR 0014.
+    ///
+    /// Never iterate accruals by `AllocationId`: UUID order is meaningless
+    /// across histories. Derived from the allocation map, so it is not
+    /// snapshotted: the proto snapshot path (`coppice_proto::convert`)
+    /// rebuilds it from the Accruing `AllocationRecord`s at load.
     pub accrual_queue: BTreeMap<(NodeId, u64), AllocationId>,
-    /// Commit-order sequence for allocations. Part of replicated state so it
-    /// is a pure function of the command history.
+    /// Commit-order sequence for allocations.
+    ///
+    /// Part of replicated state so it is a pure function of the command
+    /// history.
     pub next_allocation_seq: u64,
     /// Replicated cluster policy (ADR 0020: never in node config files).
     pub policy: PolicyConfig,
     /// Semantic feature gate (ADR 0003), bumped only by `BumpClusterVersion`.
     pub cluster_version: u32,
-    /// Count of applied log entries, accepted or rejected. Bumped on every
-    /// applied command so it is a stable coordinate for `expected_version`
-    /// and read-consistency cursors.
+    /// Count of applied log entries, accepted or rejected.
+    ///
+    /// Bumped on every applied command so it is a stable coordinate for
+    /// `expected_version` and read-consistency cursors.
     pub version: u64,
 }
 
@@ -80,7 +84,9 @@ pub struct JobRecord {
     /// (ADR 0019: apply never sees the raw `i32` in arithmetic).
     pub multiplier: PriorityMultiplier,
     pub submitted_at_us: i64,
-    /// Retries consumed. `Revoked` outcomes requeue without touching this.
+    /// Retries consumed.
+    ///
+    /// `Revoked` outcomes requeue without touching this.
     pub retries_used: u32,
     pub current_attempt: Option<AttemptId>,
     /// Every attempt this job has had, in creation order.
@@ -92,15 +98,18 @@ pub struct JobRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptRecord {
     pub attempt: Attempt,
-    /// The placement group sharing the `Ready` barrier. v1: the job's id.
+    /// The placement group sharing the `Ready` barrier.
+    ///
+    /// v1: the job's id.
     pub group: GroupId,
     pub charge: ChargeRecord,
     /// Rate and multiplier the charge used, so true-up never repriced by a
     /// later policy edit (ADR 0019).
     pub rate_ucu_per_second: u64,
     pub multiplier: PriorityMultiplier,
-    /// Set when the attempt is observed `Running`. An attempt that never
-    /// started has actual cost zero at true-up.
+    /// Set when the attempt is observed `Running`.
+    ///
+    /// An attempt that never started has actual cost zero at true-up.
     pub started_at_us: Option<i64>,
 }
 
@@ -109,6 +118,7 @@ pub struct AttemptRecord {
 pub struct AllocationRecord {
     pub allocation: Allocation,
     /// Commit order: assigned from `next_allocation_seq` at creation.
+    ///
     /// Funding iterates ascending `seq`, never id order.
     pub seq: u64,
 }
@@ -133,20 +143,24 @@ pub struct QuotaEntity {
     pub usage: UsageState,
 }
 
-/// Maximum quota-tree depth. Bounds the ancestor walk during charging so no
-/// command can turn apply into unbounded work.
+/// Maximum quota-tree depth.
+///
+/// Bounds the ancestor walk during charging so no command can turn apply
+/// into unbounded work.
 pub const QUOTA_TREE_DEPTH_CAP: u32 = 32;
 
-/// Replicated cluster policy (ADR 0020). Everything here would diverge
-/// scheduling or accounting if replicas disagreed, so none of it may appear
-/// in a node config file.
+/// Replicated cluster policy (ADR 0020).
+///
+/// Everything here would diverge scheduling or accounting if replicas
+/// disagreed, so none of it may appear in a node config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyConfig {
     pub cost_weights: CostWeights,
     pub decay: DecayPolicy,
     pub penalty_exponent_milli: u32,
-    /// Maps the user-facing `priority: i32` to a Q32.32 cost multiplier. The
-    /// API resolves through this table at proposal time.
+    /// Maps the user-facing `priority: i32` to a Q32.32 cost multiplier.
+    ///
+    /// The API resolves through this table at proposal time.
     pub priority_multipliers: BTreeMap<i32, PriorityMultiplier>,
     /// K: at most this many jobs hold accruing allocations at once
     /// (ADR 0014, default 4).
@@ -154,7 +168,9 @@ pub struct PolicyConfig {
     /// Charge-time runtime for jobs with no enforced `max_runtime`, seconds.
     pub default_charge_runtime_s: u64,
     /// Terminal jobs are eligible for `EvictTerminalJobs` this long after
-    /// terminal state (ADR 0012). Consulted by the proposer, never by apply.
+    /// terminal state (ADR 0012).
+    ///
+    /// Consulted by the proposer, never by apply.
     pub terminal_retention_us: i64,
     /// Default SIGTERM→SIGKILL grace for aborts, microseconds.
     pub abort_grace_us: i64,
@@ -175,11 +191,12 @@ impl Default for PolicyConfig {
     }
 }
 
-/// Why a committed command was refused. The rejection is part of the
-/// deterministic apply result: every replica computes the identical reason,
-/// state changes only by the `version` bump, and the proposer observes it
-/// through the leader's apply result. See the taxonomy table in
-/// `docs/architecture/command-catalog.md`.
+/// Why a committed command was refused.
+///
+/// The rejection is part of the deterministic apply result: every replica
+/// computes the identical reason, state changes only by the `version` bump,
+/// and the proposer observes it through the leader's apply result. See the
+/// taxonomy table in `docs/architecture/command-catalog.md`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RejectionReason {
     #[error("job {0} not found")]

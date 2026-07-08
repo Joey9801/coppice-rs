@@ -14,15 +14,19 @@ use crate::CoordinatorId;
 /// [`ConsensusError::is_retryable`].
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ConsensusError {
-    /// This replica is not the leader. `leader`, when known, is where the
-    /// caller should redirect; `None` means an election is in progress.
+    /// This replica is not the leader.
+    ///
+    /// `leader`, when known, is where the caller should redirect; `None`
+    /// means an election is in progress.
     #[error("not the leader{}", .leader.map(|l| format!(" (leader is {l})")).unwrap_or_default())]
     NotLeader { leader: Option<CoordinatorId> },
 
-    /// The operation did not resolve in time. For [`propose`](crate::Consensus::propose)
-    /// the outcome is genuinely UNKNOWN — the command may yet commit — so
-    /// proposers lean on the catalog's idempotency rules rather than blindly
-    /// resubmitting non-idempotent intents (command-catalog.md).
+    /// The operation did not resolve in time.
+    ///
+    /// For [`propose`](crate::Consensus::propose) the outcome is genuinely
+    /// UNKNOWN — the command may yet commit — so proposers lean on the
+    /// catalog's idempotency rules rather than blindly resubmitting
+    /// non-idempotent intents (command-catalog.md).
     #[error("operation timed out; outcome unknown")]
     Timeout,
 

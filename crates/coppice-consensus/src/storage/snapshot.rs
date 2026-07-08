@@ -46,8 +46,10 @@ pub const ENCODING_PROTOBUF_LD: &str = "protobuf-ld";
 /// and the closing magic.
 const TRAILER_LEN: usize = 4 + 4 + 8;
 
-/// One section's bytes plus its index entry, ready for assembly. Exposed so
-/// the crash suite can drive the container layer with opaque payloads.
+/// One section's bytes plus its index entry, ready for assembly.
+///
+/// Exposed so the crash suite can drive the container layer with opaque
+/// payloads.
 pub struct RawSection {
     pub kind: pb::SectionKind,
     pub shard: u32,
@@ -88,8 +90,10 @@ pub fn assemble_container(meta: &pb::SnapshotMeta, sections: Vec<RawSection>) ->
 
 /// Validate a container end to end without decoding any records: header,
 /// closing magic, total CRC, meta record, and every section's bounds and
-/// CRC32C. This is the adoption gate for `install_snapshot` — every section
-/// CRC is checked before anything durable points at the bytes (ADR 0016).
+/// CRC32C.
+///
+/// This is the adoption gate for `install_snapshot` — every section CRC is
+/// checked before anything durable points at the bytes (ADR 0016).
 pub fn validate_container(
     path: &Path,
     bytes: &[u8],
@@ -171,8 +175,10 @@ pub fn section_bytes<'a>(bytes: &'a [u8], entry: &pb::SectionEntry) -> &'a [u8] 
 
 /// Encode a state's records into a full container, sharding each entity
 /// section `shards` ways and encoding the shards on parallel threads
-/// (ADR 0018: snapshot cost scales with cores). Shard assignment is a writer
-/// choice readers never depend on; contiguous chunks keep it deterministic.
+/// (ADR 0018: snapshot cost scales with cores).
+///
+/// Shard assignment is a writer choice readers never depend on; contiguous
+/// chunks keep it deterministic.
 pub fn encode_state(meta: &pb::SnapshotMeta, records: &StateRecords, shards: u32) -> Vec<u8> {
     let shards = shards.max(1) as usize;
     let mut sections: Vec<RawSection> = Vec::new();
@@ -255,9 +261,11 @@ pub fn encode_state(meta: &pb::SnapshotMeta, records: &StateRecords, shards: u32
 }
 
 /// Decode a validated container back into records, sections in parallel
-/// (the learner-rebuild path, ADR 0016/0018). Rebuild is order-independent
-/// across sections; shards are merged in (kind, shard) order only for
-/// determinism of the intermediate `StateRecords`.
+/// (the learner-rebuild path, ADR 0016/0018).
+///
+/// Rebuild is order-independent across sections; shards are merged in
+/// (kind, shard) order only for determinism of the intermediate
+/// `StateRecords`.
 pub fn decode_state(path: &Path, bytes: &[u8]) -> io::Result<(pb::SnapshotMeta, StateRecords)> {
     let (meta, index) = validate_container(path, bytes)?;
 

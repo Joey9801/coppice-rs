@@ -34,8 +34,10 @@ struct Tagged {
     batch: EventBatch,
 }
 
-/// Apply-side sender. Single owner (the apply task); [`EventTap::emit`] is
-/// synchronous and never blocks.
+/// Apply-side sender.
+///
+/// Single owner (the apply task); [`EventTap::emit`] is synchronous and
+/// never blocks.
 pub struct EventTap {
     tx: mpsc::Sender<Tagged>,
     /// Dense counter of *emitted* batches, advanced even when a batch is
@@ -81,10 +83,12 @@ impl EventTap {
         (tap, receiver)
     }
 
-    /// Emit a batch. Empty batches are skipped. Never blocks: on a full channel
-    /// the batch is dropped (the receiver synthesizes a gap); if the receiver
-    /// is gone the batch is dropped silently. The sequence counter advances in
-    /// every case, which is precisely what lets a drop show up as a gap.
+    /// Emit a batch.
+    ///
+    /// Empty batches are skipped. Never blocks: on a full channel the batch
+    /// is dropped (the receiver synthesizes a gap); if the receiver is gone
+    /// the batch is dropped silently. The sequence counter advances in every
+    /// case, which is precisely what lets a drop show up as a gap.
     pub fn emit(&mut self, batch: EventBatch) {
         if batch.events.is_empty() {
             return;
@@ -107,9 +111,11 @@ impl EventTap {
 }
 
 impl EventTapReceiver {
-    /// Receive the next item. Yields a [`TapItem::Gap`] before the first batch
-    /// that follows a drop, then the batch itself on the following call.
-    /// Returns `None` once the tap is dropped and fully drained.
+    /// Receive the next item.
+    ///
+    /// Yields a [`TapItem::Gap`] before the first batch that follows a drop,
+    /// then the batch itself on the following call. Returns `None` once the
+    /// tap is dropped and fully drained.
     pub async fn recv(&mut self) -> Option<TapItem> {
         if let Some(batch) = self.held.take() {
             self.last_index = batch.applied_index;

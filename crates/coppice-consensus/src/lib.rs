@@ -82,9 +82,11 @@ pub struct ConsensusStatus {
 pub struct Applied {
     /// Raft log index at which the command applied.
     pub log_index: u64,
-    /// The deterministic apply outcome. `Err` is a *rejection* — committed as a
-    /// no-op on every replica with the reason recorded (command-catalog.md);
-    /// normal control flow for racing proposers, not a failure of `propose`.
+    /// The deterministic apply outcome.
+    ///
+    /// `Err` is a *rejection* — committed as a no-op on every replica with
+    /// the reason recorded (command-catalog.md); normal control flow for
+    /// racing proposers, not a failure of `propose`.
     pub outcome: Result<coppice_state::Applied, coppice_state::RejectionReason>,
 }
 
@@ -95,11 +97,13 @@ pub struct Applied {
 /// [`ConsensusError::NotLeader`]. Implementations are a thin adapter over
 /// openraft (ADR 0002); see [`OpenraftConsensus`].
 pub trait Consensus: Send + Sync + 'static {
-    /// Propose a command. Resolves only once the command is committed AND
-    /// applied, carrying the apply outcome. Backpressured by a bounded
-    /// in-flight budget. On [`ConsensusError::Timeout`] the outcome is UNKNOWN —
-    /// the command may still commit; proposers rely on the catalog's
-    /// idempotency rules, never blind resubmission of non-idempotent intents.
+    /// Propose a command.
+    ///
+    /// Resolves only once the command is committed AND applied, carrying the
+    /// apply outcome. Backpressured by a bounded in-flight budget. On
+    /// [`ConsensusError::Timeout`] the outcome is UNKNOWN — the command may
+    /// still commit; proposers rely on the catalog's idempotency rules,
+    /// never blind resubmission of non-idempotent intents.
     fn propose(
         &self,
         command: Command,
@@ -116,8 +120,9 @@ pub trait Consensus: Send + Sync + 'static {
     /// Handle to published read views of applied state.
     fn views(&self) -> StateViews;
 
-    /// Add a fresh node as a non-voting learner (ADR 0016 step 2). `addr` is
-    /// the network endpoint the Raft transport dials.
+    /// Add a fresh node as a non-voting learner (ADR 0016 step 2).
+    ///
+    /// `addr` is the network endpoint the Raft transport dials.
     fn add_learner(
         &self,
         node: CoordinatorId,

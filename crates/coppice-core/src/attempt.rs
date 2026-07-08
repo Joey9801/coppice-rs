@@ -67,8 +67,10 @@ impl AttemptState {
     }
 }
 
-/// Why an attempt ended. Recorded on every terminal attempt so that "what
-/// stopped this job" is always answerable from state, never inferred.
+/// Why an attempt ended.
+///
+/// Recorded on every terminal attempt so that "what stopped this job" is
+/// always answerable from state, never inferred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptOutcome {
     /// The container exited on its own with this code.
@@ -93,9 +95,10 @@ pub enum AttemptOutcome {
     AgentError,
 }
 
-/// Who or what an outcome is attributed to. Drives default retry policy:
-/// platform failures retry, user errors don't (job policy may opt in),
-/// user requests never do.
+/// Who or what an outcome is attributed to.
+///
+/// Drives default retry policy: platform failures retry, user errors don't
+/// (job policy may opt in), user requests never do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutcomeClass {
     Success,

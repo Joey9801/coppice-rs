@@ -17,11 +17,12 @@ use coppice_state::Event;
 
 use crate::limits::{FANOUT_RING_MAX_AGE, FANOUT_RING_MAX_EVENTS, SUBSCRIBER_QUEUE_CAPACITY};
 
-/// What a subscriber wants to see. `Job`/`Node` scope by the entity carried
-/// on an event (ADR 0008); `All` is the unscoped stream dispatch subscribes
-/// with internally. `Job`/`Node` are for the future HTTP subscription
-/// endpoints (no transport built yet, so nothing constructs them today —
-/// see the module doc on `tasks::api_server`).
+/// What a subscriber wants to see.
+///
+/// `Job`/`Node` scope by the entity carried on an event (ADR 0008); `All` is
+/// the unscoped stream dispatch subscribes with internally. `Job`/`Node` are
+/// for the future HTTP subscription endpoints (no transport built yet, so
+/// nothing constructs them today — see the module doc on `tasks::api_server`).
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventFilter {
@@ -35,13 +36,13 @@ pub enum EventFilter {
 pub enum SubscriptionItem {
     /// A batch of events admitted by the subscriber's filter.
     Events(EventBatch),
-    /// One or more batches were skipped for this subscriber (a tap-level
-    /// gap, or its own queue overflowed); resync from `earliest_available`.
+    /// One or more batches were skipped for this subscriber.
+    ///
+    /// Either a tap-level gap or its own queue overflowed; resync from `earliest_available`.
     Gap { earliest_available: u64 },
 }
 
-/// A live subscription: the receiving half of the subscriber's bounded
-/// queue.
+/// A live subscription: the receiving half of the subscriber's bounded queue.
 pub struct Subscription {
     pub items: mpsc::Receiver<SubscriptionItem>,
 }
@@ -72,10 +73,11 @@ pub struct FanoutHandle {
 }
 
 impl FanoutHandle {
-    /// Subscribe to events matching `filter`. `cursor`, when given, resumes
-    /// from just after that applied index if it is still within the
-    /// reconnection ring's retention; otherwise the subscription opens with
-    /// an immediate [`SubscriptionItem::Gap`].
+    /// Subscribe to events matching `filter`.
+    ///
+    /// `cursor`, when given, resumes from just after that applied index if it
+    /// is still within the reconnection ring's retention; otherwise the
+    /// subscription opens with an immediate [`SubscriptionItem::Gap`].
     pub async fn subscribe(
         &self,
         filter: EventFilter,
@@ -90,8 +92,9 @@ impl FanoutHandle {
     }
 }
 
-/// The bounded reconnection ring plus its running event count, so eviction
-/// never has to rescan the whole ring to decide whether it's over budget.
+/// The bounded reconnection ring plus its running event count.
+///
+/// Eviction never has to rescan the whole ring to decide whether it's over budget.
 struct Ring {
     entries: VecDeque<(Instant, EventBatch)>,
     event_count: usize,
@@ -121,8 +124,9 @@ impl Ring {
         }
     }
 
-    /// The oldest applied index still retained, or 0 when the ring is empty
-    /// (an empty ring retains everything from the start).
+    /// The oldest applied index still retained, or 0 when the ring is empty.
+    ///
+    /// An empty ring retains everything from the start.
     fn earliest_index(&self) -> u64 {
         self.entries.front().map(|(_, batch)| batch.applied_index).unwrap_or(0)
     }
@@ -136,15 +140,17 @@ impl Ring {
 struct SubscriberState {
     filter: EventFilter,
     tx: mpsc::Sender<SubscriptionItem>,
-    /// Set when a `try_send` found the subscriber's queue full. Delivery is
-    /// paused until a `Gap` marker itself is accepted, at which point normal
-    /// delivery resumes (`docs/architecture/coordinator-runtime.md`,
-    /// "per-subscriber queue").
+    /// Set when a `try_send` found the subscriber's queue full.
+    ///
+    /// Delivery is paused until a `Gap` marker itself is accepted, at which
+    /// point normal delivery resumes. See `docs/architecture/coordinator-runtime.md`
+    /// ("per-subscriber queue").
     gapped: bool,
 }
 
-/// Spawn the fanout task. Returns the handle other tasks subscribe through,
-/// plus its `JoinHandle`.
+/// Spawn the fanout task.
+///
+/// Returns the handle other tasks subscribe through, plus its `JoinHandle`.
 pub fn spawn(
     event_tap: EventTapReceiver,
     shutdown: watch::Receiver<bool>,
@@ -205,8 +211,9 @@ async fn run(
     // Dropping `subscribers` here closes every subscription's channel.
 }
 
-/// Filter one batch's events down to what `filter` admits, or `None` if
-/// nothing in it survives (skip delivering an empty batch).
+/// Filter one batch's events down to what `filter` admits.
+///
+/// Returns `None` if nothing in it survives (skip delivering an empty batch).
 fn filter_events(filter: &EventFilter, batch: &EventBatch) -> Option<EventBatch> {
     if matches!(filter, EventFilter::All) {
         return Some(batch.clone());
@@ -237,8 +244,9 @@ fn event_matches(filter: &EventFilter, event: &Event) -> bool {
     }
 }
 
-/// Deliver one freshly-tapped batch to a subscriber, applying the gap
-/// recovery and full-queue policy of the "per-subscriber queue" channel row.
+/// Deliver one freshly-tapped batch to a subscriber.
+///
+/// Applies the gap recovery and full-queue policy of the "per-subscriber queue" channel row.
 fn deliver(sub: &mut SubscriberState, batch: &EventBatch, ring_earliest: u64) {
     if sub.gapped {
         let gap = SubscriptionItem::Gap { earliest_available: ring_earliest };
@@ -253,8 +261,9 @@ fn deliver(sub: &mut SubscriberState, batch: &EventBatch, ring_earliest: u64) {
     }
 }
 
-/// Serve a subscribe request: replay from the ring when the requested
-/// cursor is within retention, else open with an immediate gap.
+/// Serve a subscribe request.
+///
+/// Replay from the ring when the requested cursor is within retention, else open with an immediate gap.
 fn handle_subscribe(
     subscribers: &mut BTreeMap<u64, SubscriberState>,
     id: u64,

@@ -34,8 +34,10 @@ impl Resources {
         *self == Resources::ZERO
     }
 
-    /// Component-wise saturating sum. The replicated state machine forbids
-    /// panics on any input, so all resource bookkeeping saturates.
+    /// Component-wise saturating sum.
+    ///
+    /// The replicated state machine forbids panics on any input, so all
+    /// resource bookkeeping saturates.
     pub fn saturating_add(&self, other: &Resources) -> Resources {
         Resources {
             cpu_millis: self.cpu_millis.saturating_add(other.cpu_millis),

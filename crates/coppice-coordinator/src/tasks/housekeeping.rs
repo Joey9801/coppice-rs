@@ -24,11 +24,13 @@ use coppice_state::Command;
 use crate::leadership;
 use crate::limits::HOUSEKEEPING_INTERVAL;
 
-/// The job-history sink (ADR 0012). A sink, not a source: loss degrades
-/// history, never correctness.
+/// The job-history sink (ADR 0012).
+///
+/// A sink, not a source: loss degrades history, never correctness.
 pub trait HistoryStore: Send + Sync + 'static {
-    /// Resolve only once the write is DURABLE — the evict proposal is
-    /// sequenced after this.
+    /// Resolve only once the write is DURABLE.
+    ///
+    /// The evict proposal is sequenced after this.
     fn write_terminal_jobs(
         &self,
         jobs: Vec<TerminalJobRecord>,
@@ -52,8 +54,9 @@ pub struct TerminalJobRecord {
     pub submitted_at_us: i64,
 }
 
-/// Placeholder history store until the SQL sink lands: logs and reports
-/// success.
+/// Placeholder history store until the SQL sink lands.
+///
+/// Logs and reports success.
 pub struct StubHistoryStore;
 
 impl HistoryStore for StubHistoryStore {
@@ -159,8 +162,9 @@ async fn maybe_trigger_snapshot<C: Consensus>(consensus: &Arc<C>) {
     }
 }
 
-/// Whether applied-entries-since-snapshot has crossed the ADR 0017
-/// threshold. Not yet wired to real metrics, so this never fires.
+/// Whether applied-entries-since-snapshot has crossed the ADR 0017 threshold.
+///
+/// Not yet wired to real metrics, so this never fires.
 fn snapshot_due() -> bool {
     // TODO(ADR 0017): trigger once applied-entries-since-snapshot crosses
     // the configured threshold; sealed segments become deletable only once a

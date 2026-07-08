@@ -94,10 +94,11 @@ async fn handle_event<C: Consensus>(
     }
 }
 
-/// On gaining leadership, or after any event-stream gap, scan the latest
-/// view for `Ready` attempts and pending aborts. At-least-once delivery plus
-/// idempotent commands make the rescan safe
-/// (`docs/architecture/coordinator-runtime.md`, "Dispatch loop").
+/// On gaining leadership or after any event-stream gap, rescan the latest view.
+///
+/// Scans for `Ready` attempts and pending aborts. At-least-once delivery plus
+/// idempotent commands make the rescan safe. See
+/// `docs/architecture/coordinator-runtime.md` ("Dispatch loop").
 async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &RouterHandle) {
     let view = views.latest();
 
@@ -129,11 +130,10 @@ async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &R
     }
 }
 
-/// Propose `DispatchAttempt`; only once that commits and is accepted does it
-/// route `StartJob` to the attempt's node
-/// (`docs/architecture/command-catalog.md#dispatchattempt`: commit before
-/// send, so a crash in between reconciles as lost, never as an untracked
-/// container).
+/// Propose `DispatchAttempt`; only then route `StartJob` to the attempt's node.
+///
+/// Commit-before-send ordering (`docs/architecture/command-catalog.md#dispatchattempt`):
+/// a crash in between reconciles as lost, never as an untracked container.
 async fn dispatch_ready_attempt<C: Consensus>(
     consensus: &Arc<C>,
     views: &StateViews,
@@ -174,16 +174,18 @@ async fn route_stop(router: &RouterHandle, node: NodeId, allocation: AllocationI
 }
 
 /// Build the `StartJob` proto command for a freshly-dispatched attempt.
+///
 /// Deferred: the payload (image, resource limits, `max_runtime_us`) needs
 /// the job/allocation domain -> proto mapping
-/// (`docs/architecture/command-catalog.md#dispatchattempt`); the ordering
+/// (`docs/architecture/command-catalog.md#dispatchattempt`). The ordering
 /// and channel plumbing around this call are real.
 fn start_job_command(_attempt: &AttemptRecord, _allocation: &AllocationRecord) -> AgentCommand {
     todo!("StartJob AgentCommand construction (command-catalog.md#dispatchattempt)")
 }
 
-/// Build the `StopJob` proto command for an allocation. Deferred: `grace_us`
-/// comes from the replicated policy's `abort_grace_us`.
+/// Build the `StopJob` proto command for an allocation.
+///
+/// Deferred: `grace_us` comes from the replicated policy's `abort_grace_us`.
 fn stop_job_command(_allocation: AllocationId) -> AgentCommand {
     todo!("StopJob AgentCommand construction (grace_us from replicated policy)")
 }

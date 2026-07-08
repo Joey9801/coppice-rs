@@ -38,8 +38,10 @@ pub struct StateView {
 }
 
 impl StateView {
-    /// The applied state. Borrowed, not owned: a view lends read access, never
-    /// a handle that could mutate the single-writer state.
+    /// The applied state.
+    ///
+    /// Borrowed, not owned: a view lends read access, never a handle that
+    /// could mutate the single-writer state.
     pub fn state(&self) -> &StateMachine {
         &self.state
     }
@@ -51,11 +53,13 @@ impl StateView {
         self.applied_index
     }
 
-    /// The state machine's `version` — the count of applied commands, used by
-    /// the scheduler as `expected_version`. Distinct from
-    /// [`applied_index`](StateView::applied_index): the log index counts *log
-    /// entries* (including ones this replica has yet to publish), the version
-    /// counts *applied commands*. Never substitute one for the other.
+    /// The state machine's `version` — the count of applied commands, used
+    /// by the scheduler as `expected_version`.
+    ///
+    /// Distinct from [`applied_index`](StateView::applied_index): the log
+    /// index counts *log entries* (including ones this replica has yet to
+    /// publish), the version counts *applied commands*. Never substitute one
+    /// for the other.
     pub fn version(&self) -> u64 {
         self.state.version
     }
@@ -73,8 +77,10 @@ struct ViewDemand {
     notify: Notify,
 }
 
-/// Reader-side handle to the published views. Clone freely; every clone reads
-/// the same [`watch`] channel and shares the same demand signal.
+/// Reader-side handle to the published views.
+///
+/// Clone freely; every clone reads the same [`watch`] channel and shares
+/// the same demand signal.
 #[derive(Clone)]
 pub struct StateViews {
     rx: watch::Receiver<StateView>,
@@ -201,9 +207,10 @@ impl ViewPublisher {
         }
     }
 
-    /// Publish unconditionally. Used for the first post-replay publish and for
-    /// snapshot handoff, where the reader must see the exact index regardless
-    /// of cadence.
+    /// Publish unconditionally.
+    ///
+    /// Used for the first post-replay publish and for snapshot handoff,
+    /// where the reader must see the exact index regardless of cadence.
     pub fn publish_now(&mut self, state: &StateMachine, applied_index: u64) {
         self.publish_at(state, applied_index, Instant::now());
     }

@@ -57,8 +57,10 @@ use std::path::{Path, PathBuf};
 /// engine is generic over this trait; every durability decision it makes is
 /// therefore observable and perturbable by the crash suite.
 pub trait Fs: Send + Sync + 'static {
-    /// An open file handle. Independent handles to the same file observe the
-    /// same visible contents.
+    /// An open file handle.
+    ///
+    /// Independent handles to the same file observe the same visible
+    /// contents.
     type File: FsFile;
 
     /// Guard for the storage `LOCK` file; dropping it releases the lock. A
@@ -70,9 +72,10 @@ pub trait Fs: Send + Sync + 'static {
     /// second-opener refusal, not a blocking wait.
     fn lock(&self, path: &Path) -> io::Result<Self::Lock>;
 
-    /// Create a directory and any missing parents. Idempotent. Durability of
-    /// the new entries follows the same rule as files: [`Fs::sync_dir`] on
-    /// the parent.
+    /// Create a directory and any missing parents. Idempotent.
+    ///
+    /// Durability of the new entries follows the same rule as files:
+    /// [`Fs::sync_dir`] on the parent.
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
     /// File names (not paths) of the entries in a directory, sorted, so
@@ -89,18 +92,22 @@ pub trait Fs: Send + Sync + 'static {
     /// the file's full visible contents. Used for the active log segment.
     fn open_append(&self, path: &Path) -> io::Result<Self::File>;
 
-    /// Create a file that must not already exist, open for append. Used for
-    /// new segments and the temp side of every atomic swap.
+    /// Create a file that must not already exist, open for append.
+    ///
+    /// Used for new segments and the temp side of every atomic swap.
     fn create_new(&self, path: &Path) -> io::Result<Self::File>;
 
-    /// Atomically rename `from` to `to`, replacing any existing `to`. Visible
-    /// immediately; durable after [`Fs::sync_dir`] of the parent. Both paths
-    /// must share a parent directory (all ADR 0017 swaps do).
+    /// Atomically rename `from` to `to`, replacing any existing `to`.
+    ///
+    /// Visible immediately; durable after [`Fs::sync_dir`] of the parent.
+    /// Both paths must share a parent directory (all ADR 0017 swaps do).
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
-    /// Delete a file. Visible immediately; durable after [`Fs::sync_dir`] of
-    /// the parent — an un-synced delete can *reappear* after a crash, which
-    /// is why recovery's orphan cleanup must be idempotent.
+    /// Delete a file.
+    ///
+    /// Visible immediately; durable after [`Fs::sync_dir`] of the parent —
+    /// an un-synced delete can *reappear* after a crash, which is why
+    /// recovery's orphan cleanup must be idempotent.
     fn remove_file(&self, path: &Path) -> io::Result<()>;
 
     /// fsync a directory, making all namespace changes inside it (creates,
@@ -108,14 +115,18 @@ pub trait Fs: Send + Sync + 'static {
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
 }
 
-/// An open file. Only the access patterns the formats need: append at the
-/// tail, positioned reads, truncate (torn-tail repair only), and data fsync.
+/// An open file.
+///
+/// Only the access patterns the formats need: append at the tail,
+/// positioned reads, truncate (torn-tail repair only), and data fsync.
 // `len` here is a fallible size query, not a collection length; an
 // `is_empty` counterpart would be noise.
 #[allow(clippy::len_without_is_empty)]
 pub trait FsFile: Send + 'static {
-    /// Write `data` at the current end of file. Visible to all handles
-    /// immediately; durable only after [`FsFile::sync_data`].
+    /// Write `data` at the current end of file.
+    ///
+    /// Visible to all handles immediately; durable only after
+    /// [`FsFile::sync_data`].
     fn append(&mut self, data: &[u8]) -> io::Result<()>;
 
     /// Read up to `buf.len()` bytes at `offset`, returning the count read
@@ -125,9 +136,11 @@ pub trait FsFile: Send + 'static {
     /// Current visible length.
     fn len(&self) -> io::Result<u64>;
 
-    /// Shrink the file to `len`. Exists solely for recovery's torn-tail
-    /// repair of the active segment (ADR 0002); sealed bytes are never
-    /// rewritten (ADR 0017). Durable after [`FsFile::sync_data`].
+    /// Shrink the file to `len`.
+    ///
+    /// Exists solely for recovery's torn-tail repair of the active segment
+    /// (ADR 0002); sealed bytes are never rewritten (ADR 0017). Durable
+    /// after [`FsFile::sync_data`].
     fn truncate(&mut self, len: u64) -> io::Result<()>;
 
     /// Make the file's visible contents and length durable (`fdatasync`).
@@ -178,8 +191,10 @@ pub fn write_atomic<F: Fs>(fs: &F, path: &Path, tmp: &Path, bytes: &[u8]) -> io:
     Ok(())
 }
 
-/// Read a whole (small) file. For the vote file and manifest; segments and
-/// snapshots are streamed, not slurped.
+/// Read a whole (small) file.
+///
+/// For the vote file and manifest; segments and snapshots are streamed,
+/// not slurped.
 pub fn read_to_vec<F: Fs>(fs: &F, path: &Path) -> io::Result<Vec<u8>> {
     let file = fs.open_read(path)?;
     let len = file.len()?;
@@ -196,9 +211,10 @@ fn parent_of(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new(""))
 }
 
-/// The real filesystem, anchored at a root directory. A thin, unclever
-/// mapping to `std::fs` — all policy lives in the engine, all fault injection
-/// in `SimFs`.
+/// The real filesystem, anchored at a root directory.
+///
+/// A thin, unclever mapping to `std::fs` — all policy lives in the engine,
+/// all fault injection in `SimFs`.
 ///
 /// Note on macOS: `fsync` there does not guarantee platter durability without
 /// `F_FULLFSYNC`; we accept `fsync` semantics uniformly, as production targets

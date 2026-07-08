@@ -77,8 +77,9 @@ fn channel_closed() -> StorageError<CoordinatorId> {
     StorageIOError::write_state_machine(&io::Error::other("apply task is gone (shutdown)")).into()
 }
 
-/// The state-machine store (ADR 0002/0016/0018). Constructed by
-/// [`super::open`]'s [`super::Recovered::into_stores`].
+/// The state-machine store (ADR 0002/0016/0018).
+///
+/// Constructed by [`super::open`]'s [`super::Recovered::into_stores`].
 pub struct StateMachineStore<F: Fs = RealFs> {
     core: Arc<StdMutex<StorageCore<F>>>,
     apply_tx: mpsc::Sender<ApplyRequest>,
@@ -382,6 +383,7 @@ pub(super) fn openraft_meta(
 
 /// The canonical single-writer apply loop (coordinator-runtime.md): sole
 /// owner of the mutable [`StateMachine`], fed only by [`ApplyRequest`]s.
+///
 /// Ends when every sender is dropped.
 pub async fn run_apply_task(mut state: StateMachine, mut rx: mpsc::Receiver<ApplyRequest>) {
     let mut applied_index: u64 = 0;

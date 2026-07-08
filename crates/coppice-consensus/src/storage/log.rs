@@ -23,8 +23,10 @@ use crate::CoordinatorId;
 use super::engine::{EncodedEntry, StorageCore};
 use super::raftpb;
 
-/// Map an engine error onto openraft's error surface. The engine's fail-stop
-/// messages (file, offset, `coordinator replace`) ride through as the source.
+/// Map an engine error onto openraft's error surface.
+///
+/// The engine's fail-stop messages (file, offset, `coordinator replace`)
+/// ride through as the source.
 fn storage_err(err: &io::Error) -> StorageError<CoordinatorId> {
     StorageIOError::write_logs(&io::Error::new(err.kind(), err.to_string())).into()
 }
@@ -44,10 +46,11 @@ async fn blocking<F: Fs, T: Send + 'static>(
         .map_err(|e| io::Error::other(format!("storage task panicked: {e}")))?
 }
 
-/// The segment log store (ADR 0002/0017). Constructed by
-/// [`super::open`]; shares its engine with the [`super::StateMachineStore`]
-/// because the manifest is the single durable home of both the segment list
-/// and the snapshot pointer.
+/// The segment log store (ADR 0002/0017).
+///
+/// Constructed by [`super::open`]; shares its engine with the
+/// [`super::StateMachineStore`] because the manifest is the single durable
+/// home of both the segment list and the snapshot pointer.
 pub struct SegmentLogStorage<F: Fs = RealFs> {
     core: Arc<Mutex<StorageCore<F>>>,
 }

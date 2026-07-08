@@ -27,7 +27,7 @@
 
 use crate::resource::Resources;
 
-/// Micro-cost-units per cost unit: [`CostUnits`] counts µCU.
+/// Micro-cost-units per cost unit: all [`CostUnits`] values count in µCU.
 pub const MICRO_PER_COST_UNIT: u64 = 1_000_000;
 
 /// A quantity of cost or accumulated usage, in micro-cost-units (µCU).
@@ -66,7 +66,7 @@ pub enum PolicyError {
     DecayTooSlow(u64),
 }
 
-/// Replicated decay policy: tick length and per-tick retention factor.
+/// Replicated decay policy: tick length and per-tick retention factor (ADR 0019).
 ///
 /// The per-tick factor λ is Q0.64 fixed point (`decay_per_tick / 2^64`). It
 /// is derived from the human-facing half-life by config *tooling* at
@@ -254,11 +254,12 @@ pub fn runtime_seconds_ceil(runtime_us: u64) -> u64 {
     runtime_us.div_ceil(MICRO_PER_COST_UNIT)
 }
 
-/// Cost from an already-computed rate:
-/// `cost = rate × runtime_seconds × priority_multiplier`, computed in `u128`
-/// with a single `>> 32` for the Q32.32 multiplier, saturating. True-up uses
-/// this with the rate stored in the [`ChargeRecord`]'s attempt, so a policy
-/// edit mid-flight never reprices an in-flight charge (ADR 0019).
+/// Compute cost from an already-computed rate.
+///
+/// Formula: `cost = rate × runtime_seconds × priority_multiplier`, computed in
+/// `u128` with a single `>> 32` for the Q32.32 multiplier, saturating. True-up
+/// uses this with the rate stored in the [`ChargeRecord`]'s attempt, so a
+/// policy edit mid-flight never reprices an in-flight charge (ADR 0019).
 pub fn cost_from_rate(
     rate_ucu_per_second: u64,
     runtime_seconds: u64,
@@ -346,11 +347,12 @@ pub fn over_quota_ratio(usage: CostUnits, quota: CostUnits) -> f64 {
     }
 }
 
-/// The penalty an over-quota entity contributes to its descendants' effective
-/// scores: 1 within quota, `x^p` above it, with `p = exponent_milli / 1000`
-/// (default quadratic — superlinear so sustained overuse can't be linearly
-/// bought with priority multipliers, polynomial so "at 3× quota ⇒ 9×
-/// deprioritized" stays human-checkable). Continuous and monotone at x = 1.
+/// Penalty factor for an over-quota entity applied to descendants' scores.
+///
+/// Returns 1 within quota, or `x^p` above it (with `p = exponent_milli / 1000`).
+/// Default quadratic (2000 milli): superlinear so sustained overuse can't be
+/// linearly bought with priority multipliers; polynomial so "at 3× quota ⇒ 9×
+/// deprioritized" stays human-checkable. Continuous and monotone at x = 1.
 pub fn penalty(over_quota_ratio: f64, exponent_milli: u32) -> f64 {
     if over_quota_ratio <= 1.0 {
         1.0

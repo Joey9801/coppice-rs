@@ -17,10 +17,10 @@ pub enum ProposeOutcome {
     NotLeader(Option<CoordinatorId>),
 }
 
-/// A [`Consensus`] fake: `propose` returns a canned outcome instead of
-/// running real Raft. `status`/`views` are backed by a real
-/// [`ViewPublisher`]/[`StateViews`] pair so callers see the genuine seam
-/// behavior for reads.
+/// A [`Consensus`] fake: `propose` returns a canned outcome instead of running real Raft.
+///
+/// `status`/`views` are backed by a real [`ViewPublisher`]/[`StateViews`] pair
+/// so callers see the genuine seam behavior for reads.
 pub struct FakeConsensus {
     outcome: Mutex<ProposeOutcome>,
     status_rx: watch::Receiver<ConsensusStatus>,
@@ -29,8 +29,9 @@ pub struct FakeConsensus {
 }
 
 impl FakeConsensus {
-    /// Build a fake reporting `Leader { term: 1 }`, plus the [`ViewPublisher`]
-    /// half the test uses to seed/advance published state.
+    /// Build a fake reporting `Leader { term: 1 }`.
+    ///
+    /// Also returns the [`ViewPublisher`] half the test uses to seed/advance published state.
     pub fn new(outcome: ProposeOutcome) -> (Self, ViewPublisher) {
         let (publisher, views) =
             ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());

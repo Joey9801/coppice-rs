@@ -23,10 +23,11 @@ use crate::CoordinatorId;
 
 use super::container::fail_stop;
 
-/// The ClusterVersion stamped into persisted command envelopes. Every command
-/// in the v1 catalog is cluster-version 1 (ADR 0003); once proposers carry a
-/// live version, stamping moves to the proposal path and this constant goes
-/// away.
+/// The ClusterVersion stamped into persisted command envelopes.
+///
+/// Every command in the v1 catalog is cluster-version 1 (ADR 0003); once
+/// proposers carry a live version, stamping moves to the proposal path and
+/// this constant goes away.
 const WRITTEN_CLUSTER_VERSION: u32 = 1;
 
 pub fn vote_to_pb(vote: &Vote<CoordinatorId>) -> pb::Vote {
@@ -167,8 +168,9 @@ pub fn entry_to_bytes(entry: &openraft::Entry<TypeConfig>) -> Vec<u8> {
     .encode_to_vec()
 }
 
-/// Decode a durable log-entry payload back into an openraft entry. `path` and
-/// `index` name the source for fail-stop errors.
+/// Decode a durable log-entry payload back into an openraft entry.
+///
+/// `path` and `index` name the source for fail-stop errors.
 pub fn entry_from_bytes(
     path: &Path,
     index: u64,

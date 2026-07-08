@@ -356,10 +356,12 @@ impl StateMachine {
     }
 
     /// Simulate the batch and count distinct jobs left holding accruing
-    /// allocations. Mirrors the pledge arithmetic of the effects phase. A
-    /// batch may not grow the accruing set beyond K; a cluster already over
-    /// the limit (after a policy change) may keep operating and swap
-    /// accruals, it just cannot add more.
+    /// allocations.
+    ///
+    /// Mirrors the pledge arithmetic of the effects phase. A batch may not
+    /// grow the accruing set beyond K; a cluster already over the limit
+    /// (after a policy change) may keep operating and swap accruals, it
+    /// just cannot add more.
     fn check_accrual_limit(
         &self,
         c: &CommitPlacements,
@@ -803,8 +805,9 @@ impl StateMachine {
 
     /// The shared terminal path: terminal outcome, allocation release plus
     /// funding cascade, quota true-up, and job resolution — all in one apply
-    /// (the `Finalizing` funnel of ADR 0013). `pledge` is false only when
-    /// the node itself is lost.
+    /// (the `Finalizing` funnel of ADR 0013).
+    ///
+    /// `pledge` is false only when the node itself is lost.
     fn terminate_attempt(
         &mut self,
         attempt: AttemptId,
@@ -941,9 +944,10 @@ impl StateMachine {
     }
 
     /// One pledge pass: free capacity on a node flows to its accruing
-    /// allocations in commit (`seq`) order — never id order (ADR 0014). The
-    /// head takes what it needs of each dimension; dimensions it does not
-    /// need flow past it.
+    /// allocations in commit (`seq`) order — never id order (ADR 0014).
+    ///
+    /// The head takes what it needs of each dimension; dimensions it does
+    /// not need flow past it.
     fn pledge_node(&mut self, node: NodeId, events: &mut Vec<Event>) {
         let mut free = self.free_capacity(&node);
         if free.is_zero() {
@@ -982,6 +986,7 @@ impl StateMachine {
     }
 
     /// The `Ready` barrier: an AND over the placement group's live attempts.
+    ///
     /// v1 groups are singletons, but the evaluation is group-shaped from day
     /// one so gang scheduling adds members, not mechanism.
     fn check_ready_barrier(&mut self, attempt: AttemptId, events: &mut Vec<Event>) {
@@ -1016,8 +1021,10 @@ impl StateMachine {
         }
     }
 
-    /// Charge every ancestor on the entity's path (ADR 0005). The walk is
-    /// depth-capped so even a corrupted parent chain stays bounded.
+    /// Charge every ancestor on the entity's path (ADR 0005).
+    ///
+    /// The walk is depth-capped so even a corrupted parent chain stays
+    /// bounded.
     fn charge_ancestors(&mut self, entity: QuotaEntityId, amount: CostUnits, ts_us: i64) {
         let decay = self.policy.decay;
         let mut cur = Some(entity);

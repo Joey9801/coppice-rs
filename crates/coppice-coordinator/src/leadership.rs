@@ -44,9 +44,9 @@ pub async fn wait_for_leadership(
     }
 }
 
-/// Resolve the moment this replica's status no longer reports
-/// `Leader { term }` for the given `term` (a different term, or a
-/// non-leader role), or shutdown flips.
+/// Resolve the moment this replica's status no longer reports `Leader { term }` for the given `term`.
+///
+/// A moment when leadership is lost (a different term, or a non-leader role) or shutdown flips.
 ///
 /// A leader-only task selects its work against this future to know when to
 /// stop draining and re-gate on [`wait_for_leadership`].

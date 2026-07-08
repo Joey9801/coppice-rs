@@ -43,13 +43,14 @@ use crate::{Applied, Consensus, ConsensusStatus, CoordinatorId};
 pub type ApplyResult = Result<coppice_state::Applied, coppice_state::RejectionReason>;
 
 openraft::declare_raft_types!(
-    /// The openraft type binding for the coordinator. `D` is a control-plane
-    /// [`Command`], `R` is its [`ApplyResult`]; the node id is
-    /// [`CoordinatorId`] and nodes carry a dial address in a [`BasicNode`]. The
-    /// remaining associated types take openraft's defaults (tokio runtime,
-    /// oneshot responder, in-memory snapshot cursor). Neither `D` nor `R`
-    /// implements serde, so openraft is built without its `serde` feature
-    /// (ADR 0002).
+    /// The openraft type binding for the coordinator.
+    ///
+    /// `D` is a control-plane [`Command`], `R` is its [`ApplyResult`]; the
+    /// node id is [`CoordinatorId`] and nodes carry a dial address in a
+    /// [`BasicNode`]. The remaining associated types take openraft's
+    /// defaults (tokio runtime, oneshot responder, in-memory snapshot
+    /// cursor). Neither `D` nor `R` implements serde, so openraft is built
+    /// without its `serde` feature (ADR 0002).
     pub TypeConfig:
         D = Command,
         R = ApplyResult,
@@ -87,10 +88,12 @@ pub enum ApplyRequest {
 /// throttles replication rather than growing an unbounded queue.
 pub const APPLY_CHANNEL_CAPACITY: usize = 64;
 
-/// The bounded in-flight proposal budget. A proposer acquires one permit for
-/// the lifetime of a [`Consensus::propose`] call, so no more than this many
-/// commands sit un-applied in openraft at once; the excess waits on the
-/// semaphore instead of piling into openraft's queues.
+/// The bounded in-flight proposal budget.
+///
+/// A proposer acquires one permit for the lifetime of a
+/// [`Consensus::propose`] call, so no more than this many commands sit
+/// un-applied in openraft at once; the excess waits on the semaphore
+/// instead of piling into openraft's queues.
 pub const MAX_INFLIGHT_PROPOSALS: usize = 4096;
 
 /// The openraft-backed [`Consensus`] implementation.
@@ -245,9 +248,10 @@ fn map_client_write_error(
     }
 }
 
-/// Map a linearizable-read barrier error. `QuorumNotEnough` means the leader
-/// could not confirm its lease within the round — surfaced as a retryable
-/// [`ConsensusError::Timeout`].
+/// Map a linearizable-read barrier error.
+///
+/// `QuorumNotEnough` means the leader could not confirm its lease within
+/// the round — surfaced as a retryable [`ConsensusError::Timeout`].
 fn map_check_leader_error(
     error: RaftError<CoordinatorId, CheckIsLeaderError<CoordinatorId, BasicNode>>,
 ) -> ConsensusError {

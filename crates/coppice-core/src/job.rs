@@ -43,8 +43,10 @@ pub struct Job {
     pub abort_requested: Option<AbortRequest>,
 }
 
-/// Per-job retry policy. Bounds attempts beyond the first; `Revoked` outcomes
-/// never consume this budget.
+/// Per-job retry policy.
+///
+/// Bounds attempts beyond the first; `Revoked` outcomes never consume this
+/// budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub max_retries: u32,
@@ -70,11 +72,11 @@ pub struct AbortRequest {
     // already earmarked in coppice.core.v1.AbortRequest.
 }
 
-/// The lifecycle state of a job. Authoritative, Raft-replicated state.
+/// The lifecycle state of a job.
 ///
-/// Coarse by design: it stays stable while the attempt machine evolves
-/// (accrual now, gang barriers later). UIs join this with the live attempt's
-/// state for detail.
+/// Authoritative, Raft-replicated state. Coarse by design: it stays stable
+/// while the attempt machine evolves (accrual now, gang barriers later). UIs
+/// join this with the live attempt's state for detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     /// Recorded durably; awaiting admission evaluation.
@@ -101,15 +103,17 @@ pub enum JobState {
 }
 
 impl JobState {
-    /// Whether this state is terminal. Terminal jobs never transition again
-    /// and are eventually evicted to the history store (ADR 0012).
+    /// Whether this state is terminal.
+    ///
+    /// Terminal jobs never transition again and are eventually evicted to the
+    /// history store (ADR 0012).
     pub fn is_terminal(self) -> bool {
         matches!(self, JobState::Succeeded | JobState::Failed | JobState::Aborted)
     }
 
-    /// The legal transition table from
-    /// `docs/lifecycle/job-lifecycle.md`. The state machine rejects any edge
-    /// not listed here.
+    /// The legal transition table from `docs/lifecycle/job-lifecycle.md`.
+    ///
+    /// The state machine rejects any edge not listed here.
     pub fn may_transition_to(self, next: JobState) -> bool {
         use JobState::*;
         match (self, next) {

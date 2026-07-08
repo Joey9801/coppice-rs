@@ -19,14 +19,17 @@ use coppice_state::{Command, StateMachine};
 
 use crate::leadership;
 
-/// How long an empty pass waits before trying again, so the loop doesn't
-/// spin when there is nothing to schedule. `StateViews` has no "wait for any
-/// change" primitive (only `at_least(index)`, which needs a target index),
-/// so a short poll is the available alternative to a true view-change wait.
+/// How long an empty pass waits before trying again.
+///
+/// Prevents spinning when there is nothing to schedule. `StateViews` has no
+/// "wait for any change" primitive (only `at_least(index)`, which needs a
+/// target index), so a short poll is the available alternative to a true
+/// view-change wait.
 const EMPTY_PASS_BACKOFF: Duration = Duration::from_millis(200);
 
-/// Placeholder `Scheduler` until a real engine lands in `coppice-scheduler`,
-/// which today defines only the trait and an empty `PlacementProposal`.
+/// Placeholder `Scheduler` until a real engine lands in `coppice-scheduler`.
+///
+/// Today `coppice-scheduler` defines only the trait and an empty `PlacementProposal`.
 /// Keeps the task topology wired and exercised; every pass is a no-op.
 pub struct NoopScheduler;
 
@@ -102,15 +105,17 @@ pub async fn run<C, S>(
     }
 }
 
-/// `PlacementProposal` doesn't yet carry placement/revocation data
-/// (`coppice-scheduler` ships only the trait and an audit-only proposal
-/// today) — until it does, every pass is trivially empty.
+/// `PlacementProposal` doesn't yet carry placement/revocation data.
+///
+/// `coppice-scheduler` ships only the trait and an audit-only proposal today —
+/// until it does, every pass is trivially empty.
 fn proposal_is_empty(_proposal: &PlacementProposal) -> bool {
     true
 }
 
-/// Deferred: `PlacementProposal` -> `CommitPlacements` once
-/// `coppice-scheduler` carries real placement/revocation data.
+/// Deferred: convert `PlacementProposal` -> `CommitPlacements`.
+///
+/// Waits for `coppice-scheduler` to carry real placement/revocation data.
 fn commit_placements_from_proposal(proposal: PlacementProposal) -> CommitPlacements {
     todo!(
         "PlacementProposal -> CommitPlacements conversion once coppice-scheduler \

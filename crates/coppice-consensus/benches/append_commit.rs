@@ -48,17 +48,20 @@ use coppice_consensus::storage::raw::{self, ENTRY_OVERHEAD};
 use coppice_consensus::storage::{EncodedEntry, FrameLogId, StorageCore, StorageOptions};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 
-/// Representative size of one log entry's command payload. Small enough to
-/// be dominated by fsync latency at every group size in `GROUP_SIZES`, which
-/// is exactly the property ADR 0018's thesis depends on.
+/// Representative size of one log entry's command payload.
+///
+/// Small enough to be dominated by fsync latency at every group size in
+/// `GROUP_SIZES`, which is exactly the property ADR 0018's thesis depends
+/// on.
 const ENTRY_PAYLOAD_LEN: usize = 256;
 
 /// Group sizes spanning "no batching" to "deep batching under load".
 const GROUP_SIZES: [usize; 4] = [1, 8, 64, 256];
 
-/// Identity for the raw-seam groups' frame ids. These groups never go
-/// through `StorageCore`, so the id only has to be well-formed, not
-/// contiguous with anything.
+/// Identity for the raw-seam groups' frame ids.
+///
+/// These groups never go through `StorageCore`, so the id only has to be
+/// well-formed, not contiguous with anything.
 const RAW_TERM: u64 = 1;
 const RAW_NODE: u64 = 1;
 
@@ -81,10 +84,12 @@ fn make_group(group_size: usize) -> Vec<u8> {
     buf
 }
 
-/// A fresh, empty segment file for one measured iteration. Every iteration
-/// gets its own file (unique name from `counter`) so the file never grows
-/// across the sample and `sync_data` cost stays representative of a single
-/// group commit rather than of an ever-larger segment.
+/// A fresh, empty segment file for one measured iteration.
+///
+/// Every iteration gets its own file (unique name from `counter`) so the
+/// file never grows across the sample and `sync_data` cost stays
+/// representative of a single group commit rather than of an ever-larger
+/// segment.
 fn fresh_segment(fs: &RealFs, counter: &mut u64) -> <RealFs as Fs>::File {
     let name = format!("seg-{:010}", *counter);
     *counter += 1;
@@ -133,9 +138,10 @@ fn bench_group_commit_with_fsync(c: &mut Criterion) {
     group.finish();
 }
 
-/// The encoding-only ceiling: append made visible, but never synced. ADR
-/// 0018 claims this is never the limiter; this bench is how that claim gets
-/// checked rather than assumed. A regression here is a framing/append
+/// The encoding-only ceiling: append made visible, but never synced.
+///
+/// ADR 0018 claims this is never the limiter; this bench is how that claim
+/// gets checked rather than assumed. A regression here is a framing/append
 /// regression, not a disk one — the no-fsync numbers should be orders of
 /// magnitude faster than the fsync'd numbers above at every group size.
 fn bench_encoding_only_ceiling(c: &mut Criterion) {

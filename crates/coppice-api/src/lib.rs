@@ -36,7 +36,7 @@ pub enum ApiError {
 
     /// The command committed and applied, but apply refused it
     /// deterministically — a normal outcome of a race between proposers
-    /// (command-catalog.md rejection semantics), not a server fault.
+    /// (see `docs/architecture/command-catalog.md` for rejection semantics), not a server fault.
     #[error("rejected: {0}")]
     Rejected(#[source] coppice_state::RejectionReason),
 

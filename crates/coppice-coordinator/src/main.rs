@@ -33,13 +33,13 @@ async fn main() -> Result<()> {
     runtime::run(consensus, views, event_tap).await
 }
 
-/// Construct the openraft node, segment storage, and the apply task, then
-/// return the [`Consensus`](coppice_consensus::Consensus) seam plus its view
+/// Construct the openraft node, segment storage, and the apply task.
+///
+/// Returns the [`Consensus`](coppice_consensus::Consensus) seam plus its view
 /// and event-tap handles for `runtime::run` to wire up.
 ///
-/// Not implemented yet: the segment storage layer and openraft node
-/// construction are not built yet; see
-/// `docs/architecture/coordinator-runtime.md`.
+/// Not implemented yet: the segment storage layer and openraft node construction
+/// are not built yet; see `docs/architecture/coordinator-runtime.md`.
 async fn bootstrap() -> Result<(OpenraftConsensus, StateViews, EventTapReceiver)> {
     // Sizing the tap now — even though the rest of bootstrap isn't built —
     // keeps `limits::EVENT_TAP_CAPACITY` live here rather than dead, and

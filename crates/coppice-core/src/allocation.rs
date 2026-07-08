@@ -11,9 +11,10 @@
 use crate::id::{AllocationId, AttemptId, JobId, NodeId};
 use crate::resource::Resources;
 
-/// A claim on one node's resources. Authoritative, Raft-replicated state —
-/// including `funded`, which must survive failover because accrual progress
-/// is exactly what a reservation is.
+/// A claim on one node's resources.
+///
+/// Authoritative, Raft-replicated state — including `funded`, which must
+/// survive failover because accrual progress is exactly what a reservation is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allocation {
     pub id: AllocationId,
@@ -27,10 +28,11 @@ pub struct Allocation {
     pub state: AllocationState,
 }
 
-/// The allocation state machine: `Accruing → Funded → Active → Released`,
-/// with early release from `Accruing` (revocation, abort) and `Funded`
-/// (abort). Revocation is legal only while accruing; funded allocations are
-/// stable.
+/// Allocation state machine with early-release and revocation rules.
+///
+/// States: `Accruing → Funded → Active → Released`. Early release is legal
+/// from `Accruing` (revocation, abort) and `Funded` (abort only). Revocation
+/// is restricted to the accruing phase; funded allocations are stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocationState {
     /// Committed but not fully funded; holds capacity as it frees. Revocable

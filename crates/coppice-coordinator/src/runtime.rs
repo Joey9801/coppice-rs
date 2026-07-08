@@ -16,8 +16,9 @@ use crate::tasks::housekeeping::StubHistoryStore;
 use crate::tasks::scheduler_driver::NoopScheduler;
 use crate::tasks::{agent_gateway, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver};
 
-/// Wire up and run every coordinator task. Returns once shutdown has fully
-/// drained.
+/// Wire up and run every coordinator task.
+///
+/// Returns once shutdown has fully drained.
 pub async fn run<C>(consensus: C, views: StateViews, event_tap: EventTapReceiver) -> anyhow::Result<()>
 where
     C: Consensus,

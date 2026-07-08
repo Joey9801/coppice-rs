@@ -44,9 +44,10 @@ const CLUSTER_UUID: [u8; 16] = *b"replay-bench-clu";
 const INSTANCE_UUID: [u8; 16] = [0x77; 16];
 const NODE_ID: u64 = 1;
 
-/// Entry count in the replay-floor fixture. Large enough that read-ahead
-/// and per-chunk overhead average out, small enough that `--quick` runs
-/// finish in seconds.
+/// Entry count in the replay-floor fixture.
+///
+/// Large enough that read-ahead and per-chunk overhead average out, small
+/// enough that `--quick` runs finish in seconds.
 const ENTRY_COUNT: usize = 100_000;
 
 /// Batch size the fixture is appended in (matches a realistic group-commit
@@ -109,9 +110,11 @@ fn decode_fixture_entry(bytes: &[u8]) -> Command {
 
 /// Build the fixture directory once, through the seam, appending
 /// `ENTRY_COUNT` real `RegisterNode` entries in `APPEND_BATCH`-sized group
-/// commits. Not timed: this is the "cold recovery finds this on disk"
-/// precondition, not the replay itself. The engine is dropped at the end of
-/// this function, releasing the data directory's `LOCK` for the benches.
+/// commits.
+///
+/// Not timed: this is the "cold recovery finds this on disk" precondition,
+/// not the replay itself. The engine is dropped at the end of this
+/// function, releasing the data directory's `LOCK` for the benches.
 fn build_fixture(fs_root: &Path, options: &StorageOptions) {
     let fs = RealFs::new(fs_root);
     StorageCore::init(&fs, options, INSTANCE_UUID).expect("init");

@@ -25,8 +25,9 @@
 use std::io;
 use std::path::Path;
 
-/// Current container format version, shared by all four file kinds. Bumps are
-/// ClusterVersion-gated per ADR 0015 and documented by a new ADR.
+/// Current container format version, shared by all four file kinds.
+///
+/// Bumps are ClusterVersion-gated per ADR 0015 and documented by a new ADR.
 pub const CONTAINER_VERSION: u32 = 1;
 
 /// Size of the fixed container header: magic (8) + version (4) + CRC (4).
@@ -72,7 +73,9 @@ pub fn fail_stop_file(path: &Path, what: impl std::fmt::Display) -> io::Error {
 }
 
 /// Add fail-stop context to a seam read error only when the error's kind
-/// proves a data-shape problem (the file is missing or shorter than claimed).
+/// proves a data-shape problem (the file is missing or shorter than
+/// claimed).
+///
 /// Every other error — I/O trouble, and in the crash suite the injected
 /// `SimCrashed` marker — passes through untouched, because wrapping would
 /// destroy the payload the harness (and any caller inspecting sources)
@@ -102,8 +105,10 @@ pub fn header(magic: [u8; 8]) -> [u8; HEADER_LEN] {
 }
 
 /// Validate a container header read from `path`: magic, supported version,
-/// header CRC. Unknown-or-above-range versions fail stop naming the readable
-/// range (ADR 0015).
+/// header CRC.
+///
+/// Unknown-or-above-range versions fail stop naming the readable range
+/// (ADR 0015).
 pub fn check_header(path: &Path, bytes: &[u8], magic: [u8; 8]) -> io::Result<()> {
     if bytes.len() < HEADER_LEN {
         return Err(fail_stop(path, 0, "container header truncated"));
@@ -134,7 +139,9 @@ pub fn check_header(path: &Path, bytes: &[u8], magic: [u8; 8]) -> io::Result<()>
     Ok(())
 }
 
-/// Append one plain record frame — `[len u32][crc32c u32][payload]` — to `out`.
+/// Append one plain record frame — `[len u32][crc32c u32][payload]` — to
+/// `out`.
+///
 /// Used by the vote file, the manifest, and snapshot meta/index records.
 pub fn frame_record(payload: &[u8], out: &mut Vec<u8>) {
     let len = u32::try_from(payload.len()).expect("record payload under 4 GiB");
@@ -177,7 +184,9 @@ pub struct FrameLogId {
 }
 
 /// Append one log-entry frame —
-/// `[len u32][index u64][term u64][node u64][crc32c u32][payload]` — to `out`.
+/// `[len u32][index u64][term u64][node u64][crc32c u32][payload]` — to
+/// `out`.
+///
 /// The CRC covers index, term, node, and payload.
 pub fn frame_entry(id: FrameLogId, payload: &[u8], out: &mut Vec<u8>) {
     let len = u32::try_from(payload.len()).expect("entry payload under 4 GiB");
@@ -204,9 +213,10 @@ pub enum FrameStep<'a> {
     },
     /// Clean end of input at a frame boundary.
     End,
-    /// The bytes at this offset are not a complete, CRC-valid frame. Whether
-    /// this is a self-healable torn tail or fail-stop corruption is the
-    /// caller's decision (ADR 0017 recovery step 4).
+    /// The bytes at this offset are not a complete, CRC-valid frame.
+    ///
+    /// Whether this is a self-healable torn tail or fail-stop corruption is
+    /// the caller's decision (ADR 0017 recovery step 4).
     Torn,
 }
 

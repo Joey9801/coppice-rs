@@ -22,8 +22,10 @@ use crate::pb::command::v1 as pb;
 use crate::pb::command::v1::command::Body;
 use crate::pb::core::v1 as pbcore;
 
-/// Wrap a command in the versioned envelope (ADR 0003). `cluster_version`
-/// is the replicated `ClusterVersion` the proposer is writing under.
+/// Wrap a command in the versioned envelope (ADR 0003).
+///
+/// `cluster_version` is the replicated `ClusterVersion` the proposer is
+/// writing under.
 pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
     let body = match command {
         Command::SubmitJob(c) => Body::SubmitJob(c.into()),
@@ -45,10 +47,11 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
     pb::Command { version: cluster_version, body: Some(body) }
 }
 
-/// Unwrap the envelope, returning the version it was written under. An
-/// absent body means the arm was written by a binary this one does not know
-/// — unreachable while the ClusterVersion write gate holds, and an error
-/// (never a silent skip) when it does not.
+/// Unwrap the envelope, returning the version it was written under.
+///
+/// An absent body means the arm was written by a binary this one does not
+/// know — unreachable while the ClusterVersion write gate holds, and an
+/// error (never a silent skip) when it does not.
 pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertError> {
     let command_version = command.version;
     let body = match req(command.body, "Command.body")? {

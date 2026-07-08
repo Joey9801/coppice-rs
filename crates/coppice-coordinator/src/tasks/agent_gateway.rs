@@ -40,9 +40,10 @@ impl std::fmt::Display for RouterClosed {
 
 impl std::error::Error for RouterClosed {}
 
-/// Cloneable handle to the session manager's command router
-/// (`COMMAND_ROUTER_CAPACITY`, `send().await` — producers are leader-only
-/// loops that tolerate this backpressure per the channel inventory).
+/// Cloneable handle to the session manager's command router.
+///
+/// Capacity: `COMMAND_ROUTER_CAPACITY`; uses `send().await` — producers are
+/// leader-only loops that tolerate this backpressure per the channel inventory.
 #[derive(Clone)]
 pub struct RouterHandle {
     tx: mpsc::Sender<RouteCommand>,
@@ -54,28 +55,31 @@ impl RouterHandle {
     }
 }
 
-/// A report from a node agent, decoded off the wire and handed to
-/// ingestion. Constructed by [`run_session`] once a real transport exists.
+/// A report from a node agent, decoded off the wire and handed to ingestion.
+///
+/// Constructed by [`run_session`] once a real transport exists.
 #[allow(dead_code)] // shape for the future accept loop; see `run_session`.
 pub struct InboundReport {
     pub node: NodeId,
     pub report: AgentReport,
 }
 
-/// The manager's per-session bookkeeping. Only the outbound half is kept
-/// here: inbound reports flow into the shared inbound channel directly
-/// (never back through the manager).
+/// The manager's per-session bookkeeping.
+///
+/// Only the outbound half is kept here: inbound reports flow into the shared
+/// inbound channel directly (never back through the manager).
 #[allow(dead_code)] // constructed by a future accept loop; see `run_session`.
 struct SessionHandle {
     outbound: mpsc::Sender<AgentCommand>,
 }
 
-/// Spawn the session manager. `inbound` is the shared sender side of the
-/// agent-inbound channel (`AGENT_INBOUND_CAPACITY`, created by
-/// `crate::runtime`): the manager holds it so a future accept loop can clone
-/// it into each session it spawns via [`run_session`]. Returns the router
-/// handle other leader-only tasks route agent commands through, plus the
-/// manager's `JoinHandle`.
+/// Spawn the session manager.
+///
+/// `inbound` is the shared sender side of the agent-inbound channel
+/// (`AGENT_INBOUND_CAPACITY`, created by `crate::runtime`): the manager holds
+/// it so a future accept loop can clone it into each session it spawns via
+/// [`run_session`]. Returns the router handle other leader-only tasks route
+/// agent commands through, plus the manager's `JoinHandle`.
 pub fn spawn(
     inbound: mpsc::Sender<InboundReport>,
     status: watch::Receiver<ConsensusStatus>,
@@ -142,8 +146,9 @@ async fn run_manager(
     // Dropping `sessions` here closes every outbound channel.
 }
 
-/// The shape a real accept loop will spawn per accepted connection, once a
-/// transport exists. Not called today, so `run_manager`'s session registry
+/// The shape a real accept loop will spawn per accepted connection.
+///
+/// Not called today once a transport exists. `run_manager`'s session registry
 /// stays empty until a real accept loop is wired in.
 #[allow(dead_code)]
 async fn run_session(

@@ -52,8 +52,10 @@ pub use engine::{EncodedEntry, StorageCore, StorageOptions};
 pub use log::{SegmentLogReader, SegmentLogStorage};
 pub use sm::{run_apply_task, SegmentSnapshotBuilder, StateMachineStore};
 
-/// Container/framing internals, exported for the storage test suites and the
-/// ADR 0018 benches. Not a stable API.
+/// Container/framing internals, exported for the storage test suites and
+/// the ADR 0018 benches.
+///
+/// Not a stable API.
 pub mod raw {
     pub use super::container::{
         check_header, fail_stop, frame_entry, frame_record, header, parse_entry, read_record,
@@ -81,17 +83,20 @@ use crate::fs::Fs;
 use crate::CoordinatorId;
 
 /// Initialize an empty data directory: `log/`, `snap/`, and an
-/// identity-stamped manifest (ADR 0016). The instance UUID is minted here —
-/// a new one for every directory life, so "same node id, different life" is
-/// distinguishable in forensics.
+/// identity-stamped manifest (ADR 0016).
+///
+/// The instance UUID is minted here — a new one for every directory life, so
+/// "same node id, different life" is distinguishable in forensics.
 pub fn init<F: Fs>(fs: &F, options: &StorageOptions) -> io::Result<()> {
     StorageCore::init(fs, options, *uuid::Uuid::new_v4().as_bytes())
 }
 
 /// Open a data directory through full recovery (ADR 0017), rebuilding the
-/// applied state from the current snapshot (ADR 0016). Log replay from the
-/// snapshot index happens through openraft's startup path, driven by the
-/// manifest's best-effort committed index — one apply path, not two.
+/// applied state from the current snapshot (ADR 0016).
+///
+/// Log replay from the snapshot index happens through openraft's startup
+/// path, driven by the manifest's best-effort committed index — one apply
+/// path, not two.
 pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
     let shards = options.snapshot_shards;
     let cluster_uuid = options.cluster_uuid;
@@ -137,9 +142,10 @@ pub struct Recovered<F: Fs> {
 
 impl<F: Fs> Recovered<F> {
     /// Split into the openraft stores, wiring the state-machine store to an
-    /// apply task the caller owns. The caller must have seeded that task
-    /// with [`Recovered::state`] (and applied-index
-    /// `last_applied.map(|l| l.index)`).
+    /// apply task the caller owns.
+    ///
+    /// The caller must have seeded that task with [`Recovered::state`] (and
+    /// applied-index `last_applied.map(|l| l.index)`).
     pub fn into_stores(
         self,
         apply_tx: mpsc::Sender<ApplyRequest>,
@@ -157,9 +163,10 @@ impl<F: Fs> Recovered<F> {
     }
 
     /// Split into the openraft stores, spawning the canonical
-    /// [`run_apply_task`] loop on the current tokio runtime. For tests and
-    /// tools; the coordinator runtime wraps the same loop with view and
-    /// status publication.
+    /// [`run_apply_task`] loop on the current tokio runtime.
+    ///
+    /// For tests and tools; the coordinator runtime wraps the same loop with
+    /// view and status publication.
     pub fn into_stores_with_local_apply_task(self) -> (SegmentLogStorage<F>, StateMachineStore<F>) {
         let (tx, rx) = mpsc::channel(APPLY_CHANNEL_CAPACITY);
         let state = self.state.clone();
