@@ -40,9 +40,11 @@ Two rules keep the seam meaningful:
   layer is invisible to the crash suite and therefore untested by
   construction; there is no legitimate reason for one.
 - **The seam is synchronous.** openraft's storage traits are async; the
-  engine adapts (dedicated writer thread for the group-commit loop,
-  `spawn_blocking` for cold paths). Decided once, for two reasons: a
-  group-commit loop *is* a thread that blocks on `fdatasync`, and putting it
+  engine adapts via `spawn_blocking` over one shared engine mutex
+  (openraft 0.9 serializes storage write IO through its core loop, so a
+  dedicated writer thread would add machinery without changing the fsync
+  schedule — see `storage-engine.md`). Decided once, for two reasons: the
+  commit path *is* code that blocks on `fdatasync`, and running it inline
   on the tokio pool adds scheduling latency to every commit; and a sync seam
   has no await points, so a simulated crash at operation *k* is exactly
   reproducible from a seed instead of racing the runtime's scheduling.
@@ -141,15 +143,16 @@ scenario to the named tests if it wasn't already covered.
 
 ### The toy engine
 
-Until the real segment engine lands, the harness runs against
-`coppice_testkit::toy` — a miniature storage engine implementing the full
-ADR 0017 protocol (segments with CRC32C-framed entries, manifest-first
+The real segment storage engine (`docs/architecture/storage-engine.md`) now
+implements `CrashSubject` in `crates/coppice-consensus/tests/crash_storage.rs`
+and runs the full crash sweep against itself. The harness also still runs
+against `coppice_testkit::toy` — a miniature storage engine implementing the
+full ADR 0017 protocol (segments with CRC32C-framed entries, manifest-first
 orderings, atomic-swap vote file, footer-last snapshots, the five-step
 recovery procedure) over the fs seam, with simplified binary encodings in
 place of protobuf. It exists for two reasons: it proves the harness catches
 real bugs (its development is the harness's own crash test), and it is
-executable documentation of the recovery procedure. The real engine replaces
-it in the suite by implementing `CrashSubject`; the toy stays as the
+executable documentation of the recovery procedure. The toy remains as the
 harness's self-test.
 
 ## The benchmark suite

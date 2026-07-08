@@ -18,6 +18,9 @@ it correct under failure and change.
   breaking-change gate.
 - [data-storage-boundaries.md](data-storage-boundaries.md) — which store owns
   what.
+- [storage-engine.md](storage-engine.md) — the segment storage engine's
+  on-disk layout, byte-level file formats, recovery algorithm, and the
+  crash-ordering argument for the manifest protocol.
 - [storage-testing.md](storage-testing.md) — the filesystem seam, the SimFs
   crash model, the crash-injection harness and its invariants, and the
   storage benchmark/compliance gates.
