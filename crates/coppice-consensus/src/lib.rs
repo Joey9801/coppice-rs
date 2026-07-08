@@ -28,6 +28,7 @@ mod adapter;
 mod error;
 mod events;
 pub mod fs;
+pub mod storage;
 mod view;
 
 pub use adapter::{
@@ -99,7 +100,10 @@ pub trait Consensus: Send + Sync + 'static {
     /// in-flight budget. On [`ConsensusError::Timeout`] the outcome is UNKNOWN —
     /// the command may still commit; proposers rely on the catalog's
     /// idempotency rules, never blind resubmission of non-idempotent intents.
-    fn propose(&self, command: Command) -> impl Future<Output = Result<Applied, ConsensusError>> + Send;
+    fn propose(
+        &self,
+        command: Command,
+    ) -> impl Future<Output = Result<Applied, ConsensusError>> + Send;
 
     /// Linearizable read barrier (leader only): returns an index N such that
     /// reading any view with `applied_index >= N` is a strong read (ADR 0007).
@@ -114,14 +118,25 @@ pub trait Consensus: Send + Sync + 'static {
 
     /// Add a fresh node as a non-voting learner (ADR 0016 step 2). `addr` is
     /// the network endpoint the Raft transport dials.
-    fn add_learner(&self, node: CoordinatorId, addr: String) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+    fn add_learner(
+        &self,
+        node: CoordinatorId,
+        addr: String,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Promote a caught-up learner to voter, optionally removing a departed
     /// voter in the same joint-consensus change (ADR 0016 step 3).
-    fn promote_voter(&self, promote: CoordinatorId, remove: Option<CoordinatorId>) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+    fn promote_voter(
+        &self,
+        promote: CoordinatorId,
+        remove: Option<CoordinatorId>,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Remove a node from membership.
-    fn remove_node(&self, node: CoordinatorId) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+    fn remove_node(
+        &self,
+        node: CoordinatorId,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Ask consensus to build a snapshot now (housekeeping trigger; sealed
     /// segments become deletable once covered — ADR 0002/0017).
