@@ -1,0 +1,100 @@
+// The coordinator↔coordinator Raft RPC surface (ADR 0002): openraft 0.9's
+// AppendEntries, Vote, and full-snapshot install, expressed in our own
+// schema so an openraft upgrade cannot silently change what crosses the
+// wire. `coppice-consensus` converts these to and from openraft's types at
+// the trait boundary; openraft's serde forms never travel.
+//
+// Every request stamps the ADR 0016 cluster identity in tag 1 so a server
+// can reject cross-cluster traffic before touching Raft state. The channel
+// itself is mutually authenticated TLS between coordinators (ADR 0011).
+
+syntax = "proto3";
+
+package coppice.raft.v1;
+
+import "coppice/raft/v1/raft.proto";
+
+// openraft AppendEntriesRequest: the leader replicating log to a follower,
+// and the heartbeat that carries no entries.
+message AppendEntriesRequest {
+  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  Vote vote = 2;
+  LogId prev_log_id = 3; // absent = replicating from the log start.
+  LogId leader_commit = 4; // absent = the leader knows no committed entry.
+  repeated LogEntry entries = 8;
+}
+
+// openraft AppendEntriesResponse. One message per openraft variant inside
+// the oneof so each arm can grow fields later without restructuring
+// (schema-style rich-enums-are-oneofs rule).
+message AppendEntriesResponse {
+  oneof result {
+    AppendSuccess success = 1;
+    AppendPartialSuccess partial_success = 2;
+    AppendConflict conflict = 3;
+    Vote higher_vote = 4;
+  }
+}
+
+// The follower accepted every entry in the request.
+message AppendSuccess {}
+
+// The follower accepted a prefix of the entries; openraft resumes above it.
+message AppendPartialSuccess {
+  LogId upto = 1; // absent = accepted nothing.
+}
+
+// The follower's log conflicts with prev_log_id; the leader backs up.
+message AppendConflict {}
+
+// openraft VoteRequest: a candidate soliciting a vote.
+message VoteRequest {
+  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  Vote vote = 2;
+  LogId last_log_id = 3; // absent = the candidate has an empty log.
+}
+
+// openraft VoteResponse.
+message VoteResponse {
+  Vote vote = 1; // the responder's own vote (may be higher than requested).
+  bool vote_granted = 2;
+  LogId last_log_id = 3; // absent = the responder has an empty log.
+}
+
+// One frame of the client-streaming snapshot install: exactly one
+// InstallSnapshotHeader first, then the ADR 0018 container bytes in file
+// order as `data` chunks. The receiver decodes sections as chunks arrive
+// (ADR 0018) and the sender never holds the whole container in one message.
+message InstallSnapshotRequest {
+  oneof chunk {
+    InstallSnapshotHeader header = 8;
+    bytes data = 9;
+  }
+}
+
+// The opening frame of an InstallSnapshot stream (openraft's full-snapshot
+// protocol): the sending leader's identity and the snapshot's metadata.
+message InstallSnapshotHeader {
+  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  Vote vote = 2; // the sending leader's vote.
+  SnapshotIdent meta = 3;
+}
+
+// openraft SnapshotMeta: which log point this snapshot captures.
+message SnapshotIdent {
+  LogId last_log_id = 1; // absent = the snapshot is empty.
+  StoredMembership last_membership = 2;
+  string snapshot_id = 3;
+}
+
+// openraft SnapshotResponse.
+message InstallSnapshotResponse {
+  Vote vote = 1; // the receiver's own vote.
+}
+
+// The coordinator Raft transport (ADR 0002), served over mTLS (ADR 0011).
+service RaftTransportService {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc Vote(VoteRequest) returns (VoteResponse);
+  rpc InstallSnapshot(stream InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}

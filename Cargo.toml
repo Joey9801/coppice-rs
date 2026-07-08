@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/coppice-core",
     "crates/coppice-proto",
+    "crates/coppice-raft-net",
     "crates/coppice-state",
     "crates/coppice-consensus",
     "crates/coppice-scheduler",
@@ -25,6 +26,7 @@ authors = ["The Coppice Authors"]
 # Internal crates
 coppice-core = { path = "crates/coppice-core" }
 coppice-proto = { path = "crates/coppice-proto" }
+coppice-raft-net = { path = "crates/coppice-raft-net" }
 coppice-state = { path = "crates/coppice-state" }
 coppice-consensus = { path = "crates/coppice-consensus" }
 coppice-scheduler = { path = "crates/coppice-scheduler" }
@@ -35,6 +37,9 @@ coppice-testkit = { path = "crates/coppice-testkit" }
 # Common third-party dependencies. Versions are pinned centrally so every
 # crate in the workspace stays in lockstep.
 anyhow = "1"
+# Coordinator CLI surface — deliberately tiny per ADR 0020: `--config`, the
+# ADR 0016 intent flags, and the hidden admin verbs.
+clap = { version = "4", features = ["derive"] }
 # CRC32C (Castagnoli) — the per-entry / per-section checksum mandated by
 # ADR 0002 and ADR 0018.
 crc32c = "0.6"
@@ -55,11 +60,28 @@ prost = "0.13"
 prost-build = "0.13"
 prost-types = "0.13"
 protox = "0.7"
+# Test-only certificate generation (ring provider, avoiding the aws-lc build
+# toolchain) for the mTLS the Raft transport requires (ADR 0011).
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
+# Adapts a bounded tokio mpsc receiver into a `Stream` for the client-streaming
+# InstallSnapshot RPC (ADR 0018); a direct, minimal dep from the tonic family
+# rather than pulling in async-stream. Pinned here so the whole workspace stays
+# in lockstep with the tokio/tonic versions above.
+tokio-stream = "0.1"
+# gRPC transport for coordinator↔coordinator Raft traffic and the membership
+# admin surface; TLS because intra-cluster traffic is mTLS from day one
+# (ADR 0011). tonic 0.12 matches the workspace's prost 0.13 pin.
+tonic = { version = "0.12", features = ["tls"] }
+tonic-build = "0.12"
+# Node configuration is one TOML file per process (ADR 0020), with humane
+# duration strings ("1500ms") parsed at load.
+toml = "0.8"
+humantime-serde = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

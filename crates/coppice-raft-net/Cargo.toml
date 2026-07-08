@@ -1,0 +1,22 @@
+[package]
+name = "coppice-raft-net"
+description = "tonic service stubs for the coordinator Raft transport and membership admin surface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+coppice-proto.workspace = true
+prost.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+tonic-build.workspace = true
+
+[lints]
+workspace = true

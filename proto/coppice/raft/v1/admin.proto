@@ -1,0 +1,75 @@
+// The membership admin surface (ADR 0016): thin RPC wrappers over the
+// Consensus trait — add a learner, promote it to voter (with the optional
+// joint removal of a departed voter), remove a node — plus a status RPC
+// operators and integration tests poll for leader identity, applied
+// progress, membership, and per-follower replication lag.
+//
+// Like the transport, every request stamps the ADR 0016 cluster identity in
+// tag 1 and the channel is mutually authenticated TLS (ADR 0011). Node ids
+// are allocate-once u64 Raft coordinator identities (ADR 0016), never
+// coppice.core.v1.NodeId compute-node ids.
+
+syntax = "proto3";
+
+package coppice.raft.v1;
+
+import "coppice/raft/v1/raft.proto";
+
+// Add a coordinator to membership as a non-voting learner so it can catch
+// up on the log before any voter change (ADR 0016 step 1).
+message AddLearnerRequest {
+  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  uint64 node_id = 8;
+  string address = 9; // the address peers dial to reach it.
+}
+
+message AddLearnerResponse {}
+
+// Promote a caught-up learner to voter, optionally dropping a departed
+// voter in the same joint change (ADR 0016 step 3).
+message PromoteVoterRequest {
+  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  uint64 promote_node_id = 8;
+  optional uint64 remove_node_id = 9; // absent = pure addition, no removal.
+}
+
+message PromoteVoterResponse {}
+
+// Remove a node from membership entirely.
+message RemoveNodeRequest {
+  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  uint64 node_id = 8;
+}
+
+message RemoveNodeResponse {}
+
+// Poll a coordinator for its view of cluster state.
+message ClusterStatusRequest {
+  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+}
+
+// A coordinator's answer to ClusterStatus. The replication list is populated
+// only when the responder is the leader; it is empty everywhere else.
+message ClusterStatusResponse {
+  uint64 local_node_id = 1;
+  optional uint64 leader_node_id = 2; // absent = no leader currently known.
+  uint64 term = 3;
+  uint64 last_applied_index = 4;
+  uint64 known_committed_index = 5;
+  Membership membership = 6;
+  repeated ReplicationProgress replication = 7; // leader only; empty elsewhere.
+}
+
+// One follower's replication progress as the leader tracks it.
+message ReplicationProgress {
+  uint64 node_id = 1;
+  uint64 matched_index = 2;
+}
+
+// The membership admin surface (ADR 0016), served over mTLS (ADR 0011).
+service RaftAdminService {
+  rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
+  rpc PromoteVoter(PromoteVoterRequest) returns (PromoteVoterResponse);
+  rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+}
