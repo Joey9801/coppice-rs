@@ -10,21 +10,22 @@ authors.workspace = true
 
 [dependencies]
 coppice-core.workspace = true
+coppice-proto.workspace = true
 coppice-state.workspace = true
+crc32c.workspace = true
 fs2.workspace = true
 openraft.workspace = true
+prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 # coppice-testkit dev-depends back on this crate; Cargo permits the cycle
 # because dev-dependencies sit outside the library's own build graph.
-coppice-proto.workspace = true
 coppice-testkit.workspace = true
-crc32c.workspace = true
 criterion.workspace = true
-prost.workspace = true
 tempfile.workspace = true
 
 [features]

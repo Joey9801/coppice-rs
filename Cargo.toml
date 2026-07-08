@@ -46,8 +46,10 @@ fs2 = "0.4"
 # openraft drives election, replication, and membership; the app data types
 # (`Command`, `Applied`, `RejectionReason`) do not implement serde, so the
 # "serde" feature is deliberately left off (ADR 0002). Default features cover
-# the tokio runtime support the adapter needs.
-openraft = "0.9"
+# the tokio runtime support the adapter needs. "storage-v2" unseals the
+# `RaftLogStorage`/`RaftStateMachine` traits the segment storage engine
+# implements (ADR 0002).
+openraft = { version = "0.9", features = ["storage-v2"] }
 proptest = "1"
 prost = "0.13"
 prost-build = "0.13"
