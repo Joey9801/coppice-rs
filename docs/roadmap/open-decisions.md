@@ -34,6 +34,7 @@ re-deriving it from the whole design.
 | [OD-10](#od-10-container-execution-security-model) | Container execution security model | High | Resolved — [ADR 0011](../decisions/0011-container-security-posture.md) |
 | [OD-11](#od-11-data-retention-policy) | Data retention policy | Low | Resolved — [ADR 0012](../decisions/0012-data-retention.md) |
 | [OD-12](#od-12-abort-semantics-partial-scheduling-and-job-groups) | Abort semantics, partial scheduling & job groups | High | Resolved — [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md), [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) |
+| [OD-13](#od-13-base-score-and-the-exact-job-costing-formula) | Base score and the exact job-costing formula | High | Resolved — [ADR 0021](../decisions/0021-effective-score-ranking.md) |
 
 All eleven initial questions were resolved on 2026-07-07; the ADRs linked above
 carry the decisions and rationale. New questions get the next free `OD-N`.
@@ -330,8 +331,14 @@ depend on it.
 
 ## OD-13: Base score and the exact job-costing formula
 
-**Open** (raised 2026-07-07, while deciding
-[ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md)).
+**Resolved** (2026-07-08): `base(job)` is the job's Q32.32 priority
+multiplier alone, `m(j)`, divided by ADR 0005's ancestor penalty product
+plus an additive age term bounded by the replicated decay half-life — no
+size term (packing and strict backfill already bias small jobs; a second
+term would double-count), no lump-charge smoothing (true-up plus decay
+already cover it), and per-entity-memoized penalties keep rescoring
+`O(entities)` —
+[ADR 0021](../decisions/0021-effective-score-ranking.md).
 
 **Question.** What exactly is `base(job)` in
 `effective_score = base(job) / Π penalty(usage_a / quota_a)`, and does the
