@@ -18,6 +18,9 @@ it correct under failure and change.
   breaking-change gate.
 - [data-storage-boundaries.md](data-storage-boundaries.md) — which store owns
   what.
+- [storage-testing.md](storage-testing.md) — the filesystem seam, the SimFs
+  crash model, the crash-injection harness and its invariants, and the
+  storage benchmark/compliance gates.
 
 ## Crate map
 
