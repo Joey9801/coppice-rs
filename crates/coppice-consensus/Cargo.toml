@@ -28,13 +28,6 @@ coppice-testkit.workspace = true
 criterion.workspace = true
 tempfile.workspace = true
 
-[features]
-# Turns on the openraft storage compliance suite in
-# tests/openraft_compliance.rs. Off until the segment storage engine exists;
-# the storage task flips it on (and then removes the gate once green — the
-# suite is a merge gate per ADR 0002, not an optional extra).
-storage-compliance = []
-
 [lints]
 workspace = true
 
