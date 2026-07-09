@@ -25,9 +25,11 @@
 //! `COMPRESSION_NONE`; `COMPRESSION_ZSTD` decodes to a fail-stop
 //! "unsupported" error until a ClusterVersion gate enables it (ADR 0015).
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Condvar, Mutex};
 
 use prost::Message;
 
@@ -307,91 +309,307 @@ pub fn validate_container_file(
     Ok((meta, index))
 }
 
-/// Encode a state's records into a full container, sharding each entity
-/// section `shards` ways and encoding the shards on parallel threads
-/// (ADR 0018: snapshot cost scales with cores).
+/// One shard's not-yet-encoded records, type-erased so a single worker pool
+/// can pull sections of every kind.
+enum SectionRecords<'a> {
+    Jobs(&'a [pb::JobRecord]),
+    Attempts(&'a [pb::AttemptRecord]),
+    Allocations(&'a [pb::AllocationRecord]),
+    Nodes(&'a [pb::NodeRecord]),
+    QuotaEntities(&'a [pb::QuotaEntityRecord]),
+    Cluster(&'a pb::ClusterStateRecord),
+}
+
+/// One section's encode work: its identity plus the records it serializes.
+struct SectionJob<'a> {
+    kind: pb::SectionKind,
+    shard: u32,
+    records: SectionRecords<'a>,
+}
+
+/// Split a state's records into per-(kind, shard) encode jobs, in the
+/// (kind, shard) order the container is written.
 ///
 /// Shard assignment is a writer choice readers never depend on; contiguous
 /// chunks keep it deterministic.
-pub fn encode_state(meta: &pb::SnapshotMeta, records: &StateRecords, shards: u32) -> Vec<u8> {
-    let shards = shards.max(1) as usize;
-    let mut sections: Vec<RawSection> = Vec::new();
-
-    fn shard_section<M: Message>(
+fn section_jobs(records: &StateRecords, shards: usize) -> Vec<SectionJob<'_>> {
+    fn shard<'a, M>(
         kind: pb::SectionKind,
-        records: &[M],
+        records: &'a [M],
         shards: usize,
-        out: &mut Vec<RawSection>,
+        wrap: fn(&'a [M]) -> SectionRecords<'a>,
+        out: &mut Vec<SectionJob<'a>>,
     ) {
         let per = records.len().div_ceil(shards).max(1);
-        let chunks: Vec<&[M]> = records.chunks(per).collect();
-        let mut encoded: Vec<(usize, Vec<u8>, u64)> = Vec::new();
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = chunks
-                .iter()
-                .enumerate()
-                .map(|(shard, chunk)| {
-                    scope.spawn(move || {
-                        let mut buf = Vec::new();
-                        for record in *chunk {
-                            record
-                                .encode_length_delimited(&mut buf)
-                                .expect("Vec<u8> writes are infallible");
-                        }
-                        (shard, buf, chunk.len() as u64)
-                    })
-                })
-                .collect();
-            for handle in handles {
-                encoded.push(handle.join().expect("encode shard panicked"));
-            }
-        });
-        encoded.sort_by_key(|(shard, ..)| *shard);
-        for (shard, bytes, record_count) in encoded {
-            out.push(RawSection {
+        for (shard, chunk) in records.chunks(per).enumerate() {
+            out.push(SectionJob {
                 kind,
                 shard: shard as u32,
-                encoding: ENCODING_PROTOBUF_LD.to_string(),
-                record_count,
-                bytes,
+                records: wrap(chunk),
             });
         }
     }
-
-    shard_section(pb::SectionKind::Job, &records.jobs, shards, &mut sections);
-    shard_section(
+    let mut jobs = Vec::new();
+    shard(
+        pb::SectionKind::Job,
+        &records.jobs,
+        shards,
+        SectionRecords::Jobs,
+        &mut jobs,
+    );
+    shard(
         pb::SectionKind::Attempt,
         &records.attempts,
         shards,
-        &mut sections,
+        SectionRecords::Attempts,
+        &mut jobs,
     );
-    shard_section(
+    shard(
         pb::SectionKind::Allocation,
         &records.allocations,
         shards,
-        &mut sections,
+        SectionRecords::Allocations,
+        &mut jobs,
     );
-    shard_section(pb::SectionKind::Node, &records.nodes, shards, &mut sections);
-    shard_section(
+    shard(
+        pb::SectionKind::Node,
+        &records.nodes,
+        shards,
+        SectionRecords::Nodes,
+        &mut jobs,
+    );
+    shard(
         pb::SectionKind::QuotaEntity,
         &records.quota_entities,
         shards,
-        &mut sections,
+        SectionRecords::QuotaEntities,
+        &mut jobs,
     );
     if let Some(cluster) = &records.cluster {
-        let mut bytes = Vec::new();
-        cluster
-            .encode_length_delimited(&mut bytes)
-            .expect("Vec<u8> writes are infallible");
-        sections.push(RawSection {
+        jobs.push(SectionJob {
             kind: pb::SectionKind::ClusterState,
             shard: 0,
-            encoding: ENCODING_PROTOBUF_LD.to_string(),
-            record_count: 1,
-            bytes,
+            records: SectionRecords::Cluster(cluster),
         });
     }
+    jobs
+}
+
+/// Encode one job's records as its section's length-delimited protobuf
+/// stream.
+fn encode_job(job: &SectionJob) -> RawSection {
+    fn encode<M: Message>(records: &[M], bytes: &mut Vec<u8>) -> u64 {
+        for record in records {
+            record
+                .encode_length_delimited(bytes)
+                .expect("Vec<u8> writes are infallible");
+        }
+        records.len() as u64
+    }
+    let mut bytes = Vec::new();
+    let record_count = match job.records {
+        SectionRecords::Jobs(records) => encode(records, &mut bytes),
+        SectionRecords::Attempts(records) => encode(records, &mut bytes),
+        SectionRecords::Allocations(records) => encode(records, &mut bytes),
+        SectionRecords::Nodes(records) => encode(records, &mut bytes),
+        SectionRecords::QuotaEntities(records) => encode(records, &mut bytes),
+        SectionRecords::Cluster(record) => encode(std::slice::from_ref(record), &mut bytes),
+    };
+    RawSection {
+        kind: job.kind,
+        shard: job.shard,
+        encoding: ENCODING_PROTOBUF_LD.to_string(),
+        record_count,
+        bytes,
+    }
+}
+
+/// Encode a state's records into a full container, sharding each entity
+/// section `shards` ways and encoding the sections on parallel threads
+/// (ADR 0018: snapshot cost scales with cores).
+pub fn encode_state(meta: &pb::SnapshotMeta, records: &StateRecords, shards: u32) -> Vec<u8> {
+    let jobs = section_jobs(records, shards.max(1) as usize);
+    let sections: Vec<RawSection> = std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|job| scope.spawn(move || encode_job(job)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("encode shard panicked"))
+            .collect()
+    });
     assemble_container(meta, sections)
+}
+
+/// Streaming counterpart of [`assemble_container`]: writes the same bytes
+/// section by section into a file, keeping a running CRC32C over
+/// `header..index_start` (the total-CRC region) so the trailer never needs
+/// the container as one slice.
+pub struct ContainerWriter<'a> {
+    file: &'a mut dyn FsFile,
+    /// Bytes written so far — the next section's offset.
+    offset: u64,
+    /// Running CRC32C of everything written so far; frozen as the total CRC
+    /// when the index record begins.
+    crc: u32,
+    index: pb::SectionIndex,
+}
+
+impl<'a> ContainerWriter<'a> {
+    /// Write the container header and meta record.
+    pub fn new(file: &'a mut dyn FsFile, meta: &pb::SnapshotMeta) -> io::Result<ContainerWriter<'a>> {
+        let mut head = header(SNAPSHOT_MAGIC).to_vec();
+        frame_record(&meta.encode_to_vec(), &mut head);
+        let mut writer = ContainerWriter {
+            file,
+            offset: 0,
+            crc: 0,
+            index: pb::SectionIndex::default(),
+        };
+        writer.write(&head)?;
+        Ok(writer)
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.append(bytes)?;
+        self.crc = crc32c::crc32c_append(self.crc, bytes);
+        self.offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Append one encoded section and record its index entry.
+    pub fn append_section(&mut self, section: &RawSection) -> io::Result<()> {
+        self.index.sections.push(pb::SectionEntry {
+            kind: section.kind as i32,
+            shard: section.shard,
+            offset: self.offset,
+            length: section.bytes.len() as u64,
+            record_count: section.record_count,
+            encoding: section.encoding.clone(),
+            compression: pb::Compression::None as i32,
+            crc32c: crc32c::crc32c(&section.bytes),
+        });
+        self.write(&section.bytes)
+    }
+
+    /// Write the index record and trailer. The file now holds exactly what
+    /// [`assemble_container`] would have produced for the same sections in
+    /// the same order; durability (fsync, rename) is the caller's.
+    pub fn finish(self) -> io::Result<()> {
+        let total_crc = self.crc;
+        let mut tail = Vec::new();
+        frame_record(&self.index.encode_to_vec(), &mut tail);
+        let index_len = tail.len() as u32;
+        tail.extend_from_slice(&index_len.to_le_bytes());
+        tail.extend_from_slice(&total_crc.to_le_bytes());
+        tail.extend_from_slice(&SNAPSHOT_FOOTER_MAGIC);
+        self.file.append(&tail)
+    }
+}
+
+/// A counting gate bounding how many encoded-but-unwritten sections exist
+/// at once — the memory bound of [`write_state`].
+struct InFlightSlots {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl InFlightSlots {
+    fn new(count: usize) -> InFlightSlots {
+        InFlightSlots {
+            free: Mutex::new(count),
+            freed: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) {
+        let mut free = self.free.lock().expect("slot gate poisoned");
+        while *free == 0 {
+            free = self.freed.wait(free).expect("slot gate poisoned");
+        }
+        *free -= 1;
+    }
+
+    fn release(&self) {
+        *self.free.lock().expect("slot gate poisoned") += 1;
+        self.freed.notify_one();
+    }
+}
+
+/// Encode a state's records straight into `file` as a complete container —
+/// the streaming counterpart of [`encode_state`], byte-identical output —
+/// keeping the shard-parallel encode but never the whole container in
+/// memory: a worker pool encodes sections while this thread appends them in
+/// job order, and each worker takes an in-flight slot before it encodes, so
+/// peak buffering is a few sections however large the state (ADR 0018).
+///
+/// Durability (fsync, rename, manifest flip) is the caller's — the engine's
+/// snapshot-build entrypoints own that ordering (ADR 0017).
+pub fn write_state(
+    file: &mut dyn FsFile,
+    meta: &pb::SnapshotMeta,
+    records: &StateRecords,
+    shards: u32,
+) -> io::Result<()> {
+    let jobs = section_jobs(records, shards.max(1) as usize);
+    let mut writer = ContainerWriter::new(file, meta)?;
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(jobs.len())
+        .max(1);
+    // Every claimed job holds a slot from before its encode starts until its
+    // section is written; two slots of headroom keep encoders busy while the
+    // writer drains.
+    let slots = InFlightSlots::new(workers + 2);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel::<(usize, RawSection)>();
+
+    let result: io::Result<()> = std::thread::scope(|scope| {
+        let jobs = &jobs;
+        let next = &next;
+        let slots = &slots;
+        for _ in 0..workers {
+            let tx = tx.clone();
+            scope.spawn(move || loop {
+                slots.acquire();
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(job) = jobs.get(i) else {
+                    slots.release();
+                    break;
+                };
+                if tx.send((i, encode_job(job))).is_err() {
+                    slots.release();
+                    break;
+                }
+            });
+        }
+        drop(tx);
+
+        // Append in job order, buffering the few sections that finish early.
+        // Workers claim job ordinals in order and every claimed job holds a
+        // slot, so the next-to-write section is always in flight — and a
+        // write error only stops writing: draining (and releasing slots)
+        // continues so no worker blocks forever.
+        let mut result = Ok(());
+        let mut pending: BTreeMap<usize, RawSection> = BTreeMap::new();
+        let mut next_write = 0usize;
+        for (i, section) in rx {
+            pending.insert(i, section);
+            while let Some(section) = pending.remove(&next_write) {
+                if result.is_ok() {
+                    result = writer.append_section(&section);
+                }
+                slots.release();
+                next_write += 1;
+            }
+        }
+        result
+    });
+    result?;
+    writer.finish()
 }
 
 /// Decode a validated container back into records, sections in parallel
@@ -738,6 +956,30 @@ mod tests {
                 validate_container_file(Path::new("t"), &*file).is_err(),
                 "flip at {at}"
             );
+        }
+    }
+
+    #[test]
+    fn streamed_write_matches_the_slice_encoder() {
+        let records = StateRecords {
+            jobs: vec![pb::JobRecord::default(); 10],
+            nodes: vec![pb::NodeRecord::default(); 3],
+            cluster: Some(pb::ClusterStateRecord::default()),
+            ..StateRecords::default()
+        };
+        for shards in [1u32, 2, 8] {
+            let slice_bytes = encode_state(&meta(), &records, shards);
+
+            use crate::fs::{Fs, RealFs};
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fs = RealFs::new(dir.path());
+            let mut file = fs.create_new(Path::new("c.snap")).expect("create");
+            write_state(&mut file, &meta(), &records, shards).expect("write_state");
+
+            let len = file.len().expect("len") as usize;
+            let mut streamed = vec![0u8; len];
+            file.read_exact_at(0, &mut streamed).expect("read back");
+            assert_eq!(streamed, slice_bytes, "shards {shards}");
         }
     }
 

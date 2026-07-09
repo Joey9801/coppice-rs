@@ -414,17 +414,23 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
         };
 
         // Serialize + write + pointer flip on the blocking pool; the apply
-        // task is free the whole time (ADR 0018). The encoded container is
-        // dropped once durable — what openraft holds (and the network later
-        // streams) is a read handle to the adopted file, never the bytes.
+        // task is free the whole time (ADR 0018). The container streams
+        // section by section into the engine's temp file — never held in
+        // memory whole — and the engine is locked only to create that file
+        // and to adopt it, so appends continue while the encode runs. What
+        // openraft holds (and the network later streams) is a read handle to
+        // the adopted file, never the bytes.
         let core = Arc::clone(&self.core);
         let shards = self.shards;
         let file = tokio::task::spawn_blocking(move || -> io::Result<Box<dyn FsFile>> {
             let records = state_to_records(&state);
-            let bytes = snapshot::encode_state(&meta, &records, shards);
+            let mut spool = core
+                .lock()
+                .expect("storage engine poisoned")
+                .begin_snapshot_build(&meta.snapshot_id)?;
+            snapshot::write_state(&mut *spool, &meta, &records, shards)?;
             let mut core = core.lock().expect("storage engine poisoned");
-            core.install_snapshot(&bytes, false)?;
-            drop(bytes);
+            core.finish_snapshot_build(spool)?;
             let (_, _, file) = core.current_snapshot_reader()?.ok_or_else(|| {
                 io::Error::other("freshly built snapshot is not the current one")
             })?;

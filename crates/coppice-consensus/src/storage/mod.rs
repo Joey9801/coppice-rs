@@ -64,7 +64,8 @@ pub mod raw {
     };
     pub use super::snapshot::{
         assemble_container, decode_state, decode_state_file, encode_state, section_bytes,
-        validate_container, validate_container_file, RawSection, ENCODING_PROTOBUF_LD,
+        validate_container, validate_container_file, write_state, ContainerWriter, RawSection,
+        ENCODING_PROTOBUF_LD,
     };
 }
 

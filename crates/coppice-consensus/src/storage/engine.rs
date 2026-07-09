@@ -941,6 +941,46 @@ impl<F: Fs> StorageCore<F> {
         Ok(())
     }
 
+    /// Open the temp file a locally built snapshot streams into
+    /// (`snap/<id>.snap.tmp`), replacing any stale one. The builder writes
+    /// the container into it section by section (without holding the engine
+    /// lock), then adopts via [`StorageCore::finish_snapshot_build`]. The
+    /// temp file is never claimed by the manifest, so a crash mid-build
+    /// leaves an orphan the recovery sweep deletes (ADR 0017).
+    pub fn begin_snapshot_build(&mut self, id: &str) -> io::Result<Box<dyn FsFile>> {
+        check_snapshot_id(id)?;
+        let tmp = PathBuf::from(format!("snap/{id}.snap.tmp"));
+        if self.fs.exists(&tmp)? {
+            self.fs.remove_file(&tmp)?;
+        }
+        Ok(Box::new(self.fs.create_new(&tmp)?))
+    }
+
+    /// Adopt the container streamed into
+    /// [`StorageCore::begin_snapshot_build`]'s temp file: streaming
+    /// validation of every section CRC (ADR 0016 — nothing durable points at
+    /// unvalidated bytes), then fsync, rename, and the same one-swap manifest
+    /// flip as the other install entrypoints (ADR 0017). The container is
+    /// never materialized in memory.
+    ///
+    /// A locally built snapshot never advances the purge floor; purging is
+    /// openraft's own, separate call.
+    pub fn finish_snapshot_build(
+        &mut self,
+        file: Box<dyn FsFile>,
+    ) -> io::Result<pbstorage::SnapshotMeta> {
+        let snap_dir_path = Path::new("snap/container");
+        let (meta, _) = snapshot::validate_container_file(snap_dir_path, &*file)?;
+        let (id, path, tmp) = self.checked_snapshot_paths(snap_dir_path, &meta)?;
+
+        file.sync_data()?;
+        drop(file);
+        self.fs.rename(&tmp, &path)?;
+        self.fs.sync_dir(Path::new("snap"))?;
+
+        self.adopt_snapshot(meta, id, path, false)
+    }
+
     /// Adopt a complete snapshot container held in memory: validate it, make
     /// the file durable, then atomically flip the manifest pointer (the
     /// commit point); the previous snapshot is retained until the flip is
@@ -950,10 +990,12 @@ impl<F: Fs> StorageCore<F> {
     /// same manifest write advances the purge floor past everything the
     /// snapshot covers.
     ///
-    /// This is the local-build entrypoint (the container was just encoded in
-    /// memory) and the crash suite's; a snapshot received over the wire is
-    /// adopted from its spool file by [`StorageCore::install_snapshot_from`],
-    /// which never materializes the container.
+    /// This is the slice entrypoint the crash suite drives with opaque
+    /// containers; production never materializes one — a local build streams
+    /// through [`StorageCore::begin_snapshot_build`] /
+    /// [`StorageCore::finish_snapshot_build`], and a snapshot received over
+    /// the wire is adopted from its spool file by
+    /// [`StorageCore::install_snapshot_from`].
     pub fn install_snapshot(
         &mut self,
         container: &[u8],
