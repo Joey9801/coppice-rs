@@ -301,8 +301,29 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
 #[ignore = "1M-scale; run in release"]
 fn throughput_one_million_jobs_under_budget() {
     let cfg = SynthConfig::with_jobs(1_000_000);
-    let sm = synth_state(&cfg);
+    let mut sm = synth_state(&cfg);
     let now = 1_700_000_000_000_000 + 1_000_000;
+
+    // synth's live allocations oversubscribe every node, so on the raw state a
+    // pass is scan-only: it scores the backlog and walks the nodes but emits
+    // nothing. Register a bank of roomy nodes (the
+    // `synth_seeds_apply_without_rejection` trick, sized up) with the
+    // aggregate headroom for a full placement budget of worst-case synth
+    // requests (8 cores / 16 GiB / 50 GiB each), so the measured pass also
+    // pays for a whole cycle's real decisions: accrual reseats with their
+    // revocations, funded free-fit seatings, and best-fit packing across the
+    // bank. Backfill lends and fresh accrual opens stay short-circuited
+    // regardless of headroom — the synth state holds far more than K accruing
+    // jobs, so the engine's accrual-cap guard skips those paths, as it would
+    // on any cluster past its cap.
+    let roomy = Resources {
+        cpu_millis: 128_000,
+        memory_bytes: 256 << 30,
+        disk_bytes: 1 << 40,
+    };
+    for i in 0..64u128 {
+        apply_ok(&mut sm, register_node_cmd(nid(0xB16_00DE + i), roomy, now));
+    }
 
     let scheduler = HeuristicScheduler::default();
     let start = std::time::Instant::now();
@@ -315,6 +336,14 @@ fn throughput_one_million_jobs_under_budget() {
     );
 
     let defaults = SchedulerConfig::default();
+    // The bank fits a whole budget, so the pass must fill it: an under-full
+    // batch would mean the budget below measures a pass that stopped working.
+    assert!(
+        proposal.placements.len() >= defaults.max_placements_per_cycle,
+        "expected a full {}-placement cycle, got {}",
+        defaults.max_placements_per_cycle,
+        proposal.placements.len()
+    );
     // The placement cap bounds the batch; a lend can append at most K reseats
     // past the last seated candidate.
     assert!(
@@ -322,6 +351,10 @@ fn throughput_one_million_jobs_under_budget() {
             <= defaults.max_placements_per_cycle + sm.policy.accrual_limit as usize,
         "placements {} exceed the work cap",
         proposal.placements.len()
+    );
+    assert!(
+        !proposal.revocations.is_empty(),
+        "re-planning must move existing accruals onto the roomy bank"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(5),
