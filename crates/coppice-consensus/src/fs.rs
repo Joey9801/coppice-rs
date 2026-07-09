@@ -119,10 +119,14 @@ pub trait Fs: Send + Sync + 'static {
 ///
 /// Only the access patterns the formats need: append at the tail,
 /// positioned reads, truncate (torn-tail repair only), and data fsync.
+///
+/// `Sync` because positioned reads (`read_at`) take `&self` and the snapshot
+/// paths read one file's sections from parallel decode threads (ADR 0018);
+/// both implementations are already thread-safe (`pread` / a mutex).
 // `len` here is a fallible size query, not a collection length; an
 // `is_empty` counterpart would be noise.
 #[allow(clippy::len_without_is_empty)]
-pub trait FsFile: Send + 'static {
+pub trait FsFile: Send + Sync + 'static {
     /// Write `data` at the current end of file.
     ///
     /// Visible to all handles immediately; durable only after

@@ -25,13 +25,11 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Code;
 
 use openraft::error::{
-    Fatal, InstallSnapshotError, NetworkError, RPCError, RaftError, ReplicationClosed,
-    StreamingError, Unreachable,
+    Fatal, NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
 };
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, Snapshot, Vote};
 
@@ -46,10 +44,11 @@ use super::convert;
 
 /// Wire chunk size for a streaming snapshot install (ADR 0018).
 ///
-/// The ADR 0018 container streams in file order so the receiver can decode
-/// sections as they arrive; the snapshot bytes are already in memory (the
-/// `SnapshotData` binding is an in-memory `Cursor`, see `adapter.rs`), so this
-/// bounds the *wire* message size, not memory.
+/// The ADR 0018 container streams in file order, read straight off the
+/// sender's durable snapshot file (the `SnapshotData` binding is the
+/// file-backed `SnapshotFile`, see `adapter.rs`), so this bounds both the
+/// wire message size and the sender's memory: one chunk in flight, however
+/// large the snapshot.
 pub const SNAPSHOT_CHUNK_BYTES: usize = 1 << 20;
 
 /// The path name fail-stop wire-decode errors are attributed to.
@@ -254,23 +253,9 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }
 
-    async fn install_snapshot(
-        &mut self,
-        _rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<CoordinatorId>,
-        RPCError<CoordinatorId, BasicNode, RaftError<CoordinatorId, InstallSnapshotError>>,
-    > {
-        // Dead path: openraft only invokes the chunked `install_snapshot` from
-        // the *default* `full_snapshot` implementation, which is overridden
-        // below with a streaming install. Return a Network error rather than
-        // `unimplemented!()` so a future openraft revision that somehow reaches
-        // here degrades to a retry instead of crashing the node.
-        Err(RPCError::Network(NetworkError::new(&io::Error::other(
-            "chunked install_snapshot is not used; full_snapshot streams the ADR 0018 container",
-        ))))
-    }
+    // The chunked `install_snapshot` RPC is not implemented: under openraft's
+    // `generic-snapshot-data` feature it is a deprecated dead path, and
+    // `full_snapshot` below is the one send path (ADR 0018).
 
     async fn full_snapshot(
         &mut self,
@@ -287,31 +272,51 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         let mut client = Client::new(channel);
 
         // Header first, then the container bytes in file order as `data`
-        // chunks (ADR 0018). The bytes are already in memory (the `SnapshotData`
-        // binding is an in-memory `Cursor`, see `adapter.rs`); chunking bounds
-        // the wire message size only.
+        // chunks (ADR 0018), read straight off the durable snapshot file (the
+        // `SnapshotData` binding is the file-backed `SnapshotFile`): one wire
+        // chunk in memory at a time, however large the snapshot.
         let header = pb::InstallSnapshotHeader {
             cluster_uuid: self.cluster_uuid.to_vec(),
             vote: Some(raftpb::vote_to_pb(&vote)),
             meta: Some(convert::snapshot_ident_to_pb(&snapshot.meta)),
         };
-        let bytes = (*snapshot.snapshot).into_inner();
+        let file = snapshot.snapshot;
 
+        // The feeder runs on the blocking pool (file reads are sync seam IO).
+        // On any local read error it drops `tx`, truncating the stream — the
+        // receiver's container validation refuses the torn copy and openraft
+        // retries. If the RPC ends first (cancel or response), `rx` drops and
+        // the next `blocking_send` fails, so the thread exits promptly.
         let (tx, rx) = mpsc::channel::<pb::InstallSnapshotRequest>(2);
-        let feeder = tokio::spawn(async move {
+        let _feeder = tokio::task::spawn_blocking(move || {
             let header_msg = pb::InstallSnapshotRequest {
                 chunk: Some(pb::install_snapshot_request::Chunk::Header(header)),
             };
-            if tx.send(header_msg).await.is_err() {
+            if tx.blocking_send(header_msg).is_err() {
                 return;
             }
-            for chunk in bytes.chunks(SNAPSHOT_CHUNK_BYTES) {
-                let msg = pb::InstallSnapshotRequest {
-                    chunk: Some(pb::install_snapshot_request::Chunk::Data(chunk.to_vec())),
-                };
-                if tx.send(msg).await.is_err() {
+            let len = match file.len() {
+                Ok(len) => len,
+                Err(error) => {
+                    tracing::warn!(%error, "snapshot send aborted: cannot size snapshot file");
                     return;
                 }
+            };
+            let mut buf = vec![0u8; SNAPSHOT_CHUNK_BYTES.min(len.max(1) as usize)];
+            let mut at = 0u64;
+            while at < len {
+                let n = ((len - at) as usize).min(buf.len());
+                if let Err(error) = file.read_exact_at(at, &mut buf[..n]) {
+                    tracing::warn!(%error, "snapshot send aborted: cannot read snapshot file");
+                    return;
+                }
+                let msg = pb::InstallSnapshotRequest {
+                    chunk: Some(pb::install_snapshot_request::Chunk::Data(buf[..n].to_vec())),
+                };
+                if tx.blocking_send(msg).is_err() {
+                    return;
+                }
+                at += n as u64;
             }
         });
 
@@ -322,12 +327,11 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
 
         tokio::select! {
             reason = &mut cancel => {
-                feeder.abort();
+                // Returning drops the call (and with it the feeder's channel),
+                // so the blocking feeder unblocks and exits.
                 Err(StreamingError::Closed(reason))
             }
             result = &mut call => {
-                // The call is finished; the feeder either completed or its
-                // channel is now dropped, so it will exit on its own.
                 let resp = result.map_err(|status| status_to_streaming(self.target, status))?;
                 let vote_pb = resp.into_inner().vote.ok_or_else(|| {
                     StreamingError::Network(NetworkError::new(&io::Error::new(

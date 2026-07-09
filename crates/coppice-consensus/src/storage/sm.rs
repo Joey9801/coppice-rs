@@ -17,6 +17,9 @@
 //!   [`ApplyRequest::Snapshot`]; serialization then happens off the apply
 //!   task, on the blocking pool.
 //! - Snapshot installs swap state wholesale via [`ApplyRequest::Install`].
+//!   The container itself moves as a [`SnapshotFile`] — decoded, validated,
+//!   and adopted from disk in bounded memory, never as one in-memory buffer
+//!   (ADR 0018).
 //!
 //! The canonical apply loop lives here as [`run_apply_task`]; the
 //! coordinator runtime spawns the same loop (wrapping it with view/status
@@ -35,7 +38,8 @@
 //! through this very `apply` path — the "log replay from the snapshot index"
 //! of ADR 0016 runs through one code path, not two).
 
-use std::io::{self, Cursor};
+use std::fmt;
+use std::io;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use openraft::storage::{RaftStateMachine, Snapshot, SnapshotMeta};
@@ -50,12 +54,70 @@ use coppice_proto::pb::storage::v1 as pbstorage;
 use coppice_state::StateMachine;
 
 use crate::adapter::{ApplyRequest, ApplyResult, TypeConfig};
-use crate::fs::{Fs, RealFs};
+use crate::fs::{Fs, FsFile, RealFs};
 use crate::CoordinatorId;
 
 use super::engine::StorageCore;
 use super::raftpb;
 use super::snapshot;
+
+/// The openraft `SnapshotData` binding: a file-backed handle to one ADR 0018
+/// snapshot container. (openraft's `generic-snapshot-data` feature lifts the
+/// tokio IO bounds, so this is a plain positioned-IO handle over the [`FsFile`]
+/// seam, not an async stream.)
+///
+/// It leads two lives:
+///
+/// - **Reading / sending**: a read handle to a store's durable
+///   `snap/<id>.snap`; the network layer streams it in wire-sized chunks.
+/// - **Receiving**: the engine's receive spool (`snap/receiving.tmp`),
+///   appended one wire frame at a time. The spool is never claimed by the
+///   manifest, so a crash mid-receive leaves an orphan the recovery sweep
+///   deletes (ADR 0017).
+///
+/// Bounded memory is the point of the binding: neither side of an
+/// install-snapshot ever materializes the container (ADR 0018's 1M-job
+/// snapshots are tens of MB to GB).
+// `len` is a fallible size query on a file, not a collection length.
+#[allow(clippy::len_without_is_empty)]
+pub struct SnapshotFile {
+    file: Box<dyn FsFile>,
+}
+
+impl SnapshotFile {
+    pub(crate) fn new(file: Box<dyn FsFile>) -> SnapshotFile {
+        SnapshotFile { file }
+    }
+
+    /// Append one received wire chunk (receive spool only). Visible, not
+    /// durable — durability happens at adoption (ADR 0017).
+    pub fn append(&mut self, data: &[u8]) -> io::Result<()> {
+        self.file.append(data)
+    }
+
+    /// Current length of the underlying file.
+    pub fn len(&self) -> io::Result<u64> {
+        self.file.len()
+    }
+
+    /// Read exactly `buf.len()` bytes at `offset`.
+    pub fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.file.read_exact_at(offset, buf)
+    }
+
+    /// The underlying seam file, for the validate/decode/adopt paths.
+    pub(crate) fn as_file(&self) -> &dyn FsFile {
+        &*self.file
+    }
+}
+
+impl fmt::Debug for SnapshotFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotFile")
+            .field("len", &self.file.len())
+            .finish()
+    }
+}
 
 /// The Raft coordinates of the applied state, tracked beside the apply
 /// channel (see module docs).
@@ -215,45 +277,65 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<CoordinatorId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> Result<Box<SnapshotFile>, StorageError<CoordinatorId>> {
+        // The spool lives in this store's own snap/ directory, through the
+        // Fs seam, so the crash suite's recovery sweep sees (and deletes) a
+        // torn receive like any other orphan.
+        let core = Arc::clone(&self.core);
+        let file = tokio::task::spawn_blocking(move || {
+            core.lock()
+                .expect("storage engine poisoned")
+                .begin_snapshot_receive()
+        })
+        .await
+        .map_err(|e| sm_write_err(&io::Error::other(format!("storage task panicked: {e}"))))?
+        .map_err(|e| sm_write_err(&e))?;
+        Ok(Box::new(SnapshotFile::new(file)))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<CoordinatorId, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<CoordinatorId>> {
-        let bytes = snapshot.into_inner();
-        let path = std::path::Path::new("install-snapshot");
-
-        // Decode first: every section CRC is validated and every record must
-        // convert before anything durable changes (ADR 0016 — a snapshot
-        // that cannot rebuild state is never adopted).
-        let (embedded, records) =
-            snapshot::decode_state(path, &bytes).map_err(|e| sm_write_err(&e))?;
-        if embedded.snapshot_id != meta.snapshot_id {
-            return Err(sm_write_err(&io::Error::other(format!(
-                "snapshot stream claims id {:?} but carries {:?}",
-                meta.snapshot_id, embedded.snapshot_id
-            ))));
-        }
-        let state = state_from_records(records).map_err(|e| {
-            sm_write_err(&io::Error::other(format!(
-                "snapshot records do not rebuild: {e}"
-            )))
-        })?;
+        // Decode first, streaming from the file: every section CRC is
+        // validated and every record must convert before anything durable
+        // changes (ADR 0016 — a snapshot that cannot rebuild state is never
+        // adopted). Only per-section buffers are ever in memory (ADR 0018).
+        let expect_id = meta.snapshot_id.clone();
+        let (snapshot, state) = tokio::task::spawn_blocking(
+            move || -> io::Result<(Box<SnapshotFile>, StateMachine)> {
+                let path = std::path::Path::new("install-snapshot");
+                let (embedded, records) = snapshot::decode_state_file(path, snapshot.as_file())?;
+                if embedded.snapshot_id != expect_id {
+                    return Err(io::Error::other(format!(
+                        "snapshot stream claims id {expect_id:?} but carries {:?}",
+                        embedded.snapshot_id
+                    )));
+                }
+                let state = state_from_records(records).map_err(|e| {
+                    io::Error::other(format!("snapshot records do not rebuild: {e}"))
+                })?;
+                Ok((snapshot, state))
+            },
+        )
+        .await
+        .map_err(|e| sm_write_err(&io::Error::other(format!("storage task panicked: {e}"))))?
+        .map_err(|e| sm_write_err(&e))?;
 
         let mut applied = self.applied.lock().await;
 
-        // Durable adoption: write the file, flip the manifest pointer, and
-        // advance the purge floor past everything the snapshot covers, in
-        // one manifest swap (ADR 0016 learner rebuild; ADR 0017 ordering).
+        // Durable adoption: stream the container into this store (copy,
+        // fsync, rename), flip the manifest pointer, and advance the purge
+        // floor past everything the snapshot covers, in one manifest swap
+        // (ADR 0016 learner rebuild; ADR 0017 ordering).
         let core = Arc::clone(&self.core);
         tokio::task::spawn_blocking(move || {
-            core.lock()
-                .expect("storage engine poisoned")
-                .install_snapshot(&bytes, true)
+            let mut core = core.lock().expect("storage engine poisoned");
+            core.install_snapshot_from(snapshot.as_file(), true)?;
+            // If this snapshot arrived over the wire, `snapshot` is the
+            // receive spool — adopted now, so drop the spool file.
+            core.remove_snapshot_spool()
         })
         .await
         .map_err(|e| sm_write_err(&io::Error::other(format!("storage task panicked: {e}"))))?
@@ -284,18 +366,18 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
         let current = tokio::task::spawn_blocking(move || {
             core.lock()
                 .expect("storage engine poisoned")
-                .current_snapshot()
+                .current_snapshot_reader()
         })
         .await
         .map_err(|e| sm_read_err(&io::Error::other(format!("storage task panicked: {e}"))))?
         .map_err(|e| sm_read_err(&e))?;
-        let Some((meta, bytes)) = current else {
+        let Some((meta, _index, file)) = current else {
             return Ok(None);
         };
         let meta = openraft_meta(&meta).map_err(|e| sm_read_err(&e))?;
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(bytes)),
+            snapshot: Box::new(SnapshotFile::new(file)),
         }))
     }
 }
@@ -332,16 +414,21 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
         };
 
         // Serialize + write + pointer flip on the blocking pool; the apply
-        // task is free the whole time (ADR 0018).
+        // task is free the whole time (ADR 0018). The encoded container is
+        // dropped once durable — what openraft holds (and the network later
+        // streams) is a read handle to the adopted file, never the bytes.
         let core = Arc::clone(&self.core);
         let shards = self.shards;
-        let bytes = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+        let file = tokio::task::spawn_blocking(move || -> io::Result<Box<dyn FsFile>> {
             let records = state_to_records(&state);
             let bytes = snapshot::encode_state(&meta, &records, shards);
-            core.lock()
-                .expect("storage engine poisoned")
-                .install_snapshot(&bytes, false)?;
-            Ok(bytes)
+            let mut core = core.lock().expect("storage engine poisoned");
+            core.install_snapshot(&bytes, false)?;
+            drop(bytes);
+            let (_, _, file) = core.current_snapshot_reader()?.ok_or_else(|| {
+                io::Error::other("freshly built snapshot is not the current one")
+            })?;
+            Ok(file)
         })
         .await
         .map_err(|e| sm_write_err(&io::Error::other(format!("storage task panicked: {e}"))))?
@@ -353,7 +440,7 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
                 last_membership: membership,
                 snapshot_id,
             },
-            snapshot: Box::new(Cursor::new(bytes)),
+            snapshot: Box::new(SnapshotFile::new(file)),
         })
     }
 }

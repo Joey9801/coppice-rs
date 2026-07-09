@@ -407,6 +407,54 @@ async fn three_node_cluster_lifecycle() {
     )
     .await;
 
+    // -- Step 6b: the resync's durable artifact. Install-snapshot streams the
+    // ADR 0018 container disk-to-disk (the `SnapshotData` binding is a
+    // file-backed handle; neither side holds the container in memory), so the
+    // learner must have adopted the leader-built file itself: same snapshot id,
+    // byte-identical content, a complete footer-valid container behind its
+    // manifest pointer — and no leftover receive spool, which is deleted once
+    // the copy is adopted (a crash mid-receive would leave it for the
+    // recovery sweep instead).
+    {
+        let snap_files = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+            let mut files: Vec<_> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                .map(|entry| entry.expect("snap dir entry").path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "snap"))
+                .collect();
+            files.sort();
+            files
+        };
+        let leader_snaps = snap_files(&nodes[leader_idx].data_dir().join("snap"));
+        let node4_snap_dir = node4.data_dir().join("snap");
+        let node4_snaps = snap_files(&node4_snap_dir);
+        assert_eq!(leader_snaps.len(), 1, "leader holds one current snapshot");
+        assert_eq!(node4_snaps.len(), 1, "node 4 holds one current snapshot");
+        assert_eq!(
+            node4_snaps[0].file_name(),
+            leader_snaps[0].file_name(),
+            "node 4 must have adopted the leader-built snapshot (same id)"
+        );
+
+        let leader_bytes = std::fs::read(&leader_snaps[0]).expect("read leader snapshot");
+        let node4_bytes = std::fs::read(&node4_snaps[0]).expect("read node 4 snapshot");
+        assert_eq!(
+            leader_bytes, node4_bytes,
+            "the container must arrive disk-to-disk unchanged"
+        );
+
+        // Container-level validity: header, every section CRC, total CRC,
+        // closing magic. The manifest may only ever point at a complete,
+        // durably renamed container (ADR 0017/0018).
+        coppice_consensus::storage::raw::validate_container(&node4_snaps[0], &node4_bytes)
+            .expect("node 4's adopted snapshot must validate end to end");
+
+        assert!(
+            !node4_snap_dir.join("receiving.tmp").exists(),
+            "the receive spool must be deleted once the snapshot is adopted"
+        );
+    }
+
     // -- Step 7: graceful shutdown of all remaining nodes. ------------------
     node4.graceful_stop().await;
     for &i in &survivors {

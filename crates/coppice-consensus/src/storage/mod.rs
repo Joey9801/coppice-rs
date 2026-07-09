@@ -50,7 +50,7 @@ mod snapshot;
 pub use container::{FrameLogId, CONTAINER_VERSION};
 pub use engine::{EncodedEntry, StorageCore, StorageOptions};
 pub use log::{SegmentLogReader, SegmentLogStorage};
-pub use sm::{run_apply_task, SegmentSnapshotBuilder, StateMachineStore};
+pub use sm::{run_apply_task, SegmentSnapshotBuilder, SnapshotFile, StateMachineStore};
 
 /// Container/framing internals, exported for the storage test suites and
 /// the ADR 0018 benches.
@@ -63,8 +63,8 @@ pub mod raw {
         SNAPSHOT_FOOTER_MAGIC, SNAPSHOT_MAGIC, VOTE_MAGIC,
     };
     pub use super::snapshot::{
-        assemble_container, decode_state, encode_state, section_bytes, validate_container,
-        RawSection, ENCODING_PROTOBUF_LD,
+        assemble_container, decode_state, decode_state_file, encode_state, section_bytes,
+        validate_container, validate_container_file, RawSection, ENCODING_PROTOBUF_LD,
     };
 }
 
@@ -102,10 +102,13 @@ pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
     let cluster_uuid = options.cluster_uuid;
     let core = StorageCore::open(fs, options)?;
 
-    let (state, last_applied, membership) = match core.current_snapshot()? {
-        Some((meta, bytes)) => {
+    // Rebuild from the snapshot file in bounded memory: streaming validation
+    // already ran inside `current_snapshot_reader`, so only the per-section
+    // record decode remains (ADR 0018).
+    let (state, last_applied, membership) = match core.current_snapshot_reader()? {
+        Some((meta, index, file)) => {
             let path = Path::new("snap");
-            let (_, records) = snapshot::decode_state(path, &bytes)?;
+            let records = snapshot::decode_records_file(path, &*file, &index)?;
             let state = state_from_records(records).map_err(|e| {
                 container::fail_stop_file(path, format!("snapshot records do not rebuild: {e}"))
             })?;

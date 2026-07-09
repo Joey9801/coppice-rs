@@ -213,6 +213,13 @@ log_level = "warn"
         self.booted.is_some()
     }
 
+    /// This replica's storage data directory (`<tempdir>/data`), for tests
+    /// that assert on durable artifacts (e.g. the installed snapshot file).
+    #[allow(dead_code)]
+    pub fn data_dir(&self) -> PathBuf {
+        self.dir.path().join("data")
+    }
+
     fn booted(&self) -> &BootedCoordinator {
         self.booted
             .as_ref()

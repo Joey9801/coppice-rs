@@ -173,9 +173,10 @@ without decoding the world (ADR 0018).
 2. **Orphan sweep.** Delete anything in `log/`, `snap/`, and the directory
    root that the manifest does not claim (segments not in its list, a
    snapshot file whose id doesn't match its pointer, any leftover `.tmp`
-   file). Idempotent: an un-synced delete from a prior crash may have
-   resurrected a file a previous recovery already removed, and sweeping
-   again is harmless.
+   file — including `snap/receiving.tmp`, the install-snapshot receive
+   spool a crash mid-stream leaves behind). Idempotent: an un-synced delete
+   from a prior crash may have resurrected a file a previous recovery
+   already removed, and sweeping again is harmless.
 
 3. **Open claimed segments; verify headers and chain.** For every segment
    but the tail, open it and check its container header. (Ascending start
@@ -239,7 +240,7 @@ state as fully formed). There is no window where recovery must guess.
 | **Suffix truncation** | `write_manifest` (drop segments ≥ `from`, set `logical_end`, fsync) → **then** drop in-memory tables / clear `active` → delete the dropped segment files → `sync_dir(log/)`. | Crash before the manifest fsync: nothing changed: the truncation never took effect, and openraft can retry it. Crash after: the dropped segments are already unclaimed, so the orphan sweep deletes whatever's left of them at next open regardless of how far the explicit delete loop got — the delete loop is an optimization, not the correctness mechanism. Sealed bytes past `logical_end` are never rewritten, only ignored. |
 | **Purge** | `write_manifest` (advance `purge_floor`, drop fully-covered segments, fsync) → **then** in-memory update → delete segment files → `sync_dir(log/)`. | Same shape as truncation: manifest-first means a crash mid-delete just leaves orphans the next open's sweep clears. |
 | **Snapshot build-flip** (`install_snapshot(container, advance_floor=false)`) | validate the container → write to `snap/<id>.snap.tmp` → `sync_data` → rename to `snap/<id>.snap` → `sync_dir(snap/)` (**durable before anything points at it**) → **then** flip `manifest.snapshot_id`, stamp `committed_index` → `write_manifest` → **then** delete the previous snapshot file → `sync_dir(snap/)`. | Crash before the rename+dir-sync: the new file is a `.tmp` (or an un-synced rename), swept as an orphan; the manifest still points at the old snapshot (or none). Crash after the file is durable but before the manifest fsync: the new snapshot exists but is unclaimed, swept at next open. Crash after the manifest fsync: the previous snapshot is now unclaimed even if the explicit delete step never ran — the orphan sweep removes it, so "delete-after-flip" is enforced by the sweep, not by the delete call completing. |
-| **Learner install** (`install_snapshot(container, advance_floor=true)`) | Identical snapshot-file durability as above, but the **same single `write_manifest` call** both flips `snapshot_id` **and** advances `purge_floor` / drops now-covered log segments — one atomic swap carries both facts. Log segment deletion and old-snapshot deletion both happen only after that one manifest write is durable. | A crash anywhere before the manifest write leaves the pre-install state fully intact (new snapshot file orphaned, swept). A crash anywhere after leaves both the pointer flip and the floor advance already committed together — there is no state where one took effect without the other, because they share one `write_manifest` call. Superseded log segments and the old snapshot are orphans either way and are swept if the explicit deletes didn't finish. |
+| **Learner install** (`install_snapshot_from(source, advance_floor=true)`) | The container arrives as a *file* (the receive spool a streamed install appended to, never claimed by the manifest), not a byte slice: streaming validation of every section CRC on the source, then a chunked copy into `snap/<id>.snap.tmp` → `sync_data` → rename → `sync_dir(snap/)` — identical snapshot-file durability as above, in bounded memory. Then the **same single `write_manifest` call** both flips `snapshot_id` **and** advances `purge_floor` / drops now-covered log segments — one atomic swap carries both facts. Log segment deletion and old-snapshot deletion both happen only after that one manifest write is durable. | A crash anywhere before the manifest write leaves the pre-install state fully intact (spool and new snapshot file orphaned, swept). A crash anywhere after leaves both the pointer flip and the floor advance already committed together — there is no state where one took effect without the other, because they share one `write_manifest` call. Superseded log segments, the old snapshot, and the spool are orphans either way and are swept if the explicit deletes didn't finish. |
 | **Vote write** | `write_atomic("vote", ...)`: write-new → `sync_data` → rename → `sync_dir(parent)` — **only after this returns** does `save_vote` update `self.vote` and the call is acknowledged to openraft. | A crash during the write_atomic sequence is, by definition, before acknowledgment — SimFs may drop, apply, or tear the un-synced write, but Raft never learns the vote happened, so no correctness property (vote monotonicity) is violated. Once acknowledged, the vote is fully durable by construction — there is no post-ack crash window. |
 
 ## The async bridge
@@ -280,6 +281,12 @@ a dedicated thread would add.
 - `install_snapshot` decodes and validates the incoming container fully
   (every section CRC checked, every record required to convert) **before**
   anything durable changes, then swaps state via `ApplyRequest::Install`.
+  The container itself moves as a `SnapshotFile` — the openraft
+  `SnapshotData` binding is a file-backed handle over the `Fs` seam, so a
+  streamed install spools wire chunks to `snap/receiving.tmp`, validates
+  and decodes from that file in per-section buffers, and adopts it with a
+  chunked copy: at no point does either side of the transfer hold the
+  container in memory (ADR 0018 targets GB-scale snapshots).
 
 An `Arc<tokio::sync::Mutex<AppliedState>>` — the **coherence lock** — is
 held across every `apply` round-trip and every snapshot-state capture, so a

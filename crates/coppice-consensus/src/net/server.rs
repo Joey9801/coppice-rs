@@ -14,7 +14,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::fmt::Write as _;
-use std::io::Cursor;
+use std::io;
 
 use tonic::{Request, Response, Status, Streaming};
 
@@ -24,7 +24,7 @@ use coppice_proto::pb::raft::v1 as pb;
 use coppice_net::transport::RaftTransportService;
 
 use crate::adapter::TypeConfig;
-use crate::storage::raftpb;
+use crate::storage::{raftpb, SnapshotFile};
 
 use super::convert;
 
@@ -135,15 +135,30 @@ impl RaftTransportService for RaftTransportHandler {
         let meta = convert::snapshot_meta_from_pb(ident)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        // Accumulate the `data` frames. This bounds nothing by design: the
-        // `SnapshotData` binding is an in-memory `Cursor` (see `adapter.rs`),
-        // so a snapshot install is always a whole-container-in-memory affair;
-        // the chunking is only about wire-message size.
-        let mut buf: Vec<u8> = Vec::new();
+        // Spool the `data` frames straight to disk: the `SnapshotData`
+        // binding is the file-backed `SnapshotFile` (the engine's receive
+        // spool), so one wire chunk is the only buffered snapshot data,
+        // however large the container (ADR 0018). Each append is seam IO,
+        // run on the blocking pool.
+        let mut data: Box<SnapshotFile> = self
+            .raft
+            .begin_receiving_snapshot()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         while let Some(frame) = stream.message().await? {
             match frame.chunk {
-                Some(pb::install_snapshot_request::Chunk::Data(data)) => {
-                    buf.extend_from_slice(&data)
+                Some(pb::install_snapshot_request::Chunk::Data(bytes)) => {
+                    data = tokio::task::spawn_blocking(
+                        move || -> io::Result<Box<SnapshotFile>> {
+                            data.append(&bytes)?;
+                            Ok(data)
+                        },
+                    )
+                    .await
+                    .map_err(|e| Status::internal(format!("snapshot spool task panicked: {e}")))?
+                    .map_err(|e| {
+                        Status::internal(format!("cannot spool snapshot chunk: {e}"))
+                    })?;
                 }
                 Some(pb::install_snapshot_request::Chunk::Header(_)) => {
                     return Err(Status::invalid_argument(
@@ -160,7 +175,7 @@ impl RaftTransportService for RaftTransportHandler {
 
         let snapshot = Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(buf)),
+            snapshot: data,
         };
         let resp = self
             .raft

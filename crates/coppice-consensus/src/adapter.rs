@@ -19,9 +19,6 @@
 //! which then assembles this adapter with [`OpenraftConsensus::new`].
 
 use std::collections::BTreeSet;
-// `declare_raft_types!` expands its default `SnapshotData = Cursor<Vec<u8>>`,
-// which resolves against this import.
-use std::io::Cursor;
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, watch, Semaphore};
@@ -47,13 +44,17 @@ openraft::declare_raft_types!(
     ///
     /// `D` is a control-plane [`Command`], `R` is its [`ApplyResult`]; the
     /// node id is [`CoordinatorId`] and nodes carry a dial address in a
-    /// [`BasicNode`]. The remaining associated types take openraft's
-    /// defaults (tokio runtime, oneshot responder, in-memory snapshot
-    /// cursor). Neither `D` nor `R` implements serde, so openraft is built
-    /// without its `serde` feature (ADR 0002).
+    /// [`BasicNode`]. Snapshots move as the file-backed
+    /// [`SnapshotFile`](crate::storage::SnapshotFile) — never an in-memory
+    /// buffer — so an ADR 0018 container streams disk-to-disk through
+    /// install-snapshot (openraft's `generic-snapshot-data` feature). The
+    /// remaining associated types take openraft's defaults (tokio runtime,
+    /// oneshot responder). Neither `D` nor `R` implements serde, so openraft
+    /// is built without its `serde` feature (ADR 0002).
     pub TypeConfig:
         D = Command,
         R = ApplyResult,
+        SnapshotData = crate::storage::SnapshotFile,
 );
 
 /// One unit of work for the apply task — the single writer of [`StateMachine`].

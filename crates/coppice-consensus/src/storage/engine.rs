@@ -137,6 +137,16 @@ pub struct StorageCore<F: Fs> {
     _lock: F::Lock,
 }
 
+/// Chunk size of the streaming snapshot copy in
+/// [`StorageCore::install_snapshot_from`]: the only per-install allocation,
+/// however large the container (ADR 0018).
+const SNAPSHOT_COPY_CHUNK: usize = 1 << 20;
+
+/// The install-snapshot receive spool: where a streamed container lands
+/// frame by frame before adoption. Never claimed by the manifest, so a crash
+/// mid-receive leaves an orphan the recovery sweep deletes (ADR 0017).
+const RECEIVE_SPOOL: &str = "snap/receiving.tmp";
+
 fn seg_path(start: u64) -> PathBuf {
     PathBuf::from(format!("log/{start}.seg"))
 }
@@ -909,14 +919,41 @@ impl<F: Fs> StorageCore<F> {
         id
     }
 
-    /// Adopt a complete snapshot container: validate it, make the file
-    /// durable, then atomically flip the manifest pointer (the commit point);
-    /// the previous snapshot is retained until the flip is durable and
-    /// deleted after (ADR 0002/0018).
+    /// Open a fresh receive spool for a streamed install-snapshot, replacing
+    /// any stale one. The caller appends wire chunks to it, then adopts via
+    /// [`StorageCore::install_snapshot_from`].
+    pub fn begin_snapshot_receive(&mut self) -> io::Result<Box<dyn FsFile>> {
+        let path = Path::new(RECEIVE_SPOOL);
+        if self.fs.exists(path)? {
+            self.fs.remove_file(path)?;
+        }
+        Ok(Box::new(self.fs.create_new(path)?))
+    }
+
+    /// Delete the receive spool, if present. Called after a streamed install
+    /// is adopted; a crash before this point leaves an orphan the recovery
+    /// sweep removes, so best-effort ordering is fine here.
+    pub fn remove_snapshot_spool(&mut self) -> io::Result<()> {
+        let path = Path::new(RECEIVE_SPOOL);
+        if self.fs.exists(path)? {
+            self.fs.remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    /// Adopt a complete snapshot container held in memory: validate it, make
+    /// the file durable, then atomically flip the manifest pointer (the
+    /// commit point); the previous snapshot is retained until the flip is
+    /// durable and deleted after (ADR 0002/0018).
     ///
     /// With `advance_floor` (the ADR 0016 learner-rebuild install path) the
     /// same manifest write advances the purge floor past everything the
     /// snapshot covers.
+    ///
+    /// This is the local-build entrypoint (the container was just encoded in
+    /// memory) and the crash suite's; a snapshot received over the wire is
+    /// adopted from its spool file by [`StorageCore::install_snapshot_from`],
+    /// which never materializes the container.
     pub fn install_snapshot(
         &mut self,
         container: &[u8],
@@ -924,18 +961,9 @@ impl<F: Fs> StorageCore<F> {
     ) -> io::Result<pbstorage::SnapshotMeta> {
         let snap_dir_path = Path::new("snap/container");
         let (meta, _) = snapshot::validate_container(snap_dir_path, container)?;
-        if meta.cluster_uuid != self.options.cluster_uuid {
-            return Err(fail_stop_file(
-                snap_dir_path,
-                "snapshot carries another cluster's uuid; refusing to adopt it (ADR 0016)",
-            ));
-        }
-        let id = meta.snapshot_id.clone();
-        check_snapshot_id(&id)?;
+        let (id, path, tmp) = self.checked_snapshot_paths(snap_dir_path, &meta)?;
 
         // The snapshot file becomes durable before anything points at it.
-        let path = snap_path(&id);
-        let tmp = PathBuf::from(format!("snap/{id}.snap.tmp"));
         if self.fs.exists(&tmp)? {
             self.fs.remove_file(&tmp)?;
         }
@@ -946,6 +974,79 @@ impl<F: Fs> StorageCore<F> {
         self.fs.rename(&tmp, &path)?;
         self.fs.sync_dir(Path::new("snap"))?;
 
+        self.adopt_snapshot(meta, id, path, advance_floor)
+    }
+
+    /// [`StorageCore::install_snapshot`] from a readable file instead of a
+    /// byte slice, in bounded memory: streaming validation of every section
+    /// CRC on the source, then a chunked copy into this store's temp file,
+    /// fsync, rename, and the same one-swap manifest flip (ADR 0016/0017).
+    ///
+    /// The source is any [`FsFile`] — the receive spool of a streamed
+    /// install, or another store's snapshot file — and is left untouched.
+    pub fn install_snapshot_from(
+        &mut self,
+        source: &dyn FsFile,
+        advance_floor: bool,
+    ) -> io::Result<pbstorage::SnapshotMeta> {
+        let snap_dir_path = Path::new("snap/container");
+        let (meta, _) = snapshot::validate_container_file(snap_dir_path, source)?;
+        let (id, path, tmp) = self.checked_snapshot_paths(snap_dir_path, &meta)?;
+
+        if self.fs.exists(&tmp)? {
+            self.fs.remove_file(&tmp)?;
+        }
+        let mut file = self.fs.create_new(&tmp)?;
+        let len = source.len()?;
+        let mut buf = vec![0u8; SNAPSHOT_COPY_CHUNK.min(len.max(1) as usize)];
+        let mut at = 0u64;
+        while at < len {
+            let n = ((len - at) as usize).min(buf.len());
+            source.read_exact_at(at, &mut buf[..n])?;
+            file.append(&buf[..n])?;
+            at += n as u64;
+        }
+        file.sync_data()?;
+        drop(file);
+        self.fs.rename(&tmp, &path)?;
+        self.fs.sync_dir(Path::new("snap"))?;
+
+        self.adopt_snapshot(meta, id, path, advance_floor)
+    }
+
+    /// Identity and file-name checks shared by both install entrypoints:
+    /// refuse a foreign cluster's snapshot (ADR 0016), then derive the final
+    /// and temp paths for its id.
+    fn checked_snapshot_paths(
+        &self,
+        label: &Path,
+        meta: &pbstorage::SnapshotMeta,
+    ) -> io::Result<(String, PathBuf, PathBuf)> {
+        if meta.cluster_uuid != self.options.cluster_uuid {
+            return Err(fail_stop_file(
+                label,
+                "snapshot carries another cluster's uuid; refusing to adopt it (ADR 0016)",
+            ));
+        }
+        let id = meta.snapshot_id.clone();
+        check_snapshot_id(&id)?;
+        let path = snap_path(&id);
+        let tmp = PathBuf::from(format!("snap/{id}.snap.tmp"));
+        Ok((id, path, tmp))
+    }
+
+    /// The adoption tail shared by both install entrypoints. Runs once the
+    /// snapshot file is durably renamed into place: one atomic manifest swap
+    /// flips the pointer (and, with `advance_floor`, the purge floor), then
+    /// covered segments and the previous snapshot are deleted (ADR 0017:
+    /// delete only after the flip is durable).
+    fn adopt_snapshot(
+        &mut self,
+        meta: pbstorage::SnapshotMeta,
+        id: String,
+        path: PathBuf,
+        advance_floor: bool,
+    ) -> io::Result<pbstorage::SnapshotMeta> {
         let previous = self.manifest.snapshot_id.replace(id.clone());
         let mut dropped: Vec<u64> = Vec::new();
         if advance_floor {
@@ -999,11 +1100,34 @@ impl<F: Fs> StorageCore<F> {
         Ok(meta)
     }
 
-    /// Read and fully validate the current snapshot, if the manifest points
-    /// at one.
+    /// Open and fully validate the current snapshot, if the manifest points
+    /// at one, returning a read handle — the container is CRC-checked in
+    /// streaming reads and never materialized (ADR 0018).
     ///
     /// The manifest only ever points at a durably renamed file, so any
     /// damage here is fail-stop corruption, never a torn write.
+    #[allow(clippy::type_complexity)]
+    pub fn current_snapshot_reader(
+        &self,
+    ) -> io::Result<Option<(pbstorage::SnapshotMeta, pbstorage::SectionIndex, Box<dyn FsFile>)>>
+    {
+        let Some(id) = &self.manifest.snapshot_id else {
+            return Ok(None);
+        };
+        let path = snap_path(id);
+        let file = self
+            .fs
+            .open_read(&path)
+            .map_err(|e| fail_stop_on_shape(&path, 0, "claimed snapshot unreadable", e))?;
+        let (meta, index) = snapshot::validate_container_file(&path, &file)?;
+        Ok(Some((meta, index, Box::new(file))))
+    }
+
+    /// Read and fully validate the current snapshot into memory.
+    ///
+    /// Test/tooling convenience over [`StorageCore::current_snapshot_reader`]
+    /// (the crash suite's observer slurps deliberately); production paths
+    /// stream through the reader instead.
     pub fn current_snapshot(&self) -> io::Result<Option<(pbstorage::SnapshotMeta, Vec<u8>)>> {
         let Some(id) = &self.manifest.snapshot_id else {
             return Ok(None);

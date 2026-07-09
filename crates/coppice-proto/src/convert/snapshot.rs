@@ -146,7 +146,7 @@ impl TryFrom<pb::QuotaEntityRecord> for (coppice_core::id::QuotaEntityId, QuotaE
 
 /// A `StateMachine` flattened into snapshot records, grouped per entity
 /// type — the unit the storage layer shards into sections.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StateRecords {
     pub jobs: Vec<pb::JobRecord>,
     pub attempts: Vec<pb::AttemptRecord>,

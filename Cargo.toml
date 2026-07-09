@@ -54,8 +54,11 @@ fs2 = "0.4"
 # "serde" feature is deliberately left off (ADR 0002). Default features cover
 # the tokio runtime support the adapter needs. "storage-v2" unseals the
 # `RaftLogStorage`/`RaftStateMachine` traits the segment storage engine
-# implements (ADR 0002).
-openraft = { version = "0.9", features = ["storage-v2"] }
+# implements (ADR 0002). "generic-snapshot-data" lifts the tokio
+# AsyncRead/Write/Seek bounds on `SnapshotData`, letting the binding be the
+# file-backed `SnapshotFile` handle so install-snapshot streams the ADR 0018
+# container instead of holding it in memory.
+openraft = { version = "0.9", features = ["storage-v2", "generic-snapshot-data"] }
 proptest = "1"
 prost = "0.13"
 prost-build = "0.13"
