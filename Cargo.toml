@@ -4,6 +4,7 @@ members = [
     "crates/coppice-core",
     "crates/coppice-proto",
     "crates/coppice-raft-net",
+    "crates/coppice-agent-net",
     "crates/coppice-state",
     "crates/coppice-consensus",
     "crates/coppice-scheduler",
@@ -27,6 +28,8 @@ authors = ["The Coppice Authors"]
 coppice-core = { path = "crates/coppice-core" }
 coppice-proto = { path = "crates/coppice-proto" }
 coppice-raft-net = { path = "crates/coppice-raft-net" }
+coppice-agent-net = { path = "crates/coppice-agent-net" }
+coppice-agent = { path = "crates/coppice-agent" }
 coppice-state = { path = "crates/coppice-state" }
 coppice-consensus = { path = "crates/coppice-consensus" }
 coppice-scheduler = { path = "crates/coppice-scheduler" }
@@ -85,6 +88,12 @@ humantime-serde = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+# X.509 leaf-certificate parsing for the agent gateway's mTLS identity check
+# (ADR 0011): the client cert's subject CN must equal the claimed NodeId. Only
+# the DER→CN parse is used today (the TLS layer already validated the chain);
+# the enrollment/CSR issuance flow is future work. Default features are empty,
+# so this pulls in no crypto verification backend.
+x509-parser = { version = "0.18", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

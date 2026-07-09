@@ -10,6 +10,7 @@
 //! test can also drive directly.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -68,6 +69,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
     resolved.log_effective();
 
     tracing::info!("coppice-coordinator starting");
+
+    // Bind the agent gateway listener early (fail-fast on a port conflict),
+    // before consensus starts. Only the daemon path binds it — the integration
+    // test drives `bootstrap` directly and runs several replicas in one
+    // process, so binding a shared default agent port there would collide.
+    let agent_listener = prepare_agent_listener(&resolved.config)?;
+
     let BootedCoordinator {
         consensus,
         views,
@@ -78,8 +86,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
     } = bootstrap(resolved).await?;
 
     // The task runtime owns steps 1–4 of the shutdown order and returns once
-    // its own signal-driven shutdown has fully drained.
-    runtime_run(Arc::clone(&consensus), views, event_tap).await?;
+    // its own signal-driven shutdown has fully drained (`None`: the daemon path
+    // lets the runtime install its own signal handler).
+    serve_runtime(
+        Arc::clone(&consensus),
+        views,
+        event_tap,
+        agent_listener,
+        None,
+    )
+    .await?;
 
     // Shutdown tail (coordinator-runtime.md steps 5–6), in dependency order.
     tracing::info!("shutdown: stopping raft/admin transport (no new peer traffic)");
@@ -106,16 +122,87 @@ pub async fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Hand the shared consensus seam to `runtime::run`.
+/// Run the coordinator's agent-facing task runtime over the shared consensus
+/// seam.
 ///
 /// `runtime::run` takes ownership of a `Consensus`; the wrapper delegates to
-/// the shared [`Arc`] so the admin service keeps its own reference.
-async fn runtime_run(
+/// the shared [`Arc`] so the admin service keeps its own reference. `shutdown`
+/// selects the stop mechanism: `None` lets the runtime install its own
+/// signal handler (the daemon path); `Some(rx)` hands it a caller-owned trigger
+/// so an integration test can drive [`bootstrap`] and this runtime directly and
+/// shut them down without raising a real signal.
+pub async fn serve_runtime(
     consensus: Arc<OpenraftConsensus>,
     views: StateViews,
     event_tap: EventTapReceiver,
+    agent_listener: AgentListener,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
-    crate::runtime::run(SharedConsensus(consensus), views, event_tap).await
+    crate::runtime::run(
+        SharedConsensus(consensus),
+        views,
+        event_tap,
+        agent_listener,
+        shutdown,
+    )
+    .await
+}
+
+/// The bound agent gateway listener and its mTLS config, handed to
+/// `runtime::run` which starts the tonic server after creating the session
+/// channels.
+///
+/// Bound eagerly in [`run`] (fail-fast) but served inside the runtime so the
+/// listener stops accepting first on shutdown, alongside the API server.
+pub struct AgentListener {
+    pub(crate) incoming: TcpIncoming,
+    pub(crate) tls: ServerTlsConfig,
+}
+
+impl AgentListener {
+    /// Bind the agent gateway's dedicated mTLS listener on `addr` from PEM
+    /// material already in memory (ADR 0009/0011).
+    ///
+    /// The same cert/key/ca as the Raft/admin server; client certs are REQUIRED
+    /// (`client_auth_optional(false)`) so the gateway can bind the agent's leaf
+    /// CN to its NodeId at session accept. The daemon path reaches this through
+    /// [`prepare_agent_listener`], which reads the PEM from the config's
+    /// `[tls]` paths; the integration test calls it directly on a free port so
+    /// several replicas can run in one process without colliding on the default
+    /// agent port.
+    pub fn bind(
+        addr: SocketAddr,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        ca_pem: &[u8],
+    ) -> Result<AgentListener> {
+        let tls = ServerTlsConfig::new()
+            .identity(Identity::from_pem(cert_pem, key_pem))
+            .client_ca_root(Certificate::from_pem(ca_pem))
+            .client_auth_optional(false);
+
+        let incoming = TcpIncoming::new(addr, true, None)
+            .map_err(|e| anyhow!("binding agent gateway listener on {addr}: {e}"))?;
+        tracing::info!(%addr, "bootstrap: agent gateway listener bound");
+
+        Ok(AgentListener { incoming, tls })
+    }
+}
+
+/// Bind the agent gateway's dedicated mTLS listener from the config's `[tls]`
+/// paths (ADR 0009/0011).
+///
+/// Reads the same cert/key/ca the Raft/admin server uses and hands them to
+/// [`AgentListener::bind`], naming each path on a read failure.
+fn prepare_agent_listener(cfg: &config::Config) -> Result<AgentListener> {
+    let cert = std::fs::read(&cfg.tls.cert_path)
+        .with_context(|| format!("reading TLS certificate {}", cfg.tls.cert_path.display()))?;
+    let key = std::fs::read(&cfg.tls.key_path)
+        .with_context(|| format!("reading TLS private key {}", cfg.tls.key_path.display()))?;
+    let ca = std::fs::read(&cfg.tls.ca_path)
+        .with_context(|| format!("reading TLS CA certificate {}", cfg.tls.ca_path.display()))?;
+
+    AgentListener::bind(cfg.listen.agent_addr, &cert, &key, &ca)
 }
 
 /// Assemble and start a coordinator replica (does not run the task runtime).

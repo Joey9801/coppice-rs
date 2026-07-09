@@ -1,0 +1,66 @@
+// The agent's local durable journal (ADR 0009). Never on the wire: these
+// records live only in the agent's data directory, written through the
+// filesystem seam with the same crash-safety care as coordinator storage
+// (fsync before container start).
+//
+// The journal plus the container runtime (queried by label) is what the
+// agent trusts over its own memory: on restart it recovers these records,
+// observes the runtime, and reports the full ObservedSet before accepting
+// new work. Framing (length + CRC32C) is the storage engine's concern, not
+// the schema's.
+
+syntax = "proto3";
+
+package coppice.agent.v1;
+
+import "coppice/core/v1/attempt.proto";
+import "coppice/core/v1/ids.proto";
+
+// One journal entry. Append-only; compaction rewrites the live set.
+message JournalRecord {
+  oneof body {
+    FencingUpdate fencing = 1;
+    StartIntent start_intent = 2;
+    AllocationTombstone tombstone = 3;
+    ObservedExit observed_exit = 4;
+  }
+}
+
+// The highest fencing token the agent has accepted (ADR 0009): journaled
+// before acting on any command carrying a higher token, so a restarted
+// agent never regresses to obeying a deposed leader. `command_seq` is
+// deliberately absent — a restart re-registers, and the epoch bump
+// invalidates the old sequence space.
+message FencingUpdate {
+  uint64 leader_term = 1;
+  uint64 node_epoch = 2;
+}
+
+// Journaled durably *before* the container is started (ADR 0009): a running
+// container always has a durable intent record, so recovery can never find
+// work it cannot account for. Idempotency anchor for StartJob.
+message StartIntent {
+  coppice.core.v1.AllocationId allocation = 1;
+  coppice.core.v1.AttemptId attempt = 2;
+  coppice.core.v1.JobId job = 3;
+  // The node epoch the StartJob was accepted under.
+  uint64 node_epoch = 4;
+}
+
+// A StopJob was accepted for this allocation (ADR 0013): journaled before
+// acting so a racing or re-delivered StartJob is refused even across an
+// agent restart. Valid for allocations the agent has never seen.
+message AllocationTombstone {
+  coppice.core.v1.AllocationId allocation = 1;
+}
+
+// The container's exit was observed and classified (ADR 0013 taxonomy).
+// Kept so a restarted agent's ObservedSet reports the honest outcome for
+// work that ended while the report may not have reached the coordinator.
+message ObservedExit {
+  coppice.core.v1.AllocationId allocation = 1;
+  coppice.core.v1.AttemptId attempt = 2;
+  coppice.core.v1.JobId job = 3;
+  coppice.core.v1.AttemptOutcome outcome = 4;
+  uint64 runtime_us = 5;
+}

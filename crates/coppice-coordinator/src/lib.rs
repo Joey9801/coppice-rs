@@ -20,6 +20,7 @@ pub mod cli;
 pub mod config;
 mod leadership;
 mod limits;
+mod liveness;
 mod runtime;
 mod tasks;
 

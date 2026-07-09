@@ -50,8 +50,16 @@ message AgentCommand {
     Drain drain = 10;
     PrepareCache prepare_cache = 11;
     EvictImageHint evict_image_hint = 12;
+    RegisterAccepted register_accepted = 13;
   }
 }
+
+// Registration applied (ADR 0009, restart reconciliation step 2): the agent
+// "registers, receives its new node_epoch, and sends the full ObservedSet".
+// The body is empty on purpose — the fresh fencing token rides in this
+// command's `CommandHeader` like any other, and the agent adopts it through
+// the ordinary fencing-update path before reporting its ObservedSet.
+message RegisterAccepted {}
 
 // Start the given job under an allocation. Idempotent on `allocation`: an
 // agent that has already journaled it acknowledges without acting. The
@@ -176,4 +184,21 @@ message CachedImage {
   string digest = 1;
   uint64 size_bytes = 2;
   int64 last_used_at_us = 3;
+}
+
+// The agent↔coordinator transport (ADR 0009), served over mTLS (ADR 0011).
+//
+// One long-lived bidirectional stream per agent session: the agent pushes
+// `AgentReport`s up (register, heartbeat, attempt status, observed set) and
+// the coordinator pushes `AgentCommand`s down (start/stop/drain/cache). The
+// stream itself carries no framing beyond the two envelope messages — every
+// command's fencing token and `command_seq` ride in its `CommandHeader`, and
+// every report echoes the `node_epoch` it was observed under, so the protocol
+// tolerates duplicate, delayed, and reordered delivery on either half.
+//
+// Sessions terminate on the coordinator leader only; a follower refuses with a
+// leader hint (coordinator-runtime.md). A deposed leader's in-flight commands
+// fail closed at the agent on the term check (ADR 0009).
+service AgentService {
+  rpc Session(stream AgentReport) returns (stream AgentCommand);
 }

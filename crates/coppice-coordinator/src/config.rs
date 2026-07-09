@@ -100,10 +100,10 @@ pub(crate) struct ListenConfig {
     #[serde(default = "default_raft_addr")]
     pub(crate) raft_addr: SocketAddr,
 
-    /// Agent heartbeat and report address. Parsed now; the agent gateway that
-    /// binds it is a later change.
+    /// Agent heartbeat and report address: the dedicated mTLS listener the
+    /// agent gateway binds for `coppice.agent.v1.AgentService` sessions
+    /// (ADR 0009/0011).
     #[serde(default = "default_agent_addr")]
-    #[allow(dead_code)]
     pub(crate) agent_addr: SocketAddr,
 
     /// The hostname peers and agents dial. No default: `0.0.0.0` binds are

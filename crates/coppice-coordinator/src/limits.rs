@@ -29,16 +29,20 @@ pub const AGENT_INBOUND_CAPACITY: usize = 8192;
 /// Router -> one outbound queue per session ("agent outbound" row).
 ///
 /// `try_send`; on full the session is DISCONNECTED (idempotent commands plus
-/// ADR 0009 reconciliation heal the reconnect). No transport exists yet to
-/// actually open a session (`tasks::agent_gateway::run_session`), so this
-/// isn't wired into a live channel construction today.
-#[allow(dead_code)]
+/// ADR 0009 reconciliation heal the reconnect).
 pub const AGENT_OUTBOUND_CAPACITY: usize = 256;
 
 /// Dispatch/ingestion -> session manager ("command router" row).
 ///
 /// `send().await`; producers are leader-only loops that tolerate this backpressure.
 pub const COMMAND_ROUTER_CAPACITY: usize = 1024;
+
+/// Per-session pump tasks -> session manager (session open/close registrations).
+///
+/// Not a channel-inventory row: the manager's own small control inbox, sized
+/// like the other control channels. `send().await`; the producers are the
+/// per-session pump tasks, which tolerate this backpressure.
+pub const SESSION_CONTROL_CAPACITY: usize = 64;
 
 /// Client -> event fanout subscribe requests (not itself a channel-inventory row).
 ///
@@ -57,3 +61,13 @@ pub const FANOUT_RING_MAX_AGE: Duration = Duration::from_secs(3600);
 
 /// Housekeeping tick cadence (ADR 0012 / ADR 0017).
 pub const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Agent-liveness deadline before the leader proposes `DeclareNodeLost`
+/// (ADR 0009 health monitor).
+///
+/// A node whose last report is older than this and that is still schedulable
+/// or holds live allocations is declared lost. This is documented as
+/// replicated policy in `docs/operations/configuration.md` ("Agent-liveness /
+/// allocation-lost deadlines") and will migrate into `PolicyConfig` later; a
+/// node-local constant keeps `coppice-state` frozen for now.
+pub const AGENT_LIVENESS_DEADLINE: Duration = Duration::from_secs(90);

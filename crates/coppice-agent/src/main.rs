@@ -11,16 +11,68 @@
 //! fencing token before being acted on. See
 //! `docs/protocols/agent-coordinator.md` and `docs/operations/failure-handling.md`.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use coppice_agent::config;
+use coppice_agent::executor::DockerExecutor;
+use coppice_agent::journal::Journal;
+use coppice_agent::session::{run, Session};
+use coppice_consensus::fs::RealFs;
+use coppice_proto::pb::core::v1 as pbcore;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    tracing::info!("coppice-agent starting (skeleton)");
+    let config_path = parse_args()?;
+    let config = config::load(&config_path)?;
+    config.log_effective();
 
-    // TODO: load config, register with the coordinator, recover local durable
-    // state, reconcile running containers, and enter the heartbeat/execute loop.
-    Ok(())
+    // The journal lives directly under the data directory; anchor RealFs there.
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
+    let fs = RealFs::new(config.data_dir.clone());
+    let (journal, state) = Journal::open(fs).context("recovering the agent journal")?;
+
+    let labels: Vec<pbcore::Label> = config
+        .labels
+        .iter()
+        .map(|(key, value)| pbcore::Label {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect();
+
+    let session = Session::new(
+        config.node(),
+        config.capacity_resources(),
+        labels,
+        journal,
+        state,
+        DockerExecutor::new(),
+    );
+
+    tracing::info!("coppice-agent started; entering the session loop");
+    run(session, &config).await
+}
+
+/// Parse the tiny CLI surface by hand (clap is not a dependency): `--config
+/// <path>` is the only flag.
+fn parse_args() -> Result<std::path::PathBuf> {
+    let mut args = std::env::args().skip(1);
+    let mut config_path = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                config_path = Some(
+                    args.next()
+                        .context("--config requires a path argument")?
+                        .into(),
+                );
+            }
+            other => bail!("unexpected argument {other:?}; usage: coppice-agent --config <path>"),
+        }
+    }
+    config_path.context("missing required --config <path>")
 }

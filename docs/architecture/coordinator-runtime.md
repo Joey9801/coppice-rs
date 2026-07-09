@@ -128,8 +128,15 @@ followers, which is what lets followers serve reads and event streams.
    [command-catalog.md](command-catalog.md#the-agent-report-ingestion-boundary):
    fencing check, dedupe by `(AttemptId, attempt_state)`, timestamping, and
    the ObservedSet diff — then `propose` (`RecordAttempt*`, `ReconcileNode`,
-   `RegisterNode`, `DeclareNodeLost`). It ignores benign apply rejections
-   (`StaleAttemptState` and the like) rather than treating them as failures.
+   `RegisterNode`). It ignores benign apply rejections (`StaleAttemptState`
+   and the like) rather than treating them as failures. Two side effects
+   ride alongside the proposals: *stop* verdicts are routed straight to the
+   session (never the log), and a successful `RegisterNode` is followed —
+   after a read-your-writes barrier on its log index — by the
+   `RegisterAccepted` command that hands the agent its fresh epoch
+   ([ADR 0009](../decisions/0009-fencing-and-reconciliation.md) step 2). It
+   also marks node liveness (a shared map, not a channel) for the health
+   monitor in housekeeping.
 
 7. **Dispatch loop** (leader-only). Consumes the event stream. On an attempt
    reaching `Ready` it proposes `DispatchAttempt`, and **only after that
@@ -162,6 +169,14 @@ followers, which is what lets followers serve reads and event streams.
    sealed segments are deletable only once a snapshot covers them). Duplicate
    history writes across a leader change are harmless (idempotent by job id);
    duplicate evict proposals are absorbed by apply (missing ids are skipped).
+   The same tick is the **leader health monitor** of
+   [command-catalog.md](command-catalog.md#declarenodelost): it seeds the
+   liveness map on gaining leadership (grace) and proposes `DeclareNodeLost`
+   for any node silent past `AGENT_LIVENESS_DEADLINE` that is still
+   schedulable or holds live allocations (the guard that stops re-declaring
+   an already-lost node every tick). The deadline is a node-local constant
+   today; [configuration.md](../operations/configuration.md) records it as
+   replicated policy, where it migrates once the policy schema grows it.
 
 10. **Snapshot builder.** Serializes the `Arc`'d state handed out by the
     apply task and writes it through the storage layer, keeping CPU and IO
@@ -322,6 +337,7 @@ full" is the crux: it is what makes the blocking graph acyclic.
 | agent inbound | session tasks → ingestion | mpsc (shared) | 8192 | **await** ⇒ the session stops reading its socket ⇒ TCP backpressure to the agent. Never touches apply. |
 | agent outbound | router → per-session | mpsc | 256 | **`try_send`; on full DISCONNECT the session** — commands are idempotent and reconciliation ([ADR 0009](../decisions/0009-fencing-and-reconciliation.md) ObservedSet) heals on reconnect |
 | command router | dispatch/ingestion → session manager | mpsc | 1024 | **await** (producers are leader-only loops that tolerate backpressure) |
+| session control | session accept/close → session manager | mpsc | 64 | **await** (open/close notifications from per-session tasks; tiny and bursty, never on the apply path) |
 | view / status / shutdown watch | various | watch | latest-value | **overwrite** (lossy by design, latest wins) |
 
 ### Deadlock-freedom

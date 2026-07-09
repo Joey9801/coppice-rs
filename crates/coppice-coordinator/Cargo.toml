@@ -20,6 +20,7 @@ path = "src/main.rs"
 coppice-core.workspace = true
 coppice-proto.workspace = true
 coppice-raft-net.workspace = true
+coppice-agent-net.workspace = true
 coppice-state.workspace = true
 coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
@@ -27,6 +28,9 @@ coppice-api.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
+# Wraps the per-session outbound mpsc as a `Stream` for the tonic bidi
+# response half of the agent session RPC (`coppice.agent.v1.AgentService`).
+tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 # `json` (not in the workspace default feature set) backs the config's
@@ -39,6 +43,9 @@ humantime-serde.workspace = true
 # `Uuid` needs the "serde" feature (not part of the workspace default) to
 # deserialize `cluster_id` from the config file's hyphenated string form.
 uuid = { workspace = true, features = ["serde"] }
+# Parses the agent's mTLS client-leaf certificate to enforce CN == NodeId at
+# session accept (ADR 0011); see `tasks::agent_gateway`.
+x509-parser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -46,6 +53,10 @@ tempfile.workspace = true
 # the multi-node integration test drives (ADR 0011). Dev-only: production nodes
 # read PEM material from disk (config `[tls]`), never mint it.
 rcgen.workspace = true
+# The real node agent (lib): its `Session` runner, `FakeExecutor`, and journal
+# drive the end-to-end agent↔coordinator reconciliation protocol test
+# (`tests/agent_protocol.rs`) against the live coordinator runtime.
+coppice-agent.workspace = true
 
 [lints]
 workspace = true

@@ -7,6 +7,11 @@
 //! exposes the same lifecycle a running daemon has (graceful stop, abrupt
 //! kill, restart-from-disk). No production code mints certificates or picks
 //! ports — that all lives here.
+//!
+//! `dead_code` is allowed module-wide: `common` is shared across the test
+//! binaries (`cluster`, `agent_protocol`), and each uses a different slice of
+//! the harness, so items unused in one binary are not truly dead.
+#![allow(dead_code)]
 
 use std::future::Future;
 use std::net::TcpListener;
@@ -19,11 +24,14 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use tempfile::TempDir;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use coppice_consensus::{ClusterSummary, ConsensusStatus, OpenraftConsensus, StateViews};
-use coppice_coordinator::bootstrap::{self, BootedCoordinator};
+use coppice_consensus::{
+    ClusterSummary, Consensus, ConsensusStatus, NodeHandle, OpenraftConsensus, StateViews,
+};
+use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator};
 use coppice_coordinator::config::{self, CliOverrides};
 
 /// A test CA plus one issued leaf's PEM material.
@@ -65,13 +73,20 @@ impl Ca {
     /// and the admin client presents one too, so each leaf carries both EKUs.
     /// SANs cover `localhost` and `127.0.0.1` so either dial form validates.
     pub fn leaf(&self) -> Leaf {
+        self.leaf_with_cn("coppice-test-node")
+    }
+
+    /// Issue a leaf as [`Ca::leaf`] but with an explicit subject `cn`.
+    ///
+    /// The agent gateway parses the client leaf's CN and compares it against
+    /// the claimed NodeId at session accept (ADR 0011), so the agent's client
+    /// certificate must carry its node UUID string as its CN.
+    pub fn leaf_with_cn(&self, cn: &str) -> Leaf {
         let key = KeyPair::generate().expect("generate leaf key pair");
         let mut params =
             CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
                 .expect("leaf params");
-        params
-            .distinguished_name
-            .push(DnType::CommonName, "coppice-test-node");
+        params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
@@ -213,7 +228,6 @@ log_level = "warn"
     }
 
     pub fn status_rx(&self) -> watch::Receiver<ConsensusStatus> {
-        use coppice_consensus::Consensus;
         self.booted().consensus.status()
     }
 
@@ -296,6 +310,164 @@ where
             panic!("timed out after {deadline:?} waiting for: {label}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A single bootstrapped coordinator replica **with its agent-facing task
+/// runtime running** — what the agent↔coordinator protocol test drives.
+///
+/// [`Node`] boots `bootstrap::bootstrap` but stops there (the multi-node test
+/// only needs consensus + the Raft/admin transport). This wrapper goes one step
+/// further: it binds the agent gateway's mTLS listener on its own free port
+/// (via [`AgentListener::bind`]) and runs `bootstrap::serve_runtime` — ingestion,
+/// dispatch, the scheduler driver, and the agent session server — under a
+/// caller-owned shutdown watch, so a test can boot it, drive a real agent
+/// against `agent_endpoint`, and tear it down without raising a signal.
+pub struct RunningCoordinator {
+    /// Owns the tempdir (certs, config, data dir); kept alive for the run.
+    _dir: TempDir,
+    /// The shared consensus seam — propose commands here.
+    pub consensus: Arc<OpenraftConsensus>,
+    /// Published read views of applied state.
+    pub views: StateViews,
+    /// `localhost:PORT` the agent dials for its `AgentService` session.
+    pub agent_endpoint: String,
+    runtime_shutdown: watch::Sender<bool>,
+    runtime_join: JoinHandle<anyhow::Result<()>>,
+    handle: NodeHandle,
+    raft_server_shutdown: Option<oneshot::Sender<()>>,
+    raft_server: JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl RunningCoordinator {
+    /// Lay down a fresh single-node cluster (bootstrap intent) and start its
+    /// full agent-facing runtime. The Raft/admin transport and the agent
+    /// gateway each get their own free localhost port so several can run in one
+    /// test process in parallel.
+    pub async fn start(cluster_id: Uuid, ca: &Ca) -> RunningCoordinator {
+        let raft_port = free_port();
+        let agent_port = free_port();
+        let dir = tempfile::tempdir().expect("create coordinator tempdir");
+        let root = dir.path();
+
+        // One leaf serves the Raft/admin transport AND the agent gateway (both
+        // reuse the node's identity, ADR 0011).
+        let leaf = ca.leaf();
+        let cert_path = root.join("node.crt");
+        let key_path = root.join("node.key");
+        let ca_path = root.join("ca.crt");
+        std::fs::write(&cert_path, &leaf.cert_pem).expect("write cert");
+        std::fs::write(&key_path, &leaf.key_pem).expect("write key");
+        std::fs::write(&ca_path, &ca.pem).expect("write ca");
+
+        let data_dir = root.join("data");
+        let config_path = root.join("coordinator.toml");
+        let toml = format!(
+            r#"node_id = 1
+cluster_id = "{cluster_id}"
+data_dir = "{data_dir}"
+peers = []
+
+[listen]
+raft_addr = "127.0.0.1:{raft_port}"
+advertise_host = "localhost"
+
+[raft]
+election_timeout = "300ms"
+heartbeat_interval = "100ms"
+rpc_timeout = "2s"
+snapshot_log_entries = 32
+snapshot_keep_log_entries = 0
+
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ca_path = "{ca}"
+
+[observability]
+log_level = "warn"
+"#,
+            data_dir = data_dir.display(),
+            cert = cert_path.display(),
+            key = key_path.display(),
+            ca = ca_path.display(),
+        );
+        std::fs::write(&config_path, toml).expect("write config");
+
+        let resolved = config::load(
+            &config_path,
+            CliOverrides {
+                bootstrap: true,
+                join: false,
+            },
+        )
+        .expect("load coordinator config");
+
+        let BootedCoordinator {
+            consensus,
+            views,
+            event_tap,
+            handle,
+            raft_server_shutdown,
+            raft_server,
+        } = bootstrap::bootstrap(resolved)
+            .await
+            .expect("bootstrap coordinator");
+
+        // Bind the agent gateway listener on our own free port (bootstrap
+        // itself never binds it — only the daemon `run` path does).
+        let agent_addr = format!("127.0.0.1:{agent_port}")
+            .parse()
+            .expect("agent socket addr");
+        let listener = AgentListener::bind(agent_addr, &leaf.cert_pem, &leaf.key_pem, &ca.pem)
+            .expect("bind agent listener");
+
+        let (runtime_shutdown, shutdown_rx) = watch::channel(false);
+        let runtime_join = tokio::spawn(bootstrap::serve_runtime(
+            Arc::clone(&consensus),
+            views.clone(),
+            event_tap,
+            listener,
+            Some(shutdown_rx),
+        ));
+
+        RunningCoordinator {
+            _dir: dir,
+            consensus,
+            views,
+            agent_endpoint: format!("localhost:{agent_port}"),
+            runtime_shutdown,
+            runtime_join,
+            handle,
+            raft_server_shutdown: Some(raft_server_shutdown),
+            raft_server,
+        }
+    }
+
+    pub fn consensus(&self) -> Arc<OpenraftConsensus> {
+        Arc::clone(&self.consensus)
+    }
+
+    pub fn views(&self) -> StateViews {
+        self.views.clone()
+    }
+
+    pub fn is_leader(&self) -> bool {
+        self.consensus.status().borrow().role.is_leader()
+    }
+
+    /// Ordered teardown mirroring the daemon shutdown tail: drain the task
+    /// runtime (agent + leader loops), then the Raft/admin transport, then
+    /// consensus.
+    pub async fn shutdown(mut self) {
+        let _ = self.runtime_shutdown.send(true);
+        let _ = self.runtime_join.await;
+        if let Some(tx) = self.raft_server_shutdown.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.raft_server.await;
+        let _ = self.handle.shutdown().await;
+        drop(self.consensus);
     }
 }
 

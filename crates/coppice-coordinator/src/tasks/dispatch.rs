@@ -17,9 +17,11 @@ use tokio::sync::watch;
 use coppice_consensus::{Applied, Consensus, ConsensusStatus, StateViews};
 use coppice_core::attempt::AttemptState;
 use coppice_core::id::{AllocationId, AttemptId, NodeId};
-use coppice_proto::pb::agent::v1::AgentCommand;
+use coppice_proto::pb::agent::v1::{
+    agent_command, AgentCommand, RegisterAccepted, StartJob, StopJob,
+};
 use coppice_state::command::DispatchAttempt;
-use coppice_state::{AllocationRecord, AttemptRecord, Command, Event};
+use coppice_state::{AllocationRecord, AttemptRecord, Command, Event, JobRecord};
 
 use crate::leadership;
 use crate::tasks::agent_gateway::{RouteCommand, RouterHandle};
@@ -91,7 +93,7 @@ async fn handle_event<C: Consensus>(
             dispatch_ready_attempt(consensus, views, router, *attempt).await;
         }
         Event::StopRequested { node, allocation } => {
-            route_stop(router, *node, *allocation).await;
+            route_stop(router, views, *node, *allocation).await;
         }
         _ => {}
     }
@@ -132,7 +134,7 @@ async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &R
         .map(|record| (record.attempt.node, record.attempt.allocation))
         .collect();
     for (node, allocation) in pending_aborts {
-        route_stop(router, node, allocation).await;
+        route_stop(router, views, node, allocation).await;
     }
 }
 
@@ -159,8 +161,14 @@ async fn dispatch_ready_attempt<C: Consensus>(
             let Some(allocation) = view.state().allocations.get(&record.attempt.allocation) else {
                 return;
             };
+            let Some(job) = view.state().jobs.get(&record.attempt.job) else {
+                // Racing eviction: the job vanished before we could build its
+                // StartJob. Reconciliation heals any container that slips out.
+                tracing::warn!(?attempt, "dispatch: job record missing, skipping StartJob");
+                return;
+            };
             let node = record.attempt.node;
-            let agent_command = start_job_command(record, allocation);
+            let agent_command = start_job_command(job, record, allocation);
             if router
                 .send(RouteCommand {
                     node,
@@ -187,28 +195,67 @@ async fn dispatch_ready_attempt<C: Consensus>(
     }
 }
 
-async fn route_stop(router: &RouterHandle, node: NodeId, allocation: AllocationId) {
-    let command = stop_job_command(allocation);
+async fn route_stop(
+    router: &RouterHandle,
+    views: &StateViews,
+    node: NodeId,
+    allocation: AllocationId,
+) {
+    let grace_us = views.latest().state().policy.abort_grace_us;
+    let command = stop_job_command(allocation, grace_us);
     if router.send(RouteCommand { node, command }).await.is_err() {
         tracing::warn!(?allocation, "dispatch: router channel closed");
     }
 }
 
-/// Build the `StartJob` proto command for a freshly-dispatched attempt.
+/// Build the header-less `StartJob` command for a freshly-dispatched attempt.
 ///
-/// Deferred: the payload (image, resource limits, `max_runtime_us`) needs
-/// the job/allocation domain -> proto mapping
-/// (`docs/architecture/command-catalog.md#dispatchattempt`). The ordering
-/// and channel plumbing around this call are real.
-fn start_job_command(_attempt: &AttemptRecord, _allocation: &AllocationRecord) -> AgentCommand {
-    todo!("StartJob AgentCommand construction (command-catalog.md#dispatchattempt)")
+/// `header: None` — the session manager stamps the fencing token as it routes
+/// (`docs/architecture/command-catalog.md#dispatchattempt`). The `limits` are
+/// the allocation's requested vector; `max_runtime_us` rides straight from the
+/// job spec (absent = unbounded).
+pub(crate) fn start_job_command(
+    job: &JobRecord,
+    attempt: &AttemptRecord,
+    allocation: &AllocationRecord,
+) -> AgentCommand {
+    AgentCommand {
+        header: None,
+        body: Some(agent_command::Body::StartJob(StartJob {
+            allocation: Some(allocation.allocation.id.into()),
+            attempt: Some(attempt.attempt.id.into()),
+            job: Some(job.spec.id.into()),
+            image: job.spec.image.clone(),
+            limits: Some((&allocation.allocation.requested).into()),
+            max_runtime_us: job.spec.max_runtime_us,
+        })),
+    }
 }
 
-/// Build the `StopJob` proto command for an allocation.
+/// Build the header-less `StopJob` command for an allocation.
 ///
-/// Deferred: `grace_us` comes from the replicated policy's `abort_grace_us`.
-fn stop_job_command(_allocation: AllocationId) -> AgentCommand {
-    todo!("StopJob AgentCommand construction (grace_us from replicated policy)")
+/// `grace_us` is the replicated policy's `abort_grace_us` at the call site;
+/// `header: None` — the manager stamps the token as it routes.
+pub(crate) fn stop_job_command(allocation: AllocationId, grace_us: i64) -> AgentCommand {
+    AgentCommand {
+        header: None,
+        body: Some(agent_command::Body::StopJob(StopJob {
+            allocation: Some(allocation.into()),
+            grace_us,
+        })),
+    }
+}
+
+/// Build the header-less `RegisterAccepted` command (ADR 0009 step 2).
+///
+/// The body is empty; the fresh fencing token rides in the header the manager
+/// stamps, which is exactly how the agent adopts its new epoch before
+/// reporting its ObservedSet.
+pub(crate) fn register_accepted_command() -> AgentCommand {
+    AgentCommand {
+        header: None,
+        body: Some(agent_command::Body::RegisterAccepted(RegisterAccepted {})),
+    }
 }
 
 fn now_us() -> i64 {
@@ -217,4 +264,126 @@ fn now_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coppice_core::allocation::AllocationState;
+    use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
+    use coppice_core::resource::Resources;
+
+    use crate::test_support::{allocation_record, attempt_record, job_record};
+
+    fn requested() -> Resources {
+        Resources {
+            cpu_millis: 500,
+            memory_bytes: 1 << 20,
+            disk_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn start_job_command_maps_every_field() {
+        let job_id = JobId::new();
+        let attempt_id = AttemptId::new();
+        let alloc_id = AllocationId::new();
+        let node = NodeId::new();
+
+        let job = job_record(job_id, "registry/img:1", requested(), Some(1_234));
+        let attempt = attempt_record(
+            attempt_id,
+            job_id,
+            alloc_id,
+            node,
+            AttemptState::Ready,
+            None,
+        );
+        let allocation = allocation_record(
+            alloc_id,
+            job_id,
+            attempt_id,
+            node,
+            requested(),
+            AllocationState::Funded,
+        );
+
+        let command = start_job_command(&job, &attempt, &allocation);
+        // The manager stamps the header on the way out.
+        assert!(command.header.is_none());
+        let agent_command::Body::StartJob(sj) = command.body.expect("body") else {
+            panic!("expected StartJob");
+        };
+        assert_eq!(
+            AllocationId::try_from(sj.allocation.unwrap()).unwrap(),
+            alloc_id
+        );
+        assert_eq!(
+            AttemptId::try_from(sj.attempt.unwrap()).unwrap(),
+            attempt_id
+        );
+        assert_eq!(JobId::try_from(sj.job.unwrap()).unwrap(), job_id);
+        assert_eq!(sj.image, "registry/img:1");
+        assert_eq!(
+            Resources::try_from(sj.limits.unwrap()).unwrap(),
+            requested()
+        );
+        assert_eq!(sj.max_runtime_us, Some(1_234));
+    }
+
+    #[test]
+    fn start_job_command_carries_absent_max_runtime() {
+        let job_id = JobId::new();
+        let attempt_id = AttemptId::new();
+        let alloc_id = AllocationId::new();
+        let node = NodeId::new();
+        let job = job_record(job_id, "img", requested(), None);
+        let attempt = attempt_record(
+            attempt_id,
+            job_id,
+            alloc_id,
+            node,
+            AttemptState::Ready,
+            None,
+        );
+        let allocation = allocation_record(
+            alloc_id,
+            job_id,
+            attempt_id,
+            node,
+            requested(),
+            AllocationState::Funded,
+        );
+
+        let command = start_job_command(&job, &attempt, &allocation);
+        let agent_command::Body::StartJob(sj) = command.body.expect("body") else {
+            panic!("expected StartJob");
+        };
+        assert_eq!(sj.max_runtime_us, None);
+    }
+
+    #[test]
+    fn stop_job_command_carries_allocation_and_grace() {
+        let alloc_id = AllocationId::new();
+        let command = stop_job_command(alloc_id, 30_000_000);
+        assert!(command.header.is_none());
+        let agent_command::Body::StopJob(sj) = command.body.expect("body") else {
+            panic!("expected StopJob");
+        };
+        assert_eq!(
+            AllocationId::try_from(sj.allocation.unwrap()).unwrap(),
+            alloc_id
+        );
+        assert_eq!(sj.grace_us, 30_000_000);
+    }
+
+    #[test]
+    fn register_accepted_command_is_an_empty_body() {
+        let command = register_accepted_command();
+        assert!(command.header.is_none());
+        assert!(matches!(
+            command.body,
+            Some(agent_command::Body::RegisterAccepted(_))
+        ));
+    }
 }
