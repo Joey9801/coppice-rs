@@ -4,7 +4,7 @@
 //! the network seam it drives them through. The [`client`] side implements
 //! openraft's [`RaftNetworkFactory`](openraft::network::RaftNetworkFactory) and
 //! [`RaftNetwork`](openraft::network::RaftNetwork) over the generated tonic gRPC
-//! stubs (`coppice-raft-net`); the [`server`] side implements the generated
+//! stubs (`coppice-net`); the [`server`] side implements the generated
 //! service trait over the local [`Raft`](openraft::Raft) handle.
 //!
 //! Two invariants run through both sides:

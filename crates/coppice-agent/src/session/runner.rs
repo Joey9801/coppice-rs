@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::executor::Executor;
 use crate::session::Session;
 
-use coppice_agent_net::session::Client;
+use coppice_net::session::Client;
 
 /// Metadata key a follower uses to point the agent at the current leader.
 const LEADER_HINT: &str = "x-coppice-leader-hint";

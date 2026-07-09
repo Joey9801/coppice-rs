@@ -33,7 +33,7 @@ use coppice_agent::config::{CapacityConfig, Config, TlsConfig};
 use coppice_agent::executor::{ExitInfo, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{run, Session};
-use coppice_agent_net::session::{AgentService, Server as AgentServiceServer};
+use coppice_net::session::{AgentService, Server as AgentServiceServer};
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, StateViews};
 use coppice_core::attempt::{AttemptOutcome, AttemptState};

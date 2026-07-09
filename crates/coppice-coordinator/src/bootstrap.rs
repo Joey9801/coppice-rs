@@ -23,7 +23,7 @@ use coppice_consensus::{
     Applied, Consensus, ConsensusError, ConsensusStatus, CoordinatorId, EventTapReceiver,
     NodeHandle, NodeOptions, NodeTls, OpenraftConsensus, StartIntent, StartedNode, StateViews,
 };
-use coppice_raft_net::admin::Server as AdminServer;
+use coppice_net::admin::Server as AdminServer;
 use coppice_state::Command;
 
 use crate::admin::AdminService;

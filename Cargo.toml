@@ -3,8 +3,7 @@ resolver = "2"
 members = [
     "crates/coppice-core",
     "crates/coppice-proto",
-    "crates/coppice-raft-net",
-    "crates/coppice-agent-net",
+    "crates/coppice-net",
     "crates/coppice-state",
     "crates/coppice-consensus",
     "crates/coppice-scheduler",
@@ -27,8 +26,7 @@ authors = ["The Coppice Authors"]
 # Internal crates
 coppice-core = { path = "crates/coppice-core" }
 coppice-proto = { path = "crates/coppice-proto" }
-coppice-raft-net = { path = "crates/coppice-raft-net" }
-coppice-agent-net = { path = "crates/coppice-agent-net" }
+coppice-net = { path = "crates/coppice-net" }
 coppice-agent = { path = "crates/coppice-agent" }
 coppice-state = { path = "crates/coppice-state" }
 coppice-consensus = { path = "crates/coppice-consensus" }

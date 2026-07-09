@@ -51,7 +51,7 @@ pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
 ///
 /// Re-exported so the coordinator names the concrete tonic service without
 /// depending on the `net` module's internals.
-pub use coppice_raft_net::transport::Server as RaftTransportServer;
+pub use coppice_net::transport::Server as RaftTransportServer;
 /// The handler the transport server wraps (built by [`start`]).
 pub use net::RaftTransportHandler;
 

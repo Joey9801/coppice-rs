@@ -19,8 +19,7 @@ path = "src/main.rs"
 [dependencies]
 coppice-core.workspace = true
 coppice-proto.workspace = true
-coppice-raft-net.workspace = true
-coppice-agent-net.workspace = true
+coppice-net.workspace = true
 coppice-state.workspace = true
 coppice-consensus.workspace = true
 coppice-scheduler.workspace = true

@@ -77,7 +77,7 @@ evolution follows [schema-style](../architecture/schema-style.md).
 ## The session, as implemented
 
 The transport is one long-lived tonic bidirectional stream per agent
-(`coppice.agent.v1.AgentService/Session`, stubs in `coppice-agent-net`),
+(`coppice.agent.v1.AgentService/Session`, stubs in `coppice-net`),
 served over mTLS (ADR 0011) on the coordinator's dedicated agent listener.
 Sessions terminate on the leader only: a follower refuses with
 `FAILED_PRECONDITION` and, when it knows one, a leader hint in the

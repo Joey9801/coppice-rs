@@ -30,7 +30,7 @@ use tokio_stream::StreamExt;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 
-use coppice_agent_net::session::AgentService;
+use coppice_net::session::AgentService;
 use coppice_consensus::{ConsensusStatus, Role, StateViews};
 use coppice_core::id::NodeId;
 use coppice_proto::pb::agent::v1::{AgentCommand, AgentReport, CommandHeader, FencingToken};

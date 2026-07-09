@@ -19,7 +19,7 @@ path = "src/main.rs"
 [dependencies]
 coppice-core.workspace = true
 coppice-proto.workspace = true
-coppice-agent-net.workspace = true
+coppice-net.workspace = true
 # The filesystem seam (`coppice_consensus::fs`) only: the journal is written
 # through it so the crash harness can hammer it (ADR 0009).
 coppice-consensus.workspace = true

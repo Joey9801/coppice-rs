@@ -36,7 +36,7 @@ use openraft::raft::{
 use openraft::{BasicNode, Snapshot, Vote};
 
 use coppice_proto::pb::raft::v1 as pb;
-use coppice_raft_net::transport::Client;
+use coppice_net::transport::Client;
 
 use crate::adapter::TypeConfig;
 use crate::storage::raftpb;

@@ -1,11 +1,13 @@
-//! Generates the tonic service glue for the coordinator Raft transport and
-//! membership admin surface (`coppice.raft.v1`, ADR 0002/0016).
+//! Generates the tonic service glue for every Coppice gRPC surface: the
+//! coordinator Raft transport and membership admin (`coppice.raft.v1`,
+//! ADR 0002/0016) and the agent↔coordinator session (`coppice.agent.v1`,
+//! ADR 0009/0011).
 //!
 //! Compiles the whole `proto/` corpus with `protox` (pure-Rust, no system
 //! `protoc`), exactly like `crates/coppice-proto/build.rs`, then hands the
 //! descriptor set to `tonic-build`. Every message package is `extern_path`ed
 //! to `coppice_proto::pb`, so prost regenerates none of the message types —
-//! the only output is the client/server code for the two services, which
+//! the only output is the client/server code for the services, which
 //! references the message types owned by `coppice-proto`.
 
 use std::error::Error;

@@ -1,6 +1,6 @@
 [package]
-name = "coppice-raft-net"
-description = "tonic service stubs for the coordinator Raft transport and membership admin surface."
+name = "coppice-net"
+description = "tonic service stubs for every Coppice gRPC surface: Raft transport, membership admin, and the agent session."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

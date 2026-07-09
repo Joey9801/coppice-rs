@@ -21,7 +21,7 @@ use tonic::{Request, Response, Status, Streaming};
 use openraft::{Raft, Snapshot};
 
 use coppice_proto::pb::raft::v1 as pb;
-use coppice_raft_net::transport::RaftTransportService;
+use coppice_net::transport::RaftTransportService;
 
 use crate::adapter::TypeConfig;
 use crate::storage::raftpb;

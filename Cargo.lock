@@ -473,9 +473,9 @@ name = "coppice-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "coppice-agent-net",
  "coppice-consensus",
  "coppice-core",
+ "coppice-net",
  "coppice-proto",
  "coppice-testkit",
  "crc32c",
@@ -491,18 +491,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "coppice-agent-net"
-version = "0.0.1"
-dependencies = [
- "coppice-proto",
- "prost",
- "prost-build",
- "protox",
- "tonic",
- "tonic-build",
 ]
 
 [[package]]
@@ -530,8 +518,8 @@ name = "coppice-consensus"
 version = "0.0.1"
 dependencies = [
  "coppice-core",
+ "coppice-net",
  "coppice-proto",
- "coppice-raft-net",
  "coppice-state",
  "coppice-testkit",
  "crc32c",
@@ -555,12 +543,11 @@ dependencies = [
  "anyhow",
  "clap",
  "coppice-agent",
- "coppice-agent-net",
  "coppice-api",
  "coppice-consensus",
  "coppice-core",
+ "coppice-net",
  "coppice-proto",
- "coppice-raft-net",
  "coppice-scheduler",
  "coppice-state",
  "humantime-serde",
@@ -587,6 +574,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "coppice-net"
+version = "0.0.1"
+dependencies = [
+ "coppice-proto",
+ "prost",
+ "prost-build",
+ "protox",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "coppice-proto"
 version = "0.0.1"
 dependencies = [
@@ -598,18 +597,6 @@ dependencies = [
  "protox",
  "thiserror 1.0.69",
  "uuid",
-]
-
-[[package]]
-name = "coppice-raft-net"
-version = "0.0.1"
-dependencies = [
- "coppice-proto",
- "prost",
- "prost-build",
- "protox",
- "tonic",
- "tonic-build",
 ]
 
 [[package]]

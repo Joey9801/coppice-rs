@@ -21,7 +21,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 use openraft::error::{InitializeError, RaftError};
 use openraft::{BasicNode, Config, Raft, SnapshotPolicy};
 
-use coppice_raft_net::transport::Server;
+use coppice_net::transport::Server;
 
 use crate::adapter::{OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY};
 use crate::events::{EventTap, EventTapReceiver};
