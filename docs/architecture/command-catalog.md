@@ -241,7 +241,10 @@ Replay safety follows from purity plus explicit idempotency points:
 - *Re-proposal* (the same logical fact proposed twice, e.g. across a leader
   change) is absorbed by monotonicity: duplicate attempt-progress commands
   reject as `StaleAttemptState`; duplicate `EvictTerminalJobs` entries skip
-  already-evicted ids; a duplicate `SubmitJob` rejects as `DuplicateJob`.
+  already-evicted ids; a duplicate `SubmitJob` with the identical spec is an
+  accepted no-op — the job id is client-minted and is the submission's
+  idempotency identity (ADR 0026), so this same point also absorbs a
+  *client retry* after an unknown outcome, not just command re-proposal.
   Every duplicate resolves to a *rejection or no-op that is itself
   deterministic*, so replicas agree on the non-effect.
 
@@ -274,10 +277,10 @@ cluster-version 1.
 | | |
 | --- | --- |
 | Proposer | API layer, after synchronous admission checks |
-| Payload | `job: Job` (id, image, `requests: Resources`, `priority: i32`, `max_runtime_us: optional uint64`, `quota_entity: QuotaEntityId`, `retry: RetryPolicy { max_retries: u32, retry_user_errors: bool }`), `multiplier: PriorityMultiplier` (Q32.32 — the API resolves the user's `priority` through the replicated multiplier table at proposal time; apply never sees the raw `i32` in arithmetic, per ADR 0019), `submitted_at_us` |
-| Validation | `job.id` not present in state (including terminal jobs not yet evicted); `quota_entity` exists; `abort_requested` unset |
+| Payload | `job: Job` (id — **client-minted**, the submission's idempotency identity per ADR 0026 —, image, `requests: Resources`, `priority: i32`, `max_runtime_us: optional uint64`, `quota_entity: QuotaEntityId`, `retry: RetryPolicy { max_retries: u32, retry_user_errors: bool }`), `multiplier: PriorityMultiplier` (Q32.32 — the API resolves the user's `priority` through the replicated multiplier table at proposal time; apply never sees the raw `i32` in arithmetic, per ADR 0019), `submitted_at_us` |
+| Validation | `abort_requested` unset. If `job.id` is already in state (including terminal jobs not yet evicted): identical client-supplied spec → **accepted no-op** (idempotent resubmission, no events — the retryer observes success and the original job); different spec → `SubmitSpecMismatch`. Otherwise `quota_entity` exists. |
 | Apply effects | Insert the job record; walk `Submitted → Accepted → Queued` in this one apply (admission is synchronous in v1 — the intermediate states exist for observability and appear as distinct events). No quota charge: cost is charged at placement, not submission. |
-| Rejections | `DuplicateJob`, `UnknownQuotaEntity`, `InvalidCommand` (pre-set abort flag) |
+| Rejections | `SubmitSpecMismatch`, `UnknownQuotaEntity`, `InvalidCommand` (pre-set abort flag) |
 
 #### `AbortJob`
 
@@ -436,7 +439,8 @@ cluster-version 1.
 | Reason | Meaning |
 | --- | --- |
 | `UnknownJob` / `UnknownNode` / `UnknownAttempt` / `UnknownAllocation` / `UnknownQuotaEntity` | Referenced entity not in state |
-| `DuplicateJob` / `DuplicateAttempt` / `DuplicateAllocation` | Proposer-minted id already exists |
+| `DuplicateAttempt` / `DuplicateAllocation` | Proposer-minted id already exists |
+| `SubmitSpecMismatch` | Client-minted job id reused with a different spec (an identical spec is an accepted no-op, ADR 0026) |
 | `JobTerminal` | Job already reached a terminal state |
 | `JobNotQueued` | Placement target isn't `Queued` |
 | `JobNotTerminal` | Eviction listed a live job |

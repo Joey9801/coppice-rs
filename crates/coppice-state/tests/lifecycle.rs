@@ -1094,15 +1094,16 @@ fn submit_validates_identity_and_entity() {
         &mut sm,
         submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
     );
+    // Same client-minted id, different spec: a distinct intent, rejected.
     assert_eq!(
         sm.apply(&submit_cmd(
             jid(1),
-            cpu(1_000),
+            cpu(2_000),
             None,
             RetryPolicy::default()
         ))
         .unwrap_err(),
-        RejectionReason::DuplicateJob(jid(1))
+        RejectionReason::SubmitSpecMismatch(jid(1))
     );
     let mut cmd = submit_cmd(jid(2), cpu(1_000), None, RetryPolicy::default());
     if let Command::SubmitJob(ref mut s) = cmd {
@@ -1112,6 +1113,54 @@ fn submit_validates_identity_and_entity() {
         sm.apply(&cmd).unwrap_err(),
         RejectionReason::UnknownQuotaEntity(qid(404))
     );
+}
+
+/// The job id is the submission's idempotency identity (ADR 0026, KOI-2): an
+/// identical resubmission — a client retry after an unknown outcome, or a
+/// re-proposal across a leader change — is an accepted no-op with no events,
+/// so the retrying client observes success and the original job.
+#[test]
+fn identical_resubmission_is_an_accepted_no_op() {
+    let mut sm = setup();
+    let cmd = submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default());
+    apply_ok(&mut sm, cmd.clone());
+    let mut expected = sm.clone();
+
+    let applied = apply_ok(&mut sm, cmd.clone());
+    assert_eq!(applied.events, vec![], "a repeat must not re-emit events");
+    // Only the applied-entry counter moves; the job record is untouched.
+    expected.version += 1;
+    assert_eq!(sm, expected);
+
+    // A different `submitted_at_us` (a retry re-stamps it) and multiplier are
+    // not identity: the original commit's values stay authoritative.
+    let mut restamped = cmd.clone();
+    if let Command::SubmitJob(ref mut s) = restamped {
+        s.submitted_at_us += 1_000_000;
+    }
+    apply_ok(&mut sm, restamped);
+    expected.version += 1;
+    assert_eq!(sm, expected);
+}
+
+/// The idempotent repeat holds for the job's whole residence in replicated
+/// state — after an abort mutated the record and after the job went terminal
+/// — because `abort_requested` and lifecycle state are apply-owned, not
+/// submission identity.
+#[test]
+fn resubmission_stays_idempotent_after_abort_and_terminal_state() {
+    let mut sm = setup();
+    let cmd = submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default());
+    apply_ok(&mut sm, cmd.clone());
+    // Queued job: abort is immediate and terminal.
+    apply_ok(&mut sm, abort_cmd(jid(1), TS));
+    assert!(sm.jobs[&jid(1)].state.is_terminal());
+
+    let mut expected = sm.clone();
+    let applied = apply_ok(&mut sm, cmd);
+    assert_eq!(applied.events, vec![]);
+    expected.version += 1;
+    assert_eq!(sm, expected);
 }
 
 #[test]

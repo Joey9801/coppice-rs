@@ -13,8 +13,18 @@ import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
 import "coppice/core/v1/resource.proto";
 
-// Submit a new job. The API mints the JobId, resolves `priority` through
-// the replicated multiplier table, and proposes SubmitJob.
+// Submit a new job. The client mints the JobId, the API resolves
+// `priority` through the replicated multiplier table and proposes
+// SubmitJob.
+//
+// The client-minted `job` id is the submission's idempotency identity
+// (ADR 0026): retrying after a timeout, connection loss, or leader change
+// re-sends the identical request, and a repeat whose first attempt already
+// committed resolves to the same job — success with the original JobId,
+// never a second job. Reusing an id with a *different* payload is rejected.
+// The deduplication window is the job's residence in replicated state:
+// from the original commit until the terminal record is evicted per the
+// retention policy (ADR 0012).
 message SubmitJobRequest {
   string image = 1;
   coppice.core.v1.Resources requests = 2;
@@ -25,10 +35,19 @@ message SubmitJobRequest {
   // The quota-entity leaf to charge.
   coppice.core.v1.QuotaEntityId quota_entity = 5;
   coppice.core.v1.RetryPolicy retry = 6;
+  // Client-minted job identity (`job-<uuid>`, ADR 0024) — required. Mint a
+  // fresh id per logical submission; reuse it verbatim on every retry.
+  coppice.core.v1.JobId job = 7;
 }
 
 message SubmitJobResponse {
+  // Echo of the client-minted id from the request.
   coppice.core.v1.JobId job = 1;
+  // Raft log index at which this request's command applied. Pair it with a
+  // strong read for read-your-writes (ADR 0007). On an idempotent repeat
+  // this is the repeat's own apply index, which is ≥ the original commit
+  // and therefore still a valid read-your-writes cursor for the job.
+  uint64 log_index = 2;
 }
 
 // Abort a job: commits a desired-state transition; it does not
