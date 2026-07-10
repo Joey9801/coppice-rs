@@ -1,6 +1,8 @@
 # 14. Accruing allocations replace standalone reservations
 
-- **Status:** Accepted
+- **Status:** Accepted — amended by [ADR 0027](0027-finite-projected-ready-accrual-protection.md)
+  (an unbounded `projected_ready` forbids lending rather than satisfying the
+  strict-backfill check, and accrual placement prefers finite bounds)
 - **Date:** 2026-07-07
 - **Supersedes:** [ADR 0006](0006-reservations-and-strict-backfill.md)
 
