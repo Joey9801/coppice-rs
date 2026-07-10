@@ -417,4 +417,98 @@ mod tests {
             Some(agent_command::Body::RegisterAccepted(_))
         ));
     }
+
+    /// The freshness gate, deterministically.
+    ///
+    /// `propose` commits at log index 1 while the publisher still sits at index
+    /// 0, whose state holds none of the records `StartJob` is assembled from —
+    /// the exact ordering that wedged a job in `Dispatching`. A `views.latest()`
+    /// read would miss all three lookups and drop the `StartJob` silently; the
+    /// `at_least(log_index)` gate must park until the publish lands, then route.
+    #[tokio::test]
+    async fn dispatch_waits_for_the_view_to_reach_the_committed_index() {
+        use coppice_state::StateMachine;
+
+        use crate::test_support::{FakeConsensus, ProposeOutcome};
+
+        let job_id = JobId::new();
+        let attempt_id = AttemptId::new();
+        let alloc_id = AllocationId::new();
+        let node = NodeId::new();
+
+        let (consensus, mut publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
+        let consensus = Arc::new(consensus);
+        let views = consensus.views();
+        let (router, mut router_rx) = RouterHandle::channel_for_test();
+
+        let task = {
+            let consensus = Arc::clone(&consensus);
+            let views = views.clone();
+            let router = router.clone();
+            tokio::spawn(async move {
+                dispatch_ready_attempt(&consensus, &views, &router, attempt_id).await;
+            })
+        };
+
+        // One yield is enough for the single-threaded test runtime to drive the
+        // task through `propose` (which never awaits) and park it on the gate.
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "dispatch must park until the view reaches the committed log index"
+        );
+        assert!(
+            router_rx.try_recv().is_err(),
+            "no StartJob may be routed off a view behind the commit"
+        );
+
+        // Publish the state that commit produced, at the committed index.
+        let mut state = StateMachine::default();
+        state.jobs.insert(
+            job_id,
+            job_record(job_id, "registry/img:1", requested(), None),
+        );
+        state.attempts.insert(
+            attempt_id,
+            attempt_record(
+                attempt_id,
+                job_id,
+                alloc_id,
+                node,
+                AttemptState::Dispatching,
+                None,
+            ),
+        );
+        state.allocations.insert(
+            alloc_id,
+            allocation_record(
+                alloc_id,
+                job_id,
+                attempt_id,
+                node,
+                requested(),
+                AllocationState::Funded,
+            ),
+        );
+        publisher.publish_now(&state, 1);
+
+        task.await.expect("dispatch task");
+
+        let routed = router_rx
+            .try_recv()
+            .expect("StartJob routed after the publish");
+        assert_eq!(routed.node, node);
+        let Some(agent_command::Body::StartJob(sj)) = routed.command.body else {
+            panic!("expected StartJob");
+        };
+        assert_eq!(
+            AttemptId::try_from(sj.attempt.unwrap()).unwrap(),
+            attempt_id
+        );
+        assert_eq!(
+            AllocationId::try_from(sj.allocation.unwrap()).unwrap(),
+            alloc_id
+        );
+        assert_eq!(JobId::try_from(sj.job.unwrap()).unwrap(), job_id);
+    }
 }
