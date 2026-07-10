@@ -50,6 +50,11 @@ criterion = "0.5"
 # Advisory file locking for the storage LOCK file (ADR 0017); std gains
 # File::lock only after our 1.79 MSRV.
 fs2 = "0.4"
+# Immutable ordered maps with structural sharing (KOI-5): the job-scaled maps
+# in the replicated `StateMachine` use `imbl::OrdMap` so view publication and
+# snapshot capture clone the whole state in O(1) instead of deep-copying
+# millions of entries on the sole apply task.
+imbl = "7"
 # openraft drives election, replication, and membership; the app data types
 # (`Command`, `Applied`, `RejectionReason`) do not implement serde, so the
 # "serde" feature is deliberately left off (ADR 0002). Default features cover

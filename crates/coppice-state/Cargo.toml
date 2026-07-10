@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 coppice-core.workspace = true
+imbl.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
