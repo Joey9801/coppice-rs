@@ -376,7 +376,7 @@ enum AttemptKind {
 }
 
 /// Accumulators for the flat record lists, sorted and bulk-collected into
-/// `BTreeMap`s once generation finishes — far cheaper at 1M scale than
+/// the state maps once generation finishes — far cheaper at 1M scale than
 /// inserting into the maps one record at a time.
 struct Buffers {
     attempts: Vec<(AttemptId, AttemptRecord)>,
@@ -764,7 +764,7 @@ pub fn check_consistency(sm: &StateMachine) {
     }
 
     // The accrual queue is exactly the Accruing allocations, keyed (node, seq).
-    let expected: BTreeMap<(NodeId, u64), AllocationId> = sm
+    let expected: imbl::OrdMap<(NodeId, u64), AllocationId> = sm
         .allocations
         .values()
         .filter(|r| r.allocation.state == AllocationState::Accruing)

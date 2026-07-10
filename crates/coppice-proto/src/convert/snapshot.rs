@@ -173,7 +173,7 @@ pub struct StateRecords {
 
 /// Flatten replicated state into snapshot records.
 ///
-/// Iteration is `BTreeMap` order, so identical states flatten identically;
+/// Iteration is key order, so identical states flatten identically;
 /// rebuild does not depend on this order.
 pub fn state_to_records(state: &StateMachine) -> StateRecords {
     StateRecords {

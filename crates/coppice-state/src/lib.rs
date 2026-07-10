@@ -18,6 +18,8 @@
 
 use std::collections::BTreeMap;
 
+use imbl::OrdMap;
+
 use coppice_core::allocation::Allocation;
 use coppice_core::attempt::{Attempt, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
@@ -37,14 +39,22 @@ pub use command::Command;
 ///
 /// Only durable semantic state required for correctness lives here. Derived
 /// state (indexes, queue projections, UI aggregates) is rebuilt from this.
-/// `BTreeMap` is used throughout to keep iteration deterministic, and every
+/// Every map iterates in key order to keep apply deterministic, and every
 /// field is `PartialEq` so the determinism harness can assert replica
 /// equivalence structurally.
+///
+/// The maps that scale with job count — `jobs`, `attempts`, `allocations`,
+/// and the derived `accrual_queue`, together millions of entries — are
+/// `imbl::OrdMap`, whose structural sharing makes cloning the whole state
+/// O(1). That is what lets the apply task hand a fresh state to view
+/// publication and snapshot capture without deep-copying it (KOI-5). `nodes`
+/// and `quota_entities` stay `BTreeMap`: they are bounded (~1k nodes; quota
+/// entities scale with accounts, not jobs) and cheap to deep-clone.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateMachine {
-    pub jobs: BTreeMap<JobId, JobRecord>,
-    pub attempts: BTreeMap<AttemptId, AttemptRecord>,
-    pub allocations: BTreeMap<AllocationId, AllocationRecord>,
+    pub jobs: OrdMap<JobId, JobRecord>,
+    pub attempts: OrdMap<AttemptId, AttemptRecord>,
+    pub allocations: OrdMap<AllocationId, AllocationRecord>,
     pub nodes: BTreeMap<NodeId, NodeRecord>,
     /// The quota-entity tree (ADR 0005) with each entity's replicated usage
     /// accumulator.
@@ -57,7 +67,7 @@ pub struct StateMachine {
     /// across histories. Derived from the allocation map, so it is not
     /// snapshotted: the proto snapshot path (`coppice_proto::convert`)
     /// rebuilds it from the Accruing `AllocationRecord`s at load.
-    pub accrual_queue: BTreeMap<(NodeId, u64), AllocationId>,
+    pub accrual_queue: OrdMap<(NodeId, u64), AllocationId>,
     /// Commit-order sequence for allocations.
     ///
     /// Part of replicated state so it is a pure function of the command
