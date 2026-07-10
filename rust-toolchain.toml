@@ -1,0 +1,15 @@
+# The single source of truth for the toolchain, honoured by both rustup on a
+# developer machine and by CI. Pinning matters here because CI denies warnings
+# (`RUSTFLAGS: -D warnings`): a floating `stable` means a new Rust release can
+# add a clippy lint and red-light `main` with no code change, while local runs
+# quietly disagree until the next `rustup update`.
+#
+# Bumping is a deliberate, reviewable commit — change `channel`, run the three
+# checks in the README, and fix whatever new lints the release introduced.
+#
+# This is not an MSRV declaration. The workspace's `rust-version` states the
+# oldest supported compiler; this states the one we build and gate with.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -42,9 +42,11 @@ cargo run -p coppice-agent
 cargo run -p coppice-cli
 ```
 
-Requires a recent stable Rust toolchain (see `rust-version` in the root
-`Cargo.toml`). The schema corpus is compiled in-process by `protox`, so no
-system `protoc` is needed.
+The toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml); rustup
+picks it up automatically, so local checks run the same compiler and lints as
+CI. (`rust-version` in the root `Cargo.toml` is the separate MSRV claim.) The
+schema corpus is compiled in-process by `protox`, so no system `protoc` is
+needed.
 
 CI runs exactly these three checks — run them locally to match:
 

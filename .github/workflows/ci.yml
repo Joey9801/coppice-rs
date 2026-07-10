@@ -27,9 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # With no toolchain argument this installs the *active* toolchain, which
+      # rust-toolchain.toml pins — so CI and a developer machine run the very
+      # same rustfmt/clippy binaries. Components come from that file too.
+      - run: rustup toolchain install --no-self-update
       # No compilation here, so no dependency cache is worth restoring.
       - run: cargo fmt --all --check
 
@@ -38,9 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       # `--all-targets` reaches tests, benches, and examples — not just the
       # libs. `--locked` fails if Cargo.lock is stale rather than updating it.
@@ -51,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       # The proto descriptor-set breaking gate (crates/coppice-proto,
       # tests/breaking.rs) runs as part of this; `protox` compiles the schema
