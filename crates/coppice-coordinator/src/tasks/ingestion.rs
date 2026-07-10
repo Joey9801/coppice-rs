@@ -204,6 +204,14 @@ async fn ingest<C: Consensus>(
                     tracing::warn!(%node, "ingestion: router closed routing RegisterAccepted");
                 }
             }
+        } else {
+            // Unreachable today — apply never rejects RegisterNode — but a
+            // rejection would otherwise strand the agent silently: no
+            // RegisterAccepted means it retries registration forever.
+            tracing::warn!(
+                %node,
+                "ingestion: RegisterNode was rejected, not routing RegisterAccepted"
+            );
         }
     }
 
