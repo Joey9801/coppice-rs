@@ -29,6 +29,7 @@ impl From<&JobRecord> for pb::JobRecord {
             state: pbcore::JobState::from(r.state) as i32,
             multiplier_q32_32: r.multiplier.0,
             submitted_at_us: r.submitted_at_us,
+            terminal_at_us: r.terminal_at_us,
             retries_used: r.retries_used,
             current_attempt: r.current_attempt.map(Into::into),
             attempts: r.attempts.iter().map(|id| (*id).into()).collect(),
@@ -45,6 +46,7 @@ impl TryFrom<pb::JobRecord> for JobRecord {
             state: job_state_from_pb(r.state)?,
             multiplier: PriorityMultiplier(r.multiplier_q32_32),
             submitted_at_us: r.submitted_at_us,
+            terminal_at_us: r.terminal_at_us,
             retries_used: r.retries_used,
             current_attempt: r.current_attempt.map(TryInto::try_into).transpose()?,
             attempts: r

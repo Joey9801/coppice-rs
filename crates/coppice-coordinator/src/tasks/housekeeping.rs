@@ -41,19 +41,18 @@ pub trait HistoryStore: Send + Sync + 'static {
 
 /// A terminal job as handed to the history store.
 ///
-/// Derived from what `JobRecord` exposes: it does not (yet) carry a
-/// terminal-transition timestamp, so `submitted_at_us` is the only
-/// timestamp available here. The retention scan below uses it as an age
-/// proxy for the same reason — the honest limitation of not touching
-/// `coppice-state` to add one. `state`/`submitted_at_us` aren't read beyond
-/// construction until a real history store consumes them (`StubHistoryStore`
-/// only logs a count).
+/// `state`/`submitted_at_us`/`terminal_at_us` aren't read beyond
+/// construction until a real history store consumes them
+/// (`StubHistoryStore` only logs a count).
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TerminalJobRecord {
     pub job: JobId,
     pub state: JobState,
     pub submitted_at_us: i64,
+    /// When the job reached its terminal state; the retention scan measured
+    /// eligibility from this (never from `submitted_at_us` — KOI-1).
+    pub terminal_at_us: i64,
 }
 
 /// Placeholder history store until the SQL sink lands.
@@ -188,23 +187,11 @@ async fn run_pass<C: Consensus, H: HistoryStore>(
     history: &Arc<H>,
 ) {
     let view = views.latest();
-    let retention_us = view.state().policy.terminal_retention_us;
     // Proposer-side wall clock: safe here because housekeeping runs outside
     // apply (`docs/architecture/coordinator-runtime.md`, "Housekeeping").
     let now_us = now_us();
 
-    let due: Vec<TerminalJobRecord> = view
-        .state()
-        .jobs
-        .iter()
-        .filter(|(_, record)| record.state.is_terminal())
-        .filter(|(_, record)| now_us.saturating_sub(record.submitted_at_us) >= retention_us)
-        .map(|(id, record)| TerminalJobRecord {
-            job: *id,
-            state: record.state,
-            submitted_at_us: record.submitted_at_us,
-        })
-        .collect();
+    let due = due_for_eviction(&view, now_us);
 
     if due.is_empty() {
         maybe_trigger_snapshot(consensus).await;
@@ -237,6 +224,45 @@ async fn run_pass<C: Consensus, H: HistoryStore>(
     }
 
     maybe_trigger_snapshot(consensus).await;
+}
+
+/// The terminal jobs whose full post-terminal retention interval has
+/// elapsed (ADR 0012).
+///
+/// The clock runs from `terminal_at_us`, never from submission: a
+/// low-priority job may legitimately queue longer than the retention
+/// interval before it ever runs, and must still get the full interval after
+/// it finishes (KOI-1). A terminal job with no `terminal_at_us` — a record
+/// that reached terminal state before the field existed — is never
+/// considered due; retention leaks are recoverable, evictions are not.
+fn due_for_eviction(view: &StateView, now_us: i64) -> Vec<TerminalJobRecord> {
+    let retention_us = view.state().policy.terminal_retention_us;
+    let mut unstamped: u64 = 0;
+    let due: Vec<TerminalJobRecord> = view
+        .state()
+        .jobs
+        .iter()
+        .filter(|(_, record)| record.state.is_terminal())
+        .filter_map(|(id, record)| {
+            let Some(terminal_at_us) = record.terminal_at_us else {
+                unstamped += 1;
+                return None;
+            };
+            (now_us.saturating_sub(terminal_at_us) >= retention_us).then_some(TerminalJobRecord {
+                job: *id,
+                state: record.state,
+                submitted_at_us: record.submitted_at_us,
+                terminal_at_us,
+            })
+        })
+        .collect();
+    if unstamped > 0 {
+        tracing::warn!(
+            count = unstamped,
+            "housekeeping: terminal jobs without a terminal timestamp are exempt from eviction"
+        );
+    }
+    due
 }
 
 async fn maybe_trigger_snapshot<C: Consensus>(consensus: &Arc<C>) {
@@ -272,9 +298,9 @@ mod tests {
 
     use coppice_core::id::{AllocationId, AttemptId, JobId};
     use coppice_core::resource::Resources;
-    use coppice_state::StateMachine;
+    use coppice_state::{PolicyConfig, StateMachine};
 
-    use crate::test_support::{allocation_record, node_record, view_of};
+    use crate::test_support::{allocation_record, job_record, node_record, view_of};
 
     #[test]
     fn stale_nodes_picks_schedulable_and_live_but_not_already_lost_or_fresh() {
@@ -323,5 +349,75 @@ mod tests {
         assert!(!stale.contains(&drained_lost));
         // Within its liveness grace window.
         assert!(!stale.contains(&fresh));
+    }
+
+    /// A terminal job record with the given submission and terminal times.
+    fn terminal_job(
+        id: JobId,
+        submitted_at_us: i64,
+        terminal_at_us: Option<i64>,
+    ) -> coppice_state::JobRecord {
+        let mut r = job_record(id, "img", Resources::ZERO, None);
+        r.state = JobState::Succeeded;
+        r.submitted_at_us = submitted_at_us;
+        r.terminal_at_us = terminal_at_us;
+        r
+    }
+
+    #[test]
+    fn eviction_runs_a_full_retention_from_the_terminal_transition() {
+        let retention = PolicyConfig::default().terminal_retention_us;
+        let now = 100 * retention;
+
+        let done_long_ago = JobId::new();
+        let long_queued_just_done = JobId::new();
+        let ancient_but_live = JobId::new();
+        let terminal_unstamped = JobId::new();
+
+        let mut sm = StateMachine::default();
+        // Finished a full retention interval ago: due.
+        sm.jobs.insert(
+            done_long_ago,
+            terminal_job(done_long_ago, now - 3 * retention, Some(now - retention)),
+        );
+        // Queued for three retention intervals before running — the cheap
+        // low-priority-job pattern — but finished only now: NOT due. The
+        // clock runs from the terminal transition, never submission (KOI-1).
+        sm.jobs.insert(
+            long_queued_just_done,
+            terminal_job(long_queued_just_done, now - 3 * retention, Some(now - 10)),
+        );
+        // Still waiting on the queue after all that time: not terminal,
+        // never a candidate no matter its age.
+        let mut live = job_record(ancient_but_live, "img", Resources::ZERO, None);
+        live.state = JobState::Queued;
+        live.submitted_at_us = now - 3 * retention;
+        sm.jobs.insert(ancient_but_live, live);
+        // Terminal but unstamped (reached terminal state before the field
+        // existed): exempt — a retention leak beats an early eviction.
+        sm.jobs.insert(
+            terminal_unstamped,
+            terminal_job(terminal_unstamped, now - 3 * retention, None),
+        );
+
+        let view = view_of(sm);
+        let due = due_for_eviction(&view, now);
+        assert_eq!(
+            due.iter().map(|r| r.job).collect::<Vec<_>>(),
+            vec![done_long_ago]
+        );
+        assert_eq!(due[0].terminal_at_us, now - retention);
+
+        // The moment the post-terminal interval elapses, the long-queued job
+        // becomes due too.
+        let later = now + retention;
+        let due_later: BTreeSet<JobId> = due_for_eviction(&view, later)
+            .into_iter()
+            .map(|r| r.job)
+            .collect();
+        assert!(due_later.contains(&done_long_ago));
+        assert!(due_later.contains(&long_queued_just_done));
+        assert!(!due_later.contains(&ancient_but_live));
+        assert!(!due_later.contains(&terminal_unstamped));
     }
 }

@@ -818,6 +818,153 @@ fn eviction_rejects_live_jobs_and_skips_missing() {
 }
 
 #[test]
+fn terminal_timestamp_is_stamped_by_the_resolving_command() {
+    let mut sm = setup();
+
+    // Immediate abort of a queued job: stamped from the abort's
+    // `requested_at_us`.
+    let queued = jid(1);
+    apply_ok(
+        &mut sm,
+        submit_cmd(queued, cpu(1_000), None, RetryPolicy::default()),
+    );
+    assert_eq!(sm.jobs[&queued].terminal_at_us, None);
+    apply_ok(&mut sm, abort_cmd(queued, TS + 10));
+    assert_eq!(sm.jobs[&queued].state, JobState::Aborted);
+    assert_eq!(sm.jobs[&queued].terminal_at_us, Some(TS + 10));
+
+    // Normal outcome: stamped from the outcome report's `observed_at_us`.
+    let ran = jid(2);
+    apply_ok(
+        &mut sm,
+        submit_cmd(ran, cpu(1_000), Some(60), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(placement(ran, aid(21), alid(210), nid(1), cpu(1_000)), TS),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(21), TS + 1));
+    apply_ok(&mut sm, started_cmd(aid(21), TS + 2));
+    let done_at = TS + 60_000_000;
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(21), AttemptOutcome::Exited { code: 0 }, 60, done_at),
+    );
+    assert_eq!(sm.jobs[&ran].state, JobState::Succeeded);
+    assert_eq!(sm.jobs[&ran].terminal_at_us, Some(done_at));
+
+    // A requeue is not terminal: the field stays `None` through the retry
+    // and carries the *final* resolution's time, not the first failure's.
+    let retried = jid(3);
+    let one_retry = RetryPolicy {
+        max_retries: 1,
+        retry_user_errors: false,
+    };
+    apply_ok(
+        &mut sm,
+        submit_cmd(retried, cpu(1_000), Some(60), one_retry),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(retried, aid(31), alid(310), nid(1), cpu(1_000)),
+            TS + 20,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(31), TS + 21));
+    apply_ok(&mut sm, started_cmd(aid(31), TS + 22));
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(31), AttemptOutcome::AgentError, 1, TS + 30),
+    );
+    assert_eq!(sm.jobs[&retried].state, JobState::Queued);
+    assert_eq!(sm.jobs[&retried].terminal_at_us, None);
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(retried, aid(32), alid(320), nid(1), cpu(1_000)),
+            TS + 40,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(32), TS + 41));
+    apply_ok(&mut sm, started_cmd(aid(32), TS + 42));
+    let failed_at = TS + 50;
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(32), AttemptOutcome::AgentError, 1, failed_at),
+    );
+    assert_eq!(sm.jobs[&retried].state, JobState::Failed);
+    assert_eq!(sm.jobs[&retried].terminal_at_us, Some(failed_at));
+}
+
+#[test]
+fn reconcile_and_node_loss_stamp_the_terminal_timestamp() {
+    let mut sm = setup();
+    let no_retry = RetryPolicy {
+        max_retries: 0,
+        retry_user_errors: false,
+    };
+
+    // Reconcile-lost: stamped from the reconcile report's `observed_at_us`.
+    let reconciled = jid(1);
+    apply_ok(
+        &mut sm,
+        submit_cmd(reconciled, cpu(1_000), Some(60), no_retry),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(reconciled, aid(11), alid(110), nid(1), cpu(1_000)),
+            TS,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS + 1));
+    let observed_at = TS + 90;
+    apply_ok(
+        &mut sm,
+        Command::ReconcileNode(ReconcileNode {
+            node: nid(1),
+            node_epoch: 1,
+            adopted: vec![],
+            lost: vec![LostAttempt {
+                attempt: aid(11),
+                outcome: AttemptOutcome::AgentError,
+                actual_runtime_us: 0,
+            }],
+            observed_at_us: observed_at,
+        }),
+    );
+    assert_eq!(sm.jobs[&reconciled].state, JobState::Failed);
+    assert_eq!(sm.jobs[&reconciled].terminal_at_us, Some(observed_at));
+
+    // Node loss: stamped from `declared_at_us`.
+    let stranded = jid(2);
+    apply_ok(
+        &mut sm,
+        submit_cmd(stranded, cpu(1_000), Some(60), no_retry),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(stranded, aid(21), alid(210), nid(1), cpu(1_000)),
+            TS + 100,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(21), TS + 101));
+    apply_ok(&mut sm, started_cmd(aid(21), TS + 102));
+    let declared_at = TS + 200;
+    apply_ok(
+        &mut sm,
+        Command::DeclareNodeLost(DeclareNodeLost {
+            node: nid(1),
+            declared_at_us: declared_at,
+        }),
+    );
+    assert_eq!(sm.jobs[&stranded].state, JobState::Failed);
+    assert_eq!(sm.jobs[&stranded].terminal_at_us, Some(declared_at));
+}
+
+#[test]
 fn quota_entity_updates_preserve_usage_and_reject_cycles() {
     let mut sm = setup();
     apply_ok(&mut sm, configure_entity_cmd(qid(2), Some(ROOT)));

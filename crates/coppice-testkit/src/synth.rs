@@ -294,6 +294,18 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             retry,
             abort_requested,
         };
+        // Stamped like the real terminal path: a job aborted before any
+        // attempt existed terminates in the abort apply itself, so its
+        // terminal time is the request's; every other terminal job resolves
+        // at some later report time.
+        let terminal_at_us = if !job_state.is_terminal() {
+            None
+        } else if let (true, Some(a)) = (attempt_ids.is_empty(), &spec.abort_requested) {
+            Some(a.requested_at_us)
+        } else {
+            Some(submitted_at_us + rng.range(0, 3_600_000_000) as i64)
+        };
+
         attempt_ids.shrink_to_fit();
         jobs_buf.push((
             job_id,
@@ -302,6 +314,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 state: job_state,
                 multiplier,
                 submitted_at_us,
+                terminal_at_us,
                 retries_used,
                 current_attempt,
                 attempts: attempt_ids,

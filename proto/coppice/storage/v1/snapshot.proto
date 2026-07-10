@@ -101,6 +101,10 @@ message JobRecord {
   coppice.core.v1.AttemptId current_attempt = 6;
   // Every attempt this job has had, in creation order.
   repeated coppice.core.v1.AttemptId attempts = 7;
+  // When the job reached its terminal state (resolving command's proposer
+  // timestamp); unset while the job is live. Eviction retention is measured
+  // from this, never from submitted_at_us (ADR 0012).
+  optional int64 terminal_at_us = 8;
 }
 
 // An attempt's replicated record: the attempt plus the charge that

@@ -112,6 +112,7 @@ pub fn job_record(
         state: JobState::Preparing,
         multiplier: PriorityMultiplier(0),
         submitted_at_us: 0,
+        terminal_at_us: None,
         retries_used: 0,
         current_attempt: None,
         attempts: Vec::new(),

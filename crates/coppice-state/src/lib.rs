@@ -84,6 +84,15 @@ pub struct JobRecord {
     /// (ADR 0019: apply never sees the raw `i32` in arithmetic).
     pub multiplier: PriorityMultiplier,
     pub submitted_at_us: i64,
+    /// When the job reached its terminal state, stamped from the resolving
+    /// command's proposer timestamp: abort's `requested_at_us`, an outcome
+    /// or reconcile report's `observed_at_us`, or a loss declaration's
+    /// `declared_at_us`. `None` while the job is live.
+    ///
+    /// The retention clock for `EvictTerminalJobs` runs from this, never
+    /// from `submitted_at_us` (ADR 0012): a job may legitimately queue far
+    /// longer than the retention interval before it ever runs.
+    pub terminal_at_us: Option<i64>,
     /// Retries consumed.
     ///
     /// `Revoked` outcomes requeue without touching this.

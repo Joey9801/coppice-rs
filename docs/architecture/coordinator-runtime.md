@@ -158,7 +158,10 @@ followers, which is what lets followers serve reads and event streams.
    coordinates](#the-two-coordinates-trap) distinction.
 
 9. **Housekeeping** (leader-only, 60 s tick). Scans the view for terminal
-   jobs past retention and **writes them to the SQL job-history store first**
+   jobs past retention — measured from each job's `terminal_at_us`, never
+   from submission, so a job that queued longer than the retention interval
+   still gets the full interval after it finishes (KOI-1) — and **writes
+   them to the SQL job-history store first**
    — an *external* network call, therefore outside apply, with retries — and
    only after that write is durable proposes `EvictTerminalJobs`. This is the
    [ADR 0012](../decisions/0012-data-retention.md) ordering: history-write

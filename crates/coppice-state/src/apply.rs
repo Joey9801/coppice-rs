@@ -81,6 +81,7 @@ impl StateMachine {
                 state: JobState::Queued,
                 multiplier: c.multiplier,
                 submitted_at_us: c.submitted_at_us,
+                terminal_at_us: None,
                 retries_used: 0,
                 current_attempt: None,
                 attempts: Vec::new(),
@@ -124,7 +125,12 @@ impl StateMachine {
         match state {
             // No live attempt: abort is immediate.
             JobState::Submitted | JobState::Accepted | JobState::Queued => {
-                self.job_transition(c.job, JobState::Aborted, &mut events);
+                self.job_terminal_transition(
+                    c.job,
+                    JobState::Aborted,
+                    c.requested_at_us,
+                    &mut events,
+                );
             }
             JobState::Preparing | JobState::Running => {
                 let attempt_state = current
@@ -841,6 +847,28 @@ impl StateMachine {
         }
     }
 
+    /// [`job_transition`](Self::job_transition) into a terminal state,
+    /// stamping `terminal_at_us` — the timestamp the eviction retention
+    /// clock runs from (ADR 0012).
+    ///
+    /// Callers reject or no-op on already-terminal jobs, so the first stamp
+    /// is also the only one; the guard keeps that true even if a new caller
+    /// slips.
+    fn job_terminal_transition(
+        &mut self,
+        job: JobId,
+        to: JobState,
+        ts_us: i64,
+        events: &mut Vec<Event>,
+    ) {
+        if let Some(r) = self.jobs.get_mut(&job) {
+            if r.terminal_at_us.is_none() {
+                r.terminal_at_us = Some(ts_us);
+            }
+        }
+        self.job_transition(job, to, events);
+    }
+
     fn attempt_transition(
         &mut self,
         attempt: AttemptId,
@@ -925,7 +953,7 @@ impl StateMachine {
             self.settle_ancestors(entity, adjustment, ts_us);
         }
 
-        self.resolve_job(job, &outcome, events);
+        self.resolve_job(job, &outcome, ts_us, events);
     }
 
     fn release_allocation(
@@ -950,7 +978,17 @@ impl StateMachine {
     }
 
     /// Resolve the job after its attempt reached a terminal outcome.
-    fn resolve_job(&mut self, job: JobId, outcome: &AttemptOutcome, events: &mut Vec<Event>) {
+    ///
+    /// `ts_us` is the resolving command's proposer timestamp; it becomes the
+    /// job's `terminal_at_us` when resolution lands terminal (a requeue
+    /// leaves the field `None`).
+    fn resolve_job(
+        &mut self,
+        job: JobId,
+        outcome: &AttemptOutcome,
+        ts_us: i64,
+        events: &mut Vec<Event>,
+    ) {
         let Some(rec) = self.jobs.get(&job) else {
             return;
         };
@@ -1009,7 +1047,7 @@ impl StateMachine {
                 if let Some(r) = self.jobs.get_mut(&job) {
                     r.current_attempt = None;
                 }
-                self.job_transition(job, to, events);
+                self.job_terminal_transition(job, to, ts_us, events);
             }
             Resolution::Requeue { consume_budget } => {
                 if let Some(r) = self.jobs.get_mut(&job) {

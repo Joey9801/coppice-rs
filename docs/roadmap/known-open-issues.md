@@ -16,7 +16,7 @@ waive them.
 
 | ID | Severity | Area | Status | Release impact |
 | --- | --- | --- | --- | --- |
-| [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open | Do not enable terminal-job eviction with the stub history sink |
+| [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved) | Do not enable terminal-job eviction with the stub history sink |
 | [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Open | Do not claim safely retryable job submission |
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Open | Do not expose resumable event subscriptions |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Open | Strict-backfill starvation guarantee is not established |
@@ -25,7 +25,8 @@ waive them.
 ## KOI-1: Terminal-job eviction can destroy the only history
 
 - **Severity:** Critical
-- **Status:** Open
+- **Status:** Open — the retention-timing half is resolved (2026-07-10); the
+  durable-history half is not
 - **Affected capability:** terminal-job retention and historical queries
 - **Related decisions:** [ADR 0012](../decisions/0012-data-retention.md),
   [ADR 0007](../decisions/0007-per-endpoint-read-consistency.md)
@@ -45,43 +46,53 @@ history path promised by ADR 0012.
 
 ### Current violation
 
-`JobRecord` stores `submitted_at_us` but no terminal-transition timestamp.
-Housekeeping therefore uses submission time as an explicit proxy when deciding
-whether the retention interval has elapsed
-([state record](../../crates/coppice-state/src/lib.rs),
-[housekeeping](../../crates/coppice-coordinator/src/tasks/housekeeping.rs)). A
-job that queued or ran for longer than the retention period can consequently be
-evicted on the first housekeeping pass after it finishes, rather than being
-retained for the configured interval after completion.
+~~`JobRecord` stores `submitted_at_us` but no terminal-transition timestamp.~~
+**Resolved 2026-07-10.** `JobRecord.terminal_at_us` is stamped by whichever
+command resolves the job terminally (abort `requested_at_us`, outcome and
+reconcile reports' `observed_at_us`, loss declaration's `declared_at_us`;
+a requeue leaves it unset), and the housekeeping retention scan measures
+exclusively from it ([state record](../../crates/coppice-state/src/lib.rs),
+[housekeeping](../../crates/coppice-coordinator/src/tasks/housekeeping.rs)).
+A job that queues or runs longer than the retention period — a deliberately
+supported pattern for cheap low-priority work — now gets the full configured
+interval after completion. Terminal records predating the field carry no
+stamp and are exempt from eviction (a retention leak, never an early loss).
 
-The production runtime also installs `StubHistoryStore`. That implementation
+The production runtime still installs `StubHistoryStore`. That implementation
 only logs a count and returns success, which lets housekeeping propose
 `EvictTerminalJobs` even though no durable historical copy exists. The job,
 attempts, and allocations can then disappear from replicated state with no
-queryable replacement.
+queryable replacement. This half remains open, and is an accepted limitation
+until the SQL history sink lands: eviction still runs, and evicted jobs are
+lost to history.
 
 ### Impact
 
-- Irrecoverable loss of user-visible job and attempt history.
-- Violation of the documented 72-hour replicated-state retention period.
+- Irrecoverable loss of user-visible job and attempt history (until a real
+  history store lands).
 - Eventual/history reads cannot satisfy the API contract after eviction.
-- A long-running job is at greater risk than a short job because its age is
-  measured from submission.
+- ~~A long-running job is at greater risk than a short job because its age is
+  measured from submission.~~ Resolved: the retention clock starts at the
+  terminal transition.
 
 ### Resolution requirements
 
-- Add a replicated terminal timestamp, stamped by the command that resolves the
-  job terminally. Define its behavior for immediate abort, normal outcome,
-  reconciliation, and node loss.
-- Base eviction eligibility exclusively on that terminal timestamp.
+- ~~Add a replicated terminal timestamp, stamped by the command that resolves
+  the job terminally. Define its behavior for immediate abort, normal outcome,
+  reconciliation, and node loss.~~ Done — see the `Finalizing` resolution
+  rules in [command-catalog.md](../architecture/command-catalog.md#finalizing-resolution).
+- ~~Base eviction eligibility exclusively on that terminal timestamp.~~ Done —
+  `due_for_eviction` in housekeeping.
 - Implement a durable, idempotent history store containing the full job,
   attempt, outcome, usage-summary, and audit data required by ADR 0012.
 - Fail closed: a missing, disabled, or failed history sink must not be treated
   as a successful durable write. Prefer disabling eviction explicitly over a
   success-returning stub.
-- Add tests proving that old submissions receive a full post-terminal retention
-  interval and that no eviction is proposed after a failed or stubbed history
-  write.
+- ~~Add tests proving that old submissions receive a full post-terminal
+  retention interval~~ (done: `eviction_runs_a_full_retention_from_the_terminal_transition`,
+  `terminal_timestamp_is_stamped_by_the_resolving_command`,
+  `reconcile_and_node_loss_stamp_the_terminal_timestamp`) and that no eviction
+  is proposed after a failed or stubbed history write (open).
 
 ### Closure criteria
 

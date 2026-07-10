@@ -217,6 +217,13 @@ On an attempt reaching `Terminal(outcome)` the same apply resolves the job:
    settled.
 6. **Allocations release** in the same apply, running the pledge pass on
    each affected node.
+7. **Terminal timestamp.** A resolution that lands terminal stamps the
+   job's `terminal_at_us` from the resolving command's proposer timestamp —
+   an abort's `requested_at_us`, an outcome or reconcile report's
+   `observed_at_us`, a loss declaration's `declared_at_us`. A requeue
+   leaves it unset. The `EvictTerminalJobs` retention clock (ADR 0012)
+   runs from this stamp, never from `submitted_at_us`: a job may
+   legitimately queue longer than the retention interval before it runs.
 
 The job may pass through `Finalizing` and out the other side within a single
 apply (the common case). It *rests* in `Finalizing` only between
@@ -279,7 +286,7 @@ cluster-version 1.
 | Proposer | API layer (the user command; "abort" is the vocabulary everywhere) |
 | Payload | `job: JobId`, `reason: optional string`, `requested_at_us` |
 | Validation | Job exists and is non-terminal |
-| Apply effects | Set `abort_requested` (first request wins; a second `AbortJob` is an accepted no-op preserving the original). Then by current state: **no live attempt** (`Submitted`/`Accepted`/`Queued`) → job `Aborted` immediately. **Attempt `Accruing`/`Ready`** → attempt `Terminal(Aborted)` with the full terminal path (allocations released + pledge pass, true-up with actual cost 0, job `Aborted`) — no agent interaction. **Attempt `Dispatching`/`Running`** → flag only, emit `StopRequested { node, allocation }`; the runtime sends `StopJob` (tombstone rule / SIGTERM–grace–SIGKILL per ADR 0013) and the outcome arrives later via `RecordAttemptOutcome`. **Attempt `Finalizing`** → flag only; resolution honors abort-wins-over-retry. |
+| Apply effects | Set `abort_requested` (first request wins; a second `AbortJob` is an accepted no-op preserving the original). Then by current state: **no live attempt** (`Submitted`/`Accepted`/`Queued`) → job `Aborted` immediately, `terminal_at_us` stamped from `requested_at_us`. **Attempt `Accruing`/`Ready`** → attempt `Terminal(Aborted)` with the full terminal path (allocations released + pledge pass, true-up with actual cost 0, job `Aborted`) — no agent interaction. **Attempt `Dispatching`/`Running`** → flag only, emit `StopRequested { node, allocation }`; the runtime sends `StopJob` (tombstone rule / SIGTERM–grace–SIGKILL per ADR 0013) and the outcome arrives later via `RecordAttemptOutcome`. **Attempt `Finalizing`** → flag only; resolution honors abort-wins-over-retry. |
 | Rejections | `UnknownJob`, `JobTerminal` |
 
 ### Scheduler-proposed
@@ -384,7 +391,7 @@ cluster-version 1.
 
 | | |
 | --- | --- |
-| Proposer | Leader housekeeping loop — **only after the job-history-store write for every listed job is durable** (ADR 0012). That ordering is a proposal-side obligation; the apply itself just deletes. Timestamps ride in the command; apply never consults a clock to decide "72 h have passed" — the proposer decided that. |
+| Proposer | Leader housekeeping loop — **only after the job-history-store write for every listed job is durable** (ADR 0012). That ordering is a proposal-side obligation; the apply itself just deletes. Timestamps ride in the command; apply never consults a clock to decide "72 h have passed" — the proposer decided that, measuring from each job's `terminal_at_us` (never from submission; a terminal job without the stamp is exempt). |
 | Payload | `jobs: JobId[]`, `evicted_at_us` |
 | Validation | Every listed job that exists must be terminal. Missing ids are skipped silently — duplicate eviction proposals across leader changes must be idempotent. A *non-terminal* listed job is a proposer bug and rejects the whole command. |
 | Apply effects | Remove each listed job, its attempts, and their (already `Released`) allocations from state. Quota usage is untouched — charges and true-ups have long since settled. |
