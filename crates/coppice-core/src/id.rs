@@ -37,11 +37,16 @@ macro_rules! typed_id {
 
             /// Generate a fresh identifier.
             ///
+            /// UUIDv7: the millisecond-timestamp prefix makes fresh ids sort
+            /// to the right edge of the id-keyed btrees (ADR 0024). Nothing
+            /// may *rely* on that ordering — uniqueness rests on the random
+            /// tail alone.
+            ///
             /// Deliberately no `Default`: a defaulted id is always a bug, and
             /// `..Default::default()` struct updates must not mint one silently.
             #[allow(clippy::new_without_default)]
             pub fn new() -> Self {
-                Self(Uuid::new_v4())
+                Self(Uuid::now_v7())
             }
         }
 

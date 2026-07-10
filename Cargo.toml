@@ -88,7 +88,10 @@ toml = "0.8"
 humantime-serde = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+# v7 for entity ids (time-ordered prefix -> btree locality, ADR 0024); v4
+# remains for the internal storage instance/cluster stamps and test fixtures,
+# where creation-time ordering carries no benefit.
+uuid = { version = "1", features = ["v4", "v7"] }
 # X.509 leaf-certificate parsing for the agent gateway's mTLS identity check
 # (ADR 0011): the client cert's subject CN must equal the claimed NodeId. Only
 # the DER→CN parse is used today (the TLS layer already validated the chain);
