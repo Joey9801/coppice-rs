@@ -1,5 +1,7 @@
 # Coppice
 
+[![CI](https://github.com/Joey9801/coppice-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Joey9801/coppice-rs/actions/workflows/ci.yml)
+
 Coppice is a distributed **batch job scheduler** for running containerized
 workloads across a fleet of compute nodes, written in Rust.
 
@@ -41,7 +43,16 @@ cargo run -p coppice-cli
 ```
 
 Requires a recent stable Rust toolchain (see `rust-version` in the root
-`Cargo.toml`).
+`Cargo.toml`). The schema corpus is compiled in-process by `protox`, so no
+system `protoc` is needed.
+
+CI runs exactly these three checks — run them locally to match:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+```
 
 ## Documentation
 

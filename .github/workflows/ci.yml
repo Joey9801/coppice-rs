@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a branch supersedes any run still in flight for it. `main` is
+# excluded from cancellation so every landed commit keeps a status of its own.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are errors in CI. Cargo compiles registry dependencies with
+  # `--cap-lints allow`, so this only ever fires on first-party code.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # No compilation here, so no dependency cache is worth restoring.
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `--all-targets` reaches tests, benches, and examples — not just the
+      # libs. `--locked` fails if Cargo.lock is stale rather than updating it.
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The proto descriptor-set breaking gate (crates/coppice-proto,
+      # tests/breaking.rs) runs as part of this; `protox` compiles the schema
+      # corpus in-process, so no system `protoc` is needed. The 1M-scale tests
+      # are `#[ignore]`d by default and stay that way here.
+      - run: cargo test --workspace --all-features --locked
