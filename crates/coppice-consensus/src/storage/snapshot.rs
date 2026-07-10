@@ -33,8 +33,12 @@ use std::sync::{mpsc, Condvar, Mutex};
 
 use prost::Message;
 
-use coppice_proto::convert::StateRecords;
+use coppice_proto::convert::{
+    allocation_records, attempt_records, cluster_record, job_records, node_records,
+    quota_entity_records, record_counts, RecordCounts, StateRecords,
+};
 use coppice_proto::pb::storage::v1 as pb;
+use coppice_state::StateMachine;
 
 use crate::fs::FsFile;
 
@@ -540,22 +544,27 @@ impl InFlightSlots {
     }
 }
 
-/// Encode a state's records straight into `file` as a complete container —
-/// the streaming counterpart of [`encode_state`], byte-identical output —
-/// keeping the shard-parallel encode but never the whole container in
-/// memory: a worker pool encodes sections while this thread appends them in
-/// job order, and each worker takes an in-flight slot before it encodes, so
-/// peak buffering is a few sections however large the state (ADR 0018).
+/// Stream a list of sections into `file` as a complete container, encoding
+/// them in parallel while appending in job order and never holding the whole
+/// container in memory: a worker pool runs `encode(&job)` for each job while
+/// this thread appends the finished sections in order, and each worker takes
+/// an in-flight slot before it encodes, so peak buffering is a few sections
+/// however many jobs there are (ADR 0018).
+///
+/// The job list and per-job encoder are the only difference between the
+/// slice path ([`write_state`], jobs borrow a `StateRecords`) and the
+/// state-direct path ([`write_state_direct`], jobs are plain descriptors and
+/// the encoder converts records from the live state on the fly); the
+/// container plumbing is shared here.
 ///
 /// Durability (fsync, rename, manifest flip) is the caller's — the engine's
 /// snapshot-build entrypoints own that ordering (ADR 0017).
-pub fn write_state(
+fn write_sections<J: Sync>(
     file: &mut dyn FsFile,
     meta: &pb::SnapshotMeta,
-    records: &StateRecords,
-    shards: u32,
+    jobs: &[J],
+    encode: impl Fn(&J) -> RawSection + Sync,
 ) -> io::Result<()> {
-    let jobs = section_jobs(records, shards.max(1) as usize);
     let mut writer = ContainerWriter::new(file, meta)?;
 
     let workers = std::thread::available_parallelism()
@@ -571,9 +580,9 @@ pub fn write_state(
     let (tx, rx) = mpsc::channel::<(usize, RawSection)>();
 
     let result: io::Result<()> = std::thread::scope(|scope| {
-        let jobs = &jobs;
         let next = &next;
         let slots = &slots;
+        let encode = &encode;
         for _ in 0..workers {
             let tx = tx.clone();
             scope.spawn(move || loop {
@@ -583,7 +592,7 @@ pub fn write_state(
                     slots.release();
                     break;
                 };
-                if tx.send((i, encode_job(job))).is_err() {
+                if tx.send((i, encode(job))).is_err() {
                     slots.release();
                     break;
                 }
@@ -613,6 +622,146 @@ pub fn write_state(
     });
     result?;
     writer.finish()
+}
+
+/// Encode a `StateRecords` straight into `file` as a complete container —
+/// the streaming counterpart of [`encode_state`], byte-identical output.
+///
+/// Retained for the crash suite and tests that already hold a `StateRecords`;
+/// the snapshot build path uses [`write_state_direct`], which never
+/// materializes one.
+pub fn write_state(
+    file: &mut dyn FsFile,
+    meta: &pb::SnapshotMeta,
+    records: &StateRecords,
+    shards: u32,
+) -> io::Result<()> {
+    let jobs = section_jobs(records, shards.max(1) as usize);
+    write_sections(file, meta, &jobs, encode_job)
+}
+
+/// One section's encode work on the state-direct path: its identity plus the
+/// `[start, start + count)` window of its kind's ordered record stream. Plain
+/// data — it borrows nothing, so the map type behind the stream (a
+/// `BTreeMap` today, an `imbl::OrdMap` tomorrow) is irrelevant to the plan.
+struct StateSectionJob {
+    kind: pb::SectionKind,
+    shard: u32,
+    start: usize,
+    count: usize,
+}
+
+/// Plan the per-(kind, shard) sections of a state directly from its record
+/// counts — the same sharding [`section_jobs`] applies to a `StateRecords`,
+/// but computed from lengths alone so not a single record is materialized to
+/// decide the layout.
+///
+/// Byte-for-byte identical sharding to the slice path: each entity kind is
+/// cut into contiguous windows of `len.div_ceil(shards)` records in map
+/// order, an empty kind contributes no section, and the lone cluster section
+/// trails (shard 0). A `StateMachine` always has cluster scalars, so the
+/// cluster section is always present — exactly as `state_to_records` always
+/// sets `cluster: Some(..)`.
+fn state_section_jobs(counts: &RecordCounts, shards: usize) -> Vec<StateSectionJob> {
+    fn shard(kind: pb::SectionKind, len: usize, shards: usize, out: &mut Vec<StateSectionJob>) {
+        let per = len.div_ceil(shards).max(1);
+        let mut start = 0;
+        let mut shard = 0u32;
+        while start < len {
+            out.push(StateSectionJob {
+                kind,
+                shard,
+                start,
+                count: per.min(len - start),
+            });
+            start += per;
+            shard += 1;
+        }
+    }
+    let mut jobs = Vec::new();
+    shard(pb::SectionKind::Job, counts.jobs, shards, &mut jobs);
+    shard(pb::SectionKind::Attempt, counts.attempts, shards, &mut jobs);
+    shard(
+        pb::SectionKind::Allocation,
+        counts.allocations,
+        shards,
+        &mut jobs,
+    );
+    shard(pb::SectionKind::Node, counts.nodes, shards, &mut jobs);
+    shard(
+        pb::SectionKind::QuotaEntity,
+        counts.quota_entities,
+        shards,
+        &mut jobs,
+    );
+    jobs.push(StateSectionJob {
+        kind: pb::SectionKind::ClusterState,
+        shard: 0,
+        start: 0,
+        count: 1,
+    });
+    jobs
+}
+
+/// Encode one state-direct job: convert only its window of records from the
+/// live `state` and serialize them as the section's length-delimited stream.
+/// The converted records live only for this call, so a whole snapshot's worth
+/// is never in memory at once — the point of the state-direct path (KOI-5).
+fn encode_state_job(state: &StateMachine, job: &StateSectionJob) -> RawSection {
+    fn encode<M: Message>(records: impl Iterator<Item = M>, bytes: &mut Vec<u8>) -> u64 {
+        let mut count = 0;
+        for record in records {
+            record
+                .encode_length_delimited(bytes)
+                .expect("Vec<u8> writes are infallible");
+            count += 1;
+        }
+        count
+    }
+    let (start, count) = (job.start, job.count);
+    let mut bytes = Vec::new();
+    let record_count = match job.kind {
+        pb::SectionKind::Job => encode(job_records(state, start, count), &mut bytes),
+        pb::SectionKind::Attempt => encode(attempt_records(state, start, count), &mut bytes),
+        pb::SectionKind::Allocation => encode(allocation_records(state, start, count), &mut bytes),
+        pb::SectionKind::Node => encode(node_records(state, start, count), &mut bytes),
+        pb::SectionKind::QuotaEntity => {
+            encode(quota_entity_records(state, start, count), &mut bytes)
+        }
+        pb::SectionKind::ClusterState => encode(std::iter::once(cluster_record(state)), &mut bytes),
+        pb::SectionKind::Unspecified => 0,
+    };
+    RawSection {
+        kind: job.kind,
+        shard: job.shard,
+        encoding: ENCODING_PROTOBUF_LD.to_string(),
+        record_count,
+        bytes,
+    }
+}
+
+/// Encode a live `StateMachine` straight into `file` as a complete container,
+/// byte-identical to `encode_state(meta, &state_to_records(state), shards)` —
+/// but without ever building that intermediate `StateRecords` (KOI-5).
+///
+/// Each encode worker converts only its own section's window of records from
+/// the shared state, encodes it, and drops the converted records before the
+/// next section. Peak in-memory copies are therefore: the live state, the
+/// cloned `Arc` handed to the build, and the bounded set of in-flight section
+/// buffers ([`InFlightSlots`], workers + 2) — never a second full-state
+/// protobuf copy, however large the state (ADR 0018).
+///
+/// Durability (fsync, rename, manifest flip) is the caller's — the engine's
+/// snapshot-build entrypoints own that ordering (ADR 0017).
+pub fn write_state_direct(
+    file: &mut dyn FsFile,
+    meta: &pb::SnapshotMeta,
+    state: &StateMachine,
+    shards: u32,
+) -> io::Result<()> {
+    let counts = record_counts(state);
+    let jobs = state_section_jobs(&counts, shards.max(1) as usize);
+    write_sections(file, meta, &jobs, |job| encode_state_job(state, job))
 }
 
 /// Decode a validated container back into records, sections in parallel

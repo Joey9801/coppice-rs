@@ -48,7 +48,7 @@ use openraft::{
 };
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
-use coppice_proto::convert::{state_from_records, state_to_records};
+use coppice_proto::convert::state_from_records;
 use coppice_proto::pb::storage::v1 as pbstorage;
 
 use coppice_state::StateMachine;
@@ -414,21 +414,24 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
         };
 
         // Serialize + write + pointer flip on the blocking pool; the apply
-        // task is free the whole time (ADR 0018). The container streams
-        // section by section into the engine's temp file — never held in
-        // memory whole — and the engine is locked only to create that file
-        // and to adopt it, so appends continue while the encode runs. What
-        // openraft holds (and the network later streams) is a read handle to
-        // the adopted file, never the bytes.
+        // task is free the whole time (ADR 0018). Sections are encoded
+        // straight from the captured state — each worker converts only its
+        // own shard's window of records to protobuf and drops them before the
+        // next (KOI-5) — and streamed section by section into the engine's
+        // temp file, never held in memory whole. No whole-state protobuf copy
+        // exists at any point; peak is the live state, this cloned `Arc`, and
+        // a bounded set of in-flight section buffers. The engine is locked
+        // only to create the temp file and to adopt it, so appends continue
+        // while the encode runs. What openraft holds (and the network later
+        // streams) is a read handle to the adopted file, never the bytes.
         let core = Arc::clone(&self.core);
         let shards = self.shards;
         let file = tokio::task::spawn_blocking(move || -> io::Result<Box<dyn FsFile>> {
-            let records = state_to_records(&state);
             let mut spool = core
                 .lock()
                 .expect("storage engine poisoned")
                 .begin_snapshot_build(&meta.snapshot_id)?;
-            snapshot::write_state(&mut *spool, &meta, &records, shards)?;
+            snapshot::write_state_direct(&mut *spool, &meta, &state, shards)?;
             let mut core = core.lock().expect("storage engine poisoned");
             core.finish_snapshot_build(spool)?;
             let (_, _, file) = core
