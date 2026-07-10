@@ -18,7 +18,7 @@ waive them.
 | --- | --- | --- | --- | --- |
 | [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved) | Do not enable terminal-job eviction with the stub history sink |
 | [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Open | Do not claim safely retryable job submission |
-| [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Open | Do not expose resumable event subscriptions |
+| [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Open | Strict-backfill starvation guarantee is not established |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open | Do not advertise the 1M-job target as supported |
 
@@ -155,7 +155,7 @@ unknown submission outcome without a possibility of creating a second job.
 ## KOI-3: Event cursors depend on local apply batching
 
 - **Severity:** High
-- **Status:** Open
+- **Status:** Resolved (2026-07-10)
 - **Affected capability:** resumable event subscriptions and follower fanout
 - **Related decision:** [ADR 0008](../decisions/0008-event-delivery-guarantees.md)
 
@@ -167,47 +167,38 @@ ordered sequence independently of how OpenRaft groups entries into apply
 calls. Cursor replay must neither skip committed events nor make a cursor mean
 different things on different replicas.
 
-### Current violation
+### Resolution (2026-07-10)
 
-`StateMachineStore` deliberately sends several normal log entries in one
-`ApplyRequest::Apply`. The apply loop accumulates all events from that request
-and emits one `EventBatch` tagged with the final entry's index
-([apply loop](../../crates/coppice-consensus/src/apply_loop.rs),
-[state-machine bridge](../../crates/coppice-consensus/src/storage/sm.rs)).
+~~The apply loop accumulated all events from one `ApplyRequest::Apply` and
+emitted a single `EventBatch` tagged with the final entry's index, so apply
+batch boundaries — a local runtime detail — leaked into the public stream.~~
+The apply loop now emits **one `EventBatch` per accepted command, tagged with
+that command's own log index**
+([apply loop](../../crates/coppice-consensus/src/apply_loop.rs)). Because
+apply is deterministic, which commands emit events (and which batches are
+therefore skipped as empty) is a pure function of the committed log, so every
+replica derives byte-for-byte identical batches and cursor positions
+regardless of how OpenRaft grouped entries into apply requests.
+`event_stream_is_invariant_under_apply_batching` pins this: the same command
+sequence — including a rejected command mid-sequence — run under three
+different artificial batchings yields the identical `(index, events)` stream.
 
-Apply batch boundaries are a local runtime detail and may differ between
-replicas. Events from earlier commands in a batch consequently lose their own
-index, and equivalent replicas can construct different event batches and
-cursor positions from the same log.
-
-Scoped fanout has a second incompleteness: job and node filters currently omit
-attempt- and allocation-scoped events because the fanout layer cannot map those
-events back to their owning job or node
+~~Scoped fanout had a second incompleteness: job and node filters omitted
+attempt- and allocation-scoped events because the fanout layer could not map
+those events back to their owning job or node.~~ `AttemptStateChanged`,
+`AllocationFunded`, and `StopRequested` now carry their owning job and node
+ids as scope keys, stamped during apply while the association is
+authoritative ([state events](../../crates/coppice-state/src/lib.rs)); the
+fanout filters on them directly with no mutable lookups
 ([fanout](../../crates/coppice-coordinator/src/tasks/event_fanout.rs)).
-
-### Impact
-
-- ADR 0008's identical follower-derived stream is not guaranteed.
-- Reconnecting through a different replica can change cursor behavior.
-- A job subscription can miss attempt progress and allocation-funding events
-  even without a channel gap.
-
-### Resolution requirements
-
-- Preserve the `(log_index, apply outcome, events)` association per command
-  inside an apply request.
-- Emit one index-addressable batch per command, or define an equally precise
-  composite cursor. OpenRaft batch shape must never affect the public stream.
-- Carry sufficient scope keys on each derived event, or enrich events before
-  fanout, so job/node subscriptions include all relevant attempt and allocation
-  changes without mutable lookups that can race later state.
-- Test the same command sequence under different artificial apply batchings and
-  assert byte-for-byte identical event/cursor output.
 
 ### Closure criteria
 
-This issue is resolved when event derivation is invariant under apply batching
-and scoped subscriptions deliver the complete documented event set.
+Met: event derivation is invariant under apply batching
+(`event_stream_is_invariant_under_apply_batching`) and scoped subscriptions
+deliver the complete documented event set
+(`job_filter_admits_attempt_and_allocation_events`,
+`node_filter_admits_attempt_and_allocation_events`).
 
 ## KOI-4: Unbounded `projected_ready` does not protect accrual progress
 

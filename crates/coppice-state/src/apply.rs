@@ -155,6 +155,7 @@ impl StateMachine {
                             events.push(Event::StopRequested {
                                 node: a.attempt.node,
                                 allocation: a.attempt.allocation,
+                                job: a.attempt.job,
                             });
                         }
                     }
@@ -314,11 +315,15 @@ impl StateMachine {
             );
             events.push(Event::AttemptStateChanged {
                 attempt: p.attempt,
+                job: p.job,
+                node: spec.node,
                 state: attempt_state,
             });
             if fully {
                 events.push(Event::AllocationFunded {
                     allocation: spec.id,
+                    job: p.job,
+                    node: spec.node,
                 });
             }
             if let Some(j) = self.jobs.get_mut(&p.job) {
@@ -878,7 +883,12 @@ impl StateMachine {
         if let Some(a) = self.attempts.get_mut(&attempt) {
             if a.attempt.state != to {
                 a.attempt.state = to.clone();
-                events.push(Event::AttemptStateChanged { attempt, state: to });
+                events.push(Event::AttemptStateChanged {
+                    attempt,
+                    job: a.attempt.job,
+                    node: a.attempt.node,
+                    state: to,
+                });
             }
         }
     }
@@ -1111,9 +1121,12 @@ impl StateMachine {
             free = free.saturating_sub(&pledge);
             if rec.allocation.funded == rec.allocation.requested {
                 rec.allocation.state = AllocationState::Funded;
+                let job = rec.allocation.job;
                 self.accrual_queue.remove(&(node, seq));
                 events.push(Event::AllocationFunded {
                     allocation: alloc_id,
+                    job,
+                    node,
                 });
                 newly_funded.push(alloc_id);
             }

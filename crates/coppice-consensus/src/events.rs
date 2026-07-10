@@ -17,12 +17,18 @@ use tokio::sync::mpsc::error::TrySendError;
 
 use coppice_state::Event;
 
-/// The events emitted while applying the commands committed up to
-/// `applied_index`, in commit order.
+/// The events emitted by applying **one** committed command, in emission
+/// order.
+///
+/// One batch per command is a load-bearing invariant (ADR 0008, KOI-3): the
+/// index is the command's own log index, so every replica derives the same
+/// batches and cursor positions regardless of how openraft grouped entries
+/// into apply requests, and a cursor resume can never split or skip a
+/// command's events.
 #[derive(Debug, Clone)]
 pub struct EventBatch {
-    /// The Raft applied log index this batch was produced at — the global
-    /// sequence cursor of ADR 0008.
+    /// The Raft log index of the command that produced these events — the
+    /// global sequence cursor of ADR 0008.
     pub applied_index: u64,
     pub events: Vec<Event>,
 }
