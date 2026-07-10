@@ -102,13 +102,25 @@ mirroring apply's `check_accrual_limit` exactly (`before`/`after` count
 distinct jobs holding accruing allocations in the pass's batch simulator).
 If some node passes the hard filters on total capacity and labels, and
 opening one more accrual would not push the accruing-job count over the
-limit, the job is placed there with `expect_funded = false` — the node
-chosen is the one that maximizes `sim_free.component_min(requests)`
-(smallest remaining need after pledge), ties by `NodeId`. If no license or
-no feasible node exists, the job is skipped for this pass and stays
-`Queued`; jobs beyond the top-K protected window, or ones that fit no
-node's total capacity at all, are simply passed over rather than treated
-as an error.
+limit, the job is placed there with `expect_funded = false`.
+
+Node choice prefers a **finite `projected_ready`** (ADR 0027): for each
+eligible node the pass computes the bound the new accrual would get —
+appended behind that node's surviving accrual queue and any accruals this
+batch already placed there, swept against the node's guaranteed release
+events — and never picks a node where that bound is indefinite while some
+eligible node offers a finite one. Finite candidates are ranked by
+earliest bound, ties by largest immediately-pledged fraction
+(`sim_free.component_min(requests)`, normalized); indefinite candidates
+fall back to the pledged-fraction ranking among themselves. Ties break by
+`NodeId` throughout. When only indefinite nodes exist the accrual still
+opens — the job keeps its top-K protection, and the strict-backfill rule
+below makes such a node lend-free, so the accrual's funding is monotone.
+
+If no license or no feasible node exists, the job is skipped for this
+pass and stays `Queued`; jobs beyond the top-K protected window, or ones
+that fit no node's total capacity at all, are simply passed over rather
+than treated as an error.
 
 ## Strict backfill: the revoke-and-reseat lend
 
@@ -125,17 +137,19 @@ lent from:
 now + r ≤ projected_ready(A)     for every surviving accrual A on the node
 ```
 
-**`projected_ready(A) = None` (unbounded) counts as satisfied.** This is
-deliberate, not an oversight: `projected_ready(A)` is the *guaranteed*
-worst-case time by which `A` gets funded from currently-running,
-`max_runtime`-enforced allocations (see below). When that sweep runs out
-of guaranteed events before covering `A`'s remaining need, there is no
-finite worst-case bound to violate in the first place — the inequality is
-checked *against* the worst-case bound, and an unbounded bound makes any
-finite `now + r` trivially satisfy it. The safety property ADR 0014
-promises ("accruing allocations are never delayed by backfill") is stated
-relative to that guaranteed bound; where none exists, lending cannot make
-a nonexistent guarantee worse.
+**`projected_ready(A) = None` (unbounded) forbids the lend**
+([ADR 0027](../decisions/0027-finite-projected-ready-accrual-protection.md),
+which reversed the original `None => true` reading of ADR 0014).
+`projected_ready(A)` is the *guaranteed* worst-case time by which `A` gets
+funded from currently-running, `max_runtime`-enforced allocations (see
+below). When that sweep runs out of guaranteed events before covering
+`A`'s remaining need, `A` is waiting on capacity nothing bounds — exactly
+the accrual an adversarial stream of bounded jobs could otherwise
+revoke-and-reseat forever, taking back capacity it had already been
+funded. With `None` excluded, an accrual with no finite bound keeps every
+unit it accrues: its node lends nothing, and its funding is monotone. The
+utilization this forgoes on such nodes is deliberate and bounded by K
+(ADR 0027's consequences).
 
 Among nodes that pass, the pass picks the one minimizing borrowed capacity
 (`Σ_d (requests − sim_free).saturating_sub(0) / capacity_d`, ties by
@@ -172,18 +186,39 @@ component-wise to the node's accrual queue in `seq` order (mirroring
 remaining need reaches zero — or `None` if the events run out first.
 Simultaneous events tie-break by allocation `seq`.
 
+Events are collected for **every** node in the pass's model (one scan of
+the allocation table, as before), because candidate bounds for opening or
+moving an accrual sweep any eligible node, not only current accrual hosts
+(ADR 0027). Accruals the batch itself places on a node are carried as
+pending claims so later candidate sweeps on that node see the whole queue.
+
 ## Re-planning existing accruals
 
 Before the seating loop, the pass looks at every existing accruing job
-(distinct, in `seq` order): if its full `requested` now fits within some
-*other* schedulable node's free capacity (label-checked), it revokes the
-accrual and reseats the job there with `expect_funded = true` — "if the
-job's slot appears on a different node first it is seated there and the
-accrual is revoked"
-([scheduling-model.md](scheduling-model.md#large-jobs-accrual-and-backfilling)).
-This is subject to the same anti-churn rule as everything else: a
-revocation is only planned when it enables this concrete reseat-elsewhere,
-never in place with no gain.
+(distinct, in `seq` order) and re-plans it in two tiers:
+
+1. **Reseat-elsewhere (immediate fit).** If its full `requested` now fits
+   within some *other* schedulable, accrual-free node's free capacity
+   (label-checked), revoke the accrual and reseat the job there with
+   `expect_funded = true` — "if the job's slot appears on a different node
+   first it is seated there and the accrual is revoked"
+   ([scheduling-model.md](scheduling-model.md#large-jobs-accrual-and-backfilling)).
+2. **Improvement move (ADR 0027).** Failing that, if some other
+   schedulable node would give the accrual a finite `projected_ready`
+   *meaningfully better* than its current bound — any finite bound when
+   the current one is indefinite, or earlier by at least
+   `replan_min_improvement_us` (scheduler config, default 300 s) between
+   finite bounds — revoke and reseat it there, usually re-accruing. An
+   immediate fit is just the degenerate case `projected_ready = now`, and
+   a node whose bound would be indefinite is never a move target. The
+   move's batch shape is a lend's revoke-then-reseat, so it is gated on
+   the exact batch simulator the same way.
+
+Both tiers obey the same anti-churn rule as everything else: a revocation
+is only planned when it enables a concrete, strictly better reseat in the
+same batch, never in place with no gain — the threshold keeps
+finite-to-finite moves from oscillating, and the fixpoint rule below
+still holds.
 
 ## Work bounds
 
@@ -197,7 +232,11 @@ never in place with no gain.
   counted against it — they are already bounded by the replicated accrual
   cap `K` (`policy.accrual_limit`, default 4).
 - Node scans are `O(#nodes)` per candidate (best-fit and backfill node
-  choice both scan the node set once).
+  choice both scan the node set once). Candidate-bound scans (accrual
+  opens and improvement moves) additionally sweep each scanned node's
+  release events; opens are bounded by K per pass via the accrual guard,
+  and improvement scans are explicitly capped at K per pass so an
+  over-cap backlog cannot wedge the pass.
 
 ## Anti-churn and the fixpoint rule
 
@@ -220,6 +259,9 @@ and spin.
 - [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) —
   why accruing allocations replace standalone reservations, and the
   strict-backfill rule this page implements.
+- [ADR 0027](../decisions/0027-finite-projected-ready-accrual-protection.md) —
+  why an indefinite `projected_ready` forbids lending, and the
+  finite-first placement and improvement-move rules.
 - [scheduling-model.md](scheduling-model.md) — the operating model and
   vocabulary (accrual, license to backfill, `projected_ready`, K) this
   page assumes.

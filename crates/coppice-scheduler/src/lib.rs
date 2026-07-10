@@ -54,6 +54,11 @@ pub struct SchedulerConfig {
     /// Weight of the ADR 0021 age term, in effective-priority points per
     /// decay half-life waited.
     pub w_age: f64,
+    /// Minimum earliness, in µs, by which a move to another node must improve
+    /// an existing accrual's finite `projected_ready` bound before the pass
+    /// will revoke and reseat it there (ADR 0027). An indefinite bound is
+    /// always worth trading for a finite one, whatever the threshold.
+    pub replan_min_improvement_us: i64,
 }
 
 impl Default for SchedulerConfig {
@@ -62,6 +67,7 @@ impl Default for SchedulerConfig {
             max_candidates: 4096,
             max_placements_per_cycle: 512,
             w_age: score::DEFAULT_AGE_WEIGHT,
+            replan_min_improvement_us: 300_000_000,
         }
     }
 }

@@ -48,9 +48,11 @@ does **not** react by pinning queued jobs to nodes:
 - **Backfill safety never rests on runtime guesses.** A job may jump the queue
   into pledged capacity only if it has an *enforced* `max_runtime` ending
   before the accrual's `projected_ready`, a worst-case bound computed from the
-  enforced `max_runtime`s of the jobs currently holding that capacity.
-  Advisory estimates influence which node an accrual targets — never whether
-  a backfill is safe.
+  enforced `max_runtime`s of the jobs currently holding that capacity. An
+  accrual with no finite bound is never lent from at all (ADR 0027), and
+  accruals are placed — and re-planned — to have a finite bound wherever one
+  is achievable. Advisory estimates influence which node an accrual targets —
+  never whether a backfill is safe.
 - **Starvation protection comes from score dynamics, not from accruals.**
   Decayed usage keeps effective scores moving, so the protected top-K window
   rotates rather than being camped on. Declaring a tight `max_runtime` both

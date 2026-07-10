@@ -19,7 +19,7 @@ waive them.
 | [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved) | Do not enable terminal-job eviction with the stub history sink |
 | [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Resolved (2026-07-10, ADR 0026) | — |
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10) | — |
-| [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Open | Strict-backfill starvation guarantee is not established |
+| [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open | Do not advertise the 1M-job target as supported |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
@@ -226,9 +226,11 @@ deliver the complete documented event set
 ## KOI-4: Unbounded `projected_ready` does not protect accrual progress
 
 - **Severity:** High
-- **Status:** Open
+- **Status:** Resolved (2026-07-10) —
+  [ADR 0027](../decisions/0027-finite-projected-ready-accrual-protection.md)
 - **Affected capability:** strict backfill and starvation protection
-- **Related decision:** [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md)
+- **Related decision:** [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md),
+  amended by ADR 0027
 
 ### Required invariant
 
@@ -244,43 +246,63 @@ ADR 0014 permits lending only when
 `projected_ready(A)` as a guaranteed worst-case funding time. It concludes
 that accruing allocations are never delayed by backfill.
 
-The materialised scheduler design later declares
+~~The materialised scheduler design later declares
 `projected_ready(A) = None`—meaning no finite guaranteed release events are
 known—to satisfy the check automatically. The implementation follows that
-rule with `None => true`
+rule with `None => true`.~~ **Resolved 2026-07-10.**
+[ADR 0027](../decisions/0027-finite-projected-ready-accrual-protection.md)
+amends ADR 0014: an indefinite `projected_ready` now *forbids* the lend
+(`None => false`), accrual placement prefers nodes that yield a finite bound
+(never an indefinite node while a finite one is eligible), and re-planning
+moves an existing accrual to a node that meaningfully improves its bound —
+mandatorily when indefinite becomes finite
 ([scheduler design](../scheduling/scheduler-v1.md#strict-backfill-the-revoke-and-reseat-lend),
 [scheduler implementation](../../crates/coppice-scheduler/src/engine.rs)).
 
-This makes the guarantee vacuous for the allocations that most need
-protection. A succession of bounded jobs can repeatedly revoke and reseat an
-accrual behind new work when it has no finite `projected_ready`, including
-borrowing capacity it had already funded.
+The previous behavior made the guarantee vacuous for the allocations that
+most need protection: a succession of bounded jobs could repeatedly revoke
+and reseat an accrual behind new work when it had no finite
+`projected_ready`, including borrowing capacity it had already funded. Under
+ADR 0027 such an accrual keeps everything it accrues: its node lends
+nothing, so funding is monotone.
 
 ### Impact
 
-- A protected blocked job can continue to lose accrued capacity to backfill.
-- The claim that backfill never delays accrual is false in the ordinary sense
-  operators and users will infer.
-- The top-K accrual mechanism does not by itself establish a starvation bound.
+(Historical, before the resolution.)
+
+- A protected blocked job could continue to lose accrued capacity to
+  backfill.
+- The claim that backfill never delays accrual was false in the ordinary
+  sense operators and users would infer.
+- The top-K accrual mechanism did not by itself establish a starvation bound.
 
 ### Resolution requirements
 
-- Make the safety semantics explicit in a superseding or amending ADR. At
-  minimum, decide whether `None` forbids lending (`None => false`).
-- If unbounded lending is retained for utilization, add a separately bounded
+- ~~Make the safety semantics explicit in a superseding or amending ADR. At
+  minimum, decide whether `None` forbids lending (`None => false`).~~ Done —
+  ADR 0027 decides `None => false`.
+- ~~If unbounded lending is retained for utilization, add a separately bounded
   mechanism—credit, maximum cumulative lend time, protected funded floor, or
-  equivalent—that proves forward progress.
-- State the starvation/progress property formally enough for a property test,
-  including repeated scheduling passes and an adversarial stream of bounded
-  backfill jobs.
-- Add regression tests for an accrual with no finite projected release and for
-  repeated backfill arrivals.
+  equivalent—that proves forward progress.~~ Not applicable — unbounded
+  lending is not retained; a lend-credit mechanism remains ADR 0027's
+  documented escape hatch if the utilization cost is ever measured to matter.
+- ~~State the starvation/progress property formally enough for a property
+  test, including repeated scheduling passes and an adversarial stream of
+  bounded backfill jobs.~~ Done — ADR 0027's P1–P3.
+- ~~Add regression tests for an accrual with no finite projected release and
+  for repeated backfill arrivals.~~ Done —
+  `no_lend_when_the_accruals_bound_is_indefinite` and
+  `an_indefinite_accrual_survives_an_adversarial_backfill_stream` in
+  [the scheduler's behavioural tests](../../crates/coppice-scheduler/tests/engine.rs),
+  plus finite-first placement and improvement-move coverage.
 
 ### Closure criteria
 
-This issue is resolved when the design states a non-vacuous progress invariant
-and scheduler tests demonstrate it under repeated backfill, not only for one
-pass at a finite boundary.
+Met: ADR 0027 states the non-vacuous progress invariant, and the scheduler
+tests demonstrate it under a repeated adversarial stream of bounded backfill
+arrivals across passes — the accrual is never revoked by a lend, its funded
+capacity is monotone, and it funds the instant its unbounded holder releases,
+exactly as with no backfill stream.
 
 ## KOI-5: View and snapshot publication do not fit the 1M-job target
 

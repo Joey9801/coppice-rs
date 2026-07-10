@@ -124,7 +124,9 @@ user-declared whale flag.
   camped on.
 - An accrual is a hold, not a destination commitment. The scheduler re-plans
   every pass; if the job's slot appears on a different node first it is
-  seated there and the accrual is revoked.
+  seated there and the accrual is revoked, and an accrual is moved to
+  another node when that meaningfully improves its `projected_ready` bound —
+  always when an indefinite bound becomes finite (ADR 0027).
 - Accruing allocations are revocable by scheduler command for re-planning
   (attempt outcome `Revoked`, requeued free of retry budget) — the
   anti-deadlock and anti-leak story for overlapping half-funded whales.
@@ -133,7 +135,15 @@ user-declared whale flag.
   accruing allocation A it would touch, where `projected_ready` is the
   worst-case funding time computed from the enforced `max_runtime`s of the
   jobs currently holding A's remainder. Jobs without a `max_runtime` never
-  touch pledged capacity, so accrual is never delayed by backfill.
+  touch pledged capacity, and an accrual whose `projected_ready` is not
+  finite is never lent from at all (ADR 0027) — so accrual is never delayed
+  by backfill, and where no finite bound exists, funding is monotone.
+- The scheduler places accruals to give every one a finite `projected_ready`
+  wherever feasible — never on a node with an indefinite bound while a
+  finite-bound node is eligible. Where no finite bound is achievable the
+  accrual still opens: the job keeps its protection, and the honest answer
+  to "why is it waiting?" is the set of unbounded holders, not a
+  manufactured time.
 - Advisory runtime estimates may inform heuristics but never the backfill
   safety check.
 
