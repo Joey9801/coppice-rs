@@ -102,10 +102,13 @@ async fn handle_event<C: Consensus>(
         Event::AttemptStateChanged {
             attempt,
             state: AttemptState::Ready,
+            ..
         } => {
             dispatch_ready_attempt(consensus, views, router, *attempt).await;
         }
-        Event::StopRequested { node, allocation } => {
+        Event::StopRequested {
+            node, allocation, ..
+        } => {
             route_stop(router, views, *node, *allocation).await;
         }
         _ => {}
@@ -119,7 +122,7 @@ async fn handle_event<C: Consensus>(
 /// `docs/architecture/coordinator-runtime.md` ("Dispatch loop").
 ///
 /// The scan must be a strong read, not `views.latest()`: the event tap emits
-/// on every apply batch while view publishing is cadence-gated, so the events
+/// on every applied command while view publishing is cadence-gated, so the events
 /// this resync stands in for (missed before subscribing, or dropped in a gap)
 /// are routinely *ahead* of the latest published view. A stale scan misses a
 /// `Ready` attempt that no future event re-emits — the same silent wedge as

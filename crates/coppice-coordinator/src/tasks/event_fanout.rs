@@ -248,20 +248,26 @@ fn filter_events(filter: &EventFilter, batch: &EventBatch) -> Option<EventBatch>
     }
 }
 
-/// Whether `event` is in `filter`'s scope. // scope keys per ADR 0008
+/// Whether `event` is in `filter`'s scope, decided entirely by the scope
+/// keys the event carries (ADR 0008).
 ///
-/// Only the event variants that carry a job or node id directly can be
-/// scoped this way; attempt/allocation-scoped events would need a
-/// job/node cross-index to place into a `Job`/`Node` filter, which is
-/// future work — they are simply not delivered to scoped subscribers today.
+/// Attempt- and allocation-scoped events are stamped with their owning job
+/// and node during apply, so a `Job`/`Node` subscription sees the complete
+/// documented set — no cross-index lookups against state that may have moved
+/// on by delivery time.
 fn event_matches(filter: &EventFilter, event: &Event) -> bool {
     match (filter, event) {
         (EventFilter::All, _) => true,
         (EventFilter::Job(job), Event::JobSubmitted { job: j }) => j == job,
         (EventFilter::Job(job), Event::JobStateChanged { job: j, .. }) => j == job,
         (EventFilter::Job(job), Event::JobEvicted { job: j }) => j == job,
+        (EventFilter::Job(job), Event::AttemptStateChanged { job: j, .. }) => j == job,
+        (EventFilter::Job(job), Event::AllocationFunded { job: j, .. }) => j == job,
+        (EventFilter::Job(job), Event::StopRequested { job: j, .. }) => j == job,
         (EventFilter::Node(node), Event::StopRequested { node: n, .. }) => n == node,
         (EventFilter::Node(node), Event::NodeEpochBumped { node: n, .. }) => n == node,
+        (EventFilter::Node(node), Event::AttemptStateChanged { node: n, .. }) => n == node,
+        (EventFilter::Node(node), Event::AllocationFunded { node: n, .. }) => n == node,
         _ => false,
     }
 }
@@ -338,10 +344,35 @@ fn handle_subscribe(
 
 #[cfg(test)]
 mod tests {
+    use coppice_core::attempt::AttemptState;
+    use coppice_core::id::{AllocationId, AttemptId};
+
     use super::*;
 
     fn job_event(job: JobId) -> Event {
         Event::JobSubmitted { job }
+    }
+
+    /// The attempt/allocation-scoped variants, all owned by `job` on `node`.
+    fn scoped_events(job: JobId, node: NodeId) -> Vec<Event> {
+        vec![
+            Event::AttemptStateChanged {
+                attempt: AttemptId::new(),
+                job,
+                node,
+                state: AttemptState::Ready,
+            },
+            Event::AllocationFunded {
+                allocation: AllocationId::new(),
+                job,
+                node,
+            },
+            Event::StopRequested {
+                node,
+                allocation: AllocationId::new(),
+                job,
+            },
+        ]
     }
 
     #[test]
@@ -375,6 +406,34 @@ mod tests {
             events: vec![event],
         };
         assert!(filter_events(&EventFilter::Node(node), &batch).is_some());
+        assert!(filter_events(&EventFilter::Node(other), &batch).is_none());
+    }
+
+    #[test]
+    fn job_filter_admits_attempt_and_allocation_events() {
+        let job = JobId::new();
+        let other = JobId::new();
+        let batch = EventBatch {
+            applied_index: 1,
+            events: scoped_events(job, NodeId::new()),
+        };
+        let filtered = filter_events(&EventFilter::Job(job), &batch)
+            .expect("attempt/allocation events carry their owning job");
+        assert_eq!(filtered.events.len(), 3);
+        assert!(filter_events(&EventFilter::Job(other), &batch).is_none());
+    }
+
+    #[test]
+    fn node_filter_admits_attempt_and_allocation_events() {
+        let node = NodeId::new();
+        let other = NodeId::new();
+        let batch = EventBatch {
+            applied_index: 1,
+            events: scoped_events(JobId::new(), node),
+        };
+        let filtered = filter_events(&EventFilter::Node(node), &batch)
+            .expect("attempt/allocation events carry their node");
+        assert_eq!(filtered.events.len(), 3);
         assert!(filter_events(&EventFilter::Node(other), &batch).is_none());
     }
 

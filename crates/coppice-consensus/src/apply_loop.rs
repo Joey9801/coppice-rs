@@ -9,6 +9,12 @@
 //! in exactly that order (the doc's `apply → emit events → maybe_publish →
 //! reply`). It never awaits a full channel: the event tap `try_send`s, the view
 //! watch overwrites, and replies are oneshots.
+//!
+//! Events are emitted as **one batch per command**, tagged with that command's
+//! own log index. How openraft grouped entries into an [`ApplyRequest`] is a
+//! local runtime detail; the emitted stream must be a pure function of the
+//! committed log so every replica derives identical batches and cursor
+//! positions (ADR 0008, KOI-3).
 
 use std::sync::Arc;
 
@@ -56,18 +62,23 @@ pub(crate) async fn run(
                 match request {
                     ApplyRequest::Apply { entries, reply } => {
                         let mut outcomes = Vec::with_capacity(entries.len());
-                        let mut events = Vec::new();
                         for (index, command) in &entries {
                             let outcome = state.apply(command);
                             if let Ok(applied) = &outcome {
-                                events.extend(applied.events.iter().cloned());
+                                // One batch per command at the command's own
+                                // index: the stream is a function of the log,
+                                // never of the request's batching (KOI-3).
+                                // `emit` skips an empty batch and never blocks.
+                                tap.emit(EventBatch {
+                                    applied_index: *index,
+                                    events: applied.events.clone(),
+                                });
                             }
                             outcomes.push(outcome);
                             applied_index = *index;
                         }
                         // Order is mandated: apply -> emit events -> publish ->
-                        // reply. `emit` skips an empty batch and never blocks.
-                        tap.emit(EventBatch { applied_index, events });
+                        // reply.
                         publisher.maybe_publish(&state, applied_index);
                         // A dropped receiver just means the proposer went away.
                         let _ = reply.send(outcomes);
@@ -154,6 +165,79 @@ mod tests {
 
         drop(tx);
         handle.await.unwrap();
+    }
+
+    /// Run the loop over `batchings` (each inner vec is one `ApplyRequest`)
+    /// and return the full tapped `(index, events)` stream.
+    async fn tapped_stream(
+        batchings: Vec<Vec<(u64, coppice_state::Command)>>,
+    ) -> Vec<(u64, Vec<coppice_state::Event>)> {
+        let (publisher, views) =
+            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+        let (tap, mut tap_rx) = EventTap::channel(64);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
+
+        for entries in batchings {
+            let (reply, reply_rx) = oneshot::channel();
+            tx.send(ApplyRequest::Apply { entries, reply })
+                .await
+                .unwrap();
+            reply_rx.await.unwrap();
+        }
+        drop(tx);
+        handle.await.unwrap();
+        drop(views);
+
+        let mut stream = Vec::new();
+        while let Some(item) = tap_rx.recv().await {
+            match item {
+                TapItem::Batch(batch) => stream.push((batch.applied_index, batch.events)),
+                TapItem::Gap { .. } => panic!("nothing was dropped; no gap expected"),
+            }
+        }
+        stream
+    }
+
+    #[tokio::test]
+    async fn event_stream_is_invariant_under_apply_batching() {
+        // The same committed log — including a rejected command mid-sequence
+        // (the second bump to 2) — grouped into apply requests three different
+        // ways. KOI-3: the tapped stream must be identical in every case, and
+        // each batch must carry its own command's log index.
+        let log = || {
+            vec![
+                (3, bump_command(1)),
+                (4, bump_command(2)),
+                (5, bump_command(2)), // rejected: not monotonic
+                (6, bump_command(3)),
+            ]
+        };
+
+        let one_request = tapped_stream(vec![log()]).await;
+        let singletons = tapped_stream(log().into_iter().map(|entry| vec![entry]).collect()).await;
+        let mut split = log();
+        let tail = split.split_off(2);
+        let pairs = tapped_stream(vec![split, tail]).await;
+
+        let expected: Vec<(u64, Vec<coppice_state::Event>)> = vec![
+            (
+                3,
+                vec![coppice_state::Event::ClusterVersionBumped { to: 1 }],
+            ),
+            (
+                4,
+                vec![coppice_state::Event::ClusterVersionBumped { to: 2 }],
+            ),
+            // Index 5 was rejected: no batch, and index 6 keeps its own index.
+            (
+                6,
+                vec![coppice_state::Event::ClusterVersionBumped { to: 3 }],
+            ),
+        ];
+        assert_eq!(one_request, expected);
+        assert_eq!(singletons, expected);
+        assert_eq!(pairs, expected);
     }
 
     #[tokio::test]

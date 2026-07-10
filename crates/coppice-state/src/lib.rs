@@ -265,6 +265,12 @@ pub enum RejectionReason {
 /// Change events produced by an accepted command — derived output for the
 /// event fanout (ADR 0008) and the coordinator runtime, never read back by
 /// apply.
+///
+/// Every attempt- and allocation-scoped event carries its owning job and node
+/// ids as **scope keys**, stamped during apply while the association is
+/// authoritative. Scoped subscriptions (ADR 0008) filter on these directly;
+/// the fanout never has to look the owner up in mutable state that may have
+/// moved on by delivery time (KOI-3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     JobSubmitted {
@@ -277,16 +283,21 @@ pub enum Event {
     },
     AttemptStateChanged {
         attempt: AttemptId,
+        job: JobId,
+        node: NodeId,
         state: AttemptState,
     },
     AllocationFunded {
         allocation: AllocationId,
+        job: JobId,
+        node: NodeId,
     },
     /// An abort needs a `StopJob` sent to this node — apply does no I/O; the
     /// runtime acts on this.
     StopRequested {
         node: NodeId,
         allocation: AllocationId,
+        job: JobId,
     },
     NodeEpochBumped {
         node: NodeId,

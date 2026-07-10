@@ -42,8 +42,11 @@ vocabulary:
   is the reader handle; `StateView` is one immutable point-in-time snapshot.
 - **`ViewPublisher`** — the apply-side counterpart that publishes new views.
 - **`EventBatch` / `EventTap` / `EventTapReceiver`** — non-blocking,
-  apply-side event emission. The tap carries a dense sequence so a dropped
-  batch is recoverable as a synthesized gap ([ADR 0008](../decisions/0008-event-delivery-guarantees.md)).
+  apply-side event emission, **one batch per committed command** tagged with
+  that command's log index, so the stream and its cursors are invariant under
+  how openraft batches entries into apply requests. The tap carries a dense
+  sequence so a dropped batch is recoverable as a synthesized gap
+  ([ADR 0008](../decisions/0008-event-delivery-guarantees.md)).
 - **`ConsensusError`** — split into *retryable* (`NotLeader`, `Timeout`,
   `MembershipInProgress`, `LearnerNotCaughtUp`) and *fatal* (`Shutdown`,
   `Fatal`).
