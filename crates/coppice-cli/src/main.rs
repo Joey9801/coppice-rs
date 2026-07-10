@@ -4,6 +4,7 @@
 //! - `coppice coordinator --config …` — run a coordinator replica (plus its
 //!   hidden `admin` membership verbs);
 //! - `coppice agent --config …` — run a node agent;
+//! - `coppice dev …` — a self-contained single-node dev cluster;
 //! - `coppice job …` — client commands against a cluster's API.
 //!
 //! Shipping one binary keeps deployment to a single artifact: the same build
@@ -12,6 +13,8 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+mod dev;
 
 #[derive(Debug, Parser)]
 #[command(name = "coppice", version, about = "Coppice batch scheduler")]
@@ -27,6 +30,12 @@ enum Command {
 
     /// Run a node agent.
     Agent(AgentArgs),
+
+    /// Run a self-contained single-node dev cluster: one coordinator plus an
+    /// in-process agent, throwaway per-run TLS (effectively no
+    /// authentication), and a temp data directory unless --data-dir is set.
+    /// For local development and integration tests only.
+    Dev(dev::DevArgs),
 
     /// Job operations against a cluster's API.
     #[command(subcommand)]
@@ -68,6 +77,10 @@ async fn main() -> Result<()> {
         Command::Agent(args) => {
             init_tracing();
             coppice_agent::run_daemon(&args.config).await
+        }
+        Command::Dev(args) => {
+            init_tracing();
+            dev::run(args).await
         }
         Command::Job(_) => {
             // The write-path logic exists (coppice-api's ControlPlane), but

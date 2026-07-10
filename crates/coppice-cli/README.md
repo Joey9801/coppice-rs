@@ -7,6 +7,13 @@ deployment ships exactly one artifact.
   ([coppice-coordinator](../coppice-coordinator)), including the hidden
   `admin` membership verbs;
 - `coppice agent --config …` — run a node agent ([coppice-agent](../coppice-agent));
+- `coppice dev` — a self-contained single-node dev cluster: one coordinator
+  plus an in-process agent over localhost, a throwaway per-run CA (the
+  production mTLS paths run unmodified, but there is effectively **no
+  authentication** — localhost development only), and a temp data directory
+  unless `--data-dir` pins one for restartable state. `--executor fake`
+  (default) runs the job lifecycle without containers until the Docker
+  executor lands;
 - `coppice job …` — client commands over the public API
   ([coppice-api](../coppice-api)), the same surface the web UI is built on
   ([components](../../docs/architecture/components.md)).

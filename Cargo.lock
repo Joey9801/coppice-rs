@@ -510,8 +510,13 @@ dependencies = [
  "anyhow",
  "clap",
  "coppice-agent",
+ "coppice-consensus",
  "coppice-coordinator",
+ "coppice-core",
+ "rcgen",
+ "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
