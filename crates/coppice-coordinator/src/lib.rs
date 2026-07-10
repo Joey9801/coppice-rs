@@ -34,6 +34,21 @@ use anyhow::Result;
 // submit/abort path the (future) HTTP listener will host.
 pub use tasks::api_server::CoordinatorControlPlane;
 
+/// Register descriptions for every metric a coordinator process can emit,
+/// recursing into each crate and module that exposes metrics. The future
+/// /metrics endpoint (ADR 0020's `observability.metrics_addr`) calls this
+/// once after installing its recorder, without knowing any module's internals.
+pub fn describe_metrics() {
+    coppice_consensus::describe_metrics();
+}
+
+/// Run any point-in-time sampling behind coordinator metrics, recursing the
+/// same modules as [`describe_metrics`]. The /metrics endpoint calls this
+/// immediately before rendering each scrape.
+pub fn gather_metrics() {
+    coppice_consensus::gather_metrics();
+}
+
 /// Parse-and-dispatch entry point the binary calls.
 ///
 /// The default (no subcommand) invocation boots and runs a coordinator replica

@@ -25,6 +25,59 @@ use coppice_state::StateMachine;
 
 use crate::error::ConsensusError;
 
+/// The KOI-5 escape-hatch trigger metric (coordinator-runtime.md § clone-cost
+/// analysis): sustained p99 above 25 ms, or above 10% of the publish
+/// interval, is the documented signal to revisit the state representation.
+const VIEW_CLONE_SECONDS: &str = "coordinator_view_clone_seconds";
+const VIEW_PUBLISHES_TOTAL: &str = "coordinator_view_publishes_total";
+const VIEW_APPLIED_INDEX: &str = "coordinator_view_applied_index";
+const STATE_JOBS: &str = "coordinator_state_jobs";
+const STATE_ATTEMPTS: &str = "coordinator_state_attempts";
+const STATE_ALLOCATIONS: &str = "coordinator_state_allocations";
+const STATE_NODES: &str = "coordinator_state_nodes";
+
+pub(crate) fn describe_metrics() {
+    metrics::describe_histogram!(
+        VIEW_CLONE_SECONDS,
+        metrics::Unit::Seconds,
+        "Duration of the full-state clone behind one view publish, on the apply task."
+    );
+    metrics::describe_counter!(
+        VIEW_PUBLISHES_TOTAL,
+        metrics::Unit::Count,
+        "Views published (routine cadence, demand-driven, and unconditional)."
+    );
+    metrics::describe_gauge!(
+        VIEW_APPLIED_INDEX,
+        metrics::Unit::Count,
+        "Raft applied log index of the most recently published view."
+    );
+    metrics::describe_gauge!(
+        STATE_JOBS,
+        metrics::Unit::Count,
+        "Jobs in the published state."
+    );
+    metrics::describe_gauge!(
+        STATE_ATTEMPTS,
+        metrics::Unit::Count,
+        "Attempts in the published state."
+    );
+    metrics::describe_gauge!(
+        STATE_ALLOCATIONS,
+        metrics::Unit::Count,
+        "Allocations in the published state."
+    );
+    metrics::describe_gauge!(
+        STATE_NODES,
+        metrics::Unit::Count,
+        "Nodes in the published state."
+    );
+}
+
+pub(crate) fn gather_metrics() {
+    // Every view metric is pushed at publish time; nothing needs sampling.
+}
+
 /// An immutable snapshot of applied control-plane state at a known log index.
 ///
 /// Cheap to clone: it is an [`Arc`] to the state plus a cursor. Carries **both**
@@ -237,8 +290,18 @@ impl ViewPublisher {
     }
 
     fn publish_at(&mut self, state: &StateMachine, applied_index: u64, now: Instant) {
+        let clone_started = Instant::now();
+        let cloned = state.clone();
+        metrics::histogram!(VIEW_CLONE_SECONDS).record(clone_started.elapsed().as_secs_f64());
+        metrics::counter!(VIEW_PUBLISHES_TOTAL).increment(1);
+        metrics::gauge!(VIEW_APPLIED_INDEX).set(applied_index as f64);
+        metrics::gauge!(STATE_JOBS).set(state.jobs.len() as f64);
+        metrics::gauge!(STATE_ATTEMPTS).set(state.attempts.len() as f64);
+        metrics::gauge!(STATE_ALLOCATIONS).set(state.allocations.len() as f64);
+        metrics::gauge!(STATE_NODES).set(state.nodes.len() as f64);
+
         let view = StateView {
-            state: Arc::new(state.clone()),
+            state: Arc::new(cloned),
             applied_index,
         };
         self.published_index = applied_index;

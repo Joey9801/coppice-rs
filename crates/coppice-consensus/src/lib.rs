@@ -55,6 +55,22 @@ pub use coppice_net::transport::Server as RaftTransportServer;
 /// The handler the transport server wraps (built by [`start`]).
 pub use net::RaftTransportHandler;
 
+/// Register descriptions for every metric this crate can emit, recursing into
+/// each submodule that exposes metrics. Call once, after the process installs
+/// its global metrics recorder.
+pub fn describe_metrics() {
+    apply_loop::describe_metrics();
+    view::describe_metrics();
+}
+
+/// Run any point-in-time sampling behind this crate's metrics, recursing into
+/// each submodule that exposes metrics. The future /metrics endpoint calls
+/// this immediately before rendering a scrape.
+pub fn gather_metrics() {
+    apply_loop::gather_metrics();
+    view::gather_metrics();
+}
+
 /// Raft identity of one coordinator replica — an instance identity, never a
 /// reusable slot (ADR 0016). Distinct from [`coppice_core::id::NodeId`], which
 /// identifies compute nodes.

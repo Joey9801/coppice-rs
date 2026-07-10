@@ -15,6 +15,7 @@ coppice-net.workspace = true
 coppice-state.workspace = true
 crc32c.workspace = true
 fs2.workspace = true
+metrics.workspace = true
 openraft.workspace = true
 prost.workspace = true
 thiserror.workspace = true
