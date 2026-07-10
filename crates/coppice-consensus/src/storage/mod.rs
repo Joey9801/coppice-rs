@@ -52,6 +52,14 @@ pub use engine::{EncodedEntry, StorageCore, StorageOptions};
 pub use log::{SegmentLogReader, SegmentLogStorage};
 pub use sm::{run_apply_task, SegmentSnapshotBuilder, SnapshotFile, StateMachineStore};
 
+pub(crate) fn describe_metrics() {
+    sm::describe_metrics();
+}
+
+pub(crate) fn gather_metrics() {
+    sm::gather_metrics();
+}
+
 /// Container/framing internals, exported for the storage test suites and
 /// the ADR 0018 benches.
 ///

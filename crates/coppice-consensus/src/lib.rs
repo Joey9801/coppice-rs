@@ -60,6 +60,7 @@ pub use net::RaftTransportHandler;
 /// its global metrics recorder.
 pub fn describe_metrics() {
     apply_loop::describe_metrics();
+    storage::describe_metrics();
     view::describe_metrics();
 }
 
@@ -68,6 +69,7 @@ pub fn describe_metrics() {
 /// this immediately before rendering a scrape.
 pub fn gather_metrics() {
     apply_loop::gather_metrics();
+    storage::gather_metrics();
     view::gather_metrics();
 }
 
