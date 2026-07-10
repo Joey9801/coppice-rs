@@ -1,18 +1,21 @@
 //! Behavioural tests for the `HeuristicScheduler` against real apply-built
 //! states: resource-fit filtering, best-fit choice, the accrual cap K,
-//! per-cycle work caps, emitted command shape, and the strict-backfill
-//! boundary (ADR 0014).
+//! per-cycle work caps, emitted command shape, the strict-backfill boundary
+//! (ADR 0014), and the finite projected-ready protection rules (ADR 0027).
 
 mod common;
 
 use common::*;
 
 use coppice_core::allocation::AllocationState;
-use coppice_core::attempt::AttemptState;
+use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::id::AllocationId;
 use coppice_core::job::JobState;
 use coppice_core::quota::PriorityMultiplier;
+use coppice_core::resource::Resources;
 use coppice_scheduler::{HeuristicScheduler, PlacementProposal, Scheduler, SchedulerConfig};
-use coppice_state::StateMachine;
+use coppice_state::command::RecordAttemptOutcome;
+use coppice_state::{Command, StateMachine};
 
 fn schedule(sm: &StateMachine, now_us: i64) -> PlacementProposal {
     HeuristicScheduler::default().schedule(sm, now_us)
@@ -398,4 +401,239 @@ fn strict_backfill_declines_one_microsecond_past_the_boundary() {
             .any(|a| a.attempt.state == AttemptState::Accruing),
         "the whale is still accruing"
     );
+}
+
+// ---- ADR 0027: finite projected-ready protection ----
+
+/// Seed a running holder on a node: submit, place, dispatch, start (all at
+/// `TS`). `max_runtime_s = None` makes the hold unbounded.
+fn seed_running(
+    sm: &mut StateMachine,
+    n: u128,
+    node: u128,
+    requests: Resources,
+    max_runtime_s: Option<u64>,
+) {
+    apply_ok(
+        sm,
+        submit_cmd(jid(n), requests, max_runtime_s, PriorityMultiplier::ONE, TS),
+    );
+    apply_ok(
+        sm,
+        place_cmd(placement(jid(n), aid(n), alid(n), nid(node), requests), TS),
+    );
+    apply_ok(sm, dispatch_cmd(aid(n), TS));
+    apply_ok(sm, started_cmd(aid(n), TS));
+}
+
+/// One 32-cpu node where an *unbounded* runner `jid(1)` holds 16 cpu, and a
+/// whale `jid(2)` (32 cpu, no `max_runtime`) accrues with 16 cpu funded. The
+/// whale's remainder waits on the unbounded runner, so its `projected_ready`
+/// is indefinite.
+fn state_with_indefinite_whale() -> (StateMachine, AllocationId) {
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(16_000), None);
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(2), cpu(32_000), None, PriorityMultiplier::ONE, TS),
+    );
+
+    // The fallback (ADR 0027): no node offers a finite bound, but the whale
+    // still gets its accrual — protection does not depend on the bound.
+    let proposal = schedule(&sm, TS + 50);
+    assert_eq!(proposal.placements.len(), 1);
+    assert!(!proposal.placements[0].expect_funded, "the whale accrues");
+    let mut minted = Vec::new();
+    let mut mint = minter_from(1000);
+    let cmd = proposal.to_commit_placements(&mut || {
+        let ids = mint();
+        minted.push(ids.1);
+        ids
+    });
+    sm.apply(&Command::CommitPlacements(cmd))
+        .expect("the accrual opens");
+    let whale_alloc = minted[0];
+    assert_eq!(sm.allocations[&whale_alloc].allocation.funded, cpu(16_000));
+    (sm, whale_alloc)
+}
+
+#[test]
+fn no_lend_when_the_accruals_bound_is_indefinite() {
+    let (mut sm, whale_alloc) = state_with_indefinite_whale();
+    // S is small and tightly bounded. Under ADR 0014's `None => true` it
+    // would lend the whale's pledge; under ADR 0027 an indefinite bound
+    // forbids the lend outright.
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(3),
+            cpu(8_000),
+            Some(600),
+            PriorityMultiplier::ONE,
+            TS + 60,
+        ),
+    );
+    let proposal = schedule(&sm, TS + 100);
+    assert!(
+        proposal.revocations.is_empty(),
+        "no lend without a finite bound"
+    );
+    // S queues up behind the whale (its own accrual) instead of jumping it.
+    assert!(proposal
+        .placements
+        .iter()
+        .all(|p| p.job == jid(3) && !p.expect_funded));
+    commit(&mut sm, &proposal).expect("applies without a lend");
+    assert_eq!(
+        sm.allocations[&whale_alloc].allocation.funded,
+        cpu(16_000),
+        "the whale keeps every unit it accrued"
+    );
+}
+
+#[test]
+fn an_indefinite_accrual_survives_an_adversarial_backfill_stream() {
+    // The KOI-4 scenario: a succession of bounded jobs arrives while the
+    // whale's bound is indefinite. P1: none of them may take anything back;
+    // the whale's funding must be exactly what it would be with no stream.
+    let (mut sm, whale_alloc) = state_with_indefinite_whale();
+    let mut mint = minter();
+    for i in 0..8u32 {
+        let now = TS + 100 + i64::from(i) * 1_000_000;
+        apply_ok(
+            &mut sm,
+            submit_cmd(
+                jid(100 + u128::from(i)),
+                cpu(8_000),
+                Some(600),
+                PriorityMultiplier::ONE,
+                now,
+            ),
+        );
+        let proposal = schedule(&sm, now + 1);
+        assert!(
+            proposal.revocations.is_empty(),
+            "pass {i}: backfill must not touch the indefinite accrual"
+        );
+        if proposal.is_empty() {
+            continue;
+        }
+        let cmd = proposal.to_commit_placements(&mut mint);
+        sm.apply(&Command::CommitPlacements(cmd))
+            .unwrap_or_else(|e| panic!("pass {i}: applies: {e}"));
+        assert_eq!(
+            sm.allocations[&whale_alloc].allocation.funded,
+            cpu(16_000),
+            "pass {i}: funded capacity is monotone"
+        );
+        assert_eq!(
+            sm.allocations[&whale_alloc].allocation.state,
+            AllocationState::Accruing
+        );
+    }
+
+    // The unbounded holder finally finishes. Its 16 cpu must fund the whale
+    // at that very instant — funding is seq order and the adversarial
+    // accruals all sit behind it — exactly as if the stream never arrived.
+    let done = TS + 100 + 9_000_000;
+    apply_ok(
+        &mut sm,
+        Command::RecordAttemptOutcome(RecordAttemptOutcome {
+            attempt: aid(1),
+            outcome: AttemptOutcome::Exited { code: 0 },
+            actual_runtime_us: (done - TS) as u64,
+            observed_at_us: done,
+        }),
+    );
+    assert_eq!(
+        sm.allocations[&whale_alloc].allocation.state,
+        AllocationState::Funded,
+        "the whale funds the moment its holder releases"
+    );
+    assert_eq!(sm.allocations[&whale_alloc].allocation.funded, cpu(32_000));
+}
+
+#[test]
+fn accrual_opens_where_the_bound_is_finite() {
+    // Two full nodes: node1 held by an unbounded job, node2 by a bounded one.
+    // Both pledge nothing today, and the pledge-only ranking would take node1
+    // (lowest NodeId). ADR 0027 never opens on an indefinite-bound node while
+    // a finite-bound node is eligible.
+    let mut sm = setup(cpu(32_000), 4);
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(32_000), TS));
+    seed_running(&mut sm, 1, 1, cpu(32_000), None);
+    seed_running(&mut sm, 2, 2, cpu(32_000), Some(3600));
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(3), cpu(32_000), None, PriorityMultiplier::ONE, TS),
+    );
+
+    let proposal = schedule(&sm, TS + 1);
+    assert_eq!(proposal.placements.len(), 1);
+    assert_eq!(proposal.placements[0].node, nid(2), "finite bound wins");
+    assert!(!proposal.placements[0].expect_funded);
+}
+
+#[test]
+fn an_accrual_moves_when_a_finite_bound_appears_elsewhere() {
+    let (mut sm, whale_alloc) = state_with_indefinite_whale();
+    // A second node appears, fully held by a bounded job: moving the whale
+    // there trades an indefinite bound for a finite one — always worth it,
+    // whatever the improvement threshold.
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(32_000), TS));
+    seed_running(&mut sm, 3, 2, cpu(32_000), Some(3600));
+
+    let proposal = schedule(&sm, TS + 200);
+    assert_eq!(proposal.revocations, vec![whale_alloc], "the move revokes");
+    assert_eq!(proposal.placements.len(), 1);
+    let p = &proposal.placements[0];
+    assert_eq!((p.job, p.node), (jid(2), nid(2)));
+    assert!(!p.expect_funded, "the whale re-accrues on the target");
+
+    commit(&mut sm, &proposal).expect("the move applies");
+    // Fixpoint: re-running immediately on the applied state proposes nothing
+    // (the driver's backoff depends on this).
+    assert!(
+        schedule(&sm, TS + 300).is_empty(),
+        "no churn after the move"
+    );
+}
+
+#[test]
+fn a_finite_bound_moves_only_for_a_meaningful_improvement() {
+    // The whale accrues on node1 with a finite bound (its holder releases at
+    // TS + 7200 s) before node2 exists.
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(16_000), Some(7200));
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(2), cpu(32_000), None, PriorityMultiplier::ONE, TS),
+    );
+    let open = schedule(&sm, TS + 50);
+    assert_eq!(open.placements.len(), 1);
+    assert!(!open.placements[0].expect_funded);
+    let mut mint = minter_from(1000);
+    let cmd = open.to_commit_placements(&mut mint);
+    sm.apply(&Command::CommitPlacements(cmd))
+        .expect("the accrual opens");
+
+    // node2's bound would be 60 s earlier — a real improvement, but under the
+    // default 300 s threshold not a meaningful one.
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(32_000), TS));
+    seed_running(&mut sm, 3, 2, cpu(32_000), Some(7140));
+    assert!(
+        schedule(&sm, TS + 100).is_empty(),
+        "a 60 s gain does not justify a move at the default threshold"
+    );
+
+    // The same state under a 30 s threshold does move (the pass is a pure
+    // function of the snapshot, so re-scheduling it is legal).
+    let cfg = SchedulerConfig {
+        replan_min_improvement_us: 30_000_000,
+        ..SchedulerConfig::default()
+    };
+    let proposal = schedule_with(&sm, cfg, TS + 100);
+    assert_eq!(proposal.revocations.len(), 1, "the lower threshold moves");
+    assert_eq!(proposal.placements.len(), 1);
+    assert_eq!(proposal.placements[0].node, nid(2));
 }

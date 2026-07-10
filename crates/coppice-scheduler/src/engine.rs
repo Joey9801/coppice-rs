@@ -3,7 +3,9 @@
 //! One pass is a pure function of `(snapshot, now_us)`: it scores the queued
 //! backlog in effective-score order (ADR 0021), packs jobs onto nodes best-fit,
 //! and uses accruing allocations as the license to backfill *past* a blocked
-//! high-score job (ADR 0014). Every proposal it emits is shaped so the apply
+//! high-score job (ADR 0014), lending pledged capacity only against finite
+//! `projected_ready` bounds and steering accruals toward nodes that give them
+//! one (ADR 0027). Every proposal it emits is shaped so the apply
 //! side (`coppice_state::apply::commit_placements`) accepts it: the engine
 //! carries its own faithful simulator of apply's funding arithmetic and accrual
 //! guard, and never proposes a batch that simulator would see rejected. No
@@ -147,6 +149,14 @@ struct NodeModel<'a> {
     sim_free: Resources,
     /// Surviving accrual queue in ascending `seq` (funding order, ADR 0014).
     accruals: Vec<SimAccrual>,
+    /// Guaranteed release events on this node, sorted by `(time, seq)`
+    /// (`collect_release_events`), for `projected_ready` sweeps against both
+    /// the existing queue and would-be accrual placements (ADR 0027).
+    events: Vec<(i64, u64, Resources)>,
+    /// Remaining needs of accruals this batch placed on the node (opens and
+    /// moves, in payload order — they fund behind the surviving queue), so
+    /// later candidate sweeps see the whole claim on the node's events.
+    pending_accruals: Vec<Resources>,
 }
 
 // ---- the pass ----
@@ -160,6 +170,9 @@ struct Pass<'a> {
     horizon: i64,
     /// K, the replicated accrual cap.
     accrual_limit: usize,
+    /// The finite→finite move threshold (ADR 0027):
+    /// `SchedulerConfig::replan_min_improvement_us`.
+    min_improvement_us: i64,
     /// Distinct jobs holding an accrual at pass start. When this already meets
     /// K, no new accrual (an open or a lend's net growth) can be admitted, so
     /// those paths short-circuit rather than scan (cheap in a healthy cluster,
@@ -191,7 +204,9 @@ impl<'a> Pass<'a> {
             .keys()
             .map(|(node, _)| *node)
             .collect();
-        let mut events = collect_release_events(snapshot, &accrual_nodes);
+        // Events for every node, not only accrual hosts: candidate bounds for
+        // opening or moving an accrual sweep any eligible node (ADR 0027).
+        let mut events = collect_release_events(snapshot);
 
         let mut nodes: Vec<NodeModel> = Vec::new();
         let mut node_index: BTreeMap<NodeId, usize> = BTreeMap::new();
@@ -215,13 +230,14 @@ impl<'a> Pass<'a> {
                     projected_ready: None,
                 });
             }
+            let mut evs = events.remove(id).unwrap_or_default();
+            sort_release_events(&mut evs);
             if !accruals.is_empty() {
                 let remaining: Vec<Resources> = accruals
                     .iter()
                     .map(|a| a.requested.saturating_sub(&a.funded))
                     .collect();
-                let mut evs = events.remove(id).unwrap_or_default();
-                let ready = sweep_projected_ready(&mut evs, &remaining);
+                let ready = sweep_projected_ready(&evs, &remaining);
                 for (a, t) in accruals.iter_mut().zip(ready) {
                     a.projected_ready = t;
                 }
@@ -232,6 +248,8 @@ impl<'a> Pass<'a> {
                 node: &rec.node,
                 sim_free: base_free.get(id).copied().unwrap_or(Resources::ZERO),
                 accruals,
+                events: evs,
+                pending_accruals: Vec::new(),
             });
         }
 
@@ -245,6 +263,7 @@ impl<'a> Pass<'a> {
             w_age: config.w_age,
             horizon,
             accrual_limit: snapshot.policy.accrual_limit as usize,
+            min_improvement_us: config.replan_min_improvement_us,
             base_before,
             base_free,
             nodes,
@@ -305,12 +324,16 @@ impl<'a> Pass<'a> {
         ranks
     }
 
-    /// Re-plan existing accruals onto free space (scheduling-model.md): if a
-    /// distinct accruing job's full request now fits on another schedulable
-    /// node, revoke its accrual and reseat it there, funded.
+    /// Re-plan existing accruals (scheduling-model.md): if a distinct
+    /// accruing job's full request now fits on another schedulable node,
+    /// revoke its accrual and reseat it there, funded. Failing that, move it
+    /// to a node that meaningfully improves its `projected_ready` bound
+    /// (ADR 0027): always when the move turns an indefinite bound finite,
+    /// and past the configured improvement threshold between finite bounds.
     ///
     /// Anti-churn (ADR 0014): a revocation is emitted only when it enables a
-    /// concrete funded reseat in the same batch — never a revoke-in-place.
+    /// concrete, strictly better reseat in the same batch — never a
+    /// revoke-in-place.
     fn replan_existing_accruals(&mut self) {
         let snapshot = self.snapshot;
         let entries: Vec<(JobId, AllocationId, NodeId)> = snapshot
@@ -322,6 +345,10 @@ impl<'a> Pass<'a> {
             })
             .collect();
         let mut seen: BTreeSet<JobId> = BTreeSet::new();
+        // Improvement scans sweep every node's events, so bound them by K per
+        // pass: a healthy cluster holds at most K accruals anyway, and a
+        // pathological over-cap backlog must not wedge the pass.
+        let mut improvement_scans = 0usize;
         for (job_id, alloc, source) in entries {
             if !seen.insert(job_id) {
                 continue;
@@ -355,25 +382,158 @@ impl<'a> Pass<'a> {
             }
             let requested = jr.spec.requests;
             let required = required_labels(&jr.spec);
-            let Some(target_idx) = self.best_reseat_target(source, &jr.spec, &requested, &required)
-            else {
+            if let Some(target_idx) =
+                self.best_reseat_target(source, &jr.spec, &requested, &required)
+            {
+                self.revoke_accrual_on_source(source, alloc);
+                self.revocations.push(alloc);
+                self.revoked_nodes.insert(source);
+                let target_id = self.nodes[target_idx].node.id;
+                let pledge = self.nodes[target_idx].sim_free.component_min(&requested);
+                self.nodes[target_idx].sim_free =
+                    self.nodes[target_idx].sim_free.saturating_sub(&pledge);
+                self.placed_nodes.insert(target_id);
+                self.placements.push(ProposedPlacement {
+                    job: job_id,
+                    node: target_id,
+                    requested,
+                    expect_funded: true,
+                });
                 continue;
-            };
-            self.revoke_accrual_on_source(source, alloc);
-            self.revocations.push(alloc);
-            self.revoked_nodes.insert(source);
-            let target_id = self.nodes[target_idx].node.id;
-            let pledge = self.nodes[target_idx].sim_free.component_min(&requested);
-            self.nodes[target_idx].sim_free =
-                self.nodes[target_idx].sim_free.saturating_sub(&pledge);
-            self.placed_nodes.insert(target_id);
-            self.placements.push(ProposedPlacement {
-                job: job_id,
-                node: target_id,
-                requested,
-                expect_funded: true,
-            });
+            }
+            if improvement_scans < self.accrual_limit {
+                improvement_scans += 1;
+                self.try_improve_accrual_bound(job_id, alloc, source, &requested, &required);
+            }
         }
+    }
+
+    /// The ADR 0027 improvement move: reseat one accrual on a node that gives
+    /// it a strictly better `projected_ready` bound. Same batch shape as a
+    /// lend's reseat — revoke on the source, place (usually accruing again)
+    /// on the target — so, like the lend, it is gated on the exact simulator:
+    /// a move never grows the distinct accruing-job count, but an over-cap
+    /// cluster would still trip apply's guard.
+    fn try_improve_accrual_bound(
+        &mut self,
+        job_id: JobId,
+        alloc: AllocationId,
+        source: NodeId,
+        requested: &Resources,
+        required: &BTreeMap<String, String>,
+    ) -> bool {
+        let Some(&source_idx) = self.node_index.get(&source) else {
+            return false;
+        };
+        let Some(current) = self.accrual_projected_ready(source_idx, alloc) else {
+            return false;
+        };
+        let Some(target_idx) = self.best_improvement_target(source, requested, required, current)
+        else {
+            return false;
+        };
+        let target_id = self.nodes[target_idx].node.id;
+        let mut revocations = self.revocations.clone();
+        revocations.push(alloc);
+        let mut placements = self.placements.clone();
+        placements.push(ProposedPlacement {
+            job: job_id,
+            node: target_id,
+            requested: *requested,
+            expect_funded: false,
+        });
+        if simulate_batch(self.snapshot, &self.base_free, &revocations, &placements).rejects_accrual
+        {
+            return false;
+        }
+        self.revoke_accrual_on_source(source, alloc);
+        self.revocations = revocations;
+        self.revoked_nodes.insert(source);
+        let pledge = self.nodes[target_idx].sim_free.component_min(requested);
+        self.nodes[target_idx].sim_free = self.nodes[target_idx].sim_free.saturating_sub(&pledge);
+        let remaining = requested.saturating_sub(&pledge);
+        if !remaining.is_zero() {
+            self.nodes[target_idx].pending_accruals.push(remaining);
+        }
+        self.placed_nodes.insert(target_id);
+        self.placements = placements;
+        true
+    }
+
+    /// This accrual's `projected_ready` on its current node, recomputed from
+    /// the pass's working model (an earlier revocation on the node may have
+    /// grown the survivors' funding, making the pass-start value stale).
+    /// Outer `None` when the allocation is not in the model.
+    fn accrual_projected_ready(&self, node_idx: usize, alloc: AllocationId) -> Option<Option<i64>> {
+        let nm = &self.nodes[node_idx];
+        let pos = nm.accruals.iter().position(|a| a.alloc == alloc)?;
+        let needs: Vec<Resources> = nm
+            .accruals
+            .iter()
+            .map(|a| a.requested.saturating_sub(&a.funded))
+            .collect();
+        Some(sweep_projected_ready(&nm.events, &needs)[pos])
+    }
+
+    /// Best node — schedulable, not the source, not already a revocation
+    /// source — that gives the moved accrual a finite `projected_ready`
+    /// meaningfully better than `current` (ADR 0027): any finite bound when
+    /// `current` is indefinite, otherwise earlier by at least the configured
+    /// threshold. Earliest bound wins, ties by largest immediately-pledged
+    /// fraction, then lowest `NodeId`.
+    fn best_improvement_target(
+        &self,
+        source: NodeId,
+        requested: &Resources,
+        required: &BTreeMap<String, String>,
+        current: Option<i64>,
+    ) -> Option<usize> {
+        let mut best: Option<(i64, f64, usize)> = None;
+        for (i, nm) in self.nodes.iter().enumerate() {
+            if nm.node.id == source || !nm.node.schedulable {
+                continue;
+            }
+            if self.revoked_nodes.contains(&nm.node.id) {
+                continue;
+            }
+            if !requested.fits_within(&nm.node.capacity)
+                || !node_satisfies_labels(required, &nm.node.labels)
+            {
+                continue;
+            }
+            let pledge = nm.sim_free.component_min(requested);
+            let remaining = requested.saturating_sub(&pledge);
+            let ready = if remaining.is_zero() {
+                // A full immediate fit: the best possible bound. Reached only
+                // on accrual-hosting nodes — `best_reseat_target` already took
+                // any accrual-free full fit.
+                self.now_us
+            } else {
+                match candidate_projected_ready(nm, &remaining) {
+                    Some(t) => t,
+                    // An indefinite bound is never worth moving to.
+                    None => continue,
+                }
+            };
+            let improves = match current {
+                None => true,
+                Some(c) => ready < c && ready.saturating_add(self.min_improvement_us) <= c,
+            };
+            if !improves {
+                continue;
+            }
+            let pledged = pledge_fraction(&nm.sim_free, requested);
+            let better = match best {
+                None => true,
+                Some((best_ready, best_pledged, _)) => {
+                    ready < best_ready || (ready == best_ready && pledged > best_pledged)
+                }
+            };
+            if better {
+                best = Some((ready, pledged, i));
+            }
+        }
+        best.map(|(_, _, i)| i)
     }
 
     /// Best schedulable node — other than `source`, accrual-free, and not
@@ -566,10 +726,11 @@ impl<'a> Pass<'a> {
                 continue;
             }
             // Conservative touch set: the strict rule must hold for every
-            // surviving accrual. `projected_ready == None` is unbounded, so the
-            // job's finish is trivially no later than it (ADR 0014).
+            // surviving accrual. `projected_ready == None` forbids the lend
+            // (ADR 0027): an accrual with no guaranteed funding bound keeps
+            // every unit it accrues, so backfill can never starve it.
             let safe = nm.accruals.iter().all(|a| match a.projected_ready {
-                None => true,
+                None => false,
                 Some(ready) => deadline <= ready,
             });
             if !safe {
@@ -617,7 +778,8 @@ impl<'a> Pass<'a> {
 
         // Commit. sim_free reflects revoking every survivor (their pledge
         // returns whole, nothing survives to re-pledge), then the job, then the
-        // reseats in seq order.
+        // reseats in seq order; the reseats' remainders stay visible to later
+        // candidate sweeps as pending claims on the node's events.
         self.revocations = revocations;
         self.placements = placements;
         self.revoked_nodes.insert(node_id);
@@ -627,17 +789,31 @@ impl<'a> Pass<'a> {
             free = free.saturating_add(&a.funded);
         }
         free = free.saturating_sub(&free.component_min(requested));
+        let mut pending: Vec<Resources> = Vec::with_capacity(survivors.len());
         for a in &survivors {
-            free = free.saturating_sub(&free.component_min(&a.requested));
+            let pledge = free.component_min(&a.requested);
+            free = free.saturating_sub(&pledge);
+            let remaining = a.requested.saturating_sub(&pledge);
+            if !remaining.is_zero() {
+                pending.push(remaining);
+            }
         }
         self.nodes[idx].sim_free = free;
         self.nodes[idx].accruals.clear();
+        self.nodes[idx].pending_accruals.extend(pending);
         true
     }
 
     /// Open an accrual for a blocked head-of-order job — the license to
     /// backfill past it (ADR 0014) — when the accrual guard permits another
     /// accruing job and some node passes the hard filters.
+    ///
+    /// Node choice prefers a finite `projected_ready` (ADR 0027): a node on
+    /// which the accrual's bound would be indefinite is never chosen while
+    /// some eligible node offers a finite one. Finite candidates rank by
+    /// earliest bound, ties by largest immediately-pledged fraction;
+    /// indefinite candidates rank by pledged fraction alone. Ties to lowest
+    /// `NodeId` throughout (iteration is `NodeId`-ascending, keep the first).
     fn try_open_accrual(
         &mut self,
         job_id: JobId,
@@ -650,7 +826,7 @@ impl<'a> Pass<'a> {
         if self.base_before >= self.accrual_limit {
             return false;
         }
-        let mut best: Option<(f64, usize)> = None;
+        let mut best: Option<(Option<i64>, f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
             if !nm.node.schedulable
                 || !requested.fits_within(&nm.node.capacity)
@@ -658,18 +834,27 @@ impl<'a> Pass<'a> {
             {
                 continue;
             }
-            let key = pledge_fraction(&nm.sim_free, requested);
-            // Maximize the immediately-pledged fraction; ties to lowest NodeId
-            // (iteration is NodeId-ascending, so keep the first maximum).
-            let better = match best {
+            // Nonzero: a full free fit was already taken by `try_free_fit`,
+            // which scans the same nodes under the same filters.
+            let remaining = requested.saturating_sub(&nm.sim_free.component_min(requested));
+            let ready = candidate_projected_ready(nm, &remaining);
+            let pledged = pledge_fraction(&nm.sim_free, requested);
+            let better = match &best {
                 None => true,
-                Some((bk, _)) => key > bk,
+                Some((best_ready, best_pledged, _)) => match (ready, *best_ready) {
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (Some(t), Some(bt)) => t < bt || (t == bt && pledged > *best_pledged),
+                    (None, None) => pledged > *best_pledged,
+                },
             };
             if better {
-                best = Some((key, i));
+                best = Some((ready, pledged, i));
             }
         }
-        let Some((_, idx)) = best else { return false };
+        let Some((_, _, idx)) = best else {
+            return false;
+        };
         let node_id = self.nodes[idx].node.id;
         let mut placements = self.placements.clone();
         placements.push(ProposedPlacement {
@@ -692,6 +877,9 @@ impl<'a> Pass<'a> {
         self.placed_nodes.insert(node_id);
         let pledge = self.nodes[idx].sim_free.component_min(requested);
         self.nodes[idx].sim_free = self.nodes[idx].sim_free.saturating_sub(&pledge);
+        self.nodes[idx]
+            .pending_accruals
+            .push(requested.saturating_sub(&pledge));
         true
     }
 
@@ -752,22 +940,17 @@ fn free_capacity_map(snapshot: &StateMachine) -> BTreeMap<NodeId, Resources> {
         .collect()
 }
 
-/// Guaranteed release events per accrual-hosting node: an allocation whose
-/// attempt is `Running` with a start time, on a job with an enforced
-/// `max_runtime`, releases its funded capacity at `start + max_runtime`
-/// (ADR 0014). Any other live allocation has no guaranteed bound and
-/// contributes nothing.
-fn collect_release_events(
-    snapshot: &StateMachine,
-    accrual_nodes: &BTreeSet<NodeId>,
-) -> BTreeMap<NodeId, Vec<(i64, u64, Resources)>> {
+/// Guaranteed release events per node: an allocation whose attempt is
+/// `Running` with a start time, on a job with an enforced `max_runtime`,
+/// releases its funded capacity at `start + max_runtime` (ADR 0014). Any
+/// other live allocation has no guaranteed bound and contributes nothing.
+/// Collected for every node — candidate bounds for opening or moving an
+/// accrual sweep any eligible node (ADR 0027), not only current hosts.
+fn collect_release_events(snapshot: &StateMachine) -> BTreeMap<NodeId, Vec<(i64, u64, Resources)>> {
     let mut events: BTreeMap<NodeId, Vec<(i64, u64, Resources)>> = BTreeMap::new();
-    if accrual_nodes.is_empty() {
-        return events;
-    }
     for rec in snapshot.allocations.values() {
         let node = rec.allocation.node;
-        if !accrual_nodes.contains(&node) || rec.allocation.state == AllocationState::Released {
+        if rec.allocation.state == AllocationState::Released {
             continue;
         }
         let Some(at) = snapshot.attempts.get(&rec.allocation.attempt) else {
@@ -794,16 +977,22 @@ fn collect_release_events(
     events
 }
 
+/// Order release events for [`sweep_projected_ready`]: ascending time, ties
+/// by allocation `seq`.
+fn sort_release_events(events: &mut [(i64, u64, Resources)]) {
+    events.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+}
+
 /// Sweep guaranteed release events to compute `projected_ready` per accrual
-/// (ADR 0014): walk events in time order (ties by allocation `seq`), pool the
-/// freed capacity, and pledge it to the accrual queue in `seq` order exactly as
-/// `pledge_node` would. An accrual's `projected_ready` is the event time its
-/// remaining need first reaches zero, or `None` if events run out.
+/// (ADR 0014): walk events in time order (pre-sorted by
+/// [`sort_release_events`]), pool the freed capacity, and pledge it to the
+/// accrual queue in `seq` order exactly as `pledge_node` would. An accrual's
+/// `projected_ready` is the event time its remaining need first reaches zero,
+/// or `None` if events run out.
 fn sweep_projected_ready(
-    events: &mut [(i64, u64, Resources)],
+    events: &[(i64, u64, Resources)],
     remaining: &[Resources],
 ) -> Vec<Option<i64>> {
-    events.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     let mut rem: Vec<Resources> = remaining.to_vec();
     let mut ready: Vec<Option<i64>> = vec![None; remaining.len()];
     let mut pool = Resources::ZERO;
@@ -825,6 +1014,24 @@ fn sweep_projected_ready(
         }
     }
     ready
+}
+
+/// The `projected_ready` a new accrual with `remaining` unfunded need would
+/// get on this node (ADR 0027): appended behind the surviving queue and the
+/// batch's pending accruals — funding is `seq` order, and batch placements
+/// take seqs after the survivors — then swept against the node's guaranteed
+/// releases.
+fn candidate_projected_ready(nm: &NodeModel, remaining: &Resources) -> Option<i64> {
+    let mut needs: Vec<Resources> = nm
+        .accruals
+        .iter()
+        .map(|a| a.requested.saturating_sub(&a.funded))
+        .collect();
+    needs.extend(nm.pending_accruals.iter().copied());
+    needs.push(*remaining);
+    sweep_projected_ready(&nm.events, &needs)
+        .pop()
+        .expect("needs is nonempty")
 }
 
 /// The outcome of a faithful batch simulation.
@@ -988,16 +1195,16 @@ mod tests {
     #[test]
     fn projected_ready_is_the_event_that_completes_the_need() {
         // One accrual needing 16 cpu; a single release at t=100 frees 16.
-        let mut events = vec![(100_i64, 0_u64, res(16_000, 0, 0))];
-        let ready = sweep_projected_ready(&mut events, &[res(16_000, 0, 0)]);
+        let events = vec![(100_i64, 0_u64, res(16_000, 0, 0))];
+        let ready = sweep_projected_ready(&events, &[res(16_000, 0, 0)]);
         assert_eq!(ready, vec![Some(100)]);
     }
 
     #[test]
     fn projected_ready_unbounded_when_events_fall_short() {
         // Needs 32 cpu but only 16 is ever guaranteed to free ⇒ unbounded.
-        let mut events = vec![(100_i64, 0_u64, res(16_000, 0, 0))];
-        let ready = sweep_projected_ready(&mut events, &[res(32_000, 0, 0)]);
+        let events = vec![(100_i64, 0_u64, res(16_000, 0, 0))];
+        let ready = sweep_projected_ready(&events, &[res(32_000, 0, 0)]);
         assert_eq!(ready, vec![None]);
     }
 
@@ -1006,7 +1213,8 @@ mod tests {
         // Two releases (t=50, t=100) each free 16; head accrual (seq order)
         // completes at the first, the next at the second.
         let mut events = vec![(100_i64, 1, res(16_000, 0, 0)), (50, 0, res(16_000, 0, 0))];
-        let ready = sweep_projected_ready(&mut events, &[res(16_000, 0, 0), res(16_000, 0, 0)]);
+        sort_release_events(&mut events);
+        let ready = sweep_projected_ready(&events, &[res(16_000, 0, 0), res(16_000, 0, 0)]);
         assert_eq!(ready, vec![Some(50), Some(100)]);
     }
 
