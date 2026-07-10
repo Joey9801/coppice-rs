@@ -1,6 +1,6 @@
 [package]
 name = "coppice-cli"
-description = "Command-line client for Coppice: submit, cancel, and query jobs against the public API."
+description = "The single `coppice` binary: coordinator, agent, and API client behind one entry point."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,9 +13,12 @@ name = "coppice"
 path = "src/main.rs"
 
 [dependencies]
-coppice-core.workspace = true
-coppice-proto.workspace = true
+coppice-coordinator.workspace = true
+coppice-agent.workspace = true
 anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

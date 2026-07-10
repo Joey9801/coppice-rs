@@ -38,7 +38,7 @@ ID, different life" is distinguishable in logs and forensics.
 
 ```
 uuidgen                       # once; becomes cluster_id in every config
-coppice-coordinator --config /etc/coppice/coordinator.toml --bootstrap
+coppice coordinator --config /etc/coppice/coordinator.toml --bootstrap
 ```
 
 `--bootstrap` is legal only on an **empty** data directory. It stamps the
@@ -51,7 +51,7 @@ node afterwards uses no flag at all.
 ## Restart: the default
 
 ```
-coppice-coordinator --config /etc/coppice/coordinator.toml
+coppice coordinator --config /etc/coppice/coordinator.toml
 ```
 
 No intent flag means "resume the instance on this disk". The startup
@@ -75,7 +75,7 @@ can only ever enter the cluster as a new learner.
 On the new machine, with an empty data directory:
 
 ```
-coppice-coordinator --config /etc/coppice/coordinator.toml --join
+coppice coordinator --config /etc/coppice/coordinator.toml --join
 ```
 
 `--join` mints and stamps a fresh identity and starts the replica idle — it
@@ -87,7 +87,7 @@ first entry of the config's `peers` list, and authenticates with the config's
 TLS material):
 
 ```
-coppice-coordinator admin --config coordinator.toml --target coord-1:7071 \
+coppice coordinator admin --config coordinator.toml --target coord-1:7071 \
     add-learner --node-id 4 --addr coord-4:7071
 ```
 
@@ -95,14 +95,14 @@ The leader begins replicating to the learner — snapshot install plus log
 replay, with no quorum impact while it syncs. Watch progress:
 
 ```
-coppice-coordinator admin --config coordinator.toml --target coord-1:7071 status
+coppice coordinator admin --config coordinator.toml --target coord-1:7071 status
 ```
 
 Once the learner's replication lag is inside the promotion threshold,
 promote it to voter:
 
 ```
-coppice-coordinator admin --config coordinator.toml --target coord-1:7071 \
+coppice coordinator admin --config coordinator.toml --target coord-1:7071 \
     promote --node-id 4
 ```
 
@@ -127,7 +127,7 @@ verb; the polished `coppice-cli` wrapper drives exactly this sequence):
    joint-consensus change**:
 
    ```
-   coppice-coordinator admin --config coordinator.toml --target coord-1:7071 \
+   coppice coordinator admin --config coordinator.toml --target coord-1:7071 \
        promote --node-id <new> --remove <departed>
    ```
 
@@ -142,7 +142,7 @@ If only membership cleanup is needed (a learner added by mistake, a node
 already removed from the voter set):
 
 ```
-coppice-coordinator admin --config coordinator.toml --target coord-1:7071 \
+coppice coordinator admin --config coordinator.toml --target coord-1:7071 \
     remove --node-id <id>
 ```
 

@@ -32,6 +32,7 @@ coppice-state = { path = "crates/coppice-state" }
 coppice-consensus = { path = "crates/coppice-consensus" }
 coppice-scheduler = { path = "crates/coppice-scheduler" }
 coppice-api = { path = "crates/coppice-api" }
+coppice-coordinator = { path = "crates/coppice-coordinator" }
 # Test and bench infrastructure only — always a dev-dependency, never shipped.
 coppice-testkit = { path = "crates/coppice-testkit" }
 

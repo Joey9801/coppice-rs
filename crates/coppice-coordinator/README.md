@@ -2,15 +2,16 @@
 
 The coordinator is the control-plane daemon: one process per replica that binds
 Raft consensus, the deterministic state machine, the scheduler, and the API into
-a single running node. This crate is the runtime that wires those subsystems
-together and the thin binary that launches it; the full concurrency contract
+a single running node. This crate is the runtime library that wires those subsystems
+together; the single `coppice` binary ([coppice-cli](../coppice-cli)) launches
+it as `coppice coordinator --config …`. The full concurrency contract
 lives in [coordinator-runtime](../../docs/architecture/coordinator-runtime.md).
 
 ## Structure
 
-The binary ([`main.rs`](src/main.rs)) is a shell — it parses the deliberately
-tiny CLI and hands off to the library, so integration tests drive the exact
-paths the binary does. [`bootstrap`](src/bootstrap.rs) is the assembly half: it
+[`cli`](src/cli.rs) + [`lib.rs`](src/lib.rs) expose the deliberately tiny
+command surface the `coppice` binary mounts, so integration tests drive the
+exact paths the binary does. [`bootstrap`](src/bootstrap.rs) is the assembly half: it
 loads config, initializes tracing, brings the consensus replica up through
 `coppice-consensus::start`, stands up the mTLS Raft + admin server, and returns a
 `BootedCoordinator`. [`runtime`](src/runtime.rs) is the task half: it constructs
@@ -70,7 +71,7 @@ traffic is mutual TLS ([ADR 0011]) with no insecure fallback.
 [`admin`](src/admin.rs) is the membership surface, both halves in one module: the
 server implements the `RaftAdminService` RPCs (add-learner, promote-voter,
 remove-node, cluster-status) over the local consensus seam, and the client
-helpers back the hidden `coppice-coordinator admin` subcommand and the multi-node
+helpers back the hidden `coppice coordinator admin` subcommand and the multi-node
 integration test. The promote wrapper polls while a learner is still catching up,
 which is what makes replica replacement operable end to end. Every RPC first
 checks the request's stamped cluster identity before touching Raft. See

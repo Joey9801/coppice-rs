@@ -5,7 +5,8 @@
 //! resolves file-over-default inside [`crate::config`]. A single hidden `admin`
 //! subcommand carries the membership operations an operator runs against a
 //! live cluster (ADR 0016) — hidden because it is plumbing for
-//! `coppice-cli`/runbooks, not part of the daemon's day-to-day surface.
+//! runbooks/automation, not part of the daemon's day-to-day surface. The
+//! `coppice` binary mounts this surface as the `coordinator` subcommand.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,7 +19,7 @@ use clap::{Args, Parser, Subcommand};
 /// `admin` subcommand drives the membership admin RPCs against a running node.
 #[derive(Debug, Parser)]
 #[command(
-    name = "coppice-coordinator",
+    name = "coordinator",
     version,
     // `--config` is only required on the default run path; a subcommand negates
     // that requirement, and the two surfaces never mix. The run args are inlined

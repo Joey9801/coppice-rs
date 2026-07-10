@@ -110,11 +110,11 @@ eviction absolutely and cache state is observed, never replicated. Central
 
 A single node-local TOML file (`config.rs`,
 [ADR 0020 conventions](../../docs/decisions/0020-node-config-vs-replicated-policy.md)):
-`node_id`, data directory, coordinator endpoints, mTLS material (by path),
+`node_id` (typed form `node-<uuid>`), data directory, coordinator endpoints, mTLS material (by path),
 advertised capacity, labels, and timing knobs. Anything two replicas must agree
 on is cluster policy and never appears here. Unknown keys and bare-integer
 durations fail-stop naming the offending key. Launched with
-`coppice-agent --config <path>` (`main.rs`).
+`coppice agent --config <path>` (the single `coppice` binary, [coppice-cli](../coppice-cli)).
 
 See [components](../../docs/architecture/components.md) for where the agent sits
 in the system and [failure-handling](../../docs/operations/failure-handling.md)

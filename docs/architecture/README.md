@@ -37,9 +37,9 @@ The subsystems described here map onto the workspace crates roughly as follows:
 | Raft consensus | `coppice-consensus` |
 | Scheduler engine | `coppice-scheduler` |
 | External API layer | `coppice-api` |
-| Coordinator daemon | `coppice-coordinator` |
-| Node agent daemon | `coppice-agent` |
-| CLI client | `coppice-cli` |
+| Coordinator daemon (library) | `coppice-coordinator` |
+| Node agent daemon (library) | `coppice-agent` |
+| The single `coppice` binary (coordinator/agent/client subcommands) | `coppice-cli` |
 
 The web UI is not yet scaffolded; it will be built on the public API surface
 exposed by `coppice-api`.

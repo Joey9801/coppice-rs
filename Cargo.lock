@@ -489,7 +489,6 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -509,8 +508,11 @@ name = "coppice-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "coppice-core",
- "coppice-proto",
+ "clap",
+ "coppice-agent",
+ "coppice-coordinator",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

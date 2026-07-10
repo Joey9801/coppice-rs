@@ -1,13 +1,21 @@
 # coppice-cli
 
-The `coppice` command — the user- and operator-facing client for driving a
-Coppice cluster from the terminal. It is a thin client over the public API
-([coppice-api](../coppice-api)), the same surface the web UI is built on
-([components](../../docs/architecture/components.md)).
+The single `coppice` binary: every component behind one entry point, so a
+deployment ships exactly one artifact.
 
-> **Status: skeleton.** `src/main.rs` today is a placeholder `main` with no
-> argument parsing and no commands wired up. The role below is the intended
-> shape; the doc links are the specification it will be built against.
+- `coppice coordinator --config …` — run a coordinator replica
+  ([coppice-coordinator](../coppice-coordinator)), including the hidden
+  `admin` membership verbs;
+- `coppice agent --config …` — run a node agent ([coppice-agent](../coppice-agent));
+- `coppice job …` — client commands over the public API
+  ([coppice-api](../coppice-api)), the same surface the web UI is built on
+  ([components](../../docs/architecture/components.md)).
+
+> **Status:** the daemon subcommands are fully wired; the `job` client
+> commands parse but fail with a clear error until the API network edge
+> exists (coppice-api has no transport yet). The client role below is the
+> intended shape; the doc links are the specification it will be built
+> against.
 
 ## Role
 

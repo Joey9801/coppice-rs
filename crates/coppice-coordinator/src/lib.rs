@@ -8,11 +8,12 @@
 //! wires together — the task inventory, channel table, and leader-transition
 //! rules — is specified in `docs/architecture/coordinator-runtime.md`.
 //!
-//! The binary ([`main`](../main.rs)) is a thin CLI shell: it parses arguments
-//! and dispatches into [`run`]. Everything else — config loading, the boot
-//! sequence ([`bootstrap`]), the membership admin surface ([`admin`]), and the
-//! task runtime (the private `runtime` module) — lives here so integration
-//! tests can drive the same code paths the binary does.
+//! The single `coppice` binary (the `coppice-cli` crate) mounts this crate's
+//! CLI as `coppice coordinator …` and dispatches into [`run`]. Everything —
+//! config loading, the boot sequence ([`bootstrap`]), the membership admin
+//! surface ([`admin`]), and the task runtime (the private `runtime` module) —
+//! lives here so integration tests can drive the same code paths the binary
+//! does.
 
 pub mod admin;
 pub mod bootstrap;

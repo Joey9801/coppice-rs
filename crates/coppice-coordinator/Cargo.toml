@@ -8,14 +8,6 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[lib]
-name = "coppice_coordinator"
-path = "src/lib.rs"
-
-[[bin]]
-name = "coppice-coordinator"
-path = "src/main.rs"
-
 [dependencies]
 coppice-core.workspace = true
 coppice-proto.workspace = true

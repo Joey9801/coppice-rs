@@ -40,8 +40,8 @@ is policy.
 One file per binary, passed explicitly:
 
 ```
-coppice-coordinator --config /etc/coppice/coordinator.toml
-coppice-agent       --config /etc/coppice/agent.toml
+coppice coordinator --config /etc/coppice/coordinator.toml
+coppice agent       --config /etc/coppice/agent.toml
 ```
 
 Conventions (all from ADR 0020):
