@@ -25,8 +25,8 @@ use openraft::storage::RaftStateMachine;
 use openraft::RaftSnapshotBuilder;
 use tokio::sync::{mpsc, oneshot};
 
-use coppice_consensus::fs::RealFs;
-use coppice_consensus::storage::raw::{decode_state, encode_state};
+use coppice_consensus::fs::{Fs, FsFile, RealFs};
+use coppice_consensus::storage::raw::{decode_state, encode_state, write_state_direct};
 use coppice_consensus::storage::{self, run_apply_task, StorageOptions};
 use coppice_consensus::{ApplyRequest, APPLY_CHANNEL_CAPACITY};
 use coppice_proto::convert::{state_from_records, state_to_records};
@@ -69,6 +69,37 @@ fn codec_roundtrip_medium() {
         "rebuilt state must equal the original bit-for-bit"
     );
     check_consistency(&rebuilt);
+}
+
+/// The state-direct streaming build (`write_state_direct`, the snapshot build
+/// path) must produce a container byte-identical to the slice encoder
+/// (`encode_state` over a materialized `state_to_records`) — same section
+/// order, sharding, and per-record encoding — while never building that
+/// whole-state `StateRecords` (KOI-5). Checked across shard counts, including
+/// one that leaves small sections unsharded and one that splits every kind.
+#[test]
+fn state_direct_write_matches_the_slice_encoder() {
+    let cfg = SynthConfig::with_jobs(6_000);
+    let state = synth_state(&cfg);
+    check_consistency(&state);
+
+    for shards in [1u32, 3, 8] {
+        let meta = bare_meta("direct-vs-slice", shards);
+        let slice_bytes = encode_state(&meta, &state_to_records(&state), shards);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs = RealFs::new(dir.path());
+        let mut file = fs.create_new(Path::new("c.snap")).expect("create");
+        write_state_direct(&mut file, &meta, &state, shards).expect("write_state_direct");
+
+        let len = file.len().expect("len") as usize;
+        let mut streamed = vec![0u8; len];
+        file.read_exact_at(0, &mut streamed).expect("read back");
+        assert_eq!(
+            streamed, slice_bytes,
+            "state-direct build must match the slice encoder byte-for-byte (shards {shards})"
+        );
+    }
 }
 
 /// The full openraft path across two stores: build a snapshot on store A

@@ -29,7 +29,11 @@ mod core;
 mod snapshot;
 
 pub use command::{command_from_pb, command_to_pb};
-pub use snapshot::{state_from_records, state_to_records, StateRecords};
+pub use snapshot::{
+    allocation_records, attempt_records, cluster_record, job_records, node_records,
+    quota_entity_records, record_counts, state_from_records, state_to_records, RecordCounts,
+    StateRecords,
+};
 
 /// Why a wire value could not become a domain value.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

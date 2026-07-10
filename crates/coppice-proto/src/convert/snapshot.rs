@@ -2,12 +2,16 @@
 //! records, and whole-state assembly/disassembly for the snapshot path.
 //!
 //! The storage layer owns sharding, framing, compression, and CRCs
-//! (ADR 0018); this module owns only the payloads. [`state_to_records`]
-//! flattens a `StateMachine` into per-entity record lists (each record
-//! individually decodable, carrying its own key), and
-//! [`state_from_records`] rebuilds — including the accrual queue, which is
-//! *derived* from the Accruing allocations rather than snapshotted, so
-//! there is no second copy to disagree with the allocation records.
+//! (ADR 0018); this module owns only the payloads. The per-kind record
+//! streams ([`job_records`] and friends) are the single mapping from
+//! `StateMachine` fields to snapshot record kinds: [`state_to_records`]
+//! collects them into per-entity lists (each record individually decodable,
+//! carrying its own key) for the slice encoder, while the storage layer's
+//! streaming build shards and converts them one window at a time so it never
+//! holds a whole-state record copy. [`state_from_records`] rebuilds —
+//! including the accrual queue, which is *derived* from the Accruing
+//! allocations rather than snapshotted, so there is no second copy to
+//! disagree with the allocation records.
 
 use coppice_core::allocation::AllocationState;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
@@ -171,23 +175,132 @@ pub struct StateRecords {
     pub cluster: Option<pb::ClusterStateRecord>,
 }
 
+/// Per-kind record counts of a state, in section order.
+///
+/// The shard planner on the streaming build path sizes each section from
+/// these without materializing a single record (the whole point of that
+/// path — see the storage layer's `write_state_direct`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecordCounts {
+    pub jobs: usize,
+    pub attempts: usize,
+    pub allocations: usize,
+    pub nodes: usize,
+    pub quota_entities: usize,
+}
+
+/// Count each entity kind without touching a record.
+pub fn record_counts(state: &StateMachine) -> RecordCounts {
+    RecordCounts {
+        jobs: state.jobs.len(),
+        attempts: state.attempts.len(),
+        allocations: state.allocations.len(),
+        nodes: state.nodes.len(),
+        quota_entities: state.quota_entities.len(),
+    }
+}
+
+// ---- Per-kind record streams: the single field→kind mapping ----
+//
+// These are the one place that maps a `StateMachine` field to a snapshot
+// record stream. Both the eager [`state_to_records`] and the storage
+// layer's streaming build (which shards each stream and encodes one
+// `[start, count)` window at a time) draw from them, so neither the
+// field→kind wiring nor the per-record conversion is duplicated.
+//
+// Each `skip`s on the *unconverted* ordered iterator and only then converts,
+// so a sharded build converts just the window it is about to encode — never
+// the whole entity list at once. Iteration is in map order
+// (`values`/`iter`), so identical states flatten identically; rebuild does
+// not depend on the order. The pattern is generic over `Iterator`, so it is
+// unaffected by whether a field is a `BTreeMap` or an ordered `imbl::OrdMap`.
+
+/// Job records for the window `[start, start + count)` of the ordered map.
+pub fn job_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::JobRecord> + '_ {
+    state.jobs.values().skip(start).take(count).map(Into::into)
+}
+
+/// Attempt records for the window `[start, start + count)`.
+pub fn attempt_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::AttemptRecord> + '_ {
+    state
+        .attempts
+        .values()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
+/// Allocation records for the window `[start, start + count)`.
+pub fn allocation_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::AllocationRecord> + '_ {
+    state
+        .allocations
+        .values()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
+/// Node records for the window `[start, start + count)`.
+pub fn node_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::NodeRecord> + '_ {
+    state.nodes.values().skip(start).take(count).map(Into::into)
+}
+
+/// Quota-entity records for the window `[start, start + count)`. Each record
+/// carries its own key, so the stream is `(&id, &entity)` pairs.
+pub fn quota_entity_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::QuotaEntityRecord> + '_ {
+    state
+        .quota_entities
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
+/// The single `ClusterStateRecord` — the state's scalar tail (policy,
+/// versions, allocation sequence). Not sharded: exactly one per snapshot.
+pub fn cluster_record(state: &StateMachine) -> pb::ClusterStateRecord {
+    pb::ClusterStateRecord {
+        policy: Some((&state.policy).into()),
+        cluster_version: state.cluster_version,
+        version: state.version,
+        next_allocation_seq: state.next_allocation_seq,
+    }
+}
+
 /// Flatten replicated state into snapshot records.
 ///
-/// Iteration is key order, so identical states flatten identically;
-/// rebuild does not depend on this order.
+/// Iteration is key order, so identical states flatten identically; rebuild
+/// does not depend on this order. Built from the per-kind record streams
+/// above, the single source of the field→kind mapping.
 pub fn state_to_records(state: &StateMachine) -> StateRecords {
+    let counts = record_counts(state);
     StateRecords {
-        jobs: state.jobs.values().map(Into::into).collect(),
-        attempts: state.attempts.values().map(Into::into).collect(),
-        allocations: state.allocations.values().map(Into::into).collect(),
-        nodes: state.nodes.values().map(Into::into).collect(),
-        quota_entities: state.quota_entities.iter().map(Into::into).collect(),
-        cluster: Some(pb::ClusterStateRecord {
-            policy: Some((&state.policy).into()),
-            cluster_version: state.cluster_version,
-            version: state.version,
-            next_allocation_seq: state.next_allocation_seq,
-        }),
+        jobs: job_records(state, 0, counts.jobs).collect(),
+        attempts: attempt_records(state, 0, counts.attempts).collect(),
+        allocations: allocation_records(state, 0, counts.allocations).collect(),
+        nodes: node_records(state, 0, counts.nodes).collect(),
+        quota_entities: quota_entity_records(state, 0, counts.quota_entities).collect(),
+        cluster: Some(cluster_record(state)),
     }
 }
 
