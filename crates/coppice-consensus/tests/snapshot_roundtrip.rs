@@ -86,7 +86,7 @@ async fn engine_roundtrip_through_build_and_install() {
 
     // --- Store A: seeded with the synthetic state, builds a snapshot. ---
     let dir_a = tempfile::tempdir().expect("tempdir for store A");
-    let options_a = StorageOptions::new(CLUSTER, 1);
+    let options_a = StorageOptions::new(CLUSTER);
     storage::init(&RealFs::new(dir_a.path()), &options_a).expect("init A");
     let recovered_a = storage::open(RealFs::new(dir_a.path()), options_a).expect("open A");
 
@@ -103,7 +103,7 @@ async fn engine_roundtrip_through_build_and_install() {
 
     // --- Store B: separate directory, same cluster identity. ---
     let dir_b = tempfile::tempdir().expect("tempdir for store B");
-    let options_b = StorageOptions::new(CLUSTER, 2);
+    let options_b = StorageOptions::new(CLUSTER);
     storage::init(&RealFs::new(dir_b.path()), &options_b).expect("init B");
     let recovered_b = storage::open(RealFs::new(dir_b.path()), options_b).expect("open B");
 
@@ -144,7 +144,7 @@ async fn engine_roundtrip_through_build_and_install() {
     drop(sm_b);
     drop(tx_b_query);
 
-    let reopened = storage::open(RealFs::new(dir_b.path()), StorageOptions::new(CLUSTER, 2))
+    let reopened = storage::open(RealFs::new(dir_b.path()), StorageOptions::new(CLUSTER))
         .expect("reopen B through recovery");
     assert_eq!(
         reopened.state, synth,

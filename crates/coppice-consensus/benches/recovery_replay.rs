@@ -117,7 +117,7 @@ fn decode_fixture_entry(bytes: &[u8]) -> Command {
 /// function, releasing the data directory's `LOCK` for the benches.
 fn build_fixture(fs_root: &Path, options: &StorageOptions) {
     let fs = RealFs::new(fs_root);
-    StorageCore::init(&fs, options, INSTANCE_UUID).expect("init");
+    StorageCore::init(&fs, options, NODE_ID, INSTANCE_UUID).expect("init");
     let mut core = StorageCore::open(fs, options.clone()).expect("open");
 
     let mut index = 0u64;
@@ -134,7 +134,7 @@ fn build_fixture(fs_root: &Path, options: &StorageOptions) {
 fn bench_recovery_replay(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let fs_root: PathBuf = dir.path().to_path_buf();
-    let options = StorageOptions::new(CLUSTER_UUID, NODE_ID);
+    let options = StorageOptions::new(CLUSTER_UUID);
 
     build_fixture(&fs_root, &options);
 

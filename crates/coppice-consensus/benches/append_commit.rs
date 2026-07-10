@@ -188,8 +188,8 @@ fn bench_encoding_only_ceiling(c: &mut Criterion) {
 fn bench_engine_append(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let fs = RealFs::new(dir.path());
-    let options = StorageOptions::new([0x13; 16], 1);
-    StorageCore::init(&fs, &options, [0x14; 16]).expect("init");
+    let options = StorageOptions::new([0x13; 16]);
+    StorageCore::init(&fs, &options, 1, [0x14; 16]).expect("init");
     let mut core = StorageCore::open(fs, options).expect("open");
 
     // Shared across every group size and every sample: the index counter

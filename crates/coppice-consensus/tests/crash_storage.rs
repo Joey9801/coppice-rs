@@ -46,7 +46,7 @@ impl Default for RealEngine {
 
 impl RealEngine {
     fn options(&self) -> StorageOptions {
-        let mut options = StorageOptions::new(CLUSTER_UUID, NODE_ID);
+        let mut options = StorageOptions::new(CLUSTER_UUID);
         options.segment_max_bytes = self.segment_max_bytes;
         options
     }
@@ -170,7 +170,7 @@ impl CrashSubject for RealEngine {
     type Store = RefCell<StorageCore<SimFs>>;
 
     fn init(&self, fs: &SimFs) -> io::Result<()> {
-        StorageCore::init(fs, &self.options(), INSTANCE_UUID)
+        StorageCore::init(fs, &self.options(), NODE_ID, INSTANCE_UUID)
     }
 
     fn open(&self, fs: &SimFs) -> io::Result<Self::Store> {

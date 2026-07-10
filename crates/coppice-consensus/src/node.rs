@@ -56,9 +56,11 @@ pub enum StartIntent {
 }
 
 /// Everything a coordinator supplies to bring up its consensus replica.
+///
+/// Deliberately no node id: the replica's allocate-once Raft identity is
+/// minted at init and read back from the data directory's manifest stamp on
+/// every restart (ADR 0025) — operators never choose one.
 pub struct NodeOptions {
-    /// This replica's allocate-once Raft identity (ADR 0016).
-    pub node_id: CoordinatorId,
     /// The cluster this replica belongs to (ADR 0016).
     pub cluster_uuid: [u8; 16],
     /// The data directory; must already exist.
@@ -108,6 +110,12 @@ pub struct NodeHandle {
 }
 
 impl NodeHandle {
+    /// This replica's allocate-once Raft identity, read from the data
+    /// directory's manifest stamp at start (ADR 0025).
+    pub fn node_id(&self) -> CoordinatorId {
+        self.node_id
+    }
+
     /// Shut the replica down (coordinator-runtime.md shutdown step 5): the apply
     /// task drains and exits when the adapter drops the request channel.
     pub async fn shutdown(&self) -> Result<(), ConsensusError> {
@@ -221,7 +229,6 @@ pub async fn start(
     intent: StartIntent,
 ) -> Result<StartedNode, NodeStartError> {
     let NodeOptions {
-        node_id,
         cluster_uuid,
         data_dir,
         advertise_addr,
@@ -263,14 +270,22 @@ pub async fn start(
             )));
         }
         (StartIntent::Bootstrap | StartIntent::Join, false) => {
-            // Mints a fresh instance UUID (ADR 0016).
-            storage::init(&fs, &StorageOptions::new(cluster_uuid, node_id))?;
+            // Mints this replica's allocate-once Raft identity and a fresh
+            // instance UUID, both stamped into the manifest (ADR 0016 / 0025).
+            let minted = storage::init(&fs, &StorageOptions::new(cluster_uuid))?;
+            tracing::info!(
+                node_id = minted,
+                "minted coordinator raft identity (stamped in the data directory; \
+                 pass it to `admin add-learner` when joining, ADR 0025)"
+            );
         }
     }
 
-    // Step 4: recovery. An identity-stamp mismatch fail-stops inside `open`
-    // with context and rides out as `Storage`.
-    let mut recovered = storage::open(fs, StorageOptions::new(cluster_uuid, node_id))?;
+    // Step 4: recovery. The replica's identity comes back from the manifest
+    // stamp; a cluster-stamp mismatch fail-stops inside `open` with context
+    // and rides out as `Storage`.
+    let mut recovered = storage::open(fs, StorageOptions::new(cluster_uuid))?;
+    let node_id = recovered.node_id;
     let last_applied_index = recovered.last_applied.map(|id| id.index).unwrap_or(0);
 
     // Step 5: the publishing apply task. The recovered state moves into the

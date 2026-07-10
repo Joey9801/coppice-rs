@@ -21,8 +21,13 @@ Two identities exist before any process starts:
   data directory at initialization. A directory whose stamp disagrees with
   the config fail-stops at startup: that is the wrong-volume /
   cross-cluster-mixup guard.
-- **Node ID** — a small integer allocated once per *instance*, never reused.
-  A rebuilt machine gets a *new* node ID; the old one is removed from
+- **Node ID** — an integer allocated once per *instance*, never reused.
+  It is **minted automatically** when the data directory is initialized
+  (`--bootstrap`/`--join`), stamped into the manifest, and read back on
+  every restart ([ADR 0025](../decisions/0025-self-minted-coordinator-identity.md)) —
+  it never appears in the config file and operators never choose one. Each
+  process logs its identity at startup (`coordinator raft identity`); a
+  rebuilt machine mints a *new* node ID and the old one is removed from
   membership during replace. Do not think of node IDs as slots.
 
 The data directory additionally receives an **instance UUID** at
@@ -37,8 +42,9 @@ coppice-coordinator --config /etc/coppice/coordinator.toml --bootstrap
 ```
 
 `--bootstrap` is legal only on an **empty** data directory. It stamps the
-directory with the configured cluster UUID and node ID plus a fresh instance
-UUID, then forms a single-voter Raft cluster with this node as leader. On a
+directory with the configured cluster UUID, a freshly-minted node ID, and a
+fresh instance UUID, then forms a single-voter Raft cluster with this node
+as leader. On a
 non-empty directory it fail-stops ("already initialized"); restarting the
 node afterwards uses no flag at all.
 
@@ -55,24 +61,27 @@ refuses to run if:
   a failed mount, never as permission to start clean; the error names the
   directory and both intent flags;
 - the directory's **cluster UUID** doesn't match `cluster_id` — wrong volume
-  or cross-cluster mixup;
-- the directory's **node ID** doesn't match `node_id` — volume attached to
-  the wrong instance.
+  or cross-cluster mixup.
+
+The node ID needs no cross-check: the manifest stamp *is* the identity
+(ADR 0025), so whatever replica the attached volume carries is the replica
+this process resumes.
 
 These refusals are the whole ADR 0016 amnesiac-voter defense: an empty disk
 can only ever enter the cluster as a new learner.
 
 ## Join: adding a coordinator
 
-On the new machine, with a fresh node ID in its config and an empty data
-directory:
+On the new machine, with an empty data directory:
 
 ```
 coppice-coordinator --config /etc/coppice/coordinator.toml --join
 ```
 
-`--join` stamps a fresh instance identity and starts the replica idle — it
-holds no vote and triggers no election; it waits to be added. From any
+`--join` mints and stamps a fresh identity and starts the replica idle — it
+holds no vote and triggers no election; it waits to be added. Read the
+minted node ID off the new replica's startup log line
+(`coordinator raft identity`). From any
 machine with a coordinator config (the admin client dials `--target`, or the
 first entry of the config's `peers` list, and authenticates with the config's
 TLS material):
@@ -107,8 +116,8 @@ Replacing a coordinator — dead disk or healthy-but-recycled during an
 upgrade — is join plus a joint removal (ADR 0016's `coordinator replace`
 verb; the polished `coppice-cli` wrapper drives exactly this sequence):
 
-1. Provision the new machine with an **empty** data directory and a **new
-   node ID** in its config; start it with `--join`.
+1. Provision the new machine with an **empty** data directory; start it
+   with `--join` and read the minted node ID from its startup log.
 2. `admin add-learner --node-id <new> --addr <new-addr>` against the leader.
    Because sealed log segments are purged once a snapshot covers them
    ([ADR 0017](../decisions/0017-log-manifest-truncation-and-purge.md)), a
@@ -142,7 +151,7 @@ coppice-coordinator admin --config coordinator.toml --target coord-1:7071 \
 | Startup message contains | Meaning | Action |
 | --- | --- | --- |
 | "has no manifest: refusing to start on an unexpectedly empty directory" | failed mount, wrong volume, or a genuinely fresh machine started without an intent flag | fix the mount, or pass `--bootstrap`/`--join` if the empty disk is deliberate |
-| "already initialized (manifest present)" | `--bootstrap`/`--join` on a live data directory | drop the flag to restart, or wipe the directory only if this machine is truly being reborn (then also allocate a new node ID) |
+| "already initialized (manifest present)" | `--bootstrap`/`--join` on a live data directory | drop the flag to restart, or wipe the directory only if this machine is truly being reborn (a fresh node ID is minted automatically) |
 | "identity stamp mismatch" | volume belongs to another cluster or another instance | attach the right volume; never edit the stamp |
 | "cross-cluster contact refused (ADR 0016)" (in logs, from a peer) | a coordinator from a different cluster dialed this one | fix the peer's config/addressing |
 

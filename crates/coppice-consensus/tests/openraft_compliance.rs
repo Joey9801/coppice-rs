@@ -19,9 +19,6 @@ use coppice_consensus::{CoordinatorId, TypeConfig};
 /// belong to the same "cluster".
 const CLUSTER_UUID: [u8; 16] = *b"compliance-suite";
 
-/// The suite drives everything as node 0 (`openraft::testing::suite::NODE_ID`).
-const NODE_ID: u64 = 0;
-
 struct SegmentStoreBuilder;
 
 impl StoreBuilder<TypeConfig, SegmentLogStorage, StateMachineStore, tempfile::TempDir>
@@ -34,7 +31,7 @@ impl StoreBuilder<TypeConfig, SegmentLogStorage, StateMachineStore, tempfile::Te
         StorageError<CoordinatorId>,
     > {
         let dir = tempfile::tempdir().expect("tempdir for compliance suite");
-        let options = StorageOptions::new(CLUSTER_UUID, NODE_ID);
+        let options = StorageOptions::new(CLUSTER_UUID);
         storage::init(&RealFs::new(dir.path()), &options).expect("init data dir");
         let recovered =
             storage::open(RealFs::new(dir.path()), options).expect("open through recovery");

@@ -19,7 +19,7 @@ node want a different value than its peers?* → config file.
 | Setting | Where |
 | --- | --- |
 | Listen/advertise addresses, ports | config file |
-| Data directory, `node_id` | config file (cross-checked against the disk stamp, [ADR 0016](../decisions/0016-coordinator-rebuild-learner-join.md)) |
+| Data directory | config file (the raft node id is *not* config: minted at init and read from the disk stamp, [ADR 0025](../decisions/0025-self-minted-coordinator-identity.md)) |
 | TLS cert/key/CA paths, enrollment token path | config file |
 | SSO issuer, client id, client-secret path | config file |
 | Log level/format, OTLP endpoint, metrics address | config file |
@@ -67,7 +67,6 @@ Conventions (all from ADR 0020):
 # Node-local configuration only. Cluster-wide behaviour — quotas, decay,
 # retention, authorization — is replicated policy: see `coppice-cli policy`.
 
-node_id = 3                     # must match the data directory's stamp
 # Generated once per cluster, identical in every replica's file, and
 # cross-checked against the data directory's stamp at startup (ADR 0016).
 # Typed string form per ADR 0024.

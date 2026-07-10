@@ -42,8 +42,11 @@ and [high-availability](../../docs/architecture/high-availability.md).
 
 [`config`](src/config.rs) reads exactly one TOML file at startup
 ([ADR 0020](../../docs/decisions/0020-node-config-vs-replicated-policy.md)):
-addresses, data directory, `node_id`, the cluster UUID, TLS paths, Raft liveness
-timing, SSO connection parameters, and observability settings. Anything two
+addresses, data directory, the cluster id, TLS paths, Raft liveness
+timing, SSO connection parameters, and observability settings. (The raft
+node id is *not* config: it is minted at init and read back from the data
+directory's manifest stamp,
+[ADR 0025](../../docs/decisions/0025-self-minted-coordinator-identity.md).) Anything two
 replicas must agree on — quotas, decay policy, retention, authorization mappings
 — is **replicated cluster policy** held in the state machine, never in this file.
 Unknown keys fail-stop naming the offending key, durations are humane strings

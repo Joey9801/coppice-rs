@@ -118,7 +118,10 @@ pub fn free_port() -> u16 {
 /// The tempdir is retained across a graceful stop / kill so the same replica
 /// can be re-booted from its own disk (ADR 0016 Restart intent).
 pub struct Node {
+    /// Fixture label for panic messages — NOT the raft identity, which is
+    /// minted at init and cached in [`Node::raft_id`] once booted (ADR 0025).
     pub id: u64,
+    raft_id: Option<u64>,
     #[allow(dead_code)]
     pub port: u16,
     /// `localhost:PORT` — the address peers dial and admin tooling targets.
@@ -148,8 +151,7 @@ impl Node {
         let data_dir = root.join("data");
         let config_path = root.join("coordinator.toml");
         let toml = format!(
-            r#"node_id = {id}
-cluster_id = "{cluster_id}"
+            r#"cluster_id = "{cluster_id}"
 data_dir = "{data_dir}"
 peers = []
 
@@ -181,6 +183,7 @@ log_level = "warn"
 
         Node {
             id,
+            raft_id: None,
             port,
             advertise: format!("localhost:{port}"),
             cluster_id,
@@ -198,6 +201,9 @@ log_level = "warn"
         let booted = bootstrap::bootstrap(resolved)
             .await
             .unwrap_or_else(|e| panic!("bootstrap node {}: {e:#}", self.id));
+        // Cache the minted/stamped raft identity: it survives kill/stop so
+        // membership surgery can still name a dead replica (ADR 0016 step 3).
+        self.raft_id = Some(booted.handle.node_id());
         self.booted = Some(booted);
     }
 
@@ -211,6 +217,13 @@ log_level = "warn"
 
     pub fn is_booted(&self) -> bool {
         self.booted.is_some()
+    }
+
+    /// The allocate-once raft identity this replica's data directory carries
+    /// (ADR 0025). Available from first boot onward, including after a kill.
+    pub fn raft_id(&self) -> u64 {
+        self.raft_id
+            .unwrap_or_else(|| panic!("node {} was never booted: no raft identity yet", self.id))
     }
 
     /// This replica's storage data directory (`<tempdir>/data`), for tests
@@ -370,8 +383,7 @@ impl RunningCoordinator {
         let data_dir = root.join("data");
         let config_path = root.join("coordinator.toml");
         let toml = format!(
-            r#"node_id = 1
-cluster_id = "{cluster_id}"
+            r#"cluster_id = "{cluster_id}"
 data_dir = "{data_dir}"
 peers = []
 

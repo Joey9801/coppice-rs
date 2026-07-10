@@ -234,9 +234,9 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
     let cluster_uuid = *cfg.cluster_id.0.as_bytes();
     let raft_addr = cfg.listen.raft_addr;
 
-    // Step 4: node options from config.
+    // Step 4: node options from config. No node id: the replica's identity
+    // is minted at init and read from the manifest stamp thereafter (ADR 0025).
     let options = NodeOptions {
-        node_id: cfg.node_id,
         cluster_uuid,
         data_dir: cfg.data_dir.clone(),
         advertise_addr: cfg.listen.advertised_raft_addr(),
@@ -271,6 +271,10 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
     } = coppice_consensus::start(options, intent)
         .await
         .context("starting consensus replica")?;
+
+    // Surfaced on every start (not just at mint) so an operator can always
+    // read the id off the newest log lines, e.g. for `admin add-learner`.
+    tracing::info!(node_id = handle.node_id(), "coordinator raft identity");
 
     let consensus = Arc::new(consensus);
 

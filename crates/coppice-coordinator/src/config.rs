@@ -1,14 +1,16 @@
 //! Node configuration file (ADR 0020).
 //!
 //! Every coordinator process reads exactly one TOML file at startup: listen
-//! and advertise addresses, the data directory, `node_id`, TLS paths, Raft
+//! and advertise addresses, the data directory, TLS paths, Raft
 //! liveness timing, SSO connection parameters, and observability settings.
 //! Anything two replicas must agree on — quotas, decay policy, retention,
 //! authorization mappings — is **cluster policy** instead, held in replicated
 //! state and changed through `coppice-cli policy …`; it never appears here
-//! (ADR 0020's litmus test). `node_id` and the cluster UUID are cross-checked
-//! against the data directory's stamped identity at startup (ADR 0016) —
-//! this module only parses them, the check itself lives in bootstrap.
+//! (ADR 0020's litmus test). The cluster id is cross-checked against the
+//! data directory's stamped identity at startup (ADR 0016) — this module
+//! only parses it, the check itself lives in bootstrap. The replica's Raft
+//! node id is deliberately *not* configuration: it is minted at init and
+//! read back from the manifest stamp (ADR 0025).
 //!
 //! Unknown keys are startup errors (`deny_unknown_fields`): a typo'd knob
 //! fail-stops naming the offending key rather than silently defaulting.
@@ -40,11 +42,6 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    /// This instance's Raft identity. Allocate-once, never reused across a
-    /// rebuild (ADR 0016) — cross-checked against the data directory's
-    /// stamped node ID at startup.
-    pub(crate) node_id: u64,
-
     /// The cluster identity every replica shares, generated once at
     /// `coppice-cli cluster init` and cross-checked against the data
     /// directory's stamp at startup (ADR 0016). Parsed from the typed
@@ -304,7 +301,6 @@ impl ResolvedConfig {
     /// never inline material (ADR 0020), so there is nothing to redact.
     pub(crate) fn log_effective(&self) {
         tracing::info!(
-            node_id = self.config.node_id,
             cluster_id = %self.config.cluster_id,
             bootstrap = self.bootstrap,
             join = self.join,
@@ -360,7 +356,6 @@ mod tests {
     /// extended with `cluster_id`, `peers`, and `[raft].rpc_timeout` (fields
     /// this module adds ahead of the doc pass).
     const FULL_EXAMPLE: &str = r#"
-node_id = 3
 cluster_id = "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice"
 peers = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
@@ -396,7 +391,6 @@ metrics_addr  = "127.0.0.1:9090"
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
-node_id = 1
 cluster_id = "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice"
 
@@ -414,7 +408,6 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         let (_guard, path) = write_config(FULL_EXAMPLE);
         let config = read_config(&path).expect("full example should parse");
 
-        assert_eq!(config.node_id, 3);
         assert_eq!(
             config.cluster_id,
             "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10".parse().unwrap()

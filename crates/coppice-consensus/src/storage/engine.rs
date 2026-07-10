@@ -48,16 +48,17 @@ use super::container::{
 };
 use super::snapshot;
 
-/// Node-local configuration of the engine plus the identity the directory
-/// must carry (ADR 0016).
+/// Node-local configuration of the engine plus the cluster identity the
+/// directory must carry (ADR 0016).
 ///
-/// Identity mismatches fail-stop at open.
+/// A cluster-stamp mismatch fail-stops at open. The *node* id is not an
+/// input: it is minted at init, stamped into the manifest, and read back at
+/// open — the directory alone is the authority on which replica it is
+/// (ADR 0025).
 #[derive(Debug, Clone)]
 pub struct StorageOptions {
     /// The cluster this replica belongs to; stamped at `cluster init`.
     pub cluster_uuid: [u8; 16],
-    /// This replica's allocate-once Raft node id.
-    pub node_id: u64,
     /// Size threshold past which the active segment is sealed and the next
     /// append opens a fresh one.
     pub segment_max_bytes: u64,
@@ -66,10 +67,9 @@ pub struct StorageOptions {
 }
 
 impl StorageOptions {
-    pub fn new(cluster_uuid: [u8; 16], node_id: u64) -> StorageOptions {
+    pub fn new(cluster_uuid: [u8; 16]) -> StorageOptions {
         StorageOptions {
             cluster_uuid,
-            node_id,
             segment_max_bytes: 64 << 20,
             snapshot_shards: 4,
         }
@@ -260,9 +260,17 @@ impl<F: Fs> StorageCore<F> {
     /// Initialize an empty data directory: `log/`, `snap/`, and an
     /// identity-stamped manifest claiming nothing (ADR 0016 / 0017).
     ///
+    /// `node_id` is the freshly-minted allocate-once identity this directory
+    /// will carry for its whole life (ADR 0025).
+    ///
     /// Refuses a directory that already has a manifest. Not crash-armed by
     /// the crash suite (initialization precedes any acknowledged state).
-    pub fn init(fs: &F, options: &StorageOptions, instance_uuid: [u8; 16]) -> io::Result<()> {
+    pub fn init(
+        fs: &F,
+        options: &StorageOptions,
+        node_id: u64,
+        instance_uuid: [u8; 16],
+    ) -> io::Result<()> {
         if fs.exists(Path::new("manifest"))? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -274,7 +282,7 @@ impl<F: Fs> StorageCore<F> {
         fs.sync_dir(Path::new(""))?;
         let manifest = ManifestState {
             cluster_uuid: options.cluster_uuid,
-            node_id: options.node_id,
+            node_id,
             instance_uuid,
             segments: Vec::new(),
             purge_floor: None,
@@ -313,14 +321,14 @@ impl<F: Fs> StorageCore<F> {
         let manifest = pbstorage::Manifest::decode(payload)
             .map_err(|e| fail_stop_file(manifest_path, format!("manifest does not decode: {e}")))?;
         let manifest = ManifestState::from_pb(manifest_path, manifest)?;
-        if manifest.cluster_uuid != options.cluster_uuid || manifest.node_id != options.node_id {
+        if manifest.cluster_uuid != options.cluster_uuid {
             return Err(fail_stop_file(
                 manifest_path,
                 format!(
-                    "identity stamp mismatch: directory is stamped for cluster {:02x?} node {}, \
-                     this process is configured for cluster {:02x?} node {} (wrong volume or \
-                     cross-cluster mixup, ADR 0016)",
-                    manifest.cluster_uuid, manifest.node_id, options.cluster_uuid, options.node_id
+                    "identity stamp mismatch: directory is stamped for cluster {:02x?}, this \
+                     process is configured for cluster {:02x?} (wrong volume or cross-cluster \
+                     mixup, ADR 0016)",
+                    manifest.cluster_uuid, options.cluster_uuid
                 ),
             ));
         }
@@ -445,6 +453,12 @@ impl<F: Fs> StorageCore<F> {
         }
 
         Ok(core)
+    }
+
+    /// The allocate-once Raft identity stamped into this directory's
+    /// manifest at init (ADR 0025).
+    pub fn node_id(&self) -> u64 {
+        self.manifest.node_id
     }
 
     // ---- log reads ----------------------------------------------------

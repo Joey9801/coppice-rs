@@ -86,10 +86,26 @@ use crate::CoordinatorId;
 /// Initialize an empty data directory: `log/`, `snap/`, and an
 /// identity-stamped manifest (ADR 0016).
 ///
-/// The instance UUID is minted here — a new one for every directory life, so
-/// "same node id, different life" is distinguishable in forensics.
-pub fn init<F: Fs>(fs: &F, options: &StorageOptions) -> io::Result<()> {
-    StorageCore::init(fs, options, *uuid::Uuid::new_v4().as_bytes())
+/// Both halves of the node's identity are minted here (ADR 0025): the
+/// allocate-once Raft node id this directory will carry for its whole life
+/// (returned, so the caller can surface it to the operator), and the
+/// instance UUID — a new one for every directory life, so "same node id,
+/// different life" is distinguishable in forensics.
+pub fn init<F: Fs>(fs: &F, options: &StorageOptions) -> io::Result<CoordinatorId> {
+    let node_id = mint_node_id();
+    StorageCore::init(fs, options, node_id, *uuid::Uuid::new_v4().as_bytes())?;
+    Ok(node_id)
+}
+
+/// Mint a random allocate-once Raft identity (ADR 0025).
+///
+/// 64 uniform bits (the XOR of a v4 uuid's two halves — no extra RNG
+/// dependency). Uniqueness rests on collision improbability across a
+/// cluster's whole membership history, exactly like entity ids; ids are
+/// never reused even after the node leaves (ADR 0016).
+fn mint_node_id() -> CoordinatorId {
+    let (hi, lo) = uuid::Uuid::new_v4().as_u64_pair();
+    hi ^ lo
 }
 
 /// Open a data directory through full recovery (ADR 0017), rebuilding the
@@ -102,6 +118,7 @@ pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
     let shards = options.snapshot_shards;
     let cluster_uuid = options.cluster_uuid;
     let core = StorageCore::open(fs, options)?;
+    let node_id = core.node_id();
 
     // Rebuild from the snapshot file in bounded memory: streaming validation
     // already ran inside `current_snapshot_reader`, so only the per-section
@@ -126,6 +143,7 @@ pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
         membership,
         shards,
         cluster_uuid,
+        node_id,
     })
 }
 
@@ -140,6 +158,9 @@ pub struct Recovered<F: Fs> {
     pub last_applied: Option<LogId<CoordinatorId>>,
     /// Membership as of `last_applied`.
     pub membership: StoredMembership<CoordinatorId, BasicNode>,
+    /// The allocate-once Raft identity stamped in the manifest (ADR 0025):
+    /// the directory, not config, is the authority on which replica this is.
+    pub node_id: CoordinatorId,
     shards: u32,
     cluster_uuid: [u8; 16],
 }

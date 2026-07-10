@@ -179,7 +179,7 @@ async fn three_node_cluster_lifecycle() {
             admin::add_learner(
                 &mut client,
                 cluster_uuid,
-                nodes[i].id,
+                nodes[i].raft_id(),
                 nodes[i].advertise.clone(),
             )
             .await
@@ -193,7 +193,7 @@ async fn three_node_cluster_lifecycle() {
         &admin_leaf.key_pem,
         &target,
         cluster_uuid,
-        &[nodes[1].id, nodes[2].id],
+        &[nodes[1].raft_id(), nodes[2].raft_id()],
         DEADLINE,
     )
     .await;
@@ -205,7 +205,7 @@ async fn three_node_cluster_lifecycle() {
                 .expect("dial leader admin surface");
         // No removal: pure promotions. The helper polls the catch-up gate.
         for i in [1usize, 2] {
-            admin::promote_voter(&mut client, cluster_uuid, nodes[i].id, None, DEADLINE)
+            admin::promote_voter(&mut client, cluster_uuid, nodes[i].raft_id(), None, DEADLINE)
                 .await
                 .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
         }
@@ -334,7 +334,7 @@ async fn three_node_cluster_lifecycle() {
             join: true,
         })
         .await;
-    let dead_id = nodes[dead_idx].id;
+    let dead_id = nodes[dead_idx].raft_id();
 
     let leader_target = nodes[leader_idx].advertise.clone();
     {
@@ -346,7 +346,7 @@ async fn three_node_cluster_lifecycle() {
         )
         .await
         .expect("dial leader admin surface");
-        admin::add_learner(&mut client, cluster_uuid, node4.id, node4.advertise.clone())
+        admin::add_learner(&mut client, cluster_uuid, node4.raft_id(), node4.advertise.clone())
             .await
             .expect("add-learner node 4");
     }
@@ -357,7 +357,7 @@ async fn three_node_cluster_lifecycle() {
         &admin_leaf.key_pem,
         &leader_target,
         cluster_uuid,
-        &[node4.id],
+        &[node4.raft_id()],
         DEADLINE,
     )
     .await;
@@ -372,7 +372,7 @@ async fn three_node_cluster_lifecycle() {
         .await
         .expect("dial leader admin surface");
         // Promote node 4 and drop the dead node in one joint change (ADR 0016 step 3).
-        admin::promote_voter(&mut client, cluster_uuid, node4.id, Some(dead_id), DEADLINE)
+        admin::promote_voter(&mut client, cluster_uuid, node4.raft_id(), Some(dead_id), DEADLINE)
             .await
             .expect("promote node 4, remove dead node");
     }
@@ -382,7 +382,7 @@ async fn three_node_cluster_lifecycle() {
         "membership = {leader, follower, node4}, no dead node",
         || async {
             let voters = voter_ids(&nodes[leader_idx]);
-            voters.contains(&node4.id) && !voters.contains(&dead_id) && voters.len() == 3
+            voters.contains(&node4.raft_id()) && !voters.contains(&dead_id) && voters.len() == 3
         },
     )
     .await;
