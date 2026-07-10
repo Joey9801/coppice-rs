@@ -1,10 +1,11 @@
 // Strongly-typed identifiers (mirrors `coppice_core::id`).
 //
-// Every id is a distinct message wrapping the 16 raw bytes of a UUID so that,
+// Every id is a distinct message wrapping the self-describing textual form
+// `<prefix>-<uuid>`, e.g. `job-1683852a-993f-4497-a48b-6527b458fbd1`, so that,
 // exactly as in the Rust domain model, a JobId can never be passed where a
-// NodeId is expected — in generated code and in any future non-Rust tooling.
-// The 16-byte length is validated at the conversion boundary, never assumed
-// by decoders.
+// NodeId is expected — in generated code, in any future non-Rust tooling, and
+// in a raw captured payload (ADR 0024). The prefix and the uuid are validated
+// at the conversion boundary, never assumed by decoders.
 //
 // Note: Raft *coordinator* node ids are allocate-once integers (ADR 0016) and
 // live in coppice.raft.v1; NodeId here identifies a compute node.
@@ -13,34 +14,35 @@ syntax = "proto3";
 
 package coppice.core.v1;
 
-// Identifies a submitted job across its whole lifecycle.
+// Identifies a submitted job across its whole lifecycle. `job-<uuid>`.
 message JobId {
-  bytes value = 1;
+  string value = 1;
 }
 
-// Identifies a compute node registered with the coordinator.
+// Identifies a compute node registered with the coordinator. `node-<uuid>`.
 message NodeId {
-  bytes value = 1;
+  string value = 1;
 }
 
-// Identifies a single placement of a job onto a node.
+// Identifies a single placement of a job onto a node. `alloc-<uuid>`.
 message AllocationId {
-  bytes value = 1;
+  string value = 1;
 }
 
 // Identifies one execution attempt of a job (retries produce new attempts).
+// `attempt-<uuid>`.
 message AttemptId {
-  bytes value = 1;
+  string value = 1;
 }
 
 // Identifies a placement group whose attempts share the `Ready` barrier
 // (gang scheduling). v1 groups are singletons: one job, one group, and the
-// group id equals the job id.
+// group id equals the job id. `group-<uuid>`.
 message GroupId {
-  bytes value = 1;
+  string value = 1;
 }
 
-// Identifies a node in the quota-entity tree (ADR 0005).
+// Identifies a node in the quota-entity tree (ADR 0005). `quota-<uuid>`.
 message QuotaEntityId {
-  bytes value = 1;
+  string value = 1;
 }

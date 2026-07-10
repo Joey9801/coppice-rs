@@ -82,7 +82,8 @@ served over mTLS (ADR 0011) on the coordinator's dedicated agent listener.
 Sessions terminate on the leader only: a follower refuses with
 `FAILED_PRECONDITION` and, when it knows one, a leader hint in the
 `x-coppice-leader-hint` metadata; the agent rotates endpoints on refusal.
-The agent's client certificate carries its `NodeId` as the subject CN; the
+The agent's client certificate carries its `NodeId`'s typed string form
+(`node-<uuid>`, ADR 0024) as the subject CN; the
 gateway rejects a session whose reports claim any other node. The
 enrollment/CSR flow of ADR 0011 will replace ad-hoc issuance later; the
 CN↔NodeId binding is the stable part.

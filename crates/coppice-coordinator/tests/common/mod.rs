@@ -26,7 +26,7 @@ use rcgen::{
 use tempfile::TempDir;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use uuid::Uuid;
+use coppice_core::id::ClusterId;
 
 use coppice_consensus::{
     ClusterSummary, Consensus, ConsensusStatus, NodeHandle, OpenraftConsensus, StateViews,
@@ -123,7 +123,7 @@ pub struct Node {
     pub port: u16,
     /// `localhost:PORT` — the address peers dial and admin tooling targets.
     pub advertise: String,
-    pub cluster_id: Uuid,
+    pub cluster_id: ClusterId,
     #[allow(dead_code)]
     dir: TempDir,
     config_path: PathBuf,
@@ -132,7 +132,7 @@ pub struct Node {
 
 impl Node {
     /// Lay down a fresh replica's tempdir (certs + config), without booting.
-    pub fn new(id: u64, cluster_id: Uuid, ca: &Ca) -> Node {
+    pub fn new(id: u64, cluster_id: ClusterId, ca: &Ca) -> Node {
         let port = free_port();
         let dir = tempfile::tempdir().expect("create node tempdir");
         let root = dir.path();
@@ -248,7 +248,7 @@ log_level = "warn"
 
     /// Overwrite this node's config file with a different cluster id (identity
     /// matrix): a Restart must then refuse the disk it was stamped against.
-    pub fn rewrite_cluster_id(&mut self, new_cluster_id: Uuid) {
+    pub fn rewrite_cluster_id(&mut self, new_cluster_id: ClusterId) {
         let raw = std::fs::read_to_string(&self.config_path).expect("read config");
         let replaced = raw.replace(
             &format!("cluster_id = \"{}\"", self.cluster_id),
@@ -351,7 +351,7 @@ impl RunningCoordinator {
     /// full agent-facing runtime. The Raft/admin transport and the agent
     /// gateway each get their own free localhost port so several can run in one
     /// test process in parallel.
-    pub async fn start(cluster_id: Uuid, ca: &Ca) -> RunningCoordinator {
+    pub async fn start(cluster_id: ClusterId, ca: &Ca) -> RunningCoordinator {
         let raft_port = free_port();
         let agent_port = free_port();
         let dir = tempfile::tempdir().expect("create coordinator tempdir");

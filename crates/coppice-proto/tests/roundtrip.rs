@@ -156,17 +156,21 @@ fn empty_envelope_is_an_error_not_a_skip() {
 }
 
 #[test]
-fn malformed_uuids_are_rejected_at_the_boundary() {
-    let envelope = pb::command::v1::Command {
-        version: 1,
-        body: Some(pb::command::v1::command::Body::DispatchAttempt(
-            pb::command::v1::DispatchAttempt {
-                attempt: Some(pb::core::v1::AttemptId { value: vec![0xAB; 15] }),
-                dispatched_at_us: TS,
-            },
-        )),
-    };
-    assert_eq!(command_from_pb(envelope), Err(ConvertError::InvalidUuid("AttemptId")));
+fn malformed_ids_are_rejected_at_the_boundary() {
+    // A bare uuid without the `attempt-` type tag must not decode, and
+    // neither must a well-formed id carrying the wrong tag.
+    for value in ["1683852a-993f-4497-a48b-6527b458fbd1", "job-1683852a-993f-4497-a48b-6527b458fbd1", "attempt-not-a-uuid"] {
+        let envelope = pb::command::v1::Command {
+            version: 1,
+            body: Some(pb::command::v1::command::Body::DispatchAttempt(
+                pb::command::v1::DispatchAttempt {
+                    attempt: Some(pb::core::v1::AttemptId { value: value.to_string() }),
+                    dispatched_at_us: TS,
+                },
+            )),
+        };
+        assert_eq!(command_from_pb(envelope), Err(ConvertError::InvalidId("AttemptId")));
+    }
 }
 
 #[test]

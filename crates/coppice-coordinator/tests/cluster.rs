@@ -22,7 +22,7 @@ use coppice_coordinator::admin;
 use coppice_coordinator::config::CliOverrides;
 use coppice_state::command::BumpClusterVersion;
 use coppice_state::Command;
-use uuid::Uuid;
+use coppice_core::id::ClusterId;
 
 use common::{poll, wait_converged, Ca, Leaf, Node};
 
@@ -31,8 +31,8 @@ use common::{poll, wait_converged, Ca, Leaf, Node};
 /// timeout.
 const DEADLINE: Duration = Duration::from_secs(20);
 
-fn uuid_bytes(u: Uuid) -> [u8; 16] {
-    *u.as_bytes()
+fn uuid_bytes(u: ClusterId) -> [u8; 16] {
+    *u.0.as_bytes()
 }
 
 fn init_tracing() {
@@ -143,7 +143,7 @@ async fn three_node_cluster_lifecycle() {
     // A dedicated admin-client identity signed by the same CA (ADR 0011): the
     // test acts as an operator presenting a valid client cert.
     let admin_leaf: Leaf = ca.leaf();
-    let cluster_id = Uuid::new_v4();
+    let cluster_id = ClusterId::new();
     let cluster_uuid = uuid_bytes(cluster_id);
 
     // Three replicas, ids 1..=3, each its own tempdir/port/cert.
@@ -467,7 +467,7 @@ async fn three_node_cluster_lifecycle() {
 async fn identity_matrix() {
     init_tracing();
     let ca = Ca::new();
-    let cluster_id = Uuid::new_v4();
+    let cluster_id = ClusterId::new();
 
     // (a) Restart intent on an empty directory must fail-stop, pointing the
     //     operator at the intent flags.
@@ -519,7 +519,7 @@ async fn identity_matrix() {
         .await;
         node.graceful_stop().await;
 
-        node.rewrite_cluster_id(Uuid::new_v4());
+        node.rewrite_cluster_id(ClusterId::new());
         let err = node
             .try_boot(CliOverrides::default())
             .await

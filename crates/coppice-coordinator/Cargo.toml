@@ -39,9 +39,7 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 serde.workspace = true
 toml.workspace = true
 humantime-serde.workspace = true
-# `Uuid` needs the "serde" feature (not part of the workspace default) to
-# deserialize `cluster_id` from the config file's hyphenated string form.
-uuid = { workspace = true, features = ["serde"] }
+uuid.workspace = true
 # Parses the agent's mTLS client-leaf certificate to enforce CN == NodeId at
 # session accept (ADR 0011); see `tasks::agent_gateway`.
 x509-parser.workspace = true

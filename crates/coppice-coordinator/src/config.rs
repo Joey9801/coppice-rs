@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use coppice_core::id::ClusterId;
 use serde::Deserialize;
-use uuid::Uuid;
 
 /// The coordinator's fully-parsed node configuration file.
 ///
@@ -45,11 +45,11 @@ pub(crate) struct Config {
     /// stamped node ID at startup.
     pub(crate) node_id: u64,
 
-    /// The cluster UUID every replica shares, generated once at
+    /// The cluster identity every replica shares, generated once at
     /// `coppice-cli cluster init` and cross-checked against the data
-    /// directory's stamp at startup (ADR 0016). Parsed from the canonical
-    /// hyphenated string form.
-    pub(crate) cluster_id: Uuid,
+    /// directory's stamp at startup (ADR 0016). Parsed from the typed
+    /// string form `cluster-<uuid>` (ADR 0024).
+    pub(crate) cluster_id: ClusterId,
 
     /// Root of this replica's on-disk state (segment storage, manifest).
     pub(crate) data_dir: PathBuf,
@@ -361,7 +361,7 @@ mod tests {
     /// this module adds ahead of the doc pass).
     const FULL_EXAMPLE: &str = r#"
 node_id = 3
-cluster_id = "5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
+cluster_id = "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice"
 peers = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
 
@@ -397,7 +397,7 @@ metrics_addr  = "127.0.0.1:9090"
 
     const MINIMAL_EXAMPLE: &str = r#"
 node_id = 1
-cluster_id = "5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
+cluster_id = "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice"
 
 [listen]
@@ -417,7 +417,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         assert_eq!(config.node_id, 3);
         assert_eq!(
             config.cluster_id,
-            Uuid::parse_str("5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10").unwrap()
+            "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10".parse().unwrap()
         );
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/coppice"));
         assert_eq!(

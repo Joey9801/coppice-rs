@@ -68,9 +68,10 @@ Conventions (all from ADR 0020):
 # retention, authorization — is replicated policy: see `coppice-cli policy`.
 
 node_id = 3                     # must match the data directory's stamp
-# Generated once per cluster (`uuidgen`), identical in every replica's file,
-# and cross-checked against the data directory's stamp at startup (ADR 0016).
-cluster_id = "6fa1e2c4-9b0d-4c1e-8f6a-2d3b5a7c9e01"
+# Generated once per cluster, identical in every replica's file, and
+# cross-checked against the data directory's stamp at startup (ADR 0016).
+# Typed string form per ADR 0024.
+cluster_id = "cluster-6fa1e2c4-9b0d-4c1e-8f6a-2d3b5a7c9e01"
 data_dir = "/var/lib/coppice"
 # Seed list for admin tooling to find the cluster; authoritative addresses
 # live in replicated membership.

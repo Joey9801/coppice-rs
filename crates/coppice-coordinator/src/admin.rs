@@ -376,7 +376,7 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
         })?,
     };
 
-    let cluster_uuid = *cfg.cluster_id.as_bytes();
+    let cluster_uuid = *cfg.cluster_id.0.as_bytes();
     let ca = read_pem(&cfg.tls.ca_path)?;
     let cert = read_pem(&cfg.tls.cert_path)?;
     let key = read_pem(&cfg.tls.key_path)?;

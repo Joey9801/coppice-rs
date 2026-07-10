@@ -108,11 +108,15 @@ classification field could only ever disagree with it.
   seconds/nanos (two varints, not fixed-width semantics), maps to an
   RFC 3339 *string* in JSON, and invites nanosecond precision the
   deterministic apply contract never wants.
-- **UUIDs are `bytes` (16), wrapped in typed id messages** (`JobId`,
-  `NodeId`, …) so ids stay unmixable in generated code too. Length is
-  validated at the conversion boundary (`ConvertError::InvalidUuid`), never
+- **Entity ids are typed strings** (`<prefix>-<uuid>`, e.g.
+  `job-1683852a-…`), wrapped in typed id messages (`JobId`, `NodeId`, …) so
+  ids stay unmixable in generated code *and* self-describing in any captured
+  payload, log line, or JSON body (ADR 0024). The prefix and the uuid are
+  validated at the conversion boundary (`ConvertError::InvalidId`), never
   assumed. (Raft *coordinator* ids are allocate-once `uint64`s per ADR 0016
-  and are not UUIDs.)
+  and are not UUIDs; the cluster/instance identity stamps in the storage
+  manifest and raft transport remain raw 16-byte `bytes` — internal
+  cross-checks, not user-facing ids.)
 - **No `float`/`double` anywhere replicated or hashed**
   ([ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md)): cost
   and usage are `uint64` µCU, weights and multipliers `uint64` Q32.32, the
@@ -172,8 +176,8 @@ migration window. Do not create one casually.
 
 The HTTP API maps `coppice.api.v1` onto JSON via the standard proto3 JSON
 mapping (ADR 0003), so schema choices leak into the JSON contract: field
-names become `lowerCamelCase` keys, `bytes` render as base64 (the API layer
-may present canonical UUID strings at its own edge), and 64-bit integers
+names become `lowerCamelCase` keys, entity ids pass through as their typed
+string form (`"job-<uuid>"`, ADR 0024), and 64-bit integers
 render as strings. Renaming a field is therefore a JSON break even though
 the wire tag is unchanged — one more reason renames are forbidden.
 

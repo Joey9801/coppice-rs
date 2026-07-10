@@ -27,7 +27,6 @@ use tokio_stream::StreamExt;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Certificate, Identity, Server as TonicServer, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
-use uuid::Uuid;
 
 use coppice_agent::config::{CapacityConfig, Config, TlsConfig};
 use coppice_agent::executor::{ExitInfo, FakeExecutor};
@@ -37,7 +36,7 @@ use coppice_net::session::{AgentService, Server as AgentServiceServer};
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, StateViews};
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
-use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
+use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
@@ -82,10 +81,11 @@ fn requested() -> Resources {
 // ---- agent harness -------------------------------------------------------
 
 /// Build an agent config pointing at `endpoint`, writing its mTLS PKI into
-/// `pki_dir`. The client leaf's subject CN is the node UUID string, which the
-/// gateway binds to the claimed NodeId at session accept (ADR 0011).
+/// `pki_dir`. The client leaf's subject CN is the node id's typed string form
+/// (`node-<uuid>`), which the gateway binds to the claimed NodeId at session
+/// accept (ADR 0011).
 fn agent_config(
-    node_id: Uuid,
+    node_id: NodeId,
     data_dir: PathBuf,
     endpoint: &str,
     ca: &Ca,
@@ -247,7 +247,6 @@ async fn submit_job(
 struct RunningJob {
     coord: RunningCoordinator,
     ca: Ca,
-    node_id: Uuid,
     node: NodeId,
     job: JobId,
     attempt: AttemptId,
@@ -261,19 +260,18 @@ struct RunningJob {
 /// attempt `Running` with the container started exactly once.
 async fn run_to_running() -> RunningJob {
     let ca = Ca::new();
-    let coord = RunningCoordinator::start(Uuid::new_v4(), &ca).await;
+    let coord = RunningCoordinator::start(ClusterId::new(), &ca).await;
     poll(DEADLINE, "coordinator leadership", || {
         let coord = &coord;
         async move { coord.is_leader() }
     })
     .await;
 
-    let node_id = Uuid::new_v4();
-    let node = NodeId(node_id);
+    let node = NodeId::new();
     let agent_dir = tempfile::tempdir().expect("agent tempdir");
     let executor = FakeExecutor::new();
     let config = agent_config(
-        node_id,
+        node,
         agent_dir.path().join("data"),
         &coord.agent_endpoint,
         &ca,
@@ -292,9 +290,9 @@ async fn run_to_running() -> RunningJob {
     .await;
 
     // Seed the quota entity, then submit a schedulable job.
-    let entity = QuotaEntityId(Uuid::new_v4());
+    let entity = QuotaEntityId::new();
     seed_quota(&coord, entity).await;
-    let job = JobId(Uuid::new_v4());
+    let job = JobId::new();
     submit_job(&coord, job, entity, 0).await;
 
     // The scheduler places it, dispatch sends StartJob, the agent starts the
@@ -324,7 +322,6 @@ async fn run_to_running() -> RunningJob {
     RunningJob {
         coord,
         ca,
-        node_id,
         node,
         job,
         attempt,
@@ -405,7 +402,7 @@ async fn agent_restart_mid_run_converges_without_duplicate_execution() {
     // state (a forked executor: shared containers, its own exit queue).
     let executor2 = world.executor.fork();
     let config2 = agent_config(
-        world.node_id,
+        world.node,
         world.agent_dir.path().join("data"),
         &world.coord.agent_endpoint,
         &world.ca,
@@ -586,7 +583,7 @@ async fn assert_never<F: Fn() -> bool>(window: Duration, label: &str, cond: F) {
 async fn stale_fenced_command_is_rejected_by_the_agent() {
     init_tracing();
     let ca = Ca::new();
-    let node_id = Uuid::new_v4();
+    let node_id = NodeId::new();
     let port = free_port();
     let endpoint = format!("localhost:{port}");
 
@@ -730,19 +727,18 @@ async fn node_lost_then_reappearing_container_is_stopped() {
     init_tracing();
     // Give the job one retry so the NodeLost requeue is observable.
     let ca = Ca::new();
-    let coord = RunningCoordinator::start(Uuid::new_v4(), &ca).await;
+    let coord = RunningCoordinator::start(ClusterId::new(), &ca).await;
     poll(DEADLINE, "coordinator leadership", || {
         let coord = &coord;
         async move { coord.is_leader() }
     })
     .await;
 
-    let node_id = Uuid::new_v4();
-    let node = NodeId(node_id);
+    let node = NodeId::new();
     let agent_dir = tempfile::tempdir().expect("agent tempdir");
     let executor = FakeExecutor::new();
     let config = agent_config(
-        node_id,
+        node,
         agent_dir.path().join("data"),
         &coord.agent_endpoint,
         &ca,
@@ -756,9 +752,9 @@ async fn node_lost_then_reappearing_container_is_stopped() {
         async move { node_epoch(&views, node).is_some_and(|e| e >= 1) }
     })
     .await;
-    let entity = QuotaEntityId(Uuid::new_v4());
+    let entity = QuotaEntityId::new();
     seed_quota(&coord, entity).await;
-    let job = JobId(Uuid::new_v4());
+    let job = JobId::new();
     submit_job(&coord, job, entity, 1).await;
 
     poll(DEADLINE, "attempt Running", || {
@@ -827,7 +823,7 @@ async fn node_lost_then_reappearing_container_is_stopped() {
     let executor2 = executor.fork();
     assert!(executor2.is_running(alloc));
     let config2 = agent_config(
-        node_id,
+        node,
         agent_dir.path().join("data"),
         &coord.agent_endpoint,
         &ca,

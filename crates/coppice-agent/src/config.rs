@@ -19,19 +19,17 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use coppice_core::id::NodeId;
 use coppice_core::resource::Resources;
-use serde::{Deserialize, Deserializer};
-use uuid::Uuid;
+use serde::Deserialize;
 
 /// The agent's fully-parsed configuration file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// This node's identity (ADR 0009). The agent's mTLS client certificate
-    /// carries this UUID as its subject CN; the coordinator authenticates
-    /// that the CN matches the `node` in every report. Parsed from the
-    /// canonical hyphenated string form.
-    #[serde(deserialize_with = "de_uuid")]
-    pub node_id: Uuid,
+    /// carries this id's typed string form (`node-<uuid>`) as its subject CN;
+    /// the coordinator authenticates that the CN matches the `node` in every
+    /// report. Parsed from the same typed string form (ADR 0024).
+    pub node_id: NodeId,
 
     /// Root of this node's on-disk state: the durable journal (`journal`) and
     /// its `LOCK` live directly under here.
@@ -104,7 +102,7 @@ impl Config {
 
     /// The strongly-typed node identity.
     pub fn node(&self) -> NodeId {
-        NodeId(self.node_id)
+        self.node_id
     }
 
     /// Emit the effective configuration at startup.
@@ -124,16 +122,6 @@ impl Config {
             "effective agent configuration"
         );
     }
-}
-
-/// Parse a UUID from its canonical hyphenated string, without requiring the
-/// `uuid/serde` feature in this crate's dependency set.
-fn de_uuid<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    Uuid::parse_str(&s).map_err(serde::de::Error::custom)
 }
 
 fn default_heartbeat_interval() -> Duration {
@@ -171,7 +159,7 @@ mod tests {
     }
 
     const FULL_EXAMPLE: &str = r#"
-node_id = "5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
+node_id = "node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice-agent"
 coordinators = ["coord-1.example.com:7072", "coord-2.example.com:7072"]
 
@@ -195,7 +183,7 @@ pool = "batch"
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
-node_id = "5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
+node_id = "node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice-agent"
 coordinators = ["coord-1.example.com:7072"]
 
@@ -217,7 +205,7 @@ disk_bytes   = 107374182400
 
         assert_eq!(
             config.node_id,
-            Uuid::parse_str("5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10").unwrap()
+            "node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10".parse().unwrap()
         );
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/coppice-agent"));
         assert_eq!(config.coordinators.len(), 2);

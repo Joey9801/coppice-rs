@@ -231,7 +231,7 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
     let ca = std::fs::read(&cfg.tls.ca_path)
         .with_context(|| format!("reading TLS CA certificate {}", cfg.tls.ca_path.display()))?;
 
-    let cluster_uuid = *cfg.cluster_id.as_bytes();
+    let cluster_uuid = *cfg.cluster_id.0.as_bytes();
     let raft_addr = cfg.listen.raft_addr;
 
     // Step 4: node options from config.

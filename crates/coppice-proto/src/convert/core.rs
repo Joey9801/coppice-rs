@@ -11,7 +11,6 @@ use coppice_core::quota::{
     ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, UsageState,
 };
 use coppice_core::resource::Resources;
-use uuid::Uuid;
 
 use super::{req, ConvertError};
 use crate::pb::core::v1 as pb;
@@ -22,7 +21,7 @@ macro_rules! convert_id {
     ($name:ident) => {
         impl From<coppice_core::id::$name> for pb::$name {
             fn from(id: coppice_core::id::$name) -> Self {
-                pb::$name { value: id.0.as_bytes().to_vec() }
+                pb::$name { value: id.to_string() }
             }
         }
 
@@ -30,12 +29,9 @@ macro_rules! convert_id {
             type Error = ConvertError;
 
             fn try_from(id: pb::$name) -> Result<Self, ConvertError> {
-                let bytes: [u8; 16] = id
-                    .value
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| ConvertError::InvalidUuid(stringify!($name)))?;
-                Ok(coppice_core::id::$name(Uuid::from_bytes(bytes)))
+                // The typed `<prefix>-<uuid>` form is validated here, so a
+                // JobId payload smuggled into a NodeId field fails loudly.
+                id.value.parse().map_err(|_| ConvertError::InvalidId(stringify!($name)))
             }
         }
     };

@@ -10,7 +10,7 @@
 //!   with zero/empty entries omitted, so identical domain values encode to
 //!   identical bytes.
 //! - **pb → domain is fallible.** The wire admits shapes the domain does
-//!   not (wrong-length UUIDs, missing required messages, unknown enum
+//!   not (malformed or wrongly-prefixed ids, missing required messages, unknown enum
 //!   values, duplicate keys). What a [`ConvertError`] means depends on
 //!   where the bytes came from: on a committed log entry it becomes a
 //!   deterministic `InvalidCommand` rejection (decode is a pure function,
@@ -36,8 +36,8 @@ pub use snapshot::{state_from_records, state_to_records, StateRecords};
 pub enum ConvertError {
     #[error("missing required field {0}")]
     MissingField(&'static str),
-    #[error("{0} is not a 16-byte UUID")]
-    InvalidUuid(&'static str),
+    #[error("{0} is not a typed `<prefix>-<uuid>` id")]
+    InvalidId(&'static str),
     #[error("unknown enum value {value} in {field}")]
     UnknownEnum { field: &'static str, value: i32 },
     #[error("duplicate entry in {0}")]
