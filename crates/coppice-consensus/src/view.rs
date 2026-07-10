@@ -7,13 +7,14 @@
 //! views, so there is exactly one owner of the mutable state and no locks on
 //! the read path (`docs/architecture/coordinator-runtime.md`).
 //!
-//! Publishing clones the whole [`coppice_state::StateMachine`]; that full-state
-//! clone is the price of a publish, and the cadence bound in
-//! [`ViewPublisherConfig`] caps the clone rate. When that cost bites, the
-//! escape hatch is persistent (`im`-style) maps inside the state machine — see
-//! the runtime doc. Wall-clock time drives the cadence here, which is safe:
-//! publishing is outside replicated state, so it may read the clock freely
-//! (unlike apply, which must be a pure function of the command log).
+//! Publishing clones the whole [`coppice_state::StateMachine`]. Since ADR
+//! 0028 the job-scaled maps inside it are persistent (`imbl::OrdMap`), so the
+//! clone is O(1) structural sharing rather than a deep copy; the cadence
+//! bound in [`ViewPublisherConfig`] now mostly caps watch-channel churn, and
+//! the `coordinator_view_clone_seconds` histogram verifies the clone stays
+//! cheap. Wall-clock time drives the cadence here, which is safe: publishing
+//! is outside replicated state, so it may read the clock freely (unlike
+//! apply, which must be a pure function of the command log).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,9 +26,11 @@ use coppice_state::StateMachine;
 
 use crate::error::ConsensusError;
 
-/// The KOI-5 escape-hatch trigger metric (coordinator-runtime.md § clone-cost
-/// analysis): sustained p99 above 25 ms, or above 10% of the publish
-/// interval, is the documented signal to revisit the state representation.
+/// The clone-cost trigger metric promised by coordinator-runtime.md § clone-
+/// cost analysis: sustained p99 above 25 ms, or above 10% of the publish
+/// interval, means the state representation needs revisiting. ADR 0028's
+/// persistent maps should keep this flat regardless of state size; the
+/// histogram is here to prove it.
 const VIEW_CLONE_SECONDS: &str = "coordinator_view_clone_seconds";
 const VIEW_PUBLISHES_TOTAL: &str = "coordinator_view_publishes_total";
 const VIEW_APPLIED_INDEX: &str = "coordinator_view_applied_index";

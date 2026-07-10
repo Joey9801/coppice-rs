@@ -41,6 +41,7 @@
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use openraft::storage::{RaftStateMachine, Snapshot, SnapshotMeta};
 use openraft::{
@@ -60,6 +61,22 @@ use crate::CoordinatorId;
 use super::engine::StorageCore;
 use super::raftpb;
 use super::snapshot;
+
+/// Off-apply-task snapshot build cost: encode + write + validate + adopt of
+/// one container, on the blocking pool.
+const SNAPSHOT_BUILD_SECONDS: &str = "coordinator_snapshot_build_seconds";
+
+pub(crate) fn describe_metrics() {
+    metrics::describe_histogram!(
+        SNAPSHOT_BUILD_SECONDS,
+        metrics::Unit::Seconds,
+        "Time to encode, write, validate, and adopt one snapshot container (off the apply task)."
+    );
+}
+
+pub(crate) fn gather_metrics() {
+    // The build histogram is pushed as builds run; nothing needs sampling.
+}
 
 /// The openraft `SnapshotData` binding: a file-backed handle to one ADR 0018
 /// snapshot container. (openraft's `generic-snapshot-data` feature lifts the
@@ -427,6 +444,7 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
         let core = Arc::clone(&self.core);
         let shards = self.shards;
         let file = tokio::task::spawn_blocking(move || -> io::Result<Box<dyn FsFile>> {
+            let build_started = Instant::now();
             let mut spool = core
                 .lock()
                 .expect("storage engine poisoned")
@@ -434,6 +452,8 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
             snapshot::write_state_direct(&mut *spool, &meta, &state, shards)?;
             let mut core = core.lock().expect("storage engine poisoned");
             core.finish_snapshot_build(spool)?;
+            metrics::histogram!(SNAPSHOT_BUILD_SECONDS)
+                .record(build_started.elapsed().as_secs_f64());
             let (_, _, file) = core
                 .current_snapshot_reader()?
                 .ok_or_else(|| io::Error::other("freshly built snapshot is not the current one"))?;

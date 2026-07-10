@@ -933,4 +933,24 @@ mod tests {
         assert_eq!(state.jobs.len(), 1_000_000);
         check_consistency(&state);
     }
+
+    /// The KOI-5 clone bound: view publication and snapshot capture clone the
+    /// whole state on the apply task, so the clone must stay structurally
+    /// shared (ADR 0028), never a deep copy. A deep copy at this scale runs
+    /// hundreds of milliseconds; the bound would catch any regression to one.
+    #[test]
+    #[ignore = "1M-scale; run in release"]
+    fn clone_at_1m_is_structurally_shared() {
+        let cfg = SynthConfig::with_jobs(1_000_000);
+        let state = synth_state(&cfg);
+        let start = std::time::Instant::now();
+        let cloned = state.clone();
+        let elapsed = start.elapsed();
+        eprintln!("clone of a 1M-job state took {elapsed:?}");
+        assert_eq!(cloned.version, state.version);
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "full-state clone took {elapsed:?}; expected O(1) structural sharing"
+        );
+    }
 }
