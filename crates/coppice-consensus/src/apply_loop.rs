@@ -16,6 +16,8 @@
 //! committed log so every replica derives identical batches and cursor
 //! positions (ADR 0008, KOI-3).
 
+use std::time::Instant;
+
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -24,6 +26,29 @@ use coppice_state::StateMachine;
 use crate::adapter::ApplyRequest;
 use crate::events::{EventBatch, EventTap};
 use crate::view::ViewPublisher;
+
+/// Apply-stall measurement (coordinator-runtime.md § clone-cost analysis):
+/// how long the sole apply task is occupied per request, i.e. the pause every
+/// other apply, publish, and strong read waits out.
+const APPLY_BATCH_SECONDS: &str = "coordinator_apply_batch_seconds";
+const SNAPSHOT_CAPTURE_SECONDS: &str = "coordinator_snapshot_capture_seconds";
+
+pub(crate) fn describe_metrics() {
+    metrics::describe_histogram!(
+        APPLY_BATCH_SECONDS,
+        metrics::Unit::Seconds,
+        "Time the apply task spends on one apply batch (apply, emit, publish, reply)."
+    );
+    metrics::describe_histogram!(
+        SNAPSHOT_CAPTURE_SECONDS,
+        metrics::Unit::Seconds,
+        "Time the apply task spends capturing state for a snapshot."
+    );
+}
+
+pub(crate) fn gather_metrics() {
+    // Both histograms are pushed as the loop runs; nothing needs sampling.
+}
 
 /// Run the apply loop until the request channel closes.
 ///
@@ -59,6 +84,7 @@ pub(crate) async fn run(
                 };
                 match request {
                     ApplyRequest::Apply { entries, reply } => {
+                        let batch_started = Instant::now();
                         let mut outcomes = Vec::with_capacity(entries.len());
                         for (index, command) in &entries {
                             let outcome = state.apply(command);
@@ -80,13 +106,18 @@ pub(crate) async fn run(
                         publisher.maybe_publish(&state, applied_index);
                         // A dropped receiver just means the proposer went away.
                         let _ = reply.send(outcomes);
+                        metrics::histogram!(APPLY_BATCH_SECONDS)
+                            .record(batch_started.elapsed().as_secs_f64());
                     }
                     ApplyRequest::Snapshot { reply } => {
                         // Share one clone with the view watch instead of
                         // taking a second: reuse the published view when it
                         // is current, publish (and reset the cadence clock)
                         // when it is not.
+                        let capture_started = Instant::now();
                         let _ = reply.send((publisher.state_at(&state, applied_index), applied_index));
+                        metrics::histogram!(SNAPSHOT_CAPTURE_SECONDS)
+                            .record(capture_started.elapsed().as_secs_f64());
                     }
                     ApplyRequest::Install { state: new_state, applied_index: idx, reply } => {
                         state = *new_state;

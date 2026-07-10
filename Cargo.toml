@@ -83,6 +83,12 @@ tokio-stream = "0.1"
 # (ADR 0011). tonic 0.12 matches the workspace's prost 0.13 pin.
 tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
+# Metric emission facade. Each module that exposes metrics defines
+# `describe_metrics()` (describe_* calls plus recursion into submodules) and
+# `gather_metrics()` (point-in-time sampling plus the same recursion), so a
+# future /metrics endpoint (metrics-exporter-prometheus behind the public API)
+# only calls the crate roots without knowing any module's internals.
+metrics = "0.24"
 # Node configuration is one TOML file per process (ADR 0020), with humane
 # duration strings ("1500ms") parsed at load.
 toml = "0.8"
