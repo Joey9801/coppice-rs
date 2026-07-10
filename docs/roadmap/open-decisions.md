@@ -35,6 +35,8 @@ re-deriving it from the whole design.
 | [OD-11](#od-11-data-retention-policy) | Data retention policy | Low | Resolved — [ADR 0012](../decisions/0012-data-retention.md) |
 | [OD-12](#od-12-abort-semantics-partial-scheduling-and-job-groups) | Abort semantics, partial scheduling & job groups | High | Resolved — [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md), [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) |
 | [OD-13](#od-13-base-score-and-the-exact-job-costing-formula) | Base score and the exact job-costing formula | High | Resolved — [ADR 0021](../decisions/0021-effective-score-ranking.md) |
+| [OD-14](#od-14-coordinator-discovery-and-control-plane-pki) | Coordinator discovery & control-plane PKI | Medium | Open — plan in [deployment-story.md](deployment-story.md) |
+| [OD-15](#od-15-agent-enrollment-signer-and-decommission-protocol) | Agent enrollment signer & decommission protocol | High — gates zero-touch autoscaling | Open — plan in [deployment-story.md](deployment-story.md) |
 
 All eleven initial questions were resolved on 2026-07-07; the ADRs linked above
 carry the decisions and rationale. New questions get the next free `OD-N`.
@@ -369,3 +371,63 @@ budget faster) but is silent on its effect on *rank*.
 **Related:** [ADR 0005](../decisions/0005-cost-based-soft-quotas.md),
 [ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md),
 [scheduling/quotas-and-priorities.md](../scheduling/quotas-and-priorities.md).
+
+## OD-14: Coordinator discovery and control-plane PKI
+
+**Question.** (a) Which discovery backends feed the coordinator seed list —
+static config (today), DNS, Consul — and is any of them load-bearing beyond
+first-dial? (b) Where do coordinator↔coordinator certificates come from in a
+templated deployment — externally managed PKI (Vault / cert-manager) with
+in-process cert reload, or something the cluster itself issues?
+
+**Why it matters.** ADR 0025 removed the last hand-allocated identity from
+coordinator config, so replicas are now template-stampable *except* for
+finding each other on first dial and being issued key material. ADR 0016
+already commits to "discovery/config cannot hard-code node 1/2/3 forever".
+The wrong shape here either adds a hard runtime dependency on an external
+system to the consensus core, or bakes in long-lived certs that make
+rotation a fleet-wide manual event.
+
+**Considerations.** Authoritative addressing must stay in replicated
+membership; discovery may only ever feed seed lists and admin-CLI targets.
+DNS is dependency-free and probably sufficient; Consul adds health-checked
+entries at the cost of an operational dependency. For PKI, short-lived
+Vault-issued leaves require cert reload without restart in the tonic
+servers — that reload seam is the only real code decision. Self-join
+automation (`coppice coordinator join` driving add-learner/promote itself)
+is gated on ADRs 0022/0023 formalizing who may drive membership RPCs.
+
+**Related:** [deployment-story.md](deployment-story.md),
+[ADR 0016](../decisions/0016-coordinator-rebuild-learner-join.md),
+[ADR 0025](../decisions/0025-self-minted-coordinator-identity.md),
+[ADR 0011](../decisions/0011-container-security-posture.md).
+
+## OD-15: Agent enrollment signer and decommission protocol
+
+**Question.** (a) Who signs agent leaves in the ADR 0011 enrollment flow —
+a coordinator-held CA (key on the leader, cert in replicated policy) or an
+external signer (Vault) behind the same enrollment endpoint? (b) What is
+the graceful scale-in protocol — the drain verb, agent-side SIGTERM drain,
+ASG lifecycle-hook integration, and the retention/GC rule for departed
+node records?
+
+**Why it matters.** These are the two halves of zero-touch autoscaling that
+are genuinely undecided (the rest of the plan is mechanical). Enrollment is
+the trust root for the entire agent fleet; the signer choice trades
+no-new-infra simplicity against key hygiene and revocation. Scale-in today
+relies on the 90 s `DeclareNodeLost` timeout, which kills running work —
+fine as a crash backstop, wrong as the *planned* path; and node records
+are currently immortal, so a churning ASG grows state forever.
+
+**Considerations.** `SetNodeSchedulable` already exists in the state
+machine with no production caller — the drain verb is mostly surface. The
+enrollment endpoint's protocol (token → CSR → leaf with CN = typed node
+id, renewal under the current cert) is identical for either signer, so the
+built-in signer can ship first with Vault as a backend later. Node-record
+GC wants an ADR 0012-style retention window. Both surfaces are
+authorization-shaped and should follow ADRs 0022/0023.
+
+**Related:** [deployment-story.md](deployment-story.md),
+[ADR 0011](../decisions/0011-container-security-posture.md),
+[ADR 0009](../decisions/0009-fencing-and-reconciliation.md),
+[ADR 0012](../decisions/0012-data-retention.md).
