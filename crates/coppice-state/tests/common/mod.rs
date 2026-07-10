@@ -55,15 +55,26 @@ pub fn test_weights() -> CostWeights {
 }
 
 pub fn test_policy(accrual_limit: u32) -> PolicyConfig {
-    PolicyConfig { cost_weights: test_weights(), accrual_limit, ..PolicyConfig::default() }
+    PolicyConfig {
+        cost_weights: test_weights(),
+        accrual_limit,
+        ..PolicyConfig::default()
+    }
 }
 
 pub fn cpu(millis: u64) -> Resources {
-    Resources { cpu_millis: millis, memory_bytes: 0, disk_bytes: 0 }
+    Resources {
+        cpu_millis: millis,
+        memory_bytes: 0,
+        disk_bytes: 0,
+    }
 }
 
 pub fn update_policy_cmd(policy: PolicyConfig) -> Command {
-    Command::UpdatePolicy(UpdatePolicy { policy, updated_at_us: TS })
+    Command::UpdatePolicy(UpdatePolicy {
+        policy,
+        updated_at_us: TS,
+    })
 }
 
 pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>) -> Command {
@@ -85,7 +96,12 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, ts: i64) -> Command 
     })
 }
 
-pub fn submit_cmd(job: JobId, requests: Resources, max_runtime_s: Option<u64>, retry: RetryPolicy) -> Command {
+pub fn submit_cmd(
+    job: JobId,
+    requests: Resources,
+    max_runtime_s: Option<u64>,
+    retry: RetryPolicy,
+) -> Command {
     Command::SubmitJob(SubmitJob {
         job: Job {
             id: job,
@@ -102,12 +118,22 @@ pub fn submit_cmd(job: JobId, requests: Resources, max_runtime_s: Option<u64>, r
     })
 }
 
-pub fn placement(job: JobId, attempt: AttemptId, alloc: AllocationId, node: NodeId, requested: Resources) -> Placement {
+pub fn placement(
+    job: JobId,
+    attempt: AttemptId,
+    alloc: AllocationId,
+    node: NodeId,
+    requested: Resources,
+) -> Placement {
     Placement {
         job,
         attempt,
         group: GroupId(job.0),
-        allocations: vec![AllocationSpec { id: alloc, node, requested }],
+        allocations: vec![AllocationSpec {
+            id: alloc,
+            node,
+            requested,
+        }],
     }
 }
 
@@ -121,15 +147,24 @@ pub fn place_cmd(p: Placement, ts: i64) -> Command {
 }
 
 pub fn dispatch_cmd(attempt: AttemptId, ts: i64) -> Command {
-    Command::DispatchAttempt(DispatchAttempt { attempt, dispatched_at_us: ts })
+    Command::DispatchAttempt(DispatchAttempt {
+        attempt,
+        dispatched_at_us: ts,
+    })
 }
 
 pub fn started_cmd(attempt: AttemptId, ts: i64) -> Command {
-    Command::RecordAttemptStarted(RecordAttemptStarted { attempt, observed_at_us: ts })
+    Command::RecordAttemptStarted(RecordAttemptStarted {
+        attempt,
+        observed_at_us: ts,
+    })
 }
 
 pub fn exited_cmd(attempt: AttemptId, ts: i64) -> Command {
-    Command::RecordAttemptExited(RecordAttemptExited { attempt, observed_at_us: ts })
+    Command::RecordAttemptExited(RecordAttemptExited {
+        attempt,
+        observed_at_us: ts,
+    })
 }
 
 pub fn outcome_cmd(
@@ -147,7 +182,11 @@ pub fn outcome_cmd(
 }
 
 pub fn abort_cmd(job: JobId, ts: i64) -> Command {
-    Command::AbortJob(AbortJob { job, reason: Some("test".into()), requested_at_us: ts })
+    Command::AbortJob(AbortJob {
+        job,
+        reason: Some("test".into()),
+        requested_at_us: ts,
+    })
 }
 
 /// A bootstrapped cluster: root quota entity, reference cost weights, one

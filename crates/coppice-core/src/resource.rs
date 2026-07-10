@@ -21,7 +21,11 @@ pub struct Resources {
 }
 
 impl Resources {
-    pub const ZERO: Resources = Resources { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 };
+    pub const ZERO: Resources = Resources {
+        cpu_millis: 0,
+        memory_bytes: 0,
+        disk_bytes: 0,
+    };
 
     /// Returns true if `self` fits within `capacity` on every dimension.
     pub fn fits_within(&self, capacity: &Resources) -> bool {

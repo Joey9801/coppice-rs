@@ -300,7 +300,9 @@ impl Fs for RealFs {
     }
 
     fn open_read(&self, path: &Path) -> io::Result<RealFile> {
-        let file = std::fs::OpenOptions::new().read(true).open(self.full(path)?)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(self.full(path)?)?;
         Ok(RealFile { file })
     }
 
@@ -410,7 +412,10 @@ mod tests {
         fs.create_dir_all(Path::new("log")).unwrap();
         fs.create_new(Path::new("log/10.seg")).unwrap();
         fs.create_new(Path::new("log/2.seg")).unwrap();
-        assert_eq!(fs.list_dir(Path::new("log")).unwrap(), vec!["10.seg", "2.seg"]);
+        assert_eq!(
+            fs.list_dir(Path::new("log")).unwrap(),
+            vec!["10.seg", "2.seg"]
+        );
     }
 
     #[test]

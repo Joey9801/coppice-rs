@@ -35,9 +35,7 @@ pub const MICRO_PER_COST_UNIT: u64 = 1_000_000;
 /// All arithmetic is saturating; overflow pins at `u64::MAX` (maximal usage,
 /// hence maximal penalty) rather than wrapping or panicking. See ADR 0019 for
 /// the overflow-horizon analysis behind the µCU scale.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CostUnits(pub u64);
 
 impl CostUnits {
@@ -124,7 +122,9 @@ impl DecayPolicy {
         // Indices span at most the i64 range / tick_us, so the difference of
         // two indices cannot overflow i64's width in practice; saturate to be
         // airtight at the extremes.
-        let dn = self.tick_index(to_us).saturating_sub(self.tick_index(from_us));
+        let dn = self
+            .tick_index(to_us)
+            .saturating_sub(self.tick_index(from_us));
         dn.max(0) as u64
     }
 
@@ -170,7 +170,10 @@ pub struct UsageState {
 impl UsageState {
     /// A fresh accumulator, zero usage as of `created_us`.
     pub fn new(created_us: i64) -> UsageState {
-        UsageState { usage: CostUnits::ZERO, last_update_us: created_us }
+        UsageState {
+            usage: CostUnits::ZERO,
+            last_update_us: created_us,
+        }
     }
 
     /// Bring the accumulator forward to a command timestamp.
@@ -279,7 +282,11 @@ pub fn job_cost(
     runtime_seconds: u64,
     multiplier: PriorityMultiplier,
 ) -> CostUnits {
-    cost_from_rate(resource_rate(requests, weights), runtime_seconds, multiplier)
+    cost_from_rate(
+        resource_rate(requests, weights),
+        runtime_seconds,
+        multiplier,
+    )
 }
 
 /// The replicated record of a placement charge, kept on the attempt so its
@@ -381,13 +388,20 @@ mod tests {
 
     #[test]
     fn policy_validation_rejects_bad_configs() {
-        let bad_tick = DecayPolicy { tick_us: 0, ..DecayPolicy::DEFAULT };
+        let bad_tick = DecayPolicy {
+            tick_us: 0,
+            ..DecayPolicy::DEFAULT
+        };
         assert_eq!(bad_tick.validate(), Err(PolicyError::NonPositiveTick(0)));
-        let too_slow =
-            DecayPolicy { decay_per_tick: DecayPolicy::MAX_DECAY_PER_TICK + 1, ..DecayPolicy::DEFAULT };
+        let too_slow = DecayPolicy {
+            decay_per_tick: DecayPolicy::MAX_DECAY_PER_TICK + 1,
+            ..DecayPolicy::DEFAULT
+        };
         assert_eq!(
             too_slow.validate(),
-            Err(PolicyError::DecayTooSlow(DecayPolicy::MAX_DECAY_PER_TICK + 1))
+            Err(PolicyError::DecayTooSlow(
+                DecayPolicy::MAX_DECAY_PER_TICK + 1
+            ))
         );
     }
 
@@ -450,7 +464,10 @@ mod tests {
         );
         assert_eq!(actual, CostUnits(27_000_000_000));
         let charged_at = 1_760_000_000_000_000;
-        let record = ChargeRecord { amount: charged, charged_at_us: charged_at };
+        let record = ChargeRecord {
+            amount: charged,
+            charged_at_us: charged_at,
+        };
         let adjustment = true_up(
             &record,
             actual,
@@ -462,7 +479,10 @@ mod tests {
 
     #[test]
     fn true_up_surcharges_grace_overrun() {
-        let record = ChargeRecord { amount: CostUnits(1000), charged_at_us: 0 };
+        let record = ChargeRecord {
+            amount: CostUnits(1000),
+            charged_at_us: 0,
+        };
         let adjustment = true_up(&record, CostUnits(1010), 60_000_000, &DecayPolicy::DEFAULT);
         assert_eq!(adjustment, TrueUp::Surcharge(CostUnits(10)));
     }
@@ -472,7 +492,10 @@ mod tests {
         // Actual cost zero (never ran) ⇒ the whole charge comes back, decayed
         // by however long it sat — requeue is free with no special case.
         let p = DecayPolicy::DEFAULT;
-        let record = ChargeRecord { amount: CostUnits(1_000_000_000_000), charged_at_us: 0 };
+        let record = ChargeRecord {
+            amount: CostUnits(1_000_000_000_000),
+            charged_at_us: 0,
+        };
         let resolved_at = 86_400_000_000; // one half-life
         assert_eq!(
             true_up(&record, CostUnits::ZERO, resolved_at, &p),
@@ -517,10 +540,16 @@ mod tests {
         assert_eq!(penalty(0.0, DEFAULT_PENALTY_EXPONENT_MILLI), 1.0);
         assert_eq!(penalty(1.0, DEFAULT_PENALTY_EXPONENT_MILLI), 1.0);
         assert_eq!(penalty(3.0, DEFAULT_PENALTY_EXPONENT_MILLI), 9.0);
-        assert_eq!(penalty(f64::INFINITY, DEFAULT_PENALTY_EXPONENT_MILLI), f64::INFINITY);
+        assert_eq!(
+            penalty(f64::INFINITY, DEFAULT_PENALTY_EXPONENT_MILLI),
+            f64::INFINITY
+        );
         // Zero quota: infinitely over unless also unused.
         assert_eq!(over_quota_ratio(CostUnits::ZERO, CostUnits::ZERO), 0.0);
-        assert_eq!(over_quota_ratio(CostUnits(1), CostUnits::ZERO), f64::INFINITY);
+        assert_eq!(
+            over_quota_ratio(CostUnits(1), CostUnits::ZERO),
+            f64::INFINITY
+        );
     }
 
     #[test]

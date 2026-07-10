@@ -62,7 +62,10 @@ impl AttemptState {
         }
         matches!(
             (self, next),
-            (Accruing, Ready) | (Ready, Dispatching) | (Dispatching, Running) | (Running, Finalizing)
+            (Accruing, Ready)
+                | (Ready, Dispatching)
+                | (Dispatching, Running)
+                | (Running, Finalizing)
         )
     }
 }
@@ -135,7 +138,10 @@ mod tests {
         use AttemptState::*;
         let terminal = Terminal(AttemptOutcome::Aborted);
         for state in [Accruing, Ready, Dispatching, Running, Finalizing] {
-            assert!(state.may_transition_to(&terminal), "{state:?} must be able to end early");
+            assert!(
+                state.may_transition_to(&terminal),
+                "{state:?} must be able to end early"
+            );
         }
         assert!(!terminal.may_transition_to(&Terminal(AttemptOutcome::NodeLost)));
     }
@@ -155,7 +161,13 @@ mod tests {
         assert_eq!(Exited { code: 137 }.class(), OutcomeClass::UserError);
         assert_eq!(Aborted.class(), OutcomeClass::UserRequest);
         assert_eq!(Revoked.class(), OutcomeClass::Platform);
-        assert_eq!(PullFailed { user_error: true }.class(), OutcomeClass::UserError);
-        assert_eq!(PullFailed { user_error: false }.class(), OutcomeClass::Platform);
+        assert_eq!(
+            PullFailed { user_error: true }.class(),
+            OutcomeClass::UserError
+        );
+        assert_eq!(
+            PullFailed { user_error: false }.class(),
+            OutcomeClass::Platform
+        );
     }
 }

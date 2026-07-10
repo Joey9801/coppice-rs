@@ -38,7 +38,9 @@ pub struct SimConfig {
 
 impl Default for SimConfig {
     fn default() -> SimConfig {
-        SimConfig { tear_granularity: 4096 }
+        SimConfig {
+            tear_granularity: 4096,
+        }
     }
 }
 
@@ -73,7 +75,10 @@ fn stale_handle_error() -> io::Error {
 }
 
 fn not_found(path: &Path) -> io::Error {
-    io::Error::new(io::ErrorKind::NotFound, format!("no such file: {}", path.display()))
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no such file: {}", path.display()),
+    )
 }
 
 fn to_usize(v: u64) -> usize {
@@ -93,19 +98,34 @@ enum DataOp {
     /// adversary can replay surviving writes at their true positions even
     /// when earlier ones were dropped (zero-filling the gap, as a page cache
     /// with a hole of never-written pages would).
-    Append { offset: u64, bytes: Vec<u8> },
-    Truncate { len: u64 },
+    Append {
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    Truncate {
+        len: u64,
+    },
 }
 
 /// An un-synced mutation of one directory's name table, kept until
 /// `sync_dir` promotes it or the crash adversary decides its fate.
 enum NsOp {
     /// `create_new` of a file or a `create_dir_all` step.
-    Create { name: String, ino: Ino },
-    Remove { name: String, ino: Ino },
+    Create {
+        name: String,
+        ino: Ino,
+    },
+    Remove {
+        name: String,
+        ino: Ino,
+    },
     /// Same-directory rename; atomic across a crash (fully happened or
     /// fully didn't).
-    Rename { from: String, to: String, ino: Ino },
+    Rename {
+        from: String,
+        to: String,
+        ino: Ino,
+    },
 }
 
 /// A regular file: the crash-surviving image plus the journal of visible but
@@ -266,9 +286,9 @@ impl Inner {
     /// name. Errors if `path` is empty — the root has no name.
     fn resolve_parent(&self, path: &Path) -> io::Result<(Ino, String)> {
         let mut names = path_names(path)?;
-        let name = names.pop().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no file name")
-        })?;
+        let name = names
+            .pop()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
         let parent = self.lookup(&names).ok_or_else(|| not_found(path))?;
         match self.nodes.get(&parent) {
             Some(Node::Dir(_)) => Ok((parent, name)),
@@ -370,7 +390,10 @@ pub struct SimFs {
 
 impl SimFs {
     pub fn new(config: SimConfig) -> SimFs {
-        assert!(config.tear_granularity > 0, "tear_granularity must be nonzero");
+        assert!(
+            config.tear_granularity > 0,
+            "tear_granularity must be nonzero"
+        );
         let mut nodes = BTreeMap::new();
         nodes.insert(ROOT, Node::Dir(DirNode::default()));
         SimFs {
@@ -557,7 +580,10 @@ impl Fs for SimFs {
         let token = inner.next_lock_token;
         inner.next_lock_token += 1;
         inner.lock_holder = Some(token);
-        Ok(SimLock { inner: Arc::clone(&self.inner), token })
+        Ok(SimLock {
+            inner: Arc::clone(&self.inner),
+            token,
+        })
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -675,7 +701,11 @@ impl Fs for SimFs {
         let dir = inner.dir_mut(from_parent);
         dir.visible.remove(&from_name);
         dir.visible.insert(to_name.clone(), ino);
-        dir.journal.push(NsOp::Rename { from: from_name, to: to_name, ino });
+        dir.journal.push(NsOp::Rename {
+            from: from_name,
+            to: to_name,
+            ino,
+        });
         Ok(())
     }
 
@@ -731,7 +761,10 @@ impl FsFile for SimFile {
         }
         let file = inner.file_mut(self.ino);
         let offset = file.visible.len() as u64;
-        file.journal.push(DataOp::Append { offset, bytes: data.to_vec() });
+        file.journal.push(DataOp::Append {
+            offset,
+            bytes: data.to_vec(),
+        });
         file.visible.extend_from_slice(data);
         Ok(())
     }
@@ -812,7 +845,10 @@ mod tests {
         assert_eq!(&buf, b"world");
 
         // A second handle sees the same visible contents.
-        assert_eq!(read_to_vec(&fs, Path::new("log/1.seg")).unwrap(), b"hello world");
+        assert_eq!(
+            read_to_vec(&fs, Path::new("log/1.seg")).unwrap(),
+            b"hello world"
+        );
 
         f.truncate(5).unwrap();
         assert_eq!(read_to_vec(&fs, Path::new("log/1.seg")).unwrap(), b"hello");
@@ -822,7 +858,10 @@ mod tests {
         assert!(!fs.exists(Path::new("log/2.seg")).unwrap());
         assert!(fs.create_new(Path::new("log/1.seg")).is_err());
         fs.create_new(Path::new("log/0.seg")).unwrap();
-        assert_eq!(fs.list_dir(Path::new("log")).unwrap(), vec!["0.seg", "1.seg"]);
+        assert_eq!(
+            fs.list_dir(Path::new("log")).unwrap(),
+            vec!["0.seg", "1.seg"]
+        );
 
         let mut ro = fs.open_read(Path::new("log/1.seg")).unwrap();
         assert!(ro.append(b"x").is_err());
@@ -899,7 +938,10 @@ mod tests {
                 seen_gap = true;
             }
         }
-        assert!(seen_gap, "no seed dropped the first append while keeping the second");
+        assert!(
+            seen_gap,
+            "no seed dropped the first append while keeping the second"
+        );
     }
 
     #[test]
@@ -985,7 +1027,10 @@ mod tests {
             }
             crash_point += 1;
         }
-        assert!(crash_point > 0, "crash injection never interrupted write_atomic");
+        assert!(
+            crash_point > 0,
+            "crash injection never interrupted write_atomic"
+        );
     }
 
     #[test]
@@ -1049,7 +1094,8 @@ mod tests {
             let mut b = fs.create_new(Path::new("manifest.tmp")).unwrap();
             b.append(b"manifest v2").unwrap();
             b.sync_data().unwrap();
-            fs.rename(Path::new("manifest.tmp"), Path::new("manifest")).unwrap();
+            fs.rename(Path::new("manifest.tmp"), Path::new("manifest"))
+                .unwrap();
             fs.create_new(Path::new("log/2.seg")).unwrap();
             fs.remove_file(Path::new("log/2.seg")).unwrap();
             fs
@@ -1107,7 +1153,10 @@ mod tests {
             f.read_at(0, &mut [0u8; 1]).unwrap_err(),
             f.len().unwrap_err(),
         ] {
-            assert!(!is_sim_crash(&err), "stale-handle failure is not a crash point");
+            assert!(
+                !is_sim_crash(&err),
+                "stale-handle failure is not a crash point"
+            );
         }
         // A fresh handle works and sees the durable contents.
         assert_eq!(read_to_vec(&fs, Path::new("f")).unwrap(), b"x");

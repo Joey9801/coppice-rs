@@ -85,7 +85,10 @@ struct Index<'a> {
 }
 
 fn index(set: &FileDescriptorSet) -> Index<'_> {
-    let mut idx = Index { messages: BTreeMap::new(), enums: BTreeMap::new() };
+    let mut idx = Index {
+        messages: BTreeMap::new(),
+        enums: BTreeMap::new(),
+    };
     for file in &set.file {
         let package = file.package();
         for e in &file.enum_type {
@@ -118,10 +121,16 @@ fn compare_message(
     problems: &mut Vec<String>,
 ) {
     // Message reserved ranges use an *exclusive* end.
-    let base_reserved: Vec<(i32, i32)> =
-        base.reserved_range.iter().map(|r| (r.start(), r.end() - 1)).collect();
-    let cur_reserved: Vec<(i32, i32)> =
-        cur.reserved_range.iter().map(|r| (r.start(), r.end() - 1)).collect();
+    let base_reserved: Vec<(i32, i32)> = base
+        .reserved_range
+        .iter()
+        .map(|r| (r.start(), r.end() - 1))
+        .collect();
+    let cur_reserved: Vec<(i32, i32)> = cur
+        .reserved_range
+        .iter()
+        .map(|r| (r.start(), r.end() - 1))
+        .collect();
 
     for base_field in &base.field {
         let tag = base_field.number();
@@ -137,7 +146,10 @@ fn compare_message(
                 if base_field.r#type != cur_field.r#type
                     || base_field.type_name != cur_field.type_name
                 {
-                    problems.push(format!("{name}.{} (tag {tag}) changed type", base_field.name()));
+                    problems.push(format!(
+                        "{name}.{} (tag {tag}) changed type",
+                        base_field.name()
+                    ));
                 }
                 if base_field.label != cur_field.label {
                     problems.push(format!(
@@ -198,19 +210,28 @@ fn compare_message(
             ));
         }
         if base.reserved_name.iter().any(|n| n == cur_field.name()) {
-            problems.push(format!("{name}.{} reuses a reserved name", cur_field.name()));
+            problems.push(format!(
+                "{name}.{} reuses a reserved name",
+                cur_field.name()
+            ));
         }
     }
 }
 
-fn real_oneof(message: &DescriptorProto, field: &prost_types::FieldDescriptorProto) -> Option<String> {
+fn real_oneof(
+    message: &DescriptorProto,
+    field: &prost_types::FieldDescriptorProto,
+) -> Option<String> {
     // proto3 `optional` is implemented as a synthetic single-field oneof;
     // only real oneof membership is a wire-visible property.
     if field.proto3_optional.unwrap_or(false) {
         return None;
     }
     let index = field.oneof_index?;
-    message.oneof_decl.get(index as usize).map(|o| o.name().to_string())
+    message
+        .oneof_decl
+        .get(index as usize)
+        .map(|o| o.name().to_string())
 }
 
 // ---- Enums ----
@@ -222,10 +243,16 @@ fn compare_enum(
     problems: &mut Vec<String>,
 ) {
     // Enum reserved ranges use an *inclusive* end.
-    let base_reserved: Vec<(i32, i32)> =
-        base.reserved_range.iter().map(|r| (r.start(), r.end())).collect();
-    let cur_reserved: Vec<(i32, i32)> =
-        cur.reserved_range.iter().map(|r| (r.start(), r.end())).collect();
+    let base_reserved: Vec<(i32, i32)> = base
+        .reserved_range
+        .iter()
+        .map(|r| (r.start(), r.end()))
+        .collect();
+    let cur_reserved: Vec<(i32, i32)> = cur
+        .reserved_range
+        .iter()
+        .map(|r| (r.start(), r.end()))
+        .collect();
 
     for base_value in &base.value {
         let number = base_value.number();

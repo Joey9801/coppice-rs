@@ -43,7 +43,10 @@ pub enum ConvertError {
     #[error("duplicate entry in {0}")]
     DuplicateEntry(&'static str),
     #[error("invalid {field}: {reason}")]
-    Invalid { field: &'static str, reason: &'static str },
+    Invalid {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 /// Unwrap a required message field (prost decodes them as `Option`).

@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 use coppice_consensus::{Consensus, OpenraftConsensus};
 use coppice_coordinator::admin;
 use coppice_coordinator::config::CliOverrides;
+use coppice_core::id::ClusterId;
 use coppice_state::command::BumpClusterVersion;
 use coppice_state::Command;
-use coppice_core::id::ClusterId;
 
 use common::{poll, wait_converged, Ca, Leaf, Node};
 
@@ -205,9 +205,15 @@ async fn three_node_cluster_lifecycle() {
                 .expect("dial leader admin surface");
         // No removal: pure promotions. The helper polls the catch-up gate.
         for i in [1usize, 2] {
-            admin::promote_voter(&mut client, cluster_uuid, nodes[i].raft_id(), None, DEADLINE)
-                .await
-                .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
+            admin::promote_voter(
+                &mut client,
+                cluster_uuid,
+                nodes[i].raft_id(),
+                None,
+                DEADLINE,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
         }
     }
 
@@ -346,9 +352,14 @@ async fn three_node_cluster_lifecycle() {
         )
         .await
         .expect("dial leader admin surface");
-        admin::add_learner(&mut client, cluster_uuid, node4.raft_id(), node4.advertise.clone())
-            .await
-            .expect("add-learner node 4");
+        admin::add_learner(
+            &mut client,
+            cluster_uuid,
+            node4.raft_id(),
+            node4.advertise.clone(),
+        )
+        .await
+        .expect("add-learner node 4");
     }
 
     wait_learners_caught_up(
@@ -372,9 +383,15 @@ async fn three_node_cluster_lifecycle() {
         .await
         .expect("dial leader admin surface");
         // Promote node 4 and drop the dead node in one joint change (ADR 0016 step 3).
-        admin::promote_voter(&mut client, cluster_uuid, node4.raft_id(), Some(dead_id), DEADLINE)
-            .await
-            .expect("promote node 4, remove dead node");
+        admin::promote_voter(
+            &mut client,
+            cluster_uuid,
+            node4.raft_id(),
+            Some(dead_id),
+            DEADLINE,
+        )
+        .await
+        .expect("promote node 4, remove dead node");
     }
 
     poll(

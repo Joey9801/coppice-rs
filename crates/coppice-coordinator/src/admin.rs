@@ -25,8 +25,8 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic::{Code, Request, Response, Status};
 
 use coppice_consensus::{ClusterSummary, Consensus, ConsensusError, CoordinatorId, NodeHandle};
-use coppice_proto::pb::raft::v1 as pb;
 use coppice_net::admin::{Client, RaftAdminService};
+use coppice_proto::pb::raft::v1 as pb;
 
 use crate::cli::{AdminArgs, AdminVerb};
 use crate::config;

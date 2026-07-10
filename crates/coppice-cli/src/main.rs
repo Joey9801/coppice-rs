@@ -101,7 +101,13 @@ mod tests {
 
     #[test]
     fn coordinator_subcommand_parses_run_flags() {
-        let cli = Cli::parse_from(["coppice", "coordinator", "--config", "/etc/c.toml", "--join"]);
+        let cli = Cli::parse_from([
+            "coppice",
+            "coordinator",
+            "--config",
+            "/etc/c.toml",
+            "--join",
+        ]);
         match cli.command {
             Command::Coordinator(c) => {
                 let run = c.run_args();

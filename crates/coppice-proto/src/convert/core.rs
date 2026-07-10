@@ -21,7 +21,9 @@ macro_rules! convert_id {
     ($name:ident) => {
         impl From<coppice_core::id::$name> for pb::$name {
             fn from(id: coppice_core::id::$name) -> Self {
-                pb::$name { value: id.to_string() }
+                pb::$name {
+                    value: id.to_string(),
+                }
             }
         }
 
@@ -31,7 +33,9 @@ macro_rules! convert_id {
             fn try_from(id: pb::$name) -> Result<Self, ConvertError> {
                 // The typed `<prefix>-<uuid>` form is validated here, so a
                 // JobId payload smuggled into a NodeId field fails loudly.
-                id.value.parse().map_err(|_| ConvertError::InvalidId(stringify!($name)))
+                id.value
+                    .parse()
+                    .map_err(|_| ConvertError::InvalidId(stringify!($name)))
             }
         }
     };
@@ -52,7 +56,10 @@ impl From<&Resources> for pb::Resources {
         let mut quantities = Vec::new();
         let mut push = |kind: pb::ResourceKind, amount: u64| {
             if amount != 0 {
-                quantities.push(pb::ResourceQuantity { kind: kind as i32, amount });
+                quantities.push(pb::ResourceQuantity {
+                    kind: kind as i32,
+                    amount,
+                });
             }
         };
         push(pb::ResourceKind::CpuMillis, r.cpu_millis);
@@ -100,7 +107,10 @@ impl TryFrom<pb::Resources> for Resources {
 pub(crate) fn labels_to_pb(labels: &BTreeMap<String, String>) -> Vec<pb::Label> {
     labels
         .iter()
-        .map(|(key, value)| pb::Label { key: key.clone(), value: value.clone() })
+        .map(|(key, value)| pb::Label {
+            key: key.clone(),
+            value: value.clone(),
+        })
         .collect()
 }
 
@@ -179,7 +189,10 @@ impl From<&AbortRequest> for pb::AbortRequest {
 
 impl From<pb::AbortRequest> for AbortRequest {
     fn from(abort: pb::AbortRequest) -> Self {
-        AbortRequest { reason: abort.reason, requested_at_us: abort.requested_at_us }
+        AbortRequest {
+            reason: abort.reason,
+            requested_at_us: abort.requested_at_us,
+        }
     }
 }
 
@@ -210,7 +223,10 @@ pub(crate) fn job_state_from_pb(value: i32) -> Result<JobState, ConvertError> {
         Ok(pb::JobState::Succeeded) => Ok(JobState::Succeeded),
         Ok(pb::JobState::Failed) => Ok(JobState::Failed),
         Ok(pb::JobState::Aborted) => Ok(JobState::Aborted),
-        _ => Err(ConvertError::UnknownEnum { field: "JobState", value }),
+        _ => Err(ConvertError::UnknownEnum {
+            field: "JobState",
+            value,
+        }),
     }
 }
 
@@ -227,16 +243,18 @@ impl From<&AttemptOutcome> for pb::AttemptOutcome {
             }
             AttemptOutcome::Aborted => o::Outcome::Aborted(o::Aborted {}),
             AttemptOutcome::Revoked => o::Outcome::Revoked(o::Revoked {}),
-            AttemptOutcome::PullFailed { user_error } => {
-                o::Outcome::PullFailed(o::PullFailed { user_error: *user_error })
-            }
-            AttemptOutcome::StartFailed { user_error } => {
-                o::Outcome::StartFailed(o::StartFailed { user_error: *user_error })
-            }
+            AttemptOutcome::PullFailed { user_error } => o::Outcome::PullFailed(o::PullFailed {
+                user_error: *user_error,
+            }),
+            AttemptOutcome::StartFailed { user_error } => o::Outcome::StartFailed(o::StartFailed {
+                user_error: *user_error,
+            }),
             AttemptOutcome::NodeLost => o::Outcome::NodeLost(o::NodeLost {}),
             AttemptOutcome::AgentError => o::Outcome::AgentError(o::AgentError {}),
         };
-        pb::AttemptOutcome { outcome: Some(outcome) }
+        pb::AttemptOutcome {
+            outcome: Some(outcome),
+        }
     }
 }
 
@@ -251,8 +269,12 @@ impl TryFrom<pb::AttemptOutcome> for AttemptOutcome {
             o::Outcome::MaxRuntimeExceeded(_) => AttemptOutcome::MaxRuntimeExceeded,
             o::Outcome::Aborted(_) => AttemptOutcome::Aborted,
             o::Outcome::Revoked(_) => AttemptOutcome::Revoked,
-            o::Outcome::PullFailed(p) => AttemptOutcome::PullFailed { user_error: p.user_error },
-            o::Outcome::StartFailed(s) => AttemptOutcome::StartFailed { user_error: s.user_error },
+            o::Outcome::PullFailed(p) => AttemptOutcome::PullFailed {
+                user_error: p.user_error,
+            },
+            o::Outcome::StartFailed(s) => AttemptOutcome::StartFailed {
+                user_error: s.user_error,
+            },
             o::Outcome::NodeLost(_) => AttemptOutcome::NodeLost,
             o::Outcome::AgentError(_) => AttemptOutcome::AgentError,
         })
@@ -267,11 +289,12 @@ impl From<&AttemptState> for pb::AttemptState {
             AttemptState::Dispatching => (pb::AttemptPhase::Dispatching, None),
             AttemptState::Running => (pb::AttemptPhase::Running, None),
             AttemptState::Finalizing => (pb::AttemptPhase::Finalizing, None),
-            AttemptState::Terminal(outcome) => {
-                (pb::AttemptPhase::Terminal, Some(outcome.into()))
-            }
+            AttemptState::Terminal(outcome) => (pb::AttemptPhase::Terminal, Some(outcome.into())),
         };
-        pb::AttemptState { phase: phase as i32, outcome }
+        pb::AttemptState {
+            phase: phase as i32,
+            outcome,
+        }
     }
 }
 
@@ -279,9 +302,11 @@ impl TryFrom<pb::AttemptState> for AttemptState {
     type Error = ConvertError;
 
     fn try_from(state: pb::AttemptState) -> Result<Self, ConvertError> {
-        let phase = pb::AttemptPhase::try_from(state.phase).map_err(|_| {
-            ConvertError::UnknownEnum { field: "AttemptState.phase", value: state.phase }
-        })?;
+        let phase =
+            pb::AttemptPhase::try_from(state.phase).map_err(|_| ConvertError::UnknownEnum {
+                field: "AttemptState.phase",
+                value: state.phase,
+            })?;
         // Strict both ways: an outcome on a non-terminal phase is as
         // malformed as a terminal phase without one.
         if !matches!(phase, pb::AttemptPhase::Terminal) && state.outcome.is_some() {
@@ -296,9 +321,9 @@ impl TryFrom<pb::AttemptState> for AttemptState {
             pb::AttemptPhase::Dispatching => AttemptState::Dispatching,
             pb::AttemptPhase::Running => AttemptState::Running,
             pb::AttemptPhase::Finalizing => AttemptState::Finalizing,
-            pb::AttemptPhase::Terminal => AttemptState::Terminal(
-                req(state.outcome, "AttemptState.outcome")?.try_into()?,
-            ),
+            pb::AttemptPhase::Terminal => {
+                AttemptState::Terminal(req(state.outcome, "AttemptState.outcome")?.try_into()?)
+            }
             pb::AttemptPhase::Unspecified => {
                 return Err(ConvertError::UnknownEnum {
                     field: "AttemptState.phase",
@@ -354,7 +379,10 @@ pub(crate) fn allocation_state_from_pb(value: i32) -> Result<AllocationState, Co
         Ok(pb::AllocationState::Funded) => Ok(AllocationState::Funded),
         Ok(pb::AllocationState::Active) => Ok(AllocationState::Active),
         Ok(pb::AllocationState::Released) => Ok(AllocationState::Released),
-        _ => Err(ConvertError::UnknownEnum { field: "AllocationState", value }),
+        _ => Err(ConvertError::UnknownEnum {
+            field: "AllocationState",
+            value,
+        }),
     }
 }
 
@@ -422,11 +450,17 @@ impl From<&CostWeights> for pb::CostWeights {
         let mut out = Vec::new();
         let mut push = |kind: pb::ResourceKind, weight_q32_32: u64| {
             if weight_q32_32 != 0 {
-                out.push(pb::CostWeight { kind: kind as i32, weight_q32_32 });
+                out.push(pb::CostWeight {
+                    kind: kind as i32,
+                    weight_q32_32,
+                });
             }
         };
         push(pb::ResourceKind::CpuMillis, weights.per_cpu_milli_second);
-        push(pb::ResourceKind::MemoryBytes, weights.per_memory_byte_second);
+        push(
+            pb::ResourceKind::MemoryBytes,
+            weights.per_memory_byte_second,
+        );
         push(pb::ResourceKind::DiskBytes, weights.per_disk_byte_second);
         pb::CostWeights { weights: out }
     }
@@ -462,37 +496,55 @@ impl TryFrom<pb::CostWeights> for CostWeights {
 
 impl From<DecayPolicy> for pb::DecayPolicy {
     fn from(decay: DecayPolicy) -> Self {
-        pb::DecayPolicy { tick_us: decay.tick_us, decay_per_tick_q0_64: decay.decay_per_tick }
+        pb::DecayPolicy {
+            tick_us: decay.tick_us,
+            decay_per_tick_q0_64: decay.decay_per_tick,
+        }
     }
 }
 
 impl From<pb::DecayPolicy> for DecayPolicy {
     fn from(decay: pb::DecayPolicy) -> Self {
-        DecayPolicy { tick_us: decay.tick_us, decay_per_tick: decay.decay_per_tick_q0_64 }
+        DecayPolicy {
+            tick_us: decay.tick_us,
+            decay_per_tick: decay.decay_per_tick_q0_64,
+        }
     }
 }
 
 impl From<UsageState> for pb::UsageState {
     fn from(usage: UsageState) -> Self {
-        pb::UsageState { usage_ucu: usage.usage.0, last_update_us: usage.last_update_us }
+        pb::UsageState {
+            usage_ucu: usage.usage.0,
+            last_update_us: usage.last_update_us,
+        }
     }
 }
 
 impl From<pb::UsageState> for UsageState {
     fn from(usage: pb::UsageState) -> Self {
-        UsageState { usage: CostUnits(usage.usage_ucu), last_update_us: usage.last_update_us }
+        UsageState {
+            usage: CostUnits(usage.usage_ucu),
+            last_update_us: usage.last_update_us,
+        }
     }
 }
 
 impl From<ChargeRecord> for pb::ChargeRecord {
     fn from(charge: ChargeRecord) -> Self {
-        pb::ChargeRecord { amount_ucu: charge.amount.0, charged_at_us: charge.charged_at_us }
+        pb::ChargeRecord {
+            amount_ucu: charge.amount.0,
+            charged_at_us: charge.charged_at_us,
+        }
     }
 }
 
 impl From<pb::ChargeRecord> for ChargeRecord {
     fn from(charge: pb::ChargeRecord) -> Self {
-        ChargeRecord { amount: CostUnits(charge.amount_ucu), charged_at_us: charge.charged_at_us }
+        ChargeRecord {
+            amount: CostUnits(charge.amount_ucu),
+            charged_at_us: charge.charged_at_us,
+        }
     }
 }
 
@@ -514,8 +566,13 @@ pub(crate) fn multipliers_from_pb(
 ) -> Result<BTreeMap<i32, PriorityMultiplier>, ConvertError> {
     let mut out = BTreeMap::new();
     for entry in entries {
-        if out.insert(entry.priority, PriorityMultiplier(entry.multiplier_q32_32)).is_some() {
-            return Err(ConvertError::DuplicateEntry("PolicyConfig.priority_multipliers"));
+        if out
+            .insert(entry.priority, PriorityMultiplier(entry.multiplier_q32_32))
+            .is_some()
+        {
+            return Err(ConvertError::DuplicateEntry(
+                "PolicyConfig.priority_multipliers",
+            ));
         }
     }
     Ok(out)

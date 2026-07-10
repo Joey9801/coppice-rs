@@ -136,7 +136,10 @@ impl Model {
                 self.purge_floor = self.purge_floor.max(*upto);
                 self.next_index = self.next_index.max(self.purge_floor + 1);
             }
-            StorageOp::InstallSnapshot { upto_index, payload } => {
+            StorageOp::InstallSnapshot {
+                upto_index,
+                payload,
+            } => {
                 self.snapshot = Some((*upto_index, payload.clone()));
             }
             StorageOp::Rotate => {}
@@ -157,7 +160,10 @@ pub struct SweepConfig {
 
 impl Default for SweepConfig {
     fn default() -> SweepConfig {
-        SweepConfig { adversary_seeds_per_point: 3, recovery_crash: true }
+        SweepConfig {
+            adversary_seeds_per_point: 3,
+            recovery_crash: true,
+        }
     }
 }
 
@@ -179,7 +185,14 @@ pub fn crash_sweep<S: CrashSubject>(
     for k in base..total {
         for s in 0..cfg.adversary_seeds_per_point {
             let adv = adversary_seed(scenario, k, s);
-            run_crash_point(scenario, subject, workload, k, adv, cfg.recovery_crash && s == 0);
+            run_crash_point(
+                scenario,
+                subject,
+                workload,
+                k,
+                adv,
+                cfg.recovery_crash && s == 0,
+            );
         }
     }
 }
@@ -199,9 +212,12 @@ fn clean_pass<S: CrashSubject>(
     let mut store = subject.open(&fs).expect("clean open");
     let mut model = Model::new();
     for (i, op) in workload.iter().enumerate() {
-        subject
-            .apply(&mut store, op)
-            .unwrap_or_else(|e| panic!("scenario={scenario}: clean apply of op {i} ({}) failed: {e}", op_kind(op)));
+        subject.apply(&mut store, op).unwrap_or_else(|e| {
+            panic!(
+                "scenario={scenario}: clean apply of op {i} ({}) failed: {e}",
+                op_kind(op)
+            )
+        });
         model.apply(op);
     }
     let total = fs.op_count();
@@ -224,7 +240,10 @@ fn clean_pass<S: CrashSubject>(
     let init_fs = SimFs::new(SimConfig::default());
     subject.init(&init_fs).expect("init for base measurement");
     let base = init_fs.op_count();
-    assert!(base <= total, "scenario={scenario}: init consumed more ops than the whole run");
+    assert!(
+        base <= total,
+        "scenario={scenario}: init consumed more ops than the whole run"
+    );
     (base, total, model)
 }
 
@@ -261,7 +280,9 @@ fn run_crash_point<S: CrashSubject>(
     // Invariant 6, part 1: opening an already-recovered directory again
     // observes identical state.
     drop(store);
-    let store_b = subject.open(&fs).expect("second open of a recovered directory");
+    let store_b = subject
+        .open(&fs)
+        .expect("second open of a recovered directory");
     let obs_b = subject.observe(&store_b);
     assert_eq!(
         obs, obs_b,
@@ -272,7 +293,16 @@ fn run_crash_point<S: CrashSubject>(
 
     // Invariant 6, part 2: recovery may itself crash and must still converge.
     if recovery_crash && rec_ops > 0 {
-        crash_during_recovery(scenario, subject, workload, k, adv, rec_ops, &model, inflight.as_ref());
+        crash_during_recovery(
+            scenario,
+            subject,
+            workload,
+            k,
+            adv,
+            rec_ops,
+            &model,
+            inflight.as_ref(),
+        );
     }
 }
 
@@ -347,7 +377,9 @@ fn drive_and_crash<S: CrashSubject>(
     adv: u64,
 ) -> (SimFs, Model, Option<StorageOp>) {
     let fs = SimFs::new(SimConfig::default());
-    subject.init(&fs).expect("init runs un-armed and must not fail");
+    subject
+        .init(&fs)
+        .expect("init runs un-armed and must not fail");
     fs.set_crash_at(k);
 
     let mut model = Model::new();
@@ -418,7 +450,10 @@ fn check(model: &Model, inflight: Option<&StorageOp>, obs: &Observed) -> Result<
     }
     // Invariant 5: the snapshot is the acknowledged one or the in-flight one,
     // and nothing else (a torn/footer-less snapshot must never be adopted).
-    if !allowed_snapshots(model, inflight).iter().any(|s| s == &obs.snapshot) {
+    if !allowed_snapshots(model, inflight)
+        .iter()
+        .any(|s| s == &obs.snapshot)
+    {
         return Err(format!(
             "invariant 5 (snapshot integrity): observed snapshot {:?} is neither the acknowledged \
              snapshot {:?} nor the in-flight one",
@@ -469,7 +504,11 @@ fn candidates(model: &Model, inflight: Option<&StorageOp>) -> Vec<Observed> {
 /// one if the interrupted op was a snapshot install.
 fn allowed_snapshots(model: &Model, inflight: Option<&StorageOp>) -> Vec<Option<(u64, Vec<u8>)>> {
     let mut out = vec![model.snapshot.clone()];
-    if let Some(StorageOp::InstallSnapshot { upto_index, payload }) = inflight {
+    if let Some(StorageOp::InstallSnapshot {
+        upto_index,
+        payload,
+    }) = inflight
+    {
         out.push(Some((*upto_index, payload.clone())));
     }
     out
@@ -537,7 +576,9 @@ fn bounds<S: CrashSubject>(subject: &S, workload: &[StorageOp]) -> (u64, u64) {
     for op in workload {
         // A generated workload must be applyable cleanly; a failure here is a
         // generator bug, not a crash-safety finding.
-        subject.apply(&mut store, op).expect("clean apply of generated op");
+        subject
+            .apply(&mut store, op)
+            .expect("clean apply of generated op");
     }
     (base, fs.op_count())
 }
@@ -561,14 +602,19 @@ fn random_workload(rng: &mut Rng, len: u64) -> Vec<StorageOp> {
         } else if choice < 60 {
             // Non-regressing vote: term stays or advances.
             term += rng.below(2);
-            StorageOp::SetVote { term, voted_for: rng.below(5) }
+            StorageOp::SetVote {
+                term,
+                voted_for: rng.below(5),
+            }
         } else if choice < 70 {
             StorageOp::Rotate
         } else if choice < 80 {
             // Truncate a suffix that keeps at least the snapshot-covered prefix.
             let lo = model.purge_floor.max(snap_upto) + 1;
             if lo < model.next_index {
-                StorageOp::TruncateSuffix { from: rng.range(lo, model.next_index) }
+                StorageOp::TruncateSuffix {
+                    from: rng.range(lo, model.next_index),
+                }
             } else {
                 StorageOp::Rotate
             }
@@ -579,14 +625,19 @@ fn random_workload(rng: &mut Rng, len: u64) -> Vec<StorageOp> {
             if last >= lo {
                 let upto = rng.range(lo, last + 1);
                 snap_upto = upto;
-                StorageOp::InstallSnapshot { upto_index: upto, payload: random_snapshot(rng) }
+                StorageOp::InstallSnapshot {
+                    upto_index: upto,
+                    payload: random_snapshot(rng),
+                }
             } else {
                 StorageOp::Rotate
             }
         } else {
             // Purge up to a durable snapshot's coverage.
             if snap_upto > model.purge_floor {
-                StorageOp::Purge { upto: rng.range(model.purge_floor + 1, snap_upto + 1) }
+                StorageOp::Purge {
+                    upto: rng.range(model.purge_floor + 1, snap_upto + 1),
+                }
             } else {
                 StorageOp::Rotate
             }
@@ -649,14 +700,20 @@ fn summarize(obs: &Observed) -> String {
     format!(
         "{entries}, vote {:?}, snapshot {:?}, purge_floor {}",
         obs.vote,
-        obs.snapshot.as_ref().map(|(u, p)| format!("upto={u},len={}", p.len())),
+        obs.snapshot
+            .as_ref()
+            .map(|(u, p)| format!("upto={u},len={}", p.len())),
         obs.purge_floor,
     )
 }
 
 /// File names and sizes on the crashed disk, for the panic's reproduction dump.
 fn summarize_disk(fs: &SimFs) -> String {
-    let mut parts: Vec<String> = fs.dump().iter().map(|(p, b)| format!("{p}({})", b.len())).collect();
+    let mut parts: Vec<String> = fs
+        .dump()
+        .iter()
+        .map(|(p, b)| format!("{p}({})", b.len()))
+        .collect();
     parts.sort();
     parts.join(" ")
 }

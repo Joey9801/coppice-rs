@@ -47,7 +47,11 @@ impl TryFrom<pb::JobRecord> for JobRecord {
             submitted_at_us: r.submitted_at_us,
             retries_used: r.retries_used,
             current_attempt: r.current_attempt.map(TryInto::try_into).transpose()?,
-            attempts: r.attempts.into_iter().map(TryInto::try_into).collect::<Result<_, _>>()?,
+            attempts: r
+                .attempts
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -82,7 +86,10 @@ impl TryFrom<pb::AttemptRecord> for AttemptRecord {
 
 impl From<&AllocationRecord> for pb::AllocationRecord {
     fn from(r: &AllocationRecord) -> Self {
-        pb::AllocationRecord { allocation: Some((&r.allocation).into()), seq: r.seq }
+        pb::AllocationRecord {
+            allocation: Some((&r.allocation).into()),
+            seq: r.seq,
+        }
     }
 }
 
@@ -99,7 +106,10 @@ impl TryFrom<pb::AllocationRecord> for AllocationRecord {
 
 impl From<&NodeRecord> for pb::NodeRecord {
     fn from(r: &NodeRecord) -> Self {
-        pb::NodeRecord { node: Some((&r.node).into()), epoch: r.epoch }
+        pb::NodeRecord {
+            node: Some((&r.node).into()),
+            epoch: r.epoch,
+        }
     }
 }
 
@@ -107,7 +117,10 @@ impl TryFrom<pb::NodeRecord> for NodeRecord {
     type Error = ConvertError;
 
     fn try_from(r: pb::NodeRecord) -> Result<Self, ConvertError> {
-        Ok(NodeRecord { node: req(r.node, "NodeRecord.node")?.try_into()?, epoch: r.epoch })
+        Ok(NodeRecord {
+            node: req(r.node, "NodeRecord.node")?.try_into()?,
+            epoch: r.epoch,
+        })
     }
 }
 
@@ -204,7 +217,11 @@ pub fn state_from_records(records: StateRecords) -> Result<StateMachine, Convert
                 .accrual_queue
                 .insert((record.allocation.node, record.seq), record.allocation.id);
         }
-        if state.allocations.insert(record.allocation.id, record).is_some() {
+        if state
+            .allocations
+            .insert(record.allocation.id, record)
+            .is_some()
+        {
             return Err(ConvertError::DuplicateEntry("StateRecords.allocations"));
         }
     }

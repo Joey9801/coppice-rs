@@ -84,8 +84,7 @@ where
     // here it starts accepting and stops on shutdown (listeners drain first,
     // `docs/architecture/coordinator-runtime.md`, "Shutdown order").
     let AgentListener { incoming, tls } = agent_listener;
-    let agent_service =
-        coppice_net::session::Server::new(AgentSessionService::new(authority));
+    let agent_service = coppice_net::session::Server::new(AgentSessionService::new(authority));
     let agent_router = Server::builder()
         .tls_config(tls)
         .context("configuring the agent gateway server TLS")?

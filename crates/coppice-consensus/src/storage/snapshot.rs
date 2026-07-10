@@ -239,11 +239,7 @@ pub fn validate_container_file(
 ) -> io::Result<(pb::SnapshotMeta, pb::SectionIndex)> {
     let len = file.len()?;
     if len < (HEADER_LEN + TRAILER_LEN) as u64 {
-        return Err(fail_stop(
-            path,
-            len,
-            "snapshot truncated before its footer",
-        ));
+        return Err(fail_stop(path, len, "snapshot truncated before its footer"));
     }
     let mut hdr = [0u8; HEADER_LEN];
     file.read_exact_at(0, &mut hdr)?;
@@ -288,7 +284,11 @@ pub fn validate_container_file(
 
     for entry in &index.sections {
         if entry.offset < sections_start {
-            return Err(fail_stop(path, entry.offset, "section offset out of bounds"));
+            return Err(fail_stop(
+                path,
+                entry.offset,
+                "section offset out of bounds",
+            ));
         }
         let end = entry
             .offset
@@ -458,7 +458,10 @@ pub struct ContainerWriter<'a> {
 
 impl<'a> ContainerWriter<'a> {
     /// Write the container header and meta record.
-    pub fn new(file: &'a mut dyn FsFile, meta: &pb::SnapshotMeta) -> io::Result<ContainerWriter<'a>> {
+    pub fn new(
+        file: &'a mut dyn FsFile,
+        meta: &pb::SnapshotMeta,
+    ) -> io::Result<ContainerWriter<'a>> {
         let mut head = header(SNAPSHOT_MAGIC).to_vec();
         frame_record(&meta.encode_to_vec(), &mut head);
         let mut writer = ContainerWriter {
@@ -779,9 +782,7 @@ fn decode_entry(path: &Path, entry: &pb::SectionEntry, section: &[u8]) -> io::Re
     Ok(match entry.kind() {
         pb::SectionKind::Job => Decoded::Jobs(decode_section(path, entry, section)?),
         pb::SectionKind::Attempt => Decoded::Attempts(decode_section(path, entry, section)?),
-        pb::SectionKind::Allocation => {
-            Decoded::Allocations(decode_section(path, entry, section)?)
-        }
+        pb::SectionKind::Allocation => Decoded::Allocations(decode_section(path, entry, section)?),
         pb::SectionKind::Node => Decoded::Nodes(decode_section(path, entry, section)?),
         pb::SectionKind::QuotaEntity => {
             Decoded::QuotaEntities(decode_section(path, entry, section)?)

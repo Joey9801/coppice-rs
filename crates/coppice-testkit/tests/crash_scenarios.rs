@@ -29,7 +29,12 @@ fn batch(rng: &mut Rng, sizes: &[u64]) -> StorageOp {
 }
 
 fn sweep(scenario: &str, workload: &[StorageOp]) {
-    crash_sweep(scenario, &ToyConfig::default(), workload, &SweepConfig::default());
+    crash_sweep(
+        scenario,
+        &ToyConfig::default(),
+        workload,
+        &SweepConfig::default(),
+    );
 }
 
 #[test]
@@ -52,7 +57,10 @@ fn crash_during_rotation() {
     let mut rng = Rng::new(0x0707);
     // Explicit rotations between appends, plus one automatic rotation forced
     // by a small threshold.
-    let small = ToyConfig { rotation_threshold: 2048, ..ToyConfig::default() };
+    let small = ToyConfig {
+        rotation_threshold: 2048,
+        ..ToyConfig::default()
+    };
     let workload = [
         batch(&mut rng, &[500, 500]),
         StorageOp::Rotate,
@@ -91,7 +99,10 @@ fn crash_during_purge() {
         batch(&mut rng, &[300, 300]),
         StorageOp::Rotate,
         batch(&mut rng, &[300]),
-        StorageOp::InstallSnapshot { upto_index: 4, payload: vec![0x51; 128] },
+        StorageOp::InstallSnapshot {
+            upto_index: 4,
+            payload: vec![0x51; 128],
+        },
         // Floor mid-segment-2: only segment 1 is fully covered and deleted.
         StorageOp::Purge { upto: 3 },
         // Floor at the segment-2 boundary: segment 2 goes too.
@@ -108,9 +119,15 @@ fn crash_during_snapshot_install() {
         batch(&mut rng, &[100, 100, 100, 100]),
         // First install, then a second superseding it: exercises
         // previous-retained-until-the-new-one-is-durable at every crash point.
-        StorageOp::InstallSnapshot { upto_index: 2, payload: vec![0xAA; 5000] },
+        StorageOp::InstallSnapshot {
+            upto_index: 2,
+            payload: vec![0xAA; 5000],
+        },
         batch(&mut rng, &[100]),
-        StorageOp::InstallSnapshot { upto_index: 4, payload: vec![0xBB; 900] },
+        StorageOp::InstallSnapshot {
+            upto_index: 4,
+            payload: vec![0xBB; 900],
+        },
     ];
     sweep("snapshot-install", &workload);
 }
@@ -125,7 +142,10 @@ fn crash_during_manifest_swap() {
         batch(&mut rng, &[600, 600]),
         StorageOp::Rotate,
         batch(&mut rng, &[600, 600]),
-        StorageOp::InstallSnapshot { upto_index: 3, payload: vec![0x11; 64] },
+        StorageOp::InstallSnapshot {
+            upto_index: 3,
+            payload: vec![0x11; 64],
+        },
         StorageOp::Purge { upto: 2 },
         StorageOp::TruncateSuffix { from: 4 },
         batch(&mut rng, &[600]),
@@ -137,12 +157,24 @@ fn crash_during_manifest_swap() {
 fn crash_during_vote_write() {
     let mut rng = Rng::new(0x707E);
     let workload = [
-        StorageOp::SetVote { term: 1, voted_for: 1 },
+        StorageOp::SetVote {
+            term: 1,
+            voted_for: 1,
+        },
         batch(&mut rng, &[100]),
-        StorageOp::SetVote { term: 2, voted_for: 3 },
-        StorageOp::SetVote { term: 2, voted_for: 3 },
+        StorageOp::SetVote {
+            term: 2,
+            voted_for: 3,
+        },
+        StorageOp::SetVote {
+            term: 2,
+            voted_for: 3,
+        },
         batch(&mut rng, &[100]),
-        StorageOp::SetVote { term: 5, voted_for: 1 },
+        StorageOp::SetVote {
+            term: 5,
+            voted_for: 1,
+        },
     ];
     sweep("vote", &workload);
 }

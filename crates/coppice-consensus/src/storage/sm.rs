@@ -431,9 +431,9 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
             snapshot::write_state(&mut *spool, &meta, &records, shards)?;
             let mut core = core.lock().expect("storage engine poisoned");
             core.finish_snapshot_build(spool)?;
-            let (_, _, file) = core.current_snapshot_reader()?.ok_or_else(|| {
-                io::Error::other("freshly built snapshot is not the current one")
-            })?;
+            let (_, _, file) = core
+                .current_snapshot_reader()?
+                .ok_or_else(|| io::Error::other("freshly built snapshot is not the current one"))?;
             Ok(file)
         })
         .await

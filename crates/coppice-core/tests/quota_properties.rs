@@ -15,8 +15,12 @@ use proptest::prelude::*;
 
 /// Any policy that passes validation.
 fn valid_policy() -> impl Strategy<Value = DecayPolicy> {
-    (1i64..=3_600_000_000, 0u64..=DecayPolicy::MAX_DECAY_PER_TICK)
-        .prop_map(|(tick_us, decay_per_tick)| DecayPolicy { tick_us, decay_per_tick })
+    (1i64..=3_600_000_000, 0u64..=DecayPolicy::MAX_DECAY_PER_TICK).prop_map(
+        |(tick_us, decay_per_tick)| DecayPolicy {
+            tick_us,
+            decay_per_tick,
+        },
+    )
 }
 
 /// Timestamps within a realistic window (± a few months around 2026) so

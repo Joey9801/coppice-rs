@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 
+use coppice_core::allocation::Allocation;
 use coppice_core::attempt::{Attempt, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, JobState};
@@ -26,7 +27,6 @@ use coppice_core::quota::{
     ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, UsageState,
     DEFAULT_PENALTY_EXPONENT_MILLI,
 };
-use coppice_core::allocation::Allocation;
 
 mod apply;
 pub mod command;
@@ -230,7 +230,11 @@ pub enum RejectionReason {
     #[error("node {0} is not schedulable")]
     NodeNotSchedulable(NodeId),
     #[error("observed set for node {node} carries epoch {got}, current is {current}")]
-    StaleNodeEpoch { node: NodeId, current: u64, got: u64 },
+    StaleNodeEpoch {
+        node: NodeId,
+        current: u64,
+        got: u64,
+    },
     #[error("allocation {0} requests more than the node's total capacity")]
     RequestExceedsNodeCapacity(AllocationId),
     #[error("batch would leave more than {limit} jobs accruing")]
@@ -254,18 +258,41 @@ pub enum RejectionReason {
 /// apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    JobSubmitted { job: JobId },
-    JobStateChanged { job: JobId, from: JobState, to: JobState },
-    AttemptStateChanged { attempt: AttemptId, state: AttemptState },
-    AllocationFunded { allocation: AllocationId },
+    JobSubmitted {
+        job: JobId,
+    },
+    JobStateChanged {
+        job: JobId,
+        from: JobState,
+        to: JobState,
+    },
+    AttemptStateChanged {
+        attempt: AttemptId,
+        state: AttemptState,
+    },
+    AllocationFunded {
+        allocation: AllocationId,
+    },
     /// An abort needs a `StopJob` sent to this node — apply does no I/O; the
     /// runtime acts on this.
-    StopRequested { node: NodeId, allocation: AllocationId },
-    NodeEpochBumped { node: NodeId, epoch: u64 },
-    JobEvicted { job: JobId },
-    QuotaEntityConfigured { entity: QuotaEntityId },
+    StopRequested {
+        node: NodeId,
+        allocation: AllocationId,
+    },
+    NodeEpochBumped {
+        node: NodeId,
+        epoch: u64,
+    },
+    JobEvicted {
+        job: JobId,
+    },
+    QuotaEntityConfigured {
+        entity: QuotaEntityId,
+    },
     PolicyUpdated,
-    ClusterVersionBumped { to: u32 },
+    ClusterVersionBumped {
+        to: u32,
+    },
 }
 
 /// The successful result of applying one command.

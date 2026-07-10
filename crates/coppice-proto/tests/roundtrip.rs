@@ -5,9 +5,7 @@
 use std::collections::BTreeMap;
 
 use coppice_core::attempt::AttemptOutcome;
-use coppice_core::id::{
-    AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId,
-};
+use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
@@ -28,7 +26,11 @@ fn job(n: u128) -> Job {
     Job {
         id: jid(n),
         image: "registry/img:latest".into(),
-        requests: Resources { cpu_millis: 2_000, memory_bytes: 1 << 30, disk_bytes: 0 },
+        requests: Resources {
+            cpu_millis: 2_000,
+            memory_bytes: 1 << 30,
+            disk_bytes: 0,
+        },
         priority: -2,
         max_runtime_us: Some(3_600_000_000),
         quota_entity: QuotaEntityId(Uuid::from_u128(0xEE)),
@@ -62,14 +64,27 @@ fn every_command() -> Vec<Command> {
                 allocations: vec![AllocationSpec {
                     id: alloc,
                     node,
-                    requested: Resources { cpu_millis: 2_000, memory_bytes: 0, disk_bytes: 0 },
+                    requested: Resources {
+                        cpu_millis: 2_000,
+                        memory_bytes: 0,
+                        disk_bytes: 0,
+                    },
                 }],
             }],
             proposed_at_us: TS,
         }),
-        Command::DispatchAttempt(DispatchAttempt { attempt, dispatched_at_us: TS }),
-        Command::RecordAttemptStarted(RecordAttemptStarted { attempt, observed_at_us: TS }),
-        Command::RecordAttemptExited(RecordAttemptExited { attempt, observed_at_us: TS }),
+        Command::DispatchAttempt(DispatchAttempt {
+            attempt,
+            dispatched_at_us: TS,
+        }),
+        Command::RecordAttemptStarted(RecordAttemptStarted {
+            attempt,
+            observed_at_us: TS,
+        }),
+        Command::RecordAttemptExited(RecordAttemptExited {
+            attempt,
+            observed_at_us: TS,
+        }),
         Command::RecordAttemptOutcome(RecordAttemptOutcome {
             attempt,
             outcome: AttemptOutcome::Exited { code: 137 },
@@ -89,17 +104,27 @@ fn every_command() -> Vec<Command> {
         }),
         Command::RegisterNode(RegisterNode {
             node,
-            capacity: Resources { cpu_millis: 16_000, memory_bytes: 64 << 30, disk_bytes: 0 },
+            capacity: Resources {
+                cpu_millis: 16_000,
+                memory_bytes: 64 << 30,
+                disk_bytes: 0,
+            },
             labels: BTreeMap::from([("zone".into(), "a".into()), ("gpu".into(), "none".into())]),
             registered_at_us: TS,
         }),
-        Command::DeclareNodeLost(DeclareNodeLost { node, declared_at_us: TS }),
+        Command::DeclareNodeLost(DeclareNodeLost {
+            node,
+            declared_at_us: TS,
+        }),
         Command::SetNodeSchedulable(SetNodeSchedulable {
             node,
             schedulable: false,
             updated_at_us: TS,
         }),
-        Command::EvictTerminalJobs(EvictTerminalJobs { jobs: vec![jid(1), jid(2)], evicted_at_us: TS }),
+        Command::EvictTerminalJobs(EvictTerminalJobs {
+            jobs: vec![jid(1), jid(2)],
+            evicted_at_us: TS,
+        }),
         Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
             entity: QuotaEntityId(Uuid::from_u128(0xE1)),
             parent: Some(QuotaEntityId(Uuid::from_u128(0xEE))),
@@ -117,7 +142,10 @@ fn every_command() -> Vec<Command> {
             },
             updated_at_us: TS,
         }),
-        Command::BumpClusterVersion(BumpClusterVersion { to: 2, bumped_at_us: TS }),
+        Command::BumpClusterVersion(BumpClusterVersion {
+            to: 2,
+            bumped_at_us: TS,
+        }),
     ]
 }
 
@@ -125,8 +153,8 @@ fn every_command() -> Vec<Command> {
 fn every_command_roundtrips_through_encoded_bytes() {
     for command in every_command() {
         let encoded = command_to_pb(&command, 1).encode_to_vec();
-        let decoded = pb::command::v1::Command::decode(encoded.as_slice())
-            .expect("envelope must decode");
+        let decoded =
+            pb::command::v1::Command::decode(encoded.as_slice()).expect("envelope must decode");
         let (version, back) = command_from_pb(decoded).expect("conversion must succeed");
         assert_eq!(version, 1);
         assert_eq!(back, command, "roundtrip must be lossless");
@@ -151,25 +179,40 @@ fn abort_requests_roundtrip_inside_job_specs() {
 
 #[test]
 fn empty_envelope_is_an_error_not_a_skip() {
-    let envelope = pb::command::v1::Command { version: 1, body: None };
-    assert_eq!(command_from_pb(envelope), Err(ConvertError::MissingField("Command.body")));
+    let envelope = pb::command::v1::Command {
+        version: 1,
+        body: None,
+    };
+    assert_eq!(
+        command_from_pb(envelope),
+        Err(ConvertError::MissingField("Command.body"))
+    );
 }
 
 #[test]
 fn malformed_ids_are_rejected_at_the_boundary() {
     // A bare uuid without the `attempt-` type tag must not decode, and
     // neither must a well-formed id carrying the wrong tag.
-    for value in ["1683852a-993f-4497-a48b-6527b458fbd1", "job-1683852a-993f-4497-a48b-6527b458fbd1", "attempt-not-a-uuid"] {
+    for value in [
+        "1683852a-993f-4497-a48b-6527b458fbd1",
+        "job-1683852a-993f-4497-a48b-6527b458fbd1",
+        "attempt-not-a-uuid",
+    ] {
         let envelope = pb::command::v1::Command {
             version: 1,
             body: Some(pb::command::v1::command::Body::DispatchAttempt(
                 pb::command::v1::DispatchAttempt {
-                    attempt: Some(pb::core::v1::AttemptId { value: value.to_string() }),
+                    attempt: Some(pb::core::v1::AttemptId {
+                        value: value.to_string(),
+                    }),
                     dispatched_at_us: TS,
                 },
             )),
         };
-        assert_eq!(command_from_pb(envelope), Err(ConvertError::InvalidId("AttemptId")));
+        assert_eq!(
+            command_from_pb(envelope),
+            Err(ConvertError::InvalidId("AttemptId"))
+        );
     }
 }
 
@@ -179,7 +222,9 @@ fn duplicate_resource_kinds_are_rejected() {
         kind: pb::core::v1::ResourceKind::CpuMillis as i32,
         amount: 1,
     };
-    let resources = pb::core::v1::Resources { quantities: vec![quantity, quantity] };
+    let resources = pb::core::v1::Resources {
+        quantities: vec![quantity, quantity],
+    };
     assert_eq!(
         Resources::try_from(resources),
         Err(ConvertError::DuplicateEntry("Resources.quantities"))
@@ -191,22 +236,35 @@ fn unknown_resource_kinds_fail_loud() {
     // A future kind written past the ClusterVersion gate must error, never
     // silently drop a priced dimension.
     let resources = pb::core::v1::Resources {
-        quantities: vec![pb::core::v1::ResourceQuantity { kind: 99, amount: 1 }],
+        quantities: vec![pb::core::v1::ResourceQuantity {
+            kind: 99,
+            amount: 1,
+        }],
     };
     assert_eq!(
         Resources::try_from(resources),
-        Err(ConvertError::UnknownEnum { field: "ResourceQuantity.kind", value: 99 })
+        Err(ConvertError::UnknownEnum {
+            field: "ResourceQuantity.kind",
+            value: 99
+        })
     );
 }
 
 #[test]
 fn resources_encode_canonically() {
     // Ascending kind, zeros omitted — byte-identical encodes for equal values.
-    let r = Resources { cpu_millis: 5, memory_bytes: 0, disk_bytes: 7 };
+    let r = Resources {
+        cpu_millis: 5,
+        memory_bytes: 0,
+        disk_bytes: 7,
+    };
     let encoded = pb::core::v1::Resources::from(&r);
     let kinds: Vec<i32> = encoded.quantities.iter().map(|q| q.kind).collect();
-    assert_eq!(kinds, vec![
-        pb::core::v1::ResourceKind::CpuMillis as i32,
-        pb::core::v1::ResourceKind::DiskBytes as i32,
-    ]);
+    assert_eq!(
+        kinds,
+        vec![
+            pb::core::v1::ResourceKind::CpuMillis as i32,
+            pb::core::v1::ResourceKind::DiskBytes as i32,
+        ]
+    );
 }

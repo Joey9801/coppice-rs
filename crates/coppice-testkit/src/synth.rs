@@ -70,8 +70,10 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
     let nodes = build_nodes(&mut rng, cfg.nodes.max(1));
     let node_ids: Vec<NodeId> = nodes.keys().copied().collect();
 
-    let policy =
-        PolicyConfig { priority_multipliers: build_priority_table(), ..PolicyConfig::default() };
+    let policy = PolicyConfig {
+        priority_multipliers: build_priority_table(),
+        ..PolicyConfig::default()
+    };
     let priorities: Vec<i32> = policy.priority_multipliers.keys().copied().collect();
 
     let mut jobs_buf: Vec<(JobId, JobRecord)> = Vec::with_capacity(cfg.jobs);
@@ -111,15 +113,27 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 .unwrap_or(policy.default_charge_runtime_s),
             multiplier,
         );
-        let ctx = AttemptCtx { job: job_id, requested, rate, multiplier, charge_amount };
+        let ctx = AttemptCtx {
+            job: job_id,
+            requested,
+            rate,
+            multiplier,
+            charge_amount,
+        };
 
         let bucket = rng.below(100);
         let (job_state, current_attempt, mut attempt_ids, abort_eligible) = if bucket < 55 {
             // Running.
             let node = *rng.pick(&node_ids);
             let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
-            let mut ids =
-                gen_history(&mut rng, &ctx, &node_ids, submitted_at_us, &mut next_seq, &mut bufs);
+            let mut ids = gen_history(
+                &mut rng,
+                &ctx,
+                &node_ids,
+                submitted_at_us,
+                &mut next_seq,
+                &mut bufs,
+            );
             let seq = next_seq;
             next_seq += 1;
             let id = build_attempt(
@@ -135,15 +149,27 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             (JobState::Running, Some(id), ids, true)
         } else if bucket < 70 {
             // Queued: no current attempt, possibly a retry history.
-            let ids =
-                gen_history(&mut rng, &ctx, &node_ids, submitted_at_us, &mut next_seq, &mut bufs);
+            let ids = gen_history(
+                &mut rng,
+                &ctx,
+                &node_ids,
+                submitted_at_us,
+                &mut next_seq,
+                &mut bufs,
+            );
             (JobState::Queued, None, ids, false)
         } else if bucket < 80 {
             // Preparing: current attempt is accruing, ready, or dispatching.
             let node = *rng.pick(&node_ids);
             let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
-            let mut ids =
-                gen_history(&mut rng, &ctx, &node_ids, submitted_at_us, &mut next_seq, &mut bufs);
+            let mut ids = gen_history(
+                &mut rng,
+                &ctx,
+                &node_ids,
+                submitted_at_us,
+                &mut next_seq,
+                &mut bufs,
+            );
             let kind = match rng.below(3) {
                 0 => AttemptKind::Accruing,
                 1 => AttemptKind::Ready,
@@ -158,8 +184,14 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             // Finalizing: exit observed, resolution not yet committed.
             let node = *rng.pick(&node_ids);
             let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
-            let mut ids =
-                gen_history(&mut rng, &ctx, &node_ids, submitted_at_us, &mut next_seq, &mut bufs);
+            let mut ids = gen_history(
+                &mut rng,
+                &ctx,
+                &node_ids,
+                submitted_at_us,
+                &mut next_seq,
+                &mut bufs,
+            );
             let seq = next_seq;
             next_seq += 1;
             let id = build_attempt(
@@ -181,9 +213,15 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             // attempt (if any) is still listed in `attempts`.
             let r2 = rng.below(100);
             let (state, outcome) = if r2 < 70 {
-                (JobState::Succeeded, Some(AttemptOutcome::Exited { code: 0 }))
+                (
+                    JobState::Succeeded,
+                    Some(AttemptOutcome::Exited { code: 0 }),
+                )
             } else if r2 < 90 {
-                (JobState::Failed, Some(random_terminal_failure_outcome(&mut rng)))
+                (
+                    JobState::Failed,
+                    Some(random_terminal_failure_outcome(&mut rng)),
+                )
             } else if rng.chance(1, 2) {
                 // Aborted while still queued: no attempt ever existed.
                 (JobState::Aborted, None)
@@ -191,7 +229,14 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 (JobState::Aborted, Some(AttemptOutcome::Aborted))
             };
             let mut ids = if outcome.is_some() {
-                gen_history(&mut rng, &ctx, &node_ids, submitted_at_us, &mut next_seq, &mut bufs)
+                gen_history(
+                    &mut rng,
+                    &ctx,
+                    &node_ids,
+                    submitted_at_us,
+                    &mut next_seq,
+                    &mut bufs,
+                )
             } else {
                 Vec::new()
             };
@@ -231,7 +276,10 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         } else if abort_eligible && rng.chance(3, 100) {
             // Legal in every non-terminal state: an abort can be in flight
             // while the attempt is still winding down.
-            Some(AbortRequest { reason: None, requested_at_us: submitted_at_us + rng.range(0, 3_600_000_000) as i64 })
+            Some(AbortRequest {
+                reason: None,
+                requested_at_us: submitted_at_us + rng.range(0, 3_600_000_000) as i64,
+            })
         } else {
             None
         };
@@ -347,17 +395,37 @@ fn build_attempt(
                 memory_bytes: ctx.requested.memory_bytes * frac / 100,
                 disk_bytes: ctx.requested.disk_bytes * frac / 100,
             };
-            (AttemptState::Accruing, AllocationState::Accruing, funded, None, true)
+            (
+                AttemptState::Accruing,
+                AllocationState::Accruing,
+                funded,
+                None,
+                true,
+            )
         }
-        AttemptKind::Ready => {
-            (AttemptState::Ready, AllocationState::Funded, ctx.requested, None, false)
-        }
-        AttemptKind::Dispatching => {
-            (AttemptState::Dispatching, AllocationState::Funded, ctx.requested, None, false)
-        }
+        AttemptKind::Ready => (
+            AttemptState::Ready,
+            AllocationState::Funded,
+            ctx.requested,
+            None,
+            false,
+        ),
+        AttemptKind::Dispatching => (
+            AttemptState::Dispatching,
+            AllocationState::Funded,
+            ctx.requested,
+            None,
+            false,
+        ),
         AttemptKind::Running => {
             let started = charged_at_us + rng.range(1_000_000, 60_000_000) as i64;
-            (AttemptState::Running, AllocationState::Active, ctx.requested, Some(started), false)
+            (
+                AttemptState::Running,
+                AllocationState::Active,
+                ctx.requested,
+                Some(started),
+                false,
+            )
         }
         AttemptKind::Finalizing => {
             let started = charged_at_us + rng.range(1_000_000, 60_000_000) as i64;
@@ -402,7 +470,10 @@ fn build_attempt(
             attempt,
             // v1 groups are singletons keyed by the job id.
             group: GroupId(ctx.job.0),
-            charge: ChargeRecord { amount: ctx.charge_amount, charged_at_us },
+            charge: ChargeRecord {
+                amount: ctx.charge_amount,
+                charged_at_us,
+            },
             rate_ucu_per_second: ctx.rate,
             multiplier: ctx.multiplier,
             started_at_us,
@@ -417,7 +488,8 @@ fn build_attempt(
         funded,
         state: alloc_state,
     };
-    bufs.allocations.push((allocation_id, AllocationRecord { allocation, seq }));
+    bufs.allocations
+        .push((allocation_id, AllocationRecord { allocation, seq }));
     if accruing {
         bufs.accrual.push(((node, seq), allocation_id));
     }
@@ -465,8 +537,12 @@ fn random_early_outcome(rng: &mut Rng) -> AttemptOutcome {
         0 => AttemptOutcome::Revoked,
         1 => AttemptOutcome::NodeLost,
         2 => AttemptOutcome::AgentError,
-        3 => AttemptOutcome::PullFailed { user_error: rng.chance(1, 2) },
-        _ => AttemptOutcome::Exited { code: rng.range(1, 255) as i32 },
+        3 => AttemptOutcome::PullFailed {
+            user_error: rng.chance(1, 2),
+        },
+        _ => AttemptOutcome::Exited {
+            code: rng.range(1, 255) as i32,
+        },
     }
 }
 
@@ -475,11 +551,17 @@ fn random_early_outcome(rng: &mut Rng) -> AttemptOutcome {
 /// (which always requeues rather than terminating).
 fn random_terminal_failure_outcome(rng: &mut Rng) -> AttemptOutcome {
     match rng.below(6) {
-        0 => AttemptOutcome::Exited { code: rng.range(1, 255) as i32 },
+        0 => AttemptOutcome::Exited {
+            code: rng.range(1, 255) as i32,
+        },
         1 => AttemptOutcome::OomKilled,
         2 => AttemptOutcome::MaxRuntimeExceeded,
-        3 => AttemptOutcome::PullFailed { user_error: rng.chance(1, 2) },
-        4 => AttemptOutcome::StartFailed { user_error: rng.chance(1, 2) },
+        3 => AttemptOutcome::PullFailed {
+            user_error: rng.chance(1, 2),
+        },
+        4 => AttemptOutcome::StartFailed {
+            user_error: rng.chance(1, 2),
+        },
         _ => AttemptOutcome::NodeLost,
     }
 }
@@ -516,8 +598,19 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time_us: i64) -> QuotaTree
     for i in 0..roots {
         let id = QuotaEntityId(next_uuid(rng));
         let quota = CostUnits(rng.range(1_000_000_000, 100_000_000_000_000));
-        let usage = UsageState { usage: CostUnits(rng.range(0, quota.0.max(2))), last_update_us: base_time_us };
-        entities.push((id, QuotaEntity { parent: None, name: format!("org-{i}"), quota, usage }));
+        let usage = UsageState {
+            usage: CostUnits(rng.range(0, quota.0.max(2))),
+            last_update_us: base_time_us,
+        };
+        entities.push((
+            id,
+            QuotaEntity {
+                parent: None,
+                name: format!("org-{i}"),
+                quota,
+                usage,
+            },
+        ));
         root_ids.push(id);
     }
 
@@ -526,10 +619,18 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time_us: i64) -> QuotaTree
         let parent = *rng.pick(&root_ids);
         let id = QuotaEntityId(next_uuid(rng));
         let quota = CostUnits(rng.range(100_000_000, 10_000_000_000_000));
-        let usage = UsageState { usage: CostUnits(rng.range(0, quota.0.max(2))), last_update_us: base_time_us };
+        let usage = UsageState {
+            usage: CostUnits(rng.range(0, quota.0.max(2))),
+            last_update_us: base_time_us,
+        };
         entities.push((
             id,
-            QuotaEntity { parent: Some(parent), name: format!("team-{i}"), quota, usage },
+            QuotaEntity {
+                parent: Some(parent),
+                name: format!("team-{i}"),
+                quota,
+                usage,
+            },
         ));
         team_ids.push(id);
     }
@@ -539,15 +640,26 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time_us: i64) -> QuotaTree
         let parent = *rng.pick(&team_ids);
         let id = QuotaEntityId(next_uuid(rng));
         let quota = CostUnits(rng.range(10_000_000, 1_000_000_000_000));
-        let usage = UsageState { usage: CostUnits(rng.range(0, quota.0.max(2))), last_update_us: base_time_us };
+        let usage = UsageState {
+            usage: CostUnits(rng.range(0, quota.0.max(2))),
+            last_update_us: base_time_us,
+        };
         entities.push((
             id,
-            QuotaEntity { parent: Some(parent), name: format!("leaf-{i}"), quota, usage },
+            QuotaEntity {
+                parent: Some(parent),
+                name: format!("leaf-{i}"),
+                quota,
+                usage,
+            },
         ));
         leaf_ids.push(id);
     }
 
-    QuotaTree { entities, leaves: leaf_ids }
+    QuotaTree {
+        entities,
+        leaves: leaf_ids,
+    }
 }
 
 /// Build `count` nodes with plausible capacity, a few labels each, and ~5%
@@ -568,10 +680,24 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
         let mut labels = BTreeMap::new();
         labels.insert("zone".to_string(), (*rng.pick(&ZONES)).to_string());
         labels.insert("pool".to_string(), (*rng.pick(&POOLS)).to_string());
-        labels.insert("instance-type".to_string(), (*rng.pick(&INSTANCE_TYPES)).to_string());
+        labels.insert(
+            "instance-type".to_string(),
+            (*rng.pick(&INSTANCE_TYPES)).to_string(),
+        );
         let schedulable = rng.chance(95, 100);
         let epoch = rng.range(1, 6);
-        pairs.push((id, NodeRecord { node: Node { id, capacity, labels, schedulable }, epoch }));
+        pairs.push((
+            id,
+            NodeRecord {
+                node: Node {
+                    id,
+                    capacity,
+                    labels,
+                    schedulable,
+                },
+                epoch,
+            },
+        ));
     }
     pairs.sort_unstable_by_key(|(id, _)| *id);
     pairs.into_iter().collect()
@@ -580,8 +706,12 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
 /// A realistic-looking image reference: `registry/name:tag@sha256:<hex>`,
 /// roughly 40-70 characters.
 fn gen_image(rng: &mut Rng) -> String {
-    const REGISTRIES: [&str; 4] =
-        ["registry.example.com", "ghcr.io/coppice", "docker.io/coppice", "us.pkg.dev/coppice"];
+    const REGISTRIES: [&str; 4] = [
+        "registry.example.com",
+        "ghcr.io/coppice",
+        "docker.io/coppice",
+        "us.pkg.dev/coppice",
+    ];
     const NAMES: [&str; 8] = [
         "worker",
         "ingest",
@@ -610,7 +740,10 @@ pub fn check_consistency(sm: &StateMachine) {
     let mut seqs: Vec<u64> = sm.allocations.values().map(|r| r.seq).collect();
     seqs.sort_unstable();
     for pair in seqs.windows(2) {
-        assert!(pair[0] < pair[1], "allocation seq must be unique and strictly ordered");
+        assert!(
+            pair[0] < pair[1],
+            "allocation seq must be unique and strictly ordered"
+        );
     }
     match seqs.last() {
         Some(&max_seq) => assert_eq!(sm.next_allocation_seq, max_seq + 1),
@@ -624,28 +757,47 @@ pub fn check_consistency(sm: &StateMachine) {
         .filter(|r| r.allocation.state == AllocationState::Accruing)
         .map(|r| ((r.allocation.node, r.seq), r.allocation.id))
         .collect();
-    assert_eq!(sm.accrual_queue, expected, "accrual_queue must match Accruing allocations exactly");
+    assert_eq!(
+        sm.accrual_queue, expected,
+        "accrual_queue must match Accruing allocations exactly"
+    );
 
     for (job_id, jr) in &sm.jobs {
         match jr.state {
             JobState::Queued | JobState::Succeeded | JobState::Failed | JobState::Aborted => {
-                assert!(jr.current_attempt.is_none(), "job {job_id} in {:?} must have no current attempt", jr.state);
+                assert!(
+                    jr.current_attempt.is_none(),
+                    "job {job_id} in {:?} must have no current attempt",
+                    jr.state
+                );
             }
             JobState::Preparing | JobState::Running | JobState::Finalizing => {
-                assert!(jr.current_attempt.is_some(), "live job {job_id} must have a current attempt");
+                assert!(
+                    jr.current_attempt.is_some(),
+                    "live job {job_id} must have a current attempt"
+                );
             }
             JobState::Submitted | JobState::Accepted => {}
         }
         if let Some(cur) = jr.current_attempt {
-            assert!(jr.attempts.contains(&cur), "job {job_id}'s attempts must list its current attempt");
+            assert!(
+                jr.attempts.contains(&cur),
+                "job {job_id}'s attempts must list its current attempt"
+            );
         }
         assert!(
             sm.quota_entities.contains_key(&jr.spec.quota_entity),
             "job {job_id} references an unknown quota entity"
         );
         for aid in &jr.attempts {
-            let ar = sm.attempts.get(aid).unwrap_or_else(|| panic!("job {job_id} lists unknown attempt {aid}"));
-            assert_eq!(ar.attempt.job, *job_id, "attempt {aid} back-reference must match its job");
+            let ar = sm
+                .attempts
+                .get(aid)
+                .unwrap_or_else(|| panic!("job {job_id} lists unknown attempt {aid}"));
+            assert_eq!(
+                ar.attempt.job, *job_id,
+                "attempt {aid} back-reference must match its job"
+            );
         }
         if let Some(cur) = jr.current_attempt {
             let ar = &sm.attempts[&cur];
@@ -655,11 +807,27 @@ pub fn check_consistency(sm: &StateMachine) {
             assert_eq!(alloc.allocation.node, ar.attempt.node);
             let legal = matches!(
                 (jr.state, &ar.attempt.state, alloc.allocation.state),
-                (JobState::Preparing, AttemptState::Accruing, AllocationState::Accruing)
-                    | (JobState::Preparing, AttemptState::Ready, AllocationState::Funded)
-                    | (JobState::Preparing, AttemptState::Dispatching, AllocationState::Funded)
-                    | (JobState::Running, AttemptState::Running, AllocationState::Active)
-                    | (JobState::Finalizing, AttemptState::Finalizing, AllocationState::Active)
+                (
+                    JobState::Preparing,
+                    AttemptState::Accruing,
+                    AllocationState::Accruing
+                ) | (
+                    JobState::Preparing,
+                    AttemptState::Ready,
+                    AllocationState::Funded
+                ) | (
+                    JobState::Preparing,
+                    AttemptState::Dispatching,
+                    AllocationState::Funded
+                ) | (
+                    JobState::Running,
+                    AttemptState::Running,
+                    AllocationState::Active
+                ) | (
+                    JobState::Finalizing,
+                    AttemptState::Finalizing,
+                    AllocationState::Active
+                )
             );
             assert!(
                 legal,
@@ -670,27 +838,46 @@ pub fn check_consistency(sm: &StateMachine) {
     }
 
     for (aid, ar) in &sm.attempts {
-        assert!(sm.jobs.contains_key(&ar.attempt.job), "attempt {aid} references unknown job");
-        assert!(sm.nodes.contains_key(&ar.attempt.node), "attempt {aid} references unknown node");
+        assert!(
+            sm.jobs.contains_key(&ar.attempt.job),
+            "attempt {aid} references unknown job"
+        );
+        assert!(
+            sm.nodes.contains_key(&ar.attempt.node),
+            "attempt {aid} references unknown node"
+        );
         let alloc = sm
             .allocations
             .get(&ar.attempt.allocation)
             .unwrap_or_else(|| panic!("attempt {aid} references unknown allocation"));
-        assert_eq!(alloc.allocation.attempt, *aid, "allocation back-reference must match its attempt");
+        assert_eq!(
+            alloc.allocation.attempt, *aid,
+            "allocation back-reference must match its attempt"
+        );
         assert_eq!(alloc.allocation.job, ar.attempt.job);
         assert_eq!(alloc.allocation.node, ar.attempt.node);
         if ar.attempt.state.is_terminal() {
-            assert_eq!(alloc.allocation.state, AllocationState::Released, "a terminal attempt's allocation must be released");
+            assert_eq!(
+                alloc.allocation.state,
+                AllocationState::Released,
+                "a terminal attempt's allocation must be released"
+            );
         }
     }
 
     for r in sm.allocations.values() {
-        assert!(sm.nodes.contains_key(&r.allocation.node), "allocation references unknown node");
+        assert!(
+            sm.nodes.contains_key(&r.allocation.node),
+            "allocation references unknown node"
+        );
     }
 
     for entity in sm.quota_entities.values() {
         if let Some(parent) = entity.parent {
-            assert!(sm.quota_entities.contains_key(&parent), "quota entity references unknown parent");
+            assert!(
+                sm.quota_entities.contains_key(&parent),
+                "quota entity references unknown parent"
+            );
         }
     }
 }

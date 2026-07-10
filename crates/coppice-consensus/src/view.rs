@@ -242,7 +242,8 @@ mod tests {
 
     #[tokio::test]
     async fn at_least_resolves_after_publish() {
-        let (mut publisher, views) = ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+        let (mut publisher, views) =
+            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
 
         let waiter = tokio::spawn(async move { views.at_least(5).await });
 
@@ -262,7 +263,8 @@ mod tests {
 
     #[tokio::test]
     async fn idle_wakeup_fires_on_demand() {
-        let (publisher, views) = ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+        let (publisher, views) =
+            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
 
         let woke = tokio::spawn(async move {
             publisher.idle_wakeup().await;

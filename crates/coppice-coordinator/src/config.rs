@@ -410,7 +410,9 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 
         assert_eq!(
             config.cluster_id,
-            "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10".parse().unwrap()
+            "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
+                .parse()
+                .unwrap()
         );
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/coppice"));
         assert_eq!(

@@ -32,7 +32,6 @@ use coppice_agent::config::{CapacityConfig, Config, TlsConfig};
 use coppice_agent::executor::{ExitInfo, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{run, Session};
-use coppice_net::session::{AgentService, Server as AgentServiceServer};
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, StateViews};
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
@@ -40,6 +39,7 @@ use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaE
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
+use coppice_net::session::{AgentService, Server as AgentServiceServer};
 use coppice_proto::pb::agent::v1 as pb;
 use coppice_state::command::{ConfigureQuotaEntity, DeclareNodeLost, SubmitJob};
 use coppice_state::Command;

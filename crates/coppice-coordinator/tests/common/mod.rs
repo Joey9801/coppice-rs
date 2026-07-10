@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use coppice_core::id::ClusterId;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -26,7 +27,6 @@ use rcgen::{
 use tempfile::TempDir;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use coppice_core::id::ClusterId;
 
 use coppice_consensus::{
     ClusterSummary, Consensus, ConsensusStatus, NodeHandle, OpenraftConsensus, StateViews,

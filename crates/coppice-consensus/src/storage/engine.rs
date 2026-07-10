@@ -1165,8 +1165,13 @@ impl<F: Fs> StorageCore<F> {
     #[allow(clippy::type_complexity)]
     pub fn current_snapshot_reader(
         &self,
-    ) -> io::Result<Option<(pbstorage::SnapshotMeta, pbstorage::SectionIndex, Box<dyn FsFile>)>>
-    {
+    ) -> io::Result<
+        Option<(
+            pbstorage::SnapshotMeta,
+            pbstorage::SectionIndex,
+            Box<dyn FsFile>,
+        )>,
+    > {
         let Some(id) = &self.manifest.snapshot_id else {
             return Ok(None);
         };

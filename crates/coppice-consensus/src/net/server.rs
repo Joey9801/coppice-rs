@@ -20,8 +20,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use openraft::{Raft, Snapshot};
 
-use coppice_proto::pb::raft::v1 as pb;
 use coppice_net::transport::RaftTransportService;
+use coppice_proto::pb::raft::v1 as pb;
 
 use crate::adapter::TypeConfig;
 use crate::storage::{raftpb, SnapshotFile};
@@ -148,17 +148,13 @@ impl RaftTransportService for RaftTransportHandler {
         while let Some(frame) = stream.message().await? {
             match frame.chunk {
                 Some(pb::install_snapshot_request::Chunk::Data(bytes)) => {
-                    data = tokio::task::spawn_blocking(
-                        move || -> io::Result<Box<SnapshotFile>> {
-                            data.append(&bytes)?;
-                            Ok(data)
-                        },
-                    )
+                    data = tokio::task::spawn_blocking(move || -> io::Result<Box<SnapshotFile>> {
+                        data.append(&bytes)?;
+                        Ok(data)
+                    })
                     .await
                     .map_err(|e| Status::internal(format!("snapshot spool task panicked: {e}")))?
-                    .map_err(|e| {
-                        Status::internal(format!("cannot spool snapshot chunk: {e}"))
-                    })?;
+                    .map_err(|e| Status::internal(format!("cannot spool snapshot chunk: {e}")))?;
                 }
                 Some(pb::install_snapshot_request::Chunk::Header(_)) => {
                     return Err(Status::invalid_argument(

@@ -72,25 +72,30 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
         proptest::option::of(60u64..7_200),
         arb_ts(),
     )
-        .prop_map(move |(progress, abort_at, outcome, node_ix, cpu_millis, max_rt, ts)| {
-            let job = jid(1_000 + i as u128);
-            let attempt = aid(2_000 + i as u128);
-            let alloc = alid(3_000 + i as u128);
-            let mut chain = vec![
-                submit_cmd(job, cpu(cpu_millis), max_rt, RetryPolicy::default()),
-                place_cmd(placement(job, attempt, alloc, node_of(node_ix), cpu(cpu_millis)), ts),
-                dispatch_cmd(attempt, ts),
-                started_cmd(attempt, ts),
-                exited_cmd(attempt, ts),
-                outcome_cmd(attempt, outcome, 30, ts),
-            ];
-            chain.truncate(progress);
-            if let Some(at) = abort_at {
-                let at = at.min(chain.len());
-                chain.insert(at, abort_cmd(job, ts));
-            }
-            chain
-        })
+        .prop_map(
+            move |(progress, abort_at, outcome, node_ix, cpu_millis, max_rt, ts)| {
+                let job = jid(1_000 + i as u128);
+                let attempt = aid(2_000 + i as u128);
+                let alloc = alid(3_000 + i as u128);
+                let mut chain = vec![
+                    submit_cmd(job, cpu(cpu_millis), max_rt, RetryPolicy::default()),
+                    place_cmd(
+                        placement(job, attempt, alloc, node_of(node_ix), cpu(cpu_millis)),
+                        ts,
+                    ),
+                    dispatch_cmd(attempt, ts),
+                    started_cmd(attempt, ts),
+                    exited_cmd(attempt, ts),
+                    outcome_cmd(attempt, outcome, 30, ts),
+                ];
+                chain.truncate(progress);
+                if let Some(at) = abort_at {
+                    let at = at.min(chain.len());
+                    chain.insert(at, abort_cmd(job, ts));
+                }
+                chain
+            },
+        )
 }
 
 /// Cluster-level commands referencing the same id pools, so some are valid
@@ -106,7 +111,10 @@ fn arb_global() -> impl Strategy<Value = Command> {
             })
         }),
         (0usize..NODES as usize, arb_ts()).prop_map(|(n, ts)| {
-            Command::DeclareNodeLost(DeclareNodeLost { node: node_of(n), declared_at_us: ts })
+            Command::DeclareNodeLost(DeclareNodeLost {
+                node: node_of(n),
+                declared_at_us: ts,
+            })
         }),
         (0usize..NODES as usize, any::<bool>(), arb_ts()).prop_map(|(n, schedulable, ts)| {
             Command::SetNodeSchedulable(SetNodeSchedulable {
@@ -134,11 +142,20 @@ fn arb_global() -> impl Strategy<Value = Command> {
             })
         }),
         (1u32..6, arb_ts()).prop_map(|(to, ts)| {
-            Command::BumpClusterVersion(BumpClusterVersion { to, bumped_at_us: ts })
+            Command::BumpClusterVersion(BumpClusterVersion {
+                to,
+                bumped_at_us: ts,
+            })
         }),
-        (0u32..5, ).prop_map(|(k,)| update_policy_cmd(test_policy(k))),
-        (0usize..NODES as usize, 1u64..4, any::<u8>(), any::<u8>(), arb_ts()).prop_map(
-            |(n, epoch, adopt_mask, lost_mask, ts)| {
+        (0u32..5,).prop_map(|(k,)| update_policy_cmd(test_policy(k))),
+        (
+            0usize..NODES as usize,
+            1u64..4,
+            any::<u8>(),
+            any::<u8>(),
+            arb_ts()
+        )
+            .prop_map(|(n, epoch, adopt_mask, lost_mask, ts)| {
                 Command::ReconcileNode(ReconcileNode {
                     node: node_of(n),
                     node_epoch: epoch,
@@ -156,8 +173,7 @@ fn arb_global() -> impl Strategy<Value = Command> {
                         .collect(),
                     observed_at_us: ts,
                 })
-            }
-        ),
+            }),
     ]
 }
 
@@ -168,7 +184,9 @@ fn snapshot_roundtrip(state: &StateMachine) -> StateMachine {
     fn recode<M: prost::Message + Default>(records: Vec<M>) -> Vec<M> {
         let mut buf = Vec::new();
         for record in &records {
-            record.encode_length_delimited(&mut buf).expect("record must encode");
+            record
+                .encode_length_delimited(&mut buf)
+                .expect("record must encode");
         }
         let mut slice = buf.as_slice();
         let mut out = Vec::new();
@@ -199,8 +217,9 @@ fn interleave(chains: Vec<Vec<Command>>, picks: Vec<prop::sample::Index>) -> Vec
         chains.into_iter().map(Into::into).collect();
     let mut out = Vec::new();
     for pick in picks {
-        let live: Vec<usize> =
-            (0..chains.len()).filter(|&i| !chains[i].is_empty()).collect();
+        let live: Vec<usize> = (0..chains.len())
+            .filter(|&i| !chains[i].is_empty())
+            .collect();
         if live.is_empty() {
             break;
         }
@@ -324,11 +343,34 @@ proptest! {
 #[test]
 fn extreme_resources_never_panic() {
     let mut sm = setup();
-    let huge = Resources { cpu_millis: u64::MAX, memory_bytes: u64::MAX, disk_bytes: u64::MAX };
+    let huge = Resources {
+        cpu_millis: u64::MAX,
+        memory_bytes: u64::MAX,
+        disk_bytes: u64::MAX,
+    };
     apply_ok(&mut sm, register_node_cmd(nid(9), huge, TS));
-    apply_ok(&mut sm, submit_cmd(jid(9), huge, Some(u64::MAX / 2_000_000), RetryPolicy::default()));
-    apply_ok(&mut sm, place_cmd(placement(jid(9), aid(9), alid(9), nid(9), huge), TS));
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(9),
+            huge,
+            Some(u64::MAX / 2_000_000),
+            RetryPolicy::default(),
+        ),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(placement(jid(9), aid(9), alid(9), nid(9), huge), TS),
+    );
     apply_ok(&mut sm, dispatch_cmd(aid(9), TS));
     apply_ok(&mut sm, started_cmd(aid(9), TS));
-    apply_ok(&mut sm, outcome_cmd(aid(9), AttemptOutcome::Exited { code: 0 }, u64::MAX / 2_000_000, TS + 1));
+    apply_ok(
+        &mut sm,
+        outcome_cmd(
+            aid(9),
+            AttemptOutcome::Exited { code: 0 },
+            u64::MAX / 2_000_000,
+            TS + 1,
+        ),
+    );
 }

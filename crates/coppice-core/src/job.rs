@@ -57,7 +57,10 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        RetryPolicy { max_retries: 3, retry_user_errors: false }
+        RetryPolicy {
+            max_retries: 3,
+            retry_user_errors: false,
+        }
     }
 }
 
@@ -108,7 +111,10 @@ impl JobState {
     /// Terminal jobs never transition again and are eventually evicted to the
     /// history store (ADR 0012).
     pub fn is_terminal(self) -> bool {
-        matches!(self, JobState::Succeeded | JobState::Failed | JobState::Aborted)
+        matches!(
+            self,
+            JobState::Succeeded | JobState::Failed | JobState::Aborted
+        )
     }
 
     /// The legal transition table from `docs/lifecycle/job-lifecycle.md`.
@@ -144,7 +150,10 @@ mod tests {
     fn terminal_states_have_no_exits() {
         for from in [Succeeded, Failed, Aborted] {
             for to in ALL {
-                assert!(!from.may_transition_to(to), "{from:?} -> {to:?} must be illegal");
+                assert!(
+                    !from.may_transition_to(to),
+                    "{from:?} -> {to:?} must be illegal"
+                );
             }
         }
     }

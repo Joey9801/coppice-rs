@@ -24,7 +24,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let descriptors = protox::compile(&files, [&proto_root])?;
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-    fs::write(out_dir.join("descriptor.binpb"), descriptors.encode_to_vec())?;
+    fs::write(
+        out_dir.join("descriptor.binpb"),
+        descriptors.encode_to_vec(),
+    )?;
 
     prost_build::Config::new().compile_fds(descriptors)?;
     Ok(())

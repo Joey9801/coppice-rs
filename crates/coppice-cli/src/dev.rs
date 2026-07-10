@@ -25,9 +25,9 @@ use coppice_agent::executor::{DockerExecutor, Executor, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{self, Session};
 use coppice_consensus::fs::RealFs;
-use coppice_core::id::{ClusterId, NodeId};
 use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator};
 use coppice_coordinator::config::{self as coord_config, CliOverrides};
+use coppice_core::id::{ClusterId, NodeId};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -73,7 +73,9 @@ fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
     let ca_key = KeyPair::generate().context("generate dev CA key")?;
     let mut params = CertificateParams::new(Vec::<String>::new()).context("dev CA params")?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.distinguished_name.push(DnType::CommonName, "coppice-dev-ca");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "coppice-dev-ca");
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,
@@ -117,8 +119,8 @@ where
     T::Err: std::error::Error + Send + Sync + 'static,
 {
     if path.exists() {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         Ok(raw
             .trim()
             .parse()
@@ -231,8 +233,13 @@ ca_path = "{ca}"
     let agent_addr = format!("127.0.0.1:{agent_port}")
         .parse()
         .expect("agent socket addr");
-    let listener = AgentListener::bind(agent_addr, &pki.coordinator.0, &pki.coordinator.1, &pki.ca_pem)
-        .context("binding the dev agent listener")?;
+    let listener = AgentListener::bind(
+        agent_addr,
+        &pki.coordinator.0,
+        &pki.coordinator.1,
+        &pki.ca_pem,
+    )
+    .context("binding the dev agent listener")?;
 
     let (runtime_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime_join = tokio::spawn(bootstrap::serve_runtime(
@@ -283,7 +290,13 @@ ca_path = "{ca}"
         let views = views.clone();
         tokio::spawn(async move {
             loop {
-                match views.latest().state().nodes.get(&agent_node).map(|n| n.epoch) {
+                match views
+                    .latest()
+                    .state()
+                    .nodes
+                    .get(&agent_node)
+                    .map(|n| n.epoch)
+                {
                     Some(epoch) => {
                         tracing::info!(node = %agent_node, epoch, "dev agent registered");
                         break;

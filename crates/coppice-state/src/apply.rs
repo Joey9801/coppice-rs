@@ -24,7 +24,7 @@ use crate::command::{
     UpdatePolicy,
 };
 use crate::{
-    Applied, AllocationRecord, AttemptRecord, Command, Event, JobRecord, NodeRecord, QuotaEntity,
+    AllocationRecord, Applied, AttemptRecord, Command, Event, JobRecord, NodeRecord, QuotaEntity,
     RejectionReason, StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
 
@@ -91,8 +91,16 @@ impl StateMachine {
         Ok(Applied {
             events: vec![
                 Event::JobSubmitted { job },
-                Event::JobStateChanged { job, from: JobState::Submitted, to: JobState::Accepted },
-                Event::JobStateChanged { job, from: JobState::Accepted, to: JobState::Queued },
+                Event::JobStateChanged {
+                    job,
+                    from: JobState::Submitted,
+                    to: JobState::Accepted,
+                },
+                Event::JobStateChanged {
+                    job,
+                    from: JobState::Accepted,
+                    to: JobState::Queued,
+                },
             ],
         })
     }
@@ -220,20 +228,20 @@ impl StateMachine {
         }
         for p in &c.placements {
             // Validation guarantees exactly one allocation (v1 shape).
-            let Some(spec) = p.allocations.first() else { continue };
-            let Some((entity, multiplier, runtime_s, requests)) =
-                self.jobs.get(&p.job).map(|j| {
-                    (
-                        j.spec.quota_entity,
-                        j.multiplier,
-                        j.spec
-                            .max_runtime_us
-                            .map(quota::runtime_seconds_ceil)
-                            .unwrap_or(self.policy.default_charge_runtime_s),
-                        j.spec.requests,
-                    )
-                })
-            else {
+            let Some(spec) = p.allocations.first() else {
+                continue;
+            };
+            let Some((entity, multiplier, runtime_s, requests)) = self.jobs.get(&p.job).map(|j| {
+                (
+                    j.spec.quota_entity,
+                    j.multiplier,
+                    j.spec
+                        .max_runtime_us
+                        .map(quota::runtime_seconds_ceil)
+                        .unwrap_or(self.policy.default_charge_runtime_s),
+                    j.spec.requests,
+                )
+            }) else {
                 continue;
             };
             let seq = self.next_allocation_seq;
@@ -246,8 +254,11 @@ impl StateMachine {
             let free = self.free_capacity(&spec.node);
             let funded = free.component_min(&spec.requested);
             let fully = funded == spec.requested;
-            let alloc_state =
-                if fully { AllocationState::Funded } else { AllocationState::Accruing };
+            let alloc_state = if fully {
+                AllocationState::Funded
+            } else {
+                AllocationState::Accruing
+            };
             self.allocations.insert(
                 spec.id,
                 AllocationRecord {
@@ -268,7 +279,11 @@ impl StateMachine {
             }
             // Accruing is skipped entirely when capacity is immediately
             // available (the common case).
-            let attempt_state = if fully { AttemptState::Ready } else { AttemptState::Accruing };
+            let attempt_state = if fully {
+                AttemptState::Ready
+            } else {
+                AttemptState::Accruing
+            };
             let rate = quota::resource_rate(&requests, &self.policy.cost_weights);
             let charge = quota::cost_from_rate(rate, runtime_s, multiplier);
             self.attempts.insert(
@@ -282,15 +297,23 @@ impl StateMachine {
                         state: attempt_state.clone(),
                     },
                     group: p.group,
-                    charge: ChargeRecord { amount: charge, charged_at_us: c.proposed_at_us },
+                    charge: ChargeRecord {
+                        amount: charge,
+                        charged_at_us: c.proposed_at_us,
+                    },
                     rate_ucu_per_second: rate,
                     multiplier,
                     started_at_us: None,
                 },
             );
-            events.push(Event::AttemptStateChanged { attempt: p.attempt, state: attempt_state });
+            events.push(Event::AttemptStateChanged {
+                attempt: p.attempt,
+                state: attempt_state,
+            });
             if fully {
-                events.push(Event::AllocationFunded { allocation: spec.id });
+                events.push(Event::AllocationFunded {
+                    allocation: spec.id,
+                });
             }
             if let Some(j) = self.jobs.get_mut(&p.job) {
                 j.current_attempt = Some(p.attempt);
@@ -405,8 +428,13 @@ impl StateMachine {
                 if revoked.contains(alloc_id) {
                     continue;
                 }
-                let Some(rec) = self.allocations.get(alloc_id) else { continue };
-                let need = rec.allocation.requested.saturating_sub(&rec.allocation.funded);
+                let Some(rec) = self.allocations.get(alloc_id) else {
+                    continue;
+                };
+                let need = rec
+                    .allocation
+                    .requested
+                    .saturating_sub(&rec.allocation.funded);
                 let pledge = free.component_min(&need);
                 free = free.saturating_sub(&pledge);
                 if pledge == need {
@@ -420,8 +448,12 @@ impl StateMachine {
         }
         for p in &c.placements {
             // Item validation already pinned the v1 single-allocation shape.
-            let Some(spec) = p.allocations.first() else { continue };
-            let Some(free) = sim_free.get_mut(&spec.node) else { continue };
+            let Some(spec) = p.allocations.first() else {
+                continue;
+            };
+            let Some(free) = sim_free.get_mut(&spec.node) else {
+                continue;
+            };
             let pledge = free.component_min(&spec.requested);
             *free = free.saturating_sub(&pledge);
             if pledge != spec.requested {
@@ -521,8 +553,13 @@ impl StateMachine {
         for id in &c.adopted {
             match self.attempts.get(id) {
                 None => items.push((idx, RejectionReason::UnknownAttempt(*id))),
-                Some(a) if a.attempt.node != c.node => items
-                    .push((idx, RejectionReason::AttemptNotOnNode { attempt: *id, node: c.node })),
+                Some(a) if a.attempt.node != c.node => items.push((
+                    idx,
+                    RejectionReason::AttemptNotOnNode {
+                        attempt: *id,
+                        node: c.node,
+                    },
+                )),
                 Some(_) => {}
             }
             idx += 1;
@@ -532,7 +569,10 @@ impl StateMachine {
                 None => items.push((idx, RejectionReason::UnknownAttempt(l.attempt))),
                 Some(a) if a.attempt.node != c.node => items.push((
                     idx,
-                    RejectionReason::AttemptNotOnNode { attempt: l.attempt, node: c.node },
+                    RejectionReason::AttemptNotOnNode {
+                        attempt: l.attempt,
+                        node: c.node,
+                    },
                 )),
                 Some(_) if l.outcome == AttemptOutcome::Revoked => {
                     items.push((
@@ -564,8 +604,11 @@ impl StateMachine {
             }
         }
         for l in &c.lost {
-            let live =
-                self.attempts.get(&l.attempt).map(|a| !a.attempt.state.is_terminal()).unwrap_or(false);
+            let live = self
+                .attempts
+                .get(&l.attempt)
+                .map(|a| !a.attempt.state.is_terminal())
+                .unwrap_or(false);
             if live {
                 self.terminate_attempt(
                     l.attempt,
@@ -592,7 +635,10 @@ impl StateMachine {
                 rec.epoch += 1;
                 rec.node.capacity = c.capacity;
                 rec.node.labels = c.labels.clone();
-                events.push(Event::NodeEpochBumped { node: c.node, epoch: rec.epoch });
+                events.push(Event::NodeEpochBumped {
+                    node: c.node,
+                    epoch: rec.epoch,
+                });
             }
             None => {
                 self.nodes.insert(
@@ -607,7 +653,10 @@ impl StateMachine {
                         epoch: 1,
                     },
                 );
-                events.push(Event::NodeEpochBumped { node: c.node, epoch: 1 });
+                events.push(Event::NodeEpochBumped {
+                    node: c.node,
+                    epoch: 1,
+                });
             }
         }
         // Capacity may have grown; fund waiting accruals.
@@ -622,7 +671,10 @@ impl StateMachine {
             Some(rec) => {
                 rec.epoch += 1;
                 rec.node.schedulable = false;
-                events.push(Event::NodeEpochBumped { node: c.node, epoch: rec.epoch });
+                events.push(Event::NodeEpochBumped {
+                    node: c.node,
+                    epoch: rec.epoch,
+                });
             }
         }
         // Every live attempt on the node ends NodeLost, in commit order. No
@@ -630,7 +682,9 @@ impl StateMachine {
         let mut victims: Vec<(u64, AttemptId)> = self
             .allocations
             .values()
-            .filter(|r| r.allocation.node == c.node && r.allocation.state != AllocationState::Released)
+            .filter(|r| {
+                r.allocation.node == c.node && r.allocation.state != AllocationState::Released
+            })
             .map(|r| (r.seq, r.allocation.attempt))
             .collect();
         victims.sort_unstable_by_key(|(seq, _)| *seq);
@@ -683,7 +737,9 @@ impl StateMachine {
         }
         let mut events = Vec::new();
         for job in &c.jobs {
-            let Some(rec) = self.jobs.remove(job) else { continue };
+            let Some(rec) = self.jobs.remove(job) else {
+                continue;
+            };
             for attempt in &rec.attempts {
                 if let Some(a) = self.attempts.remove(attempt) {
                     if let Some(al) = self.allocations.remove(&a.attempt.allocation) {
@@ -743,7 +799,9 @@ impl StateMachine {
                 );
             }
         }
-        Ok(Applied { events: vec![Event::QuotaEntityConfigured { entity: c.entity }] })
+        Ok(Applied {
+            events: vec![Event::QuotaEntityConfigured { entity: c.entity }],
+        })
     }
 
     fn update_policy(&mut self, c: &UpdatePolicy) -> ApplyResult {
@@ -753,7 +811,9 @@ impl StateMachine {
         // In-flight charge records keep their recorded rate and multiplier;
         // decay re-times from each entity's next touch (ADR 0019).
         self.policy = c.policy.clone();
-        Ok(Applied { events: vec![Event::PolicyUpdated] })
+        Ok(Applied {
+            events: vec![Event::PolicyUpdated],
+        })
     }
 
     fn bump_cluster_version(&mut self, c: &BumpClusterVersion) -> ApplyResult {
@@ -764,7 +824,9 @@ impl StateMachine {
             });
         }
         self.cluster_version = c.to;
-        Ok(Applied { events: vec![Event::ClusterVersionBumped { to: c.to }] })
+        Ok(Applied {
+            events: vec![Event::ClusterVersionBumped { to: c.to }],
+        })
     }
 
     // ---- Shared effect helpers (infallible; validation happened first) ----
@@ -779,7 +841,12 @@ impl StateMachine {
         }
     }
 
-    fn attempt_transition(&mut self, attempt: AttemptId, to: AttemptState, events: &mut Vec<Event>) {
+    fn attempt_transition(
+        &mut self,
+        attempt: AttemptId,
+        to: AttemptState,
+        events: &mut Vec<Event>,
+    ) {
         if let Some(a) = self.attempts.get_mut(&attempt) {
             if a.attempt.state != to {
                 a.attempt.state = to.clone();
@@ -788,8 +855,15 @@ impl StateMachine {
         }
     }
 
-    fn mark_attempt_running(&mut self, attempt: AttemptId, observed_at_us: i64, events: &mut Vec<Event>) {
-        let Some(a) = self.attempts.get_mut(&attempt) else { return };
+    fn mark_attempt_running(
+        &mut self,
+        attempt: AttemptId,
+        observed_at_us: i64,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(a) = self.attempts.get_mut(&attempt) else {
+            return;
+        };
         if a.started_at_us.is_none() {
             a.started_at_us = Some(observed_at_us);
         }
@@ -817,7 +891,9 @@ impl StateMachine {
         pledge: bool,
         events: &mut Vec<Event>,
     ) {
-        let Some(a) = self.attempts.get(&attempt) else { return };
+        let Some(a) = self.attempts.get(&attempt) else {
+            return;
+        };
         if a.attempt.state.is_terminal() {
             return;
         }
@@ -835,7 +911,11 @@ impl StateMachine {
         // actual cost zero — which is exactly what makes revocation requeue
         // free without a special case.
         let actual = if started {
-            quota::cost_from_rate(rate, quota::runtime_seconds_ceil(actual_runtime_us), multiplier)
+            quota::cost_from_rate(
+                rate,
+                quota::runtime_seconds_ceil(actual_runtime_us),
+                multiplier,
+            )
         } else {
             CostUnits::ZERO
         };
@@ -848,8 +928,15 @@ impl StateMachine {
         self.resolve_job(job, &outcome, events);
     }
 
-    fn release_allocation(&mut self, allocation: AllocationId, pledge: bool, events: &mut Vec<Event>) {
-        let Some(rec) = self.allocations.get_mut(&allocation) else { return };
+    fn release_allocation(
+        &mut self,
+        allocation: AllocationId,
+        pledge: bool,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(rec) = self.allocations.get_mut(&allocation) else {
+            return;
+        };
         if rec.allocation.state == AllocationState::Released {
             return;
         }
@@ -864,7 +951,9 @@ impl StateMachine {
 
     /// Resolve the job after its attempt reached a terminal outcome.
     fn resolve_job(&mut self, job: JobId, outcome: &AttemptOutcome, events: &mut Vec<Event>) {
-        let Some(rec) = self.jobs.get(&job) else { return };
+        let Some(rec) = self.jobs.get(&job) else {
+            return;
+        };
         if rec.state.is_terminal() {
             return;
         }
@@ -892,7 +981,9 @@ impl StateMachine {
                 if abort_pending {
                     Resolution::Terminal(JobState::Aborted)
                 } else {
-                    Resolution::Requeue { consume_budget: false }
+                    Resolution::Requeue {
+                        consume_budget: false,
+                    }
                 }
             }
             // Deterministic recurrence: never retried, opt-in does not apply.
@@ -905,7 +996,9 @@ impl StateMachine {
                 };
                 // Abort wins over retry: once requested, never back to Queued.
                 if eligible && !abort_pending && retries_used < retry.max_retries {
-                    Resolution::Requeue { consume_budget: true }
+                    Resolution::Requeue {
+                        consume_budget: true,
+                    }
                 } else {
                     Resolution::Terminal(JobState::Failed)
                 }
@@ -933,7 +1026,9 @@ impl StateMachine {
     /// Advertised capacity minus the funded holds of every live allocation
     /// on the node.
     fn free_capacity(&self, node: &NodeId) -> Resources {
-        let Some(rec) = self.nodes.get(node) else { return Resources::ZERO };
+        let Some(rec) = self.nodes.get(node) else {
+            return Resources::ZERO;
+        };
         let mut used = Resources::ZERO;
         for a in self.allocations.values() {
             if a.allocation.node == *node && a.allocation.state != AllocationState::Released {
@@ -963,8 +1058,13 @@ impl StateMachine {
             if free.is_zero() {
                 break;
             }
-            let Some(rec) = self.allocations.get_mut(&alloc_id) else { continue };
-            let need = rec.allocation.requested.saturating_sub(&rec.allocation.funded);
+            let Some(rec) = self.allocations.get_mut(&alloc_id) else {
+                continue;
+            };
+            let need = rec
+                .allocation
+                .requested
+                .saturating_sub(&rec.allocation.funded);
             let pledge = free.component_min(&need);
             if pledge.is_zero() {
                 continue;
@@ -974,12 +1074,18 @@ impl StateMachine {
             if rec.allocation.funded == rec.allocation.requested {
                 rec.allocation.state = AllocationState::Funded;
                 self.accrual_queue.remove(&(node, seq));
-                events.push(Event::AllocationFunded { allocation: alloc_id });
+                events.push(Event::AllocationFunded {
+                    allocation: alloc_id,
+                });
                 newly_funded.push(alloc_id);
             }
         }
         for alloc_id in newly_funded {
-            if let Some(attempt) = self.allocations.get(&alloc_id).map(|r| r.allocation.attempt) {
+            if let Some(attempt) = self
+                .allocations
+                .get(&alloc_id)
+                .map(|r| r.allocation.attempt)
+            {
                 self.check_ready_barrier(attempt, events);
             }
         }
@@ -990,7 +1096,9 @@ impl StateMachine {
     /// v1 groups are singletons, but the evaluation is group-shaped from day
     /// one so gang scheduling adds members, not mechanism.
     fn check_ready_barrier(&mut self, attempt: AttemptId, events: &mut Vec<Event>) {
-        let Some(group) = self.attempts.get(&attempt).map(|a| a.group) else { return };
+        let Some(group) = self.attempts.get(&attempt).map(|a| a.group) else {
+            return;
+        };
         let mut members: Vec<AttemptId> = Vec::new();
         for (id, a) in &self.attempts {
             if a.group == group && !a.attempt.state.is_terminal() {
@@ -1002,7 +1110,10 @@ impl StateMachine {
                 .get(id)
                 .and_then(|a| self.allocations.get(&a.attempt.allocation))
                 .map(|r| {
-                    matches!(r.allocation.state, AllocationState::Funded | AllocationState::Active)
+                    matches!(
+                        r.allocation.state,
+                        AllocationState::Funded | AllocationState::Active
+                    )
                 })
                 .unwrap_or(false)
         });
@@ -1030,7 +1141,9 @@ impl StateMachine {
         let mut cur = Some(entity);
         for _ in 0..QUOTA_TREE_DEPTH_CAP {
             let Some(id) = cur else { break };
-            let Some(e) = self.quota_entities.get_mut(&id) else { break };
+            let Some(e) = self.quota_entities.get_mut(&id) else {
+                break;
+            };
             e.usage.charge(amount, ts_us, &decay);
             cur = e.parent;
         }
@@ -1041,7 +1154,9 @@ impl StateMachine {
         let mut cur = Some(entity);
         for _ in 0..QUOTA_TREE_DEPTH_CAP {
             let Some(id) = cur else { break };
-            let Some(e) = self.quota_entities.get_mut(&id) else { break };
+            let Some(e) = self.quota_entities.get_mut(&id) else {
+                break;
+            };
             e.usage.settle(adjustment, ts_us, &decay);
             cur = e.parent;
         }

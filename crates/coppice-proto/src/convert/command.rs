@@ -7,14 +7,14 @@
 //! single-allocation placements) pass through untouched so apply can reject
 //! them itself.
 
+use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_state::command::{
-    AbortJob, AllocationSpec, BumpClusterVersion, Command, CommitPlacements,
-    ConfigureQuotaEntity, DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, LostAttempt,
-    Placement, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RegisterNode, SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    AbortJob, AllocationSpec, BumpClusterVersion, Command, CommitPlacements, ConfigureQuotaEntity,
+    DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, LostAttempt, Placement, ReconcileNode,
+    RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RegisterNode,
+    SetNodeSchedulable, SubmitJob, UpdatePolicy,
 };
 use coppice_state::PolicyConfig;
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
 
 use super::core::{labels_from_pb, labels_to_pb, multipliers_from_pb, multipliers_to_pb};
 use super::{req, ConvertError};
@@ -44,7 +44,10 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::UpdatePolicy(c) => Body::UpdatePolicy(c.into()),
         Command::BumpClusterVersion(c) => Body::BumpClusterVersion(c.into()),
     };
-    pb::Command { version: cluster_version, body: Some(body) }
+    pb::Command {
+        version: cluster_version,
+        body: Some(body),
+    }
 }
 
 /// Unwrap the envelope, returning the version it was written under.
@@ -309,8 +312,16 @@ impl TryFrom<pb::ReconcileNode> for ReconcileNode {
         Ok(ReconcileNode {
             node: req(c.node, "ReconcileNode.node")?.try_into()?,
             node_epoch: c.node_epoch,
-            adopted: c.adopted.into_iter().map(TryInto::try_into).collect::<Result<_, _>>()?,
-            lost: c.lost.into_iter().map(TryInto::try_into).collect::<Result<_, _>>()?,
+            adopted: c
+                .adopted
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            lost: c
+                .lost
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             observed_at_us: c.observed_at_us,
         })
     }
@@ -366,7 +377,10 @@ impl TryFrom<pb::RegisterNode> for RegisterNode {
 
 impl From<&DeclareNodeLost> for pb::DeclareNodeLost {
     fn from(c: &DeclareNodeLost) -> Self {
-        pb::DeclareNodeLost { node: Some(c.node.into()), declared_at_us: c.declared_at_us }
+        pb::DeclareNodeLost {
+            node: Some(c.node.into()),
+            declared_at_us: c.declared_at_us,
+        }
     }
 }
 
@@ -419,7 +433,11 @@ impl TryFrom<pb::EvictTerminalJobs> for EvictTerminalJobs {
 
     fn try_from(c: pb::EvictTerminalJobs) -> Result<Self, ConvertError> {
         Ok(EvictTerminalJobs {
-            jobs: c.jobs.into_iter().map(TryInto::try_into).collect::<Result<_, _>>()?,
+            jobs: c
+                .jobs
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             evicted_at_us: c.evicted_at_us,
         })
     }
@@ -455,7 +473,10 @@ impl TryFrom<pb::ConfigureQuotaEntity> for ConfigureQuotaEntity {
 
 impl From<&UpdatePolicy> for pb::UpdatePolicy {
     fn from(c: &UpdatePolicy) -> Self {
-        pb::UpdatePolicy { policy: Some((&c.policy).into()), updated_at_us: c.updated_at_us }
+        pb::UpdatePolicy {
+            policy: Some((&c.policy).into()),
+            updated_at_us: c.updated_at_us,
+        }
     }
 }
 
@@ -472,7 +493,10 @@ impl TryFrom<pb::UpdatePolicy> for UpdatePolicy {
 
 impl From<&BumpClusterVersion> for pb::BumpClusterVersion {
     fn from(c: &BumpClusterVersion) -> Self {
-        pb::BumpClusterVersion { to: c.to, bumped_at_us: c.bumped_at_us }
+        pb::BumpClusterVersion {
+            to: c.to,
+            bumped_at_us: c.bumped_at_us,
+        }
     }
 }
 
@@ -480,7 +504,10 @@ impl TryFrom<pb::BumpClusterVersion> for BumpClusterVersion {
     type Error = ConvertError;
 
     fn try_from(c: pb::BumpClusterVersion) -> Result<Self, ConvertError> {
-        Ok(BumpClusterVersion { to: c.to, bumped_at_us: c.bumped_at_us })
+        Ok(BumpClusterVersion {
+            to: c.to,
+            bumped_at_us: c.bumped_at_us,
+        })
     }
 }
 

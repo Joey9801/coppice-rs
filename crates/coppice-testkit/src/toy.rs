@@ -171,7 +171,9 @@ fn header_bytes(magic: &[u8; 8]) -> Vec<u8> {
 /// Validate a file's leading header, returning the body that follows.
 fn check_header<'a>(bytes: &'a [u8], magic: &[u8; 8], what: &str) -> io::Result<&'a [u8]> {
     if bytes.len() < HEADER_LEN as usize {
-        return Err(fail_stop(format!("{what}: shorter than a container header")));
+        return Err(fail_stop(format!(
+            "{what}: shorter than a container header"
+        )));
     }
     let (head, body) = bytes.split_at(HEADER_LEN as usize);
     if &head[0..8] != magic {
@@ -181,7 +183,9 @@ fn check_header<'a>(bytes: &'a [u8], magic: &[u8; 8], what: &str) -> io::Result<
     if version != CONTAINER_VERSION {
         // ADR 0015: unknown or above-range container versions refuse to
         // start; there is no best-effort parse.
-        return Err(fail_stop(format!("{what}: unsupported container version {version}")));
+        return Err(fail_stop(format!(
+            "{what}: unsupported container version {version}"
+        )));
     }
     let crc = u32::from_le_bytes(head[12..16].try_into().unwrap());
     if crc != crc32c::crc32c(&head[0..12]) {
@@ -272,7 +276,12 @@ impl Manifest {
 /// The one way any structural fact changes: atomic-swap the manifest
 /// (ADR 0017). Durable on return.
 fn swap_manifest<F: Fs>(fs: &F, m: &Manifest) -> io::Result<()> {
-    write_atomic(fs, Path::new("manifest"), Path::new("manifest.tmp"), &m.encode())
+    write_atomic(
+        fs,
+        Path::new("manifest"),
+        Path::new("manifest.tmp"),
+        &m.encode(),
+    )
 }
 
 // ---- Vote file ----
@@ -321,11 +330,17 @@ fn frame(index: u64, payload: &[u8]) -> Vec<u8> {
 
 /// One parsed frame, or where and why parsing stopped.
 enum FrameScan {
-    Frame { index: u64, payload: Vec<u8>, next_offset: u64 },
+    Frame {
+        index: u64,
+        payload: Vec<u8>,
+        next_offset: u64,
+    },
     /// The bytes from `offset` do not form a whole, CRC-valid frame. Whether
     /// this is a self-healing torn tail or fail-stop corruption is the
     /// caller's decision — it depends on position, which the caller knows.
-    Bad { offset: u64 },
+    Bad {
+        offset: u64,
+    },
     End,
 }
 
@@ -349,7 +364,11 @@ fn scan_frame(bytes: &[u8], offset: u64) -> FrameScan {
     if want != crc {
         return FrameScan::Bad { offset };
     }
-    FrameScan::Frame { index, payload: payload.to_vec(), next_offset: offset + 16 + len as u64 }
+    FrameScan::Frame {
+        index,
+        payload: payload.to_vec(),
+        next_offset: offset + 16 + len as u64,
+    }
 }
 
 // ---- Snapshot container ----
@@ -375,13 +394,17 @@ fn decode_snapshot(bytes: &[u8], want_upto: u64) -> io::Result<Vec<u8>> {
     let upto = r.u64()?;
     let crc = r.u32()?;
     if footer[12..20] != SNAP_FOOT_MAGIC {
-        return Err(fail_stop("snapshot: missing closing magic (truncated write adopted?)"));
+        return Err(fail_stop(
+            "snapshot: missing closing magic (truncated write adopted?)",
+        ));
     }
     if crc != crc32c::crc32c(payload) {
         return Err(fail_stop("snapshot: payload CRC mismatch"));
     }
     if upto != want_upto {
-        return Err(fail_stop("snapshot: footer index disagrees with the manifest pointer"));
+        return Err(fail_stop(
+            "snapshot: footer index disagrees with the manifest pointer",
+        ));
     }
     Ok(payload.to_vec())
 }
@@ -428,7 +451,9 @@ impl ToyConfig {
             || manifest.node_id != self.node_id
             || manifest.instance_uuid != self.instance_uuid
         {
-            return Err(fail_stop("identity stamp mismatch: wrong volume for this node"));
+            return Err(fail_stop(
+                "identity stamp mismatch: wrong volume for this node",
+            ));
         }
 
         // Step 2: delete orphans the manifest does not claim. An un-synced
@@ -495,9 +520,7 @@ impl ToyConfig {
         // ordering bug upstream — fail stop, never adopt-and-hope.
         let snapshot_payload = match manifest.snapshot {
             None => None,
-            Some((no, upto)) => {
-                Some(decode_snapshot(&read_to_vec(fs, &snap_path(no))?, upto)?)
-            }
+            Some((no, upto)) => Some(decode_snapshot(&read_to_vec(fs, &snap_path(no))?, upto)?),
         };
 
         // Step 5 ends with reporting vote, floor, log range, snapshot.
@@ -546,7 +569,10 @@ fn read_segment<F: Fs>(
         // Segments are made durable (file + dir fsync) before the manifest
         // claims them, so a claimed-but-missing segment means acknowledged
         // entries are gone.
-        return Err(fail_stop(format!("claimed segment {} is missing", path.display())));
+        return Err(fail_stop(format!(
+            "claimed segment {} is missing",
+            path.display()
+        )));
     }
     let bytes = read_to_vec(fs, &path)?;
     check_header(&bytes, &SEG_MAGIC, "segment")?;
@@ -567,7 +593,11 @@ fn read_segment<F: Fs>(
             }
         }
         match scan_frame(&bytes, offset) {
-            FrameScan::Frame { index, payload, next_offset } => {
+            FrameScan::Frame {
+                index,
+                payload,
+                next_offset,
+            } => {
                 if index != expected {
                     return Err(fail_stop(format!(
                         "segment {start}: frame index {index} where {expected} was expected"
@@ -577,9 +607,7 @@ fn read_segment<F: Fs>(
                 expected += 1;
                 offset = next_offset;
             }
-            FrameScan::End | FrameScan::Bad { .. }
-                if live_end.is_some_and(|le| expected <= le) =>
-            {
+            FrameScan::End | FrameScan::Bad { .. } if live_end.is_some_and(|le| expected <= le) => {
                 // The chain or logical end promises entries we cannot read:
                 // acknowledged state is damaged. Never truncate here.
                 return Err(fail_stop(format!(
@@ -610,9 +638,10 @@ impl<F: Fs + Clone> ToyStore<F> {
             StorageOp::SetVote { term, voted_for } => self.set_vote(*term, *voted_for),
             StorageOp::TruncateSuffix { from } => self.truncate_suffix(*from),
             StorageOp::Purge { upto } => self.purge(*upto),
-            StorageOp::InstallSnapshot { upto_index, payload } => {
-                self.install_snapshot(*upto_index, payload)
-            }
+            StorageOp::InstallSnapshot {
+                upto_index,
+                payload,
+            } => self.install_snapshot(*upto_index, payload),
             StorageOp::Rotate => self.rotate(),
         }
     }
@@ -750,7 +779,12 @@ impl<F: Fs + Clone> ToyStore<F> {
         // its live range ends where the next segment starts, or at the last
         // in-memory entry for the tail segment.
         let mut m = self.manifest.clone();
-        let last_live = self.entries.keys().next_back().copied().unwrap_or(m.purge_floor);
+        let last_live = self
+            .entries
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(m.purge_floor);
         let starts = m.segments.clone();
         let covered: Vec<u64> = starts
             .iter()
@@ -877,15 +911,24 @@ mod tests {
         let fs = SimFs::new(SimConfig::default());
         let ops = [
             payloads(&[10, 5000, 100]),
-            StorageOp::SetVote { term: 3, voted_for: 2 },
+            StorageOp::SetVote {
+                term: 3,
+                voted_for: 2,
+            },
             StorageOp::Rotate,
             payloads(&[64]),
-            StorageOp::InstallSnapshot { upto_index: 2, payload: vec![7; 40] },
+            StorageOp::InstallSnapshot {
+                upto_index: 2,
+                payload: vec![7; 40],
+            },
             StorageOp::Purge { upto: 2 },
         ];
         let store = store_with(&fs, &ops);
         let before = store.observe();
-        assert_eq!(before.entries.keys().copied().collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            before.entries.keys().copied().collect::<Vec<_>>(),
+            vec![3, 4]
+        );
         assert_eq!(before.vote, Some((3, 2)));
         assert_eq!(before.purge_floor, 2);
         assert_eq!(before.snapshot, Some((2, vec![7; 40])));
@@ -907,7 +950,10 @@ mod tests {
             ],
         );
         let obs = store.observe();
-        assert_eq!(obs.entries.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            obs.entries.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
         // The truncated segment keeps its stale physical bytes; the new
         // entries live in a fresh segment starting at 3.
         assert!(fs.exists(Path::new("log/1.seg")).unwrap());
@@ -927,7 +973,10 @@ mod tests {
     fn wrong_identity_is_refused() {
         let fs = SimFs::new(SimConfig::default());
         ToyConfig::default().init(&fs).unwrap();
-        let other = ToyConfig { node_id: 99, ..ToyConfig::default() };
+        let other = ToyConfig {
+            node_id: 99,
+            ..ToyConfig::default()
+        };
         let err = other.open(&fs).map(|_| ()).unwrap_err();
         assert!(err.to_string().contains("identity"), "{err}");
     }
