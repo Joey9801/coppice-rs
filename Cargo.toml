@@ -19,7 +19,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.79"
 license = "Apache-2.0"
-repository = "https://github.com/josephroberts/coppice"
+repository = "https://github.com/Joey9801/coppice-rs"
 authors = ["The Coppice Authors"]
 
 [workspace.dependencies]
