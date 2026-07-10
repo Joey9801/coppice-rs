@@ -20,7 +20,7 @@ waive them.
 | [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Resolved (2026-07-10, ADR 0026) | — |
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
-| [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open | Do not advertise the 1M-job target as supported |
+| [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, and instrumentation resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
 
@@ -307,7 +307,10 @@ exactly as with no backfill stream.
 ## KOI-5: View and snapshot publication do not fit the 1M-job target
 
 - **Severity:** High
-- **Status:** Open
+- **Status:** Open — the clone-cost, copy-count, and instrumentation halves
+  are resolved (2026-07-10,
+  [ADR 0028](../decisions/0028-persistent-state-maps.md)); the enforced
+  performance gate is not
 - **Affected capability:** target-scale operation, strong reads, scheduling,
   and snapshot recovery
 - **Related design:** [clone-cost analysis](../architecture/coordinator-runtime.md#clone-cost-analysis),
@@ -322,46 +325,62 @@ copies to create a credible out-of-memory risk.
 
 ### Current violation
 
-The coordinator-runtime design already estimates a deep clone of target-scale
-state at hundreds of milliseconds to roughly one second and calls that
-unacceptable. The implementation nevertheless deep-clones the full
-`StateMachine` whenever a view is published
-([view publication](../../crates/coppice-consensus/src/view.rs)). Strong-read
-demand can request early publication, so this work occurs on the sole apply
-task.
+~~The coordinator-runtime design already estimates a deep clone of
+target-scale state at hundreds of milliseconds to roughly one second and
+calls that unacceptable. The implementation nevertheless deep-clones the full
+`StateMachine` whenever a view is published.~~ **Resolved 2026-07-10.**
+ADR 0028 makes the job-scaled maps persistent (`imbl::OrdMap`), so the
+publish-time clone is O(1) structural sharing at any job count
+([view publication](../../crates/coppice-consensus/src/view.rs)); an ignored
+release-mode test bounds the 1M-job clone.
 
-Snapshot capture makes another full clone in the apply task, then builds a
-second record representation, per-shard encoded buffers, and finally a complete
-container `Vec<u8>` before writing it
-([snapshot capture](../../crates/coppice-consensus/src/apply_loop.rs),
-[snapshot builder](../../crates/coppice-consensus/src/storage/sm.rs),
-[snapshot codec](../../crates/coppice-consensus/src/storage/snapshot.rs)). At
-target scale, several large copies can coexist.
+~~Snapshot capture makes another full clone in the apply task, then builds a
+second record representation, per-shard encoded buffers, and finally a
+complete container `Vec<u8>` before writing it.~~ **Resolved 2026-07-10.**
+Capture reuses the published view's clone
+([snapshot capture](../../crates/coppice-consensus/src/apply_loop.rs)),
+sections are converted and encoded lazily per shard straight from the
+captured state ([snapshot builder](../../crates/coppice-consensus/src/storage/sm.rs)),
+and both build and install stream the container to/from the durable file
+([snapshot codec](../../crates/coppice-consensus/src/storage/snapshot.rs)).
+Peak build memory is the live state plus a structurally shared capture plus
+a bounded set of in-flight section buffers.
 
-The design promises a `coordinator_view_clone_seconds` histogram and an
+~~The design promises a `coordinator_view_clone_seconds` histogram and an
 apply-stall measurement to trigger the structural-sharing escape hatch; those
-metrics are not implemented. The million-job tests are also ignored in the
-normal test suite.
+metrics are not implemented.~~ **Resolved 2026-07-10.** The histogram,
+apply-batch and snapshot-capture/build stall timings, and state-size gauges
+exist behind the `describe_metrics()`/`gather_metrics()` module pattern; a
+/metrics endpoint to export them is still future work. The million-job tests
+remain ignored in the normal test suite, and no release-mode performance job
+runs them — this half stays open.
 
 ### Impact
 
-- Long pauses in Raft application, follower catch-up, strong reads, scheduling,
-  and event production.
-- High transient memory use and possible process OOM during snapshots.
+- ~~Long pauses in Raft application, follower catch-up, strong reads,
+  scheduling, and event production.~~ Resolved: publish and capture are O(1)
+  on the apply task; apply pays a modest O(log n) path-copy overhead
+  (single-digit percent on the recovery-replay benchmark).
+- ~~High transient memory use and possible process OOM during snapshots.~~
+  Resolved: no full-state protobuf copy or whole-container buffer exists on
+  either the build or install path.
 - The published scale target is not backed by a routinely exercised gate.
 
 ### Resolution requirements
 
-- Instrument view publication and snapshot capture before claiming a supported
-  operating envelope.
-- Replace full deep clones with structural sharing, immutable/versioned state,
-  or another representation whose snapshot acquisition is bounded and cheap.
-- Stream locally built snapshot sections to the durable file rather than
+- ~~Instrument view publication and snapshot capture before claiming a
+  supported operating envelope.~~ Done — `coordinator_view_clone_seconds`,
+  apply-batch/snapshot-capture/snapshot-build histograms, state-size gauges.
+- ~~Replace full deep clones with structural sharing, immutable/versioned
+  state, or another representation whose snapshot acquisition is bounded and
+  cheap.~~ Done — ADR 0028.
+- ~~Stream locally built snapshot sections to the durable file rather than
   retaining all record copies, section buffers, and the complete container
-  simultaneously.
+  simultaneously.~~ Done — sections encode lazily from the captured state and
+  stream to the spool file.
 - Establish explicit latency and peak-memory budgets at 10k, 100k, and 1M jobs.
-- Run the 1M scheduler, state-consistency, and snapshot tests in a release-mode
-  performance job with enforceable thresholds.
+- Run the 1M scheduler, state-consistency, clone-cost, and snapshot tests in a
+  release-mode performance job with enforceable thresholds.
 
 ### Closure criteria
 

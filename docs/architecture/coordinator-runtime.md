@@ -280,35 +280,36 @@ task.
 
 ### Clone-cost analysis
 
-Publishing a view clones the state machine. That cost is the load-bearing
+Publishing a view clones the state machine. That cost was the load-bearing
 risk of this design, so it is worth the arithmetic.
 
 The state targets **1M live jobs**. Jobs, attempts, allocations, and accrual
-entries together come to roughly **3–4M `BTreeMap` entries**; at a few hundred
-owned bytes per entry that is **on the order of 1 GB**, and a deep clone of
-that runs **hundreds of milliseconds to about a second** — unacceptable at
-cadence. The design is therefore honest about its operating envelope:
+entries together come to roughly **3–4M ordered-map entries**; at a few
+hundred owned bytes per entry that is **on the order of 1 GB**, and a deep
+clone of that runs **hundreds of milliseconds to about a second** —
+unacceptable against the 100 ms cadence, and already marginal (tens of ms)
+around 100k jobs.
 
-| Live jobs | State size | Deep clone | Verdict |
-| --- | --- | --- | --- |
-| ≤ 10k | ~10 MB | single-digit ms | fine — bring-up, small/medium clusters |
-| ~100k | ~100 MB | tens of ms | marginal |
-| 1M | ~1 GB | hundreds of ms – ~1 s | unacceptable at cadence |
+That arithmetic sat inside the documented operating envelope, so the escape
+hatch this section used to only *name* has been taken:
+[ADR 0028](../decisions/0028-persistent-state-maps.md) makes the four
+job-scaled maps persistent (`imbl::OrdMap`). A whole-state clone is now O(1)
+structural sharing regardless of job count; apply pays O(log n) path copying
+per mutation (bounded by the recovery-replay benchmark); deterministic
+ordered iteration and structural `Eq` are preserved. Snapshot capture reuses
+the published view's clone, so a capture costs at most the one clone the
+read path was going to pay anyway. The cadence/spacing machinery remains as
+a bound on watch-channel churn, no longer as protection against clone cost.
 
-Publishing is **instrumented from day one**, not retrofitted: a
-`coordinator_view_clone_seconds` histogram plus measured apply-stall time.
-
-**The escape-hatch trigger is a metric, not a hunch:** sustained
-`p99(coordinator_view_clone_seconds) > 25 ms`, or clone time exceeding 10% of
-the interval between publishes. The escape hatch itself is to make the ordered
-maps inside `coppice-state` persistent / structurally shared (an `im`-style
-`OrdMap`): O(1) clone, O(log n) per-operation overhead, preserving both the
-deterministic ordered iteration apply relies on and the structural `Eq` the
-determinism harness asserts. Under that representation views publish
-per-batch and the whole cadence/spacing machinery degenerates to a no-op.
-Swapping the state representation is a contested enough call to earn its own
-ADR *when* the trigger fires; **this document only names the trigger**, it
-does not pre-decide the swap.
+Publishing is **instrumented**, as originally promised: a
+`coordinator_view_clone_seconds` histogram, apply-batch and
+snapshot-capture stall histograms, and state-size gauges, all behind the
+`describe_metrics()`/`gather_metrics()` module pattern awaiting the /metrics
+endpoint. The original trigger — sustained
+`p99(coordinator_view_clone_seconds) > 25 ms`, or clone time exceeding 10%
+of the interval between publishes — stands as the regression alarm for the
+new representation, alongside the ignored release-mode test that bounds a
+1M-job clone.
 
 ### The two coordinates trap
 
