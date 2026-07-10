@@ -215,6 +215,27 @@ impl ViewPublisher {
         self.publish_at(state, applied_index, Instant::now());
     }
 
+    /// An `Arc` of the state at exactly `applied_index`, reusing the published
+    /// view when it is already current and publishing unconditionally
+    /// otherwise.
+    ///
+    /// Snapshot capture goes through here so a snapshot and the read path
+    /// share a single clone instead of taking one each (KOI-5). Reuse is sound
+    /// because `published_index` only ever equals `applied_index` when the
+    /// view was published from the state as of that index, and state mutates
+    /// only alongside an `applied_index` advance.
+    pub fn state_at(&mut self, state: &StateMachine, applied_index: u64) -> Arc<StateMachine> {
+        if self.published_index != applied_index {
+            self.publish_now(state, applied_index);
+        }
+        Arc::clone(&self.tx.borrow().state)
+    }
+
+    /// The configured routine-publish cadence, for the apply loop's tick.
+    pub fn cadence(&self) -> Duration {
+        self.config.cadence
+    }
+
     fn publish_at(&mut self, state: &StateMachine, applied_index: u64, now: Instant) {
         let view = StateView {
             state: Arc::new(state.clone()),
@@ -259,6 +280,32 @@ mod tests {
         let view = waiter.await.expect("join").expect("view");
         assert_eq!(view.applied_index(), 5);
         assert_eq!(view.version(), 42);
+    }
+
+    #[tokio::test]
+    async fn state_at_reuses_a_current_view_and_publishes_a_stale_one() {
+        let (mut publisher, views) =
+            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+
+        let state = StateMachine {
+            version: 7,
+            ..StateMachine::default()
+        };
+        publisher.publish_now(&state, 3);
+
+        // Current: the snapshot must share the published view's allocation.
+        let shared = publisher.state_at(&state, 3);
+        assert!(Arc::ptr_eq(&shared, &views.latest().state));
+
+        // Stale: a newer index forces a publish, and the two still share.
+        let newer = StateMachine {
+            version: 8,
+            ..StateMachine::default()
+        };
+        let republished = publisher.state_at(&newer, 4);
+        assert_eq!(views.latest().applied_index(), 4);
+        assert_eq!(republished.version, 8);
+        assert!(Arc::ptr_eq(&republished, &views.latest().state));
     }
 
     #[tokio::test]

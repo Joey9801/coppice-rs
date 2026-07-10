@@ -16,8 +16,6 @@
 //! committed log so every replica derives identical batches and cursor
 //! positions (ADR 0008, KOI-3).
 
-use std::sync::Arc;
-
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -25,7 +23,7 @@ use coppice_state::StateMachine;
 
 use crate::adapter::ApplyRequest;
 use crate::events::{EventBatch, EventTap};
-use crate::view::{ViewPublisher, ViewPublisherConfig};
+use crate::view::ViewPublisher;
 
 /// Run the apply loop until the request channel closes.
 ///
@@ -49,7 +47,7 @@ pub(crate) async fn run(
     // The cadence tick lives here (not in the publisher), so a strong-read
     // barrier resolves even on an idle log; skip missed ticks so a stall does
     // not produce a burst of catch-up publishes.
-    let mut cadence = tokio::time::interval(ViewPublisherConfig::default().cadence);
+    let mut cadence = tokio::time::interval(publisher.cadence());
     cadence.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -84,7 +82,11 @@ pub(crate) async fn run(
                         let _ = reply.send(outcomes);
                     }
                     ApplyRequest::Snapshot { reply } => {
-                        let _ = reply.send((Arc::new(state.clone()), applied_index));
+                        // Share one clone with the view watch instead of
+                        // taking a second: reuse the published view when it
+                        // is current, publish (and reset the cadence clock)
+                        // when it is not.
+                        let _ = reply.send((publisher.state_at(&state, applied_index), applied_index));
                     }
                     ApplyRequest::Install { state: new_state, applied_index: idx, reply } => {
                         state = *new_state;
@@ -109,10 +111,12 @@ pub(crate) async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use tokio::sync::oneshot;
 
     use crate::events::TapItem;
-    use crate::view::ViewPublisher;
+    use crate::view::{ViewPublisher, ViewPublisherConfig};
 
     use super::*;
 
@@ -238,6 +242,77 @@ mod tests {
         assert_eq!(one_request, expected);
         assert_eq!(singletons, expected);
         assert_eq!(pairs, expected);
+    }
+
+    #[tokio::test]
+    async fn snapshot_capture_shares_the_published_view() {
+        let (publisher, views) =
+            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+        let (tap, _tap_rx) = EventTap::channel(8);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
+
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Apply {
+            entries: vec![(7, bump_command(1))],
+            reply,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap();
+
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Snapshot { reply }).await.unwrap();
+        let (snapshot, index) = reply_rx.await.unwrap();
+        assert_eq!(index, 7);
+        assert_eq!(snapshot.cluster_version, 1);
+
+        // Capturing published (or reused) the index-7 view; the snapshot and
+        // the read path must be the same allocation, not two clones.
+        let view = views.at_least(7).await.unwrap();
+        assert!(std::ptr::eq(view.state(), snapshot.as_ref()));
+
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cadence_tick_uses_the_configured_cadence() {
+        let config = ViewPublisherConfig {
+            cadence: Duration::from_millis(20),
+            demand_spacing: Duration::from_millis(1),
+        };
+        let (publisher, views) = ViewPublisher::new(StateMachine::default(), config);
+        let (tap, _tap_rx) = EventTap::channel(8);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
+
+        // Apply right after the post-recovery publish: the batch publish is
+        // suppressed (cadence not yet elapsed, no demand registered), so the
+        // view can only advance via the routine tick.
+        let start = Instant::now();
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Apply {
+            entries: vec![(3, bump_command(1))],
+            reply,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap();
+
+        // Poll `latest` only — `at_least` would register demand and publish
+        // early, hiding the cadence. A tick from the configured 20 ms cadence
+        // lands well before the 100 ms default the loop once hardcoded.
+        while views.latest().applied_index() < 3 {
+            assert!(
+                start.elapsed() < Duration::from_millis(90),
+                "routine publish did not use the configured cadence"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        drop(tx);
+        handle.await.unwrap();
     }
 
     #[tokio::test]
