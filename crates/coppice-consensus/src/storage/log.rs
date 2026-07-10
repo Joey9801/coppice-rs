@@ -93,6 +93,13 @@ impl<F: Fs> SegmentLogStorage<F> {
     }
 }
 
+// The `Err` variant is openraft's `StorageError` (~224 bytes), which trips
+// `clippy::result_large_err`. Its size is not ours to control, and this helper
+// exists only to back `RaftLogReader::try_get_log_entries` below, whose
+// signature the trait fixes — boxing here would just mean unboxing at the trait
+// boundary. Clippy exempts the trait impl itself for exactly this reason but
+// does not extend that to free helpers.
+#[allow(clippy::result_large_err)]
 async fn get_entries<F: Fs, RB: RangeBounds<u64> + Debug>(
     core: &Arc<Mutex<StorageCore<F>>>,
     range: RB,

@@ -700,12 +700,10 @@ impl<F: Fs + Clone> ToyStore<F> {
         self.ensure_active()?;
         let (_, file, appended) = self.active.as_mut().expect("ensure_active");
         let mut batch_bytes = 0u64;
-        let mut index = self.next_index;
-        for p in payloads {
+        for (index, p) in (self.next_index..).zip(payloads) {
             let f = frame(index, p);
             batch_bytes += f.len() as u64;
             file.append(&f)?;
-            index += 1;
         }
         // Group commit: one fsync acknowledges the whole batch (ADR 0002).
         file.sync_data()?;
