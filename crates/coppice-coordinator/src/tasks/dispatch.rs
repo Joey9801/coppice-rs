@@ -4,11 +4,20 @@
 //! `DispatchAttempt`, and only after that commits does it send `StartJob` —
 //! the commit-before-send ordering of
 //! `docs/architecture/command-catalog.md#dispatchattempt`. On a
-//! `StopRequested` event it routes a `StopJob`. After any event gap (or on
-//! gaining leadership) it resyncs by scanning the latest view for `Ready`
-//! attempts and pending aborts — events emitted under a previous leader may
-//! predate this task's subscription
+//! `StopRequested` event it routes a `StopJob`. On gaining leadership (after
+//! subscribing) and after any event gap it resyncs by scanning a *strong*
+//! view for `Ready` attempts and pending aborts — events emitted under a
+//! previous leader may predate this task's subscription
 //! (`docs/architecture/coordinator-runtime.md`, "Leader transitions").
+//!
+//! Subscribe-then-resync ordering is load-bearing: every `Ready` attempt is
+//! either applied before the subscription registered — committed before
+//! `resync`'s `read_index` barrier, so its strong view shows it — or applied
+//! after, in which case the live subscription delivers it. Resyncing before
+//! subscribing leaves a window (barrier taken, subscription not yet
+//! registered) where an attempt appears in neither, and nothing re-emits
+//! `Ready`: the job would wedge exactly like the stale-view bug in
+//! `dispatch_ready_attempt`'s freshness gate below.
 
 use std::sync::Arc;
 
@@ -42,14 +51,18 @@ pub async fn run<C: Consensus>(
         };
         tracing::info!(term, "dispatch: gained leadership");
 
-        resync(&consensus, &views, &router).await;
-
+        // Subscribe BEFORE resyncing (module doc): the live subscription
+        // covers everything applied after it registers, the strong resync
+        // covers everything committed before its barrier, and this order is
+        // what makes those two ranges overlap instead of leaving a gap.
         let Ok(mut subscription) = fanout.subscribe(EventFilter::All, None).await else {
             // Fanout is gone; nothing to dispatch from until this replica
             // re-gates (which will hit the same wall, so this is really a
             // shutdown in disguise).
             continue;
         };
+
+        resync(&consensus, &views, &router).await;
 
         loop {
             tokio::select! {
@@ -68,7 +81,7 @@ pub async fn run<C: Consensus>(
                         SubscriptionItem::Gap { earliest_available } => {
                             tracing::info!(
                                 earliest_available,
-                                "dispatch: event stream gap, resyncing from the latest view"
+                                "dispatch: event stream gap, resyncing from a strong view"
                             );
                             resync(&consensus, &views, &router).await;
                         }
@@ -99,13 +112,34 @@ async fn handle_event<C: Consensus>(
     }
 }
 
-/// On gaining leadership or after any event-stream gap, rescan the latest view.
+/// On gaining leadership or after any event-stream gap, rescan a strong view.
 ///
 /// Scans for `Ready` attempts and pending aborts. At-least-once delivery plus
 /// idempotent commands make the rescan safe. See
 /// `docs/architecture/coordinator-runtime.md` ("Dispatch loop").
+///
+/// The scan must be a strong read, not `views.latest()`: the event tap emits
+/// on every apply batch while view publishing is cadence-gated, so the events
+/// this resync stands in for (missed before subscribing, or dropped in a gap)
+/// are routinely *ahead* of the latest published view. A stale scan misses a
+/// `Ready` attempt that no future event re-emits — the same silent wedge as
+/// the freshness gate in `dispatch_ready_attempt`. Every missed event was
+/// applied before this function was called, so it is committed at or below
+/// the `read_index` barrier and visible in the `at_least` view.
 async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &RouterHandle) {
-    let view = views.latest();
+    let index = match consensus.read_index().await {
+        Ok(index) => index,
+        Err(e) => {
+            // Leadership is moving or the replica is shutting down; the
+            // leadership gate in `run` re-runs resync on regain.
+            tracing::info!(error = %e, "dispatch: read_index failed during resync, skipping");
+            return;
+        }
+    };
+    let Ok(view) = views.at_least(index).await else {
+        // The apply task is gone; this replica is shutting down.
+        return;
+    };
 
     let ready_attempts: Vec<AttemptId> = view
         .state()
@@ -510,5 +544,97 @@ mod tests {
             alloc_id
         );
         assert_eq!(JobId::try_from(sj.job.unwrap()).unwrap(), job_id);
+    }
+
+    /// The resync strong read, deterministically.
+    ///
+    /// The `read_index` barrier sits at 2 while the publisher still sits at
+    /// index 0, whose state holds no attempts — the shape of a `Ready` attempt
+    /// applied ahead of the published view (the event tap emits per apply
+    /// batch; publishing is cadence-gated). A `views.latest()` scan would see
+    /// the empty state, find nothing to dispatch, and return — and since the
+    /// attempt's `Ready` event predates the subscription, nothing would ever
+    /// re-emit it. The strong read must park on `at_least(read_index)` until
+    /// the publish lands, then find the attempt and route its `StartJob`.
+    #[tokio::test]
+    async fn resync_scans_a_strong_view_not_the_latest_published_one() {
+        use coppice_state::StateMachine;
+
+        use crate::test_support::{FakeConsensus, ProposeOutcome};
+
+        let job_id = JobId::new();
+        let attempt_id = AttemptId::new();
+        let alloc_id = AllocationId::new();
+        let node = NodeId::new();
+
+        let (consensus, mut publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
+        consensus.set_read_index(2);
+        let consensus = Arc::new(consensus);
+        let views = consensus.views();
+        let (router, mut router_rx) = RouterHandle::channel_for_test();
+
+        let task = {
+            let consensus = Arc::clone(&consensus);
+            let views = views.clone();
+            let router = router.clone();
+            tokio::spawn(async move {
+                resync(&consensus, &views, &router).await;
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "resync must park until the view reaches the read_index barrier"
+        );
+        assert!(
+            router_rx.try_recv().is_err(),
+            "nothing may be routed off a view behind the barrier"
+        );
+
+        // Publish the state the barrier promises: a Ready attempt with its
+        // allocation and job, at the barrier index.
+        let mut state = StateMachine::default();
+        state.jobs.insert(
+            job_id,
+            job_record(job_id, "registry/img:1", requested(), None),
+        );
+        state.attempts.insert(
+            attempt_id,
+            attempt_record(
+                attempt_id,
+                job_id,
+                alloc_id,
+                node,
+                AttemptState::Ready,
+                None,
+            ),
+        );
+        state.allocations.insert(
+            alloc_id,
+            allocation_record(
+                alloc_id,
+                job_id,
+                attempt_id,
+                node,
+                requested(),
+                AllocationState::Funded,
+            ),
+        );
+        publisher.publish_now(&state, 2);
+
+        task.await.expect("resync task");
+
+        let routed = router_rx
+            .try_recv()
+            .expect("StartJob routed for the Ready attempt the strong view revealed");
+        assert_eq!(routed.node, node);
+        let Some(agent_command::Body::StartJob(sj)) = routed.command.body else {
+            panic!("expected StartJob");
+        };
+        assert_eq!(
+            AttemptId::try_from(sj.attempt.unwrap()).unwrap(),
+            attempt_id
+        );
     }
 }

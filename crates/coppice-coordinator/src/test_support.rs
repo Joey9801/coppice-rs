@@ -139,6 +139,7 @@ pub struct FakeConsensus {
     status_rx: watch::Receiver<ConsensusStatus>,
     views: StateViews,
     next_log_index: Mutex<u64>,
+    read_index: Mutex<u64>,
 }
 
 impl FakeConsensus {
@@ -160,8 +161,17 @@ impl FakeConsensus {
             status_rx,
             views,
             next_log_index: Mutex::new(1),
+            read_index: Mutex::new(0),
         };
         (consensus, publisher)
+    }
+
+    /// Pin the barrier [`Consensus::read_index`] returns (defaults to 0).
+    ///
+    /// Lets a test hold the linearizable read barrier *ahead* of what the
+    /// publisher has published, to exercise strong-read gating.
+    pub fn set_read_index(&self, index: u64) {
+        *self.read_index.lock().unwrap() = index;
     }
 }
 
@@ -184,7 +194,7 @@ impl Consensus for FakeConsensus {
     }
 
     async fn read_index(&self) -> Result<u64, ConsensusError> {
-        Ok(0)
+        Ok(*self.read_index.lock().unwrap())
     }
 
     fn status(&self) -> watch::Receiver<ConsensusStatus> {
