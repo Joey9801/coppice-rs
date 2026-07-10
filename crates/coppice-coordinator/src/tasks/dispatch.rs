@@ -153,12 +153,43 @@ async fn dispatch_ready_attempt<C: Consensus>(
         dispatched_at_us: now_us(),
     });
     match consensus.propose(command).await {
-        Ok(Applied { outcome: Ok(_), .. }) => {
-            let view = views.latest();
+        Ok(Applied {
+            outcome: Ok(_),
+            log_index,
+        }) => {
+            // Freshness gate. `propose` returning means the command applied to
+            // the state machine, but `views` publishes snapshots on its own
+            // cadence, so `latest()` can still sit *behind* `log_index` — and
+            // therefore behind the `CommitPlacements` that created this
+            // attempt and its allocation. Reading a stale snapshot made the
+            // two lookups below miss and silently drop the `StartJob`: the
+            // attempt is already `Dispatching`, so it never re-emits `Ready`,
+            // and `resync` only rescans `Ready` attempts, so nothing ever
+            // heals it and the job hangs forever. Wait for the view to reflect
+            // this commit, exactly as the scheduler driver does after its own
+            // propose.
+            let view = match views.at_least(log_index).await {
+                Ok(view) => view,
+                // The apply task is gone; this replica is shutting down.
+                Err(_) => return,
+            };
             let Some(record) = view.state().attempts.get(&attempt) else {
+                // Unreachable once the view reflects `log_index` — the attempt
+                // is precisely what `DispatchAttempt` just transitioned. Log
+                // rather than vanish, so a regression surfaces as a warning
+                // instead of a job wedged in `Dispatching`.
+                tracing::warn!(
+                    ?attempt,
+                    "dispatch: attempt record missing, skipping StartJob"
+                );
                 return;
             };
             let Some(allocation) = view.state().allocations.get(&record.attempt.allocation) else {
+                tracing::warn!(
+                    ?attempt,
+                    allocation = ?record.attempt.allocation,
+                    "dispatch: allocation record missing, skipping StartJob"
+                );
                 return;
             };
             let Some(job) = view.state().jobs.get(&record.attempt.job) else {
