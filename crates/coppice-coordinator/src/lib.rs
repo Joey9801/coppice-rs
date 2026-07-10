@@ -30,6 +30,10 @@ mod test_support;
 
 use anyhow::Result;
 
+// The `ControlPlane` impl, exported so integration tests exercise the same
+// submit/abort path the (future) HTTP listener will host.
+pub use tasks::api_server::CoordinatorControlPlane;
+
 /// Parse-and-dispatch entry point the binary calls.
 ///
 /// The default (no subcommand) invocation boots and runs a coordinator replica

@@ -17,7 +17,7 @@ waive them.
 | ID | Severity | Area | Status | Release impact |
 | --- | --- | --- | --- | --- |
 | [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved) | Do not enable terminal-job eviction with the stub history sink |
-| [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Open | Do not claim safely retryable job submission |
+| [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Resolved (2026-07-10, ADR 0026) | — |
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Open | Strict-backfill starvation guarantee is not established |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open | Do not advertise the 1M-job target as supported |
@@ -103,7 +103,8 @@ and an integration test queries an evicted job from the history path.
 ## KOI-2: Job submission is not idempotent across an unknown outcome
 
 - **Severity:** High
-- **Status:** Open
+- **Status:** Resolved (2026-07-10) —
+  [ADR 0026](../decisions/0026-client-minted-job-ids-idempotent-submission.md)
 - **Affected capability:** public job submission and client retries
 - **Related design:** [proposal lifecycle](../architecture/coordinator-runtime.md#proposal-lifecycle),
   [command idempotency](../architecture/command-catalog.md#idempotency-under-replay)
@@ -114,43 +115,65 @@ Retrying one logical submission after a timeout, connection loss, or leader
 change must create at most one durable job. This must hold even when the first
 request committed but its response was lost.
 
-### Current violation
+### Violation (historical)
 
-The proposal-lifecycle design argues that a duplicate `SubmitJob` is safe
-because its `JobId` will already exist. That only protects re-proposal of the
-same command. `SubmitJobRequest` carries no idempotency key or client-minted
-job identity, while `CoordinatorControlPlane::submit_job` mints a new random
-`JobId` for every invocation
-([API schema](../../proto/coppice/api/v1/api.proto),
-[API implementation](../../crates/coppice-coordinator/src/tasks/api_server.rs)).
+The proposal-lifecycle design argued that a duplicate `SubmitJob` is safe
+because its `JobId` will already exist. That only protected re-proposal of the
+same command. `SubmitJobRequest` carried no idempotency key or client-minted
+job identity, while `CoordinatorControlPlane::submit_job` minted a new random
+`JobId` for every invocation. A retry at the request boundary was therefore a
+different command with a fresh identity: if the first request committed before
+its outcome became unknown, both submissions could be accepted and both jobs
+could execute.
 
-A retry at the request boundary is therefore a different command with a fresh
-identity. If the first request committed before its outcome became unknown,
-both submissions can be accepted and both jobs can execute.
-
-### Impact
+### Impact (historical)
 
 - Duplicate workload execution and duplicate resource consumption.
 - Duplicate quota charging that is correct for the two records but incorrect
   for the user's single intent.
-- Clients cannot safely apply ordinary retry policies to transient API errors.
+- Clients could not safely apply ordinary retry policies to transient API
+  errors.
 
-### Resolution requirements
+### Resolution
 
-- Add a stable idempotency identity to the public request. A client-generated
-  submission ID or a scoped idempotency key are both viable; the scope and
-  retention window must be explicit.
-- Persist enough deduplication state in the replicated state machine so a new
-  leader gives the same answer.
-- Return the original `JobId` and commit index for a repeated completed
-  request, and define the response for a key reused with a different payload.
-- Add an integration test that drops the first successful response, retries
-  through another coordinator, and observes exactly one job and one charge.
+ADR 0026: the client mints the `JobId` (`SubmitJobRequest.job`, required) and
+it is the submission's idempotency identity; a retry re-sends the identical
+request. Resolution-requirement by resolution-requirement:
+
+- ~~Add a stable idempotency identity to the public request; the scope and
+  retention window must be explicit.~~ Done — the client-minted `JobId`. The
+  window is the job's residence in replicated state: original commit until
+  ADR 0012 eviction of the terminal record.
+- ~~Persist enough deduplication state in the replicated state machine so a
+  new leader gives the same answer.~~ Done with no new state: the replicated
+  `jobs` map is the dedup table. Apply treats an identical resubmission as an
+  accepted no-op (no events)
+  ([apply](../../crates/coppice-state/src/apply.rs)).
+- ~~Return the original `JobId` and commit index for a repeated completed
+  request, and define the response for a key reused with a different
+  payload.~~ Done — `SubmitJobResponse` echoes the id and carries `log_index`
+  (the repeat's own apply index, a valid ADR 0007 cursor); a reused id with a
+  different spec rejects deterministically as `SubmitSpecMismatch`
+  ([API schema](../../proto/coppice/api/v1/api.proto),
+  [API implementation](../../crates/coppice-coordinator/src/tasks/api_server.rs)).
+- ~~Add an integration test that drops the first successful response, retries
+  through another coordinator, and observes exactly one job~~ (done:
+  `retried_submission_across_leader_change_creates_one_job` in
+  [submit_retry.rs](../../crates/coppice-coordinator/tests/submit_retry.rs) —
+  submit through the leader, discard the response, kill the leader, retry the
+  identical request through the new leader; also covers the follower-redirect
+  and spec-mismatch paths). No quota charge exists at submission (cost is
+  charged at placement), so "one job" implies "one charge" here; the state
+  tests additionally pin the no-op (`identical_resubmission_is_an_accepted_no_op`,
+  `resubmission_stays_idempotent_after_abort_and_terminal_state` in
+  [lifecycle.rs](../../crates/coppice-state/tests/lifecycle.rs)).
 
 ### Closure criteria
 
-This issue is resolved when the public client can automatically retry an
-unknown submission outcome without a possibility of creating a second job.
+~~This issue is resolved when the public client can automatically retry an
+unknown submission outcome without a possibility of creating a second job.~~
+Met: within the documented dedup window, an identical retry can only resolve
+to the original job on every replica and across leader changes.
 
 ## KOI-3: Event cursors depend on local apply batching
 

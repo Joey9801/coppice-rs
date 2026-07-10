@@ -33,12 +33,18 @@ mirrors that seam:
 - `Invalid` — failed synchronous validation; the request is wrong, retrying
   as-is will not help.
 - `Rejected` — the command committed and apply refused it *deterministically*
-  (a racing proposer, e.g. `DuplicateJob`, `JobTerminal`): normal control flow,
-  not a server fault. The rejection taxonomy and which command produces which is
-  in
+  (a racing proposer, e.g. `SubmitSpecMismatch`, `JobTerminal`): normal control
+  flow, not a server fault. The rejection taxonomy and which command produces
+  which is in
   [../../docs/architecture/command-catalog.md](../../docs/architecture/command-catalog.md).
 - `Unavailable` — the write never resolved to a replicated decision (timeout,
   overload, seam shutting down); safe to retry.
+
+Submission is **idempotent across an unknown outcome**
+([ADR 0026](../../docs/decisions/0026-client-minted-job-ids-idempotent-submission.md)):
+the client mints the `JobId` and it is the submission's idempotency identity,
+so a retry re-sends the identical request and resolves to the original job —
+`Unavailable` and `NotLeader` are safe to retry blindly.
 
 The API is the proposer for the `SubmitJob`, `AbortJob`, and admin commands
 (`SetNodeSchedulable`, `ConfigureQuotaEntity`, `UpdatePolicy`,

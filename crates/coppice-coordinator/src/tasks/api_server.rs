@@ -41,6 +41,16 @@ impl<C> CoordinatorControlPlane<C> {
 
 impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
     async fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
+        // The client-minted job id is the submission's idempotency identity
+        // (ADR 0026): a retry re-sends the same id, and apply resolves a
+        // repeat of an already-committed submission as an accepted no-op, so
+        // the retrying caller still lands in the `Ok` arm below with the
+        // original id.
+        let job: JobId = req
+            .job
+            .ok_or_else(|| ApiError::Invalid("missing job id".into()))?
+            .try_into()
+            .map_err(invalid)?;
         let requests = req
             .requests
             .ok_or_else(|| ApiError::Invalid("missing requests".into()))?
@@ -70,7 +80,6 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 ))
             })?;
 
-        let job = JobId::new();
         let command = Command::SubmitJob(SubmitJob {
             job: Job {
                 id: job,
@@ -87,12 +96,16 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         });
 
         match self.consensus.propose(command).await {
-            // `SubmitJobResponse` carries only the minted job id; there is no
-            // commit-index field yet for ADR 0007 read-your-writes (see the
-            // `ControlPlane` trait doc) — a future proto revision would ride
-            // `log_index` here.
-            Ok(Applied { outcome: Ok(_), .. }) => Ok(SubmitJobResponse {
+            // `log_index` lets the caller pair this write with a strong read
+            // (ADR 0007 read-your-writes). On an idempotent repeat it is the
+            // repeat's own apply index — ≥ the original commit, so still a
+            // valid cursor for the job.
+            Ok(Applied {
+                outcome: Ok(_),
+                log_index,
+            }) => Ok(SubmitJobResponse {
                 job: Some(job.into()),
+                log_index,
             }),
             Ok(Applied {
                 outcome: Err(rejection),
@@ -193,7 +206,7 @@ mod tests {
         CoordinatorControlPlane::new(Arc::new(consensus), views)
     }
 
-    fn submit_request() -> SubmitJobRequest {
+    fn submit_request(job: JobId) -> SubmitJobRequest {
         SubmitJobRequest {
             image: "busybox".to_string(),
             requests: Some(pbcore::Resources { quantities: vec![] }),
@@ -201,28 +214,40 @@ mod tests {
             max_runtime_us: None,
             quota_entity: Some(coppice_core::id::QuotaEntityId::new().into()),
             retry: None,
+            job: Some(job.into()),
         }
     }
 
     #[tokio::test]
-    async fn accepted_submit_returns_the_minted_job() {
+    async fn accepted_submit_echoes_the_client_minted_job() {
         let cp = control_plane(ProposeOutcome::Accepted);
-        let response = cp.submit_job(submit_request()).await.expect("accepted");
-        assert!(response.job.is_some());
+        let job = JobId::new();
+        let response = cp.submit_job(submit_request(job)).await.expect("accepted");
+        assert_eq!(response.job, Some(job.into()));
+        assert!(response.log_index > 0);
+    }
+
+    #[tokio::test]
+    async fn submit_without_a_job_id_is_invalid() {
+        let cp = control_plane(ProposeOutcome::Accepted);
+        let mut req = submit_request(JobId::new());
+        req.job = None;
+        let result = cp.submit_job(req).await;
+        assert!(matches!(result, Err(ApiError::Invalid(_))));
     }
 
     #[tokio::test]
     async fn rejected_submit_maps_to_rejected() {
-        let reason = coppice_state::RejectionReason::DuplicateJob(JobId::new());
+        let reason = coppice_state::RejectionReason::SubmitSpecMismatch(JobId::new());
         let cp = control_plane(ProposeOutcome::Rejected(reason));
-        let result = cp.submit_job(submit_request()).await;
+        let result = cp.submit_job(submit_request(JobId::new())).await;
         assert!(matches!(result, Err(ApiError::Rejected(_))));
     }
 
     #[tokio::test]
     async fn not_leader_submit_maps_to_not_leader() {
         let cp = control_plane(ProposeOutcome::NotLeader(Some(7)));
-        let result = cp.submit_job(submit_request()).await;
+        let result = cp.submit_job(submit_request(JobId::new())).await;
         assert!(
             matches!(result, Err(ApiError::NotLeader { leader_hint: Some(hint) }) if hint == "7")
         );

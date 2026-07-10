@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass};
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
-use coppice_core::job::{AbortRequest, JobState};
+use coppice_core::job::{AbortRequest, Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::quota::{self, ChargeRecord, CostUnits, TrueUp, UsageState};
 use coppice_core::resource::Resources;
@@ -62,16 +62,27 @@ impl StateMachine {
     // ---- API-proposed ----
 
     fn submit_job(&mut self, c: &SubmitJob) -> ApplyResult {
-        if self.jobs.contains_key(&c.job.id) {
-            return Err(RejectionReason::DuplicateJob(c.job.id));
-        }
-        if !self.quota_entities.contains_key(&c.job.quota_entity) {
-            return Err(RejectionReason::UnknownQuotaEntity(c.job.quota_entity));
-        }
         if c.job.abort_requested.is_some() {
             return Err(RejectionReason::InvalidCommand(
                 "submitted job carries a pre-set abort flag".into(),
             ));
+        }
+        if let Some(existing) = self.jobs.get(&c.job.id) {
+            // The job id is the submission's idempotency identity (ADR 0026):
+            // a client retry after an unknown outcome, or a re-proposal across
+            // a leader change, re-commits the same client-minted id. When the
+            // spec matches the committed record the original commit stands —
+            // an accepted no-op with no events, so the retrying client gets
+            // success and the original JobId. An id reused with a different
+            // payload is a distinct intent and rejects.
+            return if same_submission(&existing.spec, &c.job) {
+                Ok(Applied::default())
+            } else {
+                Err(RejectionReason::SubmitSpecMismatch(c.job.id))
+            };
+        }
+        if !self.quota_entities.contains_key(&c.job.quota_entity) {
+            return Err(RejectionReason::UnknownQuotaEntity(c.job.quota_entity));
         }
         let job = c.job.id;
         self.jobs.insert(
@@ -1212,4 +1223,23 @@ impl StateMachine {
             cur = e.parent;
         }
     }
+}
+
+/// Whether a resubmitted spec is the same logical submission as the
+/// committed one (ADR 0026).
+///
+/// Compares every client-supplied field. `abort_requested` is excluded: it
+/// is apply-owned after commit (an `AbortJob` may have set it since), and
+/// `SubmitJob` validation already rejects a command that arrives with it
+/// pre-set. The command's `multiplier` and `submitted_at_us` are likewise
+/// not identity: a retry re-stamps both, and the original commit's values
+/// stay authoritative.
+fn same_submission(existing: &Job, retried: &Job) -> bool {
+    existing.id == retried.id
+        && existing.image == retried.image
+        && existing.requests == retried.requests
+        && existing.priority == retried.priority
+        && existing.max_runtime_us == retried.max_runtime_us
+        && existing.quota_entity == retried.quota_entity
+        && existing.retry == retried.retry
 }

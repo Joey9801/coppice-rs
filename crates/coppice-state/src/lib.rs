@@ -218,8 +218,8 @@ pub enum RejectionReason {
     UnknownAllocation(AllocationId),
     #[error("quota entity {0} not found")]
     UnknownQuotaEntity(QuotaEntityId),
-    #[error("job {0} already exists")]
-    DuplicateJob(JobId),
+    #[error("job {0} already exists with a different spec")]
+    SubmitSpecMismatch(JobId),
     #[error("attempt {0} already exists")]
     DuplicateAttempt(AttemptId),
     #[error("allocation {0} already exists")]

@@ -51,9 +51,11 @@ pub enum ApiError {
 ///
 /// Every method resolves only once the underlying command is committed AND
 /// applied (`Consensus::propose`'s contract) — never merely queued or
-/// merely committed. `SubmitJobResponse` carries the minted job id; a future
-/// revision that adds a commit-index field to the wire response would let
-/// callers pair a write with a strong read for read-your-writes (ADR 0007).
+/// merely committed. `SubmitJobResponse` echoes the client-minted job id —
+/// the submission's idempotency identity (ADR 0026), so a caller may retry
+/// an unknown outcome with the identical request and never create a second
+/// job — and carries the apply's `log_index` so a write can be paired with
+/// a strong read for read-your-writes (ADR 0007).
 pub trait ControlPlane: Send + Sync + 'static {
     fn submit_job(
         &self,

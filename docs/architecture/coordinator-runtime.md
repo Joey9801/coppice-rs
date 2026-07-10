@@ -408,7 +408,9 @@ step-down cannot orphan a proposal.
 **The unknown-outcome window.** A `Timeout` (or a step-down mid-proposal)
 means the outcome is genuinely *unknown* — the command may still commit later.
 Safe re-proposal rests entirely on the catalog's idempotency points: a
-duplicate `SubmitJob` rejects as `DuplicateJob`, a re-observed attempt
+`SubmitJob` repeated with its client-minted id and identical spec is an
+accepted no-op (ADR 0026 — this covers the *client's* retry at the request
+boundary, not just re-proposal of the same command), a re-observed attempt
 transition rejects as `StaleAttemptState`, an evict skips already-missing ids.
 Every re-proposal resolves to a deterministic rejection or no-op, so a retry
 after an unknown outcome can never double-apply.
