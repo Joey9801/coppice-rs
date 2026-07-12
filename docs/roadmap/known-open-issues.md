@@ -20,7 +20,7 @@ waive them.
 | [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Resolved (2026-07-10, ADR 0026) | — |
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
-| [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, and instrumentation resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
+| [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, instrumentation, and apply latency resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
 
@@ -309,8 +309,8 @@ exactly as with no backfill stream.
 - **Severity:** High
 - **Status:** Open — the clone-cost, copy-count, and instrumentation halves
   are resolved (2026-07-10,
-  [ADR 0028](../decisions/0028-persistent-state-maps.md)); the enforced
-  performance gate is not
+  [ADR 0028](../decisions/0028-persistent-state-maps.md)), as is the
+  serial-apply-latency half (2026-07-12); the enforced performance gate is not
 - **Affected capability:** target-scale operation, strong reads, scheduling,
   and snapshot recovery
 - **Related design:** [clone-cost analysis](../architecture/coordinator-runtime.md#clone-cost-analysis),
@@ -354,6 +354,16 @@ exist behind the `describe_metrics()`/`gather_metrics()` module pattern; a
 /metrics endpoint to export them is still future work. The million-job tests
 remain ignored in the normal test suite, and no release-mode performance job
 runs them — this half stays open.
+
+~~Applying a proposal at target scale stalls serial apply on its own, before
+any publication cost: `free_capacity` scanned every allocation, so a full
+cycle (~500 placements, ~500 revocations against ~1M allocations) applied in
+tens of seconds — the 1M throughput test measured only scheduling and never
+caught it.~~ **Resolved 2026-07-12.**
+`commit_placements` now builds a per-node free-capacity memo once and consults
+it for every read in the batch (state-external, thrown away after the call),
+making the apply O(N + batch·log N); the 1M cycle applies in ~0.1 s, and
+`schedule_apply.rs` now times the apply under a 1 s budget.
 
 ### Impact
 
