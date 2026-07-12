@@ -98,6 +98,15 @@ followers, which is what lets followers serve reads and event streams.
    - **apply requests** — apply each command via `StateMachine::apply` (sync,
      deterministic, bounded per the apply contract), emit events through the
      `EventTap`, `maybe_publish` a view, and reply;
+   - **cursor advances** — blank (Raft no-op) and membership entries touch
+     neither state nor the event stream, so the sm-adapter applies them itself
+     and never forwards them as commands. But the published applied index must
+     still advance past them (it is the read/event cursor — see "The two
+     coordinates trap"), or a strong read whose `read_index` barrier lands on
+     such an entry would block forever. So when a committed batch ends on one,
+     the adapter sends an `ApplyRequest::Advance` carrying that batch's final
+     index; the loop moves the cursor forward and lets the publish machinery
+     carry the view up to it;
    - **view-demand wakeups** — a strong read is waiting on an index at or
      below the committed frontier;
    - **a cadence tick** — so a strong-read barrier resolves even when the log

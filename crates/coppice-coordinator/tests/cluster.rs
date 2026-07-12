@@ -479,6 +479,54 @@ async fn three_node_cluster_lifecycle() {
     }
 }
 
+/// Regression: a strong read whose `read_index` barrier lands on a Raft no-op
+/// (the blank entry openraft appends on becoming leader) or the bootstrap
+/// membership entry must resolve — with no normal command ever proposed.
+///
+/// Those entries never reach the publishing apply task, but `read_index`
+/// returns the full Raft index, so the published view cursor has to advance
+/// past them anyway. Before the fix the cursor stalled at the last normal
+/// command (index 0 on a fresh leader), so `at_least(read_index)` blocked
+/// forever; a regression here hangs until the timeout instead of returning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strong_read_resolves_at_a_leader_noop() {
+    init_tracing();
+
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let mut node = Node::new(1, cluster_id, &ca);
+    node.boot(CliOverrides {
+        bootstrap: true,
+        join: false,
+    })
+    .await;
+    wait_for_leader(std::slice::from_ref(&node), &[0], DEADLINE).await;
+
+    // The strong-read barrier — deliberately taken with no normal command in
+    // the log, so it can only sit on the bootstrap membership entry or the
+    // leader's no-op, both of which bypass the apply task.
+    let read_index = tokio::time::timeout(DEADLINE, node.consensus().read_index())
+        .await
+        .expect("read_index returned within the deadline")
+        .expect("read_index");
+    assert!(
+        read_index >= 1,
+        "the barrier must land on a non-normal entry (membership/no-op), got {read_index}"
+    );
+
+    // The read side of the strong read: this is what used to hang.
+    let view = tokio::time::timeout(DEADLINE, node.views().at_least(read_index))
+        .await
+        .expect("strong read at a no-op/membership index must resolve, not hang")
+        .expect("view");
+    assert!(
+        view.applied_index() >= read_index,
+        "published view must have advanced past the no-op barrier"
+    );
+
+    node.graceful_stop().await;
+}
+
 /// The ADR 0016 startup identity matrix — fast, no cluster needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_matrix() {

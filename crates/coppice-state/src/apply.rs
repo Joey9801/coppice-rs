@@ -157,6 +157,7 @@ impl StateMachine {
                             c.requested_at_us,
                             true,
                             &mut events,
+                            None,
                         );
                     }
                     // In the agent's hands: signal a StopJob; the outcome
@@ -224,7 +225,15 @@ impl StateMachine {
         if !items.is_empty() {
             return Err(RejectionReason::InvalidBatch(items));
         }
-        if let Some(reason) = self.check_accrual_limit(c, &revoked) {
+
+        // One allocation scan builds the per-node funded-hold memo; every
+        // free-capacity read in this batch consults it instead of rescanning,
+        // and the batch keeps it current as it frees and seats capacity. This
+        // is what makes a target-scale apply O(batch) rather than
+        // O(batch × allocations) (KOI-5).
+        let mut used = self.used_capacity_memo();
+
+        if let Some(reason) = self.check_accrual_limit(c, &revoked, &used) {
             return Err(reason);
         }
 
@@ -241,6 +250,7 @@ impl StateMachine {
                     c.proposed_at_us,
                     true,
                     &mut events,
+                    Some(&mut used),
                 );
             }
         }
@@ -269,7 +279,7 @@ impl StateMachine {
             // standing pledge passes is capacity the accrual queue does not
             // want, so pledging it to a new allocation cannot starve the
             // queue.
-            let free = self.free_capacity(&spec.node);
+            let free = self.free_capacity(&spec.node, Some(&used));
             let funded = free.component_min(&spec.requested);
             let fully = funded == spec.requested;
             let alloc_state = if fully {
@@ -295,6 +305,9 @@ impl StateMachine {
             if !fully {
                 self.accrual_queue.insert((spec.node, seq), spec.id);
             }
+            // The seat's funded hold now loads the node for the rest of the
+            // batch's free-capacity reads.
+            Self::memo_add(&mut used, spec.node, &funded);
             // Accruing is skipped entirely when capacity is immediately
             // available (the common case).
             let attempt_state = if fully {
@@ -411,6 +424,7 @@ impl StateMachine {
         &self,
         c: &CommitPlacements,
         revoked: &BTreeSet<AllocationId>,
+        used: &BTreeMap<NodeId, Resources>,
     ) -> Option<RejectionReason> {
         let mut accruing_jobs: BTreeSet<JobId> = BTreeSet::new();
         for id in self.accrual_queue.values() {
@@ -436,7 +450,7 @@ impl StateMachine {
         }
         let mut sim_free: BTreeMap<NodeId, Resources> = BTreeMap::new();
         for node in &touched {
-            let mut free = self.free_capacity(node);
+            let mut free = self.free_capacity(node, Some(used));
             for id in revoked {
                 if let Some(a) = self.allocations.get(id) {
                     if a.allocation.node == *node {
@@ -554,6 +568,7 @@ impl StateMachine {
             c.observed_at_us,
             true,
             &mut events,
+            None,
         );
         Ok(Applied { events })
     }
@@ -639,6 +654,7 @@ impl StateMachine {
                     c.observed_at_us,
                     true,
                     &mut events,
+                    None,
                 );
             }
         }
@@ -682,7 +698,7 @@ impl StateMachine {
             }
         }
         // Capacity may have grown; fund waiting accruals.
-        self.pledge_node(c.node, &mut events);
+        self.pledge_node(c.node, &mut events, None);
         Ok(Applied { events })
     }
 
@@ -724,6 +740,7 @@ impl StateMachine {
                 c.declared_at_us,
                 false,
                 &mut events,
+                None,
             );
         }
         Ok(Applied { events })
@@ -930,7 +947,10 @@ impl StateMachine {
     /// funding cascade, quota true-up, and job resolution — all in one apply
     /// (the `Finalizing` funnel of ADR 0013).
     ///
-    /// `pledge` is false only when the node itself is lost.
+    /// `pledge` is false only when the node itself is lost. `used` is the
+    /// optional batch capacity memo threaded down to the funding cascade; only
+    /// `CommitPlacements` (which terminates in a loop) supplies one.
+    #[allow(clippy::too_many_arguments)]
     fn terminate_attempt(
         &mut self,
         attempt: AttemptId,
@@ -939,6 +959,7 @@ impl StateMachine {
         ts_us: i64,
         pledge: bool,
         events: &mut Vec<Event>,
+        used: Option<&mut BTreeMap<NodeId, Resources>>,
     ) {
         let Some(a) = self.attempts.get(&attempt) else {
             return;
@@ -954,7 +975,7 @@ impl StateMachine {
         let multiplier = a.multiplier;
 
         self.attempt_transition(attempt, AttemptState::Terminal(outcome.clone()), events);
-        self.release_allocation(allocation, pledge, events);
+        self.release_allocation(allocation, pledge, events, used);
 
         // True-up (ADR 0019): an attempt that never reached Running has
         // actual cost zero — which is exactly what makes revocation requeue
@@ -982,6 +1003,7 @@ impl StateMachine {
         allocation: AllocationId,
         pledge: bool,
         events: &mut Vec<Event>,
+        mut used: Option<&mut BTreeMap<NodeId, Resources>>,
     ) {
         let Some(rec) = self.allocations.get_mut(&allocation) else {
             return;
@@ -991,10 +1013,16 @@ impl StateMachine {
         }
         let node = rec.allocation.node;
         let seq = rec.seq;
+        let funded = rec.allocation.funded;
         rec.allocation.state = AllocationState::Released;
         self.accrual_queue.remove(&(node, seq));
+        // The freed hold returns to the node's capacity for the rest of the
+        // batch, then the pledge pass may hand some of it to waiting accruals.
+        if let Some(memo) = used.as_deref_mut() {
+            Self::memo_sub(memo, node, &funded);
+        }
         if pledge {
-            self.pledge_node(node, events);
+            self.pledge_node(node, events, used);
         }
     }
 
@@ -1082,19 +1110,70 @@ impl StateMachine {
         }
     }
 
-    /// Advertised capacity minus the funded holds of every live allocation
-    /// on the node.
-    fn free_capacity(&self, node: &NodeId) -> Resources {
+    /// Advertised capacity minus the funded holds of the node's live
+    /// (non-Released) allocations.
+    ///
+    /// `used` is an optional per-node funded-hold memo (see
+    /// [`used_capacity_memo`](Self::used_capacity_memo)). A `CommitPlacements`
+    /// batch builds one up front and threads it through every free-capacity
+    /// read — the accrual-limit check, each revocation's funding cascade, and
+    /// each placement's seat decision — so the whole batch costs one
+    /// allocation scan rather than one per item, which at target scale was the
+    /// difference between milliseconds and tens of seconds (KOI-5). Callers
+    /// outside a batch pass `None` and take the direct scan.
+    fn free_capacity(
+        &self,
+        node: &NodeId,
+        used: Option<&BTreeMap<NodeId, Resources>>,
+    ) -> Resources {
         let Some(rec) = self.nodes.get(node) else {
             return Resources::ZERO;
         };
-        let mut used = Resources::ZERO;
-        for a in self.allocations.values() {
-            if a.allocation.node == *node && a.allocation.state != AllocationState::Released {
-                used = used.saturating_add(&a.allocation.funded);
+        let used_here = match used {
+            Some(memo) => memo.get(node).copied().unwrap_or(Resources::ZERO),
+            None => {
+                let mut u = Resources::ZERO;
+                for a in self.allocations.values() {
+                    if a.allocation.node == *node && a.allocation.state != AllocationState::Released
+                    {
+                        u = u.saturating_add(&a.allocation.funded);
+                    }
+                }
+                u
+            }
+        };
+        rec.node.capacity.saturating_sub(&used_here)
+    }
+
+    /// The funded holds of every node's live allocations, in one allocation
+    /// scan — the memo `free_capacity` reads during a `CommitPlacements`
+    /// batch. Purely derived, never stored on the state: it lives only for the
+    /// duration of one `commit_placements`, which maintains it as it frees and
+    /// seats capacity (`memo_sub` / `memo_add`).
+    fn used_capacity_memo(&self) -> BTreeMap<NodeId, Resources> {
+        let mut used: BTreeMap<NodeId, Resources> = BTreeMap::new();
+        for r in self.allocations.values() {
+            if r.allocation.state != AllocationState::Released {
+                let e = used.entry(r.allocation.node).or_insert(Resources::ZERO);
+                *e = e.saturating_add(&r.allocation.funded);
             }
         }
-        rec.node.capacity.saturating_sub(&used)
+        used
+    }
+
+    /// Raise a node's funded holds in the batch memo — a fresh seat or an
+    /// accrual pledge, both of which the batch must see on later reads.
+    fn memo_add(used: &mut BTreeMap<NodeId, Resources>, node: NodeId, amount: &Resources) {
+        let e = used.entry(node).or_insert(Resources::ZERO);
+        *e = e.saturating_add(amount);
+    }
+
+    /// Return a released allocation's funded holds to free capacity in the
+    /// batch memo.
+    fn memo_sub(used: &mut BTreeMap<NodeId, Resources>, node: NodeId, amount: &Resources) {
+        if let Some(e) = used.get_mut(&node) {
+            *e = e.saturating_sub(amount);
+        }
     }
 
     /// One pledge pass: free capacity on a node flows to its accruing
@@ -1102,8 +1181,13 @@ impl StateMachine {
     ///
     /// The head takes what it needs of each dimension; dimensions it does
     /// not need flow past it.
-    fn pledge_node(&mut self, node: NodeId, events: &mut Vec<Event>) {
-        let mut free = self.free_capacity(&node);
+    fn pledge_node(
+        &mut self,
+        node: NodeId,
+        events: &mut Vec<Event>,
+        mut used: Option<&mut BTreeMap<NodeId, Resources>>,
+    ) {
+        let mut free = self.free_capacity(&node, used.as_deref());
         if free.is_zero() {
             return;
         }
@@ -1140,6 +1224,12 @@ impl StateMachine {
                     node,
                 });
                 newly_funded.push(alloc_id);
+            }
+            // The pledge stays on the same node and allocation; only the
+            // funded total grew, so the node's used capacity rises by the
+            // pledge for the rest of the batch.
+            if let Some(memo) = used.as_deref_mut() {
+                Self::memo_add(memo, node, &pledge);
             }
         }
         for alloc_id in newly_funded {

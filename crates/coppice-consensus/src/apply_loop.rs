@@ -111,6 +111,16 @@ pub(crate) async fn run(
                         metrics::histogram!(APPLY_BATCH_SECONDS)
                             .record(batch_started.elapsed().as_secs_f64());
                     }
+                    ApplyRequest::Advance { applied_index: idx, reply } => {
+                        // A Raft no-op or membership entry that touches neither
+                        // state nor the event stream. Move the cursor forward
+                        // (never back) and let the normal publish machinery —
+                        // demand wakeup and cadence tick — carry the view up to
+                        // it, so a strong read at this index resolves.
+                        applied_index = applied_index.max(idx);
+                        publisher.maybe_publish(&state, applied_index);
+                        let _ = reply.send(());
+                    }
                     ApplyRequest::Snapshot { reply } => {
                         // Share one clone with the view watch instead of
                         // taking a second: reuse the published view when it
@@ -349,6 +359,108 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn advance_lets_a_strong_read_at_a_noop_index_resolve() {
+        // Regression: a Raft no-op / membership entry never reaches the apply
+        // task, so before the fix the published cursor stalled at the last
+        // normal command and a strong read whose barrier landed on the no-op
+        // index (`read_index` returns the full Raft index) waited forever.
+        let (publisher, views) =
+            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+        let (tap, _tap_rx) = EventTap::channel(8);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
+
+        // A normal command at index 5 moves the cursor to 5.
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Apply {
+            entries: vec![(5, bump_command(1))],
+            reply,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap();
+
+        // A strong read whose barrier sits past the last normal command, at a
+        // trailing no-op index (6), must not resolve yet.
+        let waiter = tokio::spawn({
+            let views = views.clone();
+            async move { views.at_least(6).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "read at the no-op index resolved early"
+        );
+
+        // The no-op at index 6 arrives as an Advance; the cursor moves to 6 and
+        // the barrier resolves without any further normal command.
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Advance {
+            applied_index: 6,
+            reply,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap();
+
+        let view = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("read at the no-op index must resolve")
+            .expect("join")
+            .expect("view");
+        assert_eq!(view.applied_index(), 6);
+        // State is untouched by the no-op: the bump at index 5 still stands.
+        assert_eq!(view.state().cluster_version, 1);
+
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn advance_never_moves_the_cursor_backward() {
+        // A stale Advance (index below the current cursor) must be a no-op, not
+        // a regression of the published index.
+        let (publisher, views) =
+            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+        let (tap, _tap_rx) = EventTap::channel(8);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
+
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Apply {
+            entries: vec![(9, bump_command(1))],
+            reply,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap();
+        assert_eq!(views.at_least(9).await.unwrap().applied_index(), 9);
+
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Advance {
+            applied_index: 4,
+            reply,
+        })
+        .await
+        .unwrap();
+        reply_rx.await.unwrap();
+        assert_eq!(views.latest().applied_index(), 9);
+
+        // The internal cursor (not just the published view) must still be 9.
+        // A regressed cursor hides behind `maybe_publish` — a publish at 4 is
+        // suppressed as stale — but a snapshot capture trusts the cursor, and
+        // `state_at` would force-publish at 4 and move the watch backward.
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Snapshot { reply }).await.unwrap();
+        let (_state, index) = reply_rx.await.unwrap();
+        assert_eq!(index, 9);
+        assert_eq!(views.latest().applied_index(), 9);
 
         drop(tx);
         handle.await.unwrap();

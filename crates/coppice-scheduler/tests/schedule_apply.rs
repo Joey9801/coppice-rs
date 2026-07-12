@@ -361,8 +361,25 @@ fn throughput_one_million_jobs_under_budget() {
         "schedule took {elapsed:?}, over the 5 s budget"
     );
 
-    // The batch must still be legal against the state it was computed on.
+    // The batch must still be legal against the state it was computed on —
+    // and applying it must stay fast. Every placement and revocation consults
+    // free capacity on its node; when that was a scan of all ~1M allocations
+    // the serial apply of one full cycle took tens of seconds, dwarfing the
+    // sub-second schedule and blowing the KOI-5 apply-latency budget. With the
+    // per-batch free-capacity memo the apply is O(N + batch·log N).
     let mut mint = minter();
     let mut check = sm.clone();
+    let apply_start = std::time::Instant::now();
     apply_proposal(&mut check, &proposal, &mut mint).expect("the 1M-scale proposal applies");
+    let apply_elapsed = apply_start.elapsed();
+    eprintln!(
+        "apply(1_000_000 jobs) took {apply_elapsed:?}: {} placements, {} revocations",
+        proposal.placements.len(),
+        proposal.revocations.len()
+    );
+    assert!(
+        apply_elapsed < std::time::Duration::from_secs(1),
+        "serial apply took {apply_elapsed:?}, over the 1 s budget — free_capacity is scanning \
+         all allocations again"
+    );
 }
