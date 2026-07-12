@@ -20,6 +20,16 @@ pub const EVENT_TAP_CAPACITY: usize = 4096;
 /// `try_send`; on full the subscriber is marked gapped and its backlog is dropped.
 pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 1024;
 
+/// Cadence for retrying a pending `Gap` to a subscriber whose queue overflowed
+/// (or that overflowed during a cursor replay) and then saw no further events
+/// ("per-subscriber queue" row, KOI-3).
+///
+/// A gap marker is delivered on the next batch, but a subscriber that overflows
+/// and then idles would otherwise never learn it must resync. This bounds that
+/// wedge: the fanout re-attempts pending gaps on every tick once the queue has
+/// drained.
+pub const FANOUT_GAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Session tasks -> ingestion, one shared channel ("agent inbound" row).
 ///
 /// `send().await`; a full channel stalls the session's socket read, which is the

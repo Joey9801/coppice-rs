@@ -132,6 +132,12 @@ pub(crate) async fn run(
                     ApplyRequest::Install { state: new_state, applied_index: idx, reply } => {
                         state = *new_state;
                         applied_index = idx;
+                        // The applied index jumped forward over a range the
+                        // derived stream never emitted events for. Force a
+                        // discontinuity so a subscriber resyncs from strong
+                        // state instead of replaying silently across the
+                        // snapshot boundary (KOI-3).
+                        tap.force_gap();
                         // Snapshot handoff: the reader must see the exact index.
                         publisher.publish_now(&state, applied_index);
                         let _ = reply.send(());
