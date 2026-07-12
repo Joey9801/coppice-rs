@@ -216,13 +216,22 @@ pub struct ViewPublisher {
 }
 
 impl ViewPublisher {
-    /// Create a publisher seeded with `initial` state (at applied index 0) and
-    /// the matching reader handle. The apply task republishes the true index
-    /// with [`ViewPublisher::publish_now`] once it has replayed the log.
-    pub fn new(initial: StateMachine, config: ViewPublisherConfig) -> (ViewPublisher, StateViews) {
+    /// Create a publisher seeded with `initial` state at `applied_index` —
+    /// the index that state reflects — and the matching reader handle.
+    ///
+    /// The seed is what [`StateViews::latest`] serves until the apply task's
+    /// first publish, and the apply task runs unordered with the rest of
+    /// startup — early readers (the fanout's replay floor) act on the seed
+    /// before that task is ever polled. So it must carry the true recovered
+    /// index, not a placeholder.
+    pub fn new(
+        initial: StateMachine,
+        applied_index: u64,
+        config: ViewPublisherConfig,
+    ) -> (ViewPublisher, StateViews) {
         let view = StateView {
             state: Arc::new(initial),
-            applied_index: 0,
+            applied_index,
         };
         let (tx, rx) = watch::channel(view);
         let demand = Arc::new(ViewDemand {
@@ -234,7 +243,7 @@ impl ViewPublisher {
             demand: Arc::clone(&demand),
             config,
             last_published: None,
-            published_index: 0,
+            published_index: applied_index,
         };
         let views = StateViews { rx, demand };
         (publisher, views)
@@ -265,8 +274,9 @@ impl ViewPublisher {
 
     /// Publish unconditionally.
     ///
-    /// Used for the first post-replay publish and for snapshot handoff,
-    /// where the reader must see the exact index regardless of cadence.
+    /// Used for the apply loop's up-front startup publish and for snapshot
+    /// handoff, where the reader must see the exact index regardless of
+    /// cadence.
     pub fn publish_now(&mut self, state: &StateMachine, applied_index: u64) {
         self.publish_at(state, applied_index, Instant::now());
     }
@@ -327,10 +337,21 @@ impl ViewPublisher {
 mod tests {
     use super::*;
 
+    /// KOI-3: the seed view must carry the true recovered index. The fanout
+    /// reads `latest()` for its replay floor before the apply task is ever
+    /// polled, so a placeholder index 0 would let a pre-restart cursor
+    /// replay silently across the restart boundary.
+    #[test]
+    fn latest_serves_the_seed_index_before_any_publish() {
+        let (_publisher, views) =
+            ViewPublisher::new(StateMachine::default(), 100, ViewPublisherConfig::default());
+        assert_eq!(views.latest().applied_index(), 100);
+    }
+
     #[tokio::test]
     async fn at_least_resolves_after_publish() {
         let (mut publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
 
         let waiter = tokio::spawn(async move { views.at_least(5).await });
 
@@ -351,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn state_at_reuses_a_current_view_and_publishes_a_stale_one() {
         let (mut publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
 
         let state = StateMachine {
             version: 7,
@@ -377,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn idle_wakeup_fires_on_demand() {
         let (publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
 
         let woke = tokio::spawn(async move {
             publisher.idle_wakeup().await;

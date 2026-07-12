@@ -22,8 +22,7 @@ use coppice_state::{
 
 /// A read view over a hand-built state machine (published at index 1).
 pub fn view_of(state: StateMachine) -> StateView {
-    let (mut publisher, views) = ViewPublisher::new(state.clone(), ViewPublisherConfig::default());
-    publisher.publish_now(&state, 1);
+    let (_publisher, views) = ViewPublisher::new(state, 1, ViewPublisherConfig::default());
     views.latest()
 }
 
@@ -149,7 +148,7 @@ impl FakeConsensus {
     /// Also returns the [`ViewPublisher`] half the test uses to seed/advance published state.
     pub fn new(outcome: ProposeOutcome) -> (Self, ViewPublisher) {
         let (publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
         let (status_tx, status_rx) = watch::channel(ConsensusStatus {
             id: 1,
             role: Role::Leader { term: 1 },

@@ -52,9 +52,10 @@ pub(crate) fn gather_metrics() {
 
 /// Run the apply loop until the request channel closes.
 ///
-/// `initial_applied_index` is the log index the recovered `state` reflects;
-/// the loop republishes it exactly once up front (view.rs requires the true
-/// post-recovery index) before entering its `select!`.
+/// `initial_applied_index` is the log index the recovered `state` reflects —
+/// the same index the publisher's seed view carries (view.rs). The loop
+/// republishes it once up front, which seeds the startup metrics gauges and
+/// the cadence clock before entering its `select!`.
 ///
 /// Ends when every [`ApplyRequest`] sender is dropped — the adapter drops the
 /// channel at openraft shutdown (coordinator-runtime.md shutdown step 5).
@@ -66,7 +67,8 @@ pub(crate) async fn run(
     mut tap: EventTap,
 ) {
     let mut applied_index = initial_applied_index;
-    // First post-recovery publish at the true index (view.rs contract).
+    // The seed view already carries this index (view.rs); republishing seeds
+    // the startup metrics gauges and starts the cadence clock.
     publisher.publish_now(&state, applied_index);
 
     // The cadence tick lives here (not in the publisher), so a strong-read
@@ -169,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn apply_publishes_views_and_emits_events_in_order() {
         let (publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
         let (tap, mut tap_rx) = EventTap::channel(8);
         let (tx, rx) = mpsc::channel(8);
 
@@ -214,7 +216,7 @@ mod tests {
         batchings: Vec<Vec<(u64, coppice_state::Command)>>,
     ) -> Vec<(u64, Vec<coppice_state::Event>)> {
         let (publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
         let (tap, mut tap_rx) = EventTap::channel(64);
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
@@ -284,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_capture_shares_the_published_view() {
         let (publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
         let (tap, _tap_rx) = EventTap::channel(8);
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
@@ -319,7 +321,7 @@ mod tests {
             cadence: Duration::from_millis(20),
             demand_spacing: Duration::from_millis(1),
         };
-        let (publisher, views) = ViewPublisher::new(StateMachine::default(), config);
+        let (publisher, views) = ViewPublisher::new(StateMachine::default(), 0, config);
         let (tap, _tap_rx) = EventTap::channel(8);
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
@@ -355,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn install_republishes_at_the_new_index() {
         let (publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
         let (tap, _tap_rx) = EventTap::channel(8);
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
