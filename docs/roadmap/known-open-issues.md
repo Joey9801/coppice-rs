@@ -18,7 +18,7 @@ waive them.
 | --- | --- | --- | --- | --- |
 | [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved) | Do not enable terminal-job eviction with the stub history sink |
 | [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Resolved (2026-07-10, ADR 0026) | — |
-| [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10) | — |
+| [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10; drop-and-gap completeness 2026-07-12) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, and instrumentation resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
 
@@ -178,7 +178,7 @@ to the original job on every replica and across leader changes.
 ## KOI-3: Event cursors depend on local apply batching
 
 - **Severity:** High
-- **Status:** Resolved (2026-07-10)
+- **Status:** Resolved (2026-07-10; drop-and-gap completeness 2026-07-12)
 - **Affected capability:** resumable event subscriptions and follower fanout
 - **Related decision:** [ADR 0008](../decisions/0008-event-delivery-guarantees.md)
 
@@ -215,13 +215,45 @@ authoritative ([state events](../../crates/coppice-state/src/lib.rs)); the
 fanout filters on them directly with no mutable lookups
 ([fanout](../../crates/coppice-coordinator/src/tasks/event_fanout.rs)).
 
+### Resolution (2026-07-12): drop-and-gap completeness
+
+The drop-and-gap guarantee (ADR 0008) held only when a *later* event exposed
+the discontinuity, so three edges could lose events with no gap notification —
+and a lost `Ready` or `StopRequested` wedges dispatch until the next event that
+never comes:
+
+- **Trailing tap drop.** The tap detected an overflow only when a following
+  batch revealed the `seq` jump. A batch dropped as the last event before an
+  idle period was never surfaced. The sender now raises an out-of-band
+  `DropSignal` (a monotonic emitted-count plus a `Notify`) and the receiver
+  surfaces a *trailing* gap the moment the channel idles with drops outstanding
+  ([events](../../crates/coppice-consensus/src/events.rs)).
+- **Trailing per-subscriber overflow, and lost replay gaps.** A subscriber
+  whose queue overflowed was marked gapped but only re-notified on the next
+  batch; a cursor replay that filled the queue dropped its gap marker and then
+  recorded the subscriber as *not* gapped. The fanout now carries the pending
+  gap into the subscriber and a timer-driven `flush_gaps` re-delivers it once
+  the queue drains
+  ([fanout](../../crates/coppice-coordinator/src/tasks/event_fanout.rs)).
+- **Silent replay across a discontinuity.** Tap gaps, restarts, and snapshot
+  installs were not represented in the reconnection ring, so a later subscriber
+  could replay straight across the hole. The ring now tracks a monotonic replay
+  *floor* — raised by eviction, tap gaps, and snapshot installs, and seeded with
+  the recovered applied index — and a cursor below it opens with a gap instead
+  of a silent replay. A snapshot install forces the discontinuity into the
+  stream via `EventTap::force_gap`
+  ([apply loop](../../crates/coppice-consensus/src/apply_loop.rs)).
+
 ### Closure criteria
 
 Met: event derivation is invariant under apply batching
 (`event_stream_is_invariant_under_apply_batching`) and scoped subscriptions
 deliver the complete documented event set
 (`job_filter_admits_attempt_and_allocation_events`,
-`node_filter_admits_attempt_and_allocation_events`).
+`node_filter_admits_attempt_and_allocation_events`). Drop-and-gap completeness
+is pinned by `trailing_drop_surfaces_a_gap_without_a_later_batch`,
+`force_gap_surfaces_on_an_idle_tap`, `replay_overflow_stays_gapped_until_flushed`,
+`cursor_below_the_floor_opens_with_a_gap`, and `tap_gap_raises_the_ring_floor`.
 
 ## KOI-4: Unbounded `projected_ready` does not protect accrual progress
 

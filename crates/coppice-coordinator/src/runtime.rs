@@ -65,7 +65,12 @@ where
     let (inbound_tx, inbound_rx) = mpsc::channel(AGENT_INBOUND_CAPACITY);
 
     // ---- Every-replica tasks ----
-    let (fanout, fanout_join) = event_fanout::spawn(event_tap, shutdown_rx.clone());
+    // Seed the fanout's replay floor with the index the replica recovered at,
+    // so a reconnect with a pre-restart cursor gaps instead of silently
+    // replaying across the boundary (KOI-3).
+    let recovery_index = views.latest().applied_index();
+    let (fanout, fanout_join) =
+        event_fanout::spawn(event_tap, recovery_index, shutdown_rx.clone());
     tracing::info!("runtime: event fanout up");
 
     let Gateway {
