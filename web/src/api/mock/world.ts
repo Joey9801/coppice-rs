@@ -1,0 +1,1865 @@
+/**
+ * MockWorld — one deterministic, seeded simulation of a Coppice cluster.
+ *
+ * It holds rich internal records (jobs, attempts, allocations, nodes, a quota
+ * tree, coordinators) and projects them into the read-only view types in
+ * `../types.ts`. The client (`mock-client.ts`) owns a singleton and advances
+ * it lazily via `advanceTo(nowUs)`; nothing here reads the wall clock, so
+ * construction is fully reproducible from `{ seed, nowUs }`.
+ *
+ * Coherence invariants (asserted by world.test.ts) are maintained at
+ * construction and preserved by every `tick`:
+ *  - every attempt/allocation references an existing job and node
+ *  - funded ≤ requested per dimension
+ *  - Σ funded over non-Released allocations on a node ≤ node capacity
+ *  - a Running job has one current attempt Running + an Active allocation
+ *  - Queued jobs hold no allocation; terminal jobs have an outcome + time
+ *  - queue ranks are 1..depth, consistent with descending score
+ */
+
+import type {
+  AccrualView,
+  AllocationState,
+  AllocationView,
+  AttemptOutcome,
+  AttemptOutcomeKind,
+  AttemptState,
+  AttemptView,
+  ClusterOverview,
+  CoordinatorMember,
+  CoordinatorStatus,
+  CostReport,
+  JobDetail,
+  JobList,
+  JobState,
+  JobSummary,
+  JobUsage,
+  ListJobsFilter,
+  LogChunk,
+  LogEntry,
+  LogLevel,
+  NodeDetail,
+  NodeHealth,
+  NodeHistoryEntry,
+  NodeSummary,
+  NodeUtilization,
+  OutcomeClass,
+  QueuePositionExplainer,
+  QueueStats,
+  Resources,
+  TimelineEvent,
+  UtilizationSample,
+  UsageSample,
+} from '../types'
+import { TERMINAL_JOB_STATES } from '../types'
+import { GIB, hashSeed, mintImage, ORG_NAME, Rng, TEAMS, TIB } from './generate'
+
+// ---------------------------------------------------------------------------
+// Constants: time, policy, cost weights
+// ---------------------------------------------------------------------------
+
+const SECOND_US = 1_000_000
+const MINUTE_US = 60 * SECOND_US
+const HOUR_US = 60 * MINUTE_US
+
+const TICK_US = SECOND_US
+/** Cap on ticks processed in one advanceTo, so a long-idle tab can't hang. */
+const MAX_TICKS_PER_ADVANCE = 4000
+
+/** Priority class → scheduling multiplier m(j) (ADR 0021). */
+const PRIORITY_MULTIPLIER: Record<number, number> = { 0: 1, 1: 2, 2: 4 }
+const W_AGE = 0.5
+const AGE_HORIZON_US = 24 * HOUR_US
+/** Policy default runtime when a job sets no maxRuntime (2h). */
+const DEFAULT_RUNTIME_US = 2 * HOUR_US
+
+/**
+ * Cost weights, chosen so a 4-core / 16 GiB job costs ~3 CU/hour.
+ * rate = cpuMillis*W_CPU + (mem/GiB)*W_MEM + (disk/TiB)*W_DISK  (µCU/second).
+ */
+const W_CPU = 0.125
+const W_MEM = 20
+const W_DISK = 2
+
+// Kept low so admission is visibly gated: with a big accrual pool the queue
+// would drain into Preparing the moment jobs arrive (mirrors policy
+// `accrual_limit`, ADR 0014).
+const ACCRUAL_LIMIT_PER_NODE = 2
+
+/** Per-node utilization history ring: 30s buckets covering ~1h. */
+const UTIL_BUCKET_US = 30 * SECOND_US
+const UTIL_BUCKETS = 120
+const USAGE_RING = 120
+const QUEUE_BUCKET_US = 30 * SECOND_US
+const QUEUE_HISTORY_BUCKETS = 60
+const EVENTS_RING = 200
+
+// ---------------------------------------------------------------------------
+// Resource helpers
+// ---------------------------------------------------------------------------
+
+function res(cpuMillis: number, memoryBytes: number, diskBytes: number): Resources {
+  return { cpuMillis, memoryBytes, diskBytes }
+}
+
+function zeroRes(): Resources {
+  return res(0, 0, 0)
+}
+
+function addRes(a: Resources, b: Resources): Resources {
+  return res(a.cpuMillis + b.cpuMillis, a.memoryBytes + b.memoryBytes, a.diskBytes + b.diskBytes)
+}
+
+function subRes(a: Resources, b: Resources): Resources {
+  return res(a.cpuMillis - b.cpuMillis, a.memoryBytes - b.memoryBytes, a.diskBytes - b.diskBytes)
+}
+
+function scaleRes(a: Resources, f: number): Resources {
+  return res(
+    Math.round(a.cpuMillis * f),
+    Math.round(a.memoryBytes * f),
+    Math.round(a.diskBytes * f),
+  )
+}
+
+function fitsRes(need: Resources, free: Resources): boolean {
+  return (
+    need.cpuMillis <= free.cpuMillis &&
+    need.memoryBytes <= free.memoryBytes &&
+    need.diskBytes <= free.diskBytes
+  )
+}
+
+function minFraction(part: Resources, whole: Resources): number {
+  const f = (a: number, b: number) => (b > 0 ? a / b : 1)
+  return Math.min(
+    f(part.cpuMillis, whole.cpuMillis),
+    f(part.memoryBytes, whole.memoryBytes),
+    f(part.diskBytes, whole.diskBytes),
+  )
+}
+
+function computeRate(r: Resources): number {
+  return Math.round(
+    r.cpuMillis * W_CPU + (r.memoryBytes / GIB) * W_MEM + (r.diskBytes / TIB) * W_DISK,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Internal records (richer than the view types; never handed out directly)
+// ---------------------------------------------------------------------------
+
+interface QEntity {
+  id: string
+  name: string
+  parent: string | null
+  quotaUcu: number
+  usageUcu: number
+  depth: number
+}
+
+interface MNode {
+  id: string
+  capacity: Resources
+  labels: Record<string, string>
+  schedulable: boolean
+  health: NodeHealth
+  epoch: number
+  lastHeartbeatUs: number | null
+  /**
+   * Stored utilization ring (oldest first), appended every UTIL_BUCKET_US
+   * tick and seeded at construction — history must be a stable recording,
+   * never regenerated per request.
+   */
+  utilHistory: UtilizationSample[]
+}
+
+interface MAlloc {
+  id: string
+  job: string
+  attempt: string
+  node: string
+  requested: Resources
+  funded: Resources
+  state: AllocationState
+  seq: number
+}
+
+interface MAttempt {
+  id: string
+  job: string
+  node: string
+  allocation: string
+  state: AttemptState
+  outcome: AttemptOutcome | null
+  startedAtUs: number | null
+  endedAtUs: number | null
+  rateUcuPerSecond: number
+  chargedUcu: number
+}
+
+interface JobSpecInternal {
+  image: string
+  requests: Resources
+  priority: number
+  maxRuntimeUs: number | null
+  quotaEntity: string
+  retry: { maxRetries: number; retryUserErrors: boolean }
+}
+
+interface MJob {
+  id: string
+  spec: JobSpecInternal
+  state: JobState
+  submittedAtUs: number
+  terminalAtUs: number | null
+  retriesUsed: number
+  abortRequested: { reason: string | null; requestedAtUs: number } | null
+  attempts: string[]
+  currentAttempt: string | null
+  actualUcu: number | null
+  trueUp: { kind: 'Refund' | 'Surcharge'; amountUcu: number } | null
+  usage: UsageSample[]
+  projectedStartUs: number | null
+  /** Simulation clock at last state promotion (drives Submitted→Queued flow). */
+  lastTransitionUs: number
+}
+
+interface MCoordinator {
+  id: number
+  addr: string
+  role: 'Leader' | 'Follower' | 'Learner'
+  voter: boolean
+  lagEntries: number
+  host: { cpuFraction: number; memoryFraction: number; diskFraction: number }
+  lastSeenUs: number
+}
+
+interface QueueBucket {
+  tUs: number
+  depth: number
+  drainedPerMinute: number
+  arrivedPerMinute: number
+}
+
+// ---------------------------------------------------------------------------
+// Job shape pool
+// ---------------------------------------------------------------------------
+
+interface Shape {
+  cpuMillis: number
+  memGiB: number
+  diskGiB: number
+}
+
+// Weighted mean ≈ 7 cores/job: sized against the ~520-core fleet so the
+// steady-state running set (~75–85 jobs, see tickArrivals/tickRunningJobs
+// rates) saturates CPU and queueing/accrual behavior stays observable.
+const SHAPES: ReadonlyArray<readonly [Shape, number]> = [
+  [{ cpuMillis: 1000, memGiB: 4, diskGiB: 20 }, 3],
+  [{ cpuMillis: 2000, memGiB: 8, diskGiB: 40 }, 3],
+  [{ cpuMillis: 4000, memGiB: 16, diskGiB: 100 }, 4],
+  [{ cpuMillis: 8000, memGiB: 32, diskGiB: 200 }, 3],
+  [{ cpuMillis: 16000, memGiB: 64, diskGiB: 400 }, 2],
+  [{ cpuMillis: 4000, memGiB: 64, diskGiB: 100 }, 1],
+  [{ cpuMillis: 32000, memGiB: 128, diskGiB: 800 }, 1],
+]
+
+function shapeToResources(s: Shape): Resources {
+  return res(s.cpuMillis, s.memGiB * GIB, s.diskGiB * GIB)
+}
+
+/** Failure outcomes for Failed jobs: [kind, class, weight]. */
+const FAILURE_POOL: ReadonlyArray<readonly [AttemptOutcomeKind, OutcomeClass, number]> = [
+  ['OomKilled', 'UserError', 3],
+  ['Exited', 'UserError', 3],
+  ['MaxRuntimeExceeded', 'UserError', 2],
+  ['PullFailed', 'Platform', 1],
+  ['StartFailed', 'Platform', 1],
+  ['NodeLost', 'Platform', 1],
+]
+
+/** Platform-class transient outcomes used for earlier (retried) attempts. */
+const PLATFORM_POOL: ReadonlyArray<readonly [AttemptOutcomeKind, number]> = [
+  ['NodeLost', 2],
+  ['PullFailed', 2],
+  ['StartFailed', 1],
+  ['AgentError', 1],
+]
+
+// ---------------------------------------------------------------------------
+// MockWorld
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SEED = 0x00c0ff1c
+
+export class MockWorld {
+  private rng: Rng
+  private nowUs: number
+  private lastTickUs: number
+
+  private entities = new Map<string, QEntity>()
+  private leafIds: string[] = []
+  private nodes = new Map<string, MNode>()
+  private jobs = new Map<string, MJob>()
+  private attempts = new Map<string, MAttempt>()
+  private allocs = new Map<string, MAlloc>()
+  private coordinators: MCoordinator[] = []
+
+  private events: TimelineEvent[] = []
+  private jobEvents = new Map<string, TimelineEvent[]>()
+  private queueHistory: QueueBucket[] = []
+
+  private seqCounter = 0
+  private lastBucketUs = 0
+  private lastUtilBucketUs = 0
+  private arrivalsThisBucket = 0
+  private drainsThisBucket = 0
+
+  private clusterId = 'coppice-prod-1'
+  private raftIndex = 0
+  private stateVersion = 0
+  private snapshotIndex = 0
+  private snapshotAtUs = 0
+
+  constructor(nowUs: number, seed: number = DEFAULT_SEED) {
+    this.rng = new Rng(seed)
+    this.nowUs = nowUs
+    this.lastTickUs = nowUs
+    this.raftIndex = 42000
+    this.stateVersion = 61000
+    this.build()
+  }
+
+  // ---- construction --------------------------------------------------------
+
+  private build(): void {
+    this.buildQuotaTree()
+    this.buildNodes()
+    this.buildCoordinators()
+    this.buildJobs()
+    this.seedQueueHistory()
+    this.seedUtilHistories()
+    this.recomputeQueueRanks()
+  }
+
+  /**
+   * Backfill each node's utilization ring so charts are full on first load.
+   * Walk backward from the node's REAL current allocation, occasionally
+   * stepping by a job-sized chunk (placements/releases), with `used`
+   * wobbling smoothly beneath `allocated` — so the allocated line is
+   * piecewise-constant over time instead of flat, and the most recent
+   * sample agrees with live state.
+   */
+  private seedUtilHistories(): void {
+    for (const node of this.nodes.values()) {
+      const rng = new Rng(hashSeed(node.id + 'util-seed'))
+      let alloc = this.nodeAllocated(node.id)
+      let factor = rng.range(0.55, 0.8)
+      const backward: UtilizationSample[] = []
+      for (let i = 0; i < UTIL_BUCKETS; i += 1) {
+        const tUs = this.nowUs - i * UTIL_BUCKET_US
+        factor = Math.min(0.9, Math.max(0.4, factor + rng.range(-0.04, 0.04)))
+        const used = res(
+          Math.round(alloc.cpuMillis * factor),
+          Math.round(alloc.memoryBytes * Math.min(1, factor + 0.1)),
+          Math.round(alloc.diskBytes * Math.min(1, factor + 0.15)),
+        )
+        backward.push({ tUs, used, allocated: { ...alloc } })
+        if (rng.bool(0.12)) {
+          // A placement or release happened at this point (walking backward).
+          const sign = rng.bool() ? 1 : -1
+          const chunk = res(
+            rng.int(1, 8) * 1000,
+            rng.int(4, 32) * GIB,
+            Math.round(rng.range(0.05, 0.5) * TIB),
+          )
+          const step = (a: number, c: number, cap: number) =>
+            Math.min(cap, Math.max(0, a + sign * c))
+          alloc = res(
+            step(alloc.cpuMillis, chunk.cpuMillis, node.capacity.cpuMillis),
+            step(alloc.memoryBytes, chunk.memoryBytes, node.capacity.memoryBytes),
+            step(alloc.diskBytes, chunk.diskBytes, node.capacity.diskBytes),
+          )
+        }
+      }
+      node.utilHistory = backward.reverse()
+    }
+    this.lastUtilBucketUs = this.nowUs
+  }
+
+  private buildQuotaTree(): void {
+    const root: QEntity = {
+      id: this.rng.mintId('quota'),
+      name: ORG_NAME,
+      parent: null,
+      quotaUcu: 0,
+      usageUcu: 0,
+      depth: 0,
+    }
+    this.entities.set(root.id, root)
+
+    // Pre-pick which leaves are meaningfully over quota (2–3 of them).
+    const leafSpecs: Array<{ division: string; team: string }> = []
+    for (const division of Object.keys(TEAMS)) {
+      for (const team of TEAMS[division] ?? []) leafSpecs.push({ division, team })
+    }
+    const overIdx = new Set(
+      this.rng.shuffle(leafSpecs.map((_, i) => i)).slice(0, this.rng.int(2, 3)),
+    )
+
+    const divisionEntities = new Map<string, QEntity>()
+    for (const division of Object.keys(TEAMS)) {
+      const ent: QEntity = {
+        id: this.rng.mintId('quota'),
+        name: `${ORG_NAME}/${division}`,
+        parent: root.id,
+        quotaUcu: 0,
+        usageUcu: 0,
+        depth: 1,
+      }
+      divisionEntities.set(division, ent)
+      this.entities.set(ent.id, ent)
+    }
+
+    leafSpecs.forEach((spec, i) => {
+      const parent = divisionEntities.get(spec.division)
+      if (!parent) return
+      const quotaUcu = this.rng.int(300, 1500) * 1_000_000
+      const overQuota = overIdx.has(i)
+      const ratio = overQuota ? this.rng.range(1.3, 2.4) : this.rng.range(0.2, 0.9)
+      const leaf: QEntity = {
+        id: this.rng.mintId('quota'),
+        name: `${ORG_NAME}/${spec.division}/${spec.team}`,
+        parent: parent.id,
+        quotaUcu,
+        usageUcu: Math.round(quotaUcu * ratio),
+        depth: 2,
+      }
+      this.entities.set(leaf.id, leaf)
+      this.leafIds.push(leaf.id)
+    })
+
+    // Roll usage/quota up: ancestor usage ≈ sum of descendants (ADR 0021 tree).
+    for (const division of divisionEntities.values()) {
+      const children = [...this.entities.values()].filter((e) => e.parent === division.id)
+      division.quotaUcu = children.reduce((s, c) => s + c.quotaUcu, 0)
+      division.usageUcu = children.reduce((s, c) => s + c.usageUcu, 0)
+    }
+    root.quotaUcu = [...divisionEntities.values()].reduce((s, c) => s + c.quotaUcu, 0)
+    root.usageUcu = [...divisionEntities.values()].reduce((s, c) => s + c.usageUcu, 0)
+  }
+
+  private buildNodes(): void {
+    const zones = ['a', 'b', 'c']
+    const pools = ['general', 'highmem', 'compute'] as const
+    const coreOptions = [8, 16, 32, 48, 64, 96]
+    const count = 16
+    for (let i = 0; i < count; i += 1) {
+      const cores = this.rng.pick(coreOptions)
+      const pool = this.rng.pick(pools)
+      const memPerCore = pool === 'highmem' ? 12 : pool === 'compute' ? 2 : 4
+      const memGiB = cores * memPerCore
+      const diskTiB = this.rng.range(0.5, 8)
+      const draining = i === 3 // one node draining (schedulable false, still runs work)
+      const lost = i === 7 // one node Lost (stale heartbeat)
+      const node: MNode = {
+        id: this.rng.mintId('node'),
+        capacity: res(cores * 1000, memGiB * GIB, Math.round(diskTiB * TIB)),
+        labels: { zone: this.rng.pick(zones), pool },
+        schedulable: !draining,
+        health: lost ? 'Lost' : 'Healthy',
+        epoch: lost ? this.rng.int(4, 9) : this.rng.int(1, 3),
+        lastHeartbeatUs: lost
+          ? this.nowUs - this.rng.range(18 * MINUTE_US, 22 * MINUTE_US)
+          : this.nowUs - this.rng.range(SECOND_US, 15 * SECOND_US),
+        utilHistory: [],
+      }
+      this.nodes.set(node.id, node)
+    }
+  }
+
+  private buildCoordinators(): void {
+    for (let id = 1; id <= 3; id += 1) {
+      this.coordinators.push({
+        id,
+        addr: `coord-${id}.internal:7071`,
+        role: id === 1 ? 'Leader' : 'Follower',
+        voter: true,
+        lagEntries: id === 1 ? 0 : this.rng.int(0, 2),
+        host: {
+          cpuFraction: this.rng.range(0.1, 0.6),
+          memoryFraction: this.rng.range(0.2, 0.7),
+          diskFraction: this.rng.range(0.05, 0.4),
+        },
+        lastSeenUs: this.nowUs - this.rng.range(SECOND_US, 4 * SECOND_US),
+      })
+    }
+    this.snapshotIndex = this.raftIndex - this.rng.int(1200, 2500)
+    this.snapshotAtUs = this.nowUs - this.rng.range(50 * MINUTE_US, 70 * MINUTE_US)
+  }
+
+  /** Placeable nodes = healthy (draining node still hosts existing work). */
+  private placeableNodes(): MNode[] {
+    return [...this.nodes.values()].filter((n) => n.health === 'Healthy')
+  }
+
+  private nodeFreeCapacity(): Map<string, Resources> {
+    const free = new Map<string, Resources>()
+    for (const node of this.nodes.values()) free.set(node.id, { ...node.capacity })
+    for (const alloc of this.allocs.values()) {
+      if (alloc.state === 'Released') continue
+      const cur = free.get(alloc.node)
+      if (cur) free.set(alloc.node, subRes(cur, alloc.funded))
+    }
+    return free
+  }
+
+  private makeSpec(): JobSpecInternal {
+    const shape = this.rng.weighted(SHAPES)
+    const priority = this.rng.weighted([
+      [0, 6],
+      [1, 3],
+      [2, 1],
+    ] as const)
+    const hasMaxRuntime = this.rng.bool(0.6)
+    return {
+      image: mintImage(this.rng),
+      requests: shapeToResources(shape),
+      priority,
+      maxRuntimeUs: hasMaxRuntime ? this.rng.int(1, 8) * HOUR_US : null,
+      quotaEntity: this.rng.pick(this.leafIds),
+      retry: { maxRetries: this.rng.int(0, 3), retryUserErrors: this.rng.bool(0.3) },
+    }
+  }
+
+  private buildJobs(): void {
+    // Order matters: capacity-consuming states first so free capacity is real.
+    // The running count starts the cluster near CPU saturation (~65 × ~7
+    // cores against the ~520-core fleet) so the seeded queue doesn't
+    // instantly drain into the free capacity of a half-idle cluster.
+    this.buildRunningJobs(65)
+    this.buildFinalizingJobs(4)
+    this.buildPreparingJobs(16)
+    this.buildQueuedJobs(25)
+    this.buildPipelineJobs('Accepted', 4)
+    this.buildPipelineJobs('Submitted', 3)
+    this.buildTerminalJobs(150)
+  }
+
+  private newJob(state: JobState, submittedAtUs: number): MJob {
+    const job: MJob = {
+      id: this.rng.mintId('job'),
+      spec: this.makeSpec(),
+      state,
+      submittedAtUs,
+      terminalAtUs: null,
+      retriesUsed: 0,
+      abortRequested: null,
+      attempts: [],
+      currentAttempt: null,
+      actualUcu: null,
+      trueUp: null,
+      usage: [],
+      projectedStartUs: null,
+      lastTransitionUs: submittedAtUs,
+    }
+    this.jobs.set(job.id, job)
+    return job
+  }
+
+  private newAttempt(job: MJob, node: string, state: AttemptState): MAttempt {
+    const rate = computeRate(job.spec.requests)
+    const attempt: MAttempt = {
+      id: this.rng.mintId('attempt'),
+      job: job.id,
+      node,
+      allocation: '',
+      state,
+      outcome: null,
+      startedAtUs: null,
+      endedAtUs: null,
+      rateUcuPerSecond: rate,
+      chargedUcu: 0,
+    }
+    this.attempts.set(attempt.id, attempt)
+    job.attempts.push(attempt.id)
+    return attempt
+  }
+
+  private newAlloc(
+    job: MJob,
+    attempt: MAttempt,
+    node: string,
+    funded: Resources,
+    state: AllocationState,
+  ): MAlloc {
+    this.seqCounter += 1
+    const alloc: MAlloc = {
+      id: this.rng.mintId('alloc'),
+      job: job.id,
+      attempt: attempt.id,
+      node,
+      requested: { ...job.spec.requests },
+      funded,
+      state,
+      seq: this.seqCounter,
+    }
+    this.allocs.set(alloc.id, alloc)
+    attempt.allocation = alloc.id
+    return alloc
+  }
+
+  private buildRunningJobs(target: number): void {
+    const free = this.nodeFreeCapacity()
+    const placeable = this.placeableNodes()
+    let made = 0
+    let attempts = 0
+    while (made < target && attempts < target * 6) {
+      attempts += 1
+      const submittedAtUs = this.nowUs - this.rng.range(5 * MINUTE_US, 20 * HOUR_US)
+      const job = this.newJob('Running', submittedAtUs)
+      const nodeId = this.findFit(job.spec.requests, free, placeable)
+      if (!nodeId) {
+        this.jobs.delete(job.id)
+        job.attempts = []
+        continue
+      }
+      const runningForUs = this.rng.range(2 * MINUTE_US, 6 * HOUR_US)
+      const startedAtUs = this.nowUs - runningForUs
+      // Optionally give this job a prior retried attempt (transient failure).
+      this.maybeAddRetries(job, startedAtUs)
+      const attempt = this.newAttempt(job, nodeId, 'Running')
+      attempt.startedAtUs = startedAtUs
+      attempt.chargedUcu = Math.round(attempt.rateUcuPerSecond * (runningForUs / SECOND_US))
+      const alloc = this.newAlloc(job, attempt, nodeId, { ...job.spec.requests }, 'Active')
+      job.currentAttempt = attempt.id
+      const cur = free.get(nodeId)
+      if (cur) free.set(nodeId, subRes(cur, alloc.funded))
+      this.seedUsage(job, startedAtUs)
+      made += 1
+    }
+  }
+
+  private buildFinalizingJobs(target: number): void {
+    const free = this.nodeFreeCapacity()
+    const placeable = this.placeableNodes()
+    let made = 0
+    let tries = 0
+    while (made < target && tries < target * 6) {
+      tries += 1
+      const submittedAtUs = this.nowUs - this.rng.range(20 * MINUTE_US, 8 * HOUR_US)
+      const job = this.newJob('Finalizing', submittedAtUs)
+      const nodeId = this.findFit(job.spec.requests, free, placeable)
+      if (!nodeId) {
+        this.jobs.delete(job.id)
+        continue
+      }
+      const runningForUs = this.rng.range(10 * MINUTE_US, 4 * HOUR_US)
+      const startedAtUs = this.nowUs - runningForUs
+      const attempt = this.newAttempt(job, nodeId, 'Finalizing')
+      attempt.startedAtUs = startedAtUs
+      attempt.chargedUcu = Math.round(attempt.rateUcuPerSecond * (runningForUs / SECOND_US))
+      const alloc = this.newAlloc(job, attempt, nodeId, { ...job.spec.requests }, 'Active')
+      job.currentAttempt = attempt.id
+      const cur = free.get(nodeId)
+      if (cur) free.set(nodeId, subRes(cur, alloc.funded))
+      this.seedUsage(job, startedAtUs)
+      made += 1
+    }
+  }
+
+  private buildPreparingJobs(target: number): void {
+    const free = this.nodeFreeCapacity()
+    const placeable = this.placeableNodes()
+    for (let i = 0; i < target; i += 1) {
+      const submittedAtUs = this.nowUs - this.rng.range(30 * SECOND_US, 15 * MINUTE_US)
+      const job = this.newJob('Preparing', submittedAtUs)
+      // Accrue against the node with the most headroom (partial funding).
+      const nodeId = this.pickAccrualNode(placeable, free)
+      if (!nodeId) {
+        // Fall back to Queued if nothing can host an accrual.
+        job.state = 'Queued'
+        continue
+      }
+      const attempt = this.newAttempt(job, nodeId, 'Accruing')
+      attempt.startedAtUs = null
+      const frac = this.rng.range(0.2, 0.8)
+      const funded = this.clampFunded(scaleRes(job.spec.requests, frac), free.get(nodeId))
+      const alloc = this.newAlloc(job, attempt, nodeId, funded, 'Accruing')
+      job.currentAttempt = attempt.id
+      job.projectedStartUs = this.rng.bool(0.75)
+        ? this.nowUs + this.rng.range(1 * MINUTE_US, 25 * MINUTE_US)
+        : null
+      const cur = free.get(nodeId)
+      if (cur) free.set(nodeId, subRes(cur, alloc.funded))
+    }
+  }
+
+  private buildQueuedJobs(target: number): void {
+    for (let i = 0; i < target; i += 1) {
+      const submittedAtUs = this.nowUs - this.rng.range(10 * SECOND_US, 40 * MINUTE_US)
+      this.newJob('Queued', submittedAtUs)
+    }
+  }
+
+  private buildPipelineJobs(state: JobState, target: number): void {
+    for (let i = 0; i < target; i += 1) {
+      const submittedAtUs = this.nowUs - this.rng.range(1 * SECOND_US, 20 * SECOND_US)
+      this.newJob(state, submittedAtUs)
+    }
+  }
+
+  private buildTerminalJobs(target: number): void {
+    for (let i = 0; i < target; i += 1) {
+      // Spread submissions across the last ~72h of history.
+      const submittedAtUs = this.nowUs - this.rng.range(30 * MINUTE_US, 72 * HOUR_US)
+      const outcomeRoll = this.rng.float()
+      let state: JobState
+      if (outcomeRoll < 0.1) state = 'Failed'
+      else if (outcomeRoll < 0.14) state = 'Aborted'
+      else state = 'Succeeded'
+      const job = this.newJob(state, submittedAtUs)
+
+      const runForUs = this.rng.range(1 * MINUTE_US, 5 * HOUR_US)
+      const startedAtUs = submittedAtUs + this.rng.range(2 * SECOND_US, 3 * MINUTE_US)
+      const endedAtUs = Math.min(this.nowUs - MINUTE_US, startedAtUs + runForUs)
+      job.terminalAtUs = endedAtUs
+
+      this.maybeAddRetries(job, startedAtUs)
+
+      const node = this.rng.pick([...this.nodes.values()])
+      const attempt = this.newAttempt(job, node.id, 'Terminal')
+      attempt.startedAtUs = startedAtUs
+      attempt.endedAtUs = endedAtUs
+      attempt.outcome = this.finalOutcome(state)
+      const chargedUcu = Math.round(
+        attempt.rateUcuPerSecond * ((endedAtUs - startedAtUs) / SECOND_US),
+      )
+      attempt.chargedUcu = chargedUcu
+      // Released allocation: recorded for history, excluded from capacity.
+      this.newAlloc(job, attempt, node.id, { ...job.spec.requests }, 'Released')
+      job.currentAttempt = attempt.id
+
+      this.applyTrueUp(job, attempt, state)
+    }
+  }
+
+  /** Prepend earlier retried attempts (each with a transient Platform outcome). */
+  private maybeAddRetries(job: MJob, currentStartUs: number): void {
+    if (!this.rng.bool(0.15)) return
+    const retries = this.rng.int(1, Math.max(1, job.spec.retry.maxRetries || 1))
+    const node = this.rng.pick([...this.nodes.values()])
+    for (let r = 0; r < retries; r += 1) {
+      const startedAtUs =
+        currentStartUs - (retries - r) * this.rng.range(2 * MINUTE_US, 30 * MINUTE_US)
+      const endedAtUs = startedAtUs + this.rng.range(30 * SECOND_US, 8 * MINUTE_US)
+      const attempt = this.newAttempt(job, node.id, 'Terminal')
+      attempt.startedAtUs = startedAtUs
+      attempt.endedAtUs = endedAtUs
+      const kind = this.rng.weighted(PLATFORM_POOL)
+      attempt.outcome = { kind, class: 'Platform' }
+      attempt.chargedUcu = Math.round(
+        attempt.rateUcuPerSecond * ((endedAtUs - startedAtUs) / SECOND_US),
+      )
+      this.newAlloc(job, attempt, node.id, { ...job.spec.requests }, 'Released')
+      job.retriesUsed += 1
+    }
+  }
+
+  private finalOutcome(state: JobState): AttemptOutcome {
+    if (state === 'Succeeded') return { kind: 'Exited', exitCode: 0, class: 'Success' }
+    if (state === 'Aborted') return { kind: 'Aborted', class: 'UserRequest' }
+    const [kind, cls] = this.rng.weighted(
+      FAILURE_POOL.map((f) => [[f[0], f[1]] as const, f[2]] as const),
+    )
+    if (kind === 'Exited') return { kind, exitCode: this.rng.pick([1, 2, 127, 137]), class: cls }
+    return { kind, class: cls }
+  }
+
+  private applyTrueUp(job: MJob, attempt: MAttempt, state: JobState): void {
+    const charged = job.attempts.reduce((s, id) => s + (this.attempts.get(id)?.chargedUcu ?? 0), 0)
+    // Actual consumption usually a bit under the upfront charge → refund.
+    const surcharge = this.rng.bool(0.2)
+    const factor = surcharge ? this.rng.range(1.02, 1.12) : this.rng.range(0.7, 0.98)
+    const actual = Math.max(0, Math.round(charged * factor))
+    job.actualUcu = actual
+    const diff = actual - charged
+    if (diff === 0) {
+      job.trueUp = null
+    } else if (diff < 0) {
+      job.trueUp = { kind: 'Refund', amountUcu: -diff }
+    } else {
+      job.trueUp = { kind: 'Surcharge', amountUcu: diff }
+    }
+    if (state === 'Aborted') {
+      job.abortRequested = {
+        reason: this.rng.pick(['user requested', 'superseded', 'cost cap', null]),
+        requestedAtUs:
+          (attempt.endedAtUs ?? this.nowUs) - this.rng.range(SECOND_US, 30 * SECOND_US),
+      }
+    }
+  }
+
+  private findFit(
+    need: Resources,
+    free: Map<string, Resources>,
+    placeable: MNode[],
+  ): string | null {
+    const order = this.rng.shuffle([...placeable])
+    for (const node of order) {
+      const f = free.get(node.id)
+      if (f && fitsRes(need, f)) return node.id
+    }
+    return null
+  }
+
+  private pickAccrualNode(placeable: MNode[], free: Map<string, Resources>): string | null {
+    // Prefer nodes under the accrual limit; pick the one with most cpu headroom.
+    const counts = this.accrualCounts()
+    let best: string | null = null
+    let bestCpu = -1
+    for (const node of placeable) {
+      if ((counts.get(node.id) ?? 0) >= ACCRUAL_LIMIT_PER_NODE) continue
+      const f = free.get(node.id)
+      const cpu = f ? f.cpuMillis : 0
+      if (cpu > bestCpu) {
+        bestCpu = cpu
+        best = node.id
+      }
+    }
+    return best
+  }
+
+  private accrualCounts(): Map<string, number> {
+    const counts = new Map<string, number>()
+    for (const alloc of this.allocs.values()) {
+      if (alloc.state === 'Accruing') counts.set(alloc.node, (counts.get(alloc.node) ?? 0) + 1)
+    }
+    return counts
+  }
+
+  private clampFunded(funded: Resources, free: Resources | undefined): Resources {
+    if (!free) return funded
+    return res(
+      Math.min(funded.cpuMillis, Math.max(0, free.cpuMillis)),
+      Math.min(funded.memoryBytes, Math.max(0, free.memoryBytes)),
+      Math.min(funded.diskBytes, Math.max(0, free.diskBytes)),
+    )
+  }
+
+  private seedUsage(job: MJob, startedAtUs: number): void {
+    const requested = job.spec.requests
+    const span = this.nowUs - startedAtUs
+    const step = Math.max(SECOND_US, Math.floor(span / USAGE_RING))
+    const samples: UsageSample[] = []
+    const seedRng = new Rng(hashSeed(job.id))
+    for (let t = startedAtUs; t <= this.nowUs && samples.length < USAGE_RING; t += step) {
+      samples.push(this.usageSample(t, requested, seedRng))
+    }
+    job.usage = samples
+  }
+
+  private usageSample(tUs: number, requested: Resources, rng: Rng): UsageSample {
+    // Usage wobbles under requested; memory occasionally near the ceiling.
+    const cpuFrac = rng.range(0.35, 0.95)
+    const memFrac = rng.bool(0.15) ? rng.range(0.9, 0.99) : rng.range(0.4, 0.85)
+    const diskFrac = rng.range(0.2, 0.7)
+    return {
+      tUs,
+      cpuMillis: Math.round(requested.cpuMillis * cpuFrac),
+      memoryBytes: Math.round(requested.memoryBytes * memFrac),
+      diskBytes: Math.round(requested.diskBytes * diskFrac),
+    }
+  }
+
+  private seedQueueHistory(): void {
+    // Pre-fill the ~30-minute sparkline window so it is full on first load.
+    const start = this.nowUs - QUEUE_HISTORY_BUCKETS * QUEUE_BUCKET_US
+    const depth = this.countByState('Queued')
+    const histRng = new Rng(hashSeed(this.clusterId))
+    for (let i = 0; i < QUEUE_HISTORY_BUCKETS; i += 1) {
+      const tUs = start + i * QUEUE_BUCKET_US
+      const wobble = histRng.int(-4, 4)
+      this.queueHistory.push({
+        tUs,
+        depth: Math.max(0, depth + wobble),
+        // Roughly the live steady-state rates (see tickArrivals) so the
+        // sparklines don't jump when real ticks take over from the seed.
+        drainedPerMinute: histRng.int(7, 13),
+        arrivedPerMinute: histRng.int(7, 14),
+      })
+    }
+    this.lastBucketUs = this.nowUs
+  }
+
+  // ---- simulation ----------------------------------------------------------
+
+  /** Process elapsed 1s ticks up to `nowUs`, then pin the clock to `nowUs`. */
+  advanceTo(nowUs: number): void {
+    if (nowUs <= this.nowUs) {
+      this.nowUs = Math.max(this.nowUs, nowUs)
+      return
+    }
+    let steps = 0
+    while (this.lastTickUs + TICK_US <= nowUs && steps < MAX_TICKS_PER_ADVANCE) {
+      this.lastTickUs += TICK_US
+      this.nowUs = this.lastTickUs
+      this.tick()
+      steps += 1
+    }
+    this.lastTickUs = nowUs
+    this.nowUs = nowUs
+    this.recomputeQueueRanks()
+  }
+
+  private tick(): void {
+    this.raftIndex += this.rng.int(1, 4)
+    this.stateVersion += this.rng.int(1, 3)
+    this.tickRunningJobs()
+    this.tickAccruals()
+    this.tickAdmissions()
+    this.tickPipeline()
+    this.tickArrivals()
+    this.tickCoordinators()
+    this.tickUtilHistory()
+    this.rollQueueBucket()
+  }
+
+  private tickRunningJobs(): void {
+    for (const job of this.jobs.values()) {
+      if (job.state !== 'Running' && job.state !== 'Finalizing') continue
+      const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+      if (!attempt) continue
+      // Append a bounded usage sample and accrue charge.
+      const seedRng = new Rng(hashSeed(job.id + this.nowUs))
+      job.usage.push(this.usageSample(this.nowUs, job.spec.requests, seedRng))
+      if (job.usage.length > USAGE_RING) job.usage.shift()
+      attempt.chargedUcu += Math.round(attempt.rateUcuPerSecond * (TICK_US / SECOND_US))
+
+      if (job.state === 'Running') {
+        const overRuntime =
+          job.spec.maxRuntimeUs !== null &&
+          attempt.startedAtUs !== null &&
+          this.nowUs - attempt.startedAtUs > job.spec.maxRuntimeUs
+        // p ≈ 0.0035/s → mean runtime ~5min. Tuned together with the arrival
+        // rate in tickArrivals so demand roughly matches effective service
+        // at saturation and a visible queue + accruals persist at steady
+        // state without growing unboundedly.
+        if (overRuntime || this.rng.bool(0.0035)) {
+          this.transition(job, 'Finalizing')
+          attempt.state = 'Finalizing'
+        }
+      } else if (this.rng.bool(0.25)) {
+        this.finishJob(job, attempt)
+      }
+    }
+  }
+
+  private finishJob(job: MJob, attempt: MAttempt): void {
+    const failed = this.rng.bool(0.08)
+    const state: JobState = failed ? 'Failed' : 'Succeeded'
+    attempt.state = 'Terminal'
+    attempt.endedAtUs = this.nowUs
+    attempt.outcome = this.finalOutcome(state)
+    job.terminalAtUs = this.nowUs
+    this.applyTrueUp(job, attempt, state)
+    // Release the allocation, freeing node capacity.
+    const alloc = this.allocs.get(attempt.allocation)
+    if (alloc) alloc.state = 'Released'
+    this.transition(job, state)
+    this.pushEvent({
+      atUs: this.nowUs,
+      kind: 'AttemptStateChanged',
+      attempt: attempt.id,
+      job: job.id,
+      node: attempt.node,
+      state: 'Terminal',
+    })
+    this.drainsThisBucket += 0 // finishing running work isn't a queue drain
+  }
+
+  private tickAccruals(): void {
+    const free = this.nodeFreeCapacity()
+    for (const job of this.jobs.values()) {
+      if (job.state !== 'Preparing') continue
+      const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+      if (!attempt) continue
+      const alloc = this.allocs.get(attempt.allocation)
+      if (!alloc || alloc.state !== 'Accruing') continue
+      // A projection that has come and gone without funding was optimistic;
+      // re-project the way a scheduler pass would recompute the bound.
+      if (job.projectedStartUs !== null && job.projectedStartUs <= this.nowUs) {
+        job.projectedStartUs = this.nowUs + this.rng.range(1 * MINUTE_US, 15 * MINUTE_US)
+      }
+      const nodeFree = free.get(alloc.node) ?? zeroRes()
+      // Fund up toward requested, bounded by remaining node headroom.
+      const gain = this.rng.range(0.05, 0.3)
+      const target = scaleRes(alloc.requested, minFraction(alloc.funded, alloc.requested) + gain)
+      const grow = this.clampFunded(
+        res(
+          Math.min(target.cpuMillis, alloc.requested.cpuMillis),
+          Math.min(target.memoryBytes, alloc.requested.memoryBytes),
+          Math.min(target.diskBytes, alloc.requested.diskBytes),
+        ),
+        addRes(alloc.funded, nodeFree),
+      )
+      const delta = subRes(grow, alloc.funded)
+      if (delta.cpuMillis > 0 || delta.memoryBytes > 0 || delta.diskBytes > 0) {
+        alloc.funded = grow
+        free.set(alloc.node, subRes(nodeFree, delta))
+      }
+      if (fitsRes(alloc.requested, alloc.funded)) {
+        // Fully funded → Active → Running.
+        alloc.funded = { ...alloc.requested }
+        alloc.state = 'Active'
+        attempt.state = 'Running'
+        attempt.startedAtUs = this.nowUs
+        this.transition(job, 'Running')
+        this.seedUsage(job, this.nowUs - SECOND_US)
+        this.pushEvent({
+          atUs: this.nowUs,
+          kind: 'AllocationFunded',
+          allocation: alloc.id,
+          job: job.id,
+          node: alloc.node,
+        })
+      }
+    }
+  }
+
+  private tickAdmissions(): void {
+    const free = this.nodeFreeCapacity()
+    const counts = this.accrualCounts()
+    const placeable = this.placeableNodes()
+    const queued = [...this.jobs.values()].filter((j) => j.state === 'Queued')
+    // Admit the best-ranked queued jobs first, at most one per tick
+    // (mirrors `max_placements_per_cycle`) — jobs must visibly dwell in the
+    // queue instead of being whisked into Preparing on arrival.
+    queued.sort((a, b) => this.score(b) - this.score(a))
+    let placements = 0
+    for (const job of queued) {
+      if (placements >= 1) break
+      if (!this.rng.bool(0.4)) continue
+
+      // Free-fit first (mirrors the real scheduler's try_free_fit): seat the
+      // job fully funded on the node with the tightest fit. Only when no
+      // node can hold it outright does it open a partially-funded accrual —
+      // otherwise accrual slots pin big jobs to one node while free capacity
+      // idles elsewhere and the whole cluster wedges.
+      let fitNode: string | null = null
+      let fitCpu = Number.MAX_SAFE_INTEGER
+      let accrualNode: string | null = null
+      let accrualCpu = -1
+      for (const node of placeable) {
+        const f = free.get(node.id)
+        if (!f) continue
+        if (fitsRes(job.spec.requests, f) && f.cpuMillis < fitCpu) {
+          fitCpu = f.cpuMillis
+          fitNode = node.id
+        }
+        if ((counts.get(node.id) ?? 0) < ACCRUAL_LIMIT_PER_NODE && f.cpuMillis > accrualCpu) {
+          accrualCpu = f.cpuMillis
+          accrualNode = node.id
+        }
+      }
+      const placedNode = fitNode ?? accrualNode
+      if (!placedNode) break
+      const attempt = this.newAttempt(job, placedNode, 'Accruing')
+      const funded = fitNode
+        ? { ...job.spec.requests }
+        : this.clampFunded(
+            scaleRes(job.spec.requests, this.rng.range(0.15, 0.5)),
+            free.get(placedNode),
+          )
+      const alloc = this.newAlloc(job, attempt, placedNode, funded, 'Accruing')
+      job.currentAttempt = attempt.id
+      job.projectedStartUs = this.nowUs + this.rng.range(1 * MINUTE_US, 20 * MINUTE_US)
+      this.transition(job, 'Preparing')
+      counts.set(placedNode, (counts.get(placedNode) ?? 0) + 1)
+      const f = free.get(placedNode)
+      if (f) free.set(placedNode, subRes(f, alloc.funded))
+      this.drainsThisBucket += 1
+      placements += 1
+    }
+  }
+
+  private tickPipeline(): void {
+    for (const job of this.jobs.values()) {
+      if (job.state === 'Submitted' && this.nowUs - job.lastTransitionUs > 2 * SECOND_US) {
+        this.transition(job, 'Accepted')
+      } else if (job.state === 'Accepted' && this.nowUs - job.lastTransitionUs > 3 * SECOND_US) {
+        this.transition(job, 'Queued')
+        this.arrivalsThisBucket += 1
+      }
+    }
+  }
+
+  private tickArrivals(): void {
+    // Demand is elastic around a target queue depth (~30): pressure eases
+    // as the backlog grows and swells when it shrinks, so the cluster
+    // hovers near saturation with a persistent, bounded queue instead of
+    // either draining to zero or growing forever. The ±30% sinusoid (~18min
+    // cycle) gives the drain/arrival sparklines visible shape.
+    const depth = this.countByState('Queued')
+    const pressure = Math.min(1.5, Math.max(0.4, 1.5 - depth / 40))
+    const swell = 1 + 0.3 * Math.sin((2 * Math.PI * this.nowUs) / (18 * MINUTE_US))
+    if (!this.rng.bool(0.2 * pressure * swell)) return
+    const job = this.newJob('Submitted', this.nowUs)
+    this.pushEvent({ atUs: this.nowUs, kind: 'JobSubmitted', job: job.id })
+  }
+
+  private tickCoordinators(): void {
+    for (const c of this.coordinators) {
+      const wob = (v: number) => Math.min(0.95, Math.max(0.03, v + this.rng.range(-0.03, 0.03)))
+      c.host = {
+        cpuFraction: wob(c.host.cpuFraction),
+        memoryFraction: wob(c.host.memoryFraction),
+        diskFraction: wob(c.host.diskFraction),
+      }
+      c.lastSeenUs = this.nowUs - this.rng.range(SECOND_US, 3 * SECOND_US)
+      if (c.role !== 'Leader') c.lagEntries = this.rng.int(0, 2)
+    }
+    if (this.raftIndex - this.snapshotIndex > 3000) {
+      this.snapshotIndex = this.raftIndex - this.rng.int(50, 150)
+      this.snapshotAtUs = this.nowUs
+    }
+  }
+
+  /** Append a real (allocated, used) sample to every node's ring. */
+  private tickUtilHistory(): void {
+    if (this.nowUs - this.lastUtilBucketUs < UTIL_BUCKET_US) return
+    for (const node of this.nodes.values()) {
+      node.utilHistory.push({
+        tUs: this.nowUs,
+        used: this.nodeUsed(node.id),
+        allocated: this.nodeAllocated(node.id),
+      })
+      if (node.utilHistory.length > UTIL_BUCKETS) node.utilHistory.shift()
+    }
+    this.lastUtilBucketUs = this.nowUs
+  }
+
+  private rollQueueBucket(): void {
+    if (this.nowUs - this.lastBucketUs < QUEUE_BUCKET_US) return
+    const windowMin = QUEUE_BUCKET_US / MINUTE_US
+    this.queueHistory.push({
+      tUs: this.nowUs,
+      depth: this.countByState('Queued'),
+      drainedPerMinute: Math.round(this.drainsThisBucket / windowMin),
+      arrivedPerMinute: Math.round(this.arrivalsThisBucket / windowMin),
+    })
+    if (this.queueHistory.length > QUEUE_HISTORY_BUCKETS) this.queueHistory.shift()
+    this.lastBucketUs = this.nowUs
+    this.arrivalsThisBucket = 0
+    this.drainsThisBucket = 0
+  }
+
+  private transition(job: MJob, to: JobState): void {
+    const from = job.state
+    if (from === to) return
+    job.state = to
+    job.lastTransitionUs = this.nowUs
+    if (TERMINAL_JOB_STATES.includes(to)) job.terminalAtUs = job.terminalAtUs ?? this.nowUs
+    this.pushEvent({ atUs: this.nowUs, kind: 'JobStateChanged', job: job.id, from, to })
+  }
+
+  private pushEvent(ev: TimelineEvent): void {
+    this.events.push(ev)
+    if (this.events.length > EVENTS_RING) this.events.shift()
+    const jobId = 'job' in ev ? (ev.job as string) : null
+    if (jobId) {
+      const list = this.jobEvents.get(jobId) ?? []
+      list.push(ev)
+      this.jobEvents.set(jobId, list)
+    }
+  }
+
+  // ---- scoring -------------------------------------------------------------
+
+  private multiplier(priority: number): number {
+    return PRIORITY_MULTIPLIER[priority] ?? 1
+  }
+
+  private penaltyChain(entityId: string): Array<{
+    entity: string
+    name: string
+    usageUcu: number
+    quotaUcu: number
+    overQuotaRatio: number
+    penalty: number
+  }> {
+    const chain = []
+    let cur: QEntity | undefined = this.entities.get(entityId)
+    while (cur) {
+      const ratio = cur.quotaUcu > 0 ? cur.usageUcu / cur.quotaUcu : 0
+      chain.push({
+        entity: cur.id,
+        name: cur.name,
+        usageUcu: cur.usageUcu,
+        quotaUcu: cur.quotaUcu,
+        overQuotaRatio: ratio,
+        penalty: Math.max(1, ratio * ratio),
+      })
+      cur = cur.parent ? this.entities.get(cur.parent) : undefined
+    }
+    return chain
+  }
+
+  private score(job: MJob): number {
+    const chain = this.penaltyChain(job.spec.quotaEntity)
+    const penaltyProduct = chain.reduce((p, c) => p * c.penalty, 1)
+    const ageUs = this.nowUs - job.submittedAtUs
+    return this.multiplier(job.spec.priority) / penaltyProduct + (W_AGE * ageUs) / AGE_HORIZON_US
+  }
+
+  private recomputeQueueRanks(): void {
+    const queued = [...this.jobs.values()].filter((j) => j.state === 'Queued')
+    queued.sort((a, b) => this.score(b) - this.score(a))
+    this.queuedRank.clear()
+    queued.forEach((job, i) => this.queuedRank.set(job.id, i + 1))
+    this.queueDepth = queued.length
+  }
+
+  private queuedRank = new Map<string, number>()
+  private queueDepth = 0
+
+  // ---- lookups -------------------------------------------------------------
+
+  private countByState(state: JobState): number {
+    let n = 0
+    for (const job of this.jobs.values()) if (job.state === state) n += 1
+    return n
+  }
+
+  private entityName(id: string): string {
+    return this.entities.get(id)?.name ?? id
+  }
+
+  private jobOrThrow(id: string): MJob {
+    const job = this.jobs.get(id)
+    if (!job) throw new NotFound(`job ${id}`)
+    return job
+  }
+
+  private nodeOrThrow(id: string): MNode {
+    const node = this.nodes.get(id)
+    if (!node) throw new NotFound(`node ${id}`)
+    return node
+  }
+
+  // ---- node aggregates -----------------------------------------------------
+
+  private nodeAllocated(nodeId: string): Resources {
+    let total = zeroRes()
+    for (const alloc of this.allocs.values()) {
+      if (alloc.node === nodeId && alloc.state !== 'Released') total = addRes(total, alloc.funded)
+    }
+    return total
+  }
+
+  private nodeUsed(nodeId: string): Resources {
+    let total = zeroRes()
+    for (const job of this.jobs.values()) {
+      if (job.state !== 'Running' && job.state !== 'Finalizing') continue
+      const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+      if (!attempt || attempt.node !== nodeId) continue
+      const last = job.usage[job.usage.length - 1]
+      if (last) total = addRes(total, res(last.cpuMillis, last.memoryBytes, last.diskBytes))
+    }
+    return total
+  }
+
+  private nodeCounts(nodeId: string): { running: number; accruing: number } {
+    let running = 0
+    let accruing = 0
+    for (const alloc of this.allocs.values()) {
+      if (alloc.node !== nodeId) continue
+      if (alloc.state === 'Active') running += 1
+      else if (alloc.state === 'Accruing') accruing += 1
+    }
+    return { running, accruing }
+  }
+
+  // ===========================================================================
+  // View builders (public API surface). All return freshly built objects.
+  // ===========================================================================
+
+  buildClusterOverview(): ClusterOverview {
+    let capacity = zeroRes()
+    let allocated = zeroRes()
+    let used = zeroRes()
+    let schedulable = 0
+    let lost = 0
+    for (const node of this.nodes.values()) {
+      if (node.health === 'Lost') {
+        lost += 1
+      } else {
+        capacity = addRes(capacity, node.capacity)
+        if (node.schedulable) schedulable += 1
+      }
+      allocated = addRes(allocated, this.nodeAllocated(node.id))
+      used = addRes(used, this.nodeUsed(node.id))
+    }
+    return {
+      clusterId: this.clusterId,
+      queue: this.buildQueueStats(),
+      capacity: {
+        nodes: { total: this.nodes.size, schedulable, lost },
+        capacity,
+        allocated,
+        used,
+      },
+      recentEvents: [...this.events].reverse().slice(0, 20),
+    }
+  }
+
+  buildQueueStats(): QueueStats {
+    const byState = {} as Record<JobState, number>
+    for (const s of [
+      'Submitted',
+      'Accepted',
+      'Queued',
+      'Preparing',
+      'Running',
+      'Finalizing',
+      'Succeeded',
+      'Failed',
+      'Aborted',
+    ] as JobState[]) {
+      byState[s] = 0
+    }
+    let oldestQueuedAgeUs: number | null = null
+    for (const job of this.jobs.values()) {
+      byState[job.state] += 1
+      if (job.state === 'Queued') {
+        const age = this.nowUs - job.submittedAtUs
+        if (oldestQueuedAgeUs === null || age > oldestQueuedAgeUs) oldestQueuedAgeUs = age
+      }
+    }
+    const recent = this.queueHistory.slice(-6)
+    const avg = (pick: (b: QueueBucket) => number) =>
+      recent.length ? recent.reduce((s, b) => s + pick(b), 0) / recent.length : 0
+    return {
+      depth: byState.Queued,
+      drainRatePerMinute: Math.round(avg((b) => b.drainedPerMinute)),
+      arrivalRatePerMinute: Math.round(avg((b) => b.arrivedPerMinute)),
+      oldestQueuedAgeUs,
+      byState,
+      history: this.queueHistory.map((b) => ({
+        tUs: b.tUs,
+        depth: b.depth,
+        drainedPerMinute: b.drainedPerMinute,
+        arrivedPerMinute: b.arrivedPerMinute,
+      })),
+    }
+  }
+
+  listJobs(filter: ListJobsFilter): JobList {
+    const wanted = filter.states ? new Set(filter.states) : null
+    const search = filter.search?.toLowerCase()
+    let matches = [...this.jobs.values()].filter((job) => {
+      if (wanted && !wanted.has(job.state)) return false
+      if (filter.quotaEntity && job.spec.quotaEntity !== filter.quotaEntity) return false
+      if (filter.node) {
+        const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+        if (!attempt || attempt.node !== filter.node) return false
+      }
+      if (search) {
+        const hay = `${job.id} ${job.spec.image}`.toLowerCase()
+        if (!hay.includes(search)) return false
+      }
+      return true
+    })
+    // Non-terminal first (submittedAt desc), then terminal (terminalAt desc).
+    matches = matches.sort((a, b) => {
+      const at = this.isTerminal(a)
+      const bt = this.isTerminal(b)
+      if (at !== bt) return at ? 1 : -1
+      if (!at) return b.submittedAtUs - a.submittedAtUs
+      return (b.terminalAtUs ?? 0) - (a.terminalAtUs ?? 0)
+    })
+    const total = matches.length
+    const limit = filter.limit ?? 100
+    return {
+      total,
+      jobs: matches.slice(0, limit).map((job) => this.jobSummary(job)),
+    }
+  }
+
+  private isTerminal(job: MJob): boolean {
+    return TERMINAL_JOB_STATES.includes(job.state)
+  }
+
+  private jobSummary(job: MJob): JobSummary {
+    const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+    const alloc = attempt ? this.allocs.get(attempt.allocation) : undefined
+    const fundingFraction =
+      job.state === 'Preparing' && alloc ? minFraction(alloc.funded, alloc.requested) : null
+    return {
+      id: job.id,
+      state: job.state,
+      image: job.spec.image,
+      quotaEntity: job.spec.quotaEntity,
+      quotaEntityName: this.entityName(job.spec.quotaEntity),
+      priority: job.spec.priority,
+      submittedAtUs: job.submittedAtUs,
+      terminalAtUs: job.terminalAtUs,
+      node: attempt ? attempt.node : null,
+      queueRank: job.state === 'Queued' ? (this.queuedRank.get(job.id) ?? null) : null,
+      fundingFraction,
+      costUcu: this.totalCharged(job),
+      outcome: this.isTerminal(job) ? this.lastOutcome(job) : null,
+    }
+  }
+
+  private totalCharged(job: MJob): number {
+    return job.attempts.reduce((s, id) => s + (this.attempts.get(id)?.chargedUcu ?? 0), 0)
+  }
+
+  private lastOutcome(job: MJob): AttemptOutcome | null {
+    const last = job.attempts[job.attempts.length - 1]
+    return last ? (this.attempts.get(last)?.outcome ?? null) : null
+  }
+
+  buildJobDetail(id: string): JobDetail {
+    const job = this.jobOrThrow(id)
+    const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+    return {
+      id: job.id,
+      state: job.state,
+      spec: {
+        image: job.spec.image,
+        requests: { ...job.spec.requests },
+        priority: job.spec.priority,
+        maxRuntimeUs: job.spec.maxRuntimeUs,
+        quotaEntity: job.spec.quotaEntity,
+        retry: { ...job.spec.retry },
+      },
+      submittedAtUs: job.submittedAtUs,
+      terminalAtUs: job.terminalAtUs,
+      retriesUsed: job.retriesUsed,
+      abortRequested: job.abortRequested ? { ...job.abortRequested } : null,
+      entityChain: this.entityChain(job.spec.quotaEntity),
+      attempts: job.attempts.map((aid) => this.attemptView(aid)),
+      currentAttempt: job.currentAttempt,
+      queue: job.state === 'Queued' ? this.queueExplainer(job) : null,
+      accrual: attempt && attempt.state === 'Accruing' ? this.accrualView(attempt) : null,
+      cost: this.costReport(job),
+    }
+  }
+
+  private entityChain(leafId: string): JobDetail['entityChain'] {
+    // Build leaf→root then reverse to root→leaf per the contract.
+    const chain = []
+    let cur: QEntity | undefined = this.entities.get(leafId)
+    while (cur) {
+      const ratio = cur.quotaUcu > 0 ? cur.usageUcu / cur.quotaUcu : 0
+      chain.push({
+        id: cur.id,
+        name: cur.name,
+        parent: cur.parent,
+        quotaUcu: cur.quotaUcu,
+        usageUcu: cur.usageUcu,
+        overQuotaRatio: ratio,
+        penalty: Math.max(1, ratio * ratio),
+      })
+      cur = cur.parent ? this.entities.get(cur.parent) : undefined
+    }
+    return chain.reverse()
+  }
+
+  private attemptView(id: string): AttemptView {
+    const a = this.attempts.get(id)
+    if (!a) throw new NotFound(`attempt ${id}`)
+    return {
+      id: a.id,
+      job: a.job,
+      node: a.node,
+      allocation: a.allocation,
+      state: a.state,
+      outcome: a.outcome ? { ...a.outcome } : null,
+      startedAtUs: a.startedAtUs,
+      endedAtUs: a.endedAtUs,
+      rateUcuPerSecond: a.rateUcuPerSecond,
+      chargedUcu: a.chargedUcu,
+    }
+  }
+
+  private allocView(id: string): AllocationView {
+    const a = this.allocs.get(id)
+    if (!a) throw new NotFound(`allocation ${id}`)
+    return {
+      id: a.id,
+      job: a.job,
+      attempt: a.attempt,
+      node: a.node,
+      requested: { ...a.requested },
+      funded: { ...a.funded },
+      state: a.state,
+      seq: a.seq,
+    }
+  }
+
+  private queueExplainer(job: MJob): QueuePositionExplainer {
+    const chain = this.penaltyChain(job.spec.quotaEntity)
+    const penaltyProduct = chain.reduce((p, c) => p * c.penalty, 1)
+    const multiplier = this.multiplier(job.spec.priority)
+    const ageUs = this.nowUs - job.submittedAtUs
+    const ageBonus = (W_AGE * ageUs) / AGE_HORIZON_US
+    return {
+      rank: this.queuedRank.get(job.id) ?? 1,
+      queueDepth: this.queueDepth,
+      score: multiplier / penaltyProduct + ageBonus,
+      multiplier,
+      penaltyChain: chain,
+      penaltyProduct,
+      ageUs,
+      ageHorizonUs: AGE_HORIZON_US,
+      wAge: W_AGE,
+      ageBonus,
+    }
+  }
+
+  private accrualView(attempt: MAttempt): AccrualView {
+    const alloc = this.allocs.get(attempt.allocation)
+    if (!alloc) throw new NotFound(`allocation ${attempt.allocation}`)
+    const job = this.jobs.get(attempt.job)
+    const frac = (a: number, b: number) => (b > 0 ? Math.min(1, a / b) : 1)
+    return {
+      allocation: this.allocView(alloc.id),
+      fundedFraction: {
+        cpu: frac(alloc.funded.cpuMillis, alloc.requested.cpuMillis),
+        memory: frac(alloc.funded.memoryBytes, alloc.requested.memoryBytes),
+        disk: frac(alloc.funded.diskBytes, alloc.requested.diskBytes),
+      },
+      projectedStartUs: job ? job.projectedStartUs : null,
+    }
+  }
+
+  private costReport(job: MJob): CostReport {
+    const rate = computeRate(job.spec.requests)
+    const runtimeUs = job.spec.maxRuntimeUs ?? DEFAULT_RUNTIME_US
+    const estimatedUcu = Math.round(rate * (runtimeUs / SECOND_US))
+    return {
+      rateUcuPerSecond: rate,
+      estimatedUcu,
+      estimateUsedDefaultRuntime: job.spec.maxRuntimeUs === null,
+      chargedUcu: this.totalCharged(job),
+      actualUcu: this.isTerminal(job) ? job.actualUcu : null,
+      trueUp: this.isTerminal(job) && job.trueUp ? { ...job.trueUp } : null,
+    }
+  }
+
+  buildJobTimeline(id: string): TimelineEvent[] {
+    this.jobOrThrow(id)
+    const list = this.jobEvents.get(id) ?? []
+    // Always include the synthetic submission at the head.
+    const submit: TimelineEvent = {
+      atUs: this.jobs.get(id)!.submittedAtUs,
+      kind: 'JobSubmitted',
+      job: id,
+    }
+    const merged = [submit, ...list.filter((e) => e.kind !== 'JobSubmitted')]
+    return merged.sort((a, b) => a.atUs - b.atUs).map((e) => ({ ...e }))
+  }
+
+  buildJobUsage(id: string): JobUsage {
+    const job = this.jobOrThrow(id)
+    return {
+      requested: { ...job.spec.requests },
+      samples: job.usage.map((s) => ({ ...s })),
+    }
+  }
+
+  buildNodeSummaries(): NodeSummary[] {
+    return [...this.nodes.values()].map((n) => this.nodeSummary(n))
+  }
+
+  private nodeSummary(node: MNode): NodeSummary {
+    const counts = this.nodeCounts(node.id)
+    return {
+      id: node.id,
+      capacity: { ...node.capacity },
+      allocated: this.nodeAllocated(node.id),
+      used: this.nodeUsed(node.id),
+      labels: { ...node.labels },
+      schedulable: node.schedulable,
+      health: node.health,
+      epoch: node.epoch,
+      lastHeartbeatUs: node.lastHeartbeatUs,
+      runningCount: counts.running,
+      accruingCount: counts.accruing,
+    }
+  }
+
+  buildNodeDetail(id: string): NodeDetail {
+    const node = this.nodeOrThrow(id)
+    const activeAttempts: AttemptView[] = []
+    const accrualQueue: AccrualView[] = []
+    for (const attempt of this.attempts.values()) {
+      if (attempt.node !== node.id) continue
+      if (
+        attempt.state === 'Running' ||
+        attempt.state === 'Dispatching' ||
+        attempt.state === 'Finalizing'
+      ) {
+        activeAttempts.push(this.attemptView(attempt.id))
+      } else if (attempt.state === 'Accruing') {
+        accrualQueue.push(this.accrualView(attempt))
+      }
+    }
+    accrualQueue.sort((a, b) => a.allocation.seq - b.allocation.seq)
+    return { summary: this.nodeSummary(node), activeAttempts, accrualQueue }
+  }
+
+  buildNodeUtilization(id: string): NodeUtilization {
+    const node = this.nodeOrThrow(id)
+    return {
+      capacity: { ...node.capacity },
+      samples: node.utilHistory.map((s) => ({
+        tUs: s.tUs,
+        used: { ...s.used },
+        allocated: { ...s.allocated },
+      })),
+    }
+  }
+
+  buildNodeHistory(id: string): NodeHistoryEntry[] {
+    this.nodeOrThrow(id)
+    const entries: NodeHistoryEntry[] = []
+    for (const attempt of this.attempts.values()) {
+      if (attempt.node !== id || attempt.state !== 'Terminal' || !attempt.outcome) continue
+      if (attempt.endedAtUs === null) continue
+      const job = this.jobs.get(attempt.job)
+      entries.push({
+        attempt: attempt.id,
+        job: attempt.job,
+        image: job?.spec.image ?? 'unknown',
+        outcome: { ...attempt.outcome },
+        startedAtUs: attempt.startedAtUs,
+        endedAtUs: attempt.endedAtUs,
+      })
+    }
+    return entries.sort((a, b) => b.endedAtUs - a.endedAtUs).slice(0, 50)
+  }
+
+  buildCoordinatorStatus(): CoordinatorStatus {
+    const leader = this.coordinators.find((c) => c.role === 'Leader') ?? null
+    const members: CoordinatorMember[] = this.coordinators.map((c) => ({
+      id: c.id,
+      addr: c.addr,
+      role: c.role,
+      voter: c.voter,
+      lastApplied: this.raftIndex - c.lagEntries,
+      replicationLagEntries: c.lagEntries,
+      host: { ...c.host },
+      lastSeenUs: c.lastSeenUs,
+    }))
+    return {
+      clusterId: this.clusterId,
+      leader: leader ? leader.id : null,
+      term: 7,
+      knownCommitted: this.raftIndex,
+      lastApplied: this.raftIndex - (leader ? leader.lagEntries : 0),
+      stateVersion: this.stateVersion,
+      snapshot: {
+        sizeBytes: 40 * 1024 * 1024,
+        lastIncludedIndex: this.snapshotIndex,
+        takenAtUs: this.snapshotAtUs,
+        entriesSinceSnapshot: this.raftIndex - this.snapshotIndex,
+      },
+      stateCounts: {
+        jobs: this.jobs.size,
+        attempts: this.attempts.size,
+        allocations: this.allocs.size,
+        nodes: this.nodes.size,
+        quotaEntities: this.entities.size,
+      },
+      members,
+    }
+  }
+
+  // ---- logs ----------------------------------------------------------------
+
+  buildJobLogs(id: string, cursor: string | null): LogChunk {
+    const job = this.jobOrThrow(id)
+    return pageLogs(this.jobLogLines(job), cursor)
+  }
+
+  buildNodeLogs(id: string, cursor: string | null): LogChunk {
+    const node = this.nodeOrThrow(id)
+    return pageLogs(this.nodeLogLines(node), cursor)
+  }
+
+  buildCoordinatorLogs(id: number, cursor: string | null): LogChunk {
+    const c = this.coordinators.find((m) => m.id === id)
+    if (!c) throw new NotFound(`coordinator ${id}`)
+    return pageLogs(this.coordinatorLogLines(c), cursor)
+  }
+
+  private jobLogLines(job: MJob): LogEntry[] {
+    const rng = new Rng(hashSeed(job.id + 'log'))
+    const start = job.submittedAtUs
+    const end = job.terminalAtUs ?? this.nowUs
+    const lines: LogEntry[] = []
+    const push = (tUs: number, level: LogLevel, target: string, message: string) =>
+      lines.push({ tUs, level, target, message })
+    push(start, 'info', 'agent.puller', `pulling image ${job.spec.image}`)
+    push(start + 4 * SECOND_US, 'info', 'agent.puller', 'image present, extracting layers')
+    push(start + 9 * SECOND_US, 'info', 'agent.runtime', 'created container, starting entrypoint')
+    const appLines = rng.int(40, 90)
+    let t = start + 12 * SECOND_US
+    for (let i = 0; i < appLines && t < end; i += 1) {
+      t += rng.range(2 * SECOND_US, 90 * SECOND_US)
+      const level = rng.weighted([
+        ['info', 8],
+        ['debug', 3],
+        ['warn', 1],
+      ] as const) as LogLevel
+      push(t, level, 'app', APP_LINES[rng.int(0, APP_LINES.length - 1)] ?? 'working')
+    }
+    const outcome = this.lastOutcome(job)
+    if (outcome) {
+      if (outcome.kind === 'Exited' && outcome.exitCode === 0) {
+        push(end, 'info', 'app', 'done; flushing outputs')
+        push(end, 'info', 'agent.runtime', 'container exited code 0')
+      } else if (outcome.kind === 'OomKilled') {
+        push(end, 'error', 'agent.runtime', 'container OOM-killed (memory.max exceeded)')
+      } else {
+        push(end, 'error', 'agent.runtime', `container terminated: ${outcome.kind}`)
+      }
+    }
+    return lines
+  }
+
+  private nodeLogLines(node: MNode): LogEntry[] {
+    const rng = new Rng(hashSeed(node.id + 'log'))
+    const lines: LogEntry[] = []
+    const count = 100
+    let t = this.nowUs - count * 15 * SECOND_US
+    for (let i = 0; i < count; i += 1) {
+      t += rng.range(8 * SECOND_US, 20 * SECOND_US)
+      const roll = rng.float()
+      if (roll < 0.55) {
+        lines.push({ tUs: t, level: 'debug', target: 'agent.heartbeat', message: 'heartbeat ack' })
+      } else if (roll < 0.8) {
+        lines.push({
+          tUs: t,
+          level: 'info',
+          target: 'agent.reconcile',
+          message: 'reconciled desired allocations',
+        })
+      } else if (roll < 0.95) {
+        lines.push({
+          tUs: t,
+          level: 'info',
+          target: 'agent.alloc',
+          message: 'allocation funded → active',
+        })
+      } else {
+        lines.push({
+          tUs: t,
+          level: 'warn',
+          target: 'agent.reconcile',
+          message: 'drift detected, resyncing',
+        })
+      }
+    }
+    if (node.health === 'Lost') {
+      lines.push({
+        tUs: this.nowUs,
+        level: 'error',
+        target: 'agent.heartbeat',
+        message: 'heartbeat timeout; marking node Lost',
+      })
+    }
+    return lines
+  }
+
+  private coordinatorLogLines(c: MCoordinator): LogEntry[] {
+    const rng = new Rng(hashSeed(String(c.id) + 'coordlog'))
+    const lines: LogEntry[] = []
+    const count = 100
+    let t = this.nowUs - count * 10 * SECOND_US
+    let idx = this.raftIndex - count * 3
+    for (let i = 0; i < count; i += 1) {
+      t += rng.range(4 * SECOND_US, 14 * SECOND_US)
+      idx += rng.int(1, 5)
+      const roll = rng.float()
+      if (roll < 0.6) {
+        lines.push({
+          tUs: t,
+          level: 'debug',
+          target: 'raft.log',
+          message: `appended entries up to index ${idx}`,
+        })
+      } else if (roll < 0.9) {
+        lines.push({
+          tUs: t,
+          level: 'info',
+          target: 'raft.commit',
+          message: `committed index ${idx}`,
+        })
+      } else if (roll < 0.97) {
+        lines.push({
+          tUs: t,
+          level: 'info',
+          target: 'raft.snapshot',
+          message: 'snapshot trigger: log size threshold',
+        })
+      } else {
+        lines.push({
+          tUs: t,
+          level: 'warn',
+          target: 'raft.election',
+          message: `election tick; term ${7}`,
+        })
+      }
+    }
+    return lines
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+class NotFound extends Error {
+  readonly notFound = true
+  constructor(what: string) {
+    super(`not found: ${what}`)
+    this.name = 'MockNotFound'
+  }
+}
+
+export function isMockNotFound(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && 'notFound' in e
+}
+
+const LOG_PAGE = 40
+
+/** Cursor-paged newest-first; cursor is a stringified offset. */
+function pageLogs(all: LogEntry[], cursor: string | null): LogChunk {
+  const newestFirst = [...all].sort((a, b) => b.tUs - a.tUs)
+  const offset = cursor ? Math.max(0, Number.parseInt(cursor, 10) || 0) : 0
+  const slice = newestFirst.slice(offset, offset + LOG_PAGE)
+  const nextOffset = offset + LOG_PAGE
+  return {
+    entries: slice.map((e) => ({ ...e })),
+    nextCursor: nextOffset < newestFirst.length ? String(nextOffset) : null,
+  }
+}
+
+const APP_LINES = [
+  'loaded checkpoint from object store',
+  'epoch 3 step 1200 loss=0.4821',
+  'validation batch complete, acc=0.913',
+  'flushing metrics to collector',
+  'processed 10000 records',
+  'cache hit ratio 0.87',
+  'GC pause 12ms',
+  'shard 4/8 rebalanced',
+  'retrying upstream request (attempt 2)',
+  'wrote 512 MiB to scratch volume',
+]

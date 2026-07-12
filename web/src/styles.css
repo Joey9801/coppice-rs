@@ -1,0 +1,116 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Design tokens, shadcn/ui conventions: raw values live on :root / .dark,
+ * and @theme inline maps them to Tailwind color utilities (bg-background,
+ * text-muted-foreground, border-border, ...). Components must use these
+ * semantic utilities, never hardcoded palette colors, so both themes work.
+ */
+:root {
+  --background: oklch(0.985 0.002 145);
+  --foreground: oklch(0.2 0.015 155);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0.015 155);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0.015 155);
+  --primary: oklch(0.5 0.13 155);
+  --primary-foreground: oklch(0.985 0.005 145);
+  --secondary: oklch(0.95 0.008 150);
+  --secondary-foreground: oklch(0.25 0.02 155);
+  --muted: oklch(0.955 0.006 150);
+  --muted-foreground: oklch(0.5 0.015 155);
+  --accent: oklch(0.94 0.012 150);
+  --accent-foreground: oklch(0.25 0.02 155);
+  --destructive: oklch(0.55 0.2 25);
+  --destructive-foreground: oklch(0.985 0.005 145);
+  --border: oklch(0.91 0.008 150);
+  --input: oklch(0.91 0.008 150);
+  --ring: oklch(0.5 0.13 155);
+  --chart-1: oklch(0.55 0.13 155);
+  --chart-2: oklch(0.6 0.12 230);
+  --chart-3: oklch(0.7 0.15 85);
+  --chart-4: oklch(0.6 0.17 300);
+  --chart-5: oklch(0.62 0.19 25);
+  --sidebar: oklch(0.965 0.005 150);
+  --sidebar-foreground: oklch(0.25 0.02 155);
+  --sidebar-accent: oklch(0.92 0.012 150);
+  --radius: 0.5rem;
+}
+
+.dark {
+  --background: oklch(0.17 0.012 165);
+  --foreground: oklch(0.92 0.008 150);
+  --card: oklch(0.21 0.014 165);
+  --card-foreground: oklch(0.92 0.008 150);
+  --popover: oklch(0.21 0.014 165);
+  --popover-foreground: oklch(0.92 0.008 150);
+  --primary: oklch(0.72 0.14 155);
+  --primary-foreground: oklch(0.15 0.02 165);
+  --secondary: oklch(0.27 0.015 165);
+  --secondary-foreground: oklch(0.92 0.008 150);
+  --muted: oklch(0.26 0.014 165);
+  --muted-foreground: oklch(0.68 0.012 155);
+  --accent: oklch(0.29 0.018 165);
+  --accent-foreground: oklch(0.92 0.008 150);
+  --destructive: oklch(0.62 0.19 25);
+  --destructive-foreground: oklch(0.15 0.02 165);
+  --border: oklch(0.29 0.014 165);
+  --input: oklch(0.31 0.014 165);
+  --ring: oklch(0.72 0.14 155);
+  --chart-1: oklch(0.72 0.14 155);
+  --chart-2: oklch(0.68 0.13 230);
+  --chart-3: oklch(0.78 0.14 85);
+  --chart-4: oklch(0.68 0.15 300);
+  --chart-5: oklch(0.68 0.18 25);
+  --sidebar: oklch(0.19 0.013 165);
+  --sidebar-foreground: oklch(0.88 0.01 150);
+  --sidebar-accent: oklch(0.26 0.016 165);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings:
+      'tnum' 1,
+      'cv05' 1;
+  }
+}

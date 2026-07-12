@@ -57,3 +57,23 @@ jobs:
       # corpus in-process, so no system `protoc` is needed. The 1M-scale tests
       # are `#[ignore]`d by default and stay that way here.
       - run: cargo test --workspace --all-features --locked
+
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm test
+      # `build` runs `tsc -b` first, so this is also the typecheck gate.
+      - run: npm run build

@@ -41,5 +41,7 @@ The subsystems described here map onto the workspace crates roughly as follows:
 | Node agent daemon (library) | `coppice-agent` |
 | The single `coppice` binary (coordinator/agent/client subcommands) | `coppice-cli` |
 
-The web UI is not yet scaffolded; it will be built on the public API surface
-exposed by `coppice-api`.
+The web UI lives in `web/` at the repo root (Vite/React SPA, currently
+running on mock data — see `web/README.md`). It will be built on the public
+API surface exposed by `coppice-api` and eventually embedded into the
+`coppice` binary and served from each coordinator's client listener.
