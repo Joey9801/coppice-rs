@@ -254,6 +254,7 @@ export interface JobDetail {
 
 export interface ListJobsFilter {
   states?: JobState[]
+  /** Matches the entity's whole subtree (a leaf matches just itself). */
   quotaEntity?: QuotaEntityId
   node?: NodeId
   /** Substring match on job id or image. */
@@ -374,6 +375,69 @@ export interface QuotaEntityView {
   overQuotaRatio: number
   /** Multiplicative scheduling penalty ≥ 1 derived from the ratio. */
   penalty: number
+}
+
+/**
+ * How an entity came to exist. `sso` marks the auto-populated user tree
+ * (ADR 0022): the coordinator mints an entity under the reserved `users`
+ * root the first time it sees an OIDC principal, named after the `sub`
+ * claim. Auto-minted entities stay editable (quota, child sub-queues) but
+ * their name and position are owned by the identity, not the admin.
+ */
+export type QuotaEntityOrigin = 'configured' | 'sso'
+
+/** One node of the quota-entity tree, as listed by the explorer. */
+export interface QuotaEntityNode {
+  id: QuotaEntityId
+  /** Full display path, slash-separated ("Acme/Eng/Platform"). */
+  name: string
+  parent: QuotaEntityId | null
+  origin: QuotaEntityOrigin
+  /** OIDC `sub` the entity was auto-minted for; only on `sso` entities. */
+  principal: string | null
+  quotaUcu: number
+  /** Decayed usage as of "now". */
+  usageUcu: number
+  overQuotaRatio: number
+  penalty: number
+  createdAtUs: number
+  updatedAtUs: number
+  /** Live job counts over this entity's subtree (itself + descendants). */
+  queuedCount: number
+  runningCount: number
+}
+
+/** Subtree-inclusive stats for one quota entity. */
+export interface QuotaEntityStats {
+  byState: Record<JobState, number>
+  oldestQueuedAgeUs: number | null
+  /** Σ µCU/s of currently running attempts in the subtree. */
+  burnRateUcuPerSecond: number
+  /** µCU charged to this entity in the trailing 24h (pre-decay). */
+  chargedUcu24h: number
+  /** Recent decayed-usage samples for sparklines, oldest first. */
+  usageHistory: Array<{ tUs: number; usageUcu: number }>
+}
+
+export interface QuotaEntityDetail {
+  entity: QuotaEntityNode
+  /** Ancestry, root first, this entity last. */
+  chain: QuotaEntityView[]
+  children: QuotaEntityNode[]
+  stats: QuotaEntityStats
+}
+
+/**
+ * Mirrors the `ConfigureQuotaEntity` command: a create-or-update upsert,
+ * no delete in v1 (entities with historical charges stay). Updates
+ * preserve accumulated usage — reconfiguration is not an amnesty.
+ */
+export interface ConfigureQuotaEntityInput {
+  /** Null proposes a create; the server mints the id. */
+  entity: QuotaEntityId | null
+  parent: QuotaEntityId | null
+  name: string
+  quotaUcu: number
 }
 
 // ---------------------------------------------------------------------------

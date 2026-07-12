@@ -13,8 +13,10 @@ import { Route as CoordinatorsRouteImport } from './routes/coordinators'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as NodesIndexRouteImport } from './routes/nodes.index'
 import { Route as JobsIndexRouteImport } from './routes/jobs.index'
+import { Route as EntitiesIndexRouteImport } from './routes/entities.index'
 import { Route as NodesNodeIdRouteImport } from './routes/nodes.$nodeId'
 import { Route as JobsJobIdRouteImport } from './routes/jobs.$jobId'
+import { Route as EntitiesEntityIdRouteImport } from './routes/entities.$entityId'
 
 const CoordinatorsRoute = CoordinatorsRouteImport.update({
   id: '/coordinators',
@@ -36,6 +38,11 @@ const JobsIndexRoute = JobsIndexRouteImport.update({
   path: '/jobs/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const EntitiesIndexRoute = EntitiesIndexRouteImport.update({
+  id: '/entities/',
+  path: '/entities/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const NodesNodeIdRoute = NodesNodeIdRouteImport.update({
   id: '/nodes/$nodeId',
   path: '/nodes/$nodeId',
@@ -46,20 +53,29 @@ const JobsJobIdRoute = JobsJobIdRouteImport.update({
   path: '/jobs/$jobId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const EntitiesEntityIdRoute = EntitiesEntityIdRouteImport.update({
+  id: '/entities/$entityId',
+  path: '/entities/$entityId',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/coordinators': typeof CoordinatorsRoute
+  '/entities/$entityId': typeof EntitiesEntityIdRoute
   '/jobs/$jobId': typeof JobsJobIdRoute
   '/nodes/$nodeId': typeof NodesNodeIdRoute
+  '/entities/': typeof EntitiesIndexRoute
   '/jobs/': typeof JobsIndexRoute
   '/nodes/': typeof NodesIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/coordinators': typeof CoordinatorsRoute
+  '/entities/$entityId': typeof EntitiesEntityIdRoute
   '/jobs/$jobId': typeof JobsJobIdRoute
   '/nodes/$nodeId': typeof NodesNodeIdRoute
+  '/entities': typeof EntitiesIndexRoute
   '/jobs': typeof JobsIndexRoute
   '/nodes': typeof NodesIndexRoute
 }
@@ -67,8 +83,10 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/coordinators': typeof CoordinatorsRoute
+  '/entities/$entityId': typeof EntitiesEntityIdRoute
   '/jobs/$jobId': typeof JobsJobIdRoute
   '/nodes/$nodeId': typeof NodesNodeIdRoute
+  '/entities/': typeof EntitiesIndexRoute
   '/jobs/': typeof JobsIndexRoute
   '/nodes/': typeof NodesIndexRoute
 }
@@ -77,24 +95,30 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/coordinators'
+    | '/entities/$entityId'
     | '/jobs/$jobId'
     | '/nodes/$nodeId'
+    | '/entities/'
     | '/jobs/'
     | '/nodes/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/coordinators'
+    | '/entities/$entityId'
     | '/jobs/$jobId'
     | '/nodes/$nodeId'
+    | '/entities'
     | '/jobs'
     | '/nodes'
   id:
     | '__root__'
     | '/'
     | '/coordinators'
+    | '/entities/$entityId'
     | '/jobs/$jobId'
     | '/nodes/$nodeId'
+    | '/entities/'
     | '/jobs/'
     | '/nodes/'
   fileRoutesById: FileRoutesById
@@ -102,8 +126,10 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   CoordinatorsRoute: typeof CoordinatorsRoute
+  EntitiesEntityIdRoute: typeof EntitiesEntityIdRoute
   JobsJobIdRoute: typeof JobsJobIdRoute
   NodesNodeIdRoute: typeof NodesNodeIdRoute
+  EntitiesIndexRoute: typeof EntitiesIndexRoute
   JobsIndexRoute: typeof JobsIndexRoute
   NodesIndexRoute: typeof NodesIndexRoute
 }
@@ -138,6 +164,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof JobsIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/entities/': {
+      id: '/entities/'
+      path: '/entities'
+      fullPath: '/entities/'
+      preLoaderRoute: typeof EntitiesIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/nodes/$nodeId': {
       id: '/nodes/$nodeId'
       path: '/nodes/$nodeId'
@@ -152,14 +185,23 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof JobsJobIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/entities/$entityId': {
+      id: '/entities/$entityId'
+      path: '/entities/$entityId'
+      fullPath: '/entities/$entityId'
+      preLoaderRoute: typeof EntitiesEntityIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   CoordinatorsRoute: CoordinatorsRoute,
+  EntitiesEntityIdRoute: EntitiesEntityIdRoute,
   JobsJobIdRoute: JobsJobIdRoute,
   NodesNodeIdRoute: NodesNodeIdRoute,
+  EntitiesIndexRoute: EntitiesIndexRoute,
   JobsIndexRoute: JobsIndexRoute,
   NodesIndexRoute: NodesIndexRoute,
 }

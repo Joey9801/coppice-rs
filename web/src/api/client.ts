@@ -1,5 +1,6 @@
 import type {
   ClusterOverview,
+  ConfigureQuotaEntityInput,
   CoordinatorId,
   CoordinatorStatus,
   JobDetail,
@@ -14,6 +15,9 @@ import type {
   NodeSummary,
   NodeUtilization,
   QueueStats,
+  QuotaEntityDetail,
+  QuotaEntityId,
+  QuotaEntityNode,
   Session,
   TimelineEvent,
 } from './types'
@@ -65,10 +69,21 @@ export interface CoppiceApi {
   // Coordinators
   getCoordinatorStatus(): Promise<CoordinatorStatus>
   getCoordinatorLogs(id: CoordinatorId, cursor: string | null): Promise<LogChunk>
+
+  // Quota entities
+  listQuotaEntities(): Promise<QuotaEntityNode[]>
+  getQuotaEntity(id: QuotaEntityId): Promise<QuotaEntityDetail>
+  /**
+   * Proposes `ConfigureQuotaEntity` (upsert; create when `input.entity` is
+   * null). Requires an `admin` role binding covering the entity (ADR 0023) —
+   * rejections surface as `PermissionDenied`.
+   */
+  configureQuotaEntity(input: ConfigureQuotaEntityInput): Promise<QuotaEntityNode>
 }
 
 /** Error shape all clients throw; mirrors `coppice_api::ApiError` loosely. */
-export type ApiErrorCode = 'NotFound' | 'InvalidArgument' | 'Unavailable' | 'Internal'
+export type ApiErrorCode =
+  'NotFound' | 'InvalidArgument' | 'PermissionDenied' | 'Unavailable' | 'Internal'
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode

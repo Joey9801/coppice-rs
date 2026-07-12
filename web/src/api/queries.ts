@@ -1,6 +1,13 @@
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from './index'
-import type { CoordinatorId, JobId, ListJobsFilter, NodeId } from './types'
+import type {
+  ConfigureQuotaEntityInput,
+  CoordinatorId,
+  JobId,
+  ListJobsFilter,
+  NodeId,
+  QuotaEntityId,
+} from './types'
 
 /**
  * TanStack Query hooks — the ONLY way UI code reads data. One hook per
@@ -29,6 +36,8 @@ export const queryKeys = {
   nodeLogs: (id: NodeId) => ['node', id, 'logs'] as const,
   coordinators: ['coordinators'] as const,
   coordinatorLogs: (id: CoordinatorId) => ['coordinators', id, 'logs'] as const,
+  quotaEntities: ['quota-entities'] as const,
+  quotaEntity: (id: QuotaEntityId) => ['quota-entity', id] as const,
 }
 
 export function useSession() {
@@ -149,5 +158,38 @@ export function useCoordinatorLogs(id: CoordinatorId) {
     queryKey: queryKeys.coordinatorLogs(id),
     queryFn: () => api.getCoordinatorLogs(id, null),
     ...LIVE,
+  })
+}
+
+export function useQuotaEntities() {
+  return useQuery({
+    queryKey: queryKeys.quotaEntities,
+    queryFn: () => api.listQuotaEntities(),
+    placeholderData: keepPreviousData,
+    ...LIVE,
+  })
+}
+
+export function useQuotaEntity(id: QuotaEntityId) {
+  return useQuery({
+    queryKey: queryKeys.quotaEntity(id),
+    queryFn: () => api.getQuotaEntity(id),
+    ...LIVE,
+  })
+}
+
+/**
+ * Proposes `ConfigureQuotaEntity`. On success, everything derived from the
+ * tree (the list, per-entity details, job rows carrying entity names) is
+ * invalidated; the 2s LIVE polls pick the rest up.
+ */
+export function useConfigureQuotaEntity() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: ConfigureQuotaEntityInput) => api.configureQuotaEntity(input),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.quotaEntities })
+      void queryClient.invalidateQueries({ queryKey: ['quota-entity'] })
+    },
   })
 }

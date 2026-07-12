@@ -1,6 +1,6 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { Link, Outlet, createRootRouteWithContext } from '@tanstack/react-router'
-import { Boxes, Gauge, ListTodo, Moon, ServerCog, Sun } from 'lucide-react'
+import { Boxes, Gauge, ListTodo, Moon, Network, ServerCog, Sun } from 'lucide-react'
 import { useSession } from '@/auth/session'
 import { useTheme } from '@/lib/theme'
 
@@ -15,6 +15,7 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 const NAV = [
   { to: '/', label: 'Overview', icon: Gauge },
   { to: '/jobs', label: 'Jobs', icon: ListTodo },
+  { to: '/entities', label: 'Entities', icon: Network },
   { to: '/nodes', label: 'Nodes', icon: Boxes },
   { to: '/coordinators', label: 'Coordinators', icon: ServerCog },
 ] as const

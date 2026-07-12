@@ -9,4 +9,16 @@
  * `roles` comes from the replicated role bindings. Components only ever
  * consume the `Session` shape from api/types.ts, which does not change.
  */
+import type { Session } from '@/api/types'
+
 export { useSession } from '@/api/queries'
+
+/**
+ * Whether the session may propose `ConfigureQuotaEntity` (edit the entity
+ * tree). ADR 0023 grants that to `admin` bindings; today's flat
+ * `Session.roles` can't express subtree scoping, so this is all-or-nothing
+ * until scoped bindings ride in the real session payload.
+ */
+export function canConfigureEntities(session: Session | undefined): boolean {
+  return session?.roles.includes('admin') ?? false
+}

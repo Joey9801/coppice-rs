@@ -1,7 +1,14 @@
 import { ApiError } from '../client'
 import type { CoppiceApi } from '../client'
-import type { CoordinatorId, JobId, ListJobsFilter, NodeId } from '../types'
-import { isMockNotFound, MockWorld } from './world'
+import type {
+  ConfigureQuotaEntityInput,
+  CoordinatorId,
+  JobId,
+  ListJobsFilter,
+  NodeId,
+  QuotaEntityId,
+} from '../types'
+import { isMockInvalid, isMockNotFound, MockWorld } from './world'
 
 /**
  * The mock `CoppiceApi`, backed by a singleton `MockWorld`.
@@ -24,6 +31,7 @@ export function createMockClient(): CoppiceApi {
       return build()
     } catch (err) {
       if (isMockNotFound(err)) throw new ApiError('NotFound', (err as Error).message)
+      if (isMockInvalid(err)) throw new ApiError('InvalidArgument', (err as Error).message)
       throw err
     }
   }
@@ -55,6 +63,13 @@ export function createMockClient(): CoppiceApi {
     getCoordinatorStatus: () => settle(() => world.buildCoordinatorStatus()),
     getCoordinatorLogs: (id: CoordinatorId, cursor: string | null) =>
       settle(() => world.buildCoordinatorLogs(id, cursor)),
+
+    // The demo session always holds `admin`, so the mock never rejects with
+    // PermissionDenied — the real client will (ADR 0023 scoped bindings).
+    listQuotaEntities: () => settle(() => world.listQuotaEntities()),
+    getQuotaEntity: (id: QuotaEntityId) => settle(() => world.buildQuotaEntityDetail(id)),
+    configureQuotaEntity: (input: ConfigureQuotaEntityInput) =>
+      settle(() => world.configureQuotaEntity(input)),
   }
 }
 
