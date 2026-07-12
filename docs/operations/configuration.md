@@ -29,7 +29,8 @@ node want a different value than its peers?* → config file.
 | Priority-multiplier table | replicated policy |
 | Data-retention windows | replicated policy ([ADR 0012](../decisions/0012-data-retention.md)) |
 | Agent-liveness / allocation-lost deadlines (fencing inputs) | replicated policy |
-| SSO role/group → authorization mappings | replicated policy |
+| SSO role/group → authorization mappings (role bindings) | replicated policy ([ADR 0023](../decisions/0023-scoped-role-bindings.md)) |
+| OIDC groups-claim name | replicated policy (interpretation of a token decides who is an admin — [ADR 0022](../decisions/0022-oidc-identity-and-authentication.md)) |
 
 If a setting seems to belong to both, it probably splits the way SSO does:
 the *connection* parameters are node config, the *meaning* (who is an admin)
@@ -94,13 +95,19 @@ snapshot_log_entries = 50_000
 snapshot_keep_log_entries = 1_000
 
 [tls]
+# One trust root anchors node certs, Raft peer certs, and operator
+# client certs (the client listener accepts the latter as break-glass
+# admin authentication — ADR 0022; root provenance is OD-14/15).
 cert_path = "/etc/coppice/pki/node.crt"
 key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"
 
 [sso]
+# Connection identity only — the groups-claim name and all role bindings
+# are replicated policy (`coppice-cli policy`), per ADRs 0022/0023.
 issuer = "https://sso.example.com/oidc"
 client_id = "coppice"
+audience = "coppice"
 client_secret_path = "/etc/coppice/oidc-secret"
 
 [observability]

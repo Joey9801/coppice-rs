@@ -270,6 +270,19 @@ fixed-point weights/multipliers are `uint64` Q32.32, the decay factor is
 envelope `Command { version, oneof body }` (ADR 0003); all v1 commands are
 cluster-version 1.
 
+Every **API-proposed** command additionally carries
+`actor: Actor { principal: string, groups: string[], operator_cert: bool }`,
+transcribed by the API layer from the verified token or operator
+certificate ([ADR 0023](../decisions/0023-scoped-role-bindings.md)). Apply
+re-checks the actor's authority against the replicated bindings and job
+ownership in its read-only validation phase — a pure lookup, rejecting
+`PermissionDenied` — so authorization races resolve in log order. The
+actor-carrying commands are `SubmitJob`, `AbortJob`, `SetNodeSchedulable`,
+`ConfigureQuotaEntity`, `UpdatePolicy`, `UpdateAuthorization`, and
+`BumpClusterVersion`; internal proposers (scheduler, ingestion, node
+lifecycle, housekeeping) carry no actor and their command types are not
+reachable through the API.
+
 ### API-proposed
 
 #### `SubmitJob`
@@ -277,20 +290,20 @@ cluster-version 1.
 | | |
 | --- | --- |
 | Proposer | API layer, after synchronous admission checks |
-| Payload | `job: Job` (id — **client-minted**, the submission's idempotency identity per ADR 0026 —, image, `requests: Resources`, `priority: i32`, `max_runtime_us: optional uint64`, `quota_entity: QuotaEntityId`, `retry: RetryPolicy { max_retries: u32, retry_user_errors: bool }`), `multiplier: PriorityMultiplier` (Q32.32 — the API resolves the user's `priority` through the replicated multiplier table at proposal time; apply never sees the raw `i32` in arithmetic, per ADR 0019), `submitted_at_us` |
-| Validation | `abort_requested` unset. If `job.id` is already in state (including terminal jobs not yet evicted): identical client-supplied spec → **accepted no-op** (idempotent resubmission, no events — the retryer observes success and the original job); different spec → `SubmitSpecMismatch`. Otherwise `quota_entity` exists. |
-| Apply effects | Insert the job record; walk `Submitted → Accepted → Queued` in this one apply (admission is synchronous in v1 — the intermediate states exist for observability and appear as distinct events). No quota charge: cost is charged at placement, not submission. |
-| Rejections | `SubmitSpecMismatch`, `UnknownQuotaEntity`, `InvalidCommand` (pre-set abort flag) |
+| Payload | `job: Job` (id — **client-minted**, the submission's idempotency identity per ADR 0026 —, image, `requests: Resources`, `priority: i32`, `max_runtime_us: optional uint64`, `quota_entity: QuotaEntityId`, `retry: RetryPolicy { max_retries: u32, retry_user_errors: bool }`), `multiplier: PriorityMultiplier` (Q32.32 — the API resolves the user's `priority` through the replicated multiplier table at proposal time; apply never sees the raw `i32` in arithmetic, per ADR 0019), `actor: Actor`, `submitted_at_us` |
+| Validation | `abort_requested` unset. If `job.id` is already in state (including terminal jobs not yet evicted): identical client-supplied spec → **accepted no-op** (idempotent resubmission, no events — the retryer observes success and the original job; the no-op creates nothing, so it skips the authorization check and never changes `submitted_by`); different spec → `SubmitSpecMismatch`. Otherwise `quota_entity` exists and the actor holds `submitter` (or higher) over it (ADR 0023). |
+| Apply effects | Insert the job record with `submitted_by = actor.principal`; walk `Submitted → Accepted → Queued` in this one apply (admission is synchronous in v1 — the intermediate states exist for observability and appear as distinct events). No quota charge: cost is charged at placement, not submission. |
+| Rejections | `SubmitSpecMismatch`, `UnknownQuotaEntity`, `InvalidCommand` (pre-set abort flag), `PermissionDenied` |
 
 #### `AbortJob`
 
 | | |
 | --- | --- |
 | Proposer | API layer (the user command; "abort" is the vocabulary everywhere) |
-| Payload | `job: JobId`, `reason: optional string`, `requested_at_us` |
-| Validation | Job exists and is non-terminal |
+| Payload | `job: JobId`, `reason: optional string`, `actor: Actor`, `requested_at_us` |
+| Validation | Job exists and is non-terminal; actor is the job's `submitted_by` or holds `operator`/`admin` over the job's quota entity (ADR 0023) |
 | Apply effects | Set `abort_requested` (first request wins; a second `AbortJob` is an accepted no-op preserving the original). Then by current state: **no live attempt** (`Submitted`/`Accepted`/`Queued`) → job `Aborted` immediately, `terminal_at_us` stamped from `requested_at_us`. **Attempt `Accruing`/`Ready`** → attempt `Terminal(Aborted)` with the full terminal path (allocations released + pledge pass, true-up with actual cost 0, job `Aborted`) — no agent interaction. **Attempt `Dispatching`/`Running`** → flag only, emit `StopRequested { node, allocation }`; the runtime sends `StopJob` (tombstone rule / SIGTERM–grace–SIGKILL per ADR 0013) and the outcome arrives later via `RecordAttemptOutcome`. **Attempt `Finalizing`** → flag only; resolution honors abort-wins-over-retry. |
-| Rejections | `UnknownJob`, `JobTerminal` |
+| Rejections | `UnknownJob`, `JobTerminal`, `PermissionDenied` |
 
 ### Scheduler-proposed
 
@@ -383,10 +396,10 @@ cluster-version 1.
 | | |
 | --- | --- |
 | Proposer | Admin API (drain / undrain) |
-| Payload | `node: NodeId`, `schedulable: bool`, `updated_at_us` |
-| Validation | Node exists |
+| Payload | `node: NodeId`, `schedulable: bool`, `actor: Actor`, `updated_at_us` |
+| Validation | Node exists; actor holds unscoped `operator` or `admin` (node operations are cluster verbs — ADR 0023) |
 | Apply effects | Set the flag. Drain blocks new placements only: running work continues, and existing accruing allocations keep funding (revoking them is the scheduler's call, via `CommitPlacements`). |
-| Rejections | `UnknownNode` |
+| Rejections | `UnknownNode`, `PermissionDenied` |
 
 ### Housekeeping
 
@@ -407,30 +420,40 @@ cluster-version 1.
 | | |
 | --- | --- |
 | Proposer | Admin API / `coppice-cli policy` (bootstrap tree included — ADR 0020: the node config file never seeds policy) |
-| Payload | `entity: QuotaEntityId`, `parent: optional QuotaEntityId`, `name: string`, `quota: CostUnits` (a *stock* in µCU; the CLI converts human rates, per ADR 0019), `updated_at_us` |
-| Validation | Parent (if any) exists and is not the entity itself; the new parent chain is acyclic and within the depth cap (32) |
+| Payload | `entity: QuotaEntityId`, `parent: optional QuotaEntityId`, `name: string`, `quota: CostUnits` (a *stock* in µCU; the CLI converts human rates, per ADR 0019), `actor: Actor`, `updated_at_us` |
+| Validation | Parent (if any) exists and is not the entity itself; the new parent chain is acyclic and within the depth cap (32); actor holds `admin` whose scope covers both the entity's current position and its new parent (unscoped admin covers everything — ADR 0023) |
 | Apply effects | Create (usage accumulator initialized zero at `updated_at_us`) or update (parent/name/quota replaced; **usage is preserved** — reconfiguring an entity is not an amnesty). No delete command in v1: entities with historical charges stay; removal is a future decision. |
-| Rejections | `UnknownQuotaEntity` (parent), `QuotaEntityCycle` |
+| Rejections | `UnknownQuotaEntity` (parent), `QuotaEntityCycle`, `PermissionDenied` |
 
 #### `UpdatePolicy`
 
 | | |
 | --- | --- |
 | Proposer | Admin API / CLI. The CLI converts human-facing forms (half-life → Q0.64 λ, rates → stocks) so no transcendental math ever runs in a replica (ADR 0019/0020). |
-| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `terminal_retention_us: i64` (72 h default), `abort_grace_us: i64` (30 s default); plus `updated_at_us` |
-| Validation | `decay.validate()` (positive tick, λ within the iteration bound); a full-replacement payload is otherwise self-consistent by construction |
+| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `terminal_retention_us: i64` (72 h default), `abort_grace_us: i64` (30 s default), `groups_claim: string` (`"groups"` default — ADR 0023); plus `actor: Actor`, `updated_at_us` |
+| Validation | `decay.validate()` (positive tick, λ within the iteration bound); actor holds unscoped `admin`; a full-replacement payload is otherwise self-consistent by construction |
 | Apply effects | Replace the replicated policy. In-flight charge records keep their recorded rate/multiplier (no retroactive repricing); decay re-times from each entity's next touch; quota-stock rescaling on half-life change is owned by the tooling that authored the command. |
-| Rejections | `InvalidPolicy` |
+| Rejections | `InvalidPolicy`, `PermissionDenied` |
+
+#### `UpdateAuthorization`
+
+| | |
+| --- | --- |
+| Proposer | Admin API / `coppice-cli policy` — full replacement of the role-binding list, mirroring `UpdatePolicy` (concurrent edits resolve last-writer-wins in log order) |
+| Payload | `bindings: Binding[]` where `Binding = { subject: oneof { group: string, principal: string }, role: Role (submitter \| operator \| admin), scope: optional QuotaEntityId }`; plus `actor: Actor`, `updated_at_us` |
+| Validation | Actor holds unscoped `admin`; every role is from the closed set and every subject non-empty; every `scope` references an existing quota entity; the new list retains at least one unscoped `admin` binding (lockout prevention — operator certs make lockout recoverable, but an empty admin list is almost always an accident, per ADR 0023) |
+| Apply effects | Replace the replicated bindings. Takes effect for every command ordered after this one — in-flight commands proposed under the old bindings re-validate against the new ones at their own log position. Operator certificates (`actor.operator_cert`) are an implicit unscoped `admin` outside this list and cannot be revoked through it. |
+| Rejections | `PermissionDenied`, `UnknownQuotaEntity` (scope), `InvalidAuthorization`, `AuthorizationLockout` |
 
 #### `BumpClusterVersion`
 
 | | |
 | --- | --- |
 | Proposer | Admin, via the leader. The leader **refuses to propose** a bump past the minimum version supported by current voting members (ADR 0003) — a proposal-side gate, since apply cannot see binaries. Each bump documents its downgrade limit. |
-| Payload | `to: u32`, `bumped_at_us` |
-| Validation | `to` strictly greater than the current `ClusterVersion` |
+| Payload | `to: u32`, `actor: Actor`, `bumped_at_us` |
+| Validation | `to` strictly greater than the current `ClusterVersion`; actor holds unscoped `admin` |
 | Apply effects | Set `ClusterVersion`. Version-gated command forms become writable; all commands in this catalog are version 1. |
-| Rejections | `ClusterVersionNotMonotonic` |
+| Rejections | `ClusterVersionNotMonotonic`, `PermissionDenied` |
 
 ---
 
@@ -454,6 +477,9 @@ cluster-version 1.
 | `UnsupportedPlacementShape` | Not one-allocation-singleton-group (v1 gate) |
 | `QuotaEntityCycle` | Parent edit would create a cycle or exceed the depth cap |
 | `InvalidPolicy` | Policy payload failed validation |
+| `PermissionDenied` | Actor lacks the role/scope (or ownership) the command requires (ADR 0023) |
+| `InvalidAuthorization` | Bindings payload failed validation (unknown role, empty subject) |
+| `AuthorizationLockout` | Bindings replacement would leave no unscoped admin |
 | `ClusterVersionNotMonotonic` | Bump not strictly increasing |
 | `InvalidCommand` | Shape violation (e.g. outcome `Revoked` outside `CommitPlacements`) |
 | `InvalidBatch[(index, reason)]` | All-or-nothing batch rejection with per-item diagnostics |
