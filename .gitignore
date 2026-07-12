@@ -10,3 +10,8 @@ Cargo.lock.orig
 
 
 prompts/
+
+# Web UI (web/.gitignore has the full list; these guard root-level tools)
+web/node_modules/
+web/dist/
+.claude/settings.local.json
