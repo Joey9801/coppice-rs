@@ -69,8 +69,7 @@ where
     // so a reconnect with a pre-restart cursor gaps instead of silently
     // replaying across the boundary (KOI-3).
     let recovery_index = views.latest().applied_index();
-    let (fanout, fanout_join) =
-        event_fanout::spawn(event_tap, recovery_index, shutdown_rx.clone());
+    let (fanout, fanout_join) = event_fanout::spawn(event_tap, recovery_index, shutdown_rx.clone());
     tracing::info!("runtime: event fanout up");
 
     let Gateway {

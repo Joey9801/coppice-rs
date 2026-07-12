@@ -645,7 +645,10 @@ mod tests {
             Some(SubscriptionItem::Gap { .. }) => {}
             other => panic!("expected an immediate gap, got {other:?}"),
         }
-        assert!(!subs.get(&1).unwrap().gapped, "the gap fit, nothing pending");
+        assert!(
+            !subs.get(&1).unwrap().gapped,
+            "the gap fit, nothing pending"
+        );
     }
 
     #[tokio::test]
