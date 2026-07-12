@@ -371,7 +371,7 @@ mod tests {
         // normal command and a strong read whose barrier landed on the no-op
         // index (`read_index` returns the full Raft index) waited forever.
         let (publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
         let (tap, _tap_rx) = EventTap::channel(8);
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
@@ -427,7 +427,7 @@ mod tests {
         // A stale Advance (index below the current cursor) must be a no-op, not
         // a regression of the published index.
         let (publisher, views) =
-            ViewPublisher::new(StateMachine::default(), ViewPublisherConfig::default());
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
         let (tap, _tap_rx) = EventTap::channel(8);
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
