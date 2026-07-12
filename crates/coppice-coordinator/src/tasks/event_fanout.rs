@@ -160,12 +160,15 @@ impl Ring {
     }
 
     /// The oldest applied index still retained, reported to clients as the
-    /// resync point; falls back to the floor when the ring is empty.
+    /// resync point; falls back to the floor when the ring is empty. Never
+    /// below the floor: a discontinuity can raise the floor past entries
+    /// still retained, and those are no longer a complete resume point.
     fn earliest_available(&self) -> u64 {
         self.entries
             .front()
             .map(|(_, batch)| batch.applied_index)
             .unwrap_or(self.floor)
+            .max(self.floor)
     }
 
     fn iter(&self) -> impl Iterator<Item = &EventBatch> {
@@ -610,6 +613,16 @@ mod tests {
     }
 
     #[test]
+    fn earliest_available_never_reports_below_the_floor() {
+        // A tap gap can raise the floor above entries still retained; those
+        // are not a complete resume point and must not be advertised as one.
+        let mut ring = Ring::new(0);
+        ring.push(one_event_batch(5));
+        ring.raise_floor(21);
+        assert_eq!(ring.earliest_available(), 21);
+    }
+
+    #[test]
     fn raise_floor_is_monotonic() {
         let mut ring = Ring::new(10);
         ring.raise_floor(5);
@@ -711,6 +724,42 @@ mod tests {
         match sub.items.recv().await {
             Some(SubscriptionItem::Gap { .. }) => {}
             other => panic!("expected a gap at a cursor below the raised floor, got {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(true);
+        drop(tap);
+        let _ = join.await;
+    }
+
+    /// KOI-3: cursors are portable across replicas (ADR 0008), so a trailing
+    /// gap's floor must cover the *whole* dropped range. A cursor from another
+    /// replica that falls inside it must gap, not replay silently.
+    #[tokio::test]
+    async fn cursor_inside_trailing_drop_range_gaps() {
+        // Global batches at 10, 15, 20. This replica delivers 10, then drops
+        // 15 and 20 as the trailing emissions (tap overflow, then idle): no
+        // yields between emits, so the current-thread fanout cannot drain and
+        // 10 occupies the single slot.
+        let (mut tap, tap_rx) = coppice_consensus::EventTap::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (handle, join) = spawn(tap_rx, 0, shutdown_rx);
+
+        tap.emit(one_event_batch(10));
+        tap.emit(one_event_batch(15)); // dropped: channel full
+        tap.emit(one_event_batch(20)); // dropped: channel full
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // A client that saw batch 15 on another replica fails over here.
+        // Batch 20 was dropped and never entered this ring, so this must gap.
+        let mut sub = handle
+            .subscribe(EventFilter::All, Some(15))
+            .await
+            .expect("subscribe");
+        match sub.items.try_recv() {
+            Ok(SubscriptionItem::Gap { .. }) => {}
+            other => panic!("silent replay across dropped batch 20: {other:?}"),
         }
 
         let _ = shutdown_tx.send(true);
