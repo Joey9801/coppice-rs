@@ -21,6 +21,7 @@ waive them.
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, and instrumentation resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
+| [KOI-6](#koi-6-strong-reads-can-hang-after-a-raft-no-op-or-membership-entry) | High | Reads / replication | Resolved (2026-07-12) | — |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
 
@@ -387,3 +388,46 @@ runs them — this half stays open.
 This issue is resolved when a repeatable target-scale test demonstrates bounded
 apply stalls and peak memory for both view publication and snapshot creation,
 and those bounds are enforced in CI or a required performance gate.
+
+## KOI-6: Strong reads can hang after a Raft no-op or membership entry
+
+- **Severity:** High
+- **Status:** Resolved (2026-07-12)
+- **Affected capability:** strong reads (ADR 0007) and event resync (ADR 0008),
+  including dispatch's gap recovery
+- **Related decision:** [ADR 0007](../decisions/0007-per-endpoint-read-consistency.md)
+
+### Required invariant
+
+The published applied log index is the cursor for read barriers and event
+sequence numbers, and it counts *every* applied log entry — normal commands,
+membership changes, and blank/no-op entries alike
+([coordinator-runtime.md](../architecture/coordinator-runtime.md), "The two
+coordinates trap"). A strong read pairs `Consensus::read_index` (the full Raft
+index) with `StateViews::at_least`, so the published cursor must reach any
+committed index `read_index` can return, or the read cannot resolve.
+
+### Resolution (2026-07-12)
+
+~~The state-machine adapter advanced its own `last_applied` for blank (Raft
+no-op) and membership entries but never forwarded them to the publishing apply
+task, which advanced its published cursor only on normal commands. Meanwhile
+`read_index` returned the full Raft index. When the last committed entry was a
+no-op (appended on every leader election) or a membership change, the published
+cursor stalled below the barrier and `at_least(read_index)` blocked until the
+next *normal* command happened to arrive — potentially forever on an otherwise
+idle cluster.~~ When a committed batch ends on a blank or membership entry, the
+adapter now sends one `ApplyRequest::Advance` carrying that batch's final log
+index ([sm.rs](../../crates/coppice-consensus/src/storage/sm.rs)); the apply
+loop moves its published cursor forward (never backward) and the existing
+demand/cadence publish machinery carries the view up to it
+([apply loop](../../crates/coppice-consensus/src/apply_loop.rs)). State and the
+event stream are untouched — only the cursor advances.
+
+### Closure criteria
+
+Met: `strong_read_resolves_at_a_leader_noop` boots a leader and takes a strong
+read with no normal command in the log, so the barrier lands on the bootstrap
+membership entry / leader no-op and must resolve;
+`advance_lets_a_strong_read_at_a_noop_index_resolve` and
+`advance_never_moves_the_cursor_backward` pin the apply-loop behavior directly.

@@ -68,6 +68,18 @@ pub enum ApplyRequest {
         entries: Vec<(u64, Command)>,
         reply: oneshot::Sender<Vec<ApplyResult>>,
     },
+    /// Advance the applied-index cursor to `applied_index` without touching
+    /// state or the event stream. Blank (Raft no-op) and membership entries
+    /// are applied entirely in the state-machine adapter — they never reach
+    /// this task — but the published view's cursor must still move past them,
+    /// or a strong read / event resync whose barrier lands on such an index
+    /// (`read_index` returns the full Raft index) would wait forever. Reply
+    /// acknowledges the advance so the adapter's `apply` keeps openraft's
+    /// backpressure and ordering.
+    Advance {
+        applied_index: u64,
+        reply: oneshot::Sender<()>,
+    },
     /// Hand out the current state for snapshot serialization: the apply task
     /// clones its `Arc<StateMachine>` and the applied index; serialization then
     /// happens off the apply task.

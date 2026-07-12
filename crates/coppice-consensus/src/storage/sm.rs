@@ -12,7 +12,12 @@
 //!   [`ApplyRequest::Apply`] and awaits the replies, so backpressure lands on
 //!   openraft's replication. Blank and membership entries never reach the
 //!   task — they do not touch state; the store records them (last applied,
-//!   membership) and answers `Ok(Applied::default())`.
+//!   membership) and answers `Ok(Applied::default())`. When such an entry is
+//!   the batch's last, the store sends one [`ApplyRequest::Advance`] so the
+//!   apply task's *published* cursor moves past it too; otherwise a strong
+//!   read or event resync whose `read_index` barrier lands on a no-op or
+//!   membership index would block forever (the published cursor only advances
+//!   on normal commands, but `read_index` returns the full Raft index).
 //! - Snapshot builds ask the task for its state via
 //!   [`ApplyRequest::Snapshot`]; serialization then happens off the apply
 //!   task, on the blocking pool.
@@ -276,6 +281,26 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
             }
         }
 
+        // The apply task advanced its published cursor to the last *normal*
+        // command it applied. If the batch ends on a blank (Raft no-op) or
+        // membership entry — which never reach the task — that cursor now lags
+        // the batch's true last-applied index, and a strong read there would
+        // hang. Nudge the cursor forward to the batch's final index. (When the
+        // last entry is a normal command, the task already advanced to it.)
+        if let Some(last) = entries.last() {
+            if !matches!(last.payload, EntryPayload::Normal(_)) {
+                let (reply, rx) = oneshot::channel();
+                self.apply_tx
+                    .send(ApplyRequest::Advance {
+                        applied_index: last.log_id.index,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| channel_closed())?;
+                rx.await.map_err(|_| channel_closed())?;
+            }
+        }
+
         Ok(responses
             .into_iter()
             .map(|r| r.expect("every entry produced a response"))
@@ -513,6 +538,13 @@ pub async fn run_apply_task(mut state: StateMachine, mut rx: mpsc::Receiver<Appl
                 }
                 // A dropped receiver just means the proposer went away.
                 let _ = reply.send(outcomes);
+            }
+            ApplyRequest::Advance {
+                applied_index: index,
+                reply,
+            } => {
+                applied_index = applied_index.max(index);
+                let _ = reply.send(());
             }
             ApplyRequest::Snapshot { reply } => {
                 let _ = reply.send((Arc::new(state.clone()), applied_index));
