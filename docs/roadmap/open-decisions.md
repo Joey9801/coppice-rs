@@ -37,6 +37,8 @@ re-deriving it from the whole design.
 | [OD-13](#od-13-base-score-and-the-exact-job-costing-formula) | Base score and the exact job-costing formula | High | Resolved — [ADR 0021](../decisions/0021-effective-score-ranking.md) |
 | [OD-14](#od-14-coordinator-discovery-and-control-plane-pki) | Coordinator discovery & control-plane PKI | Medium | Open — plan in [deployment-story.md](deployment-story.md) |
 | [OD-15](#od-15-agent-enrollment-signer-and-decommission-protocol) | Agent enrollment signer & decommission protocol | High — gates zero-touch autoscaling | Open — plan in [deployment-story.md](deployment-story.md) |
+| [OD-16](#od-16-user-authentication-and-principal-model) | User authentication & principal model | High | Resolved — [ADR 0022](../decisions/0022-oidc-identity-and-authentication.md) |
+| [OD-17](#od-17-authorization-model-and-enforcement) | Authorization model & enforcement | High | Resolved — [ADR 0023](../decisions/0023-scoped-role-bindings.md) |
 
 All eleven initial questions were resolved on 2026-07-07; the ADRs linked above
 carry the decisions and rationale. New questions get the next free `OD-N`.
@@ -431,3 +433,72 @@ authorization-shaped and should follow ADRs 0022/0023.
 [ADR 0011](../decisions/0011-container-security-posture.md),
 [ADR 0009](../decisions/0009-fencing-and-reconciliation.md),
 [ADR 0012](../decisions/0012-data-retention.md).
+
+## OD-16: User authentication and principal model
+
+**Resolved** (2026-07-12; decided 2026-07-08): one OIDC issuer per cluster;
+principals are IdP subjects with no replicated user records; JWT access
+tokens validated offline on every replica; PKCE flows for UI and CLI,
+client-credentials for services; operator certificates under the
+control-plane trust root as break-glass and the day-0 path —
+[ADR 0022](../decisions/0022-oidc-identity-and-authentication.md).
+
+**Question.** What is a principal in Coppice, what credential does the API
+validate, how does each client kind (web UI, CLI, headless service) obtain
+one, and what is the posture when the IdP is unavailable?
+
+**Why it matters.** Every authorization and audit feature hangs off the
+principal model, and the validation path decides whether follower reads
+(ADR 0007) stay replica-local or silently acquire an IdP dependency. Jobs
+previously had no owner: "abort your own job" was inexpressible.
+
+**Considerations.**
+- Replicated user records vs. IdP-owned identity (no local user database).
+- Offline JWT validation vs. introspection; revocation latency vs.
+  request-path IdP coupling.
+- Service identity: IdP client-credentials vs. Coppice-minted tokens (which
+  would breach the v1 no-secrets posture).
+- Break-glass when the IdP is down: none vs. local secret vs. reusing the
+  control-plane trust root for operator client certificates. (The
+  provenance of that root — cluster-held vs. external PKI — remains OD-14
+  and OD-15.)
+
+**Related:** [operations/security.md](../operations/security.md),
+[ADR 0020](../decisions/0020-node-config-vs-replicated-policy.md),
+OD-14, OD-15.
+
+## OD-17: Authorization model and enforcement
+
+**Resolved** (2026-07-12; decided 2026-07-08): three built-in roles
+(submitter / operator / admin) granted by replicated bindings, optionally
+scoped to a quota-entity subtree; jobs record their submitter and owners
+always manage their own jobs; reads open to authenticated principals in v1;
+API-proposed commands carry an `Actor` and apply re-checks authorization
+deterministically as the backstop, making the log the audit trail —
+[ADR 0023](../decisions/0023-scoped-role-bindings.md). Coordinator
+membership RPCs and enrollment administration are unscoped-admin cluster
+verbs, unblocking the self-join automation gated in OD-14/OD-15.
+
+**Question.** How are the verbs in
+[operations/security.md](../operations/security.md) granted (roles, scoping,
+subjects), and where is authorization enforced given that the API
+pre-validates and apply is the deterministic backstop?
+
+**Why it matters.** ADR 0020 requires authorization-shaped configuration to
+be replicated policy so replicas cannot disagree on who is an admin;
+enforcement location decides whether that property holds by construction or
+by discipline. Grant scoping decides whether team-level delegation needs a
+second organizational hierarchy next to the quota-entity tree.
+
+**Considerations.**
+- Global roles vs. subtree-scoped bindings vs. fully resource-scoped grants.
+- Whether commands carry the acting principal (needed for ownership, audit,
+  and apply-time checks) and how group claims stay compatible with apply's
+  purity.
+- API-only enforcement vs. an apply-time re-check (revocation races resolve
+  in log order; unauthorized attempts become deterministic rejections).
+- Lockout prevention on bindings replacement; delegated binding management
+  deferred.
+
+**Related:** [ADR 0005](../decisions/0005-cost-based-soft-quotas.md),
+[architecture/command-catalog.md](../architecture/command-catalog.md).

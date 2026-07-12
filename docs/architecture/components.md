@@ -6,9 +6,14 @@ The external API is the user-facing entry point for job submission, job
 abort, status queries, event subscriptions, administrative actions, and
 UI support.
 
-It should support authentication through SSO for user-facing access.
-Authorization should be enforced at the API layer and again at the command
-validation layer where appropriate.
+Authentication is OIDC: JWT bearer tokens validated offline on every
+replica, with PKCE flows for the UI and CLI, client-credentials for
+services, and operator client certificates as break-glass
+([ADR 0022](../decisions/0022-oidc-identity-and-authentication.md)).
+Authorization is subtree-scoped role bindings held in replicated policy,
+enforced synchronously at the API layer and re-checked deterministically at
+apply, where each API-proposed command carries its actor
+([ADR 0023](../decisions/0023-scoped-role-bindings.md)).
 
 The API layer may run on every coordinator replica. Read-only requests may be
 served by followers when sufficiently fresh reads are acceptable. Mutating
