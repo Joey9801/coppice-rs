@@ -444,6 +444,16 @@ mod tests {
         reply_rx.await.unwrap();
         assert_eq!(views.latest().applied_index(), 9);
 
+        // The internal cursor (not just the published view) must still be 9.
+        // A regressed cursor hides behind `maybe_publish` — a publish at 4 is
+        // suppressed as stale — but a snapshot capture trusts the cursor, and
+        // `state_at` would force-publish at 4 and move the watch backward.
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Snapshot { reply }).await.unwrap();
+        let (_state, index) = reply_rx.await.unwrap();
+        assert_eq!(index, 9);
+        assert_eq!(views.latest().applied_index(), 9);
+
         drop(tx);
         handle.await.unwrap();
     }
