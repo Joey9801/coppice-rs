@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { Resources } from '../types'
 import { TERMINAL_JOB_STATES } from '../types'
-import { MockWorld } from './world'
+import { ORG_NAME } from './generate'
+import { isMockInvalid, isMockNotFound, MockWorld } from './world'
 
 const NOW_US = 1_760_000_000_000_000 // pinned "now" so construction is reproducible
 
@@ -270,5 +271,201 @@ describe('MockWorld filters and lookups', () => {
     } while (cursor && pages < 20)
     expect(pages).toBeGreaterThan(1)
     expect(cursor).toBeNull()
+  })
+})
+
+describe('MockWorld quota entities', () => {
+  it('forms an acyclic tree within depth 32 where every parent exists', () => {
+    const world = new MockWorld(NOW_US)
+    const entities = world.listQuotaEntities()
+    const byId = new Map(entities.map((e) => [e.id, e]))
+    for (const ent of entities) {
+      if (ent.parent === null) continue
+      expect(byId.has(ent.parent)).toBe(true)
+      // Walk to a root within the depth cap without revisiting a node.
+      const seen = new Set<string>([ent.id])
+      let cur = byId.get(ent.parent)
+      let depth = 0
+      while (cur) {
+        expect(seen.has(cur.id)).toBe(false)
+        seen.add(cur.id)
+        depth += 1
+        expect(depth).toBeLessThanOrEqual(32)
+        cur = cur.parent ? byId.get(cur.parent) : undefined
+      }
+    }
+  })
+
+  it('auto-populates a users tree with SSO principals and sub-queues', () => {
+    const world = new MockWorld(NOW_US)
+    const entities = world.listQuotaEntities()
+    const usersRoot = entities.find((e) => e.name === 'users')
+    expect(usersRoot).toBeDefined()
+    expect(usersRoot!.parent).toBeNull()
+    expect(usersRoot!.origin).toBe('sso')
+
+    const users = entities.filter((e) => e.parent === usersRoot!.id)
+    expect(users.length).toBeGreaterThanOrEqual(5)
+    for (const user of users) {
+      expect(user.origin).toBe('sso')
+      expect(user.principal).not.toBeNull()
+      expect(user.name.startsWith('users/')).toBe(true)
+    }
+
+    // At least one admin-configured sub-queue under an SSO user.
+    const subQueues = entities.filter(
+      (e) => e.origin === 'configured' && e.parent !== null && users.some((u) => u.id === e.parent),
+    )
+    expect(subQueues.length).toBeGreaterThanOrEqual(1)
+    for (const sq of subQueues) expect(sq.principal).toBeNull()
+  })
+
+  it('reports subtree-inclusive counts that agree with listJobs', () => {
+    const world = new MockWorld(NOW_US)
+    world.advanceTo(NOW_US + 3 * 60_000_000) // some live jobs across the tree
+    const entities = world.listQuotaEntities()
+
+    const check = (id: string) => {
+      const node = entities.find((e) => e.id === id)!
+      const { jobs } = world.listJobs({ quotaEntity: id, limit: 10_000 })
+      const queued = jobs.filter((j) => j.state === 'Queued').length
+      const running = jobs.filter((j) => j.state === 'Running').length
+      expect(node.queuedCount).toBe(queued)
+      expect(node.runningCount).toBe(running)
+    }
+
+    const root = entities.find((e) => e.name === ORG_NAME)!
+    check(root.id) // whole org subtree
+    const division = entities.find((e) => e.parent === root.id)!
+    check(division.id) // a mid-tree entity
+  })
+
+  it('leaves a job-free created entity at zero usage as the world advances', () => {
+    const world = new MockWorld(NOW_US)
+    const created = world.configureQuotaEntity({
+      entity: null,
+      parent: null,
+      name: 'sandbox',
+      quotaUcu: 10_000_000,
+    })
+    expect(created.usageUcu).toBe(0)
+    world.advanceTo(NOW_US + 20 * 60_000_000)
+    const after = world.listQuotaEntities().find((e) => e.id === created.id)!
+    expect(after.usageUcu).toBe(0)
+    expect(after.queuedCount).toBe(0)
+    expect(after.runningCount).toBe(0)
+  })
+
+  it('round-trips create then update, preserving usage on reconfigure', () => {
+    const world = new MockWorld(NOW_US)
+    const created = world.configureQuotaEntity({
+      entity: null,
+      parent: null,
+      name: 'team-x',
+      quotaUcu: 5_000_000,
+    })
+    expect(created.origin).toBe('configured')
+    expect(world.listQuotaEntities().some((e) => e.id === created.id)).toBe(true)
+
+    const detail = world.buildQuotaEntityDetail(created.id)
+    expect(detail.entity.id).toBe(created.id)
+    expect(detail.chain[0]?.id).toBe(created.id)
+
+    const updated = world.configureQuotaEntity({
+      entity: created.id,
+      parent: null,
+      name: 'team-x',
+      quotaUcu: 9_000_000,
+    })
+    expect(updated.quotaUcu).toBe(9_000_000)
+    expect(updated.createdAtUs).toBe(created.createdAtUs)
+  })
+
+  it('rejects invalid configure inputs (name, parent, sso rename, cycle)', () => {
+    const world = new MockWorld(NOW_US)
+
+    expect(() =>
+      world.configureQuotaEntity({ entity: null, parent: null, name: '  ', quotaUcu: 1 }),
+    ).toThrow()
+    expect(() =>
+      world.configureQuotaEntity({ entity: null, parent: null, name: 'ok', quotaUcu: -5 }),
+    ).toThrow()
+
+    // Unknown parent → MockInvalid.
+    try {
+      world.configureQuotaEntity({ entity: null, parent: 'quota-nope', name: 'ok', quotaUcu: 1 })
+      expect.unreachable('unknown parent should throw')
+    } catch (e) {
+      expect(isMockInvalid(e)).toBe(true)
+    }
+
+    // SSO identity rename → MockInvalid; quota-only change allowed.
+    const user = world.listQuotaEntities().find((e) => e.origin === 'sso' && e.principal !== null)!
+    try {
+      world.configureQuotaEntity({
+        entity: user.id,
+        parent: user.parent,
+        name: 'users/renamed@acme.dev',
+        quotaUcu: user.quotaUcu,
+      })
+      expect.unreachable('sso rename should throw')
+    } catch (e) {
+      expect(isMockInvalid(e)).toBe(true)
+    }
+    const bumped = world.configureQuotaEntity({
+      entity: user.id,
+      parent: user.parent,
+      name: user.name,
+      quotaUcu: user.quotaUcu + 1_000_000,
+    })
+    expect(bumped.quotaUcu).toBe(user.quotaUcu + 1_000_000)
+
+    // Cycle: make A → B, then try to reparent A under B.
+    const a = world.configureQuotaEntity({ entity: null, parent: null, name: 'a', quotaUcu: 1 })
+    const b = world.configureQuotaEntity({ entity: null, parent: a.id, name: 'b', quotaUcu: 1 })
+    try {
+      world.configureQuotaEntity({ entity: a.id, parent: b.id, name: 'a', quotaUcu: 1 })
+      expect.unreachable('cycle should throw')
+    } catch (e) {
+      expect(isMockInvalid(e)).toBe(true)
+    }
+  })
+
+  it('throws a not-found marker for an unknown entity detail', () => {
+    const world = new MockWorld(NOW_US)
+    try {
+      world.buildQuotaEntityDetail('quota-does-not-exist')
+      expect.unreachable('unknown entity should throw')
+    } catch (e) {
+      expect(isMockNotFound(e)).toBe(true)
+    }
+  })
+
+  it('auto-mints new users over time but never past the cap', () => {
+    const world = new MockWorld(NOW_US)
+    const usersRoot = world.listQuotaEntities().find((e) => e.name === 'users')!
+    const before = world.listQuotaEntities().filter((e) => e.parent === usersRoot.id).length
+
+    let t = NOW_US
+    for (let i = 0; i < 30; i += 1) {
+      t += 10 * 60_000_000 // 10 minutes per step
+      world.advanceTo(t)
+    }
+    const after = world.listQuotaEntities().filter((e) => e.parent === usersRoot.id).length
+    expect(after).toBeGreaterThan(before)
+    expect(after).toBeLessThanOrEqual(15)
+  })
+
+  it('keeps every usage-history ring bounded and time-ordered', () => {
+    const world = new MockWorld(NOW_US)
+    world.advanceTo(NOW_US + 10 * 60_000_000)
+    for (const ent of world.listQuotaEntities()) {
+      const hist = world.buildQuotaEntityDetail(ent.id).stats.usageHistory
+      expect(hist.length).toBeGreaterThan(0)
+      expect(hist.length).toBeLessThanOrEqual(120)
+      for (let i = 1; i < hist.length; i += 1) {
+        expect(hist[i]!.tUs).toBeGreaterThan(hist[i - 1]!.tUs)
+      }
+    }
   })
 })
