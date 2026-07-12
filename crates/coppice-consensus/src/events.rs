@@ -266,8 +266,7 @@ impl EventTapReceiver {
                 // index (visible: the Acquire load above pairs with the
                 // Release store behind it), so only a cursor at or past that
                 // index has seen everything the drop lost.
-                let earliest_replayable =
-                    self.signal.last_emitted_index.load(Ordering::Relaxed);
+                let earliest_replayable = self.signal.last_emitted_index.load(Ordering::Relaxed);
                 // Account the drops so this gap does not re-fire until a further
                 // drop advances `emitted` again.
                 self.expected_seq = emitted;
@@ -356,8 +355,8 @@ mod tests {
         assert_eq!(batch_index(rx.recv().await), 10);
 
         tap.force_gap(40); // snapshot install jumped the applied index to 40
-        // No further batch is emitted; the gap must still arrive, with the
-        // install index as its floor.
+                           // No further batch is emitted; the gap must still arrive, with the
+                           // install index as its floor.
         assert_eq!(gap_index(rx.recv().await), 40);
     }
 
