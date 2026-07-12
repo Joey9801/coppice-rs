@@ -137,7 +137,7 @@ pub(crate) async fn run(
                         // discontinuity so a subscriber resyncs from strong
                         // state instead of replaying silently across the
                         // snapshot boundary (KOI-3).
-                        tap.force_gap();
+                        tap.force_gap(applied_index);
                         // Snapshot handoff: the reader must see the exact index.
                         publisher.publish_now(&state, applied_index);
                         let _ = reply.send(());

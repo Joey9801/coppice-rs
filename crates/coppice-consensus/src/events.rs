@@ -67,6 +67,12 @@ struct DropSignal {
     /// receiver's `expected_seq`, the difference is dropped batches that must
     /// surface as a gap.
     emitted: AtomicU64,
+    /// Highest applied index the sender has emitted (sent *or* dropped) or
+    /// forced a gap over. A trailing gap must report this as its floor: the
+    /// dropped batches reach up to it, and cursors are portable across
+    /// replicas (ADR 0008), so any lower floor would admit a cursor inside
+    /// the dropped range and replay silently across it.
+    last_emitted_index: AtomicU64,
     notify: Notify,
 }
 
@@ -115,6 +121,7 @@ impl EventTap {
         let (tx, rx) = mpsc::channel(capacity);
         let signal = Arc::new(DropSignal {
             emitted: AtomicU64::new(0),
+            last_emitted_index: AtomicU64::new(0),
             notify: Notify::new(),
         });
         let tap = EventTap {
@@ -142,6 +149,7 @@ impl EventTap {
         if batch.events.is_empty() {
             return;
         }
+        let applied_index = batch.applied_index;
         let tagged = Tagged {
             seq: self.seq,
             batch,
@@ -150,7 +158,10 @@ impl EventTap {
         let dropped = matches!(self.tx.try_send(tagged), Err(TrySendError::Full(_)));
         // Publish the new total *after* the send attempt, so a receiver that
         // observes the higher `emitted` (Acquire) also observes the queued item
-        // (the store is Release-ordered behind the channel push).
+        // and the index below (the store is Release-ordered behind both).
+        self.signal
+            .last_emitted_index
+            .store(applied_index, Ordering::Relaxed);
         self.signal.emitted.store(self.seq, Ordering::Release);
         if dropped {
             // A drop with no later batch to expose it: wake a parked receiver
@@ -162,13 +173,17 @@ impl EventTap {
     /// Force a discontinuity into the stream without carrying events.
     ///
     /// Used when the state machine jumps forward on a snapshot install: its
-    /// applied index skips a range for which the derived stream emitted
-    /// nothing, so a consumer replaying across the boundary would do so
-    /// silently. Implemented as a phantom drop — the consumed `seq` makes the
-    /// next batch expose a gap, and if the stream then idles the trailing-drop
-    /// path surfaces it instead.
-    pub fn force_gap(&mut self) {
+    /// applied index skips to `applied_index` over a range for which the
+    /// derived stream emitted nothing, so a consumer replaying across the
+    /// boundary would do so silently. Implemented as a phantom drop — the
+    /// consumed `seq` makes the next batch expose a gap, and if the stream
+    /// then idles the trailing-drop path surfaces it, with `applied_index` as
+    /// the replay floor.
+    pub fn force_gap(&mut self, applied_index: u64) {
         self.seq += 1;
+        self.signal
+            .last_emitted_index
+            .store(applied_index, Ordering::Relaxed);
         self.signal.emitted.store(self.seq, Ordering::Release);
         self.signal.notify.notify_one();
     }
@@ -247,9 +262,12 @@ impl EventTapReceiver {
         match self.rx.try_recv() {
             Ok(tagged) => Some(self.deliver(tagged)),
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
-                // Everything through `last_index` is intact; the dropped
-                // batches follow it, so a replay is safe only past it.
-                let earliest_replayable = self.last_index + 1;
+                // The dropped batches reach up to the sender's last emitted
+                // index (visible: the Acquire load above pairs with the
+                // Release store behind it), so only a cursor at or past that
+                // index has seen everything the drop lost.
+                let earliest_replayable =
+                    self.signal.last_emitted_index.load(Ordering::Relaxed);
                 // Account the drops so this gap does not re-fire until a further
                 // drop advances `emitted` again.
                 self.expected_seq = emitted;
@@ -324,7 +342,9 @@ mod tests {
         // The queued batch 20 comes first...
         assert_eq!(batch_index(rx.recv().await), 20);
         // ...then the trailing gap surfaces on its own — recv must not block.
-        assert_eq!(gap_index(rx.recv().await), 21);
+        // Its floor is the dropped batch's own index: a cursor anywhere below
+        // 30 has not seen batch 30 and must resync.
+        assert_eq!(gap_index(rx.recv().await), 30);
     }
 
     /// A forced gap (snapshot install) surfaces even on an otherwise idle tap.
@@ -335,9 +355,10 @@ mod tests {
         tap.emit(batch(10));
         assert_eq!(batch_index(rx.recv().await), 10);
 
-        tap.force_gap();
-        // No further batch is emitted; the gap must still arrive.
-        assert_eq!(gap_index(rx.recv().await), 11);
+        tap.force_gap(40); // snapshot install jumped the applied index to 40
+        // No further batch is emitted; the gap must still arrive, with the
+        // install index as its floor.
+        assert_eq!(gap_index(rx.recv().await), 40);
     }
 
     /// A forced gap exposed by the next batch reports that batch as the floor.
@@ -348,7 +369,7 @@ mod tests {
         tap.emit(batch(10));
         assert_eq!(batch_index(rx.recv().await), 10);
 
-        tap.force_gap();
+        tap.force_gap(40);
         tap.emit(batch(50)); // e.g. first command applied after the install
 
         assert_eq!(gap_index(rx.recv().await), 50);
