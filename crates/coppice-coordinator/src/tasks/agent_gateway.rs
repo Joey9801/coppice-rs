@@ -506,7 +506,7 @@ mod tests {
         );
         // The publisher may drop: `views.latest()` borrows the last-published
         // value, which survives the sender being gone.
-        let (_publisher, views) = ViewPublisher::new(sm, ViewPublisherConfig::default());
+        let (_publisher, views) = ViewPublisher::new(sm, 0, ViewPublisherConfig::default());
         views
     }
 

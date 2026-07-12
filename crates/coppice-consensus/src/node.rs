@@ -289,9 +289,15 @@ pub async fn start(
     let last_applied_index = recovered.last_applied.map(|id| id.index).unwrap_or(0);
 
     // Step 5: the publishing apply task. The recovered state moves into the
-    // apply loop; the publisher is seeded with a clone at the same index.
+    // apply loop; the publisher is seeded with a clone at the same index, so
+    // `views.latest()` is correct before the apply task is ever polled (the
+    // coordinator runtime reads it to seed the fanout's replay floor, KOI-3).
     let state = std::mem::take(&mut recovered.state);
-    let (publisher, views) = ViewPublisher::new(state.clone(), ViewPublisherConfig::default());
+    let (publisher, views) = ViewPublisher::new(
+        state.clone(),
+        last_applied_index,
+        ViewPublisherConfig::default(),
+    );
     let (tap, event_tap) = EventTap::channel(event_tap_capacity);
     let (apply_tx, apply_rx) = mpsc::channel(APPLY_CHANNEL_CAPACITY);
     tokio::spawn(apply_loop::run(
