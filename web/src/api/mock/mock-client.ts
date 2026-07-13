@@ -1,6 +1,7 @@
 import { ApiError } from '../client'
 import type { CoppiceApi } from '../client'
 import type {
+  AttemptId,
   ConfigureQuotaEntityInput,
   CoordinatorId,
   JobId,
@@ -50,7 +51,8 @@ export function createMockClient(): CoppiceApi {
     listJobs: (filter: ListJobsFilter) => settle(() => world.listJobs(filter)),
     getJob: (id: JobId) => settle(() => world.buildJobDetail(id)),
     getJobTimeline: (id: JobId) => settle(() => world.buildJobTimeline(id)),
-    getJobUsage: (id: JobId) => settle(() => world.buildJobUsage(id)),
+    getJobUsage: (id: JobId, attempt?: AttemptId | null) =>
+      settle(() => world.buildJobUsage(id, attempt ?? null)),
     getJobLogs: (id: JobId, cursor: string | null) => settle(() => world.buildJobLogs(id, cursor)),
 
     listNodes: () => settle(() => world.buildNodeSummaries()),

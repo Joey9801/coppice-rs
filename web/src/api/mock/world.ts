@@ -58,7 +58,17 @@ import type {
   UsageSample,
 } from '../types'
 import { TERMINAL_JOB_STATES } from '../types'
-import { GIB, hashSeed, mintImage, ORG_NAME, Rng, TEAMS, TIB } from './generate'
+import {
+  GIB,
+  hashSeed,
+  mintCommand,
+  mintEnv,
+  mintImage,
+  ORG_NAME,
+  Rng,
+  TEAMS,
+  TIB,
+} from './generate'
 
 // ---------------------------------------------------------------------------
 // Constants: time, policy, cost weights
@@ -271,10 +281,15 @@ interface MAttempt {
   endedAtUs: number | null
   rateUcuPerSecond: number
   chargedUcu: number
+  /** Usage samples recorded while this attempt ran (bounded ring). */
+  usage: UsageSample[]
 }
 
 interface JobSpecInternal {
   image: string
+  entrypoint: string[] | null
+  command: string[]
+  env: Record<string, string>
   requests: Resources
   priority: number
   maxRuntimeUs: number | null
@@ -294,7 +309,6 @@ interface MJob {
   currentAttempt: string | null
   actualUcu: number | null
   trueUp: { kind: 'Refund' | 'Surcharge'; amountUcu: number } | null
-  usage: UsageSample[]
   projectedStartUs: number | null
   /** Simulation clock at last state promotion (drives Submitted→Queued flow). */
   lastTransitionUs: number
@@ -743,8 +757,12 @@ export class MockWorld {
       [2, 1],
     ] as const)
     const hasMaxRuntime = this.rng.bool(0.6)
+    const command = mintCommand(this.rng)
     return {
       image: mintImage(this.rng),
+      entrypoint: command.entrypoint,
+      command: command.command,
+      env: mintEnv(this.rng),
       requests: shapeToResources(shape),
       priority,
       maxRuntimeUs: hasMaxRuntime ? this.rng.int(1, 8) * HOUR_US : null,
@@ -780,7 +798,6 @@ export class MockWorld {
       currentAttempt: null,
       actualUcu: null,
       trueUp: null,
-      usage: [],
       projectedStartUs: null,
       lastTransitionUs: submittedAtUs,
     }
@@ -801,6 +818,7 @@ export class MockWorld {
       endedAtUs: null,
       rateUcuPerSecond: rate,
       chargedUcu: 0,
+      usage: [],
     }
     this.attempts.set(attempt.id, attempt)
     job.attempts.push(attempt.id)
@@ -856,7 +874,7 @@ export class MockWorld {
       job.currentAttempt = attempt.id
       const cur = free.get(nodeId)
       if (cur) free.set(nodeId, subRes(cur, alloc.funded))
-      this.seedUsage(job, startedAtUs)
+      this.seedUsage(attempt, job.spec.requests, startedAtUs, this.nowUs)
       made += 1
     }
   }
@@ -884,7 +902,7 @@ export class MockWorld {
       job.currentAttempt = attempt.id
       const cur = free.get(nodeId)
       if (cur) free.set(nodeId, subRes(cur, alloc.funded))
-      this.seedUsage(job, startedAtUs)
+      this.seedUsage(attempt, job.spec.requests, startedAtUs, this.nowUs)
       made += 1
     }
   }
@@ -952,11 +970,12 @@ export class MockWorld {
       const attempt = this.newAttempt(job, node.id, 'Terminal')
       attempt.startedAtUs = startedAtUs
       attempt.endedAtUs = endedAtUs
-      attempt.outcome = this.finalOutcome(state)
+      attempt.outcome = this.finalOutcome(state, job)
       const chargedUcu = Math.round(
         attempt.rateUcuPerSecond * ((endedAtUs - startedAtUs) / SECOND_US),
       )
       attempt.chargedUcu = chargedUcu
+      this.seedUsage(attempt, job.spec.requests, startedAtUs, endedAtUs)
       // Released allocation: recorded for history, excluded from capacity.
       this.newAlloc(job, attempt, node.id, { ...job.spec.requests }, 'Released')
       job.currentAttempt = attempt.id
@@ -965,10 +984,14 @@ export class MockWorld {
     }
   }
 
-  /** Prepend earlier retried attempts (each with a transient Platform outcome). */
+  /**
+   * Prepend earlier retried attempts (each with a transient Platform
+   * outcome), never exceeding the job's retry budget — total attempts must
+   * stay ≤ maxRetries + 1 or views like "attempts 2 of 1" turn nonsensical.
+   */
   private maybeAddRetries(job: MJob, currentStartUs: number): void {
-    if (!this.rng.bool(0.15)) return
-    const retries = this.rng.int(1, Math.max(1, job.spec.retry.maxRetries || 1))
+    if (job.spec.retry.maxRetries === 0 || !this.rng.bool(0.15)) return
+    const retries = this.rng.int(1, job.spec.retry.maxRetries)
     const node = this.rng.pick([...this.nodes.values()])
     for (let r = 0; r < retries; r += 1) {
       const startedAtUs =
@@ -982,17 +1005,23 @@ export class MockWorld {
       attempt.chargedUcu = Math.round(
         attempt.rateUcuPerSecond * ((endedAtUs - startedAtUs) / SECOND_US),
       )
+      // Pull/start failures never ran a container, so they record no usage.
+      if (kind !== 'PullFailed' && kind !== 'StartFailed') {
+        this.seedUsage(attempt, job.spec.requests, startedAtUs, endedAtUs)
+      }
       this.newAlloc(job, attempt, node.id, { ...job.spec.requests }, 'Released')
       job.retriesUsed += 1
     }
   }
 
-  private finalOutcome(state: JobState): AttemptOutcome {
+  private finalOutcome(state: JobState, job: MJob): AttemptOutcome {
     if (state === 'Succeeded') return { kind: 'Exited', exitCode: 0, class: 'Success' }
     if (state === 'Aborted') return { kind: 'Aborted', class: 'UserRequest' }
-    const [kind, cls] = this.rng.weighted(
-      FAILURE_POOL.map((f) => [[f[0], f[1]] as const, f[2]] as const),
+    // A job with no runtime bound can never time out on it.
+    const pool = FAILURE_POOL.filter(
+      (f) => f[0] !== 'MaxRuntimeExceeded' || job.spec.maxRuntimeUs !== null,
     )
+    const [kind, cls] = this.rng.weighted(pool.map((f) => [[f[0], f[1]] as const, f[2]] as const))
     if (kind === 'Exited') return { kind, exitCode: this.rng.pick([1, 2, 127, 137]), class: cls }
     return { kind, class: cls }
   }
@@ -1068,16 +1097,16 @@ export class MockWorld {
     )
   }
 
-  private seedUsage(job: MJob, startedAtUs: number): void {
-    const requested = job.spec.requests
-    const span = this.nowUs - startedAtUs
+  /** Backfill an attempt's usage ring over its [start, end] run window. */
+  private seedUsage(attempt: MAttempt, requested: Resources, startUs: number, endUs: number): void {
+    const span = Math.max(0, endUs - startUs)
     const step = Math.max(SECOND_US, Math.floor(span / USAGE_RING))
     const samples: UsageSample[] = []
-    const seedRng = new Rng(hashSeed(job.id))
-    for (let t = startedAtUs; t <= this.nowUs && samples.length < USAGE_RING; t += step) {
+    const seedRng = new Rng(hashSeed(attempt.id))
+    for (let t = startUs; t <= endUs && samples.length < USAGE_RING; t += step) {
       samples.push(this.usageSample(t, requested, seedRng))
     }
-    job.usage = samples
+    attempt.usage = samples
   }
 
   private usageSample(tUs: number, requested: Resources, rng: Rng): UsageSample {
@@ -1225,9 +1254,9 @@ export class MockWorld {
       const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
       if (!attempt) continue
       // Append a bounded usage sample and accrue charge.
-      const seedRng = new Rng(hashSeed(job.id + this.nowUs))
-      job.usage.push(this.usageSample(this.nowUs, job.spec.requests, seedRng))
-      if (job.usage.length > USAGE_RING) job.usage.shift()
+      const seedRng = new Rng(hashSeed(attempt.id + this.nowUs))
+      attempt.usage.push(this.usageSample(this.nowUs, job.spec.requests, seedRng))
+      if (attempt.usage.length > USAGE_RING) attempt.usage.shift()
       const delta = Math.round(attempt.rateUcuPerSecond * (TICK_US / SECOND_US))
       attempt.chargedUcu += delta
       // Charge the full per-tick cost to every ancestor (charge_ancestors).
@@ -1257,7 +1286,7 @@ export class MockWorld {
     const state: JobState = failed ? 'Failed' : 'Succeeded'
     attempt.state = 'Terminal'
     attempt.endedAtUs = this.nowUs
-    attempt.outcome = this.finalOutcome(state)
+    attempt.outcome = this.finalOutcome(state, job)
     job.terminalAtUs = this.nowUs
     this.applyTrueUp(job, attempt, state)
     this.applyTrueUpToAncestors(job)
@@ -1313,7 +1342,7 @@ export class MockWorld {
         attempt.state = 'Running'
         attempt.startedAtUs = this.nowUs
         this.transition(job, 'Running')
-        this.seedUsage(job, this.nowUs - SECOND_US)
+        this.seedUsage(attempt, job.spec.requests, this.nowUs - SECOND_US, this.nowUs)
         this.pushEvent({
           atUs: this.nowUs,
           kind: 'AllocationFunded',
@@ -1601,7 +1630,7 @@ export class MockWorld {
       if (job.state !== 'Running' && job.state !== 'Finalizing') continue
       const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
       if (!attempt || attempt.node !== nodeId) continue
-      const last = job.usage[job.usage.length - 1]
+      const last = attempt.usage[attempt.usage.length - 1]
       if (last) total = addRes(total, res(last.cpuMillis, last.memoryBytes, last.diskBytes))
     }
     return total
@@ -1769,6 +1798,9 @@ export class MockWorld {
       state: job.state,
       spec: {
         image: job.spec.image,
+        entrypoint: job.spec.entrypoint ? [...job.spec.entrypoint] : null,
+        command: [...job.spec.command],
+        env: { ...job.spec.env },
         requests: { ...job.spec.requests },
         priority: job.spec.priority,
         maxRuntimeUs: job.spec.maxRuntimeUs,
@@ -1776,6 +1808,7 @@ export class MockWorld {
         retry: { ...job.spec.retry },
       },
       submittedAtUs: job.submittedAtUs,
+      stateSinceUs: this.stateSince(job, attempt),
       terminalAtUs: job.terminalAtUs,
       retriesUsed: job.retriesUsed,
       abortRequested: job.abortRequested ? { ...job.abortRequested } : null,
@@ -1800,6 +1833,18 @@ export class MockWorld {
       overQuotaRatio: ratio,
       penalty: Math.max(1, ratio * ratio),
     }
+  }
+
+  /**
+   * When the job entered its current state. Seeded jobs are built directly
+   * into a state (no event history), so fall back to the best per-state
+   * anchor: attempt start for Running, terminal time for terminal states,
+   * last recorded transition otherwise.
+   */
+  private stateSince(job: MJob, attempt: MAttempt | undefined): number {
+    if (this.isTerminal(job) && job.terminalAtUs !== null) return job.terminalAtUs
+    if (job.state === 'Running' && attempt?.startedAtUs != null) return attempt.startedAtUs
+    return job.lastTransitionUs
   }
 
   private entityChain(leafId: string): JobDetail['entityChain'] {
@@ -1910,11 +1955,19 @@ export class MockWorld {
     return merged.sort((a, b) => a.atUs - b.atUs).map((e) => ({ ...e }))
   }
 
-  buildJobUsage(id: string): JobUsage {
+  /** Usage for one attempt; null = the current (else latest) attempt. */
+  buildJobUsage(id: string, attemptId: string | null = null): JobUsage {
     const job = this.jobOrThrow(id)
+    const chosen = attemptId ?? job.currentAttempt ?? job.attempts[job.attempts.length - 1] ?? null
+    if (chosen === null) {
+      return { attempt: null, requested: { ...job.spec.requests }, samples: [] }
+    }
+    const attempt = this.attempts.get(chosen)
+    if (!attempt || attempt.job !== id) throw new NotFound(`attempt ${chosen} of job ${id}`)
     return {
+      attempt: attempt.id,
       requested: { ...job.spec.requests },
-      samples: job.usage.map((s) => ({ ...s })),
+      samples: attempt.usage.map((s) => ({ ...s })),
     }
   }
 

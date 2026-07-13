@@ -18,6 +18,11 @@ export default defineConfig({
       '@': path.resolve(__dirname, 'src'),
     },
   },
+  server: {
+    // Honor a harness/CI-assigned port (e.g. Claude Code preview autoPort);
+    // vite only reads ports from the CLI/config, never the environment.
+    port: process.env.PORT ? Number(process.env.PORT) : undefined,
+  },
   test: {
     environment: 'jsdom',
     setupFiles: ['src/test-setup.ts'],

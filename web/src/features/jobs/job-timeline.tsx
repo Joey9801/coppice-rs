@@ -16,7 +16,7 @@ import { formatTimeAgo, formatTimestampUs } from '@/lib/format'
 import { EmptyState, IdLink } from '@/components'
 import { Skeleton } from '@/components/ui/skeleton'
 
-export function JobTimelineTab({ jobId }: { jobId: JobId }) {
+export function JobTimeline({ jobId }: { jobId: JobId }) {
   const timeline = useJobTimeline(jobId)
 
   if (timeline.isLoading) {

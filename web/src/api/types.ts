@@ -136,9 +136,24 @@ export interface AttemptView {
 // Jobs
 // ---------------------------------------------------------------------------
 
-/** Mirrors `coppice_core::Job` (the immutable submitted spec). */
+/**
+ * Mirrors `coppice_core::Job` (the immutable submitted spec).
+ *
+ * NOTE: `env` is not yet on the Rust `Job` — it is the UI's proposal for
+ * the environment overlay that lands with the Docker executor; reconcile
+ * when `coppice_core::job` grows it.
+ */
 export interface JobSpec {
   image: string
+  /**
+   * The container command line, pre-tokenized (argv semantics, no shell).
+   * Required and never empty. May be large — render lazily.
+   */
+  command: string[]
+  /** Entrypoint override; null runs the image's own entrypoint. */
+  entrypoint: string[] | null
+  /** Environment overlay. May be large — render lazily. */
+  env: Record<string, string>
   requests: Resources
   /** Small integer priority class, mapped to a multiplier by policy. */
   priority: number
@@ -238,6 +253,11 @@ export interface JobDetail {
   state: JobState
   spec: JobSpec
   submittedAtUs: number
+  /**
+   * When the job entered its current state (µs). Server-derived from the
+   * event history; drives "in this state for …" displays.
+   */
+  stateSinceUs: number
   terminalAtUs: number | null
   retriesUsed: number
   abortRequested: { reason: string | null; requestedAtUs: number } | null
@@ -300,6 +320,12 @@ export interface UsageSample {
 }
 
 export interface JobUsage {
+  /**
+   * The attempt these samples belong to (usage is measured per attempt);
+   * null when the job has no attempts yet. When the request named no
+   * attempt, the server picks the current (else latest) one.
+   */
+  attempt: AttemptId | null
   /** What the job asked for — chart ceilings. */
   requested: Resources
   samples: UsageSample[]

@@ -1,6 +1,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from './index'
 import type {
+  AttemptId,
   ConfigureQuotaEntityInput,
   CoordinatorId,
   JobId,
@@ -27,7 +28,8 @@ export const queryKeys = {
   jobs: (filter: ListJobsFilter) => ['jobs', filter] as const,
   job: (id: JobId) => ['job', id] as const,
   jobTimeline: (id: JobId) => ['job', id, 'timeline'] as const,
-  jobUsage: (id: JobId) => ['job', id, 'usage'] as const,
+  jobUsage: (id: JobId, attempt: AttemptId | null) =>
+    ['job', id, 'usage', attempt ?? 'current'] as const,
   jobLogs: (id: JobId) => ['job', id, 'logs'] as const,
   nodes: ['nodes'] as const,
   node: (id: NodeId) => ['node', id] as const,
@@ -89,10 +91,11 @@ export function useJobTimeline(id: JobId) {
   })
 }
 
-export function useJobUsage(id: JobId) {
+export function useJobUsage(id: JobId, attempt: AttemptId | null = null) {
   return useQuery({
-    queryKey: queryKeys.jobUsage(id),
-    queryFn: () => api.getJobUsage(id),
+    queryKey: queryKeys.jobUsage(id, attempt),
+    queryFn: () => api.getJobUsage(id, attempt),
+    placeholderData: keepPreviousData,
     ...LIVE,
   })
 }
