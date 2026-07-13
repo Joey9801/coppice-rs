@@ -26,6 +26,11 @@ pub struct StartSpec {
     pub attempt: AttemptId,
     pub job: JobId,
     pub image: String,
+    /// The container command line, pre-tokenized (argv semantics). Never
+    /// empty — the job spec requires it and StartJob copies it verbatim.
+    pub command: Vec<String>,
+    /// Entrypoint override; `None` runs the image's own entrypoint.
+    pub entrypoint: Option<Vec<String>>,
     pub limits: Resources,
     /// Enforced runtime bound; the agent's watchdog kills the container past
     /// it (outcome `MaxRuntimeExceeded`). `None` = unbounded.
@@ -429,6 +434,8 @@ mod tests {
             attempt: AttemptId::new(),
             job: JobId::new(),
             image: "img".into(),
+            command: vec!["run".into()],
+            entrypoint: None,
             limits: Resources::ZERO,
             max_runtime_us: None,
         })
@@ -460,6 +467,8 @@ mod tests {
             attempt: AttemptId::new(),
             job: JobId::new(),
             image: "img".into(),
+            command: vec!["run".into()],
+            entrypoint: None,
             limits: Resources::ZERO,
             max_runtime_us: None,
         })

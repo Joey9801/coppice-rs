@@ -38,6 +38,11 @@ message SubmitJobRequest {
   // Client-minted job identity (`job-<uuid>`, ADR 0024) — required. Mint a
   // fresh id per logical submission; reuse it verbatim on every retry.
   coppice.core.v1.JobId job = 7;
+  // The container command line, pre-tokenized (argv semantics, no shell
+  // parsing) — required and non-empty, mirroring core.v1.Job.command.
+  repeated string command = 8;
+  // Entrypoint override; absent runs the image's own entrypoint.
+  coppice.core.v1.Entrypoint entrypoint = 9;
 }
 
 message SubmitJobResponse {

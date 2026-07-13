@@ -198,8 +198,10 @@ the same apply resolves the job:
    the abort — a combination the ordered log makes unreachable, specified
    for completeness.)
 3. **`Revoked` requeues free.** Job returns to `Queued`; `retries_used` is
-   not incremented. No special-cased refund exists: the attempt never ran,
-   so true-up returns the full (decayed) charge (ADR 0019).
+   not incremented. `Revoked` is pre-`Running` and `Platform`-class, so
+   true-up's refund fraction (ADR 0029) is 1000 either way: the attempt
+   never ran and true-up returns the full (decayed) charge, exactly as
+   under ADR 0019.
 4. **Retry policy** for everything else:
    - `Success` → job `Succeeded`.
    - `MaxRuntimeExceeded` → job `Failed`, never retried (deterministic
@@ -212,12 +214,17 @@ the same apply resolves the job:
    - A retry is: `retries_used += 1` (except `Revoked`), job → `Queued` —
      the state transition drops the attempt id. The next attempt is created
      by a future `CommitPlacements`.
-5. **Quota true-up** (ADR 0019) runs in the same apply: actual cost is
-   computed from the rate and multiplier stored in the attempt's charge
-   record (policy edits never retroactively reprice); an attempt that never
-   reached `Running` has actual cost zero; refunds are decayed from charge
-   time to the command's timestamp; every ancestor entity is touched then
-   settled.
+5. **Quota true-up** (ADR 0019, refund fraction per ADR 0029) runs in the
+   same apply: actual cost is computed from the rate and multiplier stored
+   in the attempt's charge record (policy edits never retroactively
+   reprice); an attempt that never reached `Running` has actual cost zero;
+   the refund is `unused × f / 1000` where `f` is the fraction recorded on
+   the charge record at placement, decayed from charge time to the
+   command's timestamp; every ancestor entity is touched then settled. `f`
+   is always 1000 (full refund) unless the attempt reached `Running`, the
+   outcome's `OutcomeClass` is not `Platform`, and the job declared an
+   enforced `max_runtime` — otherwise the recorded `refund_fraction_milli`
+   applies.
 6. **Allocations release** in the same apply, running the pledge pass on
    each affected node.
 7. **Terminal timestamp.** A resolution that lands terminal stamps the
@@ -318,7 +325,7 @@ reachable through the API.
 | Proposer | Scheduler engine via the leader — one batch per scheduling pass |
 | Payload | `expected_version: u64` (audit record of the snapshot version; see contract), `proposed_at_us` (the charge timestamp), `revocations: AllocationId[]`, `placements: Placement[]` where `Placement = { job: JobId, attempt: AttemptId, group: GroupId, allocations: AllocationSpec[] }`, `AllocationSpec = { id: AllocationId, node: NodeId, requested: Resources }`. The proto field is repeated; **v1 writers emit exactly one allocation per placement and set `group` = the job's id** (singleton groups); apply rejects other shapes until the gang-scheduling ADR. |
 | Validation (all-or-nothing, per-item diagnostics) | Revocations: allocation exists and is `Accruing` (funded allocations are stable — revoking one is always a rejection). Placements: job exists and is `Queued`; attempt and allocation ids are fresh; node exists and is schedulable; `requested` fits within the node's total advertised capacity; exactly one allocation, `group` = job id. Batch-level: after simulating the batch (revocation frees → pledge pass → new placements in order), the number of distinct jobs holding accruing allocations must not exceed the replicated accrual cap K. |
-| Apply effects | In order: **(1) Revocations** — each attempt `Terminal(Revoked)`, allocations `Released`, true-up (full decayed refund; the attempt never ran), job → `Queued` free of retry budget (or `Aborted` if an abort is pending), freed capacity pledged onward in commit order. **(2) Placements**, in payload order: assign the allocation the next `seq`; insert attempt + allocation; run the pledge from the node's current free capacity — fully covered → allocation `Funded`, attempt starts `Ready` (accrual skipped, the common case); partially or not covered → allocation `Accruing` in the accrual queue, attempt starts `Accruing`. Job → `Attempting(attempt)`. **(3) Quota charge**: the job's full cost `C = rate(requests, current weights) × ceil(max_runtime_s) × multiplier` (jobs with no `max_runtime` are charged the replicated `default_charge_runtime`) is charged to every ancestor of its entity at `proposed_at_us`; the attempt records `(C, rate, multiplier, proposed_at_us)` for true-up. |
+| Apply effects | In order: **(1) Revocations** — each attempt `Terminal(Revoked)`, allocations `Released`, true-up (full decayed refund; the attempt never ran), job → `Queued` free of retry budget (or `Aborted` if an abort is pending), freed capacity pledged onward in commit order. **(2) Placements**, in payload order: assign the allocation the next `seq`; insert attempt + allocation; run the pledge from the node's current free capacity — fully covered → allocation `Funded`, attempt starts `Ready` (accrual skipped, the common case); partially or not covered → allocation `Accruing` in the accrual queue, attempt starts `Accruing`. Job → `Attempting(attempt)`. **(3) Quota charge**: a job with no *enforced* `max_runtime` first has its multiplier inflated, `m' = ⌊multiplier × unbounded_runtime_multiplier / 2³²⌋` (else `m' = multiplier`); the job's full cost `C = rate(requests, current weights) × ceil(max_runtime_s) × m'` (jobs with no `max_runtime` are charged the replicated `default_charge_runtime` at `m'`) is charged to every ancestor of its entity at `proposed_at_us`; the attempt records `(C, rate, m', proposed_at_us, refund_fraction_milli)` for true-up, where the recorded fraction is the replicated `refund_fraction_milli` for a bounded job or 1000 for an unbounded one (ADR 0029). |
 | Rejections | `InvalidBatch[(index, reason)]` wrapping `UnknownAllocation`, `AllocationNotAccruing`, `UnknownJob`, `JobNotQueued`, `DuplicateAttempt`, `DuplicateAllocation`, `UnknownNode`, `NodeNotSchedulable`, `RequestExceedsNodeCapacity`, `UnsupportedPlacementShape`, `UnknownQuotaEntity`; batch-level `AccrualLimitExceeded` |
 
 #### `DispatchAttempt`
@@ -360,7 +367,7 @@ reachable through the API.
 | Proposer | Ingestion, from the terminal `AttemptStatus` report (natural exit, OOM, `max_runtime` kill, abort completion, pull/start failure) |
 | Payload | `attempt: AttemptId`, `outcome: AttemptOutcome` (the full ADR 0013 taxonomy except `Revoked`, which only `CommitPlacements` may produce), `actual_runtime_us: uint64` (normalizer-computed), `observed_at_us` |
 | Validation | Attempt exists and is non-terminal; outcome ≠ `Revoked` |
-| Apply effects | Attempt → `Terminal(outcome)` (legal from any non-terminal state — early endings arrive without prior started/exited commands); allocations `Released` + pledge pass; quota true-up (actual cost 0 if the attempt never reached `Running`, else from recorded rate × `ceil(actual_runtime_s)` × recorded multiplier); job resolution per the rules above (retry / terminal / abort-wins / truth-wins), moving `Attempting(id)` directly to a terminal state or back to `Queued`. |
+| Apply effects | Attempt → `Terminal(outcome)` (legal from any non-terminal state — early endings arrive without prior started/exited commands); allocations `Released` + pledge pass; quota true-up (actual cost 0 if the attempt never reached `Running`, else from recorded rate × `ceil(actual_runtime_s)` × recorded multiplier; refund is the recorded `refund_fraction_milli` of the unused portion, or the full unused portion whenever the attempt never reached `Running` or `outcome`'s `OutcomeClass` is `Platform` — ADR 0029); job resolution per the rules above (retry / terminal / abort-wins / truth-wins), moving `Attempting(id)` directly to a terminal state or back to `Queued`. |
 | Rejections | `UnknownAttempt`, `StaleAttemptState`, `InvalidCommand` (outcome `Revoked`) |
 
 #### `ReconcileNode`
@@ -434,9 +441,9 @@ reachable through the API.
 | | |
 | --- | --- |
 | Proposer | Admin API / CLI. The CLI converts human-facing forms (half-life → Q0.64 λ, rates → stocks) so no transcendental math ever runs in a replica (ADR 0019/0020). |
-| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `terminal_retention_us: i64` (72 h default), `abort_grace_us: i64` (30 s default), `groups_claim: string` (`"groups"` default — ADR 0023); plus `actor: Actor`, `updated_at_us` |
-| Validation | `decay.validate()` (positive tick, λ within the iteration bound); actor holds unscoped `admin`; a full-replacement payload is otherwise self-consistent by construction |
-| Apply effects | Replace the replicated policy. In-flight charge records keep their recorded rate/multiplier (no retroactive repricing); decay re-times from each entity's next touch; quota-stock rescaling on half-life change is owned by the tooling that authored the command. |
+| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `unbounded_runtime_multiplier: u64` (Q32.32, default 2.0 — ADR 0029), `refund_fraction_milli: u32` (default 750 — ADR 0029), `terminal_retention_us: i64` (72 h default), `abort_grace_us: i64` (30 s default), `groups_claim: string` (`"groups"` default — ADR 0023); plus `actor: Actor`, `updated_at_us` |
+| Validation | `decay.validate()` (positive tick, λ within the iteration bound); `unbounded_runtime_multiplier ≥ 2³²` (≥ 1.0); `refund_fraction_milli ≤ 1000`; actor holds unscoped `admin`; a full-replacement payload is otherwise self-consistent by construction |
+| Apply effects | Replace the replicated policy. In-flight charge records keep their recorded rate/multiplier/refund fraction (no retroactive repricing); decay re-times from each entity's next touch; quota-stock rescaling on half-life change is owned by the tooling that authored the command. |
 | Rejections | `InvalidPolicy`, `PermissionDenied` |
 
 #### `UpdateAuthorization`

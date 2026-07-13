@@ -53,6 +53,14 @@ cost (µCU)   = ⌊rate × runtime_seconds × priority_multiplier / 2³²⌋
 - The user-chosen priority maps (via a policy table) to a **Q32.32
   multiplier** on cost: users burn budget faster to push one important job
   forward. Priority is not a free lane.
+- A job placed with no *enforced* `max_runtime` has that multiplier itself
+  inflated: `m' = ⌊m × unbounded_runtime_multiplier / 2³²⌋` (replicated
+  policy, Q32.32, default 2.0), and `m'` — not `m` — is what's threaded
+  through the charge above, the surcharge on overrun, and true-up. Declaring
+  a bound is cheaper than going unbounded up to about 5× your expected
+  runtime; see
+  [ADR 0029](../decisions/0029-runtime-declaration-incentives.md) for the
+  break-even and the reasoning.
 
 ## Decayed usage
 
@@ -84,17 +92,35 @@ cost is recomputed with the same weights,
 multiplier, and ceil-seconds rounding over observed runtime, and the
 difference is settled:
 
-- **Refund** (the normal case): the unused portion of the charge, **decayed
-  from charge time to resolution time**, is subtracted (saturating). The
-  entity lands where it would have been had the true cost been charged at
-  placement.
+- **Refund**: the unused portion of the charge is only *partly* returned.
+  Replicated policy `refund_fraction_milli` (parts-per-thousand, default
+  750) is captured onto the charge record at placement time, so mid-flight
+  policy edits never reprice an in-flight charge. True-up refunds
+  `unused × f / 1000`, **decayed from charge time to resolution time**; the
+  rest stays in the entity's decayed usage as a lasting record that the
+  declared bound overshot the run. `f` is 1000 (full refund) — recovering
+  ADR 0019's original behaviour exactly — whenever the attempt never
+  reached `Running`, whenever the outcome's `OutcomeClass` is `Platform`
+  (`Revoked`, `NodeLost`, `AgentError`, platform-side pull/start failures),
+  or when the job declared no `max_runtime` (the unbounded multiplier above
+  already prices that case; retaining against the synthetic
+  `default_charge_runtime_s` charge would price it twice). Otherwise — the
+  attempt ran and ended in `Success`, `UserError`, or `UserRequest` — `f` is
+  the recorded fraction, and the gap between bound and actual is priced as
+  the user's own declaration error.
 - **Surcharge** (post-`max_runtime` kill grace only): the excess is charged
-  fresh.
+  fresh, at the recorded (possibly unbounded-inflated) multiplier.
 
-There are deliberately no special cases: a `Revoked` attempt never ran, so
-its actual cost is zero and the full (decayed) charge comes back — requeue
-is free by arithmetic, as ADR 0013 requires. Retries charge each placement
-anew and true up each attempt separately.
+**Requeue is still free by arithmetic**: a `Revoked` attempt never ran, so
+its actual cost is zero, its `OutcomeClass` is `Platform`, and both guards
+give `f = 1000` — the full (decayed) charge comes back, as ADR 0013
+requires. Platform-attributed failures (`NodeLost`, `AgentError`, pull/start
+failures) refund in full for the same reason: the platform, not the user,
+chose the placement that didn't work out. Retries charge each placement
+anew and true up each attempt separately. See
+[ADR 0029](../decisions/0029-runtime-declaration-incentives.md) for the
+full mechanism, the attribution rule, and the incentive properties it's
+meant to establish.
 
 ## Effective priority
 

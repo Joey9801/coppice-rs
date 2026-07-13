@@ -258,18 +258,34 @@ impl StateMachine {
             let Some(spec) = p.allocations.first() else {
                 continue;
             };
-            let Some((entity, multiplier, runtime_s, requests)) = self.jobs.get(&p.job).map(|j| {
-                (
-                    j.spec.quota_entity,
-                    j.multiplier,
-                    j.spec
-                        .max_runtime_us
-                        .map(quota::runtime_seconds_ceil)
-                        .unwrap_or(self.policy.default_charge_runtime_s),
-                    j.spec.requests,
-                )
-            }) else {
+            let Some((entity, multiplier, bounded, runtime_s, requests)) =
+                self.jobs.get(&p.job).map(|j| {
+                    (
+                        j.spec.quota_entity,
+                        j.multiplier,
+                        j.spec.max_runtime_us.is_some(),
+                        j.spec
+                            .max_runtime_us
+                            .map(quota::runtime_seconds_ceil)
+                            .unwrap_or(self.policy.default_charge_runtime_s),
+                        j.spec.requests,
+                    )
+                })
+            else {
                 continue;
+            };
+            // ADR 0029: a job with no declared bound prices at the elevated
+            // rate everywhere (charge, true-up, surcharge) via the folded
+            // multiplier, and its synthetic charge refunds in full — the
+            // declared-bound retention never applies to the platform's own
+            // runtime estimate.
+            let (multiplier, refund_fraction_milli) = if bounded {
+                (multiplier, self.policy.refund_fraction_milli)
+            } else {
+                (
+                    multiplier.saturating_mul(self.policy.unbounded_runtime_multiplier),
+                    quota::FULL_REFUND_MILLI,
+                )
             };
             let seq = self.next_allocation_seq;
             self.next_allocation_seq += 1;
@@ -330,6 +346,7 @@ impl StateMachine {
                     charge: ChargeRecord {
                         amount: charge,
                         charged_at_us: c.proposed_at_us,
+                        refund_fraction_milli,
                     },
                     rate_ucu_per_second: rate,
                     multiplier,
@@ -851,6 +868,22 @@ impl StateMachine {
         if let Err(e) = c.policy.decay.validate() {
             return Err(RejectionReason::InvalidPolicy(e.to_string()));
         }
+        // ADR 0029: the unbounded-rate multiplier may only surcharge (≥ 1.0),
+        // and the refund fraction is parts-per-thousand of the unused charge.
+        if c.policy.unbounded_runtime_multiplier < quota::PriorityMultiplier::ONE {
+            return Err(RejectionReason::InvalidPolicy(format!(
+                "unbounded_runtime_multiplier {} is below 1.0 ({})",
+                c.policy.unbounded_runtime_multiplier.0,
+                quota::PriorityMultiplier::ONE.0
+            )));
+        }
+        if c.policy.refund_fraction_milli > quota::FULL_REFUND_MILLI {
+            return Err(RejectionReason::InvalidPolicy(format!(
+                "refund_fraction_milli {} exceeds maximum {}",
+                c.policy.refund_fraction_milli,
+                quota::FULL_REFUND_MILLI
+            )));
+        }
         // In-flight charge records keep their recorded rate and multiplier;
         // decay re-times from each entity's next touch (ADR 0019).
         self.policy = c.policy.clone();
@@ -995,8 +1028,12 @@ impl StateMachine {
         } else {
             CostUnits::ZERO
         };
+        // Retention (ADR 0029) applies only when the attempt ran and its end
+        // is the user's own — never to platform outcomes (Revoked, NodeLost,
+        // …), so requeue and platform-fault retries stay free of it.
+        let retain = started && outcome.class() != OutcomeClass::Platform;
         let decay = self.policy.decay;
-        let adjustment = quota::true_up(&charge, actual, ts_us, &decay);
+        let adjustment = quota::true_up(&charge, actual, ts_us, &decay, retain);
         if let Some(entity) = self.jobs.get(&job).map(|j| j.spec.quota_entity) {
             self.settle_ancestors(entity, adjustment, ts_us);
         }
@@ -1330,6 +1367,8 @@ impl StateMachine {
 fn same_submission(existing: &Job, retried: &Job) -> bool {
     existing.id == retried.id
         && existing.image == retried.image
+        && existing.command == retried.command
+        && existing.entrypoint == retried.entrypoint
         && existing.requests == retried.requests
         && existing.priority == retried.priority
         && existing.max_runtime_us == retried.max_runtime_us

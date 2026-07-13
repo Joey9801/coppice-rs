@@ -37,7 +37,7 @@ export function formatBytes(bytes: number): string {
     value /= 1024
     i += 1
   }
-  const digits = value >= 100 || i === 0 ? 0 : 1
+  const digits = value >= 100 || i === 0 || Number.isInteger(value) ? 0 : 1
   return `${value.toFixed(digits)} ${units[i]}`
 }
 
@@ -60,6 +60,11 @@ export function formatUcu(ucu: number): string {
   if (cu >= 100) return `${cu.toFixed(0)} CU`
   if (cu >= 1) return `${cu.toFixed(1)} CU`
   return `${cu.toFixed(3)} CU`
+}
+
+/** µCU/second → "X CU/hour", the human-scale burn rate. */
+export function formatUcuRatePerHour(rateUcuPerSecond: number): string {
+  return `${formatUcu(rateUcuPerSecond * 3600)}/hour`
 }
 
 /** Compact duration: "3h 12m", "45s", "850ms". */

@@ -68,6 +68,9 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
       expect(nodeIds.has(attempt.node)).toBe(true)
     }
 
+    // The retry budget bounds total attempts (maxRetries + the first one).
+    expect(detail.attempts.length).toBeLessThanOrEqual(detail.spec.retry.maxRetries + 1)
+
     // Attempting + attempt Running: exactly one current attempt Running with
     // an Active, fully funded allocation.
     const cur = jobCurrentAttempt(detail)

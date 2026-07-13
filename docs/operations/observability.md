@@ -70,6 +70,10 @@ Important metric categories include:
 - Placement attempts and failures.
 - Resource utilization by node and cluster.
 - Requested versus actual usage.
+- Quota usage by entity, broken out into charged, refunded, and retained
+  amounts — retained usage (ADR 0029's partial refund) should read
+  distinctly from an ordinary charge for work still running, or retention
+  looks like a billing bug.
 - Agent heartbeat health.
 - Raft leader changes, commit latency, apply latency, and snapshot metrics.
 - API latency and error rates.

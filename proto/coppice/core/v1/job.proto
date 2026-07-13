@@ -37,6 +37,21 @@ message Job {
   // Present iff the user has requested an abort (ADR 0013). Legal in every
   // non-terminal state; once set, finalization never resolves to a retry.
   AbortRequest abort_requested = 8;
+  // The container command line, pre-tokenized (argv semantics, no shell
+  // parsing). Required on every job: an empty repeated field is
+  // indistinguishable from an absent one on the wire, so conversion rejects
+  // an empty command outright.
+  repeated string command = 9;
+  // Entrypoint override; absent runs the image's own entrypoint.
+  Entrypoint entrypoint = 10;
+}
+
+// An entrypoint override for a job's container. A message rather than a
+// bare `repeated string` on Job so the override has real presence: absent
+// means "use the image entrypoint", and the only encoding of that meaning
+// is absence — a present-but-empty argv is rejected at conversion.
+message Entrypoint {
+  repeated string argv = 1;
 }
 
 // Per-job retry policy. Bounds attempts beyond the first; `Revoked` outcomes

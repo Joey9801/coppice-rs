@@ -524,6 +524,8 @@ impl From<&PolicyConfig> for pbcore::PolicyConfig {
             default_charge_runtime_s: policy.default_charge_runtime_s,
             terminal_retention_us: policy.terminal_retention_us,
             abort_grace_us: policy.abort_grace_us,
+            unbounded_runtime_multiplier_q32_32: Some(policy.unbounded_runtime_multiplier.0),
+            refund_fraction_milli: Some(policy.refund_fraction_milli),
         }
     }
 }
@@ -541,6 +543,13 @@ impl TryFrom<pbcore::PolicyConfig> for PolicyConfig {
             default_charge_runtime_s: policy.default_charge_runtime_s,
             terminal_retention_us: policy.terminal_retention_us,
             abort_grace_us: policy.abort_grace_us,
+            // Absent (a policy written by a pre-0029 coordinator) decodes to
+            // the neutral values, reproducing today's behaviour — not the new
+            // PolicyConfig::default() knobs, which only fresh policies get.
+            unbounded_runtime_multiplier: policy
+                .unbounded_runtime_multiplier_q32_32
+                .map_or(PriorityMultiplier::ONE, PriorityMultiplier),
+            refund_fraction_milli: policy.refund_fraction_milli.unwrap_or(1000),
         })
     }
 }

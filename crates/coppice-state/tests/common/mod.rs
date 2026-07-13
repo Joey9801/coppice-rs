@@ -106,6 +106,8 @@ pub fn submit_cmd(
         job: Job {
             id: job,
             image: "registry/img:latest".into(),
+            command: vec!["run".into()],
+            entrypoint: None,
             requests,
             priority: 0,
             max_runtime_us: max_runtime_s.map(|s| s * 1_000_000),

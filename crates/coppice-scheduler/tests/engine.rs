@@ -36,6 +36,8 @@ fn submit_runtime_us(
     let spec = coppice_core::job::Job {
         id: job,
         image: "img".into(),
+        command: vec!["run".into()],
+        entrypoint: None,
         requests,
         priority: 0,
         max_runtime_us: Some(max_runtime_us),

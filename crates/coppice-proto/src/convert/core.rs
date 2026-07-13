@@ -133,6 +133,11 @@ impl From<&Job> for pb::Job {
         pb::Job {
             id: Some(job.id.into()),
             image: job.image.clone(),
+            command: job.command.clone(),
+            entrypoint: job
+                .entrypoint
+                .as_ref()
+                .map(|argv| pb::Entrypoint { argv: argv.clone() }),
             requests: Some((&job.requests).into()),
             priority: job.priority,
             max_runtime_us: job.max_runtime_us,
@@ -147,9 +152,27 @@ impl TryFrom<pb::Job> for Job {
     type Error = ConvertError;
 
     fn try_from(job: pb::Job) -> Result<Self, ConvertError> {
+        // `command` is required, but an empty repeated field decodes the
+        // same as an absent one — so emptiness *is* the missing-field check.
+        if job.command.is_empty() {
+            return Err(ConvertError::MissingField("Job.command"));
+        }
+        // "No override" is encoded only by absence (see job.proto).
+        let entrypoint = match job.entrypoint {
+            None => None,
+            Some(pb::Entrypoint { argv }) if argv.is_empty() => {
+                return Err(ConvertError::Invalid {
+                    field: "Job.entrypoint",
+                    reason: "override argv must be non-empty",
+                });
+            }
+            Some(pb::Entrypoint { argv }) => Some(argv),
+        };
         Ok(Job {
             id: req(job.id, "Job.id")?.try_into()?,
             image: job.image,
+            command: job.command,
+            entrypoint,
             requests: req(job.requests, "Job.requests")?.try_into()?,
             priority: job.priority,
             max_runtime_us: job.max_runtime_us,
@@ -538,6 +561,7 @@ impl From<ChargeRecord> for pb::ChargeRecord {
         pb::ChargeRecord {
             amount_ucu: charge.amount.0,
             charged_at_us: charge.charged_at_us,
+            refund_fraction_milli: Some(charge.refund_fraction_milli),
         }
     }
 }
@@ -547,6 +571,9 @@ impl From<pb::ChargeRecord> for ChargeRecord {
         ChargeRecord {
             amount: CostUnits(charge.amount_ucu),
             charged_at_us: charge.charged_at_us,
+            // Absent (a charge recorded before ADR 0029) trues up at full
+            // refund, exactly as it did then.
+            refund_fraction_milli: charge.refund_fraction_milli.unwrap_or(1000),
         }
     }
 }

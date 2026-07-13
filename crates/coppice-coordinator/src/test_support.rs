@@ -14,7 +14,7 @@ use coppice_core::attempt::{Attempt, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
-use coppice_core::quota::{ChargeRecord, CostUnits, PriorityMultiplier};
+use coppice_core::quota::{ChargeRecord, CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
 use coppice_core::resource::Resources;
 use coppice_state::{
     AllocationRecord, AttemptRecord, Command, JobRecord, NodeRecord, RejectionReason, StateMachine,
@@ -60,6 +60,7 @@ pub fn attempt_record(
         charge: ChargeRecord {
             amount: CostUnits(0),
             charged_at_us: 0,
+            refund_fraction_milli: FULL_REFUND_MILLI,
         },
         rate_ucu_per_second: 0,
         multiplier: PriorityMultiplier(0),
@@ -109,6 +110,8 @@ pub fn job_record(
         spec: Job {
             id,
             image: image.to_string(),
+            command: vec!["run".into()],
+            entrypoint: None,
             requests,
             priority: 0,
             max_runtime_us,

@@ -10,6 +10,7 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::GroupId;
 use coppice_core::job::{JobState, RetryPolicy};
+use coppice_core::quota::{CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
 use coppice_state::command::{
     BumpClusterVersion, CommitPlacements, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
     ReconcileNode, SetNodeSchedulable,
@@ -1179,6 +1180,218 @@ fn resubmission_stays_idempotent_after_abort_and_terminal_state() {
     assert_eq!(applied.events, vec![]);
     expected.version += 1;
     assert_eq!(sm, expected);
+}
+
+/// ADR 0029: a job placed with no declared `max_runtime` prices at the folded
+/// (unbounded × base) multiplier over the synthetic `default_charge_runtime_s`,
+/// and its charge record carries a full refund fraction — the synthetic
+/// runtime is the platform's estimate, never a claim to retain against.
+#[test]
+fn unbounded_placement_charges_folded_rate_and_records_full_refund() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            TS,
+        ),
+    );
+    // 1 core = 1_000_000 µCU/s; default_charge_runtime_s = 86_400; base 1× is
+    // folded with the default 2.0× unbounded multiplier.
+    let expected = CostUnits(1_000_000 * 86_400 * 2);
+    assert_eq!(sm.attempts[&aid(11)].charge.amount, expected);
+    assert_eq!(
+        sm.attempts[&aid(11)].charge.refund_fraction_milli,
+        FULL_REFUND_MILLI
+    );
+    assert_eq!(
+        sm.attempts[&aid(11)].multiplier,
+        PriorityMultiplier::from_integer(2),
+        "the unbounded multiplier is folded into the recorded multiplier"
+    );
+    // Same tick as configure: no decay, so usage is exactly the charge.
+    assert_eq!(sm.quota_entities[&ROOT].usage.usage, expected);
+}
+
+/// ADR 0029: a bounded job that ends job-attributably before its declared
+/// bound refunds only `refund_fraction_milli` of the unused charge; the
+/// remainder settles into usage. Charge and resolution share a tick, so the
+/// retained µCU is exact.
+#[test]
+fn bounded_early_exit_retains_the_configured_fraction() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            TS,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    apply_ok(&mut sm, exited_cmd(aid(11), TS + 1));
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(11), AttemptOutcome::Exited { code: 0 }, 900, TS + 1),
+    );
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Succeeded);
+    // Charge 3600 s, ran 900 s: unused 2_700_000_000 µCU, of which the default
+    // 750-milli fraction (2_025_000_000) refunds and 675_000_000 is retained
+    // on top of the 900_000_000 actually consumed.
+    let charge = 1_000_000 * 3_600;
+    let actual = 1_000_000 * 900;
+    let unused = charge - actual;
+    let refunded = unused * 750 / 1000;
+    assert_eq!(
+        sm.quota_entities[&ROOT].usage.usage,
+        CostUnits(charge - refunded)
+    );
+}
+
+/// ADR 0029: platform-attributable resolutions never retain, even for a
+/// bounded job with a sub-1000 refund fraction. An attempt that never ran has
+/// zero actual cost, so the whole charge returns and usage lands back at the
+/// pre-placement level.
+#[test]
+fn platform_faults_refund_bounded_jobs_in_full() {
+    // Revoked while accruing: the whale never started.
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(8_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(8_000)),
+            TS,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    let before_whale = sm.quota_entities[&ROOT].usage.usage;
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(2), cpu(10_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)),
+            TS,
+        ),
+    );
+    assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Accruing);
+    assert!(
+        sm.quota_entities[&ROOT].usage.usage > before_whale,
+        "placement charges up front"
+    );
+    apply_ok(
+        &mut sm,
+        Command::CommitPlacements(CommitPlacements {
+            expected_version: 0,
+            revocations: vec![alid(222)],
+            placements: vec![],
+            proposed_at_us: TS,
+        }),
+    );
+    assert_eq!(
+        sm.quota_entities[&ROOT].usage.usage, before_whale,
+        "revoke refunds the whole bounded charge despite the 750-milli fraction"
+    );
+
+    // NodeLost while dispatched: still never started, so the same full refund.
+    let mut sm = setup();
+    let before = sm.quota_entities[&ROOT].usage.usage;
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            TS,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    assert!(sm.quota_entities[&ROOT].usage.usage > before);
+    apply_ok(
+        &mut sm,
+        Command::DeclareNodeLost(DeclareNodeLost {
+            node: nid(1),
+            declared_at_us: TS,
+        }),
+    );
+    assert_eq!(
+        sm.attempts[&aid(11)].attempt.state,
+        AttemptState::Terminal(AttemptOutcome::NodeLost)
+    );
+    assert_eq!(
+        sm.quota_entities[&ROOT].usage.usage, before,
+        "node loss refunds the whole bounded charge"
+    );
+}
+
+/// ADR 0029: an unbounded job that finishes early refunds its unused synthetic
+/// charge *in full* (the record's fraction is 1000), and both charge and
+/// true-up price at the folded rate — so usage settles at exactly the
+/// synthetic-rate consumption of what ran.
+#[test]
+fn unbounded_early_finish_refunds_synthetic_charge_in_full() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            TS,
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), TS));
+    apply_ok(&mut sm, started_cmd(aid(11), TS));
+    apply_ok(&mut sm, exited_cmd(aid(11), TS + 1));
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(11), AttemptOutcome::Exited { code: 0 }, 900, TS + 1),
+    );
+    // Ran 900 s at the folded 2.0× rate: 1_000_000 × 900 × 2 µCU. The rest of
+    // the synthetic 24 h charge comes back in full.
+    assert_eq!(
+        sm.quota_entities[&ROOT].usage.usage,
+        CostUnits(1_000_000 * 900 * 2)
+    );
+}
+
+/// ADR 0029: `UpdatePolicy` validates the two incentive knobs at commit, like
+/// the decay policy — a multiplier below 1.0 or a refund fraction above 1000
+/// rejects as `InvalidPolicy`, a deterministic no-op.
+#[test]
+fn update_policy_rejects_bad_incentive_knobs() {
+    let mut sm = setup();
+    let mut low = test_policy(4);
+    low.unbounded_runtime_multiplier = PriorityMultiplier(PriorityMultiplier::ONE.0 - 1);
+    let r = sm.apply(&update_policy_cmd(low)).unwrap_err();
+    assert!(matches!(r, RejectionReason::InvalidPolicy(_)), "got {r:?}");
+
+    let mut high = test_policy(4);
+    high.refund_fraction_milli = FULL_REFUND_MILLI + 1;
+    let r = sm.apply(&update_policy_cmd(high)).unwrap_err();
+    assert!(matches!(r, RejectionReason::InvalidPolicy(_)), "got {r:?}");
+
+    // Both rejections left the policy untouched; a valid edit still applies.
+    apply_ok(&mut sm, update_policy_cmd(test_policy(4)));
 }
 
 #[test]
