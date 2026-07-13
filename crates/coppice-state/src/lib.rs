@@ -107,9 +107,23 @@ pub struct JobRecord {
     ///
     /// `Revoked` outcomes requeue without touching this.
     pub retries_used: u32,
-    pub current_attempt: Option<AttemptId>,
-    /// Every attempt this job has had, in creation order.
+    /// Every attempt this job has had, in creation order. The attempt in
+    /// flight, when there is one, is carried by `state`
+    /// ([`JobState::Attempting`]) rather than stored separately (ADR 0029);
+    /// [`current_attempt`](JobRecord::current_attempt) derives it from there.
     pub attempts: Vec<AttemptId>,
+}
+
+impl JobRecord {
+    /// The attempt this job is currently pursuing, if any.
+    ///
+    /// A derived view of `state` — `Some` exactly while
+    /// [`JobState::Attempting`] — kept as a method so call sites read as they
+    /// did before the field was removed (ADR 0029). It cannot disagree with
+    /// the state, which is the point of folding the link into the enum.
+    pub fn current_attempt(&self) -> Option<AttemptId> {
+        self.state.attempt()
+    }
 }
 
 /// An attempt's replicated record: the attempt itself plus the charge that

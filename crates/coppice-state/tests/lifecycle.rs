@@ -32,8 +32,10 @@ fn happy_path_submit_to_eviction() {
         &mut sm,
         place_cmd(placement(job, attempt, alloc, nid(1), cpu(4_000)), TS),
     );
-    // Capacity was immediately available: accrual skipped, charge landed.
-    assert_eq!(sm.jobs[&job].state, JobState::Preparing);
+    // Capacity was immediately available: accrual skipped, charge landed. The
+    // job now carries the exact attempt id it is pursuing (ADR 0029).
+    assert_eq!(sm.jobs[&job].state, JobState::Attempting(attempt));
+    assert_eq!(sm.jobs[&job].current_attempt(), Some(attempt));
     assert_eq!(sm.attempts[&attempt].attempt.state, AttemptState::Ready);
     assert_eq!(
         sm.allocations[&alloc].allocation.state,
@@ -52,14 +54,22 @@ fn happy_path_submit_to_eviction() {
     );
 
     apply_ok(&mut sm, started_cmd(attempt, TS + 2));
-    assert_eq!(sm.jobs[&job].state, JobState::Running);
+    // The job stays Attempting while the attempt runs — no Running mirror.
+    assert_eq!(sm.jobs[&job].state, JobState::Attempting(attempt));
+    assert_eq!(sm.attempts[&attempt].attempt.state, AttemptState::Running);
     assert_eq!(
         sm.allocations[&alloc].allocation.state,
         AllocationState::Active
     );
 
     apply_ok(&mut sm, exited_cmd(attempt, TS + 60_000_000));
-    assert_eq!(sm.jobs[&job].state, JobState::Finalizing);
+    // Exit observed but outcome not yet recorded: the attempt is Finalizing
+    // while the job stays Attempting (ADR 0029 — no job-level Finalizing).
+    assert_eq!(sm.jobs[&job].state, JobState::Attempting(attempt));
+    assert_eq!(
+        sm.attempts[&attempt].attempt.state,
+        AttemptState::Finalizing
+    );
 
     apply_ok(
         &mut sm,
@@ -121,7 +131,7 @@ fn whale_accrues_then_funds_when_capacity_frees() {
     assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Accruing);
     assert_eq!(sm.allocations[&alid(222)].allocation.funded, cpu(2_000));
     assert_eq!(sm.accrual_queue.len(), 1);
-    assert_eq!(sm.jobs[&jid(2)].state, JobState::Preparing);
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Attempting(aid(22)));
 
     // Filler finishes: freed capacity pledges to the whale, Ready flips.
     apply_ok(
@@ -276,8 +286,8 @@ fn abort_while_running_signals_stop_and_truth_wins() {
         .iter()
         .any(|e| matches!(e, Event::StopRequested { allocation, .. } if *allocation == alid(111))));
     // The attempt is in the agent's hands; state is unchanged until the
-    // outcome arrives.
-    assert_eq!(sm.jobs[&jid(1)].state, JobState::Running);
+    // outcome arrives — the job stays Attempting.
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Attempting(aid(11)));
 
     // The container exited naturally before the stop landed: truth wins.
     apply_ok(
@@ -487,6 +497,9 @@ fn revocation_requeues_free_of_retry_budget() {
             TS,
         ),
     );
+    // While the attempt is in flight the job carries its id.
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Attempting(aid(22)));
+    assert_eq!(sm.jobs[&jid(2)].current_attempt(), Some(aid(22)));
 
     apply_ok(
         &mut sm,
@@ -497,7 +510,9 @@ fn revocation_requeues_free_of_retry_budget() {
             proposed_at_us: TS,
         }),
     );
+    // Requeue drops the id: the transition to Queued is the only bookkeeping.
     assert_eq!(sm.jobs[&jid(2)].state, JobState::Queued);
+    assert_eq!(sm.jobs[&jid(2)].current_attempt(), None);
     assert_eq!(
         sm.jobs[&jid(2)].retries_used,
         0,
@@ -552,7 +567,9 @@ fn revoke_and_reseat_in_one_batch() {
             proposed_at_us: TS + 1,
         }),
     );
-    assert_eq!(sm.jobs[&jid(2)].state, JobState::Preparing);
+    // The job passed through Queued (the revocation resolved it) and lands on
+    // the fresh attempt — never an Attempting → Attempting edge (ADR 0029).
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Attempting(aid(23)));
     assert_eq!(sm.attempts[&aid(23)].attempt.state, AttemptState::Ready);
     assert!(sm.accrual_queue.is_empty());
 }
@@ -663,9 +680,10 @@ fn reconcile_adopts_and_declares_lost() {
             observed_at_us: TS + 1,
         }),
     );
-    // Adopted: the missed started report is folded in.
+    // Adopted: the missed started report is folded in. The job stays
+    // Attempting; only the attempt advances to Running.
     assert_eq!(sm.attempts[&aid(11)].attempt.state, AttemptState::Running);
-    assert_eq!(sm.jobs[&jid(1)].state, JobState::Running);
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Attempting(aid(11)));
     // Lost: platform failure, retry policy applies.
     assert_eq!(sm.jobs[&jid(2)].state, JobState::Queued);
     assert_eq!(sm.jobs[&jid(2)].retries_used, 1);

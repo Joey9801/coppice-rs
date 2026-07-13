@@ -17,8 +17,10 @@ anywhere in the workspace.
   operations the state machine relies on (`fits_within`, `saturating_add/sub`,
   `component_min`). The extensible-dimension design is still an open item.
 - **Jobs** (`job`) — the coarse, user-visible `Job` and its `JobState` machine,
-  plus `RetryPolicy` and `AbortRequest`. Abort is a flag, not a state; every
-  attempt end funnels through `Finalizing`.
+  plus `RetryPolicy` and `AbortRequest`. Abort is a flag, not a state; the one
+  live-execution state `Attempting(AttemptId)` carries the attempt in flight, so
+  the job↔attempt link is the state itself, and resolution completes atomically
+  when the attempt goes terminal (ADR 0029).
 - **Attempts** (`attempt`) — `Attempt`, its `AttemptState` machine, and
   `AttemptOutcome`/`OutcomeClass`. Retries mint a fresh attempt; all agent
   reports are attempt-scoped, which is what makes duplicate/stale reports safe
