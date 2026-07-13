@@ -1,4 +1,5 @@
 import type {
+  AttemptId,
   ClusterOverview,
   ConfigureQuotaEntityInput,
   CoordinatorId,
@@ -56,7 +57,8 @@ export interface CoppiceApi {
   listJobs(filter: ListJobsFilter): Promise<JobList>
   getJob(id: JobId): Promise<JobDetail>
   getJobTimeline(id: JobId): Promise<TimelineEvent[]>
-  getJobUsage(id: JobId): Promise<JobUsage>
+  /** Usage samples for one attempt; null/omitted = current (else latest). */
+  getJobUsage(id: JobId, attempt?: AttemptId | null): Promise<JobUsage>
   getJobLogs(id: JobId, cursor: string | null): Promise<LogChunk>
 
   // Nodes
