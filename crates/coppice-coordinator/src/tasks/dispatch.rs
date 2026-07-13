@@ -294,6 +294,12 @@ pub(crate) fn start_job_command(
             attempt: Some(attempt.attempt.id.into()),
             job: Some(job.spec.id.into()),
             image: job.spec.image.clone(),
+            command: job.spec.command.clone(),
+            entrypoint: job
+                .spec
+                .entrypoint
+                .as_ref()
+                .map(|argv| coppice_proto::pb::core::v1::Entrypoint { argv: argv.clone() }),
             limits: Some((&allocation.allocation.requested).into()),
             max_runtime_us: job.spec.max_runtime_us,
         })),

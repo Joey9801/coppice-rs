@@ -323,6 +323,8 @@ impl<F: Fs, E: Executor> Session<F, E> {
             attempt,
             job,
             image: sj.image,
+            command: sj.command,
+            entrypoint: sj.entrypoint.map(|e| e.argv),
             limits: sj
                 .limits
                 .and_then(|r| r.try_into().ok())

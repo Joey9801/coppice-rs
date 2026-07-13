@@ -59,6 +59,8 @@ fn start_job(
         attempt: Some(attempt.into()),
         job: Some(job.into()),
         image: "img".into(),
+        command: vec!["run".into()],
+        entrypoint: None,
         limits: None,
         max_runtime_us,
     })

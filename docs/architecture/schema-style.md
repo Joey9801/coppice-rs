@@ -101,6 +101,20 @@ classification (success / user error / user request / platform) is a pure
 function of `AttemptOutcome` per ADR 0013's table, so a settable
 classification field could only ever disagree with it.
 
+## Repeated fields: presence and required-ness
+
+A proto3 `repeated` field has no presence: empty and absent are the same
+bytes. Two conventions follow (first instances: `Job.command` /
+`Job.entrypoint`):
+
+- **A required repeated field is enforced as non-empty at conversion.**
+  Emptiness *is* the missing-field check — pb → domain rejects it with
+  `ConvertError::MissingField`, same as a missing required message.
+- **An optional repeated field is wrapped in its own message** (e.g.
+  `Entrypoint { repeated string argv = 1; }`) so absence is real presence
+  information. The wrapped list must be non-empty: present-but-empty would
+  be a second encoding of "absent", and canonical form allows only one.
+
 ## Scalars and representations
 
 - **Timestamps are `int64` Unix microseconds**, field names `*_at_us`

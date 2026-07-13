@@ -1327,6 +1327,8 @@ impl StateMachine {
 fn same_submission(existing: &Job, retried: &Job) -> bool {
     existing.id == retried.id
         && existing.image == retried.image
+        && existing.command == retried.command
+        && existing.entrypoint == retried.entrypoint
         && existing.requests == retried.requests
         && existing.priority == retried.priority
         && existing.max_runtime_us == retried.max_runtime_us

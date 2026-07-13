@@ -26,6 +26,8 @@ fn job(n: u128) -> Job {
     Job {
         id: jid(n),
         image: "registry/img:latest".into(),
+        command: vec!["run".into(), "--epochs".into(), "3".into()],
+        entrypoint: Some(vec!["/bin/launch".into()]),
         requests: Resources {
             cpu_millis: 2_000,
             memory_bytes: 1 << 30,
@@ -175,6 +177,47 @@ fn abort_requests_roundtrip_inside_job_specs() {
     });
     let (_, back) = command_from_pb(command_to_pb(&submit, 1)).unwrap();
     assert_eq!(back, submit);
+}
+
+#[test]
+fn absent_entrypoints_roundtrip_inside_job_specs() {
+    // `job()` covers the Some side; None must also survive, distinct from it.
+    let mut spec = job(1);
+    spec.entrypoint = None;
+    let submit = Command::SubmitJob(SubmitJob {
+        job: spec,
+        multiplier: PriorityMultiplier::ONE,
+        submitted_at_us: TS,
+    });
+    let (_, back) = command_from_pb(command_to_pb(&submit, 1)).unwrap();
+    assert_eq!(back, submit);
+}
+
+#[test]
+fn empty_commands_are_rejected_at_the_boundary() {
+    // `command` is required, and an empty repeated field is the wire's only
+    // way to omit it — so emptiness is the missing-field error.
+    let mut pb_job = pb::core::v1::Job::from(&job(1));
+    pb_job.command.clear();
+    assert_eq!(
+        Job::try_from(pb_job),
+        Err(ConvertError::MissingField("Job.command"))
+    );
+}
+
+#[test]
+fn empty_entrypoint_overrides_are_rejected_at_the_boundary() {
+    // "No override" is encoded only by absence; a present-but-empty argv is
+    // a second spelling of the same meaning and must not decode.
+    let mut pb_job = pb::core::v1::Job::from(&job(1));
+    pb_job.entrypoint = Some(pb::core::v1::Entrypoint { argv: vec![] });
+    assert_eq!(
+        Job::try_from(pb_job),
+        Err(ConvertError::Invalid {
+            field: "Job.entrypoint",
+            reason: "override argv must be non-empty",
+        })
+    );
 }
 
 #[test]

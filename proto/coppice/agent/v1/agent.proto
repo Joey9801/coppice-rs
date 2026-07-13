@@ -17,6 +17,7 @@ package coppice.agent.v1;
 
 import "coppice/core/v1/attempt.proto";
 import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/job.proto";
 import "coppice/core/v1/node.proto";
 import "coppice/core/v1/resource.proto";
 
@@ -77,6 +78,11 @@ message StartJob {
   // Enforced runtime bound; the agent kills the container past it
   // (outcome MaxRuntimeExceeded). Absent = unbounded.
   optional uint64 max_runtime_us = 6;
+  // The container command line, pre-tokenized — copied verbatim from the
+  // job spec (required and non-empty there, so required and non-empty here).
+  repeated string command = 7;
+  // Entrypoint override; absent runs the image's own entrypoint.
+  coppice.core.v1.Entrypoint entrypoint = 8;
 }
 
 // Stop the work under an allocation (SIGTERM, grace, SIGKILL). Idempotent,
