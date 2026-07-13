@@ -446,6 +446,15 @@ reachable through the API.
 | Apply effects | Replace the replicated policy. In-flight charge records keep their recorded rate/multiplier/refund fraction (no retroactive repricing); decay re-times from each entity's next touch; quota-stock rescaling on half-life change is owned by the tooling that authored the command. |
 | Rejections | `InvalidPolicy`, `PermissionDenied` |
 
+A fresh cluster boots with an **empty** `priority_multipliers` table, so
+every `SubmitJob` fails synchronous validation until the first
+`UpdatePolicy` commits. That is deliberate, not a gap: multipliers are a
+pricing decision the operator must make explicitly, and per ADR 0020 no
+node config file may seed replicated policy. Production bootstrap therefore
+seeds nothing; only `coppice dev` proposes a development table (priorities
+`-2..=2`) and a well-known `"dev"` quota entity at startup, using these
+same commands.
+
 #### `UpdateAuthorization`
 
 | | |

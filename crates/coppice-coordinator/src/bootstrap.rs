@@ -75,6 +75,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // test drives `bootstrap` directly and runs several replicas in one
     // process, so binding a shared default agent port there would collide.
     let agent_listener = prepare_agent_listener(&resolved.config)?;
+    let client_listener = ClientListener::bind(resolved.config.listen.client_addr).await?;
 
     let BootedCoordinator {
         consensus,
@@ -93,6 +94,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         views,
         event_tap,
         agent_listener,
+        client_listener,
         None,
     )
     .await?;
@@ -136,6 +138,7 @@ pub async fn serve_runtime(
     views: StateViews,
     event_tap: EventTapReceiver,
     agent_listener: AgentListener,
+    client_listener: ClientListener,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -143,9 +146,42 @@ pub async fn serve_runtime(
         views,
         event_tap,
         agent_listener,
+        client_listener,
         shutdown,
     )
     .await
+}
+
+/// The bound public client-API listener (`listen.client_addr`, ADR 0031),
+/// handed to `runtime::run` which serves `coppice_api::http` on it.
+///
+/// Bound eagerly (fail-fast on a port conflict) like [`AgentListener`].
+/// Plain HTTP: unlike the fenced mTLS planes, this edge serves browsers
+/// and CLIs — TLS termination here or in front of it is deployment
+/// posture (the ADR's "config, not contract"), and authn is the bearer
+/// token contract of ADR 0022, not transport identity.
+pub struct ClientListener {
+    listener: tokio::net::TcpListener,
+}
+
+impl ClientListener {
+    /// Bind the client API listener on `addr`.
+    pub async fn bind(addr: SocketAddr) -> Result<ClientListener> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow!("binding client API listener on {addr}: {e}"))?;
+        tracing::info!(%addr, "client API listener bound");
+        Ok(ClientListener { listener })
+    }
+
+    /// The actual bound address (which resolves a `:0` request).
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
+    pub(crate) fn into_inner(self) -> tokio::net::TcpListener {
+        self.listener
+    }
 }
 
 /// The bound agent gateway listener and its mTLS config, handed to

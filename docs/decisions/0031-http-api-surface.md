@@ -1,0 +1,191 @@
+# 31. HTTP API surface: axum + proto3 JSON on the client listener
+
+- **Status:** Accepted
+- **Date:** 2026-07-13
+- **Builds on:** [ADR 0003](0003-protobuf-serialization-and-cluster-version-gates.md)
+  (JSON at the edge), [ADR 0007](0007-per-endpoint-read-consistency.md)
+  (read consistency), [ADR 0008](0008-event-delivery-guarantees.md) (event
+  cursors), [ADR 0022](0022-oidc-identity-and-authentication.md) /
+  [ADR 0023](0023-scoped-role-bindings.md) (authn/z),
+  [ADR 0026](0026-client-minted-job-ids-idempotent-submission.md)
+  (idempotent submission)
+
+## Context
+
+The web UI (`web/`) runs entirely on mock data behind the `CoppiceApi`
+interface, one method per future endpoint. The CLI needs the same surface
+for job commands. On the server side the seams already exist —
+`coppice_api::ControlPlane` is implemented by the coordinator
+(`tasks/api_server.rs`), `StateViews`/`read_index()` provide the ADR 0007
+read classes, and `listen.client_addr` (default `:7070`) is parsed but
+unbound — but there is no HTTP listener, no route map, no JSON codec, and
+no error contract. Future sessions will implement endpoints one at a time;
+without a fixed shape each one would re-litigate routing, serialization,
+consistency, and error conventions.
+
+## Decision
+
+### Stack
+
+The client listener is **axum** (tower/hyper), added to the workspace and
+owned by `coppice-api` (crate gains an `http` module with the `Router` and
+all transport plumbing). The coordinator binds it on `listen.client_addr`
+in `tasks/api_server.rs` and injects its `ControlPlane`/`QueryPlane`
+implementations. `coppice-net` remains gRPC-only (raft/agent/admin planes);
+the client edge is deliberately a separate stack because its consumers are
+browsers and curl, not fenced internal peers.
+
+### Wire format: proto3 JSON of `coppice.api.v1`
+
+Per ADR 0003, bodies are the standard **proto3 JSON mapping of
+`coppice.api.v1` messages**, generated with `pbjson-build` (serde impls on
+the existing prost types, `.coppice.api` + `.coppice.core` packages only —
+serde stays off every replicated format). Consequences callers see:
+`lowerCamelCase` keys, 64-bit integers as JSON strings, typed-string ids
+(`"job-<uuid>"`), absent optionals omitted. `serde_json` does the actual
+encode/decode inside axum extractors/responses.
+
+Read-model messages (`GetJobResponse`, `ListNodesResponse`, …) are **not
+designed up front**: each lands in `proto/coppice/api/v1/` in the same
+change that implements its endpoint, mirroring the already-reviewed shapes
+in `web/src/api/types.ts` (which mirror the Rust domain model). Naming is
+fixed now: `<Verb><Noun>Request` / `<Verb><Noun>Response`, verbs `Get`,
+`List`, `Submit`, `Abort`, `Configure`. Every response is a message (never
+a bare array) so fields can be added later.
+
+### Route map
+
+All routes sit under **`/api/v1`**. Reads are `GET` with query parameters;
+mutations are `POST` with a request-message body. One route per
+`CoppiceApi` method (`web/src/api/client.ts`) plus the two existing writes:
+
+| Route | Message pair | Class (ADR 0007) |
+| --- | --- | --- |
+| `GET  /api/v1/session` | `GetSession*` | local |
+| `GET  /api/v1/overview` | `GetClusterOverview*` | bounded |
+| `GET  /api/v1/queue/stats` | `GetQueueStats*` | bounded |
+| `GET  /api/v1/jobs?phase=&entity=&node=&search=&limit=` | `ListJobs*` | bounded |
+| `POST /api/v1/jobs` | `SubmitJob*` (exists) | write |
+| `GET  /api/v1/jobs/{job}` | `GetJob*` | bounded |
+| `POST /api/v1/jobs/{job}/abort` | `AbortJob*` (exists) | write |
+| `GET  /api/v1/jobs/{job}/timeline` | `GetJobTimeline*` | bounded |
+| `GET  /api/v1/jobs/{job}/usage?attempt=` | `GetJobUsage*` | eventual |
+| `GET  /api/v1/jobs/{job}/logs?cursor=&limit=` | `GetJobLogs*` | eventual, **provisional** |
+| `GET  /api/v1/nodes` | `ListNodes*` | bounded |
+| `GET  /api/v1/nodes/{node}` | `GetNode*` | bounded |
+| `GET  /api/v1/nodes/{node}/utilization` | `GetNodeUtilization*` | eventual |
+| `GET  /api/v1/nodes/{node}/history` | `GetNodeHistory*` | eventual |
+| `GET  /api/v1/nodes/{node}/logs?cursor=&limit=` | `GetNodeLogs*` | eventual, **provisional** |
+| `GET  /api/v1/coordinators` | `GetCoordinatorStatus*` | local |
+| `GET  /api/v1/coordinators/{id}/logs?cursor=&limit=` | `GetCoordinatorLogs*` | eventual, **provisional** |
+| `GET  /api/v1/quota-entities` | `ListQuotaEntities*` | bounded |
+| `GET  /api/v1/quota-entities/{entity}` | `GetQuotaEntity*` | strong |
+| `POST /api/v1/quota-entities` | `ConfigureQuotaEntity*` (upsert, ADR-0023-gated) | write |
+| `GET  /api/v1/events?cursor=` | ADR 0008 subscription (SSE) | **reserved** |
+
+Path ids are the typed string forms (ADR 0024); a prefix/uuid that fails
+validation is `INVALID_ARGUMENT`, not `NOT_FOUND`. **Provisional** rows
+are routed now but return `UNIMPLEMENTED` until their backing store exists
+(no log storage yet — `LogChunk` in the web UI is a proposal, and these
+routes must be reconciled with the real log design before leaving
+provisional status). The events route is reserved so nothing else claims
+the path; when built it is an SSE stream of server-throttled bounded
+batches with ADR 0008 cursors — never a raw firehose.
+
+### Consistency plumbing (ADR 0007 made concrete)
+
+- Every read accepts `?consistency=strong|bounded|eventual`, overriding
+  the endpoint default upward or downward as ADR 0007 allows.
+- Every read accepts `?min_index=N`: serve from a view with
+  `applied_index ≥ N` (`StateViews::at_least`), the read-your-writes pair
+  for a write response's `logIndex`.
+- `strong` = `Consensus::read_index()` then `at_least(that index)`;
+  `bounded` = `StateViews::latest()` with staleness surfaced;
+  `eventual`/`local` = whatever derived store or local watch backs the
+  endpoint.
+- Every response carries `Coppice-Applied-Index` and
+  `Coppice-Committed-Index` headers (decimal). Headers rather than a body
+  envelope keep bodies pure proto messages.
+- Writes always execute on the leader. v1 behavior on a follower is a
+  `NOT_LEADER` error with a `Coppice-Leader` hint header; internal
+  forwarding (ADR 0007's end state) can be added later without changing
+  the contract, since clients that handled the error keep working.
+
+### Error contract
+
+Errors are `application/json`:
+
+```json
+{ "code": "NOT_FOUND", "message": "job job-… does not exist" }
+```
+
+`code` is a closed vocabulary with fixed status mapping:
+
+| code | HTTP | source |
+| --- | --- | --- |
+| `INVALID_ARGUMENT` | 400 | synchronous validation, bad id syntax, `ApiError::Invalid` |
+| `UNAUTHENTICATED` | 401 | missing/invalid credential (ADR 0022) |
+| `PERMISSION_DENIED` | 403 | role-binding check (ADR 0023) |
+| `NOT_FOUND` | 404 | id not in the read view |
+| `REJECTED` | 409 | committed-and-refused at apply (`ApiError::Rejected`) — normal race outcome, carries the `RejectionReason` text |
+| `NOT_LEADER` | 421 | write hit a follower; `Coppice-Leader` header when known |
+| `UNAVAILABLE` | 503 | write didn't resolve; follower can't bound staleness |
+| `UNIMPLEMENTED` | 501 | provisional/reserved route |
+| `INTERNAL` | 500 | bug; details logged, not leaked |
+
+This is the JSON rendering of `coppice_api::ApiError` plus the read-side
+codes; the web client maps it onto its `ApiError` at its boundary.
+
+### AuthN/Z
+
+`Authorization: Bearer <OIDC JWT>` validated offline per ADR 0022; the
+authn middleware resolves it to the `Actor` that every proposed command
+already carries, and `GET /api/v1/session` echoes the resolved principal.
+Until the middleware lands, the listener is open and `session` returns the
+static dev principal (matching the web UI's "Demo User" stub) — the
+middleware is a seam in `coppice-api::http`, not a redesign. Operator-cert
+break-glass (ADR 0023) authenticates on the mTLS admin plane, not this
+listener. TLS on the client listener follows the deployment posture
+(terminate here via the node-config `[tls]` server cert, or in front of
+it); it is config, not contract.
+
+### Serving the UI
+
+The same listener serves `web/dist` (per `web/README.md`): static assets
+at `/`, SPA fallback to `index.html` for client routes, `/api/v1` reserved
+for the API — same-origin, no CORS, one port. Mechanism: `rust-embed` over
+`web/dist` as the router fallback (`/api/*` misses keep the JSON error
+contract). Release builds embed the assets in the binary; debug builds
+read the folder from disk per request, so `coppice dev` picks up a fresh
+`npm --prefix web run build` without recompiling. `web/dist` stays a
+gitignored npm product — a clean checkout compiles without Node
+(`coppice-api`'s build script creates the empty folder) and UI paths then
+404 with the build command. Vite's content-hashed `assets/` get
+`immutable` caching; entry points revalidate.
+
+### Agents stay off the client edge
+
+Browsers and CLI talk **only to coordinators**. Agents get no HTTP
+listener: usage samples already ride the mTLS agent-session stream
+(heartbeat reports), and job logs — when log storage is designed — will be
+fetched by the coordinator over that same fenced plane and re-served under
+`/api/v1/jobs/{job}/logs`. This keeps the ADR 0011 security posture (one
+authenticated ingress per plane) and spares agents a second identity.
+
+## Consequences
+
+- Future sessions implement one endpoint per change: proto message pair →
+  `QueryPlane` method → handler swap-in for the `UNIMPLEMENTED` stub →
+  flip the matching method in `web/src/api/index.ts`. Routing,
+  consistency, errors, and auth are already decided and mechanically
+  enforced by the shared plumbing in `coppice-api::http`.
+- axum/tower enter the workspace; pbjson adds a second codegen pass over
+  the api/core packages. Schema style now leaks into JSON contract for the
+  read models too — field renames in `coppice.api.v1` are JSON breaks
+  (already the rule per `schema-style.md`).
+- Read models get frozen tags only as their UIs stabilize, instead of
+  speculatively today; the cost is that `web/src/api/types.ts` remains the
+  reference shape until each message lands.
+- The `NOT_LEADER`-with-hint compromise means dumb clients need retry
+  logic until internal forwarding is built; the error contract already
+  accommodates that upgrade invisibly.

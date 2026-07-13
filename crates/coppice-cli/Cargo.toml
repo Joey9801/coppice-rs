@@ -14,11 +14,16 @@ path = "src/main.rs"
 
 [dependencies]
 coppice-coordinator.workspace = true
+# `coppice dev`'s ready banner asks whether a web UI build is embedded.
+coppice-api.workspace = true
 coppice-agent.workspace = true
 coppice-core.workspace = true
 # The `dev` subcommand runs an in-process agent whose journal goes through
 # the consensus crate's filesystem seam, exactly like the real daemon.
 coppice-consensus.workspace = true
+# `coppice dev` seeds the replicated policy and a dev quota entity by
+# proposing the same commands `coppice-cli policy` will use (ADR 0020).
+coppice-state.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 # `coppice dev` mints a throwaway per-run CA + leaves so the production mTLS

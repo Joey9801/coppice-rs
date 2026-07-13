@@ -10,6 +10,8 @@
 //! durable state transitions, not imperative worker control. See
 //! `docs/architecture/components.md` and `docs/operations/security.md`.
 
+pub mod http;
+
 use std::future::Future;
 
 use coppice_proto::pb::api::v1::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
