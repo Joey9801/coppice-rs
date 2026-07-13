@@ -448,7 +448,9 @@ describe('MockWorld quota entities', () => {
     }
   })
 
-  it('auto-mints new users over time but never past the cap', () => {
+  // Simulates a long stretch of world time; comfortably exceeds the 5s
+  // default on slow CI runners, so it gets an explicit budget.
+  it('auto-mints new users over time but never past the cap', { timeout: 30_000 }, () => {
     const world = new MockWorld(NOW_US)
     const usersRoot = world.listQuotaEntities().find((e) => e.name === 'users')!
     const before = world.listQuotaEntities().filter((e) => e.parent === usersRoot.id).length
