@@ -67,6 +67,101 @@ export function formatUcuRatePerHour(rateUcuPerSecond: number): string {
   return `${formatUcu(rateUcuPerSecond * 3600)}/hour`
 }
 
+/** A cost/scheduling multiplier: "×2", "×1.5" (trimmed to a few sig figs). */
+export function formatMultiplier(multiplier: number): string {
+  return `×${Number(multiplier.toPrecision(3))}`
+}
+
+/** Byte units, both binary (…iB) and SI (…B), for reciprocal price detection. */
+const PRICE_BYTE_UNITS: ReadonlyArray<{ label: string; size: number }> = [
+  { label: 'KiB', size: 2 ** 10 },
+  { label: 'MiB', size: 2 ** 20 },
+  { label: 'GiB', size: 2 ** 30 },
+  { label: 'TiB', size: 2 ** 40 },
+  { label: 'PiB', size: 2 ** 50 },
+  { label: 'kB', size: 1e3 },
+  { label: 'MB', size: 1e6 },
+  { label: 'GB', size: 1e9 },
+  { label: 'TB', size: 1e12 },
+  { label: 'PB', size: 1e15 },
+]
+
+/** Binary units for the direct-rate fallback, mirroring `formatBytes`. */
+const BINARY_BYTE_UNITS: ReadonlyArray<{ label: string; size: number }> = [
+  { label: 'B', size: 1 },
+  { label: 'KiB', size: 2 ** 10 },
+  { label: 'MiB', size: 2 ** 20 },
+  { label: 'GiB', size: 2 ** 30 },
+  { label: 'TiB', size: 2 ** 40 },
+  { label: 'PiB', size: 2 ** 50 },
+]
+
+/** CPU's only human unit; `size` is in millicores (the resource's base unit). */
+const CORE_UNIT = { label: 'core', size: 1000 }
+
+/**
+ * The largest whole number of resource-unit-hours one CU buys, when the weight
+ * reciprocates cleanly — which is how operators usually set it ("8 GiB-hours =
+ * 1 CU"). Both SI and binary byte scales are tried, since we can't assume which
+ * the operator used; the largest unit (smallest count) wins. Returns null when
+ * no unit gives a clean whole count.
+ */
+function cleanUnitReciprocal(
+  weightPerBase: number,
+  units: ReadonlyArray<{ label: string; size: number }>,
+): { count: number; label: string } | null {
+  let best: { count: number; label: string } | null = null
+  for (const unit of units) {
+    const cuPerHourPerUnit = (weightPerBase * unit.size * 3600) / MICRO_PER_COST_UNIT
+    if (cuPerHourPerUnit <= 0) continue
+    const count = 1 / cuPerHourPerUnit
+    const rounded = Math.round(count)
+    // Whole count only, kept in a human range; a tight tolerance so a weight
+    // that merely lands near an integer (e.g. 138.9) is not snapped to one.
+    if (rounded < 1 || rounded > 1024) continue
+    if (Math.abs(count - rounded) <= rounded * 5e-4 && (!best || rounded < best.count)) {
+      best = { count: rounded, label: unit.label }
+    }
+  }
+  return best
+}
+
+/** Largest binary unit `formatBytes` would display `bytes` in. */
+function displayByteUnit(bytes: number): { label: string; size: number } {
+  let chosen = BINARY_BYTE_UNITS[0]!
+  for (const unit of BINARY_BYTE_UNITS) {
+    if (bytes >= unit.size) chosen = unit
+  }
+  return chosen
+}
+
+/**
+ * The per-unit price of one resource dimension for the cost breakdown.
+ * Prefers the reciprocal "N unit-hours/CU" form (see `cleanUnitReciprocal`),
+ * falling back to the direct "X CU/hour / unit" rate — priced per the
+ * resource's own display unit — when no clean reciprocal exists.
+ *
+ * `ratePerSecond` is the total µCU/s for `quantity` of the resource; `quantity`
+ * is millicores for `cpu`, bytes otherwise. Returns null when nothing was
+ * requested (no price to quote).
+ */
+export function formatUnitPrice(
+  ratePerSecond: number,
+  kind: 'cpu' | 'bytes',
+  quantity: number,
+): string | null {
+  if (quantity <= 0 || ratePerSecond <= 0) return null
+  const weightPerBase = ratePerSecond / quantity
+
+  const clean = cleanUnitReciprocal(weightPerBase, kind === 'cpu' ? [CORE_UNIT] : PRICE_BYTE_UNITS)
+  if (clean) {
+    return `${clean.count} ${clean.label}-hour${clean.count === 1 ? '' : 's'}/CU`
+  }
+
+  const unit = kind === 'cpu' ? CORE_UNIT : displayByteUnit(quantity)
+  return `${formatUcuRatePerHour(weightPerBase * unit.size)} / ${unit.label}`
+}
+
 /** Compact duration: "3h 12m", "45s", "850ms". */
 export function formatDurationUs(us: number): string {
   if (us < 0) return '—'

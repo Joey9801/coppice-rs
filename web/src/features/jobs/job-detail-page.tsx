@@ -3,7 +3,6 @@ import { Link } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, SearchX } from 'lucide-react'
 import {
   derivePhase,
-  isTerminalJobState,
   jobAttemptId,
   jobCurrentAttempt,
   type AttemptView,
@@ -13,14 +12,7 @@ import {
   type QuotaEntityView,
 } from '@/api/types'
 import { useJob, useJobLogs } from '@/api/queries'
-import {
-  formatDurationUs,
-  formatPercent,
-  formatTimeAgo,
-  formatTimestampUs,
-  formatUcu,
-  formatUcuRatePerHour,
-} from '@/lib/format'
+import { formatDurationUs, formatPercent, formatTimeAgo, formatTimestampUs } from '@/lib/format'
 import { EmptyState, LogViewer, PageHeader, StatePill, StatTile, TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -32,7 +24,6 @@ import { JobQueuePanel } from './job-queue-panel'
 import { JobSpecCard } from './job-spec-card'
 import { JobTimeline } from './job-timeline'
 import { JobUsageSection } from './job-usage-section'
-import { TrueUpAmount } from './true-up-amount'
 
 export function JobDetailPage({ jobId }: { jobId: JobId }) {
   const job = useJob(jobId)
@@ -140,7 +131,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
             <JobSpecCard job={job} />
           </div>
           <div className="lg:col-span-2">
-            <JobCostCard cost={job.cost} />
+            <JobCostCard cost={job.cost} requests={job.spec.requests} />
           </div>
         </div>
 
@@ -163,7 +154,6 @@ function JobDetailView({ job }: { job: JobDetail }) {
 }
 
 function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
-  const terminal = isTerminalJobState(job.state)
   const lastAttempt = currentOrLastAttempt(job)
   const nowUs = Date.now() * 1000
 
@@ -172,8 +162,10 @@ function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
       ? Math.max(0, (lastAttempt.endedAtUs ?? nowUs) - lastAttempt.startedAtUs)
       : null
 
+  // Cost lives entirely in the JobCostCard now — the tiles cover the rest of
+  // the "how is it doing" story (state, runtime, retries).
   return (
-    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="grid gap-3 sm:grid-cols-3">
       <StatTile label="State" value={phase} hint={stateHint(job, phase, nowUs)} />
       <StatTile
         label="Runtime"
@@ -184,19 +176,6 @@ function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
             : job.spec.maxRuntimeUs != null
               ? `limit ${formatDurationUs(job.spec.maxRuntimeUs)}`
               : 'no runtime limit'
-        }
-      />
-      <StatTile
-        label={terminal ? 'Final cost' : 'Cost so far'}
-        value={formatUcu(
-          terminal && job.cost.actualUcu != null ? job.cost.actualUcu : job.cost.chargedUcu,
-        )}
-        hint={
-          job.cost.trueUp ? (
-            <TrueUpAmount trueUp={job.cost.trueUp} />
-          ) : (
-            formatUcuRatePerHour(job.cost.rateUcuPerSecond)
-          )
         }
       />
       <StatTile
