@@ -65,11 +65,30 @@ imbl = "7"
 # file-backed `SnapshotFile` handle so install-snapshot streams the ADR 0018
 # container instead of holding it in memory.
 openraft = { version = "0.9", features = ["storage-v2", "generic-snapshot-data"] }
+# The public client listener (ADR 0031): JSON-over-HTTP on
+# `listen.client_addr`, serving proto3-JSON bodies of `coppice.api.v1`
+# messages. 0.7 rides the same hyper-1 stack tonic 0.12 already pulls in.
+axum = "0.7"
+# Embeds `web/dist` into the coordinator so the same client listener serves
+# the UI (ADR 0031, "Serving the UI"): release builds carry the assets in
+# the binary; debug builds read them live from disk so `coppice dev` picks
+# up a fresh `npm run build` without recompiling.
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+# Test-only `ServiceExt::oneshot` for exercising the axum router without a
+# real listener; version tracks what axum 0.7/tonic 0.12 already depend on.
+tower = { version = "0.5", features = ["util"] }
 proptest = "1"
 prost = "0.13"
 prost-build = "0.13"
 prost-types = "0.13"
 protox = "0.7"
+# proto3 JSON mapping for the public-API messages: the HTTP edge is JSON
+# mapped onto `coppice.api.v1` (ADR 0003/0031), generated with pbjson-build.
+# Scoped to the api/core packages only — serde never becomes a parallel
+# encoding of replicated formats (schema-style.md). 0.7 pairs with prost 0.13.
+pbjson = "0.7"
+pbjson-build = "0.7"
 # Test-only certificate generation (ring provider, avoiding the aws-lc build
 # toolchain) for the mTLS the Raft transport requires (ADR 0011).
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }

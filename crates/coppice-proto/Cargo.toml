@@ -11,14 +11,18 @@ authors.workspace = true
 [dependencies]
 coppice-core.workspace = true
 coppice-state.workspace = true
+pbjson.workspace = true
 prost.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 prost-types.workspace = true
+serde_json.workspace = true
 
 [build-dependencies]
+pbjson-build.workspace = true
 prost.workspace = true
 prost-build.workspace = true
 protox.workspace = true
