@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
-use coppice_core::job::{Job, RetryPolicy};
+use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_proto::convert::{command_from_pb, command_to_pb, ConvertError};
@@ -159,6 +159,41 @@ fn every_command_roundtrips_through_encoded_bytes() {
         assert_eq!(version, 1);
         assert_eq!(back, command, "roundtrip must be lossless");
     }
+}
+
+fn every_job_state() -> Vec<JobState> {
+    vec![
+        JobState::Submitted,
+        JobState::Accepted,
+        JobState::Queued,
+        JobState::Attempting(AttemptId(Uuid::from_u128(0xA77))),
+        JobState::Succeeded,
+        JobState::Failed,
+        JobState::Aborted,
+    ]
+}
+
+#[test]
+fn every_job_state_roundtrips_through_encoded_bytes() {
+    // The oneof carries the attempt id structurally: Attempting must survive
+    // with its real id, and every unit variant must survive its empty message.
+    for state in every_job_state() {
+        let encoded = pb::core::v1::JobState::from(state).encode_to_vec();
+        let decoded =
+            pb::core::v1::JobState::decode(encoded.as_slice()).expect("JobState must decode");
+        let back = JobState::try_from(decoded).expect("conversion must succeed");
+        assert_eq!(back, state, "JobState roundtrip must be lossless");
+    }
+}
+
+#[test]
+fn unset_job_state_oneof_is_an_error() {
+    // An unset oneof is malformed, exactly like an empty command envelope.
+    let empty = pb::core::v1::JobState { state: None };
+    assert_eq!(
+        JobState::try_from(empty),
+        Err(ConvertError::MissingField("JobState.state"))
+    );
 }
 
 #[test]

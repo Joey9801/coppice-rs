@@ -1,9 +1,13 @@
 // Job definition and lifecycle state (mirrors `coppice_core::job`).
 //
 // The job machine is deliberately coarse and user-visible (ADR 0013); all
-// execution detail lives on the attempt. JobState is a flat enum — no
-// variant carries data — while everything data-bearing (the abort request,
-// outcomes) is a message or oneof.
+// execution detail lives on the attempt. JobState is a message with a oneof:
+// its one live-execution arm, Attempting, *carries* the attempt it points at,
+// so the job↔attempt link is the state itself, not a field beside it
+// (ADR 0029, amending ADR 0013). The unit states are empty per-variant
+// messages, matching the AttemptOutcome house style so any arm can grow
+// fields later without restructuring; the abort request and attempt outcomes
+// stay data-bearing messages of their own.
 
 syntax = "proto3";
 
@@ -56,24 +60,42 @@ message AbortRequest {
 }
 
 // The lifecycle state of a job. Authoritative, Raft-replicated.
-enum JobState {
-  JOB_STATE_UNSPECIFIED = 0;
+//
+// A oneof rather than a flat enum: the single live-execution state,
+// Attempting, carries the id of the attempt in flight, so "at most one
+// attempt in flight" is structural and there is no live state without an
+// attempt (ADR 0029). Unit states are empty messages so any arm can grow
+// fields later without restructuring, per the AttemptOutcome house style.
+// UIs join the carried attempt's own state for detail (the
+// preparing/running/finalizing distinctions live on the attempt now).
+message JobState {
   // Recorded durably; awaiting admission evaluation.
-  JOB_STATE_SUBMITTED = 1;
+  message Submitted {}
   // Passed admission (synchronous in v1; distinct for observability).
-  JOB_STATE_ACCEPTED = 2;
+  message Accepted {}
   // Waiting, unpinned. Ordered by effective score, not arrival.
-  JOB_STATE_QUEUED = 3;
-  // An attempt exists but is not yet running.
-  JOB_STATE_PREPARING = 4;
-  // The attempt's container is running.
-  JOB_STATE_RUNNING = 5;
-  // The attempt ended or its exit was observed; resolution pending.
-  JOB_STATE_FINALIZING = 6;
+  message Queued {}
+  // An attempt is in flight — the id it carries is the single attempt this
+  // job is pursuing (accruing, ready, dispatching, running, or finalizing;
+  // the attempt's own state carries that detail). "At most one attempt in
+  // flight" is structural: there is no second slot (ADR 0029).
+  message Attempting {
+    AttemptId attempt = 1;
+  }
   // Terminal: the final attempt exited successfully.
-  JOB_STATE_SUCCEEDED = 7;
+  message Succeeded {}
   // Terminal: failed and retries are exhausted or inapplicable.
-  JOB_STATE_FAILED = 8;
+  message Failed {}
   // Terminal: stopped by the abort mechanism (and only then).
-  JOB_STATE_ABORTED = 9;
+  message Aborted {}
+
+  oneof state {
+    Submitted submitted = 1;
+    Accepted accepted = 2;
+    Queued queued = 3;
+    Attempting attempting = 4;
+    Succeeded succeeded = 5;
+    Failed failed = 6;
+    Aborted aborted = 7;
+  }
 }

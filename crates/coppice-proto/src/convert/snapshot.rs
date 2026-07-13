@@ -19,9 +19,7 @@ use coppice_state::{
     AllocationRecord, AttemptRecord, JobRecord, NodeRecord, QuotaEntity, StateMachine,
 };
 
-use super::core::job_state_from_pb;
 use super::{req, ConvertError};
-use crate::pb::core::v1 as pbcore;
 use crate::pb::storage::v1 as pb;
 
 // ---- Per-record conversions ----
@@ -30,12 +28,11 @@ impl From<&JobRecord> for pb::JobRecord {
     fn from(r: &JobRecord) -> Self {
         pb::JobRecord {
             spec: Some((&r.spec).into()),
-            state: pbcore::JobState::from(r.state) as i32,
+            state: Some(r.state.into()),
             multiplier_q32_32: r.multiplier.0,
             submitted_at_us: r.submitted_at_us,
             terminal_at_us: r.terminal_at_us,
             retries_used: r.retries_used,
-            current_attempt: r.current_attempt.map(Into::into),
             attempts: r.attempts.iter().map(|id| (*id).into()).collect(),
         }
     }
@@ -47,12 +44,11 @@ impl TryFrom<pb::JobRecord> for JobRecord {
     fn try_from(r: pb::JobRecord) -> Result<Self, ConvertError> {
         Ok(JobRecord {
             spec: req(r.spec, "JobRecord.spec")?.try_into()?,
-            state: job_state_from_pb(r.state)?,
+            state: req(r.state, "JobRecord.state")?.try_into()?,
             multiplier: PriorityMultiplier(r.multiplier_q32_32),
             submitted_at_us: r.submitted_at_us,
             terminal_at_us: r.terminal_at_us,
             retries_used: r.retries_used,
-            current_attempt: r.current_attempt.map(TryInto::try_into).transpose()?,
             attempts: r
                 .attempts
                 .into_iter()
