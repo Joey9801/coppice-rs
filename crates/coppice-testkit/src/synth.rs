@@ -125,7 +125,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         // Every live-execution bucket is `Attempting(id)` now: the job↔attempt
         // link is the state itself, and the *detail* (preparing vs. running vs.
         // finalizing) lives on the pointed-at attempt's own state, not on the
-        // job (ADR 0029). The buckets and their weights are unchanged; each
+        // job (ADR 0030). The buckets and their weights are unchanged; each
         // just labels which attempt state its current attempt carries.
         let (job_state, mut attempt_ids, abort_eligible) = if bucket < 55 {
             // Attempting, attempt Running.
@@ -190,7 +190,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         } else if bucket < 85 {
             // Attempting, attempt Finalizing: exit observed, resolution not yet
             // committed. The job rests in `Attempting(id)`, not a job-level
-            // `Finalizing` state (ADR 0029): resolution completes atomically
+            // `Finalizing` state (ADR 0030): resolution completes atomically
             // once the attempt reaches `Terminal`.
             let node = *rng.pick(&node_ids);
             let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
@@ -218,7 +218,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         } else {
             // Terminal: Succeeded, Failed, or Aborted. A terminal job has no
             // current attempt by construction — `state.attempt()` is `None` for
-            // every terminal `JobState` (ADR 0029) — even though the job's last
+            // every terminal `JobState` (ADR 0030) — even though the job's last
             // attempt (if any) is still listed in `attempts`.
             let r2 = rng.below(100);
             let (state, outcome) = if r2 < 70 {
@@ -272,7 +272,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         // one; a job with no current attempt yet (Queued via requeue) has
         // already had every listed attempt counted the same way. The current
         // attempt, when there is one, is the one carried by `Attempting`
-        // (ADR 0029), so subtract it via the state rather than a separate field.
+        // (ADR 0030), so subtract it via the state rather than a separate field.
         let retries_used = attempt_ids.len() as u32 - u32::from(job_state.attempt().is_some());
 
         let abort_requested = if job_state == JobState::Aborted {
@@ -378,7 +378,7 @@ struct AttemptCtx {
 /// legal `AttemptState` × `AllocationState` combinations from
 /// `coppice-state/src/apply.rs`: an `Accruing`/`Ready`/`Dispatching` attempt
 /// keeps its owning job `Attempting(id)` (the job no longer has a `Preparing`
-/// state of its own — ADR 0029), funding only reaches `Active` once the
+/// state of its own — ADR 0030), funding only reaches `Active` once the
 /// attempt is observed `Running`, and only a terminal attempt releases its
 /// allocation.
 enum AttemptKind {
@@ -817,7 +817,7 @@ pub fn check_consistency(sm: &StateMachine) {
 
     for (job_id, jr) in &sm.jobs {
         // The old "live states have Some, queued/terminal have None" checks are
-        // gone: after ADR 0029 the current attempt *is* the `Attempting(id)`
+        // gone: after ADR 0030 the current attempt *is* the `Attempting(id)`
         // payload, so those properties are structural — no `current_attempt`
         // field can fall out of sync with the state, and they are no longer
         // falsifiable to assert. What remains checkable is that the id the
@@ -842,7 +842,7 @@ pub fn check_consistency(sm: &StateMachine) {
         // other and the node), and the (attempt state, allocation state) pair
         // is one of the five legal live combinations. The job-state axis of the
         // old triple table collapsed into `Attempting` itself, leaving a pair
-        // table over the current attempt (ADR 0029).
+        // table over the current attempt (ADR 0030).
         if let Some(cur) = jr.state.attempt() {
             assert!(
                 jr.attempts.contains(&cur),

@@ -142,7 +142,7 @@ impl StateMachine {
                     &mut events,
                 );
             }
-            // An attempt is in flight; the state carries its id (ADR 0029), so
+            // An attempt is in flight; the state carries its id (ADR 0030), so
             // steer on that attempt's own state directly.
             JobState::Attempting(id) => {
                 match self.attempts.get(&id).map(|a| a.attempt.state.clone()) {
@@ -369,7 +369,7 @@ impl StateMachine {
             if let Some(j) = self.jobs.get_mut(&p.job) {
                 j.attempts.push(p.attempt);
             }
-            // The link is the state (ADR 0029): moving to Attempting stamps the
+            // The link is the state (ADR 0030): moving to Attempting stamps the
             // attempt id, replacing the old separate `current_attempt` write.
             self.job_transition(p.job, JobState::Attempting(p.attempt), &mut events);
             // Quota charge at placement (ADR 0019); true-up settles against
@@ -395,7 +395,7 @@ impl StateMachine {
         // batch — the revoke-and-reseat re-plan of ADR 0014. The revocation
         // resolves the job to Queued before placements apply, so it passes
         // through Queued within this apply; there is no Attempting → Attempting
-        // edge (ADR 0029).
+        // edge (ADR 0030).
         let reseat = job
             .state
             .attempt()
@@ -562,7 +562,7 @@ impl StateMachine {
         }
         let mut events = Vec::new();
         // Only the attempt moves: the job stays Attempting(id) while its
-        // attempt is Finalizing (ADR 0029 — no job-level Finalizing). It
+        // attempt is Finalizing (ADR 0030 — no job-level Finalizing). It
         // resolves atomically once the attempt reaches Terminal.
         self.attempt_transition(c.attempt, AttemptState::Finalizing, &mut events);
         Ok(Applied { events })
@@ -972,7 +972,7 @@ impl StateMachine {
         }
         let allocation = a.attempt.allocation;
         // Only the attempt and its allocation move; the job stays
-        // Attempting(id) (ADR 0029 — no job-level Running mirror state).
+        // Attempting(id) (ADR 0030 — no job-level Running mirror state).
         self.attempt_transition(attempt, AttemptState::Running, events);
         if let Some(al) = self.allocations.get_mut(&allocation) {
             if al.allocation.state == AllocationState::Funded {
@@ -984,7 +984,7 @@ impl StateMachine {
     /// The shared terminal path: terminal outcome, allocation release plus
     /// funding cascade, quota true-up, and job resolution — all in one apply.
     /// The job resolves atomically as the attempt reaches `Terminal`; there is
-    /// no job-level resolution state it rests in (ADR 0029).
+    /// no job-level resolution state it rests in (ADR 0030).
     ///
     /// `pledge` is false only when the node itself is lost. `used` is the
     /// optional batch capacity memo threaded down to the funding cascade; only
@@ -1094,7 +1094,7 @@ impl StateMachine {
         // The job is Attempting(id); resolution moves it straight to a terminal
         // outcome or back to Queued. There is no intermediate Finalizing state,
         // and the transition itself drops the attempt id — nothing to clear by
-        // hand (ADR 0029).
+        // hand (ADR 0030).
 
         enum Resolution {
             Terminal(JobState),

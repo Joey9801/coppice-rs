@@ -110,7 +110,7 @@ pub struct JobRecord {
     pub retries_used: u32,
     /// Every attempt this job has had, in creation order. The attempt in
     /// flight, when there is one, is carried by `state`
-    /// ([`JobState::Attempting`]) rather than stored separately (ADR 0029);
+    /// ([`JobState::Attempting`]) rather than stored separately (ADR 0030);
     /// [`current_attempt`](JobRecord::current_attempt) derives it from there.
     pub attempts: Vec<AttemptId>,
 }
@@ -120,7 +120,7 @@ impl JobRecord {
     ///
     /// A derived view of `state` — `Some` exactly while
     /// [`JobState::Attempting`] — kept as a method so call sites read as they
-    /// did before the field was removed (ADR 0029). It cannot disagree with
+    /// did before the field was removed (ADR 0030). It cannot disagree with
     /// the state, which is the point of folding the link into the enum.
     pub fn current_attempt(&self) -> Option<AttemptId> {
         self.state.attempt()

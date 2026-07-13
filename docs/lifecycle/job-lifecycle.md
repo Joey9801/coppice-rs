@@ -4,7 +4,7 @@ Decided in
 [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md) (with
 [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) for
 partial scheduling and
-[ADR 0029](../decisions/0029-structural-job-attempt-link.md) for the job
+[ADR 0030](../decisions/0030-structural-job-attempt-link.md) for the job
 machine's structural attempt link): three machines — job, attempt, allocation
 — joined at an explicit readiness barrier.
 
@@ -54,7 +54,7 @@ detail — preparing, running, exiting — is a join at read time between
 `Attempting(id)` and that attempt's own state, which `AttemptStateChanged`'s
 job-scoped key already supports (ADR 0008); the job enum itself stays this
 coarse. See
-[ADR 0029](../decisions/0029-structural-job-attempt-link.md) for the full
+[ADR 0030](../decisions/0030-structural-job-attempt-link.md) for the full
 rationale.
 
 ## Attempt machine

@@ -179,7 +179,7 @@ Funding is deterministic bookkeeping in the apply loop (ADR 0014). Exactly:
 ### Resolution on attempt `Terminal`
 
 The job carries the id of its one in-flight attempt via `Attempting(id)`
-(ADR 0029); there is no job-level `Finalizing` rest state. Every attempt end
+(ADR 0030); there is no job-level `Finalizing` rest state. Every attempt end
 resolves the job in the same apply that lands the attempt's
 `Terminal(outcome)`, and the resolution rules live **here, in apply** —
 never in the agent (ADR 0013). On an attempt reaching `Terminal(outcome)`
@@ -347,7 +347,7 @@ reachable through the API.
 | Proposer | Ingestion, from an `AttemptStatus` report observing the container running |
 | Payload | `attempt: AttemptId`, `observed_at_us` |
 | Validation | Attempt exists and is `Dispatching` (the agent can only start what was dispatched; anything else is a stale or duplicate report) |
-| Apply effects | Attempt → `Running`, `started_at_us` recorded (the anchor for "reached Running" in true-up); allocation → `Active`; job state is unchanged — it stays `Attempting(id)` (ADR 0029: agent-observed transitions no longer move the job). |
+| Apply effects | Attempt → `Running`, `started_at_us` recorded (the anchor for "reached Running" in true-up); allocation → `Active`; job state is unchanged — it stays `Attempting(id)` (ADR 0030: agent-observed transitions no longer move the job). |
 | Rejections | `UnknownAttempt`, `StaleAttemptState` |
 
 #### `RecordAttemptExited`
@@ -357,7 +357,7 @@ reachable through the API.
 | Proposer | Ingestion, when exit is observed but agent-side finalization (log flush, usage summary) is still running |
 | Payload | `attempt: AttemptId`, `observed_at_us` |
 | Validation | Attempt exists and is `Running` |
-| Apply effects | Attempt → `Finalizing`; job state is unchanged — it stays `Attempting(id)` (there is no job-level `Finalizing`; see ADR 0029). Skipping this command (outcome arriving directly) is legal — the terminal edge exists from every non-terminal state. |
+| Apply effects | Attempt → `Finalizing`; job state is unchanged — it stays `Attempting(id)` (there is no job-level `Finalizing`; see ADR 0030). Skipping this command (outcome arriving directly) is legal — the terminal edge exists from every non-terminal state. |
 | Rejections | `UnknownAttempt`, `StaleAttemptState` |
 
 #### `RecordAttemptOutcome`
@@ -377,7 +377,7 @@ reachable through the API.
 | Proposer | Ingestion, from an ObservedSet report (agent restart registration, or the periodic heartbeat diff). The leader computes the diff; the command carries verdicts. |
 | Payload | `node: NodeId`, `node_epoch: u64` (the epoch the set was observed under), `adopted: AttemptId[]`, `lost: LostAttempt[]` where `LostAttempt = { attempt: AttemptId, outcome: AttemptOutcome, actual_runtime_us: uint64 }` (normalizer picks the outcome — typically `AgentError`; `NodeLost` and `StartFailed` are legal), `observed_at_us` |
 | Validation | Node exists; `node_epoch` equals the node's current epoch (a stale epoch means the whole set predates a re-registration and is worthless); every referenced attempt exists and lives on this node; lost outcomes ≠ `Revoked` |
-| Apply effects | **Adopted** (intended and running): attempt confirmed `Running` — `Dispatching → Running` with allocation `Active` (job state is unchanged, per ADR 0029); already-`Running` or already-terminal entries are no-ops (stale info, benign). **Lost** (intended but absent): the full terminal path with the carried outcome, identical to `RecordAttemptOutcome` — retry policy applies. The *stop* verdict never reaches apply (see the ingestion boundary). |
+| Apply effects | **Adopted** (intended and running): attempt confirmed `Running` — `Dispatching → Running` with allocation `Active` (job state is unchanged, per ADR 0030); already-`Running` or already-terminal entries are no-ops (stale info, benign). **Lost** (intended but absent): the full terminal path with the carried outcome, identical to `RecordAttemptOutcome` — retry policy applies. The *stop* verdict never reaches apply (see the ingestion boundary). |
 | Rejections | `UnknownNode`, `StaleNodeEpoch`, `InvalidBatch` wrapping `UnknownAttempt` / `AttemptNotOnNode` / `InvalidCommand` |
 
 ### Node lifecycle

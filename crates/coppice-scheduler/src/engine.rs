@@ -364,7 +364,7 @@ impl<'a> Pass<'a> {
             // Only a job Attempting(cur) whose current attempt holds this
             // accrual is reseatable (validate_placement's reseat path); an
             // aborting job is winding down, so moving it is pointless churn.
-            // The attempt id lives in the state itself now (ADR 0029), so
+            // The attempt id lives in the state itself now (ADR 0030), so
             // there is no separate `current_attempt` link to fall out of
             // sync with.
             if jr.spec.abort_requested.is_some() {

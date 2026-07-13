@@ -94,7 +94,7 @@ pub fn allocation_record(
 /// A `Queued` job record with the given spec fields.
 ///
 /// `Queued` rather than a live `Attempting(id)` state: under the collapsed
-/// job machine (ADR 0029) a live state carries the attempt it points at, and
+/// job machine (ADR 0030) a live state carries the attempt it points at, and
 /// callers of this fixture build their job and attempt records independently
 /// (there is no `attempt_id` parameter here to keep them coherent). `Queued`
 /// is the honest choice for a record with no attempt of its own; tests that

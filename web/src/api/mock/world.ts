@@ -289,7 +289,7 @@ interface JobSpecInternal {
 interface MJob {
   id: string
   spec: JobSpecInternal
-  /** The current attempt id, when there is one, lives inside `Attempting` (ADR 0029). */
+  /** The current attempt id, when there is one, lives inside `Attempting` (ADR 0030). */
   state: JobState
   submittedAtUs: number
   terminalAtUs: number | null
@@ -836,7 +836,7 @@ export class MockWorld {
     return alloc
   }
 
-  /** The attempt `job.state` points at, if any (ADR 0029: no separate link field). */
+  /** The attempt `job.state` points at, if any (ADR 0030: no separate link field). */
   private currentAttempt(job: MJob): MAttempt | undefined {
     const id = jobAttemptId(job.state)
     return id ? this.attempts.get(id) : undefined
@@ -1268,7 +1268,7 @@ export class MockWorld {
         // at saturation and a visible queue + accruals persist at steady
         // state without growing unboundedly. No job-level transition here —
         // the job stays `Attempting(attempt)`; only the attempt's state
-        // moves, which is what the timeline now shows (ADR 0029).
+        // moves, which is what the timeline now shows (ADR 0030).
         if (overRuntime || this.rng.bool(0.0035)) {
           attempt.state = 'Finalizing'
           this.pushEvent({
@@ -1341,7 +1341,7 @@ export class MockWorld {
       }
       if (fitsRes(alloc.requested, alloc.funded)) {
         // Fully funded → Active → Running. No job-level transition — the
-        // job stays `Attempting(attempt)`; only the attempt moves (ADR 0029).
+        // job stays `Attempting(attempt)`; only the attempt moves (ADR 0030).
         alloc.funded = { ...alloc.requested }
         alloc.state = 'Active'
         attempt.state = 'Running'

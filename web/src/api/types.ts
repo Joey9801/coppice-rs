@@ -44,7 +44,7 @@ export interface Resources {
 /**
  * `JobState`: Submitted → Accepted → Queued → Attempting(attempt) →
  * {Succeeded, Failed, Aborted}, with `Attempting → Queued` on retry (ADR
- * 0029). `Attempting` structurally carries the in-flight attempt id — there
+ * 0030). `Attempting` structurally carries the in-flight attempt id — there
  * is no separate `currentAttempt` field anywhere in this file;
  * `jobAttemptId` is the derived accessor and can never disagree with the
  * state. The job enum no longer distinguishes preparing/running/finalizing:
@@ -93,7 +93,7 @@ export type AttemptState =
   'Accruing' | 'Ready' | 'Dispatching' | 'Running' | 'Finalizing' | 'Terminal'
 
 /**
- * Flat display "phase" for a job (ADR 0029 observability note): a read-time
+ * Flat display "phase" for a job (ADR 0030 observability note): a read-time
  * join of `Attempting(id)` with that attempt's `AttemptState`, never
  * replicated or stored. Every UI surface that shows a single job status —
  * state pills, list filters, timelines, the overview breakdown — renders
@@ -350,7 +350,7 @@ export interface JobDetail {
   cost: CostReport
 }
 
-/** The `AttemptView` `job.state` currently points at, if any (derived, ADR 0029). */
+/** The `AttemptView` `job.state` currently points at, if any (derived, ADR 0030). */
 export function jobCurrentAttempt(job: Pick<JobDetail, 'state' | 'attempts'>): AttemptView | null {
   const id = jobAttemptId(job.state)
   return id ? (job.attempts.find((a) => a.id === id) ?? null) : null

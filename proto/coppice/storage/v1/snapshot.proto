@@ -91,7 +91,7 @@ enum Compression {
 // A job's replicated record: the submitted spec plus lifecycle bookkeeping
 // owned by the apply loop. Keyed by spec.id.
 message JobRecord {
-  // Tag 6 held current_attempt: Option<AttemptId>, removed by ADR 0029 —
+  // Tag 6 held current_attempt: Option<AttemptId>, removed by ADR 0030 —
   // the attempt in flight is now carried by JobState.Attempting, a derived
   // view that cannot disagree with the state.
   reserved 6;

@@ -61,8 +61,10 @@ fn submit_runtime_us(
 fn commit(
     sm: &mut StateMachine,
     proposal: &PlacementProposal,
-) -> Result<Vec<(coppice_core::id::AttemptId, coppice_core::id::AllocationId)>, coppice_state::RejectionReason>
-{
+) -> Result<
+    Vec<(coppice_core::id::AttemptId, coppice_core::id::AllocationId)>,
+    coppice_state::RejectionReason,
+> {
     let mut minted = Vec::new();
     let mut mint = minter();
     let cmd = proposal.to_commit_placements(&mut || {

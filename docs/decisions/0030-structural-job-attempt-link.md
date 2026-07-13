@@ -1,4 +1,4 @@
-# 29. Structural job–attempt link: `Attempting(AttemptId)`
+# 30. Structural job–attempt link: `Attempting(AttemptId)`
 
 - **Status:** Accepted
 - **Date:** 2026-07-13

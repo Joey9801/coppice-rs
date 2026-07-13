@@ -12,7 +12,7 @@
 //! recorded outcome is honestly `Attempting(id)` with the attempt in
 //! `Finalizing`, and once the attempt reaches `Terminal` resolution (outcome,
 //! retry, abort) completes atomically in the same apply. Decided in
-//! `docs/decisions/0029-structural-job-attempt-link.md`, amending
+//! `docs/decisions/0030-structural-job-attempt-link.md`, amending
 //! `docs/decisions/0013-job-attempt-allocation-state-machines.md`; the
 //! transition table lives in `docs/lifecycle/job-lifecycle.md`.
 
@@ -97,7 +97,7 @@ pub struct AbortRequest {
 /// single live-execution state, [`JobState::Attempting`], carries the id of
 /// the attempt in flight; UIs join that attempt's own state for detail
 /// (preparing/running/finalizing distinctions live on the attempt now, per
-/// ADR 0029).
+/// ADR 0030).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     /// Recorded durably; awaiting admission evaluation.
@@ -109,7 +109,7 @@ pub enum JobState {
     /// An attempt is in flight — the id it carries is the single attempt this
     /// job is pursuing (accruing, ready, dispatching, running, or finalizing;
     /// the attempt's own state carries that detail). "At most one attempt in
-    /// flight" is structural: there is no second slot (ADR 0029).
+    /// flight" is structural: there is no second slot (ADR 0030).
     Attempting(AttemptId),
     /// Terminal: the final attempt exited successfully.
     Succeeded,
@@ -135,7 +135,7 @@ impl JobState {
     /// The attempt this job points at, if any — `Some` only while
     /// [`Attempting`](JobState::Attempting).
     ///
-    /// A *derived* view of the state that cannot disagree with it (ADR 0029):
+    /// A *derived* view of the state that cannot disagree with it (ADR 0030):
     /// there is no separate `current_attempt` field to fall out of sync.
     pub fn attempt(self) -> Option<AttemptId> {
         match self {
@@ -149,7 +149,7 @@ impl JobState {
     /// The state machine rejects any edge not listed here. Equality is
     /// payload-aware, and the table is deliberately so: `Attempting(a) →
     /// Attempting(b)` is illegal even for `a == b`, because a new attempt id
-    /// only ever arrives via `Queued` (ADR 0029).
+    /// only ever arrives via `Queued` (ADR 0030).
     pub fn may_transition_to(self, next: JobState) -> bool {
         use JobState::*;
         match (self, next) {

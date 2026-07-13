@@ -20,7 +20,7 @@ anywhere in the workspace.
   plus `RetryPolicy` and `AbortRequest`. Abort is a flag, not a state; the one
   live-execution state `Attempting(AttemptId)` carries the attempt in flight, so
   the job↔attempt link is the state itself, and resolution completes atomically
-  when the attempt goes terminal (ADR 0029).
+  when the attempt goes terminal (ADR 0030).
 - **Attempts** (`attempt`) — `Attempt`, its `AttemptState` machine, and
   `AttemptOutcome`/`OutcomeClass`. Retries mint a fresh attempt; all agent
   reports are attempt-scoped, which is what makes duplicate/stale reports safe

@@ -34,7 +34,7 @@ fn happy_path_submit_to_eviction() {
         place_cmd(placement(job, attempt, alloc, nid(1), cpu(4_000)), TS),
     );
     // Capacity was immediately available: accrual skipped, charge landed. The
-    // job now carries the exact attempt id it is pursuing (ADR 0029).
+    // job now carries the exact attempt id it is pursuing (ADR 0030).
     assert_eq!(sm.jobs[&job].state, JobState::Attempting(attempt));
     assert_eq!(sm.jobs[&job].current_attempt(), Some(attempt));
     assert_eq!(sm.attempts[&attempt].attempt.state, AttemptState::Ready);
@@ -65,7 +65,7 @@ fn happy_path_submit_to_eviction() {
 
     apply_ok(&mut sm, exited_cmd(attempt, TS + 60_000_000));
     // Exit observed but outcome not yet recorded: the attempt is Finalizing
-    // while the job stays Attempting (ADR 0029 — no job-level Finalizing).
+    // while the job stays Attempting (ADR 0030 — no job-level Finalizing).
     assert_eq!(sm.jobs[&job].state, JobState::Attempting(attempt));
     assert_eq!(
         sm.attempts[&attempt].attempt.state,
@@ -569,7 +569,7 @@ fn revoke_and_reseat_in_one_batch() {
         }),
     );
     // The job passed through Queued (the revocation resolved it) and lands on
-    // the fresh attempt — never an Attempting → Attempting edge (ADR 0029).
+    // the fresh attempt — never an Attempting → Attempting edge (ADR 0030).
     assert_eq!(sm.jobs[&jid(2)].state, JobState::Attempting(aid(23)));
     assert_eq!(sm.attempts[&aid(23)].attempt.state, AttemptState::Ready);
     assert!(sm.accrual_queue.is_empty());
