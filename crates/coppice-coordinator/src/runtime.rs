@@ -70,7 +70,7 @@ where
     // replaying across the boundary (KOI-3).
     let recovery_index = views.latest().applied_index();
     let (fanout, fanout_join) = event_fanout::spawn(event_tap, recovery_index, shutdown_rx.clone());
-    tracing::info!("runtime: event fanout up");
+    tracing::debug!("runtime: event fanout up");
 
     let Gateway {
         router,
@@ -82,7 +82,7 @@ where
         status.clone(),
         shutdown_rx.clone(),
     );
-    tracing::info!("runtime: agent gateway up");
+    tracing::debug!("runtime: agent gateway up");
 
     // Agent session mTLS server. The listener is bound early in `bootstrap`;
     // here it starts accepting and stops on shutdown (listeners drain first,
@@ -105,7 +105,7 @@ where
             })
             .await
     });
-    tracing::info!("runtime: agent session server up");
+    tracing::debug!("runtime: agent session server up");
 
     let control_plane = Arc::new(CoordinatorControlPlane::new(
         Arc::clone(&consensus),
@@ -115,7 +115,7 @@ where
         control_plane,
         shutdown_rx.clone(),
     ));
-    tracing::info!("runtime: api server up");
+    tracing::debug!("runtime: API control plane up");
 
     // ---- Leader-only tasks (every replica runs the loop; each self-gates
     // on the status watch per `crate::leadership`) ----
@@ -154,7 +154,9 @@ where
         status.clone(),
         shutdown_rx.clone(),
     ));
-    tracing::info!("runtime: ingestion, dispatch, scheduler driver, housekeeping spawned");
+    tracing::info!(
+        "coordinator runtime started (agent sessions, scheduling, dispatch, and housekeeping)"
+    );
 
     // ---- Shutdown trigger ----
     // The daemon path installs the signal handler; an integration test owns the
@@ -206,16 +208,16 @@ where
     let _ = api_join.await;
     let _ = agent_server_join.await;
     let _ = router_join.await;
-    tracing::info!("runtime: api server and agent gateway down");
+    tracing::debug!("runtime: API control plane and agent gateway down");
 
     let _ = ingestion_join.await;
     let _ = dispatch_join.await;
     let _ = scheduler_join.await;
     let _ = housekeeping_join.await;
-    tracing::info!("runtime: leader-only loops down");
+    tracing::debug!("runtime: leader-only loops down");
 
     let _ = fanout_join.await;
-    tracing::info!("runtime: event fanout down; shutdown complete");
+    tracing::info!("coordinator runtime stopped");
 
     Ok(())
 }

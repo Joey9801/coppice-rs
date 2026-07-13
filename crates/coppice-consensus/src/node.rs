@@ -273,7 +273,7 @@ pub async fn start(
             // Mints this replica's allocate-once Raft identity and a fresh
             // instance UUID, both stamped into the manifest (ADR 0016 / 0025).
             let minted = storage::init(&fs, &StorageOptions::new(cluster_uuid))?;
-            tracing::info!(
+            tracing::debug!(
                 node_id = minted,
                 "minted coordinator raft identity (stamped in the data directory; \
                  pass it to `admin add-learner` when joining, ADR 0025)"

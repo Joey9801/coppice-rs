@@ -86,7 +86,7 @@ pub async fn run<C, H>(
         let Some(term) = leadership::wait_for_leadership(&mut status, &mut shutdown).await else {
             return;
         };
-        tracing::info!(term, "housekeeping: gained leadership");
+        tracing::debug!(term, "housekeeping: gained leadership");
 
         // Grant every known node a fresh liveness grace window so a node is
         // never declared lost on the first tick of a new leadership term.

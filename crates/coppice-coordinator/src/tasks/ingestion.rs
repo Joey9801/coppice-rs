@@ -79,7 +79,7 @@ pub async fn run<C: Consensus>(
         let Some(term) = leadership::wait_for_leadership(&mut status, &mut shutdown).await else {
             return;
         };
-        tracing::info!(
+        tracing::debug!(
             term,
             "ingestion: gained leadership, draining inbound reports"
         );

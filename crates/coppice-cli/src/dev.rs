@@ -61,6 +61,15 @@ enum DevExecutor {
     Docker,
 }
 
+impl std::fmt::Display for DevExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fake => f.write_str("fake"),
+            Self::Docker => f.write_str("docker"),
+        }
+    }
+}
+
 /// A throwaway in-memory CA and the two leaves a dev run needs. Minted fresh
 /// every run: TLS material is deliberately not part of the persistent state.
 struct DevPki {
@@ -284,40 +293,26 @@ ca_path = "{ca}"
         }
     };
 
-    // Positive confirmation the loop is closed: report when the agent's
-    // registration lands in applied state (epoch >= 1, ADR 0009).
-    {
-        let views = views.clone();
-        tokio::spawn(async move {
-            loop {
-                match views
-                    .latest()
-                    .state()
-                    .nodes
-                    .get(&agent_node)
-                    .map(|n| n.epoch)
-                {
-                    Some(epoch) => {
-                        tracing::info!(node = %agent_node, epoch, "dev agent registered");
-                        break;
-                    }
-                    None => tokio::time::sleep(Duration::from_millis(100)).await,
-                }
-            }
-        });
-    }
+    // The cluster is only useful once the in-process agent's registration has
+    // landed in applied state (epoch >= 1, ADR 0009). Treat that as the dev
+    // command's readiness boundary rather than printing "up" while the loop
+    // is still closing.
+    let agent_epoch = wait_for_agent(&views, agent_node).await?;
+    tracing::debug!(node = %agent_node, epoch = agent_epoch, "dev agent registered");
 
-    tracing::info!(
-        data_dir = %root.display(),
-        persistent = args.data_dir.is_some(),
-        cluster_id = %cluster_id,
-        coordinator_raft_id = handle.node_id(),
-        agent_node_id = %agent_node,
-        raft_admin_endpoint = %format!("localhost:{raft_port}"),
-        agent_gateway_endpoint = %format!("localhost:{agent_port}"),
-        executor = ?args.executor,
-        "coppice dev cluster is up (throwaway per-run TLS; no authentication — \
-         localhost development only); Ctrl-C to stop"
+    eprintln!(
+        "{}",
+        ready_summary(&ReadySummary {
+            root: &root,
+            persistent: args.data_dir.is_some(),
+            cluster_id,
+            coordinator_raft_id: handle.node_id(),
+            agent_node,
+            agent_epoch,
+            raft_port,
+            agent_port,
+            executor: args.executor,
+        })
     );
 
     tokio::signal::ctrl_c()
@@ -364,5 +359,102 @@ fn build_session<E: Executor + Clone>(
 async fn run_agent<E: Executor + Clone>(session: Session<RealFs, E>, config: AgentConfig) {
     if let Err(e) = session::run(session, &config).await {
         tracing::error!("dev agent session loop exited: {e:#}");
+    }
+}
+
+async fn wait_for_agent(views: &coppice_consensus::StateViews, agent_node: NodeId) -> Result<u64> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(epoch) = views
+                .latest()
+                .state()
+                .nodes
+                .get(&agent_node)
+                .map(|node| node.epoch)
+            {
+                return epoch;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("dev agent did not register within 10 seconds")
+}
+
+struct ReadySummary<'a> {
+    root: &'a Path,
+    persistent: bool,
+    cluster_id: ClusterId,
+    coordinator_raft_id: u64,
+    agent_node: NodeId,
+    agent_epoch: u64,
+    raft_port: u16,
+    agent_port: u16,
+    executor: DevExecutor,
+}
+
+fn ready_summary(summary: &ReadySummary<'_>) -> String {
+    let data_lifetime = if summary.persistent {
+        "persistent"
+    } else {
+        "temporary; deleted on exit"
+    };
+
+    format!(
+        "\nCoppice dev is ready\n\
+         \n\
+         \x20 UI              not running (mock UI: http://localhost:5173 after `npm --prefix web run dev`)\n\
+         \x20 API             unavailable (HTTP transport is not implemented yet)\n\
+         \x20 Raft/admin      https://localhost:{raft_port} (mTLS)\n\
+         \x20 Agent gateway   https://localhost:{agent_port} (mTLS)\n\
+         \x20 Data            {data_dir} ({data_lifetime})\n\
+         \x20 Executor        {executor}\n\
+         \x20 Cluster         {cluster_id} (Raft node {coordinator_raft_id})\n\
+         \x20 Agent           {agent_node} (registered, epoch {agent_epoch})\n\
+         \n\
+         \x20 Local development only: authentication is effectively disabled.\n\
+         \x20 Press Ctrl-C to stop.\n",
+        raft_port = summary.raft_port,
+        agent_port = summary.agent_port,
+        data_dir = summary.root.display(),
+        executor = summary.executor,
+        cluster_id = summary.cluster_id,
+        coordinator_raft_id = summary.coordinator_raft_id,
+        agent_node = summary.agent_node,
+        agent_epoch = summary.agent_epoch,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_summary_is_scannable_and_explicit_about_unavailable_surfaces() {
+        let summary = ready_summary(&ReadySummary {
+            root: Path::new("/tmp/coppice-dev"),
+            persistent: false,
+            cluster_id: "cluster-00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("cluster id"),
+            coordinator_raft_id: 42,
+            agent_node: "node-00000000-0000-0000-0000-000000000002"
+                .parse()
+                .expect("node id"),
+            agent_epoch: 1,
+            raft_port: 7071,
+            agent_port: 7072,
+            executor: DevExecutor::Fake,
+        });
+
+        assert!(summary.starts_with("\nCoppice dev is ready\n\n"));
+        assert!(summary.contains("UI              not running"));
+        assert!(summary.contains("API             unavailable"));
+        assert!(summary.contains("Raft/admin      https://localhost:7071 (mTLS)"));
+        assert!(summary.contains("Agent gateway   https://localhost:7072 (mTLS)"));
+        assert!(summary.contains("/tmp/coppice-dev (temporary; deleted on exit)"));
+        assert!(summary.contains(
+            "Agent           node-00000000-0000-0000-0000-000000000002 (registered, epoch 1)"
+        ));
     }
 }
