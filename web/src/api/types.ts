@@ -313,14 +313,39 @@ export interface AccrualView {
 }
 
 export interface CostReport {
-  /** µCU/second while running, from policy cost weights × requested. */
+  /**
+   * Base µCU/second from policy cost weights × requested resources, before any
+   * multiplier. `rateBreakdown` sums to this.
+   */
   rateUcuPerSecond: number
-  /** Upfront estimate: rate × (maxRuntime or the policy default runtime). */
+  /** Per-dimension split of the base rate (µCU/second), summing to `rateUcuPerSecond`. */
+  rateBreakdown: { cpu: number; memory: number; disk: number }
+  /** Priority-class multiplier (≥1) mapped from `spec.priority` by policy (ADR 0021). */
+  priorityMultiplier: number
+  /**
+   * Runtime penalty folded in because the job declared no `max_runtime`
+   * (ADR 0029, default 2×); 1 when the job is bounded.
+   */
+  unboundedMultiplier: number
+  /** The µCU/second actually priced: `rateUcuPerSecond × priority × unbounded`. */
+  effectiveRateUcuPerSecond: number
+  /**
+   * Duration the upfront placement charge covers: the job's `max_runtime`, or
+   * the policy default charge runtime when `max_runtime` is unset.
+   */
+  chargeWindowUs: number
+  /** True iff `chargeWindowUs` is the policy default (job declared no `max_runtime`). */
+  chargeWindowIsDefault: boolean
+  /** Upfront charge taken at placement: `effectiveRate × chargeWindow`. */
   estimatedUcu: number
-  /** True iff the estimate used the policy default because maxRuntime is unset. */
-  estimateUsedDefaultRuntime: boolean
-  /** Total charged across attempts so far. */
+  /** Total charged across attempts so far; 0 before the job is placed. */
   chargedUcu: number
+  /**
+   * Fraction (0..1) of the unused charge a true-up refunds (ADR 0029): the
+   * policy default for a declared bound, or 1 (full) for unbounded jobs and
+   * platform-attributable outcomes.
+   */
+  refundFraction: number
   /** Final cost after true-up; only when the job is terminal. */
   actualUcu: number | null
   /** Refund or surcharge applied at finalization. */

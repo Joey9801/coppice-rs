@@ -88,16 +88,34 @@ const MAX_TICKS_PER_ADVANCE = 4000
 const PRIORITY_MULTIPLIER: Record<number, number> = { 0: 1, 1: 2, 2: 4 }
 const W_AGE = 0.5
 const AGE_HORIZON_US = 24 * HOUR_US
-/** Policy default runtime when a job sets no maxRuntime (2h). */
-const DEFAULT_RUNTIME_US = 2 * HOUR_US
+/**
+ * Charge policy (ADR 0029), mirroring `coppice_state::Policy` defaults:
+ * - the upfront charge covers `max_runtime`, or this default window when the
+ *   job declared no bound (`default_charge_runtime_s: 86_400` = 24h);
+ * - unbounded jobs price at an elevated multiplier to encourage real bounds;
+ * - a true-up refunds this fraction of the unused charge for bounded jobs
+ *   (unbounded / platform outcomes refund in full).
+ */
+const DEFAULT_CHARGE_RUNTIME_US = 24 * HOUR_US
+const UNBOUNDED_RUNTIME_MULTIPLIER = 2
+const REFUND_FRACTION = 0.75
 
 /**
- * Cost weights, chosen so a 4-core / 16 GiB job costs ~3 CU/hour.
+ * Cost weights, configured the way an operator reasons about them: as
+ * reciprocals — "how much of a resource one CU buys per hour" — anchored on
+ * CPU and scaled off a typical 8 GiB/core node shape (so a node's cores and
+ * its memory cost the same). Chosen so a 4-core / 16 GiB job still costs ~3
+ * CU/hour, and so each dimension reciprocates to a clean whole number the cost
+ * breakdown can surface (2 core-hours, 16 GiB-hours, 128 TiB-hours per CU).
  * rate = cpuMillis*W_CPU + (mem/GiB)*W_MEM + (disk/TiB)*W_DISK  (µCU/second).
  */
-const W_CPU = 0.125
-const W_MEM = 20
-const W_DISK = 2
+const cuPerHourToUcuPerSecond = (cuPerHour: number): number => (cuPerHour * 1_000_000) / 3600
+/** 2 core-hours per CU → 0.5 CU/hour/core, per millicore-second. */
+const W_CPU = cuPerHourToUcuPerSecond(1 / 2) / 1000
+/** 16 GiB-hours per CU, per GiB-second. */
+const W_MEM = cuPerHourToUcuPerSecond(1 / 16)
+/** 128 TiB-hours per CU (disk priced far cheaper), per TiB-second. */
+const W_DISK = cuPerHourToUcuPerSecond(1 / 128)
 
 // Kept low so admission is visibly gated: with a big accrual pool the queue
 // would drain into Preparing the moment jobs arrive (mirrors policy
@@ -200,10 +218,18 @@ function minFraction(part: Resources, whole: Resources): number {
   )
 }
 
+/** Per-dimension cost rate (µCU/second), the weighted terms of `computeRate`. */
+function rateTerms(r: Resources): { cpu: number; memory: number; disk: number } {
+  return {
+    cpu: r.cpuMillis * W_CPU,
+    memory: (r.memoryBytes / GIB) * W_MEM,
+    disk: (r.diskBytes / TIB) * W_DISK,
+  }
+}
+
 function computeRate(r: Resources): number {
-  return Math.round(
-    r.cpuMillis * W_CPU + (r.memoryBytes / GIB) * W_MEM + (r.diskBytes / TIB) * W_DISK,
-  )
+  const t = rateTerms(r)
+  return Math.round(t.cpu + t.memory + t.disk)
 }
 
 // ---------------------------------------------------------------------------
@@ -868,7 +894,7 @@ export class MockWorld {
       this.maybeAddRetries(job, startedAtUs)
       const attempt = this.newAttempt(job, nodeId, 'Running')
       attempt.startedAtUs = startedAtUs
-      attempt.chargedUcu = Math.round(attempt.rateUcuPerSecond * (runningForUs / SECOND_US))
+      attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
       const alloc = this.newAlloc(job, attempt, nodeId, { ...job.spec.requests }, 'Active')
       job.state = { kind: 'Attempting', attempt: attempt.id }
       const cur = free.get(nodeId)
@@ -896,7 +922,7 @@ export class MockWorld {
       const startedAtUs = this.nowUs - runningForUs
       const attempt = this.newAttempt(job, nodeId, 'Finalizing')
       attempt.startedAtUs = startedAtUs
-      attempt.chargedUcu = Math.round(attempt.rateUcuPerSecond * (runningForUs / SECOND_US))
+      attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
       const alloc = this.newAlloc(job, attempt, nodeId, { ...job.spec.requests }, 'Active')
       job.state = { kind: 'Attempting', attempt: attempt.id }
       const cur = free.get(nodeId)
@@ -920,6 +946,8 @@ export class MockWorld {
       }
       const attempt = this.newAttempt(job, nodeId, 'Accruing')
       attempt.startedAtUs = null
+      // Charged in full at placement, even while still accruing capacity.
+      attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
       const frac = this.rng.range(0.2, 0.8)
       const funded = this.clampFunded(scaleRes(job.spec.requests, frac), free.get(nodeId))
       const alloc = this.newAlloc(job, attempt, nodeId, funded, 'Accruing')
@@ -969,10 +997,7 @@ export class MockWorld {
       attempt.startedAtUs = startedAtUs
       attempt.endedAtUs = endedAtUs
       attempt.outcome = this.finalOutcome(state, job)
-      const chargedUcu = Math.round(
-        attempt.rateUcuPerSecond * ((endedAtUs - startedAtUs) / SECOND_US),
-      )
-      attempt.chargedUcu = chargedUcu
+      attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
       this.seedUsage(attempt, job.spec.requests, startedAtUs, endedAtUs)
       // Released allocation: recorded for history, excluded from capacity.
       this.newAlloc(job, attempt, node.id, { ...job.spec.requests }, 'Released')
@@ -999,9 +1024,8 @@ export class MockWorld {
       attempt.endedAtUs = endedAtUs
       const kind = this.rng.weighted(PLATFORM_POOL)
       attempt.outcome = { kind, class: 'Platform' }
-      attempt.chargedUcu = Math.round(
-        attempt.rateUcuPerSecond * ((endedAtUs - startedAtUs) / SECOND_US),
-      )
+      // Platform-attributable outcomes refund in full → net zero charge.
+      attempt.chargedUcu = 0
       // Pull/start failures never ran a container, so they record no usage.
       if (kind !== 'PullFailed' && kind !== 'StartFailed') {
         this.seedUsage(attempt, job.spec.requests, startedAtUs, endedAtUs)
@@ -1025,19 +1049,22 @@ export class MockWorld {
 
   private applyTrueUp(job: MJob, attempt: MAttempt, state: JobState): void {
     const charged = job.attempts.reduce((s, id) => s + (this.attempts.get(id)?.chargedUcu ?? 0), 0)
-    // Actual consumption usually a bit under the upfront charge → refund.
-    const surcharge = this.rng.bool(0.2)
-    const factor = surcharge ? this.rng.range(1.02, 1.12) : this.rng.range(0.7, 0.98)
-    const actual = Math.max(0, Math.round(charged * factor))
-    job.actualUcu = actual
-    const diff = actual - charged
-    if (diff === 0) {
-      job.trueUp = null
-    } else if (diff < 0) {
-      job.trueUp = { kind: 'Refund', amountUcu: -diff }
-    } else {
-      job.trueUp = { kind: 'Surcharge', amountUcu: diff }
-    }
+    // The upfront charge covered the whole window at the effective rate; the
+    // tail the job never used is refunded (partly for a declared bound, fully
+    // for an unbounded job or a platform-attributable outcome).
+    const model = this.jobChargeModel(job)
+    const ranUs = Math.max(
+      0,
+      (attempt.endedAtUs ?? this.nowUs) - (attempt.startedAtUs ?? this.nowUs),
+    )
+    const unusedUs = Math.max(0, model.chargeWindowUs - ranUs)
+    const fraction = attempt.outcome?.class === 'Platform' ? 1 : model.refundFraction
+    const refund = Math.min(
+      charged,
+      Math.round(model.effectiveRate * (unusedUs / SECOND_US) * fraction),
+    )
+    job.actualUcu = Math.max(0, charged - refund)
+    job.trueUp = refund > 0 ? { kind: 'Refund', amountUcu: refund } : null
     if (state.kind === 'Aborted') {
       job.abortRequested = {
         reason: this.rng.pick(['user requested', 'superseded', 'cost cap', null]),
@@ -1207,18 +1234,6 @@ export class MockWorld {
   }
 
   /** Apply a terminal true-up to the job's ancestor chain (saturating ≥ 0). */
-  private applyTrueUpToAncestors(job: MJob): void {
-    if (!job.trueUp) return
-    const signed = job.trueUp.kind === 'Refund' ? -job.trueUp.amountUcu : job.trueUp.amountUcu
-    let cur: QEntity | undefined = this.entities.get(job.spec.quotaEntity)
-    let depth = 0
-    while (cur && depth < MAX_QUOTA_DEPTH) {
-      cur.usageUcu = Math.max(0, cur.usageUcu + signed)
-      cur = cur.parent ? this.entities.get(cur.parent) : undefined
-      depth += 1
-    }
-  }
-
   /**
    * Simulate a previously-unseen OIDC principal submitting its first job:
    * with a small per-tick probability, auto-mint a new SSO user under the
@@ -1249,13 +1264,13 @@ export class MockWorld {
     for (const job of this.jobs.values()) {
       const attempt = this.currentAttempt(job)
       if (!attempt || (attempt.state !== 'Running' && attempt.state !== 'Finalizing')) continue
-      // Append a bounded usage sample and accrue charge.
+      // Append a bounded usage sample. The job's own charge was taken upfront
+      // at placement (see tickAdmissions); the per-tick charge to ancestors is
+      // the entity-usage simulation that drives quota sparklines and penalties.
       const seedRng = new Rng(hashSeed(attempt.id + this.nowUs))
       attempt.usage.push(this.usageSample(this.nowUs, job.spec.requests, seedRng))
       if (attempt.usage.length > USAGE_RING) attempt.usage.shift()
       const delta = Math.round(attempt.rateUcuPerSecond * (TICK_US / SECOND_US))
-      attempt.chargedUcu += delta
-      // Charge the full per-tick cost to every ancestor (charge_ancestors).
       this.chargeAncestors(job.spec.quotaEntity, delta)
 
       if (attempt.state === 'Running') {
@@ -1294,7 +1309,10 @@ export class MockWorld {
     attempt.outcome = this.finalOutcome(state, job)
     job.terminalAtUs = this.nowUs
     this.applyTrueUp(job, attempt, state)
-    this.applyTrueUpToAncestors(job)
+    // Entity usage is charged pay-as-you-go per running tick (see
+    // tickRunningJobs) and already tracks actual consumption, so the job's
+    // upfront-model refund is not replayed onto ancestors — doing so would
+    // double-count and could zero out an entity's usage on a big finish.
     // Release the allocation, freeing node capacity.
     const alloc = this.allocs.get(attempt.allocation)
     if (alloc) alloc.state = 'Released'
@@ -1404,6 +1422,8 @@ export class MockWorld {
       const placedNode = fitNode ?? accrualNode
       if (!placedNode) break
       const attempt = this.newAttempt(job, placedNode, 'Accruing')
+      // Placement charges the full window upfront (trued up at finalization).
+      attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
       const funded = fitNode
         ? { ...job.spec.requests }
         : this.clampFunded(
@@ -1779,7 +1799,10 @@ export class MockWorld {
       attemptState: attempt ? attempt.state : null,
       queueRank: job.state.kind === 'Queued' ? (this.queuedRank.get(job.id) ?? null) : null,
       fundingFraction,
-      costUcu: this.totalCharged(job),
+      // Settled net cost once terminal (after the true-up refund); the gross
+      // upfront charge while the job is still holding it.
+      costUcu:
+        this.isTerminal(job) && job.actualUcu != null ? job.actualUcu : this.totalCharged(job),
       outcome: this.isTerminal(job) ? this.lastOutcome(job) : null,
     }
   }
@@ -1930,15 +1953,50 @@ export class MockWorld {
     }
   }
 
-  private costReport(job: MJob): CostReport {
-    const rate = computeRate(job.spec.requests)
-    const runtimeUs = job.spec.maxRuntimeUs ?? DEFAULT_RUNTIME_US
-    const estimatedUcu = Math.round(rate * (runtimeUs / SECOND_US))
+  /**
+   * The upfront-charge model for a job (ADR 0005/0029) — the single source of
+   * every cost number shown. The `max_runtime` window (or the policy default
+   * when the job declared no bound) is priced in full at the effective rate at
+   * placement; the unused tail is (partly) refunded at true-up.
+   */
+  private jobChargeModel(job: MJob) {
+    const terms = rateTerms(job.spec.requests)
+    const base = computeRate(job.spec.requests)
+    const bounded = job.spec.maxRuntimeUs !== null
+    const priorityMultiplier = this.multiplier(job.spec.priority)
+    const unboundedMultiplier = bounded ? 1 : UNBOUNDED_RUNTIME_MULTIPLIER
+    const effectiveRate = base * priorityMultiplier * unboundedMultiplier
+    const chargeWindowUs = job.spec.maxRuntimeUs ?? DEFAULT_CHARGE_RUNTIME_US
+    const upfrontUcu = Math.round(effectiveRate * (chargeWindowUs / SECOND_US))
+    const refundFraction = bounded ? REFUND_FRACTION : 1
     return {
-      rateUcuPerSecond: rate,
-      estimatedUcu,
-      estimateUsedDefaultRuntime: job.spec.maxRuntimeUs === null,
+      base,
+      terms,
+      bounded,
+      priorityMultiplier,
+      unboundedMultiplier,
+      effectiveRate,
+      chargeWindowUs,
+      upfrontUcu,
+      refundFraction,
+    }
+  }
+
+  private costReport(job: MJob): CostReport {
+    const m = this.jobChargeModel(job)
+    return {
+      rateUcuPerSecond: m.base,
+      // Unrounded per-dimension µCU/s: disk weights are sub-µCU/s per GiB, so
+      // rounding here would zero out the disk term and its derived per-unit rate.
+      rateBreakdown: { cpu: m.terms.cpu, memory: m.terms.memory, disk: m.terms.disk },
+      priorityMultiplier: m.priorityMultiplier,
+      unboundedMultiplier: m.unboundedMultiplier,
+      effectiveRateUcuPerSecond: m.effectiveRate,
+      chargeWindowUs: m.chargeWindowUs,
+      chargeWindowIsDefault: job.spec.maxRuntimeUs === null,
+      estimatedUcu: m.upfrontUcu,
       chargedUcu: this.totalCharged(job),
+      refundFraction: m.refundFraction,
       actualUcu: this.isTerminal(job) ? job.actualUcu : null,
       trueUp: this.isTerminal(job) && job.trueUp ? { ...job.trueUp } : null,
     }
