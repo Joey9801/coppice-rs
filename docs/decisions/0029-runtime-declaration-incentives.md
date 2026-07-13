@@ -164,12 +164,18 @@ other's gap: with only the multiplier, declare `max_runtime = 10 years` and
 pay 1.0× with a worthless bound; with only retention, declare nothing and
 pay 1.0× with no bound at all. Together they define a clean break-even. For
 expected runtime `E`, declared bound `M`, multiplier `μ`, refund fraction
-`φ`: declaring prices at `E + (1−φ)(M−E)` against `μE` unbounded, so
-declaring is cheaper exactly when
+`φ`: declaring prices at `E + (1−φ)(M−E)` against `μE` unbounded. For
+`φ < 1`, declaring is strictly cheaper when
 
 ```
 M < E × (1 + (μ−1)/(1−φ))
 ```
+
+indifferent at equality, and dearer beyond. At `φ = 1` (full refund — one
+half of the neutral configuration) the declared price collapses to `E`
+regardless of `M`: declaring beats unbounded whenever `μ > 1` and is
+indifferent when `μ = 1`, i.e. the band is infinite and only the multiplier
+carries the incentive.
 
 At the defaults (`μ = 2.0`, `φ = 0.75`) the price system rewards any bound
 within **5×** of expected runtime, is indifferent at 5×, and prefers honest
@@ -186,11 +192,18 @@ tuning `μ` or `φ` (tightening to 2× with `μ = 1.5`, `φ = 0.5`; widening to
 Stated for property tests, in the style of ADR 0027:
 
 - **(I1) Overdeclaration costs, monotonically.** For a fixed actual runtime
-  and job-attributable outcome, total settled cost is strictly increasing in
-  the declared bound (for `φ < 1`).
-- **(I2) Truth-telling is optimal within the band.** For `M ≤ E(1 + (μ−1)/(1−φ))`,
-  declaring `M` prices below unbounded; at `M = E` it is the cheapest
-  declaration that survives the run.
+  and job-attributable outcome, total settled cost is non-decreasing in the
+  declared bound, and strictly increasing whenever the larger bound retains
+  at least one more µCU through quantization. Exact strictness is not
+  achievable in the implemented arithmetic: ceil-seconds rounding, the
+  fixed-point floors, and saturation all plateau — two bounds within the
+  same rounded second settle identically, as do any two once the charge
+  saturates.
+- **(I2) Truth-telling is optimal within the band.** For `φ < 1`, declaring
+  `M` strictly under `E(1 + (μ−1)/(1−φ))` prices strictly below unbounded,
+  and equality at the threshold is indifferent; for `φ = 1` declaring any
+  `M ≥ E` prices below unbounded whenever `μ > 1`. In all cases `M = E` is
+  the cheapest declaration that survives the run.
 - **(I3) Requeue and platform faults are free of retention.** For any
   `Platform`-class or pre-`Running` resolution, settled cost equals the
   ADR 0019 value bit-for-bit.
