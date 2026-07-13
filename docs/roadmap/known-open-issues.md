@@ -79,8 +79,9 @@ lost to history.
 
 - ~~Add a replicated terminal timestamp, stamped by the command that resolves
   the job terminally. Define its behavior for immediate abort, normal outcome,
-  reconciliation, and node loss.~~ Done — see the `Finalizing` resolution
-  rules in [command-catalog.md](../architecture/command-catalog.md#finalizing-resolution).
+  reconciliation, and node loss.~~ Done — see the attempt-`Terminal`
+  resolution rules in
+  [command-catalog.md](../architecture/command-catalog.md#resolution-on-attempt-terminal).
 - ~~Base eviction eligibility exclusively on that terminal timestamp.~~ Done —
   `due_for_eviction` in housekeeping.
 - Implement a durable, idempotent history store containing the full job,
