@@ -60,8 +60,14 @@ pub enum JobState {
 
 Rules that fall out of the shape:
 
-- **One attempt in flight is structural.** `Attempting` holds exactly one id;
-  there is no second slot to fill and no live state without an attempt.
+- **The job's attempt link is structural.** `Attempting` holds exactly one
+  id; there is no live job state without an attempt and no second slot on the
+  job. The aggregate half of "at most one attempt in flight" — that the
+  attempt map holds no *other* non-terminal attempt for the job — is **not**
+  representational: it is maintained by the apply loop (an attempt only ends
+  through resolution, which requeues or terminates the job in the same apply)
+  and remains a checked invariant in the testkit, keyed off the attempt map
+  so a stray record is caught even if the job's history misses it.
 - **`Attempting(a) → Attempting(b)` is illegal.** A new attempt id only ever
   arrives via `Queued`. The revoke-and-reseat re-plan (ADR 0014) still works:
   within one `CommitPlacements` apply, the revocation resolves the job to
@@ -110,9 +116,12 @@ decode-time cross-field validation. `storage.v1.JobRecord.current_attempt`
 breaking change made under ADR 0003's evolution rules, not around them.
 
 Raft log size and codec cost are unaffected: no command carries a `JobState`
-(commands commit decisions; state is derived by apply). Snapshots shrink
-marginally for live jobs — the id that used to be encoded twice (`state` +
-`current_attempt`) is encoded once.
+(commands commit decisions; state is derived by apply). Snapshots grow
+marginally: a unit state costs ~2 extra bytes as a nested oneof message where
+the flat enum was a bare varint, and a live job's attempt id still appears
+twice — in `Attempting` and in the `attempts` history — so removing
+`current_attempt` moves the duplication rather than eliminating it. Both
+effects are noise after zstd.
 
 ## Consequences
 
@@ -122,7 +131,8 @@ marginally for live jobs — the id that used to be encoded twice (`state` +
   forgetting is a type error.
 - The testkit's job↔attempt invariant table reduces to attempt↔allocation
   combinations; "live job has an attempt" is no longer checkable because it
-  is no longer falsifiable.
+  is no longer falsifiable. The aggregate invariant — no non-terminal attempt
+  for a job other than the one `Attempting` carries — stays runtime-checked.
 - Clients switching on the bare job state see less granularity and must join
   the attempt for detail; the derived phase covers flat-tag consumers.
 - `JobState` equality and the transition table become payload-aware; the one
