@@ -87,10 +87,8 @@ pub(crate) struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListenConfig {
-    /// User/CLI API address. Parsed now; the API server that binds it is a
-    /// later change.
+    /// User/CLI API address: the JSON-over-HTTP client edge (ADR 0031).
     #[serde(default = "default_client_addr")]
-    #[allow(dead_code)]
     pub(crate) client_addr: SocketAddr,
 
     /// Coordinator peer (Raft) traffic address.

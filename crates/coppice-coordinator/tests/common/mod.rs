@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use coppice_consensus::{
     ClusterSummary, Consensus, ConsensusStatus, NodeHandle, OpenraftConsensus, StateViews,
 };
-use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator};
+use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, ClientListener};
 use coppice_coordinator::config::{self, CliOverrides};
 
 /// A test CA plus one issued leaf's PEM material.
@@ -440,6 +440,11 @@ log_level = "warn"
             .expect("agent socket addr");
         let listener = AgentListener::bind(agent_addr, &leaf.cert_pem, &leaf.key_pem, &ca.pem)
             .expect("bind agent listener");
+        // Client API listener on an ephemeral port so parallel tests never
+        // collide on the default.
+        let client_listener = ClientListener::bind("127.0.0.1:0".parse().expect("client addr"))
+            .await
+            .expect("bind client API listener");
 
         let (runtime_shutdown, shutdown_rx) = watch::channel(false);
         let runtime_join = tokio::spawn(bootstrap::serve_runtime(
@@ -447,6 +452,7 @@ log_level = "warn"
             views.clone(),
             event_tap,
             listener,
+            client_listener,
             Some(shutdown_rx),
         ));
 

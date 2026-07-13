@@ -34,16 +34,20 @@ Requires Node ≥ 20.
   (`src/components/ui/`)
 - Recharts for charts; Vitest + Testing Library for tests
 
-## How this ships (future)
+## How this ships
 
 Coppice deploys as a single `coppice` binary, and the public API is
 JSON-over-HTTP on every coordinator replica's `listen.client_addr`
-(default `:7070`). When that listener exists, `web/dist` gets embedded
-into the binary (e.g. `rust-embed`/`include_dir`) and served by the same
-listener: static assets at `/`, SPA fallback to `index.html` for client
-routes, and the JSON API under `/api/v1/...` — so the UI is same-origin
-with the API and needs no CORS. Auth follows the API's SSO (ADRs
-0022/0023); until then the UI is open and logged in as "Demo User".
+(default `:7070`) — ADR 0031, axum router in `crates/coppice-api/src/http/`
+(most read routes still `501` until their endpoints land). The same
+listener serves this app: `web/dist` is embedded via `rust-embed`, with
+static assets at `/`, SPA fallback to `index.html` for client routes, and
+the JSON API under `/api/v1/...` — same-origin, no CORS. Run
+`npm --prefix web run build` and `coppice dev` serves the UI immediately
+(debug builds read `dist/` from disk; release builds embed whatever was
+built at compile time — a real release pipeline must build the web app
+first). Auth follows the API's SSO (ADRs 0022/0023); until then the UI is
+open and logged in as "Demo User".
 
 ## Repo etiquette
 

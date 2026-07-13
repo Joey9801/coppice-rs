@@ -13,7 +13,7 @@ use tonic::transport::Server;
 use coppice_consensus::{Consensus, EventTapReceiver, StateViews};
 use coppice_scheduler::HeuristicScheduler;
 
-use crate::bootstrap::AgentListener;
+use crate::bootstrap::{AgentListener, ClientListener};
 use crate::limits::AGENT_INBOUND_CAPACITY;
 use crate::liveness::NodeLiveness;
 use crate::tasks::agent_gateway::{AgentSessionService, Gateway};
@@ -39,6 +39,7 @@ pub async fn run<C>(
     views: StateViews,
     event_tap: EventTapReceiver,
     agent_listener: AgentListener,
+    client_listener: ClientListener,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -111,11 +112,12 @@ where
         Arc::clone(&consensus),
         views.clone(),
     ));
-    let api_join = tokio::spawn(api_server::run_placeholder(
+    let api_join = tokio::spawn(api_server::run(
+        client_listener,
         control_plane,
         shutdown_rx.clone(),
     ));
-    tracing::debug!("runtime: API control plane up");
+    tracing::debug!("runtime: API server up");
 
     // ---- Leader-only tasks (every replica runs the loop; each self-gates
     // on the status watch per `crate::leadership`) ----

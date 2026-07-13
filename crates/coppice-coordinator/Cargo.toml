@@ -17,6 +17,8 @@ coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
 coppice-api.workspace = true
 anyhow.workspace = true
+# Serves the `coppice_api::http` router on the client listener (ADR 0031).
+axum.workspace = true
 clap.workspace = true
 tokio.workspace = true
 # Wraps the per-session outbound mpsc as a `Stream` for the tonic bidi

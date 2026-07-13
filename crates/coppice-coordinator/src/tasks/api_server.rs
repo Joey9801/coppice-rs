@@ -7,10 +7,9 @@
 //! every replica, including followers: a follower still accepts requests and
 //! maps `ConsensusError::NotLeader` to a redirect, per the trait's contract.
 //!
-//! The HTTP/gRPC listener itself is not built (no axum/hyper dependency
-//! added here); [`run_placeholder`] just holds the real `ControlPlane` impl
-//! and parks on the shutdown watch so it is constructed by production code
-//! and its trait methods stay exercised by the tests below rather than dead.
+//! The HTTP transport is `coppice_api::http` (axum, ADR 0031): [`run`]
+//! serves that router over the bound `listen.client_addr` listener, with
+//! this file owning only the `ControlPlane` implementation behind it.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -183,19 +182,33 @@ fn now_us() -> i64 {
         .unwrap_or(0)
 }
 
-/// Placeholder for the HTTP/gRPC listener that will host [`ControlPlane`].
+/// Serve the public client API (ADR 0031) on the bound listener.
 ///
-/// No transport dependency added yet — see the module doc. Holds the real
-/// `CoordinatorControlPlane` so it is constructed by production code, and
-/// simply parks until shutdown.
-pub async fn run_placeholder<C: Consensus>(
+/// The router (routes, JSON error contract, consistency parameters) lives
+/// in `coppice_api::http`; this task only marries it to this replica's
+/// [`ControlPlane`] and the runtime's shutdown order. Most read routes are
+/// `UNIMPLEMENTED` stubs until their endpoints land — implementing one
+/// swaps a stub handler in `coppice-api`, not anything here.
+pub async fn run<C: Consensus>(
+    listener: crate::bootstrap::ClientListener,
     control_plane: Arc<CoordinatorControlPlane<C>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let _ = control_plane;
-    tracing::debug!("API control plane ready; HTTP transport is not implemented");
-    let _ = shutdown.wait_for(|s| *s).await;
-    tracing::debug!("API control plane shutting down");
+    let app = coppice_api::http::router(control_plane);
+    let graceful = async move {
+        let _ = shutdown.wait_for(|s| *s).await;
+    };
+    tracing::debug!("API server ready");
+    if let Err(e) = axum::serve(listener.into_inner(), app)
+        .with_graceful_shutdown(graceful)
+        .await
+    {
+        // axum::serve only errors on accept-loop failure; the runtime keeps
+        // running (the cluster is still healthy without its API edge) and
+        // the operator sees why the port went dark.
+        tracing::error!(error = %e, "API server terminated with an error");
+    }
+    tracing::debug!("API server shut down");
 }
 
 #[cfg(test)]

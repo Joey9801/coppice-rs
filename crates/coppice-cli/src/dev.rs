@@ -14,10 +14,11 @@
 //! `--data-dir` to keep state across runs (the coordinator restarts from its
 //! manifest stamp and the agent keeps its journal and node identity).
 
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use coppice_agent::config::{CapacityConfig, Config as AgentConfig, TlsConfig as AgentTls};
@@ -25,9 +26,13 @@ use coppice_agent::executor::{DockerExecutor, Executor, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{self, Session};
 use coppice_consensus::fs::RealFs;
-use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator};
+use coppice_consensus::{Consensus, ConsensusError};
+use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, ClientListener};
 use coppice_coordinator::config::{self as coord_config, CliOverrides};
-use coppice_core::id::{ClusterId, NodeId};
+use coppice_core::id::{ClusterId, NodeId, QuotaEntityId};
+use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
+use coppice_state::Command;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -39,6 +44,10 @@ pub struct DevArgs {
     /// path to keep cluster and agent state across runs.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+
+    /// Client API port (0 picks a free one; logged at startup).
+    #[arg(long, default_value_t = 0)]
+    client_port: u16,
 
     /// Agent-gateway port (0 picks a free one; logged at startup).
     #[arg(long, default_value_t = 0)]
@@ -186,6 +195,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
 
     let raft_port = resolve_port(args.raft_port)?;
     let agent_port = resolve_port(args.agent_port)?;
+    let client_port = resolve_port(args.client_port)?;
 
     // -- Coordinator: the production config + bootstrap path. --------------
     let coord_data = root.join("coordinator");
@@ -250,14 +260,27 @@ ca_path = "{ca}"
     )
     .context("binding the dev agent listener")?;
 
+    let client_addr = format!("127.0.0.1:{client_port}")
+        .parse()
+        .expect("client socket addr");
+    let client_listener = ClientListener::bind(client_addr)
+        .await
+        .context("binding the dev client API listener")?;
+
     let (runtime_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let runtime_join = tokio::spawn(bootstrap::serve_runtime(
         Arc::clone(&consensus),
         views.clone(),
         event_tap,
         listener,
+        client_listener,
         Some(shutdown_rx),
     ));
+
+    // Replicated state a dev cluster needs before it can accept a job: a
+    // priority-multiplier table (empty on a fresh cluster by design) and a
+    // quota entity to charge jobs to.
+    let quota_entity = seed_dev_state(consensus.as_ref(), &views).await?;
 
     // -- Agent: in-process, dialing the gateway over localhost. ------------
     let agent_config = AgentConfig {
@@ -311,6 +334,9 @@ ca_path = "{ca}"
             agent_epoch,
             raft_port,
             agent_port,
+            client_port,
+            ui_available: coppice_api::http::ui_available(),
+            quota_entity,
             executor: args.executor,
         })
     );
@@ -362,6 +388,103 @@ async fn run_agent<E: Executor + Clone>(session: Session<RealFs, E>, config: Age
     }
 }
 
+/// The well-known quota entity dev jobs charge to. Fixed rather than minted
+/// so submit examples keep working verbatim across dev clusters.
+const DEV_QUOTA_ENTITY: &str = "quota-00000000-0000-0000-0000-000000000001";
+
+/// Dev priorities `-2..=2` mapped to cost multipliers 0.25×..4× (doubling
+/// per step — monotone in priority, as ADR 0021's ranking expects).
+fn dev_priority_table() -> BTreeMap<i32, PriorityMultiplier> {
+    (-2i32..=2)
+        .map(|p| (p, PriorityMultiplier(1u64 << (32 + p))))
+        .collect()
+}
+
+/// Seed the replicated state a fresh dev cluster needs to accept a job.
+///
+/// A new cluster's policy has an **empty** priority-multiplier table, so
+/// every `SubmitJob` fails synchronous validation until an `UpdatePolicy`
+/// commits. In production that is deliberate: policy is replicated state an
+/// operator configures explicitly through the admin tooling, and the node
+/// config file never seeds it (ADR 0020). Dev has no operator, so propose
+/// the same commands the tooling will use: multipliers for priorities
+/// `-2..=2` and the well-known "dev" quota entity. Each seed is skipped
+/// when already present, so policy or quota edits made against a persistent
+/// `--data-dir` survive restarts.
+async fn seed_dev_state<C: Consensus>(
+    consensus: &C,
+    views: &coppice_consensus::StateViews,
+) -> Result<QuotaEntityId> {
+    let entity: QuotaEntityId = DEV_QUOTA_ENTITY.parse().expect("dev quota entity id");
+    let view = views.latest();
+    let state = view.state();
+
+    if state.policy.priority_multipliers.is_empty() {
+        // UpdatePolicy is a full replacement: change only the table, keep
+        // the booted defaults for everything else.
+        let mut policy = state.policy.clone();
+        policy.priority_multipliers = dev_priority_table();
+        propose_seed(
+            consensus,
+            Command::UpdatePolicy(UpdatePolicy {
+                policy,
+                updated_at_us: now_us(),
+            }),
+            "seeding the dev priority-multiplier table",
+        )
+        .await?;
+    }
+
+    if !state.quota_entities.contains_key(&entity) {
+        propose_seed(
+            consensus,
+            Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+                entity,
+                parent: None,
+                name: "dev".to_string(),
+                // ~1e6 CU: deep enough that dev jobs never starve on quota,
+                // far enough from u64::MAX to stay clear of saturation.
+                quota: CostUnits(1_000_000_000_000),
+                updated_at_us: now_us(),
+            }),
+            "seeding the dev quota entity",
+        )
+        .await?;
+    }
+
+    Ok(entity)
+}
+
+/// Propose one seed command, riding out the single node's initial election
+/// (`NotLeader`/`Timeout` right after bootstrap) for up to 10 seconds.
+async fn propose_seed<C: Consensus>(consensus: &C, command: Command, what: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match consensus.propose(command.clone()).await {
+            Ok(applied) => {
+                applied
+                    .outcome
+                    .with_context(|| format!("{what}: rejected at apply"))?;
+                return Ok(());
+            }
+            Err(e @ (ConsensusError::NotLeader { .. } | ConsensusError::Timeout)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e).context(what.to_string());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(e).context(what.to_string()),
+        }
+    }
+}
+
+fn now_us() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 async fn wait_for_agent(views: &coppice_consensus::StateViews, agent_node: NodeId) -> Result<u64> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -390,6 +513,9 @@ struct ReadySummary<'a> {
     agent_epoch: u64,
     raft_port: u16,
     agent_port: u16,
+    client_port: u16,
+    ui_available: bool,
+    quota_entity: QuotaEntityId,
     executor: DevExecutor,
 }
 
@@ -403,25 +529,33 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
     format!(
         "\nCoppice dev is ready\n\
          \n\
-         \x20 UI              not running (mock UI: http://localhost:5173 after `npm --prefix web run dev`)\n\
-         \x20 API             unavailable (HTTP transport is not implemented yet)\n\
+         \x20 UI              {ui}\n\
+         \x20 API             http://localhost:{client_port}/api/v1 (most reads still 501 UNIMPLEMENTED)\n\
          \x20 Raft/admin      https://localhost:{raft_port} (mTLS)\n\
          \x20 Agent gateway   https://localhost:{agent_port} (mTLS)\n\
          \x20 Data            {data_dir} ({data_lifetime})\n\
          \x20 Executor        {executor}\n\
          \x20 Cluster         {cluster_id} (Raft node {coordinator_raft_id})\n\
          \x20 Agent           {agent_node} (registered, epoch {agent_epoch})\n\
+         \x20 Quota entity    {quota_entity} (\"dev\", seeded; priorities -2..=2)\n\
          \n\
          \x20 Local development only: authentication is effectively disabled.\n\
          \x20 Press Ctrl-C to stop.\n",
+        ui = if summary.ui_available {
+            format!("http://localhost:{}/", summary.client_port)
+        } else {
+            "not built (`npm --prefix web run build`, then restart)".to_string()
+        },
         raft_port = summary.raft_port,
         agent_port = summary.agent_port,
+        client_port = summary.client_port,
         data_dir = summary.root.display(),
         executor = summary.executor,
         cluster_id = summary.cluster_id,
         coordinator_raft_id = summary.coordinator_raft_id,
         agent_node = summary.agent_node,
         agent_epoch = summary.agent_epoch,
+        quota_entity = summary.quota_entity,
     )
 }
 
@@ -444,17 +578,23 @@ mod tests {
             agent_epoch: 1,
             raft_port: 7071,
             agent_port: 7072,
+            client_port: 7070,
+            ui_available: false,
+            quota_entity: DEV_QUOTA_ENTITY.parse().expect("quota entity id"),
             executor: DevExecutor::Fake,
         });
 
         assert!(summary.starts_with("\nCoppice dev is ready\n\n"));
-        assert!(summary.contains("UI              not running"));
-        assert!(summary.contains("API             unavailable"));
+        assert!(summary.contains("UI              not built"));
+        assert!(summary.contains("API             http://localhost:7070/api/v1"));
         assert!(summary.contains("Raft/admin      https://localhost:7071 (mTLS)"));
         assert!(summary.contains("Agent gateway   https://localhost:7072 (mTLS)"));
         assert!(summary.contains("/tmp/coppice-dev (temporary; deleted on exit)"));
         assert!(summary.contains(
             "Agent           node-00000000-0000-0000-0000-000000000002 (registered, epoch 1)"
         ));
+        assert!(summary.contains(&format!(
+            "Quota entity    {DEV_QUOTA_ENTITY} (\"dev\", seeded; priorities -2..=2)"
+        )));
     }
 }

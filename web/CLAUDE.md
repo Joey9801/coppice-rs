@@ -53,11 +53,18 @@ All run from `web/`:
 
 ## How to replace a mock endpoint with a real one
 
-This is the intended path for future sessions, one endpoint at a time:
+This is the intended path for future sessions, one endpoint at a time.
+The server-side contract (route table, consistency params, error codes,
+proto3-JSON conventions) is fixed by ADR 0031
+(`docs/decisions/0031-http-api-surface.md`); the axum router in
+`crates/coppice-api/src/http/` already routes every endpoint below, with
+unimplemented ones answering `501 UNIMPLEMENTED`:
 
-1. Define/confirm the real endpoint (proto message + `service` in
-   `proto/coppice/api/v1/api.proto`, JSON-at-the-edge per ADR 0003) and
-   its handler on the coordinator.
+1. Define/confirm the real endpoint's messages in
+   `proto/coppice/api/v1/` (JSON-at-the-edge per ADR 0003/0031; response
+   shape mirrors this repo's `src/api/types.ts`) and swap its stub
+   handler in `crates/coppice-api/src/http/routes.rs` for a real one
+   backed by the coordinator.
 2. Add the method to the real client (create `src/api/real-client.ts`
    implementing part of `CoppiceApi` with `fetch` against `/api/v1/...`
    when the first endpoint lands). The real client owns wire mapping:
