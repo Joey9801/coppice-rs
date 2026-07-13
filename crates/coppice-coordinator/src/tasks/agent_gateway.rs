@@ -229,7 +229,7 @@ async fn run_manager(
             }
         }
     }
-    tracing::info!("agent gateway: shutting down, dropping sessions");
+    tracing::debug!("agent gateway shutting down; dropping sessions");
     // Dropping `sessions` here closes every outbound channel.
 }
 

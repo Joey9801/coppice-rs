@@ -183,7 +183,7 @@ impl AgentListener {
 
         let incoming = TcpIncoming::new(addr, true, None)
             .map_err(|e| anyhow!("binding agent gateway listener on {addr}: {e}"))?;
-        tracing::info!(%addr, "bootstrap: agent gateway listener bound");
+        tracing::info!(%addr, "agent gateway mTLS listener bound");
 
         Ok(AgentListener { incoming, tls })
     }
@@ -312,7 +312,7 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
             })
             .await
     });
-    tracing::info!(addr = %raft_addr, "bootstrap: raft/admin mTLS server up");
+    tracing::info!(addr = %raft_addr, "raft/admin mTLS listener bound");
 
     Ok(BootedCoordinator {
         consensus,

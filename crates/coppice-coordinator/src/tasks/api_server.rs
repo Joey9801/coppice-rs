@@ -193,9 +193,9 @@ pub async fn run_placeholder<C: Consensus>(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let _ = control_plane;
-    tracing::info!("api server: placeholder listening (no HTTP transport wired yet)");
+    tracing::debug!("API control plane ready; HTTP transport is not implemented");
     let _ = shutdown.wait_for(|s| *s).await;
-    tracing::info!("api server: shutting down");
+    tracing::debug!("API control plane shutting down");
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ pub async fn run<C, S>(
         let Some(term) = leadership::wait_for_leadership(&mut status, &mut shutdown).await else {
             return;
         };
-        tracing::info!(term, "scheduler driver: gained leadership");
+        tracing::info!(term, "coordinator gained scheduling leadership");
 
         loop {
             let view = views.latest();

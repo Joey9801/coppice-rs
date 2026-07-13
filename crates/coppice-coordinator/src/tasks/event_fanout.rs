@@ -268,7 +268,7 @@ async fn run(
             }
         }
     }
-    tracing::info!("event fanout: shutting down");
+    tracing::debug!("event fanout shutting down");
     // Dropping `subscribers` here closes every subscription's channel.
 }
 

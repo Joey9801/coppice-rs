@@ -49,7 +49,7 @@ pub async fn run<C: Consensus>(
         let Some(term) = leadership::wait_for_leadership(&mut status, &mut shutdown).await else {
             return;
         };
-        tracing::info!(term, "dispatch: gained leadership");
+        tracing::debug!(term, "dispatch: gained leadership");
 
         // Subscribe BEFORE resyncing (module doc): the live subscription
         // covers everything applied after it registers, the strong resync
