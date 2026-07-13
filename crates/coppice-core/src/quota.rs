@@ -238,7 +238,29 @@ impl PriorityMultiplier {
     pub fn from_integer(n: u32) -> PriorityMultiplier {
         PriorityMultiplier((n as u64) << 32)
     }
+
+    /// Compose two Q32.32 multipliers (saturating). Used at placement to fold
+    /// the policy's unbounded-runtime multiplier into a job's effective
+    /// multiplier (ADR 0029); everything downstream — charge, true-up,
+    /// surcharge — then prices at the folded rate with no further arithmetic.
+    pub fn saturating_mul(self, other: PriorityMultiplier) -> PriorityMultiplier {
+        let scaled = (self.0 as u128).saturating_mul(other.0 as u128) >> 32;
+        PriorityMultiplier(u64::try_from(scaled).unwrap_or(u64::MAX))
+    }
 }
+
+/// A refund fraction of exactly 1: true-up returns the entire unused charge
+/// (the pre-ADR 0029 behaviour, and still the rule for platform-attributable
+/// outcomes, attempts that never ran, and jobs with no declared bound).
+pub const FULL_REFUND_MILLI: u32 = 1000;
+
+/// Default refund fraction: 750 milli (ADR 0029). With the default 2.0×
+/// unbounded-runtime multiplier this prices declared bounds cheaper than
+/// unbounded up to 5× the expected runtime.
+pub const DEFAULT_REFUND_FRACTION_MILLI: u32 = 750;
+
+/// Default unbounded-runtime multiplier: 2.0 in Q32.32 (ADR 0029).
+pub const DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER: PriorityMultiplier = PriorityMultiplier(2 << 32);
 
 /// The cost *rate* of a resource request, in µCU per second: the weighted sum
 /// over dimensions, each term `⌊quantity · weight / 2³²⌋`, saturating.
@@ -297,6 +319,12 @@ pub struct ChargeRecord {
     pub amount: CostUnits,
     /// Timestamp of the placement command that charged it (Unix µs).
     pub charged_at_us: i64,
+    /// Parts-per-thousand of the unused charge that a retaining true-up
+    /// refunds (ADR 0029). Captured from policy at charge time — a mid-flight
+    /// policy edit never reprices — and recorded as [`FULL_REFUND_MILLI`]
+    /// when the job declared no `max_runtime`, since the synthetic default
+    /// runtime is the platform's estimate, not the user's claim.
+    pub refund_fraction_milli: u32,
 }
 
 /// A true-up adjustment, applied to every ancestor via [`UsageState::settle`].
@@ -318,15 +346,29 @@ pub enum TrueUp {
 /// `Revoked`, which is only legal while accruing — has actual cost zero and
 /// gets the full (decayed) charge back, which is what makes revocation
 /// requeue free without a special case.
+///
+/// `retain` says whether the charge record's refund fraction applies
+/// (ADR 0029): true only for a job-attributable outcome of an attempt that
+/// ran. With `retain == false`, or a recorded fraction of
+/// [`FULL_REFUND_MILLI`], the refund is the entire unused charge and the
+/// result is bit-identical to the pre-ADR 0029 arithmetic.
 pub fn true_up(
     charge: &ChargeRecord,
     actual_cost: CostUnits,
     resolved_at_us: i64,
     policy: &DecayPolicy,
+    retain: bool,
 ) -> TrueUp {
     if actual_cost <= charge.amount {
         let unused = charge.amount.saturating_sub(actual_cost);
-        TrueUp::Refund(policy.decay_between(unused, charge.charged_at_us, resolved_at_us))
+        let f = if retain {
+            charge.refund_fraction_milli.min(FULL_REFUND_MILLI)
+        } else {
+            FULL_REFUND_MILLI
+        };
+        // Product ≤ u64::MAX × 1000 fits u128; the quotient fits u64.
+        let refundable = CostUnits((unused.0 as u128 * f as u128 / 1000) as u64);
+        TrueUp::Refund(policy.decay_between(refundable, charge.charged_at_us, resolved_at_us))
     } else {
         TrueUp::Surcharge(actual_cost.saturating_sub(charge.amount))
     }
@@ -467,12 +509,14 @@ mod tests {
         let record = ChargeRecord {
             amount: charged,
             charged_at_us: charged_at,
+            refund_fraction_milli: FULL_REFUND_MILLI,
         };
         let adjustment = true_up(
             &record,
             actual,
             charged_at + 86_400_000_000,
             &DecayPolicy::DEFAULT,
+            false,
         );
         assert_eq!(adjustment, TrueUp::Refund(CostUnits(40_499_999_487)));
     }
@@ -482,8 +526,15 @@ mod tests {
         let record = ChargeRecord {
             amount: CostUnits(1000),
             charged_at_us: 0,
+            refund_fraction_milli: FULL_REFUND_MILLI,
         };
-        let adjustment = true_up(&record, CostUnits(1010), 60_000_000, &DecayPolicy::DEFAULT);
+        let adjustment = true_up(
+            &record,
+            CostUnits(1010),
+            60_000_000,
+            &DecayPolicy::DEFAULT,
+            true,
+        );
         assert_eq!(adjustment, TrueUp::Surcharge(CostUnits(10)));
     }
 
@@ -495,10 +546,11 @@ mod tests {
         let record = ChargeRecord {
             amount: CostUnits(1_000_000_000_000),
             charged_at_us: 0,
+            refund_fraction_milli: FULL_REFUND_MILLI,
         };
         let resolved_at = 86_400_000_000; // one half-life
         assert_eq!(
-            true_up(&record, CostUnits::ZERO, resolved_at, &p),
+            true_up(&record, CostUnits::ZERO, resolved_at, &p, false),
             TrueUp::Refund(p.decay_between(record.amount, 0, resolved_at))
         );
     }
@@ -559,5 +611,79 @@ mod tests {
         assert_eq!(p.tick_index(-1), -1);
         assert_eq!(p.tick_index(-60_000_000), -1);
         assert_eq!(p.tick_index(-60_000_001), -2);
+    }
+
+    #[test]
+    fn saturating_mul_is_identity_at_one_and_composes_integers() {
+        let three = PriorityMultiplier::from_integer(3);
+        assert_eq!(PriorityMultiplier::ONE.saturating_mul(three), three);
+        assert_eq!(three.saturating_mul(PriorityMultiplier::ONE), three);
+        assert_eq!(
+            PriorityMultiplier::from_integer(2).saturating_mul(three),
+            PriorityMultiplier::from_integer(6)
+        );
+        // The default 2.0× unbounded multiplier doubles a base multiplier.
+        assert_eq!(
+            three.saturating_mul(DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER),
+            PriorityMultiplier::from_integer(6)
+        );
+    }
+
+    #[test]
+    fn saturating_mul_pins_at_max_instead_of_wrapping() {
+        assert_eq!(
+            PriorityMultiplier(u64::MAX).saturating_mul(PriorityMultiplier::from_integer(2)),
+            PriorityMultiplier(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn retaining_true_up_floors_the_refundable_fraction() {
+        // Resolved at charge time: no decay, so the refund is exactly the
+        // floored refundable fraction of the unused charge.
+        let record = ChargeRecord {
+            amount: CostUnits(100),
+            charged_at_us: 0,
+            refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
+        };
+        // unused = 100, ⌊100 × 750 / 1000⌋ = 75 refunded, 25 retained.
+        assert_eq!(
+            true_up(&record, CostUnits::ZERO, 0, &DecayPolicy::DEFAULT, true),
+            TrueUp::Refund(CostUnits(75))
+        );
+        // A fraction that does not divide evenly floors: ⌊7 × 333 / 1000⌋ = 2.
+        let odd = ChargeRecord {
+            amount: CostUnits(7),
+            charged_at_us: 0,
+            refund_fraction_milli: 333,
+        };
+        assert_eq!(
+            true_up(&odd, CostUnits::ZERO, 0, &DecayPolicy::DEFAULT, true),
+            TrueUp::Refund(CostUnits(2))
+        );
+    }
+
+    #[test]
+    fn refund_fraction_clamps_at_full_and_retain_false_ignores_it() {
+        // A record fraction above 1000 clamps to a full refund.
+        let over = ChargeRecord {
+            amount: CostUnits(100),
+            charged_at_us: 0,
+            refund_fraction_milli: 5000,
+        };
+        assert_eq!(
+            true_up(&over, CostUnits::ZERO, 0, &DecayPolicy::DEFAULT, true),
+            TrueUp::Refund(CostUnits(100))
+        );
+        // retain = false ignores the recorded fraction entirely.
+        let partial = ChargeRecord {
+            amount: CostUnits(100),
+            charged_at_us: 0,
+            refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
+        };
+        assert_eq!(
+            true_up(&partial, CostUnits::ZERO, 0, &DecayPolicy::DEFAULT, false),
+            TrueUp::Refund(CostUnits(100))
+        );
     }
 }

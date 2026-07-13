@@ -8,7 +8,7 @@
 
 use coppice_core::quota::{
     job_cost, penalty, true_up, ChargeRecord, CostUnits, CostWeights, DecayPolicy,
-    PriorityMultiplier, UsageState,
+    PriorityMultiplier, TrueUp, UsageState, FULL_REFUND_MILLI,
 };
 use coppice_core::resource::Resources;
 use proptest::prelude::*;
@@ -27,6 +27,35 @@ fn valid_policy() -> impl Strategy<Value = DecayPolicy> {
 /// elapsed tick counts stay in the tens of thousands.
 const TS_BASE: i64 = 1_760_000_000_000_000;
 const TS_SPAN: i64 = 1_000_000_000_000; // ~11.6 days
+
+/// The pre-ADR 0029 true-up, reimplemented independently: the entire unused
+/// charge, decayed, comes back. The retention arithmetic must reduce to this
+/// bit-for-bit whenever it does not retain (ADR 0029 I2/I3).
+fn reference_full_refund(
+    charge: &ChargeRecord,
+    actual_cost: CostUnits,
+    resolved_at_us: i64,
+    policy: &DecayPolicy,
+) -> CostUnits {
+    let unused = charge.amount.saturating_sub(actual_cost);
+    policy.decay_between(unused, charge.charged_at_us, resolved_at_us)
+}
+
+/// The cost that settles into usage for a retaining true-up, evaluated with no
+/// decay (resolution at charge time) so the retained amount is exact: the
+/// charge minus the refund on the `A ≤ C` path, or the actual on the surcharge
+/// path. Used by the monotonicity properties (ADR 0029 I1/I4).
+fn settled_undecayed(amount: u64, actual: u64, refund_fraction_milli: u32) -> u64 {
+    let record = ChargeRecord {
+        amount: CostUnits(amount),
+        charged_at_us: 0,
+        refund_fraction_milli,
+    };
+    match true_up(&record, CostUnits(actual), 0, &DecayPolicy::DEFAULT, true) {
+        TrueUp::Refund(r) => amount - r.0,
+        TrueUp::Surcharge(s) => amount + s.0,
+    }
+}
 
 proptest! {
     /// The composition invariant, at tick granularity, for arbitrary valid
@@ -119,6 +148,8 @@ proptest! {
         policy in valid_policy(),
         ts in TS_BASE..TS_BASE + TS_SPAN,
         charge2 in any::<u64>(),
+        refund_fraction in any::<u32>(),
+        retain in any::<bool>(),
     ) {
         let requests = Resources { cpu_millis: cpu, memory_bytes: memory, disk_bytes: disk };
         let weights = CostWeights {
@@ -133,8 +164,14 @@ proptest! {
         state.charge(CostUnits(charge2), ts, &policy);
         prop_assert!(state.usage <= CostUnits::MAX);
 
-        let record = ChargeRecord { amount: cost, charged_at_us: ts };
-        let adjustment = true_up(&record, CostUnits(charge2), ts + 1, &policy);
+        // The fraction is deliberately unclamped: true-up must tolerate any
+        // recorded value however extreme.
+        let record = ChargeRecord {
+            amount: cost,
+            charged_at_us: ts,
+            refund_fraction_milli: refund_fraction,
+        };
+        let adjustment = true_up(&record, CostUnits(charge2), ts + 1, &policy, retain);
         state.settle(adjustment, ts + 1, &policy);
         // Refunds saturate at zero: usage can never underflow.
         state.refund(CostUnits::MAX, ts + 2, &policy);
@@ -182,5 +219,90 @@ proptest! {
             "fixed {fixed} exceeds reference {reference} beyond slack {slack}");
         prop_assert!(reference - fixed <= floor_drift + slack,
             "fixed {fixed} lags reference {reference} beyond drift {floor_drift} + slack {slack}");
+    }
+
+    /// (I2)/(I3) ADR 0029: retention reduces to the pre-change arithmetic
+    /// bit-for-bit whenever it does not retain — a full refund of the unused
+    /// charge. Two ways to not retain: `retain = false` (any recorded
+    /// fraction, e.g. a platform outcome or an attempt that never ran, I3), or
+    /// a recorded fraction of exactly 1000 (I2). Both must equal the
+    /// independent reference on the whole `A ≤ C` refund path.
+    #[test]
+    fn not_retaining_reproduces_pre_adr0029_refund(
+        amount in any::<u64>(),
+        actual in any::<u64>(),
+        fraction in any::<u32>(),
+        policy in valid_policy(),
+        charged_at in TS_BASE..TS_BASE + TS_SPAN,
+        elapsed in 0i64..TS_SPAN,
+    ) {
+        // Constrain to the refund regime the reference covers (A ≤ C); the
+        // surcharge path carries no fraction and is exercised elsewhere.
+        let actual = CostUnits(actual.min(amount));
+        let resolved = charged_at + elapsed;
+        let reference = reference_full_refund(
+            &ChargeRecord { amount: CostUnits(amount), charged_at_us: charged_at, refund_fraction_milli: FULL_REFUND_MILLI },
+            actual,
+            resolved,
+            &policy,
+        );
+
+        // I3: retain = false ignores the recorded fraction entirely.
+        let any_fraction = ChargeRecord { amount: CostUnits(amount), charged_at_us: charged_at, refund_fraction_milli: fraction };
+        prop_assert_eq!(
+            true_up(&any_fraction, actual, resolved, &policy, false),
+            TrueUp::Refund(reference)
+        );
+        // I2: a recorded fraction of 1000 is a full refund even when retaining.
+        let full = ChargeRecord { amount: CostUnits(amount), charged_at_us: charged_at, refund_fraction_milli: FULL_REFUND_MILLI };
+        prop_assert_eq!(
+            true_up(&full, actual, resolved, &policy, true),
+            TrueUp::Refund(reference)
+        );
+    }
+
+    /// (I1) ADR 0029: for a fixed actual cost and a retaining outcome, the
+    /// settled cost is non-decreasing in the declared charge, and strictly
+    /// increasing once the extra declaration retains at least one whole µCU
+    /// (which needs `f < 1000`). Evaluated undecayed so the retained amount is
+    /// exact.
+    #[test]
+    fn settled_cost_is_monotone_in_declared_charge(
+        actual in any::<u64>(),
+        gap1 in 0u64..=2_000_000_000_000,
+        gap2 in 0u64..=2_000_000_000_000,
+        f in 0u32..=FULL_REFUND_MILLI,
+    ) {
+        // Two declared charges, both ≥ the fixed actual (the refund regime).
+        let c1 = actual.saturating_add(gap1);
+        let c2 = c1.saturating_add(gap2);
+        let s1 = settled_undecayed(c1, actual, f);
+        let s2 = settled_undecayed(c2, actual, f);
+        prop_assert!(s2 >= s1, "settled {s2} < {s1} for c2 {c2} ≥ c1 {c1}");
+        // The retained slice of the added charge is (c2 − c1)(1000 − f)/1000;
+        // once that reaches a whole µCU the settled cost must strictly rise.
+        let retained_extra = (c2 as u128 - c1 as u128) * (FULL_REFUND_MILLI - f) as u128;
+        if retained_extra >= 1000 {
+            prop_assert!(s2 > s1, "settled {s2} not > {s1} despite retained extra");
+        }
+    }
+
+    /// (I4) ADR 0029: aborting earlier never costs more. For a fixed declared
+    /// charge and fraction, the settled cost is non-decreasing in the actual
+    /// consumed cost, so a smaller actual (an earlier abort) settles no higher.
+    #[test]
+    fn aborting_earlier_never_costs_more(
+        amount in any::<u64>(),
+        a_hi in any::<u64>(),
+        below in any::<u64>(),
+        f in 0u32..=FULL_REFUND_MILLI,
+    ) {
+        // a_lo ≤ a_hi ≤ amount: both on the refund path.
+        let a_hi = a_hi.min(amount);
+        let a_lo = a_hi.saturating_sub(below);
+        prop_assert!(
+            settled_undecayed(amount, a_lo, f) <= settled_undecayed(amount, a_hi, f),
+            "earlier abort (actual {a_lo}) settled above later (actual {a_hi})"
+        );
     }
 }

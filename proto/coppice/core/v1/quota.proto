@@ -54,6 +54,11 @@ message ChargeRecord {
   uint64 amount_ucu = 1;
   // Timestamp of the placement command that charged it (Unix µs).
   int64 charged_at_us = 2;
+  // Parts-per-thousand of the unused charge that true-up refunds, captured
+  // at charge time so a mid-flight policy edit never reprices (ADR 0029).
+  // Explicit presence: absent decodes to 1000 (full refund) — a charge
+  // recorded before ADR 0029 trues up with a full refund, as it did then.
+  optional uint32 refund_fraction_milli = 3;
 }
 
 // Maps one user-facing priority to its Q32.32 cost multiplier. Part of the
@@ -85,4 +90,15 @@ message PolicyConfig {
   int64 terminal_retention_us = 7;
   // Default SIGTERM→SIGKILL grace for aborts, microseconds.
   int64 abort_grace_us = 8;
+  // Q32.32 multiplier folded into a job's effective priority multiplier when
+  // it declares no enforced max_runtime, pricing unbounded jobs at an
+  // elevated rate (ADR 0029). Explicit presence: absent decodes to the
+  // neutral 2^32 (i.e. 1.0), so a policy written by a pre-0029 coordinator
+  // round-trips to the old behaviour.
+  optional uint64 unbounded_runtime_multiplier_q32_32 = 9;
+  // Parts-per-thousand of a bounded job's unused charge that true-up refunds
+  // (ADR 0029); the remainder stays in decayed usage as the cost of
+  // overdeclaration. Explicit presence: absent decodes to the neutral 1000
+  // (full refund), so a pre-0029 policy round-trips to the old behaviour.
+  optional uint32 refund_fraction_milli = 10;
 }
