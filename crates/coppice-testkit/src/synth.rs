@@ -815,6 +815,24 @@ pub fn check_consistency(sm: &StateMachine) {
         "accrual_queue must match Accruing allocations exactly"
     );
 
+    // Aggregate half of "at most one attempt in flight per job" (ADR 0030):
+    // the job's own link is structural (`Attempting(id)` can't disagree with
+    // itself), but nothing about the representation stops the attempt map
+    // from holding a *second* non-terminal attempt for the same job — that
+    // is left as a runtime invariant the apply loop is responsible for
+    // maintaining, and checked here keyed off the attempt map (not
+    // `jr.attempts`) so a stray record missing from the job's history is
+    // still caught.
+    let mut live_attempts_by_job: BTreeMap<JobId, Vec<AttemptId>> = BTreeMap::new();
+    for (aid, ar) in &sm.attempts {
+        if !ar.attempt.state.is_terminal() {
+            live_attempts_by_job
+                .entry(ar.attempt.job)
+                .or_default()
+                .push(*aid);
+        }
+    }
+
     for (job_id, jr) in &sm.jobs {
         // The old "live states have Some, queued/terminal have None" checks are
         // gone: after ADR 0030 the current attempt *is* the `Attempting(id)`
@@ -866,6 +884,27 @@ pub fn check_consistency(sm: &StateMachine) {
                 "illegal live combo for job {job_id}: attempt={:?} allocation={:?}",
                 ar.attempt.state, alloc.allocation.state
             );
+        }
+
+        // Aggregate check: the set of non-terminal attempts belonging to
+        // this job must be exactly `{cur}` when `Attempting(cur)`, empty
+        // otherwise. See the comment above `live_attempts_by_job`.
+        let live = live_attempts_by_job.get(job_id).map_or(&[][..], |v| &v[..]);
+        match jr.state.attempt() {
+            Some(cur) => {
+                for &other in live {
+                    assert!(
+                        other == cur,
+                        "job {job_id} is Attempting({cur}) but attempt {other} is also non-terminal for it"
+                    );
+                }
+            }
+            None => {
+                assert!(
+                    live.is_empty(),
+                    "job {job_id} is not Attempting but has non-terminal attempt(s) {live:?}"
+                );
+            }
         }
     }
 
