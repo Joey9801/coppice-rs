@@ -54,16 +54,18 @@ fn submit_runtime_us(
 }
 
 /// Apply a proposal through real commands and return the applied result, plus
-/// the ids that were minted for each placement (in order).
+/// the (attempt, allocation) ids that were minted for each placement (in
+/// order).
 fn commit(
     sm: &mut StateMachine,
     proposal: &PlacementProposal,
-) -> Result<Vec<coppice_core::id::AllocationId>, coppice_state::RejectionReason> {
+) -> Result<Vec<(coppice_core::id::AttemptId, coppice_core::id::AllocationId)>, coppice_state::RejectionReason>
+{
     let mut minted = Vec::new();
     let mut mint = minter();
     let cmd = proposal.to_commit_placements(&mut || {
         let ids = mint();
-        minted.push(ids.1);
+        minted.push(ids);
         ids
     });
     sm.apply(&coppice_state::Command::CommitPlacements(cmd))?;
@@ -95,12 +97,13 @@ fn seats_a_fitting_job_and_emits_the_v1_shape() {
     assert_eq!(cmd.expected_version, proposal.against_version);
     assert_eq!(cmd.proposed_at_us, proposal.now_us);
 
-    let allocs = commit(&mut sm, &proposal).expect("batch applies");
+    let minted = commit(&mut sm, &proposal).expect("batch applies");
+    let (attempt, alloc) = minted[0];
     assert_eq!(
-        sm.allocations[&allocs[0]].allocation.state,
+        sm.allocations[&alloc].allocation.state,
         AllocationState::Funded
     );
-    assert_eq!(sm.jobs[&jid(1)].state, JobState::Preparing);
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Attempting(attempt));
 }
 
 #[test]
@@ -238,9 +241,9 @@ fn accrual_opening_respects_the_cap_k() {
     );
     assert!(proposal.placements.iter().all(|p| !p.expect_funded));
 
-    let allocs = commit(&mut sm, &proposal).expect("K-respecting batch applies");
-    assert_eq!(allocs.len(), 2);
-    for a in &allocs {
+    let minted = commit(&mut sm, &proposal).expect("K-respecting batch applies");
+    assert_eq!(minted.len(), 2);
+    for (_, a) in &minted {
         assert_eq!(
             sm.allocations[a].allocation.state,
             AllocationState::Accruing
