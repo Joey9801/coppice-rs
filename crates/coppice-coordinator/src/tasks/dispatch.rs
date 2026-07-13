@@ -160,7 +160,7 @@ async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &R
         .jobs
         .values()
         .filter(|job| job.spec.abort_requested.is_some())
-        .filter_map(|job| job.current_attempt)
+        .filter_map(|job| job.current_attempt())
         .filter_map(|attempt_id| view.state().attempts.get(&attempt_id))
         .filter(|record| {
             matches!(

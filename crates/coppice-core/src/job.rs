@@ -1,15 +1,22 @@
 //! Job definition and lifecycle.
 //!
 //! The job machine is deliberately coarse and user-visible; all execution
-//! detail lives on the [`crate::attempt::Attempt`]. Retries mint a new
-//! `AttemptId` and return the job to [`JobState::Queued`]; an abort is the
-//! [`Job::abort_requested`] flag, not a distinct state, and every attempt end
-//! funnels through [`JobState::Finalizing`] where outcome, retry, and abort
-//! are resolved in one place. Decided in
+//! detail lives on the [`crate::attempt::Attempt`]. Its one live-execution
+//! state, [`JobState::Attempting`], *carries* the attempt it points at, so the
+//! job↔attempt link is the state itself rather than a field beside it: there
+//! is no second attempt slot to fill and no live state without an attempt, and
+//! `Attempting(a) → Attempting(b)` is illegal — a fresh `AttemptId` only ever
+//! arrives by way of [`JobState::Queued`]. Retries return the job to `Queued`;
+//! an abort is the [`Job::abort_requested`] flag, not a distinct state. There
+//! is no job-level `Finalizing`: the window between an attempt's exit and its
+//! recorded outcome is honestly `Attempting(id)` with the attempt in
+//! `Finalizing`, and once the attempt reaches `Terminal` resolution (outcome,
+//! retry, abort) completes atomically in the same apply. Decided in
+//! `docs/decisions/0030-structural-job-attempt-link.md`, amending
 //! `docs/decisions/0013-job-attempt-allocation-state-machines.md`; the
 //! transition table lives in `docs/lifecycle/job-lifecycle.md`.
 
-use crate::id::{JobId, QuotaEntityId};
+use crate::id::{AttemptId, JobId, QuotaEntityId};
 use crate::resource::Resources;
 
 /// A job as submitted by a user, plus the metadata needed to schedule it.
@@ -86,8 +93,11 @@ pub struct AbortRequest {
 /// The lifecycle state of a job.
 ///
 /// Authoritative, Raft-replicated state. Coarse by design: it stays stable
-/// while the attempt machine evolves (accrual now, gang barriers later). UIs
-/// join this with the live attempt's state for detail.
+/// while the attempt machine evolves (accrual now, gang barriers later). The
+/// single live-execution state, [`JobState::Attempting`], carries the id of
+/// the attempt in flight; UIs join that attempt's own state for detail
+/// (preparing/running/finalizing distinctions live on the attempt now, per
+/// ADR 0030).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     /// Recorded durably; awaiting admission evaluation.
@@ -96,14 +106,11 @@ pub enum JobState {
     Accepted,
     /// Waiting, unpinned. Ordered by effective score, not arrival.
     Queued,
-    /// An attempt exists but is not yet running (accruing, ready, or
-    /// dispatching).
-    Preparing,
-    /// The attempt's container is running.
-    Running,
-    /// The attempt ended or its exit was observed; the coordinator is
-    /// resolving outcome, retry policy, and any abort request.
-    Finalizing,
+    /// An attempt is in flight — the id it carries is the single attempt this
+    /// job is pursuing (accruing, ready, dispatching, running, or finalizing;
+    /// the attempt's own state carries that detail). "At most one attempt in
+    /// flight" is structural: there is no second slot (ADR 0030).
+    Attempting(AttemptId),
     /// Terminal: the final attempt exited successfully.
     Succeeded,
     /// Terminal: failed and retries are exhausted or inapplicable.
@@ -125,20 +132,34 @@ impl JobState {
         )
     }
 
+    /// The attempt this job points at, if any — `Some` only while
+    /// [`Attempting`](JobState::Attempting).
+    ///
+    /// A *derived* view of the state that cannot disagree with it (ADR 0030):
+    /// there is no separate `current_attempt` field to fall out of sync.
+    pub fn attempt(self) -> Option<AttemptId> {
+        match self {
+            JobState::Attempting(id) => Some(id),
+            _ => None,
+        }
+    }
+
     /// The legal transition table from `docs/lifecycle/job-lifecycle.md`.
     ///
-    /// The state machine rejects any edge not listed here.
+    /// The state machine rejects any edge not listed here. Equality is
+    /// payload-aware, and the table is deliberately so: `Attempting(a) →
+    /// Attempting(b)` is illegal even for `a == b`, because a new attempt id
+    /// only ever arrives via `Queued` (ADR 0030).
     pub fn may_transition_to(self, next: JobState) -> bool {
         use JobState::*;
         match (self, next) {
             // Forward path.
-            (Submitted, Accepted) | (Accepted, Queued) | (Queued, Preparing) => true,
-            (Preparing, Running) | (Running, Finalizing) => true,
-            // Attempt ended before running (abort, revocation, pull/start
-            // failure): still funnels through finalization.
-            (Preparing, Finalizing) => true,
-            // Resolution: terminal outcome, or retry with a fresh attempt.
-            (Finalizing, Succeeded | Failed | Aborted | Queued) => true,
+            (Submitted, Accepted) | (Accepted, Queued) => true,
+            (Queued, Attempting(_)) => true,
+            // Resolution at the attempt's terminal: outcome, or retry — which
+            // returns to Queued so the next attempt gets a fresh id. No
+            // Attempting → Attempting edge.
+            (Attempting(_), Succeeded | Failed | Aborted | Queued) => true,
             // Abort with no live attempt is immediate.
             (Submitted | Accepted | Queued, Aborted) => true,
             _ => false,
@@ -149,15 +170,26 @@ impl JobState {
 #[cfg(test)]
 mod tests {
     use super::JobState::{self, *};
+    use crate::id::AttemptId;
+    use uuid::Uuid;
 
-    const ALL: [JobState; 9] = [
-        Submitted, Accepted, Queued, Preparing, Running, Finalizing, Succeeded, Failed, Aborted,
-    ];
+    fn att(n: u128) -> JobState {
+        Attempting(AttemptId(Uuid::from_u128(n)))
+    }
 
     #[test]
     fn terminal_states_have_no_exits() {
+        let all = [
+            Submitted,
+            Accepted,
+            Queued,
+            att(1),
+            Succeeded,
+            Failed,
+            Aborted,
+        ];
         for from in [Succeeded, Failed, Aborted] {
-            for to in ALL {
+            for to in all {
                 assert!(
                     !from.may_transition_to(to),
                     "{from:?} -> {to:?} must be illegal"
@@ -167,12 +199,22 @@ mod tests {
     }
 
     #[test]
-    fn live_attempts_abort_via_finalizing_only() {
-        // With an attempt in flight, Aborted is reached through resolution,
-        // never directly.
-        assert!(!Preparing.may_transition_to(Aborted));
-        assert!(!Running.may_transition_to(Aborted));
-        assert!(Finalizing.may_transition_to(Aborted));
+    fn attempting_to_attempting_is_illegal() {
+        // A fresh attempt id only ever arrives via Queued — not even the same
+        // id may re-arm Attempting directly.
+        assert!(!att(1).may_transition_to(att(2)));
+        assert!(!att(1).may_transition_to(att(1)));
+        assert!(att(1).may_transition_to(Queued));
+        assert!(Queued.may_transition_to(att(1)));
+    }
+
+    #[test]
+    fn live_attempts_reach_aborted_through_resolution_only() {
+        // With an attempt in flight, every terminal (Aborted included) is
+        // reached from Attempting; there is no separate mid-resolution state.
+        assert!(att(1).may_transition_to(Aborted));
+        assert!(att(1).may_transition_to(Succeeded));
+        assert!(att(1).may_transition_to(Failed));
         // With no attempt, abort is immediate.
         for from in [Submitted, Accepted, Queued] {
             assert!(from.may_transition_to(Aborted));
@@ -180,8 +222,17 @@ mod tests {
     }
 
     #[test]
-    fn retry_is_finalizing_to_queued() {
-        assert!(Finalizing.may_transition_to(Queued));
-        assert!(!Running.may_transition_to(Queued));
+    fn retry_is_attempting_to_queued() {
+        assert!(att(1).may_transition_to(Queued));
+        // Queued does not loop to itself; the retry lands in Queued once.
+        assert!(!Queued.may_transition_to(Queued));
+    }
+
+    #[test]
+    fn attempt_accessor_is_some_only_while_attempting() {
+        assert_eq!(att(7).attempt(), Some(AttemptId(Uuid::from_u128(7))));
+        for s in [Submitted, Accepted, Queued, Succeeded, Failed, Aborted] {
+            assert_eq!(s.attempt(), None);
+        }
     }
 }

@@ -122,8 +122,13 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         };
 
         let bucket = rng.below(100);
-        let (job_state, current_attempt, mut attempt_ids, abort_eligible) = if bucket < 55 {
-            // Running.
+        // Every live-execution bucket is `Attempting(id)` now: the job↔attempt
+        // link is the state itself, and the *detail* (preparing vs. running vs.
+        // finalizing) lives on the pointed-at attempt's own state, not on the
+        // job (ADR 0030). The buckets and their weights are unchanged; each
+        // just labels which attempt state its current attempt carries.
+        let (job_state, mut attempt_ids, abort_eligible) = if bucket < 55 {
+            // Attempting, attempt Running.
             let node = *rng.pick(&node_ids);
             let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
             let mut ids = gen_history(
@@ -146,7 +151,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 &mut bufs,
             );
             ids.push(id);
-            (JobState::Running, Some(id), ids, true)
+            (JobState::Attempting(id), ids, true)
         } else if bucket < 70 {
             // Queued: no current attempt, possibly a retry history.
             let ids = gen_history(
@@ -157,9 +162,11 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 &mut next_seq,
                 &mut bufs,
             );
-            (JobState::Queued, None, ids, false)
+            (JobState::Queued, ids, false)
         } else if bucket < 80 {
-            // Preparing: current attempt is accruing, ready, or dispatching.
+            // Attempting, attempt accruing, ready, or dispatching (what used to
+            // be the job-level `Preparing` phase, now a distinction on the
+            // attempt).
             let node = *rng.pick(&node_ids);
             let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
             let mut ids = gen_history(
@@ -179,9 +186,12 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             next_seq += 1;
             let id = build_attempt(&mut rng, &ctx, node, charged_at, kind, seq, &mut bufs);
             ids.push(id);
-            (JobState::Preparing, Some(id), ids, true)
+            (JobState::Attempting(id), ids, true)
         } else if bucket < 85 {
-            // Finalizing: exit observed, resolution not yet committed.
+            // Attempting, attempt Finalizing: exit observed, resolution not yet
+            // committed. The job rests in `Attempting(id)`, not a job-level
+            // `Finalizing` state (ADR 0030): resolution completes atomically
+            // once the attempt reaches `Terminal`.
             let node = *rng.pick(&node_ids);
             let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
             let mut ids = gen_history(
@@ -204,12 +214,11 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 &mut bufs,
             );
             ids.push(id);
-            (JobState::Finalizing, Some(id), ids, true)
+            (JobState::Attempting(id), ids, true)
         } else {
-            // Terminal: Succeeded, Failed, or Aborted. A terminal job's
-            // `current_attempt` is always `None` — the real apply loop
-            // clears it on every terminal resolution (see
-            // `StateMachine::resolve_job`) — even though the job's last
+            // Terminal: Succeeded, Failed, or Aborted. A terminal job has no
+            // current attempt by construction — `state.attempt()` is `None` for
+            // every terminal `JobState` (ADR 0030) — even though the job's last
             // attempt (if any) is still listed in `attempts`.
             let r2 = rng.below(100);
             let (state, outcome) = if r2 < 70 {
@@ -256,13 +265,15 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 );
                 ids.push(id);
             }
-            (state, None, ids, false)
+            (state, ids, false)
         };
 
         // `retries_used` counts terminal attempts before the live/current
         // one; a job with no current attempt yet (Queued via requeue) has
-        // already had every listed attempt counted the same way.
-        let retries_used = attempt_ids.len() as u32 - u32::from(current_attempt.is_some());
+        // already had every listed attempt counted the same way. The current
+        // attempt, when there is one, is the one carried by `Attempting`
+        // (ADR 0030), so subtract it via the state rather than a separate field.
+        let retries_used = attempt_ids.len() as u32 - u32::from(job_state.attempt().is_some());
 
         let abort_requested = if job_state == JobState::Aborted {
             Some(AbortRequest {
@@ -319,7 +330,6 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 submitted_at_us,
                 terminal_at_us,
                 retries_used,
-                current_attempt,
                 attempts: attempt_ids,
             },
         ));
@@ -366,9 +376,11 @@ struct AttemptCtx {
 
 /// What an attempt/allocation pair being built should look like. Mirrors the
 /// legal `AttemptState` × `AllocationState` combinations from
-/// `coppice-state/src/apply.rs`: `Accruing`/`Ready`/`Dispatching` all keep
-/// the job `Preparing`, funding only reaches `Active` once the attempt is
-/// observed `Running`, and only a terminal attempt releases its allocation.
+/// `coppice-state/src/apply.rs`: an `Accruing`/`Ready`/`Dispatching` attempt
+/// keeps its owning job `Attempting(id)` (the job no longer has a `Preparing`
+/// state of its own — ADR 0030), funding only reaches `Active` once the
+/// attempt is observed `Running`, and only a terminal attempt releases its
+/// allocation.
 enum AttemptKind {
     Accruing,
     Ready,
@@ -803,29 +815,32 @@ pub fn check_consistency(sm: &StateMachine) {
         "accrual_queue must match Accruing allocations exactly"
     );
 
+    // Aggregate half of "at most one attempt in flight per job" (ADR 0030):
+    // the job's own link is structural (`Attempting(id)` can't disagree with
+    // itself), but nothing about the representation stops the attempt map
+    // from holding a *second* non-terminal attempt for the same job — that
+    // is left as a runtime invariant the apply loop is responsible for
+    // maintaining, and checked here keyed off the attempt map (not
+    // `jr.attempts`) so a stray record missing from the job's history is
+    // still caught.
+    let mut live_attempts_by_job: BTreeMap<JobId, Vec<AttemptId>> = BTreeMap::new();
+    for (aid, ar) in &sm.attempts {
+        if !ar.attempt.state.is_terminal() {
+            live_attempts_by_job
+                .entry(ar.attempt.job)
+                .or_default()
+                .push(*aid);
+        }
+    }
+
     for (job_id, jr) in &sm.jobs {
-        match jr.state {
-            JobState::Queued | JobState::Succeeded | JobState::Failed | JobState::Aborted => {
-                assert!(
-                    jr.current_attempt.is_none(),
-                    "job {job_id} in {:?} must have no current attempt",
-                    jr.state
-                );
-            }
-            JobState::Preparing | JobState::Running | JobState::Finalizing => {
-                assert!(
-                    jr.current_attempt.is_some(),
-                    "live job {job_id} must have a current attempt"
-                );
-            }
-            JobState::Submitted | JobState::Accepted => {}
-        }
-        if let Some(cur) = jr.current_attempt {
-            assert!(
-                jr.attempts.contains(&cur),
-                "job {job_id}'s attempts must list its current attempt"
-            );
-        }
+        // The old "live states have Some, queued/terminal have None" checks are
+        // gone: after ADR 0030 the current attempt *is* the `Attempting(id)`
+        // payload, so those properties are structural — no `current_attempt`
+        // field can fall out of sync with the state, and they are no longer
+        // falsifiable to assert. What remains checkable is that the id the
+        // state carries is a real, back-referenced attempt whose allocation
+        // and states are consistent.
         assert!(
             sm.quota_entities.contains_key(&jr.spec.quota_entity),
             "job {job_id} references an unknown quota entity"
@@ -840,41 +855,56 @@ pub fn check_consistency(sm: &StateMachine) {
                 "attempt {aid} back-reference must match its job"
             );
         }
-        if let Some(cur) = jr.current_attempt {
+        // For an `Attempting(cur)` job: the carried attempt is in the job's
+        // history, its record and allocation back-reference the job (and each
+        // other and the node), and the (attempt state, allocation state) pair
+        // is one of the five legal live combinations. The job-state axis of the
+        // old triple table collapsed into `Attempting` itself, leaving a pair
+        // table over the current attempt (ADR 0030).
+        if let Some(cur) = jr.state.attempt() {
+            assert!(
+                jr.attempts.contains(&cur),
+                "job {job_id}'s attempts must list its current attempt"
+            );
             let ar = &sm.attempts[&cur];
             let alloc = &sm.allocations[&ar.attempt.allocation];
             assert_eq!(alloc.allocation.job, *job_id);
             assert_eq!(alloc.allocation.attempt, cur);
             assert_eq!(alloc.allocation.node, ar.attempt.node);
             let legal = matches!(
-                (jr.state, &ar.attempt.state, alloc.allocation.state),
-                (
-                    JobState::Preparing,
-                    AttemptState::Accruing,
-                    AllocationState::Accruing
-                ) | (
-                    JobState::Preparing,
-                    AttemptState::Ready,
-                    AllocationState::Funded
-                ) | (
-                    JobState::Preparing,
-                    AttemptState::Dispatching,
-                    AllocationState::Funded
-                ) | (
-                    JobState::Running,
-                    AttemptState::Running,
-                    AllocationState::Active
-                ) | (
-                    JobState::Finalizing,
-                    AttemptState::Finalizing,
-                    AllocationState::Active
-                )
+                (&ar.attempt.state, alloc.allocation.state),
+                (AttemptState::Accruing, AllocationState::Accruing)
+                    | (AttemptState::Ready, AllocationState::Funded)
+                    | (AttemptState::Dispatching, AllocationState::Funded)
+                    | (AttemptState::Running, AllocationState::Active)
+                    | (AttemptState::Finalizing, AllocationState::Active)
             );
             assert!(
                 legal,
-                "illegal live combo for job {job_id}: job={:?} attempt={:?} allocation={:?}",
-                jr.state, ar.attempt.state, alloc.allocation.state
+                "illegal live combo for job {job_id}: attempt={:?} allocation={:?}",
+                ar.attempt.state, alloc.allocation.state
             );
+        }
+
+        // Aggregate check: the set of non-terminal attempts belonging to
+        // this job must be exactly `{cur}` when `Attempting(cur)`, empty
+        // otherwise. See the comment above `live_attempts_by_job`.
+        let live = live_attempts_by_job.get(job_id).map_or(&[][..], |v| &v[..]);
+        match jr.state.attempt() {
+            Some(cur) => {
+                for &other in live {
+                    assert!(
+                        other == cur,
+                        "job {job_id} is Attempting({cur}) but attempt {other} is also non-terminal for it"
+                    );
+                }
+            }
+            None => {
+                assert!(
+                    live.is_empty(),
+                    "job {job_id} is not Attempting but has non-terminal attempt(s) {live:?}"
+                );
+            }
         }
     }
 

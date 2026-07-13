@@ -2,10 +2,14 @@ import { Fragment, type ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, SearchX } from 'lucide-react'
 import {
+  derivePhase,
+  isTerminalJobState,
+  jobAttemptId,
+  jobCurrentAttempt,
   type AttemptView,
   type JobDetail,
   type JobId,
-  TERMINAL_JOB_STATES,
+  type JobPhase,
   type QuotaEntityView,
 } from '@/api/types'
 import { useJob, useJobLogs } from '@/api/queries'
@@ -82,6 +86,9 @@ export function JobDetailPage({ jobId }: { jobId: JobId }) {
  * belongs.
  */
 function JobDetailView({ job }: { job: JobDetail }) {
+  const attempt = jobCurrentAttempt(job)
+  const phase = derivePhase(job.state, attempt?.state ?? null)
+
   return (
     <div>
       <BackLink />
@@ -90,7 +97,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
         title={
           <span className="flex flex-wrap items-center gap-2.5">
             <span className="font-mono text-lg break-all">{job.id}</span>
-            <StatePill state={job.state} />
+            <StatePill state={phase} />
           </span>
         }
         description={
@@ -106,7 +113,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
         {/* Terminal Aborted jobs carry the reason in the state tile; the
             banner is for an abort still in flight (or one that lost the
             race to a natural exit). */}
-        {job.abortRequested && job.state !== 'Aborted' ? (
+        {job.abortRequested && job.state.kind !== 'Aborted' ? (
           <Card className="border-destructive/40 bg-destructive/5 p-4">
             <div className="flex gap-3">
               <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
@@ -121,7 +128,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
           </Card>
         ) : null}
 
-        <HeroTiles job={job} />
+        <HeroTiles job={job} phase={phase} />
 
         <JobUsageSection job={job} />
 
@@ -137,7 +144,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
           </div>
         </div>
 
-        <JobAttemptsCard attempts={job.attempts} currentAttempt={job.currentAttempt} />
+        <JobAttemptsCard attempts={job.attempts} currentAttempt={jobAttemptId(job.state)} />
 
         <div className="grid gap-4 xl:grid-cols-2">
           <Card>
@@ -155,8 +162,8 @@ function JobDetailView({ job }: { job: JobDetail }) {
   )
 }
 
-function HeroTiles({ job }: { job: JobDetail }) {
-  const terminal = TERMINAL_JOB_STATES.includes(job.state)
+function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
+  const terminal = isTerminalJobState(job.state)
   const lastAttempt = currentOrLastAttempt(job)
   const nowUs = Date.now() * 1000
 
@@ -167,7 +174,7 @@ function HeroTiles({ job }: { job: JobDetail }) {
 
   return (
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-      <StatTile label="State" value={job.state} hint={stateHint(job, nowUs)} />
+      <StatTile label="State" value={phase} hint={stateHint(job, phase, nowUs)} />
       <StatTile
         label="Runtime"
         value={runtimeUs != null ? formatDurationUs(runtimeUs) : '—'}
@@ -206,17 +213,16 @@ function HeroTiles({ job }: { job: JobDetail }) {
 }
 
 function currentOrLastAttempt(job: JobDetail): AttemptView | undefined {
-  return (
-    job.attempts.find((a) => a.id === job.currentAttempt) ?? job.attempts[job.attempts.length - 1]
-  )
+  const currentId = jobAttemptId(job.state)
+  return job.attempts.find((a) => a.id === currentId) ?? job.attempts[job.attempts.length - 1]
 }
 
 /** State-specific sub-text: how long, and the one detail that matters now. */
-function stateHint(job: JobDetail, nowUs: number): ReactNode {
+function stateHint(job: JobDetail, phase: JobPhase, nowUs: number): ReactNode {
   const inState = formatDurationUs(Math.max(0, nowUs - job.stateSinceUs))
   const outcome = currentOrLastAttempt(job)?.outcome ?? null
 
-  switch (job.state) {
+  switch (phase) {
     case 'Submitted':
       return `awaiting admission · ${inState}`
     case 'Accepted':

@@ -91,6 +91,12 @@ enum Compression {
 // A job's replicated record: the submitted spec plus lifecycle bookkeeping
 // owned by the apply loop. Keyed by spec.id.
 message JobRecord {
+  // Tag 6 held current_attempt: Option<AttemptId>, removed by ADR 0030 —
+  // the attempt in flight is now carried by JobState.Attempting, a derived
+  // view that cannot disagree with the state.
+  reserved 6;
+  reserved "current_attempt";
+
   coppice.core.v1.Job spec = 1;
   coppice.core.v1.JobState state = 2;
   // The Q32.32 priority multiplier resolved by the API at proposal time.
@@ -98,7 +104,6 @@ message JobRecord {
   int64 submitted_at_us = 4;
   // Retries consumed. Revoked outcomes requeue without touching this.
   uint32 retries_used = 5;
-  coppice.core.v1.AttemptId current_attempt = 6;
   // Every attempt this job has had, in creation order.
   repeated coppice.core.v1.AttemptId attempts = 7;
   // When the job reached its terminal state (resolving command's proposer

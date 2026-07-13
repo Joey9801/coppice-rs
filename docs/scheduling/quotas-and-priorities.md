@@ -86,8 +86,9 @@ algorithm is exact, integer-only, and compositional (ADR 0019):
 
 At placement commit, every ancestor is decayed to the command's tick and
 charged the job's full cost; the attempt records `(amount, charge time)`. At
-attempt resolution ([ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md)'s
-`Finalizing` funnel), the actual cost is recomputed with the same weights,
+attempt resolution (the attempt reaching `Terminal`, resolved atomically per
+[ADR 0030](../decisions/0030-structural-job-attempt-link.md)), the actual
+cost is recomputed with the same weights,
 multiplier, and ceil-seconds rounding over observed runtime, and the
 difference is settled:
 

@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import { ArrowRight, Ban, Coins, LogOut, Play, Plus, RefreshCw } from 'lucide-react'
-import type { TimelineEvent } from '@/api/types'
+import { jobStateLabel, type TimelineEvent } from '@/api/types'
 import { IdLink, TimeAgo } from '@/components'
 
 interface RenderedEvent {
@@ -26,7 +26,8 @@ function renderEvent(event: TimelineEvent): RenderedEvent {
         icon: ArrowRight,
         body: (
           <>
-            Job <IdLink id={event.job} /> {event.from} <ArrowGlyph /> {event.to}
+            Job <IdLink id={event.job} /> {jobStateLabel(event.from)} <ArrowGlyph />{' '}
+            {jobStateLabel(event.to)}
           </>
         ),
       }

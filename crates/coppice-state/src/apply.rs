@@ -94,7 +94,6 @@ impl StateMachine {
                 submitted_at_us: c.submitted_at_us,
                 terminal_at_us: None,
                 retries_used: 0,
-                current_attempt: None,
                 attempts: Vec::new(),
             },
         );
@@ -118,10 +117,10 @@ impl StateMachine {
     }
 
     fn abort_job(&mut self, c: &AbortJob) -> ApplyResult {
-        let (state, current) = match self.jobs.get(&c.job) {
+        let state = match self.jobs.get(&c.job) {
             None => return Err(RejectionReason::UnknownJob(c.job)),
             Some(r) if r.state.is_terminal() => return Err(RejectionReason::JobTerminal(c.job)),
-            Some(r) => (r.state, r.current_attempt),
+            Some(r) => r.state,
         };
         let mut events = Vec::new();
         if let Some(r) = self.jobs.get_mut(&c.job) {
@@ -143,13 +142,12 @@ impl StateMachine {
                     &mut events,
                 );
             }
-            JobState::Preparing | JobState::Running => {
-                let attempt_state = current
-                    .and_then(|id| self.attempts.get(&id))
-                    .map(|a| a.attempt.state.clone());
-                match (current, attempt_state) {
+            // An attempt is in flight; the state carries its id (ADR 0030), so
+            // steer on that attempt's own state directly.
+            JobState::Attempting(id) => {
+                match self.attempts.get(&id).map(|a| a.attempt.state.clone()) {
                     // Not yet dispatched: no agent interaction, terminate now.
-                    (Some(id), Some(AttemptState::Accruing | AttemptState::Ready)) => {
+                    Some(AttemptState::Accruing | AttemptState::Ready) => {
                         self.terminate_attempt(
                             id,
                             AttemptOutcome::Aborted,
@@ -162,7 +160,7 @@ impl StateMachine {
                     }
                     // In the agent's hands: signal a StopJob; the outcome
                     // arrives through ingestion and truth wins the race.
-                    (Some(id), Some(AttemptState::Dispatching | AttemptState::Running)) => {
+                    Some(AttemptState::Dispatching | AttemptState::Running) => {
                         if let Some(a) = self.attempts.get(&id) {
                             events.push(Event::StopRequested {
                                 node: a.attempt.node,
@@ -171,11 +169,12 @@ impl StateMachine {
                             });
                         }
                     }
+                    // Attempt already Finalizing or Terminal: resolution is
+                    // imminent and honors abort-wins-over-retry from the flag.
                     _ => {}
                 }
             }
-            // Resolution honors abort-wins-over-retry from the flag.
-            JobState::Finalizing => {}
+            // Terminal jobs already returned above.
             _ => {}
         }
         Ok(Applied { events })
@@ -368,10 +367,11 @@ impl StateMachine {
                 });
             }
             if let Some(j) = self.jobs.get_mut(&p.job) {
-                j.current_attempt = Some(p.attempt);
                 j.attempts.push(p.attempt);
             }
-            self.job_transition(p.job, JobState::Preparing, &mut events);
+            // The link is the state (ADR 0030): moving to Attempting stamps the
+            // attempt id, replacing the old separate `current_attempt` write.
+            self.job_transition(p.job, JobState::Attempting(p.attempt), &mut events);
             // Quota charge at placement (ADR 0019); true-up settles against
             // this at terminal resolution using the recorded rate and
             // multiplier.
@@ -391,14 +391,17 @@ impl StateMachine {
         let Some(job) = self.jobs.get(&p.job) else {
             return Some(RejectionReason::UnknownJob(p.job));
         };
-        // Queued, or Preparing with its current accrual revoked in this same
-        // batch — the revoke-and-reseat re-plan of ADR 0014.
-        let reseat = job.state == JobState::Preparing
-            && job
-                .current_attempt
-                .and_then(|id| self.attempts.get(&id))
-                .map(|a| revoked.contains(&a.attempt.allocation))
-                .unwrap_or(false);
+        // Queued, or Attempting with its current accrual revoked in this same
+        // batch — the revoke-and-reseat re-plan of ADR 0014. The revocation
+        // resolves the job to Queued before placements apply, so it passes
+        // through Queued within this apply; there is no Attempting → Attempting
+        // edge (ADR 0030).
+        let reseat = job
+            .state
+            .attempt()
+            .and_then(|id| self.attempts.get(&id))
+            .map(|a| revoked.contains(&a.attempt.allocation))
+            .unwrap_or(false);
         if (job.state != JobState::Queued && !reseat) || seen_jobs.contains(&p.job) {
             return Some(RejectionReason::JobNotQueued(p.job));
         }
@@ -550,17 +553,18 @@ impl StateMachine {
     }
 
     fn record_attempt_exited(&mut self, c: &RecordAttemptExited) -> ApplyResult {
-        let job = match self.attempts.get(&c.attempt) {
+        match self.attempts.get(&c.attempt) {
             None => return Err(RejectionReason::UnknownAttempt(c.attempt)),
             Some(a) if a.attempt.state != AttemptState::Running => {
                 return Err(RejectionReason::StaleAttemptState(c.attempt));
             }
-            Some(a) => a.attempt.job,
-        };
+            Some(_) => {}
+        }
         let mut events = Vec::new();
+        // Only the attempt moves: the job stays Attempting(id) while its
+        // attempt is Finalizing (ADR 0030 — no job-level Finalizing). It
+        // resolves atomically once the attempt reaches Terminal.
         self.attempt_transition(c.attempt, AttemptState::Finalizing, &mut events);
-        // The one state the job rests in mid-resolution.
-        self.job_transition(job, JobState::Finalizing, &mut events);
         Ok(Applied { events })
     }
 
@@ -966,19 +970,21 @@ impl StateMachine {
         if a.started_at_us.is_none() {
             a.started_at_us = Some(observed_at_us);
         }
-        let (job, allocation) = (a.attempt.job, a.attempt.allocation);
+        let allocation = a.attempt.allocation;
+        // Only the attempt and its allocation move; the job stays
+        // Attempting(id) (ADR 0030 — no job-level Running mirror state).
         self.attempt_transition(attempt, AttemptState::Running, events);
         if let Some(al) = self.allocations.get_mut(&allocation) {
             if al.allocation.state == AllocationState::Funded {
                 al.allocation.state = AllocationState::Active;
             }
         }
-        self.job_transition(job, JobState::Running, events);
     }
 
     /// The shared terminal path: terminal outcome, allocation release plus
-    /// funding cascade, quota true-up, and job resolution — all in one apply
-    /// (the `Finalizing` funnel of ADR 0013).
+    /// funding cascade, quota true-up, and job resolution — all in one apply.
+    /// The job resolves atomically as the attempt reaches `Terminal`; there is
+    /// no job-level resolution state it rests in (ADR 0030).
     ///
     /// `pledge` is false only when the node itself is lost. `used` is the
     /// optional batch capacity memo threaded down to the funding cascade; only
@@ -1085,9 +1091,10 @@ impl StateMachine {
         let retries_used = rec.retries_used;
         let retry = rec.spec.retry;
 
-        // Every attempt end funnels through Finalizing, even when resolution
-        // completes within this same apply.
-        self.job_transition(job, JobState::Finalizing, events);
+        // The job is Attempting(id); resolution moves it straight to a terminal
+        // outcome or back to Queued. There is no intermediate Finalizing state,
+        // and the transition itself drops the attempt id — nothing to clear by
+        // hand (ADR 0030).
 
         enum Resolution {
             Terminal(JobState),
@@ -1130,15 +1137,11 @@ impl StateMachine {
         };
         match resolution {
             Resolution::Terminal(to) => {
-                if let Some(r) = self.jobs.get_mut(&job) {
-                    r.current_attempt = None;
-                }
                 self.job_terminal_transition(job, to, ts_us, events);
             }
             Resolution::Requeue { consume_budget } => {
-                if let Some(r) = self.jobs.get_mut(&job) {
-                    r.current_attempt = None;
-                    if consume_budget {
+                if consume_budget {
+                    if let Some(r) = self.jobs.get_mut(&job) {
                         r.retries_used += 1;
                     }
                 }

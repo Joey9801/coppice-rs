@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Resources } from '../types'
-import { TERMINAL_JOB_STATES } from '../types'
+import { isTerminalJobState, jobAttemptId, jobCurrentAttempt } from '../types'
 import { ORG_NAME } from './generate'
 import { isMockInvalid, isMockNotFound, MockWorld } from './world'
 
@@ -41,7 +41,7 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
 
   for (const summary of jobs) {
     const detail = world.buildJobDetail(summary.id)
-    const terminal = TERMINAL_JOB_STATES.includes(detail.state)
+    const terminal = isTerminalJobState(detail.state)
 
     // Terminal jobs: outcome + terminalAtUs ≥ submittedAtUs.
     if (terminal) {
@@ -71,19 +71,18 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
     // The retry budget bounds total attempts (maxRetries + the first one).
     expect(detail.attempts.length).toBeLessThanOrEqual(detail.spec.retry.maxRetries + 1)
 
-    // Running job: exactly one current attempt Running with an Active,
-    // fully funded allocation.
-    if (detail.state === 'Running') {
-      expect(detail.currentAttempt).not.toBeNull()
-      const cur = detail.attempts.find((a) => a.id === detail.currentAttempt)
-      expect(cur?.state).toBe('Running')
-      const nodeDetail = world.buildNodeDetail(cur!.node)
-      const active = nodeDetail.activeAttempts.find((a) => a.id === cur!.id)
+    // Attempting + attempt Running: exactly one current attempt Running with
+    // an Active, fully funded allocation.
+    const cur = jobCurrentAttempt(detail)
+    if (cur?.state === 'Running') {
+      expect(jobAttemptId(detail.state)).not.toBeNull()
+      const nodeDetail = world.buildNodeDetail(cur.node)
+      const active = nodeDetail.activeAttempts.find((a) => a.id === cur.id)
       expect(active).toBeDefined()
     }
 
     // Queued job: no allocation, a rank in 1..depth, an accrual-free explainer.
-    if (detail.state === 'Queued') {
+    if (detail.state.kind === 'Queued') {
       expect(detail.accrual).toBeNull()
       expect(detail.queue).not.toBeNull()
       const q = detail.queue!
@@ -119,7 +118,7 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
   }
 
   // Queue ranks form 1..depth with no gaps.
-  const queued = jobs.filter((j) => j.state === 'Queued')
+  const queued = jobs.filter((j) => j.state.kind === 'Queued')
   const ranks = queued.map((j) => j.queueRank).sort((a, b) => (a ?? 0) - (b ?? 0))
   ranks.forEach((r, i) => expect(r).toBe(i + 1))
 
@@ -252,7 +251,10 @@ describe('MockWorld filters and lookups', () => {
     const world = new MockWorld(NOW_US)
     const running = world.listJobs({ states: ['Running'], limit: 5 })
     expect(running.jobs.length).toBeLessThanOrEqual(5)
-    for (const j of running.jobs) expect(j.state).toBe('Running')
+    for (const j of running.jobs) {
+      expect(j.state.kind).toBe('Attempting')
+      expect(j.attemptState).toBe('Running')
+    }
     expect(running.total).toBeGreaterThanOrEqual(running.jobs.length)
   })
 
@@ -331,8 +333,10 @@ describe('MockWorld quota entities', () => {
     const check = (id: string) => {
       const node = entities.find((e) => e.id === id)!
       const { jobs } = world.listJobs({ quotaEntity: id, limit: 10_000 })
-      const queued = jobs.filter((j) => j.state === 'Queued').length
-      const running = jobs.filter((j) => j.state === 'Running').length
+      const queued = jobs.filter((j) => j.state.kind === 'Queued').length
+      const running = jobs.filter(
+        (j) => j.state.kind === 'Attempting' && j.attemptState === 'Running',
+      ).length
       expect(node.queuedCount).toBe(queued)
       expect(node.runningCount).toBe(running)
     }
@@ -444,7 +448,9 @@ describe('MockWorld quota entities', () => {
     }
   })
 
-  it('auto-mints new users over time but never past the cap', () => {
+  // Simulates a long stretch of world time; comfortably exceeds the 5s
+  // default on slow CI runners, so it gets an explicit budget.
+  it('auto-mints new users over time but never past the cap', { timeout: 30_000 }, () => {
     const world = new MockWorld(NOW_US)
     const usersRoot = world.listQuotaEntities().find((e) => e.name === 'users')!
     const before = world.listQuotaEntities().filter((e) => e.parent === usersRoot.id).length

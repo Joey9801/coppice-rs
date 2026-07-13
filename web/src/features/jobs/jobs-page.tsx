@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'react'
 import { getRouteApi } from '@tanstack/react-router'
 import { ListTodo, Search, X } from 'lucide-react'
-import { JOB_STATES, type JobState, type JobSummary, type ListJobsFilter } from '@/api/types'
+import {
+  derivePhase,
+  JOB_PHASES,
+  type JobPhase,
+  type JobSummary,
+  type ListJobsFilter,
+} from '@/api/types'
 import { useJobs } from '@/api/queries'
 import { formatPercent, formatUcu, shortId } from '@/lib/format'
 import { EmptyState, IdLink, outcomePill, PageHeader, StatePill, TimeAgo } from '@/components'
@@ -98,13 +104,13 @@ function FilterBar() {
           void navigate({
             search: (prev) => ({
               ...prev,
-              state: (e.target.value || undefined) as JobState | undefined,
+              state: (e.target.value || undefined) as JobPhase | undefined,
             }),
           })
         }
       >
         <option value="">All states</option>
-        {JOB_STATES.map((s) => (
+        {JOB_PHASES.map((s) => (
           <option key={s} value={s}>
             {s}
           </option>
@@ -183,54 +189,57 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
         </TableRow>
       </TableHeader>
       <TableBody>
-        {jobs.map((job) => (
-          <TableRow
-            key={job.id}
-            onClick={() => void navigate({ to: '/jobs/$jobId', params: { jobId: job.id } })}
-            className="cursor-pointer"
-          >
-            <TableCell onClick={(e) => e.stopPropagation()} className="w-px">
-              <IdLink id={job.id} />
-            </TableCell>
-            <TableCell>
-              <StatePill state={job.state} />
-            </TableCell>
-            <TableCell className="max-w-[16rem]">
-              <span
-                className="block truncate font-mono text-xs text-muted-foreground"
-                title={job.image}
-              >
-                {job.image}
-              </span>
-            </TableCell>
-            <TableCell className="whitespace-nowrap">{job.quotaEntityName}</TableCell>
-            <TableCell className="text-right tabular-nums">{job.priority}</TableCell>
-            <TableCell className="whitespace-nowrap text-muted-foreground">
-              <TimeAgo tUs={job.submittedAtUs} />
-            </TableCell>
-            <TableCell onClick={(e) => e.stopPropagation()} className="whitespace-nowrap">
-              <WhereCell job={job} />
-            </TableCell>
-            <TableCell className="text-right tabular-nums">{formatUcu(job.costUcu)}</TableCell>
-            <TableCell>
-              {job.outcome && job.state !== 'Succeeded' ? (
-                outcomePill(job.outcome)
-              ) : (
-                <span className="text-muted-foreground">—</span>
-              )}
-            </TableCell>
-          </TableRow>
-        ))}
+        {jobs.map((job) => {
+          const phase = derivePhase(job.state, job.attemptState)
+          return (
+            <TableRow
+              key={job.id}
+              onClick={() => void navigate({ to: '/jobs/$jobId', params: { jobId: job.id } })}
+              className="cursor-pointer"
+            >
+              <TableCell onClick={(e) => e.stopPropagation()} className="w-px">
+                <IdLink id={job.id} />
+              </TableCell>
+              <TableCell>
+                <StatePill state={phase} />
+              </TableCell>
+              <TableCell className="max-w-[16rem]">
+                <span
+                  className="block truncate font-mono text-xs text-muted-foreground"
+                  title={job.image}
+                >
+                  {job.image}
+                </span>
+              </TableCell>
+              <TableCell className="whitespace-nowrap">{job.quotaEntityName}</TableCell>
+              <TableCell className="text-right tabular-nums">{job.priority}</TableCell>
+              <TableCell className="whitespace-nowrap text-muted-foreground">
+                <TimeAgo tUs={job.submittedAtUs} />
+              </TableCell>
+              <TableCell onClick={(e) => e.stopPropagation()} className="whitespace-nowrap">
+                <WhereCell job={job} phase={phase} />
+              </TableCell>
+              <TableCell className="text-right tabular-nums">{formatUcu(job.costUcu)}</TableCell>
+              <TableCell>
+                {job.outcome && phase !== 'Succeeded' ? (
+                  outcomePill(job.outcome)
+                ) : (
+                  <span className="text-muted-foreground">—</span>
+                )}
+              </TableCell>
+            </TableRow>
+          )
+        })}
       </TableBody>
     </Table>
   )
 }
 
-function WhereCell({ job }: { job: JobSummary }) {
-  if (job.state === 'Queued' && job.queueRank != null) {
+function WhereCell({ job, phase }: { job: JobSummary; phase: JobPhase }) {
+  if (phase === 'Queued' && job.queueRank != null) {
     return <span className="tabular-nums text-muted-foreground">#{job.queueRank}</span>
   }
-  if (job.state === 'Preparing' && job.fundingFraction != null) {
+  if (phase === 'Preparing' && job.fundingFraction != null) {
     return (
       <span className="tabular-nums text-amber-600 dark:text-amber-400">
         {formatPercent(job.fundingFraction)} funded

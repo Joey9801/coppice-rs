@@ -221,35 +221,38 @@ impl From<pb::AbortRequest> for AbortRequest {
 
 impl From<JobState> for pb::JobState {
     fn from(state: JobState) -> Self {
-        match state {
-            JobState::Submitted => pb::JobState::Submitted,
-            JobState::Accepted => pb::JobState::Accepted,
-            JobState::Queued => pb::JobState::Queued,
-            JobState::Preparing => pb::JobState::Preparing,
-            JobState::Running => pb::JobState::Running,
-            JobState::Finalizing => pb::JobState::Finalizing,
-            JobState::Succeeded => pb::JobState::Succeeded,
-            JobState::Failed => pb::JobState::Failed,
-            JobState::Aborted => pb::JobState::Aborted,
-        }
+        use pb::job_state as s;
+        let state = match state {
+            JobState::Submitted => s::State::Submitted(s::Submitted {}),
+            JobState::Accepted => s::State::Accepted(s::Accepted {}),
+            JobState::Queued => s::State::Queued(s::Queued {}),
+            JobState::Attempting(attempt) => s::State::Attempting(s::Attempting {
+                attempt: Some(attempt.into()),
+            }),
+            JobState::Succeeded => s::State::Succeeded(s::Succeeded {}),
+            JobState::Failed => s::State::Failed(s::Failed {}),
+            JobState::Aborted => s::State::Aborted(s::Aborted {}),
+        };
+        pb::JobState { state: Some(state) }
     }
 }
 
-pub(crate) fn job_state_from_pb(value: i32) -> Result<JobState, ConvertError> {
-    match pb::JobState::try_from(value) {
-        Ok(pb::JobState::Submitted) => Ok(JobState::Submitted),
-        Ok(pb::JobState::Accepted) => Ok(JobState::Accepted),
-        Ok(pb::JobState::Queued) => Ok(JobState::Queued),
-        Ok(pb::JobState::Preparing) => Ok(JobState::Preparing),
-        Ok(pb::JobState::Running) => Ok(JobState::Running),
-        Ok(pb::JobState::Finalizing) => Ok(JobState::Finalizing),
-        Ok(pb::JobState::Succeeded) => Ok(JobState::Succeeded),
-        Ok(pb::JobState::Failed) => Ok(JobState::Failed),
-        Ok(pb::JobState::Aborted) => Ok(JobState::Aborted),
-        _ => Err(ConvertError::UnknownEnum {
-            field: "JobState",
-            value,
-        }),
+impl TryFrom<pb::JobState> for JobState {
+    type Error = ConvertError;
+
+    fn try_from(state: pb::JobState) -> Result<Self, ConvertError> {
+        use pb::job_state as s;
+        Ok(match req(state.state, "JobState.state")? {
+            s::State::Submitted(_) => JobState::Submitted,
+            s::State::Accepted(_) => JobState::Accepted,
+            s::State::Queued(_) => JobState::Queued,
+            s::State::Attempting(a) => {
+                JobState::Attempting(req(a.attempt, "JobState.attempting.attempt")?.try_into()?)
+            }
+            s::State::Succeeded(_) => JobState::Succeeded,
+            s::State::Failed(_) => JobState::Failed,
+            s::State::Aborted(_) => JobState::Aborted,
+        })
     }
 }
 

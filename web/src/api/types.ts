@@ -42,11 +42,66 @@ export interface Resources {
 // ---------------------------------------------------------------------------
 
 /**
- * `JobState`: Submitted → Accepted → Queued → Preparing → Running →
- * Finalizing → terminal. NOTE: "accruing" is not a job state — a job sits
- * in `Preparing` while its attempt/allocation accrues capacity.
+ * `JobState`: Submitted → Accepted → Queued → Attempting(attempt) →
+ * {Succeeded, Failed, Aborted}, with `Attempting → Queued` on retry (ADR
+ * 0030). `Attempting` structurally carries the in-flight attempt id — there
+ * is no separate `currentAttempt` field anywhere in this file;
+ * `jobAttemptId` is the derived accessor and can never disagree with the
+ * state. The job enum no longer distinguishes preparing/running/finalizing:
+ * that detail comes only from joining `Attempting` with its attempt's
+ * `AttemptState` (see `JobPhase`/`derivePhase` below).
  */
 export type JobState =
+  | { kind: 'Submitted' }
+  | { kind: 'Accepted' }
+  | { kind: 'Queued' }
+  | { kind: 'Attempting'; attempt: AttemptId }
+  | { kind: 'Succeeded' }
+  | { kind: 'Failed' }
+  | { kind: 'Aborted' }
+
+export type JobStateKind = JobState['kind']
+
+export const JOB_STATE_KINDS: readonly JobStateKind[] = [
+  'Submitted',
+  'Accepted',
+  'Queued',
+  'Attempting',
+  'Succeeded',
+  'Failed',
+  'Aborted',
+]
+
+export const TERMINAL_JOB_STATE_KINDS: readonly JobStateKind[] = ['Succeeded', 'Failed', 'Aborted']
+
+export function isTerminalJobState(state: JobState): boolean {
+  return (TERMINAL_JOB_STATE_KINDS as readonly JobStateKind[]).includes(state.kind)
+}
+
+/** Derived accessor mirroring the Rust `JobState::attempt()` — cannot disagree with the state. */
+export function jobAttemptId(state: JobState): AttemptId | null {
+  return state.kind === 'Attempting' ? state.attempt : null
+}
+
+/** Human label for a `JobState`, e.g. for timelines; `Attempting` includes the attempt id. */
+export function jobStateLabel(state: JobState): string {
+  return state.kind === 'Attempting' ? `Attempting(${state.attempt})` : state.kind
+}
+
+/** `AttemptState`: one execution of a job (retries mint a new attempt). */
+export type AttemptState =
+  'Accruing' | 'Ready' | 'Dispatching' | 'Running' | 'Finalizing' | 'Terminal'
+
+/**
+ * Flat display "phase" for a job (ADR 0030 observability note): a read-time
+ * join of `Attempting(id)` with that attempt's `AttemptState`, never
+ * replicated or stored. Every UI surface that shows a single job status —
+ * state pills, list filters, timelines, the overview breakdown — renders
+ * this instead of the raw `JobState`, so the flat vocabulary users already
+ * see (queued/preparing/running/finalizing/…) is unchanged even though the
+ * job machine that produces it collapsed.
+ */
+export type JobPhase =
   | 'Submitted'
   | 'Accepted'
   | 'Queued'
@@ -57,7 +112,7 @@ export type JobState =
   | 'Failed'
   | 'Aborted'
 
-export const JOB_STATES: readonly JobState[] = [
+export const JOB_PHASES: readonly JobPhase[] = [
   'Submitted',
   'Accepted',
   'Queued',
@@ -69,11 +124,30 @@ export const JOB_STATES: readonly JobState[] = [
   'Aborted',
 ]
 
-export const TERMINAL_JOB_STATES: readonly JobState[] = ['Succeeded', 'Failed', 'Aborted']
+export const TERMINAL_JOB_PHASES: readonly JobPhase[] = ['Succeeded', 'Failed', 'Aborted']
 
-/** `AttemptState`: one execution of a job (retries mint a new attempt). */
-export type AttemptState =
-  'Accruing' | 'Ready' | 'Dispatching' | 'Running' | 'Finalizing' | 'Terminal'
+/**
+ * Join a job state with its current attempt's state (null when the job
+ * carries no attempt, e.g. `Queued`) into the flat phase the UI shows.
+ * `Accruing`/`Ready`/`Dispatching` all read as `Preparing` — the UI has
+ * never distinguished them; a `Terminal` attempt means resolution is
+ * completing in the same apply, which reads as `Finalizing` a beat longer.
+ */
+export function derivePhase(state: JobState, attemptState: AttemptState | null): JobPhase {
+  if (state.kind !== 'Attempting') return state.kind
+  switch (attemptState) {
+    case 'Accruing':
+    case 'Ready':
+    case 'Dispatching':
+      return 'Preparing'
+    case 'Running':
+      return 'Running'
+    case 'Finalizing':
+    case 'Terminal':
+    case null:
+      return 'Finalizing'
+  }
+}
 
 /** `AttemptOutcome` — why an attempt reached `Terminal`. */
 export type AttemptOutcomeKind =
@@ -176,6 +250,11 @@ export interface JobSummary {
   terminalAtUs: number | null
   /** Node of the current attempt, when one exists. */
   node: NodeId | null
+  /**
+   * State of the attempt `state` points at, when one exists — lets list
+   * rows derive a phase (`derivePhase`) without a second fetch.
+   */
+  attemptState: AttemptState | null
   /** 1-based queue rank; only for `Queued` jobs. */
   queueRank: number | null
   /** Min funded/requested fraction across dims; only while accruing. */
@@ -264,7 +343,6 @@ export interface JobDetail {
   /** Quota-entity ancestry, root first, leaf (the owning entity) last. */
   entityChain: QuotaEntityView[]
   attempts: AttemptView[]
-  currentAttempt: AttemptId | null
   /** Present iff state is `Queued`. */
   queue: QueuePositionExplainer | null
   /** Present iff the current attempt is accruing. */
@@ -272,8 +350,15 @@ export interface JobDetail {
   cost: CostReport
 }
 
+/** The `AttemptView` `job.state` currently points at, if any (derived, ADR 0030). */
+export function jobCurrentAttempt(job: Pick<JobDetail, 'state' | 'attempts'>): AttemptView | null {
+  const id = jobAttemptId(job.state)
+  return id ? (job.attempts.find((a) => a.id === id) ?? null) : null
+}
+
 export interface ListJobsFilter {
-  states?: JobState[]
+  /** Filters by the displayed phase (`derivePhase`), not the raw `JobState`. */
+  states?: JobPhase[]
   /** Matches the entity's whole subtree (a leaf matches just itself). */
   quotaEntity?: QuotaEntityId
   node?: NodeId
@@ -435,7 +520,8 @@ export interface QuotaEntityNode {
 
 /** Subtree-inclusive stats for one quota entity. */
 export interface QuotaEntityStats {
-  byState: Record<JobState, number>
+  /** Tallied by displayed phase (`derivePhase`), not the raw `JobState`. */
+  byState: Record<JobPhase, number>
   oldestQueuedAgeUs: number | null
   /** Σ µCU/s of currently running attempts in the subtree. */
   burnRateUcuPerSecond: number
@@ -478,7 +564,8 @@ export interface QueueStats {
   /** Jobs entering the queue per minute, recent window. */
   arrivalRatePerMinute: number
   oldestQueuedAgeUs: number | null
-  byState: Record<JobState, number>
+  /** Tallied by displayed phase (`derivePhase`), not the raw `JobState`. */
+  byState: Record<JobPhase, number>
   /** Recent history for sparklines, oldest first. */
   history: Array<{
     tUs: number

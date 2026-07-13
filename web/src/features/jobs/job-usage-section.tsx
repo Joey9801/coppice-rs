@@ -10,7 +10,14 @@ import {
   YAxis,
 } from 'recharts'
 import { Gauge } from 'lucide-react'
-import type { AttemptId, JobDetail, UsageSample } from '@/api/types'
+import {
+  derivePhase,
+  jobAttemptId,
+  jobCurrentAttempt,
+  type AttemptId,
+  type JobDetail,
+  type UsageSample,
+} from '@/api/types'
 import { useJobUsage } from '@/api/queries'
 import { formatBytes, formatCpu, formatTimeOfDayUs, shortId } from '@/lib/format'
 import { byteTicks, cpuTicks } from '@/lib/ticks'
@@ -27,7 +34,8 @@ import { AXIS_TICK, TOOLTIP_CONTENT_STYLE } from './chart-theme'
  */
 export function JobUsageSection({ job }: { job: JobDetail }) {
   const attempts = job.attempts
-  const fallback = job.currentAttempt ?? attempts[attempts.length - 1]?.id ?? null
+  const currentAttemptId = jobAttemptId(job.state)
+  const fallback = currentAttemptId ?? attempts[attempts.length - 1]?.id ?? null
   const [picked, setPicked] = useState<AttemptId | null>(null)
   // A stale pick (e.g. the world moved on) falls back to the current attempt.
   const attemptId = picked !== null && attempts.some((a) => a.id === picked) ? picked : fallback
@@ -49,7 +57,7 @@ export function JobUsageSection({ job }: { job: JobDetail }) {
               {[...attempts].reverse().map((a) => (
                 <option key={a.id} value={a.id}>
                   {shortId(a.id)} · {a.state}
-                  {a.id === job.currentAttempt ? ' (current)' : ''}
+                  {a.id === currentAttemptId ? ' (current)' : ''}
                 </option>
               ))}
             </Select>
@@ -99,7 +107,8 @@ export function JobUsageSection({ job }: { job: JobDetail }) {
 
 /** Why there are no samples, in terms of where the job is in its lifecycle. */
 function placeholderText(job: JobDetail): string {
-  switch (job.state) {
+  const phase = derivePhase(job.state, jobCurrentAttempt(job)?.state ?? null)
+  switch (phase) {
     case 'Submitted':
     case 'Accepted':
       return "The job hasn't started yet — it is still being admitted."

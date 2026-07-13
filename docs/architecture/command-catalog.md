@@ -176,11 +176,14 @@ Funding is deterministic bookkeeping in the apply loop (ADR 0014). Exactly:
   completion of committed holds. A *lost* node's allocations are all
   released with the attempts, so no pledge pass runs there.
 
-### `Finalizing` resolution
+### Resolution on attempt `Terminal`
 
-Every attempt end funnels through the job's `Finalizing` state, and the
-resolution rules live **here, in apply** — never in the agent (ADR 0013).
-On an attempt reaching `Terminal(outcome)` the same apply resolves the job:
+The job carries the id of its one in-flight attempt via `Attempting(id)`
+(ADR 0030); there is no job-level `Finalizing` rest state. Every attempt end
+resolves the job in the same apply that lands the attempt's
+`Terminal(outcome)`, and the resolution rules live **here, in apply** —
+never in the agent (ADR 0013). On an attempt reaching `Terminal(outcome)`
+the same apply resolves the job:
 
 1. **Truth wins the race.** The recorded terminal state derives from the
    outcome that actually ended the attempt. `Aborted` job state is reached
@@ -208,9 +211,9 @@ On an attempt reaching `Terminal(outcome)` the same apply resolves the job:
      otherwise `Failed`.
    - `Platform` outcomes → retried while `retries_used < max_retries`;
      otherwise `Failed`.
-   - A retry is: `retries_used += 1` (except `Revoked`), job → `Queued`,
-     `current_attempt` cleared. The next attempt is created by a future
-     `CommitPlacements`.
+   - A retry is: `retries_used += 1` (except `Revoked`), job → `Queued` —
+     the state transition drops the attempt id. The next attempt is created
+     by a future `CommitPlacements`.
 5. **Quota true-up** (ADR 0019, refund fraction per ADR 0029) runs in the
    same apply: actual cost is computed from the rate and multiplier stored
    in the attempt's charge record (policy edits never retroactively
@@ -232,10 +235,11 @@ On an attempt reaching `Terminal(outcome)` the same apply resolves the job:
    runs from this stamp, never from `submitted_at_us`: a job may
    legitimately queue longer than the retention interval before it runs.
 
-The job may pass through `Finalizing` and out the other side within a single
-apply (the common case). It *rests* in `Finalizing` only between
-`RecordAttemptExited` (exit observed) and `RecordAttemptOutcome` (outcome
-recorded).
+The job stays `Attempting(id)` for the whole attempt lifetime, including the
+window between `RecordAttemptExited` (exit observed) and
+`RecordAttemptOutcome` (outcome recorded) — that window is the *attempt*
+resting in `Finalizing`, not the job. The job itself changes state exactly
+once, atomically, when the attempt reaches `Terminal`.
 
 ### Idempotency under replay
 
@@ -321,7 +325,7 @@ reachable through the API.
 | Proposer | Scheduler engine via the leader — one batch per scheduling pass |
 | Payload | `expected_version: u64` (audit record of the snapshot version; see contract), `proposed_at_us` (the charge timestamp), `revocations: AllocationId[]`, `placements: Placement[]` where `Placement = { job: JobId, attempt: AttemptId, group: GroupId, allocations: AllocationSpec[] }`, `AllocationSpec = { id: AllocationId, node: NodeId, requested: Resources }`. The proto field is repeated; **v1 writers emit exactly one allocation per placement and set `group` = the job's id** (singleton groups); apply rejects other shapes until the gang-scheduling ADR. |
 | Validation (all-or-nothing, per-item diagnostics) | Revocations: allocation exists and is `Accruing` (funded allocations are stable — revoking one is always a rejection). Placements: job exists and is `Queued`; attempt and allocation ids are fresh; node exists and is schedulable; `requested` fits within the node's total advertised capacity; exactly one allocation, `group` = job id. Batch-level: after simulating the batch (revocation frees → pledge pass → new placements in order), the number of distinct jobs holding accruing allocations must not exceed the replicated accrual cap K. |
-| Apply effects | In order: **(1) Revocations** — each attempt `Terminal(Revoked)`, allocations `Released`, true-up (full decayed refund; the attempt never ran), job → `Queued` free of retry budget (or `Aborted` if an abort is pending), freed capacity pledged onward in commit order. **(2) Placements**, in payload order: assign the allocation the next `seq`; insert attempt + allocation; run the pledge from the node's current free capacity — fully covered → allocation `Funded`, attempt starts `Ready` (accrual skipped, the common case); partially or not covered → allocation `Accruing` in the accrual queue, attempt starts `Accruing`. Job → `Preparing`, `current_attempt` set. **(3) Quota charge**: a job with no *enforced* `max_runtime` first has its multiplier inflated, `m' = ⌊multiplier × unbounded_runtime_multiplier / 2³²⌋` (else `m' = multiplier`); the job's full cost `C = rate(requests, current weights) × ceil(max_runtime_s) × m'` (jobs with no `max_runtime` are charged the replicated `default_charge_runtime` at `m'`) is charged to every ancestor of its entity at `proposed_at_us`; the attempt records `(C, rate, m', proposed_at_us, refund_fraction_milli)` for true-up, where the recorded fraction is the replicated `refund_fraction_milli` for a bounded job or 1000 for an unbounded one (ADR 0029). |
+| Apply effects | In order: **(1) Revocations** — each attempt `Terminal(Revoked)`, allocations `Released`, true-up (full decayed refund; the attempt never ran), job → `Queued` free of retry budget (or `Aborted` if an abort is pending), freed capacity pledged onward in commit order. **(2) Placements**, in payload order: assign the allocation the next `seq`; insert attempt + allocation; run the pledge from the node's current free capacity — fully covered → allocation `Funded`, attempt starts `Ready` (accrual skipped, the common case); partially or not covered → allocation `Accruing` in the accrual queue, attempt starts `Accruing`. Job → `Attempting(attempt)`. **(3) Quota charge**: a job with no *enforced* `max_runtime` first has its multiplier inflated, `m' = ⌊multiplier × unbounded_runtime_multiplier / 2³²⌋` (else `m' = multiplier`); the job's full cost `C = rate(requests, current weights) × ceil(max_runtime_s) × m'` (jobs with no `max_runtime` are charged the replicated `default_charge_runtime` at `m'`) is charged to every ancestor of its entity at `proposed_at_us`; the attempt records `(C, rate, m', proposed_at_us, refund_fraction_milli)` for true-up, where the recorded fraction is the replicated `refund_fraction_milli` for a bounded job or 1000 for an unbounded one (ADR 0029). |
 | Rejections | `InvalidBatch[(index, reason)]` wrapping `UnknownAllocation`, `AllocationNotAccruing`, `UnknownJob`, `JobNotQueued`, `DuplicateAttempt`, `DuplicateAllocation`, `UnknownNode`, `NodeNotSchedulable`, `RequestExceedsNodeCapacity`, `UnsupportedPlacementShape`, `UnknownQuotaEntity`; batch-level `AccrualLimitExceeded` |
 
 #### `DispatchAttempt`
@@ -343,7 +347,7 @@ reachable through the API.
 | Proposer | Ingestion, from an `AttemptStatus` report observing the container running |
 | Payload | `attempt: AttemptId`, `observed_at_us` |
 | Validation | Attempt exists and is `Dispatching` (the agent can only start what was dispatched; anything else is a stale or duplicate report) |
-| Apply effects | Attempt → `Running`, `started_at_us` recorded (the anchor for "reached Running" in true-up); allocation → `Active`; job `Preparing → Running`. |
+| Apply effects | Attempt → `Running`, `started_at_us` recorded (the anchor for "reached Running" in true-up); allocation → `Active`; job state is unchanged — it stays `Attempting(id)` (ADR 0030: agent-observed transitions no longer move the job). |
 | Rejections | `UnknownAttempt`, `StaleAttemptState` |
 
 #### `RecordAttemptExited`
@@ -353,7 +357,7 @@ reachable through the API.
 | Proposer | Ingestion, when exit is observed but agent-side finalization (log flush, usage summary) is still running |
 | Payload | `attempt: AttemptId`, `observed_at_us` |
 | Validation | Attempt exists and is `Running` |
-| Apply effects | Attempt → `Finalizing`; job `Running → Finalizing`. This is the only state the job *rests* in mid-resolution. Skipping this command (outcome arriving directly) is legal — the terminal edge exists from every non-terminal state. |
+| Apply effects | Attempt → `Finalizing`; job state is unchanged — it stays `Attempting(id)` (there is no job-level `Finalizing`; see ADR 0030). Skipping this command (outcome arriving directly) is legal — the terminal edge exists from every non-terminal state. |
 | Rejections | `UnknownAttempt`, `StaleAttemptState` |
 
 #### `RecordAttemptOutcome`
@@ -363,7 +367,7 @@ reachable through the API.
 | Proposer | Ingestion, from the terminal `AttemptStatus` report (natural exit, OOM, `max_runtime` kill, abort completion, pull/start failure) |
 | Payload | `attempt: AttemptId`, `outcome: AttemptOutcome` (the full ADR 0013 taxonomy except `Revoked`, which only `CommitPlacements` may produce), `actual_runtime_us: uint64` (normalizer-computed), `observed_at_us` |
 | Validation | Attempt exists and is non-terminal; outcome ≠ `Revoked` |
-| Apply effects | Attempt → `Terminal(outcome)` (legal from any non-terminal state — early endings arrive without prior started/exited commands); allocations `Released` + pledge pass; quota true-up (actual cost 0 if the attempt never reached `Running`, else from recorded rate × `ceil(actual_runtime_s)` × recorded multiplier; refund is the recorded `refund_fraction_milli` of the unused portion, or the full unused portion whenever the attempt never reached `Running` or `outcome`'s `OutcomeClass` is `Platform` — ADR 0029); job resolution per the `Finalizing` rules (retry / terminal / abort-wins / truth-wins). |
+| Apply effects | Attempt → `Terminal(outcome)` (legal from any non-terminal state — early endings arrive without prior started/exited commands); allocations `Released` + pledge pass; quota true-up (actual cost 0 if the attempt never reached `Running`, else from recorded rate × `ceil(actual_runtime_s)` × recorded multiplier; refund is the recorded `refund_fraction_milli` of the unused portion, or the full unused portion whenever the attempt never reached `Running` or `outcome`'s `OutcomeClass` is `Platform` — ADR 0029); job resolution per the rules above (retry / terminal / abort-wins / truth-wins), moving `Attempting(id)` directly to a terminal state or back to `Queued`. |
 | Rejections | `UnknownAttempt`, `StaleAttemptState`, `InvalidCommand` (outcome `Revoked`) |
 
 #### `ReconcileNode`
@@ -373,7 +377,7 @@ reachable through the API.
 | Proposer | Ingestion, from an ObservedSet report (agent restart registration, or the periodic heartbeat diff). The leader computes the diff; the command carries verdicts. |
 | Payload | `node: NodeId`, `node_epoch: u64` (the epoch the set was observed under), `adopted: AttemptId[]`, `lost: LostAttempt[]` where `LostAttempt = { attempt: AttemptId, outcome: AttemptOutcome, actual_runtime_us: uint64 }` (normalizer picks the outcome — typically `AgentError`; `NodeLost` and `StartFailed` are legal), `observed_at_us` |
 | Validation | Node exists; `node_epoch` equals the node's current epoch (a stale epoch means the whole set predates a re-registration and is worthless); every referenced attempt exists and lives on this node; lost outcomes ≠ `Revoked` |
-| Apply effects | **Adopted** (intended and running): attempt confirmed `Running` — `Dispatching → Running` with allocation `Active` and job → `Running` if the started report was missed; already-`Running` or already-terminal entries are no-ops (stale info, benign). **Lost** (intended but absent): the full terminal path with the carried outcome, identical to `RecordAttemptOutcome` — retry policy applies. The *stop* verdict never reaches apply (see the ingestion boundary). |
+| Apply effects | **Adopted** (intended and running): attempt confirmed `Running` — `Dispatching → Running` with allocation `Active` (job state is unchanged, per ADR 0030); already-`Running` or already-terminal entries are no-ops (stale info, benign). **Lost** (intended but absent): the full terminal path with the carried outcome, identical to `RecordAttemptOutcome` — retry policy applies. The *stop* verdict never reaches apply (see the ingestion boundary). |
 | Rejections | `UnknownNode`, `StaleNodeEpoch`, `InvalidBatch` wrapping `UnknownAttempt` / `AttemptNotOnNode` / `InvalidCommand` |
 
 ### Node lifecycle

@@ -166,7 +166,7 @@ fn job_state(views: &StateViews, job: JobId) -> Option<JobState> {
 }
 
 fn current_attempt_id(views: &StateViews, job: JobId) -> Option<AttemptId> {
-    views.latest().state().jobs.get(&job)?.current_attempt
+    views.latest().state().jobs.get(&job)?.current_attempt()
 }
 
 fn attempt_state(views: &StateViews, attempt: AttemptId) -> Option<AttemptState> {
@@ -298,7 +298,9 @@ async fn run_to_running() -> RunningJob {
     submit_job(&coord, job, entity, 0).await;
 
     // The scheduler places it, dispatch sends StartJob, the agent starts the
-    // container and reports Running (ADR 0013 Preparing -> Running).
+    // container and reports Running. The job stays `Attempting(id)` for the
+    // whole window; the attempt's own state is where Running shows up (ADR
+    // 0030 collapses the job-level Preparing/Running/Finalizing mirror).
     poll(DEADLINE, "attempt Running", || {
         let views = views.clone();
         async move {
@@ -312,9 +314,10 @@ async fn run_to_running() -> RunningJob {
     let alloc = attempt_alloc(&views, attempt).expect("attempt allocation");
 
     // Agent reported started: the FakeExecutor has the container running, and
-    // the job machine is Running.
+    // the job is Attempting this exact attempt with it Running (ADR 0030).
     assert!(executor.is_running(alloc), "container should be running");
-    assert_eq!(job_state(&views, job), Some(JobState::Running));
+    assert_eq!(job_state(&views, job), Some(JobState::Attempting(attempt)));
+    assert_eq!(attempt_state(&views, attempt), Some(AttemptState::Running));
     assert_eq!(
         executor.start_count(alloc),
         1,

@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import { Activity } from 'lucide-react'
-import { JOB_STATES, type JobState } from '@/api/types'
+import { JOB_PHASES, type JobPhase } from '@/api/types'
 import { useClusterOverview } from '@/api/queries'
 import { formatDurationUs } from '@/lib/format'
 import {
@@ -44,7 +44,7 @@ export function OverviewPage() {
   const { clusterId, queue, capacity, recentEvents } = data
   const depthSeries = queue.history.map((h) => ({ t: h.tUs, v: h.depth }))
   const drainSeries = queue.history.map((h) => ({ t: h.tUs, v: h.drainedPerMinute }))
-  const nonzeroStates = JOB_STATES.filter((s) => queue.byState[s] > 0)
+  const nonzeroStates = JOB_PHASES.filter((s) => queue.byState[s] > 0)
 
   return (
     <div>
@@ -121,7 +121,7 @@ export function OverviewPage() {
                   <li key={state}>
                     <Link
                       to="/jobs"
-                      search={{ state } as { state: JobState }}
+                      search={{ state } as { state: JobPhase }}
                       className="flex items-center justify-between rounded-md px-2 py-1.5 hover:bg-accent"
                     >
                       <StatePill state={state} />
