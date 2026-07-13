@@ -62,6 +62,21 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             .try_into()
             .map_err(invalid)?;
         let retry = req.retry.map(Into::into).unwrap_or_default();
+        // Same rules the conversion boundary enforces on core.v1.Job: a
+        // command is required (empty repeated = absent on the wire), and an
+        // entrypoint override, when present, is non-empty.
+        if req.command.is_empty() {
+            return Err(ApiError::Invalid("missing command".into()));
+        }
+        let entrypoint = match req.entrypoint {
+            None => None,
+            Some(e) if e.argv.is_empty() => {
+                return Err(ApiError::Invalid(
+                    "entrypoint override must have at least one token".into(),
+                ));
+            }
+            Some(e) => Some(e.argv),
+        };
 
         // Multiplier resolution reads the replicated table off the latest
         // view (ADR 0019: apply never sees the raw `priority: i32` in
@@ -84,6 +99,8 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             job: Job {
                 id: job,
                 image: req.image,
+                command: req.command,
+                entrypoint,
                 requests,
                 priority: req.priority,
                 max_runtime_us: req.max_runtime_us,
@@ -215,6 +232,8 @@ mod tests {
             quota_entity: Some(coppice_core::id::QuotaEntityId::new().into()),
             retry: None,
             job: Some(job.into()),
+            command: vec!["run".to_string()],
+            entrypoint: None,
         }
     }
 

@@ -18,6 +18,14 @@ pub struct Job {
     pub id: JobId,
     /// Container image reference to execute.
     pub image: String,
+    /// The container command line, pre-tokenized (argv semantics — no shell
+    /// parsing anywhere in the platform). Required: never empty, enforced at
+    /// the conversion boundary.
+    pub command: Vec<String>,
+    /// Entrypoint override; `None` runs the image's own entrypoint. When
+    /// `Some`, the argv is non-empty (also enforced at conversion) so "no
+    /// override" has exactly one representation.
+    pub entrypoint: Option<Vec<String>>,
     /// Resources requested for scheduling and isolation.
     pub requests: Resources,
     /// User-chosen priority. A multiplier on the job's cost, not a free lane:

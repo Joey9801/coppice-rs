@@ -53,6 +53,8 @@ fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> SubmitJobRequest {
         quota_entity: Some(quota_entity.into()),
         retry: None,
         job: Some(job.into()),
+        command: vec!["run".to_string()],
+        entrypoint: None,
     }
 }
 

@@ -32,8 +32,9 @@ submission's idempotency identity. The API no longer mints ids. Retrying an
 unknown outcome means re-sending the identical request, byte for byte.
 
 Apply resolves a `SubmitJob` whose id already exists in state by comparing
-the client-supplied spec fields (image, requests, priority,
-`max_runtime_us`, quota entity, retry policy) against the committed record:
+the client-supplied spec fields (image, command, entrypoint, requests,
+priority, `max_runtime_us`, quota entity, retry policy) against the
+committed record:
 
 - **Identical spec** → an **accepted no-op**: no state change beyond the
   `version` bump, no events, and the proposer observes success. The API

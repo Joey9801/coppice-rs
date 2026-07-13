@@ -101,6 +101,8 @@ pub fn job_record(
         spec: Job {
             id,
             image: image.to_string(),
+            command: vec!["run".into()],
+            entrypoint: None,
             requests,
             priority: 0,
             max_runtime_us,

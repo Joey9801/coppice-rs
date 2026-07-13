@@ -284,9 +284,12 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             None
         };
 
+        let (command, entrypoint) = gen_command(&mut rng);
         let spec = Job {
             id: job_id,
             image: gen_image(&mut rng),
+            command,
+            entrypoint,
             requests: requested,
             priority,
             max_runtime_us,
@@ -743,6 +746,30 @@ fn gen_image(rng: &mut Rng) -> String {
     // 48 bits -> 12 hex chars, like a truncated sha256 digest.
     let sha = rng.next_u64() & 0xFFFF_FFFF_FFFF;
     format!("{registry}/{name}:v{major}.{minor}.{patch}@sha256:{sha:012x}")
+}
+
+/// A non-empty tokenized command line, plus an occasional entrypoint
+/// override (both uphold the `Job` invariants the conversion boundary
+/// enforces: command never empty, override argv never empty).
+fn gen_command(rng: &mut Rng) -> (Vec<String>, Option<Vec<String>>) {
+    const PROGRAMS: [&str; 5] = ["train", "ingest", "encode", "score", "compact"];
+    const FLAGS: [&str; 6] = [
+        "--epochs",
+        "--shards",
+        "--batch-size",
+        "--workers",
+        "--seed",
+        "--timeout-s",
+    ];
+    let mut command = vec![rng.pick(&PROGRAMS).to_string()];
+    for _ in 0..rng.range(0, 4) {
+        command.push(rng.pick(&FLAGS).to_string());
+        command.push(rng.range(1, 4096).to_string());
+    }
+    let entrypoint = rng
+        .chance(1, 4)
+        .then(|| vec!["/usr/local/bin/launch".to_string()]);
+    (command, entrypoint)
 }
 
 /// Assert the cross-reference and accrual-queue invariants documented on

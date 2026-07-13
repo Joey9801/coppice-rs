@@ -250,6 +250,8 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
     let job = Job {
         id: jid(1),
         image: "img".into(),
+        command: vec!["run".into()],
+        entrypoint: None,
         requests: cpu(4_000),
         priority: 0,
         max_runtime_us: Some(600_000_000),
