@@ -2250,16 +2250,29 @@ export class MockWorld {
 
   private jobLogLines(job: MJob): LogEntry[] {
     const rng = new Rng(hashSeed(job.id + 'log'))
-    const start = job.submittedAtUs
-    const end = job.terminalAtUs ?? this.nowUs
     const lines: LogEntry[] = []
     const push = (tUs: number, level: LogLevel, target: string, message: string) =>
       lines.push({ tUs, level, target, message })
-    push(start, 'info', 'agent.puller', `pulling image ${job.spec.image}`)
-    push(start + 4 * SECOND_US, 'info', 'agent.puller', 'image present, extracting layers')
-    push(start + 9 * SECOND_US, 'info', 'agent.runtime', 'created container, starting entrypoint')
+
+    // Every job at least acknowledges submission to the coordinator.
+    push(job.submittedAtUs, 'info', 'coordinator.admission', 'job submitted, awaiting admission')
+
+    // Container-runtime lines only exist once the current attempt has actually
+    // started a container. Submitted/Accepted/Queued have no attempt at all,
+    // and a Preparing job's attempt is still Accruing (startedAtUs === null) —
+    // none of them have pulled an image or started an entrypoint yet.
+    const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+    if (!attempt || attempt.startedAtUs === null) return lines
+
+    const start = attempt.startedAtUs
+    const end = job.terminalAtUs ?? this.nowUs
+    // Anchor the pull/start sequence to when the container actually started,
+    // so it reflects the current attempt rather than the submission time.
+    push(start - 9 * SECOND_US, 'info', 'agent.puller', `pulling image ${job.spec.image}`)
+    push(start - 5 * SECOND_US, 'info', 'agent.puller', 'image present, extracting layers')
+    push(start, 'info', 'agent.runtime', 'created container, starting entrypoint')
     const appLines = rng.int(40, 90)
-    let t = start + 12 * SECOND_US
+    let t = start + 3 * SECOND_US
     for (let i = 0; i < appLines && t < end; i += 1) {
       t += rng.range(2 * SECOND_US, 90 * SECOND_US)
       const level = rng.weighted([
