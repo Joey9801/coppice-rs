@@ -558,6 +558,7 @@ impl From<ChargeRecord> for pb::ChargeRecord {
         pb::ChargeRecord {
             amount_ucu: charge.amount.0,
             charged_at_us: charge.charged_at_us,
+            refund_fraction_milli: Some(charge.refund_fraction_milli),
         }
     }
 }
@@ -567,6 +568,9 @@ impl From<pb::ChargeRecord> for ChargeRecord {
         ChargeRecord {
             amount: CostUnits(charge.amount_ucu),
             charged_at_us: charge.charged_at_us,
+            // Absent (a charge recorded before ADR 0029) trues up at full
+            // refund, exactly as it did then.
+            refund_fraction_milli: charge.refund_fraction_milli.unwrap_or(1000),
         }
     }
 }

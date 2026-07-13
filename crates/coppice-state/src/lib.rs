@@ -27,7 +27,8 @@ use coppice_core::job::{Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::quota::{
     ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, UsageState,
-    DEFAULT_PENALTY_EXPONENT_MILLI,
+    DEFAULT_PENALTY_EXPONENT_MILLI, DEFAULT_REFUND_FRACTION_MILLI,
+    DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
 };
 
 mod apply;
@@ -186,6 +187,15 @@ pub struct PolicyConfig {
     pub accrual_limit: u32,
     /// Charge-time runtime for jobs with no enforced `max_runtime`, seconds.
     pub default_charge_runtime_s: u64,
+    /// Q32.32 multiplier folded into the effective priority multiplier of
+    /// any job placed without an enforced `max_runtime` (ADR 0029).
+    /// Validated ≥ 1.0 at policy commit; 1.0 disables the surcharge.
+    pub unbounded_runtime_multiplier: PriorityMultiplier,
+    /// Parts-per-thousand of the unused charge refunded at true-up, applied
+    /// to job-attributable outcomes of attempts that ran with a declared
+    /// `max_runtime` (ADR 0029). Captured on the charge record at placement;
+    /// validated ≤ 1000 at policy commit; 1000 restores full refunds.
+    pub refund_fraction_milli: u32,
     /// Terminal jobs are eligible for `EvictTerminalJobs` this long after
     /// terminal state (ADR 0012).
     ///
@@ -204,6 +214,8 @@ impl Default for PolicyConfig {
             priority_multipliers: BTreeMap::new(),
             accrual_limit: 4,
             default_charge_runtime_s: 86_400,
+            unbounded_runtime_multiplier: DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
+            refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
             terminal_retention_us: 72 * 3_600 * 1_000_000,
             abort_grace_us: 30 * 1_000_000,
         }

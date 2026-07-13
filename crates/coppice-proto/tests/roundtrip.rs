@@ -294,6 +294,63 @@ fn unknown_resource_kinds_fail_loud() {
 }
 
 #[test]
+fn charge_record_refund_fraction_roundtrips() {
+    let record = coppice_core::quota::ChargeRecord {
+        amount: CostUnits(42_000),
+        charged_at_us: TS,
+        refund_fraction_milli: 750,
+    };
+    let encoded: pb::core::v1::ChargeRecord = record.into();
+    assert_eq!(encoded.refund_fraction_milli, Some(750));
+    let back: coppice_core::quota::ChargeRecord = encoded.into();
+    assert_eq!(back, record, "charge-record roundtrip must be lossless");
+}
+
+#[test]
+fn charge_record_absent_refund_fraction_is_full_refund() {
+    // A charge recorded before ADR 0029 carries no fraction; it must true up
+    // at the full-refund neutral (1000), preserving pre-0029 behaviour.
+    let encoded = pb::core::v1::ChargeRecord {
+        amount_ucu: 42_000,
+        charged_at_us: TS,
+        refund_fraction_milli: None,
+    };
+    let back: coppice_core::quota::ChargeRecord = encoded.into();
+    assert_eq!(back.refund_fraction_milli, 1000);
+}
+
+#[test]
+fn policy_config_incentive_knobs_roundtrip() {
+    let policy = PolicyConfig {
+        unbounded_runtime_multiplier: PriorityMultiplier::from_integer(3),
+        refund_fraction_milli: 500,
+        ..PolicyConfig::default()
+    };
+    let encoded: pb::core::v1::PolicyConfig = (&policy).into();
+    assert_eq!(
+        encoded.unbounded_runtime_multiplier_q32_32,
+        Some(PriorityMultiplier::from_integer(3).0)
+    );
+    assert_eq!(encoded.refund_fraction_milli, Some(500));
+    let back: PolicyConfig = encoded.try_into().expect("policy must convert");
+    assert_eq!(back, policy, "policy roundtrip must be lossless");
+}
+
+#[test]
+fn policy_config_absent_incentive_knobs_are_neutral() {
+    // A PolicyConfig written by a pre-0029 coordinator omits both knobs. They
+    // must decode to the neutral values (1.0, 1000) — today's behaviour — and
+    // NOT to PolicyConfig::default()'s new knobs (2.0, 750), so an old policy
+    // round-trips to the old arithmetic.
+    let mut encoded: pb::core::v1::PolicyConfig = (&PolicyConfig::default()).into();
+    encoded.unbounded_runtime_multiplier_q32_32 = None;
+    encoded.refund_fraction_milli = None;
+    let back: PolicyConfig = encoded.try_into().expect("policy must convert");
+    assert_eq!(back.unbounded_runtime_multiplier, PriorityMultiplier::ONE);
+    assert_eq!(back.refund_fraction_milli, 1000);
+}
+
+#[test]
 fn resources_encode_canonically() {
     // Ascending kind, zeros omitted — byte-identical encodes for equal values.
     let r = Resources {

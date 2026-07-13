@@ -489,6 +489,7 @@ fn build_attempt(
             charge: ChargeRecord {
                 amount: ctx.charge_amount,
                 charged_at_us,
+                refund_fraction_milli: quota::FULL_REFUND_MILLI,
             },
             rate_ucu_per_second: ctx.rate,
             multiplier: ctx.multiplier,
