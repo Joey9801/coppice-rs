@@ -168,9 +168,17 @@ fn invalid(e: ConvertError) -> ApiError {
 /// caller's side.
 fn map_consensus_error(e: ConsensusError) -> ApiError {
     match e {
-        ConsensusError::NotLeader { leader } => ApiError::NotLeader {
-            leader_hint: leader.map(|l| l.to_string()),
-        },
+        ConsensusError::NotLeader { leader } => {
+            // `leader` is the raft CoordinatorId — useful in logs, useless
+            // to a client, which needs a dialable client-API address. That
+            // mapping does not exist yet (raft membership records only the
+            // peer-plane address; ADR 0031 leaves advertising client
+            // addresses through membership — or internal forwarding — as
+            // the follow-up), so the hint stays empty rather than lying
+            // with a bare integer the caller cannot retry against.
+            tracing::debug!(leader = ?leader, "write refused: not the leader");
+            ApiError::NotLeader { leader_hint: None }
+        }
         other => ApiError::Unavailable(other.to_string()),
     }
 }
@@ -277,12 +285,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn not_leader_submit_maps_to_not_leader() {
+    async fn not_leader_submit_maps_to_not_leader_without_a_fake_hint() {
         let cp = control_plane(ProposeOutcome::NotLeader(Some(7)));
         let result = cp.submit_job(submit_request(JobId::new())).await;
-        assert!(
-            matches!(result, Err(ApiError::NotLeader { leader_hint: Some(hint) }) if hint == "7")
-        );
+        // The raft CoordinatorId is not a dialable client address, so it
+        // must not leak into the hint (which the HTTP layer would render
+        // as a retry target).
+        assert!(matches!(
+            result,
+            Err(ApiError::NotLeader { leader_hint: None })
+        ));
     }
 
     #[tokio::test]

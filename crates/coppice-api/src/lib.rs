@@ -25,8 +25,13 @@ use coppice_proto::pb::api::v1::{AbortJobRequest, SubmitJobRequest, SubmitJobRes
 /// replicated decision at all.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
-    /// This replica is not the leader; the caller should retry against the
-    /// address carried here, when known.
+    /// This replica is not the leader. `leader_hint`, when present, is the
+    /// leader's advertised **client-API address** (dialable by the caller
+    /// for a retry) — never an internal identifier like the raft
+    /// CoordinatorId. Today no producer can supply it (raft membership
+    /// records only the peer-plane address), so it is `None` until client
+    /// addresses are advertised through membership or writes are forwarded
+    /// internally (ADR 0031).
     #[error("not the leader{}", .leader_hint.as_deref().map(|h| format!(" (leader is {h})")).unwrap_or_default())]
     NotLeader { leader_hint: Option<String> },
 

@@ -12,17 +12,18 @@ use std::future::ready;
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use coppice_core::id::JobId;
+use coppice_core::id::{JobId, NodeId, QuotaEntityId};
 use coppice_proto::pb::api::v1::{AbortJobRequest, AbortJobResponse, SubmitJobRequest};
 
 use crate::ControlPlane;
 
 use super::error::HttpError;
+use super::extract::{IdPath, ReadQuery};
 
 /// Build the client-listener router around a [`ControlPlane`].
 ///
@@ -31,61 +32,81 @@ use super::error::HttpError;
 pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
     Router::new()
         // Session / auth (ADR 0022) — local read, no raft involvement.
-        .route("/api/v1/session", get(unimplemented("GetSession")))
+        .route("/api/v1/session", get(unimplemented_read("GetSession")))
         // Cluster overview — bounded reads.
-        .route("/api/v1/overview", get(unimplemented("GetClusterOverview")))
-        .route("/api/v1/queue/stats", get(unimplemented("GetQueueStats")))
+        .route(
+            "/api/v1/overview",
+            get(unimplemented_read("GetClusterOverview")),
+        )
+        .route(
+            "/api/v1/queue/stats",
+            get(unimplemented_read("GetQueueStats")),
+        )
         // Jobs. List/detail/timeline are bounded; usage is eventual
         // (derived samples); logs are provisional until log storage exists.
         .route(
             "/api/v1/jobs",
-            get(unimplemented("ListJobs")).post(submit_job::<P>),
+            get(unimplemented_read("ListJobs")).post(submit_job::<P>),
         )
-        .route("/api/v1/jobs/:job", get(unimplemented("GetJob")))
+        .route(
+            "/api/v1/jobs/:job",
+            get(unimplemented_id_read::<JobId>("GetJob")),
+        )
         .route("/api/v1/jobs/:job/abort", post(abort_job::<P>))
         .route(
             "/api/v1/jobs/:job/timeline",
-            get(unimplemented("GetJobTimeline")),
+            get(unimplemented_id_read::<JobId>("GetJobTimeline")),
         )
-        .route("/api/v1/jobs/:job/usage", get(unimplemented("GetJobUsage")))
-        .route("/api/v1/jobs/:job/logs", get(unimplemented("GetJobLogs")))
+        .route(
+            "/api/v1/jobs/:job/usage",
+            get(unimplemented_id_read::<JobId>("GetJobUsage")),
+        )
+        .route(
+            "/api/v1/jobs/:job/logs",
+            get(unimplemented_id_read::<JobId>("GetJobLogs")),
+        )
         // Nodes. List/detail bounded; utilization/history eventual; logs
         // provisional.
-        .route("/api/v1/nodes", get(unimplemented("ListNodes")))
-        .route("/api/v1/nodes/:node", get(unimplemented("GetNode")))
+        .route("/api/v1/nodes", get(unimplemented_read("ListNodes")))
+        .route(
+            "/api/v1/nodes/:node",
+            get(unimplemented_id_read::<NodeId>("GetNode")),
+        )
         .route(
             "/api/v1/nodes/:node/utilization",
-            get(unimplemented("GetNodeUtilization")),
+            get(unimplemented_id_read::<NodeId>("GetNodeUtilization")),
         )
         .route(
             "/api/v1/nodes/:node/history",
-            get(unimplemented("GetNodeHistory")),
+            get(unimplemented_id_read::<NodeId>("GetNodeHistory")),
         )
         .route(
             "/api/v1/nodes/:node/logs",
-            get(unimplemented("GetNodeLogs")),
+            get(unimplemented_id_read::<NodeId>("GetNodeLogs")),
         )
         // Coordinators — local status read; logs provisional.
         .route(
             "/api/v1/coordinators",
-            get(unimplemented("GetCoordinatorStatus")),
+            get(unimplemented_read("GetCoordinatorStatus")),
         )
         .route(
             "/api/v1/coordinators/:id/logs",
-            get(unimplemented("GetCoordinatorLogs")),
+            // Coordinator ids are raft ids: plain u64, not typed uuids (ADR 0024).
+            get(unimplemented_id_read::<u64>("GetCoordinatorLogs")),
         )
         // Quota entities. List bounded; detail defaults strong (ADR 0007:
         // configuration reads); configure is the ADR-0023-gated upsert.
         .route(
             "/api/v1/quota-entities",
-            get(unimplemented("ListQuotaEntities")).post(unimplemented("ConfigureQuotaEntity")),
+            get(unimplemented_read("ListQuotaEntities"))
+                .post(unimplemented("ConfigureQuotaEntity")),
         )
         .route(
             "/api/v1/quota-entities/:entity",
-            get(unimplemented("GetQuotaEntity")),
+            get(unimplemented_id_read::<QuotaEntityId>("GetQuotaEntity")),
         )
         // Reserved: ADR 0008 event subscription (SSE, cursor-resumed).
-        .route("/api/v1/events", get(unimplemented("SubscribeEvents")))
+        .route("/api/v1/events", get(unimplemented_read("SubscribeEvents")))
         // Everything unrouted: `/api/*` misses stay JSON 404s; anything
         // else serves the embedded web UI (static assets + SPA fallback,
         // ADR 0031 "Serving the UI").
@@ -93,13 +114,36 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         .with_state(plane)
 }
 
-/// Stub handler for a route whose endpoint is not implemented yet: routed
-/// (so the path is claimed and typos 404 distinctly) but answering
-/// `501 UNIMPLEMENTED` with the endpoint name.
+/// Stub for an unimplemented write route: routed (so the path is claimed
+/// and typos 404 distinctly) but answering `501 UNIMPLEMENTED` with the
+/// endpoint name.
 fn unimplemented(
     endpoint: &'static str,
 ) -> impl Fn() -> std::future::Ready<HttpError> + Clone + Send + 'static {
     move || ready(HttpError::unimplemented(endpoint))
+}
+
+/// Stub for an unimplemented read route. Extracting [`ReadQuery`] makes the
+/// ADR 0007 parameter contract mechanical even before the endpoint exists:
+/// `?consistency=bogus` is `INVALID_ARGUMENT` on every read, and the
+/// eventual real handler inherits the extractor instead of re-adding it.
+fn unimplemented_read(
+    endpoint: &'static str,
+) -> impl Fn(ReadQuery) -> std::future::Ready<HttpError> + Clone + Send + 'static {
+    move |ReadQuery(_)| ready(HttpError::unimplemented(endpoint))
+}
+
+/// [`unimplemented_read`] for routes with a typed id path segment: the id
+/// is validated ([`IdPath`]) before the 501, so malformed ids are
+/// `INVALID_ARGUMENT` per the contract rather than leaking the stub.
+fn unimplemented_id_read<T>(
+    endpoint: &'static str,
+) -> impl Fn(IdPath<T>, ReadQuery) -> std::future::Ready<HttpError> + Clone + Send + 'static
+where
+    T: std::str::FromStr + Send + 'static,
+    T::Err: std::fmt::Display,
+{
+    move |IdPath(_), ReadQuery(_)| ready(HttpError::unimplemented(endpoint))
 }
 
 /// `POST /api/v1/jobs` — body `SubmitJobRequest`, response
@@ -120,12 +164,9 @@ async fn submit_job<P: ControlPlane>(
 /// path — a mismatch is `INVALID_ARGUMENT`, never silently resolved.
 async fn abort_job<P: ControlPlane>(
     State(plane): State<Arc<P>>,
-    Path(job): Path<String>,
+    IdPath(job): IdPath<JobId>,
     body: Result<Json<AbortJobRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
-    let job: JobId = job
-        .parse()
-        .map_err(|e: coppice_core::id::ParseIdError| HttpError::invalid(e.to_string()))?;
     let Json(mut request) = body.map_err(bad_body)?;
     match &request.job {
         None => request.job = Some(job.into()),
@@ -208,6 +249,55 @@ mod tests {
         let body = body_json(response).await;
         assert_eq!(body["code"], "UNIMPLEMENTED");
         assert!(body["message"].as_str().unwrap().contains("ListNodes"));
+    }
+
+    #[tokio::test]
+    async fn stub_reads_validate_consistency_before_answering_501() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/nodes?consistency=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn stub_reads_validate_typed_path_ids_before_answering_501() {
+        for uri in [
+            "/api/v1/jobs/not-a-job-id",
+            "/api/v1/coordinators/seven/logs",
+        ] {
+            let response = app(None)
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                body_json(response).await["code"],
+                "INVALID_ARGUMENT",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn well_formed_stub_reads_answer_501() {
+        let job = JobId::new();
+        let response = app(None)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}?consistency=strong&min_index=3"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = body_json(response).await;
+        assert!(body["message"].as_str().unwrap().contains("GetJob"));
     }
 
     #[tokio::test]
