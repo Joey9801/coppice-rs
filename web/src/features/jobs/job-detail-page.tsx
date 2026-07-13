@@ -1,7 +1,14 @@
 import { Fragment, type ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, SearchX } from 'lucide-react'
-import { type JobDetail, type JobId, TERMINAL_JOB_STATES, type QuotaEntityView } from '@/api/types'
+import {
+  derivePhase,
+  isTerminalJobState,
+  jobCurrentAttempt,
+  type JobDetail,
+  type JobId,
+  type QuotaEntityView,
+} from '@/api/types'
 import { useJob } from '@/api/queries'
 import { formatTimestampUs, formatUcu } from '@/lib/format'
 import { EmptyState, PageHeader, StatePill, StatTile, TimeAgo } from '@/components'
@@ -65,7 +72,9 @@ export function JobDetailPage({ jobId }: { jobId: JobId }) {
 }
 
 function JobDetailView({ job }: { job: JobDetail }) {
-  const terminal = TERMINAL_JOB_STATES.includes(job.state)
+  const terminal = isTerminalJobState(job.state)
+  const attempt = jobCurrentAttempt(job)
+  const phase = derivePhase(job.state, attempt?.state ?? null)
 
   return (
     <div>
@@ -75,7 +84,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
         title={
           <span className="flex flex-wrap items-center gap-2.5">
             <span className="font-mono text-lg break-all">{job.id}</span>
-            <StatePill state={job.state} />
+            <StatePill state={phase} />
           </span>
         }
         description={

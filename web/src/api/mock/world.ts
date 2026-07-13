@@ -31,7 +31,9 @@ import type {
   CostReport,
   JobDetail,
   JobList,
+  JobPhase,
   JobState,
+  JobStateKind,
   JobSummary,
   JobUsage,
   ListJobsFilter,
@@ -57,7 +59,7 @@ import type {
   UtilizationSample,
   UsageSample,
 } from '../types'
-import { TERMINAL_JOB_STATES } from '../types'
+import { derivePhase, isTerminalJobState, jobAttemptId, JOB_PHASES } from '../types'
 import { GIB, hashSeed, mintImage, ORG_NAME, Rng, TEAMS, TIB } from './generate'
 
 // ---------------------------------------------------------------------------
@@ -71,19 +73,6 @@ const HOUR_US = 60 * MINUTE_US
 const TICK_US = SECOND_US
 /** Cap on ticks processed in one advanceTo, so a long-idle tab can't hang. */
 const MAX_TICKS_PER_ADVANCE = 4000
-
-/** Every job state, in pipeline order (for zero-filled by-state tallies). */
-const ALL_JOB_STATES: JobState[] = [
-  'Submitted',
-  'Accepted',
-  'Queued',
-  'Preparing',
-  'Running',
-  'Finalizing',
-  'Succeeded',
-  'Failed',
-  'Aborted',
-]
 
 /** Priority class → scheduling multiplier m(j) (ADR 0021). */
 const PRIORITY_MULTIPLIER: Record<number, number> = { 0: 1, 1: 2, 2: 4 }
@@ -285,13 +274,13 @@ interface JobSpecInternal {
 interface MJob {
   id: string
   spec: JobSpecInternal
+  /** The current attempt id, when there is one, lives inside `Attempting` (ADR 0029). */
   state: JobState
   submittedAtUs: number
   terminalAtUs: number | null
   retriesUsed: number
   abortRequested: { reason: string | null; requestedAtUs: number } | null
   attempts: string[]
-  currentAttempt: string | null
   actualUcu: number | null
   trueUp: { kind: 'Refund' | 'Surcharge'; amountUcu: number } | null
   usage: UsageSample[]
@@ -762,8 +751,8 @@ export class MockWorld {
     this.buildFinalizingJobs(4)
     this.buildPreparingJobs(16)
     this.buildQueuedJobs(25)
-    this.buildPipelineJobs('Accepted', 4)
-    this.buildPipelineJobs('Submitted', 3)
+    this.buildPipelineJobs({ kind: 'Accepted' }, 4)
+    this.buildPipelineJobs({ kind: 'Submitted' }, 3)
     this.buildTerminalJobs(150)
   }
 
@@ -777,7 +766,6 @@ export class MockWorld {
       retriesUsed: 0,
       abortRequested: null,
       attempts: [],
-      currentAttempt: null,
       actualUcu: null,
       trueUp: null,
       usage: [],
@@ -830,6 +818,17 @@ export class MockWorld {
     return alloc
   }
 
+  /** The attempt `job.state` points at, if any (ADR 0029: no separate link field). */
+  private currentAttempt(job: MJob): MAttempt | undefined {
+    const id = jobAttemptId(job.state)
+    return id ? this.attempts.get(id) : undefined
+  }
+
+  /** The flat display phase for a job, joining `Attempting` with its attempt's state. */
+  private jobPhase(job: MJob): JobPhase {
+    return derivePhase(job.state, this.currentAttempt(job)?.state ?? null)
+  }
+
   private buildRunningJobs(target: number): void {
     const free = this.nodeFreeCapacity()
     const placeable = this.placeableNodes()
@@ -838,7 +837,7 @@ export class MockWorld {
     while (made < target && attempts < target * 6) {
       attempts += 1
       const submittedAtUs = this.nowUs - this.rng.range(5 * MINUTE_US, 20 * HOUR_US)
-      const job = this.newJob('Running', submittedAtUs)
+      const job = this.newJob({ kind: 'Queued' }, submittedAtUs)
       const nodeId = this.findFit(job.spec.requests, free, placeable)
       if (!nodeId) {
         this.jobs.delete(job.id)
@@ -853,7 +852,7 @@ export class MockWorld {
       attempt.startedAtUs = startedAtUs
       attempt.chargedUcu = Math.round(attempt.rateUcuPerSecond * (runningForUs / SECOND_US))
       const alloc = this.newAlloc(job, attempt, nodeId, { ...job.spec.requests }, 'Active')
-      job.currentAttempt = attempt.id
+      job.state = { kind: 'Attempting', attempt: attempt.id }
       const cur = free.get(nodeId)
       if (cur) free.set(nodeId, subRes(cur, alloc.funded))
       this.seedUsage(job, startedAtUs)
@@ -869,7 +868,7 @@ export class MockWorld {
     while (made < target && tries < target * 6) {
       tries += 1
       const submittedAtUs = this.nowUs - this.rng.range(20 * MINUTE_US, 8 * HOUR_US)
-      const job = this.newJob('Finalizing', submittedAtUs)
+      const job = this.newJob({ kind: 'Queued' }, submittedAtUs)
       const nodeId = this.findFit(job.spec.requests, free, placeable)
       if (!nodeId) {
         this.jobs.delete(job.id)
@@ -881,7 +880,7 @@ export class MockWorld {
       attempt.startedAtUs = startedAtUs
       attempt.chargedUcu = Math.round(attempt.rateUcuPerSecond * (runningForUs / SECOND_US))
       const alloc = this.newAlloc(job, attempt, nodeId, { ...job.spec.requests }, 'Active')
-      job.currentAttempt = attempt.id
+      job.state = { kind: 'Attempting', attempt: attempt.id }
       const cur = free.get(nodeId)
       if (cur) free.set(nodeId, subRes(cur, alloc.funded))
       this.seedUsage(job, startedAtUs)
@@ -894,12 +893,11 @@ export class MockWorld {
     const placeable = this.placeableNodes()
     for (let i = 0; i < target; i += 1) {
       const submittedAtUs = this.nowUs - this.rng.range(30 * SECOND_US, 15 * MINUTE_US)
-      const job = this.newJob('Preparing', submittedAtUs)
+      const job = this.newJob({ kind: 'Queued' }, submittedAtUs)
       // Accrue against the node with the most headroom (partial funding).
       const nodeId = this.pickAccrualNode(placeable, free)
       if (!nodeId) {
-        // Fall back to Queued if nothing can host an accrual.
-        job.state = 'Queued'
+        // Fall back to Queued if nothing can host an accrual (already set).
         continue
       }
       const attempt = this.newAttempt(job, nodeId, 'Accruing')
@@ -907,7 +905,7 @@ export class MockWorld {
       const frac = this.rng.range(0.2, 0.8)
       const funded = this.clampFunded(scaleRes(job.spec.requests, frac), free.get(nodeId))
       const alloc = this.newAlloc(job, attempt, nodeId, funded, 'Accruing')
-      job.currentAttempt = attempt.id
+      job.state = { kind: 'Attempting', attempt: attempt.id }
       job.projectedStartUs = this.rng.bool(0.75)
         ? this.nowUs + this.rng.range(1 * MINUTE_US, 25 * MINUTE_US)
         : null
@@ -919,7 +917,7 @@ export class MockWorld {
   private buildQueuedJobs(target: number): void {
     for (let i = 0; i < target; i += 1) {
       const submittedAtUs = this.nowUs - this.rng.range(10 * SECOND_US, 40 * MINUTE_US)
-      this.newJob('Queued', submittedAtUs)
+      this.newJob({ kind: 'Queued' }, submittedAtUs)
     }
   }
 
@@ -936,9 +934,9 @@ export class MockWorld {
       const submittedAtUs = this.nowUs - this.rng.range(30 * MINUTE_US, 72 * HOUR_US)
       const outcomeRoll = this.rng.float()
       let state: JobState
-      if (outcomeRoll < 0.1) state = 'Failed'
-      else if (outcomeRoll < 0.14) state = 'Aborted'
-      else state = 'Succeeded'
+      if (outcomeRoll < 0.1) state = { kind: 'Failed' }
+      else if (outcomeRoll < 0.14) state = { kind: 'Aborted' }
+      else state = { kind: 'Succeeded' }
       const job = this.newJob(state, submittedAtUs)
 
       const runForUs = this.rng.range(1 * MINUTE_US, 5 * HOUR_US)
@@ -959,7 +957,6 @@ export class MockWorld {
       attempt.chargedUcu = chargedUcu
       // Released allocation: recorded for history, excluded from capacity.
       this.newAlloc(job, attempt, node.id, { ...job.spec.requests }, 'Released')
-      job.currentAttempt = attempt.id
 
       this.applyTrueUp(job, attempt, state)
     }
@@ -988,8 +985,8 @@ export class MockWorld {
   }
 
   private finalOutcome(state: JobState): AttemptOutcome {
-    if (state === 'Succeeded') return { kind: 'Exited', exitCode: 0, class: 'Success' }
-    if (state === 'Aborted') return { kind: 'Aborted', class: 'UserRequest' }
+    if (state.kind === 'Succeeded') return { kind: 'Exited', exitCode: 0, class: 'Success' }
+    if (state.kind === 'Aborted') return { kind: 'Aborted', class: 'UserRequest' }
     const [kind, cls] = this.rng.weighted(
       FAILURE_POOL.map((f) => [[f[0], f[1]] as const, f[2]] as const),
     )
@@ -1012,7 +1009,7 @@ export class MockWorld {
     } else {
       job.trueUp = { kind: 'Surcharge', amountUcu: diff }
     }
-    if (state === 'Aborted') {
+    if (state.kind === 'Aborted') {
       job.abortRequested = {
         reason: this.rng.pick(['user requested', 'superseded', 'cost cap', null]),
         requestedAtUs:
@@ -1221,9 +1218,8 @@ export class MockWorld {
 
   private tickRunningJobs(): void {
     for (const job of this.jobs.values()) {
-      if (job.state !== 'Running' && job.state !== 'Finalizing') continue
-      const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
-      if (!attempt) continue
+      const attempt = this.currentAttempt(job)
+      if (!attempt || (attempt.state !== 'Running' && attempt.state !== 'Finalizing')) continue
       // Append a bounded usage sample and accrue charge.
       const seedRng = new Rng(hashSeed(job.id + this.nowUs))
       job.usage.push(this.usageSample(this.nowUs, job.spec.requests, seedRng))
@@ -1233,7 +1229,7 @@ export class MockWorld {
       // Charge the full per-tick cost to every ancestor (charge_ancestors).
       this.chargeAncestors(job.spec.quotaEntity, delta)
 
-      if (job.state === 'Running') {
+      if (attempt.state === 'Running') {
         const overRuntime =
           job.spec.maxRuntimeUs !== null &&
           attempt.startedAtUs !== null &&
@@ -1241,10 +1237,19 @@ export class MockWorld {
         // p ≈ 0.0035/s → mean runtime ~5min. Tuned together with the arrival
         // rate in tickArrivals so demand roughly matches effective service
         // at saturation and a visible queue + accruals persist at steady
-        // state without growing unboundedly.
+        // state without growing unboundedly. No job-level transition here —
+        // the job stays `Attempting(attempt)`; only the attempt's state
+        // moves, which is what the timeline now shows (ADR 0029).
         if (overRuntime || this.rng.bool(0.0035)) {
-          this.transition(job, 'Finalizing')
           attempt.state = 'Finalizing'
+          this.pushEvent({
+            atUs: this.nowUs,
+            kind: 'AttemptStateChanged',
+            attempt: attempt.id,
+            job: job.id,
+            node: attempt.node,
+            state: 'Finalizing',
+          })
         }
       } else if (this.rng.bool(0.25)) {
         this.finishJob(job, attempt)
@@ -1254,7 +1259,7 @@ export class MockWorld {
 
   private finishJob(job: MJob, attempt: MAttempt): void {
     const failed = this.rng.bool(0.08)
-    const state: JobState = failed ? 'Failed' : 'Succeeded'
+    const state: JobState = failed ? { kind: 'Failed' } : { kind: 'Succeeded' }
     attempt.state = 'Terminal'
     attempt.endedAtUs = this.nowUs
     attempt.outcome = this.finalOutcome(state)
@@ -1279,9 +1284,8 @@ export class MockWorld {
   private tickAccruals(): void {
     const free = this.nodeFreeCapacity()
     for (const job of this.jobs.values()) {
-      if (job.state !== 'Preparing') continue
-      const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
-      if (!attempt) continue
+      const attempt = this.currentAttempt(job)
+      if (!attempt || attempt.state !== 'Accruing') continue
       const alloc = this.allocs.get(attempt.allocation)
       if (!alloc || alloc.state !== 'Accruing') continue
       // A projection that has come and gone without funding was optimistic;
@@ -1307,13 +1311,21 @@ export class MockWorld {
         free.set(alloc.node, subRes(nodeFree, delta))
       }
       if (fitsRes(alloc.requested, alloc.funded)) {
-        // Fully funded → Active → Running.
+        // Fully funded → Active → Running. No job-level transition — the
+        // job stays `Attempting(attempt)`; only the attempt moves (ADR 0029).
         alloc.funded = { ...alloc.requested }
         alloc.state = 'Active'
         attempt.state = 'Running'
         attempt.startedAtUs = this.nowUs
-        this.transition(job, 'Running')
         this.seedUsage(job, this.nowUs - SECOND_US)
+        this.pushEvent({
+          atUs: this.nowUs,
+          kind: 'AttemptStateChanged',
+          attempt: attempt.id,
+          job: job.id,
+          node: alloc.node,
+          state: 'Running',
+        })
         this.pushEvent({
           atUs: this.nowUs,
           kind: 'AllocationFunded',
@@ -1329,7 +1341,7 @@ export class MockWorld {
     const free = this.nodeFreeCapacity()
     const counts = this.accrualCounts()
     const placeable = this.placeableNodes()
-    const queued = [...this.jobs.values()].filter((j) => j.state === 'Queued')
+    const queued = [...this.jobs.values()].filter((j) => j.state.kind === 'Queued')
     // Admit the best-ranked queued jobs first, at most one per tick
     // (mirrors `max_placements_per_cycle`) — jobs must visibly dwell in the
     // queue instead of being whisked into Preparing on arrival.
@@ -1370,9 +1382,8 @@ export class MockWorld {
             free.get(placedNode),
           )
       const alloc = this.newAlloc(job, attempt, placedNode, funded, 'Accruing')
-      job.currentAttempt = attempt.id
       job.projectedStartUs = this.nowUs + this.rng.range(1 * MINUTE_US, 20 * MINUTE_US)
-      this.transition(job, 'Preparing')
+      this.transition(job, { kind: 'Attempting', attempt: attempt.id })
       counts.set(placedNode, (counts.get(placedNode) ?? 0) + 1)
       const f = free.get(placedNode)
       if (f) free.set(placedNode, subRes(f, alloc.funded))
@@ -1383,10 +1394,13 @@ export class MockWorld {
 
   private tickPipeline(): void {
     for (const job of this.jobs.values()) {
-      if (job.state === 'Submitted' && this.nowUs - job.lastTransitionUs > 2 * SECOND_US) {
-        this.transition(job, 'Accepted')
-      } else if (job.state === 'Accepted' && this.nowUs - job.lastTransitionUs > 3 * SECOND_US) {
-        this.transition(job, 'Queued')
+      if (job.state.kind === 'Submitted' && this.nowUs - job.lastTransitionUs > 2 * SECOND_US) {
+        this.transition(job, { kind: 'Accepted' })
+      } else if (
+        job.state.kind === 'Accepted' &&
+        this.nowUs - job.lastTransitionUs > 3 * SECOND_US
+      ) {
+        this.transition(job, { kind: 'Queued' })
         this.arrivalsThisBucket += 1
       }
     }
@@ -1402,7 +1416,7 @@ export class MockWorld {
     const pressure = Math.min(1.5, Math.max(0.4, 1.5 - depth / 40))
     const swell = 1 + 0.3 * Math.sin((2 * Math.PI * this.nowUs) / (18 * MINUTE_US))
     if (!this.rng.bool(0.2 * pressure * swell)) return
-    const job = this.newJob('Submitted', this.nowUs)
+    const job = this.newJob({ kind: 'Submitted' }, this.nowUs)
     this.pushEvent({ atUs: this.nowUs, kind: 'JobSubmitted', job: job.id })
   }
 
@@ -1454,10 +1468,10 @@ export class MockWorld {
 
   private transition(job: MJob, to: JobState): void {
     const from = job.state
-    if (from === to) return
+    if (from.kind === to.kind && jobAttemptId(from) === jobAttemptId(to)) return
     job.state = to
     job.lastTransitionUs = this.nowUs
-    if (TERMINAL_JOB_STATES.includes(to)) job.terminalAtUs = job.terminalAtUs ?? this.nowUs
+    if (isTerminalJobState(to)) job.terminalAtUs = job.terminalAtUs ?? this.nowUs
     this.pushEvent({ atUs: this.nowUs, kind: 'JobStateChanged', job: job.id, from, to })
   }
 
@@ -1511,7 +1525,7 @@ export class MockWorld {
   }
 
   private recomputeQueueRanks(): void {
-    const queued = [...this.jobs.values()].filter((j) => j.state === 'Queued')
+    const queued = [...this.jobs.values()].filter((j) => j.state.kind === 'Queued')
     queued.sort((a, b) => this.score(b) - this.score(a))
     this.queuedRank.clear()
     queued.forEach((job, i) => this.queuedRank.set(job.id, i + 1))
@@ -1523,9 +1537,9 @@ export class MockWorld {
 
   // ---- lookups -------------------------------------------------------------
 
-  private countByState(state: JobState): number {
+  private countByState(kind: JobStateKind): number {
     let n = 0
-    for (const job of this.jobs.values()) if (job.state === state) n += 1
+    for (const job of this.jobs.values()) if (job.state.kind === kind) n += 1
     return n
   }
 
@@ -1598,9 +1612,9 @@ export class MockWorld {
   private nodeUsed(nodeId: string): Resources {
     let total = zeroRes()
     for (const job of this.jobs.values()) {
-      if (job.state !== 'Running' && job.state !== 'Finalizing') continue
-      const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
-      if (!attempt || attempt.node !== nodeId) continue
+      const attempt = this.currentAttempt(job)
+      if (!attempt || (attempt.state !== 'Running' && attempt.state !== 'Finalizing')) continue
+      if (attempt.node !== nodeId) continue
       const last = job.usage[job.usage.length - 1]
       if (last) total = addRes(total, res(last.cpuMillis, last.memoryBytes, last.diskBytes))
     }
@@ -1652,24 +1666,12 @@ export class MockWorld {
   }
 
   buildQueueStats(): QueueStats {
-    const byState = {} as Record<JobState, number>
-    for (const s of [
-      'Submitted',
-      'Accepted',
-      'Queued',
-      'Preparing',
-      'Running',
-      'Finalizing',
-      'Succeeded',
-      'Failed',
-      'Aborted',
-    ] as JobState[]) {
-      byState[s] = 0
-    }
+    const byState = {} as Record<JobPhase, number>
+    for (const s of JOB_PHASES) byState[s] = 0
     let oldestQueuedAgeUs: number | null = null
     for (const job of this.jobs.values()) {
-      byState[job.state] += 1
-      if (job.state === 'Queued') {
+      byState[this.jobPhase(job)] += 1
+      if (job.state.kind === 'Queued') {
         const age = this.nowUs - job.submittedAtUs
         if (oldestQueuedAgeUs === null || age > oldestQueuedAgeUs) oldestQueuedAgeUs = age
       }
@@ -1698,10 +1700,10 @@ export class MockWorld {
     // quotaEntity matches the whole subtree (entity + descendants).
     const subtree = filter.quotaEntity ? this.subtreeEntityIds(filter.quotaEntity) : null
     let matches = [...this.jobs.values()].filter((job) => {
-      if (wanted && !wanted.has(job.state)) return false
+      if (wanted && !wanted.has(this.jobPhase(job))) return false
       if (subtree && !subtree.has(job.spec.quotaEntity)) return false
       if (filter.node) {
-        const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+        const attempt = this.currentAttempt(job)
         if (!attempt || attempt.node !== filter.node) return false
       }
       if (search) {
@@ -1727,14 +1729,14 @@ export class MockWorld {
   }
 
   private isTerminal(job: MJob): boolean {
-    return TERMINAL_JOB_STATES.includes(job.state)
+    return isTerminalJobState(job.state)
   }
 
   private jobSummary(job: MJob): JobSummary {
-    const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+    const attempt = this.currentAttempt(job)
     const alloc = attempt ? this.allocs.get(attempt.allocation) : undefined
     const fundingFraction =
-      job.state === 'Preparing' && alloc ? minFraction(alloc.funded, alloc.requested) : null
+      attempt?.state === 'Accruing' && alloc ? minFraction(alloc.funded, alloc.requested) : null
     return {
       id: job.id,
       state: job.state,
@@ -1745,7 +1747,8 @@ export class MockWorld {
       submittedAtUs: job.submittedAtUs,
       terminalAtUs: job.terminalAtUs,
       node: attempt ? attempt.node : null,
-      queueRank: job.state === 'Queued' ? (this.queuedRank.get(job.id) ?? null) : null,
+      attemptState: attempt ? attempt.state : null,
+      queueRank: job.state.kind === 'Queued' ? (this.queuedRank.get(job.id) ?? null) : null,
       fundingFraction,
       costUcu: this.totalCharged(job),
       outcome: this.isTerminal(job) ? this.lastOutcome(job) : null,
@@ -1763,7 +1766,7 @@ export class MockWorld {
 
   buildJobDetail(id: string): JobDetail {
     const job = this.jobOrThrow(id)
-    const attempt = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+    const attempt = this.currentAttempt(job)
     return {
       id: job.id,
       state: job.state,
@@ -1781,8 +1784,7 @@ export class MockWorld {
       abortRequested: job.abortRequested ? { ...job.abortRequested } : null,
       entityChain: this.entityChain(job.spec.quotaEntity),
       attempts: job.attempts.map((aid) => this.attemptView(aid)),
-      currentAttempt: job.currentAttempt,
-      queue: job.state === 'Queued' ? this.queueExplainer(job) : null,
+      queue: job.state.kind === 'Queued' ? this.queueExplainer(job) : null,
       accrual: attempt && attempt.state === 'Accruing' ? this.accrualView(attempt) : null,
       cost: this.costReport(job),
     }
@@ -1929,8 +1931,9 @@ export class MockWorld {
       running.set(id, 0)
     }
     for (const job of this.jobs.values()) {
-      if (job.state !== 'Queued' && job.state !== 'Running') continue
-      const map = job.state === 'Queued' ? queued : running
+      const phase = this.jobPhase(job)
+      if (phase !== 'Queued' && phase !== 'Running') continue
+      const map = phase === 'Queued' ? queued : running
       let cur: QEntity | undefined = this.entities.get(job.spec.quotaEntity)
       let depth = 0
       while (cur && depth < MAX_QUOTA_DEPTH) {
@@ -1999,18 +2002,19 @@ export class MockWorld {
 
   private buildQuotaStats(ent: QEntity): QuotaEntityStats {
     const subtree = this.subtreeEntityIds(ent.id)
-    const byState = {} as Record<JobState, number>
-    for (const s of ALL_JOB_STATES) byState[s] = 0
+    const byState = {} as Record<JobPhase, number>
+    for (const s of JOB_PHASES) byState[s] = 0
     let oldestQueuedAgeUs: number | null = null
     let burnRateUcuPerSecond = 0
     for (const job of this.jobs.values()) {
       if (!subtree.has(job.spec.quotaEntity)) continue
-      byState[job.state] += 1
-      if (job.state === 'Queued') {
+      const phase = this.jobPhase(job)
+      byState[phase] += 1
+      if (phase === 'Queued') {
         const age = this.nowUs - job.submittedAtUs
         if (oldestQueuedAgeUs === null || age > oldestQueuedAgeUs) oldestQueuedAgeUs = age
-      } else if (job.state === 'Running') {
-        const a = job.currentAttempt ? this.attempts.get(job.currentAttempt) : undefined
+      } else if (phase === 'Running') {
+        const a = this.currentAttempt(job)
         if (a && a.state === 'Running') burnRateUcuPerSecond += a.rateUcuPerSecond
       }
     }

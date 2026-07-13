@@ -10,7 +10,7 @@ import {
   Send,
   Shuffle,
 } from 'lucide-react'
-import type { JobId, TimelineEvent } from '@/api/types'
+import { jobStateLabel, type JobId, type TimelineEvent } from '@/api/types'
 import { useJobTimeline } from '@/api/queries'
 import { formatTimeAgo, formatTimestampUs } from '@/lib/format'
 import { EmptyState, IdLink } from '@/components'
@@ -89,7 +89,8 @@ function eventSentence(event: TimelineEvent): ReactNode {
     case 'JobStateChanged':
       return (
         <>
-          State changed <Mono>{event.from}</Mono> → <Mono>{event.to}</Mono>
+          State changed <Mono>{jobStateLabel(event.from)}</Mono> →{' '}
+          <Mono>{jobStateLabel(event.to)}</Mono>
         </>
       )
     case 'AttemptStateChanged':

@@ -3,12 +3,12 @@ import type {
   AllocationState,
   AttemptOutcome,
   AttemptState,
-  JobState,
+  JobPhase,
   NodeHealth,
 } from '@/api/types'
 import { cn } from '@/lib/utils'
 
-export type PillState = JobState | AttemptState | AllocationState | NodeHealth | 'Draining'
+export type PillState = JobPhase | AttemptState | AllocationState | NodeHealth | 'Draining'
 
 // State colors intentionally use the Tailwind palette (not semantic tokens):
 // each tone is tuned for contrast in both themes via a dark: variant.

@@ -1,4 +1,4 @@
-import type { AttemptView, JobDetail } from '@/api/types'
+import { jobAttemptId, type AttemptView, type JobDetail } from '@/api/types'
 import { formatDurationUs, formatResources, formatUcu, shortId } from '@/lib/format'
 import { IdLink, KeyValueGrid, outcomePill, StatePill, TimeAgo } from '@/components'
 import { cn } from '@/lib/utils'
@@ -55,7 +55,7 @@ export function JobSpecTab({ job }: { job: JobDetail }) {
         <h3 className="mb-2 text-sm font-medium text-foreground">
           Attempts ({job.attempts.length})
         </h3>
-        <AttemptsTable attempts={job.attempts} currentAttempt={job.currentAttempt} />
+        <AttemptsTable attempts={job.attempts} currentAttempt={jobAttemptId(job.state)} />
       </div>
     </div>
   )

@@ -2,13 +2,13 @@ import { Fragment, useState } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { ArrowLeft, ArrowRight, Network, Plus } from 'lucide-react'
 import type {
-  JobState,
+  JobPhase,
   ListJobsFilter,
   QuotaEntityDetail,
   QuotaEntityNode,
   QuotaEntityView,
 } from '@/api/types'
-import { JOB_STATES } from '@/api/types'
+import { derivePhase, JOB_PHASES } from '@/api/types'
 import { useJobs, useQuotaEntities, useQuotaEntity } from '@/api/queries'
 import { canConfigureEntities, useSession } from '@/auth/session'
 import { formatDurationUs, formatPercent, formatUcu } from '@/lib/format'
@@ -319,7 +319,7 @@ function ChildrenCard({
 }
 
 function JobsCard({ entityId }: { entityId: string }) {
-  const [state, setState] = useState<JobState | ''>('')
+  const [state, setState] = useState<JobPhase | ''>('')
   const filter: ListJobsFilter = {
     quotaEntity: entityId,
     states: state ? [state] : undefined,
@@ -335,10 +335,10 @@ function JobsCard({ entityId }: { entityId: string }) {
         <Select
           aria-label="Filter by state"
           value={state}
-          onChange={(e) => setState((e.target.value || '') as JobState | '')}
+          onChange={(e) => setState((e.target.value || '') as JobPhase | '')}
         >
           <option value="">All states</option>
-          {JOB_STATES.map((s) => (
+          {JOB_PHASES.map((s) => (
             <option key={s} value={s}>
               {s}
             </option>
@@ -374,7 +374,7 @@ function JobsCard({ entityId }: { entityId: string }) {
                       <IdLink id={job.id} />
                     </TableCell>
                     <TableCell>
-                      <StatePill state={job.state} />
+                      <StatePill state={derivePhase(job.state, job.attemptState)} />
                     </TableCell>
                     <TableCell className="max-w-[16rem]">
                       <span
