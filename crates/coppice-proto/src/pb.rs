@@ -6,8 +6,13 @@
 //! domain types convert at the boundary (see [`crate::convert`]).
 
 pub mod core {
+    // pbjson's generated visitors trip a clippy lint newer than the
+    // generator (`write!(.., &FIELDS)`); allow it on generated code only.
+    #[allow(clippy::useless_borrows_in_formatting)]
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/coppice.core.v1.rs"));
+        // proto3 JSON serde impls (pbjson): public-API packages only.
+        include!(concat!(env!("OUT_DIR"), "/coppice.core.v1.serde.rs"));
     }
 }
 
@@ -36,7 +41,11 @@ pub mod agent {
 }
 
 pub mod api {
+    // See `core`: lint allowance for pbjson-generated code.
+    #[allow(clippy::useless_borrows_in_formatting)]
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/coppice.api.v1.rs"));
+        // proto3 JSON serde impls (pbjson): public-API packages only.
+        include!(concat!(env!("OUT_DIR"), "/coppice.api.v1.serde.rs"));
     }
 }

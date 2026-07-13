@@ -24,12 +24,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let descriptors = protox::compile(&files, [&proto_root])?;
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-    fs::write(
-        out_dir.join("descriptor.binpb"),
-        descriptors.encode_to_vec(),
-    )?;
+    let descriptor_bytes = descriptors.encode_to_vec();
+    fs::write(out_dir.join("descriptor.binpb"), &descriptor_bytes)?;
 
     prost_build::Config::new().compile_fds(descriptors)?;
+
+    // proto3 JSON (serde) impls for the public-API packages only (ADR
+    // 0031): the HTTP edge maps `coppice.api.v1` onto JSON, which pulls in
+    // the `coppice.core.v1` types it references. The replicated packages
+    // (command/raft/storage/agent) deliberately get none — serde must never
+    // become a parallel encoding of a replicated format (schema-style.md).
+    pbjson_build::Builder::new()
+        .register_descriptors(&descriptor_bytes)?
+        .build(&[".coppice.api", ".coppice.core"])?;
     Ok(())
 }
 
