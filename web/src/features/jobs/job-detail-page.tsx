@@ -130,10 +130,10 @@ function JobDetailView({ job }: { job: JobDetail }) {
 
         <HeroTiles job={job} phase={phase} />
 
-        <JobUsageSection job={job} />
-
         {job.queue ? <JobQueuePanel queue={job.queue} /> : null}
         {job.accrual ? <JobAccrualPanel accrual={job.accrual} /> : null}
+
+        <JobUsageSection job={job} />
 
         <div className="grid gap-4 lg:grid-cols-5">
           <div className="lg:col-span-3">
