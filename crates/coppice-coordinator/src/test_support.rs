@@ -90,7 +90,15 @@ pub fn allocation_record(
     }
 }
 
-/// A `Preparing` job record with the given spec fields.
+/// A `Queued` job record with the given spec fields.
+///
+/// `Queued` rather than a live `Attempting(id)` state: under the collapsed
+/// job machine (ADR 0029) a live state carries the attempt it points at, and
+/// callers of this fixture build their job and attempt records independently
+/// (there is no `attempt_id` parameter here to keep them coherent). `Queued`
+/// is the honest choice for a record with no attempt of its own; tests that
+/// need a live job override `.state` with a real `Attempting(id)` alongside a
+/// matching attempt record.
 pub fn job_record(
     id: JobId,
     image: &str,
@@ -108,12 +116,11 @@ pub fn job_record(
             retry: RetryPolicy::default(),
             abort_requested: None,
         },
-        state: JobState::Preparing,
+        state: JobState::Queued,
         multiplier: PriorityMultiplier(0),
         submitted_at_us: 0,
         terminal_at_us: None,
         retries_used: 0,
-        current_attempt: None,
         attempts: Vec::new(),
     }
 }
