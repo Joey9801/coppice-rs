@@ -16,8 +16,11 @@ use rust_embed::RustEmbed;
 
 use super::error::HttpError;
 
+// `COPPICE_WEB_DIST` is set by build.rs: `web/dist` when a build exists,
+// an empty `OUT_DIR` placeholder otherwise — never a write into the source
+// tree, which may be read-only.
 #[derive(RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/../../web/dist"]
+#[folder = "$COPPICE_WEB_DIST"]
 struct Assets;
 
 /// Whether a UI build is present (embedded or, in debug, on disk) — lets

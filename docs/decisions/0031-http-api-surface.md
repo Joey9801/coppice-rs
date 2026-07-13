@@ -95,7 +95,15 @@ batches with ADR 0008 cursors — never a raw firehose.
 ### Consistency plumbing (ADR 0007 made concrete)
 
 - Every read accepts `?consistency=strong|bounded|eventual`, overriding
-  the endpoint default upward or downward as ADR 0007 allows.
+  the endpoint default upward or downward as ADR 0007 allows. The
+  parameter contract is mechanical, not per-handler discipline: shared
+  extractors (`IdPath`, `ReadQuery` in `coppice-api::http`) validate the
+  typed path id and the read parameters on **every** read route, stubs
+  included — a malformed id or a bogus `consistency` value is
+  `INVALID_ARGUMENT` even on endpoints that answer `UNIMPLEMENTED`, and a
+  real handler inherits the extractors rather than re-adding validation.
+  The staleness headers below are attached through a typed response part
+  (`ReadIndexes`) for the same reason.
 - Every read accepts `?min_index=N`: serve from a view with
   `applied_index ≥ N` (`StateViews::at_least`), the read-your-writes pair
   for a write response's `logIndex`.
@@ -107,9 +115,16 @@ batches with ADR 0008 cursors — never a raw firehose.
   `Coppice-Committed-Index` headers (decimal). Headers rather than a body
   envelope keep bodies pure proto messages.
 - Writes always execute on the leader. v1 behavior on a follower is a
-  `NOT_LEADER` error with a `Coppice-Leader` hint header; internal
-  forwarding (ADR 0007's end state) can be added later without changing
-  the contract, since clients that handled the error keep working.
+  `NOT_LEADER` error; the `Coppice-Leader` hint header, when present,
+  carries the leader's advertised **client-API address** — a value the
+  caller can actually retry against, never an internal identifier such as
+  the raft `CoordinatorId`. Today no producer can supply that address
+  (raft membership records only the peer-plane address), so the header is
+  simply absent and clients must fall back to trying their configured
+  coordinator list. Closing this properly means either advertising client
+  addresses through membership or internal forwarding (ADR 0007's end
+  state); both slot in without changing the contract, since clients that
+  handled the hint-less error keep working.
 
 ### Error contract
 
@@ -158,9 +173,11 @@ for the API — same-origin, no CORS, one port. Mechanism: `rust-embed` over
 contract). Release builds embed the assets in the binary; debug builds
 read the folder from disk per request, so `coppice dev` picks up a fresh
 `npm --prefix web run build` without recompiling. `web/dist` stays a
-gitignored npm product — a clean checkout compiles without Node
-(`coppice-api`'s build script creates the empty folder) and UI paths then
-404 with the build command. Vite's content-hashed `assets/` get
+gitignored npm product — a clean checkout compiles without Node, and the
+source tree is never written at build time (it may be read-only under
+packaging systems): `coppice-api`'s build script points the embed at
+`web/dist` when it exists and at an empty `OUT_DIR` placeholder otherwise,
+in which case UI paths 404 with the build command. Vite's content-hashed `assets/` get
 `immutable` caching; entry points revalidate.
 
 ### Agents stay off the client edge
