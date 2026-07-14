@@ -73,9 +73,9 @@ below, with unimplemented ones answering `501 UNIMPLEMENTED`:
 2. Add the method to the real client (create `src/api/real-client.ts`
    implementing part of `CoppiceApi` with `fetch` against `/api/v1/...`
    when the first endpoint lands). The real client owns the wire
-   mapping: snake_case keys and enum strings → the camelCase/PascalCase
-   `types.ts` shapes on reads, the proto3-JSON write path (wrapped ids,
-   64-bit ints as strings), and error translation.
+   mapping: snake_case keys and enum strings ↔ the camelCase/PascalCase
+   `types.ts` shapes (both directions — write bodies use the same DTO
+   conventions), and error translation.
 3. Flip that one method in the delegation table in `src/api/index.ts`
    (`{ ...mock, listJobs: real.listJobs }`).
 4. Do not delete the mock implementation — it backs tests and offline

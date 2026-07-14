@@ -12,6 +12,7 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use coppice_api::http::dto;
 use coppice_api::{ApiError, ControlPlane};
 use coppice_consensus::Consensus;
 use coppice_coordinator::admin;
@@ -19,8 +20,6 @@ use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::CoordinatorControlPlane;
 use coppice_core::id::{ClusterId, JobId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
-use coppice_proto::pb::api::v1::SubmitJobRequest;
-use coppice_proto::pb::core::v1 as pbcore;
 use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
 use coppice_state::{Command, PolicyConfig};
 
@@ -44,15 +43,19 @@ async fn wait_for_leader(nodes: &[Node], candidates: &[usize], deadline: Duratio
 }
 
 /// The one logical submission, byte-identical on every send.
-fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> SubmitJobRequest {
-    SubmitJobRequest {
+fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequest {
+    dto::SubmitJobRequest {
         image: "registry/img:latest".to_string(),
-        requests: Some(pbcore::Resources { quantities: vec![] }),
+        requests: dto::Resources {
+            cpu_millis: 1000,
+            memory_bytes: 0,
+            disk_bytes: 0,
+        },
         priority: 0,
         max_runtime_us: Some(3_600_000_000),
-        quota_entity: Some(quota_entity.into()),
+        quota_entity,
         retry: None,
-        job: Some(job.into()),
+        job,
         command: vec!["run".to_string()],
         entrypoint: None,
     }
@@ -166,7 +169,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
             .submit_job(request.clone())
             .await
             .expect("first submission accepted");
-        assert_eq!(first.job, Some(job.into()));
+        assert_eq!(first.job, job);
         // ... and here the client never receives `first`.
     }
 
@@ -197,8 +200,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
         .await
         .expect("retry after unknown outcome must succeed");
     assert_eq!(
-        retried.job,
-        Some(job.into()),
+        retried.job, job,
         "the retry must resolve to the original client-minted job id"
     );
     assert!(retried.log_index > 0);

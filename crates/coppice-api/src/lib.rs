@@ -14,7 +14,7 @@ pub mod http;
 
 use std::future::Future;
 
-use coppice_proto::pb::api::v1::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
+use http::dto::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
 
 /// Consistency class for read operations (ADR 0007).
 ///

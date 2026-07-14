@@ -18,8 +18,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
-use coppice_proto::pb::api::v1::{AbortJobRequest, AbortJobResponse, SubmitJobRequest};
 
+use super::dto::{AbortJobRequest, AbortJobResponse, SubmitJobRequest};
 use crate::{Consistency, ControlPlane};
 
 use super::error::HttpError;
@@ -144,7 +144,7 @@ where
 }
 
 /// `POST /api/v1/jobs` — body `SubmitJobRequest`, response
-/// `SubmitJobResponse` (echoed client-minted id + `logIndex` for a
+/// `SubmitJobResponse` (echoed client-minted id + `log_index` for a
 /// read-your-writes `min_index`, ADR 0026/0007).
 async fn submit_job<P: ControlPlane>(
     State(plane): State<Arc<P>>,
@@ -165,9 +165,9 @@ async fn abort_job<P: ControlPlane>(
     body: Result<Json<AbortJobRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
     let Json(mut request) = body.map_err(bad_body)?;
-    match &request.job {
-        None => request.job = Some(job.into()),
-        Some(body_job) if *body_job != job.into() => {
+    match request.job {
+        None => request.job = Some(job),
+        Some(body_job) if body_job != job => {
             return Err(HttpError::invalid(
                 "body job id does not match the path job id",
             ));
@@ -228,8 +228,8 @@ mod tests {
     use axum::http::{header, Request, StatusCode};
     use tower::ServiceExt;
 
+    use super::super::dto::SubmitJobResponse;
     use crate::{ApiError, ReadOptions, ReadView};
-    use coppice_proto::pb::api::v1::SubmitJobResponse;
 
     use crate::http::COPPICE_LEADER;
 
@@ -441,15 +441,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_round_trips_proto3_json() {
+    async fn submit_round_trips_the_dto_json() {
         let job = JobId::new().to_string();
         let request_body = format!(
             r#"{{
                 "image": "busybox",
                 "command": ["run"],
                 "priority": 0,
-                "job": {{ "value": "{job}" }},
-                "quotaEntity": {{ "value": "{}" }}
+                "requests": {{ "cpu_millis": 1000, "memory_bytes": 0, "disk_bytes": 0 }},
+                "job": "{job}",
+                "quota_entity": "{}"
             }}"#,
             coppice_core::id::QuotaEntityId::new()
         );
@@ -459,9 +460,32 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        // proto3 JSON: camelCase keys, 64-bit ints as strings, typed ids.
-        assert_eq!(body["job"]["value"], job.as_str());
-        assert_eq!(body["logIndex"], "7");
+        // DTO contract: snake_case keys, bare typed-string ids, integers
+        // as JSON numbers.
+        assert_eq!(body["job"], job.as_str());
+        assert_eq!(body["log_index"], 7);
+    }
+
+    #[tokio::test]
+    async fn submit_missing_a_required_field_is_invalid_argument() {
+        // No `requests` — the DTO owns required-ness, so this fails
+        // deserialization rather than silently defaulting.
+        let request_body = format!(
+            r#"{{
+                "image": "busybox",
+                "command": ["run"],
+                "job": "{}",
+                "quota_entity": "{}"
+            }}"#,
+            JobId::new(),
+            coppice_core::id::QuotaEntityId::new()
+        );
+        let response = app(None)
+            .oneshot(post_json("/api/v1/jobs", &request_body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
     }
 
     #[tokio::test]
@@ -486,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_rejects_a_body_job_that_contradicts_the_path() {
-        let body = format!(r#"{{ "job": {{ "value": "{}" }} }}"#, JobId::new());
+        let body = format!(r#"{{ "job": "{}" }}"#, JobId::new());
         let response = app(None)
             .oneshot(post_json(
                 &format!("/api/v1/jobs/{}/abort", JobId::new()),

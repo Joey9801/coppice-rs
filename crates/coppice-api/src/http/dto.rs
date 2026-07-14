@@ -1,14 +1,15 @@
-//! Handwritten JSON DTOs for the `/api/v1` read models.
+//! Handwritten JSON DTOs for the `/api/v1` surface — read models and
+//! write bodies alike.
 //!
-//! The read-model JSON contract is owned by these types, not by protobuf:
-//! they are versioned with the route prefix (`/api/v1` ⇔ this module),
-//! serialized with plain serde, and mirror `web/src/api/types.ts` by name
-//! and semantics (the TS side spells keys in camelCase; the web client
-//! maps casing at its wire boundary). Protobuf remains the canonical format for internal RPC,
-//! storage, and replication — it never leaks its wire idioms (wrapped ids,
-//! stringified u64, `SCREAMING_CASE` enum names, omitted empties) into
-//! these responses. Each read endpoint adds its DTOs here in the change
-//! that implements it (ADR 0031, "Wire format").
+//! The JSON contract is owned by these types, not by protobuf: they are
+//! versioned with the route prefix (`/api/v1` ⇔ this module), serialized
+//! with plain serde, and mirror `web/src/api/types.ts` by name and
+//! semantics (the TS side spells keys in camelCase; the web client maps
+//! casing at its wire boundary). Protobuf remains the canonical format
+//! for internal RPC, storage, and replication — it never leaks its wire
+//! idioms (wrapped ids, stringified u64, `SCREAMING_CASE` enum names,
+//! omitted empties) into these bodies. Each endpoint adds its DTOs here
+//! in the change that implements it (ADR 0031, "Wire format").
 //!
 //! Conventions, fixed for the v1 surface:
 //! - `snake_case` keys (`"cpu_millis"`) and enum values (`"unknown"`,
@@ -22,7 +23,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use coppice_core::attempt;
-use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
+use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 
 /// Resource quantities (mirrors `coppice_core::resource::Resources`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +257,103 @@ pub struct GetNodeResponse {
     pub accrual_queue: Vec<AccrualView>,
 }
 
+// ---------------------------------------------------------------------------
+// Writes
+// ---------------------------------------------------------------------------
+
+/// Per-job retry policy (mirrors `coppice_core::job::RetryPolicy`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    /// Opt-in to retrying user-error outcomes (nonzero exit, OOM). Never
+    /// applies to `MaxRuntimeExceeded` or aborts.
+    pub retry_user_errors: bool,
+}
+
+impl From<RetryPolicy> for coppice_core::job::RetryPolicy {
+    fn from(r: RetryPolicy) -> Self {
+        coppice_core::job::RetryPolicy {
+            max_retries: r.max_retries,
+            retry_user_errors: r.retry_user_errors,
+        }
+    }
+}
+
+impl From<Resources> for coppice_core::resource::Resources {
+    fn from(r: Resources) -> Self {
+        coppice_core::resource::Resources {
+            cpu_millis: r.cpu_millis,
+            memory_bytes: r.memory_bytes,
+            disk_bytes: r.disk_bytes,
+        }
+    }
+}
+
+/// `POST /api/v1/jobs`.
+///
+/// The client-minted `job` id is the submission's idempotency identity
+/// (ADR 0026): retrying after a timeout, connection loss, or leader change
+/// re-sends the identical request, and a repeat whose first attempt already
+/// committed resolves to the same job — success with the original `JobId`,
+/// never a second job. Reusing an id with a *different* payload is
+/// rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitJobRequest {
+    /// Client-minted job identity (`job-<uuid>`, ADR 0024) — required.
+    /// Mint a fresh id per logical submission; reuse it verbatim on every
+    /// retry.
+    pub job: JobId,
+    pub image: String,
+    /// The container command line, pre-tokenized (argv semantics, no shell
+    /// parsing) — required and non-empty.
+    pub command: Vec<String>,
+    /// Entrypoint override; absent runs the image's own entrypoint. When
+    /// present, must be non-empty.
+    #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
+    /// Resources requested for scheduling and isolation.
+    pub requests: Resources,
+    /// Resolved through the replicated multiplier table; a priority with no
+    /// configured multiplier is invalid.
+    #[serde(default)]
+    pub priority: i32,
+    /// Enforced runtime bound; absent = charged the policy default runtime.
+    #[serde(default)]
+    pub max_runtime_us: Option<u64>,
+    /// The quota-entity leaf to charge.
+    pub quota_entity: QuotaEntityId,
+    /// Absent = the platform default policy.
+    #[serde(default)]
+    pub retry: Option<RetryPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SubmitJobResponse {
+    /// Echo of the client-minted id from the request.
+    pub job: JobId,
+    /// Raft log index at which this request's command applied. Pair it
+    /// with `?min_index=` on a subsequent read for read-your-writes
+    /// (ADR 0007). On an idempotent repeat this is the repeat's own apply
+    /// index — ≥ the original commit, so still a valid cursor.
+    pub log_index: u64,
+}
+
+/// `POST /api/v1/jobs/{job}/abort` — commits a desired-state transition;
+/// it does not synchronously stop the container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortJobRequest {
+    /// The path segment is authoritative; the body's `job`, when present,
+    /// must match it (`{}` aborts with no reason).
+    #[serde(default)]
+    pub job: Option<JobId>,
+    /// Optional reason, recorded in job history and events.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AbortJobResponse {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +410,54 @@ mod tests {
     fn empty_list_serializes_as_an_empty_array() {
         let json = serde_json::to_value(ListNodesResponse { nodes: vec![] }).unwrap();
         assert_eq!(json, serde_json::json!({ "nodes": [] }));
+    }
+
+    #[test]
+    fn minimal_submit_request_deserializes_with_defaults() {
+        let job = JobId::new();
+        let entity = QuotaEntityId::new();
+        let req: SubmitJobRequest = serde_json::from_value(serde_json::json!({
+            "job": job.to_string(),
+            "image": "busybox",
+            "command": ["run"],
+            "requests": { "cpu_millis": 1000, "memory_bytes": 0, "disk_bytes": 0 },
+            "quota_entity": entity.to_string(),
+        }))
+        .expect("minimal request");
+
+        assert_eq!(req.job, job);
+        assert_eq!(req.quota_entity, entity);
+        assert_eq!(req.priority, 0);
+        assert_eq!(req.max_runtime_us, None);
+        assert!(req.entrypoint.is_none());
+        assert!(req.retry.is_none());
+    }
+
+    #[test]
+    fn submit_request_requires_its_core_fields() {
+        // Omitting a required field (here `requests`) is a deserialization
+        // error, not a silent default — the DTO owns required-ness, unlike
+        // proto3 JSON where every field is optional on the wire.
+        let result: Result<SubmitJobRequest, _> = serde_json::from_value(serde_json::json!({
+            "job": JobId::new().to_string(),
+            "image": "busybox",
+            "command": ["run"],
+            "quota_entity": QuotaEntityId::new().to_string(),
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn submit_response_serializes_ids_bare_and_ints_as_numbers() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let json = serde_json::to_value(SubmitJobResponse { job, log_index: 7 }).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "job": "job-00000000-0000-0000-0000-000000000001",
+                "log_index": 7,
+            })
+        );
     }
 
     #[test]
