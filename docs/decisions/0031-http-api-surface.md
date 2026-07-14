@@ -59,10 +59,12 @@ compatibility commitment for browser, CLI, and REST consumers, coupling
 the public contract to internal schema style. Instead the DTOs own the
 JSON contract and the projection layer converts domain types → DTOs at
 the HTTP boundary; **protobuf stays canonical for internal RPC, storage,
-and replication**. DTO conventions, fixed for v1: camelCase keys, ids as
-their bare typed strings (`"job-<uuid>"`), integers as JSON numbers,
-`null` for absent optionals, `[]` for empty lists, PascalCase string
-enums matching the `types.ts` unions.
+and replication**. DTO conventions, fixed for v1: snake_case keys
+(`"cpu_millis"`) and snake_case string enums (`"unknown"`,
+`"oom_killed"`), ids as their bare typed strings (`"job-<uuid>"`),
+integers as JSON numbers, `null` for absent optionals, `[]` for empty
+lists. The web client maps snake_case wire keys onto its camelCase
+`types.ts` shapes at its boundary.
 
 Read models are **not designed up front**: each endpoint's DTOs land in
 `coppice-api::http::dto` in the same change that implements it. Naming is

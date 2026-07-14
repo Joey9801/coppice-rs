@@ -63,18 +63,19 @@ below, with unimplemented ones answering `501 UNIMPLEMENTED`:
 
 1. Define the endpoint's response DTOs in
    `crates/coppice-api/src/http/dto.rs` (shape mirrors this repo's
-   `src/api/types.ts` by name and semantics: camelCase keys, bare
+   `src/api/types.ts` by name and semantics, spelled snake_case on the
+   wire: `cpu_millis` keys, `"oom_killed"` enum strings, bare
    typed-string ids, integers as JSON numbers, `null` optionals, `[]`
-   empties, PascalCase string enums), add the projection in
+   empties), add the projection in
    `crates/coppice-api/src/http/project.rs`, and swap its stub handler
    in `crates/coppice-api/src/http/routes.rs` for a real one backed by
    the coordinator.
 2. Add the method to the real client (create `src/api/real-client.ts`
    implementing part of `CoppiceApi` with `fetch` against `/api/v1/...`
-   when the first endpoint lands). Read responses arrive already in
-   `types.ts` shape; the residual wire mapping the real client owns is
-   the write path (proto3 JSON: wrapped ids, 64-bit ints as strings) and
-   error translation.
+   when the first endpoint lands). The real client owns the wire
+   mapping: snake_case keys and enum strings → the camelCase/PascalCase
+   `types.ts` shapes on reads, the proto3-JSON write path (wrapped ids,
+   64-bit ints as strings), and error translation.
 3. Flip that one method in the delegation table in `src/api/index.ts`
    (`{ ...mock, listJobs: real.listJobs }`).
 4. Do not delete the mock implementation — it backs tests and offline
