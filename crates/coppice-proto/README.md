@@ -11,8 +11,10 @@ directory per versioned package: shared vocabulary (`coppice.core.v1`), the
 Raft log command set (`coppice.command.v1`), our own Raft envelope and
 membership types (`coppice.raft.v1`), snapshot and manifest payloads
 (`coppice.storage.v1`), the agent↔coordinator protocol (`coppice.agent.v1`),
-and the public API (`coppice.api.v1`, JSON-mapped at the edge). These are the
-*only* types on the wire and on disk; nothing else may shadow a wire format.
+and the public API (`coppice.api.v1`, the cross-language description of the
+HTTP surface — the edge itself serializes handwritten DTOs, not these types;
+ADR 0031 as amended). These are the *only* types on the wire and on disk;
+nothing else may shadow a wire format.
 
 Field tags are frozen forever — the bytes are replicated over the wire, fsynced
 into log segments, and replayed across years of rolling upgrades. All the
