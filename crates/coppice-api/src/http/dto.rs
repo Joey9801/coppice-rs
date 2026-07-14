@@ -26,7 +26,11 @@ use coppice_core::attempt;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 
 /// Resource quantities (mirrors `coppice_core::resource::Resources`).
+///
+/// `deny_unknown_fields` because this nests inside write requests: a typo
+/// (`"cpu_milis"`) must be `INVALID_ARGUMENT`, not a silent zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Resources {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
@@ -263,6 +267,7 @@ pub struct GetNodeResponse {
 
 /// Per-job retry policy (mirrors `coppice_core::job::RetryPolicy`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryPolicy {
     pub max_retries: u32,
     /// Opt-in to retrying user-error outcomes (nonzero exit, OOM). Never
@@ -297,7 +302,13 @@ impl From<Resources> for coppice_core::resource::Resources {
 /// committed resolves to the same job — success with the original `JobId`,
 /// never a second job. Reusing an id with a *different* payload is
 /// rejected.
+///
+/// `deny_unknown_fields`: on a write, an unrecognized key is a client bug
+/// — a typo (`"max_runtme_us"`) or wrong casing (`"maxRuntimeUs"`) would
+/// otherwise silently drop its field to the default, turning e.g. a
+/// bounded job into a default-priced one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitJobRequest {
     /// Client-minted job identity (`job-<uuid>`, ADR 0024) — required.
     /// Mint a fresh id per logical submission; reuse it verbatim on every
@@ -341,6 +352,7 @@ pub struct SubmitJobResponse {
 /// `POST /api/v1/jobs/{job}/abort` — commits a desired-state transition;
 /// it does not synchronously stop the container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbortJobRequest {
     /// The path segment is authoritative; the body's `job`, when present,
     /// must match it (`{}` aborts with no reason).
@@ -445,6 +457,32 @@ mod tests {
             "quota_entity": QuotaEntityId::new().to_string(),
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn submit_request_rejects_unknown_fields_at_every_level() {
+        let base = serde_json::json!({
+            "job": JobId::new().to_string(),
+            "image": "busybox",
+            "command": ["run"],
+            "requests": { "cpu_millis": 1000, "memory_bytes": 0, "disk_bytes": 0 },
+            "quota_entity": QuotaEntityId::new().to_string(),
+        });
+
+        // A top-level typo would otherwise silently default the real field.
+        let mut typo = base.clone();
+        typo["max_runtme_us"] = serde_json::json!(3_600_000_000u64);
+        assert!(serde_json::from_value::<SubmitJobRequest>(typo).is_err());
+
+        // Wrong casing is the same failure mode, not an alias.
+        let mut cased = base.clone();
+        cased["maxRuntimeUs"] = serde_json::json!(3_600_000_000u64);
+        assert!(serde_json::from_value::<SubmitJobRequest>(cased).is_err());
+
+        // Nested request objects are strict too.
+        let mut nested = base;
+        nested["requests"]["cpu_milis"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<SubmitJobRequest>(nested).is_err());
     }
 
     #[test]

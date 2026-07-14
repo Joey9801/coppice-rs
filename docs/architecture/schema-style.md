@@ -188,12 +188,13 @@ migration window. Do not create one casually.
 
 ## JSON at the edge
 
-The HTTP API maps `coppice.api.v1` onto JSON via the standard proto3 JSON
-mapping (ADR 0003), so schema choices leak into the JSON contract: field
-names become `lowerCamelCase` keys, entity ids pass through as their typed
-string form (`"job-<uuid>"`, ADR 0024), and 64-bit integers
-render as strings. Renaming a field is therefore a JSON break even though
-the wire tag is unchanged — one more reason renames are forbidden.
+The HTTP API does **not** serialize these messages: its JSON bodies are
+the handwritten serde DTOs in `coppice-api::http::dto` (ADR 0031 as
+amended), kept in sync with the `coppice.api.v1` shapes by review. A
+schema field rename therefore no longer leaks into the JSON contract —
+but renames remain forbidden here for the protobuf reasons above, and a
+rename in the DTO module is a deliberate public-API break with its own
+review bar.
 
 ## The breaking-change gate
 

@@ -37,7 +37,10 @@ state:
 - Rollback to an older binary is supported precisely up to the last
   `ClusterVersion` bump it supports; each bump documents its downgrade limit.
 
-The public HTTP API is JSON at the edge, mapped onto the same protobuf types.
+The public HTTP API is JSON at the edge. *(Amended 2026-07-14 by ADR 0031:
+that JSON is handwritten serde DTOs in `coppice-api::http::dto`, not the
+proto3 JSON mapping of these types — protobuf stays canonical for
+internal RPC, storage, and replication only.)*
 
 ## Consequences
 

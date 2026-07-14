@@ -1,4 +1,4 @@
-# 31. HTTP API surface: axum + proto3 JSON on the client listener
+# 31. HTTP API surface: axum + JSON DTOs on the client listener
 
 - **Status:** Accepted
 - **Date:** 2026-07-13
