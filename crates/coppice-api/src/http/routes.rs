@@ -259,11 +259,7 @@ mod tests {
         }
 
         async fn read_state(&self, _opts: ReadOptions) -> Result<ReadView, ApiError> {
-            Ok(ReadView::new(
-                coppice_state::StateMachine::default(),
-                1,
-                1,
-            ))
+            Ok(ReadView::new(coppice_state::StateMachine::default(), 1, 1))
         }
     }
 
@@ -296,12 +292,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
         assert_eq!(body["code"], "UNIMPLEMENTED");
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("GetClusterOverview")
-        );
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("GetClusterOverview"));
     }
 
     #[tokio::test]
@@ -326,8 +320,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().contains_key(super::super::COPPICE_APPLIED_INDEX));
-        assert!(response.headers().contains_key(super::super::COPPICE_COMMITTED_INDEX));
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_COMMITTED_INDEX));
     }
 
     #[tokio::test]

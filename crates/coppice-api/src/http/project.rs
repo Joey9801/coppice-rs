@@ -176,10 +176,10 @@ mod tests {
     use super::*;
     use coppice_core::allocation::Allocation;
     use coppice_core::attempt::Attempt;
+    use coppice_core::id::GroupId;
     use coppice_core::id::{AllocationId, AttemptId, JobId};
     use coppice_core::node::Node;
     use coppice_core::quota::{ChargeRecord, CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
-    use coppice_core::id::GroupId;
     use coppice_state::{AllocationRecord, AttemptRecord, NodeRecord};
 
     fn test_node(id: NodeId) -> NodeRecord {
@@ -198,12 +198,7 @@ mod tests {
         }
     }
 
-    fn test_attempt(
-        id: AttemptId,
-        job: JobId,
-        node: NodeId,
-        state: AttemptState,
-    ) -> AttemptRecord {
+    fn test_attempt(id: AttemptId, job: JobId, node: NodeId, state: AttemptState) -> AttemptRecord {
         AttemptRecord {
             attempt: Attempt {
                 id,
@@ -294,11 +289,23 @@ mod tests {
         );
         state.allocations.insert(
             alloc_active,
-            test_allocation(alloc_active, job, attempt_running, node, AllocationState::Active),
+            test_allocation(
+                alloc_active,
+                job,
+                attempt_running,
+                node,
+                AllocationState::Active,
+            ),
         );
         state.allocations.insert(
             alloc_accruing,
-            test_allocation(alloc_accruing, job, attempt_accruing, node, AllocationState::Accruing),
+            test_allocation(
+                alloc_accruing,
+                job,
+                attempt_accruing,
+                node,
+                AllocationState::Accruing,
+            ),
         );
 
         let response = list_nodes(&state);
