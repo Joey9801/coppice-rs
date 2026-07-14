@@ -467,6 +467,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_with_an_unknown_field_is_invalid_argument() {
+        // `max_runtme_us` (typo) must not be accepted with the real
+        // `max_runtime_us` silently defaulting to unbounded.
+        let request_body = format!(
+            r#"{{
+                "image": "busybox",
+                "command": ["run"],
+                "requests": {{ "cpu_millis": 1000, "memory_bytes": 0, "disk_bytes": 0 }},
+                "job": "{}",
+                "quota_entity": "{}",
+                "max_runtme_us": 3600000000
+            }}"#,
+            JobId::new(),
+            coppice_core::id::QuotaEntityId::new()
+        );
+        let response = app(None)
+            .oneshot(post_json("/api/v1/jobs", &request_body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
     async fn submit_missing_a_required_field_is_invalid_argument() {
         // No `requests` — the DTO owns required-ness, so this fails
         // deserialization rather than silently defaulting.

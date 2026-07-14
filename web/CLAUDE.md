@@ -56,10 +56,11 @@ All run from `web/`:
 This is the intended path for future sessions, one endpoint at a time.
 The server-side contract (route table, consistency params, error codes,
 JSON conventions) is fixed by ADR 0031
-(`docs/decisions/0031-http-api-surface.md`, as amended: write bodies are
-proto3 JSON, read-model responses are handwritten serde DTOs); the axum
-router in `crates/coppice-api/src/http/` already routes every endpoint
-below, with unimplemented ones answering `501 UNIMPLEMENTED`:
+(`docs/decisions/0031-http-api-surface.md`, as amended: every request
+and response body is a handwritten serde DTO — nothing on the wire is
+proto3 JSON); the axum router in `crates/coppice-api/src/http/` already
+routes every endpoint below, with unimplemented ones answering
+`501 UNIMPLEMENTED`:
 
 1. Define the endpoint's response DTOs in
    `crates/coppice-api/src/http/dto.rs` (shape mirrors this repo's

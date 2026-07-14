@@ -1,4 +1,4 @@
-//! The HTTP client edge (ADR 0031): axum router, proto3-JSON bodies, and
+//! The HTTP client edge (ADR 0031): axum router, JSON DTO bodies, and
 //! the wire error/consistency contracts.
 //!
 //! This module owns everything transport: the `/api/v1` route map
@@ -11,8 +11,8 @@
 //!
 //! Most read routes are `UNIMPLEMENTED` stubs today — the ADR 0031 route
 //! table is authoritative for their consistency class and message names,
-//! and `web/src/api/types.ts` for their response shapes until each proto
-//! message lands.
+//! and `web/src/api/types.ts` for their response shapes until each DTO
+//! lands.
 
 pub mod dto;
 mod error;
