@@ -458,8 +458,13 @@ export interface NodeUtilization {
 // Nodes
 // ---------------------------------------------------------------------------
 
-/** Liveness, derived from agent heartbeats (epoch fencing per ADR 0009). */
-export type NodeHealth = 'Healthy' | 'Lost'
+/**
+ * Liveness, derived from agent heartbeats (epoch fencing per ADR 0009).
+ * `Unknown` is what the real API reports until heartbeat liveness is
+ * wired server-side — the replicated state records no health input, and
+ * a `DeclareNodeLost` is indistinguishable from an operator drain there.
+ */
+export type NodeHealth = 'Unknown' | 'Healthy' | 'Lost'
 
 export interface NodeSummary {
   id: NodeId

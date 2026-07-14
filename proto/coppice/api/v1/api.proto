@@ -9,11 +9,8 @@ syntax = "proto3";
 
 package coppice.api.v1;
 
-import "coppice/core/v1/allocation.proto";
-import "coppice/core/v1/attempt.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
-import "coppice/core/v1/node.proto";
 import "coppice/core/v1/resource.proto";
 
 // Submit a new job. The client mints the JobId, the API resolves
@@ -68,96 +65,3 @@ message AbortJobRequest {
 }
 
 message AbortJobResponse {}
-
-// ---------------------------------------------------------------------------
-// Nodes — read-model types for the nodes API (ADR 0031).
-// ---------------------------------------------------------------------------
-
-// Liveness, derived from agent heartbeats (epoch fencing per ADR 0009).
-// Not replicated — the coordinator derives it at read time.
-enum NodeHealth {
-  NODE_HEALTH_UNSPECIFIED = 0;
-  NODE_HEALTH_HEALTHY = 1;
-  NODE_HEALTH_LOST = 2;
-}
-
-// Summary of a compute node's current state for the list view.
-message NodeSummary {
-  coppice.core.v1.NodeId id = 1;
-  coppice.core.v1.Resources capacity = 2;
-  // Sum of funded resources across non-Released allocations.
-  coppice.core.v1.Resources allocated = 3;
-  // Actual measured consumption (agent telemetry); zero until agents report.
-  coppice.core.v1.Resources used = 4;
-  repeated coppice.core.v1.Label labels = 5;
-  // False = draining: no new placements, running work continues.
-  bool schedulable = 6;
-  NodeHealth health = 7;
-  // Bumps on (re)registration or loss; fences stale agent commands.
-  uint64 epoch = 8;
-  // Last heartbeat from the agent; absent until agents report.
-  optional int64 last_heartbeat_us = 9;
-  // Attempts currently in Running state on this node.
-  uint32 running_count = 10;
-  // Allocations currently in Accruing state on this node.
-  uint32 accruing_count = 11;
-}
-
-message ListNodesResponse {
-  repeated NodeSummary nodes = 1;
-}
-
-message GetNodeResponse {
-  NodeSummary summary = 1;
-  // Attempts in Dispatching, Running, or Finalizing on this node.
-  repeated AttemptView active_attempts = 2;
-  // Accruing allocations queued against this node, in funding order.
-  repeated AccrualView accrual_queue = 3;
-}
-
-// ---------------------------------------------------------------------------
-// Shared read-model projections (reused across nodes/jobs endpoints).
-// ---------------------------------------------------------------------------
-
-// Read-model projection of an attempt with its charge metadata.
-message AttemptView {
-  coppice.core.v1.AttemptId id = 1;
-  coppice.core.v1.JobId job = 2;
-  coppice.core.v1.NodeId node = 3;
-  coppice.core.v1.AllocationId allocation = 4;
-  coppice.core.v1.AttemptState state = 5;
-  optional int64 started_at_us = 6;
-  optional int64 ended_at_us = 7;
-  // µCU per second while running (from cost weights × requested resources).
-  uint64 rate_ucu_per_second = 8;
-  // Upfront charge for this attempt (trued-up at finalization).
-  uint64 charged_ucu = 9;
-}
-
-// Read-model projection of an allocation.
-message AllocationView {
-  coppice.core.v1.AllocationId id = 1;
-  coppice.core.v1.JobId job = 2;
-  coppice.core.v1.AttemptId attempt = 3;
-  coppice.core.v1.NodeId node = 4;
-  coppice.core.v1.Resources requested = 5;
-  coppice.core.v1.Resources funded = 6;
-  coppice.core.v1.AllocationState state = 7;
-  // Commit order — drives funding priority within a node.
-  uint64 seq = 8;
-}
-
-// An accruing allocation with funding progress.
-message AccrualView {
-  AllocationView allocation = 1;
-  FundedFraction funded_fraction = 2;
-  // Earliest guaranteed full-funding time; absent when unbounded.
-  optional int64 projected_start_us = 3;
-}
-
-// Per-dimension funding progress, 0..1.
-message FundedFraction {
-  double cpu = 1;
-  double memory = 2;
-  double disk = 3;
-}

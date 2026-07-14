@@ -155,8 +155,6 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
     }
 
     async fn read_state(&self, opts: ReadOptions) -> Result<ReadView, ApiError> {
-        let committed_index = self.consensus.status().borrow().known_committed;
-
         let view = match opts.consistency {
             Consistency::Strong => {
                 let barrier = self
@@ -182,6 +180,18 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 }
             }
         };
+
+        // Sampled after the view resolves, and clamped to the applied
+        // index: a barrier or `min_index` wait can apply entries past a
+        // pre-sampled `known_committed`, and status publication is not
+        // atomic with apply publication — either way, telling the caller
+        // applied > committed would be a contradiction.
+        let committed_index = self
+            .consensus
+            .status()
+            .borrow()
+            .known_committed
+            .max(view.applied_index());
 
         Ok(ReadView::new(
             view.state().clone(),
@@ -331,6 +341,23 @@ mod tests {
             result,
             Err(ApiError::NotLeader { leader_hint: None })
         ));
+    }
+
+    #[tokio::test]
+    async fn read_state_never_reports_applied_ahead_of_committed() {
+        // FakeConsensus pins status at known_committed = 0 while its
+        // publisher has published applied index 1 — the exact skew the
+        // post-resolve clamp exists for.
+        let cp = control_plane(ProposeOutcome::Accepted);
+        let view = cp
+            .read_state(ReadOptions {
+                consistency: Consistency::Bounded,
+                min_index: None,
+            })
+            .await
+            .expect("bounded read");
+        assert_eq!(view.applied_index(), 1);
+        assert!(view.committed_index() >= view.applied_index());
     }
 
     #[tokio::test]

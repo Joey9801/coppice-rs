@@ -1,4 +1,4 @@
-//! Read-model projections: `StateMachine` → API response types.
+//! Read-model projections: `StateMachine` → JSON DTOs ([`super::dto`]).
 //!
 //! These are pure functions of the replicated state, run at read time in
 //! the handler (never in apply). Aggregations that scan the allocation or
@@ -11,9 +11,9 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
 use coppice_core::id::NodeId;
 use coppice_core::resource::Resources;
-use coppice_proto::pb::api::v1 as pb;
-use coppice_proto::pb::core::v1 as pbcore;
-use coppice_state::StateMachine;
+use coppice_state::{AttemptRecord, StateMachine};
+
+use super::dto;
 
 #[derive(Default)]
 struct NodeMemo {
@@ -53,23 +53,20 @@ fn node_summary(
     node_id: &NodeId,
     record: &coppice_state::NodeRecord,
     memo: &NodeMemo,
-) -> pb::NodeSummary {
-    pb::NodeSummary {
-        id: Some((*node_id).into()),
-        capacity: Some((&record.node.capacity).into()),
-        allocated: Some((&memo.allocated).into()),
-        used: Some((&Resources::ZERO).into()),
-        labels: record
-            .node
-            .labels
-            .iter()
-            .map(|(k, v)| pbcore::Label {
-                key: k.clone(),
-                value: v.clone(),
-            })
-            .collect(),
+) -> dto::NodeSummary {
+    dto::NodeSummary {
+        id: *node_id,
+        capacity: (&record.node.capacity).into(),
+        allocated: (&memo.allocated).into(),
+        used: (&Resources::ZERO).into(),
+        labels: record.node.labels.clone(),
         schedulable: record.node.schedulable,
-        health: pb::NodeHealth::Healthy as i32,
+        // Health has no reliable input yet: the replicated state records no
+        // loss flag (`DeclareNodeLost` bumps the epoch and clears
+        // `schedulable`, indistinguishable from an operator drain) and
+        // heartbeat liveness is not wired, so every node reports `Unknown`
+        // rather than a fabricated `Healthy`.
+        health: dto::NodeHealth::Unknown,
         epoch: record.epoch,
         last_heartbeat_us: None,
         running_count: memo.running_count,
@@ -77,7 +74,7 @@ fn node_summary(
     }
 }
 
-pub fn list_nodes(state: &StateMachine) -> pb::ListNodesResponse {
+pub fn list_nodes(state: &StateMachine) -> dto::ListNodesResponse {
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
 
@@ -90,10 +87,10 @@ pub fn list_nodes(state: &StateMachine) -> pb::ListNodesResponse {
         })
         .collect();
 
-    pb::ListNodesResponse { nodes }
+    dto::ListNodesResponse { nodes }
 }
 
-pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<pb::GetNodeResponse> {
+pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<dto::GetNodeResponse> {
     let record = state.nodes.get(id)?;
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
@@ -111,17 +108,7 @@ pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<pb::GetNodeResponse
                     AttemptState::Dispatching | AttemptState::Running | AttemptState::Finalizing
                 )
         })
-        .map(|(_, ar)| pb::AttemptView {
-            id: Some(ar.attempt.id.into()),
-            job: Some(ar.attempt.job.into()),
-            node: Some(ar.attempt.node.into()),
-            allocation: Some(ar.attempt.allocation.into()),
-            state: Some((&ar.attempt.state).into()),
-            started_at_us: ar.started_at_us,
-            ended_at_us: None,
-            rate_ucu_per_second: ar.rate_ucu_per_second,
-            charged_ucu: ar.charge.amount.0,
-        })
+        .map(|(_, ar)| attempt_view(ar))
         .collect();
 
     let accrual_queue = state
@@ -131,32 +118,49 @@ pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<pb::GetNodeResponse
         .filter_map(|((_, _), alloc_id)| {
             let alloc_record = state.allocations.get(alloc_id)?;
             let alloc = &alloc_record.allocation;
-            let funded_fraction = funded_fraction(&alloc.funded, &alloc.requested);
-            Some(pb::AccrualView {
-                allocation: Some(pb::AllocationView {
-                    id: Some(alloc.id.into()),
-                    job: Some(alloc.job.into()),
-                    attempt: Some(alloc.attempt.into()),
-                    node: Some(alloc.node.into()),
-                    requested: Some((&alloc.requested).into()),
-                    funded: Some((&alloc.funded).into()),
-                    state: pbcore::AllocationState::from(alloc.state) as i32,
+            Some(dto::AccrualView {
+                allocation: dto::AllocationView {
+                    id: alloc.id,
+                    job: alloc.job,
+                    attempt: alloc.attempt,
+                    node: alloc.node,
+                    requested: (&alloc.requested).into(),
+                    funded: (&alloc.funded).into(),
+                    state: alloc.state.into(),
                     seq: alloc_record.seq,
-                }),
-                funded_fraction: Some(funded_fraction),
+                },
+                funded_fraction: funded_fraction(&alloc.funded, &alloc.requested),
                 projected_start_us: None,
             })
         })
         .collect();
 
-    Some(pb::GetNodeResponse {
-        summary: Some(summary),
+    Some(dto::GetNodeResponse {
+        summary,
         active_attempts,
         accrual_queue,
     })
 }
 
-fn funded_fraction(funded: &Resources, requested: &Resources) -> pb::FundedFraction {
+fn attempt_view(ar: &AttemptRecord) -> dto::AttemptView {
+    dto::AttemptView {
+        id: ar.attempt.id,
+        job: ar.attempt.job,
+        node: ar.attempt.node,
+        allocation: ar.attempt.allocation,
+        state: (&ar.attempt.state).into(),
+        outcome: match &ar.attempt.state {
+            AttemptState::Terminal(outcome) => Some(outcome.into()),
+            _ => None,
+        },
+        started_at_us: ar.started_at_us,
+        ended_at_us: None,
+        rate_ucu_per_second: ar.rate_ucu_per_second,
+        charged_ucu: ar.charge.amount.0,
+    }
+}
+
+fn funded_fraction(funded: &Resources, requested: &Resources) -> dto::FundedFraction {
     let frac = |funded: u64, requested: u64| -> f64 {
         if requested == 0 {
             1.0
@@ -164,7 +168,7 @@ fn funded_fraction(funded: &Resources, requested: &Resources) -> pb::FundedFract
             funded as f64 / requested as f64
         }
     };
-    pb::FundedFraction {
+    dto::FundedFraction {
         cpu: frac(funded.cpu_millis, requested.cpu_millis),
         memory: frac(funded.memory_bytes, requested.memory_bytes),
         disk: frac(funded.disk_bytes, requested.disk_bytes),
@@ -316,6 +320,16 @@ mod tests {
     }
 
     #[test]
+    fn nodes_report_unknown_health_until_liveness_exists() {
+        let node = NodeId::new();
+        let mut state = StateMachine::default();
+        state.nodes.insert(node, test_node(node));
+
+        let response = list_nodes(&state);
+        assert_eq!(response.nodes[0].health, dto::NodeHealth::Unknown);
+    }
+
+    #[test]
     fn get_node_returns_none_for_missing() {
         let state = StateMachine::default();
         assert!(get_node(&state, &NodeId::new()).is_none());
@@ -340,9 +354,9 @@ mod tests {
         );
 
         let response = get_node(&state, &node).unwrap();
-        assert!(response.summary.is_some());
         assert_eq!(response.active_attempts.len(), 1);
         assert_eq!(response.active_attempts[0].rate_ucu_per_second, 100);
+        assert_eq!(response.active_attempts[0].outcome, None);
     }
 
     #[test]

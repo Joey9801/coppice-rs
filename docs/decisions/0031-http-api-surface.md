@@ -35,23 +35,40 @@ implementations. `coppice-net` remains gRPC-only (raft/agent/admin planes);
 the client edge is deliberately a separate stack because its consumers are
 browsers and curl, not fenced internal peers.
 
-### Wire format: proto3 JSON of `coppice.api.v1`
+### Wire format: proto3 JSON for writes, handwritten DTOs for read models
 
-Per ADR 0003, bodies are the standard **proto3 JSON mapping of
-`coppice.api.v1` messages**, generated with `pbjson-build` (serde impls on
-the existing prost types, `.coppice.api` + `.coppice.core` packages only —
-serde stays off every replicated format). Consequences callers see:
-`lowerCamelCase` keys, 64-bit integers as JSON strings, typed-string ids
-(`"job-<uuid>"`), absent optionals omitted. `serde_json` does the actual
-encode/decode inside axum extractors/responses.
+*(Amended 2026-07-14, before the first read model shipped: read-model
+responses are handwritten serde DTOs, not proto3 JSON.)*
 
-Read-model messages (`GetJobResponse`, `ListNodesResponse`, …) are **not
-designed up front**: each lands in `proto/coppice/api/v1/` in the same
-change that implements its endpoint, mirroring the already-reviewed shapes
-in `web/src/api/types.ts` (which mirror the Rust domain model). Naming is
-fixed now: `<Verb><Noun>Request` / `<Verb><Noun>Response`, verbs `Get`,
-`List`, `Submit`, `Abort`, `Configure`. Every response is a message (never
-a bare array) so fields can be added later.
+Write bodies (`SubmitJob*`, `AbortJob*`, `ConfigureQuotaEntity*`) are the
+standard **proto3 JSON mapping of `coppice.api.v1` messages**, generated
+with `pbjson-build` (serde impls on the existing prost types,
+`.coppice.api` + `.coppice.core` packages only — serde stays off every
+replicated format). Consequences callers see on writes: `lowerCamelCase`
+keys, 64-bit integers as JSON strings, wrapped typed ids
+(`{"value": "job-<uuid>"}`), absent optionals omitted. `serde_json` does
+the actual encode/decode inside axum extractors/responses.
+
+Read-model responses are **handwritten, versioned serde DTOs** in
+`coppice-api::http::dto`, versioned with the route prefix (`/api/v1` ⇔
+that module) and mirroring `web/src/api/types.ts` by name and semantics.
+Proto3 JSON is protobuf's internal wire model, and exposing it would
+freeze its idioms — wrapped id objects, u64-as-string, `SCREAMING_CASE`
+enum names, empty lists omitted, zero messages as `{}` — into a public
+compatibility commitment for browser, CLI, and REST consumers, coupling
+the public contract to internal schema style. Instead the DTOs own the
+JSON contract and the projection layer converts domain types → DTOs at
+the HTTP boundary; **protobuf stays canonical for internal RPC, storage,
+and replication**. DTO conventions, fixed for v1: camelCase keys, ids as
+their bare typed strings (`"job-<uuid>"`), integers as JSON numbers,
+`null` for absent optionals, `[]` for empty lists, PascalCase string
+enums matching the `types.ts` unions.
+
+Read models are **not designed up front**: each endpoint's DTOs land in
+`coppice-api::http::dto` in the same change that implements it. Naming is
+fixed now: `<Verb><Noun>Response`, verbs `Get`, `List`, `Submit`,
+`Abort`, `Configure`. Every response is an object envelope (never a bare
+array) so fields can be added later.
 
 ### Route map
 
@@ -92,6 +109,10 @@ provisional status). The events route is reserved so nothing else claims
 the path; when built it is an SSE stream of server-throttled bounded
 batches with ADR 0008 cursors — never a raw firehose.
 
+The table's "message pair" naming survives the wire-format amendment
+unchanged: write pairs are proto messages, read responses are the
+same-named DTOs in `coppice-api::http::dto`.
+
 ### Consistency plumbing (ADR 0007 made concrete)
 
 - Every read accepts `?consistency=strong|bounded|eventual`, overriding
@@ -113,7 +134,7 @@ batches with ADR 0008 cursors — never a raw firehose.
   endpoint.
 - Every response carries `Coppice-Applied-Index` and
   `Coppice-Committed-Index` headers (decimal). Headers rather than a body
-  envelope keep bodies pure proto messages.
+  envelope keep bodies pure response messages.
 - Writes always execute on the leader. v1 behavior on a follower is a
   `NOT_LEADER` error; the `Coppice-Leader` hint header, when present,
   carries the leader's advertised **client-API address** — a value the
@@ -191,18 +212,20 @@ authenticated ingress per plane) and spares agents a second identity.
 
 ## Consequences
 
-- Future sessions implement one endpoint per change: proto message pair →
-  `QueryPlane` method → handler swap-in for the `UNIMPLEMENTED` stub →
-  flip the matching method in `web/src/api/index.ts`. Routing,
-  consistency, errors, and auth are already decided and mechanically
-  enforced by the shared plumbing in `coppice-api::http`.
+- Future sessions implement one endpoint per change: response DTOs →
+  projection → handler swap-in for the `UNIMPLEMENTED` stub → flip the
+  matching method in `web/src/api/index.ts`. Routing, consistency,
+  errors, and auth are already decided and mechanically enforced by the
+  shared plumbing in `coppice-api::http`.
 - axum/tower enter the workspace; pbjson adds a second codegen pass over
-  the api/core packages. Schema style now leaks into JSON contract for the
-  read models too — field renames in `coppice.api.v1` are JSON breaks
-  (already the rule per `schema-style.md`).
-- Read models get frozen tags only as their UIs stabilize, instead of
-  speculatively today; the cost is that `web/src/api/types.ts` remains the
-  reference shape until each message lands.
+  the api/core packages for the write messages. Schema style leaks into
+  the write-body JSON only — field renames in `coppice.api.v1` are JSON
+  breaks there (already the rule per `schema-style.md`); read-model
+  compatibility is owned by the DTO module, where a rename is a
+  deliberate contract change, not a schema side effect.
+- Read models get frozen shapes only as their UIs stabilize, instead of
+  speculatively today; the cost is that `web/src/api/types.ts` remains
+  the reference shape until each DTO lands.
 - The `NOT_LEADER`-with-hint compromise means dumb clients need retry
   logic until internal forwarding is built; the error contract already
   accommodates that upgrade invisibly.

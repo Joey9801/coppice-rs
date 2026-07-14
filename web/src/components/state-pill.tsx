@@ -49,9 +49,10 @@ const STATE_TONE: Record<PillState, Tone> = {
   // orange / violet — cancellation / drain
   Aborted: 'orange',
   Draining: 'violet',
-  // muted terminal / released
+  // muted terminal / released / no signal
   Terminal: 'slate',
   Released: 'slate',
+  Unknown: 'slate',
 }
 
 function Pill({
