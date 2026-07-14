@@ -29,14 +29,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     prost_build::Config::new().compile_fds(descriptors)?;
 
-    // proto3 JSON (serde) impls for the public-API packages only (ADR
-    // 0031): the HTTP edge maps `coppice.api.v1` onto JSON, which pulls in
-    // the `coppice.core.v1` types it references. The replicated packages
-    // (command/raft/storage/agent) deliberately get none — serde must never
+    // No JSON (serde) codegen: the HTTP edge serializes handwritten DTOs
+    // (`coppice-api::http::dto`, ADR 0031 as amended), not these types, so
+    // the prost structs need only their binary encoding. serde must never
     // become a parallel encoding of a replicated format (schema-style.md).
-    pbjson_build::Builder::new()
-        .register_descriptors(&descriptor_bytes)?
-        .build(&[".coppice.api", ".coppice.core"])?;
     Ok(())
 }
 

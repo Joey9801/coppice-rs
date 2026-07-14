@@ -83,12 +83,6 @@ prost = "0.13"
 prost-build = "0.13"
 prost-types = "0.13"
 protox = "0.7"
-# proto3 JSON mapping for the public-API messages: the HTTP edge is JSON
-# mapped onto `coppice.api.v1` (ADR 0003/0031), generated with pbjson-build.
-# Scoped to the api/core packages only — serde never becomes a parallel
-# encoding of replicated formats (schema-style.md). 0.7 pairs with prost 0.13.
-pbjson = "0.7"
-pbjson-build = "0.7"
 # Test-only certificate generation (ring provider, avoiding the aws-lc build
 # toolchain) for the mTLS the Raft transport requires (ADR 0011).
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
