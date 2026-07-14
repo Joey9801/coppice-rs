@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tonic::transport::Server;
 
 use coppice_consensus::{Consensus, EventTapReceiver, StateViews};
+use coppice_core::id::ClusterId;
 use coppice_scheduler::HeuristicScheduler;
 
 use crate::bootstrap::{AgentListener, ClientListener};
@@ -40,6 +41,7 @@ pub async fn run<C>(
     event_tap: EventTapReceiver,
     agent_listener: AgentListener,
     client_listener: ClientListener,
+    cluster_id: ClusterId,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -111,6 +113,7 @@ where
     let control_plane = Arc::new(CoordinatorControlPlane::new(
         Arc::clone(&consensus),
         views.clone(),
+        cluster_id,
     ));
     let api_join = tokio::spawn(api_server::run(
         client_listener,

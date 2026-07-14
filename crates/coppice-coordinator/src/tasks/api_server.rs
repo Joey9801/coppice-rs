@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use coppice_api::http::dto::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
 use coppice_api::{ApiError, Consistency, ControlPlane, ReadOptions, ReadView};
 use coppice_consensus::{Applied, Consensus, ConsensusError, StateViews};
+use coppice_core::id::ClusterId;
 use coppice_core::job::Job;
 use coppice_state::command::{AbortJob, SubmitJob};
 use coppice_state::Command;
@@ -28,15 +29,27 @@ use coppice_state::Command;
 pub struct CoordinatorControlPlane<C> {
     consensus: Arc<C>,
     views: StateViews,
+    /// This replica's cluster identity, from node config (ADR 0020). Not
+    /// replicated state — a replica knows it before it applies anything —
+    /// so reads that report it (`GET /api/v1/overview`) take it from here.
+    cluster_id: ClusterId,
 }
 
 impl<C> CoordinatorControlPlane<C> {
-    pub fn new(consensus: Arc<C>, views: StateViews) -> Self {
-        CoordinatorControlPlane { consensus, views }
+    pub fn new(consensus: Arc<C>, views: StateViews, cluster_id: ClusterId) -> Self {
+        CoordinatorControlPlane {
+            consensus,
+            views,
+            cluster_id,
+        }
     }
 }
 
 impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
+    fn cluster_id(&self) -> ClusterId {
+        self.cluster_id
+    }
+
     async fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
         // The client-minted job id is the submission's idempotency identity
         // (ADR 0026): a retry re-sends the same id, and apply resolves a
@@ -267,7 +280,7 @@ mod tests {
         publisher.publish_now(&state, 1);
 
         let views = consensus.views();
-        CoordinatorControlPlane::new(Arc::new(consensus), views)
+        CoordinatorControlPlane::new(Arc::new(consensus), views, ClusterId::new())
     }
 
     fn submit_request(job: JobId) -> SubmitJobRequest {

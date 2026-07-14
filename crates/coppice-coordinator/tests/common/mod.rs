@@ -277,6 +277,7 @@ log_level = "warn"
     /// the replica can re-boot from its own disk.
     pub async fn graceful_stop(&mut self) {
         let BootedCoordinator {
+            cluster_id: _,
             consensus,
             views,
             event_tap,
@@ -297,6 +298,7 @@ log_level = "warn"
     /// then shut down to release resources. The tempdir survives.
     pub async fn kill(&mut self) {
         let BootedCoordinator {
+            cluster_id: _,
             consensus,
             views,
             event_tap,
@@ -423,6 +425,7 @@ log_level = "warn"
         .expect("load coordinator config");
 
         let BootedCoordinator {
+            cluster_id,
             consensus,
             views,
             event_tap,
@@ -453,6 +456,7 @@ log_level = "warn"
             event_tap,
             listener,
             client_listener,
+            cluster_id,
             Some(shutdown_rx),
         ));
 

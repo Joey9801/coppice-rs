@@ -239,6 +239,9 @@ ca_path = "{ca}"
     .context("loading dev coordinator config")?;
 
     let BootedCoordinator {
+        // The same id `dev` minted (or loaded) above and wrote into the config
+        // bootstrap just read back.
+        cluster_id: _,
         consensus,
         views,
         event_tap,
@@ -274,6 +277,7 @@ ca_path = "{ca}"
         event_tap,
         listener,
         client_listener,
+        cluster_id,
         Some(shutdown_rx),
     ));
 

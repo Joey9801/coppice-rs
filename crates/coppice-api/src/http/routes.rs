@@ -34,10 +34,7 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         // Session / auth (ADR 0022) — local read, no raft involvement.
         .route("/api/v1/session", get(unimplemented_read("GetSession")))
         // Cluster overview — bounded reads.
-        .route(
-            "/api/v1/overview",
-            get(unimplemented_read("GetClusterOverview")),
-        )
+        .route("/api/v1/overview", get(get_overview::<P>))
         .route(
             "/api/v1/queue/stats",
             get(unimplemented_read("GetQueueStats")),
@@ -178,6 +175,36 @@ async fn abort_job<P: ControlPlane>(
     Ok(Json(AbortJobResponse {}))
 }
 
+/// `GET /api/v1/overview` — bounded by default (ADR 0031).
+async fn get_overview<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    let response = super::project::cluster_overview(view.state(), plane.cluster_id(), now_us());
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// Wall-clock now, in microseconds.
+///
+/// Only reads sample the clock — they are not replicated, so a handler may
+/// (an *apply* may never: `coppice-state`'s determinism contract). It feeds
+/// read-time ages like `oldest_queued_age_us`, never anything stored.
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 /// `GET /api/v1/nodes` — bounded by default (ADR 0031).
 async fn list_nodes<P: ControlPlane>(
     State(plane): State<Arc<P>>,
@@ -240,7 +267,13 @@ mod tests {
         fail_with: Option<fn() -> ApiError>,
     }
 
+    const STUB_CLUSTER: &str = "cluster-00000000-0000-0000-0000-000000000009";
+
     impl ControlPlane for StubPlane {
+        fn cluster_id(&self) -> coppice_core::id::ClusterId {
+            STUB_CLUSTER.parse().unwrap()
+        }
+
         async fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
             match self.fail_with {
                 Some(make) => Err(make()),
@@ -283,7 +316,7 @@ mod tests {
     async fn stub_routes_answer_501_with_the_endpoint_name() {
         let response = app(None)
             .oneshot(
-                Request::get("/api/v1/overview")
+                Request::get("/api/v1/queue/stats")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -292,10 +325,36 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
         assert_eq!(body["code"], "UNIMPLEMENTED");
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("GetClusterOverview"));
+        assert!(body["message"].as_str().unwrap().contains("GetQueueStats"));
+    }
+
+    #[tokio::test]
+    async fn overview_answers_from_the_replica_and_its_cluster_identity() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Bounded reads carry their staleness bound, like every other read.
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+
+        let body = body_json(response).await;
+        // The cluster identity comes from the replica's config, not the view:
+        // an empty state machine still knows which cluster it belongs to.
+        assert_eq!(body["cluster_id"], STUB_CLUSTER);
+        assert_eq!(body["queue"]["depth"], 0);
+        assert_eq!(
+            body["queue"]["oldest_queued_age_us"],
+            serde_json::Value::Null
+        );
+        assert_eq!(body["queue"]["by_state"]["queued"], 0);
+        assert_eq!(body["capacity"]["nodes"]["total"], 0);
     }
 
     #[tokio::test]
