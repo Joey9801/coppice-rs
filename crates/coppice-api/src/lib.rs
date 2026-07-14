@@ -16,6 +16,62 @@ use std::future::Future;
 
 use coppice_proto::pb::api::v1::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
 
+/// Consistency class for read operations (ADR 0007).
+///
+/// Every read endpoint has a default class set by ADR 0031; the caller may
+/// override it with `?consistency=`. `Deserialize` covers the query-parameter
+/// path; the rename keeps the wire form lowercase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Consistency {
+    Strong,
+    Bounded,
+    Eventual,
+}
+
+/// Transport-independent parameters for a read operation.
+pub struct ReadOptions {
+    pub consistency: Consistency,
+    pub min_index: Option<u64>,
+}
+
+/// A consistent snapshot of the state machine with staleness metadata.
+///
+/// The `StateMachine` clone is O(1) (persistent maps, ADR 0028). Handlers
+/// project the state into their response type and attach the indexes as
+/// response headers.
+pub struct ReadView {
+    state: coppice_state::StateMachine,
+    applied_index: u64,
+    committed_index: u64,
+}
+
+impl ReadView {
+    pub fn new(
+        state: coppice_state::StateMachine,
+        applied_index: u64,
+        committed_index: u64,
+    ) -> Self {
+        ReadView {
+            state,
+            applied_index,
+            committed_index,
+        }
+    }
+
+    pub fn state(&self) -> &coppice_state::StateMachine {
+        &self.state
+    }
+
+    pub fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    pub fn committed_index(&self) -> u64 {
+        self.committed_index
+    }
+}
+
 /// Errors surfaced to API callers.
 ///
 /// A `Rejected` outcome means the command committed and apply refused it
@@ -70,4 +126,15 @@ pub trait ControlPlane: Send + Sync + 'static {
     ) -> impl Future<Output = Result<SubmitJobResponse, ApiError>> + Send;
 
     fn abort_job(&self, req: AbortJobRequest) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Resolve a read at the requested consistency and return a snapshot of
+    /// the replicated state with its staleness metadata.
+    ///
+    /// Strong reads call `Consensus::read_index` (leader only) then wait for
+    /// the view to catch up; bounded/eventual reads serve the latest
+    /// published view, optionally gated by `min_index` for read-your-writes.
+    fn read_state(
+        &self,
+        opts: ReadOptions,
+    ) -> impl Future<Output = Result<ReadView, ApiError>> + Send;
 }

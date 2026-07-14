@@ -20,10 +20,10 @@ use axum::{Json, Router};
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
 use coppice_proto::pb::api::v1::{AbortJobRequest, AbortJobResponse, SubmitJobRequest};
 
-use crate::ControlPlane;
+use crate::{Consistency, ControlPlane};
 
 use super::error::HttpError;
-use super::extract::{IdPath, ReadQuery};
+use super::extract::{IdPath, ReadIndexes, ReadQuery};
 
 /// Build the client-listener router around a [`ControlPlane`].
 ///
@@ -67,11 +67,8 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         )
         // Nodes. List/detail bounded; utilization/history eventual; logs
         // provisional.
-        .route("/api/v1/nodes", get(unimplemented_read("ListNodes")))
-        .route(
-            "/api/v1/nodes/:node",
-            get(unimplemented_id_read::<NodeId>("GetNode")),
-        )
+        .route("/api/v1/nodes", get(list_nodes::<P>))
+        .route("/api/v1/nodes/:node", get(get_node::<P>))
         .route(
             "/api/v1/nodes/:node/utilization",
             get(unimplemented_id_read::<NodeId>("GetNodeUtilization")),
@@ -181,6 +178,44 @@ async fn abort_job<P: ControlPlane>(
     Ok(Json(AbortJobResponse {}))
 }
 
+/// `GET /api/v1/nodes` — bounded by default (ADR 0031).
+async fn list_nodes<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    let response = super::project::list_nodes(view.state());
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `GET /api/v1/nodes/{node}` — bounded by default (ADR 0031).
+async fn get_node<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    IdPath(id): IdPath<NodeId>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    let response = super::project::get_node(view.state(), &id)
+        .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
 fn bad_body(rejection: JsonRejection) -> HttpError {
     HttpError::invalid(rejection.body_text())
 }
@@ -193,13 +228,14 @@ mod tests {
     use axum::http::{header, Request, StatusCode};
     use tower::ServiceExt;
 
-    use crate::ApiError;
+    use crate::{ApiError, ReadOptions, ReadView};
     use coppice_proto::pb::api::v1::SubmitJobResponse;
 
     use crate::http::COPPICE_LEADER;
 
     /// A canned `ControlPlane`: submit echoes the request's job id with a
-    /// fixed log index, or fails with the configured error.
+    /// fixed log index, or fails with the configured error. Reads serve an
+    /// empty state.
     struct StubPlane {
         fail_with: Option<fn() -> ApiError>,
     }
@@ -220,6 +256,14 @@ mod tests {
                 Some(make) => Err(make()),
                 None => Ok(()),
             }
+        }
+
+        async fn read_state(&self, _opts: ReadOptions) -> Result<ReadView, ApiError> {
+            Ok(ReadView::new(
+                coppice_state::StateMachine::default(),
+                1,
+                1,
+            ))
         }
     }
 
@@ -242,27 +286,84 @@ mod tests {
     #[tokio::test]
     async fn stub_routes_answer_501_with_the_endpoint_name() {
         let response = app(None)
-            .oneshot(Request::get("/api/v1/nodes").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = body_json(response).await;
-        assert_eq!(body["code"], "UNIMPLEMENTED");
-        assert!(body["message"].as_str().unwrap().contains("ListNodes"));
-    }
-
-    #[tokio::test]
-    async fn stub_reads_validate_consistency_before_answering_501() {
-        let response = app(None)
             .oneshot(
-                Request::get("/api/v1/nodes?consistency=bogus")
+                Request::get("/api/v1/overview")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "UNIMPLEMENTED");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("GetClusterOverview")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_nodes_returns_ok_with_empty_state() {
+        let response = app(None)
+            .oneshot(Request::get("/api/v1/nodes").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        // proto3 JSON omits empty repeated fields.
+        assert!(
+            body["nodes"].is_null() || body["nodes"].as_array().unwrap().is_empty(),
+            "expected absent or empty nodes array, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_nodes_carries_staleness_headers() {
+        let response = app(None)
+            .oneshot(Request::get("/api/v1/nodes").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(super::super::COPPICE_APPLIED_INDEX));
+        assert!(response.headers().contains_key(super::super::COPPICE_COMMITTED_INDEX));
+    }
+
+    #[tokio::test]
+    async fn get_node_returns_not_found_for_missing_node() {
+        let node = coppice_core::id::NodeId::new();
+        let response = app(None)
+            .oneshot(
+                Request::get(format!("/api/v1/nodes/{node}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn reads_validate_consistency_parameter() {
+        // Bogus consistency is INVALID_ARGUMENT on both implemented and
+        // stub endpoints.
+        for uri in [
+            "/api/v1/nodes?consistency=bogus",
+            "/api/v1/overview?consistency=bogus",
+        ] {
+            let response = app(None)
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                body_json(response).await["code"],
+                "INVALID_ARGUMENT",
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test]
