@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use coppice_core::attempt;
-use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
+use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 
 /// Resource quantities (mirrors `coppice_core::resource::Resources`).
 ///
@@ -262,6 +262,135 @@ pub struct GetNodeResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Cluster overview
+// ---------------------------------------------------------------------------
+
+/// A job's flat display **phase**: the read-time join of its `JobState` with
+/// the state of the attempt it carries (ADR 0030). Never replicated — the
+/// state machine stores `Attempting(attempt)` and the attempt's own state,
+/// and every UI surface that shows a single job status renders this join.
+///
+/// `Accruing`/`Ready`/`Dispatching` all read as `Preparing`; a `Terminal`
+/// attempt under a still-`Attempting` job means resolution is completing in
+/// the same apply, which reads as `Finalizing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobPhase {
+    Submitted,
+    Accepted,
+    Queued,
+    Preparing,
+    Running,
+    Finalizing,
+    Succeeded,
+    Failed,
+    Aborted,
+}
+
+impl JobPhase {
+    /// Every phase, in lifecycle order. [`QueueStats::by_state`] reports a
+    /// count for each one, so a caller never has to tell "zero" from
+    /// "absent"; `Ord` follows this order, so the map iterates in it.
+    pub const ALL: [JobPhase; 9] = [
+        JobPhase::Submitted,
+        JobPhase::Accepted,
+        JobPhase::Queued,
+        JobPhase::Preparing,
+        JobPhase::Running,
+        JobPhase::Finalizing,
+        JobPhase::Succeeded,
+        JobPhase::Failed,
+        JobPhase::Aborted,
+    ];
+}
+
+/// One point in the queue's recent history (for sparklines), oldest first.
+///
+/// Nothing produces these yet — see [`QueueStats::history`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct QueueSample {
+    pub t_us: i64,
+    pub depth: u32,
+    pub drained_per_minute: f64,
+    pub arrived_per_minute: f64,
+}
+
+/// Queue depth and composition, projected from replicated state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueStats {
+    /// Jobs currently in `Queued` — the same number as
+    /// `by_state[JobPhase::Queued]`.
+    pub depth: u32,
+    /// Jobs leaving (placed) / entering the queue per minute over a recent
+    /// window.
+    ///
+    /// Both are `null`: a rate is a *windowed* quantity and nothing retains
+    /// the window. The replicated state holds no history (a job's queue
+    /// entries and exits leave no trace once it moves on), and the fanout
+    /// ring that sees the transitions is explicitly a reconnection buffer,
+    /// not history (`docs/architecture/coordinator-runtime.md`). Serving
+    /// `0.0` until then would assert "nothing is draining", which is a claim,
+    /// not a gap. Tracked as KOI-6
+    /// (`docs/roadmap/known-open-issues.md`).
+    pub drain_rate_per_minute: Option<f64>,
+    pub arrival_rate_per_minute: Option<f64>,
+    /// Age of the longest-waiting `Queued` job, measured at read time
+    /// against the wall clock; `null` when nothing is queued.
+    pub oldest_queued_age_us: Option<i64>,
+    /// Job counts by displayed phase — every [`JobPhase`], zeros included.
+    pub by_state: BTreeMap<JobPhase, u32>,
+    /// Recent queue history, oldest first. Empty for the same reason the
+    /// rates above are `null`.
+    pub history: Vec<QueueSample>,
+}
+
+/// Node counts behind the cluster's capacity totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCounts {
+    pub total: u32,
+    /// Registered, not draining, and not lost.
+    pub schedulable: u32,
+    /// Nodes reported [`NodeHealth::Lost`] — always 0 until liveness has an
+    /// input (see [`NodeHealth`]), never a fabricated count.
+    pub lost: u32,
+}
+
+/// Cluster-wide capacity, summed over the nodes in [`NodeCounts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterCapacity {
+    pub nodes: NodeCounts,
+    /// Registered capacity, excluding lost nodes.
+    pub capacity: Resources,
+    /// Sum of funded resources across non-Released allocations.
+    pub allocated: Resources,
+    /// Actual measured consumption; zero until agent telemetry lands, like
+    /// [`NodeSummary::used`] it sums.
+    pub used: Resources,
+}
+
+/// `GET /api/v1/overview` (mirrors `ClusterOverview` in `types.ts`, minus
+/// its `recentEvents`).
+///
+/// **No `recent_events` field.** `types.ts` pairs the overview with a window
+/// of recent cluster events, and nothing can serve one: apply emits
+/// `coppice_state::Event`s without timestamps (it may not read a clock), and
+/// no store retains them — the fanout ring that sees them is explicitly a
+/// reconnection buffer, not history
+/// (`docs/architecture/coordinator-runtime.md`). Serving `[]` from an
+/// invented event shape would freeze that shape into the v1 contract before
+/// KOI-6 (`docs/roadmap/known-open-issues.md`) settles where the
+/// events and their timestamps come from; *adding* the field later is a
+/// compatible change, replacing a wrong one is not. Until then a client
+/// reads the absent key as "no window", not as "no events".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetClusterOverviewResponse {
+    /// The cluster this replica belongs to (node config, ADR 0020).
+    pub cluster_id: ClusterId,
+    pub queue: QueueStats,
+    pub capacity: ClusterCapacity,
+}
+
+// ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
 
@@ -422,6 +551,84 @@ mod tests {
     fn empty_list_serializes_as_an_empty_array() {
         let json = serde_json::to_value(ListNodesResponse { nodes: vec![] }).unwrap();
         assert_eq!(json, serde_json::json!({ "nodes": [] }));
+    }
+
+    #[test]
+    fn overview_serializes_to_the_contract_shape() {
+        let cluster: ClusterId = "cluster-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let response = GetClusterOverviewResponse {
+            cluster_id: cluster,
+            queue: QueueStats {
+                depth: 1,
+                drain_rate_per_minute: None,
+                arrival_rate_per_minute: None,
+                oldest_queued_age_us: Some(5_000_000),
+                by_state: JobPhase::ALL
+                    .iter()
+                    .map(|phase| (*phase, u32::from(*phase == JobPhase::Queued)))
+                    .collect(),
+                history: vec![],
+            },
+            capacity: ClusterCapacity {
+                nodes: NodeCounts {
+                    total: 1,
+                    schedulable: 1,
+                    lost: 0,
+                },
+                capacity: Resources {
+                    cpu_millis: 4000,
+                    memory_bytes: 0,
+                    disk_bytes: 0,
+                },
+                allocated: Resources {
+                    cpu_millis: 0,
+                    memory_bytes: 0,
+                    disk_bytes: 0,
+                },
+                used: Resources {
+                    cpu_millis: 0,
+                    memory_bytes: 0,
+                    disk_bytes: 0,
+                },
+            },
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "cluster_id": "cluster-00000000-0000-0000-0000-000000000001",
+                "queue": {
+                    "depth": 1,
+                    // Rates and history have no source; `null`/`[]`, never a
+                    // fabricated 0.0 (see `QueueStats`).
+                    "drain_rate_per_minute": null,
+                    "arrival_rate_per_minute": null,
+                    "oldest_queued_age_us": 5_000_000,
+                    // Every phase is present, zeros included, in lifecycle order.
+                    "by_state": {
+                        "submitted": 0,
+                        "accepted": 0,
+                        "queued": 1,
+                        "preparing": 0,
+                        "running": 0,
+                        "finalizing": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "aborted": 0,
+                    },
+                    "history": [],
+                },
+                "capacity": {
+                    "nodes": { "total": 1, "schedulable": 1, "lost": 0 },
+                    "capacity": { "cpu_millis": 4000, "memory_bytes": 0, "disk_bytes": 0 },
+                    "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
+                    "used": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
+                },
+            })
+        );
     }
 
     #[test]

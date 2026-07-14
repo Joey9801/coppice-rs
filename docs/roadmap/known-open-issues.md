@@ -21,6 +21,7 @@ waive them.
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10; drop-and-gap completeness 2026-07-12) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, instrumentation, and apply latency resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
+| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open | Every time-ranged read stays unserved: no queue rates or history, no job timeline, no usage/utilization series, no events window |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
 
@@ -430,3 +431,150 @@ making the apply O(N + batch·log N); the 1M cycle applies in ~0.1 s, and
 This issue is resolved when a repeatable target-scale test demonstrates bounded
 apply stalls and peak memory for both view publication and snapshot creation,
 and those bounds are enforced in CI or a required performance gate.
+
+## KOI-6: Nothing records *when* anything happened, so no windowed read can be served
+
+- **Severity:** High
+- **Status:** Open
+- **Affected capability:** every time-ranged read on the public API — the
+  overview's queue rates and history and its recent-events window, the job
+  timeline, job usage and node utilization series, and the ADR 0008 event
+  subscription
+- **Related decisions:** [ADR 0031](../decisions/0031-http-api-surface.md)
+  (the route map that promises these reads),
+  [ADR 0008](../decisions/0008-event-delivery-guarantees.md) (event delivery),
+  [ADR 0012](../decisions/0012-data-retention.md) (history store)
+- **Related issue:** [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history)
+  — the same missing history store; KOI-1 is about *losing* the current record,
+  this issue is about never having recorded the *transitions* in the first place
+
+### Required invariant
+
+Every read model the API promises must be servable from something the
+coordinator actually retains. Point-in-time reads (what is queued, what is
+running, what is allocated) project from replicated state. Time-ranged reads
+(what happened to this job and in what order; how fast the queue drained over
+the last hour; what this node consumed over the last day) require an ordered,
+retained record of transitions, each attributable to a wall-clock instant that
+every replica agrees on. Where such a record does not exist, the API must say
+so — an absent window, never a fabricated zero.
+
+### Current violation
+
+No such record exists anywhere in the system, for three compounding reasons:
+
+1. **Events carry no time.** `coppice_state::Event` is the derived output of
+   apply, and apply may not read a clock (the determinism contract in
+   [coppice-state](../../crates/coppice-state/src/lib.rs)). So the one
+   representation of "a thing happened" is unstamped.
+2. **Nothing retains events.** The fanout ring is a *reconnection buffer, not
+   history* (bounded 1 h / 1M events, evict-oldest — see the channel inventory
+   in [coordinator-runtime.md](../architecture/coordinator-runtime.md)),
+   replica-local, and seeded only from the index this process recovered at. The
+   only other sink is `StubHistoryStore`, which logs a count (KOI-1).
+3. **Replicated state records facts, not transitions.** It carries a handful of
+   per-record timestamps (`submitted_at_us`, `terminal_at_us`,
+   `started_at_us`) — enough for an age, nowhere near enough to reconstruct a
+   sequence of state changes or to bucket them into a window.
+
+The consequence is visible in the shipped surface. `GET /api/v1/overview`
+([routes](../../crates/coppice-api/src/http/routes.rs),
+[projection](../../crates/coppice-api/src/http/project.rs)) serves queue depth,
+the by-phase tally, and the oldest queued age from replicated state, but:
+
+- `drain_rate_per_minute` and `arrival_rate_per_minute` are `null` and
+  `history` is `[]` — a rate is a windowed quantity and nothing retains the
+  window;
+- the response has **no `recent_events` field at all**, unlike the UI's
+  `ClusterOverview` in `web/src/api/types.ts`. Serving `[]` would have meant
+  inventing a `TimelineEvent` wire shape — and freezing it into the v1
+  contract — before this issue decides where events and their timestamps come
+  from ([dto](../../crates/coppice-api/src/http/dto.rs)).
+
+`GetJobTimeline`, `GetJobUsage`, `GetNodeUtilization`, `GetNodeHistory`, and
+`SubscribeEvents` remain `501 UNIMPLEMENTED` for the same root cause; the ADR
+0031 table already classes them bounded/eventual, so the routing is not what
+blocks them.
+
+### Impact
+
+- The UI's queue sparklines, queue chart, and events feed have no data source,
+  and the per-job timeline page cannot be built at all.
+- Operators cannot answer *"what happened to this job, in what order, and
+  when"* after the fact — the first question of every incident. Compounded by
+  KOI-1: eviction then destroys even the current-state record.
+- Any implementation tempted to fill the gap with `0.0` rates or synthesized
+  events would make a cluster with no observability indistinguishable from a
+  healthy cluster with no activity. The endpoints must keep failing honestly
+  until they can answer.
+
+### Likely direction: advisory event timestamps
+
+Not yet an ADR, but the shape the resolution is expected to take, recorded so
+the next session does not re-derive it:
+
+**Every command already carries a proposer-stamped timestamp** —
+`submitted_at_us`, `requested_at_us`, `observed_at_us`, `dispatched_at_us`,
+`declared_at_us`, and so on
+([command catalog](../../crates/coppice-state/src/command.rs)). Apply can
+therefore stamp each `Event` it emits with the timestamp of the command that
+produced it. That is *deterministic*: the timestamp rides in the replicated
+log, not off the applying replica's clock, so every replica derives the same
+value for the same log — no determinism contract is touched, and apply's
+latency budget is unaffected (it is a copy, not a syscall).
+
+The timestamp is **advisory only**:
+
+- apply never reads it back, never branches on it, and never lets it influence
+  a decision or a rejection — a skewed or hostile proposer clock can make a
+  timeline look odd but cannot corrupt state;
+- it is not the ordering key. The Raft log index remains the order (KOI-3), and
+  events already arrive one batch per command tagged with that index;
+- it exists to render a human-facing timeline and to bucket transitions into
+  windows after the fact.
+
+With events timestamped, the durable history sink KOI-1 already requires
+becomes the natural home for a retained per-job transition timeline, and the
+windowed stats (queue rates and history, job usage, node utilization) become
+projections over that retained record rather than new replicated structures.
+It also unblocks the two payloads that are stuck purely for want of an `at_us`:
+the overview's `recent_events` window and the ADR 0008 SSE event body.
+
+Questions the ADR still has to settle:
+
+- **Placement.** Per-`Event` or per-`EventBatch`? Since KOI-3 made batches
+  one-per-command, a batch-level stamp is equivalent and cheaper.
+- **Nested items.** Which timestamp is authoritative for events derived from a
+  sub-item of a command (`ReconcileNode.observed_at_us` covering the
+  `LostAttempt` entries it carries).
+- **Skew and monotonicity.** A laggy proposer can stamp log index N+1 earlier
+  than N. Clamp to monotonic at the edge, or expose the raw value and let the
+  reader see it? "Advisory" argues for exposing it, but a timeline that goes
+  backwards is a support ticket.
+- **Retention line.** What the fanout ring keeps (reconnection only), what the
+  history store keeps (per-job timeline), and what a derived stats store keeps
+  (pre-bucketed series) — and which of the three each API read is served from.
+
+### Resolution requirements
+
+- Record the event-timestamp design in an ADR: advisory semantics, placement,
+  nested-item rule, skew/monotonicity handling, and the retention line above.
+- Stamp events deterministically from the proposing command's timestamp, and
+  pin it with a determinism test (an identical log yields identical
+  `(index, at_us, events)` on every replica).
+- Retain transitions durably and queryably — the KOI-1 history store is the
+  natural home — with an explicit bounded window.
+- Serve them from one representation: the overview's `recent_events`,
+  `GetJobTimeline`, and the ADR 0008 subscription payload must not each invent
+  their own event shape. Queue rates/history and the usage/utilization series
+  are then projections over the retained record.
+- Keep failing honestly in the meantime: an endpoint with no retained window
+  answers `null`/absent, never `0`.
+
+### Closure criteria
+
+This issue is resolved when a job's full transition timeline is queryable after
+the fact from a coordinator that never observed it live (a restarted process,
+or a different replica), the overview serves non-null queue rates and a
+recent-events window from retained data, and a determinism test pins identical
+event timestamps across replicas for an identical committed log.

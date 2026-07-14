@@ -23,6 +23,7 @@ use coppice_consensus::{
     Applied, Consensus, ConsensusError, ConsensusStatus, CoordinatorId, EventTapReceiver,
     NodeHandle, NodeOptions, NodeTls, OpenraftConsensus, StartIntent, StartedNode, StateViews,
 };
+use coppice_core::id::ClusterId;
 use coppice_net::admin::Server as AdminServer;
 use coppice_state::Command;
 
@@ -37,6 +38,11 @@ use crate::{config, limits};
 /// trigger and join handle). The consensus seam is shared behind an [`Arc`] so
 /// the admin service and the task runtime can both reach it.
 pub struct BootedCoordinator {
+    /// The cluster this replica belongs to (its config's `cluster_id`, ADR
+    /// 0020/0024). Carried out of bootstrap because the config itself is
+    /// crate-private, and the task runtime's API edge reports it
+    /// (`GET /api/v1/overview`).
+    pub cluster_id: ClusterId,
     /// The consensus seam, shared with the mounted admin service.
     pub consensus: Arc<OpenraftConsensus>,
     /// Published read views of applied state.
@@ -78,6 +84,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let client_listener = ClientListener::bind(resolved.config.listen.client_addr).await?;
 
     let BootedCoordinator {
+        cluster_id,
         consensus,
         views,
         event_tap,
@@ -95,6 +102,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         event_tap,
         agent_listener,
         client_listener,
+        cluster_id,
         None,
     )
     .await?;
@@ -139,6 +147,7 @@ pub async fn serve_runtime(
     event_tap: EventTapReceiver,
     agent_listener: AgentListener,
     client_listener: ClientListener,
+    cluster_id: ClusterId,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -147,6 +156,7 @@ pub async fn serve_runtime(
         event_tap,
         agent_listener,
         client_listener,
+        cluster_id,
         shutdown,
     )
     .await
@@ -351,6 +361,7 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
     tracing::info!(addr = %raft_addr, "raft/admin mTLS listener bound");
 
     Ok(BootedCoordinator {
+        cluster_id: cfg.cluster_id,
         consensus,
         views,
         event_tap,

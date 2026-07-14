@@ -164,7 +164,11 @@ async fn retried_submission_across_leader_change_creates_one_job() {
     let job = JobId::new();
     let request = submit_request(job, quota_entity);
     {
-        let cp = CoordinatorControlPlane::new(nodes[leader].consensus(), nodes[leader].views());
+        let cp = CoordinatorControlPlane::new(
+            nodes[leader].consensus(),
+            nodes[leader].views(),
+            cluster_id,
+        );
         let first = cp
             .submit_job(request.clone())
             .await
@@ -182,7 +186,11 @@ async fn retried_submission_across_leader_change_creates_one_job() {
     // like any other write — dedup does not depend on hitting one replica.
     let follower = *survivors.iter().find(|&&i| i != new_leader).unwrap();
     {
-        let cp = CoordinatorControlPlane::new(nodes[follower].consensus(), nodes[follower].views());
+        let cp = CoordinatorControlPlane::new(
+            nodes[follower].consensus(),
+            nodes[follower].views(),
+            cluster_id,
+        );
         let redirected = cp.submit_job(request.clone()).await;
         assert!(
             matches!(redirected, Err(ApiError::NotLeader { .. })),
@@ -194,6 +202,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
     let cp = Arc::new(CoordinatorControlPlane::new(
         nodes[new_leader].consensus(),
         nodes[new_leader].views(),
+        cluster_id,
     ));
     let retried = cp
         .submit_job(request.clone())

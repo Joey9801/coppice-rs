@@ -120,6 +120,15 @@ pub enum ApiError {
 /// job — and carries the apply's `log_index` so a write can be paired with
 /// a strong read for read-your-writes (ADR 0007).
 pub trait ControlPlane: Send + Sync + 'static {
+    /// The cluster this replica belongs to (its node config, ADR 0020 — not
+    /// replicated state, and constant for the process's lifetime).
+    ///
+    /// Reads that identify the cluster to a caller (`GET /api/v1/overview`)
+    /// take it from here rather than from a view: no `StateMachine` field
+    /// carries it, and a replica knows its own cluster before it has applied
+    /// anything.
+    fn cluster_id(&self) -> coppice_core::id::ClusterId;
+
     fn submit_job(
         &self,
         req: SubmitJobRequest,
