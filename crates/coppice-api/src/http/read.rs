@@ -10,14 +10,8 @@
 
 use serde::Deserialize;
 
-/// The caller-selectable consistency class (`?consistency=`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Consistency {
-    Strong,
-    Bounded,
-    Eventual,
-}
+pub use crate::Consistency;
+use crate::ReadOptions;
 
 /// Query parameters common to every read endpoint.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -33,6 +27,15 @@ impl ReadParams {
     /// The class this request reads at, given the endpoint's default.
     pub fn class(self, default: Consistency) -> Consistency {
         self.consistency.unwrap_or(default)
+    }
+
+    /// Convert to transport-independent [`ReadOptions`], resolving the
+    /// effective consistency class against the endpoint's default.
+    pub fn into_options(self, default: Consistency) -> ReadOptions {
+        ReadOptions {
+            consistency: self.class(default),
+            min_index: self.min_index,
+        }
     }
 }
 

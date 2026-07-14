@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
-use coppice_api::{ApiError, ControlPlane};
+use coppice_api::{ApiError, Consistency, ControlPlane, ReadOptions, ReadView};
 use coppice_consensus::{Applied, Consensus, ConsensusError, StateViews};
 use coppice_core::id::JobId;
 use coppice_core::job::Job;
@@ -152,6 +152,42 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             }) => Err(ApiError::Rejected(rejection)),
             Err(e) => Err(map_consensus_error(e)),
         }
+    }
+
+    async fn read_state(&self, opts: ReadOptions) -> Result<ReadView, ApiError> {
+        let committed_index = self.consensus.status().borrow().known_committed;
+
+        let view = match opts.consistency {
+            Consistency::Strong => {
+                let barrier = self
+                    .consensus
+                    .read_index()
+                    .await
+                    .map_err(map_consensus_error)?;
+                let target = opts.min_index.map_or(barrier, |min| min.max(barrier));
+                self.views
+                    .at_least(target)
+                    .await
+                    .map_err(map_consensus_error)?
+            }
+            Consistency::Bounded | Consistency::Eventual => {
+                let latest = self.views.latest();
+                match opts.min_index {
+                    Some(min) if latest.applied_index() < min => self
+                        .views
+                        .at_least(min)
+                        .await
+                        .map_err(map_consensus_error)?,
+                    _ => latest,
+                }
+            }
+        };
+
+        Ok(ReadView::new(
+            view.state().clone(),
+            view.applied_index(),
+            committed_index,
+        ))
     }
 }
 
