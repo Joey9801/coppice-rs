@@ -3,10 +3,10 @@
 //! One route per `CoppiceApi` method in `web/src/api/client.ts`, plus the
 //! two writes `ControlPlane` already serves. Reads are stubbed with
 //! [`unimplemented`] until their endpoint lands; implementing one means:
-//! proto message pair in `proto/coppice/api/v1/` (shape mirrors
-//! `web/src/api/types.ts`), a method on the (future) query-plane trait,
-//! and swapping the stub for a real handler here — routing, errors, and
-//! consistency parameters are already decided.
+//! response DTOs in [`super::dto`] (shape mirrors `web/src/api/types.ts`),
+//! a projection in [`super::project`], and swapping the stub for a real
+//! handler here — routing, errors, and consistency parameters are already
+//! decided.
 
 use std::future::ready;
 use std::sync::Arc;
@@ -306,11 +306,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        // proto3 JSON omits empty repeated fields.
-        assert!(
-            body["nodes"].is_null() || body["nodes"].as_array().unwrap().is_empty(),
-            "expected absent or empty nodes array, got {body}"
-        );
+        // The DTO contract: empty lists are explicit `[]`, never omitted.
+        assert_eq!(body["nodes"], serde_json::json!([]));
     }
 
     #[tokio::test]

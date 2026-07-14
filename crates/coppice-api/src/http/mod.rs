@@ -5,14 +5,17 @@
 //! ([`router`]), the JSON error contract ([`HttpError`]/[`ErrorCode`]),
 //! and the ADR 0007 read parameters ([`ReadParams`]). The coordinator
 //! binds the router on `listen.client_addr` and injects its
-//! [`crate::ControlPlane`]; bodies are the proto3-JSON mapping of
-//! `coppice.api.v1` messages (pbjson-generated serde, ADR 0003).
+//! [`crate::ControlPlane`]. Write bodies are the proto3-JSON mapping of
+//! `coppice.api.v1` messages (pbjson-generated serde, ADR 0003);
+//! read-model responses are the handwritten serde DTOs in [`dto`]
+//! (ADR 0031, "Wire format") — protobuf idioms never leak into them.
 //!
 //! Most read routes are `UNIMPLEMENTED` stubs today — the ADR 0031 route
 //! table is authoritative for their consistency class and message names,
 //! and `web/src/api/types.ts` for their response shapes until each proto
 //! message lands.
 
+pub mod dto;
 mod error;
 mod extract;
 mod project;

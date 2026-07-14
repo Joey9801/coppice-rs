@@ -55,21 +55,26 @@ All run from `web/`:
 
 This is the intended path for future sessions, one endpoint at a time.
 The server-side contract (route table, consistency params, error codes,
-proto3-JSON conventions) is fixed by ADR 0031
-(`docs/decisions/0031-http-api-surface.md`); the axum router in
-`crates/coppice-api/src/http/` already routes every endpoint below, with
-unimplemented ones answering `501 UNIMPLEMENTED`:
+JSON conventions) is fixed by ADR 0031
+(`docs/decisions/0031-http-api-surface.md`, as amended: write bodies are
+proto3 JSON, read-model responses are handwritten serde DTOs); the axum
+router in `crates/coppice-api/src/http/` already routes every endpoint
+below, with unimplemented ones answering `501 UNIMPLEMENTED`:
 
-1. Define/confirm the real endpoint's messages in
-   `proto/coppice/api/v1/` (JSON-at-the-edge per ADR 0003/0031; response
-   shape mirrors this repo's `src/api/types.ts`) and swap its stub
-   handler in `crates/coppice-api/src/http/routes.rs` for a real one
-   backed by the coordinator.
+1. Define the endpoint's response DTOs in
+   `crates/coppice-api/src/http/dto.rs` (shape mirrors this repo's
+   `src/api/types.ts` by name and semantics: camelCase keys, bare
+   typed-string ids, integers as JSON numbers, `null` optionals, `[]`
+   empties, PascalCase string enums), add the projection in
+   `crates/coppice-api/src/http/project.rs`, and swap its stub handler
+   in `crates/coppice-api/src/http/routes.rs` for a real one backed by
+   the coordinator.
 2. Add the method to the real client (create `src/api/real-client.ts`
    implementing part of `CoppiceApi` with `fetch` against `/api/v1/...`
-   when the first endpoint lands). The real client owns wire mapping:
-   proto3 JSON camelCase, 64-bit ints arrive as strings → parse to
-   `number` at this boundary, typed ids stay strings.
+   when the first endpoint lands). Read responses arrive already in
+   `types.ts` shape; the residual wire mapping the real client owns is
+   the write path (proto3 JSON: wrapped ids, 64-bit ints as strings) and
+   error translation.
 3. Flip that one method in the delegation table in `src/api/index.ts`
    (`{ ...mock, listJobs: real.listJobs }`).
 4. Do not delete the mock implementation — it backs tests and offline
