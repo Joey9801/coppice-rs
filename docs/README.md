@@ -19,6 +19,7 @@ documents so that each concern can grow independently.
 | [scheduling/](scheduling/) | Scheduling model, the v1 scheduler algorithm, quotas and priorities, image-cache policy. |
 | [protocols/](protocols/) | The agent–coordinator protocol. |
 | [operations/](operations/) | Configuration, observability, failure handling, and security. |
+| [testing/](testing/) | The [end-to-end test register](testing/end-to-end.md): behaviours only ever checked by driving a real cluster, pending an automated suite. |
 | [roadmap/](roadmap/) | Initial scope, the design-decision register, and the [known open-issues register](roadmap/known-open-issues.md). |
 | [decisions/](decisions/) | Architecture Decision Records (ADRs). |
 | [design-principles.md](design-principles.md) | The principles that guide the whole design. |
