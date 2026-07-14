@@ -16,12 +16,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
+use coppice_api::http::dto::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
 use coppice_api::{ApiError, Consistency, ControlPlane, ReadOptions, ReadView};
 use coppice_consensus::{Applied, Consensus, ConsensusError, StateViews};
-use coppice_core::id::JobId;
 use coppice_core::job::Job;
-use coppice_proto::convert::ConvertError;
-use coppice_proto::pb::api::v1::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
 use coppice_state::command::{AbortJob, SubmitJob};
 use coppice_state::Command;
 
@@ -45,36 +43,24 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         // repeat of an already-committed submission as an accepted no-op, so
         // the retrying caller still lands in the `Ok` arm below with the
         // original id.
-        let job: JobId = req
-            .job
-            .ok_or_else(|| ApiError::Invalid("missing job id".into()))?
-            .try_into()
-            .map_err(invalid)?;
-        let requests = req
-            .requests
-            .ok_or_else(|| ApiError::Invalid("missing requests".into()))?
-            .try_into()
-            .map_err(invalid)?;
-        let quota_entity = req
-            .quota_entity
-            .ok_or_else(|| ApiError::Invalid("missing quota_entity".into()))?
-            .try_into()
-            .map_err(invalid)?;
-        let retry = req.retry.map(Into::into).unwrap_or_default();
-        // Same rules the conversion boundary enforces on core.v1.Job: a
-        // command is required (empty repeated = absent on the wire), and an
-        // entrypoint override, when present, is non-empty.
+        //
+        // The DTO already carries typed ids and required fields; what's
+        // left to validate here are the rules serde can't express — the
+        // same ones the conversion boundary enforces on core.v1.Job: a
+        // command is required non-empty, and an entrypoint override, when
+        // present, is non-empty.
+        let job = req.job;
         if req.command.is_empty() {
             return Err(ApiError::Invalid("missing command".into()));
         }
         let entrypoint = match req.entrypoint {
             None => None,
-            Some(e) if e.argv.is_empty() => {
+            Some(argv) if argv.is_empty() => {
                 return Err(ApiError::Invalid(
                     "entrypoint override must have at least one token".into(),
                 ));
             }
-            Some(e) => Some(e.argv),
+            Some(argv) => Some(argv),
         };
 
         // Multiplier resolution reads the replicated table off the latest
@@ -100,11 +86,11 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 image: req.image,
                 command: req.command,
                 entrypoint,
-                requests,
+                requests: req.requests.into(),
                 priority: req.priority,
                 max_runtime_us: req.max_runtime_us,
-                quota_entity,
-                retry,
+                quota_entity: req.quota_entity,
+                retry: req.retry.map(Into::into).unwrap_or_default(),
                 abort_requested: None,
             },
             multiplier,
@@ -119,10 +105,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             Ok(Applied {
                 outcome: Ok(_),
                 log_index,
-            }) => Ok(SubmitJobResponse {
-                job: Some(job.into()),
-                log_index,
-            }),
+            }) => Ok(SubmitJobResponse { job, log_index }),
             Ok(Applied {
                 outcome: Err(rejection),
                 ..
@@ -132,11 +115,11 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
     }
 
     async fn abort_job(&self, req: AbortJobRequest) -> Result<(), ApiError> {
+        // The HTTP layer resolves the authoritative id from the path; a
+        // request arriving here without one skipped that resolution.
         let job = req
             .job
-            .ok_or_else(|| ApiError::Invalid("missing job".into()))?
-            .try_into()
-            .map_err(invalid)?;
+            .ok_or_else(|| ApiError::Invalid("missing job".into()))?;
 
         let command = Command::AbortJob(AbortJob {
             job,
@@ -199,10 +182,6 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             committed_index,
         ))
     }
-}
-
-fn invalid(e: ConvertError) -> ApiError {
-    ApiError::Invalid(e.to_string())
 }
 
 /// Map every non-`NotLeader` consensus failure to an API error.
@@ -269,7 +248,8 @@ pub async fn run<C: Consensus>(
 mod tests {
     use super::*;
     use crate::test_support::{FakeConsensus, ProposeOutcome};
-    use coppice_proto::pb::core::v1 as pbcore;
+    use coppice_api::http::dto;
+    use coppice_core::id::JobId;
 
     fn control_plane(outcome: ProposeOutcome) -> CoordinatorControlPlane<FakeConsensus> {
         let (consensus, mut publisher) = FakeConsensus::new(outcome);
@@ -293,12 +273,16 @@ mod tests {
     fn submit_request(job: JobId) -> SubmitJobRequest {
         SubmitJobRequest {
             image: "busybox".to_string(),
-            requests: Some(pbcore::Resources { quantities: vec![] }),
+            requests: dto::Resources {
+                cpu_millis: 1000,
+                memory_bytes: 0,
+                disk_bytes: 0,
+            },
             priority: 0,
             max_runtime_us: None,
-            quota_entity: Some(coppice_core::id::QuotaEntityId::new().into()),
+            quota_entity: coppice_core::id::QuotaEntityId::new(),
             retry: None,
-            job: Some(job.into()),
+            job,
             command: vec!["run".to_string()],
             entrypoint: None,
         }
@@ -309,15 +293,15 @@ mod tests {
         let cp = control_plane(ProposeOutcome::Accepted);
         let job = JobId::new();
         let response = cp.submit_job(submit_request(job)).await.expect("accepted");
-        assert_eq!(response.job, Some(job.into()));
+        assert_eq!(response.job, job);
         assert!(response.log_index > 0);
     }
 
     #[tokio::test]
-    async fn submit_without_a_job_id_is_invalid() {
+    async fn submit_with_an_empty_command_is_invalid() {
         let cp = control_plane(ProposeOutcome::Accepted);
         let mut req = submit_request(JobId::new());
-        req.job = None;
+        req.command.clear();
         let result = cp.submit_job(req).await;
         assert!(matches!(result, Err(ApiError::Invalid(_))));
     }
@@ -364,7 +348,7 @@ mod tests {
     async fn accepted_abort_returns_ok() {
         let cp = control_plane(ProposeOutcome::Accepted);
         let req = AbortJobRequest {
-            job: Some(JobId::new().into()),
+            job: Some(JobId::new()),
             reason: None,
         };
         assert!(cp.abort_job(req).await.is_ok());

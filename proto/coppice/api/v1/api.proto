@@ -1,9 +1,11 @@
 // Public API request/response types.
 //
-// The HTTP surface is JSON at the edge mapped onto these same messages
-// (ADR 0003, proto3 JSON mapping) — endpoints are durable state
-// transitions, not imperative worker control. Field names here are part of
-// the JSON contract; see docs/architecture/schema-style.md.
+// These messages are the cross-language description of the client API
+// surface — endpoints are durable state transitions, not imperative
+// worker control. The HTTP edge does NOT serialize them: its JSON bodies
+// are the handwritten DTOs in `coppice-api::http::dto` (ADR 0031 as
+// amended), kept in sync with these shapes by review. Schema style rules
+// still apply here; see docs/architecture/schema-style.md.
 
 syntax = "proto3";
 

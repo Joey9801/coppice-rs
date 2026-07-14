@@ -35,42 +35,40 @@ implementations. `coppice-net` remains gRPC-only (raft/agent/admin planes);
 the client edge is deliberately a separate stack because its consumers are
 browsers and curl, not fenced internal peers.
 
-### Wire format: proto3 JSON for writes, handwritten DTOs for read models
+### Wire format: handwritten serde DTOs
 
-*(Amended 2026-07-14, before the first read model shipped: read-model
-responses are handwritten serde DTOs, not proto3 JSON.)*
+*(Amended 2026-07-14, before the first read model shipped: the JSON
+surface — read models and write bodies alike — is handwritten serde
+DTOs, not the proto3 JSON mapping this ADR originally specified.)*
 
-Write bodies (`SubmitJob*`, `AbortJob*`, `ConfigureQuotaEntity*`) are the
-standard **proto3 JSON mapping of `coppice.api.v1` messages**, generated
-with `pbjson-build` (serde impls on the existing prost types,
-`.coppice.api` + `.coppice.core` packages only — serde stays off every
-replicated format). Consequences callers see on writes: `lowerCamelCase`
-keys, 64-bit integers as JSON strings, wrapped typed ids
-(`{"value": "job-<uuid>"}`), absent optionals omitted. `serde_json` does
-the actual encode/decode inside axum extractors/responses.
-
-Read-model responses are **handwritten, versioned serde DTOs** in
-`coppice-api::http::dto`, versioned with the route prefix (`/api/v1` ⇔
+Every request and response body is a **handwritten, versioned serde DTO**
+in `coppice-api::http::dto`, versioned with the route prefix (`/api/v1` ⇔
 that module) and mirroring `web/src/api/types.ts` by name and semantics.
 Proto3 JSON is protobuf's internal wire model, and exposing it would
 freeze its idioms — wrapped id objects, u64-as-string, `SCREAMING_CASE`
 enum names, empty lists omitted, zero messages as `{}` — into a public
 compatibility commitment for browser, CLI, and REST consumers, coupling
 the public contract to internal schema style. Instead the DTOs own the
-JSON contract and the projection layer converts domain types → DTOs at
-the HTTP boundary; **protobuf stays canonical for internal RPC, storage,
-and replication**. DTO conventions, fixed for v1: snake_case keys
-(`"cpu_millis"`) and snake_case string enums (`"unknown"`,
+JSON contract, converted to/from domain types at the HTTP boundary
+(request DTOs also make required-ness explicit, where proto3 JSON treats
+every field as optional); **protobuf stays canonical for internal RPC,
+storage, and replication**. DTO conventions, fixed for v1: snake_case
+keys (`"cpu_millis"`) and snake_case string enums (`"unknown"`,
 `"oom_killed"`), ids as their bare typed strings (`"job-<uuid>"`),
 integers as JSON numbers, `null` for absent optionals, `[]` for empty
 lists. The web client maps snake_case wire keys onto its camelCase
 `types.ts` shapes at its boundary.
 
+The `coppice.api.v1` proto messages remain the cross-language description
+of this surface (and what a future gRPC client plane would serve); the
+HTTP edge no longer serializes them, and `coppice-api` no longer depends
+on `coppice-proto` at all — `ControlPlane` speaks DTOs.
+
 Read models are **not designed up front**: each endpoint's DTOs land in
 `coppice-api::http::dto` in the same change that implements it. Naming is
-fixed now: `<Verb><Noun>Response`, verbs `Get`, `List`, `Submit`,
-`Abort`, `Configure`. Every response is an object envelope (never a bare
-array) so fields can be added later.
+fixed now: `<Verb><Noun>Request` / `<Verb><Noun>Response`, verbs `Get`,
+`List`, `Submit`, `Abort`, `Configure`. Every response is an object
+envelope (never a bare array) so fields can be added later.
 
 ### Route map
 
@@ -112,8 +110,9 @@ the path; when built it is an SSE stream of server-throttled bounded
 batches with ADR 0008 cursors — never a raw firehose.
 
 The table's "message pair" naming survives the wire-format amendment
-unchanged: write pairs are proto messages, read responses are the
-same-named DTOs in `coppice-api::http::dto`.
+unchanged: the pairs are the same-named DTOs in
+`coppice-api::http::dto`, with the `coppice.api.v1` messages as their
+cross-language mirror.
 
 ### Consistency plumbing (ADR 0007 made concrete)
 
@@ -219,12 +218,12 @@ authenticated ingress per plane) and spares agents a second identity.
   matching method in `web/src/api/index.ts`. Routing, consistency,
   errors, and auth are already decided and mechanically enforced by the
   shared plumbing in `coppice-api::http`.
-- axum/tower enter the workspace; pbjson adds a second codegen pass over
-  the api/core packages for the write messages. Schema style leaks into
-  the write-body JSON only — field renames in `coppice.api.v1` are JSON
-  breaks there (already the rule per `schema-style.md`); read-model
-  compatibility is owned by the DTO module, where a rename is a
-  deliberate contract change, not a schema side effect.
+- axum/tower enter the workspace. JSON compatibility is owned entirely
+  by the DTO module, where a rename is a deliberate contract change, not
+  a schema side effect; `coppice.api.v1` field renames no longer touch
+  the JSON surface (schema-style rules still apply to the protos as the
+  cross-language mirror). The pbjson codegen pass over the api/core
+  packages now has no production consumer and can be retired.
 - Read models get frozen shapes only as their UIs stabilize, instead of
   speculatively today; the cost is that `web/src/api/types.ts` remains
   the reference shape until each DTO lands.
