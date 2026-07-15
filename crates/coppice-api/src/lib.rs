@@ -84,6 +84,11 @@ impl ReadView {
 pub struct QueueBucket {
     /// Bucket start (inclusive), Unix µs.
     pub start_us: i64,
+    /// Bucket close (exclusive), Unix µs. Buckets are nominally 30 s wide,
+    /// but a stalled producer closes one *long* bucket rather than
+    /// back-filling — so every rate over a bucket must scale by this actual
+    /// span, never an assumed width.
+    pub end_us: i64,
     /// Jobs in `Queued` at bucket close.
     pub depth: u32,
     /// Transitions into `Queued` during the bucket (submissions + requeues).
@@ -97,11 +102,9 @@ pub struct QueueBucket {
 ///
 /// Contiguous by construction: the producing task drops the whole window
 /// when it loses event-stream coverage, so a bucket's presence means its
-/// counts are complete.
+/// counts are complete over its own `[start_us, end_us)` span.
 #[derive(Debug, Clone, Default)]
 pub struct QueueWindow {
-    /// Bucket width, µs.
-    pub bucket_us: i64,
     pub buckets: Vec<QueueBucket>,
 }
 
@@ -123,9 +126,10 @@ pub struct StampedEvent {
 /// The most recent cluster events, newest first, served from the fanout
 /// ring (ADR 0032, tier 1).
 ///
-/// `floor_index` is the coverage floor — the earliest applied index the
-/// window is complete from. An empty `events` with a high floor is a
-/// freshly restarted coordinator, not a quiet cluster.
+/// `floor_index` is an exclusive coverage cursor: the window is complete
+/// for every applied index *strictly above* it and claims nothing at or
+/// below it. An empty `events` with a high cursor is a freshly restarted
+/// coordinator, not a quiet cluster.
 #[derive(Debug, Clone)]
 pub struct RecentClusterEvents {
     pub floor_index: u64,

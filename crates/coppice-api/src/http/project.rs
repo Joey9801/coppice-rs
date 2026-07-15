@@ -19,8 +19,9 @@ use crate::{QueueWindow, RecentClusterEvents};
 use super::dto;
 
 /// How many of the newest closed buckets feed the headline queue rates:
-/// 10 × 30 s = a 5-minute window (the full retained hour still ships in
-/// `history` for sparklines).
+/// nominally 10 × 30 s = a 5-minute window (buckets record their actual
+/// span, so a stall-stretched bucket widens the window rather than skewing
+/// the rate). The full retained hour still ships in `history`.
 const RATE_WINDOW_BUCKETS: usize = 10;
 
 #[derive(Default)]
@@ -265,14 +266,17 @@ fn queue_stats(state: &StateMachine, now_us: i64, window: &QueueWindow) -> dto::
 }
 
 /// Headline `(arrivals, drains)` per minute over the newest
-/// [`RATE_WINDOW_BUCKETS`] closed buckets; `None` when the window has no
-/// coverage at all (never a fabricated `0.0` — see `dto::QueueStats`).
+/// [`RATE_WINDOW_BUCKETS`] closed buckets, scaled by their *recorded*
+/// spans — a stall-stretched bucket contributes its real coverage, never an
+/// assumed 30 s. `None` when the window covers no time at all (never a
+/// fabricated `0.0` — see `dto::QueueStats`).
 fn queue_rates(window: &QueueWindow) -> (Option<f64>, Option<f64>) {
-    if window.buckets.is_empty() || window.bucket_us <= 0 {
+    let newest = &window.buckets[window.buckets.len().saturating_sub(RATE_WINDOW_BUCKETS)..];
+    let covered_us: i64 = newest.iter().map(|b| (b.end_us - b.start_us).max(0)).sum();
+    if covered_us <= 0 {
         return (None, None);
     }
-    let newest = &window.buckets[window.buckets.len().saturating_sub(RATE_WINDOW_BUCKETS)..];
-    let minutes = (newest.len() as f64 * window.bucket_us as f64) / 60_000_000.0;
+    let minutes = covered_us as f64 / 60_000_000.0;
     let arrivals: u64 = newest.iter().map(|b| u64::from(b.arrivals)).sum();
     let drains: u64 = newest.iter().map(|b| u64::from(b.drains)).sum();
     (
@@ -281,21 +285,23 @@ fn queue_rates(window: &QueueWindow) -> (Option<f64>, Option<f64>) {
     )
 }
 
-/// Every retained bucket as a history sample, oldest first. Missing
-/// coverage is a missing sample (its `t_us` never appears), never a zero.
+/// Every retained bucket as a history sample, oldest first, each scaled by
+/// its own recorded span. Missing coverage is a missing sample (its `t_us`
+/// never appears), never a zero; a degenerate zero-length bucket has no
+/// honest rate and is skipped.
 fn queue_history(window: &QueueWindow) -> Vec<dto::QueueSample> {
-    if window.bucket_us <= 0 {
-        return Vec::new();
-    }
-    let per_minute = 60_000_000.0 / window.bucket_us as f64;
     window
         .buckets
         .iter()
-        .map(|b| dto::QueueSample {
-            t_us: b.start_us,
-            depth: b.depth,
-            drained_per_minute: f64::from(b.drains) * per_minute,
-            arrived_per_minute: f64::from(b.arrivals) * per_minute,
+        .filter(|b| b.end_us > b.start_us)
+        .map(|b| {
+            let per_minute = 60_000_000.0 / (b.end_us - b.start_us) as f64;
+            dto::QueueSample {
+                t_us: b.start_us,
+                depth: b.depth,
+                drained_per_minute: f64::from(b.drains) * per_minute,
+                arrived_per_minute: f64::from(b.arrivals) * per_minute,
+            }
         })
         .collect()
 }
@@ -742,15 +748,14 @@ mod tests {
     }
 
     fn window_of(buckets: Vec<crate::QueueBucket>) -> QueueWindow {
-        QueueWindow {
-            bucket_us: 30_000_000,
-            buckets,
-        }
+        QueueWindow { buckets }
     }
 
+    /// A nominal-width (30 s) bucket.
     fn bucket(start_us: i64, depth: u32, arrivals: u32, drains: u32) -> crate::QueueBucket {
         crate::QueueBucket {
             start_us,
+            end_us: start_us + 30_000_000,
             depth,
             arrivals,
             drains,
@@ -779,6 +784,27 @@ mod tests {
         // 10 buckets × 30 s = 5 minutes, 10 arrivals → 2/min.
         assert_eq!(arrivals, Some(2.0));
         assert_eq!(drains, Some(0.0));
+    }
+
+    /// A missed-tick stall closes one honest long bucket; rates must scale
+    /// by its recorded span, not the nominal width — a five-minute bucket
+    /// with 10 arrivals is 2/min, not 20/min.
+    #[test]
+    fn a_stall_stretched_bucket_scales_by_its_recorded_span() {
+        let long = crate::QueueBucket {
+            start_us: 0,
+            end_us: 300_000_000,
+            depth: 0,
+            arrivals: 10,
+            drains: 5,
+        };
+        let (arrivals, drains) = queue_rates(&window_of(vec![long]));
+        assert_eq!(arrivals, Some(2.0));
+        assert_eq!(drains, Some(1.0));
+
+        let history = queue_history(&window_of(vec![long]));
+        assert_eq!(history[0].arrived_per_minute, 2.0);
+        assert_eq!(history[0].drained_per_minute, 1.0);
     }
 
     #[test]

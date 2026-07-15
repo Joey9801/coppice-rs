@@ -329,9 +329,9 @@ mod tests {
             fail_with,
             queue_window: QueueWindow::default(),
             recent: RecentClusterEvents {
-                // ReadView serves applied index 1, so "nothing covered" is a
-                // floor just above it.
-                floor_index: 2,
+                // ReadView serves applied index 1, so "nothing covered" is
+                // the exclusive cursor sitting at it.
+                floor_index: 1,
                 events: Vec::new(),
             },
         }))
@@ -393,12 +393,12 @@ mod tests {
         assert_eq!(body["queue"]["by_state"]["queued"], 0);
         assert_eq!(body["capacity"]["nodes"]["total"], 0);
         // No derived coverage: rates null, and the empty events window still
-        // says how far back it would have covered (ADR 0032).
+        // carries its exclusive coverage cursor (ADR 0032).
         assert_eq!(
             body["queue"]["drain_rate_per_minute"],
             serde_json::Value::Null
         );
-        assert_eq!(body["recent_events"]["floor_index"], 2);
+        assert_eq!(body["recent_events"]["floor_index"], 1);
         assert_eq!(body["recent_events"]["events"], serde_json::json!([]));
     }
 
@@ -408,9 +408,9 @@ mod tests {
         let plane = StubPlane {
             fail_with: None,
             queue_window: QueueWindow {
-                bucket_us: 30_000_000,
                 buckets: vec![crate::QueueBucket {
                     start_us: 60_000_000,
+                    end_us: 90_000_000,
                     depth: 4,
                     arrivals: 2,
                     drains: 1,
