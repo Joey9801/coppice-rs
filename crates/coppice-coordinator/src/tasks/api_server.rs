@@ -17,12 +17,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 use coppice_api::http::dto::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
-use coppice_api::{ApiError, Consistency, ControlPlane, ReadOptions, ReadView};
+use coppice_api::{
+    ApiError, Consistency, ControlPlane, QueueWindow, ReadOptions, ReadView, RecentClusterEvents,
+    StampedEvent,
+};
 use coppice_consensus::{Applied, Consensus, ConsensusError, StateViews};
 use coppice_core::id::ClusterId;
 use coppice_core::job::Job;
 use coppice_state::command::{AbortJob, SubmitJob};
 use coppice_state::Command;
+
+use crate::tasks::event_fanout::FanoutHandle;
 
 /// Implements [`ControlPlane`] by proposing through the consensus seam.
 #[allow(dead_code)] // fields are read by submit_job/abort_job, exercised in tests below.
@@ -33,15 +38,41 @@ pub struct CoordinatorControlPlane<C> {
     /// replicated state — a replica knows it before it applies anything —
     /// so reads that report it (`GET /api/v1/overview`) take it from here.
     cluster_id: ClusterId,
+    /// The derived-stats task's published window (ADR 0032, tier 3).
+    /// Empty until [`with_derived`](Self::with_derived) attaches the real
+    /// watch — an honest "no coverage", which is also what tests that never
+    /// spawn the task serve.
+    queue_window: watch::Receiver<QueueWindow>,
+    /// Handle to the fanout's ring for `recent_events` (ADR 0032, tier 1);
+    /// `None` (again: no coverage) until `with_derived`.
+    fanout: Option<FanoutHandle>,
 }
 
 impl<C> CoordinatorControlPlane<C> {
     pub fn new(consensus: Arc<C>, views: StateViews, cluster_id: ClusterId) -> Self {
+        // A watch whose sender is dropped immediately: borrows keep serving
+        // the seeded empty window.
+        let (_, queue_window) = watch::channel(QueueWindow::default());
         CoordinatorControlPlane {
             consensus,
             views,
             cluster_id,
+            queue_window,
+            fanout: None,
         }
+    }
+
+    /// Attach the replica-local derived read sources: the derived-stats
+    /// task's window watch and the fanout's ring handle. The runtime calls
+    /// this; a control plane without them serves honestly empty windows.
+    pub fn with_derived(
+        mut self,
+        queue_window: watch::Receiver<QueueWindow>,
+        fanout: FanoutHandle,
+    ) -> Self {
+        self.queue_window = queue_window;
+        self.fanout = Some(fanout);
+        self
     }
 }
 
@@ -194,6 +225,39 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             view.applied_index(),
             committed_index,
         ))
+    }
+
+    fn queue_window(&self) -> QueueWindow {
+        self.queue_window.borrow().clone()
+    }
+
+    async fn recent_events(&self, limit: usize) -> RecentClusterEvents {
+        // "No ring" and "ring unreachable at shutdown" both serve the same
+        // honest answer: nothing covered — a floor above everything this
+        // replica has applied, with no events.
+        let uncovered = || RecentClusterEvents {
+            floor_index: self.views.latest().applied_index() + 1,
+            events: Vec::new(),
+        };
+        let Some(fanout) = &self.fanout else {
+            return uncovered();
+        };
+        match fanout.recent(limit).await {
+            Ok(recent) => RecentClusterEvents {
+                floor_index: recent.floor_index,
+                events: recent
+                    .events
+                    .into_iter()
+                    .map(|e| StampedEvent {
+                        index: e.index,
+                        ordinal: e.ordinal,
+                        at_us: e.at_us,
+                        event: e.event,
+                    })
+                    .collect(),
+            },
+            Err(_closed) => uncovered(),
+        }
     }
 }
 

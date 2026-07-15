@@ -69,6 +69,17 @@ pub const FANOUT_RING_MAX_EVENTS: usize = 1_000_000;
 /// Evict-oldest when full.
 pub const FANOUT_RING_MAX_AGE: Duration = Duration::from_secs(3600);
 
+/// Width of one derived queue-stats bucket (ADR 0032, tier 3).
+///
+/// The derived-stats task closes a bucket of queue arrival/drain counts at
+/// this cadence; the overview's rates and `history` are projections over
+/// the closed buckets.
+pub const QUEUE_BUCKET_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Closed queue-stats buckets retained (ADR 0032: ≤ 1 h of 30 s buckets,
+/// task-local, never on the `StateMachine`, never snapshotted).
+pub const QUEUE_WINDOW_MAX_BUCKETS: usize = 120;
+
 /// Housekeeping tick cadence (ADR 0012 / ADR 0017).
 pub const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
 

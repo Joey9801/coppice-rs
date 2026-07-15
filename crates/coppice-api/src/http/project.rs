@@ -14,7 +14,14 @@ use coppice_core::job::JobState;
 use coppice_core::resource::Resources;
 use coppice_state::{AttemptRecord, JobRecord, StateMachine};
 
+use crate::{QueueWindow, RecentClusterEvents};
+
 use super::dto;
+
+/// How many of the newest closed buckets feed the headline queue rates:
+/// 10 × 30 s = a 5-minute window (the full retained hour still ships in
+/// `history` for sparklines).
+const RATE_WINDOW_BUCKETS: usize = 10;
 
 #[derive(Default)]
 struct NodeMemo {
@@ -153,16 +160,37 @@ pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<dto::GetNodeRespons
 ///
 /// `now_us` is the reader's wall clock, used only for `oldest_queued_age_us`
 /// — a *read-time* age, not replicated state (apply never reads a clock).
-/// The caller passes it in so this stays a pure function of its inputs.
+/// The caller passes it in so this stays a pure function of its inputs, as
+/// are the two derived sources: `window` (this replica's queue buckets,
+/// ADR 0032 tier 3) and `recent` (its fanout ring's newest events, tier 1).
 pub fn cluster_overview(
     state: &StateMachine,
     cluster_id: ClusterId,
     now_us: i64,
+    window: &QueueWindow,
+    recent: &RecentClusterEvents,
 ) -> dto::GetClusterOverviewResponse {
     dto::GetClusterOverviewResponse {
         cluster_id,
-        queue: queue_stats(state, now_us),
+        queue: queue_stats(state, now_us, window),
         capacity: cluster_capacity(state),
+        recent_events: recent_events(recent),
+    }
+}
+
+fn recent_events(recent: &RecentClusterEvents) -> dto::RecentEventsWindow {
+    dto::RecentEventsWindow {
+        floor_index: recent.floor_index,
+        events: recent
+            .events
+            .iter()
+            .map(|e| dto::TimelineEvent {
+                index: e.index,
+                ordinal: e.ordinal,
+                at_us: e.at_us,
+                body: (&e.event).into(),
+            })
+            .collect(),
     }
 }
 
@@ -206,7 +234,7 @@ fn cluster_capacity(state: &StateMachine) -> dto::ClusterCapacity {
     }
 }
 
-fn queue_stats(state: &StateMachine, now_us: i64) -> dto::QueueStats {
+fn queue_stats(state: &StateMachine, now_us: i64, window: &QueueWindow) -> dto::QueueStats {
     // Seeded with every phase so the response reports a count for each one,
     // zeros included.
     let mut by_state: BTreeMap<dto::JobPhase, u32> =
@@ -224,15 +252,52 @@ fn queue_stats(state: &StateMachine, now_us: i64) -> dto::QueueStats {
         }
     }
 
+    let (arrival_rate_per_minute, drain_rate_per_minute) = queue_rates(window);
+
     dto::QueueStats {
         depth: by_state[&dto::JobPhase::Queued],
-        // No windowed history exists to compute rates from; see `QueueStats`.
-        drain_rate_per_minute: None,
-        arrival_rate_per_minute: None,
+        drain_rate_per_minute,
+        arrival_rate_per_minute,
         oldest_queued_age_us,
         by_state,
-        history: Vec::new(),
+        history: queue_history(window),
     }
+}
+
+/// Headline `(arrivals, drains)` per minute over the newest
+/// [`RATE_WINDOW_BUCKETS`] closed buckets; `None` when the window has no
+/// coverage at all (never a fabricated `0.0` — see `dto::QueueStats`).
+fn queue_rates(window: &QueueWindow) -> (Option<f64>, Option<f64>) {
+    if window.buckets.is_empty() || window.bucket_us <= 0 {
+        return (None, None);
+    }
+    let newest = &window.buckets[window.buckets.len().saturating_sub(RATE_WINDOW_BUCKETS)..];
+    let minutes = (newest.len() as f64 * window.bucket_us as f64) / 60_000_000.0;
+    let arrivals: u64 = newest.iter().map(|b| u64::from(b.arrivals)).sum();
+    let drains: u64 = newest.iter().map(|b| u64::from(b.drains)).sum();
+    (
+        Some(arrivals as f64 / minutes),
+        Some(drains as f64 / minutes),
+    )
+}
+
+/// Every retained bucket as a history sample, oldest first. Missing
+/// coverage is a missing sample (its `t_us` never appears), never a zero.
+fn queue_history(window: &QueueWindow) -> Vec<dto::QueueSample> {
+    if window.bucket_us <= 0 {
+        return Vec::new();
+    }
+    let per_minute = 60_000_000.0 / window.bucket_us as f64;
+    window
+        .buckets
+        .iter()
+        .map(|b| dto::QueueSample {
+            t_us: b.start_us,
+            depth: b.depth,
+            drained_per_minute: f64::from(b.drains) * per_minute,
+            arrived_per_minute: f64::from(b.arrivals) * per_minute,
+        })
+        .collect()
 }
 
 /// The read-time join of a job's state with its attempt's (ADR 0030).
@@ -509,9 +574,28 @@ mod tests {
         CLUSTER.parse().unwrap()
     }
 
+    fn no_recent() -> RecentClusterEvents {
+        RecentClusterEvents {
+            floor_index: 0,
+            events: Vec::new(),
+        }
+    }
+
+    /// [`cluster_overview`] with empty derived sources — what a replica with
+    /// no bucket or ring coverage serves.
+    fn overview(state: &StateMachine, now_us: i64) -> dto::GetClusterOverviewResponse {
+        cluster_overview(
+            state,
+            cluster(),
+            now_us,
+            &QueueWindow::default(),
+            &no_recent(),
+        )
+    }
+
     #[test]
     fn overview_of_an_empty_cluster_counts_nothing() {
-        let response = cluster_overview(&StateMachine::default(), cluster(), 1_000);
+        let response = overview(&StateMachine::default(), 1_000);
 
         assert_eq!(response.cluster_id, cluster());
         assert_eq!(response.queue.depth, 0);
@@ -540,7 +624,7 @@ mod tests {
             test_allocation(alloc, job, attempt, n1, AllocationState::Active),
         );
 
-        let capacity = cluster_overview(&state, cluster(), 0).capacity;
+        let capacity = overview(&state, 0).capacity;
 
         assert_eq!(capacity.nodes.total, 2);
         // A draining node is registered capacity but not schedulable.
@@ -587,7 +671,7 @@ mod tests {
             ),
         );
 
-        let queue = cluster_overview(&state, cluster(), 0).queue;
+        let queue = overview(&state, 0).queue;
 
         // `Attempting` is never reported raw: an accruing attempt reads as
         // `Preparing`, a running one as `Running` (ADR 0030's read-time join).
@@ -617,7 +701,7 @@ mod tests {
             ),
         );
 
-        let queue = cluster_overview(&state, cluster(), 0).queue;
+        let queue = overview(&state, 0).queue;
         assert_eq!(queue.by_state[&dto::JobPhase::Finalizing], 1);
     }
 
@@ -639,7 +723,7 @@ mod tests {
             .jobs
             .insert(running, test_job(running, JobState::Succeeded, 0));
 
-        let queue = cluster_overview(&state, cluster(), 10_000).queue;
+        let queue = overview(&state, 10_000).queue;
         assert_eq!(queue.oldest_queued_age_us, Some(9_000));
     }
 
@@ -653,15 +737,112 @@ mod tests {
             .jobs
             .insert(job, test_job(job, JobState::Queued, 5_000));
 
-        let queue = cluster_overview(&state, cluster(), 1_000).queue;
+        let queue = overview(&state, 1_000).queue;
         assert_eq!(queue.oldest_queued_age_us, Some(0));
+    }
+
+    fn window_of(buckets: Vec<crate::QueueBucket>) -> QueueWindow {
+        QueueWindow {
+            bucket_us: 30_000_000,
+            buckets,
+        }
+    }
+
+    fn bucket(start_us: i64, depth: u32, arrivals: u32, drains: u32) -> crate::QueueBucket {
+        crate::QueueBucket {
+            start_us,
+            depth,
+            arrivals,
+            drains,
+        }
+    }
+
+    #[test]
+    fn queue_rates_are_per_minute_over_the_covered_window() {
+        // Two closed 30 s buckets = one covered minute: 3 arrivals and 1
+        // drain in it are exactly those per-minute rates.
+        let window = window_of(vec![bucket(0, 5, 2, 1), bucket(30_000_000, 6, 1, 0)]);
+        let (arrivals, drains) = queue_rates(&window);
+        assert_eq!(arrivals, Some(3.0));
+        assert_eq!(drains, Some(1.0));
+    }
+
+    #[test]
+    fn queue_rates_use_only_the_newest_rate_window_buckets() {
+        // An old burst outside the 10-bucket rate window must not inflate
+        // the headline rate (it still ships in `history`).
+        let mut buckets = vec![bucket(0, 0, 600, 600)];
+        for i in 1..=(RATE_WINDOW_BUCKETS as i64) {
+            buckets.push(bucket(i * 30_000_000, 0, 1, 0));
+        }
+        let (arrivals, drains) = queue_rates(&window_of(buckets));
+        // 10 buckets × 30 s = 5 minutes, 10 arrivals → 2/min.
+        assert_eq!(arrivals, Some(2.0));
+        assert_eq!(drains, Some(0.0));
+    }
+
+    #[test]
+    fn queue_history_carries_every_retained_bucket_scaled_per_minute() {
+        let window = window_of(vec![bucket(0, 5, 2, 1), bucket(30_000_000, 6, 0, 3)]);
+        let history = queue_history(&window);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].t_us, 0);
+        assert_eq!(history[0].depth, 5);
+        assert_eq!(history[0].arrived_per_minute, 4.0);
+        assert_eq!(history[0].drained_per_minute, 2.0);
+        assert_eq!(history[1].t_us, 30_000_000);
+        assert_eq!(history[1].drained_per_minute, 6.0);
+    }
+
+    #[test]
+    fn overview_serves_rates_and_history_from_the_window() {
+        let window = window_of(vec![bucket(0, 5, 2, 1)]);
+        let queue = cluster_overview(
+            &StateMachine::default(),
+            cluster(),
+            0,
+            &window,
+            &no_recent(),
+        )
+        .queue;
+        assert_eq!(queue.arrival_rate_per_minute, Some(4.0));
+        assert_eq!(queue.drain_rate_per_minute, Some(2.0));
+        assert_eq!(queue.history.len(), 1);
+    }
+
+    #[test]
+    fn recent_events_keep_their_identity_and_stamp() {
+        let job = JobId::new();
+        let recent = RecentClusterEvents {
+            floor_index: 4,
+            events: vec![crate::StampedEvent {
+                index: 9,
+                ordinal: 3,
+                at_us: 1_234,
+                event: coppice_state::Event::JobSubmitted { job },
+            }],
+        };
+        let rendered = cluster_overview(
+            &StateMachine::default(),
+            cluster(),
+            0,
+            &QueueWindow::default(),
+            &recent,
+        )
+        .recent_events;
+        assert_eq!(rendered.floor_index, 4);
+        assert_eq!(rendered.events.len(), 1);
+        let event = &rendered.events[0];
+        assert_eq!((event.index, event.ordinal, event.at_us), (9, 3, 1_234));
+        assert_eq!(event.body, dto::TimelineEventBody::JobSubmitted { job });
     }
 
     #[test]
     fn queue_rates_and_history_are_absent_not_zero() {
-        // Nothing retains the window they would be computed over; `0.0` would
-        // claim "nothing is draining" (see `dto::QueueStats`).
-        let queue = cluster_overview(&StateMachine::default(), cluster(), 0).queue;
+        // A window with no coverage (fresh replica, or one that just lost
+        // the event stream); `0.0` would claim "nothing is draining" (see
+        // `dto::QueueStats`).
+        let queue = overview(&StateMachine::default(), 0).queue;
         assert_eq!(queue.drain_rate_per_minute, None);
         assert_eq!(queue.arrival_rate_per_minute, None);
         assert!(queue.history.is_empty());

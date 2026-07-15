@@ -175,7 +175,14 @@ async fn abort_job<P: ControlPlane>(
     Ok(Json(AbortJobResponse {}))
 }
 
-/// `GET /api/v1/overview` — bounded by default (ADR 0031).
+/// Events served in the overview's `recent_events` window — a display
+/// window, deliberately smaller than the ring behind it (a client wanting
+/// more history uses the timeline/subscription endpoints).
+const RECENT_EVENTS_LIMIT: usize = 50;
+
+/// `GET /api/v1/overview` — bounded by default (ADR 0031) for the
+/// replicated-state fields; the rates/history and `recent_events` are
+/// derived, replica-local reads (ADR 0032).
 async fn get_overview<P: ControlPlane>(
     State(plane): State<Arc<P>>,
     ReadQuery(params): ReadQuery,
@@ -183,7 +190,15 @@ async fn get_overview<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    let response = super::project::cluster_overview(view.state(), plane.cluster_id(), now_us());
+    let window = plane.queue_window();
+    let recent = plane.recent_events(RECENT_EVENTS_LIMIT).await;
+    let response = super::project::cluster_overview(
+        view.state(),
+        plane.cluster_id(),
+        now_us(),
+        &window,
+        &recent,
+    );
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -256,15 +271,18 @@ mod tests {
     use tower::ServiceExt;
 
     use super::super::dto::SubmitJobResponse;
-    use crate::{ApiError, ReadOptions, ReadView};
+    use crate::{ApiError, QueueWindow, ReadOptions, ReadView, RecentClusterEvents};
 
     use crate::http::COPPICE_LEADER;
 
     /// A canned `ControlPlane`: submit echoes the request's job id with a
     /// fixed log index, or fails with the configured error. Reads serve an
-    /// empty state.
+    /// empty state, and the derived sources serve whatever the test seeded
+    /// (by default: no coverage, like a fresh replica).
     struct StubPlane {
         fail_with: Option<fn() -> ApiError>,
+        queue_window: QueueWindow,
+        recent: RecentClusterEvents,
     }
 
     const STUB_CLUSTER: &str = "cluster-00000000-0000-0000-0000-000000000009";
@@ -272,6 +290,16 @@ mod tests {
     impl ControlPlane for StubPlane {
         fn cluster_id(&self) -> coppice_core::id::ClusterId {
             STUB_CLUSTER.parse().unwrap()
+        }
+
+        fn queue_window(&self) -> QueueWindow {
+            self.queue_window.clone()
+        }
+
+        async fn recent_events(&self, limit: usize) -> RecentClusterEvents {
+            let mut recent = self.recent.clone();
+            recent.events.truncate(limit);
+            recent
         }
 
         async fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
@@ -297,7 +325,16 @@ mod tests {
     }
 
     fn app(fail_with: Option<fn() -> ApiError>) -> Router {
-        router(Arc::new(StubPlane { fail_with }))
+        router(Arc::new(StubPlane {
+            fail_with,
+            queue_window: QueueWindow::default(),
+            recent: RecentClusterEvents {
+                // ReadView serves applied index 1, so "nothing covered" is a
+                // floor just above it.
+                floor_index: 2,
+                events: Vec::new(),
+            },
+        }))
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -355,6 +392,61 @@ mod tests {
         );
         assert_eq!(body["queue"]["by_state"]["queued"], 0);
         assert_eq!(body["capacity"]["nodes"]["total"], 0);
+        // No derived coverage: rates null, and the empty events window still
+        // says how far back it would have covered (ADR 0032).
+        assert_eq!(
+            body["queue"]["drain_rate_per_minute"],
+            serde_json::Value::Null
+        );
+        assert_eq!(body["recent_events"]["floor_index"], 2);
+        assert_eq!(body["recent_events"]["events"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn overview_serves_derived_rates_history_and_recent_events() {
+        let job = JobId::new();
+        let plane = StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow {
+                bucket_us: 30_000_000,
+                buckets: vec![crate::QueueBucket {
+                    start_us: 60_000_000,
+                    depth: 4,
+                    arrivals: 2,
+                    drains: 1,
+                }],
+            },
+            recent: RecentClusterEvents {
+                floor_index: 5,
+                events: vec![crate::StampedEvent {
+                    index: 8,
+                    ordinal: 0,
+                    at_us: 90_000_000,
+                    event: coppice_state::Event::JobSubmitted { job },
+                }],
+            },
+        };
+        let response = router(Arc::new(plane))
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_json(response).await;
+        assert_eq!(body["queue"]["arrival_rate_per_minute"], 4.0);
+        assert_eq!(body["queue"]["drain_rate_per_minute"], 2.0);
+        assert_eq!(body["queue"]["history"][0]["t_us"], 60_000_000);
+        assert_eq!(body["recent_events"]["floor_index"], 5);
+        let event = &body["recent_events"]["events"][0];
+        assert_eq!(event["index"], 8);
+        assert_eq!(event["ordinal"], 0);
+        assert_eq!(event["at_us"], 90_000_000);
+        assert_eq!(event["kind"], "job_submitted");
+        assert_eq!(event["job"], job.to_string());
     }
 
     #[tokio::test]

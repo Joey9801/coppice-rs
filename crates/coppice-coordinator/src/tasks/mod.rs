@@ -7,6 +7,7 @@
 
 pub mod agent_gateway;
 pub mod api_server;
+pub mod derived_stats;
 pub mod dispatch;
 pub mod event_fanout;
 pub mod housekeeping;

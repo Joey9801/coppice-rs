@@ -72,6 +72,66 @@ impl ReadView {
     }
 }
 
+/// One closed bucket of queue transitions (ADR 0032, tier 3), derived
+/// replica-locally by counting the event stream — never replicated, never
+/// snapshotted.
+///
+/// Counts are transitions observed *during* the bucket; `depth` is sampled
+/// from the latest published view at bucket close. A bucket that was never
+/// produced (the process wasn't running, or coverage was lost to an event
+/// gap) is simply absent from the window — honest absence, never a zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueBucket {
+    /// Bucket start (inclusive), Unix µs.
+    pub start_us: i64,
+    /// Jobs in `Queued` at bucket close.
+    pub depth: u32,
+    /// Transitions into `Queued` during the bucket (submissions + requeues).
+    pub arrivals: u32,
+    /// Transitions out of `Queued` during the bucket (placements, aborts).
+    pub drains: u32,
+}
+
+/// The rolling window of closed queue buckets, oldest first — the source
+/// for the overview's queue rates and `history` (ADR 0032, tier 3).
+///
+/// Contiguous by construction: the producing task drops the whole window
+/// when it loses event-stream coverage, so a bucket's presence means its
+/// counts are complete.
+#[derive(Debug, Clone, Default)]
+pub struct QueueWindow {
+    /// Bucket width, µs.
+    pub bucket_us: i64,
+    pub buckets: Vec<QueueBucket>,
+}
+
+/// One event with the identity and stamp of ADR 0032's shared timeline
+/// shape: ordered and deduplicated by `(index, ordinal)`, rendered at the
+/// advisory `at_us`.
+#[derive(Debug, Clone)]
+pub struct StampedEvent {
+    /// The producing command's log index.
+    pub index: u64,
+    /// The event's position in its full batch, assigned before any
+    /// filtering — part of its identity.
+    pub ordinal: u32,
+    /// The command's proposer stamp; advisory, never an ordering key.
+    pub at_us: i64,
+    pub event: coppice_state::Event,
+}
+
+/// The most recent cluster events, newest first, served from the fanout
+/// ring (ADR 0032, tier 1).
+///
+/// `floor_index` is the coverage floor — the earliest applied index the
+/// window is complete from. An empty `events` with a high floor is a
+/// freshly restarted coordinator, not a quiet cluster.
+#[derive(Debug, Clone)]
+pub struct RecentClusterEvents {
+    pub floor_index: u64,
+    pub events: Vec<StampedEvent>,
+}
+
 /// Errors surfaced to API callers.
 ///
 /// A `Rejected` outcome means the command committed and apply refused it
@@ -146,4 +206,15 @@ pub trait ControlPlane: Send + Sync + 'static {
         &self,
         opts: ReadOptions,
     ) -> impl Future<Output = Result<ReadView, ApiError>> + Send;
+
+    /// This replica's rolling window of queue-transition buckets (ADR 0032,
+    /// tier 3) — derived class, replica-local, coverage-annotated by
+    /// absence. Cheap: a clone of the latest published window, no locks
+    /// held, no consensus involvement.
+    fn queue_window(&self) -> QueueWindow;
+
+    /// The most recent cluster events this replica's fanout ring retains
+    /// (ADR 0032, tier 1), newest first, at most `limit` — derived class,
+    /// replica-local, with the coverage floor.
+    fn recent_events(&self, limit: usize) -> impl Future<Output = RecentClusterEvents> + Send;
 }

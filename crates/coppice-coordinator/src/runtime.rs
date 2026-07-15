@@ -21,7 +21,7 @@ use crate::tasks::agent_gateway::{AgentSessionService, Gateway};
 use crate::tasks::api_server::{self, CoordinatorControlPlane};
 use crate::tasks::housekeeping::StubHistoryStore;
 use crate::tasks::{
-    agent_gateway, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver,
+    agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver,
 };
 
 /// Wire up and run every coordinator task.
@@ -75,6 +75,13 @@ where
     let (fanout, fanout_join) = event_fanout::spawn(event_tap, recovery_index, shutdown_rx.clone());
     tracing::debug!("runtime: event fanout up");
 
+    // Derived queue stats (ADR 0032, tier 3): counts the event stream into
+    // rolling buckets and publishes the window the overview's rates and
+    // history are projected from.
+    let (queue_window, derived_stats_join) =
+        derived_stats::spawn(fanout.clone(), views.clone(), shutdown_rx.clone());
+    tracing::debug!("runtime: derived stats up");
+
     let Gateway {
         router,
         authority,
@@ -110,11 +117,10 @@ where
     });
     tracing::debug!("runtime: agent session server up");
 
-    let control_plane = Arc::new(CoordinatorControlPlane::new(
-        Arc::clone(&consensus),
-        views.clone(),
-        cluster_id,
-    ));
+    let control_plane = Arc::new(
+        CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
+            .with_derived(queue_window, fanout.clone()),
+    );
     let api_join = tokio::spawn(api_server::run(
         client_listener,
         control_plane,
@@ -221,6 +227,8 @@ where
     let _ = housekeeping_join.await;
     tracing::debug!("runtime: leader-only loops down");
 
+    // Derived stats subscribes to the fanout, so it drains before it.
+    let _ = derived_stats_join.await;
     let _ = fanout_join.await;
     tracing::info!("coordinator runtime stopped");
 
