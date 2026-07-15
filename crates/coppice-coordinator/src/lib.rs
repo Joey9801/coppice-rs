@@ -40,6 +40,7 @@ pub use tasks::api_server::CoordinatorControlPlane;
 /// once after installing its recorder, without knowing any module's internals.
 pub fn describe_metrics() {
     coppice_consensus::describe_metrics();
+    tasks::event_fanout::describe_metrics();
 }
 
 /// Run any point-in-time sampling behind coordinator metrics, recursing the
@@ -47,6 +48,7 @@ pub fn describe_metrics() {
 /// immediately before rendering each scrape.
 pub fn gather_metrics() {
     coppice_consensus::gather_metrics();
+    tasks::event_fanout::gather_metrics();
 }
 
 /// Parse-and-dispatch entry point the binary calls.

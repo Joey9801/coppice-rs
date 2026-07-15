@@ -609,6 +609,7 @@ dependencies = [
  "coppice-scheduler",
  "coppice-state",
  "humantime-serde",
+ "metrics",
  "rcgen",
  "serde",
  "tempfile",
