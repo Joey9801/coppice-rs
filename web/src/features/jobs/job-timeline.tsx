@@ -10,7 +10,7 @@ import {
   Send,
   Shuffle,
 } from 'lucide-react'
-import { jobStateLabel, type JobId, type TimelineEvent } from '@/api/types'
+import type { JobId, TimelineEvent } from '@/api/types'
 import { useJobTimeline } from '@/api/queries'
 import { formatTimeAgo, formatTimestampUs } from '@/lib/format'
 import { EmptyState, IdLink } from '@/components'
@@ -39,7 +39,11 @@ export function JobTimeline({ jobId }: { jobId: JobId }) {
         const Icon = eventIcon(event)
         const last = i === timeline.data.length - 1
         return (
-          <li key={i} className="relative flex gap-3 pb-5 last:pb-0">
+          // `(index, ordinal)` is the event's identity (ADR 0032).
+          <li
+            key={`${event.index}:${event.ordinal}`}
+            className="relative flex gap-3 pb-5 last:pb-0"
+          >
             {!last ? (
               <span className="absolute left-3 top-6 -ml-px h-full w-px bg-border" aria-hidden />
             ) : null}
@@ -89,8 +93,7 @@ function eventSentence(event: TimelineEvent): ReactNode {
     case 'JobStateChanged':
       return (
         <>
-          State changed <Mono>{jobStateLabel(event.from)}</Mono> →{' '}
-          <Mono>{jobStateLabel(event.to)}</Mono>
+          State changed <Mono>{event.from}</Mono> → <Mono>{event.to}</Mono>
         </>
       )
     case 'AttemptStateChanged':
@@ -108,7 +111,11 @@ function eventSentence(event: TimelineEvent): ReactNode {
         </>
       )
     case 'StopRequested':
-      return event.reason ? `Stop requested — ${event.reason}` : 'Stop requested'
+      return (
+        <>
+          Stop requested on <IdLink id={event.node} />
+        </>
+      )
     case 'NodeEpochBumped':
       return (
         <>
@@ -116,11 +123,7 @@ function eventSentence(event: TimelineEvent): ReactNode {
         </>
       )
     case 'JobEvicted':
-      return (
-        <>
-          Evicted from <IdLink id={event.node} />
-        </>
-      )
+      return 'Evicted from replicated state'
     default:
       return 'Unknown event'
   }

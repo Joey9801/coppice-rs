@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
-import { ArrowRight, Ban, Coins, LogOut, Play, Plus, RefreshCw } from 'lucide-react'
-import { jobStateLabel, type TimelineEvent } from '@/api/types'
+import { ArrowRight, Ban, Coins, LogOut, Play, Plus, RefreshCw, Settings2, Tag } from 'lucide-react'
+import type { TimelineEvent } from '@/api/types'
 import { IdLink, TimeAgo } from '@/components'
 
 interface RenderedEvent {
@@ -26,8 +26,7 @@ function renderEvent(event: TimelineEvent): RenderedEvent {
         icon: ArrowRight,
         body: (
           <>
-            Job <IdLink id={event.job} /> {jobStateLabel(event.from)} <ArrowGlyph />{' '}
-            {jobStateLabel(event.to)}
+            Job <IdLink id={event.job} /> {event.from} <ArrowGlyph /> {event.to}
           </>
         ),
       }
@@ -55,8 +54,7 @@ function renderEvent(event: TimelineEvent): RenderedEvent {
         icon: Ban,
         body: (
           <>
-            Stop requested for Job <IdLink id={event.job} />
-            {event.reason ? <span className="text-muted-foreground"> — {event.reason}</span> : null}
+            Stop requested for Job <IdLink id={event.job} /> on <IdLink id={event.node} />
           </>
         ),
       }
@@ -74,10 +72,23 @@ function renderEvent(event: TimelineEvent): RenderedEvent {
         icon: LogOut,
         body: (
           <>
-            Job <IdLink id={event.job} /> evicted from <IdLink id={event.node} />
+            Job <IdLink id={event.job} /> evicted from replicated state
           </>
         ),
       }
+    case 'QuotaEntityConfigured':
+      return {
+        icon: Settings2,
+        body: (
+          <>
+            Quota entity <IdLink id={event.entity} /> configured
+          </>
+        ),
+      }
+    case 'PolicyUpdated':
+      return { icon: Settings2, body: <>Cluster policy updated</> }
+    case 'ClusterVersionBumped':
+      return { icon: Tag, body: <>Cluster version bumped to {event.to}</> }
     default: {
       const _exhaustive: never = event
       return _exhaustive
@@ -95,19 +106,12 @@ export interface EventsFeedProps {
 
 /**
  * Stable identity for a rendered event row so polling refreshes reuse DOM
- * nodes instead of remounting the whole list (index keys would remount
- * every row whenever a new event shifts the window).
+ * nodes instead of remounting the whole list. `(index, ordinal)` is the
+ * event's identity (ADR 0032) — never key or deduplicate by `atUs`, which
+ * can collide within a batch and run backwards across proposers.
  */
 function eventKey(event: TimelineEvent): string {
-  const subject =
-    'attempt' in event
-      ? event.attempt
-      : 'allocation' in event
-        ? event.allocation
-        : 'job' in event
-          ? event.job
-          : event.node
-  return `${event.atUs}:${event.kind}:${subject}`
+  return `${event.index}:${event.ordinal}`
 }
 
 /**
