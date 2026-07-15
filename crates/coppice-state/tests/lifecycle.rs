@@ -15,7 +15,7 @@ use coppice_state::command::{
     BumpClusterVersion, CommitPlacements, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
     ReconcileNode, SetNodeSchedulable,
 };
-use coppice_state::{Command, Event, RejectionReason};
+use coppice_state::{Command, Event, Rejection, RejectionReason};
 
 #[test]
 fn happy_path_submit_to_eviction() {
@@ -793,7 +793,10 @@ fn drained_node_rejects_placements_but_keeps_funding() {
         .unwrap_err();
     assert_eq!(
         rejection,
-        RejectionReason::InvalidBatch(vec![(0, RejectionReason::NodeNotSchedulable(nid(1)))])
+        RejectionReason::InvalidBatch(vec![Rejection {
+            item_index: 0,
+            reason: RejectionReason::NodeNotSchedulable(nid(1))
+        }])
     );
 
     // Existing accrual keeps funding on the drained node.
@@ -822,7 +825,10 @@ fn eviction_rejects_live_jobs_and_skips_missing() {
         .unwrap_err();
     assert_eq!(
         rejection,
-        RejectionReason::InvalidBatch(vec![(0, RejectionReason::JobNotTerminal(jid(1)))])
+        RejectionReason::InvalidBatch(vec![Rejection {
+            item_index: 0,
+            reason: RejectionReason::JobNotTerminal(jid(1))
+        }])
     );
 
     // Missing ids skip silently: duplicate eviction proposals are idempotent.
@@ -1405,6 +1411,9 @@ fn v1_placement_shape_is_enforced() {
     p.group = GroupId(jid(999).0);
     assert_eq!(
         sm.apply(&place_cmd(p, TS)).unwrap_err(),
-        RejectionReason::InvalidBatch(vec![(0, RejectionReason::UnsupportedPlacementShape)])
+        RejectionReason::InvalidBatch(vec![Rejection {
+            item_index: 0,
+            reason: RejectionReason::UnsupportedPlacementShape
+        }])
     );
 }

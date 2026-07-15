@@ -11,6 +11,7 @@ use coppice_proto::pb::agent::v1 as pb;
 
 use crate::executor::{ExitInfo, FakeExecutor, StartError};
 use crate::journal::Journal;
+use crate::session::ArmedWatchdog;
 
 use super::Session;
 
@@ -417,7 +418,13 @@ async fn max_runtime_watchdog_classifies_exceeded() {
         ))
         .await
         .unwrap();
-    assert_eq!(session.take_armed_watchdogs(), vec![(alloc, 1_000)]);
+    assert_eq!(
+        session.take_armed_watchdogs(),
+        vec![ArmedWatchdog {
+            allocation: alloc,
+            max_runtime_us: 1_000
+        }]
+    );
 
     let reports = session.trigger_max_runtime(alloc).await.unwrap();
     assert_eq!(

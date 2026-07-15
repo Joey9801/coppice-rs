@@ -66,9 +66,23 @@ pub struct FilteredBatch {
     pub applied_index: u64,
     /// The batch's advisory proposer stamp (ADR 0032); never an ordering key.
     pub at_us: i64,
-    /// `(ordinal, event)` pairs admitted by the subscriber's filter, in
-    /// batch order.
-    pub events: Vec<(u32, Event)>,
+    /// Events admitted by the subscriber's filter, in batch order.
+    pub events: Vec<OrdinalEvent>,
+}
+
+/// One event paired with the ordinal it was assigned within its full batch,
+/// before any subscription filter ran (ADR 0032). The ordinal is part of the
+/// event's identity from that moment on: a `Job`- or `Node`-scoped
+/// subscription may legitimately see ordinal gaps within an index, but it
+/// never sees a different ordinal for the same event than an unscoped one
+/// would — renumbering after the filter would give the same event a
+/// different identity per subscription scope.
+#[derive(Debug, Clone)]
+pub struct OrdinalEvent {
+    /// Position within the *full* batch as derived by apply.
+    pub ordinal: u32,
+    /// The event admitted at that ordinal.
+    pub event: Event,
 }
 
 /// One event with its full identity and stamp, as served from the ring.
@@ -464,12 +478,15 @@ fn record_proposer_skew(batch: &EventBatch) {
 ///
 /// Returns `None` if nothing in it survives (skip delivering an empty batch).
 fn filter_events(filter: &EventFilter, batch: &EventBatch) -> Option<FilteredBatch> {
-    let events: Vec<(u32, Event)> = batch
+    let events: Vec<OrdinalEvent> = batch
         .events
         .iter()
         .enumerate()
         .filter(|(_, e)| event_matches(filter, e))
-        .map(|(ordinal, e)| (ordinal as u32, e.clone()))
+        .map(|(ordinal, e)| OrdinalEvent {
+            ordinal: ordinal as u32,
+            event: e.clone(),
+        })
         .collect();
     if events.is_empty() {
         None
@@ -689,14 +706,14 @@ mod tests {
 
         let all = filter_events(&EventFilter::All, &batch).expect("all admits both");
         assert_eq!(
-            all.events.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            all.events.iter().map(|e| e.ordinal).collect::<Vec<_>>(),
             vec![0, 1]
         );
 
         // job_b's event keeps ordinal 1 even though it is the only survivor.
         let scoped = filter_events(&EventFilter::Job(job_b), &batch).expect("admits job_b");
         assert_eq!(
-            scoped.events.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            scoped.events.iter().map(|e| e.ordinal).collect::<Vec<_>>(),
             vec![1]
         );
         assert_eq!(scoped.at_us, batch.at_us);

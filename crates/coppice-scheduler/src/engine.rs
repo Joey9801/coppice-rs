@@ -140,6 +140,17 @@ struct SimAccrual {
     projected_ready: Option<i64>,
 }
 
+/// A guaranteed future capacity release on a node (ADR 0014): at `at_us`, the
+/// allocation with this `seq` (used only to break ties when two releases land
+/// at the same instant, matching accrual funding order) returns `freed` to
+/// the node's free pool.
+#[derive(Debug, Clone)]
+struct ReleaseEvent {
+    at_us: i64,
+    seq: u64,
+    freed: Resources,
+}
+
 /// A node's per-pass working model. Borrows the snapshot's [`Node`] so the hot
 /// packing loops read capacity and labels without a map lookup.
 struct NodeModel<'a> {
@@ -152,7 +163,7 @@ struct NodeModel<'a> {
     /// Guaranteed release events on this node, sorted by `(time, seq)`
     /// (`collect_release_events`), for `projected_ready` sweeps against both
     /// the existing queue and would-be accrual placements (ADR 0027).
-    events: Vec<(i64, u64, Resources)>,
+    events: Vec<ReleaseEvent>,
     /// Remaining needs of accruals this batch placed on the node (opens and
     /// moves, in payload order — they fund behind the surviving queue), so
     /// later candidate sweeps see the whole claim on the node's events.
@@ -949,8 +960,8 @@ fn free_capacity_map(snapshot: &StateMachine) -> BTreeMap<NodeId, Resources> {
 /// other live allocation has no guaranteed bound and contributes nothing.
 /// Collected for every node — candidate bounds for opening or moving an
 /// accrual sweep any eligible node (ADR 0027), not only current hosts.
-fn collect_release_events(snapshot: &StateMachine) -> BTreeMap<NodeId, Vec<(i64, u64, Resources)>> {
-    let mut events: BTreeMap<NodeId, Vec<(i64, u64, Resources)>> = BTreeMap::new();
+fn collect_release_events(snapshot: &StateMachine) -> BTreeMap<NodeId, Vec<ReleaseEvent>> {
+    let mut events: BTreeMap<NodeId, Vec<ReleaseEvent>> = BTreeMap::new();
     for rec in snapshot.allocations.values() {
         let node = rec.allocation.node;
         if rec.allocation.state == AllocationState::Released {
@@ -972,18 +983,19 @@ fn collect_release_events(snapshot: &StateMachine) -> BTreeMap<NodeId, Vec<(i64,
             continue;
         };
         let release = started.saturating_add(runtime as i64);
-        events
-            .entry(node)
-            .or_default()
-            .push((release, rec.seq, rec.allocation.funded));
+        events.entry(node).or_default().push(ReleaseEvent {
+            at_us: release,
+            seq: rec.seq,
+            freed: rec.allocation.funded,
+        });
     }
     events
 }
 
 /// Order release events for [`sweep_projected_ready`]: ascending time, ties
 /// by allocation `seq`.
-fn sort_release_events(events: &mut [(i64, u64, Resources)]) {
-    events.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+fn sort_release_events(events: &mut [ReleaseEvent]) {
+    events.sort_unstable_by(|a, b| a.at_us.cmp(&b.at_us).then(a.seq.cmp(&b.seq)));
 }
 
 /// Sweep guaranteed release events to compute `projected_ready` per accrual
@@ -992,15 +1004,12 @@ fn sort_release_events(events: &mut [(i64, u64, Resources)]) {
 /// accrual queue in `seq` order exactly as `pledge_node` would. An accrual's
 /// `projected_ready` is the event time its remaining need first reaches zero,
 /// or `None` if events run out.
-fn sweep_projected_ready(
-    events: &[(i64, u64, Resources)],
-    remaining: &[Resources],
-) -> Vec<Option<i64>> {
+fn sweep_projected_ready(events: &[ReleaseEvent], remaining: &[Resources]) -> Vec<Option<i64>> {
     let mut rem: Vec<Resources> = remaining.to_vec();
     let mut ready: Vec<Option<i64>> = vec![None; remaining.len()];
     let mut pool = Resources::ZERO;
-    for (time, _seq, freed) in events.iter() {
-        pool = pool.saturating_add(freed);
+    for ev in events.iter() {
+        pool = pool.saturating_add(&ev.freed);
         for (r, rd) in rem.iter_mut().zip(ready.iter_mut()) {
             if pool.is_zero() {
                 break;
@@ -1012,7 +1021,7 @@ fn sweep_projected_ready(
             pool = pool.saturating_sub(&pledge);
             *r = r.saturating_sub(&pledge);
             if r.is_zero() && rd.is_none() {
-                *rd = Some(*time);
+                *rd = Some(ev.at_us);
             }
         }
     }
@@ -1198,7 +1207,11 @@ mod tests {
     #[test]
     fn projected_ready_is_the_event_that_completes_the_need() {
         // One accrual needing 16 cpu; a single release at t=100 frees 16.
-        let events = vec![(100_i64, 0_u64, res(16_000, 0, 0))];
+        let events = vec![ReleaseEvent {
+            at_us: 100,
+            seq: 0,
+            freed: res(16_000, 0, 0),
+        }];
         let ready = sweep_projected_ready(&events, &[res(16_000, 0, 0)]);
         assert_eq!(ready, vec![Some(100)]);
     }
@@ -1206,7 +1219,11 @@ mod tests {
     #[test]
     fn projected_ready_unbounded_when_events_fall_short() {
         // Needs 32 cpu but only 16 is ever guaranteed to free ⇒ unbounded.
-        let events = vec![(100_i64, 0_u64, res(16_000, 0, 0))];
+        let events = vec![ReleaseEvent {
+            at_us: 100,
+            seq: 0,
+            freed: res(16_000, 0, 0),
+        }];
         let ready = sweep_projected_ready(&events, &[res(32_000, 0, 0)]);
         assert_eq!(ready, vec![None]);
     }
@@ -1215,7 +1232,18 @@ mod tests {
     fn projected_ready_pledges_in_seq_order() {
         // Two releases (t=50, t=100) each free 16; head accrual (seq order)
         // completes at the first, the next at the second.
-        let mut events = vec![(100_i64, 1, res(16_000, 0, 0)), (50, 0, res(16_000, 0, 0))];
+        let mut events = vec![
+            ReleaseEvent {
+                at_us: 100,
+                seq: 1,
+                freed: res(16_000, 0, 0),
+            },
+            ReleaseEvent {
+                at_us: 50,
+                seq: 0,
+                freed: res(16_000, 0, 0),
+            },
+        ];
         sort_release_events(&mut events);
         let ready = sweep_projected_ready(&events, &[res(16_000, 0, 0), res(16_000, 0, 0)]);
         assert_eq!(ready, vec![Some(50), Some(100)]);

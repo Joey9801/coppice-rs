@@ -253,16 +253,26 @@ fn queue_stats(state: &StateMachine, now_us: i64, window: &QueueWindow) -> dto::
         }
     }
 
-    let (arrival_rate_per_minute, drain_rate_per_minute) = queue_rates(window);
+    let rates = queue_rates(window);
 
     dto::QueueStats {
         depth: by_state[&dto::JobPhase::Queued],
-        drain_rate_per_minute,
-        arrival_rate_per_minute,
+        drain_rate_per_minute: rates.drains_per_minute,
+        arrival_rate_per_minute: rates.arrivals_per_minute,
         oldest_queued_age_us,
         by_state,
         history: queue_history(window),
     }
+}
+
+/// Headline queue rates per minute over the newest closed buckets. Each field
+/// is `None` when the window covers no time at all — never a fabricated `0.0`
+/// (see `dto::QueueStats`).
+struct QueueRates {
+    /// Jobs enqueued per minute, scaled by the buckets' recorded spans.
+    arrivals_per_minute: Option<f64>,
+    /// Jobs drained per minute, scaled the same way.
+    drains_per_minute: Option<f64>,
 }
 
 /// Headline `(arrivals, drains)` per minute over the newest
@@ -270,19 +280,22 @@ fn queue_stats(state: &StateMachine, now_us: i64, window: &QueueWindow) -> dto::
 /// spans — a stall-stretched bucket contributes its real coverage, never an
 /// assumed 30 s. `None` when the window covers no time at all (never a
 /// fabricated `0.0` — see `dto::QueueStats`).
-fn queue_rates(window: &QueueWindow) -> (Option<f64>, Option<f64>) {
+fn queue_rates(window: &QueueWindow) -> QueueRates {
     let newest = &window.buckets[window.buckets.len().saturating_sub(RATE_WINDOW_BUCKETS)..];
     let covered_us: i64 = newest.iter().map(|b| (b.end_us - b.start_us).max(0)).sum();
     if covered_us <= 0 {
-        return (None, None);
+        return QueueRates {
+            arrivals_per_minute: None,
+            drains_per_minute: None,
+        };
     }
     let minutes = covered_us as f64 / 60_000_000.0;
     let arrivals: u64 = newest.iter().map(|b| u64::from(b.arrivals)).sum();
     let drains: u64 = newest.iter().map(|b| u64::from(b.drains)).sum();
-    (
-        Some(arrivals as f64 / minutes),
-        Some(drains as f64 / minutes),
-    )
+    QueueRates {
+        arrivals_per_minute: Some(arrivals as f64 / minutes),
+        drains_per_minute: Some(drains as f64 / minutes),
+    }
 }
 
 /// Every retained bucket as a history sample, oldest first, each scaled by
@@ -767,9 +780,9 @@ mod tests {
         // Two closed 30 s buckets = one covered minute: 3 arrivals and 1
         // drain in it are exactly those per-minute rates.
         let window = window_of(vec![bucket(0, 5, 2, 1), bucket(30_000_000, 6, 1, 0)]);
-        let (arrivals, drains) = queue_rates(&window);
-        assert_eq!(arrivals, Some(3.0));
-        assert_eq!(drains, Some(1.0));
+        let rates = queue_rates(&window);
+        assert_eq!(rates.arrivals_per_minute, Some(3.0));
+        assert_eq!(rates.drains_per_minute, Some(1.0));
     }
 
     #[test]
@@ -780,10 +793,10 @@ mod tests {
         for i in 1..=(RATE_WINDOW_BUCKETS as i64) {
             buckets.push(bucket(i * 30_000_000, 0, 1, 0));
         }
-        let (arrivals, drains) = queue_rates(&window_of(buckets));
+        let rates = queue_rates(&window_of(buckets));
         // 10 buckets × 30 s = 5 minutes, 10 arrivals → 2/min.
-        assert_eq!(arrivals, Some(2.0));
-        assert_eq!(drains, Some(0.0));
+        assert_eq!(rates.arrivals_per_minute, Some(2.0));
+        assert_eq!(rates.drains_per_minute, Some(0.0));
     }
 
     /// A missed-tick stall closes one honest long bucket; rates must scale
@@ -798,9 +811,9 @@ mod tests {
             arrivals: 10,
             drains: 5,
         };
-        let (arrivals, drains) = queue_rates(&window_of(vec![long]));
-        assert_eq!(arrivals, Some(2.0));
-        assert_eq!(drains, Some(1.0));
+        let rates = queue_rates(&window_of(vec![long]));
+        assert_eq!(rates.arrivals_per_minute, Some(2.0));
+        assert_eq!(rates.drains_per_minute, Some(1.0));
 
         let history = queue_history(&window_of(vec![long]));
         assert_eq!(history[0].arrived_per_minute, 2.0);

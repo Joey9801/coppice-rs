@@ -43,6 +43,20 @@ enum Admit {
     Fresh,
 }
 
+/// A runtime watchdog armed by a successful start: the allocation to kill and
+/// the runtime bound it may not exceed.
+///
+/// `max_runtime_us` is the enforced bound copied from `StartJob.max_runtime_us`
+/// (ADR 0014), not a wall-clock deadline — the live loop converts it to a timer
+/// when it drains these via [`Session::take_armed_watchdogs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArmedWatchdog {
+    /// The allocation whose container the timer will stop.
+    pub allocation: AllocationId,
+    /// The maximum runtime, in microseconds, before the watchdog fires.
+    pub max_runtime_us: u64,
+}
+
 /// The transport-free session core. Generic over the filesystem seam (for the
 /// journal) and the executor.
 pub struct Session<F: Fs, E: Executor> {
@@ -68,7 +82,7 @@ pub struct Session<F: Fs, E: Executor> {
     drained: bool,
     /// Watchdogs armed by successful starts with a `max_runtime_us`, drained
     /// by the live loop which owns the timers.
-    armed_watchdogs: Vec<(AllocationId, u64)>,
+    armed_watchdogs: Vec<ArmedWatchdog>,
 }
 
 impl<F: Fs, E: Executor> Session<F, E> {
@@ -123,9 +137,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
         self.last_seq = None;
     }
 
-    /// Drain the watchdogs armed since the last call: `(allocation,
-    /// max_runtime_us)` pairs the loop must set timers for.
-    pub fn take_armed_watchdogs(&mut self) -> Vec<(AllocationId, u64)> {
+    /// Drain the watchdogs armed since the last call — the [`ArmedWatchdog`]s
+    /// the loop must set timers for.
+    pub fn take_armed_watchdogs(&mut self) -> Vec<ArmedWatchdog> {
         std::mem::take(&mut self.armed_watchdogs)
     }
 
@@ -235,7 +249,12 @@ impl<F: Fs, E: Executor> Session<F, E> {
         body: pb::agent_command::Body,
     ) -> std::io::Result<Vec<pb::AgentReport>> {
         if let pb::agent_command::Body::StartJob(sj) = body {
-            if let Some((alloc, attempt, job)) = start_ids(&sj) {
+            if let Some(StartIds {
+                allocation: alloc,
+                attempt,
+                job,
+            }) = start_ids(&sj)
+            {
                 return Ok(self.report_current_status(alloc, attempt, job));
             }
         }
@@ -271,7 +290,12 @@ impl<F: Fs, E: Executor> Session<F, E> {
     // ---- StartJob ----
 
     async fn start_job(&mut self, sj: pb::StartJob) -> std::io::Result<Vec<pb::AgentReport>> {
-        let Some((alloc, attempt, job)) = start_ids(&sj) else {
+        let Some(StartIds {
+            allocation: alloc,
+            attempt,
+            job,
+        }) = start_ids(&sj)
+        else {
             tracing::warn!(node = %self.node, "dropping malformed StartJob (missing ids)");
             return Ok(Vec::new());
         };
@@ -334,7 +358,10 @@ impl<F: Fs, E: Executor> Session<F, E> {
         match self.executor.start(spec).await {
             Ok(()) => {
                 if let Some(max) = sj.max_runtime_us {
-                    self.armed_watchdogs.push((alloc, max));
+                    self.armed_watchdogs.push(ArmedWatchdog {
+                        allocation: alloc,
+                        max_runtime_us: max,
+                    });
                 }
                 Ok(vec![self.running_status(alloc, attempt, job)])
             }
@@ -611,11 +638,26 @@ impl<F: Fs, E: Executor> Session<F, E> {
     }
 }
 
-fn start_ids(sj: &pb::StartJob) -> Option<(AllocationId, AttemptId, JobId)> {
-    let alloc = sj.allocation.clone()?.try_into().ok()?;
+/// The three identifiers naming the work in a `StartJob`, parsed from its proto
+/// ids. `None` if any is missing or malformed (a StartJob we must drop).
+struct StartIds {
+    /// The allocation the executor runs.
+    allocation: AllocationId,
+    /// The attempt this run records against.
+    attempt: AttemptId,
+    /// The job the attempt belongs to.
+    job: JobId,
+}
+
+fn start_ids(sj: &pb::StartJob) -> Option<StartIds> {
+    let allocation = sj.allocation.clone()?.try_into().ok()?;
     let attempt = sj.attempt.clone()?.try_into().ok()?;
     let job = sj.job.clone()?.try_into().ok()?;
-    Some((alloc, attempt, job))
+    Some(StartIds {
+        allocation,
+        attempt,
+        job,
+    })
 }
 
 fn observed_to_pb(o: &ObservedAllocation) -> pb::ObservedAllocation {
