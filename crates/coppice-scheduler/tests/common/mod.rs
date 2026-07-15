@@ -209,7 +209,9 @@ pub fn drain_cmd(node: NodeId, ts: i64) -> Command {
 /// Collect the reasons carried by an `InvalidBatch` rejection.
 pub fn batch_reasons(reason: &RejectionReason) -> Vec<RejectionReason> {
     match reason {
-        RejectionReason::InvalidBatch(items) => items.iter().map(|(_, r)| r.clone()).collect(),
+        RejectionReason::InvalidBatch(items) => {
+            items.iter().map(|item| item.reason.clone()).collect()
+        }
         other => vec![other.clone()],
     }
 }

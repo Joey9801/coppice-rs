@@ -109,7 +109,7 @@ async fn serve_once<F, E>(
     cert: &[u8],
     key: &[u8],
     config: &Config,
-    exit_rx: &mut mpsc::Receiver<(coppice_core::id::AllocationId, crate::executor::ExitInfo)>,
+    exit_rx: &mut mpsc::Receiver<crate::executor::ExitEvent>,
 ) -> anyhow::Result<()>
 where
     F: Fs,
@@ -149,8 +149,11 @@ where
                     Ok(Some(cmd)) => {
                         let reports = session.handle_command(cmd).await?;
                         send_all(&tx, reports).await?;
-                        for (alloc, max) in session.take_armed_watchdogs() {
-                            deadlines.insert(alloc, Instant::now() + Duration::from_micros(max));
+                        for w in session.take_armed_watchdogs() {
+                            deadlines.insert(
+                                w.allocation,
+                                Instant::now() + Duration::from_micros(w.max_runtime_us),
+                            );
                         }
                     }
                     Ok(None) => return Ok(()),
@@ -169,9 +172,9 @@ where
                 }
             }
             exit = exit_rx.recv() => {
-                if let Some((alloc, info)) = exit {
-                    deadlines.remove(&alloc);
-                    let reports = session.handle_observed_exit(alloc, info).await?;
+                if let Some(crate::executor::ExitEvent { allocation, exit: info }) = exit {
+                    deadlines.remove(&allocation);
+                    let reports = session.handle_observed_exit(allocation, info).await?;
                     send_all(&tx, reports).await?;
                 }
             }

@@ -169,8 +169,8 @@ async fn run(
             item = subscription.items.recv() => {
                 match item {
                     Some(SubscriptionItem::Events(batch)) => {
-                        for (_ordinal, event) in &batch.events {
-                            state.observe(event);
+                        for ordinal_event in &batch.events {
+                            state.observe(&ordinal_event.event);
                         }
                     }
                     Some(SubscriptionItem::Gap { earliest_available }) => {

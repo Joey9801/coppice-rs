@@ -45,6 +45,15 @@ pub struct ExitInfo {
     pub runtime_us: u64,
 }
 
+/// An allocation's process having exited, with how it ended. Carried from
+/// [`Executor::next_exit`] through the session runner's exit-watcher channel
+/// to [`crate::session::Session::handle_observed_exit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitEvent {
+    pub allocation: AllocationId,
+    pub exit: ExitInfo,
+}
+
 /// A container's observed state (running or exited).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerState {
@@ -155,7 +164,7 @@ pub trait Executor: Send + Sync + 'static {
     /// Await the next natural container exit. The session loop runs this on a
     /// dedicated task, so the returned future must be `Send`; for runtimes with
     /// no containers it never resolves.
-    fn next_exit(&self) -> impl std::future::Future<Output = (AllocationId, ExitInfo)> + Send;
+    fn next_exit(&self) -> impl std::future::Future<Output = ExitEvent> + Send;
 
     /// Summarized image-cache inventory (ADR 0010). Empty in v1.
     fn cache_inventory(&self) -> pb::ImageCacheInventory {
@@ -201,7 +210,7 @@ pub struct FakeExecutor {
     /// This instance's natural-exit queue, drained by [`Executor::next_exit`].
     /// Separated from [`FakeInner`] so [`FakeExecutor::fork`] can hand a
     /// restarted agent a private queue (see the type docs).
-    exits: Arc<Mutex<VecDeque<(AllocationId, ExitInfo)>>>,
+    exits: Arc<Mutex<VecDeque<ExitEvent>>>,
 }
 
 impl FakeExecutor {
@@ -241,7 +250,7 @@ impl FakeExecutor {
             self.exits
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push_back((allocation, exit));
+                .push_back(ExitEvent { allocation, exit });
         }
     }
 
@@ -316,7 +325,7 @@ impl Executor for FakeExecutor {
             .collect())
     }
 
-    fn next_exit(&self) -> impl std::future::Future<Output = (AllocationId, ExitInfo)> + Send {
+    fn next_exit(&self) -> impl std::future::Future<Output = ExitEvent> + Send {
         let exits = Arc::clone(&self.exits);
         async move {
             loop {
@@ -375,7 +384,7 @@ impl Executor for DockerExecutor {
         Err(ExecutorError::Unimplemented("DockerExecutor::observe"))
     }
 
-    fn next_exit(&self) -> impl std::future::Future<Output = (AllocationId, ExitInfo)> + Send {
+    fn next_exit(&self) -> impl std::future::Future<Output = ExitEvent> + Send {
         // No containers to watch until the runtime is implemented.
         std::future::pending()
     }

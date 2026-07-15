@@ -79,12 +79,21 @@ impl std::fmt::Display for DevExecutor {
     }
 }
 
+/// A minted leaf credential: the certificate and its private key, as PEM bytes.
+#[derive(Debug, Clone)]
+struct CertKey {
+    /// The X.509 leaf certificate, PEM-encoded.
+    cert: Vec<u8>,
+    /// The corresponding private key, PEM-encoded.
+    key: Vec<u8>,
+}
+
 /// A throwaway in-memory CA and the two leaves a dev run needs. Minted fresh
 /// every run: TLS material is deliberately not part of the persistent state.
 struct DevPki {
     ca_pem: Vec<u8>,
-    coordinator: (Vec<u8>, Vec<u8>),
-    agent: (Vec<u8>, Vec<u8>),
+    coordinator: CertKey,
+    agent: CertKey,
 }
 
 fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
@@ -101,7 +110,7 @@ fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
     ];
     let ca_cert = params.self_signed(&ca_key).context("self-sign dev CA")?;
 
-    let leaf = |cn: &str| -> Result<(Vec<u8>, Vec<u8>)> {
+    let leaf = |cn: &str| -> Result<CertKey> {
         let key = KeyPair::generate().context("generate dev leaf key")?;
         let mut params =
             CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -118,7 +127,10 @@ fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
         let cert = params
             .signed_by(&key, &ca_cert, &ca_key)
             .context("sign dev leaf")?;
-        Ok((cert.pem().into_bytes(), key.serialize_pem().into_bytes()))
+        Ok(CertKey {
+            cert: cert.pem().into_bytes(),
+            key: key.serialize_pem().into_bytes(),
+        })
     };
 
     Ok(DevPki {
@@ -187,10 +199,10 @@ pub async fn run(args: DevArgs) -> Result<()> {
     let agent_cert = pki_dir.join("agent.crt");
     let agent_key = pki_dir.join("agent.key");
     let ca_path = pki_dir.join("ca.crt");
-    std::fs::write(&coord_cert, &pki.coordinator.0)?;
-    std::fs::write(&coord_key, &pki.coordinator.1)?;
-    std::fs::write(&agent_cert, &pki.agent.0)?;
-    std::fs::write(&agent_key, &pki.agent.1)?;
+    std::fs::write(&coord_cert, &pki.coordinator.cert)?;
+    std::fs::write(&coord_key, &pki.coordinator.key)?;
+    std::fs::write(&agent_cert, &pki.agent.cert)?;
+    std::fs::write(&agent_key, &pki.agent.key)?;
     std::fs::write(&ca_path, &pki.ca_pem)?;
 
     let raft_port = resolve_port(args.raft_port)?;
@@ -257,8 +269,8 @@ ca_path = "{ca}"
         .expect("agent socket addr");
     let listener = AgentListener::bind(
         agent_addr,
-        &pki.coordinator.0,
-        &pki.coordinator.1,
+        &pki.coordinator.cert,
+        &pki.coordinator.key,
         &pki.ca_pem,
     )
     .context("binding the dev agent listener")?;

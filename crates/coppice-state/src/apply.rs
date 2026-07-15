@@ -25,7 +25,7 @@ use crate::command::{
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, Command, Event, JobRecord, NodeRecord, QuotaEntity,
-    RejectionReason, StateMachine, QUOTA_TREE_DEPTH_CAP,
+    Rejection, RejectionReason, StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
 
 type ApplyResult = Result<Applied, RejectionReason>;
@@ -186,17 +186,23 @@ impl StateMachine {
         // Validation. All-or-nothing with per-item diagnostics; item indices
         // cover revocations first, then placements. `expected_version` is an
         // audit record — semantic re-validation is what gates the batch.
-        let mut items: Vec<(u32, RejectionReason)> = Vec::new();
+        let mut items: Vec<Rejection> = Vec::new();
         let mut idx: u32 = 0;
         let mut revoked: BTreeSet<AllocationId> = BTreeSet::new();
         for alloc_id in &c.revocations {
             match self.allocations.get(alloc_id) {
-                None => items.push((idx, RejectionReason::UnknownAllocation(*alloc_id))),
+                None => items.push(Rejection {
+                    item_index: idx,
+                    reason: RejectionReason::UnknownAllocation(*alloc_id),
+                }),
                 Some(r)
                     if r.allocation.state != AllocationState::Accruing
                         || revoked.contains(alloc_id) =>
                 {
-                    items.push((idx, RejectionReason::AllocationNotAccruing(*alloc_id)));
+                    items.push(Rejection {
+                        item_index: idx,
+                        reason: RejectionReason::AllocationNotAccruing(*alloc_id),
+                    });
                 }
                 Some(_) => {
                     revoked.insert(*alloc_id);
@@ -209,7 +215,10 @@ impl StateMachine {
         let mut seen_allocs: BTreeSet<AllocationId> = BTreeSet::new();
         for p in &c.placements {
             match self.validate_placement(p, &revoked, &seen_jobs, &seen_attempts, &seen_allocs) {
-                Some(reason) => items.push((idx, reason)),
+                Some(reason) => items.push(Rejection {
+                    item_index: idx,
+                    reason,
+                }),
                 None => {
                     seen_jobs.insert(p.job);
                     seen_attempts.insert(p.attempt);
@@ -606,39 +615,45 @@ impl StateMachine {
                 got: c.node_epoch,
             });
         }
-        let mut items: Vec<(u32, RejectionReason)> = Vec::new();
+        let mut items: Vec<Rejection> = Vec::new();
         let mut idx: u32 = 0;
         for id in &c.adopted {
             match self.attempts.get(id) {
-                None => items.push((idx, RejectionReason::UnknownAttempt(*id))),
-                Some(a) if a.attempt.node != c.node => items.push((
-                    idx,
-                    RejectionReason::AttemptNotOnNode {
+                None => items.push(Rejection {
+                    item_index: idx,
+                    reason: RejectionReason::UnknownAttempt(*id),
+                }),
+                Some(a) if a.attempt.node != c.node => items.push(Rejection {
+                    item_index: idx,
+                    reason: RejectionReason::AttemptNotOnNode {
                         attempt: *id,
                         node: c.node,
                     },
-                )),
+                }),
                 Some(_) => {}
             }
             idx += 1;
         }
         for l in &c.lost {
             match self.attempts.get(&l.attempt) {
-                None => items.push((idx, RejectionReason::UnknownAttempt(l.attempt))),
-                Some(a) if a.attempt.node != c.node => items.push((
-                    idx,
-                    RejectionReason::AttemptNotOnNode {
+                None => items.push(Rejection {
+                    item_index: idx,
+                    reason: RejectionReason::UnknownAttempt(l.attempt),
+                }),
+                Some(a) if a.attempt.node != c.node => items.push(Rejection {
+                    item_index: idx,
+                    reason: RejectionReason::AttemptNotOnNode {
                         attempt: l.attempt,
                         node: c.node,
                     },
-                )),
+                }),
                 Some(_) if l.outcome == AttemptOutcome::Revoked => {
-                    items.push((
-                        idx,
-                        RejectionReason::InvalidCommand(
+                    items.push(Rejection {
+                        item_index: idx,
+                        reason: RejectionReason::InvalidCommand(
                             "outcome Revoked is only produced by CommitPlacements".into(),
                         ),
-                    ));
+                    });
                 }
                 Some(_) => {}
             }
@@ -784,11 +799,14 @@ impl StateMachine {
     fn evict_terminal_jobs(&mut self, c: &EvictTerminalJobs) -> ApplyResult {
         // Missing ids are skipped: duplicate eviction proposals across leader
         // changes must be idempotent. A live listed job is a proposer bug.
-        let mut items: Vec<(u32, RejectionReason)> = Vec::new();
+        let mut items: Vec<Rejection> = Vec::new();
         for (i, job) in c.jobs.iter().enumerate() {
             if let Some(r) = self.jobs.get(job) {
                 if !r.state.is_terminal() {
-                    items.push((i as u32, RejectionReason::JobNotTerminal(*job)));
+                    items.push(Rejection {
+                        item_index: i as u32,
+                        reason: RejectionReason::JobNotTerminal(*job),
+                    });
                 }
             }
         }

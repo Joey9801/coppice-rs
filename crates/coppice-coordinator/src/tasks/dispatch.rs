@@ -74,8 +74,8 @@ pub async fn run<C: Consensus>(
                     let Some(item) = item else { break };
                     match item {
                         SubscriptionItem::Events(batch) => {
-                            for (_ordinal, event) in &batch.events {
-                                handle_event(&consensus, &views, &router, event).await;
+                            for ordinal_event in &batch.events {
+                                handle_event(&consensus, &views, &router, &ordinal_event.event).await;
                             }
                         }
                         SubscriptionItem::Gap { earliest_available } => {

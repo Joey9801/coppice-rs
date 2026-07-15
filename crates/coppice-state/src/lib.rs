@@ -295,7 +295,17 @@ pub enum RejectionReason {
     #[error("command shape invalid: {0}")]
     InvalidCommand(String),
     #[error("batch rejected; per-item diagnostics attached")]
-    InvalidBatch(Vec<(u32, RejectionReason)>),
+    InvalidBatch(Vec<Rejection>),
+}
+
+/// One item's rejection within an otherwise-processed batch: the failing
+/// item's position and why it was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// Zero-based position of the offending item within the submitted batch.
+    pub item_index: u32,
+    /// Why the item at `item_index` was refused.
+    pub reason: RejectionReason,
 }
 
 /// Change events produced by an accepted command — derived output for the
