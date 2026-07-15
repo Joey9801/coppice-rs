@@ -233,10 +233,10 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
 
     async fn recent_events(&self, limit: usize) -> RecentClusterEvents {
         // "No ring" and "ring unreachable at shutdown" both serve the same
-        // honest answer: nothing covered — a floor above everything this
-        // replica has applied, with no events.
+        // honest answer: nothing covered — the exclusive cursor sits at
+        // everything this replica has applied, with no events.
         let uncovered = || RecentClusterEvents {
-            floor_index: self.views.latest().applied_index() + 1,
+            floor_index: self.views.latest().applied_index(),
             events: Vec::new(),
         };
         let Some(fanout) = &self.fanout else {

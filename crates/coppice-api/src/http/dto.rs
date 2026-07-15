@@ -524,10 +524,10 @@ impl From<&coppice_state::Event> for TimelineEventBody {
 /// newest first, served from this replica's fanout ring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecentEventsWindow {
-    /// The coverage floor: the earliest applied index the window is
-    /// complete from (ADR 0032's honest-absence vocabulary). Empty `events`
-    /// with a high floor is a freshly restarted coordinator, not a quiet
-    /// cluster.
+    /// Exclusive coverage cursor: the window is complete for every applied
+    /// index *strictly above* this, and claims nothing at or below it
+    /// (ADR 0032's honest-absence vocabulary). Empty `events` with a high
+    /// cursor is a freshly restarted coordinator, not a quiet cluster.
     pub floor_index: u64,
     pub events: Vec<TimelineEvent>,
 }

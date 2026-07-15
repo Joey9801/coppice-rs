@@ -66,9 +66,14 @@ impl WindowState {
 
     /// Close the open bucket with the depth sampled at close time and open
     /// the next one at `now_us`.
+    ///
+    /// `now_us` becomes the bucket's `end_us`: after a stalled tick (missed
+    /// ticks are skipped) this is one honest *long* bucket, and consumers
+    /// scale by the recorded span rather than the nominal 30 s.
     fn close_bucket(&mut self, depth: u32, now_us: i64) {
         self.closed.push_back(QueueBucket {
             start_us: self.open_start_us,
+            end_us: now_us,
             depth,
             arrivals: self.open_arrivals,
             drains: self.open_drains,
@@ -92,7 +97,6 @@ impl WindowState {
 
     fn window(&self) -> QueueWindow {
         QueueWindow {
-            bucket_us: QUEUE_BUCKET_INTERVAL.as_micros() as i64,
             buckets: self.closed.iter().copied().collect(),
         }
     }
@@ -127,10 +131,7 @@ pub fn spawn(
     views: StateViews,
     shutdown: watch::Receiver<bool>,
 ) -> (watch::Receiver<QueueWindow>, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = watch::channel(QueueWindow {
-        bucket_us: QUEUE_BUCKET_INTERVAL.as_micros() as i64,
-        buckets: Vec::new(),
-    });
+    let (tx, rx) = watch::channel(QueueWindow::default());
     let join = tokio::spawn(run(fanout, views, tx, shutdown));
     (rx, join)
 }
@@ -235,15 +236,18 @@ mod tests {
         assert_eq!(window.buckets.len(), 1);
         let bucket = window.buckets[0];
         assert_eq!(bucket.start_us, 1_000);
+        assert_eq!(bucket.end_us, 31_000);
         assert_eq!(bucket.arrivals, 2);
         assert_eq!(bucket.drains, 1);
         assert_eq!(bucket.depth, 7);
 
-        // The next bucket opens at the close time with fresh counts.
+        // The next bucket opens at the close time with fresh counts; a late
+        // close (a stalled tick) records the honest long span.
         state.observe(&queued_transition(true));
-        state.close_bucket(8, 61_000);
+        state.close_bucket(8, 331_000);
         let window = state.window();
         assert_eq!(window.buckets[1].start_us, 31_000);
+        assert_eq!(window.buckets[1].end_us, 331_000);
         assert_eq!(window.buckets[1].arrivals, 1);
         assert_eq!(window.buckets[1].drains, 0);
     }
@@ -299,11 +303,14 @@ mod tests {
         // the window publishes.
         window_rx.changed().await.expect("task publishes a window");
         let window = window_rx.borrow().clone();
-        assert_eq!(window.bucket_us, QUEUE_BUCKET_INTERVAL.as_micros() as i64);
         assert_eq!(window.buckets.len(), 1);
         assert_eq!(window.buckets[0].arrivals, 1);
         assert_eq!(window.buckets[0].drains, 1);
         assert_eq!(window.buckets[0].depth, 1);
+        // The recorded span is wall-clock time between open and close. Under
+        // virtual time that is near zero — the point is that it is measured,
+        // not assumed to be the nominal interval.
+        assert!(window.buckets[0].end_us >= window.buckets[0].start_us);
     }
 
     /// ADR 0032's honest-gap rule for tier 3: a gap voids every bucket's
