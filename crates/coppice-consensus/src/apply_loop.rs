@@ -94,9 +94,13 @@ pub(crate) async fn run(
                                 // One batch per command at the command's own
                                 // index: the stream is a function of the log,
                                 // never of the request's batching (KOI-3).
-                                // `emit` skips an empty batch and never blocks.
+                                // The advisory stamp is attached here, outside
+                                // apply(), from the command the log already
+                                // carries (ADR 0032). `emit` skips an empty
+                                // batch and never blocks.
                                 tap.emit(EventBatch {
                                     applied_index: *index,
+                                    at_us: command.stamped_at_us(),
                                     events: applied.events.clone(),
                                 });
                             }
@@ -171,10 +175,12 @@ mod tests {
 
     fn bump_command(to: u32) -> coppice_state::Command {
         use coppice_state::command::BumpClusterVersion;
-        // Accepted from a default state (cluster_version 0) and emits an event.
+        // Accepted from a default state (cluster_version 0) and emits an
+        // event. The stamp is distinct per command so the tests below can
+        // pin which command's stamp a batch carries.
         coppice_state::Command::BumpClusterVersion(BumpClusterVersion {
             to,
-            bumped_at_us: 0,
+            bumped_at_us: to as i64 * 100,
         })
     }
 
@@ -207,10 +213,12 @@ mod tests {
         assert_eq!(view.applied_index(), 7);
         assert_eq!(view.state().cluster_version, 1);
 
-        // The batch's events were emitted at index 7.
+        // The batch's events were emitted at index 7, stamped with the
+        // command's own proposer timestamp (ADR 0032).
         match tap_rx.recv().await {
             Some(TapItem::Batch(batch)) => {
                 assert_eq!(batch.applied_index, 7);
+                assert_eq!(batch.at_us, 100);
                 assert!(!batch.events.is_empty());
             }
             other => panic!("expected a batch, got {:?}", other.map(|_| ())),
@@ -221,10 +229,10 @@ mod tests {
     }
 
     /// Run the loop over `batchings` (each inner vec is one `ApplyRequest`)
-    /// and return the full tapped `(index, events)` stream.
+    /// and return the full tapped `(index, at_us, events)` stream.
     async fn tapped_stream(
         batchings: Vec<Vec<(u64, coppice_state::Command)>>,
-    ) -> Vec<(u64, Vec<coppice_state::Event>)> {
+    ) -> Vec<(u64, i64, Vec<coppice_state::Event>)> {
         let (publisher, views) =
             ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
         let (tap, mut tap_rx) = EventTap::channel(64);
@@ -245,7 +253,9 @@ mod tests {
         let mut stream = Vec::new();
         while let Some(item) = tap_rx.recv().await {
             match item {
-                TapItem::Batch(batch) => stream.push((batch.applied_index, batch.events)),
+                TapItem::Batch(batch) => {
+                    stream.push((batch.applied_index, batch.at_us, batch.events))
+                }
                 TapItem::Gap { .. } => panic!("nothing was dropped; no gap expected"),
             }
         }
@@ -256,8 +266,9 @@ mod tests {
     async fn event_stream_is_invariant_under_apply_batching() {
         // The same committed log — including a rejected command mid-sequence
         // (the second bump to 2) — grouped into apply requests three different
-        // ways. KOI-3: the tapped stream must be identical in every case, and
-        // each batch must carry its own command's log index.
+        // ways. KOI-3 / ADR 0032 (T1): the tapped `(index, at_us, events)`
+        // stream must be identical in every case, and each batch must carry
+        // its own command's log index and proposer stamp.
         let log = || {
             vec![
                 (3, bump_command(1)),
@@ -273,18 +284,21 @@ mod tests {
         let tail = split.split_off(2);
         let pairs = tapped_stream(vec![split, tail]).await;
 
-        let expected: Vec<(u64, Vec<coppice_state::Event>)> = vec![
+        let expected: Vec<(u64, i64, Vec<coppice_state::Event>)> = vec![
             (
                 3,
+                100,
                 vec![coppice_state::Event::ClusterVersionBumped { to: 1 }],
             ),
             (
                 4,
+                200,
                 vec![coppice_state::Event::ClusterVersionBumped { to: 2 }],
             ),
             // Index 5 was rejected: no batch, and index 6 keeps its own index.
             (
                 6,
+                300,
                 vec![coppice_state::Event::ClusterVersionBumped { to: 3 }],
             ),
         ];
