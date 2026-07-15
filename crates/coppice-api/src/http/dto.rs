@@ -304,9 +304,12 @@ impl JobPhase {
     ];
 }
 
-/// One point in the queue's recent history (for sparklines), oldest first.
+/// One point in the queue's recent history (for sparklines), oldest first:
+/// one closed derived-stats bucket (ADR 0032, tier 3).
 ///
-/// Nothing produces these yet — see [`QueueStats::history`].
+/// A missing instant is a missing *sample* — buckets that predate the
+/// process or an event-stream gap are absent from the list (their `t_us`
+/// simply never appears), never rendered as zeros.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct QueueSample {
     pub t_us: i64,
@@ -315,23 +318,21 @@ pub struct QueueSample {
     pub arrived_per_minute: f64,
 }
 
-/// Queue depth and composition, projected from replicated state.
+/// Queue depth and composition. Point-in-time fields project from
+/// replicated state; the rates and `history` are **derived** fields
+/// (ADR 0032's per-field re-class of ADR 0031): served from this replica's
+/// in-memory bucket window, coverage-annotated, replica-local.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueStats {
     /// Jobs currently in `Queued` — the same number as
     /// `by_state[JobPhase::Queued]`.
     pub depth: u32,
-    /// Jobs leaving (placed) / entering the queue per minute over a recent
-    /// window.
+    /// Jobs leaving / entering the queue per minute over the recent window
+    /// (the newest derived buckets).
     ///
-    /// Both are `null`: a rate is a *windowed* quantity and nothing retains
-    /// the window. The replicated state holds no history (a job's queue
-    /// entries and exits leave no trace once it moves on), and the fanout
-    /// ring that sees the transitions is explicitly a reconnection buffer,
-    /// not history (`docs/architecture/coordinator-runtime.md`). Serving
-    /// `0.0` until then would assert "nothing is draining", which is a claim,
-    /// not a gap. Tracked as KOI-6
-    /// (`docs/roadmap/known-open-issues.md`).
+    /// `null` when the window has no coverage — a freshly (re)started
+    /// replica, or one that just lost the event stream — which is a gap,
+    /// not the claim `0.0` would make ("nothing is draining").
     pub drain_rate_per_minute: Option<f64>,
     pub arrival_rate_per_minute: Option<f64>,
     /// Age of the longest-waiting `Queued` job, measured at read time
@@ -339,8 +340,8 @@ pub struct QueueStats {
     pub oldest_queued_age_us: Option<i64>,
     /// Job counts by displayed phase — every [`JobPhase`], zeros included.
     pub by_state: BTreeMap<JobPhase, u32>,
-    /// Recent queue history, oldest first. Empty for the same reason the
-    /// rates above are `null`.
+    /// Recent queue history, oldest first — the retained derived buckets.
+    /// Empty exactly when the rates above are `null`.
     pub history: Vec<QueueSample>,
 }
 
@@ -368,26 +369,182 @@ pub struct ClusterCapacity {
     pub used: Resources,
 }
 
-/// `GET /api/v1/overview` (mirrors `ClusterOverview` in `types.ts`, minus
-/// its `recentEvents`).
+/// A job's lifecycle state as event payloads render it — the raw
+/// `coppice_core::job::JobState` union with `Attempting`'s attempt id
+/// flattened away (the id travels on attempt-scoped events, not on a job
+/// transition's `from`/`to`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStateKind {
+    Submitted,
+    Accepted,
+    Queued,
+    Attempting,
+    Succeeded,
+    Failed,
+    Aborted,
+}
+
+impl From<coppice_core::job::JobState> for JobStateKind {
+    fn from(s: coppice_core::job::JobState) -> Self {
+        use coppice_core::job::JobState as S;
+        match s {
+            S::Submitted => JobStateKind::Submitted,
+            S::Accepted => JobStateKind::Accepted,
+            S::Queued => JobStateKind::Queued,
+            S::Attempting(_) => JobStateKind::Attempting,
+            S::Succeeded => JobStateKind::Succeeded,
+            S::Failed => JobStateKind::Failed,
+            S::Aborted => JobStateKind::Aborted,
+        }
+    }
+}
+
+/// ADR 0032's one timeline-event wire shape, shared by the overview's
+/// `recent_events`, `GetJobTimeline`, and the ADR 0008 subscription payload
+/// — no endpoint invents its own.
 ///
-/// **No `recent_events` field.** `types.ts` pairs the overview with a window
-/// of recent cluster events, and nothing can serve one: apply emits
-/// `coppice_state::Event`s without timestamps (it may not read a clock), and
-/// no store retains them — the fanout ring that sees them is explicitly a
-/// reconnection buffer, not history
-/// (`docs/architecture/coordinator-runtime.md`). Serving `[]` from an
-/// invented event shape would freeze that shape into the v1 contract before
-/// KOI-6 (`docs/roadmap/known-open-issues.md`) settles where the
-/// events and their timestamps come from; *adding* the field later is a
-/// compatible change, replacing a wrong one is not. Until then a client
-/// reads the absent key as "no window", not as "no events".
+/// `(index, ordinal)` is the event's identity: the ordering and
+/// deduplication key everywhere. `at_us` is the advisory proposer stamp —
+/// it may run backwards across proposers as the index advances, and no
+/// consumer may reorder or "correct" by it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    /// The producing command's Raft log index.
+    pub index: u64,
+    /// The event's position within that command's full batch, assigned
+    /// before any filtering — a scoped stream may show gaps, never renumber.
+    pub ordinal: u32,
+    /// When the proposer asserted this fact (ADR 0032's flattened
+    /// semantics: sub-items inherit their command's stamp).
+    pub at_us: i64,
+    #[serde(flatten)]
+    pub body: TimelineEventBody,
+}
+
+/// The event payload: kind plus the scope keys stamped during apply
+/// (mirrors `coppice_state::Event` arm for arm).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TimelineEventBody {
+    JobSubmitted {
+        job: JobId,
+    },
+    JobStateChanged {
+        job: JobId,
+        from: JobStateKind,
+        to: JobStateKind,
+    },
+    AttemptStateChanged {
+        attempt: AttemptId,
+        job: JobId,
+        node: NodeId,
+        state: AttemptState,
+    },
+    AllocationFunded {
+        allocation: AllocationId,
+        job: JobId,
+        node: NodeId,
+    },
+    StopRequested {
+        node: NodeId,
+        allocation: AllocationId,
+        job: JobId,
+    },
+    NodeEpochBumped {
+        node: NodeId,
+        epoch: u64,
+    },
+    JobEvicted {
+        job: JobId,
+    },
+    QuotaEntityConfigured {
+        entity: QuotaEntityId,
+    },
+    PolicyUpdated,
+    ClusterVersionBumped {
+        to: u32,
+    },
+}
+
+impl From<&coppice_state::Event> for TimelineEventBody {
+    fn from(e: &coppice_state::Event) -> Self {
+        use coppice_state::Event as E;
+        match e {
+            E::JobSubmitted { job } => TimelineEventBody::JobSubmitted { job: *job },
+            E::JobStateChanged { job, from, to } => TimelineEventBody::JobStateChanged {
+                job: *job,
+                from: (*from).into(),
+                to: (*to).into(),
+            },
+            E::AttemptStateChanged {
+                attempt,
+                job,
+                node,
+                state,
+            } => TimelineEventBody::AttemptStateChanged {
+                attempt: *attempt,
+                job: *job,
+                node: *node,
+                state: state.into(),
+            },
+            E::AllocationFunded {
+                allocation,
+                job,
+                node,
+            } => TimelineEventBody::AllocationFunded {
+                allocation: *allocation,
+                job: *job,
+                node: *node,
+            },
+            E::StopRequested {
+                node,
+                allocation,
+                job,
+            } => TimelineEventBody::StopRequested {
+                node: *node,
+                allocation: *allocation,
+                job: *job,
+            },
+            E::NodeEpochBumped { node, epoch } => TimelineEventBody::NodeEpochBumped {
+                node: *node,
+                epoch: *epoch,
+            },
+            E::JobEvicted { job } => TimelineEventBody::JobEvicted { job: *job },
+            E::QuotaEntityConfigured { entity } => {
+                TimelineEventBody::QuotaEntityConfigured { entity: *entity }
+            }
+            E::PolicyUpdated => TimelineEventBody::PolicyUpdated,
+            E::ClusterVersionBumped { to } => TimelineEventBody::ClusterVersionBumped { to: *to },
+        }
+    }
+}
+
+/// The overview's window of recent cluster events (ADR 0032, tier 1),
+/// newest first, served from this replica's fanout ring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentEventsWindow {
+    /// The coverage floor: the earliest applied index the window is
+    /// complete from (ADR 0032's honest-absence vocabulary). Empty `events`
+    /// with a high floor is a freshly restarted coordinator, not a quiet
+    /// cluster.
+    pub floor_index: u64,
+    pub events: Vec<TimelineEvent>,
+}
+
+/// `GET /api/v1/overview` (mirrors `ClusterOverview` in `types.ts`).
+///
+/// Consistency is per-field (ADR 0032 amending ADR 0031): `queue.depth`,
+/// `by_state`, and `capacity` are bounded reads of replicated state, while
+/// the queue rates/history (derived buckets) and `recent_events` (fanout
+/// ring) are derived, replica-local, and coverage-annotated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetClusterOverviewResponse {
     /// The cluster this replica belongs to (node config, ADR 0020).
     pub cluster_id: ClusterId,
     pub queue: QueueStats,
     pub capacity: ClusterCapacity,
+    pub recent_events: RecentEventsWindow,
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +715,7 @@ mod tests {
         let cluster: ClusterId = "cluster-00000000-0000-0000-0000-000000000001"
             .parse()
             .unwrap();
+        let job: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
         let response = GetClusterOverviewResponse {
             cluster_id: cluster,
             queue: QueueStats {
@@ -569,7 +727,25 @@ mod tests {
                     .iter()
                     .map(|phase| (*phase, u32::from(*phase == JobPhase::Queued)))
                     .collect(),
-                history: vec![],
+                history: vec![QueueSample {
+                    t_us: 10,
+                    depth: 1,
+                    drained_per_minute: 2.0,
+                    arrived_per_minute: 4.0,
+                }],
+            },
+            recent_events: RecentEventsWindow {
+                floor_index: 3,
+                events: vec![TimelineEvent {
+                    index: 7,
+                    ordinal: 2,
+                    at_us: 5_000_100,
+                    body: TimelineEventBody::JobStateChanged {
+                        job,
+                        from: JobStateKind::Accepted,
+                        to: JobStateKind::Queued,
+                    },
+                }],
             },
             capacity: ClusterCapacity {
                 nodes: NodeCounts {
@@ -602,7 +778,7 @@ mod tests {
                 "cluster_id": "cluster-00000000-0000-0000-0000-000000000001",
                 "queue": {
                     "depth": 1,
-                    // Rates and history have no source; `null`/`[]`, never a
+                    // A window with no coverage keeps `null` rates — never a
                     // fabricated 0.0 (see `QueueStats`).
                     "drain_rate_per_minute": null,
                     "arrival_rate_per_minute": null,
@@ -619,7 +795,12 @@ mod tests {
                         "failed": 0,
                         "aborted": 0,
                     },
-                    "history": [],
+                    "history": [{
+                        "t_us": 10,
+                        "depth": 1,
+                        "drained_per_minute": 2.0,
+                        "arrived_per_minute": 4.0,
+                    }],
                 },
                 "capacity": {
                     "nodes": { "total": 1, "schedulable": 1, "lost": 0 },
@@ -627,8 +808,46 @@ mod tests {
                     "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
                     "used": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
                 },
+                // ADR 0032's shared timeline shape: identity `(index,
+                // ordinal)` + advisory `at_us`, kind and scope keys flat.
+                "recent_events": {
+                    "floor_index": 3,
+                    "events": [{
+                        "index": 7,
+                        "ordinal": 2,
+                        "at_us": 5_000_100,
+                        "kind": "job_state_changed",
+                        "job": "job-00000000-0000-0000-0000-000000000002",
+                        "from": "accepted",
+                        "to": "queued",
+                    }],
+                },
             })
         );
+    }
+
+    /// The flattened tag: a payload-free kind serializes to just the
+    /// identity triple plus `kind`, and unit variants round-trip.
+    #[test]
+    fn timeline_event_kinds_flatten_without_payload_noise() {
+        let event = TimelineEvent {
+            index: 9,
+            ordinal: 0,
+            at_us: 42,
+            body: TimelineEventBody::PolicyUpdated,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "index": 9,
+                "ordinal": 0,
+                "at_us": 42,
+                "kind": "policy_updated",
+            })
+        );
+        let back: TimelineEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back.body, TimelineEventBody::PolicyUpdated);
     }
 
     #[test]
