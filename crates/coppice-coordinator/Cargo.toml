@@ -17,6 +17,9 @@ coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
 coppice-api.workspace = true
 anyhow.workspace = true
+# The fanout's `proposer_skew` histogram (ADR 0032), registered through the
+# same describe/gather pattern as `coppice-consensus`.
+metrics.workspace = true
 # Serves the `coppice_api::http` router on the client listener (ADR 0031).
 axum.workspace = true
 clap.workspace = true
@@ -40,6 +43,8 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `start_paused` virtual time for the derived-stats bucket-interval test.
+tokio = { workspace = true, features = ["test-util"] }
 # Test-only self-signed CA + per-node leaf certs for the mTLS Raft/admin mesh
 # the multi-node integration test drives (ADR 0011). Dev-only: production nodes
 # read PEM material from disk (config `[tls]`), never mint it.

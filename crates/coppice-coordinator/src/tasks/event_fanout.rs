@@ -21,6 +21,23 @@ use crate::limits::{
     SUBSCRIBER_QUEUE_CAPACITY,
 };
 
+/// Cross-proposer clock skew, observed at the fanout: |batch `at_us` − local
+/// receipt time| (ADR 0032). Chronic skew is an operational signal — a
+/// misconfigured coordinator clock — not something any consumer corrects for.
+const PROPOSER_SKEW_SECONDS: &str = "coordinator_event_proposer_skew_seconds";
+
+pub(crate) fn describe_metrics() {
+    metrics::describe_histogram!(
+        PROPOSER_SKEW_SECONDS,
+        metrics::Unit::Seconds,
+        "Absolute difference between a batch's proposer stamp and this replica's clock at receipt."
+    );
+}
+
+pub(crate) fn gather_metrics() {
+    // The histogram is pushed as batches arrive; nothing needs sampling.
+}
+
 /// What a subscriber wants to see.
 ///
 /// `Job`/`Node` scope by the entity carried on an event (ADR 0008); `All` is
@@ -35,11 +52,53 @@ pub enum EventFilter {
     Node(NodeId),
 }
 
+/// A filtered view of one batch, delivered to a subscriber.
+///
+/// Ordinals are assigned once, before any filtering: each is the event's
+/// position within its *full* batch as derived by apply, and it is part of
+/// the event's identity from that moment on (ADR 0032). A `Job`- or
+/// `Node`-scoped subscription may legitimately see ordinal gaps within an
+/// index; renumbering after the filter would give the same event a different
+/// identity per subscription scope.
+#[derive(Debug, Clone)]
+pub struct FilteredBatch {
+    /// The producing command's log index (ADR 0008's global cursor).
+    pub applied_index: u64,
+    /// The batch's advisory proposer stamp (ADR 0032); never an ordering key.
+    pub at_us: i64,
+    /// `(ordinal, event)` pairs admitted by the subscriber's filter, in
+    /// batch order.
+    pub events: Vec<(u32, Event)>,
+}
+
+/// One event with its full identity and stamp, as served from the ring.
+#[derive(Debug, Clone)]
+pub struct StampedEvent {
+    pub index: u64,
+    pub ordinal: u32,
+    pub at_us: i64,
+    pub event: Event,
+}
+
+/// The most recent events the ring retains, newest first.
+///
+/// `floor_index` is the coverage floor — the earliest applied index the
+/// window is complete from (ADR 0032's honest-absence vocabulary): an empty
+/// `events` on a freshly restarted coordinator carries a floor at the
+/// recovery index, distinguishable from a quiet cluster that has genuinely
+/// emitted nothing since index 0.
+#[derive(Debug, Clone)]
+pub struct RecentEvents {
+    pub floor_index: u64,
+    pub events: Vec<StampedEvent>,
+}
+
 /// One item delivered to a subscriber.
 #[derive(Debug, Clone)]
 pub enum SubscriptionItem {
-    /// A batch of events admitted by the subscriber's filter.
-    Events(EventBatch),
+    /// A batch's events admitted by the subscriber's filter, with their
+    /// batch-assigned ordinals.
+    Events(FilteredBatch),
     /// One or more batches were skipped for this subscriber.
     ///
     /// Either a tap-level gap or its own queue overflowed; resync from `earliest_available`.
@@ -70,10 +129,22 @@ struct SubscribeRequest {
     reply: oneshot::Sender<Result<Subscription, FanoutClosed>>,
 }
 
-/// Cloneable handle to the fanout task's subscribe inbox.
+/// One request on the fanout task's inbox.
+enum Request {
+    Subscribe(SubscribeRequest),
+    /// The most recent `limit` events from the ring, newest first — the
+    /// bounded most-recent cache behind the overview's `recent_events`
+    /// (ADR 0032, tier 1). A point-in-time copy, not a subscription.
+    Recent {
+        limit: usize,
+        reply: oneshot::Sender<RecentEvents>,
+    },
+}
+
+/// Cloneable handle to the fanout task's inbox.
 #[derive(Clone)]
 pub struct FanoutHandle {
-    tx: mpsc::Sender<SubscribeRequest>,
+    tx: mpsc::Sender<Request>,
 }
 
 impl FanoutHandle {
@@ -89,14 +160,28 @@ impl FanoutHandle {
     ) -> Result<Subscription, FanoutClosed> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(SubscribeRequest {
+            .send(Request::Subscribe(SubscribeRequest {
                 filter,
                 cursor,
+                reply: reply_tx,
+            }))
+            .await
+            .map_err(|_| FanoutClosed)?;
+        reply_rx.await.map_err(|_| FanoutClosed)?
+    }
+
+    /// The most recent `limit` events retained by the ring, newest first,
+    /// with the coverage floor (see [`RecentEvents`]).
+    pub async fn recent(&self, limit: usize) -> Result<RecentEvents, FanoutClosed> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Request::Recent {
+                limit,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| FanoutClosed)?;
-        reply_rx.await.map_err(|_| FanoutClosed)?
+        reply_rx.await.map_err(|_| FanoutClosed)
     }
 }
 
@@ -174,6 +259,39 @@ impl Ring {
     fn iter(&self) -> impl Iterator<Item = &EventBatch> {
         self.entries.iter().map(|(_, batch)| batch)
     }
+
+    /// The most recent `limit` events, newest first, each with its
+    /// batch-assigned ordinal and stamp.
+    ///
+    /// The floor is the coverage the *response* can claim: the ring's
+    /// earliest-available index when everything retained fit, else the
+    /// oldest index whose batch was included whole (a batch cut by `limit`
+    /// is not covered — claiming its index would present a partial batch as
+    /// the complete record at that index).
+    fn recent(&self, limit: usize) -> RecentEvents {
+        let mut events = Vec::with_capacity(limit.min(self.event_count));
+        let mut floor_index = self.earliest_available();
+        'outer: for (_, batch) in self.entries.iter().rev() {
+            for (ordinal, event) in batch.events.iter().enumerate().rev() {
+                if events.len() == limit {
+                    // This event did not fit, so coverage is complete only
+                    // strictly above its index.
+                    floor_index = floor_index.max(batch.applied_index + 1);
+                    break 'outer;
+                }
+                events.push(StampedEvent {
+                    index: batch.applied_index,
+                    ordinal: ordinal as u32,
+                    at_us: batch.at_us,
+                    event: event.clone(),
+                });
+            }
+        }
+        RecentEvents {
+            floor_index,
+            events,
+        }
+    }
 }
 
 /// One registered subscriber's delivery state.
@@ -200,7 +318,7 @@ pub fn spawn(
     recovery_index: u64,
     shutdown: watch::Receiver<bool>,
 ) -> (FanoutHandle, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel(crate::limits::SUBSCRIBE_REQUESTS_CAPACITY);
+    let (tx, rx) = mpsc::channel::<Request>(crate::limits::SUBSCRIBE_REQUESTS_CAPACITY);
     let handle = FanoutHandle { tx };
     let join = tokio::spawn(run(event_tap, recovery_index, rx, shutdown));
     (handle, join)
@@ -209,7 +327,7 @@ pub fn spawn(
 async fn run(
     mut event_tap: EventTapReceiver,
     recovery_index: u64,
-    mut subscribe_rx: mpsc::Receiver<SubscribeRequest>,
+    mut subscribe_rx: mpsc::Receiver<Request>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ring = Ring::new(recovery_index);
@@ -233,6 +351,7 @@ async fn run(
             item = event_tap.recv() => {
                 match item {
                     Some(TapItem::Batch(batch)) => {
+                        record_proposer_skew(&batch);
                         ring.push(batch.clone());
                         let earliest = ring.earliest_available();
                         for sub in subscribers.values_mut() {
@@ -258,9 +377,16 @@ async fn run(
             req = subscribe_rx.recv() => {
                 // `None` means no more producers will register new
                 // subscriptions; existing ones keep being served.
-                if let Some(req) = req {
-                    next_id += 1;
-                    handle_subscribe(&mut subscribers, next_id, &ring, req);
+                match req {
+                    Some(Request::Subscribe(req)) => {
+                        next_id += 1;
+                        handle_subscribe(&mut subscribers, next_id, &ring, req);
+                    }
+                    Some(Request::Recent { limit, reply }) => {
+                        // The caller may be gone already; nothing to do.
+                        let _ = reply.send(ring.recent(limit));
+                    }
+                    None => {}
                 }
             }
             _ = gap_retry.tick() => {
@@ -293,24 +419,37 @@ fn flush_gaps(subscribers: &mut BTreeMap<u64, SubscriberState>, ring: &Ring) {
     }
 }
 
-/// Filter one batch's events down to what `filter` admits.
+/// Observe |`at_us` − local now| for the arriving batch (see
+/// [`PROPOSER_SKEW_SECONDS`]).
+fn record_proposer_skew(batch: &EventBatch) {
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let skew_seconds = (now_us.abs_diff(batch.at_us)) as f64 / 1_000_000.0;
+    metrics::histogram!(PROPOSER_SKEW_SECONDS).record(skew_seconds);
+}
+
+/// Filter one batch's events down to what `filter` admits, preserving each
+/// event's batch-assigned ordinal (ADR 0032: ordinals are assigned before
+/// any filtering, so an event's `(index, ordinal)` identity is the same
+/// under every subscription scope).
 ///
 /// Returns `None` if nothing in it survives (skip delivering an empty batch).
-fn filter_events(filter: &EventFilter, batch: &EventBatch) -> Option<EventBatch> {
-    if matches!(filter, EventFilter::All) {
-        return Some(batch.clone());
-    }
-    let events: Vec<Event> = batch
+fn filter_events(filter: &EventFilter, batch: &EventBatch) -> Option<FilteredBatch> {
+    let events: Vec<(u32, Event)> = batch
         .events
         .iter()
-        .filter(|e| event_matches(filter, e))
-        .cloned()
+        .enumerate()
+        .filter(|(_, e)| event_matches(filter, e))
+        .map(|(ordinal, e)| (ordinal as u32, e.clone()))
         .collect();
     if events.is_empty() {
         None
     } else {
-        Some(EventBatch {
+        Some(FilteredBatch {
             applied_index: batch.applied_index,
+            at_us: batch.at_us,
             events,
         })
     }
@@ -456,12 +595,17 @@ mod tests {
         ]
     }
 
+    fn batch_of(applied_index: u64, events: Vec<Event>) -> EventBatch {
+        EventBatch {
+            applied_index,
+            at_us: 0,
+            events,
+        }
+    }
+
     #[test]
     fn all_filter_admits_everything() {
-        let batch = EventBatch {
-            applied_index: 1,
-            events: vec![job_event(JobId::new())],
-        };
+        let batch = batch_of(1, vec![job_event(JobId::new())]);
         assert!(filter_events(&EventFilter::All, &batch).is_some());
     }
 
@@ -469,10 +613,7 @@ mod tests {
     fn job_filter_only_admits_its_own_job() {
         let job = JobId::new();
         let other = JobId::new();
-        let batch = EventBatch {
-            applied_index: 1,
-            events: vec![job_event(job)],
-        };
+        let batch = batch_of(1, vec![job_event(job)]);
         assert!(filter_events(&EventFilter::Job(job), &batch).is_some());
         assert!(filter_events(&EventFilter::Job(other), &batch).is_none());
     }
@@ -482,10 +623,7 @@ mod tests {
         let node = NodeId::new();
         let other = NodeId::new();
         let event = Event::NodeEpochBumped { node, epoch: 1 };
-        let batch = EventBatch {
-            applied_index: 1,
-            events: vec![event],
-        };
+        let batch = batch_of(1, vec![event]);
         assert!(filter_events(&EventFilter::Node(node), &batch).is_some());
         assert!(filter_events(&EventFilter::Node(other), &batch).is_none());
     }
@@ -494,10 +632,7 @@ mod tests {
     fn job_filter_admits_attempt_and_allocation_events() {
         let job = JobId::new();
         let other = JobId::new();
-        let batch = EventBatch {
-            applied_index: 1,
-            events: scoped_events(job, NodeId::new()),
-        };
+        let batch = batch_of(1, scoped_events(job, NodeId::new()));
         let filtered = filter_events(&EventFilter::Job(job), &batch)
             .expect("attempt/allocation events carry their owning job");
         assert_eq!(filtered.events.len(), 3);
@@ -508,14 +643,36 @@ mod tests {
     fn node_filter_admits_attempt_and_allocation_events() {
         let node = NodeId::new();
         let other = NodeId::new();
-        let batch = EventBatch {
-            applied_index: 1,
-            events: scoped_events(JobId::new(), node),
-        };
+        let batch = batch_of(1, scoped_events(JobId::new(), node));
         let filtered = filter_events(&EventFilter::Node(node), &batch)
             .expect("attempt/allocation events carry their node");
         assert_eq!(filtered.events.len(), 3);
         assert!(filter_events(&EventFilter::Node(other), &batch).is_none());
+    }
+
+    /// ADR 0032 (T6): ordinals are batch positions assigned before the
+    /// filter, so a scoped subscription sees the same `(index, ordinal)` for
+    /// an event as an all-events one — with gaps where its filter skipped
+    /// events, never a renumbering.
+    #[test]
+    fn filtering_preserves_batch_assigned_ordinals() {
+        let job_a = JobId::new();
+        let job_b = JobId::new();
+        let batch = batch_of(9, vec![job_event(job_a), job_event(job_b)]);
+
+        let all = filter_events(&EventFilter::All, &batch).expect("all admits both");
+        assert_eq!(
+            all.events.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        // job_b's event keeps ordinal 1 even though it is the only survivor.
+        let scoped = filter_events(&EventFilter::Job(job_b), &batch).expect("admits job_b");
+        assert_eq!(
+            scoped.events.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(scoped.at_us, batch.at_us);
     }
 
     #[tokio::test]
@@ -527,18 +684,9 @@ mod tests {
             gapped: false,
         };
 
-        let b1 = EventBatch {
-            applied_index: 1,
-            events: vec![job_event(JobId::new())],
-        };
-        let b2 = EventBatch {
-            applied_index: 2,
-            events: vec![job_event(JobId::new())],
-        };
-        let b3 = EventBatch {
-            applied_index: 3,
-            events: vec![job_event(JobId::new())],
-        };
+        let b1 = batch_of(1, vec![job_event(JobId::new())]);
+        let b2 = batch_of(2, vec![job_event(JobId::new())]);
+        let b3 = batch_of(3, vec![job_event(JobId::new())]);
 
         deliver(&mut sub, &b1, 0); // 1/2
         deliver(&mut sub, &b2, 0); // 2/2, still not full
@@ -556,10 +704,7 @@ mod tests {
 
         // Queue is empty again; the next delivery clears the gap and gets
         // its own batch through in the same call.
-        let b4 = EventBatch {
-            applied_index: 4,
-            events: vec![job_event(JobId::new())],
-        };
+        let b4 = batch_of(4, vec![job_event(JobId::new())]);
         deliver(&mut sub, &b4, 2);
         assert!(!sub.gapped);
 
@@ -574,10 +719,7 @@ mod tests {
     }
 
     fn one_event_batch(index: u64) -> EventBatch {
-        EventBatch {
-            applied_index: index,
-            events: vec![job_event(JobId::new())],
-        }
+        batch_of(index, vec![job_event(JobId::new())])
     }
 
     fn subscribe(
@@ -601,6 +743,55 @@ mod tests {
             .try_recv()
             .expect("handle_subscribe replies synchronously")
             .expect("subscription")
+    }
+
+    #[test]
+    fn recent_serves_newest_first_with_the_ring_floor() {
+        let mut ring = Ring::new(0);
+        ring.push(batch_of(5, vec![job_event(JobId::new())]));
+        ring.push(batch_of(
+            7,
+            vec![job_event(JobId::new()), job_event(JobId::new())],
+        ));
+
+        let recent = ring.recent(10);
+        // Everything retained fit, so coverage is the ring's own floor.
+        assert_eq!(recent.floor_index, 5);
+        let identities: Vec<(u64, u32)> =
+            recent.events.iter().map(|e| (e.index, e.ordinal)).collect();
+        // Newest first: batch 7's events (in reverse batch order), then 5's.
+        assert_eq!(identities, vec![(7, 1), (7, 0), (5, 0)]);
+    }
+
+    /// A `limit` that cuts a batch must not claim coverage of that batch's
+    /// index: coverage is complete only strictly above it.
+    #[test]
+    fn recent_truncated_by_limit_raises_its_coverage_floor() {
+        let mut ring = Ring::new(0);
+        ring.push(batch_of(
+            5,
+            vec![job_event(JobId::new()), job_event(JobId::new())],
+        ));
+        ring.push(batch_of(7, vec![job_event(JobId::new())]));
+
+        // Room for batch 7 and only one of batch 5's two events.
+        let recent = ring.recent(2);
+        assert_eq!(
+            recent.events.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![7, 5]
+        );
+        assert_eq!(recent.floor_index, 6, "batch 5 was cut, so not covered");
+    }
+
+    /// ADR 0032's honest-absence vocabulary: an empty window on a restarted
+    /// coordinator carries the recovery index as its floor — distinguishable
+    /// from a quiet cluster whose floor is 0.
+    #[test]
+    fn recent_on_an_empty_ring_reports_the_floor_not_a_quiet_cluster() {
+        let ring = Ring::new(42);
+        let recent = ring.recent(10);
+        assert!(recent.events.is_empty());
+        assert_eq!(recent.floor_index, 42);
     }
 
     #[test]

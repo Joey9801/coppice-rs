@@ -74,7 +74,7 @@ pub async fn run<C: Consensus>(
                     let Some(item) = item else { break };
                     match item {
                         SubscriptionItem::Events(batch) => {
-                            for event in &batch.events {
+                            for (_ordinal, event) in &batch.events {
                                 handle_event(&consensus, &views, &router, event).await;
                             }
                         }
