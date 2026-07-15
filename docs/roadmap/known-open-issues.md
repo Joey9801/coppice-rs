@@ -21,7 +21,7 @@ waive them.
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10; drop-and-gap completeness 2026-07-12) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, instrumentation, and apply latency resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
-| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open (design settled 2026-07-15, ADR 0032) | Every time-ranged read stays unserved: no queue rates or history, no job timeline, no usage/utilization series, no events window |
+| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open (design settled 2026-07-15, ADR 0032; stamps + tiers 1/3 + the overview's windowed fields landed the same day) | The durable half stays unserved: no job timeline or node history (tier 2 store + writer), and `SubscribeEvents` has no transport |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
 
@@ -436,8 +436,14 @@ and those bounds are enforced in CI or a required performance gate.
 
 - **Severity:** High
 - **Status:** Open — the design is settled (2026-07-15,
-  [ADR 0032](../decisions/0032-advisory-event-timestamps.md)); the
-  implementation is not
+  [ADR 0032](../decisions/0032-advisory-event-timestamps.md)), and the
+  in-memory half is implemented (same day): `Command::stamped_at_us()`,
+  `EventBatch.at_us`, ordinal-preserving fanout with the `proposer_skew`
+  metric, the tier-3 derived-stats task, and the overview's queue
+  rates/history and `recent_events` window (with its coverage floor). The
+  durable half — the tier-2 history event table and writer, and the
+  endpoints they serve (`GetJobTimeline`, `GetNodeHistory`,
+  `SubscribeEvents`) — is not
 - **Affected capability:** every time-ranged read on the public API — the
   overview's queue rates and history and its recent-events window, the job
   timeline, job usage and node utilization series, and the ADR 0008 event
@@ -467,40 +473,45 @@ so — an absent window, never a fabricated zero.
 
 ### Current violation
 
-No such record exists anywhere in the system, for three compounding reasons:
+No such record existed anywhere in the system, for three compounding reasons:
 
-1. **Events carry no time.** `coppice_state::Event` is the derived output of
-   apply, and apply may not read a clock (the determinism contract in
-   [coppice-state](../../crates/coppice-state/src/lib.rs)). So the one
-   representation of "a thing happened" is unstamped.
-2. **Nothing retains events.** The fanout ring is a *reconnection buffer, not
-   history* (bounded 1 h / 1M events, evict-oldest — see the channel inventory
-   in [coordinator-runtime.md](../architecture/coordinator-runtime.md)),
-   replica-local, and seeded only from the index this process recovered at. The
-   only other sink is `StubHistoryStore`, which logs a count (KOI-1).
+1. ~~**Events carry no time.**~~ **Resolved 2026-07-15** (ADR 0032):
+   `EventBatch.at_us` is stamped by the apply loop from
+   `Command::stamped_at_us()` — deterministic (the stamp rides in the log,
+   T1 pinned by `event_stream_is_invariant_under_apply_batching`) and
+   advisory (attached outside `apply()`, never read back). Every fanout
+   delivery and ring entry now carries `(index, ordinal, at_us)`, with
+   ordinals assigned before any filtering.
+2. **Nothing retains events durably.** The fanout ring is a *reconnection
+   buffer, not history* (bounded 1 h / 1M events, evict-oldest — see the
+   channel inventory in
+   [coordinator-runtime.md](../architecture/coordinator-runtime.md)),
+   replica-local, and seeded only from the index this process recovered at.
+   ADR 0032 sanctions it as the bounded most-recent cache (tier 1) and the
+   in-memory bucket window as tier 3 — both now implemented — but the
+   durable tier 2 (the history event table and writer in the ADR 0012 store)
+   does not exist; the only durable sink is `StubHistoryStore`, which logs a
+   count (KOI-1).
 3. **Replicated state records facts, not transitions.** It carries a handful of
    per-record timestamps (`submitted_at_us`, `terminal_at_us`,
    `started_at_us`) — enough for an age, nowhere near enough to reconstruct a
-   sequence of state changes or to bucket them into a window.
+   sequence of state changes or to bucket them into a window. (Unchanged by
+   design: ADR 0032 keeps derived series off the `StateMachine`.)
 
-The consequence is visible in the shipped surface. `GET /api/v1/overview`
+~~The consequence is visible in the shipped surface.~~ The overview half is
+served as of 2026-07-15: `GET /api/v1/overview`
 ([routes](../../crates/coppice-api/src/http/routes.rs),
-[projection](../../crates/coppice-api/src/http/project.rs)) serves queue depth,
-the by-phase tally, and the oldest queued age from replicated state, but:
-
-- `drain_rate_per_minute` and `arrival_rate_per_minute` are `null` and
-  `history` is `[]` — a rate is a windowed quantity and nothing retains the
-  window;
-- the response has **no `recent_events` field at all**, unlike the UI's
-  `ClusterOverview` in `web/src/api/types.ts`. Serving `[]` would have meant
-  inventing a `TimelineEvent` wire shape — and freezing it into the v1
-  contract — before this issue decides where events and their timestamps come
-  from ([dto](../../crates/coppice-api/src/http/dto.rs)).
+[projection](../../crates/coppice-api/src/http/project.rs)) serves queue
+rates and `history` from the derived-stats task's 30 s buckets (`null`/empty
+exactly when the window has no coverage), and a `recent_events` window in
+ADR 0032's shared `TimelineEvent` shape with the ring's coverage floor
+([dto](../../crates/coppice-api/src/http/dto.rs)).
 
 `GetJobTimeline`, `GetJobUsage`, `GetNodeUtilization`, `GetNodeHistory`, and
-`SubscribeEvents` remain `501 UNIMPLEMENTED` for the same root cause; the ADR
-0031 table already classes them bounded/eventual, so the routing is not what
-blocks them.
+`SubscribeEvents` remain `501 UNIMPLEMENTED`: the timeline/history pair waits
+on the tier-2 store and writer, the subscription on its SSE transport, and
+the measured-usage series on the out-of-scope measurement pipeline (item 7
+of the ADR).
 
 ### Impact
 
@@ -576,17 +587,24 @@ Questions the ADR still has to settle:
   placement, nested-item rule, skew/monotonicity handling, and the retention
   line above.~~ Done —
   [ADR 0032](../decisions/0032-advisory-event-timestamps.md).
-- Stamp events deterministically from the proposing command's timestamp, and
+- ~~Stamp events deterministically from the proposing command's timestamp, and
   pin it with a determinism test (an identical log yields identical
-  `(index, at_us, events)` on every replica).
+  `(index, at_us, events)` on every replica).~~ Done 2026-07-15 —
+  `Command::stamped_at_us()` + `EventBatch.at_us`, pinned by
+  `event_stream_is_invariant_under_apply_batching`.
 - Retain transitions durably and queryably — the KOI-1 history store is the
-  natural home — with an explicit bounded window.
+  natural home — with an explicit bounded window. (Tier 2; not started.)
 - Serve them from one representation: the overview's `recent_events`,
   `GetJobTimeline`, and the ADR 0008 subscription payload must not each invent
   their own event shape. Queue rates/history and the usage/utilization series
-  are then projections over the retained record.
-- Keep failing honestly in the meantime: an endpoint with no retained window
-  answers `null`/absent, never `0`.
+  are then projections over the retained record. (The shape exists —
+  `dto::TimelineEvent`, `(index, ordinal, at_us)` + kind + scope keys — and
+  the overview serves it; the remaining endpoints must reuse it.)
+- ~~Keep failing honestly in the meantime: an endpoint with no retained window
+  answers `null`/absent, never `0`.~~ Upheld: rates are `null` and buckets
+  absent exactly when coverage is missing, and `recent_events` carries the
+  ring's coverage floor so an empty window on a fresh replica is
+  distinguishable from a quiet cluster.
 
 ### Closure criteria
 
