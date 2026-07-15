@@ -399,12 +399,19 @@ export interface JobList {
 }
 
 // ---------------------------------------------------------------------------
-// Timeline events (mirrors the `Event` enum in coppice-state)
+// Timeline events (ADR 0032's one shared wire shape: identity + advisory
+// stamp + a body mirroring the `Event` enum in coppice-state arm for arm)
 // ---------------------------------------------------------------------------
 
-export type TimelineEvent = { atUs: number } & (
+/**
+ * The event payload: kind plus the scope keys apply stamped while the
+ * association was authoritative. `from`/`to` are state *kinds* — the wire
+ * flattens `Attempting`'s attempt id away (it travels on attempt-scoped
+ * events instead).
+ */
+export type TimelineEventBody =
   | { kind: 'JobSubmitted'; job: JobId }
-  | { kind: 'JobStateChanged'; job: JobId; from: JobState; to: JobState }
+  | { kind: 'JobStateChanged'; job: JobId; from: JobStateKind; to: JobStateKind }
   | {
       kind: 'AttemptStateChanged'
       attempt: AttemptId
@@ -413,10 +420,41 @@ export type TimelineEvent = { atUs: number } & (
       state: AttemptState
     }
   | { kind: 'AllocationFunded'; allocation: AllocationId; job: JobId; node: NodeId }
-  | { kind: 'StopRequested'; job: JobId; reason: string | null }
+  | { kind: 'StopRequested'; node: NodeId; allocation: AllocationId; job: JobId }
   | { kind: 'NodeEpochBumped'; node: NodeId; epoch: number }
-  | { kind: 'JobEvicted'; job: JobId; node: NodeId }
-)
+  | { kind: 'JobEvicted'; job: JobId }
+  | { kind: 'QuotaEntityConfigured'; entity: QuotaEntityId }
+  | { kind: 'PolicyUpdated' }
+  | { kind: 'ClusterVersionBumped'; to: number }
+
+export type TimelineEvent = {
+  /** The producing command's Raft log index. */
+  index: number
+  /**
+   * The event's position within that command's full batch, assigned before
+   * any filtering. `(index, ordinal)` is the event's identity — the only
+   * valid ordering and deduplication key. Scoped streams may show ordinal
+   * gaps within an index; they never renumber.
+   */
+  ordinal: number
+  /**
+   * Advisory proposer stamp ("when the proposer asserted this fact").
+   * Stamps come from different replicas' clocks, so this may run backwards
+   * as `index` advances: render it, never sort or deduplicate by it.
+   */
+  atUs: number
+} & TimelineEventBody
+
+/**
+ * A bounded most-recent window of events (ADR 0032, tier 1). `floorIndex`
+ * is an exclusive coverage cursor: the window is complete for every index
+ * strictly above it and claims nothing at or below. Empty `events` with a
+ * high cursor is a freshly restarted coordinator, not a quiet cluster.
+ */
+export interface RecentEventsWindow {
+  floorIndex: number
+  events: TimelineEvent[]
+}
 
 // ---------------------------------------------------------------------------
 // Usage / utilization series
@@ -589,10 +627,14 @@ export interface ConfigureQuotaEntityInput {
 export interface QueueStats {
   /** Jobs currently in `Queued`. */
   depth: number
-  /** Jobs leaving the queue (placed) per minute, recent window. */
-  drainRatePerMinute: number
-  /** Jobs entering the queue per minute, recent window. */
-  arrivalRatePerMinute: number
+  /**
+   * Jobs leaving the queue (placed) per minute, recent window. `null` means
+   * the serving replica has no windowed coverage yet (fresh restart or a
+   * lost event stream) — a gap, never "nothing is draining" (ADR 0032).
+   */
+  drainRatePerMinute: number | null
+  /** Jobs entering the queue per minute, recent window; `null` as above. */
+  arrivalRatePerMinute: number | null
   oldestQueuedAgeUs: number | null
   /** Tallied by displayed phase (`derivePhase`), not the raw `JobState`. */
   byState: Record<JobPhase, number>
@@ -616,8 +658,8 @@ export interface ClusterOverview {
   clusterId: string
   queue: QueueStats
   capacity: ClusterCapacity
-  /** Most recent cluster events, newest first. */
-  recentEvents: TimelineEvent[]
+  /** Most recent cluster events, newest first, with its coverage cursor. */
+  recentEvents: RecentEventsWindow
 }
 
 // ---------------------------------------------------------------------------

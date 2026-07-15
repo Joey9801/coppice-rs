@@ -54,8 +54,10 @@ import type {
   QuotaEntityOrigin,
   QuotaEntityStats,
   QuotaEntityView,
+  RecentEventsWindow,
   Resources,
   TimelineEvent,
+  TimelineEventBody,
   UtilizationSample,
   UsageSample,
 } from '../types'
@@ -422,6 +424,12 @@ export class MockWorld {
 
   private events: TimelineEvent[] = []
   private jobEvents = new Map<string, TimelineEvent[]>()
+  /**
+   * Stand-in for the Raft log index that stamps every real event's
+   * identity (ADR 0032). The mock emits one event per "command", so
+   * ordinals are always 0.
+   */
+  private nextEventIndex = 1
   private queueHistory: QueueBucket[] = []
 
   private seqCounter = 0
@@ -1521,10 +1529,21 @@ export class MockWorld {
     job.state = to
     job.lastTransitionUs = this.nowUs
     if (isTerminalJobState(to)) job.terminalAtUs = job.terminalAtUs ?? this.nowUs
-    this.pushEvent({ atUs: this.nowUs, kind: 'JobStateChanged', job: job.id, from, to })
+    // The wire event carries state *kinds*: `Attempting`'s attempt id is
+    // flattened away, exactly like `coppice_state::Event` on the wire.
+    this.pushEvent({
+      atUs: this.nowUs,
+      kind: 'JobStateChanged',
+      job: job.id,
+      from: from.kind,
+      to: to.kind,
+    })
   }
 
-  private pushEvent(ev: TimelineEvent): void {
+  private pushEvent(body: { atUs: number } & TimelineEventBody): void {
+    // Identity is stamped here, once, like the real apply loop: the mock
+    // emits one event per simulated command, so ordinals are always 0.
+    const ev: TimelineEvent = { index: this.nextEventIndex++, ordinal: 0, ...body }
     this.events.push(ev)
     if (this.events.length > EVENTS_RING) this.events.shift()
     const jobId = 'job' in ev ? (ev.job as string) : null
@@ -1710,8 +1729,23 @@ export class MockWorld {
         allocated,
         used,
       },
-      recentEvents: [...this.events].reverse().slice(0, 20),
+      recentEvents: this.buildRecentEvents(20),
     }
+  }
+
+  /**
+   * The bounded most-recent window with its exclusive coverage cursor
+   * (ADR 0032): complete strictly above `floorIndex`, which rises when the
+   * ring evicted or the limit truncated.
+   */
+  private buildRecentEvents(limit: number): RecentEventsWindow {
+    const events = [...this.events]
+      .reverse()
+      .slice(0, limit)
+      .map((e) => ({ ...e }))
+    const oldest = events[events.length - 1]
+    const floorIndex = oldest !== undefined ? oldest.index - 1 : this.nextEventIndex - 1
+    return { floorIndex, events }
   }
 
   buildQueueStats(): QueueStats {
@@ -2005,14 +2039,19 @@ export class MockWorld {
   buildJobTimeline(id: string): TimelineEvent[] {
     this.jobOrThrow(id)
     const list = this.jobEvents.get(id) ?? []
-    // Always include the synthetic submission at the head.
+    // Always include the synthetic submission at the head. Index 0 sits
+    // below every real index, so identity ordering keeps it first.
     const submit: TimelineEvent = {
+      index: 0,
+      ordinal: 0,
       atUs: this.jobs.get(id)!.submittedAtUs,
       kind: 'JobSubmitted',
       job: id,
     }
     const merged = [submit, ...list.filter((e) => e.kind !== 'JobSubmitted')]
-    return merged.sort((a, b) => a.atUs - b.atUs).map((e) => ({ ...e }))
+    // Order by identity `(index, ordinal)`, never by `atUs` (ADR 0032: the
+    // stamp is advisory and may run backwards across proposers).
+    return merged.sort((a, b) => a.index - b.index || a.ordinal - b.ordinal).map((e) => ({ ...e }))
   }
 
   /** Usage for one attempt; null = the current (else latest) attempt. */

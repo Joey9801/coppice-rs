@@ -17,8 +17,9 @@ import { cn } from '@/lib/utils'
 import { EventsFeed } from './events-feed'
 import { QueueChart } from './queue-chart'
 
-function formatRatePerMinute(n: number): string {
-  return `${n.toFixed(1)}/min`
+/** `null` is a coverage gap (ADR 0032), rendered as absent — never `0.0`. */
+function formatRatePerMinute(n: number | null): string {
+  return n != null ? `${n.toFixed(1)}/min` : '—'
 }
 
 export function OverviewPage() {
@@ -158,8 +159,8 @@ export function OverviewPage() {
             <CardTitle>Recent events</CardTitle>
           </CardHeader>
           <CardContent>
-            {recentEvents.length > 0 ? (
-              <EventsFeed events={recentEvents} />
+            {recentEvents.events.length > 0 ? (
+              <EventsFeed events={recentEvents.events} />
             ) : (
               <EmptyState title="No recent events" />
             )}

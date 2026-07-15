@@ -158,6 +158,36 @@ describe('MockWorld construction', () => {
     }
   })
 
+  it('stamps every event with a unique, monotone (index, ordinal) identity', () => {
+    const world = new MockWorld(NOW_US)
+    // Advance far enough that ticks emit submissions and transitions.
+    world.advanceTo(NOW_US + 120_000_000)
+
+    const { events, floorIndex } = world.buildClusterOverview().recentEvents
+    expect(events.length).toBeGreaterThan(0)
+    // Newest first, strictly ordered by identity — never by atUs (ADR 0032).
+    for (let i = 1; i < events.length; i += 1) {
+      const [newer, older] = [events[i - 1]!, events[i]!]
+      expect(
+        newer.index > older.index || (newer.index === older.index && newer.ordinal > older.ordinal),
+      ).toBe(true)
+    }
+    // The exclusive coverage cursor sits strictly below everything served.
+    expect(floorIndex).toBeLessThan(events[events.length - 1]!.index)
+
+    // Per-job timelines share the same identity ordering, oldest first.
+    const { jobs } = world.listJobs({ limit: 10_000 })
+    const withTimeline = jobs.find((j) => world.buildJobTimeline(j.id).length > 1)
+    expect(withTimeline).toBeDefined()
+    const timeline = world.buildJobTimeline(withTimeline!.id)
+    for (let i = 1; i < timeline.length; i += 1) {
+      const [prev, next] = [timeline[i - 1]!, timeline[i]!]
+      expect(
+        next.index > prev.index || (next.index === prev.index && next.ordinal > prev.ordinal),
+      ).toBe(true)
+    }
+  })
+
   it('has coordinators with a single leader and plausible snapshot', () => {
     const world = new MockWorld(NOW_US)
     const status = world.buildCoordinatorStatus()
