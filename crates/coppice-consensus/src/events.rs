@@ -44,6 +44,13 @@ pub struct EventBatch {
     /// The Raft log index of the command that produced these events — the
     /// global sequence cursor of ADR 0008.
     pub applied_index: u64,
+    /// The producing command's proposer stamp (`Command::stamped_at_us`,
+    /// ADR 0032): when the proposer asserted the facts these events record.
+    /// Advisory only — copied on by the apply loop, never read back by
+    /// apply, and never an ordering key (order is `applied_index` plus the
+    /// event's position in `events`). Stamps come from different replicas'
+    /// clocks, so `at_us` regressing as the index advances is normal.
+    pub at_us: i64,
     pub events: Vec<Event>,
 }
 
@@ -285,6 +292,7 @@ mod tests {
     fn batch(applied_index: u64) -> EventBatch {
         EventBatch {
             applied_index,
+            at_us: 0,
             events: vec![Event::PolicyUpdated],
         }
     }
@@ -380,6 +388,7 @@ mod tests {
         let (mut tap, mut rx) = EventTap::channel(4);
         tap.emit(EventBatch {
             applied_index: 1,
+            at_us: 0,
             events: vec![],
         });
         tap.emit(batch(2));

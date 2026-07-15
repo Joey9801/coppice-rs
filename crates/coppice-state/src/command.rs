@@ -47,6 +47,36 @@ pub enum Command {
     BumpClusterVersion(BumpClusterVersion),
 }
 
+impl Command {
+    /// The proposer stamp this command carries — every variant has exactly
+    /// one `*_at_us` field (ADR 0032).
+    ///
+    /// The apply loop copies it onto the command's `EventBatch` as the
+    /// batch's advisory timestamp: "when the proposer asserted this fact,"
+    /// never an ordering key, and never read back by apply. No wildcard arm,
+    /// so a future command without a timestamp fails to compile here instead
+    /// of silently emitting unstamped events.
+    pub fn stamped_at_us(&self) -> i64 {
+        match self {
+            Command::SubmitJob(c) => c.submitted_at_us,
+            Command::AbortJob(c) => c.requested_at_us,
+            Command::CommitPlacements(c) => c.proposed_at_us,
+            Command::DispatchAttempt(c) => c.dispatched_at_us,
+            Command::RecordAttemptStarted(c) => c.observed_at_us,
+            Command::RecordAttemptExited(c) => c.observed_at_us,
+            Command::RecordAttemptOutcome(c) => c.observed_at_us,
+            Command::ReconcileNode(c) => c.observed_at_us,
+            Command::RegisterNode(c) => c.registered_at_us,
+            Command::DeclareNodeLost(c) => c.declared_at_us,
+            Command::SetNodeSchedulable(c) => c.updated_at_us,
+            Command::EvictTerminalJobs(c) => c.evicted_at_us,
+            Command::ConfigureQuotaEntity(c) => c.updated_at_us,
+            Command::UpdatePolicy(c) => c.updated_at_us,
+            Command::BumpClusterVersion(c) => c.bumped_at_us,
+        }
+    }
+}
+
 /// Record a newly submitted job.
 ///
 /// Admission is synchronous in v1, so one apply walks
@@ -266,4 +296,43 @@ pub struct UpdatePolicy {
 pub struct BumpClusterVersion {
     pub to: u32,
     pub bumped_at_us: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The accessor's exhaustive `match` is the real guard (a stampless new
+    /// command fails to compile); this pins that it reads the *right* field
+    /// where a command carries more than one plausible candidate.
+    #[test]
+    fn stamped_at_us_reads_the_proposer_stamp() {
+        let abort = Command::AbortJob(AbortJob {
+            job: JobId::new(),
+            reason: None,
+            requested_at_us: 7,
+        });
+        assert_eq!(abort.stamped_at_us(), 7);
+
+        let reconcile = Command::ReconcileNode(ReconcileNode {
+            node: NodeId::new(),
+            node_epoch: 1,
+            adopted: vec![],
+            // Sub-items carry no stamp of their own: every LostAttempt in
+            // this report inherits the report's observed_at_us (ADR 0032).
+            lost: vec![LostAttempt {
+                attempt: AttemptId::new(),
+                outcome: AttemptOutcome::AgentError,
+                actual_runtime_us: 99,
+            }],
+            observed_at_us: 11,
+        });
+        assert_eq!(reconcile.stamped_at_us(), 11);
+
+        let bump = Command::BumpClusterVersion(BumpClusterVersion {
+            to: 2,
+            bumped_at_us: 13,
+        });
+        assert_eq!(bump.stamped_at_us(), 13);
+    }
 }
