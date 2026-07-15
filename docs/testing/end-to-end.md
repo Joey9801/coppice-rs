@@ -98,14 +98,31 @@ case pins rather than restating it.
 
 ### E2E-6 — The overview never fabricates what it cannot know
 
-- **Do:** `GET $API/overview` at any point.
+- **Do:** `GET $API/overview` within ~30 s of cluster start (before the first
+  derived bucket closes).
 - **Expect:** `queue.drain_rate_per_minute` and `arrival_rate_per_minute` are
-  `null`; `queue.history` is `[]`; the response has **no `recent_events` key**;
-  `capacity.used` is all zeros.
-- **Guards:** [KOI-6](../roadmap/known-open-issues.md) — no store retains a
-  window, so these stay absent rather than becoming a fabricated `0`. If a
-  future change makes them non-null, it must be because retention landed. Flip
-  this case when it does.
+  `null` and `queue.history` is `[]` (no closed bucket yet — coverage, not
+  activity, is what they report); `capacity.used` is all zeros (no
+  measurement pipeline, ADR 0032 item 7); `recent_events.floor_index` is
+  present even when `events` is empty, so a fresh replica is distinguishable
+  from a quiet cluster.
+- **Guards:** [KOI-6](../roadmap/known-open-issues.md) /
+  [ADR 0032](../decisions/0032-advisory-event-timestamps.md) honest absence —
+  a window without coverage is `null`/absent, never a fabricated `0`.
+
+### E2E-9 — Queue rates, history, and recent events serve from retained data
+
+- **Do:** submit two jobs (one placeable, one not); wait for the 30 s bucket
+  containing them to close (~35 s); `GET $API/overview`.
+- **Expect:** `arrival_rate_per_minute`/`drain_rate_per_minute` non-null and
+  consistent with the bucket counts scaled per minute; `history` has one
+  sample per closed bucket, oldest first, each with the sampled `depth`;
+  `recent_events.events` is newest-first, each carrying
+  `(index, ordinal, at_us, kind)` with ordinals dense within an index and one
+  shared `at_us` per index (the batch stamp); no event is ordered by `at_us`.
+- **Guards:** ADR 0032 tiers 1/3 — the overview's windowed fields come from
+  the derived bucket window and the fanout ring, keyed by `(index, ordinal)`.
+- **State:** mutates — same jobs as E2E-3/E2E-4 (run this alongside them).
 
 ## API contract
 

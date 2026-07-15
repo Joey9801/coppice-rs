@@ -72,7 +72,8 @@ followers, which is what lets followers serve reads and event streams.
 | openraft core + replication + election | `coppice-consensus` (openraft) | no | the Raft log, election, membership | its own internal machinery |
 | Apply task | `coppice-consensus` | no | the mutable `StateMachine` (by value) | apply requests, view demand, cadence tick |
 | API server | `coppice-coordinator` (handlers in `coppice-api`) | no | client connections | HTTP requests |
-| Event fanout | `coppice-coordinator` | no | the reconnection ring, subscriptions | event-tap batches, subscribe/unsubscribe |
+| Event fanout | `coppice-coordinator` | no | the reconnection ring, subscriptions | event-tap batches, subscribe/unsubscribe, recent-events queries |
+| Derived stats | `coppice-coordinator` | no | the queue-bucket window ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 3) | its fanout subscription, a 30 s bucket tick |
 | Agent gateway (session mgr + per-session tasks) | `coppice-coordinator` | accept: yes | agent sockets, session state | socket reads, router sends |
 | Ingestion / normalizer | `coppice-coordinator` | yes | the ObservedSet diff, dedupe state | agent inbound reports |
 | Dispatch loop | `coppice-coordinator` | yes | in-flight dispatch bookkeeping | the event stream |
@@ -125,8 +126,22 @@ followers, which is what lets followers serve reads and event streams.
 4. **Event fanout** (every replica). Consumes the `EventTapReceiver`, owns
    the [ADR 0008](../decisions/0008-event-delivery-guarantees.md)
    reconnection ring (bounded: 1 h / 1M events), and manages subscriptions.
+   Subscribers receive `(ordinal, event)` pairs — ordinals assigned per full
+   batch before any filtering, so an event's `(index, ordinal)` identity is
+   scope-invariant ([ADR 0032](../decisions/0032-advisory-event-timestamps.md))
+   — and the ring doubles as the bounded most-recent cache behind the
+   overview's `recent_events` (a query on the fanout inbox). Exports the
+   `proposer_skew` histogram.
 
-5. **Agent gateway.** A session manager plus one task per agent session.
+5. **Derived stats** (every replica). Subscribes to the fanout (`All` scope)
+   and counts queue transitions into 30 s rolling buckets (≤ 1 h retained,
+   task-local — [ADR 0032](../decisions/0032-advisory-event-timestamps.md)
+   tier 3), sampling queue depth from `views.latest()` at each bucket close.
+   Publishes the closed-bucket window over a watch the API's overview
+   handler projects rates and history from. An event-stream gap drops the
+   whole window: a bucket's presence is the claim its counts are complete.
+
+6. **Agent gateway.** A session manager plus one task per agent session.
    **Sessions terminate on the leader only** — a follower refuses an agent
    connection with a leader hint. The justification is not arbitrary: every
    inbound report must be normalized and proposed by the leader anyway (the
@@ -136,7 +151,7 @@ followers, which is what lets followers serve reads and event streams.
    *measured* bottleneck. Sessions re-fence with the new
    `(leader_term, node_epoch)` on every leader change ([ADR 0009](../decisions/0009-fencing-and-reconciliation.md)).
 
-6. **Ingestion / normalizer** (leader-only). The boundary of
+7. **Ingestion / normalizer** (leader-only). The boundary of
    [command-catalog.md](command-catalog.md#the-agent-report-ingestion-boundary):
    fencing check, dedupe by `(AttemptId, attempt_state)`, timestamping, and
    the ObservedSet diff — then `propose` (`RecordAttempt*`, `ReconcileNode`,
@@ -150,7 +165,7 @@ followers, which is what lets followers serve reads and event streams.
    also marks node liveness (a shared map, not a channel) for the health
    monitor in housekeeping.
 
-7. **Dispatch loop** (leader-only). Consumes the event stream. On an attempt
+8. **Dispatch loop** (leader-only). Consumes the event stream. On an attempt
    reaching `Ready` it proposes `DispatchAttempt`, and **only after that
    applies** does it send `StartJob` — the commit-before-send ordering of
    [command-catalog.md](command-catalog.md#dispatchattempt). A crash in the
@@ -160,7 +175,7 @@ followers, which is what lets followers serve reads and event streams.
    pending aborts; at-least-once delivery plus idempotent commands make the
    rescan safe.
 
-8. **Scheduler driver** (leader-only). A loop of: take `views.latest()`, run
+9. **Scheduler driver** (leader-only). A loop of: take `views.latest()`, run
    the CPU-heavy `Scheduler::schedule` pass in `spawn_blocking` (the trait
    stays *sync* — it is pure CPU over an immutable view), propose
    `CommitPlacements`, await the outcome. **At most one proposal is in flight
@@ -169,7 +184,7 @@ followers, which is what lets followers serve reads and event streams.
    `expected_version` comes from `StateView::version()` — see the [two
    coordinates](#the-two-coordinates-trap) distinction.
 
-9. **Housekeeping** (leader-only, 60 s tick). Scans the view for terminal
+10. **Housekeeping** (leader-only, 60 s tick). Scans the view for terminal
    jobs past retention — measured from each job's `terminal_at_us`, never
    from submission, so a job that queued longer than the retention interval
    still gets the full interval after it finishes (KOI-1) — and **writes
@@ -193,7 +208,7 @@ followers, which is what lets followers serve reads and event streams.
    today; [configuration.md](../operations/configuration.md) records it as
    replicated policy, where it migrates once the policy schema grows it.
 
-10. **Snapshot builder.** Serializes the `Arc`'d state handed out by the
+11. **Snapshot builder.** Serializes the `Arc`'d state handed out by the
     apply task and writes it through the storage layer, keeping CPU and IO
     off the apply path.
 
@@ -348,8 +363,9 @@ full" is the crux: it is what makes the blocking graph acyclic.
 | apply requests | openraft sm-adapter → apply task | mpsc | 64 | **await** (backpressure into openraft replication) |
 | proposal admission | proposers → openraft | semaphore | 4096 in-flight | **await permit** (backpressure to proposers) |
 | event tap | apply task → fanout | mpsc | 4096 batches | **`try_send`; on full DROP the batch** — the receiver synthesizes a gap from the dense tap sequence ([ADR 0008](../decisions/0008-event-delivery-guarantees.md) drop+gap). Apply NEVER awaits fanout. |
-| fanout ring | fanout-internal | ring | 1 h / 1M events | **evict oldest** — it is a reconnection buffer, not history |
+| fanout ring | fanout-internal | ring | 1 h / 1M events | **evict oldest** — it is a reconnection buffer, not history; doubles as the bounded most-recent cache for the overview's `recent_events` ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 1) |
 | per-subscriber queue | fanout → client conn | mpsc | 1024 | **`try_send`; on full mark the subscriber gapped**, drop its backlog, deliver `Gap{earliest_available}`; client resyncs via query ([ADR 0008](../decisions/0008-event-delivery-guarantees.md)) |
+| queue-window watch | derived stats → API server | watch | latest-value | **overwrite** — the overview projects rates/history from whatever window is current ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 3) |
 | agent inbound | session tasks → ingestion | mpsc (shared) | 8192 | **await** ⇒ the session stops reading its socket ⇒ TCP backpressure to the agent. Never touches apply. |
 | agent outbound | router → per-session | mpsc | 256 | **`try_send`; on full DISCONNECT the session** — commands are idempotent and reconciliation ([ADR 0009](../decisions/0009-fencing-and-reconciliation.md) ObservedSet) heals on reconnect |
 | command router | dispatch/ingestion → session manager | mpsc | 1024 | **await** (producers are leader-only loops that tolerate backpressure) |
@@ -486,7 +502,8 @@ re-proposal by the new leader resolves deterministically (above).
 1. flip the shutdown watch;
 2. the API and agent listeners stop accepting new work;
 3. the leader-only loops drain and exit at their chosen await points;
-4. fanout closes its subscribers;
+4. derived stats exits (it subscribes to the fanout, so it drains first),
+   then fanout closes its subscribers;
 5. openraft shuts down — the apply task drains its request queue and exits
    when the adapter drops the `mpsc(64)`;
 6. the storage layer flushes and closes.
