@@ -89,10 +89,24 @@ Alternatives considered and rejected:
    clocks (submit from the API-serving replica, dispatch from the leader), so
    `at_us` regressing as the index advances is normal, not exceptional. The
    record keeps the raw value everywhere. Every wire event carries
-   `(index, ordinal, at_us)` — `ordinal` is the event's position within its
-   batch, deterministic per KOI-3 — and **all ordering, rendering, and
+   `(index, ordinal, at_us)`, and **all ordering, rendering, and
    deduplication key on `(index, ordinal)`, never on `at_us`** (the web UI's
    current timeline sort and feed dedup key must change accordingly).
+
+   **Ordinals are assigned once, before any filtering.** `ordinal` is the
+   event's position within its *full* batch as derived by apply —
+   deterministic per KOI-3 — and it is part of the event's identity from
+   that moment on. Every downstream layer carries `(ordinal, event)` pairs:
+   the scoped fanout filters pairs and preserves the assigned ordinals (so a
+   `Job`- or `Node`-scoped subscription may legitimately see ordinal gaps
+   within an index), and the history writer and wire encoders emit the
+   assigned ordinal verbatim. The current `filter_events` implementation,
+   which collects matching events into a fresh `Vec` and thereby discards
+   their positions, must change: renumbering after a filter would give the
+   same event a different identity per subscription scope (batch
+   `[job-A, job-B]`: an all-events consumer would call job-B ordinal 1
+   while a job-B subscription called it ordinal 0), silently breaking
+   deduplication and history keys.
    Windowing consumers may clamp locally when bucketing. The fanout exports a
    `proposer_skew` measurement (|`at_us` − local receipt time|) via the
    standard `describe_metrics()`/`gather_metrics()` pattern so a
@@ -123,7 +137,18 @@ Alternatives considered and rejected:
    span — tap overflow, restart beyond the ring window, a store outage longer
    than an hour — it writes an **explicit gap row** (`from_index`,
    `to_index`), and the timeline renders the hole; it never serves a silently
-   smooth line across one. The pipeline never blocks apply, never gates log
+   smooth line across one.
+
+   **Cursor persistence invariant: rows before cursor.** The cursor may
+   advance only after every event and gap row it would newly cover has
+   durably committed — in the same transaction as those rows, or strictly
+   after them; never before. The asymmetry is why: a cursor *behind* the
+   rows is safe (a crash re-inserts rows that conflict-away against the
+   idempotent PK), while a cursor *ahead* of the rows is a silent, permanent
+   hole — the next leader resumes past data that was never written and never
+   records the gap, violating T3 and T4 with no trace in the record.
+
+   The pipeline never blocks apply, never gates log
    purge, and never fails a proposal: exactly ADR 0012's sink. The one
    *blocking* history write in the system remains KOI-1's terminal-record
    write sequenced before `EvictTerminalJobs`, which guarantees final
@@ -166,6 +191,15 @@ Alternatives considered and rejected:
   cursor advances and rows resume with no duplicates.
 - **(T4) Handoff.** Writer resumption on a different replica from the stored
   cursor, within the ring window, produces the same table as no handoff.
+- **(T5) Crash safety of the cursor.** A writer killed at any point between
+  committing rows and advancing the cursor yields, after resumption, the same
+  table as an uninterrupted writer (duplicates conflict away against the
+  idempotent PK); no interleaving of crash and resume can produce a cursor
+  ahead of a missing row without a covering gap row.
+- **(T6) Scope-invariant identity.** For an identical committed log, the
+  `(index, ordinal)` assigned to a given event is identical whether observed
+  through an all-events subscription, any scoped subscription that admits it,
+  the history table, or a wire payload.
 
 ## Consequences
 
@@ -197,6 +231,10 @@ Alternatives considered and rejected:
   event table is possible later without changing any contract.
 - The web UI changes sort/dedup keys from `atUs` to `(index, ordinal)`, and
   the mock's `TimelineEvent` gains those fields before the real client swap.
+- The scoped fanout's shape changes: subscriptions deliver `(ordinal, event)`
+  pairs filtered from the batch rather than a repacked `Vec<Event>`, at the
+  cost of one small integer per delivered event — the price of an identity
+  that survives filtering.
 - What this does **not** unblock stays visibly unblocked: measured usage
   series wait on the measurement-pipeline decision, and container logs remain
   provisional per ADR 0031.
