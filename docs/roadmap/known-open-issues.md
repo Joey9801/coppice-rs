@@ -21,7 +21,7 @@ waive them.
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10; drop-and-gap completeness 2026-07-12) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, instrumentation, and apply latency resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
-| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open | Every time-ranged read stays unserved: no queue rates or history, no job timeline, no usage/utilization series, no events window |
+| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open (design settled 2026-07-15, ADR 0032) | Every time-ranged read stays unserved: no queue rates or history, no job timeline, no usage/utilization series, no events window |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
 
@@ -435,11 +435,17 @@ and those bounds are enforced in CI or a required performance gate.
 ## KOI-6: Nothing records *when* anything happened, so no windowed read can be served
 
 - **Severity:** High
-- **Status:** Open
+- **Status:** Open — the design is settled (2026-07-15,
+  [ADR 0032](../decisions/0032-advisory-event-timestamps.md)); the
+  implementation is not
 - **Affected capability:** every time-ranged read on the public API — the
   overview's queue rates and history and its recent-events window, the job
   timeline, job usage and node utilization series, and the ADR 0008 event
-  subscription
+  subscription. *Narrowed by ADR 0032:* measured usage series (`GetJobUsage`
+  samples and node utilization's `used` half) are measurements, not
+  transitions — no command carries them, so no event derivation can serve
+  them; they wait on a separate off-consensus measurement-pipeline decision
+  and are no longer in this issue's scope
 - **Related decisions:** [ADR 0031](../decisions/0031-http-api-surface.md)
   (the route map that promises these reads),
   [ADR 0008](../decisions/0008-event-delivery-guarantees.md) (event delivery),
@@ -510,8 +516,17 @@ blocks them.
 
 ### Likely direction: advisory event timestamps
 
-Not yet an ADR, but the shape the resolution is expected to take, recorded so
-the next session does not re-derive it:
+**Settled 2026-07-15 by
+[ADR 0032](../decisions/0032-advisory-event-timestamps.md)**, which confirms
+this direction and answers the open questions below: batch-level stamping via
+an exhaustive `Command::stamped_at_us()` (per-event is the identical value,
+since every command carries exactly one stamp); sub-items inherit the batch's
+stamp under the documented "proposer-asserted time" semantics; skew is stored
+raw with all ordering on `(index, ordinal)` and clamping left to consumers;
+and the retention line is three tiers (fanout ring for reconnection and the
+recent-events cache, a history event table for timelines, in-memory 30 s
+buckets for windowed stats). The section below is preserved as the original
+derivation:
 
 **Every command already carries a proposer-stamped timestamp** —
 `submitted_at_us`, `requested_at_us`, `observed_at_us`, `dispatched_at_us`,
@@ -557,8 +572,10 @@ Questions the ADR still has to settle:
 
 ### Resolution requirements
 
-- Record the event-timestamp design in an ADR: advisory semantics, placement,
-  nested-item rule, skew/monotonicity handling, and the retention line above.
+- ~~Record the event-timestamp design in an ADR: advisory semantics,
+  placement, nested-item rule, skew/monotonicity handling, and the retention
+  line above.~~ Done —
+  [ADR 0032](../decisions/0032-advisory-event-timestamps.md).
 - Stamp events deterministically from the proposing command's timestamp, and
   pin it with a determinism test (an identical log yields identical
   `(index, at_us, events)` on every replica).
