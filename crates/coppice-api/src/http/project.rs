@@ -275,11 +275,11 @@ struct QueueRates {
     drains_per_minute: Option<f64>,
 }
 
-/// Headline `(arrivals, drains)` per minute over the newest
-/// [`RATE_WINDOW_BUCKETS`] closed buckets, scaled by their *recorded*
-/// spans — a stall-stretched bucket contributes its real coverage, never an
-/// assumed 30 s. `None` when the window covers no time at all (never a
-/// fabricated `0.0` — see `dto::QueueStats`).
+/// Headline [`QueueRates`] (`arrivals_per_minute`, `drains_per_minute`) over
+/// the newest [`RATE_WINDOW_BUCKETS`] closed buckets, scaled by their
+/// *recorded* spans — a stall-stretched bucket contributes its real coverage,
+/// never an assumed 30 s. Each field is `None` when the window covers no time
+/// at all (never a fabricated `0.0` — see `dto::QueueStats`).
 fn queue_rates(window: &QueueWindow) -> QueueRates {
     let newest = &window.buckets[window.buckets.len().saturating_sub(RATE_WINDOW_BUCKETS)..];
     let covered_us: i64 = newest.iter().map(|b| (b.end_us - b.start_us).max(0)).sum();
