@@ -345,11 +345,17 @@ async fn run(
         // The biased select below polls the tap ahead of the request inbox,
         // so a saturated tap would starve requests indefinitely — and a
         // `Recent` request has an HTTP handler blocked on its reply. Requests
-        // are cheap and their inbox is small, so drain whatever is pending
-        // between select points: at most one inbox of requests is served per
-        // tap item, and neither side can starve the other.
-        while let Ok(req) = subscribe_rx.try_recv() {
-            handle_request(&mut subscribers, &mut next_id, &ring, req);
+        // are cheap and their inbox is small, so sweep what is pending
+        // between select points. The sweep is bounded to one inbox's
+        // capacity: concurrent senders can refill the channel while it
+        // drains, and an unbounded `while try_recv` would let sustained
+        // request traffic pin the loop here and starve the tap — the exact
+        // starvation this sweep exists to prevent, reversed.
+        for _ in 0..crate::limits::SUBSCRIBE_REQUESTS_CAPACITY {
+            match subscribe_rx.try_recv() {
+                Ok(req) => handle_request(&mut subscribers, &mut next_id, &ring, req),
+                Err(_) => break,
+            }
         }
         tokio::select! {
             biased;
@@ -803,6 +809,55 @@ mod tests {
 
         producer.abort();
         let _ = shutdown_tx.send(true);
+        let _ = join.await;
+    }
+
+    /// The converse: a sustained flood of requests must not pin the sweep
+    /// and starve the tap (the sweep is bounded per select point). Multi-
+    /// threaded so the flooders genuinely refill the inbox while it drains.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tap_makes_progress_under_sustained_request_traffic() {
+        let (mut tap, tap_rx) = coppice_consensus::EventTap::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (handle, join) = spawn(tap_rx, 0, shutdown_rx);
+
+        let mut sub = handle
+            .subscribe(EventFilter::All, None)
+            .await
+            .expect("subscribe");
+
+        // Enough concurrent clients to keep the 64-slot inbox refilled.
+        let flooders: Vec<_> = (0..64)
+            .map(|_| {
+                let handle = handle.clone();
+                tokio::spawn(async move { while handle.recent(1).await.is_ok() {} })
+            })
+            .collect();
+
+        // Emitted batches must still reach the subscriber: any delivery
+        // (events, or a gap from tap overflow) proves the loop is servicing
+        // the tap under the flood.
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut index = 1u64;
+            loop {
+                tap.emit(one_event_batch(index));
+                index += 1;
+                match sub.items.try_recv() {
+                    Ok(_) => return,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        assert!(
+            delivered.is_ok(),
+            "tap starved behind sustained request traffic"
+        );
+
+        let _ = shutdown_tx.send(true);
+        for flooder in flooders {
+            flooder.abort();
+        }
         let _ = join.await;
     }
 
