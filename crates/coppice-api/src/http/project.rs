@@ -1309,6 +1309,8 @@ mod tests {
                 name: "root".to_string(),
                 quota: coppice_core::quota::CostUnits::ZERO,
                 usage: coppice_core::quota::UsageState::new(ts(0)),
+                created_at: ts(0),
+                updated_at: ts(0),
             },
         );
         state.quota_entities.insert(
@@ -1318,6 +1320,8 @@ mod tests {
                 name: "child".to_string(),
                 quota: coppice_core::quota::CostUnits::ZERO,
                 usage: coppice_core::quota::UsageState::new(ts(0)),
+                created_at: ts(0),
+                updated_at: ts(0),
             },
         );
         let root_job = job_id(1);

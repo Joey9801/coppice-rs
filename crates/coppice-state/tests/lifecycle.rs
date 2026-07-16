@@ -13,8 +13,8 @@ use coppice_core::job::{JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
 use coppice_core::time::Duration;
 use coppice_state::command::{
-    BumpClusterVersion, CommitPlacements, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
-    ReconcileNode, SetNodeSchedulable,
+    BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs,
+    LostAttempt, ReconcileNode, SetNodeSchedulable,
 };
 use coppice_state::{Command, Event, Rejection, RejectionReason};
 
@@ -1045,6 +1045,35 @@ fn quota_entity_updates_preserve_usage_and_reject_cycles() {
     let usage = sm.quota_entities[&ROOT].usage;
     apply_ok(&mut sm, configure_entity_cmd(ROOT, None));
     assert_eq!(sm.quota_entities[&ROOT].usage, usage);
+}
+
+#[test]
+fn quota_entity_timestamps_stamp_on_create_and_advance_only_updated() {
+    let mut sm = setup();
+    let create_at = ts(1_000_000);
+    let update_at = ts(9_000_000);
+    let configure = |entity, parent, name: &str, at| {
+        Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+            entity,
+            parent,
+            name: name.into(),
+            quota: CostUnits(1_000_000_000_000),
+            updated_at: at,
+        })
+    };
+
+    // On insert, created_at == updated_at == the command's stamp.
+    apply_ok(&mut sm, configure(qid(7), Some(ROOT), "seven", create_at));
+    let created = &sm.quota_entities[&qid(7)];
+    assert_eq!(created.created_at, create_at);
+    assert_eq!(created.updated_at, create_at);
+
+    // On update, updated_at advances to the new stamp; created_at is preserved.
+    apply_ok(&mut sm, configure(qid(7), Some(ROOT), "renamed", update_at));
+    let updated = &sm.quota_entities[&qid(7)];
+    assert_eq!(updated.name, "renamed");
+    assert_eq!(updated.created_at, create_at);
+    assert_eq!(updated.updated_at, update_at);
 }
 
 #[test]

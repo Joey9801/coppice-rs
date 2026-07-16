@@ -179,6 +179,8 @@ mod tests {
                 usage: CostUnits(usage),
                 last_update: ts(),
             },
+            created_at: ts(),
+            updated_at: ts(),
         }
     }
 

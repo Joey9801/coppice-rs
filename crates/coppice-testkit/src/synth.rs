@@ -659,6 +659,8 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time: Timestamp) -> QuotaT
                 name: format!("org-{i}"),
                 quota,
                 usage,
+                created_at: base_time,
+                updated_at: base_time,
             },
         ));
         root_ids.push(id);
@@ -680,6 +682,8 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time: Timestamp) -> QuotaT
                 name: format!("team-{i}"),
                 quota,
                 usage,
+                created_at: base_time,
+                updated_at: base_time,
             },
         ));
         team_ids.push(id);
@@ -701,6 +705,8 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time: Timestamp) -> QuotaT
                 name: format!("leaf-{i}"),
                 quota,
                 usage,
+                created_at: base_time,
+                updated_at: base_time,
             },
         ));
         leaf_ids.push(id);
