@@ -22,7 +22,9 @@ use serde::Deserialize;
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 
-use super::dto::{self, AbortJobRequest, AbortJobResponse, SubmitJobRequest};
+use super::dto::{
+    self, AbortJobRequest, AbortJobResponse, ConfigureQuotaEntityRequest, SubmitJobRequest,
+};
 use crate::{Consistency, ControlPlane};
 
 use super::error::HttpError;
@@ -92,13 +94,9 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         // configuration reads); configure is the ADR-0023-gated upsert.
         .route(
             "/api/v1/quota-entities",
-            get(unimplemented_read("ListQuotaEntities"))
-                .post(unimplemented("ConfigureQuotaEntity")),
+            get(list_quota_entities::<P>).post(configure_quota_entity::<P>),
         )
-        .route(
-            "/api/v1/quota-entities/:entity",
-            get(unimplemented_id_read::<QuotaEntityId>("GetQuotaEntity")),
-        )
+        .route("/api/v1/quota-entities/:entity", get(get_quota_entity::<P>))
         // Reserved: ADR 0008 event subscription (SSE, cursor-resumed).
         .route("/api/v1/events", get(unimplemented_read("SubscribeEvents")))
         // Everything unrouted: `/api/*` misses stay JSON 404s; anything
@@ -106,15 +104,6 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         // ADR 0031 "Serving the UI").
         .fallback(super::ui::fallback)
         .with_state(plane)
-}
-
-/// Stub for an unimplemented write route: routed (so the path is claimed
-/// and typos 404 distinctly) but answering `501 UNIMPLEMENTED` with the
-/// endpoint name.
-fn unimplemented(
-    endpoint: &'static str,
-) -> impl Fn() -> std::future::Ready<HttpError> + Clone + Send + 'static {
-    move || ready(HttpError::unimplemented(endpoint))
 }
 
 /// Stub for an unimplemented read route. Extracting [`ReadQuery`] makes the
@@ -248,6 +237,20 @@ async fn abort_job<P: ControlPlane>(
     Ok(Json(AbortJobResponse {}))
 }
 
+/// `POST /api/v1/quota-entities` — body `ConfigureQuotaEntityRequest`, the
+/// create-or-update upsert (ADR 0031's write class). Response echoes the
+/// client-minted entity id + `log_index` for read-your-writes, exactly like
+/// `SubmitJob`. A cycle / unknown-parent refusal maps to `REJECTED` (409),
+/// the normal committed-and-refused outcome.
+async fn configure_quota_entity<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    body: Result<Json<ConfigureQuotaEntityRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let Json(request) = body.map_err(bad_body)?;
+    let response = plane.configure_quota_entity(request).await?;
+    Ok(Json(response))
+}
+
 /// Events served in the overview's `recent_events` window — a display
 /// window, deliberately smaller than the ring behind it (a client wanting
 /// more history uses the timeline/subscription endpoints).
@@ -323,6 +326,47 @@ async fn get_node<P: ControlPlane>(
     ))
 }
 
+/// `GET /api/v1/quota-entities` — bounded by default (ADR 0031). `Timestamp::now()`
+/// decays each entity's usage to read time (a read-time figure, never stored).
+async fn list_quota_entities<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    let response = super::project::list_quota_entities(view.state(), Timestamp::now());
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `GET /api/v1/quota-entities/{entity}` — **strong** by default (ADR 0031
+/// puts it in the ADR 0007 configuration-read class, unlike the bounded list
+/// and node reads). 404 when the id is not in the tree, like [`get_node`].
+async fn get_quota_entity<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    IdPath(id): IdPath<QuotaEntityId>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Strong))
+        .await?;
+    let response = super::project::get_quota_entity(view.state(), &id, Timestamp::now())
+        .ok_or_else(|| HttpError::not_found(format!("quota entity {id} not found")))?;
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
 fn bad_body(rejection: JsonRejection) -> HttpError {
     HttpError::invalid(rejection.body_text())
 }
@@ -349,6 +393,9 @@ mod tests {
         queue_window: QueueWindow,
         recent: RecentClusterEvents,
         state: coppice_state::StateMachine,
+        /// Every consistency class `read_state` was asked for, so a test can
+        /// assert a route's default (e.g. the strong quota-entity detail).
+        read_consistency: std::sync::Mutex<Vec<Consistency>>,
     }
 
     const STUB_CLUSTER: &str = "cluster-00000000-0000-0000-0000-000000000009";
@@ -385,7 +432,21 @@ mod tests {
             }
         }
 
-        async fn read_state(&self, _opts: ReadOptions) -> Result<ReadView, ApiError> {
+        async fn configure_quota_entity(
+            &self,
+            req: dto::ConfigureQuotaEntityRequest,
+        ) -> Result<dto::ConfigureQuotaEntityResponse, ApiError> {
+            match self.fail_with {
+                Some(make) => Err(make()),
+                None => Ok(dto::ConfigureQuotaEntityResponse {
+                    entity: req.entity,
+                    log_index: 7,
+                }),
+            }
+        }
+
+        async fn read_state(&self, opts: ReadOptions) -> Result<ReadView, ApiError> {
+            self.read_consistency.lock().unwrap().push(opts.consistency);
             Ok(ReadView::new(self.state.clone(), 1, 1))
         }
     }
@@ -408,6 +469,7 @@ mod tests {
                 events: Vec::new(),
             },
             state,
+            read_consistency: std::sync::Mutex::default(),
         }))
     }
 
@@ -500,6 +562,7 @@ mod tests {
                 }],
             },
             state: coppice_state::StateMachine::default(),
+            read_consistency: std::sync::Mutex::default(),
         };
         let response = router(Arc::new(plane))
             .oneshot(
@@ -924,6 +987,184 @@ mod tests {
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    /// An `Arc<StubPlane>` kept alongside the router, so a test can both
+    /// drive the app and inspect what the plane was asked (e.g. the read
+    /// consistency a route defaulted to).
+    fn stub_plane(state: coppice_state::StateMachine) -> Arc<StubPlane> {
+        Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            recent: RecentClusterEvents {
+                floor_index: 1,
+                events: Vec::new(),
+            },
+            state,
+            read_consistency: std::sync::Mutex::default(),
+        })
+    }
+
+    /// A state machine holding one quota entity (root, at-quota) so the list
+    /// and detail reads project a real node.
+    fn state_with_entity(id: QuotaEntityId) -> coppice_state::StateMachine {
+        let mut state = coppice_state::StateMachine::default();
+        state.quota_entities.insert(
+            id,
+            coppice_state::QuotaEntity {
+                parent: None,
+                name: "root".to_string(),
+                quota: coppice_core::quota::CostUnits(1_000_000),
+                usage: coppice_core::quota::UsageState::new(Timestamp::from_micros(0).unwrap()),
+                created_at: Timestamp::from_micros(1_000_000).unwrap(),
+                updated_at: Timestamp::from_micros(1_000_000).unwrap(),
+            },
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn list_quota_entities_returns_an_envelope_with_headers() {
+        let id = QuotaEntityId::new();
+        let response = app_with_state(None, state_with_entity(id))
+            .oneshot(
+                Request::get("/api/v1/quota-entities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        let body = body_json(response).await;
+        // Object envelope, never a bare array (ADR 0031).
+        assert_eq!(body["entities"][0]["id"], id.to_string());
+        assert_eq!(body["entities"][0]["queued_count"], 0);
+        // SSO provenance is omitted, not null.
+        assert!(body["entities"][0].get("origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_quota_entities_defaults_to_a_bounded_read() {
+        let plane = stub_plane(coppice_state::StateMachine::default());
+        let response = router(plane.clone())
+            .oneshot(
+                Request::get("/api/v1/quota-entities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            plane.read_consistency.lock().unwrap().last(),
+            Some(&Consistency::Bounded)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_quota_entity_returns_not_found_for_missing() {
+        let entity = QuotaEntityId::new();
+        let response = app(None)
+            .oneshot(
+                Request::get(format!("/api/v1/quota-entities/{entity}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn get_quota_entity_defaults_to_a_strong_read() {
+        // ADR 0031 puts the detail read in the configuration-read class:
+        // strong by default, unlike the bounded list and node reads.
+        let id = QuotaEntityId::new();
+        let plane = stub_plane(state_with_entity(id));
+        let response = router(plane.clone())
+            .oneshot(
+                Request::get(format!("/api/v1/quota-entities/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            plane.read_consistency.lock().unwrap().last(),
+            Some(&Consistency::Strong)
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["entity"]["id"], id.to_string());
+        assert_eq!(body["chain"][0]["id"], id.to_string());
+        assert_eq!(body["stats"]["charged_ucu_24h"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn get_quota_entity_rejects_a_malformed_path_id() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/quota-entities/not-an-entity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn configure_quota_entity_echoes_the_entity_and_log_index() {
+        let entity = QuotaEntityId::new();
+        let body = format!(
+            r#"{{ "entity": "{entity}", "parent": null, "name": "team", "quota_ucu": 1000 }}"#
+        );
+        let response = app(None)
+            .oneshot(post_json("/api/v1/quota-entities", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["entity"], entity.to_string());
+        assert_eq!(body["log_index"], 7);
+    }
+
+    #[tokio::test]
+    async fn configure_quota_entity_maps_a_rejection_to_409() {
+        let entity = QuotaEntityId::new();
+        let response = app(Some(|| {
+            ApiError::Rejected(coppice_state::RejectionReason::QuotaEntityCycle(
+                QuotaEntityId::new(),
+            ))
+        }))
+        .oneshot(post_json(
+            "/api/v1/quota-entities",
+            &format!(r#"{{ "entity": "{entity}", "name": "team", "quota_ucu": 1000 }}"#),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["code"], "REJECTED");
+    }
+
+    #[tokio::test]
+    async fn configure_quota_entity_with_an_unknown_field_is_invalid_argument() {
+        let entity = QuotaEntityId::new();
+        // camelCase `quotaUcu` must not be accepted alongside `quota_ucu`.
+        let body = format!(
+            r#"{{ "entity": "{entity}", "name": "team", "quota_ucu": 1000, "quotaUcu": 2000 }}"#
+        );
+        let response = app(None)
+            .oneshot(post_json("/api/v1/quota-entities", &body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);

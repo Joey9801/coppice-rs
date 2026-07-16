@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
-use coppice_api::http::dto::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
+use coppice_api::http::dto::{
+    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest,
+    SubmitJobResponse,
+};
 use coppice_api::{
     ApiError, Consistency, ControlPlane, QueueWindow, ReadOptions, ReadView, RecentClusterEvents,
     StampedEvent,
@@ -23,8 +26,9 @@ use coppice_api::{
 use coppice_consensus::{Applied, Consensus, ConsensusError, StateViews};
 use coppice_core::id::ClusterId;
 use coppice_core::job::Job;
+use coppice_core::quota::CostUnits;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::command::{AbortJob, SubmitJob};
+use coppice_state::command::{AbortJob, ConfigureQuotaEntity, SubmitJob};
 use coppice_state::Command;
 
 use crate::tasks::event_fanout::FanoutHandle;
@@ -192,6 +196,39 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
 
         match self.consensus.propose(command).await {
             Ok(Applied { outcome: Ok(_), .. }) => Ok(()),
+            Ok(Applied {
+                outcome: Err(rejection),
+                ..
+            }) => Err(ApiError::Rejected(rejection)),
+            Err(e) => Err(map_consensus_error(e)),
+        }
+    }
+
+    async fn configure_quota_entity(
+        &self,
+        req: ConfigureQuotaEntityRequest,
+    ) -> Result<ConfigureQuotaEntityResponse, ApiError> {
+        // The client-minted entity id is the upsert's idempotency identity
+        // (ADR 0026), echoed back on success. Direct copy of abort_job's
+        // propose-and-map shape; the id and quota ride the command as-is,
+        // with `updated_at` stamped by this proposer (apply never reads a
+        // clock). Cycle / unknown-parent refusals come back through the
+        // rejection arm as a normal 409. No authz — matching the existing
+        // submit_job/abort_job precedent (ADR 0023 is a separate subsystem).
+        let entity = req.entity;
+        let command = Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+            entity,
+            parent: req.parent,
+            name: req.name,
+            quota: CostUnits(req.quota_ucu),
+            updated_at: Timestamp::now(),
+        });
+
+        match self.consensus.propose(command).await {
+            Ok(Applied {
+                outcome: Ok(_),
+                log_index,
+            }) => Ok(ConfigureQuotaEntityResponse { entity, log_index }),
             Ok(Applied {
                 outcome: Err(rejection),
                 ..
@@ -453,5 +490,52 @@ mod tests {
             reason: None,
         };
         assert!(cp.abort_job(req).await.is_ok());
+    }
+
+    fn configure_request(entity: coppice_core::id::QuotaEntityId) -> ConfigureQuotaEntityRequest {
+        ConfigureQuotaEntityRequest {
+            entity,
+            parent: None,
+            name: "team".to_string(),
+            quota_ucu: 1_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_configure_echoes_the_entity_and_log_index() {
+        let cp = control_plane(ProposeOutcome::Accepted);
+        let entity = coppice_core::id::QuotaEntityId::new();
+        let response = cp
+            .configure_quota_entity(configure_request(entity))
+            .await
+            .expect("accepted");
+        assert_eq!(response.entity, entity);
+        assert!(response.log_index > 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_configure_maps_to_rejected() {
+        // A cycle / unknown-parent refusal is a committed-and-refused apply,
+        // surfaced as a normal 409, not a server fault.
+        let reason = coppice_state::RejectionReason::QuotaEntityCycle(
+            coppice_core::id::QuotaEntityId::new(),
+        );
+        let cp = control_plane(ProposeOutcome::Rejected(reason));
+        let result = cp
+            .configure_quota_entity(configure_request(coppice_core::id::QuotaEntityId::new()))
+            .await;
+        assert!(matches!(result, Err(ApiError::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn not_leader_configure_maps_to_not_leader_without_a_fake_hint() {
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)));
+        let result = cp
+            .configure_quota_entity(configure_request(coppice_core::id::QuotaEntityId::new()))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApiError::NotLeader { leader_hint: None })
+        ));
     }
 }
