@@ -137,6 +137,54 @@ pub struct RecentClusterEvents {
     pub events: Vec<StampedEvent>,
 }
 
+/// This replica's view of the raft cluster for `GET /api/v1/coordinators`
+/// (ADR 0031, local read) — the consensus/membership facts the raft layer
+/// knows, with no replicated-state counts (those come from a `read_state`
+/// snapshot at the handler and are projected purely).
+///
+/// Ids are plain `u64` raft identities: `coppice-api` speaks DTOs and does
+/// not depend on `coppice-consensus`, so its `CoordinatorId` type never
+/// crosses this boundary. The coordinator translates its `ClusterSummary`
+/// into this shape before handing it over.
+#[derive(Debug, Clone)]
+pub struct CoordinatorSummary {
+    /// The serving replica's own raft id — the one member whose applied
+    /// index we can report exactly.
+    pub local_id: u64,
+    /// The current leader's raft id, when one is known.
+    pub leader: Option<u64>,
+    /// The current raft term.
+    pub term: u64,
+    /// Highest committed index this replica knows of.
+    pub known_committed: u64,
+    /// Highest applied index on this replica.
+    pub last_applied: u64,
+    /// Log index the last snapshot covers, from openraft metrics — `None`
+    /// when this replica has taken no snapshot yet. The projection derives
+    /// `entries_since_snapshot` from it; snapshot size and time have no
+    /// source (`SnapshotMeta` carries neither) and are always null.
+    pub snapshot_last_index: Option<u64>,
+    /// One entry per configured cluster member.
+    pub members: Vec<CoordinatorMemberSummary>,
+}
+
+/// One membership entry in a [`CoordinatorSummary`].
+#[derive(Debug, Clone)]
+pub struct CoordinatorMemberSummary {
+    /// The member's raft id.
+    pub id: u64,
+    /// The address peers dial (host:port).
+    pub addr: String,
+    /// Whether the member is a voter (vs a learner) — drives the projected
+    /// role.
+    pub voter: bool,
+    /// The leader's matched (replicated) index for this member, when this
+    /// replica is leader and tracks it; `None` on followers or for a member
+    /// with no replication entry. The projection turns it into
+    /// `replication_lag_entries`.
+    pub matched_index: Option<u64>,
+}
+
 /// Errors surfaced to API callers.
 ///
 /// A `Rejected` outcome means the command committed and apply refused it
@@ -222,4 +270,15 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// (ADR 0032, tier 1), newest first, at most `limit` — derived class,
     /// replica-local, with the coverage floor.
     fn recent_events(&self, limit: usize) -> impl Future<Output = RecentClusterEvents> + Send;
+
+    /// This replica's view of the raft cluster for `GET /api/v1/coordinators`
+    /// (ADR 0031, local read): leader/term/indexes and per-member membership,
+    /// read straight from the consensus metrics — no replicated state, no
+    /// consensus round-trip.
+    ///
+    /// `Err(ApiError::Unavailable)` when the consensus handle is not attached
+    /// to this API server (the same "no coverage" posture as a missing fanout
+    /// ring): the replicated-state reads still work, but this raft-level view
+    /// cannot be produced.
+    fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError>;
 }

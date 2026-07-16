@@ -288,6 +288,7 @@ ca_path = "{ca}"
         Arc::clone(&consensus),
         views.clone(),
         event_tap,
+        handle.clone(),
         listener,
         client_listener,
         cluster_id,

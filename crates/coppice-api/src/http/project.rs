@@ -16,7 +16,7 @@ use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::{AttemptRecord, JobRecord, StateMachine};
 
-use crate::{QueueWindow, RecentClusterEvents};
+use crate::{CoordinatorSummary, QueueWindow, RecentClusterEvents};
 
 use super::dto;
 
@@ -382,6 +382,79 @@ fn funded_fraction(funded: &Resources, requested: &Resources) -> dto::FundedFrac
         cpu: frac(funded.cpu_millis, requested.cpu_millis),
         memory: frac(funded.memory_bytes, requested.memory_bytes),
         disk: frac(funded.disk_bytes, requested.disk_bytes),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coordinators (GET /api/v1/coordinators)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/coordinators`.
+///
+/// Joins the consensus/membership `summary` (leader, term, indexes, roster)
+/// with a replica-local `state` snapshot (version + object counts) and the
+/// replica's own `cluster_id`. Pure: role, per-member lag, and the snapshot
+/// derivation are computed here from the inputs, never stored.
+pub fn coordinator_status(
+    summary: &CoordinatorSummary,
+    cluster_id: ClusterId,
+    state: &StateMachine,
+) -> dto::GetCoordinatorStatusResponse {
+    let members = summary
+        .members
+        .iter()
+        .map(|m| {
+            let role = if summary.leader == Some(m.id) {
+                dto::CoordinatorRole::Leader
+            } else if !m.voter {
+                dto::CoordinatorRole::Learner
+            } else {
+                dto::CoordinatorRole::Follower
+            };
+            dto::CoordinatorMember {
+                id: m.id,
+                addr: m.addr.clone(),
+                role,
+                voter: m.voter,
+                // Exact for the serving replica; unknowable for peers (their
+                // apply progress is not tracked — only their replicated index).
+                last_applied: (m.id == summary.local_id).then_some(summary.last_applied),
+                // Leader-only, from the matched (replicated) index.
+                replication_lag_entries: m
+                    .matched_index
+                    .map(|matched| summary.known_committed.saturating_sub(matched)),
+            }
+        })
+        .collect();
+
+    // A snapshot section only when this replica has actually taken one; size
+    // and time have no source, so they are null (see `dto::CoordinatorSnapshot`).
+    let snapshot =
+        summary
+            .snapshot_last_index
+            .map(|last_included_index| dto::CoordinatorSnapshot {
+                size_bytes: None,
+                last_included_index,
+                taken_at: None,
+                entries_since_snapshot: summary.last_applied.saturating_sub(last_included_index),
+            });
+
+    dto::GetCoordinatorStatusResponse {
+        cluster_id,
+        leader: summary.leader,
+        term: summary.term,
+        known_committed: summary.known_committed,
+        last_applied: summary.last_applied,
+        state_version: state.version,
+        snapshot,
+        state_counts: dto::CoordinatorStateCounts {
+            jobs: state.jobs.len() as u64,
+            attempts: state.attempts.len() as u64,
+            allocations: state.allocations.len() as u64,
+            nodes: state.nodes.len() as u64,
+            quota_entities: state.quota_entities.len() as u64,
+        },
+        members,
     }
 }
 
