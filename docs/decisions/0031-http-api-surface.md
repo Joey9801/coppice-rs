@@ -55,17 +55,15 @@ every field as optional); **protobuf stays canonical for internal RPC,
 storage, and replication**. DTO conventions, fixed for v1: snake_case
 keys (`"cpu_millis"`) and snake_case string enums (`"unknown"`,
 `"oom_killed"`), ids as their bare typed strings (`"job-<uuid>"`),
-integers as JSON numbers, `null` for absent optionals, `[]` for empty
-lists. The web client maps snake_case wire keys onto its camelCase
-`types.ts` shapes at its boundary.
-
-*(Amended 2026-07-16: "integers as JSON numbers" no longer covers time.
-Instants are ISO 8601 strings (`"2026-07-16T09:30:00Z"`) and durations
-are `_seconds`-suffixed JSON numbers, mirroring the `Timestamp` and
-`Duration` types in `coppice_core::time`. An integer carries neither its
-epoch nor its scale, so every client had to be told what
-`"submitted_at_us": 1760000000000000` meant. Everything else here
-stands.)*
+instants as ISO 8601 strings (`"2026-07-16T09:30:00Z"`) and durations as
+`_seconds`-suffixed JSON numbers, other integers as JSON numbers, `null`
+for absent optionals, `[]` for empty lists. Time is spelled out rather
+than left as a bare integer because an integer carries neither its epoch
+nor its scale, so every client would have to be told what
+`1760000000000000` meant; a duration has no epoch or timezone to lose,
+which is the argument for stringifying an instant, so it stays a number
+with the unit in the key. The web client maps snake_case wire keys onto
+its camelCase `types.ts` shapes at its boundary.
 
 The `coppice.api.v1` proto messages remain the cross-language description
 of this surface (and what a future gRPC client plane would serve); the
