@@ -165,6 +165,7 @@ impl NodeHandle {
             term: m.current_term,
             last_applied: m.last_applied.map(|id| id.index).unwrap_or(0),
             known_committed,
+            snapshot_last_index: m.snapshot.map(|id| id.index),
             members,
             replication,
         }
@@ -184,6 +185,9 @@ pub struct ClusterSummary {
     pub last_applied: u64,
     /// Highest committed index this node knows of.
     pub known_committed: u64,
+    /// Log index the last snapshot covers (openraft's snapshot metric);
+    /// `None` when this node has taken no snapshot yet.
+    pub snapshot_last_index: Option<u64>,
     /// Membership: id, dial address, and whether the node is a voter.
     pub members: Vec<MemberSummary>,
     /// Per-follower matched index; empty when this node is not leader.

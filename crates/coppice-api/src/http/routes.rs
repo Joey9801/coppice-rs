@@ -75,10 +75,7 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
             get(unimplemented_id_read::<NodeId>("GetNodeLogs")),
         )
         // Coordinators — local status read; logs provisional.
-        .route(
-            "/api/v1/coordinators",
-            get(unimplemented_read("GetCoordinatorStatus")),
-        )
+        .route("/api/v1/coordinators", get(get_coordinators::<P>))
         .route(
             "/api/v1/coordinators/:id/logs",
             // Coordinator ids are raft ids: plain u64, not typed uuids (ADR 0024).
@@ -408,6 +405,34 @@ async fn get_quota_entity<P: ControlPlane>(
     ))
 }
 
+/// `GET /api/v1/coordinators` — local read (ADR 0031). Two sources: the
+/// consensus/membership summary (raft-level, from `coordinator_status`) and a
+/// replica-local state snapshot (version + object counts). The snapshot rides
+/// the read plumbing so the response still carries staleness headers and
+/// honours `?consistency=`/`?min_index=`; local defaults to `Eventual` (the
+/// latest published view, no consensus round-trip).
+///
+/// When the consensus handle is not attached, `coordinator_status` is
+/// `UNAVAILABLE` (503) and the route fails as a whole — the raft-level view is
+/// the point of the endpoint.
+async fn get_coordinators<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let summary = plane.coordinator_status()?;
+    let view = plane
+        .read_state(params.into_options(Consistency::Eventual))
+        .await?;
+    let response = super::project::coordinator_status(&summary, plane.cluster_id(), view.state());
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
 fn bad_body(rejection: JsonRejection) -> HttpError {
     HttpError::invalid(rejection.body_text())
 }
@@ -421,7 +446,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::super::dto::SubmitJobResponse;
-    use crate::{ApiError, QueueWindow, ReadOptions, ReadView, RecentClusterEvents};
+    use crate::{
+        ApiError, CoordinatorMemberSummary, CoordinatorSummary, QueueWindow, ReadOptions, ReadView,
+        RecentClusterEvents,
+    };
 
     use crate::http::COPPICE_LEADER;
 
@@ -437,6 +465,9 @@ mod tests {
         /// Every consistency class `read_state` was asked for, so a test can
         /// assert a route's default (e.g. the strong quota-entity detail).
         read_consistency: std::sync::Mutex<Vec<Consistency>>,
+        /// The seeded raft summary, or `None` to model a control plane with no
+        /// consensus handle attached (→ `coordinator_status` is `Unavailable`).
+        coordinator: Option<CoordinatorSummary>,
     }
 
     const STUB_CLUSTER: &str = "cluster-00000000-0000-0000-0000-000000000009";
@@ -454,6 +485,12 @@ mod tests {
             let mut recent = self.recent.clone();
             recent.events.truncate(limit);
             recent
+        }
+
+        fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
+            self.coordinator
+                .clone()
+                .ok_or_else(|| ApiError::Unavailable("no consensus handle".into()))
         }
 
         async fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
@@ -511,6 +548,9 @@ mod tests {
             },
             state,
             read_consistency: std::sync::Mutex::default(),
+            // No handle by default: coordinator-status tests build their own
+            // plane with a seeded summary.
+            coordinator: None,
         }))
     }
 
@@ -600,6 +640,7 @@ mod tests {
             },
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),
+            coordinator: None,
         };
         let response = router(Arc::new(plane))
             .oneshot(
@@ -1045,6 +1086,7 @@ mod tests {
             },
             state,
             read_consistency: std::sync::Mutex::default(),
+            coordinator: None,
         })
     }
 
@@ -1345,5 +1387,203 @@ mod tests {
             "10.0.0.3:7070"
         );
         assert_eq!(body_json(response).await["code"], "NOT_LEADER");
+    }
+
+    // ---- coordinators -----------------------------------------------------
+
+    /// A control plane with a seeded raft summary and state, wired (a handle
+    /// is present).
+    fn coordinator_app(
+        coordinator: CoordinatorSummary,
+        state: coppice_state::StateMachine,
+    ) -> Router {
+        router(Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            recent: RecentClusterEvents {
+                floor_index: 1,
+                events: Vec::new(),
+            },
+            state,
+            read_consistency: std::sync::Mutex::default(),
+            coordinator: Some(coordinator),
+        }))
+    }
+
+    /// A three-member cluster: local leader (id 1), a follower (id 2), and a
+    /// learner (id 3), from the perspective of the leader.
+    fn seeded_summary() -> CoordinatorSummary {
+        CoordinatorSummary {
+            local_id: 1,
+            leader: Some(1),
+            term: 5,
+            known_committed: 100,
+            last_applied: 100,
+            snapshot_last_index: Some(64),
+            members: vec![
+                CoordinatorMemberSummary {
+                    id: 1,
+                    addr: "10.0.0.1:9001".to_string(),
+                    voter: true,
+                    matched_index: Some(100),
+                },
+                CoordinatorMemberSummary {
+                    id: 2,
+                    addr: "10.0.0.2:9001".to_string(),
+                    voter: true,
+                    matched_index: Some(90),
+                },
+                CoordinatorMemberSummary {
+                    id: 3,
+                    addr: "10.0.0.3:9001".to_string(),
+                    voter: false,
+                    matched_index: None,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinators_project_roles_lag_and_snapshot() {
+        let response = coordinator_app(seeded_summary(), coppice_state::StateMachine::default())
+            .oneshot(
+                Request::get("/api/v1/coordinators")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // A local read still carries the staleness headers.
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+
+        let body = body_json(response).await;
+        assert_eq!(body["leader"], 1);
+        assert_eq!(body["term"], 5);
+        assert_eq!(body["known_committed"], 100);
+        assert_eq!(body["last_applied"], 100);
+
+        // Roles derive from leader id + voter flag.
+        let members = body["members"].as_array().unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0]["role"], "leader");
+        assert_eq!(members[1]["role"], "follower");
+        assert_eq!(members[2]["role"], "learner");
+
+        // last_applied: exact for the local leader, null for peers.
+        assert_eq!(members[0]["last_applied"], 100);
+        assert_eq!(members[1]["last_applied"], serde_json::Value::Null);
+        assert_eq!(members[2]["last_applied"], serde_json::Value::Null);
+
+        // Lag math: known_committed − matched, leader-only.
+        assert_eq!(members[0]["replication_lag_entries"], 0); // 100 − 100
+        assert_eq!(members[1]["replication_lag_entries"], 10); // 100 − 90
+                                                               // The learner has no matched entry → null, never a fabricated 0.
+        assert_eq!(
+            members[2]["replication_lag_entries"],
+            serde_json::Value::Null
+        );
+
+        // Snapshot: only the covered index is real; size/time are explicit null.
+        assert_eq!(body["snapshot"]["last_included_index"], 64);
+        assert_eq!(body["snapshot"]["entries_since_snapshot"], 36); // 100 − 64
+        assert_eq!(body["snapshot"]["size_bytes"], serde_json::Value::Null);
+        assert_eq!(body["snapshot"]["taken_at"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn coordinators_omit_the_invented_host_and_last_seen_fields() {
+        let body = body_json(
+            coordinator_app(seeded_summary(), coppice_state::StateMachine::default())
+                .oneshot(
+                    Request::get("/api/v1/coordinators")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let member = &body["members"][0];
+        // These have no data source; the DTO omits them rather than inventing.
+        assert!(member.get("host").is_none());
+        assert!(member.get("last_seen").is_none());
+    }
+
+    #[tokio::test]
+    async fn coordinators_count_the_replicated_state() {
+        let a: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let b: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let mut state = state_with_jobs(&[a, b]);
+        state.version = 42;
+
+        let body = body_json(
+            coordinator_app(seeded_summary(), state)
+                .oneshot(
+                    Request::get("/api/v1/coordinators")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        // state_version is the applied-command count, not the raft log index.
+        assert_eq!(body["state_version"], 42);
+        assert_eq!(body["state_counts"]["jobs"], 2);
+        assert_eq!(body["state_counts"]["attempts"], 0);
+        assert_eq!(body["state_counts"]["allocations"], 0);
+        assert_eq!(body["state_counts"]["nodes"], 0);
+        assert_eq!(body["state_counts"]["quota_entities"], 0);
+    }
+
+    #[tokio::test]
+    async fn coordinators_serve_a_null_snapshot_before_the_first_one() {
+        let mut summary = seeded_summary();
+        summary.snapshot_last_index = None;
+        let body = body_json(
+            coordinator_app(summary, coppice_state::StateMachine::default())
+                .oneshot(
+                    Request::get("/api/v1/coordinators")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        // No snapshot yet: the whole object is null, never a zeroed shape.
+        assert_eq!(body["snapshot"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn coordinators_are_unavailable_without_a_consensus_handle() {
+        // `app(None)` builds a plane with `coordinator: None` — no handle wired.
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/coordinators")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(response).await["code"], "UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn coordinators_still_validate_the_consistency_parameter() {
+        let response = coordinator_app(seeded_summary(), coppice_state::StateMachine::default())
+            .oneshot(
+                Request::get("/api/v1/coordinators?consistency=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
     }
 }

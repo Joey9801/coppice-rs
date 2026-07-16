@@ -20,10 +20,10 @@ use coppice_api::http::dto::{
     SubmitJobResponse,
 };
 use coppice_api::{
-    ApiError, Consistency, ControlPlane, QueueWindow, ReadOptions, ReadView, RecentClusterEvents,
-    StampedEvent,
+    ApiError, Consistency, ControlPlane, CoordinatorMemberSummary, CoordinatorSummary, QueueWindow,
+    ReadOptions, ReadView, RecentClusterEvents, StampedEvent,
 };
-use coppice_consensus::{Applied, Consensus, ConsensusError, StateViews};
+use coppice_consensus::{Applied, Consensus, ConsensusError, NodeHandle, StateViews};
 use coppice_core::id::ClusterId;
 use coppice_core::job::Job;
 use coppice_core::quota::CostUnits;
@@ -50,6 +50,13 @@ pub struct CoordinatorControlPlane<C> {
     /// Handle to the fanout's ring for `recent_events` (ADR 0032, tier 1);
     /// `None` (again: no coverage) until `with_derived`.
     fanout: Option<FanoutHandle>,
+    /// Admin handle to the consensus node, for `coordinator_status`'s raft-level
+    /// view (leader/term/membership). `None` until [`with_node_handle`] attaches
+    /// it — a plane without it answers `GET /api/v1/coordinators` with
+    /// `UNAVAILABLE`, the same "no coverage" posture as a missing fanout ring.
+    ///
+    /// [`with_node_handle`]: Self::with_node_handle
+    node_handle: Option<NodeHandle>,
 }
 
 impl<C> CoordinatorControlPlane<C> {
@@ -63,6 +70,7 @@ impl<C> CoordinatorControlPlane<C> {
             cluster_id,
             queue_window,
             fanout: None,
+            node_handle: None,
         }
     }
 
@@ -76,6 +84,14 @@ impl<C> CoordinatorControlPlane<C> {
     ) -> Self {
         self.queue_window = queue_window;
         self.fanout = Some(fanout);
+        self
+    }
+
+    /// Attach the consensus admin handle backing `coordinator_status`. The
+    /// runtime calls this with the replica's [`NodeHandle`]; a plane without it
+    /// answers `GET /api/v1/coordinators` with `UNAVAILABLE`.
+    pub fn with_node_handle(mut self, node_handle: NodeHandle) -> Self {
+        self.node_handle = Some(node_handle);
         self
     }
 }
@@ -314,6 +330,44 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             },
             Err(_closed) => uncovered(),
         }
+    }
+
+    fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
+        // No handle attached is "no coverage": the replicated-state reads still
+        // work, but this raft-level view cannot be produced (mirrors the
+        // missing-fanout branch in `recent_events`, but as an error — the raft
+        // view *is* the endpoint, so there is no honest partial answer).
+        let Some(handle) = &self.node_handle else {
+            return Err(ApiError::Unavailable(
+                "coordinator status unavailable: no consensus handle attached".into(),
+            ));
+        };
+
+        // One point-in-time read of the consensus metrics; the matched-index
+        // list is populated only while this replica is leader.
+        let summary = handle.cluster_summary();
+        let matched: std::collections::BTreeMap<u64, u64> =
+            summary.replication.into_iter().collect();
+        let members = summary
+            .members
+            .into_iter()
+            .map(|m| CoordinatorMemberSummary {
+                id: m.id,
+                addr: m.addr,
+                voter: m.voter,
+                matched_index: matched.get(&m.id).copied(),
+            })
+            .collect();
+
+        Ok(CoordinatorSummary {
+            local_id: summary.local_id,
+            leader: summary.leader,
+            term: summary.term,
+            known_committed: summary.known_committed,
+            last_applied: summary.last_applied,
+            snapshot_last_index: summary.snapshot_last_index,
+            members,
+        })
     }
 }
 

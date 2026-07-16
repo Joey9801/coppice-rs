@@ -1242,6 +1242,110 @@ pub struct ConfigureQuotaEntityResponse {
     pub log_index: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Coordinators (GET /api/v1/coordinators)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/coordinators` (ADR 0031, local read) — this replica's view of
+/// the raft cluster: leader/term/indexes, replicated-state counts, and the
+/// per-member roster. Mirrors `CoordinatorStatus` in `web/src/api/types.ts`.
+///
+/// Read locally off the consensus metrics and a replica-local state snapshot,
+/// so every figure is "as this replica sees it" — a follower answers from its
+/// own applied position, not the leader's.
+#[derive(Debug, Clone, Serialize)]
+pub struct GetCoordinatorStatusResponse {
+    /// The cluster this replica belongs to (node config, ADR 0020).
+    pub cluster_id: ClusterId,
+    /// The current leader's raft id, when one is known.
+    pub leader: Option<u64>,
+    /// The current raft term.
+    pub term: u64,
+    /// Highest committed log index known to the serving replica.
+    pub known_committed: u64,
+    /// Highest applied log index on the serving replica.
+    pub last_applied: u64,
+    /// Applied-command count on the serving replica
+    /// (`StateMachine::version`) — a state coordinate, distinct from the raft
+    /// log index.
+    pub state_version: u64,
+    /// The last snapshot's coverage, or `null` when this replica has taken no
+    /// snapshot yet. `size_bytes` and `taken_at` inside it are always null:
+    /// `SnapshotMeta` (snapshot.proto) records neither.
+    pub snapshot: Option<CoordinatorSnapshot>,
+    /// Object counts in the replicated state machine.
+    pub state_counts: CoordinatorStateCounts,
+    /// One entry per configured cluster member.
+    pub members: Vec<CoordinatorMember>,
+    // `host` per-member and any cluster-wide health rollup are deliberately
+    // omitted: no inter-coordinator reporting exists (openraft metrics carry
+    // no host stats — the web mock invents them). Out of scope until an
+    // inter-coordinator reporting channel exists.
+}
+
+/// The serving replica's last snapshot, as far as it is knowable from
+/// openraft metrics. Only the covered log index is real today.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CoordinatorSnapshot {
+    /// Snapshot size on disk. Always `null`: `SnapshotMeta` carries no size,
+    /// and computing one would mean stat-ing snapshot files on a read path.
+    pub size_bytes: Option<u64>,
+    /// Log index the last snapshot covers (openraft's snapshot metric).
+    pub last_included_index: u64,
+    /// When the snapshot was taken. Always `null`: `SnapshotMeta` records no
+    /// timestamp.
+    pub taken_at: Option<Timestamp>,
+    /// Applied entries since the snapshot: `last_applied − last_included_index`.
+    pub entries_since_snapshot: u64,
+}
+
+/// Object counts in the replicated state machine (`StateMachine` map lengths).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CoordinatorStateCounts {
+    pub jobs: u64,
+    pub attempts: u64,
+    pub allocations: u64,
+    pub nodes: u64,
+    pub quota_entities: u64,
+}
+
+/// A coordinator's role in the raft cluster, derived from the leader id and
+/// its voter flag (ADR 0031): leader if it is the current leader, learner if
+/// it is a non-voter, follower otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorRole {
+    Leader,
+    Follower,
+    Learner,
+}
+
+/// One cluster member in a [`GetCoordinatorStatusResponse`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CoordinatorMember {
+    /// The member's raft id.
+    pub id: u64,
+    /// The address peers dial (host:port).
+    pub addr: String,
+    /// Derived role (see [`CoordinatorRole`]).
+    pub role: CoordinatorRole,
+    /// Whether the member is a voter (vs a learner).
+    pub voter: bool,
+    /// Highest applied index on this member: the serving replica reports its
+    /// own exactly; peers are `null` (their apply progress is not tracked
+    /// here — the leader observes only their *replicated* index, which
+    /// feeds `replication_lag_entries` instead).
+    pub last_applied: Option<u64>,
+    /// Entries this member is behind the leader's committed index
+    /// (`known_committed − matched`), leader-only; `null` on followers or for
+    /// a member the leader has no replication entry for.
+    pub replication_lag_entries: Option<u64>,
+    // `host` (cpu/memory/disk fractions) and `last_seen` are omitted: neither
+    // has any source (no inter-coordinator host reporting; coordinator
+    // liveness is not tracked — liveness follows compute nodes). The web mock
+    // invents both. Out of scope.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
