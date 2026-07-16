@@ -29,7 +29,7 @@ committed commands from a snapshot, so any dependence on anything but the
 two arguments is a divergence bug. Concretely:
 
 - **No wall clock.** Every command that needs a time carries it as an
-  explicit `*_at` field (a `Timestamp`, ADR 0033), stamped by the proposer.
+  explicit `*_at` field (a `Timestamp`), stamped by the proposer.
   Apply only ever reads timestamps out of the command — never
   `Timestamp::now()`.
 - **No randomness, no id minting.** Every `JobId`, `AttemptId`,
@@ -286,7 +286,7 @@ These are the **proto** field names and types, and they are unchanged. The
 Rust domain types drop the `_us` suffix and carry a `Timestamp` or a
 `Duration` instead (`submitted_at_us: int64` on the wire is
 `submitted_at: Timestamp` in `coppice-state`); `coppice_proto::convert`
-maps between them at the boundary. See ADR 0033.
+maps between them at the boundary. See `coppice_core::time`.
 
 Every **API-proposed** command additionally carries
 `actor: Actor { principal: string, groups: string[], operator_cert: bool }`,

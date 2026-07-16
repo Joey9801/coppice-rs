@@ -68,7 +68,7 @@ routes every endpoint below, with unimplemented ones answering
    `src/api/types.ts` by name and semantics, spelled snake_case on the
    wire: `cpu_millis` keys, `"oom_killed"` enum strings, bare
    typed-string ids, instants as ISO 8601 strings and durations as
-   `_seconds` numbers (ADR 0033), other integers as JSON numbers, `null`
+   `_seconds` numbers, other integers as JSON numbers, `null`
    optionals, `[]` empties), add the projection in
    `crates/coppice-api/src/http/project.rs`, and swap its stub handler
    in `crates/coppice-api/src/http/routes.rs` for a real one backed by

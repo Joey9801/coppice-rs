@@ -59,10 +59,13 @@ integers as JSON numbers, `null` for absent optionals, `[]` for empty
 lists. The web client maps snake_case wire keys onto its camelCase
 `types.ts` shapes at its boundary.
 
-*(The "integers as JSON numbers" convention no longer covers time:
-[ADR 0033](0033-explicit-time-types.md) narrows it, so instants are ISO
-8601 strings and durations are `_seconds`-suffixed numbers. Everything
-else here stands.)*
+*(Amended 2026-07-16: "integers as JSON numbers" no longer covers time.
+Instants are ISO 8601 strings (`"2026-07-16T09:30:00Z"`) and durations
+are `_seconds`-suffixed JSON numbers, mirroring the `Timestamp` and
+`Duration` types in `coppice_core::time`. An integer carries neither its
+epoch nor its scale, so every client had to be told what
+`"submitted_at_us": 1760000000000000` meant. Everything else here
+stands.)*
 
 The `coppice.api.v1` proto messages remain the cross-language description
 of this surface (and what a future gRPC client plane would serve); the
