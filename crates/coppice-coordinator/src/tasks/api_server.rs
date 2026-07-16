@@ -113,7 +113,17 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                     "max_runtime_seconds must be positive".into(),
                 ));
             }
-            Some(seconds) => Some(Duration::from_secs(seconds)),
+            Some(seconds) => match Duration::checked_from_secs(seconds) {
+                Some(duration) => Some(duration),
+                // Saturating here would accept the request and then run the
+                // job to a wildly shorter limit than the one asked for.
+                None => {
+                    return Err(ApiError::Invalid(format!(
+                        "max_runtime_seconds {seconds} is out of range (at most {})",
+                        Duration::MAX.as_secs()
+                    )));
+                }
+            },
         };
 
         // Multiplier resolution reads the replicated table off the latest
@@ -381,6 +391,18 @@ mod tests {
         let cp = control_plane(ProposeOutcome::Accepted);
         let mut req = submit_request(JobId::new());
         req.command.clear();
+        let result = cp.submit_job(req).await;
+        assert!(matches!(result, Err(ApiError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn submit_with_an_unrepresentable_max_runtime_is_invalid() {
+        // Rejecting beats saturating: accepting this and storing `Duration::MAX`
+        // would run the job to a limit ~292 000 years short of the one asked
+        // for, and report success while doing it.
+        let cp = control_plane(ProposeOutcome::Accepted);
+        let mut req = submit_request(JobId::new());
+        req.max_runtime_seconds = Some(i64::MAX);
         let result = cp.submit_job(req).await;
         assert!(matches!(result, Err(ApiError::Invalid(_))));
     }
