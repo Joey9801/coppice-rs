@@ -143,6 +143,8 @@ impl From<(&coppice_core::id::QuotaEntityId, &QuotaEntity)> for pb::QuotaEntityR
             name: e.name.clone(),
             quota_ucu: e.quota.0,
             usage: Some(e.usage.into()),
+            created_at_us: e.created_at.as_micros(),
+            updated_at_us: e.updated_at.as_micros(),
         }
     }
 }
@@ -158,6 +160,10 @@ impl TryFrom<pb::QuotaEntityRecord> for (coppice_core::id::QuotaEntityId, QuotaE
                 name: r.name,
                 quota: CostUnits(r.quota_ucu),
                 usage: req(r.usage, "QuotaEntityRecord.usage")?.try_into()?,
+                // Pre-timestamp snapshots decode these as 0 (epoch) — an
+                // accepted loss of a display-only instant.
+                created_at: timestamp(r.created_at_us, "QuotaEntityRecord.created_at_us")?,
+                updated_at: timestamp(r.updated_at_us, "QuotaEntityRecord.updated_at_us")?,
             },
         ))
     }
@@ -362,4 +368,57 @@ pub fn state_from_records(records: StateRecords) -> Result<StateMachine, Convert
     state.next_allocation_seq = cluster.next_allocation_seq;
 
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coppice_core::id::QuotaEntityId;
+    use coppice_core::quota::{CostUnits, UsageState};
+    use coppice_core::time::Timestamp;
+
+    fn ts(micros: i64) -> Timestamp {
+        Timestamp::from_micros(micros).expect("fixture timestamps are in range")
+    }
+
+    #[test]
+    fn quota_entity_record_roundtrips_created_and_updated_timestamps() {
+        let id = QuotaEntityId(uuid::Uuid::from_u128(0xE1));
+        let entity = QuotaEntity {
+            parent: Some(QuotaEntityId(uuid::Uuid::from_u128(0xEE))),
+            name: "team".to_string(),
+            quota: CostUnits(1_000_000),
+            usage: UsageState::new(ts(5_000_000)),
+            created_at: ts(1_000_000),
+            updated_at: ts(9_000_000),
+        };
+
+        let record: pb::QuotaEntityRecord = (&id, &entity).into();
+        assert_eq!(record.created_at_us, 1_000_000);
+        assert_eq!(record.updated_at_us, 9_000_000);
+
+        let (decoded_id, decoded): (QuotaEntityId, QuotaEntity) = record.try_into().unwrap();
+        assert_eq!(decoded_id, id);
+        assert_eq!(decoded, entity);
+    }
+
+    #[test]
+    fn quota_entity_record_without_timestamps_decodes_to_epoch() {
+        // A snapshot written before the timestamp fields existed leaves both
+        // int64s at their proto3 default of 0, which must decode to epoch-0
+        // instants rather than fail — an accepted loss of a display-only value.
+        let record = pb::QuotaEntityRecord {
+            entity: Some(QuotaEntityId(uuid::Uuid::from_u128(0xE2)).into()),
+            parent: None,
+            name: "legacy".to_string(),
+            quota_ucu: 42,
+            usage: Some(UsageState::new(ts(0)).into()),
+            created_at_us: 0,
+            updated_at_us: 0,
+        };
+
+        let (_, decoded): (QuotaEntityId, QuotaEntity) = record.try_into().unwrap();
+        assert_eq!(decoded.created_at, ts(0));
+        assert_eq!(decoded.updated_at, ts(0));
+    }
 }

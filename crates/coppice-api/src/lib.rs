@@ -15,7 +15,10 @@ pub mod http;
 use std::future::Future;
 
 use coppice_core::time::Timestamp;
-use http::dto::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
+use http::dto::{
+    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest,
+    SubmitJobResponse,
+};
 
 /// Consistency class for read operations (ADR 0007).
 ///
@@ -200,6 +203,17 @@ pub trait ControlPlane: Send + Sync + 'static {
     ) -> impl Future<Output = Result<SubmitJobResponse, ApiError>> + Send;
 
     fn abort_job(&self, req: AbortJobRequest) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Propose the `ConfigureQuotaEntity` upsert (ADR 0031's write class).
+    /// Resolves once committed and applied; a cycle or unknown-parent refusal
+    /// surfaces as [`ApiError::Rejected`] (a normal 409 race outcome). No
+    /// authz today — `submit_job`/`abort_job` ship unauthenticated and this
+    /// follows the same precedent; ADR 0023 enforcement is a separate future
+    /// subsystem, not gated here.
+    fn configure_quota_entity(
+        &self,
+        req: ConfigureQuotaEntityRequest,
+    ) -> impl Future<Output = Result<ConfigureQuotaEntityResponse, ApiError>> + Send;
 
     /// Resolve a read at the requested consistency and return a snapshot of
     /// the replicated state with its staleness metadata.

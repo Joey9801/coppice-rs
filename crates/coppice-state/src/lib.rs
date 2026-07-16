@@ -176,6 +176,12 @@ pub struct QuotaEntity {
     /// human rates.
     pub quota: CostUnits,
     pub usage: UsageState,
+    /// When this entity was first configured, from the creating command's
+    /// proposer stamp; preserved verbatim across every later reconfigure.
+    pub created_at: Timestamp,
+    /// The most recent `ConfigureQuotaEntity`'s proposer stamp. Equal to
+    /// `created_at` on a freshly created entity.
+    pub updated_at: Timestamp,
 }
 
 /// Maximum quota-tree depth.

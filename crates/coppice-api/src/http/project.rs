@@ -16,7 +16,9 @@ use coppice_core::quota::{self, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_scheduler::score;
-use coppice_state::{AttemptRecord, JobRecord, StateMachine, QUOTA_TREE_DEPTH_CAP};
+use coppice_state::{
+    AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, QUOTA_TREE_DEPTH_CAP,
+};
 
 use crate::{QueueWindow, RecentClusterEvents};
 
@@ -1035,6 +1037,216 @@ pub fn get_job(state: &StateMachine, id: &JobId, now: Timestamp) -> Option<dto::
     })
 }
 
+// Quota entities (GET /api/v1/quota-entities[/{entity}])
+// ---------------------------------------------------------------------------
+
+/// Subtree-inclusive queued/running job counts for one entity.
+#[derive(Default, Clone, Copy)]
+struct QuotaCounts {
+    queued: u32,
+    running: u32,
+}
+
+/// Subtree-inclusive queued/running counts for **every** entity, in one pass
+/// over the jobs. Each queued/running job increments the counter of its own
+/// entity and every ancestor (bounded by [`QUOTA_TREE_DEPTH_CAP`], exactly as
+/// apply walks the tree), so a node's count covers itself and all descendants
+/// — the `types.ts` `QuotaEntityNode` semantics. Cheaper than a per-entity
+/// subtree scan (`O(jobs × depth)`, not `O(entities × jobs)`), and a
+/// handler-scoped memo, never state.
+fn subtree_job_counts(state: &StateMachine) -> BTreeMap<QuotaEntityId, QuotaCounts> {
+    let mut counts: BTreeMap<QuotaEntityId, QuotaCounts> = BTreeMap::new();
+    for (_, record) in &state.jobs {
+        let bump: fn(&mut QuotaCounts) = match job_phase(state, record) {
+            dto::JobPhase::Queued => |c: &mut QuotaCounts| c.queued += 1,
+            dto::JobPhase::Running => |c: &mut QuotaCounts| c.running += 1,
+            _ => continue,
+        };
+        let mut cur = Some(record.spec.quota_entity);
+        for _ in 0..QUOTA_TREE_DEPTH_CAP {
+            let Some(id) = cur else { break };
+            bump(counts.entry(id).or_default());
+            cur = state.quota_entities.get(&id).and_then(|e| e.parent);
+        }
+    }
+    counts
+}
+
+/// Decayed usage, over-quota ratio, and penalty for an entity at read time —
+/// the shared derivation behind both the node and the chain view, matching
+/// `score.rs`'s lazy decay so a listed figure never disagrees with the
+/// scheduler's.
+fn decayed_quota_figures(
+    e: &QuotaEntity,
+    now: Timestamp,
+    policy: &PolicyConfig,
+) -> (u64, f64, f64) {
+    let usage = policy
+        .decay
+        .decay_between(e.usage.usage, e.usage.last_update, now);
+    let ratio = quota::over_quota_ratio(usage, e.quota);
+    let penalty = quota::penalty(ratio, policy.penalty_exponent_milli);
+    (usage.0, ratio, penalty)
+}
+
+fn quota_entity_node(
+    id: &QuotaEntityId,
+    e: &QuotaEntity,
+    now: Timestamp,
+    policy: &PolicyConfig,
+    counts: &BTreeMap<QuotaEntityId, QuotaCounts>,
+) -> dto::QuotaEntityNode {
+    let (usage_ucu, over_quota_ratio, penalty) = decayed_quota_figures(e, now, policy);
+    let count = counts.get(id).copied().unwrap_or_default();
+    dto::QuotaEntityNode {
+        id: *id,
+        name: e.name.clone(),
+        parent: e.parent,
+        quota_ucu: e.quota.0,
+        usage_ucu,
+        over_quota_ratio,
+        penalty,
+        created_at: e.created_at,
+        updated_at: e.updated_at,
+        queued_count: count.queued,
+        running_count: count.running,
+    }
+}
+
+fn quota_entity_view(
+    id: &QuotaEntityId,
+    e: &QuotaEntity,
+    now: Timestamp,
+    policy: &PolicyConfig,
+) -> dto::QuotaEntityView {
+    let (usage_ucu, over_quota_ratio, penalty) = decayed_quota_figures(e, now, policy);
+    dto::QuotaEntityView {
+        id: *id,
+        name: e.name.clone(),
+        parent: e.parent,
+        quota_ucu: e.quota.0,
+        usage_ucu,
+        over_quota_ratio,
+        penalty,
+    }
+}
+
+/// `GET /api/v1/quota-entities`.
+///
+/// Every entity as a subtree-counted node, in id order (`quota_entities` is a
+/// `BTreeMap`, so iteration is deterministic). `now` is the reader's wall
+/// clock, used only to decay usage to read time — never replicated state.
+pub fn list_quota_entities(state: &StateMachine, now: Timestamp) -> dto::ListQuotaEntitiesResponse {
+    let counts = subtree_job_counts(state);
+    let entities = state
+        .quota_entities
+        .iter()
+        .map(|(id, e)| quota_entity_node(id, e, now, &state.policy, &counts))
+        .collect();
+    dto::ListQuotaEntitiesResponse { entities }
+}
+
+/// `GET /api/v1/quota-entities/{entity}`; `None` when the id is not in the
+/// tree (the handler's 404). `now` decays usage to read time, as in the list.
+pub fn get_quota_entity(
+    state: &StateMachine,
+    id: &QuotaEntityId,
+    now: Timestamp,
+) -> Option<dto::GetQuotaEntityResponse> {
+    let entity = state.quota_entities.get(id)?;
+    let counts = subtree_job_counts(state);
+    let node = quota_entity_node(id, entity, now, &state.policy, &counts);
+
+    // Ancestry, this entity first then up to the root, bounded by the depth
+    // cap; reversed to root-first for the response.
+    let mut chain_ids = Vec::new();
+    let mut cur = Some(*id);
+    for _ in 0..QUOTA_TREE_DEPTH_CAP {
+        let Some(cid) = cur else { break };
+        chain_ids.push(cid);
+        cur = state.quota_entities.get(&cid).and_then(|e| e.parent);
+    }
+    chain_ids.reverse();
+    let chain = chain_ids
+        .iter()
+        .filter_map(|cid| {
+            state
+                .quota_entities
+                .get(cid)
+                .map(|e| quota_entity_view(cid, e, now, &state.policy))
+        })
+        .collect();
+
+    // Direct children only, in id order.
+    let children = state
+        .quota_entities
+        .iter()
+        .filter(|(_, e)| e.parent == Some(*id))
+        .map(|(cid, e)| quota_entity_node(cid, e, now, &state.policy, &counts))
+        .collect();
+
+    let stats = quota_entity_stats(state, *id, now);
+
+    Some(dto::GetQuotaEntityResponse {
+        entity: node,
+        chain,
+        children,
+        stats,
+    })
+}
+
+/// Subtree-inclusive stats for one entity: job counts by phase, oldest
+/// queued age, and the running burn rate over the entity and its descendants.
+///
+/// Reuses ListJobs' subtree machinery ([`child_adjacency`] +
+/// [`descendant_set`]) to resolve the descendant id set once, then a single
+/// pass over the jobs. `charged_ucu_24h` and `usage_history` are left
+/// unbacked (null / empty): no charge ledger or usage-series sampler exists.
+fn quota_entity_stats(
+    state: &StateMachine,
+    id: QuotaEntityId,
+    now: Timestamp,
+) -> dto::QuotaEntityStats {
+    let children = child_adjacency(state);
+    let subtree = descendant_set(&children, state, id);
+
+    let mut by_state: BTreeMap<dto::JobPhase, u32> =
+        dto::JobPhase::ALL.iter().map(|phase| (*phase, 0)).collect();
+    let mut oldest_queued_age: Option<Duration> = None;
+    let mut burn_rate: u64 = 0;
+
+    for (_, record) in &state.jobs {
+        if !subtree.contains(&record.spec.quota_entity) {
+            continue;
+        }
+        *by_state.entry(job_phase(state, record)).or_default() += 1;
+
+        if record.state == JobState::Queued {
+            let age = (now - record.submitted_at).max(Duration::ZERO);
+            oldest_queued_age = Some(oldest_queued_age.map_or(age, |old| old.max(age)));
+        }
+        // The running attempt's recorded charge rate is µCU/s already — the
+        // same figure `AttemptView::rate_ucu_per_second` reports, no re-derive.
+        if let Some(attempt_id) = record.state.attempt() {
+            if let Some(ar) = state.attempts.get(&attempt_id) {
+                if matches!(ar.attempt.state, AttemptState::Running) {
+                    burn_rate = burn_rate.saturating_add(ar.rate_ucu_per_second);
+                }
+            }
+        }
+    }
+
+    dto::QuotaEntityStats {
+        by_state,
+        oldest_queued_age_seconds: oldest_queued_age.map(Duration::as_secs),
+        burn_rate_ucu_per_second: burn_rate,
+        // No charge ledger or usage-series sampler exists — served unbacked
+        // rather than fabricated (null / empty).
+        charged_ucu_24h: None,
+        usage_history: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1687,6 +1899,8 @@ mod tests {
                 name: "root".to_string(),
                 quota: coppice_core::quota::CostUnits::ZERO,
                 usage: coppice_core::quota::UsageState::new(ts(0)),
+                created_at: ts(0),
+                updated_at: ts(0),
             },
         );
         state.quota_entities.insert(
@@ -1696,6 +1910,8 @@ mod tests {
                 name: "child".to_string(),
                 quota: coppice_core::quota::CostUnits::ZERO,
                 usage: coppice_core::quota::UsageState::new(ts(0)),
+                created_at: ts(0),
+                updated_at: ts(0),
             },
         );
         let root_job = job_id(1);
@@ -1987,6 +2203,8 @@ mod tests {
                     usage: CostUnits(usage),
                     last_update: at,
                 },
+                created_at: at,
+                updated_at: at,
             },
         );
     }
@@ -2212,5 +2430,189 @@ mod tests {
         assert_eq!(detail.attempts.len(), 1);
         // Attempting, not queued: no queue explainer.
         assert!(detail.queue.is_none());
+    }
+
+    // ---- quota entities ---------------------------------------------------
+
+    /// A quota entity with the fields the projections read made explicit.
+    /// `usage`'s accumulator is stamped at `last_update`, and `created_at ==
+    /// updated_at` (the freshly created case).
+    fn entity(
+        parent: Option<QuotaEntityId>,
+        name: &str,
+        quota: u64,
+        usage: u64,
+        last_update: Timestamp,
+        created_at: Timestamp,
+    ) -> QuotaEntity {
+        QuotaEntity {
+            parent,
+            name: name.to_string(),
+            quota: CostUnits(quota),
+            usage: coppice_core::quota::UsageState {
+                usage: CostUnits(usage),
+                last_update,
+            },
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    /// An `Attempting` job in the given phase-driving attempt state, charged
+    /// to `entity`.
+    fn attempting_job(
+        state: &mut StateMachine,
+        id: JobId,
+        entity_id: QuotaEntityId,
+        node: NodeId,
+        attempt_state: AttemptState,
+    ) {
+        let attempt = AttemptId::new();
+        let mut record = spec_job(id, "img", entity_id, Resources::ZERO, 0);
+        record.state = JobState::Attempting(attempt);
+        record.attempts = vec![attempt];
+        state.jobs.insert(id, record);
+        state
+            .attempts
+            .insert(attempt, test_attempt(attempt, id, node, attempt_state));
+    }
+
+    #[test]
+    fn list_quota_entities_projects_figures_and_subtree_counts() {
+        let root = quota_id(1);
+        let child = quota_id(2);
+        let now = ts(2_000_000);
+        let mut state = StateMachine::default();
+        // No decay at read time (last_update == now): usage is the stored
+        // accumulator, so ratio/penalty are exact. Root is 2× over quota →
+        // quadratic penalty 4.0 at the default exponent.
+        state.quota_entities.insert(
+            root,
+            entity(None, "root", 1_000_000, 2_000_000, now, ts(1_000_000)),
+        );
+        state.quota_entities.insert(
+            child,
+            entity(Some(root), "child", 4_000_000, 0, now, ts(1_500_000)),
+        );
+        // A queued job and a running job, both charged to the child.
+        let node = NodeId::new();
+        state.jobs.insert(
+            job_id(1),
+            spec_job(job_id(1), "img", child, Resources::ZERO, 0),
+        );
+        attempting_job(&mut state, job_id(2), child, node, AttemptState::Running);
+
+        let response = list_quota_entities(&state, now);
+        // BTreeMap id order: root (id 1) then child (id 2).
+        assert_eq!(response.entities.len(), 2);
+        let root_node = &response.entities[0];
+        assert_eq!(root_node.id, root);
+        assert_eq!(root_node.usage_ucu, 2_000_000);
+        assert_eq!(root_node.over_quota_ratio, 2.0);
+        assert_eq!(root_node.penalty, 4.0);
+        assert_eq!(root_node.created_at, ts(1_000_000));
+        // Subtree counts: both the child's jobs roll up to the root.
+        assert_eq!(root_node.queued_count, 1);
+        assert_eq!(root_node.running_count, 1);
+        // The child counts its own jobs too.
+        let child_node = &response.entities[1];
+        assert_eq!(child_node.queued_count, 1);
+        assert_eq!(child_node.running_count, 1);
+        // Within quota → penalty 1.0.
+        assert_eq!(child_node.over_quota_ratio, 0.0);
+        assert_eq!(child_node.penalty, 1.0);
+    }
+
+    #[test]
+    fn list_quota_entities_decays_usage_to_read_time() {
+        let root = quota_id(1);
+        let mut state = StateMachine::default();
+        // Accumulator stamped at the epoch; read one default half-life later
+        // (1440 × 60 s ticks) must show decayed — strictly less — usage.
+        state.quota_entities.insert(
+            root,
+            entity(None, "root", 10_000_000, 1_000_000, ts(0), ts(0)),
+        );
+        let one_half_life = ts(86_400_000_000);
+        let node = &list_quota_entities(&state, one_half_life).entities[0];
+        assert!(node.usage_ucu < 1_000_000, "usage must decay to read time");
+        assert!(node.usage_ucu > 0);
+    }
+
+    #[test]
+    fn get_quota_entity_returns_none_for_missing() {
+        let state = StateMachine::default();
+        assert!(get_quota_entity(&state, &quota_id(99), ts(0)).is_none());
+    }
+
+    #[test]
+    fn get_quota_entity_returns_chain_children_and_subtree_stats() {
+        let root = quota_id(1);
+        let mid = quota_id(2);
+        let leaf = quota_id(3);
+        let now = ts(2_000_000);
+        let mut state = StateMachine::default();
+        state
+            .quota_entities
+            .insert(root, entity(None, "root", 1_000_000, 0, now, ts(0)));
+        state
+            .quota_entities
+            .insert(mid, entity(Some(root), "mid", 1_000_000, 0, now, ts(0)));
+        state
+            .quota_entities
+            .insert(leaf, entity(Some(mid), "leaf", 1_000_000, 0, now, ts(0)));
+
+        // Under the subtree of `mid`: a queued job on leaf, a running job on
+        // mid. A job on the root is *outside* mid's subtree.
+        let node = NodeId::new();
+        state.jobs.insert(
+            job_id(1),
+            spec_job(job_id(1), "img", leaf, Resources::ZERO, 0),
+        );
+        attempting_job(&mut state, job_id(2), mid, node, AttemptState::Running);
+        state.jobs.insert(
+            job_id(3),
+            spec_job(job_id(3), "img", root, Resources::ZERO, 0),
+        );
+
+        let detail = get_quota_entity(&state, &mid, now).expect("mid exists");
+        assert_eq!(detail.entity.id, mid);
+        // Chain is root-first, this entity last.
+        let chain_ids: Vec<_> = detail.chain.iter().map(|v| v.id).collect();
+        assert_eq!(chain_ids, vec![root, mid]);
+        // Only direct children.
+        let child_ids: Vec<_> = detail.children.iter().map(|c| c.id).collect();
+        assert_eq!(child_ids, vec![leaf]);
+        // Subtree stats cover mid + leaf, not the root's own job.
+        assert_eq!(detail.stats.by_state[&dto::JobPhase::Queued], 1);
+        assert_eq!(detail.stats.by_state[&dto::JobPhase::Running], 1);
+        // Oldest queued job submitted at 0, read at 2 s → age 2 s.
+        assert_eq!(detail.stats.oldest_queued_age_seconds, Some(2));
+        // The one running attempt's fixture rate (100 µCU/s).
+        assert_eq!(detail.stats.burn_rate_ucu_per_second, 100);
+        // Unbacked stats: null / empty, never fabricated.
+        assert_eq!(detail.stats.charged_ucu_24h, None);
+        assert!(detail.stats.usage_history.is_empty());
+        // Every phase present at zero-or-more, none missing.
+        assert_eq!(detail.stats.by_state.len(), dto::JobPhase::ALL.len());
+    }
+
+    #[test]
+    fn get_quota_entity_chain_and_counts_are_depth_capped() {
+        // A chain longer than the depth cap is walked at most
+        // QUOTA_TREE_DEPTH_CAP hops, exactly as apply and the counts do.
+        let mut state = StateMachine::default();
+        let depth = QUOTA_TREE_DEPTH_CAP + 5;
+        for i in 0..depth {
+            let id = quota_id(i as u16 + 1);
+            let parent = (i > 0).then(|| quota_id(i as u16));
+            state
+                .quota_entities
+                .insert(id, entity(parent, "e", 1_000_000, 0, ts(0), ts(0)));
+        }
+        let leaf = quota_id(depth as u16);
+        let detail = get_quota_entity(&state, &leaf, ts(0)).expect("leaf exists");
+        // The chain is capped at the depth cap, not the full ancestry.
+        assert_eq!(detail.chain.len(), QUOTA_TREE_DEPTH_CAP as usize);
     }
 }
