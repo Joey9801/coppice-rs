@@ -15,7 +15,6 @@ use coppice_core::job::JobState;
 use coppice_core::quota::{self, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_scheduler::score;
 use coppice_state::{
     AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
@@ -750,12 +749,6 @@ fn job_summary(state: &StateMachine, record: &JobRecord) -> dto::JobSummary {
 /// `score` module uses to render a fixed-point multiplier as a real number.
 const Q32_SCALE: f64 = 4_294_967_296.0;
 
-/// Queued jobs examined when ranking a single job's queue position. The bound
-/// keeps a job detail on a huge backlog from turning one read into an
-/// unbounded scan; past it, `rank`/`queue_depth` reflect the examined prefix
-/// (a job outside it simply reports the ranking within what was scanned).
-const QUEUE_RANK_BUDGET: usize = 100_000;
-
 /// A quota entity's decayed metrics as of `now`, shared by the two ancestry
 /// projections (`entity_chain` root-first, `penalty_chain` leaf-first).
 struct EntityMetrics {
@@ -850,42 +843,17 @@ fn penalty_chain(
         .collect()
 }
 
-/// A queued job's ADR 0021 [`Rank`](score::Rank) at `now`, reusing the
-/// scheduler's own scoring so the ordering here is the one the scheduler
-/// would apply — never a reimplementation.
-fn job_rank(
-    state: &StateMachine,
-    record: &JobRecord,
-    now: Timestamp,
-    horizon: Duration,
-    w_age: f64,
-) -> score::Rank {
-    let penalty_product = score::penalty_product(
-        &state.quota_entities,
-        record.spec.quota_entity,
-        &state.policy,
-        now,
-    );
-    let s = score::effective_score(
-        record.multiplier,
-        penalty_product,
-        record.submitted_at,
-        now,
-        horizon,
-        w_age,
-    );
-    score::Rank {
-        score: s,
-        submitted_at: record.submitted_at,
-        job: record.spec.id,
-    }
-}
-
 /// The `queue` explainer for a job — `None` unless the job is `Queued`.
 ///
-/// Ranks the job among all queued jobs (bounded by [`QUEUE_RANK_BUDGET`]) via
-/// the scheduler's [`Rank`](score::Rank) total order, and reports the penalty
-/// chain and age terms that produced the score.
+/// Reports the ADR 0021 priority-term inputs that replicated state alone can
+/// answer: the multiplier, the per-ancestor penalty chain and its product,
+/// and the job's age. Rank, queue depth, and the composed score are
+/// deliberately absent — ranking would mean either an O(queue) scan per read
+/// or duplicating scheduler-owned scoring inputs (`w_age`, the age horizon)
+/// that would drift from what the scheduler actually applies. If those fields
+/// return, they should be read from a scheduler-published structure recording
+/// how the last invocation's unplaced jobs fared against each other, never
+/// recomputed per request.
 fn queue_explainer(
     state: &StateMachine,
     record: &JobRecord,
@@ -894,46 +862,18 @@ fn queue_explainer(
     if record.state != JobState::Queued {
         return None;
     }
-    let policy = &state.policy;
-    let horizon = score::age_horizon(&policy.decay);
-    let w_age = score::DEFAULT_AGE_WEIGHT;
-
-    let this_rank = job_rank(state, record, now, horizon, w_age);
-
-    // Rank = 1 + the number of queued jobs that strictly outrank this one
-    // (`Rank`'s `Ord` puts a better candidate `Less`). The total order has no
-    // ties across distinct jobs, so this job is never counted against itself.
-    let mut queue_depth: u32 = 0;
-    let mut ahead: u32 = 0;
-    for (_, other) in state
-        .jobs
-        .iter()
-        .filter(|(_, r)| r.state == JobState::Queued)
-        .take(QUEUE_RANK_BUDGET)
-    {
-        queue_depth += 1;
-        if job_rank(state, other, now, horizon, w_age) < this_rank {
-            ahead += 1;
-        }
-    }
-
-    let penalty_product =
-        score::penalty_product(&state.quota_entities, record.spec.quota_entity, policy, now);
-    let multiplier = record.multiplier.0 as f64 / Q32_SCALE;
+    let chain = penalty_chain(state, record.spec.quota_entity, now);
+    // The product of the chain's links: the same per-link `quota::penalty`
+    // values the scheduler's penalty product composes, over the same
+    // depth-capped ancestor walk with the same read-time decay.
+    let penalty_product = chain.iter().map(|l| l.penalty).product();
     let age = (now - record.submitted_at).max(Duration::ZERO);
-    let age_bonus = this_rank.score - multiplier / penalty_product;
 
     Some(dto::QueuePositionExplainer {
-        rank: ahead + 1,
-        queue_depth,
-        score: this_rank.score,
-        multiplier,
-        penalty_chain: penalty_chain(state, record.spec.quota_entity, now),
+        multiplier: record.multiplier.0 as f64 / Q32_SCALE,
+        penalty_chain: chain,
         penalty_product,
         age_seconds: age.as_secs(),
-        age_horizon_seconds: horizon.as_secs(),
-        w_age,
-        age_bonus,
     })
 }
 
@@ -2429,52 +2369,41 @@ mod tests {
     }
 
     #[test]
-    fn get_job_queue_explainer_ranks_and_explains() {
+    fn get_job_queue_explainer_reports_the_penalty_chain() {
         let now = ts(1_000_000);
         let mut state = StateMachine::default();
-        // Two queued jobs. Entities stamped at `now` so usage does not decay.
-        let ea = quota_id(1);
-        let eb = quota_id(2);
-        // A: 2× over quota → penalty 4 (quadratic); multiplier 2 → term 0.5.
-        put_entity(&mut state, ea, None, "team-a", 1_000_000, 2_000_000, now);
-        // B: within quota → penalty 1; multiplier 1 → term 1.0 (ranks first).
-        put_entity(&mut state, eb, None, "team-b", 1_000_000, 0, now);
+        // A two-level ancestry, stamped at `now` so usage does not decay.
+        let root = quota_id(1);
+        let leaf = quota_id(2);
+        // Root: 2× over quota → penalty 4 (quadratic default exponent).
+        put_entity(&mut state, root, None, "team", 1_000_000, 2_000_000, now);
+        // Leaf: within quota → penalty 1.
+        put_entity(&mut state, leaf, Some(root), "user", 1_000_000, 0, now);
 
         let a = job_id(1);
-        let b = job_id(2);
         let mut ra = test_job(a, JobState::Queued, now);
-        ra.spec.quota_entity = ea;
+        ra.spec.quota_entity = leaf;
         ra.multiplier = PriorityMultiplier::from_integer(2);
         state.jobs.insert(a, ra);
-        let mut rb = test_job(b, JobState::Queued, now);
-        rb.spec.quota_entity = eb;
-        rb.multiplier = PriorityMultiplier::ONE;
-        state.jobs.insert(b, rb);
 
         let qa = get_job(&state, &a, now)
             .unwrap()
             .queue
             .expect("A is queued");
-        assert_eq!(qa.queue_depth, 2);
-        // B (score 1.0) outranks A (score 0.5): A is second.
-        assert_eq!(qa.rank, 2);
         assert_eq!(qa.multiplier, 2.0);
-        assert_eq!(qa.penalty_chain.len(), 1);
-        let link = &qa.penalty_chain[0];
-        assert_eq!(link.entity, ea);
+        // Chain is leaf → root.
+        assert_eq!(qa.penalty_chain.len(), 2);
+        assert_eq!(qa.penalty_chain[0].entity, leaf);
+        assert_eq!(qa.penalty_chain[0].penalty, 1.0);
+        let link = &qa.penalty_chain[1];
+        assert_eq!(link.entity, root);
         assert_eq!(link.usage_ucu, 2_000_000);
         assert_eq!(link.quota_ucu, 1_000_000);
         assert_eq!(link.over_quota_ratio, 2.0);
         assert_eq!(link.penalty, 4.0);
+        // The product composes the chain's links: 1 × 4.
         assert_eq!(qa.penalty_product, 4.0);
-        // Age zero (submitted at `now`): score is exactly the priority term.
         assert_eq!(qa.age_seconds, 0);
-        assert!((qa.score - 0.5).abs() < 1e-9, "score {}", qa.score);
-        assert!(qa.age_bonus.abs() < 1e-9);
-
-        // And B ranks first.
-        let qb = get_job(&state, &b, now).unwrap().queue.unwrap();
-        assert_eq!(qb.rank, 1);
     }
 
     #[test]

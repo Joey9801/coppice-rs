@@ -979,16 +979,18 @@ pub struct PenaltyLink {
     pub penalty: f64,
 }
 
-/// Why a `Queued` job sits where it does in the ranked queue (ADR 0021),
-/// mirroring `QueuePositionExplainer` in `types.ts`:
-/// `score = multiplier / penalty_product + w_age · age_seconds / age_horizon_seconds`.
+/// The ADR 0021 priority-term inputs for a `Queued` job.
+///
+/// Deviation from `QueuePositionExplainer` in `types.ts`: `rank`,
+/// `queueDepth`, `score`, `wAge`, `ageHorizonSeconds`, and `ageBonus` are
+/// **absent, not null**. Ranking the queued set would cost an O(queue) scan
+/// per read, and composing the score would duplicate scheduler-owned inputs
+/// that drift; both were cut rather than served badly. If they return, the
+/// intended source is a scheduler-published structure recording how the last
+/// scheduling invocation's unplaced jobs fared against each other, read here
+/// — never recomputed per request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuePositionExplainer {
-    /// 1-based position in the effective-score order.
-    pub rank: u32,
-    /// Total queued jobs examined (the ranked set this `rank` is within).
-    pub queue_depth: u32,
-    pub score: f64,
     /// The job's priority multiplier `m(j)` as a real number.
     pub multiplier: f64,
     /// One entry per ancestor entity, leaf → root.
@@ -996,10 +998,6 @@ pub struct QueuePositionExplainer {
     /// Product of the chain penalties, `P(j)`.
     pub penalty_product: f64,
     pub age_seconds: i64,
-    pub age_horizon_seconds: i64,
-    pub w_age: f64,
-    /// The additive aging term, `w_age · age_seconds / age_horizon_seconds`.
-    pub age_bonus: f64,
 }
 
 /// Per-dimension split of the base cost rate (µCU/second), summing to

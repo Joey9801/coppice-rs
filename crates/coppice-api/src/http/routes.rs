@@ -1363,7 +1363,9 @@ mod tests {
         assert_eq!(body["state"], "queued");
         // A queued job carries its explainer and no accrual.
         assert!(body["queue"].is_object());
-        assert_eq!(body["queue"]["rank"], 1);
+        // Ranking fields are absent, not null — see the DTO doc.
+        assert!(body["queue"].get("rank").is_none());
+        assert!(body["queue"]["penalty_product"].is_number());
         assert_eq!(body["accrual"], serde_json::Value::Null);
         // Cost is always present; absent-data fields are explicit null.
         assert_eq!(body["cost"]["actual_ucu"], serde_json::Value::Null);

@@ -540,7 +540,6 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "coppice-core",
- "coppice-scheduler",
  "coppice-state",
  "mime_guess",
  "rust-embed",
