@@ -11,11 +11,12 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::Duration as StdDuration;
 
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
 use coppice_core::resource::Resources;
+use coppice_core::time::Duration;
 use coppice_proto::pb::agent::v1 as pb;
 
 /// Everything the agent needs to start one container. Ids are carried through
@@ -34,7 +35,7 @@ pub struct StartSpec {
     pub limits: Resources,
     /// Enforced runtime bound; the agent's watchdog kills the container past
     /// it (outcome `MaxRuntimeExceeded`). `None` = unbounded.
-    pub max_runtime_us: Option<u64>,
+    pub max_runtime: Option<Duration>,
 }
 
 /// How a container exited, as observed from the runtime.
@@ -42,7 +43,7 @@ pub struct StartSpec {
 pub struct ExitInfo {
     pub code: i32,
     pub oom_killed: bool,
-    pub runtime_us: u64,
+    pub runtime: Duration,
 }
 
 /// An allocation's process having exited, with how it ended. Carried from
@@ -57,7 +58,7 @@ pub struct ExitEvent {
 /// A container's observed state (running or exited).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerState {
-    Running { runtime_us: u64 },
+    Running { runtime: Duration },
     Exited(ExitInfo),
 }
 
@@ -284,7 +285,9 @@ impl Executor for FakeExecutor {
                 allocation: spec.allocation,
                 attempt: spec.attempt,
                 job: spec.job,
-                state: ContainerState::Running { runtime_us: 0 },
+                state: ContainerState::Running {
+                    runtime: Duration::ZERO,
+                },
             },
         );
         Ok(())
@@ -306,7 +309,7 @@ impl Executor for FakeExecutor {
             let exit = ExitInfo {
                 code: 137,
                 oom_killed: false,
-                runtime_us: 0,
+                runtime: Duration::ZERO,
             };
             c.state = ContainerState::Exited(exit);
             inner.exited.insert(allocation, c);
@@ -338,7 +341,7 @@ impl Executor for FakeExecutor {
                 // No exit pending: yield and poll again. Tests that need a
                 // prompt exit call `finish` before awaiting; the live loop
                 // runs this on its own task alongside the command pump.
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::time::sleep(StdDuration::from_millis(1)).await;
             }
         }
     }
@@ -400,7 +403,7 @@ mod tests {
             classify_exit(&ExitInfo {
                 code: 0,
                 oom_killed: false,
-                runtime_us: 1
+                runtime: Duration::from_micros(1)
             }),
             AttemptOutcome::Exited { code: 0 }
         );
@@ -408,7 +411,7 @@ mod tests {
             classify_exit(&ExitInfo {
                 code: 137,
                 oom_killed: true,
-                runtime_us: 1
+                runtime: Duration::from_micros(1)
             }),
             AttemptOutcome::OomKilled
         );
@@ -446,7 +449,7 @@ mod tests {
             command: vec!["run".into()],
             entrypoint: None,
             limits: Resources::ZERO,
-            max_runtime_us: None,
+            max_runtime: None,
         })
         .await
         .unwrap();
@@ -458,7 +461,7 @@ mod tests {
             ExitInfo {
                 code: 0,
                 oom_killed: false,
-                runtime_us: 5,
+                runtime: Duration::from_micros(5),
             },
         );
         match exec.stop(alloc, Duration::ZERO).await.unwrap() {
@@ -479,7 +482,7 @@ mod tests {
             command: vec!["run".into()],
             entrypoint: None,
             limits: Resources::ZERO,
-            max_runtime_us: None,
+            max_runtime: None,
         })
         .await
         .unwrap();

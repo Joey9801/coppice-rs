@@ -9,12 +9,21 @@
  * - Ids are typed `<prefix>-<uuidv7>` strings (ADR 0024): `job-…`,
  *   `node-…`, `alloc-…`, `attempt-…`, `quota-…`. Coordinators are Raft
  *   ids (plain small integers), not uuid-typed ids.
- * - Timestamps are microseconds since the Unix epoch, suffixed `Us`
- *   (matching the Rust `*_us: i64` fields). Durations are also `Us`.
+ * - Instants are `Date`, never a bare number: a `Date` carries its epoch and
+ *   its unit, where a number carries neither and silently invites the
+ *   thousand-fold mistake (reading µs as ms). This mirrors the Rust side,
+ *   whose internal type is a `Timestamp` wrapping `chrono::DateTime<Utc>`.
+ *   The wire carries ISO 8601 / RFC 3339 strings
+ *   (`"2026-07-16T09:30:00.000000Z"`, always UTC, µs precision); parsing
+ *   them into `Date` is the client's job at its boundary, like every other
+ *   transport mapping below.
+ * - Durations are whole seconds as a plain `number`, suffixed `Seconds` —
+ *   a duration has no epoch or timezone to lose, which is what motivates
+ *   `Date` for instants, and arithmetic on it needs no parser.
  * - Costs are µCU (micro cost units, `CostUnits` in Rust), suffixed `Ucu`.
  *   1 CU = 1_000_000 µCU (see lib/format.ts).
- * - All numbers are plain `number`. The future real client owns the
- *   proto3-JSON wire mapping (i64-as-string etc.) at its boundary; these
+ * - All other numbers are plain `number`. The future real client owns the
+ *   wire mapping (ISO strings, i64-as-string etc.) at its boundary; these
  *   types never change for that.
  */
 
@@ -198,8 +207,8 @@ export interface AttemptView {
   state: AttemptState
   /** Present iff state is `Terminal`. */
   outcome: AttemptOutcome | null
-  startedAtUs: number | null
-  endedAtUs: number | null
+  startedAt: Date | null
+  endedAt: Date | null
   /** µCU per second while running (from cost weights × requested resources). */
   rateUcuPerSecond: number
   /** Upfront charge for this attempt (trued-up at finalization). */
@@ -231,7 +240,7 @@ export interface JobSpec {
   requests: Resources
   /** Small integer priority class, mapped to a multiplier by policy. */
   priority: number
-  maxRuntimeUs: number | null
+  maxRuntimeSeconds: number | null
   quotaEntity: QuotaEntityId
   retry: {
     maxRetries: number
@@ -246,8 +255,8 @@ export interface JobSummary {
   quotaEntity: QuotaEntityId
   quotaEntityName: string
   priority: number
-  submittedAtUs: number
-  terminalAtUs: number | null
+  submittedAt: Date
+  terminalAt: Date | null
   /** Node of the current attempt, when one exists. */
   node: NodeId | null
   /**
@@ -267,7 +276,7 @@ export interface JobSummary {
 
 /**
  * Queue-position explainer for a `Queued` job (ADR 0021):
- * `score = multiplier / penaltyProduct + wAge * ageUs / ageHorizonUs`.
+ * `score = multiplier / penaltyProduct + wAge * ageSeconds / ageHorizonSeconds`.
  */
 export interface QueuePositionExplainer {
   /** 1-based position in the ranked queue. */
@@ -289,10 +298,10 @@ export interface QueuePositionExplainer {
   }>
   /** Product of the chain penalties, P(j). */
   penaltyProduct: number
-  ageUs: number
-  ageHorizonUs: number
+  ageSeconds: number
+  ageHorizonSeconds: number
   wAge: number
-  /** The additive aging term, wAge * ageUs / ageHorizonUs. */
+  /** The additive aging term, wAge * ageSeconds / ageHorizonSeconds. */
   ageBonus: number
 }
 
@@ -309,7 +318,7 @@ export interface AccrualView {
    * Earliest guaranteed full-funding time from committed capacity
    * releases; null means unbounded (no guaranteed release covers it).
    */
-  projectedStartUs: number | null
+  projectedStart: Date | null
 }
 
 export interface CostReport {
@@ -333,8 +342,8 @@ export interface CostReport {
    * Duration the upfront placement charge covers: the job's `max_runtime`, or
    * the policy default charge runtime when `max_runtime` is unset.
    */
-  chargeWindowUs: number
-  /** True iff `chargeWindowUs` is the policy default (job declared no `max_runtime`). */
+  chargeWindowSeconds: number
+  /** True iff `chargeWindowSeconds` is the policy default (job declared no `max_runtime`). */
   chargeWindowIsDefault: boolean
   /** Upfront charge taken at placement: `effectiveRate × chargeWindow`. */
   estimatedUcu: number
@@ -356,15 +365,15 @@ export interface JobDetail {
   id: JobId
   state: JobState
   spec: JobSpec
-  submittedAtUs: number
+  submittedAt: Date
   /**
-   * When the job entered its current state (µs). Server-derived from the
+   * When the job entered its current state. Server-derived from the
    * event history; drives "in this state for …" displays.
    */
-  stateSinceUs: number
-  terminalAtUs: number | null
+  stateSince: Date
+  terminalAt: Date | null
   retriesUsed: number
-  abortRequested: { reason: string | null; requestedAtUs: number } | null
+  abortRequested: { reason: string | null; requestedAt: Date } | null
   /** Quota-entity ancestry, root first, leaf (the owning entity) last. */
   entityChain: QuotaEntityView[]
   attempts: AttemptView[]
@@ -442,7 +451,7 @@ export type TimelineEvent = {
    * Stamps come from different replicas' clocks, so this may run backwards
    * as `index` advances: render it, never sort or deduplicate by it.
    */
-  atUs: number
+  at: Date
 } & TimelineEventBody
 
 /**
@@ -461,7 +470,7 @@ export interface RecentEventsWindow {
 // ---------------------------------------------------------------------------
 
 export interface UsageSample {
-  tUs: number
+  t: Date
   cpuMillis: number
   memoryBytes: number
   diskBytes: number
@@ -480,7 +489,7 @@ export interface JobUsage {
 }
 
 export interface UtilizationSample {
-  tUs: number
+  t: Date
   /** Actually consumed. */
   used: Resources
   /** Funded/reserved by allocations at that instant. */
@@ -517,7 +526,7 @@ export interface NodeSummary {
   health: NodeHealth
   /** Bumps on (re)registration or loss; fences stale agent commands. */
   epoch: number
-  lastHeartbeatUs: number | null
+  lastHeartbeat: Date | null
   runningCount: number
   accruingCount: number
 }
@@ -528,8 +537,8 @@ export interface NodeHistoryEntry {
   job: JobId
   image: string
   outcome: AttemptOutcome
-  startedAtUs: number | null
-  endedAtUs: number
+  startedAt: Date | null
+  endedAt: Date
 }
 
 export interface NodeDetail {
@@ -579,8 +588,8 @@ export interface QuotaEntityNode {
   usageUcu: number
   overQuotaRatio: number
   penalty: number
-  createdAtUs: number
-  updatedAtUs: number
+  createdAt: Date
+  updatedAt: Date
   /** Live job counts over this entity's subtree (itself + descendants). */
   queuedCount: number
   runningCount: number
@@ -590,13 +599,13 @@ export interface QuotaEntityNode {
 export interface QuotaEntityStats {
   /** Tallied by displayed phase (`derivePhase`), not the raw `JobState`. */
   byState: Record<JobPhase, number>
-  oldestQueuedAgeUs: number | null
+  oldestQueuedAgeSeconds: number | null
   /** Σ µCU/s of currently running attempts in the subtree. */
   burnRateUcuPerSecond: number
   /** µCU charged to this entity in the trailing 24h (pre-decay). */
   chargedUcu24h: number
   /** Recent decayed-usage samples for sparklines, oldest first. */
-  usageHistory: Array<{ tUs: number; usageUcu: number }>
+  usageHistory: Array<{ t: Date; usageUcu: number }>
 }
 
 export interface QuotaEntityDetail {
@@ -635,12 +644,12 @@ export interface QueueStats {
   drainRatePerMinute: number | null
   /** Jobs entering the queue per minute, recent window; `null` as above. */
   arrivalRatePerMinute: number | null
-  oldestQueuedAgeUs: number | null
+  oldestQueuedAgeSeconds: number | null
   /** Tallied by displayed phase (`derivePhase`), not the raw `JobState`. */
   byState: Record<JobPhase, number>
   /** Recent history for sparklines, oldest first. */
   history: Array<{
-    tUs: number
+    t: Date
     depth: number
     drainedPerMinute: number
     arrivedPerMinute: number
@@ -680,7 +689,7 @@ export interface CoordinatorMember {
   replicationLagEntries: number
   /** Host resource use of the coordinator process's machine, 0..1. */
   host: { cpuFraction: number; memoryFraction: number; diskFraction: number }
-  lastSeenUs: number
+  lastSeen: Date
 }
 
 export interface CoordinatorStatus {
@@ -697,7 +706,7 @@ export interface CoordinatorStatus {
     sizeBytes: number
     /** Log index the last snapshot covers. */
     lastIncludedIndex: number
-    takenAtUs: number
+    takenAt: Date
     entriesSinceSnapshot: number
   }
   /** Object counts in the replicated state machine. */
@@ -720,7 +729,7 @@ export interface CoordinatorStatus {
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error'
 
 export interface LogEntry {
-  tUs: number
+  t: Date
   level: LogLevel
   /** Module path / component that emitted the line. */
   target: string

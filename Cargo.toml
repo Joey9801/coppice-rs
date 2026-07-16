@@ -42,6 +42,11 @@ anyhow = "1"
 # Coordinator CLI surface — deliberately tiny per ADR 0020: `--config`, the
 # ADR 0016 intent flags, and the hidden admin verbs.
 clap = { version = "4", features = ["derive"] }
+# Wall-clock instants and durations. The domain wraps `DateTime<Utc>` and
+# `TimeDelta` in `coppice_core::time` rather than using them bare: the
+# wrappers pin microsecond precision, which the replicated state machine
+# (ADR 0019) and the protobuf wire both assume.
+chrono = { version = "0.4", features = ["serde"] }
 # CRC32C (Castagnoli) — the per-entry / per-section checksum mandated by
 # ADR 0002 and ADR 0018.
 crc32c = "0.6"

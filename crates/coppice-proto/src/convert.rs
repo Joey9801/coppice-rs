@@ -8,7 +8,9 @@
 //!   and every domain value is representable on the wire. Encoding also
 //!   *canonicalizes*: repeated key-sorted entries are emitted in key order
 //!   with zero/empty entries omitted, so identical domain values encode to
-//!   identical bytes.
+//!   identical bytes. Time is part of this: `Timestamp` and `Duration` are
+//!   microsecond-quantised and bounded to the `int64` µs range precisely so
+//!   that every value of them encodes exactly (`coppice_core::time`).
 //! - **pb → domain is fallible.** The wire admits shapes the domain does
 //!   not (malformed or wrongly-prefixed ids, missing required messages, unknown enum
 //!   values, duplicate keys). What a [`ConvertError`] means depends on
@@ -22,6 +24,7 @@
 //! apply must see those payloads to reject them as
 //! `UnsupportedPlacementShape` per the apply contract.
 
+use coppice_core::time::{Duration, Timestamp};
 use thiserror::Error;
 
 mod command;
@@ -56,4 +59,50 @@ pub enum ConvertError {
 /// Unwrap a required message field (prost decodes them as `Option`).
 fn req<T>(field: Option<T>, name: &'static str) -> Result<T, ConvertError> {
     field.ok_or(ConvertError::MissingField(name))
+}
+
+/// Decode an `int64` Unix-microseconds field into a [`Timestamp`].
+///
+/// The wire type is wider than the domain type: `i64` µs reaches ~±292 000
+/// years, `DateTime<Utc>` only ~±262 000. The gap is unreachable by any
+/// honest producer, but it is reachable by a corrupt record or a hostile
+/// peer, so it is rejected here rather than saturated — a timestamp from the
+/// year 300 000 is a decoding failure, not a very old job.
+fn timestamp(micros: i64, field: &'static str) -> Result<Timestamp, ConvertError> {
+    Timestamp::from_micros(micros).ok_or(ConvertError::Invalid {
+        field,
+        reason: "timestamp is outside the representable range",
+    })
+}
+
+/// Decode a `uint64` microseconds field into a non-negative [`Duration`].
+///
+/// Zero is legal (an attempt that never ran has zero runtime); only the range
+/// is checked, since the signed domain type stops at `i64::MAX` µs.
+fn nonnegative_duration(micros: u64, field: &'static str) -> Result<Duration, ConvertError> {
+    let micros = i64::try_from(micros).map_err(|_| ConvertError::Invalid {
+        field,
+        reason: "duration is outside the representable range",
+    })?;
+    Ok(Duration::from_micros(micros))
+}
+
+/// Decode an optional `uint64` microseconds field into a positive [`Duration`].
+///
+/// Rejects zero (a zero-length runtime bound is not a bound; absence is how
+/// "no bound" is spelled) and any value past `i64::MAX` µs, which the signed
+/// domain type cannot hold.
+fn positive_duration(micros: u64, field: &'static str) -> Result<Duration, ConvertError> {
+    let micros = i64::try_from(micros).map_err(|_| ConvertError::Invalid {
+        field,
+        reason: "duration is outside the representable range",
+    })?;
+    let duration = Duration::from_micros(micros);
+    if !duration.is_positive() {
+        return Err(ConvertError::Invalid {
+            field,
+            reason: "duration must be positive",
+        });
+    }
+    Ok(duration)
 }

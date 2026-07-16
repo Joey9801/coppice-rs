@@ -9,7 +9,7 @@ describe('shared components smoke test', () => {
   it('renders StatePill, KeyValueGrid and LogViewer with visible text', () => {
     const logs: LogEntry[] = [
       {
-        tUs: 1_720_000_000_000_000,
+        t: new Date(1_720_000_000_000),
         level: 'error',
         target: 'scheduler',
         message: 'placement failed',

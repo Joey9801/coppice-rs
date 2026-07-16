@@ -30,6 +30,7 @@ use coppice_core::quota::{
     DEFAULT_PENALTY_EXPONENT_MILLI, DEFAULT_REFUND_FRACTION_MILLI,
     DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
 };
+use coppice_core::time::{Duration, Timestamp};
 
 mod apply;
 pub mod command;
@@ -94,16 +95,16 @@ pub struct JobRecord {
     /// The Q32.32 priority multiplier resolved by the API at proposal time
     /// (ADR 0019: apply never sees the raw `i32` in arithmetic).
     pub multiplier: PriorityMultiplier,
-    pub submitted_at_us: i64,
+    pub submitted_at: Timestamp,
     /// When the job reached its terminal state, stamped from the resolving
-    /// command's proposer timestamp: abort's `requested_at_us`, an outcome
-    /// or reconcile report's `observed_at_us`, or a loss declaration's
-    /// `declared_at_us`. `None` while the job is live.
+    /// command's proposer timestamp: abort's `requested_at`, an outcome
+    /// or reconcile report's `observed_at`, or a loss declaration's
+    /// `declared_at`. `None` while the job is live.
     ///
     /// The retention clock for `EvictTerminalJobs` runs from this, never
-    /// from `submitted_at_us` (ADR 0012): a job may legitimately queue far
+    /// from `submitted_at` (ADR 0012): a job may legitimately queue far
     /// longer than the retention interval before it ever runs.
-    pub terminal_at_us: Option<i64>,
+    pub terminal_at: Option<Timestamp>,
     /// Retries consumed.
     ///
     /// `Revoked` outcomes requeue without touching this.
@@ -144,7 +145,7 @@ pub struct AttemptRecord {
     /// Set when the attempt is observed `Running`.
     ///
     /// An attempt that never started has actual cost zero at true-up.
-    pub started_at_us: Option<i64>,
+    pub started_at: Option<Timestamp>,
 }
 
 /// An allocation's replicated record plus its commit-order sequence.
@@ -214,9 +215,9 @@ pub struct PolicyConfig {
     /// terminal state (ADR 0012).
     ///
     /// Consulted by the proposer, never by apply.
-    pub terminal_retention_us: i64,
-    /// Default SIGTERM→SIGKILL grace for aborts, microseconds.
-    pub abort_grace_us: i64,
+    pub terminal_retention: Duration,
+    /// Default SIGTERM→SIGKILL grace for aborts.
+    pub abort_grace: Duration,
 }
 
 impl Default for PolicyConfig {
@@ -230,8 +231,8 @@ impl Default for PolicyConfig {
             default_charge_runtime_s: 86_400,
             unbounded_runtime_multiplier: DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
             refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
-            terminal_retention_us: 72 * 3_600 * 1_000_000,
-            abort_grace_us: 30 * 1_000_000,
+            terminal_retention: Duration::from_hours(72),
+            abort_grace: Duration::from_secs(30),
         }
     }
 }

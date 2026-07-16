@@ -12,7 +12,7 @@ import {
   type QuotaEntityView,
 } from '@/api/types'
 import { useJob, useJobLogs } from '@/api/queries'
-import { formatDurationUs, formatPercent, formatTimeAgo, formatTimestampUs } from '@/lib/format'
+import { formatDuration, formatPercent, formatTimeAgo, formatTimestamp } from '@/lib/format'
 import { EmptyState, LogViewer, PageHeader, StatePill, StatTile, TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -95,7 +95,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
           <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
             <EntityChain chain={job.entityChain} />
             <span className="text-muted-foreground">· submitted</span>
-            <TimeAgo tUs={job.submittedAtUs} />
+            <TimeAgo t={job.submittedAt} />
           </span>
         }
       />
@@ -112,7 +112,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
                 <p className="font-medium text-foreground">Abort requested</p>
                 <p className="text-muted-foreground">
                   {job.abortRequested.reason ?? 'No reason given'} ·{' '}
-                  {formatTimestampUs(job.abortRequested.requestedAtUs)}
+                  {formatTimestamp(job.abortRequested.requestedAt)}
                 </p>
               </div>
             </div>
@@ -155,26 +155,29 @@ function JobDetailView({ job }: { job: JobDetail }) {
 
 function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
   const lastAttempt = currentOrLastAttempt(job)
-  const nowUs = Date.now() * 1000
+  const now = new Date()
 
-  const runtimeUs =
-    lastAttempt?.startedAtUs != null
-      ? Math.max(0, (lastAttempt.endedAtUs ?? nowUs) - lastAttempt.startedAtUs)
+  const runtimeSeconds =
+    lastAttempt?.startedAt != null
+      ? Math.max(
+          0,
+          ((lastAttempt.endedAt ?? now).getTime() - lastAttempt.startedAt.getTime()) / 1000,
+        )
       : null
 
   // Cost lives entirely in the JobCostCard now — the tiles cover the rest of
   // the "how is it doing" story (state, runtime, retries).
   return (
     <div className="grid gap-3 sm:grid-cols-3">
-      <StatTile label="State" value={phase} hint={stateHint(job, phase, nowUs)} />
+      <StatTile label="State" value={phase} hint={stateHint(job, phase, now)} />
       <StatTile
         label="Runtime"
-        value={runtimeUs != null ? formatDurationUs(runtimeUs) : '—'}
+        value={runtimeSeconds != null ? formatDuration(runtimeSeconds) : '—'}
         hint={
-          runtimeUs == null
+          runtimeSeconds == null
             ? 'not started'
-            : job.spec.maxRuntimeUs != null
-              ? `limit ${formatDurationUs(job.spec.maxRuntimeUs)}`
+            : job.spec.maxRuntimeSeconds != null
+              ? `limit ${formatDuration(job.spec.maxRuntimeSeconds)}`
               : 'no runtime limit'
         }
       />
@@ -197,8 +200,8 @@ function currentOrLastAttempt(job: JobDetail): AttemptView | undefined {
 }
 
 /** State-specific sub-text: how long, and the one detail that matters now. */
-function stateHint(job: JobDetail, phase: JobPhase, nowUs: number): ReactNode {
-  const inState = formatDurationUs(Math.max(0, nowUs - job.stateSinceUs))
+function stateHint(job: JobDetail, phase: JobPhase, now: Date): ReactNode {
+  const inState = formatDuration(Math.max(0, (now.getTime() - job.stateSince.getTime()) / 1000))
   const outcome = currentOrLastAttempt(job)?.outcome ?? null
 
   switch (phase) {
@@ -223,14 +226,14 @@ function stateHint(job: JobDetail, phase: JobPhase, nowUs: number): ReactNode {
     case 'Finalizing':
       return `resolving outcome · ${inState}`
     case 'Succeeded':
-      return `exit 0 · finished ${formatTimeAgo(job.stateSinceUs)}`
+      return `exit 0 · finished ${formatTimeAgo(job.stateSince)}`
     case 'Failed': {
       const kind =
         outcome?.kind === 'Exited' ? `exit ${outcome.exitCode ?? '?'}` : (outcome?.kind ?? 'failed')
-      return `${kind} · ${formatTimeAgo(job.stateSinceUs)}`
+      return `${kind} · ${formatTimeAgo(job.stateSince)}`
     }
     case 'Aborted':
-      return `${job.abortRequested?.reason ?? 'no reason given'} · ${formatTimeAgo(job.stateSinceUs)}`
+      return `${job.abortRequested?.reason ?? 'no reason given'} · ${formatTimeAgo(job.stateSince)}`
   }
 }
 

@@ -17,6 +17,7 @@ pub mod job;
 pub mod node;
 pub mod quota;
 pub mod resource;
+pub mod time;
 
 // The old single-value `Epoch` placeholder is gone: ADR 0009 settled the
 // fencing token as the (leader_term, node_epoch) pair, defined on the wire

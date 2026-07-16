@@ -8,6 +8,7 @@
 //! them itself.
 
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::time::Duration;
 use coppice_state::command::{
     AbortJob, AllocationSpec, BumpClusterVersion, Command, CommitPlacements, ConfigureQuotaEntity,
     DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, LostAttempt, Placement, ReconcileNode,
@@ -17,7 +18,7 @@ use coppice_state::command::{
 use coppice_state::PolicyConfig;
 
 use super::core::{labels_from_pb, labels_to_pb, multipliers_from_pb, multipliers_to_pb};
-use super::{req, ConvertError};
+use super::{nonnegative_duration, req, timestamp, ConvertError};
 use crate::pb::command::v1 as pb;
 use crate::pb::command::v1::command::Body;
 use crate::pb::core::v1 as pbcore;
@@ -84,7 +85,7 @@ impl From<&SubmitJob> for pb::SubmitJob {
         pb::SubmitJob {
             job: Some((&c.job).into()),
             multiplier_q32_32: c.multiplier.0,
-            submitted_at_us: c.submitted_at_us,
+            submitted_at_us: c.submitted_at.as_micros(),
         }
     }
 }
@@ -96,7 +97,7 @@ impl TryFrom<pb::SubmitJob> for SubmitJob {
         Ok(SubmitJob {
             job: req(c.job, "SubmitJob.job")?.try_into()?,
             multiplier: PriorityMultiplier(c.multiplier_q32_32),
-            submitted_at_us: c.submitted_at_us,
+            submitted_at: timestamp(c.submitted_at_us, "SubmitJob.submitted_at_us")?,
         })
     }
 }
@@ -106,7 +107,7 @@ impl From<&AbortJob> for pb::AbortJob {
         pb::AbortJob {
             job: Some(c.job.into()),
             reason: c.reason.clone(),
-            requested_at_us: c.requested_at_us,
+            requested_at_us: c.requested_at.as_micros(),
         }
     }
 }
@@ -118,7 +119,7 @@ impl TryFrom<pb::AbortJob> for AbortJob {
         Ok(AbortJob {
             job: req(c.job, "AbortJob.job")?.try_into()?,
             reason: c.reason,
-            requested_at_us: c.requested_at_us,
+            requested_at: timestamp(c.requested_at_us, "AbortJob.requested_at_us")?,
         })
     }
 }
@@ -131,7 +132,7 @@ impl From<&CommitPlacements> for pb::CommitPlacements {
             expected_version: c.expected_version,
             revocations: c.revocations.iter().map(|id| (*id).into()).collect(),
             placements: c.placements.iter().map(Into::into).collect(),
-            proposed_at_us: c.proposed_at_us,
+            proposed_at_us: c.proposed_at.as_micros(),
         }
     }
 }
@@ -152,7 +153,7 @@ impl TryFrom<pb::CommitPlacements> for CommitPlacements {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
-            proposed_at_us: c.proposed_at_us,
+            proposed_at: timestamp(c.proposed_at_us, "CommitPlacements.proposed_at_us")?,
         })
     }
 }
@@ -211,7 +212,7 @@ impl From<&DispatchAttempt> for pb::DispatchAttempt {
     fn from(c: &DispatchAttempt) -> Self {
         pb::DispatchAttempt {
             attempt: Some(c.attempt.into()),
-            dispatched_at_us: c.dispatched_at_us,
+            dispatched_at_us: c.dispatched_at.as_micros(),
         }
     }
 }
@@ -222,7 +223,7 @@ impl TryFrom<pb::DispatchAttempt> for DispatchAttempt {
     fn try_from(c: pb::DispatchAttempt) -> Result<Self, ConvertError> {
         Ok(DispatchAttempt {
             attempt: req(c.attempt, "DispatchAttempt.attempt")?.try_into()?,
-            dispatched_at_us: c.dispatched_at_us,
+            dispatched_at: timestamp(c.dispatched_at_us, "DispatchAttempt.dispatched_at_us")?,
         })
     }
 }
@@ -233,7 +234,7 @@ impl From<&RecordAttemptStarted> for pb::RecordAttemptStarted {
     fn from(c: &RecordAttemptStarted) -> Self {
         pb::RecordAttemptStarted {
             attempt: Some(c.attempt.into()),
-            observed_at_us: c.observed_at_us,
+            observed_at_us: c.observed_at.as_micros(),
         }
     }
 }
@@ -244,7 +245,7 @@ impl TryFrom<pb::RecordAttemptStarted> for RecordAttemptStarted {
     fn try_from(c: pb::RecordAttemptStarted) -> Result<Self, ConvertError> {
         Ok(RecordAttemptStarted {
             attempt: req(c.attempt, "RecordAttemptStarted.attempt")?.try_into()?,
-            observed_at_us: c.observed_at_us,
+            observed_at: timestamp(c.observed_at_us, "RecordAttemptStarted.observed_at_us")?,
         })
     }
 }
@@ -253,7 +254,7 @@ impl From<&RecordAttemptExited> for pb::RecordAttemptExited {
     fn from(c: &RecordAttemptExited) -> Self {
         pb::RecordAttemptExited {
             attempt: Some(c.attempt.into()),
-            observed_at_us: c.observed_at_us,
+            observed_at_us: c.observed_at.as_micros(),
         }
     }
 }
@@ -264,7 +265,7 @@ impl TryFrom<pb::RecordAttemptExited> for RecordAttemptExited {
     fn try_from(c: pb::RecordAttemptExited) -> Result<Self, ConvertError> {
         Ok(RecordAttemptExited {
             attempt: req(c.attempt, "RecordAttemptExited.attempt")?.try_into()?,
-            observed_at_us: c.observed_at_us,
+            observed_at: timestamp(c.observed_at_us, "RecordAttemptExited.observed_at_us")?,
         })
     }
 }
@@ -274,8 +275,8 @@ impl From<&RecordAttemptOutcome> for pb::RecordAttemptOutcome {
         pb::RecordAttemptOutcome {
             attempt: Some(c.attempt.into()),
             outcome: Some((&c.outcome).into()),
-            actual_runtime_us: c.actual_runtime_us,
-            observed_at_us: c.observed_at_us,
+            actual_runtime_us: c.actual_runtime.as_micros() as u64,
+            observed_at_us: c.observed_at.as_micros(),
         }
     }
 }
@@ -287,8 +288,11 @@ impl TryFrom<pb::RecordAttemptOutcome> for RecordAttemptOutcome {
         Ok(RecordAttemptOutcome {
             attempt: req(c.attempt, "RecordAttemptOutcome.attempt")?.try_into()?,
             outcome: req(c.outcome, "RecordAttemptOutcome.outcome")?.try_into()?,
-            actual_runtime_us: c.actual_runtime_us,
-            observed_at_us: c.observed_at_us,
+            actual_runtime: nonnegative_duration(
+                c.actual_runtime_us,
+                "RecordAttemptOutcome.actual_runtime_us",
+            )?,
+            observed_at: timestamp(c.observed_at_us, "RecordAttemptOutcome.observed_at_us")?,
         })
     }
 }
@@ -300,7 +304,7 @@ impl From<&ReconcileNode> for pb::ReconcileNode {
             node_epoch: c.node_epoch,
             adopted: c.adopted.iter().map(|id| (*id).into()).collect(),
             lost: c.lost.iter().map(Into::into).collect(),
-            observed_at_us: c.observed_at_us,
+            observed_at_us: c.observed_at.as_micros(),
         }
     }
 }
@@ -322,7 +326,7 @@ impl TryFrom<pb::ReconcileNode> for ReconcileNode {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
-            observed_at_us: c.observed_at_us,
+            observed_at: timestamp(c.observed_at_us, "ReconcileNode.observed_at_us")?,
         })
     }
 }
@@ -332,7 +336,7 @@ impl From<&LostAttempt> for pb::LostAttempt {
         pb::LostAttempt {
             attempt: Some(l.attempt.into()),
             outcome: Some((&l.outcome).into()),
-            actual_runtime_us: l.actual_runtime_us,
+            actual_runtime_us: l.actual_runtime.as_micros() as u64,
         }
     }
 }
@@ -344,7 +348,10 @@ impl TryFrom<pb::LostAttempt> for LostAttempt {
         Ok(LostAttempt {
             attempt: req(l.attempt, "LostAttempt.attempt")?.try_into()?,
             outcome: req(l.outcome, "LostAttempt.outcome")?.try_into()?,
-            actual_runtime_us: l.actual_runtime_us,
+            actual_runtime: nonnegative_duration(
+                l.actual_runtime_us,
+                "LostAttempt.actual_runtime_us",
+            )?,
         })
     }
 }
@@ -357,7 +364,7 @@ impl From<&RegisterNode> for pb::RegisterNode {
             node: Some(c.node.into()),
             capacity: Some((&c.capacity).into()),
             labels: labels_to_pb(&c.labels),
-            registered_at_us: c.registered_at_us,
+            registered_at_us: c.registered_at.as_micros(),
         }
     }
 }
@@ -370,7 +377,7 @@ impl TryFrom<pb::RegisterNode> for RegisterNode {
             node: req(c.node, "RegisterNode.node")?.try_into()?,
             capacity: req(c.capacity, "RegisterNode.capacity")?.try_into()?,
             labels: labels_from_pb(c.labels)?,
-            registered_at_us: c.registered_at_us,
+            registered_at: timestamp(c.registered_at_us, "RegisterNode.registered_at_us")?,
         })
     }
 }
@@ -379,7 +386,7 @@ impl From<&DeclareNodeLost> for pb::DeclareNodeLost {
     fn from(c: &DeclareNodeLost) -> Self {
         pb::DeclareNodeLost {
             node: Some(c.node.into()),
-            declared_at_us: c.declared_at_us,
+            declared_at_us: c.declared_at.as_micros(),
         }
     }
 }
@@ -390,7 +397,7 @@ impl TryFrom<pb::DeclareNodeLost> for DeclareNodeLost {
     fn try_from(c: pb::DeclareNodeLost) -> Result<Self, ConvertError> {
         Ok(DeclareNodeLost {
             node: req(c.node, "DeclareNodeLost.node")?.try_into()?,
-            declared_at_us: c.declared_at_us,
+            declared_at: timestamp(c.declared_at_us, "DeclareNodeLost.declared_at_us")?,
         })
     }
 }
@@ -400,7 +407,7 @@ impl From<&SetNodeSchedulable> for pb::SetNodeSchedulable {
         pb::SetNodeSchedulable {
             node: Some(c.node.into()),
             schedulable: c.schedulable,
-            updated_at_us: c.updated_at_us,
+            updated_at_us: c.updated_at.as_micros(),
         }
     }
 }
@@ -412,7 +419,7 @@ impl TryFrom<pb::SetNodeSchedulable> for SetNodeSchedulable {
         Ok(SetNodeSchedulable {
             node: req(c.node, "SetNodeSchedulable.node")?.try_into()?,
             schedulable: c.schedulable,
-            updated_at_us: c.updated_at_us,
+            updated_at: timestamp(c.updated_at_us, "SetNodeSchedulable.updated_at_us")?,
         })
     }
 }
@@ -423,7 +430,7 @@ impl From<&EvictTerminalJobs> for pb::EvictTerminalJobs {
     fn from(c: &EvictTerminalJobs) -> Self {
         pb::EvictTerminalJobs {
             jobs: c.jobs.iter().map(|id| (*id).into()).collect(),
-            evicted_at_us: c.evicted_at_us,
+            evicted_at_us: c.evicted_at.as_micros(),
         }
     }
 }
@@ -438,7 +445,7 @@ impl TryFrom<pb::EvictTerminalJobs> for EvictTerminalJobs {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
-            evicted_at_us: c.evicted_at_us,
+            evicted_at: timestamp(c.evicted_at_us, "EvictTerminalJobs.evicted_at_us")?,
         })
     }
 }
@@ -452,7 +459,7 @@ impl From<&ConfigureQuotaEntity> for pb::ConfigureQuotaEntity {
             parent: c.parent.map(Into::into),
             name: c.name.clone(),
             quota_ucu: c.quota.0,
-            updated_at_us: c.updated_at_us,
+            updated_at_us: c.updated_at.as_micros(),
         }
     }
 }
@@ -466,7 +473,7 @@ impl TryFrom<pb::ConfigureQuotaEntity> for ConfigureQuotaEntity {
             parent: c.parent.map(TryInto::try_into).transpose()?,
             name: c.name,
             quota: CostUnits(c.quota_ucu),
-            updated_at_us: c.updated_at_us,
+            updated_at: timestamp(c.updated_at_us, "ConfigureQuotaEntity.updated_at_us")?,
         })
     }
 }
@@ -475,7 +482,7 @@ impl From<&UpdatePolicy> for pb::UpdatePolicy {
     fn from(c: &UpdatePolicy) -> Self {
         pb::UpdatePolicy {
             policy: Some((&c.policy).into()),
-            updated_at_us: c.updated_at_us,
+            updated_at_us: c.updated_at.as_micros(),
         }
     }
 }
@@ -486,7 +493,7 @@ impl TryFrom<pb::UpdatePolicy> for UpdatePolicy {
     fn try_from(c: pb::UpdatePolicy) -> Result<Self, ConvertError> {
         Ok(UpdatePolicy {
             policy: req(c.policy, "UpdatePolicy.policy")?.try_into()?,
-            updated_at_us: c.updated_at_us,
+            updated_at: timestamp(c.updated_at_us, "UpdatePolicy.updated_at_us")?,
         })
     }
 }
@@ -495,7 +502,7 @@ impl From<&BumpClusterVersion> for pb::BumpClusterVersion {
     fn from(c: &BumpClusterVersion) -> Self {
         pb::BumpClusterVersion {
             to: c.to,
-            bumped_at_us: c.bumped_at_us,
+            bumped_at_us: c.bumped_at.as_micros(),
         }
     }
 }
@@ -506,7 +513,7 @@ impl TryFrom<pb::BumpClusterVersion> for BumpClusterVersion {
     fn try_from(c: pb::BumpClusterVersion) -> Result<Self, ConvertError> {
         Ok(BumpClusterVersion {
             to: c.to,
-            bumped_at_us: c.bumped_at_us,
+            bumped_at: timestamp(c.bumped_at_us, "BumpClusterVersion.bumped_at_us")?,
         })
     }
 }
@@ -522,8 +529,8 @@ impl From<&PolicyConfig> for pbcore::PolicyConfig {
             priority_multipliers: multipliers_to_pb(&policy.priority_multipliers),
             accrual_limit: policy.accrual_limit,
             default_charge_runtime_s: policy.default_charge_runtime_s,
-            terminal_retention_us: policy.terminal_retention_us,
-            abort_grace_us: policy.abort_grace_us,
+            terminal_retention_us: policy.terminal_retention.as_micros(),
+            abort_grace_us: policy.abort_grace.as_micros(),
             unbounded_runtime_multiplier_q32_32: Some(policy.unbounded_runtime_multiplier.0),
             refund_fraction_milli: Some(policy.refund_fraction_milli),
         }
@@ -541,8 +548,11 @@ impl TryFrom<pbcore::PolicyConfig> for PolicyConfig {
             priority_multipliers: multipliers_from_pb(policy.priority_multipliers)?,
             accrual_limit: policy.accrual_limit,
             default_charge_runtime_s: policy.default_charge_runtime_s,
-            terminal_retention_us: policy.terminal_retention_us,
-            abort_grace_us: policy.abort_grace_us,
+            // Signed on the wire and signed in the domain, so this is total;
+            // a nonsensical (negative) retention is policy's to validate, not
+            // the codec's.
+            terminal_retention: Duration::from_micros(policy.terminal_retention_us),
+            abort_grace: Duration::from_micros(policy.abort_grace_us),
             // Absent (a policy written by a pre-0029 coordinator) decodes to
             // the neutral values, reproducing today's behaviour — not the new
             // PolicyConfig::default() knobs, which only fresh policies get.

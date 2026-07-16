@@ -19,7 +19,7 @@ use coppice_state::{
     AllocationRecord, AttemptRecord, JobRecord, NodeRecord, QuotaEntity, StateMachine,
 };
 
-use super::{req, ConvertError};
+use super::{req, timestamp, ConvertError};
 use crate::pb::storage::v1 as pb;
 
 // ---- Per-record conversions ----
@@ -30,8 +30,8 @@ impl From<&JobRecord> for pb::JobRecord {
             spec: Some((&r.spec).into()),
             state: Some(r.state.into()),
             multiplier_q32_32: r.multiplier.0,
-            submitted_at_us: r.submitted_at_us,
-            terminal_at_us: r.terminal_at_us,
+            submitted_at_us: r.submitted_at.as_micros(),
+            terminal_at_us: r.terminal_at.map(|t| t.as_micros()),
             retries_used: r.retries_used,
             attempts: r.attempts.iter().map(|id| (*id).into()).collect(),
         }
@@ -46,8 +46,11 @@ impl TryFrom<pb::JobRecord> for JobRecord {
             spec: req(r.spec, "JobRecord.spec")?.try_into()?,
             state: req(r.state, "JobRecord.state")?.try_into()?,
             multiplier: PriorityMultiplier(r.multiplier_q32_32),
-            submitted_at_us: r.submitted_at_us,
-            terminal_at_us: r.terminal_at_us,
+            submitted_at: timestamp(r.submitted_at_us, "JobRecord.submitted_at_us")?,
+            terminal_at: r
+                .terminal_at_us
+                .map(|us| timestamp(us, "JobRecord.terminal_at_us"))
+                .transpose()?,
             retries_used: r.retries_used,
             attempts: r
                 .attempts
@@ -66,7 +69,7 @@ impl From<&AttemptRecord> for pb::AttemptRecord {
             charge: Some(r.charge.into()),
             rate_ucu_per_second: r.rate_ucu_per_second,
             multiplier_q32_32: r.multiplier.0,
-            started_at_us: r.started_at_us,
+            started_at_us: r.started_at.map(|t| t.as_micros()),
         }
     }
 }
@@ -78,10 +81,13 @@ impl TryFrom<pb::AttemptRecord> for AttemptRecord {
         Ok(AttemptRecord {
             attempt: req(r.attempt, "AttemptRecord.attempt")?.try_into()?,
             group: req(r.group, "AttemptRecord.group")?.try_into()?,
-            charge: req(r.charge, "AttemptRecord.charge")?.into(),
+            charge: req(r.charge, "AttemptRecord.charge")?.try_into()?,
             rate_ucu_per_second: r.rate_ucu_per_second,
             multiplier: PriorityMultiplier(r.multiplier_q32_32),
-            started_at_us: r.started_at_us,
+            started_at: r
+                .started_at_us
+                .map(|us| timestamp(us, "AttemptRecord.started_at_us"))
+                .transpose()?,
         })
     }
 }
@@ -151,7 +157,7 @@ impl TryFrom<pb::QuotaEntityRecord> for (coppice_core::id::QuotaEntityId, QuotaE
                 parent: r.parent.map(TryInto::try_into).transpose()?,
                 name: r.name,
                 quota: CostUnits(r.quota_ucu),
-                usage: req(r.usage, "QuotaEntityRecord.usage")?.into(),
+                usage: req(r.usage, "QuotaEntityRecord.usage")?.try_into()?,
             },
         ))
     }

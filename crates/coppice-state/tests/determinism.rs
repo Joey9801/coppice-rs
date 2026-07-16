@@ -24,6 +24,7 @@ use coppice_core::attempt::AttemptOutcome;
 use coppice_core::job::RetryPolicy;
 use coppice_core::quota::CostUnits;
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{state_from_records, state_to_records, StateRecords};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
@@ -39,10 +40,10 @@ fn node_of(ix: usize) -> coppice_core::id::NodeId {
     nid(1 + (ix as u128 % NODES as u128))
 }
 
-fn arb_ts() -> impl Strategy<Value = i64> {
+fn arb_ts() -> impl Strategy<Value = Timestamp> {
     // A day's spread around the fixture base, deliberately not monotone:
     // the clock-skew clamp must make regressed timestamps harmless.
-    (TS - 43_200_000_000)..(TS + 43_200_000_000)
+    ((TS_US - 43_200_000_000)..(TS_US + 43_200_000_000)).prop_map(ts)
 }
 
 fn arb_outcome() -> impl Strategy<Value = AttemptOutcome> {
@@ -69,7 +70,7 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
         arb_outcome(),
         0usize..NODES as usize,
         500u64..12_000,
-        proptest::option::of(60u64..7_200),
+        proptest::option::of(60i64..7_200),
         arb_ts(),
     )
         .prop_map(
@@ -107,20 +108,20 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 node: node_of(n),
                 capacity: cpu(cpu_millis),
                 labels: BTreeMap::new(),
-                registered_at_us: ts,
+                registered_at: ts,
             })
         }),
         (0usize..NODES as usize, arb_ts()).prop_map(|(n, ts)| {
             Command::DeclareNodeLost(DeclareNodeLost {
                 node: node_of(n),
-                declared_at_us: ts,
+                declared_at: ts,
             })
         }),
         (0usize..NODES as usize, any::<bool>(), arb_ts()).prop_map(|(n, schedulable, ts)| {
             Command::SetNodeSchedulable(SetNodeSchedulable {
                 node: node_of(n),
                 schedulable,
-                updated_at_us: ts,
+                updated_at: ts,
             })
         }),
         (any::<u8>(), arb_ts()).prop_map(|(mask, ts)| {
@@ -129,7 +130,7 @@ fn arb_global() -> impl Strategy<Value = Command> {
                     .filter(|k| mask & (1 << k) != 0)
                     .map(|k| jid(1_000 + k as u128))
                     .collect(),
-                evicted_at_us: ts,
+                evicted_at: ts,
             })
         }),
         (0u128..4, arb_ts()).prop_map(|(e, ts)| {
@@ -138,14 +139,11 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 parent: Some(ROOT),
                 name: "team".into(),
                 quota: CostUnits(1_000_000_000),
-                updated_at_us: ts,
+                updated_at: ts,
             })
         }),
         (1u32..6, arb_ts()).prop_map(|(to, ts)| {
-            Command::BumpClusterVersion(BumpClusterVersion {
-                to,
-                bumped_at_us: ts,
-            })
+            Command::BumpClusterVersion(BumpClusterVersion { to, bumped_at: ts })
         }),
         (0u32..5,).prop_map(|(k,)| update_policy_cmd(test_policy(k))),
         (
@@ -168,10 +166,10 @@ fn arb_global() -> impl Strategy<Value = Command> {
                         .map(|k| LostAttempt {
                             attempt: aid(2_000 + k as u128),
                             outcome: AttemptOutcome::AgentError,
-                            actual_runtime_us: 0,
+                            actual_runtime: Duration::ZERO,
                         })
                         .collect(),
-                    observed_at_us: ts,
+                    observed_at: ts,
                 })
             }),
     ]
@@ -269,7 +267,11 @@ fn arb_scenario() -> impl Strategy<Value = Scenario> {
                 update_policy_cmd(test_policy(4)),
             ];
             for n in 0..NODES {
-                commands.push(register_node_cmd(node_of(n as usize), cpu(16_000), TS));
+                commands.push(register_node_cmd(
+                    node_of(n as usize),
+                    cpu(16_000),
+                    base_ts(),
+                ));
             }
             commands.extend(interleave(chains, picks));
             let split = split.index(commands.len() + 1);
@@ -348,29 +350,29 @@ fn extreme_resources_never_panic() {
         memory_bytes: u64::MAX,
         disk_bytes: u64::MAX,
     };
-    apply_ok(&mut sm, register_node_cmd(nid(9), huge, TS));
+    apply_ok(&mut sm, register_node_cmd(nid(9), huge, base_ts()));
     apply_ok(
         &mut sm,
         submit_cmd(
             jid(9),
             huge,
-            Some(u64::MAX / 2_000_000),
+            Some(i64::MAX / 2_000_000),
             RetryPolicy::default(),
         ),
     );
     apply_ok(
         &mut sm,
-        place_cmd(placement(jid(9), aid(9), alid(9), nid(9), huge), TS),
+        place_cmd(placement(jid(9), aid(9), alid(9), nid(9), huge), base_ts()),
     );
-    apply_ok(&mut sm, dispatch_cmd(aid(9), TS));
-    apply_ok(&mut sm, started_cmd(aid(9), TS));
+    apply_ok(&mut sm, dispatch_cmd(aid(9), base_ts()));
+    apply_ok(&mut sm, started_cmd(aid(9), base_ts()));
     apply_ok(
         &mut sm,
         outcome_cmd(
             aid(9),
             AttemptOutcome::Exited { code: 0 },
-            u64::MAX / 2_000_000,
-            TS + 1,
+            i64::MAX / 2_000_000,
+            ts(TS_US + 1),
         ),
     );
 }

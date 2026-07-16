@@ -19,12 +19,11 @@
 //! ObservedSet, so an outcome observed while the coordinator was unreachable
 //! survives to the next resync (it is durable in the journal until then).
 
-use std::time::Duration;
-
 use coppice_consensus::fs::Fs;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::resource::Resources;
+use coppice_core::time::Duration;
 use coppice_proto::pb::agent::v1 as pb;
 use coppice_proto::pb::core::v1 as pbcore;
 
@@ -46,15 +45,15 @@ enum Admit {
 /// A runtime watchdog armed by a successful start: the allocation to kill and
 /// the runtime bound it may not exceed.
 ///
-/// `max_runtime_us` is the enforced bound copied from `StartJob.max_runtime_us`
+/// `max_runtime` is the enforced bound copied from `StartJob.max_runtime_us`
 /// (ADR 0014), not a wall-clock deadline — the live loop converts it to a timer
 /// when it drains these via [`Session::take_armed_watchdogs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArmedWatchdog {
     /// The allocation whose container the timer will stop.
     pub allocation: AllocationId,
-    /// The maximum runtime, in microseconds, before the watchdog fires.
-    pub max_runtime_us: u64,
+    /// The maximum runtime before the watchdog fires.
+    pub max_runtime: Duration,
 }
 
 /// The transport-free session core. Generic over the filesystem seam (for the
@@ -80,7 +79,7 @@ pub struct Session<F: Fs, E: Executor> {
     /// so a StartJob that arrives drained is still executed (committed intent
     /// predating the drain) — this only records the request.
     drained: bool,
-    /// Watchdogs armed by successful starts with a `max_runtime_us`, drained
+    /// Watchdogs armed by successful starts with a `max_runtime`, drained
     /// by the live loop which owns the timers.
     armed_watchdogs: Vec<ArmedWatchdog>,
 }
@@ -309,7 +308,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
                     exit.attempt,
                     exit.job,
                     exit.outcome.clone(),
-                    exit.runtime_us,
+                    exit.runtime,
                 )]);
             }
             return Ok(vec![self.terminal_status(
@@ -317,7 +316,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 attempt,
                 job,
                 AttemptOutcome::Aborted,
-                0,
+                Duration::ZERO,
             )]);
         }
 
@@ -342,6 +341,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
         self.journal.journal_intent(&intent)?;
         self.state.intents.insert(alloc, intent);
 
+        let max_runtime = sj.max_runtime_us.map(runtime_bound);
         let spec = StartSpec {
             allocation: alloc,
             attempt,
@@ -353,14 +353,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 .limits
                 .and_then(|r| r.try_into().ok())
                 .unwrap_or(Resources::ZERO),
-            max_runtime_us: sj.max_runtime_us,
+            max_runtime,
         };
         match self.executor.start(spec).await {
             Ok(()) => {
-                if let Some(max) = sj.max_runtime_us {
+                if let Some(max) = max_runtime {
                     self.armed_watchdogs.push(ArmedWatchdog {
                         allocation: alloc,
-                        max_runtime_us: max,
+                        max_runtime: max,
                     });
                 }
                 Ok(vec![self.running_status(alloc, attempt, job)])
@@ -368,8 +368,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
             Err(e) => {
                 let outcome = e.outcome();
                 tracing::warn!(node = %self.node, %alloc, error = %e, "container start failed");
-                self.record_exit(alloc, attempt, job, outcome.clone(), 0)?;
-                Ok(vec![self.terminal_status(alloc, attempt, job, outcome, 0)])
+                self.record_exit(alloc, attempt, job, outcome.clone(), Duration::ZERO)?;
+                Ok(vec![self.terminal_status(
+                    alloc,
+                    attempt,
+                    job,
+                    outcome,
+                    Duration::ZERO,
+                )])
             }
         }
     }
@@ -381,7 +387,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             tracing::warn!(node = %self.node, "dropping malformed StopJob (missing allocation)");
             return Ok(Vec::new());
         };
-        let grace = Duration::from_micros(sp.grace_us.max(0) as u64);
+        let grace = Duration::from_micros(sp.grace_us).max(Duration::ZERO);
 
         // Tombstone first, fsynced, valid even for an unknown allocation: a
         // racing or re-delivered StartJob is refused even across a restart
@@ -396,7 +402,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 exit.attempt,
                 exit.job,
                 exit.outcome.clone(),
-                exit.runtime_us,
+                exit.runtime,
             )]);
         }
 
@@ -430,24 +436,24 @@ impl<F: Fs, E: Executor> Session<F, E> {
     ) -> std::io::Result<Vec<pb::AgentReport>> {
         match self.executor.stop(alloc, grace).await {
             Ok(StopOutcome::Stopped(exit)) => {
-                self.record_exit(alloc, attempt, job, kill_outcome.clone(), exit.runtime_us)?;
+                self.record_exit(alloc, attempt, job, kill_outcome.clone(), exit.runtime)?;
                 Ok(vec![self.terminal_status(
                     alloc,
                     attempt,
                     job,
                     kill_outcome,
-                    exit.runtime_us,
+                    exit.runtime,
                 )])
             }
             Ok(StopOutcome::AlreadyExited(exit)) => {
                 let outcome = classify_exit(&exit);
-                self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime_us)?;
+                self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;
                 Ok(vec![self.terminal_status(
                     alloc,
                     attempt,
                     job,
                     outcome,
-                    exit.runtime_us,
+                    exit.runtime,
                 )])
             }
             Ok(StopOutcome::Unknown) => {
@@ -506,14 +512,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
             intent.attempt,
             intent.job,
             outcome.clone(),
-            exit.runtime_us,
+            exit.runtime,
         )?;
         Ok(vec![self.terminal_status(
             alloc,
             intent.attempt,
             intent.job,
             outcome,
-            exit.runtime_us,
+            exit.runtime,
         )])
     }
 
@@ -567,11 +573,17 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 exit.attempt,
                 exit.job,
                 exit.outcome.clone(),
-                exit.runtime_us,
+                exit.runtime,
             )];
         }
         if self.state.tombstones.contains(&alloc) {
-            return vec![self.terminal_status(alloc, attempt, job, AttemptOutcome::Aborted, 0)];
+            return vec![self.terminal_status(
+                alloc,
+                attempt,
+                job,
+                AttemptOutcome::Aborted,
+                Duration::ZERO,
+            )];
         }
         // Intent present (or best-effort): believed running.
         vec![self.running_status(alloc, attempt, job)]
@@ -583,14 +595,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
         attempt: AttemptId,
         job: JobId,
         outcome: AttemptOutcome,
-        runtime_us: u64,
+        runtime: Duration,
     ) -> std::io::Result<()> {
         let exit = ExitRec {
             allocation: alloc,
             attempt,
             job,
             outcome,
-            runtime_us,
+            runtime,
         };
         self.journal.journal_exit(&exit)?;
         self.state.exits.insert(alloc, exit);
@@ -626,14 +638,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
         attempt: AttemptId,
         job: JobId,
         outcome: AttemptOutcome,
-        runtime_us: u64,
+        runtime: Duration,
     ) -> pb::AgentReport {
         self.report(pb::agent_report::Body::AttemptStatus(pb::AttemptStatus {
             allocation: Some(alloc.into()),
             attempt: Some(attempt.into()),
             job: Some(job.into()),
             observed: Some((&AttemptState::Terminal(outcome)).into()),
-            runtime_us,
+            runtime_us: runtime.as_micros() as u64,
         }))
     }
 }
@@ -647,6 +659,13 @@ struct StartIds {
     attempt: AttemptId,
     /// The job the attempt belongs to.
     job: JobId,
+}
+
+/// The runtime bound a `StartJob` carries, as a span. The wire field is
+/// unsigned and so reaches past [`Duration`]'s range; a bound that far out
+/// saturates, which is indistinguishable from the unbounded case it means.
+fn runtime_bound(micros: u64) -> Duration {
+    Duration::from_micros(i64::try_from(micros).unwrap_or(i64::MAX))
 }
 
 fn start_ids(sj: &pb::StartJob) -> Option<StartIds> {
@@ -667,7 +686,7 @@ fn observed_to_pb(o: &ObservedAllocation) -> pb::ObservedAllocation {
         job: Some(o.job.into()),
         running: o.running,
         outcome: o.outcome.as_ref().map(|oc| oc.into()),
-        runtime_us: o.runtime_us,
+        runtime_us: o.runtime.as_micros() as u64,
     }
 }
 

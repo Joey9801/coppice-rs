@@ -426,6 +426,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -627,6 +628,7 @@ dependencies = [
 name = "coppice-core"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "proptest",
  "serde",
  "serde_json",

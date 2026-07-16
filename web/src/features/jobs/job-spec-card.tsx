@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import type { JobDetail, JobSpec } from '@/api/types'
-import { formatDurationUs, formatResources, shortId } from '@/lib/format'
+import { formatDuration, formatResources, shortId } from '@/lib/format'
 import { KeyValueGrid } from '@/components'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 
@@ -21,8 +21,8 @@ export function JobSpecCard({ job }: { job: JobDetail }) {
     {
       label: 'Max runtime',
       value:
-        spec.maxRuntimeUs != null ? (
-          formatDurationUs(spec.maxRuntimeUs)
+        spec.maxRuntimeSeconds != null ? (
+          formatDuration(spec.maxRuntimeSeconds)
         ) : (
           <span className="text-muted-foreground">none — cost estimate uses policy default</span>
         ),

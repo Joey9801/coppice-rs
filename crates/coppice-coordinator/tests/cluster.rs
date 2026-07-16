@@ -21,6 +21,7 @@ use coppice_consensus::{Consensus, OpenraftConsensus};
 use coppice_coordinator::admin;
 use coppice_coordinator::config::CliOverrides;
 use coppice_core::id::ClusterId;
+use coppice_core::time::Timestamp;
 use coppice_state::command::BumpClusterVersion;
 use coppice_state::Command;
 
@@ -52,7 +53,7 @@ async fn propose_bump(node: &Node, to: u32) -> u64 {
         .consensus()
         .propose(Command::BumpClusterVersion(BumpClusterVersion {
             to,
-            bumped_at_us: to as i64,
+            bumped_at: Timestamp::from_micros(to as i64).expect("in range"),
         }))
         .await
         .unwrap_or_else(|e| panic!("propose bump to={to} failed: {e:?}"));
@@ -278,7 +279,7 @@ async fn three_node_cluster_lifecycle() {
             let applied = leader_consensus
                 .propose(Command::BumpClusterVersion(BumpClusterVersion {
                     to,
-                    bumped_at_us: to as i64,
+                    bumped_at: Timestamp::from_micros(to as i64).expect("in range"),
                 }))
                 .await
                 .unwrap_or_else(|e| panic!("offline-window bump to={to} failed: {e:?}"));

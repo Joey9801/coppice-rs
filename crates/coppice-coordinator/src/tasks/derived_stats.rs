@@ -24,6 +24,7 @@ use tokio::time::MissedTickBehavior;
 use coppice_api::{QueueBucket, QueueWindow};
 use coppice_consensus::StateViews;
 use coppice_core::job::JobState;
+use coppice_core::time::Timestamp;
 use coppice_state::Event;
 
 use crate::limits::{QUEUE_BUCKET_INTERVAL, QUEUE_WINDOW_MAX_BUCKETS};
@@ -36,17 +37,17 @@ use crate::tasks::event_fanout::{EventFilter, FanoutHandle, SubscriptionItem};
 struct WindowState {
     /// Closed buckets, oldest first, bounded by [`QUEUE_WINDOW_MAX_BUCKETS`].
     closed: VecDeque<QueueBucket>,
-    /// Start of the open bucket, Unix µs.
-    open_start_us: i64,
+    /// Start of the open bucket.
+    open_start: Timestamp,
     open_arrivals: u32,
     open_drains: u32,
 }
 
 impl WindowState {
-    fn new(now_us: i64) -> Self {
+    fn new(now: Timestamp) -> Self {
         WindowState {
             closed: VecDeque::new(),
-            open_start_us: now_us,
+            open_start: now,
             open_arrivals: 0,
             open_drains: 0,
         }
@@ -65,15 +66,15 @@ impl WindowState {
     }
 
     /// Close the open bucket with the depth sampled at close time and open
-    /// the next one at `now_us`.
+    /// the next one at `now`.
     ///
-    /// `now_us` becomes the bucket's `end_us`: after a stalled tick (missed
+    /// `now` becomes the bucket's `end`: after a stalled tick (missed
     /// ticks are skipped) this is one honest *long* bucket, and consumers
     /// scale by the recorded span rather than the nominal 30 s.
-    fn close_bucket(&mut self, depth: u32, now_us: i64) {
+    fn close_bucket(&mut self, depth: u32, now: Timestamp) {
         self.closed.push_back(QueueBucket {
-            start_us: self.open_start_us,
-            end_us: now_us,
+            start: self.open_start,
+            end: now,
             depth,
             arrivals: self.open_arrivals,
             drains: self.open_drains,
@@ -81,16 +82,16 @@ impl WindowState {
         while self.closed.len() > QUEUE_WINDOW_MAX_BUCKETS {
             self.closed.pop_front();
         }
-        self.open_start_us = now_us;
+        self.open_start = now;
         self.open_arrivals = 0;
         self.open_drains = 0;
     }
 
     /// Drop everything: coverage was lost, and a partially counted window
-    /// would be indistinguishable from a complete one. Restart from `now_us`.
-    fn reset(&mut self, now_us: i64) {
+    /// would be indistinguishable from a complete one. Restart from `now`.
+    fn reset(&mut self, now: Timestamp) {
         self.closed.clear();
-        self.open_start_us = now_us;
+        self.open_start = now;
         self.open_arrivals = 0;
         self.open_drains = 0;
     }
@@ -112,13 +113,6 @@ fn sample_depth(views: &StateViews) -> u32 {
         .count()
         .try_into()
         .unwrap_or(u32::MAX)
-}
-
-fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 /// Spawn the derived-stats task.
@@ -150,7 +144,7 @@ async fn run(
         return;
     };
 
-    let mut state = WindowState::new(now_us());
+    let mut state = WindowState::new(Timestamp::now());
 
     // Skip missed ticks: a stalled loop should close one (long) bucket, not
     // burst out a run of empty ones with fabricated timestamps.
@@ -180,7 +174,7 @@ async fn run(
                             earliest_available,
                             "derived stats: event stream gap, dropping the queue window"
                         );
-                        state.reset(now_us());
+                        state.reset(Timestamp::now());
                         let _ = tx.send(state.window());
                     }
                     // Fanout shut down; nothing further will arrive.
@@ -188,7 +182,7 @@ async fn run(
                 }
             }
             _ = tick.tick() => {
-                state.close_bucket(sample_depth(&views), now_us());
+                state.close_bucket(sample_depth(&views), Timestamp::now());
                 let _ = tx.send(state.window());
             }
         }
@@ -200,6 +194,12 @@ async fn run(
 mod tests {
     use super::*;
     use coppice_core::id::JobId;
+
+    /// Fixture instants are milliseconds from the epoch, so the range check
+    /// cannot fire.
+    fn ts(micros: i64) -> Timestamp {
+        Timestamp::from_micros(micros).expect("fixture timestamps are in range")
+    }
 
     fn queued_transition(to_queued: bool) -> Event {
         let job = JobId::new();
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn counts_arrivals_and_drains_into_the_open_bucket() {
-        let mut state = WindowState::new(1_000);
+        let mut state = WindowState::new(ts(1_000));
         state.observe(&queued_transition(true));
         state.observe(&queued_transition(true));
         state.observe(&queued_transition(false));
@@ -231,12 +231,12 @@ mod tests {
             to: JobState::Accepted,
         });
 
-        state.close_bucket(7, 31_000);
+        state.close_bucket(7, ts(31_000));
         let window = state.window();
         assert_eq!(window.buckets.len(), 1);
         let bucket = window.buckets[0];
-        assert_eq!(bucket.start_us, 1_000);
-        assert_eq!(bucket.end_us, 31_000);
+        assert_eq!(bucket.start, ts(1_000));
+        assert_eq!(bucket.end, ts(31_000));
         assert_eq!(bucket.arrivals, 2);
         assert_eq!(bucket.drains, 1);
         assert_eq!(bucket.depth, 7);
@@ -244,24 +244,24 @@ mod tests {
         // The next bucket opens at the close time with fresh counts; a late
         // close (a stalled tick) records the honest long span.
         state.observe(&queued_transition(true));
-        state.close_bucket(8, 331_000);
+        state.close_bucket(8, ts(331_000));
         let window = state.window();
-        assert_eq!(window.buckets[1].start_us, 31_000);
-        assert_eq!(window.buckets[1].end_us, 331_000);
+        assert_eq!(window.buckets[1].start, ts(31_000));
+        assert_eq!(window.buckets[1].end, ts(331_000));
         assert_eq!(window.buckets[1].arrivals, 1);
         assert_eq!(window.buckets[1].drains, 0);
     }
 
     #[test]
     fn window_is_bounded_by_evicting_the_oldest_bucket() {
-        let mut state = WindowState::new(0);
+        let mut state = WindowState::new(ts(0));
         for i in 0..(QUEUE_WINDOW_MAX_BUCKETS + 3) {
-            state.close_bucket(0, (i as i64 + 1) * 30_000_000);
+            state.close_bucket(0, ts((i as i64 + 1) * 30_000_000));
         }
         let window = state.window();
         assert_eq!(window.buckets.len(), QUEUE_WINDOW_MAX_BUCKETS);
         // Oldest three were evicted: the window starts at the fourth bucket.
-        assert_eq!(window.buckets[0].start_us, 3 * 30_000_000);
+        assert_eq!(window.buckets[0].start, ts(3 * 30_000_000));
     }
 
     /// The task end to end under virtual time: events counted off a real
@@ -295,7 +295,7 @@ mod tests {
 
         tap.emit(EventBatch {
             applied_index: 2,
-            at_us: 1_000,
+            at: ts(1_000),
             events: vec![queued_transition(true), queued_transition(false)],
         });
 
@@ -310,7 +310,7 @@ mod tests {
         // The recorded span is wall-clock time between open and close. Under
         // virtual time that is near zero — the point is that it is measured,
         // not assumed to be the nominal interval.
-        assert!(window.buckets[0].end_us >= window.buckets[0].start_us);
+        assert!(window.buckets[0].end >= window.buckets[0].start);
     }
 
     /// ADR 0032's honest-gap rule for tier 3: a gap voids every bucket's
@@ -318,19 +318,19 @@ mod tests {
     /// that silently miss a span.
     #[test]
     fn a_gap_drops_the_whole_window() {
-        let mut state = WindowState::new(0);
+        let mut state = WindowState::new(ts(0));
         state.observe(&queued_transition(true));
-        state.close_bucket(1, 30_000_000);
+        state.close_bucket(1, ts(30_000_000));
         assert_eq!(state.window().buckets.len(), 1);
 
-        state.reset(45_000_000);
+        state.reset(ts(45_000_000));
         assert!(state.window().buckets.is_empty());
         // Counting restarts cleanly from the gap.
         state.observe(&queued_transition(true));
-        state.close_bucket(1, 75_000_000);
+        state.close_bucket(1, ts(75_000_000));
         let window = state.window();
         assert_eq!(window.buckets.len(), 1);
-        assert_eq!(window.buckets[0].start_us, 45_000_000);
+        assert_eq!(window.buckets[0].start, ts(45_000_000));
         assert_eq!(window.buckets[0].arrivals, 1);
     }
 }

@@ -1,5 +1,5 @@
 import type { LogEntry, LogLevel } from '@/api/types'
-import { formatTimeOfDayUs } from '@/lib/format'
+import { formatTimeOfDay } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { Skeleton } from '@/components/ui/skeleton'
 
@@ -45,7 +45,7 @@ export function LogViewer({
           {entries.map((e, i) => (
             <li key={i} className="flex gap-2">
               <span className="shrink-0 tabular-nums text-muted-foreground">
-                {formatTimeOfDayUs(e.tUs)}
+                {formatTimeOfDay(e.t)}
               </span>
               <span
                 className={cn('w-10 shrink-0 font-medium uppercase', LEVEL_CLASS[e.level])}

@@ -14,6 +14,7 @@ use tokio::time::MissedTickBehavior;
 
 use coppice_consensus::{EventBatch, EventTapReceiver, TapItem};
 use coppice_core::id::{JobId, NodeId};
+use coppice_core::time::Timestamp;
 use coppice_state::Event;
 
 use crate::limits::{
@@ -21,7 +22,7 @@ use crate::limits::{
     SUBSCRIBER_QUEUE_CAPACITY,
 };
 
-/// Cross-proposer clock skew, observed at the fanout: |batch `at_us` − local
+/// Cross-proposer clock skew, observed at the fanout: |batch `at` − local
 /// receipt time| (ADR 0032). Chronic skew is an operational signal — a
 /// misconfigured coordinator clock — not something any consumer corrects for.
 const PROPOSER_SKEW_SECONDS: &str = "coordinator_event_proposer_skew_seconds";
@@ -65,7 +66,7 @@ pub struct FilteredBatch {
     /// The producing command's log index (ADR 0008's global cursor).
     pub applied_index: u64,
     /// The batch's advisory proposer stamp (ADR 0032); never an ordering key.
-    pub at_us: i64,
+    pub at: Timestamp,
     /// Events admitted by the subscriber's filter, in batch order.
     pub events: Vec<OrdinalEvent>,
 }
@@ -90,7 +91,7 @@ pub struct OrdinalEvent {
 pub struct StampedEvent {
     pub index: u64,
     pub ordinal: u32,
-    pub at_us: i64,
+    pub at: Timestamp,
     pub event: Event,
 }
 
@@ -297,7 +298,7 @@ impl Ring {
                 events.push(StampedEvent {
                     index: batch.applied_index,
                     ordinal: ordinal as u32,
-                    at_us: batch.at_us,
+                    at: batch.at,
                     event: event.clone(),
                 });
             }
@@ -460,15 +461,11 @@ fn flush_gaps(subscribers: &mut BTreeMap<u64, SubscriberState>, ring: &Ring) {
     }
 }
 
-/// Observe |`at_us` − local now| for the arriving batch (see
+/// Observe |`at` − local now| for the arriving batch (see
 /// [`PROPOSER_SKEW_SECONDS`]).
 fn record_proposer_skew(batch: &EventBatch) {
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    let skew_seconds = (now_us.abs_diff(batch.at_us)) as f64 / 1_000_000.0;
-    metrics::histogram!(PROPOSER_SKEW_SECONDS).record(skew_seconds);
+    let skew = (Timestamp::now() - batch.at).abs();
+    metrics::histogram!(PROPOSER_SKEW_SECONDS).record(skew.as_secs_f64());
 }
 
 /// Filter one batch's events down to what `filter` admits, preserving each
@@ -493,7 +490,7 @@ fn filter_events(filter: &EventFilter, batch: &EventBatch) -> Option<FilteredBat
     } else {
         Some(FilteredBatch {
             applied_index: batch.applied_index,
-            at_us: batch.at_us,
+            at: batch.at,
             events,
         })
     }
@@ -642,7 +639,7 @@ mod tests {
     fn batch_of(applied_index: u64, events: Vec<Event>) -> EventBatch {
         EventBatch {
             applied_index,
-            at_us: 0,
+            at: Timestamp::UNIX_EPOCH,
             events,
         }
     }
@@ -716,7 +713,7 @@ mod tests {
             scoped.events.iter().map(|e| e.ordinal).collect::<Vec<_>>(),
             vec![1]
         );
-        assert_eq!(scoped.at_us, batch.at_us);
+        assert_eq!(scoped.at, batch.at);
     }
 
     #[tokio::test]

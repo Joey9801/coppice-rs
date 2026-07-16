@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use coppice_agent::config::{CapacityConfig, Config as AgentConfig, TlsConfig as AgentTls};
@@ -31,6 +31,7 @@ use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, Cli
 use coppice_coordinator::config::{self as coord_config, CliOverrides};
 use coppice_core::id::{ClusterId, NodeId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::time::Timestamp;
 use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
 use coppice_state::Command;
 use rcgen::{
@@ -444,7 +445,7 @@ async fn seed_dev_state<C: Consensus>(
             consensus,
             Command::UpdatePolicy(UpdatePolicy {
                 policy,
-                updated_at_us: now_us(),
+                updated_at: Timestamp::now(),
             }),
             "seeding the dev priority-multiplier table",
         )
@@ -461,7 +462,7 @@ async fn seed_dev_state<C: Consensus>(
                 // ~1e6 CU: deep enough that dev jobs never starve on quota,
                 // far enough from u64::MAX to stay clear of saturation.
                 quota: CostUnits(1_000_000_000_000),
-                updated_at_us: now_us(),
+                updated_at: Timestamp::now(),
             }),
             "seeding the dev quota entity",
         )
@@ -492,13 +493,6 @@ async fn propose_seed<C: Consensus>(consensus: &C, command: Command, what: &str)
             Err(e) => return Err(e).context(what.to_string()),
         }
     }
-}
-
-fn now_us() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 async fn wait_for_agent(views: &coppice_consensus::StateViews, agent_node: NodeId) -> Result<u64> {

@@ -11,7 +11,7 @@ import type {
 import { derivePhase, JOB_PHASES } from '@/api/types'
 import { useJobs, useQuotaEntities, useQuotaEntity } from '@/api/queries'
 import { canConfigureEntities, useSession } from '@/auth/session'
-import { formatDurationUs, formatPercent, formatUcu } from '@/lib/format'
+import { formatDuration, formatPercent, formatUcu } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
   EmptyState,
@@ -90,7 +90,7 @@ function EntityDetailBody({
   const canEdit = canConfigureEntities(session)
   const over = entity.overQuotaRatio > 1
 
-  const usageSeries = stats.usageHistory.map((h) => ({ t: h.tUs, v: h.usageUcu }))
+  const usageSeries = stats.usageHistory.map((h) => ({ t: h.t.getTime(), v: h.usageUcu }))
 
   return (
     <div className="space-y-6">
@@ -151,8 +151,8 @@ function EntityDetailBody({
           label="Queued"
           value={entity.queuedCount}
           hint={
-            stats.oldestQueuedAgeUs != null
-              ? `oldest ${formatDurationUs(stats.oldestQueuedAgeUs)}`
+            stats.oldestQueuedAgeSeconds != null
+              ? `oldest ${formatDuration(stats.oldestQueuedAgeSeconds)}`
               : 'subtree total'
           }
         />
@@ -386,7 +386,7 @@ function JobsCard({ entityId }: { entityId: string }) {
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{job.priority}</TableCell>
                     <TableCell className="whitespace-nowrap text-muted-foreground">
-                      <TimeAgo tUs={job.submittedAtUs} />
+                      <TimeAgo t={job.submittedAt} />
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
                       {formatUcu(job.costUcu)}

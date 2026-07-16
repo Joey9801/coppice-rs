@@ -29,6 +29,7 @@
 
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId};
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{AllocationSpec, CommitPlacements, Placement};
 use coppice_state::StateMachine;
 
@@ -54,11 +55,11 @@ pub struct SchedulerConfig {
     /// Weight of the ADR 0021 age term, in effective-priority points per
     /// decay half-life waited.
     pub w_age: f64,
-    /// Minimum earliness, in µs, by which a move to another node must improve
-    /// an existing accrual's finite `projected_ready` bound before the pass
+    /// Minimum earliness by which a move to another node must improve an
+    /// existing accrual's finite `projected_ready` bound before the pass
     /// will revoke and reseat it there (ADR 0027). An indefinite bound is
     /// always worth trading for a finite one, whatever the threshold.
-    pub replan_min_improvement_us: i64,
+    pub replan_min_improvement: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -67,7 +68,7 @@ impl Default for SchedulerConfig {
             max_candidates: 4096,
             max_placements_per_cycle: 512,
             w_age: score::DEFAULT_AGE_WEIGHT,
-            replan_min_improvement_us: 300_000_000,
+            replan_min_improvement: Duration::from_secs(300),
         }
     }
 }
@@ -91,14 +92,14 @@ pub struct ProposedPlacement {
 /// The coordinator commits or rejects it atomically (all-or-nothing with
 /// per-item diagnostics, `docs/architecture/command-catalog.md`). Placement
 /// order is funding order and must be preserved through conversion.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementProposal {
     /// The state version this proposal was computed against; becomes the
     /// command's `expected_version` (an audit record — semantic re-validation
     /// is what gates the batch).
     pub against_version: u64,
-    /// The `now` the pass ran at; becomes the command's `proposed_at_us`.
-    pub now_us: i64,
+    /// The `now` the pass ran at; becomes the command's `proposed_at`.
+    pub now: Timestamp,
     /// Accruing allocations to revoke, always paired with placements they
     /// enable in this same batch (a reseat elsewhere or a strict-backfill
     /// lend). Never a funded allocation (ADR 0014).
@@ -145,7 +146,7 @@ impl PlacementProposal {
             expected_version: self.against_version,
             revocations: self.revocations.clone(),
             placements,
-            proposed_at_us: self.now_us,
+            proposed_at: self.now,
         }
     }
 }
@@ -155,7 +156,7 @@ pub trait Scheduler {
     /// Run one scheduling pass against a snapshot, returning proposed
     /// placements for the coordinator to validate.
     ///
-    /// `now_us` is proposer-stamped wall time (Unix µs), passed in so the
-    /// pass itself never reads a clock.
-    fn schedule(&self, snapshot: &StateMachine, now_us: i64) -> PlacementProposal;
+    /// `now` is proposer-stamped wall time, passed in so the pass itself
+    /// never reads a clock.
+    fn schedule(&self, snapshot: &StateMachine, now: Timestamp) -> PlacementProposal;
 }

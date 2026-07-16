@@ -26,6 +26,7 @@ use tokio::sync::watch;
 use coppice_consensus::{Applied, Consensus, ConsensusStatus, StateViews};
 use coppice_core::attempt::AttemptState;
 use coppice_core::id::{AllocationId, AttemptId, NodeId};
+use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1::{
     agent_command, AgentCommand, RegisterAccepted, StartJob, StopJob,
 };
@@ -187,7 +188,7 @@ async fn dispatch_ready_attempt<C: Consensus>(
 ) {
     let command = Command::DispatchAttempt(DispatchAttempt {
         attempt,
-        dispatched_at_us: now_us(),
+        dispatched_at: Timestamp::now(),
     });
     match consensus.propose(command).await {
         Ok(Applied {
@@ -269,8 +270,8 @@ async fn route_stop(
     node: NodeId,
     allocation: AllocationId,
 ) {
-    let grace_us = views.latest().state().policy.abort_grace_us;
-    let command = stop_job_command(allocation, grace_us);
+    let grace = views.latest().state().policy.abort_grace;
+    let command = stop_job_command(allocation, grace);
     if router.send(RouteCommand { node, command }).await.is_err() {
         tracing::warn!(?allocation, "dispatch: router channel closed");
     }
@@ -280,8 +281,8 @@ async fn route_stop(
 ///
 /// `header: None` — the session manager stamps the fencing token as it routes
 /// (`docs/architecture/command-catalog.md#dispatchattempt`). The `limits` are
-/// the allocation's requested vector; `max_runtime_us` rides straight from the
-/// job spec (absent = unbounded).
+/// the allocation's requested vector; `max_runtime` rides straight from the
+/// job spec's `max_runtime` (absent = unbounded).
 pub(crate) fn start_job_command(
     job: &JobRecord,
     attempt: &AttemptRecord,
@@ -301,21 +302,21 @@ pub(crate) fn start_job_command(
                 .as_ref()
                 .map(|argv| coppice_proto::pb::core::v1::Entrypoint { argv: argv.clone() }),
             limits: Some((&allocation.allocation.requested).into()),
-            max_runtime_us: job.spec.max_runtime_us,
+            max_runtime_us: job.spec.max_runtime.map(|d| d.as_micros() as u64),
         })),
     }
 }
 
 /// Build the header-less `StopJob` command for an allocation.
 ///
-/// `grace_us` is the replicated policy's `abort_grace_us` at the call site;
+/// `grace` is the replicated policy's `abort_grace` at the call site;
 /// `header: None` — the manager stamps the token as it routes.
-pub(crate) fn stop_job_command(allocation: AllocationId, grace_us: i64) -> AgentCommand {
+pub(crate) fn stop_job_command(allocation: AllocationId, grace: Duration) -> AgentCommand {
     AgentCommand {
         header: None,
         body: Some(agent_command::Body::StopJob(StopJob {
             allocation: Some(allocation.into()),
-            grace_us,
+            grace_us: grace.as_micros(),
         })),
     }
 }
@@ -330,14 +331,6 @@ pub(crate) fn register_accepted_command() -> AgentCommand {
         header: None,
         body: Some(agent_command::Body::RegisterAccepted(RegisterAccepted {})),
     }
-}
-
-fn now_us() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -364,7 +357,12 @@ mod tests {
         let alloc_id = AllocationId::new();
         let node = NodeId::new();
 
-        let job = job_record(job_id, "registry/img:1", requested(), Some(1_234));
+        let job = job_record(
+            job_id,
+            "registry/img:1",
+            requested(),
+            Some(Duration::from_micros(1_234)),
+        );
         let attempt = attempt_record(
             attempt_id,
             job_id,
@@ -439,7 +437,7 @@ mod tests {
     #[test]
     fn stop_job_command_carries_allocation_and_grace() {
         let alloc_id = AllocationId::new();
-        let command = stop_job_command(alloc_id, 30_000_000);
+        let command = stop_job_command(alloc_id, Duration::from_secs(30));
         assert!(command.header.is_none());
         let agent_command::Body::StopJob(sj) = command.body.expect("body") else {
             panic!("expected StopJob");

@@ -2,7 +2,7 @@ import { Link } from '@tanstack/react-router'
 import { Activity } from 'lucide-react'
 import { JOB_PHASES, type JobPhase } from '@/api/types'
 import { useClusterOverview } from '@/api/queries'
-import { formatDurationUs } from '@/lib/format'
+import { formatDuration } from '@/lib/format'
 import {
   EmptyState,
   PageHeader,
@@ -43,8 +43,8 @@ export function OverviewPage() {
   }
 
   const { clusterId, queue, capacity, recentEvents } = data
-  const depthSeries = queue.history.map((h) => ({ t: h.tUs, v: h.depth }))
-  const drainSeries = queue.history.map((h) => ({ t: h.tUs, v: h.drainedPerMinute }))
+  const depthSeries = queue.history.map((h) => ({ t: h.t.getTime(), v: h.depth }))
+  const drainSeries = queue.history.map((h) => ({ t: h.t.getTime(), v: h.drainedPerMinute }))
   const nonzeroStates = JOB_PHASES.filter((s) => queue.byState[s] > 0)
 
   return (
@@ -74,7 +74,11 @@ export function OverviewPage() {
 
         <StatTile
           label="Oldest queued"
-          value={queue.oldestQueuedAgeUs != null ? formatDurationUs(queue.oldestQueuedAgeUs) : '—'}
+          value={
+            queue.oldestQueuedAgeSeconds != null
+              ? formatDuration(queue.oldestQueuedAgeSeconds)
+              : '—'
+          }
         />
 
         <StatTile

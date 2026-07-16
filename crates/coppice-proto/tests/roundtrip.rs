@@ -9,6 +9,7 @@ use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEnt
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{command_from_pb, command_to_pb, ConvertError};
 use coppice_proto::pb;
 use coppice_state::command::*;
@@ -16,7 +17,12 @@ use coppice_state::PolicyConfig;
 use prost::Message;
 use uuid::Uuid;
 
-const TS: i64 = 1_760_000_000_000_000;
+const TS_US: i64 = 1_760_000_000_000_000;
+
+/// The fixture instant, well inside the representable range.
+fn ts() -> Timestamp {
+    Timestamp::from_micros(TS_US).expect("fixture timestamp is in range")
+}
 
 fn jid(n: u128) -> JobId {
     JobId(Uuid::from_u128(n))
@@ -34,7 +40,7 @@ fn job(n: u128) -> Job {
             disk_bytes: 0,
         },
         priority: -2,
-        max_runtime_us: Some(3_600_000_000),
+        max_runtime: Some(Duration::from_hours(1)),
         quota_entity: QuotaEntityId(Uuid::from_u128(0xEE)),
         retry: RetryPolicy::default(),
         abort_requested: None,
@@ -49,12 +55,12 @@ fn every_command() -> Vec<Command> {
         Command::SubmitJob(SubmitJob {
             job: job(1),
             multiplier: PriorityMultiplier::from_integer(3),
-            submitted_at_us: TS,
+            submitted_at: ts(),
         }),
         Command::AbortJob(AbortJob {
             job: jid(1),
             reason: Some("wrong dataset".into()),
-            requested_at_us: TS,
+            requested_at: ts(),
         }),
         Command::CommitPlacements(CommitPlacements {
             expected_version: 41,
@@ -73,25 +79,25 @@ fn every_command() -> Vec<Command> {
                     },
                 }],
             }],
-            proposed_at_us: TS,
+            proposed_at: ts(),
         }),
         Command::DispatchAttempt(DispatchAttempt {
             attempt,
-            dispatched_at_us: TS,
+            dispatched_at: ts(),
         }),
         Command::RecordAttemptStarted(RecordAttemptStarted {
             attempt,
-            observed_at_us: TS,
+            observed_at: ts(),
         }),
         Command::RecordAttemptExited(RecordAttemptExited {
             attempt,
-            observed_at_us: TS,
+            observed_at: ts(),
         }),
         Command::RecordAttemptOutcome(RecordAttemptOutcome {
             attempt,
             outcome: AttemptOutcome::Exited { code: 137 },
-            actual_runtime_us: 30_000_000,
-            observed_at_us: TS,
+            actual_runtime: Duration::from_secs(30),
+            observed_at: ts(),
         }),
         Command::ReconcileNode(ReconcileNode {
             node,
@@ -100,9 +106,9 @@ fn every_command() -> Vec<Command> {
             lost: vec![LostAttempt {
                 attempt: AttemptId(Uuid::from_u128(7)),
                 outcome: AttemptOutcome::PullFailed { user_error: false },
-                actual_runtime_us: 0,
+                actual_runtime: Duration::ZERO,
             }],
-            observed_at_us: TS,
+            observed_at: ts(),
         }),
         Command::RegisterNode(RegisterNode {
             node,
@@ -112,27 +118,27 @@ fn every_command() -> Vec<Command> {
                 disk_bytes: 0,
             },
             labels: BTreeMap::from([("zone".into(), "a".into()), ("gpu".into(), "none".into())]),
-            registered_at_us: TS,
+            registered_at: ts(),
         }),
         Command::DeclareNodeLost(DeclareNodeLost {
             node,
-            declared_at_us: TS,
+            declared_at: ts(),
         }),
         Command::SetNodeSchedulable(SetNodeSchedulable {
             node,
             schedulable: false,
-            updated_at_us: TS,
+            updated_at: ts(),
         }),
         Command::EvictTerminalJobs(EvictTerminalJobs {
             jobs: vec![jid(1), jid(2)],
-            evicted_at_us: TS,
+            evicted_at: ts(),
         }),
         Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
             entity: QuotaEntityId(Uuid::from_u128(0xE1)),
             parent: Some(QuotaEntityId(Uuid::from_u128(0xEE))),
             name: "team".into(),
             quota: CostUnits(1_000_000_000),
-            updated_at_us: TS,
+            updated_at: ts(),
         }),
         Command::UpdatePolicy(UpdatePolicy {
             policy: PolicyConfig {
@@ -142,11 +148,11 @@ fn every_command() -> Vec<Command> {
                 ]),
                 ..PolicyConfig::default()
             },
-            updated_at_us: TS,
+            updated_at: ts(),
         }),
         Command::BumpClusterVersion(BumpClusterVersion {
             to: 2,
-            bumped_at_us: TS,
+            bumped_at: ts(),
         }),
     ]
 }
@@ -203,12 +209,12 @@ fn abort_requests_roundtrip_inside_job_specs() {
     let mut spec = job(1);
     spec.abort_requested = Some(coppice_core::job::AbortRequest {
         reason: None,
-        requested_at_us: TS + 5,
+        requested_at: ts() + Duration::from_micros(5),
     });
     let submit = Command::SubmitJob(SubmitJob {
         job: spec,
         multiplier: PriorityMultiplier::ONE,
-        submitted_at_us: TS,
+        submitted_at: ts(),
     });
     let (_, back) = command_from_pb(command_to_pb(&submit, 1)).unwrap();
     assert_eq!(back, submit);
@@ -222,7 +228,7 @@ fn absent_entrypoints_roundtrip_inside_job_specs() {
     let submit = Command::SubmitJob(SubmitJob {
         job: spec,
         multiplier: PriorityMultiplier::ONE,
-        submitted_at_us: TS,
+        submitted_at: ts(),
     });
     let (_, back) = command_from_pb(command_to_pb(&submit, 1)).unwrap();
     assert_eq!(back, submit);
@@ -283,7 +289,7 @@ fn malformed_ids_are_rejected_at_the_boundary() {
                     attempt: Some(pb::core::v1::AttemptId {
                         value: value.to_string(),
                     }),
-                    dispatched_at_us: TS,
+                    dispatched_at_us: ts().as_micros(),
                 },
             )),
         };
@@ -332,12 +338,12 @@ fn unknown_resource_kinds_fail_loud() {
 fn charge_record_refund_fraction_roundtrips() {
     let record = coppice_core::quota::ChargeRecord {
         amount: CostUnits(42_000),
-        charged_at_us: TS,
+        charged_at: ts(),
         refund_fraction_milli: 750,
     };
     let encoded: pb::core::v1::ChargeRecord = record.into();
     assert_eq!(encoded.refund_fraction_milli, Some(750));
-    let back: coppice_core::quota::ChargeRecord = encoded.into();
+    let back: coppice_core::quota::ChargeRecord = encoded.try_into().expect("decodes");
     assert_eq!(back, record, "charge-record roundtrip must be lossless");
 }
 
@@ -347,10 +353,10 @@ fn charge_record_absent_refund_fraction_is_full_refund() {
     // at the full-refund neutral (1000), preserving pre-0029 behaviour.
     let encoded = pb::core::v1::ChargeRecord {
         amount_ucu: 42_000,
-        charged_at_us: TS,
+        charged_at_us: ts().as_micros(),
         refund_fraction_milli: None,
     };
-    let back: coppice_core::quota::ChargeRecord = encoded.into();
+    let back: coppice_core::quota::ChargeRecord = encoded.try_into().expect("decodes");
     assert_eq!(back.refund_fraction_milli, 1000);
 }
 

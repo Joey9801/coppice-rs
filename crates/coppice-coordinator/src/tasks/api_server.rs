@@ -12,7 +12,6 @@
 //! this file owning only the `ControlPlane` implementation behind it.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
@@ -24,6 +23,7 @@ use coppice_api::{
 use coppice_consensus::{Applied, Consensus, ConsensusError, StateViews};
 use coppice_core::id::ClusterId;
 use coppice_core::job::Job;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{AbortJob, SubmitJob};
 use coppice_state::Command;
 
@@ -106,6 +106,15 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             }
             Some(argv) => Some(argv),
         };
+        let max_runtime = match req.max_runtime_seconds {
+            None => None,
+            Some(seconds) if seconds <= 0 => {
+                return Err(ApiError::Invalid(
+                    "max_runtime_seconds must be positive".into(),
+                ));
+            }
+            Some(seconds) => Some(Duration::from_secs(seconds)),
+        };
 
         // Multiplier resolution reads the replicated table off the latest
         // view (ADR 0019: apply never sees the raw `priority: i32` in
@@ -132,13 +141,13 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 entrypoint,
                 requests: req.requests.into(),
                 priority: req.priority,
-                max_runtime_us: req.max_runtime_us,
+                max_runtime,
                 quota_entity: req.quota_entity,
                 retry: req.retry.map(Into::into).unwrap_or_default(),
                 abort_requested: None,
             },
             multiplier,
-            submitted_at_us: now_us(),
+            submitted_at: Timestamp::now(),
         });
 
         match self.consensus.propose(command).await {
@@ -168,7 +177,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         let command = Command::AbortJob(AbortJob {
             job,
             reason: req.reason,
-            requested_at_us: now_us(),
+            requested_at: Timestamp::now(),
         });
 
         match self.consensus.propose(command).await {
@@ -251,7 +260,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                     .map(|e| StampedEvent {
                         index: e.index,
                         ordinal: e.ordinal,
-                        at_us: e.at_us,
+                        at: e.at,
                         event: e.event,
                     })
                     .collect(),
@@ -283,13 +292,6 @@ fn map_consensus_error(e: ConsensusError) -> ApiError {
         }
         other => ApiError::Unavailable(other.to_string()),
     }
-}
-
-fn now_us() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 /// Serve the public client API (ADR 0031) on the bound listener.
@@ -356,7 +358,7 @@ mod tests {
                 disk_bytes: 0,
             },
             priority: 0,
-            max_runtime_us: None,
+            max_runtime_seconds: None,
             quota_entity: coppice_core::id::QuotaEntityId::new(),
             retry: None,
             job,

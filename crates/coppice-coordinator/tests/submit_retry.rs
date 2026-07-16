@@ -20,6 +20,7 @@ use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::CoordinatorControlPlane;
 use coppice_core::id::{ClusterId, JobId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::time::Timestamp;
 use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
 use coppice_state::{Command, PolicyConfig};
 
@@ -52,7 +53,7 @@ fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequ
             disk_bytes: 0,
         },
         priority: 0,
-        max_runtime_us: Some(3_600_000_000),
+        max_runtime_seconds: Some(3_600),
         quota_entity,
         retry: None,
         job,
@@ -126,7 +127,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
             parent: None,
             name: "root".into(),
             quota: CostUnits(1_000_000),
-            updated_at_us: 1,
+            updated_at: Timestamp::from_micros(1).expect("in range"),
         }))
         .await
         .expect("configure quota entity")
@@ -139,7 +140,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
     consensus
         .propose(Command::UpdatePolicy(UpdatePolicy {
             policy,
-            updated_at_us: 2,
+            updated_at: Timestamp::from_micros(2).expect("in range"),
         }))
         .await
         .expect("update policy")

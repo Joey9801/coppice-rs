@@ -7,6 +7,7 @@ use coppice_consensus::fs::RealFs;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::resource::Resources;
+use coppice_core::time::Duration;
 use coppice_proto::pb::agent::v1 as pb;
 
 use crate::executor::{ExitInfo, FakeExecutor, StartError};
@@ -278,7 +279,7 @@ async fn truth_wins_journaled_exit_beats_tombstone_abort() {
         ExitInfo {
             code: 0,
             oom_killed: false,
-            runtime_us: 9,
+            runtime: Duration::from_micros(9),
         },
     );
     let exit_reports = session
@@ -287,7 +288,7 @@ async fn truth_wins_journaled_exit_beats_tombstone_abort() {
             ExitInfo {
                 code: 0,
                 oom_killed: false,
-                runtime_us: 9,
+                runtime: Duration::from_micros(9),
             },
         )
         .await
@@ -356,7 +357,7 @@ async fn observed_exit_classifies_oom_and_nonzero() {
             ExitInfo {
                 code: 137,
                 oom_killed: true,
-                runtime_us: 1,
+                runtime: Duration::from_micros(1),
             },
             AttemptOutcome::OomKilled,
         ),
@@ -364,7 +365,7 @@ async fn observed_exit_classifies_oom_and_nonzero() {
             ExitInfo {
                 code: 3,
                 oom_killed: false,
-                runtime_us: 1,
+                runtime: Duration::from_micros(1),
             },
             AttemptOutcome::Exited { code: 3 },
         ),
@@ -422,7 +423,7 @@ async fn max_runtime_watchdog_classifies_exceeded() {
         session.take_armed_watchdogs(),
         vec![ArmedWatchdog {
             allocation: alloc,
-            max_runtime_us: 1_000
+            max_runtime: Duration::from_micros(1_000)
         }]
     );
 
@@ -452,7 +453,7 @@ async fn max_runtime_after_natural_exit_is_a_noop() {
         ExitInfo {
             code: 0,
             oom_killed: false,
-            runtime_us: 5,
+            runtime: Duration::from_micros(5),
         },
     );
     session
@@ -461,7 +462,7 @@ async fn max_runtime_after_natural_exit_is_a_noop() {
             ExitInfo {
                 code: 0,
                 oom_killed: false,
-                runtime_us: 5,
+                runtime: Duration::from_micros(5),
             },
         )
         .await

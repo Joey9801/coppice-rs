@@ -38,6 +38,7 @@ use std::path::Path;
 use coppice_consensus::fs::{write_atomic, Fs, FsFile};
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
+use coppice_core::time::Duration;
 use coppice_proto::pb::agent::v1 as pb;
 use prost::Message;
 
@@ -69,7 +70,7 @@ pub struct ExitRec {
     pub attempt: AttemptId,
     pub job: JobId,
     pub outcome: AttemptOutcome,
-    pub runtime_us: u64,
+    pub runtime: Duration,
 }
 
 /// The pure recovered state of the journal: the fencing watermark plus the
@@ -134,7 +135,7 @@ impl JournalState {
                         attempt,
                         job,
                         outcome,
-                        runtime_us: e.runtime_us,
+                        runtime: try_duration(e.runtime_us, "ObservedExit.runtime_us")?,
                     },
                 );
             }
@@ -279,7 +280,7 @@ fn record_exit(exit: &ExitRec) -> pb::JournalRecord {
             attempt: Some(exit.attempt.into()),
             job: Some(exit.job.into()),
             outcome: Some((&exit.outcome).into()),
-            runtime_us: exit.runtime_us,
+            runtime_us: exit.runtime.as_micros() as u64,
         })),
     }
 }
@@ -341,6 +342,15 @@ where
     D::try_from(value).map_err(|_| corrupt(field))
 }
 
+/// A journaled span, which the wire encodes as *unsigned* microseconds. Only a
+/// corrupt frame can carry one past `i64`, so this reports rather than clamps —
+/// same rule as [`try_id`].
+fn try_duration(micros: u64, field: &'static str) -> io::Result<Duration> {
+    i64::try_from(micros)
+        .map(Duration::from_micros)
+        .map_err(|_| corrupt(field))
+}
+
 fn corrupt(msg: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -388,7 +398,7 @@ mod tests {
                 attempt,
                 job,
                 outcome: AttemptOutcome::Exited { code: 0 },
-                runtime_us: 42,
+                runtime: Duration::from_micros(42),
             };
             journal.journal_exit(&exit).unwrap();
             state.exits.insert(alloc, exit);
@@ -404,7 +414,10 @@ mod tests {
             }
         );
         assert_eq!(recovered.intents.get(&alloc).unwrap().node_epoch, 7);
-        assert_eq!(recovered.exits.get(&alloc).unwrap().runtime_us, 42);
+        assert_eq!(
+            recovered.exits.get(&alloc).unwrap().runtime,
+            Duration::from_micros(42)
+        );
     }
 
     #[test]

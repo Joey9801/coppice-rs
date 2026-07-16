@@ -9,6 +9,7 @@ use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEnt
 use coppice_core::job::{Job, RetryPolicy};
 use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier};
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
     AbortJob, AllocationSpec, CommitPlacements, ConfigureQuotaEntity, DispatchAttempt, Placement,
     RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RegisterNode, SubmitJob,
@@ -17,8 +18,22 @@ use coppice_state::command::{
 use coppice_state::{Applied, Command, PolicyConfig, StateMachine};
 use uuid::Uuid;
 
-/// A plausible base wall-clock instant; tests offset from here.
-pub const TS: i64 = 1_760_000_000_000_000;
+/// A plausible base wall-clock instant in µs; tests offset from here and wrap
+/// the result in [`ts`]. Kept as raw µs (rather than a `Timestamp` constant)
+/// because `Timestamp` has no const constructor — the range check is a
+/// runtime one.
+pub const TS_US: i64 = 1_760_000_000_000_000;
+
+/// A fixture instant. Test offsets stay within days of [`TS_US`], so the
+/// range check cannot fire.
+pub fn ts(micros: i64) -> Timestamp {
+    Timestamp::from_micros(micros).expect("fixture timestamps are in range")
+}
+
+/// The base instant as a [`Timestamp`] — the common case of `ts(TS_US)`.
+pub fn base_ts() -> Timestamp {
+    ts(TS_US)
+}
 
 pub const ROOT: QuotaEntityId = QuotaEntityId(Uuid::from_u128(0xEE));
 
@@ -73,7 +88,7 @@ pub fn cpu(millis: u64) -> Resources {
 pub fn update_policy_cmd(policy: PolicyConfig) -> Command {
     Command::UpdatePolicy(UpdatePolicy {
         policy,
-        updated_at_us: TS,
+        updated_at: base_ts(),
     })
 }
 
@@ -83,23 +98,23 @@ pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>
         parent,
         name: "entity".into(),
         quota: CostUnits(1_000_000_000_000),
-        updated_at_us: TS,
+        updated_at: base_ts(),
     })
 }
 
-pub fn register_node_cmd(node: NodeId, capacity: Resources, ts: i64) -> Command {
+pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Command {
     Command::RegisterNode(RegisterNode {
         node,
         capacity,
         labels: BTreeMap::new(),
-        registered_at_us: ts,
+        registered_at: at,
     })
 }
 
 pub fn submit_cmd(
     job: JobId,
     requests: Resources,
-    max_runtime_s: Option<u64>,
+    max_runtime_s: Option<i64>,
     retry: RetryPolicy,
 ) -> Command {
     Command::SubmitJob(SubmitJob {
@@ -110,13 +125,13 @@ pub fn submit_cmd(
             entrypoint: None,
             requests,
             priority: 0,
-            max_runtime_us: max_runtime_s.map(|s| s * 1_000_000),
+            max_runtime: max_runtime_s.map(Duration::from_secs),
             quota_entity: ROOT,
             retry,
             abort_requested: None,
         },
         multiplier: PriorityMultiplier::ONE,
-        submitted_at_us: TS,
+        submitted_at: base_ts(),
     })
 }
 
@@ -139,55 +154,55 @@ pub fn placement(
     }
 }
 
-pub fn place_cmd(p: Placement, ts: i64) -> Command {
+pub fn place_cmd(p: Placement, at: Timestamp) -> Command {
     Command::CommitPlacements(CommitPlacements {
         expected_version: 0,
         revocations: vec![],
         placements: vec![p],
-        proposed_at_us: ts,
+        proposed_at: at,
     })
 }
 
-pub fn dispatch_cmd(attempt: AttemptId, ts: i64) -> Command {
+pub fn dispatch_cmd(attempt: AttemptId, at: Timestamp) -> Command {
     Command::DispatchAttempt(DispatchAttempt {
         attempt,
-        dispatched_at_us: ts,
+        dispatched_at: at,
     })
 }
 
-pub fn started_cmd(attempt: AttemptId, ts: i64) -> Command {
+pub fn started_cmd(attempt: AttemptId, at: Timestamp) -> Command {
     Command::RecordAttemptStarted(RecordAttemptStarted {
         attempt,
-        observed_at_us: ts,
+        observed_at: at,
     })
 }
 
-pub fn exited_cmd(attempt: AttemptId, ts: i64) -> Command {
+pub fn exited_cmd(attempt: AttemptId, at: Timestamp) -> Command {
     Command::RecordAttemptExited(RecordAttemptExited {
         attempt,
-        observed_at_us: ts,
+        observed_at: at,
     })
 }
 
 pub fn outcome_cmd(
     attempt: AttemptId,
     outcome: coppice_core::attempt::AttemptOutcome,
-    runtime_s: u64,
-    ts: i64,
+    runtime_s: i64,
+    at: Timestamp,
 ) -> Command {
     Command::RecordAttemptOutcome(RecordAttemptOutcome {
         attempt,
         outcome,
-        actual_runtime_us: runtime_s * 1_000_000,
-        observed_at_us: ts,
+        actual_runtime: Duration::from_secs(runtime_s),
+        observed_at: at,
     })
 }
 
-pub fn abort_cmd(job: JobId, ts: i64) -> Command {
+pub fn abort_cmd(job: JobId, at: Timestamp) -> Command {
     Command::AbortJob(AbortJob {
         job,
         reason: Some("test".into()),
-        requested_at_us: ts,
+        requested_at: at,
     })
 }
 
@@ -197,6 +212,6 @@ pub fn setup() -> StateMachine {
     let mut sm = StateMachine::default();
     apply_ok(&mut sm, configure_entity_cmd(ROOT, None));
     apply_ok(&mut sm, update_policy_cmd(test_policy(4)));
-    apply_ok(&mut sm, register_node_cmd(nid(1), cpu(10_000), TS));
+    apply_ok(&mut sm, register_node_cmd(nid(1), cpu(10_000), base_ts()));
     sm
 }

@@ -11,13 +11,14 @@ use coppice_core::quota::{
     PriorityMultiplier, TrueUp, UsageState, FULL_REFUND_MILLI,
 };
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use proptest::prelude::*;
 
 /// Any policy that passes validation.
 fn valid_policy() -> impl Strategy<Value = DecayPolicy> {
     (1i64..=3_600_000_000, 0u64..=DecayPolicy::MAX_DECAY_PER_TICK).prop_map(
         |(tick_us, decay_per_tick)| DecayPolicy {
-            tick_us,
+            tick: Duration::from_micros(tick_us),
             decay_per_tick,
         },
     )
@@ -28,17 +29,23 @@ fn valid_policy() -> impl Strategy<Value = DecayPolicy> {
 const TS_BASE: i64 = 1_760_000_000_000_000;
 const TS_SPAN: i64 = 1_000_000_000_000; // ~11.6 days
 
+/// Every instant these properties generate is inside `TS_BASE ± TS_SPAN`, far
+/// inside the representable range, so the range check cannot fire.
+fn ts(micros: i64) -> Timestamp {
+    Timestamp::from_micros(micros).expect("test timestamps are in range")
+}
+
 /// The pre-ADR 0029 true-up, reimplemented independently: the entire unused
 /// charge, decayed, comes back. The retention arithmetic must reduce to this
 /// bit-for-bit whenever it does not retain (ADR 0029 I2/I3).
 fn reference_full_refund(
     charge: &ChargeRecord,
     actual_cost: CostUnits,
-    resolved_at_us: i64,
+    resolved_at: Timestamp,
     policy: &DecayPolicy,
 ) -> CostUnits {
     let unused = charge.amount.saturating_sub(actual_cost);
-    policy.decay_between(unused, charge.charged_at_us, resolved_at_us)
+    policy.decay_between(unused, charge.charged_at, resolved_at)
 }
 
 /// The cost that settles into usage for a retaining true-up, evaluated with no
@@ -48,10 +55,16 @@ fn reference_full_refund(
 fn settled_undecayed(amount: u64, actual: u64, refund_fraction_milli: u32) -> u64 {
     let record = ChargeRecord {
         amount: CostUnits(amount),
-        charged_at_us: 0,
+        charged_at: ts(0),
         refund_fraction_milli,
     };
-    match true_up(&record, CostUnits(actual), 0, &DecayPolicy::DEFAULT, true) {
+    match true_up(
+        &record,
+        CostUnits(actual),
+        ts(0),
+        &DecayPolicy::DEFAULT,
+        true,
+    ) {
         TrueUp::Refund(r) => amount - r.0,
         TrueUp::Surcharge(s) => amount + s.0,
     }
@@ -85,13 +98,13 @@ proptest! {
         d2 in 0i64..TS_SPAN,
     ) {
         let policy = DecayPolicy::DEFAULT;
-        let (a, b, c) = (start, start + d1, start + d1 + d2);
+        let (a, b, c) = (ts(start), ts(start + d1), ts(start + d1 + d2));
 
-        let mut stepped = UsageState { usage: CostUnits(u), last_update_us: a };
+        let mut stepped = UsageState { usage: CostUnits(u), last_update: a };
         stepped.touch(b, &policy);
         stepped.touch(c, &policy);
 
-        let mut direct = UsageState { usage: CostUnits(u), last_update_us: a };
+        let mut direct = UsageState { usage: CostUnits(u), last_update: a };
         direct.touch(c, &policy);
 
         prop_assert_eq!(stepped, direct);
@@ -111,9 +124,9 @@ proptest! {
         last in TS_BASE..TS_BASE + TS_SPAN,
         skew in 0i64..TS_SPAN,
     ) {
-        let mut state = UsageState { usage: CostUnits(u), last_update_us: last };
+        let mut state = UsageState { usage: CostUnits(u), last_update: ts(last) };
         let before = state;
-        state.touch(last - skew, &policy);
+        state.touch(ts(last - skew), &policy);
         prop_assert_eq!(state, before);
     }
 
@@ -146,7 +159,7 @@ proptest! {
         runtime_s in any::<u64>(),
         multiplier in any::<u64>(),
         policy in valid_policy(),
-        ts in TS_BASE..TS_BASE + TS_SPAN,
+        charged_at_us in TS_BASE..TS_BASE + TS_SPAN,
         charge2 in any::<u64>(),
         refund_fraction in any::<u32>(),
         retain in any::<bool>(),
@@ -159,22 +172,24 @@ proptest! {
         };
         let cost = job_cost(&requests, &weights, runtime_s, PriorityMultiplier(multiplier));
 
-        let mut state = UsageState::new(ts - 1_000_000);
-        state.charge(cost, ts, &policy);
-        state.charge(CostUnits(charge2), ts, &policy);
+        let charged_at = ts(charged_at_us);
+        let mut state = UsageState::new(charged_at - Duration::from_secs(1));
+        state.charge(cost, charged_at, &policy);
+        state.charge(CostUnits(charge2), charged_at, &policy);
         prop_assert!(state.usage <= CostUnits::MAX);
 
         // The fraction is deliberately unclamped: true-up must tolerate any
         // recorded value however extreme.
         let record = ChargeRecord {
             amount: cost,
-            charged_at_us: ts,
+            charged_at,
             refund_fraction_milli: refund_fraction,
         };
-        let adjustment = true_up(&record, CostUnits(charge2), ts + 1, &policy, retain);
-        state.settle(adjustment, ts + 1, &policy);
+        let resolved_at = charged_at + Duration::from_micros(1);
+        let adjustment = true_up(&record, CostUnits(charge2), resolved_at, &policy, retain);
+        state.settle(adjustment, resolved_at, &policy);
         // Refunds saturate at zero: usage can never underflow.
-        state.refund(CostUnits::MAX, ts + 2, &policy);
+        state.refund(CostUnits::MAX, charged_at + Duration::from_micros(2), &policy);
         prop_assert_eq!(state.usage, CostUnits::ZERO);
     }
 
@@ -233,28 +248,29 @@ proptest! {
         actual in any::<u64>(),
         fraction in any::<u32>(),
         policy in valid_policy(),
-        charged_at in TS_BASE..TS_BASE + TS_SPAN,
+        charged_at_us in TS_BASE..TS_BASE + TS_SPAN,
         elapsed in 0i64..TS_SPAN,
     ) {
         // Constrain to the refund regime the reference covers (A ≤ C); the
         // surcharge path carries no fraction and is exercised elsewhere.
         let actual = CostUnits(actual.min(amount));
-        let resolved = charged_at + elapsed;
+        let charged_at = ts(charged_at_us);
+        let resolved = charged_at + Duration::from_micros(elapsed);
         let reference = reference_full_refund(
-            &ChargeRecord { amount: CostUnits(amount), charged_at_us: charged_at, refund_fraction_milli: FULL_REFUND_MILLI },
+            &ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: FULL_REFUND_MILLI },
             actual,
             resolved,
             &policy,
         );
 
         // I3: retain = false ignores the recorded fraction entirely.
-        let any_fraction = ChargeRecord { amount: CostUnits(amount), charged_at_us: charged_at, refund_fraction_milli: fraction };
+        let any_fraction = ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: fraction };
         prop_assert_eq!(
             true_up(&any_fraction, actual, resolved, &policy, false),
             TrueUp::Refund(reference)
         );
         // I2: a recorded fraction of 1000 is a full refund even when retaining.
-        let full = ChargeRecord { amount: CostUnits(amount), charged_at_us: charged_at, refund_fraction_milli: FULL_REFUND_MILLI };
+        let full = ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: FULL_REFUND_MILLI };
         prop_assert_eq!(
             true_up(&full, actual, resolved, &policy, true),
             TrueUp::Refund(reference)

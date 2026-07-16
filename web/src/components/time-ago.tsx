@@ -1,14 +1,14 @@
 import { useEffect, useState } from 'react'
-import { formatTimeAgo, formatTimestampUs } from '@/lib/format'
+import { formatTimeAgo, formatTimestamp } from '@/lib/format'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 
 export interface TimeAgoProps {
-  tUs: number
+  t: Date
   className?: string
 }
 
 /** Relative time that self-refreshes every 30s, with an absolute tooltip. */
-export function TimeAgo({ tUs, className }: TimeAgoProps) {
+export function TimeAgo({ t, className }: TimeAgoProps) {
   const [, setTick] = useState(0)
 
   useEffect(() => {
@@ -20,9 +20,9 @@ export function TimeAgo({ tUs, className }: TimeAgoProps) {
     <TooltipProvider delayDuration={300}>
       <Tooltip>
         <TooltipTrigger asChild>
-          <span className={className}>{formatTimeAgo(tUs)}</span>
+          <span className={className}>{formatTimeAgo(t)}</span>
         </TooltipTrigger>
-        <TooltipContent>{formatTimestampUs(tUs)}</TooltipContent>
+        <TooltipContent>{formatTimestamp(t)}</TooltipContent>
       </Tooltip>
     </TooltipProvider>
   )

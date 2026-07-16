@@ -17,7 +17,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, watch};
 
@@ -26,6 +25,7 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, NodeId};
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
     LostAttempt, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
     RegisterNode,
@@ -144,7 +144,7 @@ async fn ingest<C: Consensus>(
     report: &InboundReport,
 ) -> Option<bool> {
     let node = report.node;
-    let now = now_us();
+    let now = Timestamp::now();
     let view = views.latest();
     let normalized = normalize(&view, report, now);
 
@@ -184,9 +184,9 @@ async fn ingest<C: Consensus>(
 
     // Route stops directly (never log commands, command-catalog.md).
     if !normalized.stops.is_empty() {
-        let grace_us = view.state().policy.abort_grace_us;
+        let grace = view.state().policy.abort_grace;
         for allocation in normalized.stops {
-            let command = stop_job_command(allocation, grace_us);
+            let command = stop_job_command(allocation, grace);
             if router.send(RouteCommand { node, command }).await.is_err() {
                 tracing::warn!(?allocation, "ingestion: router closed routing StopJob");
             }
@@ -223,7 +223,7 @@ async fn ingest<C: Consensus>(
 /// Fencing (ADR 0009), view-based dedupe, timestamping, and the ObservedSet /
 /// heartbeat diffs. See
 /// `docs/architecture/command-catalog.md#the-agent-report-ingestion-boundary`.
-fn normalize(view: &StateView, report: &InboundReport, now_us: i64) -> Normalized {
+fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normalized {
     let node = report.node;
     let report_epoch = report.report.node_epoch;
     let mut out = Normalized::empty();
@@ -260,7 +260,7 @@ fn normalize(view: &StateView, report: &InboundReport, now_us: i64) -> Normalize
                 node,
                 capacity,
                 labels,
-                registered_at_us: now_us,
+                registered_at: now,
             }));
         }
 
@@ -277,7 +277,7 @@ fn normalize(view: &StateView, report: &InboundReport, now_us: i64) -> Normalize
                 // commands or diff (ADR 0009).
                 return out;
             }
-            heartbeat_diff(view, node, report_epoch, hb, now_us, &mut out);
+            heartbeat_diff(view, node, report_epoch, hb, now, &mut out);
         }
 
         Body::AttemptStatus(status) => {
@@ -290,7 +290,7 @@ fn normalize(view: &StateView, report: &InboundReport, now_us: i64) -> Normalize
                 tracing::debug!(%node, "ingestion: stale-epoch attempt status dropped");
                 return out;
             }
-            attempt_status_diff(view, status, now_us, &mut out);
+            attempt_status_diff(view, status, now, &mut out);
         }
 
         Body::ObservedSet(set) => {
@@ -299,7 +299,7 @@ fn normalize(view: &StateView, report: &InboundReport, now_us: i64) -> Normalize
                 return out;
             };
             let stale = report_epoch != node_record.epoch;
-            observed_set_diff(view, node, report_epoch, set, now_us, stale, &mut out);
+            observed_set_diff(view, node, report_epoch, set, now, stale, &mut out);
         }
     }
 
@@ -318,12 +318,22 @@ fn phase_rank(state: &AttemptState) -> u8 {
     }
 }
 
-/// Runtime since the attempt reached `Running`, saturating and clamped at 0.
-fn runtime_since(started_at_us: Option<i64>, now_us: i64) -> u64 {
-    match started_at_us {
-        Some(started) => u64::try_from(now_us.saturating_sub(started)).unwrap_or(0),
-        None => 0,
+/// Runtime since the attempt reached `Running`, clamped at zero: the
+/// reporting node's clock can legitimately be behind the stamp that recorded
+/// the start.
+fn runtime_since(started_at: Option<Timestamp>, now: Timestamp) -> Duration {
+    match started_at {
+        Some(started) => (now - started).max(Duration::ZERO),
+        None => Duration::ZERO,
     }
+}
+
+/// An agent-reported runtime (`uint64` µs on the agent wire) as a domain
+/// span, saturating: the domain type is signed, so a report past `i64::MAX`
+/// µs — ~292 000 years, only reachable from a corrupt or hostile agent —
+/// pins at the maximum rather than wrapping negative and pricing as zero.
+fn reported_runtime(runtime_us: u64) -> Duration {
+    Duration::from_micros(i64::try_from(runtime_us).unwrap_or(i64::MAX))
 }
 
 /// An `AttemptStatus` report (fresh epoch): dedupe by `(attempt, state)`
@@ -332,7 +342,7 @@ fn runtime_since(started_at_us: Option<i64>, now_us: i64) -> u64 {
 fn attempt_status_diff(
     view: &StateView,
     status: &coppice_proto::pb::agent::v1::AttemptStatus,
-    now_us: i64,
+    now: Timestamp,
     out: &mut Normalized,
 ) {
     let Some(attempt_id) = status
@@ -367,7 +377,7 @@ fn attempt_status_diff(
                 out.commands
                     .push(Command::RecordAttemptStarted(RecordAttemptStarted {
                         attempt: attempt_id,
-                        observed_at_us: now_us,
+                        observed_at: now,
                     }));
             }
         }
@@ -377,7 +387,7 @@ fn attempt_status_diff(
                 out.commands
                     .push(Command::RecordAttemptExited(RecordAttemptExited {
                         attempt: attempt_id,
-                        observed_at_us: now_us,
+                        observed_at: now,
                     }));
             }
         }
@@ -394,8 +404,8 @@ fn attempt_status_diff(
                 .push(Command::RecordAttemptOutcome(RecordAttemptOutcome {
                     attempt: attempt_id,
                     outcome,
-                    actual_runtime_us: status.runtime_us,
-                    observed_at_us: now_us,
+                    actual_runtime: reported_runtime(status.runtime_us),
+                    observed_at: now,
                 }));
         }
         // Agents cannot observe pre-dispatch phases.
@@ -418,7 +428,7 @@ fn heartbeat_diff(
     node: NodeId,
     report_epoch: u64,
     hb: &coppice_proto::pb::agent::v1::Heartbeat,
-    now_us: i64,
+    now: Timestamp,
     out: &mut Normalized,
 ) {
     let running: BTreeSet<AllocationId> = hb
@@ -463,7 +473,7 @@ fn heartbeat_diff(
             lost.push(LostAttempt {
                 attempt: *attempt_id,
                 outcome: AttemptOutcome::AgentError,
-                actual_runtime_us: runtime_since(att.started_at_us, now_us),
+                actual_runtime: runtime_since(att.started_at, now),
             });
         }
     }
@@ -475,7 +485,7 @@ fn heartbeat_diff(
             node_epoch: report_epoch,
             adopted,
             lost,
-            observed_at_us: now_us,
+            observed_at: now,
         }));
     }
 }
@@ -489,7 +499,7 @@ fn observed_set_diff(
     node: NodeId,
     report_epoch: u64,
     set: &coppice_proto::pb::agent::v1::ObservedSet,
-    now_us: i64,
+    now: Timestamp,
     stale: bool,
     out: &mut Normalized,
 ) {
@@ -566,8 +576,8 @@ fn observed_set_diff(
                 .push(Command::RecordAttemptOutcome(RecordAttemptOutcome {
                     attempt: attempt_id,
                     outcome,
-                    actual_runtime_us: obs.runtime_us,
-                    observed_at_us: now_us,
+                    actual_runtime: reported_runtime(obs.runtime_us),
+                    observed_at: now,
                 }));
         }
     }
@@ -596,7 +606,7 @@ fn observed_set_diff(
             lost.push(LostAttempt {
                 attempt: *attempt_id,
                 outcome: AttemptOutcome::AgentError,
-                actual_runtime_us: runtime_since(att.started_at_us, now_us),
+                actual_runtime: runtime_since(att.started_at, now),
             });
         }
     }
@@ -607,16 +617,9 @@ fn observed_set_diff(
             node_epoch: report_epoch,
             adopted,
             lost,
-            observed_at_us: now_us,
+            observed_at: now,
         }));
     }
-}
-
-fn now_us() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -632,7 +635,11 @@ mod tests {
 
     use crate::test_support::{allocation_record, attempt_record, node_record, view_of};
 
-    const NOW: i64 = 1_000_000;
+    /// The fixture "now", one second past the epoch. A function rather than
+    /// a const because `Timestamp`'s range check is a runtime one.
+    fn now() -> Timestamp {
+        Timestamp::UNIX_EPOCH + Duration::from_secs(1)
+    }
 
     fn requested() -> Resources {
         Resources {
@@ -700,7 +707,7 @@ mod tests {
             }],
         });
 
-        let out = normalize(&view, &report(node, 0, reg), NOW);
+        let out = normalize(&view, &report(node, 0, reg), now());
 
         assert!(out.register);
         assert!(out.liveness);
@@ -710,7 +717,7 @@ mod tests {
                 assert_eq!(rn.node, node);
                 assert_eq!(rn.capacity, requested());
                 assert_eq!(rn.labels.get("zone").map(String::as_str), Some("a"));
-                assert_eq!(rn.registered_at_us, NOW);
+                assert_eq!(rn.registered_at, now());
             }
             other => panic!("expected RegisterNode, got {other:?}"),
         }
@@ -724,7 +731,7 @@ mod tests {
         let view = view_of(sm);
 
         // Report epoch 1 != current 2.
-        let out = normalize(&view, &report(node, 1, heartbeat(&[])), NOW);
+        let out = normalize(&view, &report(node, 1, heartbeat(&[])), now());
         assert!(out.commands.is_empty());
         assert!(out.stops.is_empty());
         assert!(out.liveness);
@@ -752,7 +759,7 @@ mod tests {
         let out = normalize(
             &view,
             &report(node, 1, attempt_status(attempt, &AttemptState::Running, 0)),
-            NOW,
+            now(),
         );
         assert!(out.commands.is_empty());
     }
@@ -780,7 +787,7 @@ mod tests {
         let out = normalize(
             &view_of(sm),
             &report(node, 5, attempt_status(attempt, &AttemptState::Running, 0)),
-            NOW,
+            now(),
         );
         assert_eq!(out.commands.len(), 1);
         assert!(matches!(out.commands[0], Command::RecordAttemptStarted(_)));
@@ -796,13 +803,13 @@ mod tests {
                 AllocationId::new(),
                 node,
                 AttemptState::Running,
-                Some(NOW),
+                Some(now()),
             ),
         );
         let out = normalize(
             &view_of(sm),
             &report(node, 5, attempt_status(attempt, &AttemptState::Running, 0)),
-            NOW,
+            now(),
         );
         assert!(out.commands.is_empty());
     }
@@ -821,7 +828,7 @@ mod tests {
                 AllocationId::new(),
                 node,
                 AttemptState::Running,
-                Some(NOW),
+                Some(now()),
             ),
         );
         let out = normalize(
@@ -831,7 +838,7 @@ mod tests {
                 5,
                 attempt_status(attempt, &AttemptState::Terminal(AttemptOutcome::Revoked), 0),
             ),
-            NOW,
+            now(),
         );
         assert!(out.commands.is_empty());
     }
@@ -858,8 +865,13 @@ mod tests {
         sm.nodes.insert(node, node_record(node, 5, true));
         for (att, alloc, state, started) in [
             (att_adopt, a_adopt, AttemptState::Dispatching, None),
-            (att_run, a_run, AttemptState::Running, Some(NOW)),
-            (att_lost, a_lost, AttemptState::Running, Some(NOW - 1_000)),
+            (att_run, a_run, AttemptState::Running, Some(now())),
+            (
+                att_lost,
+                a_lost,
+                AttemptState::Running,
+                Some(now() - Duration::from_micros(1_000)),
+            ),
             (att_disp, a_disp, AttemptState::Dispatching, None),
         ] {
             sm.attempts
@@ -875,7 +887,7 @@ mod tests {
         let out = normalize(
             &view,
             &report(node, 5, heartbeat(&[a_adopt, a_run, a_ghost])),
-            NOW,
+            now(),
         );
 
         assert_eq!(out.stops, vec![a_ghost]);
@@ -889,7 +901,7 @@ mod tests {
         assert_eq!(rn.lost.len(), 1);
         assert_eq!(rn.lost[0].attempt, att_lost);
         assert_eq!(rn.lost[0].outcome, AttemptOutcome::AgentError);
-        assert_eq!(rn.lost[0].actual_runtime_us, 1_000);
+        assert_eq!(rn.lost[0].actual_runtime, Duration::from_micros(1_000));
         // att_disp (Dispatching, absent from running) is NOT lost.
         assert!(!rn.lost.iter().any(|l| l.attempt == att_disp));
     }
@@ -922,7 +934,14 @@ mod tests {
         ] {
             sm.attempts.insert(
                 att,
-                attempt_record(att, job, alloc, node, state, Some(NOW - 500)),
+                attempt_record(
+                    att,
+                    job,
+                    alloc,
+                    node,
+                    state,
+                    Some(now() - Duration::from_micros(500)),
+                ),
             );
             sm.allocations.insert(
                 alloc,
@@ -946,7 +965,7 @@ mod tests {
             ],
         });
 
-        let out = normalize(&view, &report(node, 5, set), NOW);
+        let out = normalize(&view, &report(node, 5, set), now());
 
         // Orphaned running container -> stop.
         assert_eq!(out.stops, vec![a_stop]);
@@ -957,7 +976,7 @@ mod tests {
             Command::RecordAttemptOutcome(o)
                 if o.attempt == att_exit
                     && o.outcome == AttemptOutcome::Exited { code: 0 }
-                    && o.actual_runtime_us == 7
+                    && o.actual_runtime == Duration::from_micros(7)
         )));
         // Revoked from an agent is substituted with AgentError.
         assert!(out.commands.iter().any(|c| matches!(
@@ -1013,7 +1032,7 @@ mod tests {
                 observed(a_stop, AttemptId::new(), true, None, 0), // no intent -> stop
             ],
         });
-        let out = normalize(&view, &report(node, 4, set), NOW);
+        let out = normalize(&view, &report(node, 4, set), now());
 
         assert_eq!(out.stops, vec![a_stop]);
         assert!(
@@ -1026,7 +1045,7 @@ mod tests {
     fn unknown_node_heartbeat_is_dropped() {
         let node = NodeId::new();
         let view = view_of(StateMachine::default());
-        let out = normalize(&view, &report(node, 1, heartbeat(&[])), NOW);
+        let out = normalize(&view, &report(node, 1, heartbeat(&[])), now());
         assert!(out.commands.is_empty());
         assert!(out.stops.is_empty());
         assert!(out.liveness);
@@ -1045,7 +1064,7 @@ mod tests {
                 5,
                 attempt_status(AttemptId::new(), &AttemptState::Running, 0),
             ),
-            NOW,
+            now(),
         );
         assert!(out.commands.is_empty());
     }

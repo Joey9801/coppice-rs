@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -39,6 +39,7 @@ use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaE
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
+use coppice_core::time::Timestamp;
 use coppice_net::session::{AgentService, Server as AgentServiceServer};
 use coppice_proto::pb::agent::v1 as pb;
 use coppice_state::command::{ConfigureQuotaEntity, DeclareNodeLost, SubmitJob};
@@ -59,13 +60,6 @@ fn init_tracing() {
         )
         .with_test_writer()
         .try_init();
-}
-
-fn now_us() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 /// A small resource request that fits comfortably in the agent's advertised
@@ -197,7 +191,7 @@ async fn seed_quota(coord: &RunningCoordinator, entity: QuotaEntityId) {
             parent: None,
             name: "root".into(),
             quota: CostUnits(1_000_000_000_000),
-            updated_at_us: now_us(),
+            updated_at: Timestamp::now(),
         }))
         .await
         .expect("propose ConfigureQuotaEntity");
@@ -224,7 +218,7 @@ async fn submit_job(
                 entrypoint: None,
                 requests: requested(),
                 priority: 0,
-                max_runtime_us: None,
+                max_runtime: None,
                 quota_entity: entity,
                 retry: RetryPolicy {
                     max_retries,
@@ -233,7 +227,7 @@ async fn submit_job(
                 abort_requested: None,
             },
             multiplier: PriorityMultiplier::ONE,
-            submitted_at_us: now_us(),
+            submitted_at: Timestamp::now(),
         }))
         .await
         .expect("propose SubmitJob");
@@ -357,7 +351,7 @@ async fn job_runs_end_to_end() {
         ExitInfo {
             code: 0,
             oom_killed: false,
-            runtime_us: 1_000,
+            runtime: coppice_core::time::Duration::from_micros(1_000),
         },
     );
 
@@ -442,7 +436,7 @@ async fn agent_restart_mid_run_converges_without_duplicate_execution() {
         ExitInfo {
             code: 0,
             oom_killed: false,
-            runtime_us: 2_000,
+            runtime: coppice_core::time::Duration::from_micros(2_000),
         },
     );
     poll(DEADLINE, "job Succeeded after restart", || {
@@ -787,7 +781,7 @@ async fn node_lost_then_reappearing_container_is_stopped() {
         .consensus()
         .propose(Command::DeclareNodeLost(DeclareNodeLost {
             node,
-            declared_at_us: now_us(),
+            declared_at: Timestamp::now(),
         }))
         .await
         .expect("propose DeclareNodeLost");

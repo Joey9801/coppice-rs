@@ -86,6 +86,17 @@ const TICK_US = SECOND_US
 /** Cap on ticks processed in one advanceTo, so a long-idle tab can't hang. */
 const MAX_TICKS_PER_ADVANCE = 4000
 
+// The simulation clock is microseconds throughout — it is a pinned pseudo-clock
+// (`advanceTo(nowUs)`), never a wall clock, and integer µs keeps every tick
+// reproducible. The *view* types are `Date`/seconds (see ../types.ts), so these
+// two convert at the projection boundary and nowhere else.
+
+/** Simulation µs → the `Date` a view type carries. */
+const at = (us: number): Date => new Date(us / 1000)
+
+/** A simulation µs span → the whole seconds a view type carries. */
+const secondsOf = (us: number): number => Math.trunc(us / SECOND_US)
+
 /** Priority class → scheduling multiplier m(j) (ADR 0021). */
 const PRIORITY_MULTIPLIER: Record<number, number> = { 0: 1, 1: 2, 2: 4 }
 const W_AGE = 0.5
@@ -488,7 +499,7 @@ export class MockWorld {
           Math.round(alloc.memoryBytes * Math.min(1, factor + 0.1)),
           Math.round(alloc.diskBytes * Math.min(1, factor + 0.15)),
         )
-        backward.push({ tUs, used, allocated: { ...alloc } })
+        backward.push({ t: at(tUs), used, allocated: { ...alloc } })
         if (rng.bool(0.12)) {
           // A placement or release happened at this point (walking backward).
           const sign = rng.bool() ? 1 : -1
@@ -1147,7 +1158,7 @@ export class MockWorld {
     const memFrac = rng.bool(0.15) ? rng.range(0.9, 0.99) : rng.range(0.4, 0.85)
     const diskFrac = rng.range(0.2, 0.7)
     return {
-      tUs,
+      t: at(tUs),
       cpuMillis: Math.round(requested.cpuMillis * cpuFrac),
       memoryBytes: Math.round(requested.memoryBytes * memFrac),
       diskBytes: Math.round(requested.diskBytes * diskFrac),
@@ -1499,7 +1510,7 @@ export class MockWorld {
     if (this.nowUs - this.lastUtilBucketUs < UTIL_BUCKET_US) return
     for (const node of this.nodes.values()) {
       node.utilHistory.push({
-        tUs: this.nowUs,
+        t: at(this.nowUs),
         used: this.nodeUsed(node.id),
         allocated: this.nodeAllocated(node.id),
       })
@@ -1540,10 +1551,17 @@ export class MockWorld {
     })
   }
 
-  private pushEvent(body: { atUs: number } & TimelineEventBody): void {
+  /// Callers pass the simulation clock (`atUs`); the view's `at` is stamped
+  /// here, with identity, so every caller stays in simulation µs.
+  private pushEvent({ atUs, ...body }: { atUs: number } & TimelineEventBody): void {
     // Identity is stamped here, once, like the real apply loop: the mock
     // emits one event per simulated command, so ordinals are always 0.
-    const ev: TimelineEvent = { index: this.nextEventIndex++, ordinal: 0, ...body }
+    const ev: TimelineEvent = {
+      index: this.nextEventIndex++,
+      ordinal: 0,
+      at: at(atUs),
+      ...body,
+    }
     this.events.push(ev)
     if (this.events.length > EVENTS_RING) this.events.shift()
     const jobId = 'job' in ev ? (ev.job as string) : null
@@ -1766,10 +1784,10 @@ export class MockWorld {
       depth: byState.Queued,
       drainRatePerMinute: Math.round(avg((b) => b.drainedPerMinute)),
       arrivalRatePerMinute: Math.round(avg((b) => b.arrivedPerMinute)),
-      oldestQueuedAgeUs,
+      oldestQueuedAgeSeconds: oldestQueuedAgeUs === null ? null : secondsOf(oldestQueuedAgeUs),
       byState,
       history: this.queueHistory.map((b) => ({
-        tUs: b.tUs,
+        t: at(b.tUs),
         depth: b.depth,
         drainedPerMinute: b.drainedPerMinute,
         arrivedPerMinute: b.arrivedPerMinute,
@@ -1827,8 +1845,8 @@ export class MockWorld {
       quotaEntity: job.spec.quotaEntity,
       quotaEntityName: this.entityName(job.spec.quotaEntity),
       priority: job.spec.priority,
-      submittedAtUs: job.submittedAtUs,
-      terminalAtUs: job.terminalAtUs,
+      submittedAt: at(job.submittedAtUs),
+      terminalAt: job.terminalAtUs === null ? null : at(job.terminalAtUs),
       node: attempt ? attempt.node : null,
       attemptState: attempt ? attempt.state : null,
       queueRank: job.state.kind === 'Queued' ? (this.queuedRank.get(job.id) ?? null) : null,
@@ -1863,15 +1881,20 @@ export class MockWorld {
         env: { ...job.spec.env },
         requests: { ...job.spec.requests },
         priority: job.spec.priority,
-        maxRuntimeUs: job.spec.maxRuntimeUs,
+        maxRuntimeSeconds: job.spec.maxRuntimeUs === null ? null : secondsOf(job.spec.maxRuntimeUs),
         quotaEntity: job.spec.quotaEntity,
         retry: { ...job.spec.retry },
       },
-      submittedAtUs: job.submittedAtUs,
-      stateSinceUs: this.stateSince(job, attempt),
-      terminalAtUs: job.terminalAtUs,
+      submittedAt: at(job.submittedAtUs),
+      stateSince: at(this.stateSince(job, attempt)),
+      terminalAt: job.terminalAtUs === null ? null : at(job.terminalAtUs),
       retriesUsed: job.retriesUsed,
-      abortRequested: job.abortRequested ? { ...job.abortRequested } : null,
+      abortRequested: job.abortRequested
+        ? {
+            reason: job.abortRequested.reason,
+            requestedAt: at(job.abortRequested.requestedAtUs),
+          }
+        : null,
       entityChain: this.entityChain(job.spec.quotaEntity),
       attempts: job.attempts.map((aid) => this.attemptView(aid)),
       queue: job.state.kind === 'Queued' ? this.queueExplainer(job) : null,
@@ -1929,8 +1952,8 @@ export class MockWorld {
       allocation: a.allocation,
       state: a.state,
       outcome: a.outcome ? { ...a.outcome } : null,
-      startedAtUs: a.startedAtUs,
-      endedAtUs: a.endedAtUs,
+      startedAt: a.startedAtUs === null ? null : at(a.startedAtUs),
+      endedAt: a.endedAtUs === null ? null : at(a.endedAtUs),
       rateUcuPerSecond: a.rateUcuPerSecond,
       chargedUcu: a.chargedUcu,
     }
@@ -1964,8 +1987,8 @@ export class MockWorld {
       multiplier,
       penaltyChain: chain,
       penaltyProduct,
-      ageUs,
-      ageHorizonUs: AGE_HORIZON_US,
+      ageSeconds: secondsOf(ageUs),
+      ageHorizonSeconds: secondsOf(AGE_HORIZON_US),
       wAge: W_AGE,
       ageBonus,
     }
@@ -1983,7 +2006,7 @@ export class MockWorld {
         memory: frac(alloc.funded.memoryBytes, alloc.requested.memoryBytes),
         disk: frac(alloc.funded.diskBytes, alloc.requested.diskBytes),
       },
-      projectedStartUs: job ? job.projectedStartUs : null,
+      projectedStart: job && job.projectedStartUs !== null ? at(job.projectedStartUs) : null,
     }
   }
 
@@ -2026,7 +2049,7 @@ export class MockWorld {
       priorityMultiplier: m.priorityMultiplier,
       unboundedMultiplier: m.unboundedMultiplier,
       effectiveRateUcuPerSecond: m.effectiveRate,
-      chargeWindowUs: m.chargeWindowUs,
+      chargeWindowSeconds: secondsOf(m.chargeWindowUs),
       chargeWindowIsDefault: job.spec.maxRuntimeUs === null,
       estimatedUcu: m.upfrontUcu,
       chargedUcu: this.totalCharged(job),
@@ -2044,7 +2067,7 @@ export class MockWorld {
     const submit: TimelineEvent = {
       index: 0,
       ordinal: 0,
-      atUs: this.jobs.get(id)!.submittedAtUs,
+      at: at(this.jobs.get(id)!.submittedAtUs),
       kind: 'JobSubmitted',
       job: id,
     }
@@ -2112,8 +2135,8 @@ export class MockWorld {
       usageUcu: Math.max(0, Math.round(ent.usageUcu)),
       overQuotaRatio: ratio,
       penalty: Math.max(1, ratio * ratio),
-      createdAtUs: ent.createdAtUs,
-      updatedAtUs: ent.updatedAtUs,
+      createdAt: at(ent.createdAtUs),
+      updatedAt: at(ent.updatedAtUs),
       queuedCount,
       runningCount,
     }
@@ -2175,10 +2198,10 @@ export class MockWorld {
       .reduce((s, c) => s + c.amountUcu, 0)
     return {
       byState,
-      oldestQueuedAgeUs,
+      oldestQueuedAgeSeconds: oldestQueuedAgeUs === null ? null : secondsOf(oldestQueuedAgeUs),
       burnRateUcuPerSecond,
       chargedUcu24h,
-      usageHistory: ent.usageHistory.map((h) => ({ ...h })),
+      usageHistory: ent.usageHistory.map((h) => ({ t: at(h.tUs), usageUcu: h.usageUcu })),
     }
   }
 
@@ -2292,7 +2315,7 @@ export class MockWorld {
       schedulable: node.schedulable,
       health: node.health,
       epoch: node.epoch,
-      lastHeartbeatUs: node.lastHeartbeatUs,
+      lastHeartbeat: node.lastHeartbeatUs === null ? null : at(node.lastHeartbeatUs),
       runningCount: counts.running,
       accruingCount: counts.accruing,
     }
@@ -2323,7 +2346,7 @@ export class MockWorld {
     return {
       capacity: { ...node.capacity },
       samples: node.utilHistory.map((s) => ({
-        tUs: s.tUs,
+        t: s.t,
         used: { ...s.used },
         allocated: { ...s.allocated },
       })),
@@ -2342,11 +2365,12 @@ export class MockWorld {
         job: attempt.job,
         image: job?.spec.image ?? 'unknown',
         outcome: { ...attempt.outcome },
-        startedAtUs: attempt.startedAtUs,
-        endedAtUs: attempt.endedAtUs,
+        startedAt: attempt.startedAtUs === null ? null : at(attempt.startedAtUs),
+        // Non-null: the loop skips attempts that have not ended.
+        endedAt: at(attempt.endedAtUs),
       })
     }
-    return entries.sort((a, b) => b.endedAtUs - a.endedAtUs).slice(0, 50)
+    return entries.sort((a, b) => b.endedAt.getTime() - a.endedAt.getTime()).slice(0, 50)
   }
 
   buildCoordinatorStatus(): CoordinatorStatus {
@@ -2359,7 +2383,7 @@ export class MockWorld {
       lastApplied: this.raftIndex - c.lagEntries,
       replicationLagEntries: c.lagEntries,
       host: { ...c.host },
-      lastSeenUs: c.lastSeenUs,
+      lastSeen: at(c.lastSeenUs),
     }))
     return {
       clusterId: this.clusterId,
@@ -2371,7 +2395,7 @@ export class MockWorld {
       snapshot: {
         sizeBytes: 40 * 1024 * 1024,
         lastIncludedIndex: this.snapshotIndex,
-        takenAtUs: this.snapshotAtUs,
+        takenAt: at(this.snapshotAtUs),
         entriesSinceSnapshot: this.raftIndex - this.snapshotIndex,
       },
       stateCounts: {
@@ -2407,7 +2431,7 @@ export class MockWorld {
     const rng = new Rng(hashSeed(job.id + 'log'))
     const lines: LogEntry[] = []
     const push = (tUs: number, level: LogLevel, target: string, message: string) =>
-      lines.push({ tUs, level, target, message })
+      lines.push({ t: at(tUs), level, target, message })
 
     // Every job at least acknowledges submission to the coordinator.
     push(job.submittedAtUs, 'info', 'coordinator.admission', 'job submitted, awaiting admission')
@@ -2460,24 +2484,29 @@ export class MockWorld {
       t += rng.range(8 * SECOND_US, 20 * SECOND_US)
       const roll = rng.float()
       if (roll < 0.55) {
-        lines.push({ tUs: t, level: 'debug', target: 'agent.heartbeat', message: 'heartbeat ack' })
+        lines.push({
+          t: at(t),
+          level: 'debug',
+          target: 'agent.heartbeat',
+          message: 'heartbeat ack',
+        })
       } else if (roll < 0.8) {
         lines.push({
-          tUs: t,
+          t: at(t),
           level: 'info',
           target: 'agent.reconcile',
           message: 'reconciled desired allocations',
         })
       } else if (roll < 0.95) {
         lines.push({
-          tUs: t,
+          t: at(t),
           level: 'info',
           target: 'agent.alloc',
           message: 'allocation funded → active',
         })
       } else {
         lines.push({
-          tUs: t,
+          t: at(t),
           level: 'warn',
           target: 'agent.reconcile',
           message: 'drift detected, resyncing',
@@ -2486,7 +2515,7 @@ export class MockWorld {
     }
     if (node.health === 'Lost') {
       lines.push({
-        tUs: this.nowUs,
+        t: at(this.nowUs),
         level: 'error',
         target: 'agent.heartbeat',
         message: 'heartbeat timeout; marking node Lost',
@@ -2507,28 +2536,28 @@ export class MockWorld {
       const roll = rng.float()
       if (roll < 0.6) {
         lines.push({
-          tUs: t,
+          t: at(t),
           level: 'debug',
           target: 'raft.log',
           message: `appended entries up to index ${idx}`,
         })
       } else if (roll < 0.9) {
         lines.push({
-          tUs: t,
+          t: at(t),
           level: 'info',
           target: 'raft.commit',
           message: `committed index ${idx}`,
         })
       } else if (roll < 0.97) {
         lines.push({
-          tUs: t,
+          t: at(t),
           level: 'info',
           target: 'raft.snapshot',
           message: 'snapshot trigger: log size threshold',
         })
       } else {
         lines.push({
-          tUs: t,
+          t: at(t),
           level: 'warn',
           target: 'raft.election',
           message: `election tick; term ${7}`,
@@ -2571,7 +2600,7 @@ const LOG_PAGE = 40
 
 /** Cursor-paged newest-first; cursor is a stringified offset. */
 function pageLogs(all: LogEntry[], cursor: string | null): LogChunk {
-  const newestFirst = [...all].sort((a, b) => b.tUs - a.tUs)
+  const newestFirst = [...all].sort((a, b) => b.t.getTime() - a.t.getTime())
   const offset = cursor ? Math.max(0, Number.parseInt(cursor, 10) || 0) : 0
   const slice = newestFirst.slice(offset, offset + LOG_PAGE)
   const nextOffset = offset + LOG_PAGE

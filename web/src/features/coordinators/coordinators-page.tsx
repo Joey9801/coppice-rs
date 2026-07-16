@@ -1,6 +1,6 @@
 import { Network } from 'lucide-react'
 import { useCoordinatorStatus } from '@/api/queries'
-import { formatBytes, formatTimestampUs } from '@/lib/format'
+import { formatBytes, formatTimestamp } from '@/lib/format'
 import { EmptyState, KeyValueGrid, PageHeader, StatTile, TimeAgo } from '@/components'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -86,7 +86,7 @@ export function CoordinatorsPage() {
           value={`${snapshot.entriesSinceSnapshot.toLocaleString()} entries`}
           hint={
             <>
-              {formatBytes(snapshot.sizeBytes)} · taken <TimeAgo tUs={snapshot.takenAtUs} />
+              {formatBytes(snapshot.sizeBytes)} · taken <TimeAgo t={snapshot.takenAt} />
             </>
           }
         />
@@ -135,8 +135,8 @@ export function CoordinatorsPage() {
                   label: 'Taken',
                   value: (
                     <span>
-                      {formatTimestampUs(snapshot.takenAtUs)} (
-                      <TimeAgo tUs={snapshot.takenAtUs} />)
+                      {formatTimestamp(snapshot.takenAt)} (
+                      <TimeAgo t={snapshot.takenAt} />)
                     </span>
                   ),
                 },
