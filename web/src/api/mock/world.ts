@@ -30,13 +30,14 @@ import type {
   CoordinatorStatus,
   CostReport,
   JobDetail,
+  JobFilter,
   JobList,
   JobPhase,
   JobState,
   JobStateKind,
   JobSummary,
   JobUsage,
-  ListJobsFilter,
+  ListJobsRequest,
   LogChunk,
   LogEntry,
   LogLevel,
@@ -142,6 +143,19 @@ const USAGE_RING = 120
 const QUEUE_BUCKET_US = 30 * SECOND_US
 const QUEUE_HISTORY_BUCKETS = 60
 const EVENTS_RING = 200
+
+// ---------------------------------------------------------------------------
+// ListJobs filter/pagination (ListJobs v1 wire contract)
+// ---------------------------------------------------------------------------
+
+/** Max nesting depth of a `JobFilter` AST (root = depth 1). */
+const FILTER_MAX_DEPTH = 8
+/** Max total nodes (combinators + leaves) in a `JobFilter` AST. */
+const FILTER_MAX_NODES = 64
+/** Default page size when the request omits `limit`. */
+const LIST_JOBS_DEFAULT_LIMIT = 100
+/** Opaque keyset cursor prefix; the token is `v1:<job-id>`. */
+const CURSOR_PREFIX = 'v1:'
 
 // ---------------------------------------------------------------------------
 // Quota tree: decay, history, users
@@ -1795,37 +1809,257 @@ export class MockWorld {
     }
   }
 
-  listJobs(filter: ListJobsFilter): JobList {
-    const wanted = filter.states ? new Set(filter.states) : null
-    const search = filter.search?.toLowerCase()
-    // quotaEntity matches the whole subtree (entity + descendants).
-    const subtree = filter.quotaEntity ? this.subtreeEntityIds(filter.quotaEntity) : null
-    let matches = [...this.jobs.values()].filter((job) => {
-      if (wanted && !wanted.has(this.jobPhase(job))) return false
-      if (subtree && !subtree.has(job.spec.quotaEntity)) return false
-      if (filter.node) {
-        const attempt = this.currentAttempt(job)
-        if (!attempt || attempt.node !== filter.node) return false
+  /**
+   * List jobs with the SAME semantics the real server implements, so a future
+   * HTTP client is a behavior-preserving drop-in (ListJobs v1 wire contract):
+   * validate the request, evaluate the filter AST per job, order by job id
+   * DESCENDING (UUIDv7 ⇒ ≈ newest-submitted first, an immutable position), and
+   * keyset-paginate from strictly below the cursor's id.
+   *
+   * Unlike the server, the mock has NO scan budget — it always scans to the
+   * low end of the map, so a short page always means "exhausted" here. The
+   * real server may stop early on its budget and return a short page WITH a
+   * cursor; callers must treat `nextCursor === null` (never a short page) as
+   * the only "done" signal.
+   */
+  listJobs(request: ListJobsRequest): JobList {
+    const limit = request.limit ?? LIST_JOBS_DEFAULT_LIMIT
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      throw new MockInvalid(`limit must be an integer in 1..=1000, got ${limit}`)
+    }
+    const cursorId = this.parseCursor(request.cursor)
+    const matches = request.filter ? this.compileFilter(this.validatedFilter(request.filter)) : null
+
+    // Canonical order: job id descending. Same-prefix UUIDv7 strings compare
+    // lexicographically in mint (⇒ time) order, so a plain string compare works.
+    const ordered = [...this.jobs.values()].sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
+
+    const jobs: JobSummary[] = []
+    let lastExaminedId: string | null = null
+    let exhausted = true
+    for (const job of ordered) {
+      // Keyset: begin strictly below the cursor id (skip everything at/above).
+      if (cursorId !== null && job.id >= cursorId) continue
+      lastExaminedId = job.id
+      if (!matches || matches(job)) {
+        jobs.push(this.jobSummary(job))
+        if (jobs.length >= limit) {
+          // Page filled; more may remain below this id — continue next call.
+          exhausted = false
+          break
+        }
       }
-      if (search) {
-        const hay = `${job.id} ${job.spec.image}`.toLowerCase()
-        if (!hay.includes(search)) return false
+    }
+    // nextCursor = the last examined id (matched or not), or null once the scan
+    // reached the low end of the map (the only "exhausted" signal).
+    return { jobs, nextCursor: exhausted ? null : `${CURSOR_PREFIX}${lastExaminedId}` }
+  }
+
+  /** Validate a cursor token (`v1:<job-id>`) into its id, or throw on garbage. */
+  private parseCursor(cursor: string | undefined): string | null {
+    if (cursor === undefined) return null
+    if (!cursor.startsWith(CURSOR_PREFIX)) throw new MockInvalid(`malformed cursor: ${cursor}`)
+    const id = cursor.slice(CURSOR_PREFIX.length)
+    if (!id.startsWith('job-') || id.length <= 'job-'.length) {
+      throw new MockInvalid(`malformed cursor: ${cursor}`)
+    }
+    return id
+  }
+
+  /** Validate a filter AST (throws `MockInvalid`) and return it for compiling. */
+  private validatedFilter(filter: JobFilter): JobFilter {
+    this.validateFilter(filter, 1, { count: 0 })
+    return filter
+  }
+
+  /**
+   * Walk the AST enforcing the contract's caps and per-node rules, throwing
+   * `MockInvalid` on any violation (empty combinator/`in` arrays, depth > 8,
+   * > 64 nodes, image not-exactly-one-op, submitted/requests bound rules,
+   * unknown phase/resource, malformed job id, unknown/duplicate keys).
+   */
+  private validateFilter(filter: JobFilter, depth: number, counter: { count: number }): void {
+    if (depth > FILTER_MAX_DEPTH) {
+      throw new MockInvalid(`filter nesting exceeds depth ${FILTER_MAX_DEPTH}`)
+    }
+    counter.count += 1
+    if (counter.count > FILTER_MAX_NODES) {
+      throw new MockInvalid(`filter exceeds ${FILTER_MAX_NODES} nodes`)
+    }
+    const keys = Object.keys(filter)
+    if (keys.length !== 1) {
+      throw new MockInvalid('each filter node must have exactly one key')
+    }
+    const key = keys[0]
+    switch (key) {
+      case 'all':
+      case 'any': {
+        const arr = (filter as { all?: JobFilter[]; any?: JobFilter[] })[key]
+        if (!Array.isArray(arr) || arr.length === 0) {
+          throw new MockInvalid(`"${key}" must be a non-empty array`)
+        }
+        for (const child of arr) this.validateFilter(child, depth + 1, counter)
+        break
       }
+      case 'not':
+        this.validateFilter((filter as { not: JobFilter }).not, depth + 1, counter)
+        break
+      case 'phase': {
+        const list = (filter as { phase: { in: JobPhase[] } }).phase.in
+        if (!Array.isArray(list) || list.length === 0) {
+          throw new MockInvalid('"phase.in" must be a non-empty array')
+        }
+        for (const p of list) {
+          if (!(JOB_PHASES as readonly string[]).includes(p)) {
+            throw new MockInvalid(`unknown phase: ${p}`)
+          }
+        }
+        break
+      }
+      case 'entity': {
+        const e = (filter as { entity: { id: string; scope?: string } }).entity
+        if (typeof e.id !== 'string' || e.id.length === 0) {
+          throw new MockInvalid('"entity.id" is required')
+        }
+        if (e.scope !== undefined && e.scope !== 'subtree' && e.scope !== 'exact') {
+          throw new MockInvalid('"entity.scope" must be "subtree" or "exact"')
+        }
+        break
+      }
+      case 'node': {
+        const node = (filter as { node: string }).node
+        if (typeof node !== 'string' || node.length === 0) {
+          throw new MockInvalid('"node" is required')
+        }
+        break
+      }
+      case 'image': {
+        const img = (filter as { image: { contains?: string; equals?: string } }).image
+        if ('contains' in img === 'equals' in img) {
+          throw new MockInvalid('"image" needs exactly one of contains/equals')
+        }
+        break
+      }
+      case 'id': {
+        const list = (filter as { id: { in: string[] } }).id.in
+        if (!Array.isArray(list) || list.length === 0) {
+          throw new MockInvalid('"id.in" must be a non-empty array')
+        }
+        for (const id of list) {
+          if (typeof id !== 'string' || !id.startsWith('job-') || id.length <= 'job-'.length) {
+            throw new MockInvalid(`malformed job id: ${id}`)
+          }
+        }
+        break
+      }
+      case 'search':
+        if (typeof (filter as { search: string }).search !== 'string') {
+          throw new MockInvalid('"search" must be a string')
+        }
+        break
+      case 'submitted': {
+        const s = (filter as { submitted: { after?: Date; before?: Date } }).submitted
+        const after = s.after ?? null
+        const before = s.before ?? null
+        if (after === null && before === null) {
+          throw new MockInvalid('"submitted" needs at least one of after/before')
+        }
+        if (after !== null && before !== null && after.getTime() > before.getTime()) {
+          throw new MockInvalid('"submitted.after" must be ≤ "submitted.before"')
+        }
+        break
+      }
+      case 'requests': {
+        const r = (
+          filter as {
+            requests: { resource: string; min?: number; max?: number }
+          }
+        ).requests
+        if (
+          r.resource !== 'cpuMillis' &&
+          r.resource !== 'memoryBytes' &&
+          r.resource !== 'diskBytes'
+        ) {
+          throw new MockInvalid(`unknown resource: ${r.resource}`)
+        }
+        if (r.min === undefined && r.max === undefined) {
+          throw new MockInvalid('"requests" needs at least one of min/max')
+        }
+        if (r.min !== undefined && r.max !== undefined && r.min > r.max) {
+          throw new MockInvalid('"requests.min" must be ≤ "requests.max"')
+        }
+        break
+      }
+      default:
+        throw new MockInvalid(`unknown filter node: ${key}`)
+    }
+  }
+
+  /**
+   * Compile a validated AST into an O(1)-per-job predicate, precomputing the
+   * per-request setup each leaf needs (subtree descendant sets, lowercased
+   * search needles). NEVER call on an unvalidated filter.
+   */
+  private compileFilter(filter: JobFilter): (job: MJob) => boolean {
+    if ('all' in filter) {
+      const preds = filter.all.map((f) => this.compileFilter(f))
+      return (job) => preds.every((p) => p(job))
+    }
+    if ('any' in filter) {
+      const preds = filter.any.map((f) => this.compileFilter(f))
+      return (job) => preds.some((p) => p(job))
+    }
+    if ('not' in filter) {
+      const pred = this.compileFilter(filter.not)
+      return (job) => !pred(job)
+    }
+    if ('phase' in filter) {
+      const wanted = new Set(filter.phase.in)
+      return (job) => wanted.has(this.jobPhase(job))
+    }
+    if ('entity' in filter) {
+      const ids =
+        (filter.entity.scope ?? 'subtree') === 'exact'
+          ? new Set([filter.entity.id])
+          : this.subtreeEntityIds(filter.entity.id)
+      return (job) => ids.has(job.spec.quotaEntity)
+    }
+    if ('node' in filter) {
+      const node = filter.node
+      return (job) => this.currentAttempt(job)?.node === node
+    }
+    if ('image' in filter) {
+      if ('contains' in filter.image) {
+        const needle = filter.image.contains
+        return (job) => job.spec.image.includes(needle)
+      }
+      const exact = filter.image.equals
+      return (job) => job.spec.image === exact
+    }
+    if ('id' in filter) {
+      const ids = new Set(filter.id.in)
+      return (job) => ids.has(job.id)
+    }
+    if ('search' in filter) {
+      const needle = filter.search.toLowerCase()
+      return (job) => `${job.id} ${job.spec.image}`.toLowerCase().includes(needle)
+    }
+    if ('submitted' in filter) {
+      const afterUs = filter.submitted.after ? filter.submitted.after.getTime() * 1000 : null
+      const beforeUs = filter.submitted.before ? filter.submitted.before.getTime() * 1000 : null
+      return (job) => {
+        if (afterUs !== null && job.submittedAtUs < afterUs) return false
+        if (beforeUs !== null && job.submittedAtUs >= beforeUs) return false
+        return true
+      }
+    }
+    // requests
+    const { resource, min, max } = filter.requests
+    return (job) => {
+      const value = job.spec.requests[resource]
+      if (min !== undefined && value < min) return false
+      if (max !== undefined && value > max) return false
       return true
-    })
-    // Non-terminal first (submittedAt desc), then terminal (terminalAt desc).
-    matches = matches.sort((a, b) => {
-      const at = this.isTerminal(a)
-      const bt = this.isTerminal(b)
-      if (at !== bt) return at ? 1 : -1
-      if (!at) return b.submittedAtUs - a.submittedAtUs
-      return (b.terminalAtUs ?? 0) - (a.terminalAtUs ?? 0)
-    })
-    const total = matches.length
-    const limit = filter.limit ?? 100
-    return {
-      total,
-      jobs: matches.slice(0, limit).map((job) => this.jobSummary(job)),
     }
   }
 
@@ -1849,12 +2083,12 @@ export class MockWorld {
       terminalAt: job.terminalAtUs === null ? null : at(job.terminalAtUs),
       node: attempt ? attempt.node : null,
       attemptState: attempt ? attempt.state : null,
-      queueRank: job.state.kind === 'Queued' ? (this.queuedRank.get(job.id) ?? null) : null,
       fundingFraction,
-      // Settled net cost once terminal (after the true-up refund); the gross
-      // upfront charge while the job is still holding it.
-      costUcu:
-        this.isTerminal(job) && job.actualUcu != null ? job.actualUcu : this.totalCharged(job),
+      // Gross placement charge summed over attempts, terminal or not — the
+      // server cannot report the trued-up net (the true-up settles only
+      // against entity usage and is not retained per attempt), so the mock
+      // matches. Net/settled cost lives on JobDetail's CostReport.
+      costUcu: this.totalCharged(job),
       outcome: this.isTerminal(job) ? this.lastOutcome(job) : null,
     }
   }

@@ -264,11 +264,13 @@ export interface JobSummary {
    * rows derive a phase (`derivePhase`) without a second fetch.
    */
   attemptState: AttemptState | null
-  /** 1-based queue rank; only for `Queued` jobs. */
-  queueRank: number | null
   /** Min funded/requested fraction across dims; only while accruing. */
   fundingFraction: number | null
-  /** Charged so far (upfront charges, trued-up when terminal). */
+  /**
+   * Gross µCU charged across attempts (upfront placement charges). NOT
+   * trued-up when terminal — replicated state does not retain the per-job
+   * settlement; the net figure is `JobDetail.cost.actualUcu`.
+   */
   costUcu: number
   /** Outcome of the last attempt, when terminal. */
   outcome: AttemptOutcome | null
@@ -390,21 +392,66 @@ export function jobCurrentAttempt(job: Pick<JobDetail, 'state' | 'attempts'>): A
   return id ? (job.attempts.find((a) => a.id === id) ?? null) : null
 }
 
-export interface ListJobsFilter {
-  /** Filters by the displayed phase (`derivePhase`), not the raw `JobState`. */
-  states?: JobPhase[]
-  /** Matches the entity's whole subtree (a leaf matches just itself). */
-  quotaEntity?: QuotaEntityId
-  node?: NodeId
-  /** Substring match on job id or image. */
-  search?: string
+/**
+ * Recursive job-filter AST for `listJobs`, mirroring the server's
+ * externally-tagged JSON filter (ListJobs v1 wire contract). Every node is a
+ * one-key object; the client maps this camelCase/PascalCase shape to the
+ * snake_case wire form at its boundary. Absent filter ⇒ match every job.
+ *
+ * Leaves:
+ * - `phase`: matches the displayed phase (`derivePhase`), not the raw
+ *   `JobState`; `in` is non-empty (empty is invalid).
+ * - `entity`: matches jobs owned by a quota entity. `scope` defaults to
+ *   `'subtree'` (the entity plus all descendants); `'exact'` matches only the
+ *   named entity. An unknown entity id matches nothing (not an error).
+ * - `node`: the current attempt's node. Unknown ⇒ matches nothing.
+ * - `image`: exactly one of `contains` / `equals` (both or neither invalid).
+ * - `id`: `in` is a non-empty set of job ids (empty is invalid).
+ * - `search`: case-insensitive substring over the job id string OR the image
+ *   string.
+ * - `submitted`: at least one bound; `after` is inclusive (≥), `before` is
+ *   exclusive (<); `after > before` is invalid.
+ * - `requests`: a resource dimension with at least one of `min`/`max`, both
+ *   inclusive; `min > max` is invalid.
+ *
+ * Caps (violation is invalid): max nesting depth 8, max 64 total nodes
+ * (combinators + leaves). Empty `all`/`any`/`in` arrays are invalid.
+ */
+export type JobFilter =
+  | { all: JobFilter[] }
+  | { any: JobFilter[] }
+  | { not: JobFilter }
+  | { phase: { in: JobPhase[] } }
+  | { entity: { id: QuotaEntityId; scope?: 'subtree' | 'exact' } }
+  | { node: NodeId }
+  | { image: { contains: string } | { equals: string } }
+  | { id: { in: JobId[] } }
+  | { search: string }
+  | { submitted: { after?: Date; before?: Date } }
+  | {
+      requests: { resource: 'cpuMillis' | 'memoryBytes' | 'diskBytes'; min?: number; max?: number }
+    }
+
+/**
+ * A single `listJobs` page request. `cursor` is the opaque token from a prior
+ * response's `nextCursor` (continue from where that page left off); `limit` is
+ * the page size (server default 100, valid range 1..=1000).
+ */
+export interface ListJobsRequest {
+  filter?: JobFilter
+  cursor?: string
   limit?: number
 }
 
 export interface JobList {
   jobs: JobSummary[]
-  /** Total matching before `limit` was applied. */
-  total: number
+  /**
+   * Keyset cursor to continue from (feed back as `cursor`); `null` iff the
+   * listing is exhausted. A short page with a NON-null cursor legitimately
+   * means "continue" — the server may stop early on a scan budget, so never
+   * treat a short page as "done" (only `nextCursor === null` means done).
+   */
+  nextCursor: string | null
 }
 
 // ---------------------------------------------------------------------------

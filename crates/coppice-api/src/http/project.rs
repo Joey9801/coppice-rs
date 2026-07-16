@@ -5,11 +5,12 @@
 //! attempt maps are handler-scoped throwaway memos, never stored on the
 //! state machine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
-use coppice_core::id::{ClusterId, NodeId};
+use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::JobState;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -381,6 +382,278 @@ fn funded_fraction(funded: &Resources, requested: &Resources) -> dto::FundedFrac
         cpu: frac(funded.cpu_millis, requested.cpu_millis),
         memory: frac(funded.memory_bytes, requested.memory_bytes),
         disk: frac(funded.disk_bytes, requested.disk_bytes),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Job list (GET /api/v1/jobs)
+// ---------------------------------------------------------------------------
+
+/// Records examined per request before a page is returned short with a
+/// cursor (ADR 0031 as amended). The bound keeps a filter that matches
+/// little against a huge job map from turning one read into an unbounded
+/// scan; the client continues from `next_cursor`.
+const JOB_SCAN_BUDGET: usize = 100_000;
+
+/// `GET /api/v1/jobs`.
+///
+/// Descending scan of `state.jobs` (JobId order ≈ newest-submitted first,
+/// UUIDv7) starting strictly below `cursor`, evaluating `filter` per record
+/// and collecting matches until `limit`. See [`list_jobs_scan`] for the
+/// cursor and budget semantics.
+pub fn list_jobs(
+    state: &StateMachine,
+    filter: Option<&dto::JobFilter>,
+    cursor: Option<JobId>,
+    limit: usize,
+) -> dto::ListJobsResponse {
+    list_jobs_scan(state, filter, cursor, limit, JOB_SCAN_BUDGET)
+}
+
+/// [`list_jobs`] with the scan budget injected, so the short-page-with-cursor
+/// path is testable without a 100 000-record fixture.
+///
+/// `next_cursor` is the token for the **last record examined** (matched or
+/// not) and is `null` iff the scan reached the low end of the map — i.e. the
+/// descending iterator was exhausted rather than cut off by `limit` or the
+/// budget. Continuing from a non-null cursor resumes strictly below that id,
+/// so a new head inserted between requests is never skipped and an already
+/// returned id is never repeated.
+fn list_jobs_scan(
+    state: &StateMachine,
+    filter: Option<&dto::JobFilter>,
+    cursor: Option<JobId>,
+    limit: usize,
+    budget: usize,
+) -> dto::ListJobsResponse {
+    // Per-request memo: the descendant id set of every entity-subtree leaf,
+    // computed once (BFS over the bounded `quota_entities` tree), never a
+    // field on the state machine.
+    let ctx = FilterContext::build(state, filter);
+
+    // `imbl::OrdMap::range` is double-ended, so a strictly-below-cursor
+    // descending walk is `range((Unbounded, Excluded(cursor))).rev()` — the
+    // whole map is never collected.
+    let upper = cursor.map_or(Bound::Unbounded, Bound::Excluded);
+    let iter = state.jobs.range((Bound::Unbounded, upper));
+
+    let mut jobs = Vec::new();
+    let mut last_examined: Option<JobId> = None;
+    // Stays true only if the iterator runs out on its own; any early break
+    // (page full or budget spent) means more records may lie below.
+    let mut exhausted = true;
+    // `examined` is the count already inspected, so `examined >= budget`
+    // stops the scan after exactly `budget` records.
+    for (examined, (id, record)) in iter.rev().enumerate() {
+        if jobs.len() >= limit || examined >= budget {
+            exhausted = false;
+            break;
+        }
+        last_examined = Some(*id);
+        if filter.map_or(true, |f| ctx.matches(state, f, record)) {
+            jobs.push(job_summary(state, record));
+        }
+    }
+
+    dto::ListJobsResponse {
+        next_cursor: if exhausted {
+            None
+        } else {
+            last_examined.map(dto::JobCursor::format)
+        },
+        jobs,
+    }
+}
+
+/// Per-request evaluation memo for a [`dto::JobFilter`].
+///
+/// Holds the precomputed descendant id set of each entity-subtree leaf so
+/// filter evaluation is O(1) per job after this bounded setup. An unknown
+/// entity id resolves to an empty set (matches nothing), never an error.
+struct FilterContext {
+    subtrees: BTreeMap<QuotaEntityId, BTreeSet<QuotaEntityId>>,
+}
+
+impl FilterContext {
+    fn build(state: &StateMachine, filter: Option<&dto::JobFilter>) -> FilterContext {
+        let mut ids = BTreeSet::new();
+        if let Some(f) = filter {
+            collect_subtree_ids(f, &mut ids);
+        }
+        let mut subtrees = BTreeMap::new();
+        if !ids.is_empty() {
+            let children = child_adjacency(state);
+            for id in ids {
+                subtrees.insert(id, descendant_set(&children, state, id));
+            }
+        }
+        FilterContext { subtrees }
+    }
+
+    fn matches(&self, state: &StateMachine, filter: &dto::JobFilter, record: &JobRecord) -> bool {
+        use dto::JobFilter as F;
+        match filter {
+            F::All(fs) => fs.iter().all(|f| self.matches(state, f, record)),
+            F::Any(fs) => fs.iter().any(|f| self.matches(state, f, record)),
+            F::Not(f) => !self.matches(state, f, record),
+            F::Phase(p) => p.r#in.contains(&job_phase(state, record)),
+            F::Entity(e) => match e.scope {
+                dto::EntityScope::Subtree => self
+                    .subtrees
+                    .get(&e.id)
+                    .is_some_and(|set| set.contains(&record.spec.quota_entity)),
+                dto::EntityScope::Exact => record.spec.quota_entity == e.id,
+            },
+            F::Node(n) => current_attempt_node(state, record) == Some(*n),
+            F::Image(dto::ImageFilter::Contains(s)) => record.spec.image.contains(s),
+            F::Image(dto::ImageFilter::Equals(s)) => record.spec.image == *s,
+            F::Id(i) => i.r#in.contains(&record.spec.id),
+            F::Search(s) => {
+                let needle = s.to_lowercase();
+                record.spec.id.to_string().to_lowercase().contains(&needle)
+                    || record.spec.image.to_lowercase().contains(&needle)
+            }
+            // `after` inclusive (≥), `before` exclusive (<) — the contract's
+            // half-open window.
+            F::Submitted(sf) => {
+                sf.after.map_or(true, |a| record.submitted_at >= a)
+                    && sf.before.map_or(true, |b| record.submitted_at < b)
+            }
+            // Both bounds inclusive.
+            F::Requests(r) => {
+                let value = match r.resource {
+                    dto::RequestsResource::CpuMillis => record.spec.requests.cpu_millis,
+                    dto::RequestsResource::MemoryBytes => record.spec.requests.memory_bytes,
+                    dto::RequestsResource::DiskBytes => record.spec.requests.disk_bytes,
+                };
+                r.min.map_or(true, |m| value >= m) && r.max.map_or(true, |m| value <= m)
+            }
+        }
+    }
+}
+
+/// Every entity id referenced by an entity-**subtree** leaf; exact-scope
+/// leaves need no descendant set, so they are not collected.
+fn collect_subtree_ids(filter: &dto::JobFilter, out: &mut BTreeSet<QuotaEntityId>) {
+    use dto::JobFilter as F;
+    match filter {
+        F::All(fs) | F::Any(fs) => fs.iter().for_each(|f| collect_subtree_ids(f, out)),
+        F::Not(f) => collect_subtree_ids(f, out),
+        F::Entity(e) if e.scope == dto::EntityScope::Subtree => {
+            out.insert(e.id);
+        }
+        _ => {}
+    }
+}
+
+/// Parent → children adjacency over the (bounded) quota-entity tree, built
+/// once per request that needs a subtree set.
+fn child_adjacency(state: &StateMachine) -> BTreeMap<QuotaEntityId, Vec<QuotaEntityId>> {
+    let mut children: BTreeMap<QuotaEntityId, Vec<QuotaEntityId>> = BTreeMap::new();
+    for (id, entity) in &state.quota_entities {
+        if let Some(parent) = entity.parent {
+            children.entry(parent).or_default().push(*id);
+        }
+    }
+    children
+}
+
+/// The entity and all its descendants (BFS). An id absent from the tree
+/// yields the empty set — an unknown entity matches nothing, not itself.
+fn descendant_set(
+    children: &BTreeMap<QuotaEntityId, Vec<QuotaEntityId>>,
+    state: &StateMachine,
+    root: QuotaEntityId,
+) -> BTreeSet<QuotaEntityId> {
+    let mut set = BTreeSet::new();
+    if !state.quota_entities.contains_key(&root) {
+        return set;
+    }
+    let mut queue = vec![root];
+    while let Some(id) = queue.pop() {
+        if set.insert(id) {
+            if let Some(kids) = children.get(&id) {
+                queue.extend(kids.iter().copied());
+            }
+        }
+    }
+    set
+}
+
+fn current_attempt_node(state: &StateMachine, record: &JobRecord) -> Option<NodeId> {
+    let attempt = record.state.attempt()?;
+    state.attempts.get(&attempt).map(|ar| ar.attempt.node)
+}
+
+/// µCU charged across a job's attempts.
+///
+/// This is the gross placement charge summed over every attempt, both while
+/// the job is live and once terminal. A terminal job's *net* cost — the
+/// charge after the finalization true-up (ADR 0019/0029) — is not
+/// recoverable here: `terminate_attempt` settles the refund/surcharge
+/// against the quota entity's usage accumulator and retains neither the
+/// adjustment nor the actual runtime on the attempt record, so replicated
+/// state has no per-job net figure to project. The web mock reports its net
+/// `actualUcu` when terminal; the server reports gross until the state
+/// carries the settled amount.
+fn total_charged(state: &StateMachine, record: &JobRecord) -> u64 {
+    record
+        .attempts
+        .iter()
+        .filter_map(|id| state.attempts.get(id))
+        .map(|ar| ar.charge.amount.0)
+        .fold(0u64, |acc, amount| acc.saturating_add(amount))
+}
+
+/// The last attempt's terminal outcome, if it has one.
+fn last_attempt_outcome(state: &StateMachine, record: &JobRecord) -> Option<dto::AttemptOutcome> {
+    let last = record.attempts.last()?;
+    match &state.attempts.get(last)?.attempt.state {
+        AttemptState::Terminal(outcome) => Some(outcome.into()),
+        _ => None,
+    }
+}
+
+fn job_summary(state: &StateMachine, record: &JobRecord) -> dto::JobSummary {
+    let current = record.state.attempt();
+    let attempt = current.and_then(|id| state.attempts.get(&id));
+
+    // Funding progress is meaningful only while the attempt is accruing —
+    // the min funded/requested across dimensions (the contract's scalar).
+    let funding_fraction = attempt.and_then(|ar| {
+        if matches!(ar.attempt.state, AttemptState::Accruing) {
+            state.allocations.get(&ar.attempt.allocation).map(|alloc| {
+                let ff = funded_fraction(&alloc.allocation.funded, &alloc.allocation.requested);
+                ff.cpu.min(ff.memory).min(ff.disk)
+            })
+        } else {
+            None
+        }
+    });
+
+    dto::JobSummary {
+        id: record.spec.id,
+        state: record.state.into(),
+        attempt: current,
+        image: record.spec.image.clone(),
+        quota_entity: record.spec.quota_entity,
+        quota_entity_name: state
+            .quota_entities
+            .get(&record.spec.quota_entity)
+            .map(|e| e.name.clone())
+            .unwrap_or_default(),
+        priority: record.spec.priority,
+        submitted_at: record.submitted_at,
+        terminal_at: record.terminal_at,
+        node: attempt.map(|ar| ar.attempt.node),
+        attempt_state: attempt.map(|ar| (&ar.attempt.state).into()),
+        funding_fraction,
+        cost_ucu: total_charged(state, record),
+        outcome: if record.state.is_terminal() {
+            last_attempt_outcome(state, record)
+        } else {
+            None
+        },
     }
 }
 
@@ -898,5 +1171,412 @@ mod tests {
         assert_eq!(ff.cpu, 1.0);
         assert_eq!(ff.memory, 1.0);
         assert_eq!(ff.disk, 1.0);
+    }
+
+    // ---- job list ---------------------------------------------------------
+
+    /// A JobId whose numeric order is `n`, so descending JobId order is
+    /// descending `n` — deterministic, unlike freshly minted UUIDv7s.
+    fn job_id(n: u16) -> JobId {
+        format!("job-00000000-0000-0000-0000-{n:012x}")
+            .parse()
+            .unwrap()
+    }
+
+    fn quota_id(n: u16) -> QuotaEntityId {
+        format!("quota-00000000-0000-0000-0000-{n:012x}")
+            .parse()
+            .unwrap()
+    }
+
+    /// A queued job with a controllable id and submission time; other spec
+    /// fields default (image `busybox`, zero requests, a fresh entity).
+    fn queued(id: JobId, submitted_us: i64) -> JobRecord {
+        test_job(id, JobState::Queued, ts(submitted_us))
+    }
+
+    /// A job with the spec fields the leaf filters key on made explicit.
+    fn spec_job(
+        id: JobId,
+        image: &str,
+        entity: QuotaEntityId,
+        requests: Resources,
+        submitted_us: i64,
+    ) -> JobRecord {
+        let mut record = queued(id, submitted_us);
+        record.spec.image = image.to_string();
+        record.spec.quota_entity = entity;
+        record.spec.requests = requests;
+        record
+    }
+
+    fn ids(response: &dto::ListJobsResponse) -> Vec<JobId> {
+        response.jobs.iter().map(|j| j.id).collect()
+    }
+
+    #[test]
+    fn list_jobs_returns_newest_first_and_null_cursor_when_exhausted() {
+        let mut state = StateMachine::default();
+        for n in 1..=3 {
+            let id = job_id(n);
+            state.jobs.insert(id, queued(id, n as i64));
+        }
+        let response = list_jobs(&state, None, None, 100);
+        assert_eq!(ids(&response), vec![job_id(3), job_id(2), job_id(1)]);
+        // The scan ran off the low end: no more to fetch.
+        assert_eq!(response.next_cursor, None);
+    }
+
+    #[test]
+    fn a_full_page_carries_the_cursor_of_the_last_examined_record() {
+        let mut state = StateMachine::default();
+        for n in 1..=4 {
+            let id = job_id(n);
+            state.jobs.insert(id, queued(id, n as i64));
+        }
+        let page = list_jobs(&state, None, None, 2);
+        assert_eq!(ids(&page), vec![job_id(4), job_id(3)]);
+        assert_eq!(page.next_cursor, Some(dto::JobCursor::format(job_id(3))));
+    }
+
+    #[test]
+    fn cursor_continuation_neither_skips_nor_duplicates_across_a_new_head() {
+        let mut state = StateMachine::default();
+        for n in 1..=4 {
+            let id = job_id(n);
+            state.jobs.insert(id, queued(id, n as i64));
+        }
+        let page1 = list_jobs(&state, None, None, 2);
+        assert_eq!(ids(&page1), vec![job_id(4), job_id(3)]);
+        let cursor = dto::JobCursor::parse(page1.next_cursor.as_deref().unwrap()).unwrap();
+
+        // A newer job arrives between requests; keyset paging on immutable
+        // ids ignores it (it sorts above the cursor) rather than shifting the
+        // page and skipping job_id(2).
+        let head = job_id(5);
+        state.jobs.insert(head, queued(head, 5));
+
+        let page2 = list_jobs(&state, None, Some(cursor), 2);
+        assert_eq!(ids(&page2), vec![job_id(2), job_id(1)]);
+        assert_eq!(page2.next_cursor, None);
+    }
+
+    #[test]
+    fn budget_exhaustion_returns_a_short_page_with_a_cursor() {
+        let mut state = StateMachine::default();
+        for n in 1..=5 {
+            let id = job_id(n);
+            state.jobs.insert(id, queued(id, n as i64));
+        }
+        // No job is Running, so the page stays empty; a budget of 3 stops the
+        // scan after the three newest, cursor at the last examined.
+        let filter = dto::JobFilter::Phase(dto::PhaseFilter {
+            r#in: vec![dto::JobPhase::Running],
+        });
+        let response = list_jobs_scan(&state, Some(&filter), None, 100, 3);
+        assert!(response.jobs.is_empty());
+        assert_eq!(
+            response.next_cursor,
+            Some(dto::JobCursor::format(job_id(3)))
+        );
+    }
+
+    #[test]
+    fn phase_leaf_matches_the_derived_phase() {
+        let mut state = StateMachine::default();
+        let q = job_id(1);
+        let s = job_id(2);
+        state.jobs.insert(q, test_job(q, JobState::Queued, ts(0)));
+        state
+            .jobs
+            .insert(s, test_job(s, JobState::Succeeded, ts(0)));
+        let filter = dto::JobFilter::Phase(dto::PhaseFilter {
+            r#in: vec![dto::JobPhase::Queued],
+        });
+        assert_eq!(ids(&list_jobs(&state, Some(&filter), None, 100)), vec![q]);
+    }
+
+    #[test]
+    fn entity_leaf_distinguishes_subtree_from_exact() {
+        // root → child; a job under each.
+        let root = quota_id(1);
+        let child = quota_id(2);
+        let mut state = StateMachine::default();
+        state.quota_entities.insert(
+            root,
+            coppice_state::QuotaEntity {
+                parent: None,
+                name: "root".to_string(),
+                quota: coppice_core::quota::CostUnits::ZERO,
+                usage: coppice_core::quota::UsageState::new(ts(0)),
+            },
+        );
+        state.quota_entities.insert(
+            child,
+            coppice_state::QuotaEntity {
+                parent: Some(root),
+                name: "child".to_string(),
+                quota: coppice_core::quota::CostUnits::ZERO,
+                usage: coppice_core::quota::UsageState::new(ts(0)),
+            },
+        );
+        let root_job = job_id(1);
+        let child_job = job_id(2);
+        state.jobs.insert(
+            root_job,
+            spec_job(root_job, "img", root, Resources::ZERO, 0),
+        );
+        state.jobs.insert(
+            child_job,
+            spec_job(child_job, "img", child, Resources::ZERO, 0),
+        );
+
+        let subtree = dto::JobFilter::Entity(dto::EntityFilter {
+            id: root,
+            scope: dto::EntityScope::Subtree,
+        });
+        assert_eq!(
+            ids(&list_jobs(&state, Some(&subtree), None, 100)),
+            vec![child_job, root_job]
+        );
+
+        let exact = dto::JobFilter::Entity(dto::EntityFilter {
+            id: root,
+            scope: dto::EntityScope::Exact,
+        });
+        assert_eq!(
+            ids(&list_jobs(&state, Some(&exact), None, 100)),
+            vec![root_job]
+        );
+
+        // An unknown entity matches nothing, even under subtree scope.
+        let unknown = dto::JobFilter::Entity(dto::EntityFilter {
+            id: quota_id(99),
+            scope: dto::EntityScope::Subtree,
+        });
+        assert!(list_jobs(&state, Some(&unknown), None, 100).jobs.is_empty());
+    }
+
+    #[test]
+    fn node_leaf_matches_the_current_attempts_node() {
+        let node = NodeId::new();
+        let attempting = job_id(2);
+        let queued_job = job_id(1);
+        let attempt = AttemptId::new();
+        let mut state = StateMachine::default();
+        state
+            .jobs
+            .insert(queued_job, test_job(queued_job, JobState::Queued, ts(0)));
+        state.jobs.insert(
+            attempting,
+            test_job(attempting, JobState::Attempting(attempt), ts(0)),
+        );
+        state.attempts.insert(
+            attempt,
+            test_attempt(attempt, attempting, node, AttemptState::Running),
+        );
+
+        let filter = dto::JobFilter::Node(node);
+        assert_eq!(
+            ids(&list_jobs(&state, Some(&filter), None, 100)),
+            vec![attempting]
+        );
+        // An unknown node matches nothing.
+        let other = dto::JobFilter::Node(NodeId::new());
+        assert!(list_jobs(&state, Some(&other), None, 100).jobs.is_empty());
+    }
+
+    #[test]
+    fn image_leaf_matches_contains_and_equals() {
+        let mut state = StateMachine::default();
+        let a = job_id(1);
+        let b = job_id(2);
+        state
+            .jobs
+            .insert(a, spec_job(a, "alpine:3", quota_id(1), Resources::ZERO, 0));
+        state
+            .jobs
+            .insert(b, spec_job(b, "busybox:1", quota_id(1), Resources::ZERO, 0));
+
+        let contains = dto::JobFilter::Image(dto::ImageFilter::Contains("alpine".to_string()));
+        assert_eq!(ids(&list_jobs(&state, Some(&contains), None, 100)), vec![a]);
+
+        let equals = dto::JobFilter::Image(dto::ImageFilter::Equals("busybox:1".to_string()));
+        assert_eq!(ids(&list_jobs(&state, Some(&equals), None, 100)), vec![b]);
+    }
+
+    #[test]
+    fn id_and_search_leaves() {
+        let mut state = StateMachine::default();
+        let a = job_id(1);
+        let b = job_id(2);
+        state
+            .jobs
+            .insert(a, spec_job(a, "alpine:3", quota_id(1), Resources::ZERO, 0));
+        state
+            .jobs
+            .insert(b, spec_job(b, "busybox:1", quota_id(1), Resources::ZERO, 0));
+
+        let id = dto::JobFilter::Id(dto::IdFilter { r#in: vec![b] });
+        assert_eq!(ids(&list_jobs(&state, Some(&id), None, 100)), vec![b]);
+
+        // Case-insensitive over the image string.
+        let by_image = dto::JobFilter::Search("ALPINE".to_string());
+        assert_eq!(ids(&list_jobs(&state, Some(&by_image), None, 100)), vec![a]);
+        // …and over the job id string.
+        let by_id = dto::JobFilter::Search(format!("{a}"));
+        assert_eq!(ids(&list_jobs(&state, Some(&by_id), None, 100)), vec![a]);
+    }
+
+    #[test]
+    fn submitted_window_is_after_inclusive_before_exclusive() {
+        let mut state = StateMachine::default();
+        for n in 1..=3u16 {
+            let id = job_id(n);
+            state.jobs.insert(id, queued(id, i64::from(n) * 1_000_000));
+        }
+        // after >= 1s, before < 3s → only the job at exactly 1s and 2s.
+        let filter = dto::JobFilter::Submitted(dto::SubmittedFilter {
+            after: Timestamp::from_micros(1_000_000),
+            before: Timestamp::from_micros(3_000_000),
+        });
+        let matched = ids(&list_jobs(&state, Some(&filter), None, 100));
+        assert_eq!(matched, vec![job_id(2), job_id(1)]);
+    }
+
+    #[test]
+    fn requests_bounds_are_inclusive() {
+        let mut state = StateMachine::default();
+        let small = job_id(1);
+        let big = job_id(2);
+        state
+            .jobs
+            .insert(small, spec_job(small, "img", quota_id(1), cpu(1000), 0));
+        state
+            .jobs
+            .insert(big, spec_job(big, "img", quota_id(1), cpu(4000), 0));
+
+        let filter = dto::JobFilter::Requests(dto::RequestsFilter {
+            resource: dto::RequestsResource::CpuMillis,
+            min: Some(1000),
+            max: Some(1000),
+        });
+        assert_eq!(
+            ids(&list_jobs(&state, Some(&filter), None, 100)),
+            vec![small]
+        );
+    }
+
+    fn cpu(millis: u64) -> Resources {
+        Resources {
+            cpu_millis: millis,
+            memory_bytes: 0,
+            disk_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn and_any_not_compose() {
+        let mut state = StateMachine::default();
+        let a = job_id(1); // alpine, queued
+        let b = job_id(2); // busybox, queued
+        let c = job_id(3); // alpine, succeeded
+        state
+            .jobs
+            .insert(a, spec_job(a, "alpine", quota_id(1), Resources::ZERO, 0));
+        state
+            .jobs
+            .insert(b, spec_job(b, "busybox", quota_id(1), Resources::ZERO, 0));
+        let mut c_rec = spec_job(c, "alpine", quota_id(1), Resources::ZERO, 0);
+        c_rec.state = JobState::Succeeded;
+        state.jobs.insert(c, c_rec);
+
+        // alpine AND (NOT succeeded) → just `a`.
+        let filter = dto::JobFilter::All(vec![
+            dto::JobFilter::Image(dto::ImageFilter::Contains("alpine".to_string())),
+            dto::JobFilter::Not(Box::new(dto::JobFilter::Phase(dto::PhaseFilter {
+                r#in: vec![dto::JobPhase::Succeeded],
+            }))),
+        ]);
+        assert_eq!(ids(&list_jobs(&state, Some(&filter), None, 100)), vec![a]);
+
+        // busybox OR succeeded → b and c.
+        let either = dto::JobFilter::Any(vec![
+            dto::JobFilter::Image(dto::ImageFilter::Equals("busybox".to_string())),
+            dto::JobFilter::Phase(dto::PhaseFilter {
+                r#in: vec![dto::JobPhase::Succeeded],
+            }),
+        ]);
+        assert_eq!(
+            ids(&list_jobs(&state, Some(&either), None, 100)),
+            vec![c, b]
+        );
+    }
+
+    #[test]
+    fn summary_attempt_fields_track_the_current_attempt() {
+        let node = NodeId::new();
+        let job = job_id(1);
+        let attempt = AttemptId::new();
+        let mut state = StateMachine::default();
+        let mut record = test_job(job, JobState::Attempting(attempt), ts(0));
+        record.attempts = vec![attempt];
+        state.jobs.insert(job, record);
+        // An accruing attempt pointing at a half-funded allocation.
+        let alloc = AllocationId::new();
+        let mut attempt_rec = test_attempt(attempt, job, node, AttemptState::Accruing);
+        attempt_rec.attempt.allocation = alloc;
+        state.attempts.insert(attempt, attempt_rec);
+        let mut alloc_rec = test_allocation(alloc, job, attempt, node, AllocationState::Accruing);
+        // requested cpu 1000 / mem 1_000_000 → min funded fraction 0.5.
+        alloc_rec.allocation.funded = Resources {
+            cpu_millis: 500,
+            memory_bytes: 500_000,
+            disk_bytes: 0,
+        };
+        state.allocations.insert(alloc, alloc_rec);
+
+        let summary = &list_jobs(&state, None, None, 100).jobs[0];
+        assert_eq!(summary.state, dto::JobStateKind::Attempting);
+        assert_eq!(summary.attempt, Some(attempt));
+        assert_eq!(summary.node, Some(node));
+        assert_eq!(summary.attempt_state, Some(dto::AttemptState::Accruing));
+        assert_eq!(summary.funding_fraction, Some(0.5));
+        assert_eq!(summary.outcome, None);
+        // Gross charge from the one attempt (test fixture: 1000 µCU).
+        assert_eq!(summary.cost_ucu, 1000);
+    }
+
+    #[test]
+    fn summary_outcome_present_only_when_terminal() {
+        let node = NodeId::new();
+        let job = job_id(1);
+        let attempt = AttemptId::new();
+        let mut state = StateMachine::default();
+        let mut record = test_job(job, JobState::Failed, ts(0));
+        record.attempts = vec![attempt];
+        record.terminal_at = Some(ts(5));
+        state.jobs.insert(job, record);
+        state.attempts.insert(
+            attempt,
+            test_attempt(
+                attempt,
+                job,
+                node,
+                AttemptState::Terminal(coppice_core::attempt::AttemptOutcome::OomKilled),
+            ),
+        );
+
+        let summary = &list_jobs(&state, None, None, 100).jobs[0];
+        assert_eq!(summary.state, dto::JobStateKind::Failed);
+        assert_eq!(summary.attempt, None);
+        assert_eq!(summary.node, None);
+        assert_eq!(summary.attempt_state, None);
+        assert_eq!(summary.funding_fraction, None);
+        assert_eq!(
+            summary.outcome.as_ref().map(|o| o.kind),
+            Some(dto::AttemptOutcomeKind::OomKilled)
+        );
+        assert_eq!(summary.terminal_at, Some(ts(5)));
     }
 }

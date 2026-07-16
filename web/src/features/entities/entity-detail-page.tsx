@@ -2,8 +2,8 @@ import { Fragment, useState } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { ArrowLeft, ArrowRight, Network, Plus } from 'lucide-react'
 import type {
+  JobFilter,
   JobPhase,
-  ListJobsFilter,
   QuotaEntityDetail,
   QuotaEntityNode,
   QuotaEntityView,
@@ -320,13 +320,13 @@ function ChildrenCard({
 
 function JobsCard({ entityId }: { entityId: string }) {
   const [state, setState] = useState<JobPhase | ''>('')
-  const filter: ListJobsFilter = {
-    quotaEntity: entityId,
-    states: state ? [state] : undefined,
-    limit: 25,
-  }
-  const { data, isPending } = useJobs(filter)
-  const jobs = data?.jobs ?? []
+  // Entity subtree, optionally ANDed with a phase leaf. First page only here.
+  const filter: JobFilter = state
+    ? { all: [{ entity: { id: entityId } }, { phase: { in: [state] } }] }
+    : { entity: { id: entityId } }
+  const { data, isPending } = useJobs({ filter, limit: 25 })
+  const jobs = data?.pages[0]?.jobs ?? []
+  const hasMore = (data?.pages[0]?.nextCursor ?? null) !== null
 
   return (
     <Card>
@@ -395,9 +395,9 @@ function JobsCard({ entityId }: { entityId: string }) {
                 ))}
               </TableBody>
             </Table>
-            {data && data.total > jobs.length ? (
+            {hasMore ? (
               <p className="mt-3 text-xs text-muted-foreground">
-                Showing {jobs.length} of {data.total} ·{' '}
+                Showing the first {jobs.length} ·{' '}
                 <Link
                   to="/jobs"
                   search={{ entity: entityId }}

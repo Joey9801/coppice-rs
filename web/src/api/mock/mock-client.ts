@@ -5,7 +5,7 @@ import type {
   ConfigureQuotaEntityInput,
   CoordinatorId,
   JobId,
-  ListJobsFilter,
+  ListJobsRequest,
   NodeId,
   QuotaEntityId,
 } from '../types'
@@ -48,7 +48,7 @@ export function createMockClient(): CoppiceApi {
     getClusterOverview: () => settle(() => world.buildClusterOverview()),
     getQueueStats: () => settle(() => world.buildQueueStats()),
 
-    listJobs: (filter: ListJobsFilter) => settle(() => world.listJobs(filter)),
+    listJobs: (request: ListJobsRequest) => settle(() => world.listJobs(request)),
     getJob: (id: JobId) => settle(() => world.buildJobDetail(id)),
     getJobTimeline: (id: JobId) => settle(() => world.buildJobTimeline(id)),
     getJobUsage: (id: JobId, attempt?: AttemptId | null) =>

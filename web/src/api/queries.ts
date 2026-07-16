@@ -1,11 +1,17 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { api } from './index'
 import type {
   AttemptId,
   ConfigureQuotaEntityInput,
   CoordinatorId,
   JobId,
-  ListJobsFilter,
+  ListJobsRequest,
   NodeId,
   QuotaEntityId,
 } from './types'
@@ -25,7 +31,9 @@ export const queryKeys = {
   session: ['session'] as const,
   overview: ['overview'] as const,
   queueStats: ['queue-stats'] as const,
-  jobs: (filter: ListJobsFilter) => ['jobs', filter] as const,
+  // Keyed on the request MINUS its cursor: paging within one filter shares a
+  // cache entry (the pages accumulate), and a filter change starts fresh.
+  jobs: (request: Omit<ListJobsRequest, 'cursor'>) => ['jobs', request] as const,
   job: (id: JobId) => ['job', id] as const,
   jobTimeline: (id: JobId) => ['job', id, 'timeline'] as const,
   jobUsage: (id: JobId, attempt: AttemptId | null) =>
@@ -66,10 +74,20 @@ export function useQueueStats() {
   })
 }
 
-export function useJobs(filter: ListJobsFilter) {
-  return useQuery({
-    queryKey: queryKeys.jobs(filter),
-    queryFn: () => api.listJobs(filter),
+/**
+ * Keyset-paginated jobs (ListJobs v1). `useInfiniteQuery` accumulates pages;
+ * `nextCursor` threads through as the next page's `cursor`, and a null
+ * `nextCursor` (never a merely short page) ends pagination. Stays LIVE: the
+ * accumulated pages refetch on the poll cadence. The `cursor` is dropped from
+ * the request when keying so paging shares one cache entry per filter.
+ */
+export function useJobs(request: ListJobsRequest) {
+  const { cursor: _cursor, ...keyable } = request
+  return useInfiniteQuery({
+    queryKey: queryKeys.jobs(keyable),
+    queryFn: ({ pageParam }) => api.listJobs({ ...keyable, cursor: pageParam }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.nextCursor ?? undefined,
     placeholderData: keepPreviousData,
     ...LIVE,
   })
