@@ -78,14 +78,14 @@ export function useQueueStats() {
  * Keyset-paginated jobs (ListJobs v1). `useInfiniteQuery` accumulates pages;
  * `nextCursor` threads through as the next page's `cursor`, and a null
  * `nextCursor` (never a merely short page) ends pagination. Stays LIVE: the
- * accumulated pages refetch on the poll cadence. The `cursor` is dropped from
- * the request when keying so paging shares one cache entry per filter.
+ * accumulated pages refetch on the poll cadence. Cursors are owned entirely
+ * by the infinite query, so the hook does not accept one — a caller-supplied
+ * cursor would be silently ignored, not resumed from.
  */
-export function useJobs(request: ListJobsRequest) {
-  const { cursor: _cursor, ...keyable } = request
+export function useJobs(request: Omit<ListJobsRequest, 'cursor'>) {
   return useInfiniteQuery({
-    queryKey: queryKeys.jobs(keyable),
-    queryFn: ({ pageParam }) => api.listJobs({ ...keyable, cursor: pageParam }),
+    queryKey: queryKeys.jobs(request),
+    queryFn: ({ pageParam }) => api.listJobs({ ...request, cursor: pageParam }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.nextCursor ?? undefined,
     placeholderData: keepPreviousData,

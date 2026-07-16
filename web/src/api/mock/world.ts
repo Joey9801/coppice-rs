@@ -156,6 +156,13 @@ const FILTER_MAX_NODES = 64
 const LIST_JOBS_DEFAULT_LIMIT = 100
 /** Opaque keyset cursor prefix; the token is `v1:<job-id>`. */
 const CURSOR_PREFIX = 'v1:'
+/**
+ * Canonical typed job id (`job-<uuid>`, ADR 0024) — the only form the system
+ * ever mints, and what the Rust endpoint's `JobId` parser accepts. Matching
+ * it here keeps mock validation aligned with production: `job-garbage` must
+ * be rejected in both.
+ */
+const JOB_ID_RE = /^job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 // ---------------------------------------------------------------------------
 // Quota tree: decay, history, users
@@ -1840,14 +1847,16 @@ export class MockWorld {
     for (const job of ordered) {
       // Keyset: begin strictly below the cursor id (skip everything at/above).
       if (cursorId !== null && job.id >= cursorId) continue
+      // Full page AND a further record exists — the server structures its
+      // scan the same way, so a page that fills exactly at the low end still
+      // reports null ("null iff exhausted", never a trailing empty page).
+      if (jobs.length >= limit) {
+        exhausted = false
+        break
+      }
       lastExaminedId = job.id
       if (!matches || matches(job)) {
         jobs.push(this.jobSummary(job))
-        if (jobs.length >= limit) {
-          // Page filled; more may remain below this id — continue next call.
-          exhausted = false
-          break
-        }
       }
     }
     // nextCursor = the last examined id (matched or not), or null once the scan
@@ -1860,7 +1869,7 @@ export class MockWorld {
     if (cursor === undefined) return null
     if (!cursor.startsWith(CURSOR_PREFIX)) throw new MockInvalid(`malformed cursor: ${cursor}`)
     const id = cursor.slice(CURSOR_PREFIX.length)
-    if (!id.startsWith('job-') || id.length <= 'job-'.length) {
+    if (!JOB_ID_RE.test(id)) {
       throw new MockInvalid(`malformed cursor: ${cursor}`)
     }
     return id
@@ -1946,7 +1955,7 @@ export class MockWorld {
           throw new MockInvalid('"id.in" must be a non-empty array')
         }
         for (const id of list) {
-          if (typeof id !== 'string' || !id.startsWith('job-') || id.length <= 'job-'.length) {
+          if (typeof id !== 'string' || !JOB_ID_RE.test(id)) {
             throw new MockInvalid(`malformed job id: ${id}`)
           }
         }

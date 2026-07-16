@@ -65,9 +65,15 @@ which is the argument for stringifying an instant, so it stays a number
 with the unit in the key. The web client maps snake_case wire keys onto
 its camelCase `types.ts` shapes at its boundary.
 
-The `coppice.api.v1` proto messages remain the cross-language description
-of this surface (and what a future gRPC client plane would serve); the
-HTTP edge no longer serializes them, and `coppice-api` no longer depends
+*(Amended 2026-07-16, alongside the first read endpoint: the
+cross-language-mirror requirement is dropped. A REST endpoint's contract
+is owned solely by its handwritten DTOs; new endpoints add **no**
+`coppice.api.v1` messages unless a concrete protobuf or gRPC consumer
+exists. A mirror with no runtime consumer is a redundant schema that can
+drift from the DTOs it claims to describe, while permanently freezing
+speculative fields and tags under the corpus's evolution rules. The
+existing `SubmitJob`/`AbortJob` messages remain.)* The HTTP edge does not
+serialize `coppice.api.v1` messages, and `coppice-api` does not depend
 on `coppice-proto` at all — `ControlPlane` speaks DTOs.
 
 Read models are **not designed up front**: each endpoint's DTOs land in
@@ -125,8 +131,8 @@ would force a full filtered scan.)*
 
 The table's "message pair" naming survives the wire-format amendment
 unchanged: the pairs are the same-named DTOs in
-`coppice-api::http::dto`, with the `coppice.api.v1` messages as their
-cross-language mirror.
+`coppice-api::http::dto`, which are the sole definition of each pair
+(per the 2026-07-16 amendment above, there is no proto mirror).
 
 ### Consistency plumbing (ADR 0007 made concrete)
 
@@ -235,8 +241,8 @@ authenticated ingress per plane) and spares agents a second identity.
 - axum/tower enter the workspace. JSON compatibility is owned entirely
   by the DTO module, where a rename is a deliberate contract change, not
   a schema side effect; `coppice.api.v1` field renames no longer touch
-  the JSON surface (schema-style rules still apply to the protos as the
-  cross-language mirror). The pbjson codegen pass over the api/core
+  the JSON surface (schema-style rules still apply to the messages that
+  remain in the package). The pbjson codegen pass over the api/core
   packages now has no production consumer and can be retired.
 - Read models get frozen shapes only as their UIs stabilize, instead of
   speculatively today; the cost is that `web/src/api/types.ts` remains
