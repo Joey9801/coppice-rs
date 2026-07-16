@@ -8,7 +8,7 @@ import type {
   JobId,
   JobList,
   JobUsage,
-  ListJobsFilter,
+  ListJobsRequest,
   LogChunk,
   NodeDetail,
   NodeHistoryEntry,
@@ -54,7 +54,12 @@ export interface CoppiceApi {
   getQueueStats(): Promise<QueueStats>
 
   // Jobs
-  listJobs(filter: ListJobsFilter): Promise<JobList>
+  //
+  // Keyset-paginated over job id descending (UUIDv7 ⇒ ≈ newest-first). Feed a
+  // response's `nextCursor` back as `request.cursor` to continue; the listing
+  // is exhausted only when `nextCursor` is null (a short page with a non-null
+  // cursor means the server stopped early on a scan budget — keep going).
+  listJobs(request: ListJobsRequest): Promise<JobList>
   getJob(id: JobId): Promise<JobDetail>
   getJobTimeline(id: JobId): Promise<TimelineEvent[]>
   /** Usage samples for one attempt; null/omitted = current (else latest). */

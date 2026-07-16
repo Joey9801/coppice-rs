@@ -557,6 +557,274 @@ pub struct GetClusterOverviewResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Job list (GET /api/v1/jobs)
+// ---------------------------------------------------------------------------
+
+/// A job's summary row for the list view (mirrors `JobSummary` in
+/// `types.ts`), the read-time join of a job with the attempt it carries
+/// (ADR 0030).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSummary {
+    pub id: JobId,
+    pub state: JobStateKind,
+    /// The attempt the job is pursuing — `Some` exactly while `state` is
+    /// `attempting` (the id `JobStateKind` flattened away).
+    pub attempt: Option<AttemptId>,
+    pub image: String,
+    pub quota_entity: QuotaEntityId,
+    /// `""` if the entity is (impossibly) absent from the tree, never a
+    /// fabricated name.
+    pub quota_entity_name: String,
+    pub priority: i32,
+    pub submitted_at: Timestamp,
+    pub terminal_at: Option<Timestamp>,
+    /// Node of the current attempt, when one exists.
+    pub node: Option<NodeId>,
+    /// State of the attempt `state` points at — lets a row derive its phase
+    /// without a second fetch; `null` when there is no live attempt.
+    pub attempt_state: Option<AttemptState>,
+    /// Min funded/requested fraction across dimensions; only while the
+    /// current attempt is `accruing`, `null` otherwise.
+    pub funding_fraction: Option<f64>,
+    /// µCU charged across the job's attempts so far. See the projection note
+    /// (`project::total_charged`) on why a terminal job reports its gross
+    /// charge, not the trued-up net: the true-up settles only against entity
+    /// usage and is not retained per attempt.
+    pub cost_ucu: u64,
+    /// Outcome of the last attempt; only when the job is terminal.
+    pub outcome: Option<AttemptOutcome>,
+}
+
+/// `GET /api/v1/jobs` — an envelope with the keyset-pagination cursor
+/// (ADR 0031 as amended: JSON filter AST, no `total`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListJobsResponse {
+    pub jobs: Vec<JobSummary>,
+    /// Opaque continuation token ([`JobCursor`]); `null` iff the scan
+    /// reached the low end of the map. A short page with a non-null cursor
+    /// means "more may exist, continue", never "done".
+    pub next_cursor: Option<String>,
+}
+
+/// The keyset pagination cursor: the literal `v1:<job-id>`.
+///
+/// Opaque by contract (the `v1:` version tag lets the format change), so
+/// its parse/format lives in exactly one place. Not base64 — the token is
+/// already URL-safe and human-legible, and hiding a `job-<uuid>` behind an
+/// encoding buys nothing.
+pub struct JobCursor;
+
+impl JobCursor {
+    const PREFIX: &'static str = "v1:";
+
+    /// The token for a job id.
+    pub fn format(id: JobId) -> String {
+        format!("{}{id}", Self::PREFIX)
+    }
+
+    /// Parse a cursor token back to its job id; anything that is not
+    /// `v1:` + a valid [`JobId`] is a caller error.
+    pub fn parse(token: &str) -> Result<JobId, String> {
+        let rest = token
+            .strip_prefix(Self::PREFIX)
+            .ok_or_else(|| format!("cursor must begin with `{}`", Self::PREFIX))?;
+        rest.parse::<JobId>()
+            .map_err(|e| format!("invalid cursor: {e}"))
+    }
+}
+
+/// Maximum nesting depth of a [`JobFilter`] tree (combinators deep).
+pub const MAX_FILTER_DEPTH: usize = 8;
+/// Maximum total nodes (combinators + leaves) in a [`JobFilter`] tree.
+pub const MAX_FILTER_NODES: usize = 64;
+
+/// The job-list filter AST (mirrors `JobFilter` in `types.ts`).
+///
+/// Externally tagged: every node is a JSON object with exactly one key, so
+/// an unknown key (`label`, `submitted_by` — reserved, not implemented) or
+/// a two-key object is a deserialization error, surfaced as
+/// `INVALID_ARGUMENT`. The remaining shape rules that serde cannot express
+/// — non-empty combinator/`in` lists, depth and node caps, at-least-one
+/// bound, ordered bounds — are checked in [`JobFilter::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobFilter {
+    /// AND over a non-empty list.
+    All(Vec<JobFilter>),
+    /// OR over a non-empty list.
+    Any(Vec<JobFilter>),
+    Not(Box<JobFilter>),
+    Phase(PhaseFilter),
+    Entity(EntityFilter),
+    /// Current attempt's node; an unknown node matches nothing.
+    Node(NodeId),
+    Image(ImageFilter),
+    Id(IdFilter),
+    /// Case-insensitive substring over the job id string OR the image.
+    Search(String),
+    Submitted(SubmittedFilter),
+    Requests(RequestsFilter),
+}
+
+/// `{"phase": {"in": [...]}}` — matches the derived [`JobPhase`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseFilter {
+    /// Non-empty (checked in [`JobFilter::validate`]).
+    pub r#in: Vec<JobPhase>,
+}
+
+/// `{"entity": {"id": "quota-…", "scope": "subtree"}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntityFilter {
+    pub id: QuotaEntityId,
+    #[serde(default)]
+    pub scope: EntityScope,
+}
+
+/// Entity match breadth. `Subtree` (the default) matches the entity and all
+/// its descendants; `Exact` matches only the entity itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityScope {
+    #[default]
+    Subtree,
+    Exact,
+}
+
+/// `{"image": {"contains": "…"}}` or `{"equals": "…"}` — exactly one op
+/// (the single-key object enforces it).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageFilter {
+    Contains(String),
+    Equals(String),
+}
+
+/// `{"id": {"in": ["job-…", …]}}` — a malformed id fails to deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdFilter {
+    /// Non-empty (checked in [`JobFilter::validate`]).
+    pub r#in: Vec<JobId>,
+}
+
+/// `{"submitted": {"after": ISO8601, "before": ISO8601}}` — at least one
+/// bound; `after` inclusive `≥`, `before` exclusive `<`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmittedFilter {
+    #[serde(default)]
+    pub after: Option<Timestamp>,
+    #[serde(default)]
+    pub before: Option<Timestamp>,
+}
+
+/// `{"requests": {"resource": …, "min": n, "max": n}}` — at least one
+/// bound, both inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestsFilter {
+    pub resource: RequestsResource,
+    #[serde(default)]
+    pub min: Option<u64>,
+    #[serde(default)]
+    pub max: Option<u64>,
+}
+
+/// The requested-resource dimension a [`RequestsFilter`] bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestsResource {
+    CpuMillis,
+    MemoryBytes,
+    DiskBytes,
+}
+
+impl JobFilter {
+    /// Enforce the shape rules serde cannot: non-empty combinator and `in`
+    /// lists, the depth and node caps, and the at-least-one / ordered-bound
+    /// rules on `submitted`/`requests`. Every violation names what was
+    /// wrong so the handler can return it verbatim as `INVALID_ARGUMENT`.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut nodes = 0usize;
+        self.check(1, &mut nodes)
+    }
+
+    fn check(&self, depth: usize, nodes: &mut usize) -> Result<(), String> {
+        if depth > MAX_FILTER_DEPTH {
+            return Err(format!(
+                "filter nesting exceeds the maximum depth of {MAX_FILTER_DEPTH}"
+            ));
+        }
+        *nodes += 1;
+        if *nodes > MAX_FILTER_NODES {
+            return Err(format!(
+                "filter exceeds the maximum of {MAX_FILTER_NODES} nodes"
+            ));
+        }
+        match self {
+            JobFilter::All(fs) => {
+                if fs.is_empty() {
+                    return Err("`all` filter list must be non-empty".to_string());
+                }
+                for f in fs {
+                    f.check(depth + 1, nodes)?;
+                }
+            }
+            JobFilter::Any(fs) => {
+                if fs.is_empty() {
+                    return Err("`any` filter list must be non-empty".to_string());
+                }
+                for f in fs {
+                    f.check(depth + 1, nodes)?;
+                }
+            }
+            JobFilter::Not(f) => f.check(depth + 1, nodes)?,
+            JobFilter::Phase(p) => {
+                if p.r#in.is_empty() {
+                    return Err("`phase.in` must be non-empty".to_string());
+                }
+            }
+            JobFilter::Id(i) => {
+                if i.r#in.is_empty() {
+                    return Err("`id.in` must be non-empty".to_string());
+                }
+            }
+            JobFilter::Submitted(s) => {
+                if s.after.is_none() && s.before.is_none() {
+                    return Err("`submitted` requires at least one of `after`/`before`".to_string());
+                }
+                if let (Some(after), Some(before)) = (s.after, s.before) {
+                    if after > before {
+                        return Err(
+                            "`submitted.after` must not be later than `submitted.before`"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            JobFilter::Requests(r) => {
+                if r.min.is_none() && r.max.is_none() {
+                    return Err("`requests` requires at least one of `min`/`max`".to_string());
+                }
+                if let (Some(min), Some(max)) = (r.min, r.max) {
+                    if min > max {
+                        return Err("`requests.min` must not exceed `requests.max`".to_string());
+                    }
+                }
+            }
+            JobFilter::Entity(_)
+            | JobFilter::Node(_)
+            | JobFilter::Image(_)
+            | JobFilter::Search(_) => {}
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
 
@@ -938,6 +1206,221 @@ mod tests {
                 "log_index": 7,
             })
         );
+    }
+
+    // ---- job list ---------------------------------------------------------
+
+    fn parse_filter(json: serde_json::Value) -> Result<JobFilter, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    #[test]
+    fn every_leaf_deserializes_from_the_contract_json() {
+        let job = JobId::new().to_string();
+        let entity = QuotaEntityId::new().to_string();
+        let node = NodeId::new().to_string();
+        let cases = serde_json::json!([
+            {"all": [{"phase": {"in": ["queued"]}}]},
+            {"any": [{"search": "x"}]},
+            {"not": {"search": "x"}},
+            {"phase": {"in": ["queued", "running"]}},
+            {"entity": {"id": entity, "scope": "subtree"}},
+            {"entity": {"id": entity}},
+            {"node": node},
+            {"image": {"contains": "alpine"}},
+            {"image": {"equals": "alpine:3"}},
+            {"id": {"in": [job]}},
+            {"search": "needle"},
+            {"submitted": {"after": "2026-07-16T00:00:00.000000Z"}},
+            {"requests": {"resource": "cpu_millis", "min": 1000}},
+        ]);
+        for case in cases.as_array().unwrap() {
+            let filter = parse_filter(case.clone()).expect("leaf parses");
+            filter.validate().expect("leaf validates");
+        }
+    }
+
+    #[test]
+    fn entity_scope_defaults_to_subtree() {
+        let entity = QuotaEntityId::new().to_string();
+        let filter = parse_filter(serde_json::json!({"entity": {"id": entity}})).unwrap();
+        match filter {
+            JobFilter::Entity(e) => assert_eq!(e.scope, EntityScope::Subtree),
+            other => panic!("expected entity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_keys_and_variants_are_rejected() {
+        // An unknown top-level variant (reserved `label`, or a typo).
+        assert!(parse_filter(serde_json::json!({"label": "x"})).is_err());
+        // A two-key object is not a single externally-tagged variant.
+        assert!(parse_filter(serde_json::json!({"any": [], "all": []})).is_err());
+        // An unknown field inside a leaf struct.
+        assert!(parse_filter(serde_json::json!({"phase": {"in": ["queued"], "x": 1}})).is_err());
+        // An unknown phase value.
+        assert!(parse_filter(serde_json::json!({"phase": {"in": ["nope"]}})).is_err());
+        // A malformed id.
+        assert!(parse_filter(serde_json::json!({"id": {"in": ["not-a-job"]}})).is_err());
+    }
+
+    #[test]
+    fn image_requires_exactly_one_op() {
+        // Two ops in one object → not a single-variant enum.
+        assert!(
+            parse_filter(serde_json::json!({"image": {"contains": "a", "equals": "b"}})).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_lists() {
+        assert!(parse_filter(serde_json::json!({"all": []}))
+            .unwrap()
+            .validate()
+            .is_err());
+        assert!(parse_filter(serde_json::json!({"any": []}))
+            .unwrap()
+            .validate()
+            .is_err());
+        assert!(parse_filter(serde_json::json!({"phase": {"in": []}}))
+            .unwrap()
+            .validate()
+            .is_err());
+        assert!(parse_filter(serde_json::json!({"id": {"in": []}}))
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn validate_enforces_the_depth_cap() {
+        // 8 `not`s wrapping a leaf = depth 9 > 8.
+        let mut inner = JobFilter::Search("x".to_string());
+        for _ in 0..8 {
+            inner = JobFilter::Not(Box::new(inner));
+        }
+        assert!(inner.validate().is_err());
+        // One fewer is exactly at the cap.
+        let mut ok = JobFilter::Search("x".to_string());
+        for _ in 0..7 {
+            ok = JobFilter::Not(Box::new(ok));
+        }
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_enforces_the_node_cap() {
+        // `all` (1 node) + 64 leaves = 65 > 64.
+        let leaves = (0..64)
+            .map(|_| JobFilter::Search("x".to_string()))
+            .collect();
+        assert!(JobFilter::All(leaves).validate().is_err());
+        // 63 leaves = 64 nodes, exactly the cap.
+        let leaves = (0..63)
+            .map(|_| JobFilter::Search("x".to_string()))
+            .collect();
+        assert!(JobFilter::All(leaves).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_enforces_bound_rules() {
+        // submitted needs at least one bound.
+        assert!(parse_filter(serde_json::json!({"submitted": {}}))
+            .unwrap()
+            .validate()
+            .is_err());
+        // after must not be later than before.
+        assert!(parse_filter(serde_json::json!({
+            "submitted": {"after": "2026-07-16T02:00:00.000000Z", "before": "2026-07-16T01:00:00.000000Z"}
+        }))
+        .unwrap()
+        .validate()
+        .is_err());
+        // requests needs at least one bound.
+        assert!(
+            parse_filter(serde_json::json!({"requests": {"resource": "disk_bytes"}}))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        // min must not exceed max.
+        assert!(parse_filter(serde_json::json!({
+            "requests": {"resource": "memory_bytes", "min": 10, "max": 5}
+        }))
+        .unwrap()
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn cursor_round_trips_and_rejects_garbage() {
+        let id: JobId = "job-00000000-0000-0000-0000-000000000007".parse().unwrap();
+        let token = JobCursor::format(id);
+        assert_eq!(token, "v1:job-00000000-0000-0000-0000-000000000007");
+        assert_eq!(JobCursor::parse(&token).unwrap(), id);
+        // Missing version prefix.
+        assert!(JobCursor::parse("job-00000000-0000-0000-0000-000000000007").is_err());
+        // Right prefix, unparseable id.
+        assert!(JobCursor::parse("v1:not-a-job").is_err());
+    }
+
+    #[test]
+    fn job_summary_serializes_to_the_contract_shape() {
+        let id: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000002"
+            .parse()
+            .unwrap();
+        let node: NodeId = "node-00000000-0000-0000-0000-000000000003".parse().unwrap();
+        let entity: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000004"
+            .parse()
+            .unwrap();
+        let summary = JobSummary {
+            id,
+            state: JobStateKind::Attempting,
+            attempt: Some(attempt),
+            image: "alpine:3".to_string(),
+            quota_entity: entity,
+            quota_entity_name: "team-a".to_string(),
+            priority: 1,
+            submitted_at: ts(9_500_000),
+            terminal_at: None,
+            node: Some(node),
+            attempt_state: Some(AttemptState::Accruing),
+            funding_fraction: Some(0.5),
+            cost_ucu: 42,
+            outcome: None,
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": "job-00000000-0000-0000-0000-000000000001",
+                "state": "attempting",
+                "attempt": "attempt-00000000-0000-0000-0000-000000000002",
+                "image": "alpine:3",
+                "quota_entity": "quota-00000000-0000-0000-0000-000000000004",
+                "quota_entity_name": "team-a",
+                "priority": 1,
+                "submitted_at": "1970-01-01T00:00:09.500000Z",
+                // Absent optionals are explicit null, never omitted.
+                "terminal_at": null,
+                "node": "node-00000000-0000-0000-0000-000000000003",
+                "attempt_state": "accruing",
+                "funding_fraction": 0.5,
+                "cost_ucu": 42,
+                "outcome": null,
+            })
+        );
+    }
+
+    #[test]
+    fn list_jobs_response_carries_an_explicit_null_cursor() {
+        let json = serde_json::to_value(ListJobsResponse {
+            jobs: vec![],
+            next_cursor: None,
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({ "jobs": [], "next_cursor": null }));
     }
 
     #[test]

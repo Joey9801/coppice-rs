@@ -11,16 +11,18 @@
 use std::future::ready;
 use std::sync::Arc;
 
-use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
+use serde::Deserialize;
+
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 
-use super::dto::{AbortJobRequest, AbortJobResponse, SubmitJobRequest};
+use super::dto::{self, AbortJobRequest, AbortJobResponse, SubmitJobRequest};
 use crate::{Consistency, ControlPlane};
 
 use super::error::HttpError;
@@ -42,10 +44,7 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         )
         // Jobs. List/detail/timeline are bounded; usage is eventual
         // (derived samples); logs are provisional until log storage exists.
-        .route(
-            "/api/v1/jobs",
-            get(unimplemented_read("ListJobs")).post(submit_job::<P>),
-        )
+        .route("/api/v1/jobs", get(list_jobs::<P>).post(submit_job::<P>))
         .route(
             "/api/v1/jobs/:job",
             get(unimplemented_id_read::<JobId>("GetJob")),
@@ -139,6 +138,79 @@ where
     T::Err: std::fmt::Display,
 {
     move |IdPath(_), ReadQuery(_)| ready(HttpError::unimplemented(endpoint))
+}
+
+/// Default page size when `?limit=` is absent.
+const DEFAULT_JOB_LIMIT: u64 = 100;
+/// Valid `?limit=` range; out of range is `INVALID_ARGUMENT`, never clamped.
+const JOB_LIMIT_RANGE: std::ops::RangeInclusive<u64> = 1..=1000;
+
+/// `GET /api/v1/jobs` list parameters, alongside the shared [`ReadQuery`].
+///
+/// A separate extractor rather than a flattened `ReadParams`: `serde_urlencoded`
+/// (axum's `Query`) does not support `#[serde(flatten)]` for the non-string
+/// `min_index`, so the read params ride their own [`ReadQuery`] extractor —
+/// the same one every read route uses — and these list-only params ride here.
+#[derive(Debug, Default, Deserialize)]
+struct ListJobsParams {
+    /// URL-encoded JSON [`dto::JobFilter`]; absent matches every job.
+    #[serde(default)]
+    filter: Option<String>,
+    /// Opaque continuation token from a prior response.
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// `GET /api/v1/jobs` — bounded by default (ADR 0031). The filter AST,
+/// cursor, and page size are validated here; the descending keyset scan and
+/// projection live in [`super::project::list_jobs`].
+async fn list_jobs<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(read): ReadQuery,
+    params: Result<Query<ListJobsParams>, QueryRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let Query(params) = params.map_err(|e: QueryRejection| HttpError::invalid(e.body_text()))?;
+
+    let limit = match params.limit {
+        None => DEFAULT_JOB_LIMIT,
+        Some(n) if JOB_LIMIT_RANGE.contains(&n) => n,
+        Some(n) => {
+            return Err(HttpError::invalid(format!(
+                "limit {n} is out of range {}..={}",
+                JOB_LIMIT_RANGE.start(),
+                JOB_LIMIT_RANGE.end(),
+            )))
+        }
+    };
+
+    let filter = match &params.filter {
+        None => None,
+        Some(raw) => {
+            let parsed: dto::JobFilter = serde_json::from_str(raw)
+                .map_err(|e| HttpError::invalid(format!("invalid filter: {e}")))?;
+            parsed.validate().map_err(HttpError::invalid)?;
+            Some(parsed)
+        }
+    };
+
+    let cursor = match &params.cursor {
+        None => None,
+        Some(token) => Some(dto::JobCursor::parse(token).map_err(HttpError::invalid)?),
+    };
+
+    let view = plane
+        .read_state(read.into_options(Consistency::Bounded))
+        .await?;
+    let response = super::project::list_jobs(view.state(), filter.as_ref(), cursor, limit as usize);
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
 }
 
 /// `POST /api/v1/jobs` — body `SubmitJobRequest`, response
@@ -276,6 +348,7 @@ mod tests {
         fail_with: Option<fn() -> ApiError>,
         queue_window: QueueWindow,
         recent: RecentClusterEvents,
+        state: coppice_state::StateMachine,
     }
 
     const STUB_CLUSTER: &str = "cluster-00000000-0000-0000-0000-000000000009";
@@ -313,11 +386,18 @@ mod tests {
         }
 
         async fn read_state(&self, _opts: ReadOptions) -> Result<ReadView, ApiError> {
-            Ok(ReadView::new(coppice_state::StateMachine::default(), 1, 1))
+            Ok(ReadView::new(self.state.clone(), 1, 1))
         }
     }
 
     fn app(fail_with: Option<fn() -> ApiError>) -> Router {
+        app_with_state(fail_with, coppice_state::StateMachine::default())
+    }
+
+    fn app_with_state(
+        fail_with: Option<fn() -> ApiError>,
+        state: coppice_state::StateMachine,
+    ) -> Router {
         router(Arc::new(StubPlane {
             fail_with,
             queue_window: QueueWindow::default(),
@@ -327,6 +407,7 @@ mod tests {
                 floor_index: 1,
                 events: Vec::new(),
             },
+            state,
         }))
     }
 
@@ -418,6 +499,7 @@ mod tests {
                     event: coppice_state::Event::JobSubmitted { job },
                 }],
             },
+            state: coppice_state::StateMachine::default(),
         };
         let response = router(Arc::new(plane))
             .oneshot(
@@ -700,6 +782,152 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A minimal queued job with a controllable id, for list-endpoint tests.
+    fn queued_job(id: JobId) -> coppice_state::JobRecord {
+        coppice_state::JobRecord {
+            spec: coppice_core::job::Job {
+                id,
+                image: "busybox".to_string(),
+                command: vec!["run".to_string()],
+                entrypoint: None,
+                requests: coppice_core::resource::Resources::ZERO,
+                priority: 0,
+                max_runtime: None,
+                quota_entity: coppice_core::id::QuotaEntityId::new(),
+                retry: Default::default(),
+                abort_requested: None,
+            },
+            state: coppice_core::job::JobState::Queued,
+            multiplier: coppice_core::quota::PriorityMultiplier::ONE,
+            submitted_at: Timestamp::from_micros(0).unwrap(),
+            terminal_at: None,
+            retries_used: 0,
+            attempts: Vec::new(),
+        }
+    }
+
+    fn state_with_jobs(ids: &[JobId]) -> coppice_state::StateMachine {
+        let mut state = coppice_state::StateMachine::default();
+        for id in ids {
+            state.jobs.insert(*id, queued_job(*id));
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn list_jobs_serves_matches_newest_first_with_headers() {
+        let lo: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let hi: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let response = app_with_state(None, state_with_jobs(&[lo, hi]))
+            .oneshot(Request::get("/api/v1/jobs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Bounded reads carry the staleness headers, like every other read.
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        let body = body_json(response).await;
+        assert_eq!(body["jobs"][0]["id"], hi.to_string());
+        assert_eq!(body["jobs"][1]["id"], lo.to_string());
+        // Scan reached the low end: cursor is explicit null, never omitted.
+        assert_eq!(body["next_cursor"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_applies_a_url_encoded_json_filter() {
+        let a: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let b: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let state = state_with_jobs(&[a, b]);
+        // Filter by a single id — the value is URL-encoded JSON.
+        let filter = format!(r#"{{"id":{{"in":["{a}"]}}}}"#);
+        let uri = format!("/api/v1/jobs?filter={}", urlencoding_encode(&filter));
+        let response = app_with_state(None, state)
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["jobs"][0]["id"], a.to_string());
+    }
+
+    /// Percent-encode the query-value bytes we care about (no dep on a URL
+    /// crate for a test helper).
+    fn urlencoding_encode(s: &str) -> String {
+        let mut out = String::new();
+        for byte in s.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(byte as char)
+                }
+                other => out.push_str(&format!("%{other:02X}")),
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_bad_filters_cursors_and_limits() {
+        // (query, why) — every case must be INVALID_ARGUMENT.
+        let cases = [
+            // Malformed JSON.
+            "/api/v1/jobs?filter=%7Bnot-json",
+            // An empty `any` list (parses, fails validation).
+            "/api/v1/jobs?filter=%7B%22any%22%3A%5B%5D%7D",
+            // An unknown phase value.
+            "/api/v1/jobs?filter=%7B%22phase%22%3A%7B%22in%22%3A%5B%22nope%22%5D%7D%7D",
+            // A cursor that is not `v1:` + a valid job id.
+            "/api/v1/jobs?cursor=v2%3Ajob-00000000-0000-0000-0000-000000000001",
+            "/api/v1/jobs?cursor=garbage",
+            // Limit out of range (never clamped).
+            "/api/v1/jobs?limit=0",
+            "/api/v1/jobs?limit=1001",
+        ];
+        for uri in cases {
+            let response = app(None)
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                body_json(response).await["code"],
+                "INVALID_ARGUMENT",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_a_filter_exceeding_the_node_cap() {
+        // `all` + 64 leaves = 65 nodes > 64.
+        let leaves = std::iter::repeat_n(r#"{"search":"x"}"#, 64)
+            .collect::<Vec<_>>()
+            .join(",");
+        let filter = format!(r#"{{"all":[{leaves}]}}"#);
+        let uri = format!("/api/v1/jobs?filter={}", urlencoding_encode(&filter));
+        let response = app(None)
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_still_validates_the_consistency_parameter() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/jobs?consistency=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
     }
 
     #[tokio::test]

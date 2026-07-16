@@ -87,7 +87,7 @@ mutations are `POST` with a request-message body. One route per
 | `GET  /api/v1/session` | `GetSession*` | local |
 | `GET  /api/v1/overview` | `GetClusterOverview*` | bounded |
 | `GET  /api/v1/queue/stats` | `GetQueueStats*` | bounded |
-| `GET  /api/v1/jobs?phase=&entity=&node=&search=&limit=` | `ListJobs*` | bounded |
+| `GET  /api/v1/jobs?filter=&cursor=&limit=` | `ListJobs*` | bounded |
 | `POST /api/v1/jobs` | `SubmitJob*` (exists) | write |
 | `GET  /api/v1/jobs/{job}` | `GetJob*` | bounded |
 | `POST /api/v1/jobs/{job}/abort` | `AbortJob*` (exists) | write |
@@ -114,6 +114,14 @@ routes must be reconciled with the real log design before leaving
 provisional status). The events route is reserved so nothing else claims
 the path; when built it is an SSE stream of server-throttled bounded
 batches with ADR 0008 cursors — never a raw firehose.
+
+*(ListJobs signature amended 2026-07-16, when it shipped: the sketched flat
+`?phase=&entity=&node=&search=` params are replaced by a single URL-encoded
+JSON `filter` AST (`coppice-api::http::dto::JobFilter` — an `all`/`any`/`not`
+tree over phase/entity/node/image/id/search/submitted/requests leaves), and
+paging is keyset — `?cursor=` a `v1:<job-id>` token walking JobId descending
+— rather than an offset, with no `total` on the response since an exact count
+would force a full filtered scan.)*
 
 The table's "message pair" naming survives the wire-format amendment
 unchanged: the pairs are the same-named DTOs in

@@ -4,14 +4,15 @@ import { ListTodo, Search, X } from 'lucide-react'
 import {
   derivePhase,
   JOB_PHASES,
+  type JobFilter,
   type JobPhase,
   type JobSummary,
-  type ListJobsFilter,
 } from '@/api/types'
 import { useJobs } from '@/api/queries'
 import { formatPercent, formatUcu, shortId } from '@/lib/format'
 import { EmptyState, IdLink, outcomePill, PageHeader, StatePill, TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -27,31 +28,38 @@ import { useDebouncedValue } from './use-debounced-value'
 
 const route = getRouteApi('/jobs/')
 
-const EMPTY_FILTER: ListJobsFilter = {}
+type JobsSearch = ReturnType<typeof route.useSearch>
+
+/**
+ * Build the `JobFilter` AST from the URL search params: each present param is
+ * a leaf, ANDed together with `all`; a single leaf is used bare, and no params
+ * means no filter (match everything).
+ */
+function buildFilter(search: JobsSearch): JobFilter | undefined {
+  const leaves: JobFilter[] = []
+  if (search.state) leaves.push({ phase: { in: [search.state] } })
+  if (search.entity) leaves.push({ entity: { id: search.entity } })
+  if (search.node) leaves.push({ node: search.node })
+  if (search.q) leaves.push({ search: search.q })
+  if (leaves.length === 0) return undefined
+  if (leaves.length === 1) return leaves[0]
+  return { all: leaves }
+}
 
 export function JobsPage() {
   const search = route.useSearch()
+  const filter = buildFilter(search)
+  const isFiltered = filter !== undefined
 
-  const filter: ListJobsFilter = {
-    states: search.state ? [search.state] : undefined,
-    quotaEntity: search.entity,
-    node: search.node,
-    search: search.q,
-  }
-
-  const jobs = useJobs(filter)
-  const all = useJobs(EMPTY_FILTER)
-
-  const isFiltered = Boolean(search.state || search.entity || search.node || search.q)
-  const grandTotal = all.data?.total
-  const matching = jobs.data?.total
+  const jobs = useJobs({ filter })
+  const rows = jobs.data?.pages.flatMap((page) => page.jobs) ?? []
 
   let description: string | undefined
-  if (grandTotal != null) {
-    description =
-      isFiltered && matching != null
-        ? `${grandTotal} jobs · ${matching} matching`
-        : `${grandTotal} jobs`
+  if (jobs.data) {
+    // Exact totals are gone by design (they need full filtered scans); show a
+    // loaded count, suffixed `+` while more pages remain.
+    const suffix = jobs.hasNextPage ? '+' : ''
+    description = isFiltered ? `${rows.length}${suffix} matching` : `${rows.length}${suffix} jobs`
   }
 
   return (
@@ -63,8 +71,22 @@ export function JobsPage() {
       <div className="mt-4 rounded-xl border bg-card">
         {jobs.isLoading ? (
           <TableSkeleton />
-        ) : jobs.data && jobs.data.jobs.length > 0 ? (
-          <JobsTable jobs={jobs.data.jobs} />
+        ) : rows.length > 0 ? (
+          <>
+            <JobsTable jobs={rows} />
+            {jobs.hasNextPage ? (
+              <div className="border-t p-2">
+                <Button
+                  variant="ghost"
+                  className="w-full text-muted-foreground"
+                  disabled={jobs.isFetchingNextPage}
+                  onClick={() => void jobs.fetchNextPage()}
+                >
+                  {jobs.isFetchingNextPage ? 'Loading…' : 'Load more'}
+                </Button>
+              </div>
+            ) : null}
+          </>
         ) : (
           <EmptyState
             icon={ListTodo}
@@ -236,9 +258,6 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
 }
 
 function WhereCell({ job, phase }: { job: JobSummary; phase: JobPhase }) {
-  if (phase === 'Queued' && job.queueRank != null) {
-    return <span className="tabular-nums text-muted-foreground">#{job.queueRank}</span>
-  }
   if (phase === 'Preparing' && job.fundingFraction != null) {
     return (
       <span className="tabular-nums text-amber-600 dark:text-amber-400">

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { Resources } from '../types'
+import type { JobFilter, ListJobsRequest, Resources } from '../types'
 import { isTerminalJobState, jobAttemptId, jobCurrentAttempt } from '../types'
 import { ORG_NAME } from './generate'
 import { isMockInvalid, isMockNotFound, MockWorld } from './world'
@@ -35,9 +35,10 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
     expect(fits(node.allocated, node.capacity)).toBe(true)
   }
 
-  // All jobs, via listJobs with a high limit.
-  const { jobs, total } = world.listJobs({ limit: 10_000 })
-  expect(total).toBe(jobs.length)
+  // All jobs, via listJobs with a high limit (a single page, so exhausted).
+  const page = world.listJobs({ limit: 1000 })
+  const { jobs } = page
+  expect(page.nextCursor).toBeNull()
 
   for (const summary of jobs) {
     const detail = world.buildJobDetail(summary.id)
@@ -88,7 +89,6 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
       const q = detail.queue!
       expect(q.rank).toBeGreaterThanOrEqual(1)
       expect(q.rank).toBeLessThanOrEqual(q.queueDepth)
-      expect(summary.queueRank).toBe(q.rank)
       // No attempt has a live (non-terminal) allocation for a queued job.
       for (const attempt of detail.attempts) {
         expect(attempt.state).toBe('Terminal')
@@ -119,9 +119,9 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
     }
   }
 
-  // Queue ranks form 1..depth with no gaps.
+  // Queue ranks (from each job's detail explainer) form 1..depth with no gaps.
   const queued = jobs.filter((j) => j.state.kind === 'Queued')
-  const ranks = queued.map((j) => j.queueRank).sort((a, b) => (a ?? 0) - (b ?? 0))
+  const ranks = queued.map((j) => world.buildJobDetail(j.id).queue!.rank).sort((a, b) => a - b)
   ranks.forEach((r, i) => expect(r).toBe(i + 1))
 
   // Recompute per-node allocated independently from allocations exposed via
@@ -178,7 +178,7 @@ describe('MockWorld construction', () => {
     expect(floorIndex).toBeLessThan(events[events.length - 1]!.index)
 
     // Per-job timelines share the same identity ordering, oldest first.
-    const { jobs } = world.listJobs({ limit: 10_000 })
+    const { jobs } = world.listJobs({ limit: 1000 })
     const withTimeline = jobs.find((j) => world.buildJobTimeline(j.id).length > 1)
     expect(withTimeline).toBeDefined()
     const timeline = world.buildJobTimeline(withTimeline!.id)
@@ -204,13 +204,13 @@ describe('MockWorld determinism', () => {
   it('two worlds from the same seed produce identical listJobs at construction', () => {
     const a = new MockWorld(NOW_US)
     const b = new MockWorld(NOW_US)
-    expect(a.listJobs({ limit: 10_000 })).toEqual(b.listJobs({ limit: 10_000 }))
+    expect(a.listJobs({ limit: 1000 })).toEqual(b.listJobs({ limit: 1000 }))
   })
 
   it('differs for a different seed', () => {
     const a = new MockWorld(NOW_US, 1)
     const b = new MockWorld(NOW_US, 2)
-    expect(a.listJobs({ limit: 10_000 })).not.toEqual(b.listJobs({ limit: 10_000 }))
+    expect(a.listJobs({ limit: 1000 })).not.toEqual(b.listJobs({ limit: 1000 }))
   })
 
   // Deep links (/jobs/:id, /nodes/:id) must survive a page reload, which
@@ -219,7 +219,7 @@ describe('MockWorld determinism', () => {
   it('mints the same ids regardless of construction time', () => {
     const a = new MockWorld(NOW_US)
     const b = new MockWorld(NOW_US + 3_600_000_000) // one hour later
-    const ids = (w: MockWorld) => w.listJobs({ limit: 10_000 }).jobs.map((j) => j.id)
+    const ids = (w: MockWorld) => w.listJobs({ limit: 1000 }).jobs.map((j) => j.id)
     expect(ids(a)).toEqual(ids(b))
     expect(a.buildNodeSummaries().map((n) => n.id)).toEqual(b.buildNodeSummaries().map((n) => n.id))
   })
@@ -279,15 +279,16 @@ describe('MockWorld simulation', () => {
 })
 
 describe('MockWorld filters and lookups', () => {
-  it('applies listJobs filters and reports pre-limit total', () => {
+  it('applies a phase filter and caps the page at the limit', () => {
     const world = new MockWorld(NOW_US)
-    const running = world.listJobs({ states: ['Running'], limit: 5 })
+    const running = world.listJobs({ filter: { phase: { in: ['Running'] } }, limit: 5 })
     expect(running.jobs.length).toBeLessThanOrEqual(5)
     for (const j of running.jobs) {
       expect(j.state.kind).toBe('Attempting')
       expect(j.attemptState).toBe('Running')
     }
-    expect(running.total).toBeGreaterThanOrEqual(running.jobs.length)
+    // A full page leaves a cursor to continue from.
+    if (running.jobs.length === 5) expect(running.nextCursor).not.toBeNull()
   })
 
   it('throws a not-found marker for unknown ids', () => {
@@ -364,7 +365,7 @@ describe('MockWorld quota entities', () => {
 
     const check = (id: string) => {
       const node = entities.find((e) => e.id === id)!
-      const { jobs } = world.listJobs({ quotaEntity: id, limit: 10_000 })
+      const { jobs } = world.listJobs({ filter: { entity: { id } }, limit: 1000 })
       const queued = jobs.filter((j) => j.state.kind === 'Queued').length
       const running = jobs.filter(
         (j) => j.state.kind === 'Attempting' && j.attemptState === 'Running',
@@ -508,5 +509,211 @@ describe('MockWorld quota entities', () => {
         expect(hist[i]!.t.getTime()).toBeGreaterThan(hist[i - 1]!.t.getTime())
       }
     }
+  })
+})
+
+describe('MockWorld listJobs semantics', () => {
+  const allJobs = (w: MockWorld) => w.listJobs({ limit: 1000 }).jobs
+
+  it('orders jobs by id descending (UUIDv7 ⇒ newest first) and exhausts at null', () => {
+    const world = new MockWorld(NOW_US)
+    const ids = allJobs(world).map((j) => j.id)
+    const sorted = [...ids].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
+    expect(ids).toEqual(sorted)
+    expect(world.listJobs({ limit: 1000 }).nextCursor).toBeNull()
+  })
+
+  it('pages by keyset with no skip or duplicate until exhausted', () => {
+    const world = new MockWorld(NOW_US)
+    const seen: string[] = []
+    let cursor: string | undefined
+    let pages = 0
+    for (;;) {
+      const page = world.listJobs({ limit: 40, cursor })
+      seen.push(...page.jobs.map((j) => j.id))
+      pages += 1
+      if (page.nextCursor === null) break
+      cursor = page.nextCursor
+      if (pages > 1000) throw new Error('pagination did not terminate')
+    }
+    expect(pages).toBeGreaterThan(1)
+    expect(new Set(seen).size).toBe(seen.length) // no duplicates
+    expect(seen).toEqual(allJobs(world).map((j) => j.id)) // no skips, same order
+  })
+
+  it('continues from a cursor with no skip/dup when a job is inserted at the head', () => {
+    const world = new MockWorld(NOW_US)
+    const page1 = world.listJobs({ limit: 10 })
+    expect(page1.nextCursor).not.toBeNull()
+    const p1 = page1.jobs.map((j) => j.id)
+
+    // Advance until a newer job (larger id) lands at the head of the ordering.
+    let t = NOW_US
+    do {
+      t += 30 * 1_000_000
+      world.advanceTo(t)
+    } while (allJobs(world)[0]!.id <= p1[0]! && t < NOW_US + 30 * 60_000_000)
+    expect(allJobs(world)[0]!.id > p1[0]!).toBe(true)
+
+    const page2 = world.listJobs({ limit: 10, cursor: page1.nextCursor! })
+    const p2 = page2.jobs.map((j) => j.id)
+    const cursorId = page1.nextCursor!.slice('v1:'.length)
+    for (const id of p2) expect(id < cursorId).toBe(true) // strictly below cursor
+    expect(p1.some((id) => p2.includes(id))).toBe(false) // disjoint (no dup)
+
+    // The head-inserted jobs sort above p1[0]; from p1[0] down the region is
+    // unchanged, so the two pages sit contiguously (no skip across the seam).
+    const full = allJobs(world).map((j) => j.id)
+    const start = full.indexOf(p1[0]!)
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(full.slice(start, start + p1.length + p2.length)).toEqual([...p1, ...p2])
+  })
+
+  it('matches each leaf filter', () => {
+    const world = new MockWorld(NOW_US)
+    const jobs = allJobs(world)
+    const big = 1000
+
+    // phase
+    for (const j of world.listJobs({ filter: { phase: { in: ['Running'] } }, limit: big }).jobs) {
+      expect(j.attemptState).toBe('Running')
+    }
+
+    // node = the current attempt's node
+    const running = jobs.find((j) => j.attemptState === 'Running')!
+    const byNode = world.listJobs({ filter: { node: running.node! }, limit: big }).jobs
+    expect(byNode.length).toBeGreaterThan(0)
+    for (const j of byNode) expect(j.node).toBe(running.node)
+
+    // image contains / equals
+    const img = jobs[0]!.image
+    const contains = world.listJobs({
+      filter: { image: { contains: img.slice(0, 4) } },
+      limit: big,
+    })
+    expect(contains.jobs.some((j) => j.id === jobs[0]!.id)).toBe(true)
+    for (const j of world.listJobs({ filter: { image: { equals: img } }, limit: big }).jobs) {
+      expect(j.image).toBe(img)
+    }
+
+    // id in
+    const wantIds = jobs.slice(0, 3).map((j) => j.id)
+    const byId = world.listJobs({ filter: { id: { in: wantIds } }, limit: big }).jobs
+    expect(byId.map((j) => j.id).sort()).toEqual([...wantIds].sort())
+
+    // search over id OR image
+    const needle = jobs[0]!.id.slice(-6)
+    const bySearch = world.listJobs({ filter: { search: needle }, limit: big }).jobs
+    expect(bySearch.some((j) => j.id === jobs[0]!.id)).toBe(true)
+
+    // submitted: after inclusive (≥), before exclusive (<)
+    const mid = jobs[Math.floor(jobs.length / 2)]!.submittedAt
+    for (const j of world.listJobs({ filter: { submitted: { after: mid } }, limit: big }).jobs) {
+      expect(j.submittedAt.getTime()).toBeGreaterThanOrEqual(mid.getTime())
+    }
+    for (const j of world.listJobs({ filter: { submitted: { before: mid } }, limit: big }).jobs) {
+      expect(j.submittedAt.getTime()).toBeLessThan(mid.getTime())
+    }
+
+    // requests bound (inclusive)
+    const heavy = world.listJobs({
+      filter: { requests: { resource: 'cpuMillis', min: 8000 } },
+      limit: big,
+    }).jobs
+    for (const j of heavy) {
+      expect(world.buildJobDetail(j.id).spec.requests.cpuMillis).toBeGreaterThanOrEqual(8000)
+    }
+  })
+
+  it('evaluates nested any-of-all combinators (and not)', () => {
+    const world = new MockWorld(NOW_US)
+    const filter: JobFilter = {
+      any: [
+        {
+          all: [
+            { phase: { in: ['Running'] } },
+            { not: { requests: { resource: 'cpuMillis', max: 999 } } },
+          ],
+        },
+        { phase: { in: ['Succeeded'] } },
+      ],
+    }
+    const rows = world.listJobs({ filter, limit: 1000 }).jobs
+    for (const j of rows) {
+      const cpu = world.buildJobDetail(j.id).spec.requests.cpuMillis
+      const armA = j.attemptState === 'Running' && cpu > 999
+      const armB = j.state.kind === 'Succeeded'
+      expect(armA || armB).toBe(true)
+    }
+    expect(rows.some((j) => j.state.kind === 'Succeeded')).toBe(true)
+  })
+
+  it('scopes entity filters subtree vs exact', () => {
+    const world = new MockWorld(NOW_US)
+    const entities = world.listQuotaEntities()
+    const root = entities.find((e) => e.name === ORG_NAME)!
+
+    const subtree = world.listJobs({ filter: { entity: { id: root.id } }, limit: 1000 }).jobs
+    const exact = world.listJobs({
+      filter: { entity: { id: root.id, scope: 'exact' } },
+      limit: 1000,
+    }).jobs
+    expect(subtree.length).toBeGreaterThan(0)
+    expect(exact.length).toBe(0) // the root owns no jobs directly
+
+    // A job's own (leaf) entity: exact === subtree (a leaf has no descendants).
+    const leafId = world.buildJobDetail(subtree[0]!.id).spec.quotaEntity
+    const leafExact = world.listJobs({
+      filter: { entity: { id: leafId, scope: 'exact' } },
+      limit: 1000,
+    }).jobs
+    const leafSub = world.listJobs({ filter: { entity: { id: leafId } }, limit: 1000 }).jobs
+    expect(leafExact.length).toBeGreaterThan(0)
+    expect(leafExact.map((j) => j.id).sort()).toEqual(leafSub.map((j) => j.id).sort())
+
+    // An unknown entity id matches nothing (not an error).
+    expect(world.listJobs({ filter: { entity: { id: 'quota-nope' } } }).jobs).toEqual([])
+  })
+
+  it('rejects invalid filters, cursors, and limits with InvalidArgument', () => {
+    const world = new MockWorld(NOW_US)
+    const invalid = (req: unknown) => {
+      try {
+        world.listJobs(req as ListJobsRequest)
+        expect.unreachable('expected an InvalidArgument')
+      } catch (e) {
+        expect(isMockInvalid(e)).toBe(true)
+      }
+    }
+
+    // Nine-deep nesting exceeds the depth-8 cap; a 65-node tree exceeds the
+    // 64-node cap.
+    let deep: JobFilter = { phase: { in: ['Running'] } }
+    for (let i = 0; i < 8; i += 1) deep = { not: deep }
+    invalid({ filter: deep })
+    invalid({
+      filter: { all: Array.from({ length: 64 }, () => ({ phase: { in: ['Running'] } })) },
+    })
+
+    invalid({ filter: { any: [] } }) // empty combinator
+    invalid({ filter: { all: [] } })
+    invalid({ filter: { phase: { in: [] } } }) // empty in
+    invalid({ filter: { phase: { in: ['Nope'] } } }) // unknown phase
+    invalid({ filter: { id: { in: [] } } })
+    invalid({ filter: { id: { in: ['not-a-job'] } } }) // malformed id
+    invalid({ filter: { image: {} } }) // image needs exactly one op
+    invalid({ filter: { image: { contains: 'x', equals: 'y' } } })
+    invalid({ filter: { submitted: {} } }) // needs a bound
+    invalid({ filter: { submitted: { after: new Date(2_000), before: new Date(1_000) } } })
+    invalid({ filter: { requests: { resource: 'cpuMillis' } } }) // needs a bound
+    invalid({ filter: { requests: { resource: 'nope', min: 1 } } }) // unknown resource
+    invalid({ filter: { requests: { resource: 'cpuMillis', min: 10, max: 5 } } })
+    invalid({ filter: { unknown: true } }) // unknown node key
+    invalid({ filter: { phase: { in: ['Running'] }, node: 'node-x' } }) // two keys
+
+    invalid({ cursor: 'nope' }) // not a v1: token
+    invalid({ cursor: 'v1:not-a-job' }) // token payload is not a job id
+    invalid({ limit: 0 })
+    invalid({ limit: 1001 })
   })
 })
