@@ -103,13 +103,32 @@ impl Timestamp {
         self.0.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
     }
 
+    /// The latest representable instant.
+    ///
+    /// `DateTime::MAX_UTC` itself is *not* a legal `Timestamp` — it carries a
+    /// nanosecond tail (`…:59.999999999`) that no constructor here can
+    /// produce — so the saturation bound is quantised down to the last whole
+    /// microsecond. Saturating must land on a value that still satisfies the
+    /// type's invariant, or the result would fail its own round trip.
+    pub fn max_value() -> Timestamp {
+        Timestamp::from_datetime(DateTime::<Utc>::MAX_UTC)
+    }
+
+    /// The earliest representable instant.
+    pub fn min_value() -> Timestamp {
+        // `MIN_UTC` is already whole-microsecond, so truncation is a no-op —
+        // routed through `from_datetime` anyway so the invariant holds by
+        // construction rather than by a fact about chrono's constant.
+        Timestamp::from_datetime(DateTime::<Utc>::MIN_UTC)
+    }
+
     /// `self + delta`, saturating at the representable range rather than
     /// panicking.
     pub fn saturating_add(self, delta: Duration) -> Timestamp {
         match self.0.checked_add_signed(delta.to_time_delta()) {
             Some(datetime) => Timestamp(datetime),
-            None if delta.is_positive() => Timestamp(DateTime::<Utc>::MAX_UTC),
-            None => Timestamp(DateTime::<Utc>::MIN_UTC),
+            None if delta.is_positive() => Timestamp::max_value(),
+            None => Timestamp::min_value(),
         }
     }
 
@@ -238,8 +257,22 @@ impl Duration {
     }
 
     /// A span of `seconds` seconds, saturating.
+    ///
+    /// Saturation is right for a literal written in this repo, and wrong for a
+    /// value that came from a client — silently shortening a caller's span to
+    /// [`Duration::MAX`] answers a different question than the one they asked.
+    /// Validate untrusted input with [`Duration::checked_from_secs`] instead.
     pub const fn from_secs(seconds: i64) -> Duration {
         Duration(seconds.saturating_mul(MICROS_PER_SECOND))
+    }
+
+    /// A span of `seconds` seconds, or `None` if it exceeds the representable
+    /// range — the constructor for spans supplied by a client.
+    pub const fn checked_from_secs(seconds: i64) -> Option<Duration> {
+        match seconds.checked_mul(MICROS_PER_SECOND) {
+            Some(micros) => Some(Duration(micros)),
+            None => None,
+        }
     }
 
     /// A span of `minutes` minutes, saturating.
@@ -460,13 +493,28 @@ mod tests {
     fn timestamp_arithmetic_saturates_instead_of_panicking() {
         let timestamp = Timestamp::from_micros(0).expect("in range");
         assert_eq!(
-            timestamp.saturating_add(Duration::MAX).to_datetime(),
-            DateTime::<Utc>::MAX_UTC
+            timestamp.saturating_add(Duration::MAX),
+            Timestamp::max_value()
         );
         assert_eq!(
-            timestamp.saturating_sub(Duration::MAX).to_datetime(),
-            DateTime::<Utc>::MIN_UTC
+            timestamp.saturating_sub(Duration::MAX),
+            Timestamp::min_value()
         );
+    }
+
+    #[test]
+    fn saturated_timestamps_are_whole_microseconds() {
+        // The saturation bound is a value the type hands to callers, so it owes
+        // them the same invariant as any other `Timestamp`. `DateTime::MAX_UTC`
+        // does not: its nanosecond tail would not survive the wire, so a
+        // saturated instant would stop comparing equal to its round trip.
+        assert_ne!(DateTime::<Utc>::MAX_UTC.timestamp_subsec_nanos() % 1_000, 0);
+
+        for extreme in [Timestamp::max_value(), Timestamp::min_value()] {
+            assert_eq!(extreme.to_datetime().timestamp_subsec_nanos() % 1_000, 0);
+            assert_eq!(Timestamp::from_micros(extreme.as_micros()), Some(extreme));
+            assert_eq!(Timestamp::from_datetime(extreme.to_datetime()), extreme);
+        }
     }
 
     #[test]
