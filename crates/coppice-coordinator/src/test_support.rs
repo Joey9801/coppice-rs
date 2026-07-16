@@ -16,6 +16,7 @@ use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
 use coppice_core::quota::{ChargeRecord, CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_state::{
     AllocationRecord, AttemptRecord, Command, JobRecord, NodeRecord, RejectionReason, StateMachine,
 };
@@ -39,14 +40,14 @@ pub fn node_record(id: NodeId, epoch: u64, schedulable: bool) -> NodeRecord {
     }
 }
 
-/// An attempt record in `state` on `node`, with an optional `started_at_us`.
+/// An attempt record in `state` on `node`, with an optional `started_at`.
 pub fn attempt_record(
     id: AttemptId,
     job: JobId,
     allocation: AllocationId,
     node: NodeId,
     state: AttemptState,
-    started_at_us: Option<i64>,
+    started_at: Option<Timestamp>,
 ) -> AttemptRecord {
     AttemptRecord {
         attempt: Attempt {
@@ -59,12 +60,12 @@ pub fn attempt_record(
         group: GroupId(job.0),
         charge: ChargeRecord {
             amount: CostUnits(0),
-            charged_at_us: 0,
+            charged_at: Timestamp::UNIX_EPOCH,
             refund_fraction_milli: FULL_REFUND_MILLI,
         },
         rate_ucu_per_second: 0,
         multiplier: PriorityMultiplier(0),
-        started_at_us,
+        started_at,
     }
 }
 
@@ -104,7 +105,7 @@ pub fn job_record(
     id: JobId,
     image: &str,
     requests: Resources,
-    max_runtime_us: Option<u64>,
+    max_runtime: Option<Duration>,
 ) -> JobRecord {
     JobRecord {
         spec: Job {
@@ -114,15 +115,15 @@ pub fn job_record(
             entrypoint: None,
             requests,
             priority: 0,
-            max_runtime_us,
+            max_runtime,
             quota_entity: QuotaEntityId::new(),
             retry: RetryPolicy::default(),
             abort_requested: None,
         },
         state: JobState::Queued,
         multiplier: PriorityMultiplier(0),
-        submitted_at_us: 0,
-        terminal_at_us: None,
+        submitted_at: Timestamp::UNIX_EPOCH,
+        terminal_at: None,
         retries_used: 0,
         attempts: Vec::new(),
     }

@@ -2,7 +2,7 @@
 //!
 //! Commands are the only entries in the Raft log that change authoritative
 //! state. Each carries everything needed for deterministic application:
-//! proposer-minted ids, proposer-stamped timestamps (`*_at_us`, Unix µs), and
+//! proposer-minted ids, proposer-stamped timestamps (`*_at`), and
 //! decisions rather than computations. The catalog — proposer, payload,
 //! validation, apply effects, and rejections per command — lives in
 //! `docs/architecture/command-catalog.md`; the protobuf schema
@@ -17,6 +17,7 @@ use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEnt
 use coppice_core::job::Job;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 
 use crate::PolicyConfig;
 
@@ -49,30 +50,30 @@ pub enum Command {
 
 impl Command {
     /// The proposer stamp this command carries — every variant has exactly
-    /// one `*_at_us` field (ADR 0032).
+    /// one `*_at` field (ADR 0032).
     ///
     /// The apply loop copies it onto the command's `EventBatch` as the
     /// batch's advisory timestamp: "when the proposer asserted this fact,"
     /// never an ordering key, and never read back by apply. No wildcard arm,
     /// so a future command without a timestamp fails to compile here instead
     /// of silently emitting unstamped events.
-    pub fn stamped_at_us(&self) -> i64 {
+    pub fn stamped_at(&self) -> Timestamp {
         match self {
-            Command::SubmitJob(c) => c.submitted_at_us,
-            Command::AbortJob(c) => c.requested_at_us,
-            Command::CommitPlacements(c) => c.proposed_at_us,
-            Command::DispatchAttempt(c) => c.dispatched_at_us,
-            Command::RecordAttemptStarted(c) => c.observed_at_us,
-            Command::RecordAttemptExited(c) => c.observed_at_us,
-            Command::RecordAttemptOutcome(c) => c.observed_at_us,
-            Command::ReconcileNode(c) => c.observed_at_us,
-            Command::RegisterNode(c) => c.registered_at_us,
-            Command::DeclareNodeLost(c) => c.declared_at_us,
-            Command::SetNodeSchedulable(c) => c.updated_at_us,
-            Command::EvictTerminalJobs(c) => c.evicted_at_us,
-            Command::ConfigureQuotaEntity(c) => c.updated_at_us,
-            Command::UpdatePolicy(c) => c.updated_at_us,
-            Command::BumpClusterVersion(c) => c.bumped_at_us,
+            Command::SubmitJob(c) => c.submitted_at,
+            Command::AbortJob(c) => c.requested_at,
+            Command::CommitPlacements(c) => c.proposed_at,
+            Command::DispatchAttempt(c) => c.dispatched_at,
+            Command::RecordAttemptStarted(c) => c.observed_at,
+            Command::RecordAttemptExited(c) => c.observed_at,
+            Command::RecordAttemptOutcome(c) => c.observed_at,
+            Command::ReconcileNode(c) => c.observed_at,
+            Command::RegisterNode(c) => c.registered_at,
+            Command::DeclareNodeLost(c) => c.declared_at,
+            Command::SetNodeSchedulable(c) => c.updated_at,
+            Command::EvictTerminalJobs(c) => c.evicted_at,
+            Command::ConfigureQuotaEntity(c) => c.updated_at,
+            Command::UpdatePolicy(c) => c.updated_at,
+            Command::BumpClusterVersion(c) => c.bumped_at,
         }
     }
 }
@@ -88,7 +89,7 @@ pub struct SubmitJob {
     /// Resolved by the API from the replicated multiplier table; apply never
     /// sees the raw `priority: i32` in arithmetic (ADR 0019).
     pub multiplier: PriorityMultiplier,
-    pub submitted_at_us: i64,
+    pub submitted_at: Timestamp,
 }
 
 /// Request an abort: sets `abort_requested`, terminates immediately when no
@@ -100,7 +101,7 @@ pub struct SubmitJob {
 pub struct AbortJob {
     pub job: JobId,
     pub reason: Option<String>,
-    pub requested_at_us: i64,
+    pub requested_at: Timestamp,
 }
 
 /// One scheduler pass's atomic batch of placements and revocations.
@@ -122,7 +123,7 @@ pub struct CommitPlacements {
     pub revocations: Vec<AllocationId>,
     pub placements: Vec<Placement>,
     /// Charge timestamp for the batch's quota charges and refunds.
-    pub proposed_at_us: i64,
+    pub proposed_at: Timestamp,
 }
 
 /// One job seated on one or more nodes.
@@ -158,14 +159,14 @@ pub struct AllocationSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchAttempt {
     pub attempt: AttemptId,
-    pub dispatched_at_us: i64,
+    pub dispatched_at: Timestamp,
 }
 
 /// Container observed running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAttemptStarted {
     pub attempt: AttemptId,
-    pub observed_at_us: i64,
+    pub observed_at: Timestamp,
 }
 
 /// Exit observed; agent-side finalization still in flight.
@@ -174,7 +175,7 @@ pub struct RecordAttemptStarted {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAttemptExited {
     pub attempt: AttemptId,
-    pub observed_at_us: i64,
+    pub observed_at: Timestamp,
 }
 
 /// Terminal outcome for an attempt.
@@ -189,8 +190,8 @@ pub struct RecordAttemptOutcome {
     pub outcome: AttemptOutcome,
     /// Normalizer-computed; ignored for true-up when the attempt never
     /// reached `Running` (actual cost is zero by rule).
-    pub actual_runtime_us: u64,
-    pub observed_at_us: i64,
+    pub actual_runtime: Duration,
+    pub observed_at: Timestamp,
 }
 
 /// Verdicts from the leader's ObservedSet diff (ADR 0009).
@@ -207,7 +208,7 @@ pub struct ReconcileNode {
     pub adopted: Vec<AttemptId>,
     /// Intended but absent: attempt failure, retry policy applies.
     pub lost: Vec<LostAttempt>,
-    pub observed_at_us: i64,
+    pub observed_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +216,7 @@ pub struct LostAttempt {
     pub attempt: AttemptId,
     /// Normalizer-picked, typically `AgentError`; never `Revoked`.
     pub outcome: AttemptOutcome,
-    pub actual_runtime_us: u64,
+    pub actual_runtime: Duration,
 }
 
 /// Node (re)registration.
@@ -228,7 +229,7 @@ pub struct RegisterNode {
     pub node: NodeId,
     pub capacity: Resources,
     pub labels: BTreeMap<String, String>,
-    pub registered_at_us: i64,
+    pub registered_at: Timestamp,
 }
 
 /// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,
@@ -237,7 +238,7 @@ pub struct RegisterNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclareNodeLost {
     pub node: NodeId,
-    pub declared_at_us: i64,
+    pub declared_at: Timestamp,
 }
 
 /// Admin drain / undrain.
@@ -248,7 +249,7 @@ pub struct DeclareNodeLost {
 pub struct SetNodeSchedulable {
     pub node: NodeId,
     pub schedulable: bool,
-    pub updated_at_us: i64,
+    pub updated_at: Timestamp,
 }
 
 /// Remove terminal jobs from replicated state (ADR 0012).
@@ -260,7 +261,7 @@ pub struct SetNodeSchedulable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictTerminalJobs {
     pub jobs: Vec<JobId>,
-    pub evicted_at_us: i64,
+    pub evicted_at: Timestamp,
 }
 
 /// Create or update one quota entity.
@@ -274,7 +275,7 @@ pub struct ConfigureQuotaEntity {
     pub name: String,
     /// A stock in µCU; the CLI converts human rates (ADR 0019).
     pub quota: CostUnits,
-    pub updated_at_us: i64,
+    pub updated_at: Timestamp,
 }
 
 /// Full replacement of the replicated policy.
@@ -285,7 +286,7 @@ pub struct ConfigureQuotaEntity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePolicy {
     pub policy: PolicyConfig,
-    pub updated_at_us: i64,
+    pub updated_at: Timestamp,
 }
 
 /// Bump the semantic feature gate (ADR 0003).
@@ -295,7 +296,7 @@ pub struct UpdatePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BumpClusterVersion {
     pub to: u32,
-    pub bumped_at_us: i64,
+    pub bumped_at: Timestamp,
 }
 
 #[cfg(test)]
@@ -306,33 +307,35 @@ mod tests {
     /// command fails to compile); this pins that it reads the *right* field
     /// where a command carries more than one plausible candidate.
     #[test]
-    fn stamped_at_us_reads_the_proposer_stamp() {
+    fn stamped_at_reads_the_proposer_stamp() {
+        let ts = |micros| Timestamp::from_micros(micros).expect("in range");
+
         let abort = Command::AbortJob(AbortJob {
             job: JobId::new(),
             reason: None,
-            requested_at_us: 7,
+            requested_at: ts(7),
         });
-        assert_eq!(abort.stamped_at_us(), 7);
+        assert_eq!(abort.stamped_at(), ts(7));
 
         let reconcile = Command::ReconcileNode(ReconcileNode {
             node: NodeId::new(),
             node_epoch: 1,
             adopted: vec![],
             // Sub-items carry no stamp of their own: every LostAttempt in
-            // this report inherits the report's observed_at_us (ADR 0032).
+            // this report inherits the report's observed_at (ADR 0032).
             lost: vec![LostAttempt {
                 attempt: AttemptId::new(),
                 outcome: AttemptOutcome::AgentError,
-                actual_runtime_us: 99,
+                actual_runtime: Duration::from_micros(99),
             }],
-            observed_at_us: 11,
+            observed_at: ts(11),
         });
-        assert_eq!(reconcile.stamped_at_us(), 11);
+        assert_eq!(reconcile.stamped_at(), ts(11));
 
         let bump = Command::BumpClusterVersion(BumpClusterVersion {
             to: 2,
-            bumped_at_us: 13,
+            bumped_at: ts(13),
         });
-        assert_eq!(bump.stamped_at_us(), 13);
+        assert_eq!(bump.stamped_at(), ts(13));
     }
 }

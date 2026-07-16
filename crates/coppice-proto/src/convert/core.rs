@@ -12,7 +12,9 @@ use coppice_core::quota::{
 };
 use coppice_core::resource::Resources;
 
-use super::{req, ConvertError};
+use coppice_core::time::Duration;
+
+use super::{positive_duration, req, timestamp, ConvertError};
 use crate::pb::core::v1 as pb;
 
 // ---- Ids ----
@@ -140,7 +142,7 @@ impl From<&Job> for pb::Job {
                 .map(|argv| pb::Entrypoint { argv: argv.clone() }),
             requests: Some((&job.requests).into()),
             priority: job.priority,
-            max_runtime_us: job.max_runtime_us,
+            max_runtime_us: job.max_runtime.map(|d| d.as_micros() as u64),
             quota_entity: Some(job.quota_entity.into()),
             retry: Some(job.retry.into()),
             abort_requested: job.abort_requested.as_ref().map(Into::into),
@@ -175,10 +177,13 @@ impl TryFrom<pb::Job> for Job {
             entrypoint,
             requests: req(job.requests, "Job.requests")?.try_into()?,
             priority: job.priority,
-            max_runtime_us: job.max_runtime_us,
+            max_runtime: job
+                .max_runtime_us
+                .map(|us| positive_duration(us, "Job.max_runtime_us"))
+                .transpose()?,
             quota_entity: req(job.quota_entity, "Job.quota_entity")?.try_into()?,
             retry: req(job.retry, "Job.retry")?.into(),
-            abort_requested: job.abort_requested.map(Into::into),
+            abort_requested: job.abort_requested.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -205,17 +210,19 @@ impl From<&AbortRequest> for pb::AbortRequest {
     fn from(abort: &AbortRequest) -> Self {
         pb::AbortRequest {
             reason: abort.reason.clone(),
-            requested_at_us: abort.requested_at_us,
+            requested_at_us: abort.requested_at.as_micros(),
         }
     }
 }
 
-impl From<pb::AbortRequest> for AbortRequest {
-    fn from(abort: pb::AbortRequest) -> Self {
-        AbortRequest {
+impl TryFrom<pb::AbortRequest> for AbortRequest {
+    type Error = ConvertError;
+
+    fn try_from(abort: pb::AbortRequest) -> Result<Self, ConvertError> {
+        Ok(AbortRequest {
             reason: abort.reason,
-            requested_at_us: abort.requested_at_us,
-        }
+            requested_at: timestamp(abort.requested_at_us, "AbortRequest.requested_at_us")?,
+        })
     }
 }
 
@@ -523,7 +530,7 @@ impl TryFrom<pb::CostWeights> for CostWeights {
 impl From<DecayPolicy> for pb::DecayPolicy {
     fn from(decay: DecayPolicy) -> Self {
         pb::DecayPolicy {
-            tick_us: decay.tick_us,
+            tick_us: decay.tick.as_micros(),
             decay_per_tick_q0_64: decay.decay_per_tick,
         }
     }
@@ -531,8 +538,11 @@ impl From<DecayPolicy> for pb::DecayPolicy {
 
 impl From<pb::DecayPolicy> for DecayPolicy {
     fn from(decay: pb::DecayPolicy) -> Self {
+        // A non-positive tick is not rejected here: `DecayPolicy::validate` is
+        // the gate for replicated policy, and it reports the whole policy's
+        // problems together rather than one field's at a time.
         DecayPolicy {
-            tick_us: decay.tick_us,
+            tick: Duration::from_micros(decay.tick_us),
             decay_per_tick: decay.decay_per_tick_q0_64,
         }
     }
@@ -542,17 +552,19 @@ impl From<UsageState> for pb::UsageState {
     fn from(usage: UsageState) -> Self {
         pb::UsageState {
             usage_ucu: usage.usage.0,
-            last_update_us: usage.last_update_us,
+            last_update_us: usage.last_update.as_micros(),
         }
     }
 }
 
-impl From<pb::UsageState> for UsageState {
-    fn from(usage: pb::UsageState) -> Self {
-        UsageState {
+impl TryFrom<pb::UsageState> for UsageState {
+    type Error = ConvertError;
+
+    fn try_from(usage: pb::UsageState) -> Result<Self, ConvertError> {
+        Ok(UsageState {
             usage: CostUnits(usage.usage_ucu),
-            last_update_us: usage.last_update_us,
-        }
+            last_update: timestamp(usage.last_update_us, "UsageState.last_update_us")?,
+        })
     }
 }
 
@@ -560,21 +572,23 @@ impl From<ChargeRecord> for pb::ChargeRecord {
     fn from(charge: ChargeRecord) -> Self {
         pb::ChargeRecord {
             amount_ucu: charge.amount.0,
-            charged_at_us: charge.charged_at_us,
+            charged_at_us: charge.charged_at.as_micros(),
             refund_fraction_milli: Some(charge.refund_fraction_milli),
         }
     }
 }
 
-impl From<pb::ChargeRecord> for ChargeRecord {
-    fn from(charge: pb::ChargeRecord) -> Self {
-        ChargeRecord {
+impl TryFrom<pb::ChargeRecord> for ChargeRecord {
+    type Error = ConvertError;
+
+    fn try_from(charge: pb::ChargeRecord) -> Result<Self, ConvertError> {
+        Ok(ChargeRecord {
             amount: CostUnits(charge.amount_ucu),
-            charged_at_us: charge.charged_at_us,
+            charged_at: timestamp(charge.charged_at_us, "ChargeRecord.charged_at_us")?,
             // Absent (a charge recorded before ADR 0029) trues up at full
             // refund, exactly as it did then.
             refund_fraction_milli: charge.refund_fraction_milli.unwrap_or(1000),
-        }
+        })
     }
 }
 

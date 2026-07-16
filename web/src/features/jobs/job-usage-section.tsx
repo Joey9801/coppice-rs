@@ -19,7 +19,7 @@ import {
   type UsageSample,
 } from '@/api/types'
 import { useJobUsage } from '@/api/queries'
-import { formatBytes, formatCpu, formatTimeOfDayUs, shortId } from '@/lib/format'
+import { formatBytes, formatCpu, formatTimeOfDay, shortId } from '@/lib/format'
 import { byteTicks, cpuTicks } from '@/lib/ticks'
 import { EmptyState } from '@/components'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -142,7 +142,7 @@ function UsageChart({
   color: string
 }) {
   const gradientId = `usage-fill-${dataKey}`
-  const data = samples.map((s) => ({ tUs: s.tUs, value: s[dataKey] }))
+  const data = samples.map((s) => ({ tUs: s.t, value: s[dataKey] }))
   const dataMax = data.reduce((m, d) => Math.max(m, d.value), 0)
   const ticks = makeTicks(Math.max(dataMax, requested))
   const top = ticks[ticks.length - 1] ?? requested
@@ -161,7 +161,7 @@ function UsageChart({
           <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
           <XAxis
             dataKey="tUs"
-            tickFormatter={formatTimeOfDayUs}
+            tickFormatter={formatTimeOfDay}
             tick={AXIS_TICK}
             stroke="var(--border)"
             minTickGap={48}
@@ -177,7 +177,7 @@ function UsageChart({
           />
           <Tooltip
             contentStyle={TOOLTIP_CONTENT_STYLE}
-            labelFormatter={(t) => formatTimeOfDayUs(Number(t))}
+            labelFormatter={(ms) => formatTimeOfDay(new Date(Number(ms)))}
             formatter={(value) => [format(Number(value)), title]}
           />
           <ReferenceLine

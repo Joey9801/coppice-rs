@@ -9,7 +9,7 @@ import {
   YAxis,
 } from 'recharts'
 import type { NodeUtilization } from '@/api/types'
-import { formatBytes, formatCpu, formatTimeOfDayUs } from '@/lib/format'
+import { formatBytes, formatCpu, formatTimeOfDay } from '@/lib/format'
 
 const AXIS_TICK = { fill: 'var(--muted-foreground)', fontSize: 11 } as const
 
@@ -22,8 +22,10 @@ const TOOLTIP_CONTENT_STYLE = {
 
 const LEGEND_STYLE = { fontSize: 11 } as const
 
+/// Recharts scales a numeric axis, so the series carries epoch
+/// milliseconds; `Date` is reconstructed only to format a tick.
 interface SeriesPoint {
-  tUs: number
+  tMs: number
   used: number
   allocated: number
 }
@@ -51,8 +53,8 @@ function UtilizationAreaChart({ data, format, gradientId }: UtilizationAreaChart
         </defs>
         <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
         <XAxis
-          dataKey="tUs"
-          tickFormatter={formatTimeOfDayUs}
+          dataKey="tMs"
+          tickFormatter={(ms) => formatTimeOfDay(new Date(ms))}
           tick={AXIS_TICK}
           stroke="var(--border)"
           minTickGap={48}
@@ -66,7 +68,7 @@ function UtilizationAreaChart({ data, format, gradientId }: UtilizationAreaChart
         />
         <Tooltip
           contentStyle={TOOLTIP_CONTENT_STYLE}
-          labelFormatter={(t) => formatTimeOfDayUs(Number(t))}
+          labelFormatter={(ms) => formatTimeOfDay(new Date(Number(ms)))}
           formatter={(value, name) => [format(Number(value)), name]}
         />
         <Legend wrapperStyle={LEGEND_STYLE} />
@@ -95,12 +97,12 @@ function UtilizationAreaChart({ data, format, gradientId }: UtilizationAreaChart
 
 export function UtilizationCharts({ utilization }: { utilization: NodeUtilization }) {
   const cpu = utilization.samples.map((s) => ({
-    tUs: s.tUs,
+    tMs: s.t.getTime(),
     used: s.used.cpuMillis,
     allocated: s.allocated.cpuMillis,
   }))
   const memory = utilization.samples.map((s) => ({
-    tUs: s.tUs,
+    tMs: s.t.getTime(),
     used: s.used.memoryBytes,
     allocated: s.allocated.memoryBytes,
   }))

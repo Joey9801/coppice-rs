@@ -135,11 +135,11 @@ function NodeRow({ node }: { node: NodeSummary }) {
       </TableCell>
       <TableCell className="text-right tabular-nums text-muted-foreground">{node.epoch}</TableCell>
       <TableCell className="text-right">
-        {node.lastHeartbeatUs == null ? (
+        {node.lastHeartbeat == null ? (
           <span className="text-muted-foreground">never</span>
         ) : (
           <TimeAgo
-            tUs={node.lastHeartbeatUs}
+            t={node.lastHeartbeat}
             className={cn(
               'text-sm tabular-nums',
               lost ? 'text-destructive' : 'text-muted-foreground',

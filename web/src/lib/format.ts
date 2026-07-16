@@ -5,7 +5,7 @@ import type { Resources } from '@/api/types'
  * never hand-roll byte/duration/cost formatting in components.
  *
  * Unit conventions (see src/api/types.ts):
- * - timestamps/durations: microseconds (`Us`)
+ * - instants: `Date`; durations: whole seconds (`Seconds`)
  * - cpu: millicores (`cpuMillis`, 1000 = one core)
  * - cost: µCU (`Ucu`, 1_000_000 µCU = 1 CU)
  */
@@ -162,12 +162,18 @@ export function formatUnitPrice(
   return `${formatUcuRatePerHour(weightPerBase * unit.size)} / ${unit.label}`
 }
 
-/** Compact duration: "3h 12m", "45s", "850ms". */
-export function formatDurationUs(us: number): string {
-  if (us < 0) return '—'
-  const ms = us / 1000
+/**
+ * Compact duration: "3h 12m", "45s", "850ms".
+ *
+ * Takes **seconds**, the unit the API uses for durations. Fractional is fine
+ * — that is what the sub-second branch renders — so a `Date` difference
+ * arrives here as `ms / 1000`, never as raw milliseconds.
+ */
+export function formatDuration(seconds: number): string {
+  if (seconds < 0) return '—'
+  const ms = seconds * 1000
   if (ms < 1000) return `${Math.round(ms)}ms`
-  const s = Math.floor(ms / 1000)
+  const s = Math.floor(seconds)
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
   if (m < 60) return s % 60 ? `${m}m ${s % 60}s` : `${m}m`
@@ -177,23 +183,23 @@ export function formatDurationUs(us: number): string {
   return h % 24 ? `${d}d ${h % 24}h` : `${d}d`
 }
 
-/** "3m ago" for a past µs timestamp (uses Date.now() unless given). */
-export function formatTimeAgo(tUs: number, nowMs: number = Date.now()): string {
-  const ageUs = nowMs * 1000 - tUs
-  if (ageUs < 5_000_000) return 'just now'
-  return `${formatDurationUs(ageUs)} ago`
+/** "3m ago" for a past instant (uses the current time unless given). */
+export function formatTimeAgo(t: Date, now: Date = new Date()): string {
+  const ageSeconds = (now.getTime() - t.getTime()) / 1000
+  if (ageSeconds < 5) return 'just now'
+  return `${formatDuration(ageSeconds)} ago`
 }
 
-/** "in 12m" for a future µs timestamp. */
-export function formatTimeUntil(tUs: number, nowMs: number = Date.now()): string {
-  const inUs = tUs - nowMs * 1000
-  if (inUs <= 0) return 'now'
-  return `in ${formatDurationUs(inUs)}`
+/** "in 12m" for a future instant. */
+export function formatTimeUntil(t: Date, now: Date = new Date()): string {
+  const inSeconds = (t.getTime() - now.getTime()) / 1000
+  if (inSeconds <= 0) return 'now'
+  return `in ${formatDuration(inSeconds)}`
 }
 
 /** Absolute local timestamp for detail views / tooltips. */
-export function formatTimestampUs(tUs: number): string {
-  return new Date(tUs / 1000).toLocaleString(undefined, {
+export function formatTimestamp(t: Date): string {
+  return t.toLocaleString(undefined, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -204,8 +210,8 @@ export function formatTimestampUs(tUs: number): string {
 }
 
 /** "14:03:27" — time-of-day only, for dense log/timeline rows. */
-export function formatTimeOfDayUs(tUs: number): string {
-  return new Date(tUs / 1000).toLocaleTimeString(undefined, {
+export function formatTimeOfDay(t: Date): string {
+  return t.toLocaleTimeString(undefined, {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',

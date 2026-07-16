@@ -28,6 +28,7 @@ use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
 use coppice_core::quota::{self, ChargeRecord, CostUnits, PriorityMultiplier, UsageState};
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_state::{
     AllocationRecord, AttemptRecord, JobRecord, NodeRecord, PolicyConfig, QuotaEntity, StateMachine,
 };
@@ -64,9 +65,9 @@ impl SynthConfig {
 pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
     let mut rng = Rng::new(cfg.seed);
     // Fixed rather than wall-clock: reproducibility is the entire point.
-    let base_time_us: i64 = 1_700_000_000_000_000;
+    let base_time = Timestamp::UNIX_EPOCH + Duration::from_micros(1_700_000_000_000_000);
 
-    let quota_tree = build_quota_tree(&mut rng, cfg.quota_entities, base_time_us);
+    let quota_tree = build_quota_tree(&mut rng, cfg.quota_entities, base_time);
     let nodes = build_nodes(&mut rng, cfg.nodes.max(1));
     let node_ids: Vec<NodeId> = nodes.keys().copied().collect();
 
@@ -94,13 +95,16 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             memory_bytes: rng.range(256 << 20, 16 << 30),
             disk_bytes: rng.range(0, 50 << 30).max(1),
         };
-        let max_runtime_us = if rng.chance(70, 100) {
-            // 5 minutes .. 24 hours, in microseconds.
-            Some(rng.range(300_000_000, 86_400_000_000))
+        let max_runtime = if rng.chance(70, 100) {
+            Some(rand_span(
+                &mut rng,
+                Duration::from_mins(5),
+                Duration::from_hours(24),
+            ))
         } else {
             None
         };
-        let submitted_at_us = base_time_us - rng.range(0, 90 * 24 * 3_600 * 1_000_000) as i64;
+        let submitted_at = base_time - rand_span(&mut rng, Duration::ZERO, Duration::from_days(90));
         let retry = RetryPolicy {
             max_retries: rng.range(1, 6) as u32,
             retry_user_errors: rng.chance(1, 3),
@@ -108,7 +112,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         let rate = quota::resource_rate(&requested, &policy.cost_weights);
         let charge_amount = quota::cost_from_rate(
             rate,
-            max_runtime_us
+            max_runtime
                 .map(quota::runtime_seconds_ceil)
                 .unwrap_or(policy.default_charge_runtime_s),
             multiplier,
@@ -130,12 +134,13 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         let (job_state, mut attempt_ids, abort_eligible) = if bucket < 55 {
             // Attempting, attempt Running.
             let node = *rng.pick(&node_ids);
-            let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
+            let charged_at =
+                submitted_at + rand_span(&mut rng, Duration::ZERO, Duration::from_mins(1));
             let mut ids = gen_history(
                 &mut rng,
                 &ctx,
                 &node_ids,
-                submitted_at_us,
+                submitted_at,
                 &mut next_seq,
                 &mut bufs,
             );
@@ -158,7 +163,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 &mut rng,
                 &ctx,
                 &node_ids,
-                submitted_at_us,
+                submitted_at,
                 &mut next_seq,
                 &mut bufs,
             );
@@ -168,12 +173,13 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             // be the job-level `Preparing` phase, now a distinction on the
             // attempt).
             let node = *rng.pick(&node_ids);
-            let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
+            let charged_at =
+                submitted_at + rand_span(&mut rng, Duration::ZERO, Duration::from_mins(1));
             let mut ids = gen_history(
                 &mut rng,
                 &ctx,
                 &node_ids,
-                submitted_at_us,
+                submitted_at,
                 &mut next_seq,
                 &mut bufs,
             );
@@ -193,12 +199,13 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             // `Finalizing` state (ADR 0030): resolution completes atomically
             // once the attempt reaches `Terminal`.
             let node = *rng.pick(&node_ids);
-            let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
+            let charged_at =
+                submitted_at + rand_span(&mut rng, Duration::ZERO, Duration::from_mins(1));
             let mut ids = gen_history(
                 &mut rng,
                 &ctx,
                 &node_ids,
-                submitted_at_us,
+                submitted_at,
                 &mut next_seq,
                 &mut bufs,
             );
@@ -242,7 +249,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                     &mut rng,
                     &ctx,
                     &node_ids,
-                    submitted_at_us,
+                    submitted_at,
                     &mut next_seq,
                     &mut bufs,
                 )
@@ -251,7 +258,8 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             };
             if let Some(outcome) = outcome {
                 let node = *rng.pick(&node_ids);
-                let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
+                let charged_at =
+                    submitted_at + rand_span(&mut rng, Duration::ZERO, Duration::from_mins(1));
                 let seq = next_seq;
                 next_seq += 1;
                 let id = build_attempt(
@@ -282,14 +290,16 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 } else {
                     None
                 },
-                requested_at_us: submitted_at_us + rng.range(0, 3_600_000_000) as i64,
+                requested_at: submitted_at
+                    + rand_span(&mut rng, Duration::ZERO, Duration::from_hours(1)),
             })
         } else if abort_eligible && rng.chance(3, 100) {
             // Legal in every non-terminal state: an abort can be in flight
             // while the attempt is still winding down.
             Some(AbortRequest {
                 reason: None,
-                requested_at_us: submitted_at_us + rng.range(0, 3_600_000_000) as i64,
+                requested_at: submitted_at
+                    + rand_span(&mut rng, Duration::ZERO, Duration::from_hours(1)),
             })
         } else {
             None
@@ -303,7 +313,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             entrypoint,
             requests: requested,
             priority,
-            max_runtime_us,
+            max_runtime,
             quota_entity: leaf,
             retry,
             abort_requested,
@@ -312,12 +322,12 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         // attempt existed terminates in the abort apply itself, so its
         // terminal time is the request's; every other terminal job resolves
         // at some later report time.
-        let terminal_at_us = if !job_state.is_terminal() {
+        let terminal_at = if !job_state.is_terminal() {
             None
         } else if let (true, Some(a)) = (attempt_ids.is_empty(), &spec.abort_requested) {
-            Some(a.requested_at_us)
+            Some(a.requested_at)
         } else {
-            Some(submitted_at_us + rng.range(0, 3_600_000_000) as i64)
+            Some(submitted_at + rand_span(&mut rng, Duration::ZERO, Duration::from_hours(1)))
         };
 
         attempt_ids.shrink_to_fit();
@@ -327,8 +337,8 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 spec,
                 state: job_state,
                 multiplier,
-                submitted_at_us,
-                terminal_at_us,
+                submitted_at,
+                terminal_at,
                 retries_used,
                 attempts: attempt_ids,
             },
@@ -354,6 +364,13 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         cluster_version: 1,
         version: cfg.jobs as u64 * 8,
     }
+}
+
+/// A uniform random span in `[lo, hi)`, drawn at microsecond granularity.
+/// Both bounds are non-negative in every call site here, so the casts are
+/// exact.
+fn rand_span(rng: &mut Rng, lo: Duration, hi: Duration) -> Duration {
+    Duration::from_micros(rng.range(lo.as_micros() as u64, hi.as_micros() as u64) as i64)
 }
 
 /// Mint a fresh, deterministic UUID from the testkit RNG. Never
@@ -405,7 +422,7 @@ fn build_attempt(
     rng: &mut Rng,
     ctx: &AttemptCtx,
     node: NodeId,
-    charged_at_us: i64,
+    charged_at: Timestamp,
     kind: AttemptKind,
     seq: u64,
     bufs: &mut Buffers,
@@ -413,7 +430,7 @@ fn build_attempt(
     let attempt_id = AttemptId(next_uuid(rng));
     let allocation_id = AllocationId(next_uuid(rng));
 
-    let (attempt_state, alloc_state, funded, started_at_us, accruing) = match kind {
+    let (attempt_state, alloc_state, funded, started_at, accruing) = match kind {
         AttemptKind::Accruing => {
             // Partially funded by construction: this is what distinguishes
             // Accruing from Funded in the real apply loop.
@@ -446,7 +463,8 @@ fn build_attempt(
             false,
         ),
         AttemptKind::Running => {
-            let started = charged_at_us + rng.range(1_000_000, 60_000_000) as i64;
+            let started =
+                charged_at + rand_span(rng, Duration::from_secs(1), Duration::from_mins(1));
             (
                 AttemptState::Running,
                 AllocationState::Active,
@@ -456,7 +474,8 @@ fn build_attempt(
             )
         }
         AttemptKind::Finalizing => {
-            let started = charged_at_us + rng.range(1_000_000, 60_000_000) as i64;
+            let started =
+                charged_at + rand_span(rng, Duration::from_secs(1), Duration::from_mins(1));
             (
                 AttemptState::Finalizing,
                 AllocationState::Active,
@@ -473,7 +492,9 @@ fn build_attempt(
                 AttemptOutcome::Revoked
                 | AttemptOutcome::PullFailed { .. }
                 | AttemptOutcome::StartFailed { .. } => None,
-                _ => Some(charged_at_us + rng.range(1_000_000, 60_000_000) as i64),
+                _ => Some(
+                    charged_at + rand_span(rng, Duration::from_secs(1), Duration::from_mins(1)),
+                ),
             };
             (
                 AttemptState::Terminal(outcome.clone()),
@@ -500,12 +521,12 @@ fn build_attempt(
             group: GroupId(ctx.job.0),
             charge: ChargeRecord {
                 amount: ctx.charge_amount,
-                charged_at_us,
+                charged_at,
                 refund_fraction_milli: quota::FULL_REFUND_MILLI,
             },
             rate_ucu_per_second: ctx.rate,
             multiplier: ctx.multiplier,
-            started_at_us,
+            started_at,
         },
     ));
     let allocation = Allocation {
@@ -532,7 +553,7 @@ fn gen_history(
     rng: &mut Rng,
     ctx: &AttemptCtx,
     node_ids: &[NodeId],
-    submitted_at_us: i64,
+    submitted_at: Timestamp,
     next_seq: &mut u64,
     bufs: &mut Buffers,
 ) -> Vec<AttemptId> {
@@ -541,7 +562,7 @@ fn gen_history(
         let count = rng.range(1, 3);
         for _ in 0..count {
             let node = *rng.pick(node_ids);
-            let charged_at = submitted_at_us + rng.range(0, 60_000_000) as i64;
+            let charged_at = submitted_at + rand_span(rng, Duration::ZERO, Duration::from_mins(1));
             let outcome = random_early_outcome(rng);
             let seq = *next_seq;
             *next_seq += 1;
@@ -615,7 +636,7 @@ struct QuotaTree {
 /// Build a 3-level quota-entity tree (root orgs -> teams -> leaves) with
 /// `total` entities spread across the levels, each carrying a nonzero usage
 /// accumulator.
-fn build_quota_tree(rng: &mut Rng, total: usize, base_time_us: i64) -> QuotaTree {
+fn build_quota_tree(rng: &mut Rng, total: usize, base_time: Timestamp) -> QuotaTree {
     let total = total.max(3);
     let roots = (total / 20).max(1);
     let teams = (total / 5).max(roots + 1);
@@ -629,7 +650,7 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time_us: i64) -> QuotaTree
         let quota = CostUnits(rng.range(1_000_000_000, 100_000_000_000_000));
         let usage = UsageState {
             usage: CostUnits(rng.range(0, quota.0.max(2))),
-            last_update_us: base_time_us,
+            last_update: base_time,
         };
         entities.push((
             id,
@@ -650,7 +671,7 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time_us: i64) -> QuotaTree
         let quota = CostUnits(rng.range(100_000_000, 10_000_000_000_000));
         let usage = UsageState {
             usage: CostUnits(rng.range(0, quota.0.max(2))),
-            last_update_us: base_time_us,
+            last_update: base_time,
         };
         entities.push((
             id,
@@ -671,7 +692,7 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time_us: i64) -> QuotaTree
         let quota = CostUnits(rng.range(10_000_000, 1_000_000_000_000));
         let usage = UsageState {
             usage: CostUnits(rng.range(0, quota.0.max(2))),
-            last_update_us: base_time_us,
+            last_update: base_time,
         };
         entities.push((
             id,

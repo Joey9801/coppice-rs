@@ -13,6 +13,7 @@ use coppice_core::id::AllocationId;
 use coppice_core::job::Job;
 use coppice_core::quota::PriorityMultiplier;
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::SubmitJob;
 use coppice_state::{Command, RejectionReason, StateMachine};
 
@@ -21,8 +22,8 @@ use coppice_testkit::synth::{synth_state, SynthConfig};
 
 use proptest::prelude::*;
 
-fn schedule(sm: &StateMachine, now_us: i64) -> PlacementProposal {
-    HeuristicScheduler::default().schedule(sm, now_us)
+fn schedule(sm: &StateMachine, now: Timestamp) -> PlacementProposal {
+    HeuristicScheduler::default().schedule(sm, now)
 }
 
 /// Apply a proposal via a real command, returning the minted allocation ids in
@@ -47,7 +48,7 @@ fn apply_proposal(
 #[derive(Debug, Clone)]
 struct JobGen {
     requests: Resources,
-    max_runtime_s: Option<u64>,
+    max_runtime_s: Option<i64>,
     multiplier_n: u64,
     seed_running: bool,
 }
@@ -91,7 +92,7 @@ fn node_strategy() -> impl Strategy<Value = Resources> {
 fn job_strategy() -> impl Strategy<Value = JobGen> {
     (
         resources_strategy(),
-        prop::option::of(300u64..86_400),
+        prop::option::of(300i64..86_400),
         1u64..6,
         any::<bool>(),
     )
@@ -128,7 +129,10 @@ fn build_state(s: &Scenario) -> StateMachine {
     apply_ok(&mut sm, configure_entity_cmd(ROOT, None));
     apply_ok(&mut sm, update_policy_cmd(test_policy(s.accrual_limit)));
     for (i, cap) in s.nodes.iter().enumerate() {
-        apply_ok(&mut sm, register_node_cmd(nid((i + 1) as u128), *cap, TS));
+        apply_ok(
+            &mut sm,
+            register_node_cmd(nid((i + 1) as u128), *cap, base_ts()),
+        );
     }
 
     let first_cap = s.nodes[0];
@@ -138,7 +142,13 @@ fn build_state(s: &Scenario) -> StateMachine {
         let multiplier = PriorityMultiplier(job.multiplier_n << 32);
         apply_ok(
             &mut sm,
-            submit_cmd(job_id, job.requests, job.max_runtime_s, multiplier, TS),
+            submit_cmd(
+                job_id,
+                job.requests,
+                job.max_runtime_s,
+                multiplier,
+                base_ts(),
+            ),
         );
         if job.seed_running {
             let after = used_on_first.saturating_add(&job.requests);
@@ -150,11 +160,14 @@ fn build_state(s: &Scenario) -> StateMachine {
                 let alloc = alid(1_000 + i as u128);
                 apply_ok(
                     &mut sm,
-                    place_cmd(placement(job_id, attempt, alloc, nid(1), job.requests), TS),
+                    place_cmd(
+                        placement(job_id, attempt, alloc, nid(1), job.requests),
+                        base_ts(),
+                    ),
                 );
                 if sm.allocations[&alloc].allocation.state == AllocationState::Funded {
-                    apply_ok(&mut sm, dispatch_cmd(attempt, TS));
-                    apply_ok(&mut sm, started_cmd(attempt, TS));
+                    apply_ok(&mut sm, dispatch_cmd(attempt, base_ts()));
+                    apply_ok(&mut sm, started_cmd(attempt, base_ts()));
                     used_on_first = after;
                 }
             }
@@ -183,7 +196,7 @@ proptest! {
     fn schedule_then_apply_never_rejects_and_reaches_a_fixpoint(scenario in scenario_strategy()) {
         let mut sm = build_state(&scenario);
         let mut mint = minter();
-        let mut now = TS + 10;
+        let mut now = ts(TS_US + 10);
         let mut converged = false;
         for _ in 0..64 {
             let proposal = schedule(&sm, now);
@@ -199,7 +212,7 @@ proptest! {
                 let state = sm.allocations[alloc].allocation.state;
                 prop_assert_eq!(funded, is_funded(state), "expect_funded mismatch for {}", alloc);
             }
-            now += 1_000_000;
+            now += Duration::from_secs(1);
         }
         prop_assert!(converged, "the pass never reached a fixpoint");
     }
@@ -224,7 +237,7 @@ fn synth_seeds_apply_without_rejection() {
         cfg.seed = seed;
         let mut sm = synth_state(&cfg);
         // synth timestamps predate its base instant; schedule just after it.
-        let now = 1_700_000_000_000_000 + 1_000_000;
+        let now = ts(1_700_000_000_000_000 + 1_000_000);
         apply_ok(&mut sm, register_node_cmd(nid(0xB16_00DE), roomy, now));
 
         let proposal = schedule(&sm, now);
@@ -254,7 +267,7 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
         entrypoint: None,
         requests: cpu(4_000),
         priority: 0,
-        max_runtime_us: Some(600_000_000),
+        max_runtime: Some(Duration::from_mins(10)),
         quota_entity: ROOT,
         retry: coppice_core::job::RetryPolicy::default(),
         abort_requested: None,
@@ -264,17 +277,17 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
         Command::SubmitJob(SubmitJob {
             job,
             multiplier: PriorityMultiplier::ONE,
-            submitted_at_us: TS,
+            submitted_at: base_ts(),
         }),
     );
 
-    let proposal = schedule(&sm, TS + 1);
+    let proposal = schedule(&sm, ts(TS_US + 1));
     assert_eq!(proposal.placements.len(), 1);
     let target = proposal.placements[0].node;
 
     // Interfere: drain the very node the proposal targets. The proposal is now
     // stale.
-    apply_ok(&mut sm, drain_cmd(target, TS + 2));
+    apply_ok(&mut sm, drain_cmd(target, ts(TS_US + 2)));
 
     let mut stale_mint = minter();
     let err = apply_proposal(&mut sm, &proposal, &mut stale_mint)
@@ -293,7 +306,7 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
 
     // Re-scheduling against the new snapshot yields a proposal that applies (the
     // only node is drained, so it is empty — which applies cleanly).
-    let fresh = schedule(&sm, TS + 3);
+    let fresh = schedule(&sm, ts(TS_US + 3));
     assert!(fresh.is_empty(), "no schedulable node remains");
     let mut fresh_mint = minter();
     apply_proposal(&mut sm, &fresh, &mut fresh_mint).expect("a fresh proposal applies");
@@ -304,7 +317,7 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
 fn throughput_one_million_jobs_under_budget() {
     let cfg = SynthConfig::with_jobs(1_000_000);
     let mut sm = synth_state(&cfg);
-    let now = 1_700_000_000_000_000 + 1_000_000;
+    let now = ts(1_700_000_000_000_000 + 1_000_000);
 
     // synth's live allocations oversubscribe every node, so on the raw state a
     // pass is scan-only: it scores the backlog and walks the nodes but emits

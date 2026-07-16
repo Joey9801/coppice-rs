@@ -12,7 +12,7 @@ import {
 } from 'lucide-react'
 import type { JobId, TimelineEvent } from '@/api/types'
 import { useJobTimeline } from '@/api/queries'
-import { formatTimeAgo, formatTimestampUs } from '@/lib/format'
+import { formatTimeAgo, formatTimestamp } from '@/lib/format'
 import { EmptyState, IdLink } from '@/components'
 import { Skeleton } from '@/components/ui/skeleton'
 
@@ -53,9 +53,9 @@ export function JobTimeline({ jobId }: { jobId: JobId }) {
             <div className="min-w-0 flex-1">
               <div className="text-sm text-foreground">{eventSentence(event)}</div>
               <div className="mt-0.5 text-xs text-muted-foreground">
-                <span title={formatTimestampUs(event.atUs)}>{formatTimestampUs(event.atUs)}</span>
+                <span title={formatTimestamp(event.at)}>{formatTimestamp(event.at)}</span>
                 <span className="mx-1.5">·</span>
-                <span>{formatTimeAgo(event.atUs)}</span>
+                <span>{formatTimeAgo(event.at)}</span>
               </div>
             </div>
           </li>

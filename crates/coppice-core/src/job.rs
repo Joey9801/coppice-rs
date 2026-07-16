@@ -18,6 +18,7 @@
 
 use crate::id::{AttemptId, JobId, QuotaEntityId};
 use crate::resource::Resources;
+use crate::time::{Duration, Timestamp};
 
 /// A job as submitted by a user, plus the metadata needed to schedule it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,10 +40,11 @@ pub struct Job {
     /// burning budget faster pushes this job forward. See
     /// `docs/decisions/0005-cost-based-soft-quotas.md`.
     pub priority: i32,
-    /// Enforced runtime bound in microseconds. Part of the job's price
-    /// (ADR 0005) and the license to backfill (ADR 0014); jobs without one
-    /// never touch pledged capacity and are charged a policy default runtime.
-    pub max_runtime_us: Option<u64>,
+    /// Enforced runtime bound. Part of the job's price (ADR 0005) and the
+    /// license to backfill (ADR 0014); jobs without one never touch pledged
+    /// capacity and are charged a policy default runtime. Always positive —
+    /// the conversion boundary rejects zero and negative bounds.
+    pub max_runtime: Option<Duration>,
     /// The quota-entity leaf this job charges (every ancestor on its path is
     /// charged too).
     pub quota_entity: QuotaEntityId,
@@ -84,8 +86,8 @@ impl Default for RetryPolicy {
 pub struct AbortRequest {
     /// Optional user-supplied reason, surfaced in job history and events.
     pub reason: Option<String>,
-    /// When the abort was committed (proposer-stamped, Unix µs).
-    pub requested_at_us: i64,
+    /// When the abort was committed (proposer-stamped).
+    pub requested_at: Timestamp,
     // Requester identity arrives with the identity ADR; its wire tag is
     // already earmarked in coppice.core.v1.AbortRequest.
 }

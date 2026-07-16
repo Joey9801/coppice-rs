@@ -16,6 +16,7 @@ use coppice_core::job::{AbortRequest, Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::quota::{self, ChargeRecord, CostUnits, TrueUp, UsageState};
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 
 use crate::command::{
     AbortJob, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity, DeclareNodeLost,
@@ -91,8 +92,8 @@ impl StateMachine {
                 spec: c.job.clone(),
                 state: JobState::Queued,
                 multiplier: c.multiplier,
-                submitted_at_us: c.submitted_at_us,
-                terminal_at_us: None,
+                submitted_at: c.submitted_at,
+                terminal_at: None,
                 retries_used: 0,
                 attempts: Vec::new(),
             },
@@ -128,19 +129,14 @@ impl StateMachine {
             if r.spec.abort_requested.is_none() {
                 r.spec.abort_requested = Some(AbortRequest {
                     reason: c.reason.clone(),
-                    requested_at_us: c.requested_at_us,
+                    requested_at: c.requested_at,
                 });
             }
         }
         match state {
             // No live attempt: abort is immediate.
             JobState::Submitted | JobState::Accepted | JobState::Queued => {
-                self.job_terminal_transition(
-                    c.job,
-                    JobState::Aborted,
-                    c.requested_at_us,
-                    &mut events,
-                );
+                self.job_terminal_transition(c.job, JobState::Aborted, c.requested_at, &mut events);
             }
             // An attempt is in flight; the state carries its id (ADR 0030), so
             // steer on that attempt's own state directly.
@@ -151,8 +147,8 @@ impl StateMachine {
                         self.terminate_attempt(
                             id,
                             AttemptOutcome::Aborted,
-                            0,
-                            c.requested_at_us,
+                            Duration::ZERO,
+                            c.requested_at,
                             true,
                             &mut events,
                             None,
@@ -254,8 +250,8 @@ impl StateMachine {
                 self.terminate_attempt(
                     attempt,
                     AttemptOutcome::Revoked,
-                    0,
-                    c.proposed_at_us,
+                    Duration::ZERO,
+                    c.proposed_at,
                     true,
                     &mut events,
                     Some(&mut used),
@@ -272,9 +268,9 @@ impl StateMachine {
                     (
                         j.spec.quota_entity,
                         j.multiplier,
-                        j.spec.max_runtime_us.is_some(),
+                        j.spec.max_runtime.is_some(),
                         j.spec
-                            .max_runtime_us
+                            .max_runtime
                             .map(quota::runtime_seconds_ceil)
                             .unwrap_or(self.policy.default_charge_runtime_s),
                         j.spec.requests,
@@ -354,12 +350,12 @@ impl StateMachine {
                     group: p.group,
                     charge: ChargeRecord {
                         amount: charge,
-                        charged_at_us: c.proposed_at_us,
+                        charged_at: c.proposed_at,
                         refund_fraction_milli,
                     },
                     rate_ucu_per_second: rate,
                     multiplier,
-                    started_at_us: None,
+                    started_at: None,
                 },
             );
             events.push(Event::AttemptStateChanged {
@@ -384,7 +380,7 @@ impl StateMachine {
             // Quota charge at placement (ADR 0019); true-up settles against
             // this at terminal resolution using the recorded rate and
             // multiplier.
-            self.charge_ancestors(entity, charge, c.proposed_at_us);
+            self.charge_ancestors(entity, charge, c.proposed_at);
         }
         Ok(Applied { events })
     }
@@ -557,7 +553,7 @@ impl StateMachine {
             Some(_) => {}
         }
         let mut events = Vec::new();
-        self.mark_attempt_running(c.attempt, c.observed_at_us, &mut events);
+        self.mark_attempt_running(c.attempt, c.observed_at, &mut events);
         Ok(Applied { events })
     }
 
@@ -594,8 +590,8 @@ impl StateMachine {
         self.terminate_attempt(
             c.attempt,
             c.outcome.clone(),
-            c.actual_runtime_us,
-            c.observed_at_us,
+            c.actual_runtime,
+            c.observed_at,
             true,
             &mut events,
             None,
@@ -673,7 +669,7 @@ impl StateMachine {
                 .map(|a| a.attempt.state == AttemptState::Dispatching)
                 .unwrap_or(false);
             if dispatching {
-                self.mark_attempt_running(*id, c.observed_at_us, &mut events);
+                self.mark_attempt_running(*id, c.observed_at, &mut events);
             }
         }
         for l in &c.lost {
@@ -686,8 +682,8 @@ impl StateMachine {
                 self.terminate_attempt(
                     l.attempt,
                     l.outcome.clone(),
-                    l.actual_runtime_us,
-                    c.observed_at_us,
+                    l.actual_runtime,
+                    c.observed_at,
                     true,
                     &mut events,
                     None,
@@ -763,17 +759,17 @@ impl StateMachine {
             .collect();
         victims.sort_unstable_by_key(|(seq, _)| *seq);
         for (_, attempt) in victims {
-            let runtime_us = self
+            let runtime = self
                 .attempts
                 .get(&attempt)
-                .and_then(|a| a.started_at_us)
-                .map(|s| (c.declared_at_us - s).max(0) as u64)
-                .unwrap_or(0);
+                .and_then(|a| a.started_at)
+                .map(|s| (c.declared_at - s).max(Duration::ZERO))
+                .unwrap_or(Duration::ZERO);
             self.terminate_attempt(
                 attempt,
                 AttemptOutcome::NodeLost,
-                runtime_us,
-                c.declared_at_us,
+                runtime,
+                c.declared_at,
                 false,
                 &mut events,
                 None,
@@ -872,7 +868,7 @@ impl StateMachine {
                         parent: c.parent,
                         name: c.name.clone(),
                         quota: c.quota,
-                        usage: UsageState::new(c.updated_at_us),
+                        usage: UsageState::new(c.updated_at),
                     },
                 );
             }
@@ -936,7 +932,7 @@ impl StateMachine {
     }
 
     /// [`job_transition`](Self::job_transition) into a terminal state,
-    /// stamping `terminal_at_us` — the timestamp the eviction retention
+    /// stamping `terminal_at` — the timestamp the eviction retention
     /// clock runs from (ADR 0012).
     ///
     /// Callers reject or no-op on already-terminal jobs, so the first stamp
@@ -946,12 +942,12 @@ impl StateMachine {
         &mut self,
         job: JobId,
         to: JobState,
-        ts_us: i64,
+        at: Timestamp,
         events: &mut Vec<Event>,
     ) {
         if let Some(r) = self.jobs.get_mut(&job) {
-            if r.terminal_at_us.is_none() {
-                r.terminal_at_us = Some(ts_us);
+            if r.terminal_at.is_none() {
+                r.terminal_at = Some(at);
             }
         }
         self.job_transition(job, to, events);
@@ -979,14 +975,14 @@ impl StateMachine {
     fn mark_attempt_running(
         &mut self,
         attempt: AttemptId,
-        observed_at_us: i64,
+        observed_at: Timestamp,
         events: &mut Vec<Event>,
     ) {
         let Some(a) = self.attempts.get_mut(&attempt) else {
             return;
         };
-        if a.started_at_us.is_none() {
-            a.started_at_us = Some(observed_at_us);
+        if a.started_at.is_none() {
+            a.started_at = Some(observed_at);
         }
         let allocation = a.attempt.allocation;
         // Only the attempt and its allocation move; the job stays
@@ -1012,8 +1008,8 @@ impl StateMachine {
         &mut self,
         attempt: AttemptId,
         outcome: AttemptOutcome,
-        actual_runtime_us: u64,
-        ts_us: i64,
+        actual_runtime: Duration,
+        at: Timestamp,
         pledge: bool,
         events: &mut Vec<Event>,
         used: Option<&mut BTreeMap<NodeId, Resources>>,
@@ -1026,7 +1022,7 @@ impl StateMachine {
         }
         let job = a.attempt.job;
         let allocation = a.attempt.allocation;
-        let started = a.started_at_us.is_some();
+        let started = a.started_at.is_some();
         let charge = a.charge;
         let rate = a.rate_ucu_per_second;
         let multiplier = a.multiplier;
@@ -1040,7 +1036,7 @@ impl StateMachine {
         let actual = if started {
             quota::cost_from_rate(
                 rate,
-                quota::runtime_seconds_ceil(actual_runtime_us),
+                quota::runtime_seconds_ceil(actual_runtime),
                 multiplier,
             )
         } else {
@@ -1051,12 +1047,12 @@ impl StateMachine {
         // …), so requeue and platform-fault retries stay free of it.
         let retain = started && outcome.class() != OutcomeClass::Platform;
         let decay = self.policy.decay;
-        let adjustment = quota::true_up(&charge, actual, ts_us, &decay, retain);
+        let adjustment = quota::true_up(&charge, actual, at, &decay, retain);
         if let Some(entity) = self.jobs.get(&job).map(|j| j.spec.quota_entity) {
-            self.settle_ancestors(entity, adjustment, ts_us);
+            self.settle_ancestors(entity, adjustment, at);
         }
 
-        self.resolve_job(job, &outcome, ts_us, events);
+        self.resolve_job(job, &outcome, at, events);
     }
 
     fn release_allocation(
@@ -1089,14 +1085,14 @@ impl StateMachine {
 
     /// Resolve the job after its attempt reached a terminal outcome.
     ///
-    /// `ts_us` is the resolving command's proposer timestamp; it becomes the
-    /// job's `terminal_at_us` when resolution lands terminal (a requeue
+    /// `at` is the resolving command's proposer timestamp; it becomes the
+    /// job's `terminal_at` when resolution lands terminal (a requeue
     /// leaves the field `None`).
     fn resolve_job(
         &mut self,
         job: JobId,
         outcome: &AttemptOutcome,
-        ts_us: i64,
+        at: Timestamp,
         events: &mut Vec<Event>,
     ) {
         let Some(rec) = self.jobs.get(&job) else {
@@ -1155,7 +1151,7 @@ impl StateMachine {
         };
         match resolution {
             Resolution::Terminal(to) => {
-                self.job_terminal_transition(job, to, ts_us, events);
+                self.job_terminal_transition(job, to, at, events);
             }
             Resolution::Requeue { consume_budget } => {
                 if consume_budget {
@@ -1346,7 +1342,7 @@ impl StateMachine {
     ///
     /// The walk is depth-capped so even a corrupted parent chain stays
     /// bounded.
-    fn charge_ancestors(&mut self, entity: QuotaEntityId, amount: CostUnits, ts_us: i64) {
+    fn charge_ancestors(&mut self, entity: QuotaEntityId, amount: CostUnits, at: Timestamp) {
         let decay = self.policy.decay;
         let mut cur = Some(entity);
         for _ in 0..QUOTA_TREE_DEPTH_CAP {
@@ -1354,12 +1350,12 @@ impl StateMachine {
             let Some(e) = self.quota_entities.get_mut(&id) else {
                 break;
             };
-            e.usage.charge(amount, ts_us, &decay);
+            e.usage.charge(amount, at, &decay);
             cur = e.parent;
         }
     }
 
-    fn settle_ancestors(&mut self, entity: QuotaEntityId, adjustment: TrueUp, ts_us: i64) {
+    fn settle_ancestors(&mut self, entity: QuotaEntityId, adjustment: TrueUp, at: Timestamp) {
         let decay = self.policy.decay;
         let mut cur = Some(entity);
         for _ in 0..QUOTA_TREE_DEPTH_CAP {
@@ -1367,7 +1363,7 @@ impl StateMachine {
             let Some(e) = self.quota_entities.get_mut(&id) else {
                 break;
             };
-            e.usage.settle(adjustment, ts_us, &decay);
+            e.usage.settle(adjustment, at, &decay);
             cur = e.parent;
         }
     }
@@ -1379,7 +1375,7 @@ impl StateMachine {
 /// Compares every client-supplied field. `abort_requested` is excluded: it
 /// is apply-owned after commit (an `AbortJob` may have set it since), and
 /// `SubmitJob` validation already rejects a command that arrives with it
-/// pre-set. The command's `multiplier` and `submitted_at_us` are likewise
+/// pre-set. The command's `multiplier` and `submitted_at` are likewise
 /// not identity: a retry re-stamps both, and the original commit's values
 /// stay authoritative.
 fn same_submission(existing: &Job, retried: &Job) -> bool {
@@ -1389,7 +1385,7 @@ fn same_submission(existing: &Job, retried: &Job) -> bool {
         && existing.entrypoint == retried.entrypoint
         && existing.requests == retried.requests
         && existing.priority == retried.priority
-        && existing.max_runtime_us == retried.max_runtime_us
+        && existing.max_runtime == retried.max_runtime
         && existing.quota_entity == retried.quota_entity
         && existing.retry == retried.retry
 }

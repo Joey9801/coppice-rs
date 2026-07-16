@@ -19,12 +19,13 @@
 //! the same rejection.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::sync::watch;
 
 use coppice_consensus::{Consensus, ConsensusStatus, StateViews};
 use coppice_core::id::{AllocationId, AttemptId};
+use coppice_core::time::Timestamp;
 use coppice_scheduler::Scheduler;
 use coppice_state::Command;
 
@@ -57,7 +58,7 @@ pub async fn run<C, S>(
 
         loop {
             let view = views.latest();
-            let now = now_us();
+            let now = Timestamp::now();
             let pass_scheduler = Arc::clone(&scheduler);
             let proposal = match tokio::task::spawn_blocking(move || {
                 pass_scheduler.schedule(view.state(), now)
@@ -129,11 +130,4 @@ pub async fn run<C, S>(
             }
         }
     }
-}
-
-fn now_us() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }

@@ -3,7 +3,7 @@ import type { CostReport, Resources } from '@/api/types'
 import {
   formatBytes,
   formatCpu,
-  formatDurationUs,
+  formatDuration,
   formatMultiplier,
   formatPercent,
   formatUcu,
@@ -152,7 +152,7 @@ function ChargeSection({
   const windowLine = (
     <span className="text-xs text-muted-foreground">
       {formatUcuRatePerHour(cost.effectiveRateUcuPerSecond)} ×{' '}
-      {formatDurationUs(cost.chargeWindowUs)}{' '}
+      {formatDuration(cost.chargeWindowSeconds)}{' '}
       {cost.chargeWindowIsDefault ? 'default window' : 'max runtime'}
     </span>
   )

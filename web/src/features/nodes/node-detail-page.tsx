@@ -10,7 +10,7 @@ import type {
 } from '@/api/types'
 import { useNode, useNodeHistory, useNodeLogs, useNodeUtilization } from '@/api/queries'
 import {
-  formatDurationUs,
+  formatDuration,
   formatPercent,
   formatTimeUntil,
   formatUcu,
@@ -114,10 +114,10 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
       {lost ? (
         <Banner tone="destructive">
           Agent lost — no heartbeat for{' '}
-          {summary.lastHeartbeatUs == null ? (
+          {summary.lastHeartbeat == null ? (
             'an unknown interval'
           ) : (
-            <TimeAgo tUs={summary.lastHeartbeatUs} className="font-medium" />
+            <TimeAgo t={summary.lastHeartbeat} className="font-medium" />
           )}
           . Epoch fenced at {summary.epoch}; running attempts will be declared NodeLost.
         </Banner>
@@ -206,7 +206,7 @@ function HeaderDescription({ summary }: { summary: NodeSummary }) {
       ))}
       <span className="text-sm text-muted-foreground">
         epoch {summary.epoch} · last heartbeat{' '}
-        {summary.lastHeartbeatUs == null ? 'never' : <TimeAgo tUs={summary.lastHeartbeatUs} />}
+        {summary.lastHeartbeat == null ? 'never' : <TimeAgo t={summary.lastHeartbeat} />}
       </span>
     </span>
   )
@@ -264,10 +264,10 @@ function ActiveAttemptsTable({ attempts }: { attempts: AttemptView[] }) {
               <StatePill state={a.state} />
             </TableCell>
             <TableCell>
-              {a.startedAtUs == null ? (
+              {a.startedAt == null ? (
                 <span className="text-muted-foreground">—</span>
               ) : (
-                <TimeAgo tUs={a.startedAtUs} className="text-sm text-muted-foreground" />
+                <TimeAgo t={a.startedAt} className="text-sm text-muted-foreground" />
               )}
             </TableCell>
             <TableCell className="text-right tabular-nums">
@@ -309,10 +309,10 @@ function AccrualQueueTable({ queue }: { queue: AccrualView[] }) {
                 </div>
               </TableCell>
               <TableCell>
-                {entry.projectedStartUs == null ? (
+                {entry.projectedStart == null ? (
                   <span className="text-amber-700 dark:text-amber-300">unbounded</span>
                 ) : (
-                  <span className="tabular-nums">{formatTimeUntil(entry.projectedStartUs)}</span>
+                  <span className="tabular-nums">{formatTimeUntil(entry.projectedStart)}</span>
                 )}
               </TableCell>
               <TableCell className="text-right tabular-nums text-muted-foreground">
@@ -381,14 +381,14 @@ function HistoryTable({ entries }: { entries: NodeHistoryEntry[] }) {
             </TableCell>
             <TableCell>{outcomePill(e.outcome)}</TableCell>
             <TableCell className="text-right tabular-nums">
-              {e.startedAtUs == null ? (
+              {e.startedAt == null ? (
                 <span className="text-muted-foreground">—</span>
               ) : (
-                formatDurationUs(e.endedAtUs - e.startedAtUs)
+                formatDuration((e.endedAt.getTime() - e.startedAt.getTime()) / 1000)
               )}
             </TableCell>
             <TableCell className="text-right">
-              <TimeAgo tUs={e.endedAtUs} className="text-sm text-muted-foreground" />
+              <TimeAgo t={e.endedAt} className="text-sm text-muted-foreground" />
             </TableCell>
           </TableRow>
         ))}

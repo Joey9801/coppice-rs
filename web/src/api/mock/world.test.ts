@@ -43,13 +43,13 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
     const detail = world.buildJobDetail(summary.id)
     const terminal = isTerminalJobState(detail.state)
 
-    // Terminal jobs: outcome + terminalAtUs ≥ submittedAtUs.
+    // Terminal jobs: outcome + terminalAt ≥ submittedAt.
     if (terminal) {
-      expect(detail.terminalAtUs).not.toBeNull()
-      expect(detail.terminalAtUs ?? 0).toBeGreaterThanOrEqual(detail.submittedAtUs)
+      expect(detail.terminalAt).not.toBeNull()
+      expect(detail.terminalAt!.getTime()).toBeGreaterThanOrEqual(detail.submittedAt.getTime())
       expect(summary.outcome).not.toBeNull()
     } else {
-      expect(detail.terminalAtUs).toBeNull()
+      expect(detail.terminalAt).toBeNull()
     }
 
     // entityChain runs root → leaf, matches parent links, ends at the owner.
@@ -97,7 +97,7 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
 
     // Accrual: fundedFraction per dim = funded/requested; projectedStart null or ≥ now.
     if (detail.accrual) {
-      const { allocation, fundedFraction, projectedStartUs } = detail.accrual
+      const { allocation, fundedFraction, projectedStart } = detail.accrual
       expect(fundedFraction.cpu).toBeCloseTo(
         allocation.funded.cpuMillis / allocation.requested.cpuMillis,
         6,
@@ -107,7 +107,9 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
         6,
       )
       expect(fits(allocation.funded, allocation.requested)).toBe(true)
-      if (projectedStartUs !== null) expect(projectedStartUs).toBeGreaterThanOrEqual(nowUs)
+      // `nowUs` is the simulation clock; the view carries a `Date`.
+      if (projectedStart !== null)
+        expect(projectedStart.getTime()).toBeGreaterThanOrEqual(nowUs / 1000)
     }
 
     // Non-terminal cost: no actual/trueUp yet.
@@ -154,7 +156,7 @@ describe('MockWorld construction', () => {
     const stats = world.buildQueueStats()
     expect(stats.history.length).toBeGreaterThanOrEqual(60)
     for (let i = 1; i < stats.history.length; i += 1) {
-      expect(stats.history[i]!.tUs).toBeGreaterThan(stats.history[i - 1]!.tUs)
+      expect(stats.history[i]!.t.getTime()).toBeGreaterThan(stats.history[i - 1]!.t.getTime())
     }
   })
 
@@ -165,7 +167,7 @@ describe('MockWorld construction', () => {
 
     const { events, floorIndex } = world.buildClusterOverview().recentEvents
     expect(events.length).toBeGreaterThan(0)
-    // Newest first, strictly ordered by identity — never by atUs (ADR 0032).
+    // Newest first, strictly ordered by identity — never by `at` (ADR 0032).
     for (let i = 1; i < events.length; i += 1) {
       const [newer, older] = [events[i - 1]!, events[i]!]
       expect(
@@ -263,7 +265,7 @@ describe('MockWorld simulation', () => {
     world.advanceTo(t)
     const stats = world.buildQueueStats()
     expect(stats.byState.Queued).toBeGreaterThanOrEqual(5)
-    expect(stats.oldestQueuedAgeUs ?? 0).toBeGreaterThanOrEqual(2 * 60_000_000)
+    expect(stats.oldestQueuedAgeSeconds ?? 0).toBeGreaterThanOrEqual(2 * 60)
   })
 
   it('advances raft/state version as it ticks', () => {
@@ -415,7 +417,7 @@ describe('MockWorld quota entities', () => {
       quotaUcu: 9_000_000,
     })
     expect(updated.quotaUcu).toBe(9_000_000)
-    expect(updated.createdAtUs).toBe(created.createdAtUs)
+    expect(updated.createdAt).toEqual(created.createdAt)
   })
 
   it('rejects invalid configure inputs (name, parent, sso rename, cycle)', () => {
@@ -503,7 +505,7 @@ describe('MockWorld quota entities', () => {
       expect(hist.length).toBeGreaterThan(0)
       expect(hist.length).toBeLessThanOrEqual(120)
       for (let i = 1; i < hist.length; i += 1) {
-        expect(hist[i]!.tUs).toBeGreaterThan(hist[i - 1]!.tUs)
+        expect(hist[i]!.t.getTime()).toBeGreaterThan(hist[i - 1]!.t.getTime())
       }
     }
   })

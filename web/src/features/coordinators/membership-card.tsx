@@ -108,7 +108,7 @@ export function MembershipCard({ members, leader, className }: MembershipCardPro
                   <HostBars host={m.host} />
                 </TableCell>
                 <TableCell>
-                  <TimeAgo tUs={m.lastSeenUs} className="text-muted-foreground" />
+                  <TimeAgo t={m.lastSeen} className="text-muted-foreground" />
                 </TableCell>
               </TableRow>
             ))}

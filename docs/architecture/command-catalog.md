@@ -29,8 +29,9 @@ committed commands from a snapshot, so any dependence on anything but the
 two arguments is a divergence bug. Concretely:
 
 - **No wall clock.** Every command that needs a time carries it as an
-  explicit `*_at_us` field (Unix microseconds, `int64`), stamped by the
-  proposer. Apply only ever reads timestamps out of the command.
+  explicit `*_at` field (a `Timestamp`, ADR 0033), stamped by the proposer.
+  Apply only ever reads timestamps out of the command — never
+  `Timestamp::now()`.
 - **No randomness, no id minting.** Every `JobId`, `AttemptId`,
   `AllocationId`, and `GroupId` is minted by the proposer and carried in the
   command. Apply never generates an identifier — this is why a retry
@@ -116,7 +117,7 @@ layer between the agent protocol (`coppice_proto::agent`) and the log:
    per state. Duplicates that slip through (leader change mid-stream) are
    caught deterministically at apply by the same monotonicity check and
    reject as `StaleAttemptState` — a benign rejection the proposer ignores.
-3. **Timestamping**: the leader stamps `observed_at_us` on the command at
+3. **Timestamping**: the leader stamps `observed_at` on the command at
    proposal time. Apply never asks what time it is.
 4. **Decision-making**: anything judgement-shaped is resolved *before* the
    log. The ObservedSet diff (adopt / stop / lost) is computed by the
@@ -228,11 +229,11 @@ the same apply resolves the job:
 6. **Allocations release** in the same apply, running the pledge pass on
    each affected node.
 7. **Terminal timestamp.** A resolution that lands terminal stamps the
-   job's `terminal_at_us` from the resolving command's proposer timestamp —
-   an abort's `requested_at_us`, an outcome or reconcile report's
-   `observed_at_us`, a loss declaration's `declared_at_us`. A requeue
+   job's `terminal_at` from the resolving command's proposer timestamp —
+   an abort's `requested_at`, an outcome or reconcile report's
+   `observed_at`, a loss declaration's `declared_at`. A requeue
    leaves it unset. The `EvictTerminalJobs` retention clock (ADR 0012)
-   runs from this stamp, never from `submitted_at_us`: a job may
+   runs from this stamp, never from `submitted_at`: a job may
    legitimately queue longer than the retention interval before it runs.
 
 The job stays `Attempting(id)` for the whole attempt lifetime, including the
@@ -280,6 +281,12 @@ fixed-point weights/multipliers are `uint64` Q32.32, the decay factor is
 `uint64` Q0.64 (ADR 0019). Every command is one arm of the versioned
 envelope `Command { version, oneof body }` (ADR 0003); all v1 commands are
 cluster-version 1.
+
+These are the **proto** field names and types, and they are unchanged. The
+Rust domain types drop the `_us` suffix and carry a `Timestamp` or a
+`Duration` instead (`submitted_at_us: int64` on the wire is
+`submitted_at: Timestamp` in `coppice-state`); `coppice_proto::convert`
+maps between them at the boundary. See ADR 0033.
 
 Every **API-proposed** command additionally carries
 `actor: Actor { principal: string, groups: string[], operator_cert: bool }`,

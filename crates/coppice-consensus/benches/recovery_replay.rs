@@ -34,6 +34,7 @@ use coppice_consensus::fs::{Fs, FsFile, RealFs};
 use coppice_consensus::storage::{EncodedEntry, FrameLogId, StorageCore, StorageOptions};
 use coppice_core::id::NodeId;
 use coppice_core::resource::Resources;
+use coppice_core::time::Timestamp;
 use coppice_proto::convert::{command_from_pb, command_to_pb};
 use coppice_proto::pb::raft::v1 as pbraft;
 use coppice_state::command::RegisterNode;
@@ -67,7 +68,7 @@ fn register_node_command() -> Command {
             disk_bytes: 100 << 30,
         },
         labels: BTreeMap::new(),
-        registered_at_us: 1_700_000_000_000_000,
+        registered_at: Timestamp::from_micros(1_700_000_000_000_000).expect("in range"),
     })
 }
 

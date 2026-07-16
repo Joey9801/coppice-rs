@@ -58,8 +58,8 @@ export function JobAccrualPanel({ accrual }: { accrual: AccrualView }) {
 
         <div className="text-sm">
           <span className="text-muted-foreground">Projected start: </span>
-          {accrual.projectedStartUs != null ? (
-            <span className="text-foreground">{formatTimeUntil(accrual.projectedStartUs)}</span>
+          {accrual.projectedStart != null ? (
+            <span className="text-foreground">{formatTimeUntil(accrual.projectedStart)}</span>
           ) : (
             <span className="text-amber-600 dark:text-amber-400">
               unbounded — no guaranteed release covers this yet

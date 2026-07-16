@@ -26,6 +26,7 @@
 //! `tests/quota_properties.rs` guard that any future fast path preserves it.
 
 use crate::resource::Resources;
+use crate::time::{Duration, Timestamp};
 
 /// Micro-cost-units per cost unit: all [`CostUnits`] values count in µCU.
 pub const MICRO_PER_COST_UNIT: u64 = 1_000_000;
@@ -58,8 +59,8 @@ impl CostUnits {
 /// Errors from validating replicated quota policy.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PolicyError {
-    #[error("tick_us must be positive, got {0}")]
-    NonPositiveTick(i64),
+    #[error("tick must be positive, got {0}")]
+    NonPositiveTick(Duration),
     #[error("decay_per_tick {0} exceeds maximum {max} (λ too close to 1)", max = DecayPolicy::MAX_DECAY_PER_TICK)]
     DecayTooSlow(u64),
 }
@@ -73,8 +74,8 @@ pub enum PolicyError {
 /// only need to agree on these two integers, which replication guarantees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecayPolicy {
-    /// Tick length in microseconds. Must be positive.
-    pub tick_us: i64,
+    /// Tick length. Must be positive.
+    pub tick: Duration,
     /// Per-tick retention factor λ as Q0.64: the fraction of usage kept per
     /// tick is `decay_per_tick / 2^64`. Must not exceed
     /// [`DecayPolicy::MAX_DECAY_PER_TICK`].
@@ -91,13 +92,13 @@ impl DecayPolicy {
     /// The default policy: 60 s ticks, 24 h half-life (1440 ticks), i.e.
     /// `decay_per_tick = round(2^64 · 2^(-1/1440))`. λ¹⁴⁴⁰ = 0.5 − 1.6×10⁻¹⁷.
     pub const DEFAULT: DecayPolicy = DecayPolicy {
-        tick_us: 60_000_000,
+        tick: Duration::from_secs(60),
         decay_per_tick: 18_437_866_829_417_916_986,
     };
 
     pub fn validate(&self) -> Result<(), PolicyError> {
-        if self.tick_us <= 0 {
-            return Err(PolicyError::NonPositiveTick(self.tick_us));
+        if !self.tick.is_positive() {
+            return Err(PolicyError::NonPositiveTick(self.tick));
         }
         if self.decay_per_tick > Self::MAX_DECAY_PER_TICK {
             return Err(PolicyError::DecayTooSlow(self.decay_per_tick));
@@ -105,26 +106,27 @@ impl DecayPolicy {
         Ok(())
     }
 
-    /// The absolute tick index containing a timestamp (Unix µs). Euclidean
-    /// division floors toward −∞, so it is well-defined for pre-epoch times.
-    /// Absolute indices (rather than relative Δt) make timestamp-level decay
-    /// splits sum exactly: `(i(b) − i(a)) + (i(c) − i(b)) = i(c) − i(a)`.
-    pub fn tick_index(&self, ts_us: i64) -> i64 {
-        ts_us.div_euclid(self.tick_us)
+    /// The absolute tick index containing an instant. Euclidean division
+    /// floors toward −∞, so it is well-defined for pre-epoch times. Absolute
+    /// indices (rather than relative Δt) make timestamp-level decay splits sum
+    /// exactly: `(i(b) − i(a)) + (i(c) − i(b)) = i(c) − i(a)`.
+    ///
+    /// Panics if the policy's tick is zero; [`validate`](DecayPolicy::validate)
+    /// rejects that, and replicated policy is validated before it lands.
+    pub fn tick_index(&self, at: Timestamp) -> i64 {
+        at.as_micros().div_euclid(self.tick.as_micros())
     }
 
-    /// Whole ticks elapsed from `from_us` to `to_us`, clamped at zero.
+    /// Whole ticks elapsed from `from` to `to`, clamped at zero.
     ///
     /// The clamp is the clock-skew rule (ADR 0019): command timestamps come
     /// from different leaders and may regress; a regressed timestamp decays
     /// nothing rather than time-travelling.
-    pub fn elapsed_ticks(&self, from_us: i64, to_us: i64) -> u64 {
-        // Indices span at most the i64 range / tick_us, so the difference of
-        // two indices cannot overflow i64's width in practice; saturate to be
+    pub fn elapsed_ticks(&self, from: Timestamp, to: Timestamp) -> u64 {
+        // Indices span at most the i64 range / tick, so the difference of two
+        // indices cannot overflow i64's width in practice; saturate to be
         // airtight at the extremes.
-        let dn = self
-            .tick_index(to_us)
-            .saturating_sub(self.tick_index(from_us));
+        let dn = self.tick_index(to).saturating_sub(self.tick_index(from));
         dn.max(0) as u64
     }
 
@@ -148,31 +150,30 @@ impl DecayPolicy {
         CostUnits(u)
     }
 
-    /// Decay `usage` across the whole ticks elapsed between two timestamps.
-    pub fn decay_between(&self, usage: CostUnits, from_us: i64, to_us: i64) -> CostUnits {
-        self.decay_ticks(usage, self.elapsed_ticks(from_us, to_us))
+    /// Decay `usage` across the whole ticks elapsed between two instants.
+    pub fn decay_between(&self, usage: CostUnits, from: Timestamp, to: Timestamp) -> CostUnits {
+        self.decay_ticks(usage, self.elapsed_ticks(from, to))
     }
 }
 
 /// A quota entity's replicated usage accumulator: the
 /// `(accumulated_usage, last_update_timestamp)` pair of ADR 0005.
 ///
-/// Timestamps are Unix microseconds carried in committed commands (never wall
-/// clock read during apply). Every mutation first brings the accumulator
-/// forward to the command's tick ([`UsageState::touch`]), so decay is lazy
-/// but exact.
+/// Timestamps are carried in committed commands (never wall clock read during
+/// apply). Every mutation first brings the accumulator forward to the
+/// command's tick ([`UsageState::touch`]), so decay is lazy but exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageState {
     pub usage: CostUnits,
-    pub last_update_us: i64,
+    pub last_update: Timestamp,
 }
 
 impl UsageState {
-    /// A fresh accumulator, zero usage as of `created_us`.
-    pub fn new(created_us: i64) -> UsageState {
+    /// A fresh accumulator, zero usage as of `created_at`.
+    pub fn new(created_at: Timestamp) -> UsageState {
         UsageState {
             usage: CostUnits::ZERO,
-            last_update_us: created_us,
+            last_update: created_at,
         }
     }
 
@@ -180,31 +181,31 @@ impl UsageState {
     ///
     /// A timestamp at or before the stored one (clock skew across leader
     /// changes, or the same tick) decays nothing and never moves
-    /// `last_update_us` backwards, so a decay interval can never be applied
+    /// `last_update` backwards, so a decay interval can never be applied
     /// twice.
-    pub fn touch(&mut self, ts_us: i64, policy: &DecayPolicy) {
-        self.usage = policy.decay_between(self.usage, self.last_update_us, ts_us);
-        self.last_update_us = self.last_update_us.max(ts_us);
+    pub fn touch(&mut self, at: Timestamp, policy: &DecayPolicy) {
+        self.usage = policy.decay_between(self.usage, self.last_update, at);
+        self.last_update = self.last_update.max(at);
     }
 
     /// Decay to the command's tick, then add a charge (saturating).
-    pub fn charge(&mut self, amount: CostUnits, ts_us: i64, policy: &DecayPolicy) {
-        self.touch(ts_us, policy);
+    pub fn charge(&mut self, amount: CostUnits, at: Timestamp, policy: &DecayPolicy) {
+        self.touch(at, policy);
         self.usage = self.usage.saturating_add(amount);
     }
 
     /// Decay to the command's tick, then subtract a refund (saturating, so
     /// accumulated rounding in a decayed refund can never underflow).
-    pub fn refund(&mut self, amount: CostUnits, ts_us: i64, policy: &DecayPolicy) {
-        self.touch(ts_us, policy);
+    pub fn refund(&mut self, amount: CostUnits, at: Timestamp, policy: &DecayPolicy) {
+        self.touch(at, policy);
         self.usage = self.usage.saturating_sub(amount);
     }
 
     /// Apply a true-up adjustment from [`true_up`].
-    pub fn settle(&mut self, adjustment: TrueUp, ts_us: i64, policy: &DecayPolicy) {
+    pub fn settle(&mut self, adjustment: TrueUp, at: Timestamp, policy: &DecayPolicy) {
         match adjustment {
-            TrueUp::Refund(amount) => self.refund(amount, ts_us, policy),
-            TrueUp::Surcharge(amount) => self.charge(amount, ts_us, policy),
+            TrueUp::Refund(amount) => self.refund(amount, at, policy),
+            TrueUp::Surcharge(amount) => self.charge(amount, at, policy),
         }
     }
 }
@@ -272,11 +273,17 @@ pub fn resource_rate(requests: &Resources, weights: &CostWeights) -> u64 {
     u64::try_from(rate).unwrap_or(u64::MAX)
 }
 
-/// Round a runtime in microseconds up to whole seconds — the charge-side and
-/// true-up-side rounding, chosen identically so a job that runs exactly its
-/// declared runtime trues up to exactly zero.
-pub fn runtime_seconds_ceil(runtime_us: u64) -> u64 {
-    runtime_us.div_ceil(MICRO_PER_COST_UNIT)
+/// Round a runtime up to whole seconds — the charge-side and true-up-side
+/// rounding, chosen identically so a job that runs exactly its declared
+/// runtime trues up to exactly zero.
+///
+/// A negative runtime prices as zero. [`Duration`] is signed (it is the
+/// difference of two timestamps, and those regress), but a negative *runtime*
+/// is meaningless; clamping is what stops one from reinterpreting as a
+/// ~584 000-year charge on the way through `u64`.
+pub fn runtime_seconds_ceil(runtime: Duration) -> u64 {
+    let micros = runtime.as_micros().max(0) as u64;
+    micros.div_ceil(MICRO_PER_COST_UNIT)
 }
 
 /// Compute cost from an already-computed rate.
@@ -317,8 +324,8 @@ pub fn job_cost(
 pub struct ChargeRecord {
     /// The full job cost charged to every ancestor at placement.
     pub amount: CostUnits,
-    /// Timestamp of the placement command that charged it (Unix µs).
-    pub charged_at_us: i64,
+    /// Timestamp of the placement command that charged it.
+    pub charged_at: Timestamp,
     /// Parts-per-thousand of the unused charge that a retaining true-up
     /// refunds (ADR 0029). Captured from policy at charge time — a mid-flight
     /// policy edit never reprices — and recorded as [`FULL_REFUND_MILLI`]
@@ -355,7 +362,7 @@ pub enum TrueUp {
 pub fn true_up(
     charge: &ChargeRecord,
     actual_cost: CostUnits,
-    resolved_at_us: i64,
+    resolved_at: Timestamp,
     policy: &DecayPolicy,
     retain: bool,
 ) -> TrueUp {
@@ -368,7 +375,7 @@ pub fn true_up(
         };
         // Product ≤ u64::MAX × 1000 fits u128; the quotient fits u64.
         let refundable = CostUnits((unused.0 as u128 * f as u128 / 1000) as u64);
-        TrueUp::Refund(policy.decay_between(refundable, charge.charged_at_us, resolved_at_us))
+        TrueUp::Refund(policy.decay_between(refundable, charge.charged_at, resolved_at))
     } else {
         TrueUp::Surcharge(actual_cost.saturating_sub(charge.amount))
     }
@@ -414,6 +421,12 @@ pub fn penalty(over_quota_ratio: f64, exponent_milli: u32) -> f64 {
 mod tests {
     use super::*;
 
+    /// These fixtures are all near the epoch or near 2025, so the range check
+    /// cannot fire.
+    fn ts(micros: i64) -> Timestamp {
+        Timestamp::from_micros(micros).expect("test timestamps are in range")
+    }
+
     /// The documented reference calibration (ADR 0019): 1 core-second = 1 CU,
     /// 4 GiB·s of memory = 1 CU, 64 GiB·s of disk = 1 CU. Test/docs fixture,
     /// not a shipped default — weights are replicated policy.
@@ -431,10 +444,13 @@ mod tests {
     #[test]
     fn policy_validation_rejects_bad_configs() {
         let bad_tick = DecayPolicy {
-            tick_us: 0,
+            tick: Duration::ZERO,
             ..DecayPolicy::DEFAULT
         };
-        assert_eq!(bad_tick.validate(), Err(PolicyError::NonPositiveTick(0)));
+        assert_eq!(
+            bad_tick.validate(),
+            Err(PolicyError::NonPositiveTick(Duration::ZERO))
+        );
         let too_slow = DecayPolicy {
             decay_per_tick: DecayPolicy::MAX_DECAY_PER_TICK + 1,
             ..DecayPolicy::DEFAULT
@@ -505,16 +521,16 @@ mod tests {
             PriorityMultiplier::from_integer(3),
         );
         assert_eq!(actual, CostUnits(27_000_000_000));
-        let charged_at = 1_760_000_000_000_000;
+        let charged_at = ts(1_760_000_000_000_000);
         let record = ChargeRecord {
             amount: charged,
-            charged_at_us: charged_at,
+            charged_at,
             refund_fraction_milli: FULL_REFUND_MILLI,
         };
         let adjustment = true_up(
             &record,
             actual,
-            charged_at + 86_400_000_000,
+            charged_at + Duration::from_days(1),
             &DecayPolicy::DEFAULT,
             false,
         );
@@ -525,13 +541,13 @@ mod tests {
     fn true_up_surcharges_grace_overrun() {
         let record = ChargeRecord {
             amount: CostUnits(1000),
-            charged_at_us: 0,
+            charged_at: ts(0),
             refund_fraction_milli: FULL_REFUND_MILLI,
         };
         let adjustment = true_up(
             &record,
             CostUnits(1010),
-            60_000_000,
+            ts(0) + Duration::from_mins(1),
             &DecayPolicy::DEFAULT,
             true,
         );
@@ -545,46 +561,55 @@ mod tests {
         let p = DecayPolicy::DEFAULT;
         let record = ChargeRecord {
             amount: CostUnits(1_000_000_000_000),
-            charged_at_us: 0,
+            charged_at: ts(0),
             refund_fraction_milli: FULL_REFUND_MILLI,
         };
-        let resolved_at = 86_400_000_000; // one half-life
+        let resolved_at = ts(0) + Duration::from_days(1); // one half-life
         assert_eq!(
             true_up(&record, CostUnits::ZERO, resolved_at, &p, false),
-            TrueUp::Refund(p.decay_between(record.amount, 0, resolved_at))
+            TrueUp::Refund(p.decay_between(record.amount, ts(0), resolved_at))
         );
     }
 
     #[test]
     fn skewed_timestamps_never_inflate_or_rewind() {
         let p = DecayPolicy::DEFAULT;
-        let mut state = UsageState::new(1_000_000_000_000);
-        state.charge(CostUnits(500_000), 1_000_000_000_000, &p);
+        let now = ts(1_000_000_000_000);
+        let mut state = UsageState::new(now);
+        state.charge(CostUnits(500_000), now, &p);
         let before = state;
         // A command stamped by a laggy new leader, hours in the past.
-        state.touch(1_000_000_000_000 - 7_200_000_000, &p);
+        state.touch(now - Duration::from_hours(2), &p);
         assert_eq!(state, before, "regressed timestamp must be a no-op");
     }
 
     #[test]
     fn charge_and_refund_saturate() {
         let p = DecayPolicy::DEFAULT;
-        let ts = 1_000_000_000_000;
-        let mut state = UsageState::new(ts);
-        state.charge(CostUnits::MAX, ts, &p);
-        state.charge(CostUnits::MAX, ts, &p);
+        let at = ts(1_000_000_000_000);
+        let mut state = UsageState::new(at);
+        state.charge(CostUnits::MAX, at, &p);
+        state.charge(CostUnits::MAX, at, &p);
         assert_eq!(state.usage, CostUnits::MAX);
-        state.refund(CostUnits::MAX, ts, &p);
-        state.refund(CostUnits(1), ts, &p);
+        state.refund(CostUnits::MAX, at, &p);
+        state.refund(CostUnits(1), at, &p);
         assert_eq!(state.usage, CostUnits::ZERO);
     }
 
     #[test]
     fn runtime_rounds_up_to_whole_seconds() {
-        assert_eq!(runtime_seconds_ceil(0), 0);
-        assert_eq!(runtime_seconds_ceil(1), 1);
-        assert_eq!(runtime_seconds_ceil(1_000_000), 1);
-        assert_eq!(runtime_seconds_ceil(1_000_001), 2);
+        assert_eq!(runtime_seconds_ceil(Duration::from_micros(0)), 0);
+        assert_eq!(runtime_seconds_ceil(Duration::from_micros(1)), 1);
+        assert_eq!(runtime_seconds_ceil(Duration::from_micros(1_000_000)), 1);
+        assert_eq!(runtime_seconds_ceil(Duration::from_micros(1_000_001)), 2);
+    }
+
+    #[test]
+    fn negative_runtime_prices_as_zero_rather_than_wrapping() {
+        // The hazard the signed `Duration` introduces: reinterpreting -1 µs
+        // as `u64` would charge ~584 000 years of runtime.
+        assert_eq!(runtime_seconds_ceil(Duration::from_micros(-1)), 0);
+        assert_eq!(runtime_seconds_ceil(Duration::MIN), 0);
     }
 
     #[test]
@@ -607,10 +632,10 @@ mod tests {
     #[test]
     fn tick_index_is_floor_for_negative_times() {
         let p = DecayPolicy::DEFAULT;
-        assert_eq!(p.tick_index(0), 0);
-        assert_eq!(p.tick_index(-1), -1);
-        assert_eq!(p.tick_index(-60_000_000), -1);
-        assert_eq!(p.tick_index(-60_000_001), -2);
+        assert_eq!(p.tick_index(ts(0)), 0);
+        assert_eq!(p.tick_index(ts(-1)), -1);
+        assert_eq!(p.tick_index(ts(-60_000_000)), -1);
+        assert_eq!(p.tick_index(ts(-60_000_001)), -2);
     }
 
     #[test]
@@ -643,22 +668,22 @@ mod tests {
         // floored refundable fraction of the unused charge.
         let record = ChargeRecord {
             amount: CostUnits(100),
-            charged_at_us: 0,
+            charged_at: ts(0),
             refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
         };
         // unused = 100, ⌊100 × 750 / 1000⌋ = 75 refunded, 25 retained.
         assert_eq!(
-            true_up(&record, CostUnits::ZERO, 0, &DecayPolicy::DEFAULT, true),
+            true_up(&record, CostUnits::ZERO, ts(0), &DecayPolicy::DEFAULT, true),
             TrueUp::Refund(CostUnits(75))
         );
         // A fraction that does not divide evenly floors: ⌊7 × 333 / 1000⌋ = 2.
         let odd = ChargeRecord {
             amount: CostUnits(7),
-            charged_at_us: 0,
+            charged_at: ts(0),
             refund_fraction_milli: 333,
         };
         assert_eq!(
-            true_up(&odd, CostUnits::ZERO, 0, &DecayPolicy::DEFAULT, true),
+            true_up(&odd, CostUnits::ZERO, ts(0), &DecayPolicy::DEFAULT, true),
             TrueUp::Refund(CostUnits(2))
         );
     }
@@ -668,21 +693,27 @@ mod tests {
         // A record fraction above 1000 clamps to a full refund.
         let over = ChargeRecord {
             amount: CostUnits(100),
-            charged_at_us: 0,
+            charged_at: ts(0),
             refund_fraction_milli: 5000,
         };
         assert_eq!(
-            true_up(&over, CostUnits::ZERO, 0, &DecayPolicy::DEFAULT, true),
+            true_up(&over, CostUnits::ZERO, ts(0), &DecayPolicy::DEFAULT, true),
             TrueUp::Refund(CostUnits(100))
         );
         // retain = false ignores the recorded fraction entirely.
         let partial = ChargeRecord {
             amount: CostUnits(100),
-            charged_at_us: 0,
+            charged_at: ts(0),
             refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
         };
         assert_eq!(
-            true_up(&partial, CostUnits::ZERO, 0, &DecayPolicy::DEFAULT, false),
+            true_up(
+                &partial,
+                CostUnits::ZERO,
+                ts(0),
+                &DecayPolicy::DEFAULT,
+                false
+            ),
             TrueUp::Refund(CostUnits(100))
         );
     }

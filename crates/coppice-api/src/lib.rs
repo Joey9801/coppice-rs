@@ -14,6 +14,7 @@ pub mod http;
 
 use std::future::Future;
 
+use coppice_core::time::Timestamp;
 use http::dto::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
 
 /// Consistency class for read operations (ADR 0007).
@@ -82,13 +83,13 @@ impl ReadView {
 /// gap) is simply absent from the window — honest absence, never a zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueBucket {
-    /// Bucket start (inclusive), Unix µs.
-    pub start_us: i64,
-    /// Bucket close (exclusive), Unix µs. Buckets are nominally 30 s wide,
+    /// Bucket start (inclusive).
+    pub start: Timestamp,
+    /// Bucket close (exclusive). Buckets are nominally 30 s wide,
     /// but a stalled producer closes one *long* bucket rather than
     /// back-filling — so every rate over a bucket must scale by this actual
     /// span, never an assumed width.
-    pub end_us: i64,
+    pub end: Timestamp,
     /// Jobs in `Queued` at bucket close.
     pub depth: u32,
     /// Transitions into `Queued` during the bucket (submissions + requeues).
@@ -102,7 +103,7 @@ pub struct QueueBucket {
 ///
 /// Contiguous by construction: the producing task drops the whole window
 /// when it loses event-stream coverage, so a bucket's presence means its
-/// counts are complete over its own `[start_us, end_us)` span.
+/// counts are complete over its own `[start, end)` span.
 #[derive(Debug, Clone, Default)]
 pub struct QueueWindow {
     pub buckets: Vec<QueueBucket>,
@@ -110,7 +111,7 @@ pub struct QueueWindow {
 
 /// One event with the identity and stamp of ADR 0032's shared timeline
 /// shape: ordered and deduplicated by `(index, ordinal)`, rendered at the
-/// advisory `at_us`.
+/// advisory `at`.
 #[derive(Debug, Clone)]
 pub struct StampedEvent {
     /// The producing command's log index.
@@ -119,7 +120,7 @@ pub struct StampedEvent {
     /// filtering — part of its identity.
     pub ordinal: u32,
     /// The command's proposer stamp; advisory, never an ordering key.
-    pub at_us: i64,
+    pub at: Timestamp,
     pub event: coppice_state::Event,
 }
 

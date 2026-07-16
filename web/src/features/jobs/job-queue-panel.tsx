@@ -1,5 +1,5 @@
 import type { QueuePositionExplainer } from '@/api/types'
-import { formatDurationUs, formatUcu } from '@/lib/format'
+import { formatDuration, formatUcu } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -86,8 +86,8 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
 
         <div className="space-y-1 text-sm">
           <p className="text-foreground">
-            aged {formatDurationUs(queue.ageUs)} of {formatDurationUs(queue.ageHorizonUs)} horizon ·
-            age credit +{sig(queue.ageBonus)}
+            aged {formatDuration(queue.ageSeconds)} of {formatDuration(queue.ageHorizonSeconds)}{' '}
+            horizon · age credit +{sig(queue.ageBonus)}
           </p>
           <p className="text-muted-foreground">
             Queued jobs are ranked by this score; it improves as your entities' usage decays (24h

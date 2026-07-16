@@ -152,7 +152,8 @@ where
                         for w in session.take_armed_watchdogs() {
                             deadlines.insert(
                                 w.allocation,
-                                Instant::now() + Duration::from_micros(w.max_runtime_us),
+                                Instant::now()
+                                    + w.max_runtime.to_std().unwrap_or(Duration::ZERO),
                             );
                         }
                     }

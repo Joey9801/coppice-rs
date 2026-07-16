@@ -70,10 +70,10 @@ export function JobAttemptsCard({
                         )}
                       </TableCell>
                       <TableCell className="whitespace-nowrap text-muted-foreground">
-                        {attempt.startedAtUs != null ? <TimeAgo tUs={attempt.startedAtUs} /> : '—'}
+                        {attempt.startedAt != null ? <TimeAgo t={attempt.startedAt} /> : '—'}
                       </TableCell>
                       <TableCell className="whitespace-nowrap text-muted-foreground">
-                        {attempt.endedAtUs != null ? <TimeAgo tUs={attempt.endedAtUs} /> : '—'}
+                        {attempt.endedAt != null ? <TimeAgo t={attempt.endedAt} /> : '—'}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {formatUcu(attempt.chargedUcu)}

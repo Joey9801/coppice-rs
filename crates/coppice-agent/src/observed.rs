@@ -8,6 +8,7 @@
 
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
+use coppice_core::time::Duration;
 
 use crate::executor::{classify_exit, ContainerState, ObservedContainer};
 use crate::journal::JournalState;
@@ -21,7 +22,7 @@ pub struct ObservedAllocation {
     pub job: JobId,
     pub running: bool,
     pub outcome: Option<AttemptOutcome>,
-    pub runtime_us: u64,
+    pub runtime: Duration,
 }
 
 /// Reconcile the recovered `journal` against the live `runtime` into the full
@@ -36,7 +37,7 @@ pub struct ObservedAllocation {
 /// 2. A journaled exit with no surviving runtime container → `running = false`
 ///    with the journaled outcome and runtime.
 /// 3. A journaled intent with neither a runtime container nor a journaled exit
-///    → `running = false, outcome = AgentError, runtime_us = 0`: the honest "I
+///    → `running = false, outcome = AgentError, runtime = 0`: the honest "I
 ///    lost it". The agent never restarts a pending intent after a crash — the
 ///    re-registration epoch bump has already fenced it, so it reports the
 ///    doubt and lets the coordinator re-plan (ADR 0009).
@@ -75,7 +76,7 @@ pub fn build_observed_set(
                 job: exit.job,
                 running: false,
                 outcome: Some(exit.outcome.clone()),
-                runtime_us: exit.runtime_us,
+                runtime: exit.runtime,
             });
             continue;
         }
@@ -87,7 +88,7 @@ pub fn build_observed_set(
                 job: intent.job,
                 running: false,
                 outcome: Some(AttemptOutcome::AgentError),
-                runtime_us: 0,
+                runtime: Duration::ZERO,
             });
             continue;
         }
@@ -98,13 +99,13 @@ pub fn build_observed_set(
 
 fn from_runtime(container: &ObservedContainer) -> ObservedAllocation {
     match container.state {
-        ContainerState::Running { runtime_us } => ObservedAllocation {
+        ContainerState::Running { runtime } => ObservedAllocation {
             allocation: container.allocation,
             attempt: container.attempt,
             job: container.job,
             running: true,
             outcome: None,
-            runtime_us,
+            runtime,
         },
         ContainerState::Exited(exit) => ObservedAllocation {
             allocation: container.allocation,
@@ -112,7 +113,7 @@ fn from_runtime(container: &ObservedContainer) -> ObservedAllocation {
             job: container.job,
             running: false,
             outcome: Some(classify_exit(&exit)),
-            runtime_us: exit.runtime_us,
+            runtime: exit.runtime,
         },
     }
 }
@@ -134,13 +135,15 @@ mod tests {
             allocation: a,
             attempt: at,
             job: j,
-            state: ContainerState::Running { runtime_us: 100 },
+            state: ContainerState::Running {
+                runtime: Duration::from_micros(100),
+            },
         }];
         let set = build_observed_set(&JournalState::default(), &runtime);
         assert_eq!(set.len(), 1);
         assert!(set[0].running);
         assert_eq!(set[0].outcome, None);
-        assert_eq!(set[0].runtime_us, 100);
+        assert_eq!(set[0].runtime, Duration::from_micros(100));
     }
 
     #[test]
@@ -155,7 +158,7 @@ mod tests {
             state: ContainerState::Exited(ExitInfo {
                 code: 0,
                 oom_killed: true,
-                runtime_us: 9,
+                runtime: Duration::from_micros(9),
             }),
         }];
         let set = build_observed_set(&JournalState::default(), &runtime);
@@ -174,12 +177,12 @@ mod tests {
                 attempt: at,
                 job: j,
                 outcome: AttemptOutcome::Aborted,
-                runtime_us: 7,
+                runtime: Duration::from_micros(7),
             },
         );
         let set = build_observed_set(&state, &[]);
         assert_eq!(set[0].outcome, Some(AttemptOutcome::Aborted));
-        assert_eq!(set[0].runtime_us, 7);
+        assert_eq!(set[0].runtime, Duration::from_micros(7));
     }
 
     #[test]
@@ -219,14 +222,16 @@ mod tests {
                 attempt: at,
                 job: j,
                 outcome: AttemptOutcome::Aborted,
-                runtime_us: 1,
+                runtime: Duration::from_micros(1),
             },
         );
         let runtime = vec![ObservedContainer {
             allocation: a,
             attempt: at,
             job: j,
-            state: ContainerState::Running { runtime_us: 55 },
+            state: ContainerState::Running {
+                runtime: Duration::from_micros(55),
+            },
         }];
         let set = build_observed_set(&state, &runtime);
         assert_eq!(set.len(), 1);

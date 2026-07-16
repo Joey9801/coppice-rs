@@ -12,6 +12,7 @@ use coppice_core::attempt::AttemptState;
 use coppice_core::id::{ClusterId, NodeId};
 use coppice_core::job::JobState;
 use coppice_core::resource::Resources;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_state::{AttemptRecord, JobRecord, StateMachine};
 
 use crate::{QueueWindow, RecentClusterEvents};
@@ -83,7 +84,7 @@ fn node_summary(
         schedulable: record.node.schedulable,
         health: node_health(record),
         epoch: record.epoch,
-        last_heartbeat_us: None,
+        last_heartbeat: None,
         running_count: memo.running_count,
         accruing_count: memo.accruing_count,
     }
@@ -145,7 +146,7 @@ pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<dto::GetNodeRespons
                     seq: alloc_record.seq,
                 },
                 funded_fraction: funded_fraction(&alloc.funded, &alloc.requested),
-                projected_start_us: None,
+                projected_start: None,
             })
         })
         .collect();
@@ -159,7 +160,7 @@ pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<dto::GetNodeRespons
 
 /// `GET /api/v1/overview`.
 ///
-/// `now_us` is the reader's wall clock, used only for `oldest_queued_age_us`
+/// `now` is the reader's wall clock, used only for `oldest_queued_age_seconds`
 /// — a *read-time* age, not replicated state (apply never reads a clock).
 /// The caller passes it in so this stays a pure function of its inputs, as
 /// are the two derived sources: `window` (this replica's queue buckets,
@@ -167,13 +168,13 @@ pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<dto::GetNodeRespons
 pub fn cluster_overview(
     state: &StateMachine,
     cluster_id: ClusterId,
-    now_us: i64,
+    now: Timestamp,
     window: &QueueWindow,
     recent: &RecentClusterEvents,
 ) -> dto::GetClusterOverviewResponse {
     dto::GetClusterOverviewResponse {
         cluster_id,
-        queue: queue_stats(state, now_us, window),
+        queue: queue_stats(state, now, window),
         capacity: cluster_capacity(state),
         recent_events: recent_events(recent),
     }
@@ -188,7 +189,7 @@ fn recent_events(recent: &RecentClusterEvents) -> dto::RecentEventsWindow {
             .map(|e| dto::TimelineEvent {
                 index: e.index,
                 ordinal: e.ordinal,
-                at_us: e.at_us,
+                at: e.at,
                 body: (&e.event).into(),
             })
             .collect(),
@@ -235,21 +236,21 @@ fn cluster_capacity(state: &StateMachine) -> dto::ClusterCapacity {
     }
 }
 
-fn queue_stats(state: &StateMachine, now_us: i64, window: &QueueWindow) -> dto::QueueStats {
+fn queue_stats(state: &StateMachine, now: Timestamp, window: &QueueWindow) -> dto::QueueStats {
     // Seeded with every phase so the response reports a count for each one,
     // zeros included.
     let mut by_state: BTreeMap<dto::JobPhase, u32> =
         dto::JobPhase::ALL.iter().map(|phase| (*phase, 0)).collect();
-    let mut oldest_queued_age_us: Option<i64> = None;
+    let mut oldest_queued_age: Option<Duration> = None;
 
     for (_, record) in &state.jobs {
         *by_state.entry(job_phase(state, record)).or_default() += 1;
 
         if record.state == JobState::Queued {
-            // A `submitted_at_us` in the future (proposer clock skew) is an
-            // age of zero, never a negative one.
-            let age = now_us.saturating_sub(record.submitted_at_us).max(0);
-            oldest_queued_age_us = Some(oldest_queued_age_us.map_or(age, |old| old.max(age)));
+            // A `submitted_at` in the future (proposer clock skew) is an age
+            // of zero, never a negative one.
+            let age = (now - record.submitted_at).max(Duration::ZERO);
+            oldest_queued_age = Some(oldest_queued_age.map_or(age, |old| old.max(age)));
         }
     }
 
@@ -259,7 +260,7 @@ fn queue_stats(state: &StateMachine, now_us: i64, window: &QueueWindow) -> dto::
         depth: by_state[&dto::JobPhase::Queued],
         drain_rate_per_minute: rates.drains_per_minute,
         arrival_rate_per_minute: rates.arrivals_per_minute,
-        oldest_queued_age_us,
+        oldest_queued_age_seconds: oldest_queued_age.map(Duration::as_secs),
         by_state,
         history: queue_history(window),
     }
@@ -282,14 +283,17 @@ struct QueueRates {
 /// at all (never a fabricated `0.0` — see `dto::QueueStats`).
 fn queue_rates(window: &QueueWindow) -> QueueRates {
     let newest = &window.buckets[window.buckets.len().saturating_sub(RATE_WINDOW_BUCKETS)..];
-    let covered_us: i64 = newest.iter().map(|b| (b.end_us - b.start_us).max(0)).sum();
-    if covered_us <= 0 {
+    let covered: Duration = newest
+        .iter()
+        .map(|b| (b.end - b.start).max(Duration::ZERO))
+        .sum();
+    if !covered.is_positive() {
         return QueueRates {
             arrivals_per_minute: None,
             drains_per_minute: None,
         };
     }
-    let minutes = covered_us as f64 / 60_000_000.0;
+    let minutes = covered.as_secs_f64() / 60.0;
     let arrivals: u64 = newest.iter().map(|b| u64::from(b.arrivals)).sum();
     let drains: u64 = newest.iter().map(|b| u64::from(b.drains)).sum();
     QueueRates {
@@ -299,18 +303,18 @@ fn queue_rates(window: &QueueWindow) -> QueueRates {
 }
 
 /// Every retained bucket as a history sample, oldest first, each scaled by
-/// its own recorded span. Missing coverage is a missing sample (its `t_us`
+/// its own recorded span. Missing coverage is a missing sample (its `t`
 /// never appears), never a zero; a degenerate zero-length bucket has no
 /// honest rate and is skipped.
 fn queue_history(window: &QueueWindow) -> Vec<dto::QueueSample> {
     window
         .buckets
         .iter()
-        .filter(|b| b.end_us > b.start_us)
+        .filter(|b| b.end > b.start)
         .map(|b| {
-            let per_minute = 60_000_000.0 / (b.end_us - b.start_us) as f64;
+            let per_minute = 60.0 / (b.end - b.start).as_secs_f64();
             dto::QueueSample {
-                t_us: b.start_us,
+                t: b.start,
                 depth: b.depth,
                 drained_per_minute: f64::from(b.drains) * per_minute,
                 arrived_per_minute: f64::from(b.arrivals) * per_minute,
@@ -358,8 +362,8 @@ fn attempt_view(ar: &AttemptRecord) -> dto::AttemptView {
             AttemptState::Terminal(outcome) => Some(outcome.into()),
             _ => None,
         },
-        started_at_us: ar.started_at_us,
-        ended_at_us: None,
+        started_at: ar.started_at,
+        ended_at: None,
         rate_ucu_per_second: ar.rate_ucu_per_second,
         charged_ucu: ar.charge.amount.0,
     }
@@ -419,12 +423,12 @@ mod tests {
             group: GroupId(job.0),
             charge: ChargeRecord {
                 amount: CostUnits(1000),
-                charged_at_us: 0,
+                charged_at: ts(0),
                 refund_fraction_milli: FULL_REFUND_MILLI,
             },
             rate_ucu_per_second: 100,
             multiplier: PriorityMultiplier::ONE,
-            started_at_us: Some(1000),
+            started_at: Some(ts(1000)),
         }
     }
 
@@ -564,7 +568,7 @@ mod tests {
         assert_eq!(response.active_attempts[0].outcome, None);
     }
 
-    fn test_job(id: JobId, state: JobState, submitted_at_us: i64) -> coppice_state::JobRecord {
+    fn test_job(id: JobId, state: JobState, submitted_at: Timestamp) -> coppice_state::JobRecord {
         coppice_state::JobRecord {
             spec: coppice_core::job::Job {
                 id,
@@ -573,21 +577,27 @@ mod tests {
                 entrypoint: None,
                 requests: Resources::ZERO,
                 priority: 0,
-                max_runtime_us: None,
+                max_runtime: None,
                 quota_entity: QuotaEntityId::new(),
                 retry: Default::default(),
                 abort_requested: None,
             },
             state,
             multiplier: PriorityMultiplier::ONE,
-            submitted_at_us,
-            terminal_at_us: None,
+            submitted_at,
+            terminal_at: None,
             retries_used: 0,
             attempts: Vec::new(),
         }
     }
 
     const CLUSTER: &str = "cluster-00000000-0000-0000-0000-000000000009";
+
+    /// Fixture instants are seconds from the epoch, so the range check
+    /// cannot fire.
+    fn ts(micros: i64) -> Timestamp {
+        Timestamp::from_micros(micros).expect("fixture timestamps are in range")
+    }
 
     fn cluster() -> coppice_core::id::ClusterId {
         CLUSTER.parse().unwrap()
@@ -602,23 +612,17 @@ mod tests {
 
     /// [`cluster_overview`] with empty derived sources — what a replica with
     /// no bucket or ring coverage serves.
-    fn overview(state: &StateMachine, now_us: i64) -> dto::GetClusterOverviewResponse {
-        cluster_overview(
-            state,
-            cluster(),
-            now_us,
-            &QueueWindow::default(),
-            &no_recent(),
-        )
+    fn overview(state: &StateMachine, now: Timestamp) -> dto::GetClusterOverviewResponse {
+        cluster_overview(state, cluster(), now, &QueueWindow::default(), &no_recent())
     }
 
     #[test]
     fn overview_of_an_empty_cluster_counts_nothing() {
-        let response = overview(&StateMachine::default(), 1_000);
+        let response = overview(&StateMachine::default(), ts(1_000));
 
         assert_eq!(response.cluster_id, cluster());
         assert_eq!(response.queue.depth, 0);
-        assert_eq!(response.queue.oldest_queued_age_us, None);
+        assert_eq!(response.queue.oldest_queued_age_seconds, None);
         assert_eq!(response.capacity.nodes.total, 0);
         // Every phase is reported, at zero — never an absent key.
         assert_eq!(response.queue.by_state.len(), dto::JobPhase::ALL.len());
@@ -643,7 +647,7 @@ mod tests {
             test_allocation(alloc, job, attempt, n1, AllocationState::Active),
         );
 
-        let capacity = overview(&state, 0).capacity;
+        let capacity = overview(&state, ts(0)).capacity;
 
         assert_eq!(capacity.nodes.total, 2);
         // A draining node is registered capacity but not schedulable.
@@ -667,14 +671,14 @@ mod tests {
         let mut state = StateMachine::default();
         state
             .jobs
-            .insert(queued_job, test_job(queued_job, JobState::Queued, 0));
+            .insert(queued_job, test_job(queued_job, JobState::Queued, ts(0)));
         state.jobs.insert(
             running_job,
-            test_job(running_job, JobState::Attempting(running_attempt), 0),
+            test_job(running_job, JobState::Attempting(running_attempt), ts(0)),
         );
         state.jobs.insert(
             preparing_job,
-            test_job(preparing_job, JobState::Attempting(accruing_attempt), 0),
+            test_job(preparing_job, JobState::Attempting(accruing_attempt), ts(0)),
         );
         state.attempts.insert(
             running_attempt,
@@ -690,7 +694,7 @@ mod tests {
             ),
         );
 
-        let queue = overview(&state, 0).queue;
+        let queue = overview(&state, ts(0)).queue;
 
         // `Attempting` is never reported raw: an accruing attempt reads as
         // `Preparing`, a running one as `Running` (ADR 0030's read-time join).
@@ -709,7 +713,7 @@ mod tests {
         let mut state = StateMachine::default();
         state
             .jobs
-            .insert(job, test_job(job, JobState::Attempting(attempt), 0));
+            .insert(job, test_job(job, JobState::Attempting(attempt), ts(0)));
         state.attempts.insert(
             attempt,
             test_attempt(
@@ -720,7 +724,7 @@ mod tests {
             ),
         );
 
-        let queue = overview(&state, 0).queue;
+        let queue = overview(&state, ts(0)).queue;
         assert_eq!(queue.by_state[&dto::JobPhase::Finalizing], 1);
     }
 
@@ -733,31 +737,32 @@ mod tests {
         let mut state = StateMachine::default();
         state
             .jobs
-            .insert(old, test_job(old, JobState::Queued, 1_000));
+            .insert(old, test_job(old, JobState::Queued, ts(1_000_000)));
         state
             .jobs
-            .insert(recent, test_job(recent, JobState::Queued, 9_000));
+            .insert(recent, test_job(recent, JobState::Queued, ts(9_000_000)));
         // A job that has left the queue no longer ages it, however old.
         state
             .jobs
-            .insert(running, test_job(running, JobState::Succeeded, 0));
+            .insert(running, test_job(running, JobState::Succeeded, ts(0)));
 
-        let queue = overview(&state, 10_000).queue;
-        assert_eq!(queue.oldest_queued_age_us, Some(9_000));
+        // Read at t=10 s: the older job has waited 9 s, the recent one 1 s.
+        let queue = overview(&state, ts(10_000_000)).queue;
+        assert_eq!(queue.oldest_queued_age_seconds, Some(9));
     }
 
     #[test]
     fn a_submission_timestamp_in_the_future_ages_to_zero_never_negative() {
-        // Proposer clock skew: `submitted_at_us` rides in on the command, so a
+        // Proposer clock skew: `submitted_at` rides in on the command, so a
         // reader's clock can legitimately be behind it.
         let job = JobId::new();
         let mut state = StateMachine::default();
         state
             .jobs
-            .insert(job, test_job(job, JobState::Queued, 5_000));
+            .insert(job, test_job(job, JobState::Queued, ts(5_000_000)));
 
-        let queue = overview(&state, 1_000).queue;
-        assert_eq!(queue.oldest_queued_age_us, Some(0));
+        let queue = overview(&state, ts(1_000_000)).queue;
+        assert_eq!(queue.oldest_queued_age_seconds, Some(0));
     }
 
     fn window_of(buckets: Vec<crate::QueueBucket>) -> QueueWindow {
@@ -767,8 +772,8 @@ mod tests {
     /// A nominal-width (30 s) bucket.
     fn bucket(start_us: i64, depth: u32, arrivals: u32, drains: u32) -> crate::QueueBucket {
         crate::QueueBucket {
-            start_us,
-            end_us: start_us + 30_000_000,
+            start: ts(start_us),
+            end: ts(start_us) + Duration::from_secs(30),
             depth,
             arrivals,
             drains,
@@ -805,8 +810,8 @@ mod tests {
     #[test]
     fn a_stall_stretched_bucket_scales_by_its_recorded_span() {
         let long = crate::QueueBucket {
-            start_us: 0,
-            end_us: 300_000_000,
+            start: ts(0),
+            end: ts(0) + Duration::from_mins(5),
             depth: 0,
             arrivals: 10,
             drains: 5,
@@ -825,11 +830,11 @@ mod tests {
         let window = window_of(vec![bucket(0, 5, 2, 1), bucket(30_000_000, 6, 0, 3)]);
         let history = queue_history(&window);
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].t_us, 0);
+        assert_eq!(history[0].t, ts(0));
         assert_eq!(history[0].depth, 5);
         assert_eq!(history[0].arrived_per_minute, 4.0);
         assert_eq!(history[0].drained_per_minute, 2.0);
-        assert_eq!(history[1].t_us, 30_000_000);
+        assert_eq!(history[1].t, ts(30_000_000));
         assert_eq!(history[1].drained_per_minute, 6.0);
     }
 
@@ -839,7 +844,7 @@ mod tests {
         let queue = cluster_overview(
             &StateMachine::default(),
             cluster(),
-            0,
+            ts(0),
             &window,
             &no_recent(),
         )
@@ -857,14 +862,14 @@ mod tests {
             events: vec![crate::StampedEvent {
                 index: 9,
                 ordinal: 3,
-                at_us: 1_234,
+                at: ts(1_234),
                 event: coppice_state::Event::JobSubmitted { job },
             }],
         };
         let rendered = cluster_overview(
             &StateMachine::default(),
             cluster(),
-            0,
+            ts(0),
             &QueueWindow::default(),
             &recent,
         )
@@ -872,7 +877,7 @@ mod tests {
         assert_eq!(rendered.floor_index, 4);
         assert_eq!(rendered.events.len(), 1);
         let event = &rendered.events[0];
-        assert_eq!((event.index, event.ordinal, event.at_us), (9, 3, 1_234));
+        assert_eq!((event.index, event.ordinal, event.at), (9, 3, ts(1_234)));
         assert_eq!(event.body, dto::TimelineEventBody::JobSubmitted { job });
     }
 
@@ -881,7 +886,7 @@ mod tests {
         // A window with no coverage (fresh replica, or one that just lost
         // the event stream); `0.0` would claim "nothing is draining" (see
         // `dto::QueueStats`).
-        let queue = overview(&StateMachine::default(), 0).queue;
+        let queue = overview(&StateMachine::default(), ts(0)).queue;
         assert_eq!(queue.drain_rate_per_minute, None);
         assert_eq!(queue.arrival_rate_per_minute, None);
         assert!(queue.history.is_empty());

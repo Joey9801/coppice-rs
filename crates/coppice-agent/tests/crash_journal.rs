@@ -34,6 +34,7 @@ use coppice_agent::journal::{ExitRec, IntentRec, Journal, JournalState, Watermar
 use coppice_agent::observed::{build_observed_set, ObservedAllocation};
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
+use coppice_core::time::Duration;
 use coppice_testkit::simfs::{is_sim_crash, SimConfig, SimFs};
 use uuid::Uuid;
 
@@ -70,7 +71,9 @@ impl RuntimeModel {
                 allocation: ids.allocation,
                 attempt: ids.attempt,
                 job: ids.job,
-                state: ContainerState::Running { runtime_us: 0 },
+                state: ContainerState::Running {
+                    runtime: Duration::ZERO,
+                },
             },
         );
     }
@@ -121,7 +124,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
     let exit0 = ExitInfo {
         code: 0,
         oom_killed: false,
-        runtime_us: 111,
+        runtime: Duration::from_micros(111),
     };
     runtime.exit(&ids[0], exit0);
     journal.journal_exit(&ExitRec {
@@ -129,7 +132,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
         attempt: ids[0].attempt,
         job: ids[0].job,
         outcome: AttemptOutcome::Exited { code: 0 },
-        runtime_us: exit0.runtime_us,
+        runtime: exit0.runtime,
     })?;
 
     // Epoch bump, then start allocation 2 under the new epoch.
@@ -153,7 +156,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
         ExitInfo {
             code: 137,
             oom_killed: false,
-            runtime_us: 222,
+            runtime: Duration::from_micros(222),
         },
     );
 
@@ -161,7 +164,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
     let exit2 = ExitInfo {
         code: 137,
         oom_killed: true,
-        runtime_us: 333,
+        runtime: Duration::from_micros(333),
     };
     runtime.exit(&ids[2], exit2);
     journal.journal_exit(&ExitRec {
@@ -169,7 +172,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
         attempt: ids[2].attempt,
         job: ids[2].job,
         outcome: AttemptOutcome::OomKilled,
-        runtime_us: exit2.runtime_us,
+        runtime: exit2.runtime,
     })?;
 
     Ok(())

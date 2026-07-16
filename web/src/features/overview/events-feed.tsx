@@ -107,7 +107,7 @@ export interface EventsFeedProps {
 /**
  * Stable identity for a rendered event row so polling refreshes reuse DOM
  * nodes instead of remounting the whole list. `(index, ordinal)` is the
- * event's identity (ADR 0032) — never key or deduplicate by `atUs`, which
+ * event's identity (ADR 0032) — never key or deduplicate by `at`, which
  * can collide within a batch and run backwards across proposers.
  */
 function eventKey(event: TimelineEvent): string {
@@ -133,7 +133,7 @@ export function EventsFeed({ events }: EventsFeedProps) {
               <Icon className="size-3.5" />
             </span>
             <span className="min-w-0 flex-1 leading-relaxed text-foreground">{body}</span>
-            <TimeAgo tUs={event.atUs} className="shrink-0 text-xs text-muted-foreground" />
+            <TimeAgo t={event.at} className="shrink-0 text-xs text-muted-foreground" />
           </li>
         )
       })}

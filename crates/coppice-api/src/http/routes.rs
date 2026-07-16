@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
+use coppice_core::time::Timestamp;
 
 use super::dto::{AbortJobRequest, AbortJobResponse, SubmitJobRequest};
 use crate::{Consistency, ControlPlane};
@@ -192,10 +193,14 @@ async fn get_overview<P: ControlPlane>(
         .await?;
     let window = plane.queue_window();
     let recent = plane.recent_events(RECENT_EVENTS_LIMIT).await;
+    // Only reads sample the clock — they are not replicated, so a handler
+    // may (an *apply* may never: `coppice-state`'s determinism contract).
+    // It feeds read-time ages like `oldest_queued_age_seconds`, never
+    // anything stored.
     let response = super::project::cluster_overview(
         view.state(),
         plane.cluster_id(),
-        now_us(),
+        Timestamp::now(),
         &window,
         &recent,
     );
@@ -206,18 +211,6 @@ async fn get_overview<P: ControlPlane>(
         },
         Json(response),
     ))
-}
-
-/// Wall-clock now, in microseconds.
-///
-/// Only reads sample the clock — they are not replicated, so a handler may
-/// (an *apply* may never: `coppice-state`'s determinism contract). It feeds
-/// read-time ages like `oldest_queued_age_us`, never anything stored.
-fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 /// `GET /api/v1/nodes` — bounded by default (ADR 0031).
@@ -387,7 +380,7 @@ mod tests {
         assert_eq!(body["cluster_id"], STUB_CLUSTER);
         assert_eq!(body["queue"]["depth"], 0);
         assert_eq!(
-            body["queue"]["oldest_queued_age_us"],
+            body["queue"]["oldest_queued_age_seconds"],
             serde_json::Value::Null
         );
         assert_eq!(body["queue"]["by_state"]["queued"], 0);
@@ -409,8 +402,8 @@ mod tests {
             fail_with: None,
             queue_window: QueueWindow {
                 buckets: vec![crate::QueueBucket {
-                    start_us: 60_000_000,
-                    end_us: 90_000_000,
+                    start: Timestamp::from_micros(60_000_000).expect("in range"),
+                    end: Timestamp::from_micros(90_000_000).expect("in range"),
                     depth: 4,
                     arrivals: 2,
                     drains: 1,
@@ -421,7 +414,7 @@ mod tests {
                 events: vec![crate::StampedEvent {
                     index: 8,
                     ordinal: 0,
-                    at_us: 90_000_000,
+                    at: Timestamp::from_micros(90_000_000).expect("in range"),
                     event: coppice_state::Event::JobSubmitted { job },
                 }],
             },
@@ -439,12 +432,15 @@ mod tests {
         let body = body_json(response).await;
         assert_eq!(body["queue"]["arrival_rate_per_minute"], 4.0);
         assert_eq!(body["queue"]["drain_rate_per_minute"], 2.0);
-        assert_eq!(body["queue"]["history"][0]["t_us"], 60_000_000);
+        assert_eq!(
+            body["queue"]["history"][0]["t"],
+            "1970-01-01T00:01:00.000000Z"
+        );
         assert_eq!(body["recent_events"]["floor_index"], 5);
         let event = &body["recent_events"]["events"][0];
         assert_eq!(event["index"], 8);
         assert_eq!(event["ordinal"], 0);
-        assert_eq!(event["at_us"], 90_000_000);
+        assert_eq!(event["at"], "1970-01-01T00:01:30.000000Z");
         assert_eq!(event["kind"], "job_submitted");
         assert_eq!(event["job"], job.to_string());
     }
@@ -619,8 +615,8 @@ mod tests {
 
     #[tokio::test]
     async fn submit_with_an_unknown_field_is_invalid_argument() {
-        // `max_runtme_us` (typo) must not be accepted with the real
-        // `max_runtime_us` silently defaulting to unbounded.
+        // `max_runtme_seconds` (typo) must not be accepted with the real
+        // `max_runtime_seconds` silently defaulting to unbounded.
         let request_body = format!(
             r#"{{
                 "image": "busybox",
@@ -628,7 +624,7 @@ mod tests {
                 "requests": {{ "cpu_millis": 1000, "memory_bytes": 0, "disk_bytes": 0 }},
                 "job": "{}",
                 "quota_entity": "{}",
-                "max_runtme_us": 3600000000
+                "max_runtme_seconds": 3600
             }}"#,
             JobId::new(),
             coppice_core::id::QuotaEntityId::new()

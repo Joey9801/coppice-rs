@@ -214,7 +214,7 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
               <TableCell className="whitespace-nowrap">{job.quotaEntityName}</TableCell>
               <TableCell className="text-right tabular-nums">{job.priority}</TableCell>
               <TableCell className="whitespace-nowrap text-muted-foreground">
-                <TimeAgo tUs={job.submittedAtUs} />
+                <TimeAgo t={job.submittedAt} />
               </TableCell>
               <TableCell onClick={(e) => e.stopPropagation()} className="whitespace-nowrap">
                 <WhereCell job={job} phase={phase} />

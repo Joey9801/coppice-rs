@@ -15,7 +15,15 @@
 //! - `snake_case` keys (`"cpu_millis"`) and enum values (`"unknown"`,
 //!   `"oom_killed"`);
 //! - ids as their typed string form (`"node-<uuid>"`, ADR 0024);
-//! - integers as JSON numbers (timestamps µs, costs µCU, cpu millicores);
+//! - **instants as ISO 8601 / RFC 3339 strings**
+//!   (`"2026-07-16T09:30:00.000000Z"`, always UTC, µs precision) — a bare
+//!   integer carries neither its epoch nor its unit, and the mistake it
+//!   invites (reading µs as ms) is silent and off by a thousand;
+//! - **durations as whole seconds**, in a `_seconds`-suffixed key
+//!   (`"max_runtime_seconds"`). Named units, but a number: a duration has no
+//!   epoch or timezone to lose, which is what motivates strings for instants,
+//!   and every client can do arithmetic on it without a parser;
+//! - other integers as JSON numbers (costs µCU, cpu millicores);
 //! - absent optionals as explicit `null`, empty lists as `[]`.
 
 use std::collections::BTreeMap;
@@ -24,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use coppice_core::attempt;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
+use coppice_core::time::Timestamp;
 
 /// Resource quantities (mirrors `coppice_core::resource::Resources`).
 ///
@@ -182,8 +191,8 @@ pub struct AttemptView {
     pub state: AttemptState,
     /// Present iff `state` is `Terminal`.
     pub outcome: Option<AttemptOutcome>,
-    pub started_at_us: Option<i64>,
-    pub ended_at_us: Option<i64>,
+    pub started_at: Option<Timestamp>,
+    pub ended_at: Option<Timestamp>,
     /// µCU per second while running (cost weights × requested resources).
     pub rate_ucu_per_second: u64,
     /// Upfront charge for this attempt (trued-up at finalization).
@@ -218,7 +227,7 @@ pub struct AccrualView {
     pub allocation: AllocationView,
     pub funded_fraction: FundedFraction,
     /// Earliest guaranteed full-funding time; `null` means unbounded.
-    pub projected_start_us: Option<i64>,
+    pub projected_start: Option<Timestamp>,
 }
 
 /// Summary of a compute node's current state for the list view.
@@ -237,7 +246,7 @@ pub struct NodeSummary {
     /// Bumps on (re)registration or loss; fences stale agent commands.
     pub epoch: u64,
     /// Last heartbeat from the agent; `null` until agents report.
-    pub last_heartbeat_us: Option<i64>,
+    pub last_heartbeat: Option<Timestamp>,
     /// Attempts currently `Running` on this node.
     pub running_count: u32,
     /// Allocations currently `Accruing` on this node.
@@ -308,11 +317,11 @@ impl JobPhase {
 /// one closed derived-stats bucket (ADR 0032, tier 3).
 ///
 /// A missing instant is a missing *sample* — buckets that predate the
-/// process or an event-stream gap are absent from the list (their `t_us`
+/// process or an event-stream gap are absent from the list (their `t`
 /// simply never appears), never rendered as zeros.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct QueueSample {
-    pub t_us: i64,
+    pub t: Timestamp,
     pub depth: u32,
     pub drained_per_minute: f64,
     pub arrived_per_minute: f64,
@@ -337,7 +346,7 @@ pub struct QueueStats {
     pub arrival_rate_per_minute: Option<f64>,
     /// Age of the longest-waiting `Queued` job, measured at read time
     /// against the wall clock; `null` when nothing is queued.
-    pub oldest_queued_age_us: Option<i64>,
+    pub oldest_queued_age_seconds: Option<i64>,
     /// Job counts by displayed phase — every [`JobPhase`], zeros included.
     pub by_state: BTreeMap<JobPhase, u32>,
     /// Recent queue history, oldest first — the retained derived buckets.
@@ -405,7 +414,7 @@ impl From<coppice_core::job::JobState> for JobStateKind {
 /// — no endpoint invents its own.
 ///
 /// `(index, ordinal)` is the event's identity: the ordering and
-/// deduplication key everywhere. `at_us` is the advisory proposer stamp —
+/// deduplication key everywhere. `at` is the advisory proposer stamp —
 /// it may run backwards across proposers as the index advances, and no
 /// consumer may reorder or "correct" by it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,7 +426,7 @@ pub struct TimelineEvent {
     pub ordinal: u32,
     /// When the proposer asserted this fact (ADR 0032's flattened
     /// semantics: sub-items inherit their command's stamp).
-    pub at_us: i64,
+    pub at: Timestamp,
     #[serde(flatten)]
     pub body: TimelineEventBody,
 }
@@ -590,9 +599,9 @@ impl From<Resources> for coppice_core::resource::Resources {
 /// rejected.
 ///
 /// `deny_unknown_fields`: on a write, an unrecognized key is a client bug
-/// — a typo (`"max_runtme_us"`) or wrong casing (`"maxRuntimeUs"`) would
-/// otherwise silently drop its field to the default, turning e.g. a
-/// bounded job into a default-priced one.
+/// — a typo (`"max_runtme_seconds"`) or wrong casing
+/// (`"maxRuntimeSeconds"`) would otherwise silently drop its field to the
+/// default, turning e.g. a bounded job into a default-priced one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitJobRequest {
@@ -614,9 +623,10 @@ pub struct SubmitJobRequest {
     /// configured multiplier is invalid.
     #[serde(default)]
     pub priority: i32,
-    /// Enforced runtime bound; absent = charged the policy default runtime.
+    /// Enforced runtime bound, in whole seconds; absent = charged the policy
+    /// default runtime. Must be positive when present.
     #[serde(default)]
-    pub max_runtime_us: Option<u64>,
+    pub max_runtime_seconds: Option<i64>,
     /// The quota-entity leaf to charge.
     pub quota_entity: QuotaEntityId,
     /// Absent = the platform default policy.
@@ -656,6 +666,12 @@ pub struct AbortJobResponse {}
 mod tests {
     use super::*;
 
+    /// Fixture instants are seconds from the epoch, so the range check
+    /// cannot fire.
+    fn ts(micros: i64) -> Timestamp {
+        Timestamp::from_micros(micros).expect("fixture timestamps are in range")
+    }
+
     #[test]
     fn node_summary_serializes_to_the_contract_shape() {
         let id: NodeId = "node-00000000-0000-0000-0000-000000000001".parse().unwrap();
@@ -680,7 +696,7 @@ mod tests {
             schedulable: true,
             health: NodeHealth::Unknown,
             epoch: 3,
-            last_heartbeat_us: None,
+            last_heartbeat: None,
             running_count: 2,
             accruing_count: 1,
         };
@@ -697,7 +713,7 @@ mod tests {
                 "schedulable": true,
                 "health": "unknown",
                 "epoch": 3,
-                "last_heartbeat_us": null,
+                "last_heartbeat": null,
                 "running_count": 2,
                 "accruing_count": 1,
             })
@@ -722,13 +738,13 @@ mod tests {
                 depth: 1,
                 drain_rate_per_minute: None,
                 arrival_rate_per_minute: None,
-                oldest_queued_age_us: Some(5_000_000),
+                oldest_queued_age_seconds: Some(5),
                 by_state: JobPhase::ALL
                     .iter()
                     .map(|phase| (*phase, u32::from(*phase == JobPhase::Queued)))
                     .collect(),
                 history: vec![QueueSample {
-                    t_us: 10,
+                    t: ts(10),
                     depth: 1,
                     drained_per_minute: 2.0,
                     arrived_per_minute: 4.0,
@@ -739,7 +755,7 @@ mod tests {
                 events: vec![TimelineEvent {
                     index: 7,
                     ordinal: 2,
-                    at_us: 5_000_100,
+                    at: ts(5_000_100),
                     body: TimelineEventBody::JobStateChanged {
                         job,
                         from: JobStateKind::Accepted,
@@ -782,7 +798,7 @@ mod tests {
                     // fabricated 0.0 (see `QueueStats`).
                     "drain_rate_per_minute": null,
                     "arrival_rate_per_minute": null,
-                    "oldest_queued_age_us": 5_000_000,
+                    "oldest_queued_age_seconds": 5,
                     // Every phase is present, zeros included, in lifecycle order.
                     "by_state": {
                         "submitted": 0,
@@ -796,7 +812,7 @@ mod tests {
                         "aborted": 0,
                     },
                     "history": [{
-                        "t_us": 10,
+                        "t": "1970-01-01T00:00:00.000010Z",
                         "depth": 1,
                         "drained_per_minute": 2.0,
                         "arrived_per_minute": 4.0,
@@ -809,13 +825,13 @@ mod tests {
                     "used": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
                 },
                 // ADR 0032's shared timeline shape: identity `(index,
-                // ordinal)` + advisory `at_us`, kind and scope keys flat.
+                // ordinal)` + advisory `at`, kind and scope keys flat.
                 "recent_events": {
                     "floor_index": 3,
                     "events": [{
                         "index": 7,
                         "ordinal": 2,
-                        "at_us": 5_000_100,
+                        "at": "1970-01-01T00:00:05.000100Z",
                         "kind": "job_state_changed",
                         "job": "job-00000000-0000-0000-0000-000000000002",
                         "from": "accepted",
@@ -833,7 +849,7 @@ mod tests {
         let event = TimelineEvent {
             index: 9,
             ordinal: 0,
-            at_us: 42,
+            at: ts(42),
             body: TimelineEventBody::PolicyUpdated,
         };
         let json = serde_json::to_value(&event).unwrap();
@@ -842,7 +858,7 @@ mod tests {
             serde_json::json!({
                 "index": 9,
                 "ordinal": 0,
-                "at_us": 42,
+                "at": "1970-01-01T00:00:00.000042Z",
                 "kind": "policy_updated",
             })
         );
@@ -866,7 +882,7 @@ mod tests {
         assert_eq!(req.job, job);
         assert_eq!(req.quota_entity, entity);
         assert_eq!(req.priority, 0);
-        assert_eq!(req.max_runtime_us, None);
+        assert_eq!(req.max_runtime_seconds, None);
         assert!(req.entrypoint.is_none());
         assert!(req.retry.is_none());
     }
@@ -897,12 +913,12 @@ mod tests {
 
         // A top-level typo would otherwise silently default the real field.
         let mut typo = base.clone();
-        typo["max_runtme_us"] = serde_json::json!(3_600_000_000u64);
+        typo["max_runtme_seconds"] = serde_json::json!(3_600);
         assert!(serde_json::from_value::<SubmitJobRequest>(typo).is_err());
 
         // Wrong casing is the same failure mode, not an alias.
         let mut cased = base.clone();
-        cased["maxRuntimeUs"] = serde_json::json!(3_600_000_000u64);
+        cased["maxRuntimeSeconds"] = serde_json::json!(3_600);
         assert!(serde_json::from_value::<SubmitJobRequest>(cased).is_err());
 
         // Nested request objects are strict too.

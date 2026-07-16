@@ -25,9 +25,10 @@ All run from `web/`:
 3. **Types live in `src/api/types.ts`** and mirror the Rust domain model
    (crates/coppice-core, coppice-state, coppice-scheduler,
    coppice-consensus) by name and semantics. Check the Rust source before
-   inventing a field. Units: timestamps/durations are µs (`...Us`), costs
-   are µCU (`...Ucu`), cpu is millicores. Format with `src/lib/format.ts`
-   helpers — never hand-roll formatting.
+   inventing a field. Units: instants are `Date` (ISO 8601 strings on the
+   wire), durations are whole seconds (`...Seconds`), costs are µCU
+   (`...Ucu`), cpu is millicores. Format with `src/lib/format.ts` helpers —
+   never hand-roll formatting.
 4. **Routes are thin.** Files in `src/routes/` only wire params to a page
    component from `src/features/<area>/`. Page logic, tables, panels live
    in the feature directory.
@@ -66,8 +67,9 @@ routes every endpoint below, with unimplemented ones answering
    `crates/coppice-api/src/http/dto.rs` (shape mirrors this repo's
    `src/api/types.ts` by name and semantics, spelled snake_case on the
    wire: `cpu_millis` keys, `"oom_killed"` enum strings, bare
-   typed-string ids, integers as JSON numbers, `null` optionals, `[]`
-   empties), add the projection in
+   typed-string ids, instants as ISO 8601 strings and durations as
+   `_seconds` numbers (ADR 0033), other integers as JSON numbers, `null`
+   optionals, `[]` empties), add the projection in
    `crates/coppice-api/src/http/project.rs`, and swap its stub handler
    in `crates/coppice-api/src/http/routes.rs` for a real one backed by
    the coordinator.
