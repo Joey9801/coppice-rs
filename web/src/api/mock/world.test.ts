@@ -523,6 +523,16 @@ describe('MockWorld listJobs semantics', () => {
     expect(world.listJobs({ limit: 1000 }).nextCursor).toBeNull()
   })
 
+  it('reports null cursor when the page fills exactly at the low end', () => {
+    const world = new MockWorld(NOW_US)
+    const total = allJobs(world).length
+    // Null iff exhausted: an exact fill is exhausted, never a trailing empty
+    // page behind a dangling cursor.
+    const page = world.listJobs({ limit: total })
+    expect(page.jobs).toHaveLength(total)
+    expect(page.nextCursor).toBeNull()
+  })
+
   it('pages by keyset with no skip or duplicate until exhausted', () => {
     const world = new MockWorld(NOW_US)
     const seen: string[] = []
@@ -701,6 +711,7 @@ describe('MockWorld listJobs semantics', () => {
     invalid({ filter: { phase: { in: ['Nope'] } } }) // unknown phase
     invalid({ filter: { id: { in: [] } } })
     invalid({ filter: { id: { in: ['not-a-job'] } } }) // malformed id
+    invalid({ filter: { id: { in: ['job-garbage'] } } }) // prefix without a uuid
     invalid({ filter: { image: {} } }) // image needs exactly one op
     invalid({ filter: { image: { contains: 'x', equals: 'y' } } })
     invalid({ filter: { submitted: {} } }) // needs a bound
@@ -713,6 +724,7 @@ describe('MockWorld listJobs semantics', () => {
 
     invalid({ cursor: 'nope' }) // not a v1: token
     invalid({ cursor: 'v1:not-a-job' }) // token payload is not a job id
+    invalid({ cursor: 'v1:job-garbage' }) // prefixed but not uuid-backed
     invalid({ limit: 0 })
     invalid({ limit: 1001 })
   })

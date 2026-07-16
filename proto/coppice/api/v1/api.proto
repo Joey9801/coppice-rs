@@ -1,17 +1,18 @@
-// Public API request/response types.
+// Public API write-command types.
 //
-// These messages are the cross-language description of the client API
-// surface — endpoints are durable state transitions, not imperative
-// worker control. The HTTP edge does NOT serialize them: its JSON bodies
-// are the handwritten DTOs in `coppice-api::http::dto` (ADR 0031 as
-// amended), kept in sync with these shapes by review. Schema style rules
-// still apply here; see docs/architecture/schema-style.md.
+// Only the two writes live here; the package is NOT a mirror of the HTTP
+// surface (ADR 0031 as amended 2026-07-16): each REST endpoint's contract
+// is owned solely by its handwritten DTOs in `coppice-api::http::dto`,
+// and new endpoints add no messages to this package unless a concrete
+// protobuf or gRPC consumer exists — a consumerless mirror can drift
+// while permanently freezing speculative fields and tags. The HTTP edge
+// does not serialize these messages either. Schema style rules still
+// apply here; see docs/architecture/schema-style.md.
 
 syntax = "proto3";
 
 package coppice.api.v1;
 
-import "coppice/core/v1/attempt.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
 import "coppice/core/v1/resource.proto";
@@ -68,150 +69,3 @@ message AbortJobRequest {
 }
 
 message AbortJobResponse {}
-
-// List jobs. A bounded read (ADR 0031) over the replicated job map in one
-// canonical order — JobId descending, which is ≈ newest-submitted first
-// (UUIDv7) and never shifts as a job's state changes — with keyset
-// pagination and a JSON filter AST. The HTTP edge maps this to
-// `GET /api/v1/jobs?filter=&cursor=&limit=`.
-message ListJobsRequest {
-  // Absent matches every job.
-  JobFilter filter = 1;
-  // Opaque continuation token from a prior response (`v1:<job-id>`); empty
-  // starts at the top of the descending scan.
-  string cursor = 2;
-  // Page size. 0 = the server default (100); otherwise 1..=1000, and out of
-  // range is rejected rather than clamped.
-  uint32 limit = 3;
-}
-
-message ListJobsResponse {
-  repeated JobSummary jobs = 1;
-  // Keyset cursor for the last record examined; absent iff the scan reached
-  // the low end of the map. A short page *with* a cursor means "continue".
-  optional string next_cursor = 2;
-}
-
-// A job's summary row: the read-time join (ADR 0030) of a job with the
-// attempt it carries. Mirrors the `JobSummary` DTO in
-// `coppice-api::http::dto`; the HTTP edge serializes that, not this.
-message JobSummary {
-  coppice.core.v1.JobId id = 1;
-  coppice.core.v1.JobState state = 2;
-  // Set iff `state` is Attempting — the attempt the job is pursuing.
-  coppice.core.v1.AttemptId attempt = 3;
-  string image = 4;
-  coppice.core.v1.QuotaEntityId quota_entity = 5;
-  // Empty if the entity is (impossibly) absent from the tree.
-  string quota_entity_name = 6;
-  sint32 priority = 7;
-  int64 submitted_at_us = 8;
-  // Absent while the job is live.
-  optional int64 terminal_at_us = 9;
-  // Current attempt's node; absent when there is no live attempt.
-  coppice.core.v1.NodeId node = 10;
-  // Current attempt's state; absent when there is no live attempt.
-  coppice.core.v1.AttemptState attempt_state = 11;
-  // Min funded/requested across dimensions as parts-per-thousand (the JSON
-  // DTO carries a 0..1 float; the corpus admits no float, ADR 0019).
-  // Present only while the current attempt is Accruing.
-  optional uint32 funding_fraction_milli = 12;
-  // µCU charged across the job's attempts so far (gross; the terminal
-  // true-up settles only against entity usage, so no net figure is retained).
-  uint64 cost_ucu = 13;
-  // Last attempt's outcome; present only when the job is terminal.
-  coppice.core.v1.AttemptOutcome outcome = 14;
-}
-
-// The job-list filter AST. Externally tagged in JSON (exactly one field
-// set); a oneof here. Combinator and `in` lists are non-empty, nesting is
-// capped at depth 8 and 64 total nodes — rules enforced at the edge, not by
-// the schema. `label` and `submitted_by` are reserved for the future and
-// deliberately absent.
-message JobFilter {
-  // A non-empty list of subfilters (for `all`/`any`).
-  message List {
-    repeated JobFilter filters = 1;
-  }
-  // A non-empty set of derived phases.
-  message PhaseSet {
-    repeated JobPhase phases = 1;
-  }
-  // A quota-entity match, by subtree (default) or exact entity.
-  message Entity {
-    coppice.core.v1.QuotaEntityId id = 1;
-    // Absent (UNSPECIFIED) is read as SUBTREE.
-    EntityScope scope = 2;
-  }
-  // Image substring or exact match — exactly one op.
-  message Image {
-    oneof op {
-      string contains = 1;
-      string equals = 2;
-    }
-  }
-  // A non-empty set of job ids.
-  message IdSet {
-    repeated coppice.core.v1.JobId ids = 1;
-  }
-  // A submission-time window; at least one bound. `after` is inclusive
-  // (>=), `before` exclusive (<).
-  message Submitted {
-    optional int64 after_at_us = 1;
-    optional int64 before_at_us = 2;
-  }
-  // A requested-resource bound; at least one of min/max, both inclusive.
-  message Requests {
-    ResourceDimension resource = 1;
-    optional uint64 min = 2;
-    optional uint64 max = 3;
-  }
-
-  oneof filter {
-    List all = 1;
-    List any = 2;
-    JobFilter not = 3;
-    PhaseSet phase = 4;
-    Entity entity = 5;
-    // Current attempt's node; an unknown node matches nothing.
-    coppice.core.v1.NodeId node = 6;
-    Image image = 7;
-    IdSet id = 8;
-    // Case-insensitive substring over the job id string OR the image.
-    string search = 9;
-    Submitted submitted = 10;
-    Requests requests = 11;
-  }
-}
-
-// A job's flat display phase (ADR 0030): the read-time join of its JobState
-// with the state of the attempt it carries. Derived, never replicated.
-enum JobPhase {
-  JOB_PHASE_UNSPECIFIED = 0;
-  JOB_PHASE_SUBMITTED = 1;
-  JOB_PHASE_ACCEPTED = 2;
-  JOB_PHASE_QUEUED = 3;
-  JOB_PHASE_PREPARING = 4;
-  JOB_PHASE_RUNNING = 5;
-  JOB_PHASE_FINALIZING = 6;
-  JOB_PHASE_SUCCEEDED = 7;
-  JOB_PHASE_FAILED = 8;
-  JOB_PHASE_ABORTED = 9;
-}
-
-// How broadly an entity filter matches.
-enum EntityScope {
-  ENTITY_SCOPE_UNSPECIFIED = 0;
-  // The entity and all its descendants (the default).
-  ENTITY_SCOPE_SUBTREE = 1;
-  // Only the entity itself.
-  ENTITY_SCOPE_EXACT = 2;
-}
-
-// A requested-resource dimension a filter can bound.
-enum ResourceDimension {
-  RESOURCE_DIMENSION_UNSPECIFIED = 0;
-  RESOURCE_DIMENSION_CPU_MILLIS = 1;
-  RESOURCE_DIMENSION_MEMORY_BYTES = 2;
-  RESOURCE_DIMENSION_DISK_BYTES = 3;
-}
