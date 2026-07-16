@@ -12,9 +12,11 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
 use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::JobState;
+use coppice_core::quota::{self, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::{AttemptRecord, JobRecord, StateMachine};
+use coppice_scheduler::score;
+use coppice_state::{AttemptRecord, JobRecord, StateMachine, QUOTA_TREE_DEPTH_CAP};
 
 use crate::{QueueWindow, RecentClusterEvents};
 
@@ -237,7 +239,15 @@ fn cluster_capacity(state: &StateMachine) -> dto::ClusterCapacity {
     }
 }
 
-fn queue_stats(state: &StateMachine, now: Timestamp, window: &QueueWindow) -> dto::QueueStats {
+/// `GET /api/v1/queue/stats`. The `queue` field of the overview, served on
+/// its own (the UI's `QueueStats` is byte-for-byte that object). Same derived
+/// inputs as [`cluster_overview`]'s queue block: `now` for the read-time
+/// oldest-queued age, `window` for the replica-local rates/history.
+pub(crate) fn queue_stats(
+    state: &StateMachine,
+    now: Timestamp,
+    window: &QueueWindow,
+) -> dto::QueueStats {
     // Seeded with every phase so the response reports a count for each one,
     // zeros included.
     let mut by_state: BTreeMap<dto::JobPhase, u32> =
@@ -655,6 +665,374 @@ fn job_summary(state: &StateMachine, record: &JobRecord) -> dto::JobSummary {
             None
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Job detail (GET /api/v1/jobs/{job})
+// ---------------------------------------------------------------------------
+
+/// 2³², the Q32.32 scale factor — the same conversion the scheduler's
+/// `score` module uses to render a fixed-point multiplier as a real number.
+const Q32_SCALE: f64 = 4_294_967_296.0;
+
+/// Queued jobs examined when ranking a single job's queue position. The bound
+/// keeps a job detail on a huge backlog from turning one read into an
+/// unbounded scan; past it, `rank`/`queue_depth` reflect the examined prefix
+/// (a job outside it simply reports the ranking within what was scanned).
+const QUEUE_RANK_BUDGET: usize = 100_000;
+
+/// A quota entity's decayed metrics as of `now`, shared by the two ancestry
+/// projections (`entity_chain` root-first, `penalty_chain` leaf-first).
+struct EntityMetrics {
+    id: QuotaEntityId,
+    name: String,
+    parent: Option<QuotaEntityId>,
+    quota_ucu: u64,
+    usage_ucu: u64,
+    over_quota_ratio: f64,
+    penalty: f64,
+}
+
+fn entity_metrics(
+    state: &StateMachine,
+    id: QuotaEntityId,
+    now: Timestamp,
+) -> Option<EntityMetrics> {
+    let e = state.quota_entities.get(&id)?;
+    let policy = &state.policy;
+    let decayed = policy
+        .decay
+        .decay_between(e.usage.usage, e.usage.last_update, now);
+    let over_quota_ratio = quota::over_quota_ratio(decayed, e.quota);
+    Some(EntityMetrics {
+        id,
+        name: e.name.clone(),
+        parent: e.parent,
+        quota_ucu: e.quota.0,
+        usage_ucu: decayed.0,
+        over_quota_ratio,
+        penalty: quota::penalty(over_quota_ratio, policy.penalty_exponent_milli),
+    })
+}
+
+/// A job's quota-entity ancestry, leaf → root. Walks parents exactly as apply
+/// and the scheduler do: depth-capped at [`QUOTA_TREE_DEPTH_CAP`], stopping at
+/// a missing parent.
+fn ancestor_ids(state: &StateMachine, leaf: QuotaEntityId) -> Vec<QuotaEntityId> {
+    let mut ids = Vec::new();
+    let mut cur = Some(leaf);
+    for _ in 0..QUOTA_TREE_DEPTH_CAP {
+        let Some(id) = cur else { break };
+        let Some(e) = state.quota_entities.get(&id) else {
+            break;
+        };
+        ids.push(id);
+        cur = e.parent;
+    }
+    ids
+}
+
+/// The `entity_chain` field: ancestry root → leaf, usage decayed to `now`.
+fn entity_chain(
+    state: &StateMachine,
+    leaf: QuotaEntityId,
+    now: Timestamp,
+) -> Vec<dto::QuotaEntityView> {
+    let mut chain: Vec<dto::QuotaEntityView> = ancestor_ids(state, leaf)
+        .into_iter()
+        .filter_map(|id| entity_metrics(state, id, now))
+        .map(|m| dto::QuotaEntityView {
+            id: m.id,
+            name: m.name,
+            parent: m.parent,
+            quota_ucu: m.quota_ucu,
+            usage_ucu: m.usage_ucu,
+            over_quota_ratio: m.over_quota_ratio,
+            penalty: m.penalty,
+        })
+        .collect();
+    chain.reverse();
+    chain
+}
+
+/// The `penalty_chain` field: ancestry leaf → root, usage decayed to `now`.
+fn penalty_chain(
+    state: &StateMachine,
+    leaf: QuotaEntityId,
+    now: Timestamp,
+) -> Vec<dto::PenaltyLink> {
+    ancestor_ids(state, leaf)
+        .into_iter()
+        .filter_map(|id| entity_metrics(state, id, now))
+        .map(|m| dto::PenaltyLink {
+            entity: m.id,
+            name: m.name,
+            usage_ucu: m.usage_ucu,
+            quota_ucu: m.quota_ucu,
+            over_quota_ratio: m.over_quota_ratio,
+            penalty: m.penalty,
+        })
+        .collect()
+}
+
+/// A queued job's ADR 0021 [`Rank`](score::Rank) at `now`, reusing the
+/// scheduler's own scoring so the ordering here is the one the scheduler
+/// would apply — never a reimplementation.
+fn job_rank(
+    state: &StateMachine,
+    record: &JobRecord,
+    now: Timestamp,
+    horizon: Duration,
+    w_age: f64,
+) -> score::Rank {
+    let penalty_product = score::penalty_product(
+        &state.quota_entities,
+        record.spec.quota_entity,
+        &state.policy,
+        now,
+    );
+    let s = score::effective_score(
+        record.multiplier,
+        penalty_product,
+        record.submitted_at,
+        now,
+        horizon,
+        w_age,
+    );
+    score::Rank {
+        score: s,
+        submitted_at: record.submitted_at,
+        job: record.spec.id,
+    }
+}
+
+/// The `queue` explainer for a job — `None` unless the job is `Queued`.
+///
+/// Ranks the job among all queued jobs (bounded by [`QUEUE_RANK_BUDGET`]) via
+/// the scheduler's [`Rank`](score::Rank) total order, and reports the penalty
+/// chain and age terms that produced the score.
+fn queue_explainer(
+    state: &StateMachine,
+    record: &JobRecord,
+    now: Timestamp,
+) -> Option<dto::QueuePositionExplainer> {
+    if record.state != JobState::Queued {
+        return None;
+    }
+    let policy = &state.policy;
+    let horizon = score::age_horizon(&policy.decay);
+    let w_age = score::DEFAULT_AGE_WEIGHT;
+
+    let this_rank = job_rank(state, record, now, horizon, w_age);
+
+    // Rank = 1 + the number of queued jobs that strictly outrank this one
+    // (`Rank`'s `Ord` puts a better candidate `Less`). The total order has no
+    // ties across distinct jobs, so this job is never counted against itself.
+    let mut queue_depth: u32 = 0;
+    let mut ahead: u32 = 0;
+    for (_, other) in state
+        .jobs
+        .iter()
+        .filter(|(_, r)| r.state == JobState::Queued)
+        .take(QUEUE_RANK_BUDGET)
+    {
+        queue_depth += 1;
+        if job_rank(state, other, now, horizon, w_age) < this_rank {
+            ahead += 1;
+        }
+    }
+
+    let penalty_product =
+        score::penalty_product(&state.quota_entities, record.spec.quota_entity, policy, now);
+    let multiplier = record.multiplier.0 as f64 / Q32_SCALE;
+    let age = (now - record.submitted_at).max(Duration::ZERO);
+    let age_bonus = this_rank.score - multiplier / penalty_product;
+
+    Some(dto::QueuePositionExplainer {
+        rank: ahead + 1,
+        queue_depth,
+        score: this_rank.score,
+        multiplier,
+        penalty_chain: penalty_chain(state, record.spec.quota_entity, now),
+        penalty_product,
+        age_seconds: age.as_secs(),
+        age_horizon_seconds: horizon.as_secs(),
+        w_age,
+        age_bonus,
+    })
+}
+
+/// The `accrual` field — `Some` only while the current attempt is `Accruing`,
+/// built from the attempt's allocation exactly as [`get_node`]'s accrual queue.
+fn job_accrual(state: &StateMachine, record: &JobRecord) -> Option<dto::AccrualView> {
+    let attempt = state.attempts.get(&record.state.attempt()?)?;
+    if !matches!(attempt.attempt.state, AttemptState::Accruing) {
+        return None;
+    }
+    let alloc_record = state.allocations.get(&attempt.attempt.allocation)?;
+    let alloc = &alloc_record.allocation;
+    Some(dto::AccrualView {
+        allocation: dto::AllocationView {
+            id: alloc.id,
+            job: alloc.job,
+            attempt: alloc.attempt,
+            node: alloc.node,
+            requested: (&alloc.requested).into(),
+            funded: (&alloc.funded).into(),
+            state: alloc.state.into(),
+            seq: alloc_record.seq,
+        },
+        funded_fraction: funded_fraction(&alloc.funded, &alloc.requested),
+        projected_start: None,
+    })
+}
+
+/// The `state_since` approximation — see the doc on [`dto::JobDetail::state_since`].
+fn state_since(state: &StateMachine, record: &JobRecord) -> Timestamp {
+    if record.state.is_terminal() {
+        return record.terminal_at.unwrap_or(record.submitted_at);
+    }
+    // A live attempt that has been observed running dates the current state
+    // from its start; otherwise (queued, or an attempt still preparing) the
+    // best proxy is submission time.
+    record
+        .state
+        .attempt()
+        .and_then(|id| state.attempts.get(&id))
+        .and_then(|ar| ar.started_at)
+        .unwrap_or(record.submitted_at)
+}
+
+/// A job's [`dto::CostReport`], computed from replicated policy and the job's
+/// spec/charges with the ADR 0019 quota arithmetic (`coppice_core::quota`) —
+/// the charge formulas are called, never re-derived here.
+fn cost_report(state: &StateMachine, record: &JobRecord) -> dto::CostReport {
+    let policy = &state.policy;
+    let weights = &policy.cost_weights;
+    let requests = &record.spec.requests;
+
+    // Per-dimension rate via the canonical `resource_rate`, isolating one
+    // dimension at a time (the other terms contribute zero) so the breakdown
+    // uses exactly the same arithmetic as the total.
+    let only = |cpu: u64, memory: u64, disk: u64| {
+        quota::resource_rate(
+            &Resources {
+                cpu_millis: cpu,
+                memory_bytes: memory,
+                disk_bytes: disk,
+            },
+            weights,
+        )
+    };
+    let rate_breakdown = dto::RateBreakdown {
+        cpu: only(requests.cpu_millis, 0, 0),
+        memory: only(0, requests.memory_bytes, 0),
+        disk: only(0, 0, requests.disk_bytes),
+    };
+    let rate_ucu_per_second = quota::resource_rate(requests, weights);
+
+    let priority_multiplier = record.multiplier;
+    // The unbounded-runtime surcharge is folded in only for a job with no
+    // declared `max_runtime` (ADR 0029).
+    let (unbounded_multiplier, effective_multiplier) = if record.spec.max_runtime.is_none() {
+        let u = policy.unbounded_runtime_multiplier;
+        (u, priority_multiplier.saturating_mul(u))
+    } else {
+        (PriorityMultiplier::ONE, priority_multiplier)
+    };
+
+    // The charge window: the declared bound, or the policy default when unset.
+    let (charge_window_seconds, charge_window_is_default) = match record.spec.max_runtime {
+        Some(d) => (quota::runtime_seconds_ceil(d), false),
+        None => (policy.default_charge_runtime_s, true),
+    };
+
+    let effective_rate_ucu_per_second =
+        quota::cost_from_rate(rate_ucu_per_second, 1, effective_multiplier).0;
+    let estimated_ucu = quota::cost_from_rate(
+        rate_ucu_per_second,
+        charge_window_seconds,
+        effective_multiplier,
+    )
+    .0;
+
+    // The refund fraction actually captured on the latest attempt's charge
+    // (ADR 0029 freezes it at placement); before any placement, what a
+    // placement now would capture — full for an unbounded job, else policy.
+    let refund_fraction_milli = record
+        .attempts
+        .last()
+        .and_then(|id| state.attempts.get(id))
+        .map(|ar| ar.charge.refund_fraction_milli)
+        .unwrap_or(if record.spec.max_runtime.is_none() {
+            quota::FULL_REFUND_MILLI
+        } else {
+            policy.refund_fraction_milli
+        });
+
+    dto::CostReport {
+        rate_ucu_per_second,
+        rate_breakdown,
+        priority_multiplier: priority_multiplier.0 as f64 / Q32_SCALE,
+        unbounded_multiplier: unbounded_multiplier.0 as f64 / Q32_SCALE,
+        effective_rate_ucu_per_second,
+        charge_window_seconds,
+        charge_window_is_default,
+        estimated_ucu,
+        charged_ucu: total_charged(state, record),
+        refund_fraction: refund_fraction_milli as f64 / 1000.0,
+        // No measured-usage pipeline exists, and the true-up is not retained
+        // per job — both are honestly absent rather than fabricated.
+        actual_ucu: None,
+        true_up: None,
+    }
+}
+
+/// `GET /api/v1/jobs/{job}`. `None` when the id is not in the view (a 404 at
+/// the handler). `now` is the reader's wall clock, feeding the read-time
+/// entity-usage decay, queue age, and penalty product — never replicated.
+pub fn get_job(state: &StateMachine, id: &JobId, now: Timestamp) -> Option<dto::JobDetail> {
+    let record = state.jobs.get(id)?;
+    let spec = &record.spec;
+
+    Some(dto::JobDetail {
+        id: spec.id,
+        state: record.state.into(),
+        spec: dto::JobSpecView {
+            image: spec.image.clone(),
+            command: spec.command.clone(),
+            entrypoint: spec.entrypoint.clone(),
+            requests: (&spec.requests).into(),
+            priority: spec.priority,
+            max_runtime_seconds: spec.max_runtime.map(Duration::as_secs),
+            quota_entity: spec.quota_entity,
+            retry: dto::RetryPolicy {
+                max_retries: spec.retry.max_retries,
+                retry_user_errors: spec.retry.retry_user_errors,
+            },
+        },
+        submitted_at: record.submitted_at,
+        state_since: state_since(state, record),
+        terminal_at: record.terminal_at,
+        retries_used: record.retries_used,
+        abort_requested: spec
+            .abort_requested
+            .as_ref()
+            .map(|a| dto::AbortRequestedView {
+                reason: a.reason.clone(),
+                requested_at: a.requested_at,
+            }),
+        entity_chain: entity_chain(state, spec.quota_entity, now),
+        attempts: record
+            .attempts
+            .iter()
+            .filter_map(|aid| state.attempts.get(aid))
+            .map(attempt_view)
+            .collect(),
+        queue: queue_explainer(state, record, now),
+        accrual: job_accrual(state, record),
+        cost: cost_report(state, record),
+    })
 }
 
 #[cfg(test)]
@@ -1578,5 +1956,261 @@ mod tests {
             Some(dto::AttemptOutcomeKind::OomKilled)
         );
         assert_eq!(summary.terminal_at, Some(ts(5)));
+    }
+
+    // ---- job detail (GET /api/v1/jobs/{job}) ------------------------------
+
+    /// The documented reference calibration (ADR 0019): 1 core-second = 1 CU
+    /// = 1_000_000 µCU.
+    const REFERENCE_WEIGHTS: coppice_core::quota::CostWeights = coppice_core::quota::CostWeights {
+        per_cpu_milli_second: 1000 << 32,
+        per_memory_byte_second: 1_000_000,
+        per_disk_byte_second: 62_500,
+    };
+
+    fn put_entity(
+        state: &mut StateMachine,
+        id: QuotaEntityId,
+        parent: Option<QuotaEntityId>,
+        name: &str,
+        quota: u64,
+        usage: u64,
+        at: Timestamp,
+    ) {
+        state.quota_entities.insert(
+            id,
+            coppice_state::QuotaEntity {
+                parent,
+                name: name.to_string(),
+                quota: CostUnits(quota),
+                usage: coppice_core::quota::UsageState {
+                    usage: CostUnits(usage),
+                    last_update: at,
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn get_job_returns_none_for_missing() {
+        let state = StateMachine::default();
+        assert!(get_job(&state, &job_id(1), ts(0)).is_none());
+    }
+
+    #[test]
+    fn get_job_projects_spec_and_entity_chain_root_first() {
+        let root = quota_id(1);
+        let leaf = quota_id(2);
+        let now = ts(1_000_000);
+        let mut state = StateMachine::default();
+        // No decay: usage stamped at `now`.
+        put_entity(&mut state, root, None, "root", 1_000_000, 0, now);
+        put_entity(&mut state, leaf, Some(root), "leaf", 1_000_000, 0, now);
+
+        let id = job_id(1);
+        let mut record = spec_job(id, "alpine:3", leaf, cpu(1000), 1_000_000);
+        record.spec.command = vec!["sh".to_string(), "-c".to_string()];
+        record.spec.entrypoint = Some(vec!["/bin/init".to_string()]);
+        record.spec.max_runtime = Some(Duration::from_secs(3600));
+        state.jobs.insert(id, record);
+
+        let detail = get_job(&state, &id, now).unwrap();
+        assert_eq!(detail.id, id);
+        assert_eq!(detail.spec.image, "alpine:3");
+        assert_eq!(detail.spec.command, vec!["sh", "-c"]);
+        assert_eq!(detail.spec.entrypoint, Some(vec!["/bin/init".to_string()]));
+        assert_eq!(detail.spec.max_runtime_seconds, Some(3600));
+        assert_eq!(detail.spec.quota_entity, leaf);
+        // Ancestry is root first, the owning (leaf) entity last.
+        let names: Vec<&str> = detail
+            .entity_chain
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["root", "leaf"]);
+    }
+
+    #[test]
+    fn get_job_state_since_approximates_by_phase() {
+        let now = ts(10_000_000);
+        // Terminal: dates from terminal_at.
+        let mut state = StateMachine::default();
+        let term = job_id(1);
+        let mut rec = test_job(term, JobState::Succeeded, ts(0));
+        rec.terminal_at = Some(ts(5_000_000));
+        state.jobs.insert(term, rec);
+        let detail = get_job(&state, &term, now).unwrap();
+        assert_eq!(detail.state_since, ts(5_000_000));
+        // A terminal job is never queued and never accruing.
+        assert!(detail.queue.is_none());
+        assert!(detail.accrual.is_none());
+
+        // Running: dates from the current attempt's started_at.
+        let running = job_id(2);
+        let attempt = AttemptId::new();
+        let node = NodeId::new();
+        let mut rrec = test_job(running, JobState::Attempting(attempt), ts(0));
+        rrec.attempts = vec![attempt];
+        state.jobs.insert(running, rrec);
+        let mut arec = test_attempt(attempt, running, node, AttemptState::Running);
+        arec.started_at = Some(ts(3_000_000));
+        state.attempts.insert(attempt, arec);
+        assert_eq!(
+            get_job(&state, &running, now).unwrap().state_since,
+            ts(3_000_000)
+        );
+
+        // Queued: dates from submission.
+        let queued_j = job_id(3);
+        state.jobs.insert(
+            queued_j,
+            test_job(queued_j, JobState::Queued, ts(2_000_000)),
+        );
+        assert_eq!(
+            get_job(&state, &queued_j, now).unwrap().state_since,
+            ts(2_000_000)
+        );
+    }
+
+    #[test]
+    fn get_job_cost_report_prices_a_bounded_job() {
+        let now = ts(1_000_000);
+        let mut state = StateMachine::default();
+        state.policy.cost_weights = REFERENCE_WEIGHTS;
+        let entity = quota_id(1);
+        put_entity(&mut state, entity, None, "e", 1_000_000, 0, now);
+
+        let id = job_id(1);
+        // 1 core → 1 CU/s = 1_000_000 µCU/s; 2× priority; a declared 1h bound.
+        let mut rec = spec_job(id, "img", entity, cpu(1000), 1_000_000);
+        rec.spec.max_runtime = Some(Duration::from_secs(3600));
+        rec.multiplier = PriorityMultiplier::from_integer(2);
+        state.jobs.insert(id, rec);
+
+        let cost = get_job(&state, &id, now).unwrap().cost;
+        assert_eq!(cost.rate_ucu_per_second, 1_000_000);
+        assert_eq!(cost.rate_breakdown.cpu, 1_000_000);
+        assert_eq!(cost.rate_breakdown.memory, 0);
+        assert_eq!(cost.rate_breakdown.disk, 0);
+        assert_eq!(cost.priority_multiplier, 2.0);
+        // Bounded: no unbounded surcharge.
+        assert_eq!(cost.unbounded_multiplier, 1.0);
+        assert_eq!(cost.effective_rate_ucu_per_second, 2_000_000);
+        assert_eq!(cost.charge_window_seconds, 3600);
+        assert!(!cost.charge_window_is_default);
+        // 1_000_000 µCU/s × 3600 s × 2 = 7_200_000_000 µCU.
+        assert_eq!(cost.estimated_ucu, 7_200_000_000);
+        // Not placed: nothing charged yet.
+        assert_eq!(cost.charged_ucu, 0);
+        // Bounded default refund fraction (750 milli).
+        assert_eq!(cost.refund_fraction, 0.75);
+        // No measured-usage pipeline; no retained true-up.
+        assert_eq!(cost.actual_ucu, None);
+        assert!(cost.true_up.is_none());
+    }
+
+    #[test]
+    fn get_job_cost_report_folds_the_unbounded_surcharge() {
+        let now = ts(1_000_000);
+        let mut state = StateMachine::default();
+        state.policy.cost_weights = REFERENCE_WEIGHTS;
+        let entity = quota_id(1);
+        put_entity(&mut state, entity, None, "e", 1_000_000, 0, now);
+
+        let id = job_id(1);
+        // No max_runtime: the default 2× unbounded multiplier folds in and the
+        // charge window is the policy default.
+        let mut rec = spec_job(id, "img", entity, cpu(1000), 1_000_000);
+        rec.spec.max_runtime = None;
+        state.jobs.insert(id, rec);
+
+        let cost = get_job(&state, &id, now).unwrap().cost;
+        assert_eq!(cost.unbounded_multiplier, 2.0);
+        assert_eq!(cost.priority_multiplier, 1.0);
+        assert_eq!(cost.effective_rate_ucu_per_second, 2_000_000);
+        assert_eq!(
+            cost.charge_window_seconds,
+            state.policy.default_charge_runtime_s
+        );
+        assert!(cost.charge_window_is_default);
+        // Unbounded jobs get a full refund fraction.
+        assert_eq!(cost.refund_fraction, 1.0);
+    }
+
+    #[test]
+    fn get_job_queue_explainer_ranks_and_explains() {
+        let now = ts(1_000_000);
+        let mut state = StateMachine::default();
+        // Two queued jobs. Entities stamped at `now` so usage does not decay.
+        let ea = quota_id(1);
+        let eb = quota_id(2);
+        // A: 2× over quota → penalty 4 (quadratic); multiplier 2 → term 0.5.
+        put_entity(&mut state, ea, None, "team-a", 1_000_000, 2_000_000, now);
+        // B: within quota → penalty 1; multiplier 1 → term 1.0 (ranks first).
+        put_entity(&mut state, eb, None, "team-b", 1_000_000, 0, now);
+
+        let a = job_id(1);
+        let b = job_id(2);
+        let mut ra = test_job(a, JobState::Queued, now);
+        ra.spec.quota_entity = ea;
+        ra.multiplier = PriorityMultiplier::from_integer(2);
+        state.jobs.insert(a, ra);
+        let mut rb = test_job(b, JobState::Queued, now);
+        rb.spec.quota_entity = eb;
+        rb.multiplier = PriorityMultiplier::ONE;
+        state.jobs.insert(b, rb);
+
+        let qa = get_job(&state, &a, now)
+            .unwrap()
+            .queue
+            .expect("A is queued");
+        assert_eq!(qa.queue_depth, 2);
+        // B (score 1.0) outranks A (score 0.5): A is second.
+        assert_eq!(qa.rank, 2);
+        assert_eq!(qa.multiplier, 2.0);
+        assert_eq!(qa.penalty_chain.len(), 1);
+        let link = &qa.penalty_chain[0];
+        assert_eq!(link.entity, ea);
+        assert_eq!(link.usage_ucu, 2_000_000);
+        assert_eq!(link.quota_ucu, 1_000_000);
+        assert_eq!(link.over_quota_ratio, 2.0);
+        assert_eq!(link.penalty, 4.0);
+        assert_eq!(qa.penalty_product, 4.0);
+        // Age zero (submitted at `now`): score is exactly the priority term.
+        assert_eq!(qa.age_seconds, 0);
+        assert!((qa.score - 0.5).abs() < 1e-9, "score {}", qa.score);
+        assert!(qa.age_bonus.abs() < 1e-9);
+
+        // And B ranks first.
+        let qb = get_job(&state, &b, now).unwrap().queue.unwrap();
+        assert_eq!(qb.rank, 1);
+    }
+
+    #[test]
+    fn get_job_accrual_present_only_while_accruing() {
+        let now = ts(0);
+        let node = NodeId::new();
+        let job = job_id(1);
+        let attempt = AttemptId::new();
+        let alloc = AllocationId::new();
+        let mut state = StateMachine::default();
+        let mut rec = test_job(job, JobState::Attempting(attempt), ts(0));
+        rec.attempts = vec![attempt];
+        state.jobs.insert(job, rec);
+        let mut arec = test_attempt(attempt, job, node, AttemptState::Accruing);
+        arec.attempt.allocation = alloc;
+        state.attempts.insert(attempt, arec);
+        state.allocations.insert(
+            alloc,
+            test_allocation(alloc, job, attempt, node, AllocationState::Accruing),
+        );
+
+        let detail = get_job(&state, &job, now).unwrap();
+        let accrual = detail.accrual.expect("accruing");
+        assert_eq!(accrual.allocation.id, alloc);
+        // The attempt is surfaced too.
+        assert_eq!(detail.attempts.len(), 1);
+        // Attempting, not queued: no queue explainer.
+        assert!(detail.queue.is_none());
     }
 }

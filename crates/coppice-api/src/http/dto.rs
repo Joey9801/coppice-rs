@@ -825,6 +825,175 @@ impl JobFilter {
 }
 
 // ---------------------------------------------------------------------------
+// Job detail (GET /api/v1/jobs/{job})
+// ---------------------------------------------------------------------------
+
+/// The immutable submitted spec (mirrors `JobSpec` in `types.ts`).
+///
+/// Deviation from the TS shape: no `env` field. The web `JobSpec` carries an
+/// `env` overlay, but `coppice_core::job::Job` has none yet (it lands with the
+/// Docker executor, per the TS comment), so serializing one here would be a
+/// fabricated always-empty map. It is omitted until the domain type grows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSpecView {
+    pub image: String,
+    pub command: Vec<String>,
+    /// Entrypoint override; `null` runs the image's own entrypoint.
+    pub entrypoint: Option<Vec<String>>,
+    pub requests: Resources,
+    pub priority: i32,
+    /// Enforced runtime bound in whole seconds; `null` when unbounded.
+    pub max_runtime_seconds: Option<i64>,
+    pub quota_entity: QuotaEntityId,
+    pub retry: RetryPolicy,
+}
+
+/// A committed abort request on a job (mirrors the `abortRequested` field of
+/// `JobDetail`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortRequestedView {
+    pub reason: Option<String>,
+    pub requested_at: Timestamp,
+}
+
+/// One node of a job's quota-entity ancestry (mirrors `QuotaEntityView` in
+/// `types.ts`), with usage decayed to read time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaEntityView {
+    pub id: QuotaEntityId,
+    pub name: String,
+    pub parent: Option<QuotaEntityId>,
+    pub quota_ucu: u64,
+    /// Decayed usage as of the read's `now` (ADR 0019 integer decay).
+    pub usage_ucu: u64,
+    pub over_quota_ratio: f64,
+    /// Multiplicative scheduling penalty ≥ 1 derived from the ratio.
+    pub penalty: f64,
+}
+
+/// One entity's contribution to a queued job's penalty product (mirrors an
+/// entry of `QueuePositionExplainer.penaltyChain` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyLink {
+    pub entity: QuotaEntityId,
+    pub name: String,
+    pub usage_ucu: u64,
+    pub quota_ucu: u64,
+    pub over_quota_ratio: f64,
+    pub penalty: f64,
+}
+
+/// Why a `Queued` job sits where it does in the ranked queue (ADR 0021),
+/// mirroring `QueuePositionExplainer` in `types.ts`:
+/// `score = multiplier / penalty_product + w_age · age_seconds / age_horizon_seconds`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuePositionExplainer {
+    /// 1-based position in the effective-score order.
+    pub rank: u32,
+    /// Total queued jobs examined (the ranked set this `rank` is within).
+    pub queue_depth: u32,
+    pub score: f64,
+    /// The job's priority multiplier `m(j)` as a real number.
+    pub multiplier: f64,
+    /// One entry per ancestor entity, leaf → root.
+    pub penalty_chain: Vec<PenaltyLink>,
+    /// Product of the chain penalties, `P(j)`.
+    pub penalty_product: f64,
+    pub age_seconds: i64,
+    pub age_horizon_seconds: i64,
+    pub w_age: f64,
+    /// The additive aging term, `w_age · age_seconds / age_horizon_seconds`.
+    pub age_bonus: f64,
+}
+
+/// Per-dimension split of the base cost rate (µCU/second), summing to
+/// `CostReport::rate_ucu_per_second`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateBreakdown {
+    pub cpu: u64,
+    pub memory: u64,
+    pub disk: u64,
+}
+
+/// A true-up adjustment applied at finalization (mirrors the `trueUp` field of
+/// `CostReport`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TrueUpView {
+    pub kind: TrueUpKind,
+    pub amount_ucu: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrueUpKind {
+    Refund,
+    Surcharge,
+}
+
+/// A job's cost breakdown (mirrors `CostReport` in `types.ts`), computed from
+/// replicated policy and the job's charge records with the ADR 0019 quota
+/// arithmetic — never re-derived here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostReport {
+    /// Base µCU/second from cost weights × requested resources, before any
+    /// multiplier. `rate_breakdown` sums to this.
+    pub rate_ucu_per_second: u64,
+    pub rate_breakdown: RateBreakdown,
+    /// Priority-class multiplier (≥ 1) mapped from `spec.priority` by policy.
+    pub priority_multiplier: f64,
+    /// Runtime penalty folded in for a job with no declared `max_runtime`
+    /// (ADR 0029); `1.0` when the job is bounded.
+    pub unbounded_multiplier: f64,
+    /// The µCU/second actually priced: rate × priority × unbounded.
+    pub effective_rate_ucu_per_second: u64,
+    /// Duration the upfront placement charge covers: the job's `max_runtime`,
+    /// or the policy default charge runtime when unset.
+    pub charge_window_seconds: u64,
+    /// True iff `charge_window_seconds` is the policy default (job unbounded).
+    pub charge_window_is_default: bool,
+    /// Upfront charge for one placement: effective_rate × charge_window.
+    pub estimated_ucu: u64,
+    /// Gross µCU charged across attempts so far; 0 before the job is placed.
+    pub charged_ucu: u64,
+    /// Fraction (0..1) of the unused charge a true-up refunds (ADR 0029).
+    pub refund_fraction: f64,
+    /// Final settled cost; always `null` — no measured-usage pipeline exists,
+    /// so actual consumption is not recoverable from replicated state
+    /// (`project::total_charged`).
+    pub actual_ucu: Option<u64>,
+    /// The finalization refund/surcharge; always `null` — the true-up settles
+    /// against entity usage and is not retained per job (`project::total_charged`).
+    pub true_up: Option<TrueUpView>,
+}
+
+/// `GET /api/v1/jobs/{job}` (mirrors `JobDetail` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobDetail {
+    pub id: JobId,
+    pub state: JobStateKind,
+    pub spec: JobSpecView,
+    pub submitted_at: Timestamp,
+    /// When the job entered its current state. **Approximated, not
+    /// event-derived**: no event-history store exists, so this is the best
+    /// available proxy — `submitted_at` while queued, the current attempt's
+    /// `started_at` (falling back to `submitted_at`) while running, and
+    /// `terminal_at` once terminal. Drives "in this state for …" displays; do
+    /// not treat it as an exact transition instant.
+    pub state_since: Timestamp,
+    pub terminal_at: Option<Timestamp>,
+    pub retries_used: u32,
+    pub abort_requested: Option<AbortRequestedView>,
+    /// Quota-entity ancestry, root first, the owning entity last.
+    pub entity_chain: Vec<QuotaEntityView>,
+    pub attempts: Vec<AttemptView>,
+    /// Present iff the job is `Queued`.
+    pub queue: Option<QueuePositionExplainer>,
+    /// Present iff the current attempt is accruing.
+    pub accrual: Option<AccrualView>,
+    pub cost: CostReport,
+}
+
+// ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
 
@@ -1421,6 +1590,60 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({ "jobs": [], "next_cursor": null }));
+    }
+
+    #[test]
+    fn cost_report_serializes_snake_case_with_explicit_nulls() {
+        let report = CostReport {
+            rate_ucu_per_second: 1_000_000,
+            rate_breakdown: RateBreakdown {
+                cpu: 1_000_000,
+                memory: 0,
+                disk: 0,
+            },
+            priority_multiplier: 2.0,
+            unbounded_multiplier: 1.0,
+            effective_rate_ucu_per_second: 2_000_000,
+            charge_window_seconds: 3600,
+            charge_window_is_default: false,
+            estimated_ucu: 7_200_000_000,
+            charged_ucu: 0,
+            refund_fraction: 0.75,
+            actual_ucu: None,
+            true_up: None,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "rate_ucu_per_second": 1_000_000,
+                "rate_breakdown": { "cpu": 1_000_000, "memory": 0, "disk": 0 },
+                "priority_multiplier": 2.0,
+                "unbounded_multiplier": 1.0,
+                "effective_rate_ucu_per_second": 2_000_000,
+                "charge_window_seconds": 3600,
+                "charge_window_is_default": false,
+                "estimated_ucu": 7_200_000_000u64,
+                "charged_ucu": 0,
+                "refund_fraction": 0.75,
+                // Absent-data fields are explicit null, never omitted.
+                "actual_ucu": null,
+                "true_up": null,
+            })
+        );
+    }
+
+    #[test]
+    fn true_up_view_renders_its_kind_snake_case() {
+        let json = serde_json::to_value(TrueUpView {
+            kind: TrueUpKind::Refund,
+            amount_ucu: 42,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "refund", "amount_ucu": 42 })
+        );
     }
 
     #[test]

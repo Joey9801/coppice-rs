@@ -38,17 +38,11 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         .route("/api/v1/session", get(unimplemented_read("GetSession")))
         // Cluster overview — bounded reads.
         .route("/api/v1/overview", get(get_overview::<P>))
-        .route(
-            "/api/v1/queue/stats",
-            get(unimplemented_read("GetQueueStats")),
-        )
+        .route("/api/v1/queue/stats", get(get_queue_stats::<P>))
         // Jobs. List/detail/timeline are bounded; usage is eventual
         // (derived samples); logs are provisional until log storage exists.
         .route("/api/v1/jobs", get(list_jobs::<P>).post(submit_job::<P>))
-        .route(
-            "/api/v1/jobs/:job",
-            get(unimplemented_id_read::<JobId>("GetJob")),
-        )
+        .route("/api/v1/jobs/:job", get(get_job::<P>))
         .route("/api/v1/jobs/:job/abort", post(abort_job::<P>))
         .route(
             "/api/v1/jobs/:job/timeline",
@@ -285,6 +279,30 @@ async fn get_overview<P: ControlPlane>(
     ))
 }
 
+/// `GET /api/v1/queue/stats` — bounded by default (ADR 0031). The bare
+/// [`dto::QueueStats`] object (the same shape as the overview's `queue`
+/// field), with no wrapper: it is already an object, so fields can still be
+/// added later. Same derived queue-window source as [`get_overview`].
+async fn get_queue_stats<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    let window = plane.queue_window();
+    // A read may sample the clock (an apply may not): it feeds the read-time
+    // `oldest_queued_age_seconds`, never anything stored.
+    let response = super::project::queue_stats(view.state(), Timestamp::now(), &window);
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
 /// `GET /api/v1/nodes` — bounded by default (ADR 0031).
 async fn list_nodes<P: ControlPlane>(
     State(plane): State<Arc<P>>,
@@ -314,6 +332,29 @@ async fn get_node<P: ControlPlane>(
         .await?;
     let response = super::project::get_node(view.state(), &id)
         .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `GET /api/v1/jobs/{job}` — bounded by default (ADR 0031). 404 when the id
+/// is not in the read view, exactly as [`get_node`].
+async fn get_job<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    IdPath(id): IdPath<JobId>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    // A read may sample the clock (an apply may not): `now` feeds the
+    // read-time entity-usage decay, queue age, and penalty product.
+    let response = super::project::get_job(view.state(), &id, Timestamp::now())
+        .ok_or_else(|| HttpError::not_found(format!("job {id} not found")))?;
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -426,17 +467,13 @@ mod tests {
     #[tokio::test]
     async fn stub_routes_answer_501_with_the_endpoint_name() {
         let response = app(None)
-            .oneshot(
-                Request::get("/api/v1/queue/stats")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/v1/session").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
         assert_eq!(body["code"], "UNIMPLEMENTED");
-        assert!(body["message"].as_str().unwrap().contains("GetQueueStats"));
+        assert!(body["message"].as_str().unwrap().contains("GetSession"));
     }
 
     #[tokio::test]
@@ -614,15 +651,17 @@ mod tests {
         let job = JobId::new();
         let response = app(None)
             .oneshot(
-                Request::get(format!("/api/v1/jobs/{job}?consistency=strong&min_index=3"))
-                    .body(Body::empty())
-                    .unwrap(),
+                Request::get(format!(
+                    "/api/v1/jobs/{job}/timeline?consistency=strong&min_index=3"
+                ))
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
-        assert!(body["message"].as_str().unwrap().contains("GetJob"));
+        assert!(body["message"].as_str().unwrap().contains("GetJobTimeline"));
     }
 
     #[tokio::test]
@@ -928,6 +967,126 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn queue_stats_answers_from_the_replica_with_staleness_headers() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/queue/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Bounded reads carry the staleness headers, like every other read.
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_COMMITTED_INDEX));
+
+        let body = body_json(response).await;
+        // The bare QueueStats object, no wrapper — the same shape as the
+        // overview's `queue` field.
+        assert_eq!(body["depth"], 0);
+        assert_eq!(body["by_state"]["queued"], 0);
+        assert_eq!(body["oldest_queued_age_seconds"], serde_json::Value::Null);
+        // No derived coverage on a fresh replica: rates null, history empty.
+        assert_eq!(body["drain_rate_per_minute"], serde_json::Value::Null);
+        assert_eq!(body["history"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn queue_stats_counts_a_seeded_queue() {
+        let lo: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let hi: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let response = app_with_state(None, state_with_jobs(&[lo, hi]))
+            .oneshot(
+                Request::get("/api/v1/queue/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["depth"], 2);
+        assert_eq!(body["by_state"]["queued"], 2);
+    }
+
+    #[tokio::test]
+    async fn queue_stats_validates_the_consistency_parameter() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/queue/stats?consistency=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_not_found_for_missing_job() {
+        let job = JobId::new();
+        let response = app(None)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn get_job_rejects_a_malformed_path_id() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/jobs/not-a-job-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn get_job_serves_a_queued_job_with_headers() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let response = app_with_state(None, state_with_jobs(&[job]))
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        let body = body_json(response).await;
+        assert_eq!(body["id"], job.to_string());
+        assert_eq!(body["state"], "queued");
+        // A queued job carries its explainer and no accrual.
+        assert!(body["queue"].is_object());
+        assert_eq!(body["queue"]["rank"], 1);
+        assert_eq!(body["accrual"], serde_json::Value::Null);
+        // Cost is always present; absent-data fields are explicit null.
+        assert_eq!(body["cost"]["actual_ucu"], serde_json::Value::Null);
+        assert_eq!(body["cost"]["true_up"], serde_json::Value::Null);
+        // state_since falls back to submission time for a queued job.
+        assert_eq!(body["state_since"], body["submitted_at"]);
     }
 
     #[tokio::test]
