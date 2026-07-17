@@ -30,7 +30,7 @@ once the job resolves. The two real incentives are asymmetric and weak in
 the direction that matters:
 
 - Declaring too *small* is severely punished: the job is killed at the bound
-  (`MaxRuntimeExceeded`), and a retry pays for a whole fresh attempt.
+  (`RuntimeLimitExceeded`), and a retry pays for a whole fresh attempt.
 - Declaring too *large*, or nothing at all, is punished only by backfill
   ineligibility and accrual repulsion (ADR 0027 rule 2) — real but indirect,
   invisible at submission time, and irrelevant to users whose jobs place
@@ -140,7 +140,7 @@ ADR 0019's invariants survive scoped, not broken:
   a node loss refunds the unused portion in full, so the user pays actual
   consumption per failed attempt, as today.
 - **A job that runs exactly its bound still trues up to exactly zero**
-  (`unused = 0`), and `MaxRuntimeExceeded` retains ~nothing for the same
+  (`unused = 0`), and `RuntimeLimitExceeded` retains ~nothing for the same
   reason — the kill, not the retention, is the underdeclaration penalty.
 - Retention weakens the "entity lands where it would have been had `A` been
   charged at placement" identity to: had `A + retained` been charged at

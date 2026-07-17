@@ -1,7 +1,8 @@
 # 13. Job, attempt, and allocation state machines with abort semantics
 
 - **Status:** Accepted; job machine amended by
-  [ADR 0030](0030-structural-job-attempt-link.md)
+  [ADR 0030](0030-structural-job-attempt-link.md); terminal-outcome table
+  amended by [ADR 0033](0033-aligned-limit-breach-outcomes.md)
 - **Date:** 2026-07-07
 - **Supersedes:** [ADR 0004](0004-job-lifecycle-and-attempts.md)
 

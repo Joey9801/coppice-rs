@@ -35,7 +35,8 @@ minority coordinators must reject them using epoch checks.
 ## Job execution failure
 
 Job execution failure is classified through the attempt outcome taxonomy
-(`Exited`, `OomKilled`, `MaxRuntimeExceeded`, `Aborted`, `Revoked`,
+(`Exited`, `MemoryLimitExceeded`, `RuntimeLimitExceeded`, `DiskLimitExceeded`,
+`Aborted`, `Revoked`,
 `PullFailed`, `StartFailed`, `NodeLost`, `AgentError` — see
 [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md)), each
 classified as success, user error, user request, or platform failure. Retry

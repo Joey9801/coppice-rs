@@ -458,7 +458,7 @@ fn user_errors_do_not_retry_unless_opted_in() {
     apply_ok(&mut sm, started_cmd(aid(22), base_ts()));
     apply_ok(
         &mut sm,
-        outcome_cmd(aid(22), AttemptOutcome::OomKilled, 30, base_ts()),
+        outcome_cmd(aid(22), AttemptOutcome::MemoryLimitExceeded, 30, base_ts()),
     );
     assert_eq!(sm.jobs[&jid(2)].state, JobState::Queued);
 }
@@ -483,7 +483,7 @@ fn max_runtime_exceeded_never_retries() {
     apply_ok(&mut sm, started_cmd(aid(11), base_ts()));
     apply_ok(
         &mut sm,
-        outcome_cmd(aid(11), AttemptOutcome::MaxRuntimeExceeded, 90, base_ts()),
+        outcome_cmd(aid(11), AttemptOutcome::RuntimeLimitExceeded, 90, base_ts()),
     );
     assert_eq!(sm.jobs[&jid(1)].state, JobState::Failed);
 }

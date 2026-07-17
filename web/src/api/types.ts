@@ -161,8 +161,9 @@ export function derivePhase(state: JobState, attemptState: AttemptState | null):
 /** `AttemptOutcome` — why an attempt reached `Terminal`. */
 export type AttemptOutcomeKind =
   | 'Exited'
-  | 'OomKilled'
-  | 'MaxRuntimeExceeded'
+  | 'MemoryLimitExceeded'
+  | 'RuntimeLimitExceeded'
+  | 'DiskLimitExceeded'
   | 'Aborted'
   | 'Revoked'
   | 'PullFailed'

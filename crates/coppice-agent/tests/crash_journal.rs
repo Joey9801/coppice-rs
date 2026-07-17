@@ -29,12 +29,14 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use coppice_agent::executor::{classify_exit, ContainerState, ExitInfo, ObservedContainer};
+use coppice_agent::executor::{
+    classify_exit, ContainerState, ExitCause, ExitInfo, ObservedContainer,
+};
 use coppice_agent::journal::{ExitRec, IntentRec, Journal, JournalState, Watermark};
 use coppice_agent::observed::{build_observed_set, ObservedAllocation};
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
-use coppice_core::time::Duration;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_testkit::simfs::{is_sim_crash, SimConfig, SimFs};
 use uuid::Uuid;
 
@@ -123,8 +125,9 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
     // recovery).
     let exit0 = ExitInfo {
         code: 0,
-        oom_killed: false,
+        cause: ExitCause::Natural,
         runtime: Duration::from_micros(111),
+        finished_at: Timestamp::UNIX_EPOCH,
     };
     runtime.exit(&ids[0], exit0);
     journal.journal_exit(&ExitRec {
@@ -149,29 +152,40 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
     journal.journal_intent(&intent2)?;
     runtime.start(&ids[2]);
 
-    // Stop allocation 1: tombstone journaled before the stop takes effect.
+    // Stop allocation 1: tombstone journaled before the stop takes effect,
+    // then the stop's kill outcome journaled as `Aborted` — deliberately
+    // disagreeing with the container's bare 137, so recovery must prefer the
+    // journaled classification (a crash before this journal_exit ⇒ runtime
+    // evidence still wins on recovery).
     journal.journal_tombstone(ids[1].allocation)?;
-    runtime.exit(
-        &ids[1],
-        ExitInfo {
-            code: 137,
-            oom_killed: false,
-            runtime: Duration::from_micros(222),
-        },
-    );
+    let exit1 = ExitInfo {
+        code: 137,
+        cause: ExitCause::Natural,
+        runtime: Duration::from_micros(222),
+        finished_at: Timestamp::UNIX_EPOCH,
+    };
+    runtime.exit(&ids[1], exit1);
+    journal.journal_exit(&ExitRec {
+        allocation: ids[1].allocation,
+        attempt: ids[1].attempt,
+        job: ids[1].job,
+        outcome: AttemptOutcome::Aborted,
+        runtime: exit1.runtime,
+    })?;
 
     // Allocation 2 is OOM-killed; runtime observes it, then we journal it.
     let exit2 = ExitInfo {
         code: 137,
-        oom_killed: true,
+        cause: ExitCause::OomKilled,
         runtime: Duration::from_micros(333),
+        finished_at: Timestamp::UNIX_EPOCH,
     };
     runtime.exit(&ids[2], exit2);
     journal.journal_exit(&ExitRec {
         allocation: ids[2].allocation,
         attempt: ids[2].attempt,
         job: ids[2].job,
-        outcome: AttemptOutcome::OomKilled,
+        outcome: AttemptOutcome::MemoryLimitExceeded,
         runtime: exit2.runtime,
     })?;
 
@@ -219,9 +233,18 @@ fn check_invariants(
                     "{ctx}: exited container {} reported running",
                     container.allocation
                 );
+                // The journaled classification is the truth when the exit
+                // reached the journal (it carries kill attribution the bare
+                // exit code cannot); the runtime's classification stands only
+                // for unjournaled exits.
+                let expected = recovered
+                    .exits
+                    .get(&container.allocation)
+                    .map(|rec| rec.outcome.clone())
+                    .unwrap_or_else(|| classify_exit(&info));
                 assert_eq!(
                     entry.outcome,
-                    Some(classify_exit(&info)),
+                    Some(expected),
                     "{ctx}: exited container {} misclassified",
                     container.allocation
                 );

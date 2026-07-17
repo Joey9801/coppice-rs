@@ -77,8 +77,9 @@ Each terminal attempt records an **outcome** with a classification:
 | --- | --- | --- |
 | `Exited { code: 0 }` | Success | — |
 | `Exited { code ≠ 0 }` | User error | No (retry policy may opt in) |
-| `OomKilled` | User error | No |
-| `MaxRuntimeExceeded` | User error (policy kill) | No |
+| `MemoryLimitExceeded` | User error | No |
+| `RuntimeLimitExceeded` | User error (policy kill) | No |
+| `DiskLimitExceeded` | User error (policy kill) | No |
 | `Aborted` | User request | Never |
 | `Revoked` | Platform (scheduler re-plan) | Always requeued, free |
 | `PullFailed` / `StartFailed` | User or platform per error detail | Platform yes; user no |

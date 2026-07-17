@@ -57,9 +57,12 @@ message AttemptOutcome {
     sint32 code = 1;
   }
   // Killed by the kernel for exceeding its memory limit.
-  message OomKilled {}
+  message MemoryLimitExceeded {}
   // Killed by the agent for exceeding its enforced max_runtime.
-  message MaxRuntimeExceeded {}
+  message RuntimeLimitExceeded {}
+  // Killed by the executor's disk enforcer for exceeding its hard disk limit
+  // (see docker-executor.md §6.2). Not emitted yet.
+  message DiskLimitExceeded {}
   // Terminated by the abort mechanism.
   message Aborted {}
   // Revoked by the scheduler while accruing, to re-plan. Requeued without
@@ -82,13 +85,14 @@ message AttemptOutcome {
 
   oneof outcome {
     Exited exited = 1;
-    OomKilled oom_killed = 2;
-    MaxRuntimeExceeded max_runtime_exceeded = 3;
+    MemoryLimitExceeded memory_limit_exceeded = 2;
+    RuntimeLimitExceeded runtime_limit_exceeded = 3;
     Aborted aborted = 4;
     Revoked revoked = 5;
     PullFailed pull_failed = 6;
     StartFailed start_failed = 7;
     NodeLost node_lost = 8;
     AgentError agent_error = 9;
+    DiskLimitExceeded disk_limit_exceeded = 10;
   }
 }

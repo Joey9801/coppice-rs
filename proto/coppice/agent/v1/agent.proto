@@ -76,7 +76,7 @@ message StartJob {
   // Resource limits to enforce (the allocation's requested vector).
   coppice.core.v1.Resources limits = 5;
   // Enforced runtime bound; the agent kills the container past it
-  // (outcome MaxRuntimeExceeded). Absent = unbounded.
+  // (outcome RuntimeLimitExceeded). Absent = unbounded.
   optional uint64 max_runtime_us = 6;
   // The container command line, pre-tokenized — copied verbatim from the
   // job spec (required and non-empty there, so required and non-empty here).

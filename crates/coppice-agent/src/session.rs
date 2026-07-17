@@ -23,11 +23,11 @@ use coppice_consensus::fs::Fs;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::resource::Resources;
-use coppice_core::time::Duration;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1 as pb;
 use coppice_proto::pb::core::v1 as pbcore;
 
-use crate::executor::{classify_exit, Executor, ExitInfo, StartSpec, StopOutcome};
+use crate::executor::{classify_exit, Executor, ExitCause, ExitInfo, StartSpec, StopOutcome};
 use crate::journal::{ExitRec, IntentRec, Journal, JournalState, Watermark};
 use crate::observed::{build_observed_set, ObservedAllocation};
 
@@ -235,6 +235,19 @@ impl<F: Fs, E: Executor> Session<F, E> {
         };
         let observed = build_observed_set(&self.state, &runtime);
         let allocations = observed.iter().map(observed_to_pb).collect();
+
+        // Recovery reap (§5): an exited container whose exit is already
+        // journaled is spent evidence — remove it. Exited containers with no
+        // journaled exit are left intact; their evidence is still needed.
+        use crate::executor::ContainerState;
+        for c in &runtime {
+            if matches!(c.state, ContainerState::Exited(_))
+                && self.state.exits.contains_key(&c.allocation)
+            {
+                self.reap_journaled(c.allocation).await;
+            }
+        }
+
         Ok(vec![self.report(pb::agent_report::Body::ObservedSet(
             pb::ObservedSet { allocations },
         ))])
@@ -424,7 +437,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
     }
 
     /// Stop a container and classify per truth-wins-the-race (ADR 0013):
-    /// `kill_outcome` (Aborted or MaxRuntimeExceeded) applies only if *our*
+    /// `kill_outcome` (Aborted or RuntimeLimitExceeded) applies only if *our*
     /// stop terminated it; if it had already exited, the natural outcome wins.
     async fn stop_and_classify(
         &mut self,
@@ -436,18 +449,29 @@ impl<F: Fs, E: Executor> Session<F, E> {
     ) -> std::io::Result<Vec<pb::AgentReport>> {
         match self.executor.stop(alloc, grace).await {
             Ok(StopOutcome::Stopped(exit)) => {
-                self.record_exit(alloc, attempt, job, kill_outcome.clone(), exit.runtime)?;
+                // Carve-out on the stopped path (docker-executor.md §4): if the
+                // evidence shows a limit kill (kernel OOM, disk enforcer) landed
+                // as our stop took effect, that kill wins over `kill_outcome` —
+                // the terminal state must never claim our stop terminated a
+                // container that policy had already killed.
+                let outcome = match exit.cause {
+                    ExitCause::Natural => kill_outcome,
+                    ExitCause::OomKilled | ExitCause::DiskKilled => classify_exit(&exit),
+                };
+                self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;
+                self.reap_journaled(alloc).await;
                 Ok(vec![self.terminal_status(
                     alloc,
                     attempt,
                     job,
-                    kill_outcome,
+                    outcome,
                     exit.runtime,
                 )])
             }
             Ok(StopOutcome::AlreadyExited(exit)) => {
                 let outcome = classify_exit(&exit);
                 self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;
+                self.reap_journaled(alloc).await;
                 Ok(vec![self.terminal_status(
                     alloc,
                     attempt,
@@ -470,7 +494,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
     // ---- watchdog and natural exits (driven by the live loop) ----
 
     /// The max-runtime watchdog fired for `alloc`: stop it and classify
-    /// `MaxRuntimeExceeded` (kill-reason tracking distinguishes it from an
+    /// `RuntimeLimitExceeded` (kill-reason tracking distinguishes it from an
     /// abort). A no-op if the container already exited.
     pub async fn trigger_max_runtime(
         &mut self,
@@ -487,7 +511,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             intent.attempt,
             intent.job,
             Duration::ZERO,
-            AttemptOutcome::MaxRuntimeExceeded,
+            AttemptOutcome::RuntimeLimitExceeded,
         )
         .await
     }
@@ -514,6 +538,8 @@ impl<F: Fs, E: Executor> Session<F, E> {
             outcome.clone(),
             exit.runtime,
         )?;
+        // Exit is durable → the container is now just debris; reap it (§5).
+        self.reap_journaled(alloc).await;
         Ok(vec![self.terminal_status(
             alloc,
             intent.attempt,
@@ -521,6 +547,34 @@ impl<F: Fs, E: Executor> Session<F, E> {
             outcome,
             exit.runtime,
         )])
+    }
+
+    /// Backstop reap sweep (§5): diff `observe()` against the journaled exits
+    /// and reap every exited container whose exit is journaled and whose age
+    /// (`now − finished_at`) exceeds `bound`. Running containers, unjournaled
+    /// exits, and young exits are all left untouched. Non-fatal throughout —
+    /// an observe or reap failure is logged and the next tick retries.
+    pub async fn janitor_sweep(&mut self, now: Timestamp, bound: Duration) -> std::io::Result<()> {
+        use crate::executor::ContainerState;
+        let containers = match self.executor.observe().await {
+            Ok(containers) => containers,
+            Err(e) => {
+                tracing::warn!(node = %self.node, error = %e, "executor.observe failed during janitor sweep; skipping");
+                return Ok(());
+            }
+        };
+        for c in containers {
+            let ContainerState::Exited(info) = c.state else {
+                continue; // never reap a running container
+            };
+            if !self.state.exits.contains_key(&c.allocation) {
+                continue; // exit not journaled: evidence still needed
+            }
+            if now.duration_since(info.finished_at) > bound {
+                self.reap_journaled(c.allocation).await;
+            }
+        }
+        Ok(())
     }
 
     // ---- reports ----
@@ -587,6 +641,15 @@ impl<F: Fs, E: Executor> Session<F, E> {
         }
         // Intent present (or best-effort): believed running.
         vec![self.running_status(alloc, attempt, job)]
+    }
+
+    /// Reap an exited container whose exit is already durably journaled (§5).
+    /// Non-fatal: a reap failure is logged and swallowed — the janitor sweep is
+    /// the backstop, and the exited container is harmless evidence until then.
+    async fn reap_journaled(&self, alloc: AllocationId) {
+        if let Err(e) = self.executor.reap(alloc).await {
+            tracing::warn!(node = %self.node, %alloc, error = %e, "reap failed after journaled exit; janitor will retry");
+        }
     }
 
     fn record_exit(

@@ -93,7 +93,7 @@ layer):
 
 A Rust enum whose variants carry data (`AttemptOutcome::Exited { code }`)
 is a `oneof` of per-variant messages. Every variant gets its own message
-**even when empty** (`OomKilled {}`), so any variant can grow fields later
+**even when empty** (`MemoryLimitExceeded {}`), so any variant can grow fields later
 without restructuring. Flat data-free enums (`JobState`) stay proto enums.
 
 Never encode a value that is *derived* from another field: outcome

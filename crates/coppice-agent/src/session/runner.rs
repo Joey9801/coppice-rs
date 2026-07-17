@@ -128,6 +128,17 @@ where
 
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Reap-janitor backstop (§5): the sweep bound is the configured age; the
+    // tick cadence is capped at 1h so a 24h bound still checks regularly. Guard
+    // against a zero cadence (a zero-duration `interval` panics).
+    let reap_bound = config.executor.reap_janitor_after;
+    let janitor_cadence = reap_bound
+        .min(Duration::from_secs(60 * 60))
+        .max(Duration::from_secs(1));
+    let mut janitor = tokio::time::interval(janitor_cadence);
+    janitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let reap_bound = coppice_core::time::Duration::from(reap_bound);
     // A monotonic map of pending watchdog deadlines.
     let mut deadlines: BTreeMap<coppice_core::id::AllocationId, Instant> = BTreeMap::new();
 
@@ -171,6 +182,12 @@ where
                     let hb = session.heartbeat_report().await;
                     send_all(&tx, vec![hb]).await?;
                 }
+            }
+            _ = janitor.tick() => {
+                // Clock read at the edge (workspace convention).
+                session
+                    .janitor_sweep(coppice_core::time::Timestamp::now(), reap_bound)
+                    .await?;
             }
             exit = exit_rx.recv() => {
                 if let Some(crate::executor::ExitEvent { allocation, exit: info }) = exit {

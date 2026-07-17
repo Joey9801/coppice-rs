@@ -67,6 +67,32 @@ pub struct Config {
     /// canonical ascending-key ordering the wire form requires.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+
+    /// Executor-side knobs. Defaulted whole, so a bare v1 config stays valid.
+    #[serde(default)]
+    pub executor: ExecutorConfig,
+}
+
+/// Container-executor configuration. Only the reap janitor cadence exists in
+/// v1; the rest of the `[executor]` surface (docker host, disk enforcement,
+/// affinity — docker-executor.md §10) lands with the Docker implementation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorConfig {
+    /// Age past which the session janitor reaps an exited container whose exit
+    /// is already journaled (`now − finished_at`, §5). A generous backstop —
+    /// the exit-path reap normally removes containers promptly; this only
+    /// catches ones whose reap was lost to a crash or a transient error.
+    #[serde(default = "default_reap_janitor_after", with = "humantime_serde")]
+    pub reap_janitor_after: Duration,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> ExecutorConfig {
+        ExecutorConfig {
+            reap_janitor_after: default_reap_janitor_after(),
+        }
+    }
 }
 
 /// mTLS material (ADR 0011). Secrets by path reference only.
@@ -119,6 +145,7 @@ impl Config {
             reconnect_backoff_max = ?self.reconnect_backoff_max,
             capacity = ?self.capacity,
             labels = ?self.labels,
+            executor = ?self.executor,
             "effective agent configuration"
         );
     }
@@ -134,6 +161,10 @@ fn default_backoff_min() -> Duration {
 
 fn default_backoff_max() -> Duration {
     Duration::from_secs(15)
+}
+
+fn default_reap_janitor_after() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
 }
 
 /// Read and parse the config file, wrapping any I/O or deserialization
@@ -180,6 +211,9 @@ disk_bytes   = 1099511627776
 [labels]
 zone = "us-east-1a"
 pool = "batch"
+
+[executor]
+reap_janitor_after = "1h"
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
@@ -218,6 +252,10 @@ disk_bytes   = 107374182400
             config.labels.get("zone").map(String::as_str),
             Some("us-east-1a")
         );
+        assert_eq!(
+            config.executor.reap_janitor_after,
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]
@@ -229,6 +267,14 @@ disk_bytes   = 107374182400
         assert_eq!(config.reconnect_backoff_min, default_backoff_min());
         assert_eq!(config.reconnect_backoff_max, default_backoff_max());
         assert!(config.labels.is_empty());
+        assert_eq!(
+            config.executor.reap_janitor_after,
+            default_reap_janitor_after()
+        );
+        assert_eq!(
+            config.executor.reap_janitor_after,
+            Duration::from_secs(24 * 60 * 60)
+        );
     }
 
     #[test]
@@ -249,6 +295,18 @@ disk_bytes   = 107374182400
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("unlabelled duration should fail");
         assert!(!format!("{err:#}").is_empty());
+    }
+
+    #[test]
+    fn unknown_key_in_executor_table_is_rejected() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\nreap_janitor_afterr = \"1h\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("typo'd executor key should fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("reap_janitor_afterr"),
+            "error should name the offending key, got: {message}"
+        );
     }
 
     #[test]

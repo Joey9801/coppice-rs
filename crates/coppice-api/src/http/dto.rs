@@ -13,7 +13,7 @@
 //!
 //! Conventions, fixed for the v1 surface:
 //! - `snake_case` keys (`"cpu_millis"`) and enum values (`"unknown"`,
-//!   `"oom_killed"`);
+//!   `"memory_limit_exceeded"`);
 //! - ids as their typed string form (`"node-<uuid>"`, ADR 0024);
 //! - **instants as ISO 8601 / RFC 3339 strings**
 //!   (`"2026-07-16T09:30:00.000000Z"`, always UTC, µs precision) — a bare
@@ -102,8 +102,9 @@ impl From<&attempt::AttemptState> for AttemptState {
 #[serde(rename_all = "snake_case")]
 pub enum AttemptOutcomeKind {
     Exited,
-    OomKilled,
-    MaxRuntimeExceeded,
+    MemoryLimitExceeded,
+    RuntimeLimitExceeded,
+    DiskLimitExceeded,
     Aborted,
     Revoked,
     PullFailed,
@@ -136,8 +137,9 @@ impl From<&attempt::AttemptOutcome> for AttemptOutcome {
         use attempt::AttemptOutcome as O;
         let (kind, exit_code) = match o {
             O::Exited { code } => (AttemptOutcomeKind::Exited, Some(*code)),
-            O::OomKilled => (AttemptOutcomeKind::OomKilled, None),
-            O::MaxRuntimeExceeded => (AttemptOutcomeKind::MaxRuntimeExceeded, None),
+            O::MemoryLimitExceeded => (AttemptOutcomeKind::MemoryLimitExceeded, None),
+            O::RuntimeLimitExceeded => (AttemptOutcomeKind::RuntimeLimitExceeded, None),
+            O::DiskLimitExceeded => (AttemptOutcomeKind::DiskLimitExceeded, None),
             O::Aborted => (AttemptOutcomeKind::Aborted, None),
             O::Revoked => (AttemptOutcomeKind::Revoked, None),
             O::PullFailed { .. } => (AttemptOutcomeKind::PullFailed, None),
@@ -1096,8 +1098,8 @@ pub struct JobDetail {
 #[serde(deny_unknown_fields)]
 pub struct RetryPolicy {
     pub max_retries: u32,
-    /// Opt-in to retrying user-error outcomes (nonzero exit, OOM). Never
-    /// applies to `MaxRuntimeExceeded` or aborts.
+    /// Opt-in to retrying user-error outcomes (nonzero exit, memory breach).
+    /// Never applies to `RuntimeLimitExceeded` or aborts.
     pub retry_user_errors: bool,
 }
 

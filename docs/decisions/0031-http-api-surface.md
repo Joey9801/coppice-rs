@@ -54,7 +54,7 @@ JSON contract, converted to/from domain types at the HTTP boundary
 every field as optional); **protobuf stays canonical for internal RPC,
 storage, and replication**. DTO conventions, fixed for v1: snake_case
 keys (`"cpu_millis"`) and snake_case string enums (`"unknown"`,
-`"oom_killed"`), ids as their bare typed strings (`"job-<uuid>"`),
+`"memory_limit_exceeded"`), ids as their bare typed strings (`"job-<uuid>"`),
 instants as ISO 8601 strings (`"2026-07-16T09:30:00Z"`) and durations as
 `_seconds`-suffixed JSON numbers, other integers as JSON numbers, `null`
 for absent optionals, `[]` for empty lists. Time is spelled out rather

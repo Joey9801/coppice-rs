@@ -10,11 +10,34 @@ use coppice_core::resource::Resources;
 use coppice_core::time::Duration;
 use coppice_proto::pb::agent::v1 as pb;
 
-use crate::executor::{ExitInfo, FakeExecutor, StartError};
+use coppice_core::time::Timestamp;
+
+use crate::executor::{Executor, ExitCause, ExitInfo, FakeExecutor, StartError};
 use crate::journal::Journal;
 use crate::session::ArmedWatchdog;
 
 use super::Session;
+
+/// Whether the fake executor still shows a container for `alloc` (running or
+/// exited) — the witness that a reap did or didn't happen.
+async fn observes(exec: &FakeExecutor, alloc: AllocationId) -> bool {
+    exec.observe()
+        .await
+        .unwrap()
+        .iter()
+        .any(|c| c.allocation == alloc)
+}
+
+/// A natural exit stamped at the fake executor's current clock — the value the
+/// stop path would synthesize, so tests and the fake agree on `finished_at`.
+fn natural_exit(code: i32, runtime: Duration, at: Timestamp) -> ExitInfo {
+    ExitInfo {
+        code,
+        cause: ExitCause::Natural,
+        runtime,
+        finished_at: at,
+    }
+}
 
 type TestSession = Session<RealFs, FakeExecutor>;
 
@@ -274,25 +297,9 @@ async fn truth_wins_journaled_exit_beats_tombstone_abort() {
         .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
-    exec.finish(
-        alloc,
-        ExitInfo {
-            code: 0,
-            oom_killed: false,
-            runtime: Duration::from_micros(9),
-        },
-    );
-    let exit_reports = session
-        .handle_observed_exit(
-            alloc,
-            ExitInfo {
-                code: 0,
-                oom_killed: false,
-                runtime: Duration::from_micros(9),
-            },
-        )
-        .await
-        .unwrap();
+    let exit = natural_exit(0, Duration::from_micros(9), exec.now());
+    exec.finish(alloc, exit);
+    let exit_reports = session.handle_observed_exit(alloc, exit).await.unwrap();
     assert_eq!(
         terminal_outcome(&exit_reports),
         Some(AttemptOutcome::Exited { code: 0 })
@@ -356,16 +363,18 @@ async fn observed_exit_classifies_oom_and_nonzero() {
         (
             ExitInfo {
                 code: 137,
-                oom_killed: true,
+                cause: ExitCause::OomKilled,
                 runtime: Duration::from_micros(1),
+                finished_at: Timestamp::UNIX_EPOCH,
             },
-            AttemptOutcome::OomKilled,
+            AttemptOutcome::MemoryLimitExceeded,
         ),
         (
             ExitInfo {
                 code: 3,
-                oom_killed: false,
+                cause: ExitCause::Natural,
                 runtime: Duration::from_micros(1),
+                finished_at: Timestamp::UNIX_EPOCH,
             },
             AttemptOutcome::Exited { code: 3 },
         ),
@@ -383,7 +392,7 @@ async fn observed_exit_classifies_oom_and_nonzero() {
 
 fn expected_seq(o: &AttemptOutcome) -> u64 {
     match o {
-        AttemptOutcome::OomKilled => 1,
+        AttemptOutcome::MemoryLimitExceeded => 1,
         _ => 2,
     }
 }
@@ -403,6 +412,30 @@ async fn stop_of_running_container_is_aborted() {
         .await
         .unwrap();
     assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Aborted));
+}
+
+/// The §4 carve-out (docker-executor.md): a stop whose evidence shows a limit
+/// kill landed as it took effect must record the limit breach, never claim the
+/// stop (abort / max-runtime) terminated the container.
+#[tokio::test]
+async fn stop_racing_a_limit_kill_records_the_breach() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+    exec.plan_stop_cause(alloc, ExitCause::OomKilled);
+
+    let reports = session
+        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_outcome(&reports),
+        Some(AttemptOutcome::MemoryLimitExceeded)
+    );
 }
 
 #[tokio::test]
@@ -430,7 +463,7 @@ async fn max_runtime_watchdog_classifies_exceeded() {
     let reports = session.trigger_max_runtime(alloc).await.unwrap();
     assert_eq!(
         terminal_outcome(&reports),
-        Some(AttemptOutcome::MaxRuntimeExceeded)
+        Some(AttemptOutcome::RuntimeLimitExceeded)
     );
 }
 
@@ -448,27 +481,271 @@ async fn max_runtime_after_natural_exit_is_a_noop() {
         ))
         .await
         .unwrap();
-    exec.finish(
-        alloc,
-        ExitInfo {
-            code: 0,
-            oom_killed: false,
-            runtime: Duration::from_micros(5),
-        },
-    );
-    session
-        .handle_observed_exit(
-            alloc,
-            ExitInfo {
-                code: 0,
-                oom_killed: false,
-                runtime: Duration::from_micros(5),
-            },
-        )
-        .await
-        .unwrap();
+    let exit = natural_exit(0, Duration::from_micros(5), exec.now());
+    exec.finish(alloc, exit);
+    session.handle_observed_exit(alloc, exit).await.unwrap();
 
     // The container already exited: the watchdog must not fabricate an outcome.
     let reports = session.trigger_max_runtime(alloc).await.unwrap();
     assert!(reports.is_empty());
+}
+
+// ---- reaping (docker-executor.md §5) ----
+
+#[tokio::test]
+async fn exit_path_journals_then_reaps() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+
+    // Natural-exit path: start, observe the exit → journaled and reaped.
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+    let exit = natural_exit(0, Duration::from_micros(9), exec.now());
+    exec.finish(alloc, exit);
+    session.handle_observed_exit(alloc, exit).await.unwrap();
+    assert!(
+        session.state().exits.contains_key(&alloc),
+        "the observed exit is journaled"
+    );
+    assert!(
+        !observes(&exec, alloc).await,
+        "a journaled natural exit is reaped from the runtime"
+    );
+
+    // Stop path: a container that already exited, resolved through StopJob, is
+    // journaled (truth-wins) and likewise reaped.
+    let (alloc2, attempt2, job2) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 3, start_job(alloc2, attempt2, job2, None)))
+        .await
+        .unwrap();
+    exec.finish(
+        alloc2,
+        natural_exit(0, Duration::from_micros(4), exec.now()),
+    );
+    session
+        .handle_command(command(1, 1, 4, stop_job(alloc2)))
+        .await
+        .unwrap();
+    assert!(
+        session.state().exits.contains_key(&alloc2),
+        "the stop-resolved exit is journaled"
+    );
+    assert!(
+        !observes(&exec, alloc2).await,
+        "a journaled stop-resolved exit is reaped from the runtime"
+    );
+}
+
+/// Start `alloc` (journaling intent), finish it in the fake with a controlled
+/// `finished_at`, and optionally journal the exit *without reaping* (via the
+/// private `record_exit`, accessible from this child module) — modelling a reap
+/// lost to a crash, so the container stays visible in the runtime.
+async fn arrange_exited(
+    session: &mut TestSession,
+    exec: &FakeExecutor,
+    seq: u64,
+    finished_at: Timestamp,
+    journaled: bool,
+) -> AllocationId {
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, seq, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+    exec.finish(
+        alloc,
+        ExitInfo {
+            code: 0,
+            cause: ExitCause::Natural,
+            runtime: Duration::from_micros(1),
+            finished_at,
+        },
+    );
+    if journaled {
+        session
+            .record_exit(
+                alloc,
+                attempt,
+                job,
+                AttemptOutcome::Exited { code: 0 },
+                Duration::ZERO,
+            )
+            .unwrap();
+    }
+    alloc
+}
+
+#[tokio::test]
+async fn janitor_sweeps_only_old_journaled_exits() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+
+    let bound = Duration::from_secs(100);
+    let now = Timestamp::UNIX_EPOCH + Duration::from_secs(10_000);
+
+    // (a) journaled + older than the bound → swept.
+    let old = arrange_exited(&mut session, &exec, 2, now - Duration::from_secs(200), true).await;
+    // (b) journaled + younger than the bound → kept.
+    let young = arrange_exited(&mut session, &exec, 3, now - Duration::from_secs(50), true).await;
+    // (c) exited but not journaled → kept (evidence still needed).
+    let unjournaled = arrange_exited(
+        &mut session,
+        &exec,
+        4,
+        now - Duration::from_secs(200),
+        false,
+    )
+    .await;
+
+    session.janitor_sweep(now, bound).await.unwrap();
+
+    assert!(
+        !observes(&exec, old).await,
+        "an old journaled exit is swept"
+    );
+    assert!(
+        observes(&exec, young).await,
+        "a young journaled exit is kept"
+    );
+    assert!(
+        observes(&exec, unjournaled).await,
+        "an unjournaled exit is kept even when old"
+    );
+}
+
+#[tokio::test]
+async fn recovery_reaps_journaled_survivors() {
+    // Session 1: start, observe the exit *durably journaled* but crash before
+    // reaping — the container survives in the runtime.
+    let dir = tempfile::tempdir().unwrap();
+    let (journal, state) = Journal::open(RealFs::new(dir.path())).unwrap();
+    let exec = FakeExecutor::new();
+    let mut s1 = Session::new(
+        NodeId::new(),
+        Resources::ZERO,
+        Vec::new(),
+        journal,
+        state,
+        exec.clone(),
+    );
+    register(&mut s1, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    s1.handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+    exec.finish(alloc, natural_exit(0, Duration::from_micros(7), exec.now()));
+    // Journal the exit WITHOUT reaping (models a crash between the two).
+    s1.record_exit(
+        alloc,
+        attempt,
+        job,
+        AttemptOutcome::Exited { code: 0 },
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(
+        observes(&exec, alloc).await,
+        "the container survives the crash"
+    );
+
+    // Session 2: fork the executor (the container is still visible), then drop
+    // session 1 to release its journal LOCK and reopen the journal (recovering
+    // the exit). Registration reaps the journaled survivor.
+    let forked = exec.fork();
+    drop(s1);
+    let (journal2, state2) = Journal::open(RealFs::new(dir.path())).unwrap();
+    assert!(
+        state2.exits.contains_key(&alloc),
+        "the exit was recovered from the journal"
+    );
+    let mut s2 = Session::new(
+        NodeId::new(),
+        Resources::ZERO,
+        Vec::new(),
+        journal2,
+        state2,
+        forked.clone(),
+    );
+    register(&mut s2, 1, 1, 1).await;
+    assert!(
+        !observes(&forked, alloc).await,
+        "recovery reaps a container whose exit is already journaled"
+    );
+}
+
+/// Crash window between a stop's journaled `Aborted` outcome and its reap: on
+/// recovery the surviving container's bare 137 must not reclassify the attempt
+/// as `Exited { code: 137 }` — the ObservedSet reports the journaled outcome.
+#[tokio::test]
+async fn recovery_reports_journaled_stop_outcome_over_runtime_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let (journal, state) = Journal::open(RealFs::new(dir.path())).unwrap();
+    let exec = FakeExecutor::new();
+    let mut s1 = Session::new(
+        NodeId::new(),
+        Resources::ZERO,
+        Vec::new(),
+        journal,
+        state,
+        exec.clone(),
+    );
+    register(&mut s1, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    s1.handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+    // The stop's SIGKILL surfaces as a bare 137 in the runtime…
+    exec.finish(
+        alloc,
+        natural_exit(137, Duration::from_micros(7), exec.now()),
+    );
+    // …and the session journals the kill attribution, then crashes before reap.
+    s1.record_exit(alloc, attempt, job, AttemptOutcome::Aborted, Duration::ZERO)
+        .unwrap();
+
+    let forked = exec.fork();
+    drop(s1);
+    let (journal2, state2) = Journal::open(RealFs::new(dir.path())).unwrap();
+    let mut s2 = Session::new(
+        NodeId::new(),
+        Resources::ZERO,
+        Vec::new(),
+        journal2,
+        state2,
+        forked.clone(),
+    );
+    let reports = s2
+        .handle_command(command(
+            1,
+            1,
+            1,
+            pb::agent_command::Body::RegisterAccepted(pb::RegisterAccepted {}),
+        ))
+        .await
+        .unwrap();
+    let Some(pb::agent_report::Body::ObservedSet(set)) =
+        reports.first().and_then(|r| r.body.clone())
+    else {
+        panic!("registration must report an ObservedSet");
+    };
+    let entry = set
+        .allocations
+        .iter()
+        .find(|a| a.allocation == Some(alloc.into()))
+        .expect("the surviving allocation is reported");
+    assert!(!entry.running);
+    let outcome = AttemptOutcome::try_from(entry.outcome.unwrap()).unwrap();
+    assert_eq!(
+        outcome,
+        AttemptOutcome::Aborted,
+        "the journaled stop outcome wins over the runtime's bare exit code"
+    );
+    assert!(
+        !observes(&forked, alloc).await,
+        "recovery still reaps the journaled survivor"
+    );
 }

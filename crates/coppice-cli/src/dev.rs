@@ -320,6 +320,7 @@ ca_path = "{ca}"
         reconnect_backoff_min: Duration::from_millis(100),
         reconnect_backoff_max: Duration::from_secs(2),
         labels: Default::default(),
+        executor: Default::default(),
     };
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
     // happens per concrete executor type rather than in a generic helper.

@@ -29,7 +29,7 @@ use tonic::transport::{Certificate, Identity, Server as TonicServer, ServerTlsCo
 use tonic::{Request, Response, Status, Streaming};
 
 use coppice_agent::config::{CapacityConfig, Config, TlsConfig};
-use coppice_agent::executor::{ExitInfo, FakeExecutor};
+use coppice_agent::executor::{ExitCause, ExitInfo, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{run, Session};
 use coppice_consensus::fs::RealFs;
@@ -113,6 +113,7 @@ fn agent_config(
         reconnect_backoff_min: Duration::from_millis(100),
         reconnect_backoff_max: Duration::from_millis(500),
         labels: BTreeMap::new(),
+        executor: Default::default(),
     }
 }
 
@@ -350,8 +351,9 @@ async fn job_runs_end_to_end() {
         world.alloc,
         ExitInfo {
             code: 0,
-            oom_killed: false,
+            cause: ExitCause::Natural,
             runtime: coppice_core::time::Duration::from_micros(1_000),
+            finished_at: coppice_core::time::Timestamp::now(),
         },
     );
 
@@ -435,8 +437,9 @@ async fn agent_restart_mid_run_converges_without_duplicate_execution() {
         alloc,
         ExitInfo {
             code: 0,
-            oom_killed: false,
+            cause: ExitCause::Natural,
             runtime: coppice_core::time::Duration::from_micros(2_000),
+            finished_at: coppice_core::time::Timestamp::now(),
         },
     );
     poll(DEADLINE, "job Succeeded after restart", || {

@@ -2170,7 +2170,7 @@ mod tests {
                 attempt,
                 job,
                 node,
-                AttemptState::Terminal(coppice_core::attempt::AttemptOutcome::OomKilled),
+                AttemptState::Terminal(coppice_core::attempt::AttemptOutcome::MemoryLimitExceeded),
             ),
         );
 
@@ -2182,7 +2182,7 @@ mod tests {
         assert_eq!(summary.funding_fraction, None);
         assert_eq!(
             summary.outcome.as_ref().map(|o| o.kind),
-            Some(dto::AttemptOutcomeKind::OomKilled)
+            Some(dto::AttemptOutcomeKind::MemoryLimitExceeded)
         );
         assert_eq!(summary.terminal_at, Some(ts(5)));
     }
