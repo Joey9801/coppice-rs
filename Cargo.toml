@@ -39,6 +39,12 @@ coppice-testkit = { path = "crates/coppice-testkit" }
 # Common third-party dependencies. Versions are pinned centrally so every
 # crate in the workspace stays in lockstep.
 anyhow = "1"
+# Docker Engine API client for the agent's concrete executor
+# (docker-executor.md §2): async, typed, and streams events/stats/logs —
+# no CLI shelling. Deliberately confined to `coppice-agent`'s
+# `executor/docker` modules; everything above the `Executor` trait stays
+# runtime-agnostic.
+bollard = "0.19"
 # Coordinator CLI surface — deliberately tiny per ADR 0020: `--config`, the
 # ADR 0016 intent flags, and the hidden admin verbs.
 clap = { version = "4", features = ["derive"] }
@@ -112,6 +118,10 @@ tonic-build = "0.12"
 # future /metrics endpoint (metrics-exporter-prometheus behind the public API)
 # only calls the crate roots without knowing any module's internals.
 metrics = "0.24"
+# Safe statvfs for the agent's host disk-pressure monitor
+# (docker-executor.md §9). The workspace forbids `unsafe_code`, so the raw
+# libc call is not an option; nix wraps it in a safe API.
+nix = { version = "0.30", features = ["fs"] }
 # Node configuration is one TOML file per process (ADR 0020), with humane
 # duration strings ("1500ms") parsed at load.
 toml = "0.8"

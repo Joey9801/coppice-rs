@@ -164,6 +164,15 @@ this path: a natural-exit verdict requires the daemon's own
 already-exited answer, never our guess. The gated integration suite
 races these explicitly (§12).
 
+*Implementation note (S2):* bollard maps the stop endpoint's 304 to
+success before the caller can see the status, so the 204/304 distinction
+cannot be recovered through its typed API. The implementation therefore
+answers "already exited" from the pre-stop inspect, and attributes the
+residual window — a natural exit landing between that inspect and the
+stop taking effect — to the stop. That errs only in the direction §4
+already tolerates (the TERM-grace case): a natural exit may be recorded
+as stop-terminated, never the reverse.
+
 **Start failures** map with an explicit user/platform split:
 
 | Failure | `StartError` | `user_error` |

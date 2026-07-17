@@ -114,6 +114,7 @@ fn agent_config(
         reconnect_backoff_max: Duration::from_millis(500),
         labels: BTreeMap::new(),
         executor: Default::default(),
+        pressure: Default::default(),
     }
 }
 

@@ -321,6 +321,7 @@ ca_path = "{ca}"
         reconnect_backoff_max: Duration::from_secs(2),
         labels: Default::default(),
         executor: Default::default(),
+        pressure: Default::default(),
     };
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
     // happens per concrete executor type rather than in a generic helper.
@@ -330,7 +331,28 @@ ca_path = "{ca}"
             tokio::spawn(run_agent(session, agent_config))
         }
         DevExecutor::Docker => {
-            let session = build_session(&agent_config, DockerExecutor::new())?;
+            // Mirror `run_daemon`'s wiring: connect the daemon, spawn the shared
+            // disk-pressure monitor over data_dir + the data-root, then build the
+            // executor (docker-executor.md §9, §11).
+            let docker =
+                coppice_agent::executor::docker::api::connect(&agent_config.executor.docker_host)?;
+            let data_root = coppice_agent::executor::docker::api::data_root(
+                &docker,
+                &agent_config.executor.docker_host,
+            )
+            .await?;
+            let mut pressure_paths = vec![agent_config.data_dir.clone()];
+            if let Some(root) = data_root {
+                pressure_paths.push(root);
+            }
+            let pressure_rx = coppice_agent::pressure::spawn(pressure_paths, agent_config.pressure);
+            let executor = DockerExecutor::new(
+                docker,
+                &agent_config.executor,
+                agent_config.node(),
+                pressure_rx,
+            );
+            let session = build_session(&agent_config, executor)?;
             tokio::spawn(run_agent(session, agent_config))
         }
     };

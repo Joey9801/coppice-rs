@@ -9,6 +9,8 @@
 //! can rebuild the running/exited set by label after an agent restart without
 //! trusting agent memory.
 
+pub mod docker;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
@@ -430,55 +432,12 @@ impl Executor for FakeExecutor {
     }
 }
 
-// ---- DockerExecutor (stub) ----------------------------------------------
+// ---- DockerExecutor -----------------------------------------------------
 
-/// The real container runtime — a stub for now.
-///
-/// Every method returns [`ExecutorError::Unimplemented`]. The real Docker
-/// implementation lands behind this same trait later, with ADR 0011's
-/// locked-down defaults enforced unconditionally: no privileged containers,
-/// no host mounts or host network (each container gets its own network
-/// namespace), a non-root UID (UID 0 forbidden absent an admin exception),
-/// and CPU/memory/disk limits always applied. Those defaults are anchored
-/// here so the config surface never grows a knob to relax them.
-#[derive(Clone, Default)]
-pub struct DockerExecutor;
-
-impl DockerExecutor {
-    pub fn new() -> DockerExecutor {
-        DockerExecutor
-    }
-}
-
-impl Executor for DockerExecutor {
-    async fn start(&self, _spec: StartSpec) -> Result<(), StartError> {
-        Err(StartError::Start {
-            user_error: false,
-            message: "DockerExecutor is not yet implemented".into(),
-        })
-    }
-
-    async fn stop(
-        &self,
-        _allocation: AllocationId,
-        _grace: Duration,
-    ) -> Result<StopOutcome, ExecutorError> {
-        Err(ExecutorError::Unimplemented("DockerExecutor::stop"))
-    }
-
-    async fn observe(&self) -> Result<Vec<ObservedContainer>, ExecutorError> {
-        Err(ExecutorError::Unimplemented("DockerExecutor::observe"))
-    }
-
-    async fn reap(&self, _allocation: AllocationId) -> Result<(), ExecutorError> {
-        Err(ExecutorError::Unimplemented("DockerExecutor::reap"))
-    }
-
-    fn next_exit(&self) -> impl std::future::Future<Output = ExitEvent> + Send {
-        // No containers to watch until the runtime is implemented.
-        std::future::pending()
-    }
-}
+/// The real container runtime lives in the [`docker`] module; re-exported here
+/// so `executor::DockerExecutor` keeps resolving for the daemon wiring and the
+/// `coppice dev` command.
+pub use docker::DockerExecutor;
 
 #[cfg(test)]
 mod tests {

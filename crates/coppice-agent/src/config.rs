@@ -71,14 +71,41 @@ pub struct Config {
     /// Executor-side knobs. Defaulted whole, so a bare v1 config stays valid.
     #[serde(default)]
     pub executor: ExecutorConfig,
+
+    /// Host disk-pressure thresholds (docker-executor.md §9). Defaulted whole,
+    /// so a bare v1 config stays valid.
+    #[serde(default)]
+    pub pressure: PressureConfig,
 }
 
-/// Container-executor configuration. Only the reap janitor cadence exists in
-/// v1; the rest of the `[executor]` surface (docker host, disk enforcement,
-/// affinity — docker-executor.md §10) lands with the Docker implementation.
+/// Container-executor configuration (docker-executor.md §10). Node-local knobs
+/// for the Docker runtime: the daemon endpoint, the fallback UID for images
+/// that don't pin a non-root `USER`, the PID ceiling, and the reap-janitor
+/// backstop.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
+    /// The Docker daemon endpoint the executor dials. A local Unix socket by
+    /// default; a `tcp://host:port` form reaches a remote daemon over
+    /// **plaintext** HTTP (`https://` is rejected until daemon TLS is wired),
+    /// in which case the daemon's data-root is not a local filesystem and the
+    /// §9 pressure monitor covers `data_dir` only.
+    #[serde(default = "default_docker_host")]
+    pub docker_host: String,
+
+    /// The UID a container runs as when its image does not set a non-root
+    /// `USER` (§6). `65534` (`nobody`) by default. UID 0 is rejected at load:
+    /// the whole point of the rule is that workloads never run as root, so a
+    /// root default would silently defeat it. A job may still request its own
+    /// non-root UID; UID 0 from a job is rejected at start as user error.
+    #[serde(default = "default_default_uid")]
+    pub default_uid: u32,
+
+    /// The `PidsLimit` applied to every container (§6): fork-bomb hygiene, not
+    /// user-visible policy. Must be positive.
+    #[serde(default = "default_pids_limit")]
+    pub pids_limit: i64,
+
     /// Age past which the session janitor reaps an exited container whose exit
     /// is already journaled (`now − finished_at`, §5). A generous backstop —
     /// the exit-path reap normally removes containers promptly; this only
@@ -90,7 +117,38 @@ pub struct ExecutorConfig {
 impl Default for ExecutorConfig {
     fn default() -> ExecutorConfig {
         ExecutorConfig {
+            docker_host: default_docker_host(),
+            default_uid: default_default_uid(),
+            pids_limit: default_pids_limit(),
             reap_janitor_after: default_reap_janitor_after(),
+        }
+    }
+}
+
+/// Host disk-pressure thresholds (docker-executor.md §9). Percent of a watched
+/// filesystem's space used at which the shared pressure signal escalates to
+/// `High` (telemetry retention and the image cache sweep early) and `Critical`
+/// (both sweep to floor and the agent refuses new `StartJob`s). Node-local: a
+/// smaller node may want to react sooner than a larger one.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PressureConfig {
+    /// Percent used at or above which pressure is `High`. Must satisfy
+    /// `0 < high_pct < critical_pct`.
+    #[serde(default = "default_high_pct")]
+    pub high_pct: u8,
+
+    /// Percent used at or above which pressure is `Critical`. Must satisfy
+    /// `high_pct < critical_pct <= 100`.
+    #[serde(default = "default_critical_pct")]
+    pub critical_pct: u8,
+}
+
+impl Default for PressureConfig {
+    fn default() -> PressureConfig {
+        PressureConfig {
+            high_pct: default_high_pct(),
+            critical_pct: default_critical_pct(),
         }
     }
 }
@@ -131,6 +189,33 @@ impl Config {
         self.node_id
     }
 
+    /// Reject semantically invalid values that `serde` alone cannot catch:
+    /// bounds and cross-field ordering. `serde`'s `deny_unknown_fields` and
+    /// the humane-duration codec handle shape and typos; this handles meaning.
+    /// Errors name the offending key so the operator can fix it directly.
+    fn validate(&self) -> Result<()> {
+        if self.executor.default_uid == 0 {
+            anyhow::bail!("executor.default_uid must not be 0: workloads never run as root (§6)");
+        }
+        if self.executor.pids_limit <= 0 {
+            anyhow::bail!(
+                "executor.pids_limit must be positive, got {}",
+                self.executor.pids_limit
+            );
+        }
+        let PressureConfig {
+            high_pct,
+            critical_pct,
+        } = self.pressure;
+        if !(0 < high_pct && high_pct < critical_pct && critical_pct <= 100) {
+            anyhow::bail!(
+                "pressure thresholds must satisfy 0 < high_pct < critical_pct <= 100, \
+                 got high_pct = {high_pct}, critical_pct = {critical_pct}"
+            );
+        }
+        Ok(())
+    }
+
     /// Emit the effective configuration at startup.
     ///
     /// Safe to log in full: TLS material is referenced by path, never inline
@@ -146,6 +231,7 @@ impl Config {
             capacity = ?self.capacity,
             labels = ?self.labels,
             executor = ?self.executor,
+            pressure = ?self.pressure,
             "effective agent configuration"
         );
     }
@@ -167,13 +253,38 @@ fn default_reap_janitor_after() -> Duration {
     Duration::from_secs(24 * 60 * 60)
 }
 
+fn default_docker_host() -> String {
+    "unix:///var/run/docker.sock".to_string()
+}
+
+fn default_default_uid() -> u32 {
+    65534
+}
+
+fn default_pids_limit() -> i64 {
+    4096
+}
+
+fn default_high_pct() -> u8 {
+    85
+}
+
+fn default_critical_pct() -> u8 {
+    95
+}
+
 /// Read and parse the config file, wrapping any I/O or deserialization
 /// failure with the file path so the error names both the file and (via
 /// `serde`'s own message) the offending key.
 pub fn load(path: &Path) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading agent config {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("reading agent config {}", path.display()))
+    let config: Config =
+        toml::from_str(&raw).with_context(|| format!("reading agent config {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("validating agent config {}", path.display()))?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -213,7 +324,14 @@ zone = "us-east-1a"
 pool = "batch"
 
 [executor]
+docker_host = "tcp://dockerd.internal:2375"
+default_uid = 1000
+pids_limit = 2048
 reap_janitor_after = "1h"
+
+[pressure]
+high_pct = 80
+critical_pct = 90
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
@@ -256,6 +374,11 @@ disk_bytes   = 107374182400
             config.executor.reap_janitor_after,
             Duration::from_secs(3600)
         );
+        assert_eq!(config.executor.docker_host, "tcp://dockerd.internal:2375");
+        assert_eq!(config.executor.default_uid, 1000);
+        assert_eq!(config.executor.pids_limit, 2048);
+        assert_eq!(config.pressure.high_pct, 80);
+        assert_eq!(config.pressure.critical_pct, 90);
     }
 
     #[test]
@@ -275,6 +398,11 @@ disk_bytes   = 107374182400
             config.executor.reap_janitor_after,
             Duration::from_secs(24 * 60 * 60)
         );
+        assert_eq!(config.executor.docker_host, default_docker_host());
+        assert_eq!(config.executor.default_uid, 65534);
+        assert_eq!(config.executor.pids_limit, 4096);
+        assert_eq!(config.pressure.high_pct, 85);
+        assert_eq!(config.pressure.critical_pct, 95);
     }
 
     #[test]
@@ -315,5 +443,77 @@ disk_bytes   = 107374182400
         let config = load(&path).expect("parse");
         let keys: Vec<&String> = config.labels.keys().collect();
         assert_eq!(keys, vec!["pool", "zone"]);
+    }
+
+    #[test]
+    fn root_default_uid_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\ndefault_uid = 0\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("UID 0 should be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("default_uid"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn non_positive_pids_limit_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\npids_limit = 0\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("pids_limit 0 should be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("pids_limit"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn pressure_high_at_least_critical_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[pressure]\nhigh_pct = 95\ncritical_pct = 95\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("high_pct == critical_pct should be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("high_pct") && message.contains("critical_pct"),
+            "error should name the pressure thresholds, got: {message}"
+        );
+    }
+
+    #[test]
+    fn pressure_zero_high_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[pressure]\nhigh_pct = 0\ncritical_pct = 95\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("high_pct 0 should be rejected");
+        assert!(format!("{err:#}").contains("high_pct"));
+    }
+
+    #[test]
+    fn pressure_critical_over_100_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[pressure]\nhigh_pct = 85\ncritical_pct = 101\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("critical_pct > 100 should be rejected");
+        assert!(format!("{err:#}").contains("critical_pct"));
+    }
+
+    #[test]
+    fn unknown_key_in_pressure_table_is_rejected() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[pressure]\nhigh_pctt = 85\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("typo'd pressure key should fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("high_pctt"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_in_executor_table_still_rejected_with_new_fields() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\ndocker_hostt = \"x\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("typo'd executor key should fail");
+        assert!(format!("{err:#}").contains("docker_hostt"));
     }
 }
