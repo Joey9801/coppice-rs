@@ -65,10 +65,14 @@ set after a restart without trusting agent memory.
 
 - `FakeExecutor` is an in-process, deterministic implementation that drives the
   whole agent in tests (including agent-restart scenarios via `fork`).
-- **`DockerExecutor` is a stub**: every method returns `Unimplemented`. The real
-  Docker implementation lands behind the same trait later, with ADR 0011's
-  locked-down defaults (no privileged containers, no host mounts/network,
-  non-root UID, always-applied resource limits) enforced unconditionally.
+- **`DockerExecutor`** (`executor/docker/`) is the real bollard-backed runtime
+  (docker-executor.md): the resolve→pull→create→start sequence with
+  adopt-on-name-conflict, daemon-arbitrated stop-vs-exit race discrimination,
+  label-based `observe()`, a `docker events` task feeding `next_exit`, and ADR
+  0011's locked-down posture (no privileged containers, no host mounts/network,
+  non-root UID, `no-new-privileges`, a pinned capability set, always-applied
+  resource limits) enforced unconditionally. Image cache management, disk
+  enforcement, cpuset affinity, and job telemetry land in later sessions.
 
 ## The local journal
 

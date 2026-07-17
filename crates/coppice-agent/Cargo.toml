@@ -16,8 +16,12 @@ coppice-net.workspace = true
 # through it so the crash harness can hammer it (ADR 0009).
 coppice-consensus.workspace = true
 anyhow.workspace = true
+bollard.workspace = true
+chrono.workspace = true
 crc32c.workspace = true
 humantime-serde.workspace = true
+metrics.workspace = true
+nix.workspace = true
 prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true
