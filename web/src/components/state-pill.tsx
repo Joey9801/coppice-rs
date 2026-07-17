@@ -102,8 +102,9 @@ export function StatePill({ state, className }: StatePillProps) {
 
 const OUTCOME_LABEL: Record<AttemptOutcome['kind'], string> = {
   Exited: 'Exited',
-  OomKilled: 'OOM killed',
-  MaxRuntimeExceeded: 'Timed out',
+  MemoryLimitExceeded: 'Memory limit exceeded',
+  RuntimeLimitExceeded: 'Runtime limit exceeded',
+  DiskLimitExceeded: 'Disk limit exceeded',
   Aborted: 'Aborted',
   Revoked: 'Revoked',
   PullFailed: 'Pull failed',

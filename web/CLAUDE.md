@@ -66,7 +66,7 @@ routes every endpoint below, with unimplemented ones answering
 1. Define the endpoint's response DTOs in
    `crates/coppice-api/src/http/dto.rs` (shape mirrors this repo's
    `src/api/types.ts` by name and semantics, spelled snake_case on the
-   wire: `cpu_millis` keys, `"oom_killed"` enum strings, bare
+   wire: `cpu_millis` keys, `"memory_limit_exceeded"` enum strings, bare
    typed-string ids, instants as ISO 8601 strings and durations as
    `_seconds` numbers, other integers as JSON numbers, `null`
    optionals, `[]` empties), add the projection in

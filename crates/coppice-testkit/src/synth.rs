@@ -604,8 +604,8 @@ fn random_terminal_failure_outcome(rng: &mut Rng) -> AttemptOutcome {
         0 => AttemptOutcome::Exited {
             code: rng.range(1, 255) as i32,
         },
-        1 => AttemptOutcome::OomKilled,
-        2 => AttemptOutcome::MaxRuntimeExceeded,
+        1 => AttemptOutcome::MemoryLimitExceeded,
+        2 => AttemptOutcome::RuntimeLimitExceeded,
         3 => AttemptOutcome::PullFailed {
             user_error: rng.chance(1, 2),
         },

@@ -16,7 +16,7 @@ use std::time::Duration as StdDuration;
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
 use coppice_core::resource::Resources;
-use coppice_core::time::Duration;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1 as pb;
 
 /// Everything the agent needs to start one container. Ids are carried through
@@ -34,7 +34,7 @@ pub struct StartSpec {
     pub entrypoint: Option<Vec<String>>,
     pub limits: Resources,
     /// Enforced runtime bound; the agent's watchdog kills the container past
-    /// it (outcome `MaxRuntimeExceeded`). `None` = unbounded.
+    /// it (outcome `RuntimeLimitExceeded`). `None` = unbounded.
     pub max_runtime: Option<Duration>,
 }
 
@@ -42,8 +42,28 @@ pub struct StartSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitInfo {
     pub code: i32,
-    pub oom_killed: bool,
+    /// Why the container ended — the evidence the session classifies (ADR
+    /// 0013). Replaces the bare `oom_killed` flag so the executor's own disk
+    /// kill (§6.2) can be distinguished from a natural exit and a kernel OOM.
+    pub cause: ExitCause,
     pub runtime: Duration,
+    /// When the container exited (Docker's `FinishedAt`). Feeds the session
+    /// janitor's age check when deciding whether an exited container is old
+    /// enough to reap (§5); the fake stamps it from its own clock.
+    pub finished_at: Timestamp,
+}
+
+/// What ended a container, from the runtime's point of view. `classify_exit`
+/// maps each to an [`AttemptOutcome`]; only the kernel OOM kill and the
+/// executor's disk kill (§6.2) are limit breaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCause {
+    /// The container exited on its own (its exit code stands).
+    Natural,
+    /// The kernel OOM killer terminated it against the memory limit.
+    OomKilled,
+    /// The disk enforcer killed it for exceeding its writable-layer budget.
+    DiskKilled,
 }
 
 /// An allocation's process having exited, with how it ended. Carried from
@@ -130,10 +150,10 @@ pub enum ExecutorError {
 /// the container's own exit code. Kill-initiated outcomes (abort, max-runtime)
 /// are assigned by the caller that initiated the kill, never inferred here.
 pub fn classify_exit(exit: &ExitInfo) -> AttemptOutcome {
-    if exit.oom_killed {
-        AttemptOutcome::OomKilled
-    } else {
-        AttemptOutcome::Exited { code: exit.code }
+    match exit.cause {
+        ExitCause::OomKilled => AttemptOutcome::MemoryLimitExceeded,
+        ExitCause::DiskKilled => AttemptOutcome::DiskLimitExceeded,
+        ExitCause::Natural => AttemptOutcome::Exited { code: exit.code },
     }
 }
 
@@ -162,6 +182,12 @@ pub trait Executor: Send + Sync + 'static {
     /// runtime half of restart reconciliation (ADR 0009).
     async fn observe(&self) -> Result<Vec<ObservedContainer>, ExecutorError>;
 
+    /// Remove an exited container's runtime record. Only the session may decide
+    /// to reap, and only *after* the exit is durably journaled: exited
+    /// containers are evidence and must survive the crash window (§5). Reaping
+    /// an allocation the runtime no longer knows about is a no-op (`Ok`).
+    async fn reap(&self, allocation: AllocationId) -> Result<(), ExecutorError>;
+
     /// Await the next natural container exit. The session loop runs this on a
     /// dedicated task, so the returned future must be `Send`; for runtimes with
     /// no containers it never resolves.
@@ -179,7 +205,6 @@ pub trait Executor: Send + Sync + 'static {
 /// `Arc<Mutex<_>>` so a test can keep a handle that outlives the agent — which
 /// is exactly what proves containers survive an agent restart (their state
 /// lives here, not in the agent).
-#[derive(Default)]
 struct FakeInner {
     /// Live containers, by allocation.
     running: std::collections::BTreeMap<AllocationId, ObservedContainer>,
@@ -191,6 +216,28 @@ struct FakeInner {
     /// of ADR 0009 idempotency: a re-delivered or duplicate `StartJob` must
     /// never bump this past 1 for a given allocation.
     start_counts: std::collections::BTreeMap<AllocationId, u32>,
+    /// The fake's clock. Stamped onto stop-synthesized exits' `finished_at` and
+    /// advanced by tests via [`FakeExecutor::set_now`]/[`FakeExecutor::advance`].
+    /// Read from the real clock once at construction — the fake is an edge.
+    now: Timestamp,
+    /// Pre-programmed causes for stop-synthesized exits, consumed on `stop`.
+    /// Models the daemon answering a stop with limit-kill evidence — the
+    /// kernel's OOM kill (or the disk enforcer's) landing as our stop takes
+    /// effect (docker-executor.md §4's carve-out on the 204 path).
+    stop_causes: std::collections::BTreeMap<AllocationId, ExitCause>,
+}
+
+impl Default for FakeInner {
+    fn default() -> FakeInner {
+        FakeInner {
+            running: std::collections::BTreeMap::new(),
+            exited: std::collections::BTreeMap::new(),
+            fail_starts: std::collections::BTreeMap::new(),
+            start_counts: std::collections::BTreeMap::new(),
+            now: Timestamp::now(),
+            stop_causes: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 /// An in-process, deterministic [`Executor`] for tests.
@@ -270,6 +317,31 @@ impl FakeExecutor {
             .copied()
             .unwrap_or(0)
     }
+
+    /// The fake's current clock reading — the value stamped onto stop-synthesized
+    /// exits' `finished_at`, so tests can hand-build exits that agree with it.
+    pub fn now(&self) -> Timestamp {
+        self.lock().now
+    }
+
+    /// Set the fake's clock (test control over `finished_at` and janitor aging).
+    pub fn set_now(&self, now: Timestamp) {
+        self.lock().now = now;
+    }
+
+    /// Advance the fake's clock by `delta`.
+    pub fn advance(&self, delta: Duration) {
+        let mut inner = self.lock();
+        inner.now += delta;
+    }
+
+    /// Pre-program the cause of the next `stop`-synthesized exit for
+    /// `allocation`: the stop still reports `Stopped`, but with limit-kill
+    /// evidence — the §4 carve-out race where the kernel's (or the disk
+    /// enforcer's) kill lands as our stop takes effect.
+    pub fn plan_stop_cause(&self, allocation: AllocationId, cause: ExitCause) {
+        self.lock().stop_causes.insert(allocation, cause);
+    }
 }
 
 impl Executor for FakeExecutor {
@@ -306,10 +378,15 @@ impl Executor for FakeExecutor {
             }
         }
         if let Some(mut c) = inner.running.remove(&allocation) {
+            let cause = inner
+                .stop_causes
+                .remove(&allocation)
+                .unwrap_or(ExitCause::Natural);
             let exit = ExitInfo {
                 code: 137,
-                oom_killed: false,
+                cause,
                 runtime: Duration::ZERO,
+                finished_at: inner.now,
             };
             c.state = ContainerState::Exited(exit);
             inner.exited.insert(allocation, c);
@@ -326,6 +403,12 @@ impl Executor for FakeExecutor {
             .chain(inner.exited.values())
             .copied()
             .collect())
+    }
+
+    async fn reap(&self, allocation: AllocationId) -> Result<(), ExecutorError> {
+        // Idempotent: reaping an absent allocation is a no-op.
+        self.lock().exited.remove(&allocation);
+        Ok(())
     }
 
     fn next_exit(&self) -> impl std::future::Future<Output = ExitEvent> + Send {
@@ -387,6 +470,10 @@ impl Executor for DockerExecutor {
         Err(ExecutorError::Unimplemented("DockerExecutor::observe"))
     }
 
+    async fn reap(&self, _allocation: AllocationId) -> Result<(), ExecutorError> {
+        Err(ExecutorError::Unimplemented("DockerExecutor::reap"))
+    }
+
     fn next_exit(&self) -> impl std::future::Future<Output = ExitEvent> + Send {
         // No containers to watch until the runtime is implemented.
         std::future::pending()
@@ -397,23 +484,28 @@ impl Executor for DockerExecutor {
 mod tests {
     use super::*;
 
+    fn exit(code: i32, cause: ExitCause) -> ExitInfo {
+        ExitInfo {
+            code,
+            cause,
+            runtime: Duration::from_micros(1),
+            finished_at: Timestamp::UNIX_EPOCH,
+        }
+    }
+
     #[test]
-    fn classify_distinguishes_oom_from_exit_code() {
+    fn classify_distinguishes_cause_from_exit_code() {
         assert_eq!(
-            classify_exit(&ExitInfo {
-                code: 0,
-                oom_killed: false,
-                runtime: Duration::from_micros(1)
-            }),
+            classify_exit(&exit(0, ExitCause::Natural)),
             AttemptOutcome::Exited { code: 0 }
         );
         assert_eq!(
-            classify_exit(&ExitInfo {
-                code: 137,
-                oom_killed: true,
-                runtime: Duration::from_micros(1)
-            }),
-            AttemptOutcome::OomKilled
+            classify_exit(&exit(137, ExitCause::OomKilled)),
+            AttemptOutcome::MemoryLimitExceeded
+        );
+        assert_eq!(
+            classify_exit(&exit(137, ExitCause::DiskKilled)),
+            AttemptOutcome::DiskLimitExceeded
         );
     }
 
@@ -460,8 +552,9 @@ mod tests {
             alloc,
             ExitInfo {
                 code: 0,
-                oom_killed: false,
+                cause: ExitCause::Natural,
                 runtime: Duration::from_micros(5),
+                finished_at: Timestamp::UNIX_EPOCH,
             },
         );
         match exec.stop(alloc, Duration::ZERO).await.unwrap() {

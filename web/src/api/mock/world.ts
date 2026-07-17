@@ -409,9 +409,10 @@ function shapeToResources(s: Shape): Resources {
 
 /** Failure outcomes for Failed jobs: [kind, class, weight]. */
 const FAILURE_POOL: ReadonlyArray<readonly [AttemptOutcomeKind, OutcomeClass, number]> = [
-  ['OomKilled', 'UserError', 3],
+  ['MemoryLimitExceeded', 'UserError', 3],
   ['Exited', 'UserError', 3],
-  ['MaxRuntimeExceeded', 'UserError', 2],
+  ['RuntimeLimitExceeded', 'UserError', 2],
+  ['DiskLimitExceeded', 'UserError', 1],
   ['PullFailed', 'Platform', 1],
   ['StartFailed', 'Platform', 1],
   ['NodeLost', 'Platform', 1],
@@ -1080,7 +1081,7 @@ export class MockWorld {
     if (state.kind === 'Aborted') return { kind: 'Aborted', class: 'UserRequest' }
     // A job with no runtime bound can never time out on it.
     const pool = FAILURE_POOL.filter(
-      (f) => f[0] !== 'MaxRuntimeExceeded' || job.spec.maxRuntimeUs !== null,
+      (f) => f[0] !== 'RuntimeLimitExceeded' || job.spec.maxRuntimeUs !== null,
     )
     const [kind, cls] = this.rng.weighted(pool.map((f) => [[f[0], f[1]] as const, f[2]] as const))
     if (kind === 'Exited') return { kind, exitCode: this.rng.pick([1, 2, 127, 137]), class: cls }
@@ -2709,7 +2710,7 @@ export class MockWorld {
       if (outcome.kind === 'Exited' && outcome.exitCode === 0) {
         push(end, 'info', 'app', 'done; flushing outputs')
         push(end, 'info', 'agent.runtime', 'container exited code 0')
-      } else if (outcome.kind === 'OomKilled') {
+      } else if (outcome.kind === 'MemoryLimitExceeded') {
         push(end, 'error', 'agent.runtime', 'container OOM-killed (memory.max exceeded)')
       } else {
         push(end, 'error', 'agent.runtime', `container terminated: ${outcome.kind}`)

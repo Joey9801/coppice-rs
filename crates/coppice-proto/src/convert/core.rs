@@ -270,9 +270,14 @@ impl From<&AttemptOutcome> for pb::AttemptOutcome {
         use pb::attempt_outcome as o;
         let outcome = match outcome {
             AttemptOutcome::Exited { code } => o::Outcome::Exited(o::Exited { code: *code }),
-            AttemptOutcome::OomKilled => o::Outcome::OomKilled(o::OomKilled {}),
-            AttemptOutcome::MaxRuntimeExceeded => {
-                o::Outcome::MaxRuntimeExceeded(o::MaxRuntimeExceeded {})
+            AttemptOutcome::MemoryLimitExceeded => {
+                o::Outcome::MemoryLimitExceeded(o::MemoryLimitExceeded {})
+            }
+            AttemptOutcome::RuntimeLimitExceeded => {
+                o::Outcome::RuntimeLimitExceeded(o::RuntimeLimitExceeded {})
+            }
+            AttemptOutcome::DiskLimitExceeded => {
+                o::Outcome::DiskLimitExceeded(o::DiskLimitExceeded {})
             }
             AttemptOutcome::Aborted => o::Outcome::Aborted(o::Aborted {}),
             AttemptOutcome::Revoked => o::Outcome::Revoked(o::Revoked {}),
@@ -298,8 +303,9 @@ impl TryFrom<pb::AttemptOutcome> for AttemptOutcome {
         use pb::attempt_outcome as o;
         Ok(match req(outcome.outcome, "AttemptOutcome.outcome")? {
             o::Outcome::Exited(e) => AttemptOutcome::Exited { code: e.code },
-            o::Outcome::OomKilled(_) => AttemptOutcome::OomKilled,
-            o::Outcome::MaxRuntimeExceeded(_) => AttemptOutcome::MaxRuntimeExceeded,
+            o::Outcome::MemoryLimitExceeded(_) => AttemptOutcome::MemoryLimitExceeded,
+            o::Outcome::RuntimeLimitExceeded(_) => AttemptOutcome::RuntimeLimitExceeded,
+            o::Outcome::DiskLimitExceeded(_) => AttemptOutcome::DiskLimitExceeded,
             o::Outcome::Aborted(_) => AttemptOutcome::Aborted,
             o::Outcome::Revoked(_) => AttemptOutcome::Revoked,
             o::Outcome::PullFailed(p) => AttemptOutcome::PullFailed {

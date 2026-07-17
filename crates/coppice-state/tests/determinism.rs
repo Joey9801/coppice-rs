@@ -50,8 +50,9 @@ fn arb_outcome() -> impl Strategy<Value = AttemptOutcome> {
     prop_oneof![
         Just(AttemptOutcome::Exited { code: 0 }),
         Just(AttemptOutcome::Exited { code: 1 }),
-        Just(AttemptOutcome::OomKilled),
-        Just(AttemptOutcome::MaxRuntimeExceeded),
+        Just(AttemptOutcome::MemoryLimitExceeded),
+        Just(AttemptOutcome::RuntimeLimitExceeded),
+        Just(AttemptOutcome::DiskLimitExceeded),
         Just(AttemptOutcome::Aborted),
         Just(AttemptOutcome::PullFailed { user_error: true }),
         Just(AttemptOutcome::StartFailed { user_error: false }),

@@ -30,12 +30,20 @@ pub struct ObservedAllocation {
 /// precedence:
 ///
 /// 1. Every runtime container appears, with its true state — running →
-///    `running = true`; exited → `running = false` with the *runtime-observed*
-///    classification (OOM vs. exit code). Runtime evidence wins even if the
-///    journal disagrees, and even if the journal intent is missing entirely
-///    (a survivor is never forgotten). Ids come from the container labels.
-/// 2. A journaled exit with no surviving runtime container → `running = false`
-///    with the journaled outcome and runtime.
+///    `running = true`; exited with no journaled exit → `running = false`
+///    with the *runtime-observed* classification (OOM vs. exit code). Runtime
+///    evidence wins even if the journal intent is missing entirely (a
+///    survivor is never forgotten). Ids come from the container labels.
+/// 2. A journaled exit → `running = false` with the *journaled* outcome and
+///    runtime, whether or not the exited container survives. When both
+///    sources agree the container exited, the journal's classification is
+///    the truth: it carries kill attribution (`Aborted`,
+///    `RuntimeLimitExceeded`) that the runtime's bare exit code cannot show,
+///    and re-classifying from the container would let a crash between
+///    journal and reap flip an aborted attempt into `Exited { code }`.
+///    Runtime evidence overrides a journaled exit only by showing the
+///    container still *running* (rule 1 — never claim or deny `running`
+///    without runtime evidence).
 /// 3. A journaled intent with neither a runtime container nor a journaled exit
 ///    → `running = false, outcome = AgentError, runtime = 0`: the honest "I
 ///    lost it". The agent never restarts a pending intent after a crash — the
@@ -63,10 +71,17 @@ pub fn build_observed_set(
 
     let mut out = Vec::with_capacity(allocations.len());
     for allocation in allocations {
-        // Rule 1: runtime evidence wins.
+        // Rule 1: runtime evidence wins — a running container, or an exited
+        // one whose exit never reached the journal.
         if let Some(container) = runtime_by_alloc.get(&allocation) {
-            out.push(from_runtime(container));
-            continue;
+            let journaled_exit = journal.exits.get(&allocation);
+            if matches!(container.state, ContainerState::Running { .. }) || journaled_exit.is_none()
+            {
+                out.push(from_runtime(container));
+                continue;
+            }
+            // Both sources say exited: fall through to rule 2 — the journaled
+            // classification is the truth (see the precedence doc above).
         }
         // Rule 2: journaled exit.
         if let Some(exit) = journal.exits.get(&allocation) {
@@ -121,8 +136,9 @@ fn from_runtime(container: &ObservedContainer) -> ObservedAllocation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::ExitInfo;
+    use crate::executor::{ExitCause, ExitInfo};
     use crate::journal::{ExitRec, IntentRec, JournalState};
+    use coppice_core::time::Timestamp;
 
     fn ids() -> (AllocationId, AttemptId, JobId) {
         (AllocationId::new(), AttemptId::new(), JobId::new())
@@ -157,13 +173,48 @@ mod tests {
             job: j,
             state: ContainerState::Exited(ExitInfo {
                 code: 0,
-                oom_killed: true,
+                cause: ExitCause::OomKilled,
                 runtime: Duration::from_micros(9),
+                finished_at: Timestamp::UNIX_EPOCH,
             }),
         }];
         let set = build_observed_set(&JournalState::default(), &runtime);
-        assert_eq!(set[0].outcome, Some(AttemptOutcome::OomKilled));
+        assert_eq!(set[0].outcome, Some(AttemptOutcome::MemoryLimitExceeded));
         assert!(!set[0].running);
+    }
+
+    #[test]
+    fn journaled_outcome_beats_runtime_classification_when_both_exited() {
+        // A stop journaled `Aborted`, then the crash hit before reap: the
+        // surviving container's bare 137 must not flip the outcome.
+        let (a, at, j) = ids();
+        let mut state = JournalState::default();
+        state.exits.insert(
+            a,
+            ExitRec {
+                allocation: a,
+                attempt: at,
+                job: j,
+                outcome: AttemptOutcome::Aborted,
+                runtime: Duration::from_micros(7),
+            },
+        );
+        let runtime = vec![ObservedContainer {
+            allocation: a,
+            attempt: at,
+            job: j,
+            state: ContainerState::Exited(ExitInfo {
+                code: 137,
+                cause: ExitCause::Natural,
+                runtime: Duration::from_micros(9),
+                finished_at: Timestamp::UNIX_EPOCH,
+            }),
+        }];
+        let set = build_observed_set(&state, &runtime);
+        assert_eq!(set.len(), 1);
+        assert!(!set[0].running);
+        assert_eq!(set[0].outcome, Some(AttemptOutcome::Aborted));
+        assert_eq!(set[0].runtime, Duration::from_micros(7));
     }
 
     #[test]

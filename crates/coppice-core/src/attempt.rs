@@ -79,9 +79,12 @@ pub enum AttemptOutcome {
     /// The container exited on its own with this code.
     Exited { code: i32 },
     /// Killed by the kernel for exceeding its memory limit.
-    OomKilled,
+    MemoryLimitExceeded,
     /// Killed by the agent for exceeding its enforced `max_runtime`.
-    MaxRuntimeExceeded,
+    RuntimeLimitExceeded,
+    /// Killed by the executor's disk enforcer for exceeding its hard disk
+    /// limit (see docker-executor.md §6.2). Not emitted yet.
+    DiskLimitExceeded,
     /// Terminated by the abort mechanism ([`crate::job::AbortRequest`]).
     Aborted,
     /// Revoked by the scheduler while accruing, to re-plan. Requeued without
@@ -115,7 +118,9 @@ impl AttemptOutcome {
         use AttemptOutcome::*;
         match self {
             Exited { code: 0 } => OutcomeClass::Success,
-            Exited { .. } | OomKilled | MaxRuntimeExceeded => OutcomeClass::UserError,
+            Exited { .. } | MemoryLimitExceeded | RuntimeLimitExceeded | DiskLimitExceeded => {
+                OutcomeClass::UserError
+            }
             Aborted => OutcomeClass::UserRequest,
             PullFailed { user_error } | StartFailed { user_error } => {
                 if *user_error {
@@ -159,6 +164,9 @@ mod tests {
         use AttemptOutcome::*;
         assert_eq!(Exited { code: 0 }.class(), OutcomeClass::Success);
         assert_eq!(Exited { code: 137 }.class(), OutcomeClass::UserError);
+        assert_eq!(MemoryLimitExceeded.class(), OutcomeClass::UserError);
+        assert_eq!(RuntimeLimitExceeded.class(), OutcomeClass::UserError);
+        assert_eq!(DiskLimitExceeded.class(), OutcomeClass::UserError);
         assert_eq!(Aborted.class(), OutcomeClass::UserRequest);
         assert_eq!(Revoked.class(), OutcomeClass::Platform);
         assert_eq!(
