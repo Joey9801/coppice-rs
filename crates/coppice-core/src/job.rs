@@ -50,7 +50,7 @@ pub struct Job {
     pub quota_entity: QuotaEntityId,
     /// Retry policy resolved at finalization (ADR 0013): platform failures
     /// retry within budget, user errors only if opted in, `Revoked` requeues
-    /// free, aborts and `RuntimeLimitExceeded` never retry.
+    /// free, aborts never retry.
     pub retry: RetryPolicy,
     /// Set when the user has requested an abort. Legal in every non-terminal
     /// state; once set, finalization never resolves to a retry. The job only
@@ -67,9 +67,8 @@ pub struct Job {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub max_retries: u32,
-    /// Opt-in to retrying user-error outcomes (nonzero exit, memory breach).
-    /// Never applies to `RuntimeLimitExceeded` (deterministic recurrence) or
-    /// aborts.
+    /// Opt-in to retrying user-error outcomes (nonzero exit, limit breaches).
+    /// Never applies to aborts.
     pub retry_user_errors: bool,
 }
 

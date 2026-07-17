@@ -464,14 +464,13 @@ fn user_errors_do_not_retry_unless_opted_in() {
 }
 
 #[test]
-fn max_runtime_exceeded_never_retries() {
+fn runtime_limit_exceeded_retries_like_the_other_limit_breaches() {
     let mut sm = setup();
-    // Even with user-error retries opted in: deterministic recurrence.
-    let opt_in = RetryPolicy {
-        max_retries: 3,
-        retry_user_errors: true,
-    };
-    apply_ok(&mut sm, submit_cmd(jid(1), cpu(1_000), Some(60), opt_in));
+    // Default policy: no user-error retries — the breach is terminal.
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), Some(60), RetryPolicy::default()),
+    );
     apply_ok(
         &mut sm,
         place_cmd(
@@ -486,6 +485,29 @@ fn max_runtime_exceeded_never_retries() {
         outcome_cmd(aid(11), AttemptOutcome::RuntimeLimitExceeded, 90, base_ts()),
     );
     assert_eq!(sm.jobs[&jid(1)].state, JobState::Failed);
+
+    // Opted in, the runtime breach requeues exactly like a memory or disk
+    // breach (ADR 0033: one classification for all three).
+    let opt_in = RetryPolicy {
+        max_retries: 3,
+        retry_user_errors: true,
+    };
+    apply_ok(&mut sm, submit_cmd(jid(2), cpu(1_000), Some(60), opt_in));
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(2), aid(22), alid(222), nid(1), cpu(1_000)),
+            base_ts(),
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(22), base_ts()));
+    apply_ok(&mut sm, started_cmd(aid(22), base_ts()));
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(22), AttemptOutcome::RuntimeLimitExceeded, 90, base_ts()),
+    );
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Queued);
+    assert_eq!(sm.jobs[&jid(2)].retries_used, 1);
 }
 
 #[test]

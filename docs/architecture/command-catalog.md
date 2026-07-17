@@ -205,10 +205,9 @@ the same apply resolves the job:
    under ADR 0019.
 4. **Retry policy** for everything else:
    - `Success` → job `Succeeded`.
-   - `RuntimeLimitExceeded` → job `Failed`, never retried (deterministic
-     recurrence; opt-in does not apply).
-   - Other `UserError` outcomes → retried only if the job's retry policy
-     opts in (`retry_user_errors`) and `retries_used < max_retries`;
+   - `UserError` outcomes (including all three limit breaches, ADR 0033) →
+     retried only if the job's retry policy opts in (`retry_user_errors`)
+     and `retries_used < max_retries`;
      otherwise `Failed`.
    - `Platform` outcomes → retried while `retries_used < max_retries`;
      otherwise `Failed`.

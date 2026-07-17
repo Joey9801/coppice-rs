@@ -58,9 +58,8 @@ message Entrypoint {
 // never consume this budget.
 message RetryPolicy {
   uint32 max_retries = 1;
-  // Opt-in to retrying user-error outcomes (nonzero exit, memory breach).
-  // Never applies to RuntimeLimitExceeded (deterministic recurrence) or
-  // aborts.
+  // Opt-in to retrying user-error outcomes (nonzero exit, limit breaches).
+  // Never applies to aborts.
   bool retry_user_errors = 2;
 }
 
