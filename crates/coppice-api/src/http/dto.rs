@@ -1098,8 +1098,8 @@ pub struct JobDetail {
 #[serde(deny_unknown_fields)]
 pub struct RetryPolicy {
     pub max_retries: u32,
-    /// Opt-in to retrying user-error outcomes (nonzero exit, memory breach).
-    /// Never applies to `RuntimeLimitExceeded` or aborts.
+    /// Opt-in to retrying user-error outcomes (nonzero exit, limit breaches).
+    /// Never applies to aborts.
     pub retry_user_errors: bool,
 }
 

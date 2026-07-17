@@ -1135,8 +1135,6 @@ impl StateMachine {
                     }
                 }
             }
-            // Deterministic recurrence: never retried, opt-in does not apply.
-            AttemptOutcome::RuntimeLimitExceeded => Resolution::Terminal(JobState::Failed),
             o => {
                 let eligible = match o.class() {
                     OutcomeClass::Platform => true,
