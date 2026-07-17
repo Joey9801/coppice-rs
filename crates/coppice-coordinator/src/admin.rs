@@ -527,6 +527,7 @@ mod tests {
             term: 5,
             last_applied: 100,
             known_committed: 100,
+            snapshot_last_index: Some(64),
             members: vec![
                 MemberSummary {
                     id: 3,

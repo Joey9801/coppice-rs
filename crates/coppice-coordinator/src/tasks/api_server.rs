@@ -15,16 +15,20 @@ use std::sync::Arc;
 
 use tokio::sync::watch;
 
-use coppice_api::http::dto::{AbortJobRequest, SubmitJobRequest, SubmitJobResponse};
-use coppice_api::{
-    ApiError, Consistency, ControlPlane, QueueWindow, ReadOptions, ReadView, RecentClusterEvents,
-    StampedEvent,
+use coppice_api::http::dto::{
+    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest,
+    SubmitJobResponse,
 };
-use coppice_consensus::{Applied, Consensus, ConsensusError, StateViews};
+use coppice_api::{
+    ApiError, Consistency, ControlPlane, CoordinatorMemberSummary, CoordinatorSummary, QueueWindow,
+    ReadOptions, ReadView, RecentClusterEvents, StampedEvent,
+};
+use coppice_consensus::{Applied, Consensus, ConsensusError, NodeHandle, StateViews};
 use coppice_core::id::ClusterId;
 use coppice_core::job::Job;
+use coppice_core::quota::CostUnits;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::command::{AbortJob, SubmitJob};
+use coppice_state::command::{AbortJob, ConfigureQuotaEntity, SubmitJob};
 use coppice_state::Command;
 
 use crate::tasks::event_fanout::FanoutHandle;
@@ -46,6 +50,13 @@ pub struct CoordinatorControlPlane<C> {
     /// Handle to the fanout's ring for `recent_events` (ADR 0032, tier 1);
     /// `None` (again: no coverage) until `with_derived`.
     fanout: Option<FanoutHandle>,
+    /// Admin handle to the consensus node, for `coordinator_status`'s raft-level
+    /// view (leader/term/membership). `None` until [`with_node_handle`] attaches
+    /// it — a plane without it answers `GET /api/v1/coordinators` with
+    /// `UNAVAILABLE`, the same "no coverage" posture as a missing fanout ring.
+    ///
+    /// [`with_node_handle`]: Self::with_node_handle
+    node_handle: Option<NodeHandle>,
 }
 
 impl<C> CoordinatorControlPlane<C> {
@@ -59,6 +70,7 @@ impl<C> CoordinatorControlPlane<C> {
             cluster_id,
             queue_window,
             fanout: None,
+            node_handle: None,
         }
     }
 
@@ -72,6 +84,14 @@ impl<C> CoordinatorControlPlane<C> {
     ) -> Self {
         self.queue_window = queue_window;
         self.fanout = Some(fanout);
+        self
+    }
+
+    /// Attach the consensus admin handle backing `coordinator_status`. The
+    /// runtime calls this with the replica's [`NodeHandle`]; a plane without it
+    /// answers `GET /api/v1/coordinators` with `UNAVAILABLE`.
+    pub fn with_node_handle(mut self, node_handle: NodeHandle) -> Self {
+        self.node_handle = Some(node_handle);
         self
     }
 }
@@ -200,6 +220,39 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         }
     }
 
+    async fn configure_quota_entity(
+        &self,
+        req: ConfigureQuotaEntityRequest,
+    ) -> Result<ConfigureQuotaEntityResponse, ApiError> {
+        // The client-minted entity id is the upsert's idempotency identity
+        // (ADR 0026), echoed back on success. Direct copy of abort_job's
+        // propose-and-map shape; the id and quota ride the command as-is,
+        // with `updated_at` stamped by this proposer (apply never reads a
+        // clock). Cycle / unknown-parent refusals come back through the
+        // rejection arm as a normal 409. No authz — matching the existing
+        // submit_job/abort_job precedent (ADR 0023 is a separate subsystem).
+        let entity = req.entity;
+        let command = Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+            entity,
+            parent: req.parent,
+            name: req.name,
+            quota: CostUnits(req.quota_ucu),
+            updated_at: Timestamp::now(),
+        });
+
+        match self.consensus.propose(command).await {
+            Ok(Applied {
+                outcome: Ok(_),
+                log_index,
+            }) => Ok(ConfigureQuotaEntityResponse { entity, log_index }),
+            Ok(Applied {
+                outcome: Err(rejection),
+                ..
+            }) => Err(ApiError::Rejected(rejection)),
+            Err(e) => Err(map_consensus_error(e)),
+        }
+    }
+
     async fn read_state(&self, opts: ReadOptions) -> Result<ReadView, ApiError> {
         let view = match opts.consistency {
             Consistency::Strong => {
@@ -277,6 +330,44 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             },
             Err(_closed) => uncovered(),
         }
+    }
+
+    fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
+        // No handle attached is "no coverage": the replicated-state reads still
+        // work, but this raft-level view cannot be produced (mirrors the
+        // missing-fanout branch in `recent_events`, but as an error — the raft
+        // view *is* the endpoint, so there is no honest partial answer).
+        let Some(handle) = &self.node_handle else {
+            return Err(ApiError::Unavailable(
+                "coordinator status unavailable: no consensus handle attached".into(),
+            ));
+        };
+
+        // One point-in-time read of the consensus metrics; the matched-index
+        // list is populated only while this replica is leader.
+        let summary = handle.cluster_summary();
+        let matched: std::collections::BTreeMap<u64, u64> =
+            summary.replication.into_iter().collect();
+        let members = summary
+            .members
+            .into_iter()
+            .map(|m| CoordinatorMemberSummary {
+                id: m.id,
+                addr: m.addr,
+                voter: m.voter,
+                matched_index: matched.get(&m.id).copied(),
+            })
+            .collect();
+
+        Ok(CoordinatorSummary {
+            local_id: summary.local_id,
+            leader: summary.leader,
+            term: summary.term,
+            known_committed: summary.known_committed,
+            last_applied: summary.last_applied,
+            snapshot_last_index: summary.snapshot_last_index,
+            members,
+        })
     }
 }
 
@@ -453,5 +544,52 @@ mod tests {
             reason: None,
         };
         assert!(cp.abort_job(req).await.is_ok());
+    }
+
+    fn configure_request(entity: coppice_core::id::QuotaEntityId) -> ConfigureQuotaEntityRequest {
+        ConfigureQuotaEntityRequest {
+            entity,
+            parent: None,
+            name: "team".to_string(),
+            quota_ucu: 1_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_configure_echoes_the_entity_and_log_index() {
+        let cp = control_plane(ProposeOutcome::Accepted);
+        let entity = coppice_core::id::QuotaEntityId::new();
+        let response = cp
+            .configure_quota_entity(configure_request(entity))
+            .await
+            .expect("accepted");
+        assert_eq!(response.entity, entity);
+        assert!(response.log_index > 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_configure_maps_to_rejected() {
+        // A cycle / unknown-parent refusal is a committed-and-refused apply,
+        // surfaced as a normal 409, not a server fault.
+        let reason = coppice_state::RejectionReason::QuotaEntityCycle(
+            coppice_core::id::QuotaEntityId::new(),
+        );
+        let cp = control_plane(ProposeOutcome::Rejected(reason));
+        let result = cp
+            .configure_quota_entity(configure_request(coppice_core::id::QuotaEntityId::new()))
+            .await;
+        assert!(matches!(result, Err(ApiError::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn not_leader_configure_maps_to_not_leader_without_a_fake_hint() {
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)));
+        let result = cp
+            .configure_quota_entity(configure_request(coppice_core::id::QuotaEntityId::new()))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApiError::NotLeader { leader_hint: None })
+        ));
     }
 }

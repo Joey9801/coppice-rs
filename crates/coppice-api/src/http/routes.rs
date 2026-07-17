@@ -22,7 +22,9 @@ use serde::Deserialize;
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 
-use super::dto::{self, AbortJobRequest, AbortJobResponse, SubmitJobRequest};
+use super::dto::{
+    self, AbortJobRequest, AbortJobResponse, ConfigureQuotaEntityRequest, SubmitJobRequest,
+};
 use crate::{Consistency, ControlPlane};
 
 use super::error::HttpError;
@@ -38,17 +40,11 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         .route("/api/v1/session", get(unimplemented_read("GetSession")))
         // Cluster overview — bounded reads.
         .route("/api/v1/overview", get(get_overview::<P>))
-        .route(
-            "/api/v1/queue/stats",
-            get(unimplemented_read("GetQueueStats")),
-        )
+        .route("/api/v1/queue/stats", get(get_queue_stats::<P>))
         // Jobs. List/detail/timeline are bounded; usage is eventual
         // (derived samples); logs are provisional until log storage exists.
         .route("/api/v1/jobs", get(list_jobs::<P>).post(submit_job::<P>))
-        .route(
-            "/api/v1/jobs/:job",
-            get(unimplemented_id_read::<JobId>("GetJob")),
-        )
+        .route("/api/v1/jobs/:job", get(get_job::<P>))
         .route("/api/v1/jobs/:job/abort", post(abort_job::<P>))
         .route(
             "/api/v1/jobs/:job/timeline",
@@ -79,10 +75,7 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
             get(unimplemented_id_read::<NodeId>("GetNodeLogs")),
         )
         // Coordinators — local status read; logs provisional.
-        .route(
-            "/api/v1/coordinators",
-            get(unimplemented_read("GetCoordinatorStatus")),
-        )
+        .route("/api/v1/coordinators", get(get_coordinators::<P>))
         .route(
             "/api/v1/coordinators/:id/logs",
             // Coordinator ids are raft ids: plain u64, not typed uuids (ADR 0024).
@@ -92,13 +85,9 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         // configuration reads); configure is the ADR-0023-gated upsert.
         .route(
             "/api/v1/quota-entities",
-            get(unimplemented_read("ListQuotaEntities"))
-                .post(unimplemented("ConfigureQuotaEntity")),
+            get(list_quota_entities::<P>).post(configure_quota_entity::<P>),
         )
-        .route(
-            "/api/v1/quota-entities/:entity",
-            get(unimplemented_id_read::<QuotaEntityId>("GetQuotaEntity")),
-        )
+        .route("/api/v1/quota-entities/:entity", get(get_quota_entity::<P>))
         // Reserved: ADR 0008 event subscription (SSE, cursor-resumed).
         .route("/api/v1/events", get(unimplemented_read("SubscribeEvents")))
         // Everything unrouted: `/api/*` misses stay JSON 404s; anything
@@ -106,15 +95,6 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         // ADR 0031 "Serving the UI").
         .fallback(super::ui::fallback)
         .with_state(plane)
-}
-
-/// Stub for an unimplemented write route: routed (so the path is claimed
-/// and typos 404 distinctly) but answering `501 UNIMPLEMENTED` with the
-/// endpoint name.
-fn unimplemented(
-    endpoint: &'static str,
-) -> impl Fn() -> std::future::Ready<HttpError> + Clone + Send + 'static {
-    move || ready(HttpError::unimplemented(endpoint))
 }
 
 /// Stub for an unimplemented read route. Extracting [`ReadQuery`] makes the
@@ -248,6 +228,20 @@ async fn abort_job<P: ControlPlane>(
     Ok(Json(AbortJobResponse {}))
 }
 
+/// `POST /api/v1/quota-entities` — body `ConfigureQuotaEntityRequest`, the
+/// create-or-update upsert (ADR 0031's write class). Response echoes the
+/// client-minted entity id + `log_index` for read-your-writes, exactly like
+/// `SubmitJob`. A cycle / unknown-parent refusal maps to `REJECTED` (409),
+/// the normal committed-and-refused outcome.
+async fn configure_quota_entity<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    body: Result<Json<ConfigureQuotaEntityRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let Json(request) = body.map_err(bad_body)?;
+    let response = plane.configure_quota_entity(request).await?;
+    Ok(Json(response))
+}
+
 /// Events served in the overview's `recent_events` window — a display
 /// window, deliberately smaller than the ring behind it (a client wanting
 /// more history uses the timeline/subscription endpoints).
@@ -276,6 +270,30 @@ async fn get_overview<P: ControlPlane>(
         &window,
         &recent,
     );
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `GET /api/v1/queue/stats` — bounded by default (ADR 0031). The bare
+/// [`dto::QueueStats`] object (the same shape as the overview's `queue`
+/// field), with no wrapper: it is already an object, so fields can still be
+/// added later. Same derived queue-window source as [`get_overview`].
+async fn get_queue_stats<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    let window = plane.queue_window();
+    // A read may sample the clock (an apply may not): it feeds the read-time
+    // `oldest_queued_age_seconds`, never anything stored.
+    let response = super::project::queue_stats(view.state(), Timestamp::now(), &window);
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -323,6 +341,98 @@ async fn get_node<P: ControlPlane>(
     ))
 }
 
+/// `GET /api/v1/jobs/{job}` — bounded by default (ADR 0031). 404 when the id
+/// is not in the read view, exactly as [`get_node`].
+async fn get_job<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    IdPath(id): IdPath<JobId>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    // A read may sample the clock (an apply may not): `now` feeds the
+    // read-time entity-usage decay, queue age, and penalty product.
+    let response = super::project::get_job(view.state(), &id, Timestamp::now())
+        .ok_or_else(|| HttpError::not_found(format!("job {id} not found")))?;
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `GET /api/v1/quota-entities` — bounded by default (ADR 0031). `Timestamp::now()`
+/// decays each entity's usage to read time (a read-time figure, never stored).
+async fn list_quota_entities<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Bounded))
+        .await?;
+    let response = super::project::list_quota_entities(view.state(), Timestamp::now());
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `GET /api/v1/quota-entities/{entity}` — **strong** by default (ADR 0031
+/// puts it in the ADR 0007 configuration-read class, unlike the bounded list
+/// and node reads). 404 when the id is not in the tree, like [`get_node`].
+async fn get_quota_entity<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    IdPath(id): IdPath<QuotaEntityId>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Strong))
+        .await?;
+    let response = super::project::get_quota_entity(view.state(), &id, Timestamp::now())
+        .ok_or_else(|| HttpError::not_found(format!("quota entity {id} not found")))?;
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `GET /api/v1/coordinators` — local read (ADR 0031). Two sources: the
+/// consensus/membership summary (raft-level, from `coordinator_status`) and a
+/// replica-local state snapshot (version + object counts). The snapshot rides
+/// the read plumbing so the response still carries staleness headers and
+/// honours `?consistency=`/`?min_index=`; local defaults to `Eventual` (the
+/// latest published view, no consensus round-trip).
+///
+/// When the consensus handle is not attached, `coordinator_status` is
+/// `UNAVAILABLE` (503) and the route fails as a whole — the raft-level view is
+/// the point of the endpoint.
+async fn get_coordinators<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let summary = plane.coordinator_status()?;
+    let view = plane
+        .read_state(params.into_options(Consistency::Eventual))
+        .await?;
+    let response = super::project::coordinator_status(&summary, plane.cluster_id(), view.state());
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
 fn bad_body(rejection: JsonRejection) -> HttpError {
     HttpError::invalid(rejection.body_text())
 }
@@ -336,7 +446,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::super::dto::SubmitJobResponse;
-    use crate::{ApiError, QueueWindow, ReadOptions, ReadView, RecentClusterEvents};
+    use crate::{
+        ApiError, CoordinatorMemberSummary, CoordinatorSummary, QueueWindow, ReadOptions, ReadView,
+        RecentClusterEvents,
+    };
 
     use crate::http::COPPICE_LEADER;
 
@@ -349,6 +462,12 @@ mod tests {
         queue_window: QueueWindow,
         recent: RecentClusterEvents,
         state: coppice_state::StateMachine,
+        /// Every consistency class `read_state` was asked for, so a test can
+        /// assert a route's default (e.g. the strong quota-entity detail).
+        read_consistency: std::sync::Mutex<Vec<Consistency>>,
+        /// The seeded raft summary, or `None` to model a control plane with no
+        /// consensus handle attached (→ `coordinator_status` is `Unavailable`).
+        coordinator: Option<CoordinatorSummary>,
     }
 
     const STUB_CLUSTER: &str = "cluster-00000000-0000-0000-0000-000000000009";
@@ -368,6 +487,12 @@ mod tests {
             recent
         }
 
+        fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
+            self.coordinator
+                .clone()
+                .ok_or_else(|| ApiError::Unavailable("no consensus handle".into()))
+        }
+
         async fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
             match self.fail_with {
                 Some(make) => Err(make()),
@@ -385,7 +510,21 @@ mod tests {
             }
         }
 
-        async fn read_state(&self, _opts: ReadOptions) -> Result<ReadView, ApiError> {
+        async fn configure_quota_entity(
+            &self,
+            req: dto::ConfigureQuotaEntityRequest,
+        ) -> Result<dto::ConfigureQuotaEntityResponse, ApiError> {
+            match self.fail_with {
+                Some(make) => Err(make()),
+                None => Ok(dto::ConfigureQuotaEntityResponse {
+                    entity: req.entity,
+                    log_index: 7,
+                }),
+            }
+        }
+
+        async fn read_state(&self, opts: ReadOptions) -> Result<ReadView, ApiError> {
+            self.read_consistency.lock().unwrap().push(opts.consistency);
             Ok(ReadView::new(self.state.clone(), 1, 1))
         }
     }
@@ -408,6 +547,10 @@ mod tests {
                 events: Vec::new(),
             },
             state,
+            read_consistency: std::sync::Mutex::default(),
+            // No handle by default: coordinator-status tests build their own
+            // plane with a seeded summary.
+            coordinator: None,
         }))
     }
 
@@ -426,17 +569,13 @@ mod tests {
     #[tokio::test]
     async fn stub_routes_answer_501_with_the_endpoint_name() {
         let response = app(None)
-            .oneshot(
-                Request::get("/api/v1/queue/stats")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/v1/session").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
         assert_eq!(body["code"], "UNIMPLEMENTED");
-        assert!(body["message"].as_str().unwrap().contains("GetQueueStats"));
+        assert!(body["message"].as_str().unwrap().contains("GetSession"));
     }
 
     #[tokio::test]
@@ -500,6 +639,8 @@ mod tests {
                 }],
             },
             state: coppice_state::StateMachine::default(),
+            read_consistency: std::sync::Mutex::default(),
+            coordinator: None,
         };
         let response = router(Arc::new(plane))
             .oneshot(
@@ -614,15 +755,17 @@ mod tests {
         let job = JobId::new();
         let response = app(None)
             .oneshot(
-                Request::get(format!("/api/v1/jobs/{job}?consistency=strong&min_index=3"))
-                    .body(Body::empty())
-                    .unwrap(),
+                Request::get(format!(
+                    "/api/v1/jobs/{job}/timeline?consistency=strong&min_index=3"
+                ))
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
-        assert!(body["message"].as_str().unwrap().contains("GetJob"));
+        assert!(body["message"].as_str().unwrap().contains("GetJobTimeline"));
     }
 
     #[tokio::test]
@@ -930,6 +1073,307 @@ mod tests {
         assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
     }
 
+    /// An `Arc<StubPlane>` kept alongside the router, so a test can both
+    /// drive the app and inspect what the plane was asked (e.g. the read
+    /// consistency a route defaulted to).
+    fn stub_plane(state: coppice_state::StateMachine) -> Arc<StubPlane> {
+        Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            recent: RecentClusterEvents {
+                floor_index: 1,
+                events: Vec::new(),
+            },
+            state,
+            read_consistency: std::sync::Mutex::default(),
+            coordinator: None,
+        })
+    }
+
+    /// A state machine holding one quota entity (root, at-quota) so the list
+    /// and detail reads project a real node.
+    fn state_with_entity(id: QuotaEntityId) -> coppice_state::StateMachine {
+        let mut state = coppice_state::StateMachine::default();
+        state.quota_entities.insert(
+            id,
+            coppice_state::QuotaEntity {
+                parent: None,
+                name: "root".to_string(),
+                quota: coppice_core::quota::CostUnits(1_000_000),
+                usage: coppice_core::quota::UsageState::new(Timestamp::from_micros(0).unwrap()),
+                created_at: Timestamp::from_micros(1_000_000).unwrap(),
+                updated_at: Timestamp::from_micros(1_000_000).unwrap(),
+            },
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn list_quota_entities_returns_an_envelope_with_headers() {
+        let id = QuotaEntityId::new();
+        let response = app_with_state(None, state_with_entity(id))
+            .oneshot(
+                Request::get("/api/v1/quota-entities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        let body = body_json(response).await;
+        // Object envelope, never a bare array (ADR 0031).
+        assert_eq!(body["entities"][0]["id"], id.to_string());
+        assert_eq!(body["entities"][0]["queued_count"], 0);
+        // SSO provenance is omitted, not null.
+        assert!(body["entities"][0].get("origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_quota_entities_defaults_to_a_bounded_read() {
+        let plane = stub_plane(coppice_state::StateMachine::default());
+        let response = router(plane.clone())
+            .oneshot(
+                Request::get("/api/v1/quota-entities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            plane.read_consistency.lock().unwrap().last(),
+            Some(&Consistency::Bounded)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_quota_entity_returns_not_found_for_missing() {
+        let entity = QuotaEntityId::new();
+        let response = app(None)
+            .oneshot(
+                Request::get(format!("/api/v1/quota-entities/{entity}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn get_quota_entity_defaults_to_a_strong_read() {
+        // ADR 0031 puts the detail read in the configuration-read class:
+        // strong by default, unlike the bounded list and node reads.
+        let id = QuotaEntityId::new();
+        let plane = stub_plane(state_with_entity(id));
+        let response = router(plane.clone())
+            .oneshot(
+                Request::get(format!("/api/v1/quota-entities/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            plane.read_consistency.lock().unwrap().last(),
+            Some(&Consistency::Strong)
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["entity"]["id"], id.to_string());
+        assert_eq!(body["chain"][0]["id"], id.to_string());
+        assert_eq!(body["stats"]["charged_ucu_24h"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn get_quota_entity_rejects_a_malformed_path_id() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/quota-entities/not-an-entity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn configure_quota_entity_echoes_the_entity_and_log_index() {
+        let entity = QuotaEntityId::new();
+        let body = format!(
+            r#"{{ "entity": "{entity}", "parent": null, "name": "team", "quota_ucu": 1000 }}"#
+        );
+        let response = app(None)
+            .oneshot(post_json("/api/v1/quota-entities", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["entity"], entity.to_string());
+        assert_eq!(body["log_index"], 7);
+    }
+
+    #[tokio::test]
+    async fn configure_quota_entity_maps_a_rejection_to_409() {
+        let entity = QuotaEntityId::new();
+        let response = app(Some(|| {
+            ApiError::Rejected(coppice_state::RejectionReason::QuotaEntityCycle(
+                QuotaEntityId::new(),
+            ))
+        }))
+        .oneshot(post_json(
+            "/api/v1/quota-entities",
+            &format!(r#"{{ "entity": "{entity}", "name": "team", "quota_ucu": 1000 }}"#),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["code"], "REJECTED");
+    }
+
+    #[tokio::test]
+    async fn configure_quota_entity_with_an_unknown_field_is_invalid_argument() {
+        let entity = QuotaEntityId::new();
+        // camelCase `quotaUcu` must not be accepted alongside `quota_ucu`.
+        let body = format!(
+            r#"{{ "entity": "{entity}", "name": "team", "quota_ucu": 1000, "quotaUcu": 2000 }}"#
+        );
+        let response = app(None)
+            .oneshot(post_json("/api/v1/quota-entities", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn queue_stats_answers_from_the_replica_with_staleness_headers() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/queue/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Bounded reads carry the staleness headers, like every other read.
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_COMMITTED_INDEX));
+
+        let body = body_json(response).await;
+        // The bare QueueStats object, no wrapper — the same shape as the
+        // overview's `queue` field.
+        assert_eq!(body["depth"], 0);
+        assert_eq!(body["by_state"]["queued"], 0);
+        assert_eq!(body["oldest_queued_age_seconds"], serde_json::Value::Null);
+        // No derived coverage on a fresh replica: rates null, history empty.
+        assert_eq!(body["drain_rate_per_minute"], serde_json::Value::Null);
+        assert_eq!(body["history"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn queue_stats_counts_a_seeded_queue() {
+        let lo: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let hi: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let response = app_with_state(None, state_with_jobs(&[lo, hi]))
+            .oneshot(
+                Request::get("/api/v1/queue/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["depth"], 2);
+        assert_eq!(body["by_state"]["queued"], 2);
+    }
+
+    #[tokio::test]
+    async fn queue_stats_validates_the_consistency_parameter() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/queue/stats?consistency=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_not_found_for_missing_job() {
+        let job = JobId::new();
+        let response = app(None)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn get_job_rejects_a_malformed_path_id() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/jobs/not-a-job-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn get_job_serves_a_queued_job_with_headers() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let response = app_with_state(None, state_with_jobs(&[job]))
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        let body = body_json(response).await;
+        assert_eq!(body["id"], job.to_string());
+        assert_eq!(body["state"], "queued");
+        // A queued job carries its explainer and no accrual.
+        assert!(body["queue"].is_object());
+        // Ranking fields are absent, not null — see the DTO doc.
+        assert!(body["queue"].get("rank").is_none());
+        assert!(body["queue"]["penalty_product"].is_number());
+        assert_eq!(body["accrual"], serde_json::Value::Null);
+        // Cost is always present; absent-data fields are explicit null.
+        assert_eq!(body["cost"]["actual_ucu"], serde_json::Value::Null);
+        assert_eq!(body["cost"]["true_up"], serde_json::Value::Null);
+        // state_since falls back to submission time for a queued job.
+        assert_eq!(body["state_since"], body["submitted_at"]);
+    }
+
     #[tokio::test]
     async fn not_leader_maps_to_421_with_a_leader_hint_header() {
         let job = JobId::new();
@@ -945,5 +1389,203 @@ mod tests {
             "10.0.0.3:7070"
         );
         assert_eq!(body_json(response).await["code"], "NOT_LEADER");
+    }
+
+    // ---- coordinators -----------------------------------------------------
+
+    /// A control plane with a seeded raft summary and state, wired (a handle
+    /// is present).
+    fn coordinator_app(
+        coordinator: CoordinatorSummary,
+        state: coppice_state::StateMachine,
+    ) -> Router {
+        router(Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            recent: RecentClusterEvents {
+                floor_index: 1,
+                events: Vec::new(),
+            },
+            state,
+            read_consistency: std::sync::Mutex::default(),
+            coordinator: Some(coordinator),
+        }))
+    }
+
+    /// A three-member cluster: local leader (id 1), a follower (id 2), and a
+    /// learner (id 3), from the perspective of the leader.
+    fn seeded_summary() -> CoordinatorSummary {
+        CoordinatorSummary {
+            local_id: 1,
+            leader: Some(1),
+            term: 5,
+            known_committed: 100,
+            last_applied: 100,
+            snapshot_last_index: Some(64),
+            members: vec![
+                CoordinatorMemberSummary {
+                    id: 1,
+                    addr: "10.0.0.1:9001".to_string(),
+                    voter: true,
+                    matched_index: Some(100),
+                },
+                CoordinatorMemberSummary {
+                    id: 2,
+                    addr: "10.0.0.2:9001".to_string(),
+                    voter: true,
+                    matched_index: Some(90),
+                },
+                CoordinatorMemberSummary {
+                    id: 3,
+                    addr: "10.0.0.3:9001".to_string(),
+                    voter: false,
+                    matched_index: None,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinators_project_roles_lag_and_snapshot() {
+        let response = coordinator_app(seeded_summary(), coppice_state::StateMachine::default())
+            .oneshot(
+                Request::get("/api/v1/coordinators")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // A local read still carries the staleness headers.
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+
+        let body = body_json(response).await;
+        assert_eq!(body["leader"], 1);
+        assert_eq!(body["term"], 5);
+        assert_eq!(body["known_committed"], 100);
+        assert_eq!(body["last_applied"], 100);
+
+        // Roles derive from leader id + voter flag.
+        let members = body["members"].as_array().unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0]["role"], "leader");
+        assert_eq!(members[1]["role"], "follower");
+        assert_eq!(members[2]["role"], "learner");
+
+        // last_applied: exact for the local leader, null for peers.
+        assert_eq!(members[0]["last_applied"], 100);
+        assert_eq!(members[1]["last_applied"], serde_json::Value::Null);
+        assert_eq!(members[2]["last_applied"], serde_json::Value::Null);
+
+        // Lag math: known_committed − matched, leader-only.
+        assert_eq!(members[0]["replication_lag_entries"], 0); // 100 − 100
+        assert_eq!(members[1]["replication_lag_entries"], 10); // 100 − 90
+                                                               // The learner has no matched entry → null, never a fabricated 0.
+        assert_eq!(
+            members[2]["replication_lag_entries"],
+            serde_json::Value::Null
+        );
+
+        // Snapshot: only the covered index is real; size/time are explicit null.
+        assert_eq!(body["snapshot"]["last_included_index"], 64);
+        assert_eq!(body["snapshot"]["entries_since_snapshot"], 36); // 100 − 64
+        assert_eq!(body["snapshot"]["size_bytes"], serde_json::Value::Null);
+        assert_eq!(body["snapshot"]["taken_at"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn coordinators_omit_the_invented_host_and_last_seen_fields() {
+        let body = body_json(
+            coordinator_app(seeded_summary(), coppice_state::StateMachine::default())
+                .oneshot(
+                    Request::get("/api/v1/coordinators")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let member = &body["members"][0];
+        // These have no data source; the DTO omits them rather than inventing.
+        assert!(member.get("host").is_none());
+        assert!(member.get("last_seen").is_none());
+    }
+
+    #[tokio::test]
+    async fn coordinators_count_the_replicated_state() {
+        let a: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let b: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let mut state = state_with_jobs(&[a, b]);
+        state.version = 42;
+
+        let body = body_json(
+            coordinator_app(seeded_summary(), state)
+                .oneshot(
+                    Request::get("/api/v1/coordinators")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        // state_version is the applied-command count, not the raft log index.
+        assert_eq!(body["state_version"], 42);
+        assert_eq!(body["state_counts"]["jobs"], 2);
+        assert_eq!(body["state_counts"]["attempts"], 0);
+        assert_eq!(body["state_counts"]["allocations"], 0);
+        assert_eq!(body["state_counts"]["nodes"], 0);
+        assert_eq!(body["state_counts"]["quota_entities"], 0);
+    }
+
+    #[tokio::test]
+    async fn coordinators_serve_a_null_snapshot_before_the_first_one() {
+        let mut summary = seeded_summary();
+        summary.snapshot_last_index = None;
+        let body = body_json(
+            coordinator_app(summary, coppice_state::StateMachine::default())
+                .oneshot(
+                    Request::get("/api/v1/coordinators")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        // No snapshot yet: the whole object is null, never a zeroed shape.
+        assert_eq!(body["snapshot"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn coordinators_are_unavailable_without_a_consensus_handle() {
+        // `app(None)` builds a plane with `coordinator: None` — no handle wired.
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/coordinators")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(response).await["code"], "UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn coordinators_still_validate_the_consistency_parameter() {
+        let response = coordinator_app(seeded_summary(), coppice_state::StateMachine::default())
+            .oneshot(
+                Request::get("/api/v1/coordinators?consistency=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
     }
 }

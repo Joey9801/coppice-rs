@@ -855,11 +855,13 @@ impl StateMachine {
             }
         }
         match self.quota_entities.get_mut(&c.entity) {
-            // Usage is preserved on update: reconfiguration is not an amnesty.
+            // Usage and `created_at` are preserved on update: reconfiguration
+            // is not an amnesty, and the creation instant never moves.
             Some(e) => {
                 e.parent = c.parent;
                 e.name = c.name.clone();
                 e.quota = c.quota;
+                e.updated_at = c.updated_at;
             }
             None => {
                 self.quota_entities.insert(
@@ -869,6 +871,8 @@ impl StateMachine {
                         name: c.name.clone(),
                         quota: c.quota,
                         usage: UsageState::new(c.updated_at),
+                        created_at: c.updated_at,
+                        updated_at: c.updated_at,
                     },
                 );
             }

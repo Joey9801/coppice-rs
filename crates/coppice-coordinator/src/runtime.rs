@@ -10,7 +10,7 @@ use anyhow::Context;
 use tokio::sync::{mpsc, watch};
 use tonic::transport::Server;
 
-use coppice_consensus::{Consensus, EventTapReceiver, StateViews};
+use coppice_consensus::{Consensus, EventTapReceiver, NodeHandle, StateViews};
 use coppice_core::id::ClusterId;
 use coppice_scheduler::HeuristicScheduler;
 
@@ -35,10 +35,12 @@ use crate::tasks::{
 /// no signal handler is installed and the test never has to raise a real
 /// signal. Either way the same watch drives every task's drain, so the
 /// documented shutdown join order is identical.
+#[allow(clippy::too_many_arguments)] // wiring seam: each is a distinct runtime input
 pub async fn run<C>(
     consensus: C,
     views: StateViews,
     event_tap: EventTapReceiver,
+    node_handle: NodeHandle,
     agent_listener: AgentListener,
     client_listener: ClientListener,
     cluster_id: ClusterId,
@@ -119,7 +121,8 @@ where
 
     let control_plane = Arc::new(
         CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
-            .with_derived(queue_window, fanout.clone()),
+            .with_derived(queue_window, fanout.clone())
+            .with_node_handle(node_handle),
     );
     let api_join = tokio::spawn(api_server::run(
         client_listener,

@@ -151,6 +151,8 @@ proptest! {
             name: String::new(),
             quota: CostUnits(quota),
             usage: UsageState { usage: CostUnits(usage), last_update: ts(0) },
+            created_at: ts(0),
+            updated_at: ts(0),
         };
         entities.insert(leaf, entity(usage_lo));
         let lo = penalty_product(&entities, leaf, &policy, ts(0));
@@ -202,6 +204,8 @@ fn penalty_product_is_depth_capped() {
                     usage: CostUnits(2_000_000),
                     last_update: ts(0),
                 },
+                created_at: ts(0),
+                updated_at: ts(0),
             },
         );
     }

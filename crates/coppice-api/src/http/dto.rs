@@ -825,6 +825,269 @@ impl JobFilter {
 }
 
 // ---------------------------------------------------------------------------
+// Quota entities (GET /api/v1/quota-entities[/{entity}])
+// ---------------------------------------------------------------------------
+
+/// One node of the quota-entity tree for the list/detail views (mirrors
+/// `QuotaEntityNode` in `types.ts`).
+///
+/// `origin`/`principal` — the ADR 0022 SSO provenance — are **omitted, not
+/// null**: replicated state records no SSO origin, so there is nothing to
+/// project; the fields return when an identity subsystem backs them. `name`
+/// is the entity's own stored segment, not the slash-joined path `types.ts`
+/// sketches (no path is stored). `usage_ucu`, `over_quota_ratio`, and
+/// `penalty` are decayed to read time (the same lazy decay `score.rs`
+/// applies), so they are read-time figures, not the stored accumulator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaEntityNode {
+    pub id: QuotaEntityId,
+    pub name: String,
+    pub parent: Option<QuotaEntityId>,
+    pub quota_ucu: u64,
+    /// Decayed usage as of read time.
+    pub usage_ucu: u64,
+    /// How far over quota, as a ratio. Serializes as `null` when infinite
+    /// (zero quota, nonzero usage) — JSON has no infinity, and serde renders
+    /// non-finite floats as null.
+    pub over_quota_ratio: f64,
+    /// Multiplicative scheduling penalty ≥ 1 derived from the ratio.
+    pub penalty: f64,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    /// Live job counts over this entity's **subtree** (itself + descendants),
+    /// by displayed phase — a job under a descendant counts for every
+    /// ancestor.
+    pub queued_count: u32,
+    pub running_count: u32,
+}
+
+/// A quota entity's core figures — no timestamps or counts — shared by the
+/// ancestry chains: a job's `entity_chain` and the entity detail's `chain`
+/// (mirrors `QuotaEntityView` in `types.ts`), with usage decayed to read
+/// time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaEntityView {
+    pub id: QuotaEntityId,
+    pub name: String,
+    pub parent: Option<QuotaEntityId>,
+    pub quota_ucu: u64,
+    /// Decayed usage as of the read's `now` (ADR 0019 integer decay).
+    pub usage_ucu: u64,
+    pub over_quota_ratio: f64,
+    /// Multiplicative scheduling penalty ≥ 1 derived from the ratio.
+    pub penalty: f64,
+}
+
+/// `GET /api/v1/quota-entities` — an object envelope, never a bare array.
+///
+/// `types.ts` types this endpoint as a bare `QuotaEntityNode[]`, but ADR
+/// 0031's "every response is an object envelope so fields can be added
+/// later" rule wins over the mirror (an explicit deviation the 2026-07-16
+/// amendment allows); the web client unwraps `entities` at its boundary,
+/// the same as every other list endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListQuotaEntitiesResponse {
+    pub entities: Vec<QuotaEntityNode>,
+}
+
+/// One decayed-usage sample for an entity's sparkline (mirrors the anonymous
+/// element of `QuotaEntityStats.usageHistory`). Unused today — no usage-series
+/// sampler exists — so the list is always empty (see [`QuotaEntityStats`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct UsageSample {
+    pub t: Timestamp,
+    pub usage_ucu: u64,
+}
+
+/// Subtree-inclusive stats for one quota entity (mirrors `QuotaEntityStats`
+/// in `types.ts`), tallied over the entity and all its descendants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaEntityStats {
+    /// Subtree job counts by displayed phase — every [`JobPhase`], zeros
+    /// included.
+    pub by_state: BTreeMap<JobPhase, u32>,
+    /// Age of the longest-waiting `Queued` job in the subtree, at read time;
+    /// `null` when nothing is queued.
+    pub oldest_queued_age_seconds: Option<i64>,
+    /// Σ µCU/s of the currently running attempts in the subtree (each
+    /// attempt's recorded charge rate).
+    pub burn_rate_ucu_per_second: u64,
+    /// µCU charged to the subtree in the trailing 24h. **`null`**: no charge
+    /// ledger exists to measure it — a true-up settles against entity usage
+    /// and retains no per-window total (decision to serve null, not a
+    /// fabricated 0).
+    pub charged_ucu_24h: Option<u64>,
+    /// Recent decayed-usage samples, oldest first. **Always empty**: no
+    /// usage-series sampler exists to produce them.
+    pub usage_history: Vec<UsageSample>,
+}
+
+/// `GET /api/v1/quota-entities/{entity}` (mirrors `QuotaEntityDetail` in
+/// `types.ts`): the entity node, its ancestry, its direct children, and its
+/// subtree stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetQuotaEntityResponse {
+    pub entity: QuotaEntityNode,
+    /// Ancestry, root first, this entity last.
+    pub chain: Vec<QuotaEntityView>,
+    /// Direct children, in id order.
+    pub children: Vec<QuotaEntityNode>,
+    pub stats: QuotaEntityStats,
+}
+
+// ---------------------------------------------------------------------------
+// Job detail (GET /api/v1/jobs/{job})
+// ---------------------------------------------------------------------------
+
+/// The immutable submitted spec (mirrors `JobSpec` in `types.ts`).
+///
+/// Deviation from the TS shape: no `env` field. The web `JobSpec` carries an
+/// `env` overlay, but `coppice_core::job::Job` has none yet (it lands with the
+/// Docker executor, per the TS comment), so serializing one here would be a
+/// fabricated always-empty map. It is omitted until the domain type grows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSpecView {
+    pub image: String,
+    pub command: Vec<String>,
+    /// Entrypoint override; `null` runs the image's own entrypoint.
+    pub entrypoint: Option<Vec<String>>,
+    pub requests: Resources,
+    pub priority: i32,
+    /// Enforced runtime bound in whole seconds; `null` when unbounded.
+    pub max_runtime_seconds: Option<i64>,
+    pub quota_entity: QuotaEntityId,
+    pub retry: RetryPolicy,
+}
+
+/// A committed abort request on a job (mirrors the `abortRequested` field of
+/// `JobDetail`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortRequestedView {
+    pub reason: Option<String>,
+    pub requested_at: Timestamp,
+}
+
+/// One entity's contribution to a queued job's penalty product (mirrors an
+/// entry of `QueuePositionExplainer.penaltyChain` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyLink {
+    pub entity: QuotaEntityId,
+    pub name: String,
+    pub usage_ucu: u64,
+    pub quota_ucu: u64,
+    pub over_quota_ratio: f64,
+    pub penalty: f64,
+}
+
+/// The ADR 0021 priority-term inputs for a `Queued` job.
+///
+/// Deviation from `QueuePositionExplainer` in `types.ts`: `rank`,
+/// `queueDepth`, `score`, `wAge`, `ageHorizonSeconds`, and `ageBonus` are
+/// **absent, not null**. Ranking the queued set would cost an O(queue) scan
+/// per read, and composing the score would duplicate scheduler-owned inputs
+/// that drift; both were cut rather than served badly. If they return, the
+/// intended source is a scheduler-published structure recording how the last
+/// scheduling invocation's unplaced jobs fared against each other, read here
+/// — never recomputed per request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuePositionExplainer {
+    /// The job's priority multiplier `m(j)` as a real number.
+    pub multiplier: f64,
+    /// One entry per ancestor entity, leaf → root.
+    pub penalty_chain: Vec<PenaltyLink>,
+    /// Product of the chain penalties, `P(j)`.
+    pub penalty_product: f64,
+    pub age_seconds: i64,
+}
+
+/// Per-dimension split of the base cost rate (µCU/second), summing to
+/// `CostReport::rate_ucu_per_second`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateBreakdown {
+    pub cpu: u64,
+    pub memory: u64,
+    pub disk: u64,
+}
+
+/// A true-up adjustment applied at finalization (mirrors the `trueUp` field of
+/// `CostReport`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TrueUpView {
+    pub kind: TrueUpKind,
+    pub amount_ucu: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrueUpKind {
+    Refund,
+    Surcharge,
+}
+
+/// A job's cost breakdown (mirrors `CostReport` in `types.ts`), computed from
+/// replicated policy and the job's charge records with the ADR 0019 quota
+/// arithmetic — never re-derived here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostReport {
+    /// Base µCU/second from cost weights × requested resources, before any
+    /// multiplier. `rate_breakdown` sums to this.
+    pub rate_ucu_per_second: u64,
+    pub rate_breakdown: RateBreakdown,
+    /// Priority-class multiplier (≥ 1) mapped from `spec.priority` by policy.
+    pub priority_multiplier: f64,
+    /// Runtime penalty folded in for a job with no declared `max_runtime`
+    /// (ADR 0029); `1.0` when the job is bounded.
+    pub unbounded_multiplier: f64,
+    /// The µCU/second actually priced: rate × priority × unbounded.
+    pub effective_rate_ucu_per_second: u64,
+    /// Duration the upfront placement charge covers: the job's `max_runtime`,
+    /// or the policy default charge runtime when unset.
+    pub charge_window_seconds: u64,
+    /// True iff `charge_window_seconds` is the policy default (job unbounded).
+    pub charge_window_is_default: bool,
+    /// Upfront charge for one placement: effective_rate × charge_window.
+    pub estimated_ucu: u64,
+    /// Gross µCU charged across attempts so far; 0 before the job is placed.
+    pub charged_ucu: u64,
+    /// Fraction (0..1) of the unused charge a true-up refunds (ADR 0029).
+    pub refund_fraction: f64,
+    /// Final settled cost; always `null` — no measured-usage pipeline exists,
+    /// so actual consumption is not recoverable from replicated state
+    /// (`project::total_charged`).
+    pub actual_ucu: Option<u64>,
+    /// The finalization refund/surcharge; always `null` — the true-up settles
+    /// against entity usage and is not retained per job (`project::total_charged`).
+    pub true_up: Option<TrueUpView>,
+}
+
+/// `GET /api/v1/jobs/{job}` (mirrors `JobDetail` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobDetail {
+    pub id: JobId,
+    pub state: JobStateKind,
+    pub spec: JobSpecView,
+    pub submitted_at: Timestamp,
+    /// When the job entered its current state. **Approximated, not
+    /// event-derived**: no event-history store exists, so this is the best
+    /// available proxy — `submitted_at` while queued, the current attempt's
+    /// `started_at` (falling back to `submitted_at`) while running, and
+    /// `terminal_at` once terminal. Drives "in this state for …" displays; do
+    /// not treat it as an exact transition instant.
+    pub state_since: Timestamp,
+    pub terminal_at: Option<Timestamp>,
+    pub retries_used: u32,
+    pub abort_requested: Option<AbortRequestedView>,
+    /// Quota-entity ancestry, root first, the owning entity last.
+    pub entity_chain: Vec<QuotaEntityView>,
+    pub attempts: Vec<AttemptView>,
+    /// Present iff the job is `Queued`.
+    pub queue: Option<QueuePositionExplainer>,
+    /// Present iff the current attempt is accruing.
+    pub accrual: Option<AccrualView>,
+    pub cost: CostReport,
+}
+
+// ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
 
@@ -929,6 +1192,157 @@ pub struct AbortJobRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AbortJobResponse {}
+
+/// `POST /api/v1/quota-entities` — the create-or-update upsert of the
+/// `ConfigureQuotaEntity` command (no delete in v1).
+///
+/// The client mints `entity` and it is **required**, mirroring
+/// `SubmitJobRequest.job` (ADR 0026): the id is the upsert's idempotency
+/// identity, so a retry after an unknown outcome re-sends the same request
+/// and lands on the same entity rather than creating a second one. This
+/// deviates deliberately from `types.ts`'s nullable `entity` (which sketched
+/// a server-mint-on-create path): the replicated `ConfigureQuotaEntity`
+/// command has no server-minting path — its `entity` is always required —
+/// and matching `SubmitJob` keeps id minting uniformly client-side.
+///
+/// `deny_unknown_fields`: like every write body, a typo must be
+/// `INVALID_ARGUMENT`, not a silently defaulted field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigureQuotaEntityRequest {
+    /// Client-minted entity id (`quota-<uuid>`, ADR 0024) — required. The
+    /// upsert target: an existing id updates, a fresh one creates.
+    pub entity: QuotaEntityId,
+    /// Parent in the quota tree; `null` roots the entity. A parent that does
+    /// not exist, or one that would form a cycle, is rejected at apply.
+    #[serde(default)]
+    pub parent: Option<QuotaEntityId>,
+    pub name: String,
+    /// Soft quota as a stock in µCU (ADR 0019); the caller converts human
+    /// rates.
+    pub quota_ucu: u64,
+}
+
+/// `POST /api/v1/quota-entities` response — the echoed entity id plus the
+/// apply's `log_index`, shaped exactly like [`SubmitJobResponse`].
+///
+/// `types.ts` sketches a full `QuotaEntityNode` here, but the write path
+/// (propose → committed decision) returns only the log index, not a fresh
+/// projected view; echoing the id + `log_index` lets the caller pair the
+/// write with a strong `GET /api/v1/quota-entities/{entity}?min_index=…`
+/// for read-your-writes (ADR 0007), the same pattern `SubmitJob` uses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ConfigureQuotaEntityResponse {
+    /// Echo of the client-minted id from the request.
+    pub entity: QuotaEntityId,
+    /// Raft log index at which this upsert applied; pair with `?min_index=`
+    /// on a subsequent read for read-your-writes (ADR 0007).
+    pub log_index: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Coordinators (GET /api/v1/coordinators)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/coordinators` (ADR 0031, local read) — this replica's view of
+/// the raft cluster: leader/term/indexes, replicated-state counts, and the
+/// per-member roster. Mirrors `CoordinatorStatus` in `web/src/api/types.ts`.
+///
+/// Read locally off the consensus metrics and a replica-local state snapshot,
+/// so every figure is "as this replica sees it" — a follower answers from its
+/// own applied position, not the leader's.
+#[derive(Debug, Clone, Serialize)]
+pub struct GetCoordinatorStatusResponse {
+    /// The cluster this replica belongs to (node config, ADR 0020).
+    pub cluster_id: ClusterId,
+    /// The current leader's raft id, when one is known.
+    pub leader: Option<u64>,
+    /// The current raft term.
+    pub term: u64,
+    /// Highest committed log index known to the serving replica.
+    pub known_committed: u64,
+    /// Highest applied log index on the serving replica.
+    pub last_applied: u64,
+    /// Applied-command count on the serving replica
+    /// (`StateMachine::version`) — a state coordinate, distinct from the raft
+    /// log index.
+    pub state_version: u64,
+    /// The last snapshot's coverage, or `null` when this replica has taken no
+    /// snapshot yet. `size_bytes` and `taken_at` inside it are always null:
+    /// `SnapshotMeta` (snapshot.proto) records neither.
+    pub snapshot: Option<CoordinatorSnapshot>,
+    /// Object counts in the replicated state machine.
+    pub state_counts: CoordinatorStateCounts,
+    /// One entry per configured cluster member.
+    pub members: Vec<CoordinatorMember>,
+    // `host` per-member and any cluster-wide health rollup are deliberately
+    // omitted: no inter-coordinator reporting exists (openraft metrics carry
+    // no host stats — the web mock invents them). Out of scope until an
+    // inter-coordinator reporting channel exists.
+}
+
+/// The serving replica's last snapshot, as far as it is knowable from
+/// openraft metrics. Only the covered log index is real today.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CoordinatorSnapshot {
+    /// Snapshot size on disk. Always `null`: `SnapshotMeta` carries no size,
+    /// and computing one would mean stat-ing snapshot files on a read path.
+    pub size_bytes: Option<u64>,
+    /// Log index the last snapshot covers (openraft's snapshot metric).
+    pub last_included_index: u64,
+    /// When the snapshot was taken. Always `null`: `SnapshotMeta` records no
+    /// timestamp.
+    pub taken_at: Option<Timestamp>,
+    /// Applied entries since the snapshot: `last_applied − last_included_index`.
+    pub entries_since_snapshot: u64,
+}
+
+/// Object counts in the replicated state machine (`StateMachine` map lengths).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CoordinatorStateCounts {
+    pub jobs: u64,
+    pub attempts: u64,
+    pub allocations: u64,
+    pub nodes: u64,
+    pub quota_entities: u64,
+}
+
+/// A coordinator's role in the raft cluster, derived from the leader id and
+/// its voter flag (ADR 0031): leader if it is the current leader, learner if
+/// it is a non-voter, follower otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorRole {
+    Leader,
+    Follower,
+    Learner,
+}
+
+/// One cluster member in a [`GetCoordinatorStatusResponse`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CoordinatorMember {
+    /// The member's raft id.
+    pub id: u64,
+    /// The address peers dial (host:port).
+    pub addr: String,
+    /// Derived role (see [`CoordinatorRole`]).
+    pub role: CoordinatorRole,
+    /// Whether the member is a voter (vs a learner).
+    pub voter: bool,
+    /// Highest applied index on this member: the serving replica reports its
+    /// own exactly; peers are `null` (their apply progress is not tracked
+    /// here — the leader observes only their *replicated* index, which
+    /// feeds `replication_lag_entries` instead).
+    pub last_applied: Option<u64>,
+    /// Entries this member is behind the leader's committed index
+    /// (`known_committed − matched`), leader-only; `null` on followers or for
+    /// a member the leader has no replication entry for.
+    pub replication_lag_entries: Option<u64>,
+    // `host` (cpu/memory/disk fractions) and `last_seen` are omitted: neither
+    // has any source (no inter-coordinator host reporting; coordinator
+    // liveness is not tracked — liveness follows compute nodes). The web mock
+    // invents both. Out of scope.
+}
 
 #[cfg(test)]
 mod tests {
@@ -1421,6 +1835,198 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({ "jobs": [], "next_cursor": null }));
+    }
+
+    // ---- quota entities ---------------------------------------------------
+
+    #[test]
+    fn quota_entity_node_serializes_to_the_contract_shape() {
+        let id: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let parent: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000002"
+            .parse()
+            .unwrap();
+        let node = QuotaEntityNode {
+            id,
+            name: "platform".to_string(),
+            parent: Some(parent),
+            quota_ucu: 1_000_000,
+            usage_ucu: 500_000,
+            over_quota_ratio: 0.5,
+            penalty: 1.0,
+            created_at: ts(1_000_000),
+            updated_at: ts(9_000_000),
+            queued_count: 3,
+            running_count: 2,
+        };
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": "quota-00000000-0000-0000-0000-000000000001",
+                "name": "platform",
+                "parent": "quota-00000000-0000-0000-0000-000000000002",
+                "quota_ucu": 1_000_000,
+                "usage_ucu": 500_000,
+                "over_quota_ratio": 0.5,
+                "penalty": 1.0,
+                "created_at": "1970-01-01T00:00:01.000000Z",
+                "updated_at": "1970-01-01T00:00:09.000000Z",
+                "queued_count": 3,
+                "running_count": 2,
+            })
+        );
+        // `origin`/`principal` are omitted, not null — no SSO provenance in
+        // replicated state.
+        assert!(json.get("origin").is_none());
+        assert!(json.get("principal").is_none());
+    }
+
+    #[test]
+    fn infinite_over_quota_ratio_serializes_as_null() {
+        // Zero quota with nonzero usage is infinitely over — JSON has no
+        // infinity, and serde renders a non-finite float as null.
+        let id: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let view = QuotaEntityView {
+            id,
+            name: "root".to_string(),
+            parent: None,
+            quota_ucu: 0,
+            usage_ucu: 1,
+            over_quota_ratio: f64::INFINITY,
+            penalty: f64::INFINITY,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["over_quota_ratio"], serde_json::Value::Null);
+        assert_eq!(json["penalty"], serde_json::Value::Null);
+        assert_eq!(json["parent"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn list_quota_entities_is_an_object_envelope() {
+        // ADR 0031: a list response is an object, never a bare array, even
+        // though `types.ts` types this one as `QuotaEntityNode[]`.
+        let json = serde_json::to_value(ListQuotaEntitiesResponse { entities: vec![] }).unwrap();
+        assert_eq!(json, serde_json::json!({ "entities": [] }));
+    }
+
+    #[test]
+    fn quota_entity_stats_serve_unbacked_fields_as_null_and_empty() {
+        let stats = QuotaEntityStats {
+            by_state: JobPhase::ALL.iter().map(|p| (*p, 0)).collect(),
+            oldest_queued_age_seconds: None,
+            burn_rate_ucu_per_second: 0,
+            charged_ucu_24h: None,
+            usage_history: vec![],
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        // Unbacked stats are honest null / empty, never a fabricated 0.
+        assert_eq!(json["charged_ucu_24h"], serde_json::Value::Null);
+        assert_eq!(json["usage_history"], serde_json::json!([]));
+        assert_eq!(json["oldest_queued_age_seconds"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn configure_request_requires_entity_and_rejects_unknown_fields() {
+        let entity = QuotaEntityId::new();
+        // Minimal body: entity + name + quota_ucu; parent defaults to null.
+        let req: ConfigureQuotaEntityRequest = serde_json::from_value(serde_json::json!({
+            "entity": entity.to_string(),
+            "name": "team",
+            "quota_ucu": 1000,
+        }))
+        .expect("minimal configure request");
+        assert_eq!(req.entity, entity);
+        assert!(req.parent.is_none());
+        assert_eq!(req.quota_ucu, 1000);
+
+        // The client-minted id is required (ADR 0026 idempotency identity),
+        // unlike `types.ts`'s nullable `entity`.
+        let missing_entity: Result<ConfigureQuotaEntityRequest, _> =
+            serde_json::from_value(serde_json::json!({ "name": "team", "quota_ucu": 1000 }));
+        assert!(missing_entity.is_err());
+
+        // A typo must be INVALID_ARGUMENT, not a silent default.
+        let typo: Result<ConfigureQuotaEntityRequest, _> = serde_json::from_value(
+            serde_json::json!({ "entity": entity.to_string(), "name": "t", "quota_ucu": 1, "quotaUcu": 2 }),
+        );
+        assert!(typo.is_err());
+    }
+
+    #[test]
+    fn configure_response_serializes_id_bare_and_index_as_number() {
+        let entity: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let json = serde_json::to_value(ConfigureQuotaEntityResponse {
+            entity,
+            log_index: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "entity": "quota-00000000-0000-0000-0000-000000000001",
+                "log_index": 7,
+            })
+        );
+    }
+
+    #[test]
+    fn cost_report_serializes_snake_case_with_explicit_nulls() {
+        let report = CostReport {
+            rate_ucu_per_second: 1_000_000,
+            rate_breakdown: RateBreakdown {
+                cpu: 1_000_000,
+                memory: 0,
+                disk: 0,
+            },
+            priority_multiplier: 2.0,
+            unbounded_multiplier: 1.0,
+            effective_rate_ucu_per_second: 2_000_000,
+            charge_window_seconds: 3600,
+            charge_window_is_default: false,
+            estimated_ucu: 7_200_000_000,
+            charged_ucu: 0,
+            refund_fraction: 0.75,
+            actual_ucu: None,
+            true_up: None,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "rate_ucu_per_second": 1_000_000,
+                "rate_breakdown": { "cpu": 1_000_000, "memory": 0, "disk": 0 },
+                "priority_multiplier": 2.0,
+                "unbounded_multiplier": 1.0,
+                "effective_rate_ucu_per_second": 2_000_000,
+                "charge_window_seconds": 3600,
+                "charge_window_is_default": false,
+                "estimated_ucu": 7_200_000_000u64,
+                "charged_ucu": 0,
+                "refund_fraction": 0.75,
+                // Absent-data fields are explicit null, never omitted.
+                "actual_ucu": null,
+                "true_up": null,
+            })
+        );
+    }
+
+    #[test]
+    fn true_up_view_renders_its_kind_snake_case() {
+        let json = serde_json::to_value(TrueUpView {
+            kind: TrueUpKind::Refund,
+            amount_ucu: 42,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "refund", "amount_ucu": 42 })
+        );
     }
 
     #[test]

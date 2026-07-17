@@ -100,6 +100,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         Arc::clone(&consensus),
         views,
         event_tap,
+        handle.clone(),
         agent_listener,
         client_listener,
         cluster_id,
@@ -141,10 +142,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
 /// signal handler (the daemon path); `Some(rx)` hands it a caller-owned trigger
 /// so an integration test can drive [`bootstrap`] and this runtime directly and
 /// shut them down without raising a real signal.
+#[allow(clippy::too_many_arguments)] // thin wiring seam over `runtime::run`
 pub async fn serve_runtime(
     consensus: Arc<OpenraftConsensus>,
     views: StateViews,
     event_tap: EventTapReceiver,
+    node_handle: NodeHandle,
     agent_listener: AgentListener,
     client_listener: ClientListener,
     cluster_id: ClusterId,
@@ -154,6 +157,7 @@ pub async fn serve_runtime(
         SharedConsensus(consensus),
         views,
         event_tap,
+        node_handle,
         agent_listener,
         client_listener,
         cluster_id,
