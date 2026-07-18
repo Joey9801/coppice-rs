@@ -205,7 +205,13 @@ mod harness {
     pub async fn affinity_executor(
         docker: Docker,
     ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
-        let config = ExecutorConfig::default();
+        // The config's docker_host must describe the daemon actually under
+        // test: on non-Linux hosts topology discovery gates its NCPU
+        // fallback on the transport being local.
+        let config = ExecutorConfig {
+            docker_host: docker_host(),
+            ..Default::default()
+        };
         let physical = physical_cores(&docker).await;
         let (tx, rx) = watch::channel(DiskPressure::Ok);
         let exec = DockerExecutor::new(docker, &config, physical * 1000, 0, NodeId::new(), rx)
@@ -801,6 +807,17 @@ async fn whole_core_grant_shrinks_and_release_grows_fractional_cpuset() {
     let Some(docker) = harness::docker().await else {
         return;
     };
+    if cfg!(not(target_os = "linux"))
+        && !["unix://", "npipe://"]
+            .iter()
+            .any(|scheme| harness::docker_host().starts_with(scheme))
+    {
+        eprintln!(
+            "skipping: whole-core affinity needs a local daemon on non-Linux hosts \
+             (remote daemons may hide SMT siblings behind NCPU)"
+        );
+        return;
+    }
     if harness::physical_cores(&docker).await < 2 {
         eprintln!("skipping: cpuset integration test needs at least two physical cores");
         return;
