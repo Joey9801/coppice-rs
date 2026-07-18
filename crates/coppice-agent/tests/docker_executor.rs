@@ -49,13 +49,14 @@ use bollard::query_parameters::ListContainersOptionsBuilder;
 use bollard::Docker;
 use tokio::sync::watch;
 
-use coppice_agent::config::ExecutorConfig;
+use coppice_agent::config::{DiskEnforcement, ExecutorConfig};
 use coppice_agent::executor::docker::api;
 use coppice_agent::executor::{
-    ContainerState, DockerExecutor, Executor, ExitCause, ExitInfo, ObservedContainer, StartError,
-    StartSpec, StopOutcome,
+    classify_exit, ContainerState, DockerExecutor, Executor, ExitCause, ExitInfo,
+    ObservedContainer, StartError, StartSpec, StopOutcome,
 };
 use coppice_agent::pressure::DiskPressure;
+use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration as CoreDuration, Timestamp};
@@ -120,12 +121,48 @@ mod harness {
         // Existing S2 tests exercise lifecycle behavior and run concurrently;
         // keep them out of the host-global affinity allocator. The dedicated
         // S3 test below opts in explicitly.
+        executor_with(docker, config).await
+    }
+
+    /// [`executor`] with a caller-supplied [`ExecutorConfig`] — the seam the S4
+    /// disk-kill tests use to force `disk_enforcement = poll` with a short
+    /// `disk_poll_interval`. Same fresh node identity and `Ok`-initial pressure
+    /// channel as [`executor`]; existing tests are unaffected (they still go
+    /// through [`executor`]).
+    pub async fn executor_with(
+        docker: Docker,
+        config: ExecutorConfig,
+    ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
         let node = NodeId::new();
         let (tx, rx) = watch::channel(DiskPressure::Ok);
         let exec = DockerExecutor::new(docker, &config, 1000, 0, node, rx)
             .await
             .expect("initialize Docker executor");
         (exec, tx)
+    }
+
+    /// The busybox image's on-disk size, pulling it first if the daemon does not
+    /// already have it. The poll disk-kill test sizes its budget from this so the
+    /// enforced writable budget (`disk_bytes − image_size`) lands in a known,
+    /// small window (§6.2).
+    pub async fn image_size(docker: &Docker, image: &str) -> anyhow::Result<u64> {
+        if docker.inspect_image(image).await.is_err() {
+            let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
+                .from_image(image)
+                .build();
+            let mut stream = docker.create_image(Some(options), None, None);
+            use tokio_stream::StreamExt;
+            while let Some(item) = stream.next().await {
+                item.map_err(|e| anyhow!("pulling {image}: {e}"))?;
+            }
+        }
+        let inspect = docker
+            .inspect_image(image)
+            .await
+            .map_err(|e| anyhow!("inspecting {image}: {e}"))?;
+        let size = inspect.size.unwrap_or(0).max(0) as u64;
+        ensure!(size > 0, "image {image} reported a zero on-disk size");
+        Ok(size)
     }
 
     /// Affinity-enabled executor sized to the physical topology exposed by
@@ -801,4 +838,178 @@ async fn whole_core_grant_shrinks_and_release_grows_fractional_cpuset() {
 
     harness::cleanup(&exec, &[fractional_id, whole_id]).await;
     result.unwrap();
+}
+
+// ---- 12. disk enforcement, poll strategy (§6.2) -------------------------
+//
+// Native xfs-quota mode is NOT exercised here and has no CI job: CI runs this
+// gated suite without a Docker daemon (every test skips green), and the runners
+// have no xfs-on-`pquota` data-root to make `storage_opt: size` enforceable.
+// The strategy split is behind the `DiskEnforcer` seam either way — its pure
+// pieces (budget arithmetic, the config × probe decision, the over-budget
+// verdict) are unit-tested in `executor::docker::disk`. Quota mode is verified
+// **manually** on an xfs-`pquota` overlay2 host:
+//
+//   1. run the agent with `[executor] disk_enforcement = "quota"` — startup
+//      must log the `quota` strategy (a non-xfs host fails startup, proving the
+//      probe refutation path);
+//   2. start a job with a small `disk_bytes` and have it `dd` past its budget —
+//      the write fails with `ENOSPC` and the container exits on its own,
+//      classified `Exited{code}` (the accepted §6.2 asymmetry vs. the poll
+//      kill), with `coppice.disk-mode=quota` on the container.
+
+/// Under the poll strategy, a container that fills its writable layer past the
+/// enforced budget is killed outright with cause [`ExitCause::DiskKilled`] →
+/// [`AttemptOutcome::DiskLimitExceeded`]; its evidence survives (visible via
+/// `observe()` as Exited) until `reap` removes it (§5, §6.2).
+#[tokio::test]
+async fn poll_mode_disk_kill() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    let config = ExecutorConfig {
+        whole_core_affinity: false,
+        disk_enforcement: DiskEnforcement::Poll,
+        disk_poll_interval: StdDuration::from_secs(1),
+        ..Default::default()
+    };
+    let (exec, _tx) = harness::executor_with(docker.clone(), config).await;
+
+    let r: anyhow::Result<()> = async {
+        // Budget = 8 MiB of writable layer (disk_bytes − image_size); the
+        // workload writes 32 MiB, comfortably over, then idles. The write goes
+        // to /tmp (mode 1777 in busybox, and no tmpfs mount in our HostConfig,
+        // so it lands in the overlay writable layer): containers run as the
+        // non-root default_uid (§6), which cannot write at `/`. `&&` so a
+        // failed fill exits the container instead of idling to the timeout.
+        let image_size = harness::image_size(&docker, harness::BUSYBOX).await?;
+        let limits = Resources {
+            cpu_millis: 0,
+            memory_bytes: 0,
+            disk_bytes: image_size + 8 * 1024 * 1024,
+        };
+        let sp = harness::spec(
+            harness::BUSYBOX,
+            &[
+                "sh",
+                "-c",
+                "dd if=/dev/zero of=/tmp/fill bs=1M count=32 && sleep 300",
+            ],
+            limits,
+        );
+        let alloc = sp.allocation;
+
+        let inner: anyhow::Result<()> = async {
+            exec.start(sp).await?;
+            // The poller (1s floor) needs a sweep or two to catch the fill.
+            let info = harness::wait_exit(&exec, alloc, 60).await?;
+            ensure!(
+                info.cause == ExitCause::DiskKilled,
+                "expected DiskKilled, got {:?} (code {})",
+                info.cause,
+                info.code
+            );
+            ensure!(
+                classify_exit(&info) == AttemptOutcome::DiskLimitExceeded,
+                "DiskKilled must classify as DiskLimitExceeded, got {:?}",
+                classify_exit(&info)
+            );
+
+            // Evidence survives until reap (§5): observe still reports it Exited.
+            let observed = exec.observe().await?;
+            ensure!(
+                observed
+                    .iter()
+                    .any(|c| c.allocation == alloc && matches!(c.state, ContainerState::Exited(_))),
+                "disk-killed container must remain as evidence until reap"
+            );
+
+            // Reap removes it.
+            exec.reap(alloc).await?;
+            let observed = exec.observe().await?;
+            ensure!(
+                !observed.iter().any(|c| c.allocation == alloc),
+                "container must be gone from observe() after reap"
+            );
+            Ok(())
+        }
+        .await;
+
+        harness::cleanup(&exec, &[alloc]).await;
+        inner
+    }
+    .await;
+
+    r.unwrap();
+}
+
+// ---- 13. disk-mode / disk-budget labels are stamped (§5, §6.2) ----------
+
+/// A started container under the poll strategy carries the `coppice.disk-mode`
+/// and `coppice.disk-budget` labels, so the poll enforcer can resume for it
+/// after an agent restart (§5).
+#[tokio::test]
+async fn disk_labels_present_on_started_container() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    let config = ExecutorConfig {
+        whole_core_affinity: false,
+        disk_enforcement: DiskEnforcement::Poll,
+        disk_poll_interval: StdDuration::from_secs(30),
+        ..Default::default()
+    };
+    let (exec, _tx) = harness::executor_with(docker.clone(), config).await;
+
+    let r: anyhow::Result<()> = async {
+        let image_size = harness::image_size(&docker, harness::BUSYBOX).await?;
+        let budget = 8 * 1024 * 1024u64;
+        let limits = Resources {
+            cpu_millis: 0,
+            memory_bytes: 0,
+            disk_bytes: image_size + budget,
+        };
+        let sp = harness::spec(harness::BUSYBOX, &["sleep", "300"], limits);
+        let alloc = sp.allocation;
+
+        let inner: anyhow::Result<()> = async {
+            exec.start(sp).await?;
+            harness::wait_observed_running(&exec, alloc, 30).await?;
+
+            let inspect = docker
+                .inspect_container(
+                    &format!("coppice-{alloc}"),
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .map_err(|e| anyhow!("inspect: {e}"))?;
+            let labels = inspect
+                .config
+                .and_then(|c| c.labels)
+                .ok_or_else(|| anyhow!("container has no labels"))?;
+
+            ensure!(
+                labels.get("coppice.disk-mode").map(String::as_str) == Some("poll"),
+                "coppice.disk-mode should be poll, got {:?}",
+                labels.get("coppice.disk-mode")
+            );
+            let stamped: u64 = labels
+                .get("coppice.disk-budget")
+                .ok_or_else(|| anyhow!("coppice.disk-budget label missing"))?
+                .parse()
+                .map_err(|e| anyhow!("disk-budget not decimal: {e}"))?;
+            ensure!(
+                stamped == budget,
+                "disk-budget label {stamped} should equal disk_bytes − image_size ({budget})"
+            );
+            Ok(())
+        }
+        .await;
+
+        harness::cleanup(&exec, &[alloc]).await;
+        inner
+    }
+    .await;
+
+    r.unwrap();
 }
