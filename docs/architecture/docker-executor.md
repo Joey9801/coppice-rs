@@ -859,7 +859,7 @@ all resilient to Docker daemon restarts via reconnect-and-resync):
 
 | Task | Role |
 | --- | --- |
-| events | `docker events` stream → inspect → `ExitEvent` queue (feeds `next_exit`) |
+| events | `docker events` stream → inspect → `ExitEvent` queue (feeds `next_exit`); primes the lazy stream before each resync snapshot and sweeps a periodic resync (60 s) so a subscription-establishment gap can never strand an exit |
 | disk enforcer | poll strategy only: usage sweep + kill decisions |
 | cache janitor | TTL/pressure eviction, inventory refresh |
 | pressure monitor | statfs sampling → watch channel |
