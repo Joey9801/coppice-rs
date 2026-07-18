@@ -24,9 +24,9 @@ use coppice_core::time::{Duration, Timestamp};
 
 use super::state::Mapped;
 use super::{
-    api, classify, container_name, cpuset, limits, lock_state, state, ContainerIds, Inner,
-    LABEL_ALLOCATION, LABEL_ATTEMPT, LABEL_CPU_EXCLUSIVE, LABEL_IMAGE_DIGEST, LABEL_JOB,
-    LABEL_NODE,
+    api, classify, container_name, cpuset, disk, limits, lock_state, state, ContainerIds, Inner,
+    LABEL_ALLOCATION, LABEL_ATTEMPT, LABEL_CPU_EXCLUSIVE, LABEL_DISK_BUDGET, LABEL_DISK_MODE,
+    LABEL_IMAGE_DIGEST, LABEL_JOB, LABEL_NODE,
 };
 use crate::executor::{
     ContainerState, ExecutorError, ObservedContainer, StartError, StartSpec, StopOutcome,
@@ -105,6 +105,13 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     let image_user = image.config.as_ref().and_then(|cfg| cfg.user.as_deref());
     let user = limits::resolve_user(image_user, inner.default_uid)?;
 
+    // Disk plan (§6.2): decide the create-time storage-opt/labels behind the
+    // DiskEnforcer seam, using the already-resolved image size. An image that
+    // alone exceeds the job's disk request fails here as a user error, before
+    // the container (or any CPU grant) is created.
+    let image_size = image.size.map(|size| size.max(0) as u64).unwrap_or(0);
+    let disk_plan = inner.disk.plan(&spec.limits, image_size)?;
+
     // Serialize the affinity-plan/create boundary. Without this, a concurrent
     // exclusive grant could try to `docker update` a fractional allocation
     // after it entered the allocator but before its container existed.
@@ -120,6 +127,7 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
         &image_digest,
         &user,
         cpu.as_ref().map(|allocation| &allocation.affinity),
+        &disk_plan,
     );
     match inner
         .docker
@@ -245,6 +253,7 @@ fn build_create_body(
     image_digest: &str,
     user: &str,
     affinity: Option<&cpuset::Affinity>,
+    disk_plan: &disk::DiskPlan,
 ) -> ContainerCreateBody {
     let mut labels = HashMap::new();
     labels.insert(LABEL_ALLOCATION.to_string(), spec.allocation.to_string());
@@ -255,12 +264,23 @@ fn build_create_body(
     if affinity.is_some_and(|affinity| affinity.exclusive) {
         labels.insert(LABEL_CPU_EXCLUSIVE.to_string(), "true".to_string());
     }
+    // Disk-enforcement facts, so the poll enforcer can resume after a restart
+    // (§5, §6.2): the strategy always, the enforced budget when there is one.
+    labels.insert(
+        LABEL_DISK_MODE.to_string(),
+        disk_plan.mode_label.to_string(),
+    );
+    if let Some(budget) = &disk_plan.budget_label {
+        labels.insert(LABEL_DISK_BUDGET.to_string(), budget.clone());
+    }
 
     let mut host_config = limits::host_config(&spec.limits, inner.pids_limit);
     if let Some(affinity) = affinity {
         host_config.cpuset_cpus = Some(affinity.cpuset_cpus.clone());
         host_config.nano_cpus = (affinity.nano_cpus > 0).then_some(affinity.nano_cpus);
     }
+    // Native quotas: cap the writable layer at create time (§6.2).
+    host_config.storage_opt = disk_plan.storage_opt.clone();
 
     ContainerCreateBody {
         // Pin the resolved bytes, not the tag (§7).

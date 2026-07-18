@@ -17,6 +17,7 @@
 pub mod api;
 pub mod classify;
 pub mod cpuset;
+pub mod disk;
 pub mod events;
 pub mod lifecycle;
 pub mod limits;
@@ -51,11 +52,21 @@ pub(crate) const LABEL_JOB: &str = "coppice.job";
 /// The `coppice.node` label — this node's identity on every container it owns.
 pub(crate) const LABEL_NODE: &str = "coppice.node";
 /// The `coppice.image-digest` label — the resolved digest, for cache pinning
-/// across restart (§7). (`coppice.disk-mode` is S4's; not added here.)
+/// across restart (§7).
 pub(crate) const LABEL_IMAGE_DIGEST: &str = "coppice.image-digest";
 /// Marks containers whose `HostConfig.CpusetCpus` is an exclusive grant. The
 /// cpuset itself remains the source of truth rebuilt during recovery (§6.3).
 pub(crate) const LABEL_CPU_EXCLUSIVE: &str = "coppice.cpu-exclusive";
+/// The `coppice.disk-mode` label — which disk-enforcement strategy (§6.2) chose
+/// this container (`"quota"`/`"poll"`), so the poll enforcer resumes for the
+/// right containers after an agent restart (§5).
+pub(crate) const LABEL_DISK_MODE: &str = "coppice.disk-mode";
+/// The `coppice.disk-budget` label — the enforced writable-layer budget in bytes
+/// as a decimal string, stamped at create. The poll enforcer must resume
+/// enforcement after an agent restart, and the container is the durable record
+/// of its own runtime facts (§5); `limits.disk_bytes` is not otherwise
+/// recoverable from the container.
+pub(crate) const LABEL_DISK_BUDGET: &str = "coppice.disk-budget";
 
 /// The deterministic container name for an allocation (§5): the Docker-level
 /// idempotency backstop. `alloc-<uuid>` → `coppice-alloc-<uuid>`.
@@ -77,13 +88,16 @@ pub(crate) fn describe_metrics() {
         metrics::Unit::Count,
         "Containers currently running under this agent's executor."
     );
+    disk::describe_metrics();
 }
 
 /// Point-in-time metric sampling for this module. Part of the crate-level
 /// `gather_metrics` fan-out. A no-op: [`AGENT_RUNNING_JOBS`] is pushed on every
 /// `running`-set transition (the view.rs push-on-transition convention), so
 /// there is nothing to sample here. Later sessions add their own gauges.
-pub(crate) fn gather_metrics() {}
+pub(crate) fn gather_metrics() {
+    disk::gather_metrics();
+}
 
 // ---- shared state (docker-executor.md §11) ------------------------------
 
@@ -143,15 +157,25 @@ pub(crate) struct Inner {
     /// Drained by [`Executor::next_exit`]. A tokio mutex (not std): the single
     /// watcher task holds it across the `recv().await`.
     pub(crate) exit_rx: AsyncMutex<mpsc::UnboundedReceiver<ExitEvent>>,
+    /// The disk-enforcement strategy chosen at startup (§6.2). The lifecycle
+    /// layer asks it for the per-job create-time wiring; everything else about
+    /// disk enforcement lives behind this seam.
+    pub(crate) disk: disk::DiskEnforcer,
     /// The events task, aborted on drop.
     events_task: JoinHandle<()>,
+    /// The disk-enforcer poll task (§6.2), present only under the poll strategy;
+    /// aborted on drop like the events task.
+    disk_task: Option<JoinHandle<()>>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // The events task holds only clones, so this abort is the sole thing
-        // keeping it alive — dropping the last executor handle stops it.
+        // The background tasks hold only clones, so these aborts are the sole
+        // thing keeping them alive — dropping the last executor handle stops them.
         self.events_task.abort();
+        if let Some(task) = self.disk_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -208,6 +232,9 @@ impl DockerExecutor {
         } else {
             None
         };
+        // Detect the disk-enforcement strategy once, honoring config (§6.2).
+        let disk = disk::DiskEnforcer::detect(&docker, config.disk_enforcement).await?;
+
         // Clones only — never `Arc<Inner>` — so `Inner::drop` can abort it.
         let events_task = events::spawn(
             docker.clone(),
@@ -215,6 +242,29 @@ impl DockerExecutor {
             cpuset.clone(),
             exit_tx.clone(),
         );
+        // The poll enforcer runs under the poll strategy, and also under
+        // native quotas when poll-labelled containers survived a restart
+        // across a mode flip (e.g. an at-first-inconclusive `auto` probe
+        // resolving to quota once images exist) — those containers have no
+        // kernel quota, and the label contract (§5) says we resume for them.
+        let recovered_poll = disk.mode() == disk::DiskMode::Quota
+            && disk::has_recovered_poll_containers(&docker, node).await?;
+        if recovered_poll {
+            tracing::info!(
+                "quota strategy selected but poll-labelled containers survived restart; \
+                 running the poll enforcer for them (§6.2)"
+            );
+        }
+        let disk_task = disk::poller_required(disk.mode(), recovered_poll).then(|| {
+            disk::spawn(
+                docker.clone(),
+                Arc::clone(&state),
+                cpuset.clone(),
+                exit_tx.clone(),
+                config.disk_poll_interval,
+                node,
+            )
+        });
         Ok(DockerExecutor {
             inner: Arc::new(Inner {
                 docker,
@@ -227,7 +277,9 @@ impl DockerExecutor {
                 state,
                 exit_tx,
                 exit_rx: AsyncMutex::new(exit_rx),
+                disk,
                 events_task,
+                disk_task,
             }),
         })
     }

@@ -122,6 +122,35 @@ pub struct ExecutorConfig {
     /// When disabled Docker receives only `NanoCpus`.
     #[serde(default = "default_whole_core_affinity")]
     pub whole_core_affinity: bool,
+
+    /// Which disk-enforcement strategy the executor uses (docker-executor.md
+    /// §6.2). `auto` (the default) probes the daemon at startup and picks native
+    /// xfs project quotas when available, else the poll fallback; `quota` and
+    /// `poll` pin one strategy. The choice is behind the `DiskEnforcer` seam —
+    /// per-job creation and the poll loop are the only code that differs.
+    #[serde(default = "default_disk_enforcement")]
+    pub disk_enforcement: DiskEnforcement,
+
+    /// How often the poll-fallback disk enforcer sweeps writable-layer usage
+    /// (docker-executor.md §6.2). A floor, not a deadline — the sweep runs
+    /// serially and never overlaps, so a slow daemon just lengthens the gap.
+    /// Ignored under the native-quota strategy (the kernel enforces there).
+    #[serde(default = "default_disk_poll_interval", with = "humantime_serde")]
+    pub disk_poll_interval: Duration,
+}
+
+/// The disk-enforcement strategy selector (docker-executor.md §6.2, §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskEnforcement {
+    /// Probe the daemon at startup: native xfs project quotas when supported,
+    /// else the poll fallback.
+    Auto,
+    /// Operator assertion of native xfs project quotas. Startup fails if a probe
+    /// refutes support.
+    Quota,
+    /// Force the poll fallback regardless of daemon capabilities.
+    Poll,
 }
 
 impl Default for ExecutorConfig {
@@ -132,6 +161,8 @@ impl Default for ExecutorConfig {
             pids_limit: default_pids_limit(),
             reap_janitor_after: default_reap_janitor_after(),
             whole_core_affinity: default_whole_core_affinity(),
+            disk_enforcement: default_disk_enforcement(),
+            disk_poll_interval: default_disk_poll_interval(),
         }
     }
 }
@@ -243,6 +274,9 @@ impl Config {
                 self.executor.pids_limit
             );
         }
+        if self.executor.disk_poll_interval.is_zero() {
+            anyhow::bail!("executor.disk_poll_interval must be greater than zero");
+        }
         for (key, reservation, capacity) in [
             (
                 "cpu_millis",
@@ -349,6 +383,14 @@ fn default_whole_core_affinity() -> bool {
     true
 }
 
+fn default_disk_enforcement() -> DiskEnforcement {
+    DiskEnforcement::Auto
+}
+
+fn default_disk_poll_interval() -> Duration {
+    Duration::from_secs(30)
+}
+
 fn default_reservation_cpu_millis() -> u64 {
     1000
 }
@@ -430,6 +472,8 @@ default_uid = 1000
 pids_limit = 2048
 reap_janitor_after = "1h"
 whole_core_affinity = false
+disk_enforcement = "poll"
+disk_poll_interval = "5s"
 
 [pressure]
 high_pct = 80
@@ -480,6 +524,8 @@ disk_bytes   = 107374182400
         assert_eq!(config.executor.default_uid, 1000);
         assert_eq!(config.executor.pids_limit, 2048);
         assert!(!config.executor.whole_core_affinity);
+        assert_eq!(config.executor.disk_enforcement, DiskEnforcement::Poll);
+        assert_eq!(config.executor.disk_poll_interval, Duration::from_secs(5));
         assert_eq!(config.pressure.high_pct, 80);
         assert_eq!(config.pressure.critical_pct, 90);
     }
@@ -505,6 +551,12 @@ disk_bytes   = 107374182400
         assert_eq!(config.executor.default_uid, 65534);
         assert_eq!(config.executor.pids_limit, 4096);
         assert!(config.executor.whole_core_affinity);
+        assert_eq!(config.executor.disk_enforcement, DiskEnforcement::Auto);
+        assert_eq!(
+            config.executor.disk_poll_interval,
+            default_disk_poll_interval()
+        );
+        assert_eq!(config.executor.disk_poll_interval, Duration::from_secs(30));
         assert_eq!(config.reservation.cpu_millis, 1000);
         assert_eq!(config.reservation.memory_bytes, 2 * 1024 * 1024 * 1024);
         assert_eq!(config.reservation.disk_bytes, 20 * 1024 * 1024 * 1024);
@@ -630,6 +682,39 @@ disk_bytes   = 107374182400
         let message = format!("{err:#}");
         assert!(
             message.contains("high_pctt"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn disk_enforcement_parses_all_three_variants() {
+        for (raw, expected) in [
+            ("auto", DiskEnforcement::Auto),
+            ("quota", DiskEnforcement::Quota),
+            ("poll", DiskEnforcement::Poll),
+        ] {
+            let toml = format!("{MINIMAL_EXAMPLE}\n[executor]\ndisk_enforcement = \"{raw}\"\n");
+            let (_guard, path) = write_config(&toml);
+            let config = load(&path).unwrap_or_else(|e| panic!("{raw:?} should parse: {e:#}"));
+            assert_eq!(config.executor.disk_enforcement, expected);
+        }
+    }
+
+    #[test]
+    fn unknown_disk_enforcement_variant_is_rejected() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\ndisk_enforcement = \"native\"\n");
+        let (_guard, path) = write_config(&bad);
+        assert!(load(&path).is_err(), "an unknown strategy name must fail");
+    }
+
+    #[test]
+    fn zero_disk_poll_interval_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\ndisk_poll_interval = \"0s\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero poll interval should be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("disk_poll_interval"),
             "error should name the offending key, got: {message}"
         );
     }
