@@ -216,8 +216,8 @@ impl DockerExecutor {
         let state = Arc::new(Mutex::new(ExecutorState::default()));
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
         let cpuset = if config.whole_core_affinity {
-            let topology = cpuset::Topology::discover().map_err(|err| {
-                ExecutorError::Other(format!("discovering host CPU topology: {err}"))
+            let topology = cpuset::Topology::discover(&docker).await.map_err(|err| {
+                ExecutorError::Other(format!("discovering daemon CPU topology: {err}"))
             })?;
             crate::config::validate_cpu_capacity(capacity_cpu_millis, topology.physical_cores())
                 .map_err(ExecutorError::Other)?;

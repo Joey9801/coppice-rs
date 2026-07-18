@@ -172,30 +172,41 @@ mod harness {
         Ok(size)
     }
 
-    /// Affinity-enabled executor sized to the physical topology exposed by
-    /// sysfs. Used only by the serial-in-itself S3 cpuset integration test.
-    pub fn physical_cores() -> u64 {
-        let mut groups = std::collections::BTreeSet::new();
-        for entry in std::fs::read_dir("/sys/devices/system/cpu").expect("read CPU sysfs") {
-            let entry = entry.expect("CPU sysfs entry");
-            let name = entry.file_name();
-            if !name.to_string_lossy().starts_with("cpu") {
-                continue;
+    /// Affinity-enabled executor sized to the physical topology the daemon's
+    /// cpusets apply to. Mirrors `Topology::discover`: sysfs sibling groups on
+    /// Linux, the daemon's NCPU elsewhere (macOS, where the daemon is a Linux
+    /// VM and host topology is the wrong numbering). Used only by the
+    /// serial-in-itself S3 cpuset integration test.
+    pub async fn physical_cores(docker: &Docker) -> u64 {
+        if cfg!(target_os = "linux") {
+            let mut groups = std::collections::BTreeSet::new();
+            for entry in std::fs::read_dir("/sys/devices/system/cpu").expect("read CPU sysfs") {
+                let entry = entry.expect("CPU sysfs entry");
+                let name = entry.file_name();
+                if !name.to_string_lossy().starts_with("cpu") {
+                    continue;
+                }
+                if let Ok(siblings) =
+                    std::fs::read_to_string(entry.path().join("topology/thread_siblings_list"))
+                {
+                    groups.insert(siblings.trim().to_string());
+                }
             }
-            if let Ok(siblings) =
-                std::fs::read_to_string(entry.path().join("topology/thread_siblings_list"))
-            {
-                groups.insert(siblings.trim().to_string());
-            }
+            u64::try_from(groups.len()).expect("physical core count fits u64")
+        } else {
+            let info = docker.info().await.expect("daemon /info");
+            info.ncpu
+                .filter(|n| *n > 0)
+                .and_then(|n| u64::try_from(n).ok())
+                .expect("daemon /info reported no usable NCPU")
         }
-        u64::try_from(groups.len()).expect("physical core count fits u64")
     }
 
     pub async fn affinity_executor(
         docker: Docker,
     ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
         let config = ExecutorConfig::default();
-        let physical = physical_cores();
+        let physical = physical_cores(&docker).await;
         let (tx, rx) = watch::channel(DiskPressure::Ok);
         let exec = DockerExecutor::new(docker, &config, physical * 1000, 0, NodeId::new(), rx)
             .await
@@ -790,7 +801,7 @@ async fn whole_core_grant_shrinks_and_release_grows_fractional_cpuset() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    if harness::physical_cores() < 2 {
+    if harness::physical_cores(&docker).await < 2 {
         eprintln!("skipping: cpuset integration test needs at least two physical cores");
         return;
     }
