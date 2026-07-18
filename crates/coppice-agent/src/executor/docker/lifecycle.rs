@@ -116,13 +116,17 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     // 3. Resolve the image through the cache manager (§7): local wins, 404 →
     //    per-reference-singleflight pull under the global concurrency limit,
     //    then re-inspect. The digest fallback (repo-digest else id) lives in
-    //    cache::digest_of, so label and cache key can never diverge.
-    let cache::FetchedImage { inspect, digest } = inner.cache.fetch(&spec.image).await?;
-    // Pin immediately, before the container is created, so **every** failure
-    // path below releases the pin (the guard's Drop). A running/exited
-    // container re-pins itself from its label; a failed start must not leak a
-    // pin that no container will ever release (§7).
-    inner.cache.pin(spec.allocation, &digest);
+    //    cache::digest_of, so label and cache key can never diverge. Passing
+    //    the allocation makes `fetch` place the pin itself, under the digest's
+    //    image lock — the only ordering that excludes a concurrent eviction
+    //    (which cannot rely on a daemon 409: no container exists yet).
+    let cache::FetchedImage { inspect, digest } = inner
+        .cache
+        .fetch(&spec.image, Some(spec.allocation))
+        .await?;
+    // The pin is placed; every failure path below must release it (the guard's
+    // Drop). A running/exited container re-pins itself from its label; a failed
+    // start must not leak a pin that no container will ever release (§7).
     let _pin = PinGuard {
         inner,
         allocation: spec.allocation,

@@ -230,12 +230,16 @@ impl CacheState {
 }
 
 /// A single in-flight resolution of one reference (§7 singleflight). The first
-/// holder of the async mutex runs the puller and stores its result; followers
-/// queued behind it find `done` populated and never pull, so n concurrent
-/// starts of one image collapse to one pull.
+/// holder of the async mutex runs the puller and stores its result — success
+/// *or* failure — so followers queued behind it never pull, and n concurrent
+/// starts of one image collapse to one registry request even when that request
+/// fails (a burst of starts for a missing image must not become N failed
+/// pulls). The failure is scoped to this flight's cohort: once every holder
+/// releases, the map entry is swept, and the next caller forms a fresh flight
+/// that retries.
 #[derive(Default)]
 struct Flight {
-    done: Option<FetchedImage>,
+    done: Option<Result<FetchedImage, StartError>>,
 }
 
 /// The shared guts behind every [`ImageCache`] clone.
@@ -258,12 +262,27 @@ struct CacheInner {
     /// inspect→pull→re-inspect. Entries whose `Arc::strong_count == 1` are swept
     /// after release (small map, linear sweep fine).
     inflight: Mutex<HashMap<String, Arc<AsyncMutex<Flight>>>>,
+    /// Per-digest image locks serializing pin placement against eviction (§7).
+    /// An eviction holds its digest's lock across the pin recheck **and** the
+    /// `remove_image` await; `fetch` takes the same lock to revalidate-then-
+    /// record-and-pin. Without this, a start could pin a digest after a sweep's
+    /// pin check but before its removal completed — and with no container yet,
+    /// the daemon's in-use 409 cannot protect it, so the start's create-by-id
+    /// would fail on a vanished image. Same map hygiene as `inflight`.
+    image_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Global concurrent-pull limit (§7, config default 2). Acquired around the
     /// actual pull only, never the inspect.
     pull_semaphore: Semaphore,
     /// Monotone count of pulls actually performed, for the `cache_pulls_started`
     /// integration-test seam (§7). Incremented inside the pull path.
     pulls_started: AtomicU64,
+    /// Serializes [`ImageCache::persist`]'s snapshot→write→rename sequence.
+    /// Concurrent persists (a pull racing a release racing a sweep) share one
+    /// `.json.tmp` path; unserialized, an older snapshot could overwrite a newer
+    /// one — and a stale-but-valid `last_used_at` read back after a restart
+    /// would TTL-evict prematurely. Never held across an await (the write is a
+    /// tiny sync file op).
+    persist_lock: Mutex<()>,
 }
 
 /// The image cache manager (docker-executor.md §7). A cheap `Clone` handle;
@@ -303,8 +322,10 @@ impl ImageCache {
                 by_alloc: HashMap::new(),
             }),
             inflight: Mutex::new(HashMap::new()),
+            image_locks: Mutex::new(HashMap::new()),
             pull_semaphore: Semaphore::new(permits),
             pulls_started: AtomicU64::new(0),
+            persist_lock: Mutex::new(()),
         };
         let cache = ImageCache {
             inner: Arc::new(inner),
@@ -453,13 +474,100 @@ impl ImageCache {
     /// accept the local tag — tag-drift re-resolution is future work). The pull
     /// itself is per-reference singleflight and bounded by the global
     /// concurrent-pull semaphore. On success the entry is recorded/refreshed
-    /// (`last_used_at = now`) and the inventory gauges pushed.
-    pub(crate) async fn fetch(&self, reference: &str) -> Result<FetchedImage, StartError> {
-        let fetched = self
-            .fetch_with(reference, || self.pull_and_inspect(reference))
-            .await?;
-        self.record(&fetched);
-        Ok(fetched)
+    /// (`last_used_at = now`), the inventory gauges pushed, and — when
+    /// `pin_for` names an allocation — the pin placed, all under the digest's
+    /// image lock so an eviction cannot interleave (see `image_locks`).
+    ///
+    /// The start path **must** pin through here rather than pinning after the
+    /// fact: only a pin placed under the image lock, with the image's presence
+    /// revalidated, is ordered against an in-flight eviction. If an eviction
+    /// won the race anyway (the image vanished between resolve and lock), the
+    /// resolve is retried — the image is simply re-pulled, latency never
+    /// correctness (ADR 0010).
+    pub(crate) async fn fetch(
+        &self,
+        reference: &str,
+        pin_for: Option<AllocationId>,
+    ) -> Result<FetchedImage, StartError> {
+        // Two retries cover the realistic race (one eviction in flight during
+        // resolve); the bound exists so a pathological daemon cannot loop us.
+        for _ in 0..3 {
+            let fetched = self
+                .fetch_with(reference, || self.pull_and_inspect(reference))
+                .await?;
+            let digest = fetched.digest.clone();
+            let present = {
+                let lock = self.image_lock(&digest);
+                let _guard = lock.lock().await;
+                // Revalidate under the lock: an eviction that completed between
+                // our resolve and this acquisition removed the bytes, so the
+                // resolved inspect is stale and the pull must rerun. Inspect by
+                // the image id — that is what eviction removes.
+                let target = fetched.inspect.id.as_deref().unwrap_or(reference);
+                match self.inner.docker.inspect_image(target).await {
+                    Ok(_) => {
+                        self.record(&fetched);
+                        if let Some(allocation) = pin_for {
+                            self.pin(allocation, &digest);
+                        }
+                        Ok(true)
+                    }
+                    Err(err) if api::status_code(&err) == Some(404) => Ok(false),
+                    Err(err) => Err(classify::classify_pull_error(&err, reference)),
+                }
+            };
+            self.unlock_sweep(&digest);
+            match present? {
+                true => return Ok(fetched),
+                false => {
+                    // The flight may still be caching the now-stale success for
+                    // its cohort; retire it so the retry forms a fresh flight
+                    // and re-pulls.
+                    self.inner
+                        .inflight
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(reference);
+                    tracing::debug!(
+                        reference,
+                        %digest,
+                        "image evicted between resolve and pin; re-pulling (§7)"
+                    );
+                }
+            }
+        }
+        Err(StartError::Start {
+            user_error: false,
+            message: format!("image {reference} kept vanishing between pull and pin (§7)"),
+        })
+    }
+
+    /// The per-digest image lock (see `image_locks`), get-or-insert.
+    fn image_lock(&self, digest: &str) -> Arc<AsyncMutex<()>> {
+        let mut map = self
+            .inner
+            .image_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(digest.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Sweep a digest's image-lock entry once only the map holds it — the same
+    /// hygiene `fetch_with` applies to `inflight`. Call after dropping both the
+    /// guard and the local `Arc`.
+    fn unlock_sweep(&self, digest: &str) {
+        let mut map = self
+            .inner
+            .image_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = map.get(digest) {
+            if Arc::strong_count(existing) == 1 {
+                map.remove(digest);
+            }
+        }
     }
 
     /// The singleflight orchestration around a puller closure (§7 planned
@@ -490,16 +598,15 @@ impl ImageCache {
         let result = {
             let mut slot = flight.lock().await;
             match &slot.done {
-                // A concurrent leader already resolved this reference: reuse it,
-                // never pull (the singleflight's whole point).
-                Some(fetched) => Ok(fetched.clone()),
+                // A concurrent leader already resolved this reference: reuse its
+                // result — success or failure — never pulling again (the
+                // singleflight's whole point). A failure only lives as long as
+                // this flight's cohort; the sweep below retires it, so a later,
+                // independent caller retries on a fresh flight.
+                Some(done) => done.clone(),
                 None => {
                     let resolved = puller().await;
-                    // Cache only success — a failed pull leaves the slot empty so
-                    // the next caller retries rather than inheriting the error.
-                    if let Ok(fetched) = &resolved {
-                        slot.done = Some(fetched.clone());
-                    }
+                    slot.done = Some(resolved.clone());
                     resolved
                 }
             }
@@ -652,32 +759,32 @@ impl ImageCache {
     // ---- eviction + the janitor (docker-executor.md §7, §9, §11) --------
 
     /// Run one janitor sweep with an injected `now` (the `cache_sweep_at` seam):
-    /// reconcile the inventory against the daemon, then plan and execute
-    /// evictions, returning the count actually removed. The janitor task calls
-    /// this with `Timestamp::now()`.
+    /// reconcile the inventory against the daemon, then walk the ordered
+    /// eviction candidates, returning the count actually removed. The janitor
+    /// task calls this with `Timestamp::now()`.
+    ///
+    /// Under `High` pressure the loop is driven by **actual reclamation, not
+    /// the plan**: the filesystem is resampled before each conditional
+    /// candidate and the walk stops only once genuinely below the high-water
+    /// mark. Planned sizes are never trusted as freed — a candidate that 409s
+    /// (in use, multiply tagged) or whose shared layers reclaim less than its
+    /// reported size simply moves the walk to the next candidate, instead of
+    /// leaving the node stuck over the mark selecting the same unremovable
+    /// image forever.
     pub(crate) async fn sweep(&self, now: Timestamp) -> usize {
         if let Err(err) = self.reconcile(now).await {
             tracing::warn!(error = %err, "image-cache reconcile failed this sweep; retrying next tick");
         }
         let pressure = *self.inner.pressure.borrow();
-        // The `High` byte target reads the same filesystems the pressure monitor
-        // watches (§9); `Ok`/`Critical` don't consult it (`Critical` sweeps to
-        // the floor, `Ok` is TTL-only).
-        let bytes_to_free = if pressure == DiskPressure::High {
-            self.bytes_to_free()
-        } else {
-            None
-        };
         let ttl = core_duration(self.inner.config.ttl);
 
-        let plan = {
+        let candidates = {
             let st = self.lock_state();
             let views: Vec<EntryView> = st
                 .entries
                 .values()
                 .map(|entry| EntryView {
                     digest: entry.digest.clone(),
-                    size: entry.size,
                     last_used_at: entry.last_used_at,
                     pinned: st
                         .pins
@@ -685,32 +792,36 @@ impl ImageCache {
                         .is_some_and(|set| !set.is_empty()),
                 })
                 .collect();
-            plan_evictions(&views, now, ttl, pressure, bytes_to_free)
+            eviction_candidates(views, now, ttl, pressure)
         };
 
         let mut evicted = 0;
-        for digest in plan {
-            // Attribute the reason per image: an idle-past-TTL removal is `ttl`
-            // even under `High`; anything the pressure escalation added is
-            // `pressure`.
-            let reason = {
-                let st = self.lock_state();
-                match st.entries.get(&digest) {
-                    Some(entry) if now.duration_since(entry.last_used_at) >= ttl => REASON_TTL,
-                    _ => REASON_PRESSURE,
+        for candidate in candidates {
+            if !candidate.mandatory {
+                // Conditional candidates exist only under `High`: resample the
+                // watched filesystems (§9) and stop once genuinely below the
+                // mark. `None` (no local reading — a remote daemon) keeps
+                // going: disk safety wins (ADR 0010) and every unpinned image
+                // goes.
+                if let Some(over) = self.bytes_to_free() {
+                    if over.is_zero() {
+                        break;
+                    }
                 }
-            };
-            if self.evict(&digest, reason).await {
+            }
+            if self.evict(&candidate.digest, candidate.reason).await {
                 evicted += 1;
             }
         }
         evicted
     }
 
-    /// The `High`-pressure byte target: `used − high_pct%·total` over
+    /// The `High`-pressure byte target: the minimum bytes to fall *strictly
+    /// below* the high-water mark ([`crate::pressure::bytes_over_pct`]) over
     /// [`CacheOptions::pressure_paths`], taking the **max** across paths (§9).
-    /// Empty paths or all-failed `statvfs` → `None`, which a `High` sweep reads
-    /// as "no local reading" and drops every unpinned image (disk safety wins).
+    /// Zero means genuinely below the mark. Empty paths or all-failed `statvfs`
+    /// → `None`, which a `High` sweep reads as "no local reading" and drops
+    /// every unpinned image (disk safety wins).
     fn bytes_to_free(&self) -> Option<ByteSize> {
         let mut target: Option<ByteSize> = None;
         for path in &self.inner.pressure_paths {
@@ -727,47 +838,69 @@ impl ImageCache {
     /// removal the entry is dropped, state persisted, gauges pushed, and the
     /// eviction counter incremented with `reason`. Returns whether an image was
     /// removed.
+    ///
+    /// The whole check-then-remove runs under the digest's image lock, with the
+    /// pin recheck inside it: a concurrent `fetch` either pins before we get the
+    /// lock (we see the pin and abort) or waits for the lock and finds the image
+    /// gone (it re-pulls). Without the lock, a pin landing mid-removal would be
+    /// unprotected — the pinning start has no container yet, so no daemon 409
+    /// saves it (see `image_locks`).
     async fn evict(&self, digest: &str, reason: &'static str) -> bool {
-        let Some(id) = self
-            .lock_state()
-            .entries
-            .get(digest)
-            .map(|entry| entry.id.clone())
-        else {
-            return false;
-        };
-        let options = RemoveImageOptionsBuilder::new().force(false).build();
-        let removed = match self
-            .inner
-            .docker
-            .remove_image(&id, Some(options), None)
-            .await
-        {
-            Ok(_) => true,
-            Err(err) => match api::status_code(&err) {
-                // Already gone: treat as a successful eviction (drop the entry).
-                Some(404) => true,
-                // In use by a container, or multiple tags share the id: leave it,
-                // the daemon is the backstop.
-                Some(409) => {
-                    tracing::debug!(digest, image = %id, "skipping eviction: image in use or multiply tagged");
-                    return false;
+        let removed = {
+            let lock = self.image_lock(digest);
+            let _guard = lock.lock().await;
+            let id = {
+                let st = self.lock_state();
+                if st.pins.get(digest).is_some_and(|set| !set.is_empty()) {
+                    tracing::debug!(digest, "skipping eviction: image is pinned (§7)");
+                    None
+                } else {
+                    st.entries.get(digest).map(|entry| entry.id.clone())
                 }
-                _ => {
-                    tracing::warn!(digest, image = %id, error = %err, "image eviction failed; retrying next sweep");
-                    return false;
+            };
+            let removed = match id {
+                None => false,
+                Some(id) => {
+                    let options = RemoveImageOptionsBuilder::new().force(false).build();
+                    match self
+                        .inner
+                        .docker
+                        .remove_image(&id, Some(options), None)
+                        .await
+                    {
+                        Ok(_) => true,
+                        // Already gone: treat as a successful eviction (drop the
+                        // entry).
+                        Err(err) if api::status_code(&err) == Some(404) => true,
+                        // In use by a container, or multiple tags share the id:
+                        // leave it, the daemon is the backstop.
+                        Err(err) if api::status_code(&err) == Some(409) => {
+                            tracing::debug!(digest, image = %id, "skipping eviction: image in use or multiply tagged");
+                            false
+                        }
+                        Err(err) => {
+                            tracing::warn!(digest, image = %id, error = %err, "image eviction failed; retrying next sweep");
+                            false
+                        }
+                    }
                 }
-            },
-        };
-        if removed {
-            {
-                let mut st = self.lock_state();
-                st.entries.remove(digest);
-                st.push_gauges();
+            };
+            // Drop the entry *inside* the lock scope: after release, a racing
+            // `fetch` may already have re-pulled and re-recorded this digest,
+            // and removing that fresh entry would blind the inventory until the
+            // next reconcile.
+            if removed {
+                {
+                    let mut st = self.lock_state();
+                    st.entries.remove(digest);
+                    st.push_gauges();
+                }
+                self.persist();
+                metrics::counter!(AGENT_IMAGE_EVICTIONS_TOTAL, "reason" => reason).increment(1);
             }
-            self.persist();
-            metrics::counter!(AGENT_IMAGE_EVICTIONS_TOTAL, "reason" => reason).increment(1);
-        }
+            removed
+        };
+        self.unlock_sweep(digest);
         removed
     }
 
@@ -802,27 +935,21 @@ impl ImageCache {
         }
         let cache = self.clone();
         tokio::spawn(async move {
-            if let Err(err) = cache.fetch(&image).await {
+            // A warm pull pins nothing: an evicted warm image is just latency.
+            if let Err(err) = cache.fetch(&image, None).await {
                 tracing::info!(%image, error = %err, "PrepareCache warm pull failed (advisory)");
             }
         });
     }
 
     /// The `EvictImageHint` hint (§7, ADR 0010): evict `digest` if unpinned.
-    /// Freely ignored when pinned or unknown. Fire and forget.
+    /// Freely ignored when pinned or unknown — [`ImageCache::evict`] makes the
+    /// pin recheck itself, under the digest's image lock. Fire and forget.
     pub(crate) fn evict_hint(&self, digest: String) {
         let cache = self.clone();
         tokio::spawn(async move {
-            let pinned = {
-                let st = cache.lock_state();
-                st.pins.get(&digest).is_some_and(|set| !set.is_empty())
-            };
-            if pinned {
-                tracing::debug!(%digest, "evict hint ignored: image is pinned (§7)");
-                return;
-            }
             if !cache.evict(&digest, REASON_HINT).await {
-                tracing::debug!(%digest, "evict hint: nothing to evict (unknown or in use)");
+                tracing::debug!(%digest, "evict hint: nothing to evict (pinned, unknown, or in use)");
             }
         });
     }
@@ -843,6 +970,16 @@ impl ImageCache {
         let Some(path) = self.inner.state_path.as_deref() else {
             return;
         };
+        // Serialize the whole snapshot→write→rename: concurrent persists share
+        // one `.json.tmp`, and without this a slower writer could rename an
+        // *older* snapshot over a newer one (a stale-but-valid `last_used_at`
+        // read back after restart TTL-evicts prematurely). Taking the persist
+        // lock before snapshotting makes write order match snapshot order.
+        let _persist = self
+            .inner
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot: Vec<SerEntry> = {
             self.lock_state()
                 .entries
@@ -896,83 +1033,86 @@ pub(crate) fn spawn_janitor(
 // ---- pure helpers (the unit-test surface) -------------------------------
 
 /// A read-only projection of an [`Entry`] plus its pinned bit, the pure input
-/// to [`plan_evictions`] (docker-executor.md §7).
+/// to [`eviction_candidates`] (docker-executor.md §7).
 struct EntryView {
     digest: String,
-    size: ByteSize,
     last_used_at: Timestamp,
     pinned: bool,
 }
 
-/// Most-stale-first eviction plan (docker-executor.md §7). Pure, so the policy
-/// is unit-testable without a daemon.
+/// One planned eviction. `mandatory` evictions run unconditionally;
+/// conditional ones (the `High`-pressure ahead-of-TTL extras) run only while
+/// the sweep's filesystem resample still reads over the high-water mark.
+struct Candidate {
+    digest: String,
+    mandatory: bool,
+    /// The metrics `reason` label: [`REASON_TTL`] for idle-past-TTL,
+    /// [`REASON_PRESSURE`] for everything a pressure escalation added.
+    reason: &'static str,
+}
+
+/// The ordered eviction candidates for one sweep (docker-executor.md §7).
+/// Pure, so the policy is unit-testable without a daemon; the *stop* condition
+/// lives in [`ImageCache::sweep`], driven by actual reclamation rather than
+/// planned sizes.
 ///
-/// Rules: **pinned images are never evicted.** `Ok` → entries idle at or past
-/// `ttl`. `High` → those TTL-expired entries plus, most-stale-first, enough
-/// additional unpinned entries to cover `bytes_to_free` (stopping once the
-/// summed sizes reach it). `Critical` → every unpinned entry (§9 "sweep to
-/// floor").
-///
-/// `bytes_to_free = None` under `High` means "no local reading" (a remote
-/// daemon, §9): disk safety wins (ADR 0010) and every unpinned image goes.
-fn plan_evictions(
-    entries: &[EntryView],
+/// Rules: **pinned images are never candidates** (and [`ImageCache::evict`]
+/// rechecks under the image lock). `Ok` → entries idle at or past `ttl`,
+/// mandatory. `High` → those TTL-expired entries first (mandatory), then every
+/// other unpinned entry most-stale-first (conditional — the sweep stops once
+/// below the high-water mark, or exhausts them when it has no local reading).
+/// `Critical` → every unpinned entry, mandatory (§9 "sweep to floor"). All
+/// tiers order most-stale-first so partial progress frees the longest-idle
+/// images first.
+fn eviction_candidates(
+    entries: Vec<EntryView>,
     now: Timestamp,
     ttl: Duration,
     pressure: DiskPressure,
-    bytes_to_free: Option<ByteSize>,
-) -> Vec<String> {
+) -> Vec<Candidate> {
     let expired = |entry: &EntryView| now.duration_since(entry.last_used_at) >= ttl;
+    let mut unpinned: Vec<EntryView> = entries.into_iter().filter(|entry| !entry.pinned).collect();
+    unpinned.sort_by_key(|entry| entry.last_used_at);
     match pressure {
-        DiskPressure::Ok => entries
+        DiskPressure::Ok => unpinned
             .iter()
-            .filter(|entry| !entry.pinned && expired(entry))
-            .map(|entry| entry.digest.clone())
+            .filter(|entry| expired(entry))
+            .map(|entry| Candidate {
+                digest: entry.digest.clone(),
+                mandatory: true,
+                reason: REASON_TTL,
+            })
             .collect(),
-        DiskPressure::Critical => entries
+        DiskPressure::Critical => unpinned
             .iter()
-            .filter(|entry| !entry.pinned)
-            .map(|entry| entry.digest.clone())
+            .map(|entry| Candidate {
+                reason: if expired(entry) {
+                    REASON_TTL
+                } else {
+                    REASON_PRESSURE
+                },
+                digest: entry.digest.clone(),
+                mandatory: true,
+            })
             .collect(),
         DiskPressure::High => {
-            let target = match bytes_to_free {
-                // No local reading: every unpinned image goes.
-                None => {
-                    return entries
-                        .iter()
-                        .filter(|entry| !entry.pinned)
-                        .map(|entry| entry.digest.clone())
-                        .collect()
-                }
-                Some(target) => u128::from(target.as_u64()),
-            };
-            // TTL-expired unpinned entries go regardless, and their bytes count
-            // toward the target.
-            let mut chosen: Vec<&EntryView> = entries
-                .iter()
-                .filter(|entry| !entry.pinned && expired(entry))
-                .collect();
-            let mut freed: u128 = chosen
-                .iter()
-                .map(|entry| u128::from(entry.size.as_u64()))
-                .sum();
-            if freed < target {
-                // Then the not-yet-expired unpinned entries, most-stale-first,
-                // until the target is covered.
-                let mut rest: Vec<&EntryView> = entries
-                    .iter()
-                    .filter(|entry| !entry.pinned && !expired(entry))
-                    .collect();
-                rest.sort_by_key(|entry| entry.last_used_at);
-                for entry in rest {
-                    if freed >= target {
-                        break;
-                    }
-                    freed += u128::from(entry.size.as_u64());
-                    chosen.push(entry);
-                }
-            }
-            chosen.iter().map(|entry| entry.digest.clone()).collect()
+            // TTL-expired first (they go regardless), then the ahead-of-TTL
+            // extras most-stale-first, gated by the sweep's resample.
+            let (mandatory, conditional): (Vec<&EntryView>, Vec<&EntryView>) =
+                unpinned.iter().partition(|entry| expired(entry));
+            mandatory
+                .into_iter()
+                .map(|entry| Candidate {
+                    digest: entry.digest.clone(),
+                    mandatory: true,
+                    reason: REASON_TTL,
+                })
+                .chain(conditional.into_iter().map(|entry| Candidate {
+                    digest: entry.digest.clone(),
+                    mandatory: false,
+                    reason: REASON_PRESSURE,
+                }))
+                .collect()
         }
     }
 }
@@ -1062,13 +1202,19 @@ mod tests {
         Timestamp::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
-    fn view(digest: &str, last_used_secs: i64, size: u64, pinned: bool) -> EntryView {
+    fn view(digest: &str, last_used_secs: i64, pinned: bool) -> EntryView {
         EntryView {
             digest: digest.to_string(),
-            size: ByteSize::from_bytes(size),
             last_used_at: at(last_used_secs),
             pinned,
         }
+    }
+
+    fn digests(candidates: &[Candidate]) -> Vec<&str> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.digest.as_str())
+            .collect()
     }
 
     const TTL: Duration = Duration::from_secs(1800); // 30m
@@ -1078,95 +1224,73 @@ mod tests {
     #[test]
     fn ttl_evicts_at_or_past_the_boundary_only() {
         // last_used at t=0; ttl = 1800s. now just below / at / above 1800s.
-        let entries = vec![view("d", 0, 10, false)];
-        assert!(plan_evictions(&entries, at(1799), TTL, DiskPressure::Ok, None).is_empty());
-        assert_eq!(
-            plan_evictions(&entries, at(1800), TTL, DiskPressure::Ok, None),
-            vec!["d".to_string()]
-        );
-        assert_eq!(
-            plan_evictions(&entries, at(1801), TTL, DiskPressure::Ok, None),
-            vec!["d".to_string()]
-        );
+        let entries = || vec![view("d", 0, false)];
+        assert!(eviction_candidates(entries(), at(1799), TTL, DiskPressure::Ok).is_empty());
+        for now in [1800, 1801] {
+            let plan = eviction_candidates(entries(), at(now), TTL, DiskPressure::Ok);
+            assert_eq!(digests(&plan), vec!["d"]);
+            assert!(plan[0].mandatory, "a TTL eviction is unconditional");
+            assert_eq!(plan[0].reason, REASON_TTL);
+        }
     }
 
     #[test]
     fn pinned_image_past_ttl_survives() {
-        let entries = vec![view("d", 0, 10, true)];
-        assert!(plan_evictions(&entries, at(100_000), TTL, DiskPressure::Ok, None).is_empty());
+        let entries = vec![view("d", 0, true)];
+        assert!(eviction_candidates(entries, at(100_000), TTL, DiskPressure::Ok).is_empty());
     }
 
     // ---- pressure ordering (docker-executor.md §7, §9) ---------------------
 
     #[test]
-    fn high_pressure_frees_most_stale_first_and_stops_when_covered() {
-        // Three unpinned, none TTL-expired at now=100 (< 1800). Sizes 30/30/30.
-        // Target 50 → the two stalest (oldest last_used) cover it, the freshest
-        // survives.
+    fn high_pressure_orders_expired_first_then_most_stale_conditional() {
+        // One TTL-expired image plus three fresh ones at now=100_000. The
+        // expired one leads and is mandatory (it goes regardless of the
+        // watermark); the rest follow most-stale-first as conditional
+        // candidates — the sweep stops walking them once the filesystem
+        // resample reads below the mark, so the order *is* the policy.
         let entries = vec![
-            view("stale", 0, 30, false),
-            view("mid", 10, 30, false),
-            view("fresh", 20, 30, false),
+            view("fresh", 99_000, false),
+            view("expired", 0, false),
+            view("stale", 98_500, false),
+            view("staler", 98_400, false),
         ];
-        let plan = plan_evictions(
-            &entries,
-            at(100),
-            TTL,
-            DiskPressure::High,
-            Some(ByteSize::from_bytes(50)),
-        );
-        assert_eq!(plan.len(), 2, "two 30-byte images cover a 50-byte target");
-        assert!(plan.contains(&"stale".to_string()));
-        assert!(plan.contains(&"mid".to_string()));
-        assert!(!plan.contains(&"fresh".to_string()));
+        let plan = eviction_candidates(entries, at(100_000), TTL, DiskPressure::High);
+        assert_eq!(digests(&plan), vec!["expired", "staler", "stale", "fresh"]);
+        assert!(plan[0].mandatory);
+        assert_eq!(plan[0].reason, REASON_TTL);
+        for candidate in &plan[1..] {
+            assert!(!candidate.mandatory, "ahead-of-TTL extras are conditional");
+            assert_eq!(candidate.reason, REASON_PRESSURE);
+        }
     }
 
     #[test]
-    fn high_pressure_takes_ttl_expired_regardless_of_target() {
-        // One TTL-expired (last_used far in the past) plus fresh ones; a tiny
-        // target the expired image already covers → only the expired one goes.
+    fn high_pressure_never_lists_pinned_images() {
         let entries = vec![
-            view("expired", 0, 5, false),
-            view("fresh", 100_000, 30, false),
+            view("a", 100_000, false),
+            view("b", 100_000, true), // pinned survives even here
+            view("c", 100_000, false),
         ];
-        let plan = plan_evictions(
-            &entries,
-            at(100_000),
-            TTL,
-            DiskPressure::High,
-            Some(ByteSize::from_bytes(1)),
-        );
-        assert_eq!(plan, vec!["expired".to_string()]);
-    }
-
-    #[test]
-    fn high_pressure_without_local_reading_drops_all_unpinned() {
-        let entries = vec![
-            view("a", 100_000, 5, false),
-            view("b", 100_000, 5, true), // pinned survives even here
-            view("c", 100_000, 5, false),
-        ];
-        let plan = plan_evictions(&entries, at(100_000), TTL, DiskPressure::High, None);
+        let plan = eviction_candidates(entries, at(100_000), TTL, DiskPressure::High);
         assert_eq!(plan.len(), 2);
-        assert!(!plan.contains(&"b".to_string()));
+        assert!(!digests(&plan).contains(&"b"));
     }
 
     #[test]
     fn critical_drops_all_unpinned_and_only_unpinned() {
+        // Everything unpinned is mandatory (§9 "sweep to floor"), expired
+        // entries attributed to ttl, the rest to pressure.
         let entries = vec![
-            view("a", 100_000, 5, false),
-            view("pinned", 0, 5, true),
-            view("b", 100_000, 5, false),
+            view("a", 100_000, false),
+            view("pinned", 0, true),
+            view("expired", 0, false),
         ];
-        let plan = plan_evictions(
-            &entries,
-            at(100_000),
-            TTL,
-            DiskPressure::Critical,
-            Some(ByteSize::from_bytes(1)),
-        );
-        assert_eq!(plan.len(), 2);
-        assert!(!plan.contains(&"pinned".to_string()));
+        let plan = eviction_candidates(entries, at(100_000), TTL, DiskPressure::Critical);
+        assert_eq!(digests(&plan), vec!["expired", "a"]);
+        assert!(plan.iter().all(|candidate| candidate.mandatory));
+        assert_eq!(plan[0].reason, REASON_TTL);
+        assert_eq!(plan[1].reason, REASON_PRESSURE);
     }
 
     // ---- pin/unpin refcounts (state struct directly) -----------------------
@@ -1361,6 +1485,65 @@ mod tests {
             1,
             "n concurrent fetches of one reference must run the closure once"
         );
+    }
+
+    #[tokio::test]
+    async fn singleflight_shares_a_failure_with_its_cohort_then_retries_fresh() {
+        // A burst of starts for a missing image must produce one registry
+        // request, not N: the flight caches the *failure* for its cohort. Once
+        // the cohort disperses (the map entry is swept), a later caller forms a
+        // fresh flight and retries.
+        let cache = test_cache(2);
+        let runs = Arc::new(AtomicUsize::new(0));
+        const N: usize = 8;
+        let start = Arc::new(tokio::sync::Barrier::new(N));
+
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let cache = cache.clone();
+            let runs = Arc::clone(&runs);
+            let start = Arc::clone(&start);
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                cache
+                    .fetch_with("ghost:latest", || async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err::<FetchedImage, _>(StartError::Pull {
+                            user_error: true,
+                            message: "no such image".to_string(),
+                        })
+                    })
+                    .await
+            }));
+        }
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(StartError::Pull {
+                        user_error: true,
+                        ..
+                    })
+                ),
+                "every waiter shares the cohort's single failure"
+            );
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "a failing pull must run once per cohort, not once per waiter"
+        );
+
+        // The cohort has dispersed; a fresh caller retries (and may succeed).
+        let retried = cache
+            .fetch_with("ghost:latest", || async move {
+                Ok(fake_fetched("ghost@sha256:found"))
+            })
+            .await
+            .expect("a fresh flight retries rather than inheriting the old failure");
+        assert_eq!(retried.digest, "ghost@sha256:found");
     }
 
     #[tokio::test]

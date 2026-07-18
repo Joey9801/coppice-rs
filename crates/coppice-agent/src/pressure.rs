@@ -116,22 +116,33 @@ fn sample_path(path: &Path, high_pct: u8, critical_pct: u8) -> nix::Result<DiskP
     Ok(classify(total, available, high_pct, critical_pct))
 }
 
-/// Bytes `path`'s filesystem holds *above* the `pct`-used high-water mark:
-/// `used − pct%·total`, clamped at zero (docker-executor.md §7, §9). This is
-/// how much the image cache must free under `High` pressure to bring the
-/// filesystem back below the mark. `None` on a `statvfs` error — the same
-/// "absence of a reading is never a signal" contract as [`sample_path`], which
-/// the cache reads as "no local reading" (drop every unpinned image).
+/// Bytes `path`'s filesystem must free to fall *strictly below* the
+/// `pct`-used high-water mark (docker-executor.md §7, §9) — how much the image
+/// cache must reclaim under `High` pressure. `None` on a `statvfs` error — the
+/// same "absence of a reading is never a signal" contract as [`sample_path`],
+/// which the cache reads as "no local reading" (drop every unpinned image).
 pub(crate) fn bytes_over_pct(path: &Path, pct: u8) -> Option<ByteSize> {
     let (total, available) = sample_bytes(path).ok()?;
+    Some(bytes_over(total, available, pct))
+}
+
+/// The pure half of [`bytes_over_pct`]: the minimum bytes to free so that
+/// `used × 100 < total × pct` — the negation of [`classify`]'s *inclusive*
+/// `High` test. The strictness matters at the exact boundary: 85 used of 100
+/// at an 85% mark classifies `High`, so the target must be 1, not 0 — a
+/// zero-byte target would evict nothing and leave the node `High` forever.
+/// Zero once the filesystem is genuinely below the mark.
+fn bytes_over(total: ByteSize, available: ByteSize, pct: u8) -> ByteSize {
     let used = total.saturating_sub(available).as_u128();
     // `total × pct` needs the same u128 headroom the classifier uses — the
-    // product overflows a u64 past ~184 PiB.
-    let threshold = total.as_u128().saturating_mul(u128::from(pct)) / 100;
-    let over = used.saturating_sub(threshold);
-    Some(ByteSize::from_bytes(
-        u64::try_from(over).unwrap_or(u64::MAX),
-    ))
+    // product overflows a u64 past ~184 PiB. The largest `used'` that still
+    // classifies below `High` satisfies `used' × 100 < total × pct`, i.e.
+    // `used' = ⌈total·pct / 100⌉ − 1` — spelled `(total·pct − 1) / 100` in
+    // integers (saturating: a zero mark allows no used bytes at all).
+    let scaled = total.as_u128().saturating_mul(u128::from(pct));
+    let allowed = scaled.saturating_sub(1) / 100;
+    let over = used.saturating_sub(allowed);
+    ByteSize::from_bytes(u64::try_from(over).unwrap_or(u64::MAX))
 }
 
 /// Spawn the §9 monitor over `paths` and return a [`watch::Receiver`] of the
@@ -284,6 +295,30 @@ mod tests {
         );
         assert!(DiskPressure::Ok < DiskPressure::High);
         assert!(DiskPressure::High < DiskPressure::Critical);
+    }
+
+    #[test]
+    fn bytes_over_is_nonzero_exactly_when_classify_reads_high() {
+        // `classify` is *inclusive* at the High boundary, so the eviction
+        // target must be nonzero precisely when the level is High — a zero
+        // target at exactly 85/100 used would evict nothing and leave the node
+        // High forever. Sweep the whole grid and also check that freeing
+        // exactly the target lands strictly below the mark.
+        let total = ByteSize::from_bytes(100);
+        for used in 0..=100u64 {
+            let available = ByteSize::from_bytes(100 - used);
+            let over = bytes_over(total, available, HIGH);
+            let high = classify(total, available, HIGH, CRIT) >= DiskPressure::High;
+            assert_eq!(!over.is_zero(), high, "used={used}");
+            if high {
+                let freed = ByteSize::from_bytes(100 - used + over.as_u64());
+                assert_eq!(
+                    classify(total, freed, HIGH, CRIT),
+                    DiskPressure::Ok,
+                    "freeing the target must land below the mark, used={used}"
+                );
+            }
+        }
     }
 
     #[test]
