@@ -2,8 +2,7 @@
 //!
 //! Everything runtime-specific lives under this module; classification,
 //! journaling, and fencing stay above the [`crate::executor::Executor`]
-//! trait in the session. Later sessions add `cpuset`, `disk`, `cache`,
-//! `stats`, and `logs` beside these.
+//! trait in the session. Later sessions add `stats` and `logs` beside these.
 //!
 //! [`DockerExecutor`] is a cheap `Clone` handle over a shared [`Inner`] (the
 //! session runner clones it to drive its exit-watcher task). `Inner` owns the
@@ -15,6 +14,7 @@
 //! handle alive and defeat the abort.
 
 pub mod api;
+pub mod cache;
 pub mod classify;
 pub mod cpuset;
 pub mod disk;
@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use coppice_core::id::{AllocationId, NodeId};
+use coppice_proto::pb::agent::v1 as pb;
 
 use crate::config::ExecutorConfig;
 use crate::executor::{
@@ -89,6 +90,7 @@ pub(crate) fn describe_metrics() {
         "Containers currently running under this agent's executor."
     );
     disk::describe_metrics();
+    cache::describe_metrics();
 }
 
 /// Point-in-time metric sampling for this module. Part of the crate-level
@@ -97,6 +99,7 @@ pub(crate) fn describe_metrics() {
 /// there is nothing to sample here. Later sessions add their own gauges.
 pub(crate) fn gather_metrics() {
     disk::gather_metrics();
+    cache::gather_metrics();
 }
 
 // ---- shared state (docker-executor.md §11) ------------------------------
@@ -161,11 +164,20 @@ pub(crate) struct Inner {
     /// layer asks it for the per-job create-time wiring; everything else about
     /// disk enforcement lives behind this seam.
     pub(crate) disk: disk::DiskEnforcer,
+    /// The image cache manager (§7): pulls, pinning, eviction, and the
+    /// inventory snapshot `cache_inventory` returns. A cheap `Clone` handle — the
+    /// janitor task holds its own clone, so this one never keeps the janitor
+    /// alive on its own.
+    pub(crate) cache: cache::ImageCache,
     /// The events task, aborted on drop.
     events_task: JoinHandle<()>,
     /// The disk-enforcer poll task (§6.2), present only under the poll strategy;
     /// aborted on drop like the events task.
     disk_task: Option<JoinHandle<()>>,
+    /// The image-cache janitor task (§7), aborted on drop like the others. It
+    /// captures only a [`cache::ImageCache`] clone and a pressure receiver — the
+    /// abort is what stops it, so `Inner::drop` leaves no orphaned sweeper.
+    cache_task: JoinHandle<()>,
 }
 
 impl Drop for Inner {
@@ -176,6 +188,7 @@ impl Drop for Inner {
         if let Some(task) = self.disk_task.take() {
             task.abort();
         }
+        self.cache_task.abort();
     }
 }
 
@@ -212,6 +225,7 @@ impl DockerExecutor {
         reservation_cpu_millis: u64,
         node: NodeId,
         pressure: watch::Receiver<DiskPressure>,
+        cache: cache::CacheOptions,
     ) -> Result<DockerExecutor, ExecutorError> {
         let state = Arc::new(Mutex::new(ExecutorState::default()));
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
@@ -267,6 +281,16 @@ impl DockerExecutor {
                 node,
             )
         });
+
+        // Build the image cache (§7), reconcile it against the daemon's actual
+        // images and re-pin surviving containers *before* the janitor spawns, so
+        // the first sweep sees a truthful inventory. The janitor captures only a
+        // cache clone and its own pressure receiver — never `Arc<Inner>` — so the
+        // abort in `Inner::drop` is what stops it (the mod.rs no-cycle rule).
+        let cache = cache::ImageCache::new(docker.clone(), pressure.clone(), cache);
+        cache.recover().await;
+        let cache_task = cache::spawn_janitor(cache.clone(), pressure.clone());
+
         Ok(DockerExecutor {
             inner: Arc::new(Inner {
                 docker,
@@ -280,8 +304,10 @@ impl DockerExecutor {
                 exit_tx,
                 exit_rx: AsyncMutex::new(exit_rx),
                 disk,
+                cache,
                 events_task,
                 disk_task,
+                cache_task,
             }),
         })
     }
@@ -540,6 +566,38 @@ impl Executor for DockerExecutor {
                 None => std::future::pending().await,
             }
         }
+    }
+
+    fn cache_inventory(&self) -> pb::ImageCacheInventory {
+        self.inner.cache.inventory()
+    }
+
+    fn prepare_cache(&self, image: String) {
+        self.inner.cache.prepare(image);
+    }
+
+    fn evict_image(&self, digest: String) {
+        self.inner.cache.evict_hint(digest);
+    }
+}
+
+impl DockerExecutor {
+    /// Run one image-cache janitor sweep with an injected `now`, returning the
+    /// number of images evicted (docker-executor.md §7). An integration-test
+    /// seam: it lets a test drive a deterministic TTL eviction without waiting
+    /// out a live 30-minute clock, and without a tiny live TTL that would evict
+    /// other tests' shared images mid-suite.
+    #[doc(hidden)]
+    pub async fn cache_sweep_at(&self, now: coppice_core::time::Timestamp) -> usize {
+        self.inner.cache.sweep(now).await
+    }
+
+    /// A monotone count of image pulls the cache manager actually performed
+    /// (docker-executor.md §7). An integration-test seam: `n` concurrent starts
+    /// of one image must bump this by exactly one (singleflight).
+    #[doc(hidden)]
+    pub fn cache_pulls_started(&self) -> u64 {
+        self.inner.cache.pulls_started()
     }
 }
 

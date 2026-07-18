@@ -82,6 +82,12 @@ pub struct Config {
     /// so a bare v1 config stays valid.
     #[serde(default)]
     pub pressure: PressureConfig,
+
+    /// Image-cache policy (docker-executor.md §7). A top-level `[image_cache]`
+    /// table per §10, not under `[executor]`. Defaulted whole, so a bare v1
+    /// config stays valid.
+    #[serde(default)]
+    pub image_cache: ImageCacheConfig,
 }
 
 /// Container-executor configuration (docker-executor.md §10). Node-local knobs
@@ -196,6 +202,37 @@ impl Default for PressureConfig {
     }
 }
 
+/// Image-cache policy (docker-executor.md §7, §10). Node-local: the TTL a node
+/// keeps idle images for, and how many pulls it runs at once. Both are
+/// operational tuning, never cluster policy (ADR 0020), so they live here.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageCacheConfig {
+    /// How long an unpinned image may sit idle before the janitor evicts it
+    /// (docker-executor.md §7). `last_used_at` is the end of the last attempt
+    /// that used it (or its pull time if never used). Must be nonzero — a zero
+    /// TTL would evict every image the instant its last pin drops, defeating the
+    /// cache. Default 30m.
+    #[serde(default = "default_image_cache_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+
+    /// The global concurrent-pull limit (docker-executor.md §7): at most this
+    /// many image pulls run at once across all in-flight starts, so a burst of
+    /// cold starts cannot saturate the registry or the local disk. Must be at
+    /// least 1. Default 2.
+    #[serde(default = "default_max_concurrent_pulls")]
+    pub max_concurrent_pulls: usize,
+}
+
+impl Default for ImageCacheConfig {
+    fn default() -> ImageCacheConfig {
+        ImageCacheConfig {
+            ttl: default_image_cache_ttl(),
+            max_concurrent_pulls: default_max_concurrent_pulls(),
+        }
+    }
+}
+
 /// mTLS material (ADR 0011). Secrets by path reference only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +336,12 @@ impl Config {
                 );
             }
         }
+        if self.image_cache.ttl.is_zero() {
+            anyhow::bail!("image_cache.ttl must be greater than zero (§7)");
+        }
+        if self.image_cache.max_concurrent_pulls < 1 {
+            anyhow::bail!("image_cache.max_concurrent_pulls must be at least 1 (§7)");
+        }
         let PressureConfig {
             high_pct,
             critical_pct,
@@ -329,6 +372,7 @@ impl Config {
             labels = ?self.labels,
             executor = ?self.executor,
             pressure = ?self.pressure,
+            image_cache = ?self.image_cache,
             "effective agent configuration"
         );
     }
@@ -400,6 +444,14 @@ fn default_reservation_memory() -> ByteSize {
 
 fn default_reservation_disk() -> ByteSize {
     ByteSize::from_gib(20)
+}
+
+fn default_image_cache_ttl() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+
+fn default_max_concurrent_pulls() -> usize {
+    2
 }
 
 fn default_high_pct() -> u8 {
@@ -477,6 +529,10 @@ disk_poll_interval = "5s"
 [pressure]
 high_pct = 80
 critical_pct = 90
+
+[image_cache]
+ttl = "45m"
+max_concurrent_pulls = 3
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
@@ -530,6 +586,8 @@ disk       = "100GiB"
         assert_eq!(config.executor.disk_poll_interval, Duration::from_secs(5));
         assert_eq!(config.pressure.high_pct, 80);
         assert_eq!(config.pressure.critical_pct, 90);
+        assert_eq!(config.image_cache.ttl, Duration::from_secs(45 * 60));
+        assert_eq!(config.image_cache.max_concurrent_pulls, 3);
     }
 
     #[test]
@@ -565,6 +623,13 @@ disk       = "100GiB"
         assert_eq!(config.advertised_resources().cpu_millis, 7000);
         assert_eq!(config.pressure.high_pct, 85);
         assert_eq!(config.pressure.critical_pct, 95);
+        assert_eq!(config.image_cache.ttl, default_image_cache_ttl());
+        assert_eq!(config.image_cache.ttl, Duration::from_secs(30 * 60));
+        assert_eq!(
+            config.image_cache.max_concurrent_pulls,
+            default_max_concurrent_pulls()
+        );
+        assert_eq!(config.image_cache.max_concurrent_pulls, 2);
     }
 
     #[test]
@@ -719,6 +784,38 @@ disk       = "100GiB"
             message.contains("disk_poll_interval"),
             "error should name the offending key, got: {message}"
         );
+    }
+
+    #[test]
+    fn zero_image_cache_ttl_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[image_cache]\nttl = \"0s\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero cache TTL should be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("image_cache.ttl"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn zero_max_concurrent_pulls_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[image_cache]\nmax_concurrent_pulls = 0\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero concurrent-pull limit should be rejected");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("image_cache.max_concurrent_pulls"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_in_image_cache_table_is_rejected() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[image_cache]\nttll = \"30m\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("typo'd image_cache key should fail");
+        assert!(format!("{err:#}").contains("ttll"));
     }
 
     #[test]

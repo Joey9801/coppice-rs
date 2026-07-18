@@ -117,6 +117,7 @@ fn agent_config(
         labels: BTreeMap::new(),
         executor: Default::default(),
         pressure: Default::default(),
+        image_cache: Default::default(),
     }
 }
 

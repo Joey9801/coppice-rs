@@ -10,14 +10,11 @@
 
 use std::collections::HashMap;
 
-use bollard::models::{
-    ContainerCreateBody, ContainerStateStatusEnum, ContainerUpdateBody, ImageInspect,
-};
+use bollard::models::{ContainerCreateBody, ContainerStateStatusEnum, ContainerUpdateBody};
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
-    RemoveContainerOptions, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+    CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptions,
+    RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
 };
-use tokio_stream::StreamExt;
 
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::AllocationId;
@@ -25,9 +22,9 @@ use coppice_core::time::{Duration, Timestamp};
 
 use super::state::Mapped;
 use super::{
-    api, classify, container_name, cpuset, disk, limits, lock_state, state, ContainerIds, Inner,
-    LABEL_ALLOCATION, LABEL_ATTEMPT, LABEL_CPU_EXCLUSIVE, LABEL_DISK_BUDGET, LABEL_DISK_MODE,
-    LABEL_IMAGE_DIGEST, LABEL_JOB, LABEL_NODE,
+    api, cache, classify, container_name, cpuset, disk, limits, lock_state, state, ContainerIds,
+    Inner, LABEL_ALLOCATION, LABEL_ATTEMPT, LABEL_CPU_EXCLUSIVE, LABEL_DISK_BUDGET,
+    LABEL_DISK_MODE, LABEL_IMAGE_DIGEST, LABEL_JOB, LABEL_NODE,
 };
 use crate::executor::{
     ContainerState, ExecutorError, ObservedContainer, StartError, StartSpec, StopOutcome,
@@ -50,6 +47,35 @@ impl Drop for StartingGuard<'_> {
         lock_state(&self.inner.state)
             .starting
             .remove(&self.allocation);
+    }
+}
+
+/// Releases the image pin taken right after `fetch` on every failure path out of
+/// [`start_inner`] (docker-executor.md §7). The pin must be established before
+/// the container is created so an assigned-but-not-yet-running allocation still
+/// pins its image (ADR 0010), but a create/adopt/start failure has no container
+/// to re-pin from — so unless the start commits, the pin has to be handed back
+/// here. On the success paths (`AlreadyStarted`, and a clean start) the running
+/// container owns the pin until reap, so the guard is [`commit`](PinGuard::commit)ted
+/// and does nothing on drop.
+struct PinGuard<'a> {
+    inner: &'a Inner,
+    allocation: AllocationId,
+    committed: bool,
+}
+
+impl PinGuard<'_> {
+    /// Keep the pin: a container now owns it and `reap` will release it.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PinGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.inner.cache.release(self.allocation);
+        }
     }
 }
 
@@ -87,23 +113,29 @@ pub(crate) async fn start(inner: &Inner, spec: StartSpec) -> Result<(), StartErr
 }
 
 async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> {
-    // 3. Resolve the image (local wins; 404 → pull, then re-inspect).
-    let image = resolve_image(inner, &spec.image).await?;
+    // 3. Resolve the image through the cache manager (§7): local wins, 404 →
+    //    per-reference-singleflight pull under the global concurrency limit,
+    //    then re-inspect. The digest fallback (repo-digest else id) lives in
+    //    cache::digest_of, so label and cache key can never diverge.
+    let cache::FetchedImage { inspect, digest } = inner.cache.fetch(&spec.image).await?;
+    // Pin immediately, before the container is created, so **every** failure
+    // path below releases the pin (the guard's Drop). A running/exited
+    // container re-pins itself from its label; a failed start must not leak a
+    // pin that no container will ever release (§7).
+    inner.cache.pin(spec.allocation, &digest);
+    let _pin = PinGuard {
+        inner,
+        allocation: spec.allocation,
+        committed: false,
+    };
     // Pin the exact bytes we resolved: create with the image `id`, not the
     // movable tag (tag-drift re-resolution is future work, §7).
-    let image_id = image.id.clone().unwrap_or_default();
-    // Resolved digest for the cache-pinning label: first repo-digest if any,
-    // else the image id.
-    let image_digest = image
-        .repo_digests
-        .as_ref()
-        .and_then(|digests| digests.first().cloned())
-        .or_else(|| image.id.clone())
-        .unwrap_or_default();
+    let image_id = inspect.id.clone().unwrap_or_default();
+    let image_digest = digest;
 
     // 4. User (§6): honor a non-root image `USER`, else the config default;
     //    reject UID 0 as a user error.
-    let image_user = image.config.as_ref().and_then(|cfg| cfg.user.as_deref());
+    let image_user = inspect.config.as_ref().and_then(|cfg| cfg.user.as_deref());
     let user = limits::resolve_user(image_user, inner.default_uid)?;
 
     // Disk plan (§6.2): decide the create-time storage-opt/labels behind the
@@ -113,7 +145,7 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     // Docker reports the image size as a signed integer; this is where it
     // becomes a typed size. A negative reading is nonsense rather than a real
     // image, so it clamps to zero and the plan treats it as "no image cost".
-    let image_size = ByteSize::from_bytes(image.size.map(|size| size.max(0) as u64).unwrap_or(0));
+    let image_size = ByteSize::from_bytes(inspect.size.map(|size| size.max(0) as u64).unwrap_or(0));
     let disk_plan = inner.disk.plan(&spec.limits, image_size)?;
 
     // Serialize the affinity-plan/create boundary. Without this, a concurrent
@@ -157,7 +189,11 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
                         }
                     }
                 }
-                Ok(AdoptOutcome::AlreadyStarted) => return Ok(()),
+                Ok(AdoptOutcome::AlreadyStarted) => {
+                    // The container already started; its pin stands until reap.
+                    _pin.commit();
+                    return Ok(());
+                }
                 Err(err) => {
                     rollback_cpu(inner, spec.allocation, cpu.as_ref()).await;
                     return Err(err);
@@ -179,12 +215,15 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
         return Err(classify::classify_start_error(&err));
     }
 
-    // 7. Success: record running, push the gauge. The guard clears `starting`.
+    // 7. Success: record running, push the gauge. The running container holds
+    //    the image pin until reap, so commit the guard (do not release). The
+    //    starting-guard clears `starting`.
     {
         let mut st = lock_state(&inner.state);
         st.running.insert(spec.allocation);
         st.push_running_gauge();
     }
+    _pin.commit();
     Ok(())
 }
 
@@ -215,37 +254,6 @@ async fn update_created_affinity(
 const START_OPTS: Option<bollard::query_parameters::StartContainerOptions> = None;
 /// `None` inspect options.
 const INSPECT_OPTS: Option<bollard::query_parameters::InspectContainerOptions> = None;
-
-/// Resolve `image` to an [`ImageInspect`]: use the local image if present, else
-/// pull it and inspect again (docker-executor.md §3 step 3). A non-404 inspect
-/// error, or any pull/stream error, maps to [`StartError::Pull`].
-async fn resolve_image(inner: &Inner, image: &str) -> Result<ImageInspect, StartError> {
-    match inner.docker.inspect_image(image).await {
-        Ok(inspect) => Ok(inspect),
-        Err(err) if api::status_code(&err) == Some(404) => {
-            pull_image(inner, image).await?;
-            inner
-                .docker
-                .inspect_image(image)
-                .await
-                .map_err(|err| classify::classify_pull_error(&err, image))
-        }
-        Err(err) => Err(classify::classify_pull_error(&err, image)),
-    }
-}
-
-/// Pull `image`, draining the whole progress stream. Any stream item error, or
-/// a terminal error, maps to [`StartError::Pull`] (docker-executor.md §4). The
-/// per-reference singleflight and tag/digest handling are the S3 cache
-/// manager's job (§7); here the full reference is handed to `fromImage`.
-async fn pull_image(inner: &Inner, image: &str) -> Result<(), StartError> {
-    let options = CreateImageOptionsBuilder::new().from_image(image).build();
-    let mut stream = std::pin::pin!(inner.docker.create_image(Some(options), None, None));
-    while let Some(item) = stream.next().await {
-        item.map_err(|err| classify::classify_pull_error(&err, image))?;
-    }
-    Ok(())
-}
 
 /// Assemble the create body: the resolved image bytes, the job's command and
 /// (optional) entrypoint, the resolved user, the full label set (§5), and the
@@ -556,6 +564,10 @@ pub(crate) async fn observe(inner: &Inner) -> Result<Vec<ObservedContainer>, Exe
                 let ours = lock_state(&inner.state).starting.contains(&ids.allocation);
                 if !ours {
                     remove_best_effort(inner, target, false).await;
+                    // Removing debris ends this allocation's life here, so drop
+                    // its image pin too — a pin cannot leak past the reconciler
+                    // (§7).
+                    inner.cache.release(ids.allocation);
                 }
             }
             Mapped::ReapInFlight => {
@@ -564,6 +576,9 @@ pub(crate) async fn observe(inner: &Inner) -> Result<Vec<ObservedContainer>, Exe
             Mapped::DeadUnusable => {
                 // Force-remove; report nothing (same AgentError channel, §3).
                 remove_best_effort(inner, target, true).await;
+                // Same as the debris arm: the allocation is gone, so release its
+                // image pin so the reconciler cannot leak one (§7).
+                inner.cache.release(ids.allocation);
             }
         }
     }
@@ -622,6 +637,11 @@ pub(crate) async fn reap(inner: &Inner, allocation: AllocationId) -> Result<(), 
         st.starting.remove(&allocation);
         st.push_running_gauge();
     }
+    // Reap is the terminal cleanup: drop the image pin here (evidence retention
+    // kept it through the container's exited life, §7). This stamps
+    // `last_used_at` on the image when its last pin drains, starting the TTL
+    // clock from the end of the last attempt that used it.
+    inner.cache.release(allocation);
     Ok(())
 }
 

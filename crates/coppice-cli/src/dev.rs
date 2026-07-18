@@ -332,6 +332,7 @@ ca_path = "{ca}"
             ..Default::default()
         },
         pressure: Default::default(),
+        image_cache: Default::default(),
     };
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
     // happens per concrete executor type rather than in a generic helper.
@@ -355,6 +356,15 @@ ca_path = "{ca}"
             if let Some(root) = data_root {
                 pressure_paths.push(root);
             }
+            // The image cache reads the same filesystems the pressure monitor
+            // watches for its High-pressure target (§7, §9); clone the paths
+            // before they move into `pressure::spawn`.
+            let cache_options = coppice_agent::executor::docker::cache::CacheOptions {
+                config: agent_config.image_cache.clone(),
+                state_path: Some(agent_config.data_dir.join("image-cache.json")),
+                pressure_paths: pressure_paths.clone(),
+                high_pct: agent_config.pressure.high_pct,
+            };
             let pressure_rx = coppice_agent::pressure::spawn(pressure_paths, agent_config.pressure);
             let executor = DockerExecutor::new(
                 docker,
@@ -363,6 +373,7 @@ ca_path = "{ca}"
                 agent_config.reservation.cpu_millis,
                 agent_config.node(),
                 pressure_rx,
+                cache_options,
             )
             .await?;
             let session = build_session(&agent_config, executor)?;
