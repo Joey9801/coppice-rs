@@ -285,6 +285,76 @@ impl DockerExecutor {
     }
 }
 
+/// Re-inspect delays for [`settle_oom_flag`]: ~1.6 s total, front-loaded
+/// because a lagging `OOMKilled` commit lands within milliseconds of the `die`
+/// event when it lands at all (issue #34 measurements: on a healthy daemon the
+/// flag is committed *before* the event publishes).
+const OOM_FLAG_DELAYS: [std::time::Duration; 6] = [
+    std::time::Duration::from_millis(25),
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(400),
+    std::time::Duration::from_millis(800),
+];
+
+/// Give the daemon a bounded window to commit a lagging `OOMKilled` flag
+/// before exit evidence is extracted (issue #34).
+///
+/// Some daemons set `OOMKilled` from an async OOM-event handler that can lag
+/// the `die` event, so an inspect issued at event time can read exit 137 under
+/// a memory limit with the flag still unset — which `classify::exit_info`
+/// would report as `Natural`, misclassifying a real OOM kill as `Failed`
+/// downstream. When `initial` has that racy shape
+/// ([`classify::oom_flag_may_lag`]) this re-inspects on a short backoff until
+/// the flag commits or the budget runs out, returning the freshest inspect
+/// either way; on any other shape it returns `initial` untouched, cost-free.
+///
+/// The flag remains the sole OOM gate: an exhausted budget still classifies
+/// `Natural` (an external SIGKILL of a memory-limited container is
+/// indistinguishable by code alone, and fabricating `OomKilled` would breach
+/// the documented `exit_info` contract). Callers are the *natural-exit*
+/// evidence paths only — the stop post-inspect and the disk enforcer skip it
+/// because a 137 there is expected from their own SIGKILL, and burning the
+/// budget on every hard kill would be pure latency.
+pub(crate) async fn settle_oom_flag(
+    docker: &Docker,
+    target: &str,
+    initial: bollard::models::ContainerInspectResponse,
+) -> bollard::models::ContainerInspectResponse {
+    if !classify::oom_flag_may_lag(&initial) {
+        return initial;
+    }
+    let mut latest = initial;
+    for delay in OOM_FLAG_DELAYS {
+        tokio::time::sleep(delay).await;
+        match docker
+            .inspect_container(
+                target,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(inspect) => {
+                if !classify::oom_flag_may_lag(&inspect) {
+                    return inspect;
+                }
+                latest = inspect;
+            }
+            // A torn read mid-settle: keep the evidence we already hold.
+            Err(err) => {
+                tracing::debug!(target, error = %err, "re-inspect failed while settling OOMKilled");
+            }
+        }
+    }
+    tracing::warn!(
+        target,
+        "exit 137 under a memory limit but OOMKilled never committed; \
+         classifying Natural (external SIGKILL, or a daemon that lost the OOM event)"
+    );
+    latest
+}
+
 /// Release an allocation's CPU bookkeeping and push the enlarged shared pool
 /// to every surviving fractional container. Idempotent for duplicate exits.
 pub(crate) async fn release_cpu(
