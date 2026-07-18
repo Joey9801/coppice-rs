@@ -3,8 +3,9 @@
 //! A single long-lived task live-tails `docker events` for container `die`
 //! events on labeled containers, turns each into an [`ExitEvent`] on the
 //! natural-exit channel that feeds [`crate::executor::Executor::next_exit`], and
-//! resyncs against the daemon on every (re)subscribe so a stream gap can never
-//! swallow an exit. It is aborted on [`super::Inner`] drop, so it captures only
+//! resyncs against the daemon on every (re)subscribe — after priming the lazy
+//! stream so the tail is up before the snapshot — plus a low-frequency periodic
+//! sweep, so a stream gap can never swallow an exit for long. It is aborted on [`super::Inner`] drop, so it captures only
 //! clones (`docker`, the shared state, the sender) — never an `Arc<Inner>`.
 //!
 //! Every resync — including the first, at construction — enqueues every
@@ -41,6 +42,21 @@ use crate::executor::ExitEvent;
 /// safety net, this only avoids a hot loop against a flapping daemon.
 const RECONNECT_BACKOFF: StdDuration = StdDuration::from_secs(1);
 
+/// How long to poll the freshly-built events stream before the resync
+/// snapshot. bollard's stream is lazy — the HTTP request is not sent until the
+/// first poll — so without this an exit landing between the resync's
+/// `list_containers` and the loop's first real poll would be in neither the
+/// snapshot nor the tail. Generous against a ~ms local connection setup; the
+/// periodic sweep covers a daemon slower than this.
+const SUBSCRIBE_PRIME: StdDuration = StdDuration::from_millis(250);
+
+/// Period of the steady-state resync sweep. Priming cannot *prove* the daemon
+/// registered the subscription before the snapshot was taken, so a
+/// low-frequency sweep bounds how long any exit that slipped between them can
+/// stay unjournaled — cheap (one filtered list; claimed allocations are
+/// skipped before any inspect) and unconditional.
+const RESYNC_INTERVAL: StdDuration = StdDuration::from_secs(60);
+
 /// `None` inspect options.
 const INSPECT_OPTS: Option<bollard::query_parameters::InspectContainerOptions> = None;
 
@@ -70,29 +86,61 @@ async fn run(
         let options = EventsOptionsBuilder::new().filters(&filters).build();
         let mut stream = Box::pin(docker.events(Some(options)));
 
-        // 2. Resync immediately after (re)subscribe, so exits that predate the
-        //    stream (or fell into a gap) are surfaced through `next_exit` and
-        //    reach the session's journaling path.
+        // 2. Prime the subscription. The stream is lazy (see SUBSCRIBE_PRIME):
+        //    poll it for a beat so the live tail is established *before* the
+        //    resync snapshot — the ordering the no-gap argument rests on. An
+        //    event arriving this early is handled, never dropped.
+        match tokio::time::timeout(SUBSCRIBE_PRIME, stream.next()).await {
+            Err(_elapsed) => {} // no event during the prime — the normal case
+            Ok(Some(Ok(event))) => handle_die(&docker, &state, &cpuset, &exit_tx, &event).await,
+            Ok(Some(Err(err))) => {
+                tracing::warn!(error = %err, "docker events stream error; reconnecting");
+                tokio::time::sleep(RECONNECT_BACKOFF).await;
+                continue;
+            }
+            Ok(None) => {
+                tracing::warn!("docker events stream ended; reconnecting");
+                tokio::time::sleep(RECONNECT_BACKOFF).await;
+                continue;
+            }
+        }
+
+        // 3. Resync immediately after the subscription is up, so exits that
+        //    predate the stream (or fell into a gap) are surfaced through
+        //    `next_exit` and reach the session's journaling path.
         if let Err(err) = resync(&docker, &state, &cpuset, &exit_tx).await {
             tracing::warn!(error = %err, "events resync failed; relying on later observe/resync");
         }
 
-        // 3. Per die event.
+        // 4. Per die event, with the periodic sweep as backstop (see
+        //    RESYNC_INTERVAL). The interval starts one full period out — step 3
+        //    just resynced.
+        let mut sweep = tokio::time::interval_at(
+            tokio::time::Instant::now() + RESYNC_INTERVAL,
+            RESYNC_INTERVAL,
+        );
         loop {
-            match stream.next().await {
-                Some(Ok(event)) => handle_die(&docker, &state, &cpuset, &exit_tx, &event).await,
-                Some(Err(err)) => {
-                    tracing::warn!(error = %err, "docker events stream error; reconnecting");
-                    break;
-                }
-                None => {
-                    tracing::warn!("docker events stream ended; reconnecting");
-                    break;
+            tokio::select! {
+                item = stream.next() => match item {
+                    Some(Ok(event)) => handle_die(&docker, &state, &cpuset, &exit_tx, &event).await,
+                    Some(Err(err)) => {
+                        tracing::warn!(error = %err, "docker events stream error; reconnecting");
+                        break;
+                    }
+                    None => {
+                        tracing::warn!("docker events stream ended; reconnecting");
+                        break;
+                    }
+                },
+                _ = sweep.tick() => {
+                    if let Err(err) = resync(&docker, &state, &cpuset, &exit_tx).await {
+                        tracing::warn!(error = %err, "periodic events resync failed; retrying next sweep");
+                    }
                 }
             }
         }
 
-        // 4. Backoff, then reconnect at step 1.
+        // 5. Backoff, then reconnect at step 1.
         tokio::time::sleep(RECONNECT_BACKOFF).await;
     }
 }

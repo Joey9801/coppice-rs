@@ -298,6 +298,14 @@ const OOM_FLAG_DELAYS: [std::time::Duration; 6] = [
     std::time::Duration::from_millis(800),
 ];
 
+/// Hard wall-clock ceiling on one [`settle_oom_flag`] call, covering the
+/// re-inspect *requests* as well as the sleeps. Without it the bound above is
+/// illusory: bollard requests carry a 120 s timeout (`api::DOCKER_TIMEOUT`),
+/// so six inspects against an unresponsive daemon could pin the events task,
+/// a stop, or observe for minutes. Slightly above the summed delays (~1.6 s)
+/// to leave normal requests real headroom.
+const OOM_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Give the daemon a bounded window to commit a lagging `OOMKilled` flag
 /// before exit evidence is extracted (issue #34).
 ///
@@ -326,24 +334,33 @@ pub(crate) async fn settle_oom_flag(
         return initial;
     }
     let mut latest = initial;
+    let deadline = tokio::time::Instant::now() + OOM_SETTLE_DEADLINE;
     for delay in OOM_FLAG_DELAYS {
         tokio::time::sleep(delay).await;
-        match docker
-            .inspect_container(
-                target,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await
-        {
-            Ok(inspect) => {
+        // The per-request clamp is what makes the settle's bound real: a
+        // request still in flight at the deadline is abandoned, keeping the
+        // evidence already held rather than riding out bollard's 120 s timeout.
+        let request = docker.inspect_container(
+            target,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        );
+        match tokio::time::timeout_at(deadline, request).await {
+            Ok(Ok(inspect)) => {
                 if !classify::oom_flag_may_lag(&inspect) {
                     return inspect;
                 }
                 latest = inspect;
             }
             // A torn read mid-settle: keep the evidence we already hold.
-            Err(err) => {
+            Ok(Err(err)) => {
                 tracing::debug!(target, error = %err, "re-inspect failed while settling OOMKilled");
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    target,
+                    "settle deadline hit mid-inspect; keeping prior evidence"
+                );
+                break;
             }
         }
     }
