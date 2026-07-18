@@ -221,16 +221,7 @@ impl Config {
     /// cores. Kept separate from file parsing so unit tests and non-Linux
     /// config tooling need not depend on the machine running them.
     pub fn validate_physical_cores(&self, physical_cores: usize) -> Result<()> {
-        let physical_millis = u64::try_from(physical_cores)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(1000);
-        if self.capacity.cpu_millis > physical_millis {
-            anyhow::bail!(
-                "capacity.cpu_millis ({}) exceeds {physical_cores} physical cores ({physical_millis} mCPU)",
-                self.capacity.cpu_millis
-            );
-        }
-        Ok(())
+        validate_cpu_capacity(self.capacity.cpu_millis, physical_cores).map_err(anyhow::Error::msg)
     }
 
     /// The strongly-typed node identity.
@@ -308,6 +299,22 @@ impl Config {
             "effective agent configuration"
         );
     }
+}
+
+/// Shared startup arithmetic for the affinity-enabled Docker executor.
+pub(crate) fn validate_cpu_capacity(
+    capacity_cpu_millis: u64,
+    physical_cores: usize,
+) -> std::result::Result<(), String> {
+    let physical_millis = u64::try_from(physical_cores)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1000);
+    if capacity_cpu_millis > physical_millis {
+        return Err(format!(
+            "capacity.cpu_millis ({capacity_cpu_millis}) exceeds {physical_cores} physical cores ({physical_millis} mCPU)"
+        ));
+    }
+    Ok(())
 }
 
 fn default_heartbeat_interval() -> Duration {

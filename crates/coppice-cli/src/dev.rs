@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use coppice_agent::config::{CapacityConfig, Config as AgentConfig, TlsConfig as AgentTls};
+use coppice_agent::config::{
+    CapacityConfig, Config as AgentConfig, ExecutorConfig, TlsConfig as AgentTls,
+};
 use coppice_agent::executor::{DockerExecutor, Executor, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{self, Session};
@@ -321,7 +323,13 @@ ca_path = "{ca}"
         reconnect_backoff_min: Duration::from_millis(100),
         reconnect_backoff_max: Duration::from_secs(2),
         labels: Default::default(),
-        executor: Default::default(),
+        // Docker Desktop on macOS exposes no Linux sysfs topology to this
+        // process. Dev remains portable by retaining the S2 NanoCpus-only
+        // behavior; production configs opt into affinity by default.
+        executor: ExecutorConfig {
+            whole_core_affinity: false,
+            ..Default::default()
+        },
         pressure: Default::default(),
     };
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn

@@ -44,11 +44,6 @@ pub fn gather_metrics() {
 /// belong to the `coppice` binary (`coppice agent --config <path>`).
 pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     let config = config::load(config_path)?;
-    let topology =
-        executor::docker::cpuset::Topology::discover().context("discovering host CPU topology")?;
-    config
-        .validate_physical_cores(topology.physical_cores())
-        .context("validating capacity against host CPU topology")?;
     config.log_effective();
 
     // Register metric descriptions once at startup (§8.1). The agent has no

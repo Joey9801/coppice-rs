@@ -195,15 +195,8 @@ impl DockerExecutor {
             let topology = cpuset::Topology::discover().map_err(|err| {
                 ExecutorError::Other(format!("discovering host CPU topology: {err}"))
             })?;
-            let physical_millis = u64::try_from(topology.physical_cores())
-                .unwrap_or(u64::MAX)
-                .saturating_mul(1000);
-            if capacity_cpu_millis > physical_millis {
-                return Err(ExecutorError::Other(format!(
-                    "capacity.cpu_millis ({capacity_cpu_millis}) exceeds {} physical cores ({physical_millis} mCPU)",
-                    topology.physical_cores()
-                )));
-            }
+            crate::config::validate_cpu_capacity(capacity_cpu_millis, topology.physical_cores())
+                .map_err(ExecutorError::Other)?;
             let allocator = cpuset::Allocator::new(topology, reservation_cpu_millis)
                 .map_err(ExecutorError::Other)?;
             let allocator = Arc::new(AsyncMutex::new(allocator));
@@ -262,8 +255,9 @@ pub(crate) async fn update_fractional_containers(
     allocator: &mut cpuset::Allocator,
 ) -> Result<(), String> {
     let pool = allocator.shared_cpuset();
+    let mut errors = Vec::new();
     for allocation in allocator.fractional_allocations() {
-        docker
+        if let Err(err) = docker
             .update_container(
                 &container_name(allocation),
                 ContainerUpdateBody {
@@ -272,7 +266,19 @@ pub(crate) async fn update_fractional_containers(
                 },
             )
             .await
-            .map_err(|err| format!("updating fractional container {allocation}: {err}"))?;
+        {
+            // A die/reap can race the pool update. Its release path owns
+            // removing the allocator entry; absence here must not reject an
+            // unrelated whole-core start or prevent later updates in the loop.
+            if api::status_code(&err) == Some(404) {
+                tracing::debug!(%allocation, "fractional container vanished during cpuset update");
+                continue;
+            }
+            errors.push(format!("updating fractional container {allocation}: {err}"));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
     }
     Ok(())
 }

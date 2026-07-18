@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 
-use bollard::models::{ContainerCreateBody, ContainerStateStatusEnum, ImageInspect};
+use bollard::models::{
+    ContainerCreateBody, ContainerStateStatusEnum, ContainerUpdateBody, ImageInspect,
+};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
     RemoveContainerOptions, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
@@ -130,7 +132,19 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
         Ok(_) => {}
         Err(err) if api::status_code(&err) == Some(409) => {
             match adopt(inner, &name, spec).await {
-                Ok(AdoptOutcome::StartExisting) => {} // fall through and start it
+                Ok(AdoptOutcome::StartExisting) => {
+                    // The survivor was created by the previous agent process
+                    // with that process's then-current cpuset. Refresh it to
+                    // the newly allocated grant/shared pool before starting,
+                    // otherwise the runtime and allocator can silently disagree.
+                    if let Some(cpu) = cpu.as_ref() {
+                        if let Err(err) = update_created_affinity(inner, &name, &cpu.affinity).await
+                        {
+                            rollback_cpu(inner, spec.allocation, Some(cpu)).await;
+                            return Err(err);
+                        }
+                    }
+                }
                 Ok(AdoptOutcome::AlreadyStarted) => return Ok(()),
                 Err(err) => {
                     rollback_cpu(inner, spec.allocation, cpu.as_ref()).await;
@@ -160,6 +174,28 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
         st.push_running_gauge();
     }
     Ok(())
+}
+
+async fn update_created_affinity(
+    inner: &Inner,
+    name: &str,
+    affinity: &cpuset::Affinity,
+) -> Result<(), StartError> {
+    inner
+        .docker
+        .update_container(
+            name,
+            ContainerUpdateBody {
+                cpuset_cpus: Some(affinity.cpuset_cpus.clone()),
+                nano_cpus: (affinity.nano_cpus > 0).then_some(affinity.nano_cpus),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| StartError::Start {
+            user_error: false,
+            message: format!("updating adopted created container {name} CPU affinity: {err}"),
+        })
 }
 
 /// `None` start options, spelled with the concrete type so the `Option<impl
