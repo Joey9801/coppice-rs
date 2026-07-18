@@ -316,6 +316,7 @@ ca_path = "{ca}"
             memory_bytes: 1 << 34,
             disk_bytes: 1 << 40,
         },
+        reservation: Default::default(),
         heartbeat_interval: Duration::from_secs(2),
         reconnect_backoff_min: Duration::from_millis(100),
         reconnect_backoff_max: Duration::from_secs(2),
@@ -349,9 +350,12 @@ ca_path = "{ca}"
             let executor = DockerExecutor::new(
                 docker,
                 &agent_config.executor,
+                agent_config.capacity.cpu_millis,
+                agent_config.reservation.cpu_millis,
                 agent_config.node(),
                 pressure_rx,
-            );
+            )
+            .await?;
             let session = build_session(&agent_config, executor)?;
             tokio::spawn(run_agent(session, agent_config))
         }
@@ -413,7 +417,7 @@ fn build_session<E: Executor + Clone>(
     let (journal, state) = Journal::open(fs).context("recovering the dev agent journal")?;
     Ok(Session::new(
         config.node(),
-        config.capacity_resources(),
+        config.advertised_resources(),
         Vec::new(),
         journal,
         state,

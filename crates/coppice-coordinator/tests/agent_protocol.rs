@@ -108,6 +108,7 @@ fn agent_config(
             memory_bytes: 1 << 34,
             disk_bytes: 1 << 40,
         },
+        reservation: Default::default(),
         // Fast cadences for the test (short heartbeat + reconnect backoff).
         heartbeat_interval: Duration::from_millis(300),
         reconnect_backoff_min: Duration::from_millis(100),
@@ -126,7 +127,7 @@ fn build_session(config: &Config, executor: FakeExecutor) -> Session<RealFs, Fak
     let (journal, state) = Journal::open(fs).expect("open agent journal");
     Session::new(
         config.node(),
-        config.capacity_resources(),
+        config.advertised_resources(),
         Vec::new(),
         journal,
         state,

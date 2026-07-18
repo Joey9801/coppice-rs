@@ -44,6 +44,11 @@ pub fn gather_metrics() {
 /// belong to the `coppice` binary (`coppice agent --config <path>`).
 pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     let config = config::load(config_path)?;
+    let topology =
+        executor::docker::cpuset::Topology::discover().context("discovering host CPU topology")?;
+    config
+        .validate_physical_cores(topology.physical_cores())
+        .context("validating capacity against host CPU topology")?;
     config.log_effective();
 
     // Register metric descriptions once at startup (§8.1). The agent has no
@@ -80,12 +85,20 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         pressure_paths.push(root);
     }
     let pressure_rx = pressure::spawn(pressure_paths, config.pressure);
-    let docker_executor =
-        executor::DockerExecutor::new(docker, &config.executor, config.node(), pressure_rx);
+    let docker_executor = executor::DockerExecutor::new(
+        docker,
+        &config.executor,
+        config.capacity.cpu_millis,
+        config.reservation.cpu_millis,
+        config.node(),
+        pressure_rx,
+    )
+    .await
+    .context("initializing Docker CPU affinity")?;
 
     let session = session::Session::new(
         config.node(),
-        config.capacity_resources(),
+        config.advertised_resources(),
         labels,
         journal,
         state,

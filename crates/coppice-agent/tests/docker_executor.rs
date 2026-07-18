@@ -112,12 +112,64 @@ mod harness {
     ///
     /// Must be called inside a tokio runtime: [`DockerExecutor::new`] spawns the
     /// events task, and dropping the returned executor aborts it (agent death).
-    pub fn executor(docker: Docker) -> (DockerExecutor, watch::Sender<DiskPressure>) {
-        let config = ExecutorConfig::default();
+    pub async fn executor(docker: Docker) -> (DockerExecutor, watch::Sender<DiskPressure>) {
+        let config = ExecutorConfig {
+            whole_core_affinity: false,
+            ..Default::default()
+        };
+        // Existing S2 tests exercise lifecycle behavior and run concurrently;
+        // keep them out of the host-global affinity allocator. The dedicated
+        // S3 test below opts in explicitly.
         let node = NodeId::new();
         let (tx, rx) = watch::channel(DiskPressure::Ok);
-        let exec = DockerExecutor::new(docker, &config, node, rx);
+        let exec = DockerExecutor::new(docker, &config, 1000, 0, node, rx)
+            .await
+            .expect("initialize Docker executor");
         (exec, tx)
+    }
+
+    /// Affinity-enabled executor sized to the physical topology exposed by
+    /// sysfs. Used only by the serial-in-itself S3 cpuset integration test.
+    pub fn physical_cores() -> u64 {
+        let mut groups = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir("/sys/devices/system/cpu").expect("read CPU sysfs") {
+            let entry = entry.expect("CPU sysfs entry");
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("cpu") {
+                continue;
+            }
+            if let Ok(siblings) =
+                std::fs::read_to_string(entry.path().join("topology/thread_siblings_list"))
+            {
+                groups.insert(siblings.trim().to_string());
+            }
+        }
+        u64::try_from(groups.len()).expect("physical core count fits u64")
+    }
+
+    pub async fn affinity_executor(
+        docker: Docker,
+    ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
+        let config = ExecutorConfig::default();
+        let physical = physical_cores();
+        let (tx, rx) = watch::channel(DiskPressure::Ok);
+        let exec = DockerExecutor::new(docker, &config, physical * 1000, 0, NodeId::new(), rx)
+            .await
+            .expect("initialize affinity executor");
+        (exec, tx)
+    }
+
+    pub async fn cpuset(docker: &Docker, allocation: AllocationId) -> anyhow::Result<String> {
+        let inspect = docker
+            .inspect_container(
+                &format!("coppice-{allocation}"),
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+        inspect
+            .host_config
+            .and_then(|host| host.cpuset_cpus)
+            .ok_or_else(|| anyhow!("container {allocation} has no CpusetCpus"))
     }
 
     /// A [`StartSpec`] with fresh v7 ids (`AllocationId::new()` mints
@@ -257,7 +309,7 @@ async fn exit_zero() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    let (exec, _tx) = harness::executor(docker);
+    let (exec, _tx) = harness::executor(docker).await;
     let sp = harness::spec(harness::BUSYBOX, &["sh", "-c", "exit 0"], Resources::ZERO);
     let alloc = sp.allocation;
 
@@ -310,7 +362,7 @@ async fn exit_nonzero() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    let (exec, _tx) = harness::executor(docker);
+    let (exec, _tx) = harness::executor(docker).await;
     let sp = harness::spec(harness::BUSYBOX, &["sh", "-c", "exit 7"], Resources::ZERO);
     let alloc = sp.allocation;
 
@@ -349,7 +401,7 @@ async fn oom_classification() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    let (exec, _tx) = harness::executor(docker);
+    let (exec, _tx) = harness::executor(docker).await;
     let limits = Resources {
         cpu_millis: 0,
         memory_bytes: 16 * 1024 * 1024,
@@ -391,7 +443,7 @@ async fn stop_grace_term_trap() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    let (exec, _tx) = harness::executor(docker);
+    let (exec, _tx) = harness::executor(docker).await;
     let sp = harness::spec(
         harness::BUSYBOX,
         &[
@@ -438,7 +490,7 @@ async fn exit_races_stop_truth_wins() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    let (exec, _tx) = harness::executor(docker);
+    let (exec, _tx) = harness::executor(docker).await;
     let sp = harness::spec(harness::BUSYBOX, &["sh", "-c", "exit 3"], Resources::ZERO);
     let alloc = sp.allocation;
 
@@ -487,7 +539,7 @@ async fn restart_adoption() {
 
     let r: anyhow::Result<()> = async {
         // Executor A starts the long-lived container, then "dies" (drop).
-        let (exec_a, _tx_a) = harness::executor(docker.clone());
+        let (exec_a, _tx_a) = harness::executor(docker.clone()).await;
         exec_a.start(sp.clone()).await?;
         let before = harness::wait_observed_running(&exec_a, alloc, 30).await?;
         drop(exec_a); // agent death — the container survives daemon-side.
@@ -495,7 +547,7 @@ async fn restart_adoption() {
         // Executor B on a fresh connection adopts the survivor.
         let docker_b = api::connect(&harness::docker_host())
             .map_err(|e| anyhow!("fresh connect for executor B: {e}"))?;
-        let (exec_b, _tx_b) = harness::executor(docker_b);
+        let (exec_b, _tx_b) = harness::executor(docker_b).await;
 
         let observed = exec_b.observe().await?;
         let adopted = observed
@@ -530,7 +582,7 @@ async fn restart_adoption() {
 
     // Clean up via a fresh executor over the shared client — A and B are owned
     // (and possibly dropped) inside the block above.
-    let (cleaner, _tx) = harness::executor(docker.clone());
+    let (cleaner, _tx) = harness::executor(docker.clone()).await;
     harness::cleanup(&cleaner, &[alloc]).await;
     r.unwrap();
 }
@@ -544,7 +596,7 @@ async fn duplicate_start_idempotent() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    let (exec, _tx) = harness::executor(docker.clone());
+    let (exec, _tx) = harness::executor(docker.clone()).await;
     let sp = harness::spec(harness::BUSYBOX, &["sleep", "300"], Resources::ZERO);
     let alloc = sp.allocation;
 
@@ -602,7 +654,7 @@ async fn privilege_escalation_denied() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    let (exec, _tx) = harness::executor(docker);
+    let (exec, _tx) = harness::executor(docker).await;
     let sp = harness::spec(
         harness::BUSYBOX,
         &[
@@ -653,7 +705,7 @@ async fn privilege_escalation_denied() {
 async fn pressure_critical_refuses_start() {
     let docker =
         api::connect("tcp://127.0.0.1:2375").expect("http/tcp connect builds a lazy client");
-    let (exec, tx) = harness::executor(docker);
+    let (exec, tx) = harness::executor(docker).await;
 
     tx.send(DiskPressure::Critical)
         .expect("pressure receiver lives inside the executor");
@@ -681,8 +733,72 @@ async fn reap_unknown_is_noop() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    let (exec, _tx) = harness::executor(docker);
+    let (exec, _tx) = harness::executor(docker).await;
     exec.reap(AllocationId::new())
         .await
         .expect("reap of an unknown allocation must be Ok");
+}
+
+// ---- 11. whole-core exclusivity and live fractional updates (§6.3) -----
+
+#[tokio::test]
+async fn whole_core_grant_shrinks_and_release_grows_fractional_cpuset() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    if harness::physical_cores() < 2 {
+        eprintln!("skipping: cpuset integration test needs at least two physical cores");
+        return;
+    }
+    let (exec, _tx) = harness::affinity_executor(docker.clone()).await;
+    let fractional = harness::spec(
+        harness::BUSYBOX,
+        &["sleep", "300"],
+        Resources {
+            cpu_millis: 500,
+            memory_bytes: 0,
+            disk_bytes: 0,
+        },
+    );
+    let whole = harness::spec(
+        harness::BUSYBOX,
+        &["sleep", "300"],
+        Resources {
+            cpu_millis: 1000,
+            memory_bytes: 0,
+            disk_bytes: 0,
+        },
+    );
+    let fractional_id = fractional.allocation;
+    let whole_id = whole.allocation;
+
+    let result: anyhow::Result<()> = async {
+        exec.start(fractional).await?;
+        harness::wait_observed_running(&exec, fractional_id, 30).await?;
+        let full_pool = harness::cpuset(&docker, fractional_id).await?;
+
+        exec.start(whole).await?;
+        harness::wait_observed_running(&exec, whole_id, 30).await?;
+        let exclusive = harness::cpuset(&docker, whole_id).await?;
+        let shrunk_pool = harness::cpuset(&docker, fractional_id).await?;
+        ensure!(shrunk_pool != full_pool, "fractional cpuset did not shrink");
+        let exclusive_cpus: std::collections::BTreeSet<_> = exclusive.split(',').collect();
+        let shared_cpus: std::collections::BTreeSet<_> = shrunk_pool.split(',').collect();
+        ensure!(
+            exclusive_cpus.is_disjoint(&shared_cpus),
+            "exclusive cpuset {exclusive} overlaps fractional pool {shrunk_pool}"
+        );
+
+        exec.stop(whole_id, CoreDuration::from_millis(1)).await?;
+        let grown_pool = harness::cpuset(&docker, fractional_id).await?;
+        ensure!(
+            grown_pool == full_pool,
+            "fractional pool did not grow back: before={full_pool}, after={grown_pool}"
+        );
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[fractional_id, whole_id]).await;
+    result.unwrap();
 }
