@@ -16,6 +16,7 @@
 
 pub mod api;
 pub mod classify;
+pub mod cpuset;
 pub mod events;
 pub mod lifecycle;
 pub mod limits;
@@ -24,6 +25,8 @@ pub mod state;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use bollard::models::{ContainerStateStatusEnum, ContainerUpdateBody};
+use bollard::query_parameters::ListContainersOptionsBuilder;
 use bollard::Docker;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
@@ -50,6 +53,9 @@ pub(crate) const LABEL_NODE: &str = "coppice.node";
 /// The `coppice.image-digest` label — the resolved digest, for cache pinning
 /// across restart (§7). (`coppice.disk-mode` is S4's; not added here.)
 pub(crate) const LABEL_IMAGE_DIGEST: &str = "coppice.image-digest";
+/// Marks containers whose `HostConfig.CpusetCpus` is an exclusive grant. The
+/// cpuset itself remains the source of truth rebuilt during recovery (§6.3).
+pub(crate) const LABEL_CPU_EXCLUSIVE: &str = "coppice.cpu-exclusive";
 
 /// The deterministic container name for an allocation (§5): the Docker-level
 /// idempotency backstop. `alloc-<uuid>` → `coppice-alloc-<uuid>`.
@@ -120,6 +126,12 @@ pub(crate) struct Inner {
     /// The shared host disk-pressure signal (§9); `start` refuses under
     /// `Critical`.
     pub(crate) pressure: watch::Receiver<DiskPressure>,
+    /// Whole-core allocator, absent when `whole_core_affinity = false`.
+    pub(crate) cpuset: Option<Arc<AsyncMutex<cpuset::Allocator>>>,
+    /// Serializes the cpuset plan/create boundary so a fractional allocation
+    /// never becomes visible to a concurrent pool update before its container
+    /// exists.
+    pub(crate) cpu_start: AsyncMutex<()>,
     /// Shared with the events task; never held across an await.
     pub(crate) state: Arc<Mutex<ExecutorState>>,
     /// Natural exits flow from the events task into here; kept on `Inner` as a
@@ -169,30 +181,188 @@ impl DockerExecutor {
     /// task (§11), which live-tails `docker events` and resyncs via the daemon.
     /// The caller connects the client (`api::connect`) and spawns the pressure
     /// monitor (`pressure::spawn`) first; see `run_daemon`.
-    pub fn new(
+    pub async fn new(
         docker: Docker,
         config: &ExecutorConfig,
+        capacity_cpu_millis: u64,
+        reservation_cpu_millis: u64,
         node: NodeId,
         pressure: watch::Receiver<DiskPressure>,
-    ) -> DockerExecutor {
+    ) -> Result<DockerExecutor, ExecutorError> {
         let state = Arc::new(Mutex::new(ExecutorState::default()));
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
+        let cpuset = if config.whole_core_affinity {
+            let topology = cpuset::Topology::discover().map_err(|err| {
+                ExecutorError::Other(format!("discovering host CPU topology: {err}"))
+            })?;
+            crate::config::validate_cpu_capacity(capacity_cpu_millis, topology.physical_cores())
+                .map_err(ExecutorError::Other)?;
+            let allocator = cpuset::Allocator::new(topology, reservation_cpu_millis)
+                .map_err(ExecutorError::Other)?;
+            let allocator = Arc::new(AsyncMutex::new(allocator));
+            recover_cpu_allocations(&docker, &allocator).await?;
+            update_fractional_containers(&docker, &mut *allocator.lock().await)
+                .await
+                .map_err(ExecutorError::Other)?;
+            Some(allocator)
+        } else {
+            None
+        };
         // Clones only — never `Arc<Inner>` — so `Inner::drop` can abort it.
-        let events_task = events::spawn(docker.clone(), Arc::clone(&state), exit_tx.clone());
-        DockerExecutor {
+        let events_task = events::spawn(
+            docker.clone(),
+            Arc::clone(&state),
+            cpuset.clone(),
+            exit_tx.clone(),
+        );
+        Ok(DockerExecutor {
             inner: Arc::new(Inner {
                 docker,
                 default_uid: config.default_uid,
                 pids_limit: config.pids_limit,
                 node,
                 pressure,
+                cpuset,
+                cpu_start: AsyncMutex::new(()),
                 state,
                 exit_tx,
                 exit_rx: AsyncMutex::new(exit_rx),
                 events_task,
             }),
+        })
+    }
+}
+
+/// Release an allocation's CPU bookkeeping and push the enlarged shared pool
+/// to every surviving fractional container. Idempotent for duplicate exits.
+pub(crate) async fn release_cpu(
+    docker: &Docker,
+    cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
+    allocation: AllocationId,
+) -> Result<(), String> {
+    let Some(cpuset) = cpuset else {
+        return Ok(());
+    };
+    let mut allocator = cpuset.lock().await;
+    if allocator.release(allocation) {
+        update_fractional_containers(docker, &mut allocator).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn update_fractional_containers(
+    docker: &Docker,
+    allocator: &mut cpuset::Allocator,
+) -> Result<(), String> {
+    let pool = allocator.shared_cpuset();
+    let mut errors = Vec::new();
+    for allocation in allocator.fractional_allocations() {
+        if let Err(err) = docker
+            .update_container(
+                &container_name(allocation),
+                ContainerUpdateBody {
+                    cpuset_cpus: Some(pool.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            // A die/reap can race the pool update. Its release path owns
+            // removing the allocator entry; absence here must not reject an
+            // unrelated whole-core start or prevent later updates in the loop.
+            if api::status_code(&err) == Some(404) {
+                tracing::debug!(%allocation, "fractional container vanished during cpuset update");
+                continue;
+            }
+            errors.push(format!("updating fractional container {allocation}: {err}"));
         }
     }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok(())
+}
+
+async fn recover_cpu_allocations(
+    docker: &Docker,
+    cpuset: &Arc<AsyncMutex<cpuset::Allocator>>,
+) -> Result<(), ExecutorError> {
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("label".to_string(), vec![LABEL_ALLOCATION.to_string()]);
+    let options = ListContainersOptionsBuilder::new()
+        .all(true)
+        .filters(&filters)
+        .build();
+    let summaries = docker.list_containers(Some(options)).await.map_err(|err| {
+        ExecutorError::Other(format!("listing containers for cpuset recovery: {err}"))
+    })?;
+    let mut allocator = cpuset.lock().await;
+    for summary in summaries {
+        let Some(allocation) = summary
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_ALLOCATION))
+            .and_then(|raw| raw.parse::<AllocationId>().ok())
+        else {
+            continue;
+        };
+        let Some(target) = summary.id.as_deref() else {
+            continue;
+        };
+        let inspect = match docker
+            .inspect_container(
+                target,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(inspect) => inspect,
+            Err(err) if api::status_code(&err) == Some(404) => continue,
+            Err(err) => {
+                return Err(ExecutorError::Other(format!(
+                    "inspecting {allocation} for cpuset recovery: {err}"
+                )))
+            }
+        };
+        let running = inspect
+            .state
+            .as_ref()
+            .and_then(|state| state.status)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    ContainerStateStatusEnum::RUNNING
+                        | ContainerStateStatusEnum::PAUSED
+                        | ContainerStateStatusEnum::RESTARTING
+                )
+            });
+        if !running {
+            continue;
+        }
+        let exclusive = inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .and_then(|labels| labels.get(LABEL_CPU_EXCLUSIVE))
+            .is_some_and(|value| value == "true");
+        if exclusive {
+            let cpus = inspect
+                .host_config
+                .as_ref()
+                .and_then(|host| host.cpuset_cpus.as_deref())
+                .ok_or_else(|| {
+                    ExecutorError::Other(format!(
+                        "surviving exclusive container {allocation} has no HostConfig.CpusetCpus"
+                    ))
+                })?;
+            allocator
+                .rebuild_exclusive(allocation, cpus)
+                .map_err(ExecutorError::Other)?;
+        } else {
+            allocator.rebuild_fractional(allocation);
+        }
+    }
+    Ok(())
 }
 
 impl Executor for DockerExecutor {

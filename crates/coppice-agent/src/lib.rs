@@ -80,12 +80,20 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         pressure_paths.push(root);
     }
     let pressure_rx = pressure::spawn(pressure_paths, config.pressure);
-    let docker_executor =
-        executor::DockerExecutor::new(docker, &config.executor, config.node(), pressure_rx);
+    let docker_executor = executor::DockerExecutor::new(
+        docker,
+        &config.executor,
+        config.capacity.cpu_millis,
+        config.reservation.cpu_millis,
+        config.node(),
+        pressure_rx,
+    )
+    .await
+    .context("initializing Docker CPU affinity")?;
 
     let session = session::Session::new(
         config.node(),
-        config.capacity_resources(),
+        config.advertised_resources(),
         labels,
         journal,
         state,

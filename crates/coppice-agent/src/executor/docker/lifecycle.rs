@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 
-use bollard::models::{ContainerCreateBody, ContainerStateStatusEnum, ImageInspect};
+use bollard::models::{
+    ContainerCreateBody, ContainerStateStatusEnum, ContainerUpdateBody, ImageInspect,
+};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
     RemoveContainerOptions, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
@@ -22,8 +24,9 @@ use coppice_core::time::{Duration, Timestamp};
 
 use super::state::Mapped;
 use super::{
-    api, classify, container_name, limits, lock_state, state, ContainerIds, Inner,
-    LABEL_ALLOCATION, LABEL_ATTEMPT, LABEL_IMAGE_DIGEST, LABEL_JOB, LABEL_NODE,
+    api, classify, container_name, cpuset, limits, lock_state, state, ContainerIds, Inner,
+    LABEL_ALLOCATION, LABEL_ATTEMPT, LABEL_CPU_EXCLUSIVE, LABEL_IMAGE_DIGEST, LABEL_JOB,
+    LABEL_NODE,
 };
 use crate::executor::{
     ContainerState, ExecutorError, ObservedContainer, StartError, StartSpec, StopOutcome,
@@ -102,9 +105,22 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     let image_user = image.config.as_ref().and_then(|cfg| cfg.user.as_deref());
     let user = limits::resolve_user(image_user, inner.default_uid)?;
 
+    // Serialize the affinity-plan/create boundary. Without this, a concurrent
+    // exclusive grant could try to `docker update` a fractional allocation
+    // after it entered the allocator but before its container existed.
+    let _cpu_start = inner.cpu_start.lock().await;
+    let cpu = prepare_cpu(inner, spec).await?;
+
     // 5. Create, with adopt-on-name-conflict (§5).
     let name = container_name(spec.allocation);
-    let body = build_create_body(inner, spec, &image_id, &image_digest, &user);
+    let body = build_create_body(
+        inner,
+        spec,
+        &image_id,
+        &image_digest,
+        &user,
+        cpu.as_ref().map(|allocation| &allocation.affinity),
+    );
     match inner
         .docker
         .create_container(
@@ -114,11 +130,32 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
         .await
     {
         Ok(_) => {}
-        Err(err) if api::status_code(&err) == Some(409) => match adopt(inner, &name, spec).await? {
-            AdoptOutcome::StartExisting => {} // fall through and start it
-            AdoptOutcome::AlreadyStarted => return Ok(()),
-        },
-        Err(err) => return Err(classify::classify_start_error(&err)),
+        Err(err) if api::status_code(&err) == Some(409) => {
+            match adopt(inner, &name, spec).await {
+                Ok(AdoptOutcome::StartExisting) => {
+                    // The survivor was created by the previous agent process
+                    // with that process's then-current cpuset. Refresh it to
+                    // the newly allocated grant/shared pool before starting,
+                    // otherwise the runtime and allocator can silently disagree.
+                    if let Some(cpu) = cpu.as_ref() {
+                        if let Err(err) = update_created_affinity(inner, &name, &cpu.affinity).await
+                        {
+                            rollback_cpu(inner, spec.allocation, Some(cpu)).await;
+                            return Err(err);
+                        }
+                    }
+                }
+                Ok(AdoptOutcome::AlreadyStarted) => return Ok(()),
+                Err(err) => {
+                    rollback_cpu(inner, spec.allocation, cpu.as_ref()).await;
+                    return Err(err);
+                }
+            }
+        }
+        Err(err) => {
+            rollback_cpu(inner, spec.allocation, cpu.as_ref()).await;
+            return Err(classify::classify_start_error(&err));
+        }
     }
 
     // 6. Start. 304 (already started) is `Ok` — bollard maps NOT_MODIFIED to
@@ -126,6 +163,7 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     //    would eventually clear it as debris anyway), then classify.
     if let Err(err) = inner.docker.start_container(&name, START_OPTS).await {
         remove_best_effort(inner, &name, false).await;
+        rollback_cpu(inner, spec.allocation, cpu.as_ref()).await;
         return Err(classify::classify_start_error(&err));
     }
 
@@ -136,6 +174,28 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
         st.push_running_gauge();
     }
     Ok(())
+}
+
+async fn update_created_affinity(
+    inner: &Inner,
+    name: &str,
+    affinity: &cpuset::Affinity,
+) -> Result<(), StartError> {
+    inner
+        .docker
+        .update_container(
+            name,
+            ContainerUpdateBody {
+                cpuset_cpus: Some(affinity.cpuset_cpus.clone()),
+                nano_cpus: (affinity.nano_cpus > 0).then_some(affinity.nano_cpus),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| StartError::Start {
+            user_error: false,
+            message: format!("updating adopted created container {name} CPU affinity: {err}"),
+        })
 }
 
 /// `None` start options, spelled with the concrete type so the `Option<impl
@@ -184,6 +244,7 @@ fn build_create_body(
     image_id: &str,
     image_digest: &str,
     user: &str,
+    affinity: Option<&cpuset::Affinity>,
 ) -> ContainerCreateBody {
     let mut labels = HashMap::new();
     labels.insert(LABEL_ALLOCATION.to_string(), spec.allocation.to_string());
@@ -191,6 +252,15 @@ fn build_create_body(
     labels.insert(LABEL_JOB.to_string(), spec.job.to_string());
     labels.insert(LABEL_NODE.to_string(), inner.node.to_string());
     labels.insert(LABEL_IMAGE_DIGEST.to_string(), image_digest.to_string());
+    if affinity.is_some_and(|affinity| affinity.exclusive) {
+        labels.insert(LABEL_CPU_EXCLUSIVE.to_string(), "true".to_string());
+    }
+
+    let mut host_config = limits::host_config(&spec.limits, inner.pids_limit);
+    if let Some(affinity) = affinity {
+        host_config.cpuset_cpus = Some(affinity.cpuset_cpus.clone());
+        host_config.nano_cpus = (affinity.nano_cpus > 0).then_some(affinity.nano_cpus);
+    }
 
     ContainerCreateBody {
         // Pin the resolved bytes, not the tag (§7).
@@ -200,8 +270,46 @@ fn build_create_body(
         entrypoint: spec.entrypoint.clone(),
         user: Some(user.to_string()),
         labels: Some(labels),
-        host_config: Some(limits::host_config(&spec.limits, inner.pids_limit)),
+        host_config: Some(host_config),
         ..Default::default()
+    }
+}
+
+async fn prepare_cpu(
+    inner: &Inner,
+    spec: &StartSpec,
+) -> Result<Option<cpuset::Allocation>, StartError> {
+    let Some(cpuset) = &inner.cpuset else {
+        return Ok(None);
+    };
+    let mut allocator = cpuset.lock().await;
+    let allocation = allocator
+        .allocate(spec.allocation, spec.limits.cpu_millis)
+        .map_err(|message| StartError::Start {
+            user_error: false,
+            message,
+        })?;
+    if allocation.newly_assigned && allocation.affinity.exclusive {
+        if let Err(message) =
+            super::update_fractional_containers(&inner.docker, &mut allocator).await
+        {
+            allocator.release(spec.allocation);
+            let _ = super::update_fractional_containers(&inner.docker, &mut allocator).await;
+            return Err(StartError::Start {
+                user_error: false,
+                message,
+            });
+        }
+    }
+    Ok(Some(allocation))
+}
+
+async fn rollback_cpu(inner: &Inner, allocation: AllocationId, cpu: Option<&cpuset::Allocation>) {
+    if !cpu.is_some_and(|cpu| cpu.newly_assigned) {
+        return;
+    }
+    if let Err(err) = super::release_cpu(&inner.docker, &inner.cpuset, allocation).await {
+        tracing::warn!(%allocation, error = %err, "failed to roll back CPU allocation after start failure");
     }
 }
 
@@ -300,7 +408,7 @@ pub(crate) async fn stop(
         None => return Ok(StopOutcome::Unknown),
         Some(inspect) => {
             if let Some(info) = inspect.state.as_ref().and_then(classify::exit_info) {
-                claim_exit(inner, allocation);
+                claim_exit(inner, allocation).await;
                 return Ok(StopOutcome::AlreadyExited(info));
             }
             // Running (or exited-without-evidence): proceed to the stop.
@@ -325,7 +433,7 @@ pub(crate) async fn stop(
                     // and the session's Stopped-with-limit-cause arm handles it.
                     // A plain stop is `ExitCause::Natural`; the caller assigns
                     // abort vs max-runtime attribution.
-                    claim_exit(inner, allocation);
+                    claim_exit(inner, allocation).await;
                     Ok(StopOutcome::Stopped(info))
                 }
                 // A stop that left no usable evidence is rare (a torn inspect);
@@ -511,11 +619,16 @@ async fn remove_best_effort(inner: &Inner, target: &str, force: bool) {
 
 /// Mark an exit as surfaced: claim it (duplicate suppression, §4), drop it from
 /// the running set, and push the gauge. Called on both stop evidence paths.
-fn claim_exit(inner: &Inner, allocation: AllocationId) {
-    let mut st = lock_state(&inner.state);
-    st.claimed.insert(allocation);
-    st.running.remove(&allocation);
-    st.push_running_gauge();
+async fn claim_exit(inner: &Inner, allocation: AllocationId) {
+    {
+        let mut st = lock_state(&inner.state);
+        st.claimed.insert(allocation);
+        st.running.remove(&allocation);
+        st.push_running_gauge();
+    }
+    if let Err(err) = super::release_cpu(&inner.docker, &inner.cpuset, allocation).await {
+        tracing::warn!(%allocation, error = %err, "failed to grow fractional cpuset after stop");
+    }
 }
 
 #[cfg(test)]

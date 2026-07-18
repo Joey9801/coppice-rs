@@ -27,13 +27,13 @@ use std::time::Duration as StdDuration;
 use bollard::models::EventMessageTypeEnum;
 use bollard::query_parameters::{EventsOptionsBuilder, ListContainersOptionsBuilder};
 use bollard::Docker;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use coppice_core::id::AllocationId;
 
-use super::{classify, lock_state, ExecutorState, LABEL_ALLOCATION};
+use super::{classify, cpuset, lock_state, ExecutorState, LABEL_ALLOCATION};
 use crate::executor::ExitEvent;
 
 /// Backoff between an events-stream error/end and the reconnect-and-resync
@@ -49,14 +49,16 @@ const INSPECT_OPTS: Option<bollard::query_parameters::InspectContainerOptions> =
 pub(crate) fn spawn(
     docker: Docker,
     state: Arc<Mutex<ExecutorState>>,
+    cpuset: Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: mpsc::UnboundedSender<ExitEvent>,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(docker, state, exit_tx))
+    tokio::spawn(run(docker, state, cpuset, exit_tx))
 }
 
 async fn run(
     docker: Docker,
     state: Arc<Mutex<ExecutorState>>,
+    cpuset: Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: mpsc::UnboundedSender<ExitEvent>,
 ) {
     loop {
@@ -71,14 +73,14 @@ async fn run(
         // 2. Resync immediately after (re)subscribe, so exits that predate the
         //    stream (or fell into a gap) are surfaced through `next_exit` and
         //    reach the session's journaling path.
-        if let Err(err) = resync(&docker, &state, &exit_tx).await {
+        if let Err(err) = resync(&docker, &state, &cpuset, &exit_tx).await {
             tracing::warn!(error = %err, "events resync failed; relying on later observe/resync");
         }
 
         // 3. Per die event.
         loop {
             match stream.next().await {
-                Some(Ok(event)) => handle_die(&docker, &state, &exit_tx, &event).await,
+                Some(Ok(event)) => handle_die(&docker, &state, &cpuset, &exit_tx, &event).await,
                 Some(Err(err)) => {
                     tracing::warn!(error = %err, "docker events stream error; reconnecting");
                     break;
@@ -104,6 +106,7 @@ async fn run(
 async fn resync(
     docker: &Docker,
     state: &Mutex<ExecutorState>,
+    cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: &mpsc::UnboundedSender<ExitEvent>,
 ) -> Result<(), bollard::errors::Error> {
     let mut filters = HashMap::new();
@@ -157,6 +160,9 @@ async fn resync(
             }
         };
         if enqueue {
+            if let Err(err) = super::release_cpu(docker, cpuset, allocation).await {
+                tracing::warn!(%allocation, error = %err, "failed to grow fractional cpuset after exit");
+            }
             let _ = exit_tx.send(ExitEvent {
                 allocation,
                 exit: info,
@@ -173,6 +179,7 @@ async fn resync(
 async fn handle_die(
     docker: &Docker,
     state: &Mutex<ExecutorState>,
+    cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: &mpsc::UnboundedSender<ExitEvent>,
     event: &bollard::models::EventMessage,
 ) {
@@ -222,6 +229,9 @@ async fn handle_die(
                 let mut st = lock_state(state);
                 st.running.remove(&allocation);
                 st.push_running_gauge();
+            }
+            if let Err(err) = super::release_cpu(docker, cpuset, allocation).await {
+                tracing::warn!(%allocation, error = %err, "failed to grow fractional cpuset after exit");
             }
             let _ = exit_tx.send(ExitEvent { allocation, exit });
         }

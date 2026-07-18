@@ -45,9 +45,14 @@ pub struct Config {
     /// no insecure fallback.
     pub tls: TlsConfig,
 
-    /// Advertised capacity. v1 advertises the configured vector verbatim;
-    /// live detection lands later.
+    /// Full physical capacity. The system reservation is deducted before this
+    /// vector is advertised upstream.
     pub capacity: CapacityConfig,
+
+    /// Capacity withheld for the agent, daemon, kernel, and transient system
+    /// work (§6.4). Defaults are fixed values, never capacity-scaled.
+    #[serde(default)]
+    pub reservation: ReservationConfig,
 
     /// Heartbeat cadence: `Heartbeat` (capacity, running set, image-cache
     /// inventory) is sent this often once registered.
@@ -112,6 +117,11 @@ pub struct ExecutorConfig {
     /// catches ones whose reap was lost to a crash or a transient error.
     #[serde(default = "default_reap_janitor_after", with = "humantime_serde")]
     pub reap_janitor_after: Duration,
+
+    /// Give whole-physical-core requests exclusive SMT sibling groups (§6.3).
+    /// When disabled Docker receives only `NanoCpus`.
+    #[serde(default = "default_whole_core_affinity")]
+    pub whole_core_affinity: bool,
 }
 
 impl Default for ExecutorConfig {
@@ -121,6 +131,7 @@ impl Default for ExecutorConfig {
             default_uid: default_default_uid(),
             pids_limit: default_pids_limit(),
             reap_janitor_after: default_reap_janitor_after(),
+            whole_core_affinity: default_whole_core_affinity(),
         }
     }
 }
@@ -174,14 +185,43 @@ pub struct CapacityConfig {
     pub disk_bytes: u64,
 }
 
-impl Config {
-    /// The advertised capacity as a domain [`Resources`] vector.
-    pub fn capacity_resources(&self) -> Resources {
-        Resources {
-            cpu_millis: self.capacity.cpu_millis,
-            memory_bytes: self.capacity.memory_bytes,
-            disk_bytes: self.capacity.disk_bytes,
+/// Fixed resources withheld from scheduling (§6.4).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReservationConfig {
+    #[serde(default = "default_reservation_cpu_millis")]
+    pub cpu_millis: u64,
+    #[serde(default = "default_reservation_memory_bytes")]
+    pub memory_bytes: u64,
+    #[serde(default = "default_reservation_disk_bytes")]
+    pub disk_bytes: u64,
+}
+
+impl Default for ReservationConfig {
+    fn default() -> Self {
+        Self {
+            cpu_millis: default_reservation_cpu_millis(),
+            memory_bytes: default_reservation_memory_bytes(),
+            disk_bytes: default_reservation_disk_bytes(),
         }
+    }
+}
+
+impl Config {
+    /// Full capacity minus the fixed system reservation (§6.4).
+    pub fn advertised_resources(&self) -> Resources {
+        Resources {
+            cpu_millis: self.capacity.cpu_millis - self.reservation.cpu_millis,
+            memory_bytes: self.capacity.memory_bytes - self.reservation.memory_bytes,
+            disk_bytes: self.capacity.disk_bytes - self.reservation.disk_bytes,
+        }
+    }
+
+    /// Validate the configured full CPU capacity against discovered physical
+    /// cores. Kept separate from file parsing so unit tests and non-Linux
+    /// config tooling need not depend on the machine running them.
+    pub fn validate_physical_cores(&self, physical_cores: usize) -> Result<()> {
+        validate_cpu_capacity(self.capacity.cpu_millis, physical_cores).map_err(anyhow::Error::msg)
     }
 
     /// The strongly-typed node identity.
@@ -202,6 +242,29 @@ impl Config {
                 "executor.pids_limit must be positive, got {}",
                 self.executor.pids_limit
             );
+        }
+        for (key, reservation, capacity) in [
+            (
+                "cpu_millis",
+                self.reservation.cpu_millis,
+                self.capacity.cpu_millis,
+            ),
+            (
+                "memory_bytes",
+                self.reservation.memory_bytes,
+                self.capacity.memory_bytes,
+            ),
+            (
+                "disk_bytes",
+                self.reservation.disk_bytes,
+                self.capacity.disk_bytes,
+            ),
+        ] {
+            if reservation >= capacity {
+                anyhow::bail!(
+                    "reservation.{key} ({reservation}) must be less than capacity.{key} ({capacity})"
+                );
+            }
         }
         let PressureConfig {
             high_pct,
@@ -229,12 +292,29 @@ impl Config {
             reconnect_backoff_min = ?self.reconnect_backoff_min,
             reconnect_backoff_max = ?self.reconnect_backoff_max,
             capacity = ?self.capacity,
+            reservation = ?self.reservation,
             labels = ?self.labels,
             executor = ?self.executor,
             pressure = ?self.pressure,
             "effective agent configuration"
         );
     }
+}
+
+/// Shared startup arithmetic for the affinity-enabled Docker executor.
+pub(crate) fn validate_cpu_capacity(
+    capacity_cpu_millis: u64,
+    physical_cores: usize,
+) -> std::result::Result<(), String> {
+    let physical_millis = u64::try_from(physical_cores)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1000);
+    if capacity_cpu_millis > physical_millis {
+        return Err(format!(
+            "capacity.cpu_millis ({capacity_cpu_millis}) exceeds {physical_cores} physical cores ({physical_millis} mCPU)"
+        ));
+    }
+    Ok(())
 }
 
 fn default_heartbeat_interval() -> Duration {
@@ -263,6 +343,22 @@ fn default_default_uid() -> u32 {
 
 fn default_pids_limit() -> i64 {
     4096
+}
+
+fn default_whole_core_affinity() -> bool {
+    true
+}
+
+fn default_reservation_cpu_millis() -> u64 {
+    1000
+}
+
+fn default_reservation_memory_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
+fn default_reservation_disk_bytes() -> u64 {
+    20 * 1024 * 1024 * 1024
 }
 
 fn default_high_pct() -> u8 {
@@ -319,6 +415,11 @@ cpu_millis   = 32000
 memory_bytes = 137438953472
 disk_bytes   = 1099511627776
 
+[reservation]
+cpu_millis = 2000
+memory_bytes = 4294967296
+disk_bytes = 42949672960
+
 [labels]
 zone = "us-east-1a"
 pool = "batch"
@@ -328,6 +429,7 @@ docker_host = "tcp://dockerd.internal:2375"
 default_uid = 1000
 pids_limit = 2048
 reap_janitor_after = "1h"
+whole_core_affinity = false
 
 [pressure]
 high_pct = 80
@@ -364,8 +466,8 @@ disk_bytes   = 107374182400
         assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.reconnect_backoff_min, Duration::from_millis(250));
         assert_eq!(config.reconnect_backoff_max, Duration::from_secs(30));
-        assert_eq!(config.capacity_resources().cpu_millis, 32000);
-        assert_eq!(config.capacity_resources().memory_bytes, 137438953472);
+        assert_eq!(config.advertised_resources().cpu_millis, 30000);
+        assert_eq!(config.advertised_resources().memory_bytes, 133143986176);
         assert_eq!(
             config.labels.get("zone").map(String::as_str),
             Some("us-east-1a")
@@ -377,6 +479,7 @@ disk_bytes   = 107374182400
         assert_eq!(config.executor.docker_host, "tcp://dockerd.internal:2375");
         assert_eq!(config.executor.default_uid, 1000);
         assert_eq!(config.executor.pids_limit, 2048);
+        assert!(!config.executor.whole_core_affinity);
         assert_eq!(config.pressure.high_pct, 80);
         assert_eq!(config.pressure.critical_pct, 90);
     }
@@ -401,6 +504,11 @@ disk_bytes   = 107374182400
         assert_eq!(config.executor.docker_host, default_docker_host());
         assert_eq!(config.executor.default_uid, 65534);
         assert_eq!(config.executor.pids_limit, 4096);
+        assert!(config.executor.whole_core_affinity);
+        assert_eq!(config.reservation.cpu_millis, 1000);
+        assert_eq!(config.reservation.memory_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(config.reservation.disk_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(config.advertised_resources().cpu_millis, 7000);
         assert_eq!(config.pressure.high_pct, 85);
         assert_eq!(config.pressure.critical_pct, 95);
     }
@@ -423,6 +531,23 @@ disk_bytes   = 107374182400
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("unlabelled duration should fail");
         assert!(!format!("{err:#}").is_empty());
+    }
+
+    #[test]
+    fn reservation_must_be_strictly_less_than_capacity() {
+        let bad = MINIMAL_EXAMPLE.replace("cpu_millis   = 8000", "cpu_millis   = 1000");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("reservation equal to capacity must fail");
+        assert!(format!("{err:#}").contains("reservation.cpu_millis"));
+    }
+
+    #[test]
+    fn full_capacity_must_fit_physical_cores() {
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let config = load(&path).unwrap();
+        config.validate_physical_cores(8).unwrap();
+        let err = config.validate_physical_cores(7).unwrap_err();
+        assert!(format!("{err:#}").contains("capacity.cpu_millis"));
     }
 
     #[test]
