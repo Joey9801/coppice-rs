@@ -31,16 +31,29 @@ impl Topology {
     ///
     /// Cpusets are interpreted by the kernel the *daemon* runs on. On Linux
     /// that is the agent's own kernel, and sysfs gives the full SMT/NUMA
-    /// structure. Elsewhere (macOS, where the daemon lives in a Linux VM)
-    /// sysfs does not exist and the host's core numbering would not match the
-    /// daemon's anyway, so ask the daemon how many CPUs it schedules and treat
-    /// each as a single-threaded core on one node — which is what Lima/Colima
-    /// style VMs expose.
-    pub(crate) async fn discover(docker: &Docker) -> io::Result<Self> {
+    /// structure. Elsewhere the only daemon we can size is a *local* one: on a
+    /// non-Linux host that is by construction a single-node Linux VM
+    /// (Colima/Lima/Docker Desktop) whose vCPUs carry no SMT siblings, so the
+    /// daemon's own CPU count (`/info` NCPU) is the complete topology — one
+    /// single-threaded core per vCPU. A *remote* daemon offers no such
+    /// guarantee: NCPU counts logical CPUs, and on SMT hardware treating those
+    /// as physical cores would let "exclusive" grants share a core, so we
+    /// refuse rather than guess.
+    pub(crate) async fn discover(docker: &Docker, docker_host: &str) -> io::Result<Self> {
         if cfg!(target_os = "linux") {
             Self::from_sysfs(Path::new("/sys/devices/system/cpu"))
-        } else {
+        } else if is_local_daemon(docker_host) {
             Self::from_daemon(docker).await
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "whole-core affinity needs the daemon's physical-core topology, which a \
+                     non-Linux agent can only assume for a local VM-backed daemon; remote \
+                     daemon {docker_host:?} may have SMT siblings that NCPU cannot reveal. \
+                     Run the agent on the daemon's host or disable whole_core_affinity."
+                ),
+            ))
         }
     }
 
@@ -332,6 +345,14 @@ impl Allocator {
     }
 }
 
+/// Whether `docker_host` names a daemon on this machine. Local transports
+/// (`unix://`, `npipe://`) can only reach the VM a non-Linux host boots for
+/// Docker; anything network-addressed (`tcp://`, `http://`, …) may be
+/// arbitrary hardware.
+fn is_local_daemon(docker_host: &str) -> bool {
+    docker_host.starts_with("unix://") || docker_host.starts_with("npipe://")
+}
+
 pub(crate) fn millis_to_nanos(cpu_millis: u64) -> i64 {
     i64::try_from(cpu_millis)
         .unwrap_or(i64::MAX)
@@ -485,6 +506,15 @@ mod tests {
         assert_eq!(allocator.shared_cpuset(), "0,2,4,6");
         assert!(allocator.rebuild_exclusive(alloc(), "0").is_err());
         assert!(allocator.rebuild_exclusive(alloc(), "1,5").is_err());
+    }
+
+    #[test]
+    fn only_socket_transports_count_as_local_daemons() {
+        assert!(is_local_daemon("unix:///var/run/docker.sock"));
+        assert!(is_local_daemon("npipe:////./pipe/docker_engine"));
+        assert!(!is_local_daemon("tcp://dockerd.internal:2375"));
+        assert!(!is_local_daemon("http://127.0.0.1:2375"));
+        assert!(!is_local_daemon("https://dockerd.internal:2376"));
     }
 
     #[test]
