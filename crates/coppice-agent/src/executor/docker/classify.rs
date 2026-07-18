@@ -46,7 +46,11 @@ pub(crate) fn parse_docker_time(s: &str) -> Option<Timestamp> {
 /// - `code`: `ExitCode` narrowed `i64 → i32`, saturating.
 /// - `cause`: [`ExitCause::OomKilled`] iff `OOMKilled == Some(true)`, else
 ///   [`ExitCause::Natural`]. [`ExitCause::DiskKilled`] is produced only by the
-///   S4 disk enforcer — never synthesised from inspect here.
+///   S4 disk enforcer — never synthesised from inspect here. The daemon can
+///   commit `OOMKilled` *after* the `die` event fires (issue #34); callers on
+///   the natural-exit paths give it a bounded window to land via
+///   [`super::settle_oom_flag`] before extracting evidence — the flag stays
+///   the sole gate, this function never guesses from the code alone.
 /// - `finished_at`: `parse_docker_time(FinishedAt)`; an unusable value yields
 ///   `None` (no evidence).
 /// - `runtime`: `FinishedAt − StartedAt`, clamped to ≥ 0; an unset `StartedAt`
@@ -77,6 +81,31 @@ pub(crate) fn exit_info(state: &bollard::models::ContainerState) -> Option<ExitI
         runtime,
         finished_at,
     })
+}
+
+/// The exit code of a SIGKILL-terminated PID 1 (128 + 9) — what the kernel's
+/// OOM killer leaves behind.
+const SIGKILL_EXIT_CODE: i64 = 137;
+
+/// Whether this inspect may be missing a still-uncommitted `OOMKilled` flag
+/// (issue #34): the container died to SIGKILL under an explicit memory limit,
+/// yet the flag reads unset. Some daemons commit `OOMKilled` from an async
+/// OOM-event handler that can lag the `die` event, so an inspect issued
+/// immediately after the event can transiently miss it. `true` means "worth
+/// re-inspecting before trusting `Natural`", **not** "this was an OOM" — an
+/// external SIGKILL of a memory-limited container looks identical, which is
+/// why callers re-inspect (bounded, [`super::settle_oom_flag`]) rather than
+/// reclassify on this signal alone.
+pub(crate) fn oom_flag_may_lag(inspect: &bollard::models::ContainerInspectResponse) -> bool {
+    let Some(state) = inspect.state.as_ref() else {
+        return false;
+    };
+    let memory_limited = inspect
+        .host_config
+        .as_ref()
+        .and_then(|hc| hc.memory)
+        .is_some_and(|limit| limit > 0);
+    memory_limited && state.exit_code == Some(SIGKILL_EXIT_CODE) && state.oom_killed != Some(true)
 }
 
 /// Classify a failure from the image-pull phase (docker-executor.md §4 table).
@@ -282,6 +311,83 @@ mod tests {
             ..state()
         };
         assert_eq!(exit_info(&s).expect("usable").code, i32::MAX);
+    }
+
+    // ---- oom_flag_may_lag (issue #34) --------------------------------------
+
+    fn inspect_with(
+        exit_code: Option<i64>,
+        oom_killed: Option<bool>,
+        memory: Option<i64>,
+    ) -> bollard::models::ContainerInspectResponse {
+        bollard::models::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                exit_code,
+                oom_killed,
+                ..state()
+            }),
+            host_config: Some(bollard::models::HostConfig {
+                memory,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn flag_may_lag_on_sigkill_under_memory_limit() {
+        // 137 + limit set + flag unset/false: the racy shape, worth re-inspecting.
+        assert!(oom_flag_may_lag(&inspect_with(
+            Some(137),
+            Some(false),
+            Some(16 << 20)
+        )));
+        assert!(oom_flag_may_lag(&inspect_with(
+            Some(137),
+            None,
+            Some(16 << 20)
+        )));
+    }
+
+    #[test]
+    fn flag_cannot_lag_once_committed_or_without_the_racy_shape() {
+        // Flag already committed — nothing to wait for.
+        assert!(!oom_flag_may_lag(&inspect_with(
+            Some(137),
+            Some(true),
+            Some(16 << 20)
+        )));
+        // No memory limit: a SIGKILL cannot be a cgroup OOM kill.
+        assert!(!oom_flag_may_lag(&inspect_with(
+            Some(137),
+            Some(false),
+            None
+        )));
+        assert!(!oom_flag_may_lag(&inspect_with(
+            Some(137),
+            Some(false),
+            Some(0)
+        )));
+        // Not a SIGKILL exit.
+        assert!(!oom_flag_may_lag(&inspect_with(
+            Some(1),
+            Some(false),
+            Some(16 << 20)
+        )));
+        assert!(!oom_flag_may_lag(&inspect_with(
+            None,
+            Some(false),
+            Some(16 << 20)
+        )));
+        // No state at all.
+        let no_state = bollard::models::ContainerInspectResponse {
+            host_config: Some(bollard::models::HostConfig {
+                memory: Some(16 << 20),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!oom_flag_may_lag(&no_state));
     }
 
     // ---- classify_pull_error (§4 table) ------------------------------------

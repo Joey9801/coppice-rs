@@ -139,7 +139,11 @@ async fn resync(
             continue;
         }
         let info = match docker.inspect_container(target, INSPECT_OPTS).await {
-            Ok(inspect) => inspect.state.as_ref().and_then(classify::exit_info),
+            Ok(inspect) => {
+                // Bounded settle for a lagging OOMKilled commit (issue #34).
+                let inspect = super::settle_oom_flag(docker, target, inspect).await;
+                inspect.state.as_ref().and_then(classify::exit_info)
+            }
             Err(_) => None, // vanished or torn — a later resync/stop can surface it
         };
         let Some(info) = info else {
@@ -214,10 +218,15 @@ async fn handle_die(
         return;
     }
 
-    // Inspect the container (by actor id) for terminal evidence.
+    // Inspect the container (by actor id) for terminal evidence. The inspect
+    // races the daemon's own OOMKilled commit, which can land *after* the die
+    // event — settle it before extracting evidence (issue #34).
     let info = match actor.id.as_deref() {
         Some(id) => match docker.inspect_container(id, INSPECT_OPTS).await {
-            Ok(inspect) => inspect.state.as_ref().and_then(classify::exit_info),
+            Ok(inspect) => {
+                let inspect = super::settle_oom_flag(docker, id, inspect).await;
+                inspect.state.as_ref().and_then(classify::exit_info)
+            }
             Err(_) => None,
         },
         None => None,

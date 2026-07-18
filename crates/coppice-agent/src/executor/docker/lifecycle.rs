@@ -431,6 +431,10 @@ pub(crate) async fn stop(
     match inspect_container(inner, &name).await? {
         None => return Ok(StopOutcome::Unknown),
         Some(inspect) => {
+            // A natural-exit verdict, so settle a lagging OOMKilled commit
+            // first (issue #34); a running container has no exit code and
+            // passes through untouched.
+            let inspect = super::settle_oom_flag(&inner.docker, &name, inspect).await;
             if let Some(info) = inspect.state.as_ref().and_then(classify::exit_info) {
                 claim_exit(inner, allocation).await;
                 return Ok(StopOutcome::AlreadyExited(info));
@@ -445,7 +449,12 @@ pub(crate) async fn stop(
         .build();
     match inner.docker.stop_container(&name, Some(options)).await {
         Ok(()) => {
-            // Post-inspect for the terminal evidence.
+            // Post-inspect for the terminal evidence. Deliberately *not*
+            // settled via settle_oom_flag: a 137 here is expected from our own
+            // grace-expiry SIGKILL, so the settle would burn its full budget on
+            // every hard stop of a memory-limited container. The §4 OOM
+            // carve-out stays best-effort single-inspect (a kill this close to
+            // our own stop is attributed to the stop per ADR 0013 anyway).
             let inspect = match inspect_container(inner, &name).await? {
                 Some(inspect) => inspect,
                 None => return Ok(StopOutcome::Unknown),
@@ -525,6 +534,10 @@ pub(crate) async fn observe(inner: &Inner) -> Result<Vec<ObservedContainer>, Exe
             // Vanished between list and inspect — nothing to report.
             continue;
         };
+        // Recovery evidence feeds journaling like any natural exit, so give a
+        // lagging OOMKilled commit its bounded window too (issue #34); almost
+        // always a no-op this long after the exit.
+        let inspect = super::settle_oom_flag(&inner.docker, target, inspect).await;
         let Some(cstate) = inspect.state.as_ref() else {
             continue;
         };

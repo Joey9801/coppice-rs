@@ -96,6 +96,22 @@ inspect — `code`, `oom_killed` (kernel OOM kill against the memory limit),
 `runtime`. `classify_exit` maps these to `Exited{code}` /
 `MemoryLimitExceeded`.
 
+*`OOMKilled` commit race (issue #34).* The daemon does not guarantee the
+`OOMKilled` flag is committed to inspect state at the instant the `die`
+event fires — some daemons set it from an async OOM-event handler that can
+lag the exit, so an inspect issued at event time can read exit 137 under a
+memory limit with the flag still unset. Every natural-exit evidence path
+(die event, resync, stop's pre-inspect, `observe`) therefore routes its
+inspect through a bounded settle (`settle_oom_flag`): when the racy shape
+is present — SIGKILL exit code, explicit memory limit, flag unset — it
+re-inspects on a short backoff (~1.6 s total) until the flag commits or the
+budget runs out. The flag remains the **sole** OOM gate: an exhausted
+budget still classifies `Natural` (an external SIGKILL is indistinguishable
+by code alone), so this changes timing, never the classification contract.
+The stop post-inspect and the disk enforcer's kill path skip the settle —
+a 137 there is expected from their own SIGKILL, and waiting out the budget
+on every hard kill would be pure latency for no evidence.
+
 **Executor-initiated kills**: the disk enforcer's poll strategy (§6.2) is
 the one place the *executor itself* decides to kill, analogous to the
 kernel's OOM killer. `ExitInfo` gains a cause field so this survives the
