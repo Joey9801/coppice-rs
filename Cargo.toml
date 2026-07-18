@@ -45,6 +45,14 @@ anyhow = "1"
 # `executor/docker` modules; everything above the `Executor` trait stays
 # runtime-agnostic.
 bollard = "0.19"
+# Parsing and formatting of byte quantities. `coppice_core::bytes::ByteSize`
+# wraps `byte_unit::Byte` rather than using it bare: the wrapper pins the
+# `u64` range the protobuf `uint64` assumes, makes all arithmetic saturating
+# for the replicated state machine (ADR 0019), and imposes this workspace's
+# stricter config policy — a unit suffix is mandatory and bit units are
+# refused, neither of which the crate does on its own. Already in the tree as
+# a transitive dependency of openraft.
+byte-unit = "5"
 # Coordinator CLI surface — deliberately tiny per ADR 0020: `--config`, the
 # ADR 0016 intent flags, and the hidden admin verbs.
 clap = { version = "4", features = ["derive"] }

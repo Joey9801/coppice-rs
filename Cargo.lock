@@ -686,6 +686,7 @@ dependencies = [
 name = "coppice-core"
 version = "0.0.1"
 dependencies = [
+ "byte-unit",
  "chrono",
  "proptest",
  "serde",
