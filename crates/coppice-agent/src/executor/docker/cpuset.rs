@@ -1,13 +1,18 @@
 //! Whole-physical-core allocation for Docker cpusets (§6.3).
 //!
-//! The pure allocator works in complete SMT sibling groups.  The small sysfs
-//! reader at the bottom supplies those groups on Linux; tests feed synthetic
-//! topologies so allocation correctness never depends on the test host.
+//! The pure allocator works in complete SMT sibling groups.  Discovery
+//! supplies those groups from wherever the daemon's cpusets actually apply:
+//! sysfs when the agent shares a kernel with the daemon (Linux), the daemon's
+//! own CPU count otherwise (macOS dev machines, where the daemon runs inside
+//! a Linux VM and the host's topology would be the wrong numbering entirely).
+//! Tests feed synthetic topologies so allocation correctness never depends on
+//! the test host.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 
+use bollard::Docker;
 use coppice_core::id::AllocationId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,8 +27,43 @@ pub(crate) struct Topology {
 }
 
 impl Topology {
-    pub(crate) fn discover() -> io::Result<Self> {
-        Self::from_sysfs(Path::new("/sys/devices/system/cpu"))
+    /// Discover the topology the daemon's `CpusetCpus` strings refer to.
+    ///
+    /// Cpusets are interpreted by the kernel the *daemon* runs on. On Linux
+    /// that is the agent's own kernel, and sysfs gives the full SMT/NUMA
+    /// structure. Elsewhere (macOS, where the daemon lives in a Linux VM)
+    /// sysfs does not exist and the host's core numbering would not match the
+    /// daemon's anyway, so ask the daemon how many CPUs it schedules and treat
+    /// each as a single-threaded core on one node — which is what Lima/Colima
+    /// style VMs expose.
+    pub(crate) async fn discover(docker: &Docker) -> io::Result<Self> {
+        if cfg!(target_os = "linux") {
+            Self::from_sysfs(Path::new("/sys/devices/system/cpu"))
+        } else {
+            Self::from_daemon(docker).await
+        }
+    }
+
+    async fn from_daemon(docker: &Docker) -> io::Result<Self> {
+        let info = docker.info().await.map_err(io::Error::other)?;
+        let ncpu = info
+            .ncpu
+            .filter(|n| *n > 0)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "daemon /info reported no usable NCPU",
+                )
+            })?;
+        Ok(Self {
+            cores: (0..ncpu)
+                .map(|cpu| Core {
+                    cpus: BTreeSet::from([cpu]),
+                    numa_node: 0,
+                })
+                .collect(),
+        })
     }
 
     pub(crate) fn physical_cores(&self) -> usize {
