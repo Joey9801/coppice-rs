@@ -35,6 +35,7 @@ use coppice_agent::session::{run, Session};
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, StateViews};
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
@@ -67,8 +68,8 @@ fn init_tracing() {
 fn requested() -> Resources {
     Resources {
         cpu_millis: 500,
-        memory_bytes: 1 << 20,
-        disk_bytes: 0,
+        memory: ByteSize::from_mib(1),
+        disk: ByteSize::ZERO,
     }
 }
 
@@ -105,8 +106,8 @@ fn agent_config(
         // Generous, so a job's request always fits.
         capacity: CapacityConfig {
             cpu_millis: 16_000,
-            memory_bytes: 1 << 34,
-            disk_bytes: 1 << 40,
+            memory: ByteSize::from_gib(16),
+            disk: ByteSize::from_tib(1),
         },
         reservation: Default::default(),
         // Fast cadences for the test (short heartbeat + reconnect backoff).

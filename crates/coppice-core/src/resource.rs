@@ -5,6 +5,8 @@
 //! accelerators, licenses, NUMA-local devices) without reworking callers. See
 //! `docs/scheduling/scheduling-model.md`.
 
+use crate::bytes::ByteSize;
+
 /// A vector of resource quantities requested by a job or offered by a node.
 ///
 /// This is intentionally a coarse placeholder. The extensible-dimension design
@@ -14,24 +16,24 @@
 pub struct Resources {
     /// Milli-CPU units (1000 = one core).
     pub cpu_millis: u64,
-    /// Memory in bytes.
-    pub memory_bytes: u64,
-    /// Disk in bytes.
-    pub disk_bytes: u64,
+    /// Working memory.
+    pub memory: ByteSize,
+    /// Scratch disk.
+    pub disk: ByteSize,
 }
 
 impl Resources {
     pub const ZERO: Resources = Resources {
         cpu_millis: 0,
-        memory_bytes: 0,
-        disk_bytes: 0,
+        memory: ByteSize::ZERO,
+        disk: ByteSize::ZERO,
     };
 
     /// Returns true if `self` fits within `capacity` on every dimension.
     pub fn fits_within(&self, capacity: &Resources) -> bool {
         self.cpu_millis <= capacity.cpu_millis
-            && self.memory_bytes <= capacity.memory_bytes
-            && self.disk_bytes <= capacity.disk_bytes
+            && self.memory <= capacity.memory
+            && self.disk <= capacity.disk
     }
 
     pub fn is_zero(&self) -> bool {
@@ -45,8 +47,8 @@ impl Resources {
     pub fn saturating_add(&self, other: &Resources) -> Resources {
         Resources {
             cpu_millis: self.cpu_millis.saturating_add(other.cpu_millis),
-            memory_bytes: self.memory_bytes.saturating_add(other.memory_bytes),
-            disk_bytes: self.disk_bytes.saturating_add(other.disk_bytes),
+            memory: self.memory.saturating_add(other.memory),
+            disk: self.disk.saturating_add(other.disk),
         }
     }
 
@@ -54,8 +56,8 @@ impl Resources {
     pub fn saturating_sub(&self, other: &Resources) -> Resources {
         Resources {
             cpu_millis: self.cpu_millis.saturating_sub(other.cpu_millis),
-            memory_bytes: self.memory_bytes.saturating_sub(other.memory_bytes),
-            disk_bytes: self.disk_bytes.saturating_sub(other.disk_bytes),
+            memory: self.memory.saturating_sub(other.memory),
+            disk: self.disk.saturating_sub(other.disk),
         }
     }
 
@@ -64,8 +66,8 @@ impl Resources {
     pub fn component_min(&self, other: &Resources) -> Resources {
         Resources {
             cpu_millis: self.cpu_millis.min(other.cpu_millis),
-            memory_bytes: self.memory_bytes.min(other.memory_bytes),
-            disk_bytes: self.disk_bytes.min(other.disk_bytes),
+            memory: self.memory.min(other.memory),
+            disk: self.disk.min(other.disk),
         }
     }
 }

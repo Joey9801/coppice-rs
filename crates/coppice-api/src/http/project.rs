@@ -10,6 +10,7 @@ use std::ops::Bound;
 
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::JobState;
 use coppice_core::quota::{self, PriorityMultiplier};
@@ -382,17 +383,20 @@ fn attempt_view(ar: &AttemptRecord) -> dto::AttemptView {
 }
 
 fn funded_fraction(funded: &Resources, requested: &Resources) -> dto::FundedFraction {
-    let frac = |funded: u64, requested: u64| -> f64 {
-        if requested == 0 {
+    let frac = |funded: f64, requested: f64| -> f64 {
+        if requested == 0.0 {
             1.0
         } else {
-            funded as f64 / requested as f64
+            funded / requested
         }
     };
+    // Sizes widen through `u128` before the float: the ratio is fractional by
+    // nature, and `u128` keeps a maxed-out size from wrapping on the way in.
+    let size = |s: ByteSize| s.as_u128() as f64;
     dto::FundedFraction {
-        cpu: frac(funded.cpu_millis, requested.cpu_millis),
-        memory: frac(funded.memory_bytes, requested.memory_bytes),
-        disk: frac(funded.disk_bytes, requested.disk_bytes),
+        cpu: frac(funded.cpu_millis as f64, requested.cpu_millis as f64),
+        memory: frac(size(funded.memory), size(requested.memory)),
+        disk: frac(size(funded.disk), size(requested.disk)),
     }
 }
 
@@ -605,10 +609,12 @@ impl FilterContext {
             }
             // Both bounds inclusive.
             F::Requests(r) => {
+                // The filter's bounds arrive as bare `uint64` from the JSON
+                // filter AST, so the comparison happens in the wire's units.
                 let value = match r.resource {
                     dto::RequestsResource::CpuMillis => record.spec.requests.cpu_millis,
-                    dto::RequestsResource::MemoryBytes => record.spec.requests.memory_bytes,
-                    dto::RequestsResource::DiskBytes => record.spec.requests.disk_bytes,
+                    dto::RequestsResource::MemoryBytes => record.spec.requests.memory.as_u64(),
+                    dto::RequestsResource::DiskBytes => record.spec.requests.disk.as_u64(),
                 };
                 r.min.map_or(true, |m| value >= m) && r.max.map_or(true, |m| value <= m)
             }
@@ -929,20 +935,20 @@ fn cost_report(state: &StateMachine, record: &JobRecord) -> dto::CostReport {
     // Per-dimension rate via the canonical `resource_rate`, isolating one
     // dimension at a time (the other terms contribute zero) so the breakdown
     // uses exactly the same arithmetic as the total.
-    let only = |cpu: u64, memory: u64, disk: u64| {
+    let only = |cpu: u64, memory: ByteSize, disk: ByteSize| {
         quota::resource_rate(
             &Resources {
                 cpu_millis: cpu,
-                memory_bytes: memory,
-                disk_bytes: disk,
+                memory,
+                disk,
             },
             weights,
         )
     };
     let rate_breakdown = dto::RateBreakdown {
-        cpu: only(requests.cpu_millis, 0, 0),
-        memory: only(0, requests.memory_bytes, 0),
-        disk: only(0, 0, requests.disk_bytes),
+        cpu: only(requests.cpu_millis, ByteSize::ZERO, ByteSize::ZERO),
+        memory: only(0, requests.memory, ByteSize::ZERO),
+        disk: only(0, ByteSize::ZERO, requests.disk),
     };
     let rate_ucu_per_second = quota::resource_rate(requests, weights);
 
@@ -1277,8 +1283,8 @@ mod tests {
                 id,
                 capacity: Resources {
                     cpu_millis: 4000,
-                    memory_bytes: 8_000_000_000,
-                    disk_bytes: 100_000_000_000,
+                    memory: ByteSize::from_bytes(8_000_000_000),
+                    disk: ByteSize::from_bytes(100_000_000_000),
                 },
                 labels: BTreeMap::new(),
                 schedulable: true,
@@ -1323,13 +1329,13 @@ mod tests {
                 node,
                 requested: Resources {
                     cpu_millis: 1000,
-                    memory_bytes: 1_000_000,
-                    disk_bytes: 0,
+                    memory: ByteSize::from_bytes(1_000_000),
+                    disk: ByteSize::ZERO,
                 },
                 funded: Resources {
                     cpu_millis: 1000,
-                    memory_bytes: 1_000_000,
-                    disk_bytes: 0,
+                    memory: ByteSize::from_bytes(1_000_000),
+                    disk: ByteSize::ZERO,
                 },
                 state,
             },
@@ -2077,8 +2083,8 @@ mod tests {
     fn cpu(millis: u64) -> Resources {
         Resources {
             cpu_millis: millis,
-            memory_bytes: 0,
-            disk_bytes: 0,
+            memory: ByteSize::ZERO,
+            disk: ByteSize::ZERO,
         }
     }
 
@@ -2138,8 +2144,8 @@ mod tests {
         // requested cpu 1000 / mem 1_000_000 → min funded fraction 0.5.
         alloc_rec.allocation.funded = Resources {
             cpu_millis: 500,
-            memory_bytes: 500_000,
-            disk_bytes: 0,
+            memory: ByteSize::from_bytes(500_000),
+            disk: ByteSize::ZERO,
         };
         state.allocations.insert(alloc, alloc_rec);
 

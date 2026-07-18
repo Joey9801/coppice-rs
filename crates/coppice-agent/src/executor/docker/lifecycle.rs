@@ -19,6 +19,7 @@ use bollard::query_parameters::{
 };
 use tokio_stream::StreamExt;
 
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::AllocationId;
 use coppice_core::time::{Duration, Timestamp};
 
@@ -109,7 +110,10 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     // DiskEnforcer seam, using the already-resolved image size. An image that
     // alone exceeds the job's disk request fails here as a user error, before
     // the container (or any CPU grant) is created.
-    let image_size = image.size.map(|size| size.max(0) as u64).unwrap_or(0);
+    // Docker reports the image size as a signed integer; this is where it
+    // becomes a typed size. A negative reading is nonsense rather than a real
+    // image, so it clamps to zero and the plan treats it as "no image cost".
+    let image_size = ByteSize::from_bytes(image.size.map(|size| size.max(0) as u64).unwrap_or(0));
     let disk_plan = inner.disk.plan(&spec.limits, image_size)?;
 
     // Serialize the affinity-plan/create boundary. Without this, a concurrent

@@ -57,6 +57,7 @@ use coppice_agent::executor::{
 };
 use coppice_agent::pressure::DiskPressure;
 use coppice_core::attempt::AttemptOutcome;
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration as CoreDuration, Timestamp};
@@ -143,9 +144,9 @@ mod harness {
 
     /// The busybox image's on-disk size, pulling it first if the daemon does not
     /// already have it. The poll disk-kill test sizes its budget from this so the
-    /// enforced writable budget (`disk_bytes − image_size`) lands in a known,
+    /// enforced writable budget (`disk − image_size`) lands in a known,
     /// small window (§6.2).
-    pub async fn image_size(docker: &Docker, image: &str) -> anyhow::Result<u64> {
+    pub async fn image_size(docker: &Docker, image: &str) -> anyhow::Result<ByteSize> {
         if docker.inspect_image(image).await.is_err() {
             let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
                 .from_image(image)
@@ -160,8 +161,14 @@ mod harness {
             .inspect_image(image)
             .await
             .map_err(|e| anyhow!("inspecting {image}: {e}"))?;
-        let size = inspect.size.unwrap_or(0).max(0) as u64;
-        ensure!(size > 0, "image {image} reported a zero on-disk size");
+        // Docker reports the size as a signed integer; this is the crossing
+        // into a typed size, mirroring what `lifecycle.rs` does with the same
+        // field.
+        let size = ByteSize::from_bytes(inspect.size.unwrap_or(0).max(0) as u64);
+        ensure!(
+            !size.is_zero(),
+            "image {image} reported a zero on-disk size"
+        );
         Ok(size)
     }
 
@@ -441,8 +448,8 @@ async fn oom_classification() {
     let (exec, _tx) = harness::executor(docker).await;
     let limits = Resources {
         cpu_millis: 0,
-        memory_bytes: 16 * 1024 * 1024,
-        disk_bytes: 0,
+        memory: ByteSize::from_mib(16),
+        disk: ByteSize::ZERO,
     };
     let sp = harness::spec(
         harness::BUSYBOX,
@@ -793,8 +800,8 @@ async fn whole_core_grant_shrinks_and_release_grows_fractional_cpuset() {
         &["sleep", "300"],
         Resources {
             cpu_millis: 500,
-            memory_bytes: 0,
-            disk_bytes: 0,
+            memory: ByteSize::ZERO,
+            disk: ByteSize::ZERO,
         },
     );
     let whole = harness::spec(
@@ -802,8 +809,8 @@ async fn whole_core_grant_shrinks_and_release_grows_fractional_cpuset() {
         &["sleep", "300"],
         Resources {
             cpu_millis: 1000,
-            memory_bytes: 0,
-            disk_bytes: 0,
+            memory: ByteSize::ZERO,
+            disk: ByteSize::ZERO,
         },
     );
     let fractional_id = fractional.allocation;
@@ -885,8 +892,8 @@ async fn poll_mode_disk_kill() {
         let image_size = harness::image_size(&docker, harness::BUSYBOX).await?;
         let limits = Resources {
             cpu_millis: 0,
-            memory_bytes: 0,
-            disk_bytes: image_size + 8 * 1024 * 1024,
+            memory: ByteSize::ZERO,
+            disk: image_size + ByteSize::from_mib(8),
         };
         let sp = harness::spec(
             harness::BUSYBOX,
@@ -963,11 +970,11 @@ async fn disk_labels_present_on_started_container() {
 
     let r: anyhow::Result<()> = async {
         let image_size = harness::image_size(&docker, harness::BUSYBOX).await?;
-        let budget = 8 * 1024 * 1024u64;
+        let budget = ByteSize::from_mib(8);
         let limits = Resources {
             cpu_millis: 0,
-            memory_bytes: 0,
-            disk_bytes: image_size + budget,
+            memory: ByteSize::ZERO,
+            disk: image_size + budget,
         };
         let sp = harness::spec(harness::BUSYBOX, &["sleep", "300"], limits);
         let alloc = sp.allocation;
@@ -993,14 +1000,19 @@ async fn disk_labels_present_on_started_container() {
                 "coppice.disk-mode should be poll, got {:?}",
                 labels.get("coppice.disk-mode")
             );
-            let stamped: u64 = labels
-                .get("coppice.disk-budget")
-                .ok_or_else(|| anyhow!("coppice.disk-budget label missing"))?
-                .parse()
-                .map_err(|e| anyhow!("disk-budget not decimal: {e}"))?;
+            // The label carries a bare decimal byte count, not a humane
+            // rendering: the reaper parses it back after an agent restart.
+            // Asserting on that spelling is the point of this check.
+            let stamped = ByteSize::from_bytes(
+                labels
+                    .get("coppice.disk-budget")
+                    .ok_or_else(|| anyhow!("coppice.disk-budget label missing"))?
+                    .parse()
+                    .map_err(|e| anyhow!("disk-budget not decimal: {e}"))?,
+            );
             ensure!(
                 stamped == budget,
-                "disk-budget label {stamped} should equal disk_bytes − image_size ({budget})"
+                "disk-budget label {stamped} should equal disk − image_size ({budget})"
             );
             Ok(())
         }

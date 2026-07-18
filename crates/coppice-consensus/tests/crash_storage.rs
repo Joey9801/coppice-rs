@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::io;
 
 use coppice_consensus::storage::{raw, EncodedEntry, FrameLogId, StorageCore, StorageOptions};
+use coppice_core::bytes::ByteSize;
 use coppice_proto::pb::raft::v1 as pbraft;
 use coppice_proto::pb::storage::v1 as pbstorage;
 use coppice_testkit::harness::{
@@ -33,13 +34,13 @@ const NODE_ID: u64 = 1;
 /// without protobuf (by design, ADR 0018), so the harness's byte-equality
 /// checks exercise exactly what the engine persists.
 struct RealEngine {
-    segment_max_bytes: u64,
+    segment_max: ByteSize,
 }
 
 impl Default for RealEngine {
     fn default() -> Self {
         RealEngine {
-            segment_max_bytes: 64 << 20,
+            segment_max: ByteSize::from_mib(64),
         }
     }
 }
@@ -47,7 +48,7 @@ impl Default for RealEngine {
 impl RealEngine {
     fn options(&self) -> StorageOptions {
         let mut options = StorageOptions::new(CLUSTER_UUID);
-        options.segment_max_bytes = self.segment_max_bytes;
+        options.segment_max = self.segment_max;
         options
     }
 }
@@ -224,7 +225,7 @@ fn crash_during_append() {
 fn crash_during_rotation() {
     let mut rng = Rng::new(0x0707);
     let small = RealEngine {
-        segment_max_bytes: 2048,
+        segment_max: ByteSize::from_bytes(2048),
     };
     let workload = [
         batch(&mut rng, &[500, 500]),
@@ -350,7 +351,7 @@ fn randomized_sweep() {
 fn crash_during_tight_structural_sequence() {
     let mut rng = Rng::new(0xD1CE);
     let small = RealEngine {
-        segment_max_bytes: 1024,
+        segment_max: ByteSize::from_bytes(1024),
     };
     let workload = [
         batch(&mut rng, &[400, 400, 400]), // crosses the threshold mid-workload

@@ -33,7 +33,7 @@
 //!   one engine instance over one data directory, appending with
 //!   monotonically increasing indices across the whole sweep (indices are
 //!   never reset between iterations). That means the active segment rotates
-//!   at the configured `segment_max_bytes` partway through a long sample —
+//!   at the configured `segment_max` partway through a long sample —
 //!   sustained append behavior, rotation included, rather than a fiction
 //!   where every iteration starts a fresh segment. The first-ever append
 //!   also creates and claims the first segment (extra fsyncs plus a

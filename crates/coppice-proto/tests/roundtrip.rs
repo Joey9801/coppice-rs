@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use coppice_core::attempt::AttemptOutcome;
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
@@ -36,8 +37,8 @@ fn job(n: u128) -> Job {
         entrypoint: Some(vec!["/bin/launch".into()]),
         requests: Resources {
             cpu_millis: 2_000,
-            memory_bytes: 1 << 30,
-            disk_bytes: 0,
+            memory: ByteSize::from_gib(1),
+            disk: ByteSize::ZERO,
         },
         priority: -2,
         max_runtime: Some(Duration::from_hours(1)),
@@ -74,8 +75,8 @@ fn every_command() -> Vec<Command> {
                     node,
                     requested: Resources {
                         cpu_millis: 2_000,
-                        memory_bytes: 0,
-                        disk_bytes: 0,
+                        memory: ByteSize::ZERO,
+                        disk: ByteSize::ZERO,
                     },
                 }],
             }],
@@ -114,8 +115,8 @@ fn every_command() -> Vec<Command> {
             node,
             capacity: Resources {
                 cpu_millis: 16_000,
-                memory_bytes: 64 << 30,
-                disk_bytes: 0,
+                memory: ByteSize::from_gib(64),
+                disk: ByteSize::ZERO,
             },
             labels: BTreeMap::from([("zone".into(), "a".into()), ("gpu".into(), "none".into())]),
             registered_at: ts(),
@@ -396,8 +397,8 @@ fn resources_encode_canonically() {
     // Ascending kind, zeros omitted — byte-identical encodes for equal values.
     let r = Resources {
         cpu_millis: 5,
-        memory_bytes: 0,
-        disk_bytes: 7,
+        memory: ByteSize::ZERO,
+        disk: ByteSize::from_bytes(7),
     };
     let encoded = pb::core::v1::Resources::from(&r);
     let kinds: Vec<i32> = encoded.quantities.iter().map(|q| q.kind).collect();

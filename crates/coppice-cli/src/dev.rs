@@ -31,6 +31,7 @@ use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, ConsensusError};
 use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, ClientListener};
 use coppice_coordinator::config::{self as coord_config, CliOverrides};
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{ClusterId, NodeId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::Timestamp;
@@ -315,8 +316,8 @@ ca_path = "{ca}"
         // Generous static capacity: dev jobs should never be capacity-bound.
         capacity: CapacityConfig {
             cpu_millis: 16_000,
-            memory_bytes: 1 << 34,
-            disk_bytes: 1 << 40,
+            memory: ByteSize::from_gib(16),
+            disk: ByteSize::from_tib(1),
         },
         reservation: Default::default(),
         heartbeat_interval: Duration::from_secs(2),

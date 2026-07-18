@@ -9,6 +9,7 @@ mod common;
 use common::*;
 
 use coppice_core::allocation::AllocationState;
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::AllocationId;
 use coppice_core::job::Job;
 use coppice_core::quota::PriorityMultiplier;
@@ -69,10 +70,10 @@ fn resources_strategy() -> impl Strategy<Value = Resources> {
         (256u64 << 20)..(16 << 30),
         0u64..(200 << 30),
     )
-        .prop_map(|(cpu_millis, memory_bytes, disk_bytes)| Resources {
+        .prop_map(|(cpu_millis, memory, disk)| Resources {
             cpu_millis,
-            memory_bytes,
-            disk_bytes,
+            memory: ByteSize::from_bytes(memory),
+            disk: ByteSize::from_bytes(disk),
         })
 }
 
@@ -82,10 +83,10 @@ fn node_strategy() -> impl Strategy<Value = Resources> {
         (16u64 << 30)..(64 << 30),
         (200u64 << 30)..(1000 << 30),
     )
-        .prop_map(|(cpu_millis, memory_bytes, disk_bytes)| Resources {
+        .prop_map(|(cpu_millis, memory, disk)| Resources {
             cpu_millis,
-            memory_bytes,
-            disk_bytes,
+            memory: ByteSize::from_bytes(memory),
+            disk: ByteSize::from_bytes(disk),
         })
 }
 
@@ -229,8 +230,8 @@ proptest! {
 fn synth_seeds_apply_without_rejection() {
     let roomy = Resources {
         cpu_millis: 100_000_000,
-        memory_bytes: 64 << 40,
-        disk_bytes: 1_000 << 40,
+        memory: ByteSize::from_tib(64),
+        disk: ByteSize::from_tib(1_000),
     };
     for seed in 0..4u64 {
         let mut cfg = SynthConfig::with_jobs(2_000);
@@ -333,8 +334,8 @@ fn throughput_one_million_jobs_under_budget() {
     // on any cluster past its cap.
     let roomy = Resources {
         cpu_millis: 128_000,
-        memory_bytes: 256 << 30,
-        disk_bytes: 1 << 40,
+        memory: ByteSize::from_gib(256),
+        disk: ByteSize::from_tib(1),
     };
     for i in 0..64u128 {
         apply_ok(&mut sm, register_node_cmd(nid(0xB16_00DE + i), roomy, now));

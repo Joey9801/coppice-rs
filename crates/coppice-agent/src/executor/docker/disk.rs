@@ -2,7 +2,7 @@
 //! (docker-executor.md §6.2).
 //!
 //! A job's disk usage is defined as `writable_layer + image_size`, so the
-//! *enforced* writable-layer budget is `limits.disk_bytes − image_size`. The
+//! *enforced* writable-layer budget is `limits.disk − image_size`. The
 //! [`DiskEnforcer`] chooses a strategy once at startup and records the choice
 //! (and the enforced budget) on every container it creates, so the poll
 //! enforcer can resume for the right containers after an agent restart — the
@@ -36,6 +36,7 @@ use bollard::Docker;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::AllocationId;
 use coppice_core::resource::Resources;
 
@@ -148,40 +149,52 @@ pub(crate) fn decide_mode(
 
 // ---- budget arithmetic (docker-executor.md §6.2) ------------------------
 
-/// The enforced writable-layer budget for a job, in bytes:
-/// `disk_bytes − image_size` (usage = writable_layer + image_size, §6.2).
+/// The enforced writable-layer budget for a job: `disk − image` (a job's usage
+/// is `writable_layer + image`, §6.2).
 ///
-/// - `disk_bytes == 0` means "no limit" — the same convention `limits.rs` uses
-///   for zero/absent resource values — so there is no budget to enforce:
+/// - `disk` of zero means "no limit" — the same convention `limits.rs` uses for
+///   zero/absent resource values — so there is no budget to enforce:
 ///   `Ok(None)` (no storage-opt, no budget label, the poller skips).
-/// - `image_size > disk_bytes`: the image alone exceeds the request, a user
-///   error before the container is ever created (§4 table).
-/// - otherwise `Ok(Some(disk_bytes − image_size))`. A budget of exactly 0 is
-///   legal: any write then kills.
-pub(crate) fn writable_budget(disk_bytes: u64, image_size: u64) -> Result<Option<u64>, StartError> {
-    if disk_bytes == 0 {
+/// - `image > disk`: the image alone exceeds the request, a user error before
+///   the container is ever created (§4 table).
+/// - otherwise `Ok(Some(disk − image))`. A budget of exactly 0 is legal: any
+///   write then kills.
+///
+/// The `image > disk` guard is load-bearing and must not be replaced by the
+/// saturating subtraction below. `ByteSize`'s `Sub` clamps at zero, so dropping
+/// the guard would quietly hand back a budget of zero — an *enforceable* budget
+/// that kills the job on its first write — in place of the user error that
+/// actually explains why the job cannot run.
+pub(crate) fn writable_budget(
+    disk: ByteSize,
+    image: ByteSize,
+) -> Result<Option<ByteSize>, StartError> {
+    if disk.is_zero() {
         return Ok(None);
     }
-    if image_size > disk_bytes {
+    if image > disk {
         return Err(StartError::Start {
             user_error: true,
             message: format!(
-                "image on-disk size ({image_size} bytes) exceeds the job's disk request \
-                 ({disk_bytes} bytes); the writable-layer budget would be negative \
-                 (docker-executor.md §6.2)"
+                "image on-disk size ({image}) exceeds the job's disk request ({disk}); \
+                 the writable-layer budget would be negative (docker-executor.md §6.2)"
             ),
         });
     }
-    Ok(Some(disk_bytes - image_size))
+    Ok(Some(disk - image))
 }
 
 /// Whether a container's writable-layer usage is over its budget (pure verdict,
 /// the skeleton the future soft-limit ranking generalizes, §6.1). A negative or
 /// absent `size_rw` (the daemon has not sized the writable layer) is never over
-/// budget. A budget of 0 means any positive usage is over.
-pub(crate) fn over_budget(size_rw: Option<i64>, budget: u64) -> bool {
+/// budget. A budget of zero means any positive usage is over.
+///
+/// `size_rw` stays a raw `Option<i64>`: it is Docker's inspect/df field as the
+/// API hands it over, negatives and all, and the sign check *is* the crossing
+/// into a `ByteSize`.
+pub(crate) fn over_budget(size_rw: Option<i64>, budget: ByteSize) -> bool {
     match size_rw {
-        Some(size) if size >= 0 => (size as u64) > budget,
+        Some(size) if size >= 0 => ByteSize::from_bytes(size as u64) > budget,
         _ => false,
     }
 }
@@ -193,9 +206,14 @@ pub(crate) fn over_budget(size_rw: Option<i64>, budget: u64) -> bool {
 pub(crate) struct DiskPlan {
     /// The [`LABEL_DISK_MODE`] value, always stamped.
     pub(crate) mode_label: &'static str,
-    /// The [`LABEL_DISK_BUDGET`] value (enforced writable budget in bytes, as a
-    /// decimal string): present iff there is a budget to enforce. Absent means
-    /// "no limit" (`disk_bytes == 0`) and the poller skips the container.
+    /// The [`LABEL_DISK_BUDGET`] value: present iff there is a budget to
+    /// enforce. Absent means "no limit" (a disk request of zero) and the poller
+    /// skips the container.
+    ///
+    /// A boundary, so a bare decimal count of bytes and never the humane
+    /// `ByteSize` rendering: the label is a machine-readable record that
+    /// [`sweep`] parses back after an agent restart, and the integration suite
+    /// asserts on. `"16777216"` round-trips; `"16 MiB"` would not parse.
     pub(crate) budget_label: Option<String>,
     /// `HostConfig.storage_opt`: set only under [`DiskMode::Quota`] with a
     /// budget, so the daemon caps the writable layer natively.
@@ -219,6 +237,10 @@ const PROBE_NAME: &str = "coppice-disk-probe";
 /// The writable-layer size the probe requests (docker-executor.md §6.2 example).
 /// Never actually written to — the container is removed without starting — so
 /// the value only has to be a well-formed storage-opt the daemon accepts.
+///
+/// Deliberately a string in *Docker's* size spelling rather than a
+/// [`ByteSize`]: nothing here does arithmetic on it, and the one requirement is
+/// that the daemon's own parser accepts it verbatim.
 const PROBE_SIZE: &str = "16m";
 
 impl DiskEnforcer {
@@ -289,20 +311,31 @@ impl DiskEnforcer {
     /// Produce the create-time [`DiskPlan`] for a job (docker-executor.md §6.2).
     /// The image-larger-than-request check surfaces here as a user
     /// [`StartError`] before the container is created.
-    pub(crate) fn plan(&self, limits: &Resources, image_size: u64) -> Result<DiskPlan, StartError> {
-        let budget = writable_budget(limits.disk_bytes, image_size)?;
+    ///
+    /// `image_size` arrives as a bare `u64` because the caller reads it off
+    /// Docker's image inspect (`Option<i64>`) and clamps it there; the crossing
+    /// into a [`ByteSize`] happens on the way in here.
+    pub(crate) fn plan(
+        &self,
+        limits: &Resources,
+        image_size: ByteSize,
+    ) -> Result<DiskPlan, StartError> {
+        let budget = writable_budget(limits.disk, image_size)?;
         // storage-opt only under native quotas, and only when there is a budget.
         let storage_opt = match (self.mode, budget) {
-            (DiskMode::Quota, Some(bytes)) => {
+            (DiskMode::Quota, Some(budget)) => {
                 let mut opts = HashMap::new();
-                opts.insert("size".to_string(), bytes.to_string());
+                // A bare byte count, like the budget label: `storage_opt.size`
+                // is parsed by the daemon, which takes a plain integer (or its
+                // own `16m`-style suffixes) and not a spaced IEC rendering.
+                opts.insert("size".to_string(), budget.as_u64().to_string());
                 Some(opts)
             }
             _ => None,
         };
         Ok(DiskPlan {
             mode_label: self.mode.label_value(),
-            budget_label: budget.map(|bytes| bytes.to_string()),
+            budget_label: budget.map(|budget| budget.as_u64().to_string()),
             storage_opt,
         })
     }
@@ -523,9 +556,13 @@ async fn sweep(
         if !is_ours {
             continue;
         }
+        // The label is the bare byte count `plan` stamped (see
+        // `DiskPlan::budget_label`), so it parses as a `u64` and becomes a
+        // `ByteSize` here — the one crossing on the way back in.
         let budget = labels
             .and_then(|labels| labels.get(LABEL_DISK_BUDGET))
-            .and_then(|raw| raw.parse::<u64>().ok());
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map(ByteSize::from_bytes);
         let (Some(budget), true) = (budget, is_poll) else {
             continue;
         };
@@ -580,7 +617,7 @@ async fn kill_over_budget(
     exit_tx: &mpsc::UnboundedSender<ExitEvent>,
     allocation: AllocationId,
     target: &str,
-    budget: u64,
+    budget: ByteSize,
 ) {
     // 1. Claim under the lock. If already claimed, someone else owns this exit
     //    (the events task, a stop, or a prior sweep) — leave it entirely.
@@ -633,7 +670,10 @@ async fn kill_over_budget(
         metrics::counter!(AGENT_LIMIT_KILLS_TOTAL, "kind" => KIND_DISK).increment(1);
         tracing::info!(
             %allocation,
-            budget,
+            // `%`, not a bare field: `ByteSize` is not a `tracing` primitive,
+            // and recording it through `Display` is the point — the reader of
+            // this line wants "8 MiB", not eight digits to count.
+            %budget,
             exit_code = info.code,
             "killed container for exceeding its disk budget"
         );
@@ -684,28 +724,42 @@ mod tests {
 
     // ---- writable_budget (docker-executor.md §6.2) -------------------------
 
-    #[test]
-    fn budget_subtracts_image_size() {
-        let budget = writable_budget(100, 30).expect("under budget");
-        assert_eq!(budget, Some(70));
+    /// A size written as a plain byte count, for the arithmetic cases where the
+    /// small numbers are the point and a unit would only obscure them.
+    fn bytes(count: u64) -> ByteSize {
+        ByteSize::from_bytes(count)
     }
 
     #[test]
-    fn zero_disk_bytes_means_no_enforcement() {
-        // Mirrors limits.rs: 0 is "no limit", not "budget of zero".
-        assert_eq!(writable_budget(0, 0).unwrap(), None);
-        assert_eq!(writable_budget(0, 12345).unwrap(), None);
+    fn budget_subtracts_image_size() {
+        let budget = writable_budget(bytes(100), bytes(30)).expect("under budget");
+        assert_eq!(budget, Some(bytes(70)));
+    }
+
+    #[test]
+    fn zero_disk_request_means_no_enforcement() {
+        // Mirrors limits.rs: zero is "no limit", not "budget of zero".
+        assert_eq!(
+            writable_budget(ByteSize::ZERO, ByteSize::ZERO).unwrap(),
+            None
+        );
+        assert_eq!(writable_budget(ByteSize::ZERO, bytes(12345)).unwrap(), None);
     }
 
     #[test]
     fn image_equal_to_request_is_a_legal_zero_budget() {
         // A budget of exactly 0 is legal: any write then kills.
-        assert_eq!(writable_budget(100, 100).unwrap(), Some(0));
+        assert_eq!(
+            writable_budget(bytes(100), bytes(100)).unwrap(),
+            Some(ByteSize::ZERO)
+        );
     }
 
     #[test]
     fn image_larger_than_request_is_a_user_error() {
-        let err = writable_budget(100, 101).unwrap_err();
+        // Not the saturating-subtraction outcome: an image over the request is
+        // a user error, never a silently-zero budget.
+        let err = writable_budget(bytes(100), bytes(101)).unwrap_err();
         assert!(matches!(
             err,
             StartError::Start {
@@ -715,25 +769,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn image_too_big_error_names_both_sizes_humanely() {
+        let err = writable_budget(ByteSize::from_mib(8), ByteSize::from_mib(16)).unwrap_err();
+        let StartError::Start { message, .. } = err else {
+            panic!("expected a start error");
+        };
+        assert!(
+            message.contains("(16 MiB)") && message.contains("(8 MiB)"),
+            "message should render both sizes in IEC units: {message}"
+        );
+    }
+
     // ---- over_budget verdict -----------------------------------------------
 
     #[test]
     fn over_budget_strictly_above() {
-        assert!(!over_budget(Some(100), 100)); // at the budget is not over
-        assert!(over_budget(Some(101), 100));
-        assert!(!over_budget(Some(0), 100));
+        assert!(!over_budget(Some(100), bytes(100))); // at the budget is not over
+        assert!(over_budget(Some(101), bytes(100)));
+        assert!(!over_budget(Some(0), bytes(100)));
     }
 
     #[test]
     fn zero_budget_kills_on_any_write() {
-        assert!(!over_budget(Some(0), 0));
-        assert!(over_budget(Some(1), 0));
+        assert!(!over_budget(Some(0), ByteSize::ZERO));
+        assert!(over_budget(Some(1), ByteSize::ZERO));
     }
 
     #[test]
     fn absent_or_negative_size_is_never_over_budget() {
-        assert!(!over_budget(None, 0));
-        assert!(!over_budget(Some(-1), 0));
+        assert!(!over_budget(None, ByteSize::ZERO));
+        assert!(!over_budget(Some(-1), ByteSize::ZERO));
     }
 
     // ---- decide_mode matrix (docker-executor.md §6.2) ----------------------
@@ -797,11 +863,11 @@ mod tests {
 
     // ---- plan / budget-label round-trip ------------------------------------
 
-    fn resources(disk_bytes: u64) -> Resources {
+    fn resources(disk: ByteSize) -> Resources {
         Resources {
             cpu_millis: 0,
-            memory_bytes: 0,
-            disk_bytes,
+            memory: ByteSize::ZERO,
+            disk,
         }
     }
 
@@ -810,16 +876,19 @@ mod tests {
         let enforcer = DiskEnforcer {
             mode: DiskMode::Quota,
         };
-        let plan = enforcer.plan(&resources(100), 30).expect("under budget");
+        let plan = enforcer
+            .plan(&resources(bytes(100)), bytes(30))
+            .expect("under budget");
         assert_eq!(plan.mode_label, "quota");
-        // Budget label round-trips back to the enforced budget.
+        // Budget label round-trips back to the enforced budget: a bare decimal
+        // byte count, which is what `sweep` parses after a restart.
         let parsed: u64 = plan
             .budget_label
             .as_deref()
             .expect("budget present")
             .parse()
             .expect("decimal budget");
-        assert_eq!(parsed, 70);
+        assert_eq!(ByteSize::from_bytes(parsed), bytes(70));
         assert_eq!(
             plan.storage_opt
                 .expect("quota sets storage-opt")
@@ -833,7 +902,9 @@ mod tests {
         let enforcer = DiskEnforcer {
             mode: DiskMode::Poll,
         };
-        let plan = enforcer.plan(&resources(100), 30).expect("under budget");
+        let plan = enforcer
+            .plan(&resources(bytes(100)), bytes(30))
+            .expect("under budget");
         assert_eq!(plan.mode_label, "poll");
         assert_eq!(plan.budget_label.as_deref(), Some("70"));
         assert!(plan.storage_opt.is_none(), "poll never sets a storage-opt");
@@ -843,8 +914,10 @@ mod tests {
     fn no_limit_plan_omits_budget_and_storage_opt() {
         for mode in [DiskMode::Quota, DiskMode::Poll] {
             let enforcer = DiskEnforcer { mode };
-            // disk_bytes == 0 → no enforcement in either mode.
-            let plan = enforcer.plan(&resources(0), 12345).expect("no limit");
+            // A disk request of zero → no enforcement in either mode.
+            let plan = enforcer
+                .plan(&resources(ByteSize::ZERO), bytes(12345))
+                .expect("no limit");
             assert_eq!(plan.mode_label, mode.label_value());
             assert!(
                 plan.budget_label.is_none(),
@@ -862,7 +935,9 @@ mod tests {
         let enforcer = DiskEnforcer {
             mode: DiskMode::Quota,
         };
-        let err = enforcer.plan(&resources(100), 200).unwrap_err();
+        let err = enforcer
+            .plan(&resources(bytes(100)), bytes(200))
+            .unwrap_err();
         assert!(matches!(
             err,
             StartError::Start {

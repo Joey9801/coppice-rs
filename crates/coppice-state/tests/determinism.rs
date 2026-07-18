@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 
 use common::*;
 use coppice_core::attempt::AttemptOutcome;
+use coppice_core::bytes::ByteSize;
 use coppice_core::job::RetryPolicy;
 use coppice_core::quota::CostUnits;
 use coppice_core::resource::Resources;
@@ -348,8 +349,8 @@ fn extreme_resources_never_panic() {
     let mut sm = setup();
     let huge = Resources {
         cpu_millis: u64::MAX,
-        memory_bytes: u64::MAX,
-        disk_bytes: u64::MAX,
+        memory: ByteSize::MAX,
+        disk: ByteSize::MAX,
     };
     apply_ok(&mut sm, register_node_cmd(nid(9), huge, base_ts()));
     apply_ok(

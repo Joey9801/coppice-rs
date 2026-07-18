@@ -266,10 +266,10 @@ pub const DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER: PriorityMultiplier = PriorityMul
 /// The cost *rate* of a resource request, in µCU per second: the weighted sum
 /// over dimensions, each term `⌊quantity · weight / 2³²⌋`, saturating.
 pub fn resource_rate(requests: &Resources, weights: &CostWeights) -> u64 {
-    let term = |quantity: u64, weight: u64| (quantity as u128 * weight as u128) >> 32;
-    let rate = term(requests.cpu_millis, weights.per_cpu_milli_second)
-        + term(requests.memory_bytes, weights.per_memory_byte_second)
-        + term(requests.disk_bytes, weights.per_disk_byte_second);
+    let term = |quantity: u128, weight: u64| (quantity * weight as u128) >> 32;
+    let rate = term(requests.cpu_millis as u128, weights.per_cpu_milli_second)
+        + term(requests.memory.as_u128(), weights.per_memory_byte_second)
+        + term(requests.disk.as_u128(), weights.per_disk_byte_second);
     u64::try_from(rate).unwrap_or(u64::MAX)
 }
 
@@ -420,6 +420,7 @@ pub fn penalty(over_quota_ratio: f64, exponent_milli: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytes::ByteSize;
 
     /// These fixtures are all near the epoch or near 2025, so the range check
     /// cannot fire.
@@ -498,8 +499,8 @@ mod tests {
         // exactly 4 + 4 + 2 = 10 CU/s.
         let requests = Resources {
             cpu_millis: 4000,
-            memory_bytes: 16 << 30,
-            disk_bytes: 128 << 30,
+            memory: ByteSize::from_gib(16),
+            disk: ByteSize::from_gib(128),
         };
         assert_eq!(resource_rate(&requests, &REFERENCE_WEIGHTS), 10_000_000);
 

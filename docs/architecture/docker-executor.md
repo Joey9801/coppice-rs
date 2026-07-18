@@ -238,7 +238,7 @@ All limits always enforced (ADR 0011), translated in `limits.rs`:
 | Resource | Mechanism |
 | --- | --- |
 | CPU | `NanoCpus = cpu_millis × 1_000_000` (hard ceiling via CFS); whole-core requests additionally get an exclusive cpuset (§6.3) |
-| Memory | `Memory = memory_bytes`, `MemorySwap = memory_bytes` (no swap headroom), kernel OOM kill enabled (it is our classification signal) |
+| Memory | `Memory = memory`, `MemorySwap = memory` (no swap headroom), kernel OOM kill enabled (it is our classification signal) |
 | PIDs | `PidsLimit` from config default (fork-bomb hygiene, not user-visible policy) |
 | Disk | §6.2 |
 
@@ -317,7 +317,7 @@ than the configured interval.
 `writable_layer + image_size` (the image's on-disk size from image
 inspect). Consequently:
 
-- The *enforced* writable-layer budget is `limits.disk_bytes −
+- The *enforced* writable-layer budget is `limits.disk −
   image_size`. If the image alone exceeds the request, the start fails as
   user error before the container is created (§4 table).
 - Reported usage (metrics §8.1, and any future heartbeat usage summaries)
@@ -392,13 +392,13 @@ pulls in flight):
 ```toml
 [capacity]            # what the machine has (validated against physical)
 cpu_millis   = 32000
-memory_bytes = ...
-disk_bytes   = ...
+memory       = "128GiB"
+disk         = "1TiB"
 
 [reservation]         # withheld for the agent + system; never placed
 cpu_millis   = 1000
-memory_bytes = 2147483648    # 2 GiB
-disk_bytes   = 21474836480   # 20 GiB
+memory       = "2GiB"
+disk         = "20GiB"
 ```
 
 - **Advertised capacity = `capacity − reservation`**, computed once at
@@ -810,8 +810,8 @@ The complete list of changes outside the new modules:
 
    [reservation]                       # §6.4; deducted before advertising
    cpu_millis   = 1000
-   memory_bytes = 2147483648
-   disk_bytes   = 21474836480
+   memory       = "2GiB"
+   disk         = "20GiB"
 
    [image_cache]
    ttl                  = "30m"
@@ -820,7 +820,7 @@ The complete list of changes outside the new modules:
    [telemetry]
    metrics_interval     = "10s"
    drain_force_after    = "10m"       # §8.2; forced tail loss is metered
-   segment_max_bytes    = 268435456   # 256 MiB (§8.4)
+   segment_max          = "256MiB"    # §8.4
    segment_max_age      = "6h"
    live_retention       = "24h"
    [[telemetry.sinks]]
