@@ -33,6 +33,7 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Snapshot, Vote};
 
+use coppice_core::bytes::ByteSize;
 use coppice_net::transport::Client;
 use coppice_proto::pb::raft::v1 as pb;
 
@@ -49,7 +50,7 @@ use super::convert;
 /// file-backed `SnapshotFile`, see `adapter.rs`), so this bounds both the
 /// wire message size and the sender's memory: one chunk in flight, however
 /// large the snapshot.
-pub const SNAPSHOT_CHUNK_BYTES: usize = 1 << 20;
+pub const SNAPSHOT_CHUNK: ByteSize = ByteSize::from_mib(1);
 
 /// The path name fail-stop wire-decode errors are attributed to.
 const WIRE: &str = "raft-rpc";
@@ -302,7 +303,13 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
                     return;
                 }
             };
-            let mut buf = vec![0u8; SNAPSHOT_CHUNK_BYTES.min(len.max(1) as usize)];
+            // The chunk size becomes a buffer length here, and only here.
+            let mut buf = vec![
+                0u8;
+                SNAPSHOT_CHUNK
+                    .as_usize_saturating()
+                    .min(len.max(1) as usize)
+            ];
             let mut at = 0u64;
             while at < len {
                 let n = ((len - at) as usize).min(buf.len());

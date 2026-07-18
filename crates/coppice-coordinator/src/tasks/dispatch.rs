@@ -337,6 +337,7 @@ pub(crate) fn register_accepted_command() -> AgentCommand {
 mod tests {
     use super::*;
     use coppice_core::allocation::AllocationState;
+    use coppice_core::bytes::ByteSize;
     use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
     use coppice_core::resource::Resources;
 
@@ -345,8 +346,8 @@ mod tests {
     fn requested() -> Resources {
         Resources {
             cpu_millis: 500,
-            memory_bytes: 1 << 20,
-            disk_bytes: 0,
+            memory: ByteSize::from_mib(1),
+            disk: ByteSize::ZERO,
         }
     }
 

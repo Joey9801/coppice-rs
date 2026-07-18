@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState};
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
@@ -92,8 +93,8 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         let multiplier = policy.priority_multipliers[&priority];
         let requested = Resources {
             cpu_millis: rng.range(250, 8_000),
-            memory_bytes: rng.range(256 << 20, 16 << 30),
-            disk_bytes: rng.range(0, 50 << 30).max(1),
+            memory: ByteSize::from_bytes(rng.range(256 << 20, 16 << 30)),
+            disk: ByteSize::from_bytes(rng.range(0, 50 << 30).max(1)),
         };
         let max_runtime = if rng.chance(70, 100) {
             Some(rand_span(
@@ -373,6 +374,16 @@ fn rand_span(rng: &mut Rng, lo: Duration, hi: Duration) -> Duration {
     Duration::from_micros(rng.range(lo.as_micros() as u64, hi.as_micros() as u64) as i64)
 }
 
+/// `percent` percent of `size`, rounded down.
+///
+/// Multiplying before dividing keeps the result exact for the small integer
+/// percentages the synthesizer draws, rather than compounding two roundings.
+fn fraction(size: ByteSize, percent: u64) -> ByteSize {
+    size.saturating_mul(percent)
+        .checked_div(100)
+        .unwrap_or(ByteSize::ZERO)
+}
+
 /// Mint a fresh, deterministic UUID from the testkit RNG. Never
 /// `Uuid::new_v4`: that would break seed reproducibility.
 fn next_uuid(rng: &mut Rng) -> uuid::Uuid {
@@ -437,8 +448,8 @@ fn build_attempt(
             let frac = rng.range(0, 90);
             let funded = Resources {
                 cpu_millis: ctx.requested.cpu_millis * frac / 100,
-                memory_bytes: ctx.requested.memory_bytes * frac / 100,
-                disk_bytes: ctx.requested.disk_bytes * frac / 100,
+                memory: fraction(ctx.requested.memory, frac),
+                disk: fraction(ctx.requested.disk, frac),
             };
             (
                 AttemptState::Accruing,
@@ -730,8 +741,8 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
         let id = NodeId(next_uuid(rng));
         let capacity = Resources {
             cpu_millis: rng.range(16_000, 128_000),
-            memory_bytes: rng.range(64 << 30, 512 << 30),
-            disk_bytes: rng.range(500 << 30, 4_000 << 30),
+            memory: ByteSize::from_bytes(rng.range(64 << 30, 512 << 30)),
+            disk: ByteSize::from_bytes(rng.range(500 << 30, 4_000 << 30)),
         };
         let mut labels = BTreeMap::new();
         labels.insert("zone".to_string(), (*rng.pick(&ZONES)).to_string());

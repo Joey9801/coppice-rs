@@ -33,6 +33,7 @@ use std::sync::{mpsc, Condvar, Mutex};
 
 use prost::Message;
 
+use coppice_core::bytes::ByteSize;
 use coppice_proto::convert::{
     allocation_records, attempt_records, cluster_record, job_records, node_records,
     quota_entity_records, record_counts, RecordCounts, StateRecords,
@@ -58,7 +59,7 @@ const TRAILER_LEN: usize = 4 + 4 + 8;
 /// Read granularity of the streaming (file-backed) validation passes: one
 /// buffer of this size is the only per-pass allocation, however large the
 /// container (ADR 0018 targets GB-scale snapshots).
-const FILE_CHUNK: usize = 1 << 20;
+const FILE_CHUNK: ByteSize = ByteSize::from_mib(1);
 
 /// One section's bytes plus its index entry, ready for assembly.
 ///
@@ -189,8 +190,17 @@ pub fn section_bytes<'a>(bytes: &'a [u8], entry: &pb::SectionEntry) -> &'a [u8] 
 
 /// CRC32C of the file byte range `[start, end)`, streamed in [`FILE_CHUNK`]
 /// reads.
+///
+/// `start` and `end` are positions in the file, not quantities of data, so
+/// they stay bare `u64` offsets; only the read buffer is a size.
 fn crc_of_range(file: &dyn FsFile, start: u64, end: u64) -> io::Result<u32> {
-    let mut buf = vec![0u8; FILE_CHUNK.min((end - start) as usize).max(1)];
+    let mut buf = vec![
+        0u8;
+        FILE_CHUNK
+            .as_usize_saturating()
+            .min((end - start) as usize)
+            .max(1)
+    ];
     let mut crc = 0u32;
     let mut at = start;
     while at < end {
@@ -205,6 +215,12 @@ fn crc_of_range(file: &dyn FsFile, start: u64, end: u64) -> io::Result<u32> {
 /// Read the plain record frame at file offset `offset`, whose end must not
 /// pass `limit`; returns the payload. The file counterpart of
 /// [`read_record`], for the (small) meta and index records.
+///
+/// Both `offset` and `limit` are positions within the container, not
+/// quantities of data — `limit` is the exclusive end of the region the frame
+/// must fit inside — so neither is a [`ByteSize`]. The framed record's own
+/// length is read out of the frame header and stays a bare integer for the
+/// same reason: it is bounds arithmetic against those positions.
 fn read_record_at(
     path: &Path,
     file: &dyn FsFile,

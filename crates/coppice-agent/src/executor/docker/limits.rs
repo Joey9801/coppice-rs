@@ -33,9 +33,9 @@ pub(crate) const CAP_ADD: [&str; 5] = [
 /// - `nano_cpus = cpu_millis × 1_000_000`, set only when `cpu_millis > 0`
 ///   (0 is left `None`: a real "unlimited" would be dishonest, but `Resources`
 ///   may legitimately be partial in tests).
-/// - `memory = memory_bytes` and `memory_swap = memory` (the *same* value): no
-///   swap headroom, so the kernel OOM kill against the limit is our
-///   classification signal. Both left `None` when `memory_bytes == 0`.
+/// - `memory` from the request, and `memory_swap = memory` (the *same* value):
+///   no swap headroom, so the kernel OOM kill against the limit is our
+///   classification signal. Both left `None` for a zero request.
 /// - `pids_limit` from config (fork-bomb hygiene).
 /// - `restart_policy = no`, explicitly: a Docker-initiated restart would
 ///   fabricate a second run under one attempt, violating attempt monotonicity
@@ -51,8 +51,9 @@ pub(crate) fn host_config(limits: &Resources, pids_limit: i64) -> bollard::model
             .unwrap_or(i64::MAX)
             .saturating_mul(1_000_000)
     });
-    let memory =
-        (limits.memory_bytes > 0).then(|| i64::try_from(limits.memory_bytes).unwrap_or(i64::MAX));
+    // Docker's host config types its limits as signed; this is the crossing
+    // out of the domain's `ByteSize` into the daemon's `i64`.
+    let memory = (!limits.memory.is_zero()).then(|| limits.memory.as_i64_saturating());
 
     bollard::models::HostConfig {
         // Limits.
@@ -128,24 +129,25 @@ pub(crate) fn resolve_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coppice_core::bytes::ByteSize;
 
-    fn resources(cpu_millis: u64, memory_bytes: u64) -> Resources {
+    fn resources(cpu_millis: u64, memory: ByteSize) -> Resources {
         Resources {
             cpu_millis,
-            memory_bytes,
-            disk_bytes: 0,
+            memory,
+            disk: ByteSize::ZERO,
         }
     }
 
     #[test]
     fn nano_cpus_arithmetic() {
-        let hc = host_config(&resources(1500, 0), 4096);
+        let hc = host_config(&resources(1500, ByteSize::ZERO), 4096);
         assert_eq!(hc.nano_cpus, Some(1_500_000_000));
     }
 
     #[test]
     fn memory_equals_memory_swap() {
-        let hc = host_config(&resources(0, 1 << 30), 4096);
+        let hc = host_config(&resources(0, ByteSize::from_gib(1)), 4096);
         assert_eq!(hc.memory, Some(1 << 30));
         assert_eq!(hc.memory_swap, Some(1 << 30));
         assert_eq!(hc.memory, hc.memory_swap);
@@ -174,7 +176,7 @@ mod tests {
 
     #[test]
     fn posture_is_locked_down() {
-        let hc = host_config(&resources(1000, 1 << 20), 4096);
+        let hc = host_config(&resources(1000, ByteSize::from_mib(1)), 4096);
         assert_eq!(hc.privileged, Some(false));
         assert_eq!(
             hc.security_opt,

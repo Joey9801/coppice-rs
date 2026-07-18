@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use coppice_core::attempt;
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 
@@ -50,8 +51,8 @@ impl From<&coppice_core::resource::Resources> for Resources {
     fn from(r: &coppice_core::resource::Resources) -> Self {
         Resources {
             cpu_millis: r.cpu_millis,
-            memory_bytes: r.memory_bytes,
-            disk_bytes: r.disk_bytes,
+            memory_bytes: r.memory.as_u64(),
+            disk_bytes: r.disk.as_u64(),
         }
     }
 }
@@ -1116,8 +1117,8 @@ impl From<Resources> for coppice_core::resource::Resources {
     fn from(r: Resources) -> Self {
         coppice_core::resource::Resources {
             cpu_millis: r.cpu_millis,
-            memory_bytes: r.memory_bytes,
-            disk_bytes: r.disk_bytes,
+            memory: ByteSize::from_bytes(r.memory_bytes),
+            disk: ByteSize::from_bytes(r.disk_bytes),
         }
     }
 }

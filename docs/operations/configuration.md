@@ -49,7 +49,14 @@ Conventions (all from ADR 0020):
 
 - **Unknown keys are startup errors.** A typo fail-stops with the key named.
 - **Durations and sizes are strings** — `"1500ms"`, `"24h"`, `"512MiB"`.
-  Unlabelled numbers for durations are rejected.
+  Unlabelled numbers are rejected for both: a size needs a unit suffix, and
+  an operator who writes `memory = 34359738368` gets a startup error naming
+  the key rather than a value nobody can check by eye. Sizes accept IEC
+  (`KiB`/`MiB`/`GiB`/`TiB`/`PiB`/`EiB`, powers of 1024) and SI (`KB`/`MB`/
+  `GB`/`TB`/`PB`/`EB`, powers of 1000) suffixes, case-insensitively, with an optional
+  fraction — `"1.5GiB"`, rounded up to the next whole byte. Bit units
+  (`"10Mbit"`) are refused rather than converted. Sizes are always *reported*
+  back in IEC.
 - **No inline secrets, ever** — the file holds *paths* to key material, so
   the file itself is safe to commit to config management, diff, and attach
   to support bundles.

@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, RetryPolicy};
 use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier};
@@ -80,8 +81,8 @@ pub fn test_policy(accrual_limit: u32) -> PolicyConfig {
 pub fn cpu(millis: u64) -> Resources {
     Resources {
         cpu_millis: millis,
-        memory_bytes: 0,
-        disk_bytes: 0,
+        memory: ByteSize::ZERO,
+        disk: ByteSize::ZERO,
     }
 }
 

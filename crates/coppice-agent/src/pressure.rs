@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use coppice_core::bytes::ByteSize;
 use nix::sys::statvfs::statvfs;
 use tokio::sync::watch;
 
@@ -47,17 +48,22 @@ pub enum DiskPressure {
 /// above `critical_pct` of `total`, `High` when at or above `high_pct`, else
 /// `Ok`. A zero-`total` filesystem (or one whose `statvfs` reported nonsense)
 /// classifies as [`DiskPressure::Ok`] — absence of a reading is never
-/// pressure. Comparison is exact integer arithmetic widened to `u128` so the
-/// `used × 100` scaling cannot overflow even on a maxed-out `u64` byte count.
-/// Bytes are taken as `u128` because the raw `statvfs` counts are widened there
-/// (their concrete width — `u32` or `u64` — varies by platform).
-fn classify(total: u128, available: u128, high_pct: u8, critical_pct: u8) -> DiskPressure {
-    if total == 0 {
+/// pressure.
+///
+/// The sizes cross this boundary as [`ByteSize`], which is what a caller has
+/// and what a reader of a log line wants. The `u128` widening the comparison
+/// needs is an implementation detail and stays inside: `used × 100` overflows
+/// a `u64` on any filesystem past ~184 PiB, so both sides of the percentage
+/// are lifted through [`ByteSize::as_u128`] before being scaled, and the
+/// comparison is then exact integer arithmetic with no rounding step.
+fn classify(total: ByteSize, available: ByteSize, high_pct: u8, critical_pct: u8) -> DiskPressure {
+    if total.is_zero() {
         return DiskPressure::Ok;
     }
     // `used = total − available`, clamped at zero: some network filesystems
     // report more free than total space, which must read as empty, not wrapped.
-    let used = total.saturating_sub(available);
+    let used = total.saturating_sub(available).as_u128();
+    let total = total.as_u128();
     let scaled = used * 100;
     if scaled >= total * u128::from(critical_pct) {
         DiskPressure::Critical
@@ -76,13 +82,27 @@ fn classify(total: u128, available: u128, high_pct: u8, critical_pct: u8) -> Dis
 /// path that does not exist, or a Docker data-root that lives inside a VM or on
 /// a remote daemon and so is not a local filesystem — is the caller's cue to
 /// skip the path, not a pressure signal.
+/// Narrow a `statvfs`-derived byte count into a [`ByteSize`], saturating.
+///
+/// Only reachable by a filesystem reporting more than 16 EiB, which means the
+/// reading is nonsense rather than a real disk — and [`ByteSize::MAX`] is the
+/// answer that keeps such a filesystem classified as empty rather than full.
+fn bytes_from(raw: u128) -> ByteSize {
+    ByteSize::from_bytes(u64::try_from(raw).unwrap_or(u64::MAX))
+}
+
 fn sample_path(path: &Path, high_pct: u8, critical_pct: u8) -> nix::Result<DiskPressure> {
     let stat = statvfs(path)?;
-    // `From` (not `as`) widens the platform-specific `fsblkcnt_t`/`c_ulong`
-    // without a cast, so the same code is warning-clean on 32- and 64-bit.
+    // The block count times the fragment size is where a raw kernel number
+    // becomes a quantity of bytes, so that product is the crossing into
+    // `ByteSize`. Both factors are platform-specific (`fsblkcnt_t`/`c_ulong`,
+    // `u32` or `u64` depending on the target), so they are widened with `From`
+    // rather than `as` — the same code compiles warning-clean on 32- and
+    // 64-bit. The multiply happens in `u128` so a nonsense `statvfs` reading
+    // cannot wrap, and the result saturates on the way down into `ByteSize`.
     let frsize = u128::from(stat.fragment_size());
-    let total = u128::from(stat.blocks()).saturating_mul(frsize);
-    let available = u128::from(stat.blocks_available()).saturating_mul(frsize);
+    let total = bytes_from(u128::from(stat.blocks()) * frsize);
+    let available = bytes_from(u128::from(stat.blocks_available()) * frsize);
     Ok(classify(total, available, high_pct, critical_pct))
 }
 
@@ -161,8 +181,13 @@ mod tests {
     const HIGH: u8 = 85;
     const CRIT: u8 = 95;
 
-    fn level(used: u128) -> DiskPressure {
-        classify(100, 100 - used, HIGH, CRIT)
+    fn level(used: u64) -> DiskPressure {
+        classify(
+            ByteSize::from_bytes(100),
+            ByteSize::from_bytes(100 - used),
+            HIGH,
+            CRIT,
+        )
     }
 
     #[test]
@@ -187,23 +212,38 @@ mod tests {
 
     #[test]
     fn zero_total_is_ok() {
-        assert_eq!(classify(0, 0, HIGH, CRIT), DiskPressure::Ok);
+        assert_eq!(
+            classify(ByteSize::ZERO, ByteSize::ZERO, HIGH, CRIT),
+            DiskPressure::Ok
+        );
     }
 
     #[test]
     fn available_over_total_reads_empty() {
         // Some network filesystems report available > total; treat as empty.
-        assert_eq!(classify(100, 200, HIGH, CRIT), DiskPressure::Ok);
+        assert_eq!(
+            classify(
+                ByteSize::from_bytes(100),
+                ByteSize::from_bytes(200),
+                HIGH,
+                CRIT
+            ),
+            DiskPressure::Ok
+        );
     }
 
     #[test]
     fn overflow_scale_inputs_do_not_panic() {
         // used × 100 would overflow u64; the u128 widening keeps it exact.
-        let max = u128::from(u64::MAX);
-        assert_eq!(classify(max, 0, HIGH, CRIT), DiskPressure::Critical);
+        let max = ByteSize::MAX;
+        let half = max.checked_div(2).expect("2 is not zero");
+        assert_eq!(
+            classify(max, ByteSize::ZERO, HIGH, CRIT),
+            DiskPressure::Critical
+        );
         assert_eq!(classify(max, max, HIGH, CRIT), DiskPressure::Ok);
         // Half full at u64 scale stays below High (50% used).
-        assert_eq!(classify(max, max / 2, HIGH, CRIT), DiskPressure::Ok);
+        assert_eq!(classify(max, half, HIGH, CRIT), DiskPressure::Ok);
     }
 
     #[test]

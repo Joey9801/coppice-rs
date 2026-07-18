@@ -6,6 +6,7 @@
 //! It holds by construction today (decay is literally the iterated per-tick
 //! step); these tests exist to catch any future "fast path" that breaks it.
 
+use coppice_core::bytes::ByteSize;
 use coppice_core::quota::{
     job_cost, penalty, true_up, ChargeRecord, CostUnits, CostWeights, DecayPolicy,
     PriorityMultiplier, TrueUp, UsageState, FULL_REFUND_MILLI,
@@ -151,8 +152,8 @@ proptest! {
     #[test]
     fn extreme_inputs_never_panic(
         cpu in any::<u64>(),
-        memory in any::<u64>(),
-        disk in any::<u64>(),
+        memory in any::<u64>().prop_map(ByteSize::from_bytes),
+        disk in any::<u64>().prop_map(ByteSize::from_bytes),
         w_cpu in any::<u64>(),
         w_mem in any::<u64>(),
         w_disk in any::<u64>(),
@@ -164,7 +165,7 @@ proptest! {
         refund_fraction in any::<u32>(),
         retain in any::<bool>(),
     ) {
-        let requests = Resources { cpu_millis: cpu, memory_bytes: memory, disk_bytes: disk };
+        let requests = Resources { cpu_millis: cpu, memory, disk };
         let weights = CostWeights {
             per_cpu_milli_second: w_cpu,
             per_memory_byte_second: w_mem,

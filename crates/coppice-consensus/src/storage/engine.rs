@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 use prost::Message;
 
+use coppice_core::bytes::ByteSize;
 use coppice_proto::pb::raft::v1 as pbraft;
 use coppice_proto::pb::storage::v1 as pbstorage;
 
@@ -61,7 +62,7 @@ pub struct StorageOptions {
     pub cluster_uuid: [u8; 16],
     /// Size threshold past which the active segment is sealed and the next
     /// append opens a fresh one.
-    pub segment_max_bytes: u64,
+    pub segment_max: ByteSize,
     /// Hash-shards per snapshot section kind (ADR 0018).
     pub snapshot_shards: u32,
 }
@@ -70,7 +71,7 @@ impl StorageOptions {
     pub fn new(cluster_uuid: [u8; 16]) -> StorageOptions {
         StorageOptions {
             cluster_uuid,
-            segment_max_bytes: 64 << 20,
+            segment_max: ByteSize::from_mib(64),
             snapshot_shards: 4,
         }
     }
@@ -140,7 +141,7 @@ pub struct StorageCore<F: Fs> {
 /// Chunk size of the streaming snapshot copy in
 /// [`StorageCore::install_snapshot_from`]: the only per-install allocation,
 /// however large the container (ADR 0018).
-const SNAPSHOT_COPY_CHUNK: usize = 1 << 20;
+const SNAPSHOT_COPY_CHUNK: ByteSize = ByteSize::from_mib(1);
 
 /// The install-snapshot receive spool: where a streamed container lands
 /// frame by frame before adoption. Never claimed by the manifest, so a crash
@@ -653,11 +654,14 @@ impl<F: Fs> StorageCore<F> {
         }
 
         // Seal-and-rotate on batch boundaries once the active segment is
-        // over the size threshold.
+        // over the size threshold. `len` doubles as the append position, so it
+        // is a `u64` offset in the file; it is a size only here, where it is
+        // weighed against the threshold, and the comparison is lifted into
+        // size-space rather than dropping the threshold down to a bare integer.
         if self
             .active
             .as_ref()
-            .is_some_and(|a| a.len >= self.options.segment_max_bytes)
+            .is_some_and(|a| ByteSize::from_bytes(a.len) >= self.options.segment_max)
         {
             self.active = None;
         }
@@ -1054,7 +1058,14 @@ impl<F: Fs> StorageCore<F> {
         }
         let mut file = self.fs.create_new(&tmp)?;
         let len = source.len()?;
-        let mut buf = vec![0u8; SNAPSHOT_COPY_CHUNK.min(len.max(1) as usize)];
+        // The buffer is a length in this address space, so the chunk size
+        // meets `vec!` as a `usize` here and nowhere else.
+        let mut buf = vec![
+            0u8;
+            SNAPSHOT_COPY_CHUNK
+                .as_usize_saturating()
+                .min(len.max(1) as usize)
+        ];
         let mut at = 0u64;
         while at < len {
             let n = ((len - at) as usize).min(buf.len());

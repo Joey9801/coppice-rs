@@ -625,6 +625,7 @@ fn observed_set_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coppice_core::bytes::ByteSize;
     use coppice_core::id::JobId;
     use coppice_state::StateMachine;
 
@@ -644,8 +645,8 @@ mod tests {
     fn requested() -> Resources {
         Resources {
             cpu_millis: 250,
-            memory_bytes: 1 << 20,
-            disk_bytes: 0,
+            memory: ByteSize::from_mib(1),
+            disk: ByteSize::ZERO,
         }
     }
 

@@ -32,6 +32,7 @@ use prost::Message;
 
 use coppice_consensus::fs::{Fs, FsFile, RealFs};
 use coppice_consensus::storage::{EncodedEntry, FrameLogId, StorageCore, StorageOptions};
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::NodeId;
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
@@ -64,8 +65,8 @@ fn register_node_command() -> Command {
         node: NodeId::new(),
         capacity: Resources {
             cpu_millis: 4_000,
-            memory_bytes: 8 << 30,
-            disk_bytes: 100 << 30,
+            memory: ByteSize::from_gib(8),
+            disk: ByteSize::from_gib(100),
         },
         labels: BTreeMap::new(),
         registered_at: Timestamp::from_micros(1_700_000_000_000_000).expect("in range"),

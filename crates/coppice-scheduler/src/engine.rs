@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, JobState};
 use coppice_core::node::Node;
@@ -85,6 +86,16 @@ fn cache_affinity_bonus(_job: &Job, _node: &Node) -> f64 {
 
 // ---- pure packing keys ----
 
+/// A size as an `f64`, for the ratio keys below.
+///
+/// The packing keys are proportions of a node's capacity, so the arithmetic is
+/// inherently fractional and cannot stay in the integer domain. Widening
+/// through `u128` rather than `u64` keeps a maxed-out size from wrapping on
+/// the way into the float.
+fn as_f64(size: ByteSize) -> f64 {
+    size.as_u128() as f64
+}
+
 /// Best-fit key: the dominant leftover fraction after seating `requested` in
 /// `free` on a node of `capacity` — `max` over dims of
 /// `(free − requested) / capacity`. Tighter packings score lower. Empty
@@ -95,10 +106,10 @@ fn dominant_leftover_fraction(
     capacity: &Resources,
 ) -> f64 {
     let after = free.saturating_sub(requested);
-    let frac = |a: u64, c: u64| if c == 0 { 0.0 } else { a as f64 / c as f64 };
-    frac(after.cpu_millis, capacity.cpu_millis)
-        .max(frac(after.memory_bytes, capacity.memory_bytes))
-        .max(frac(after.disk_bytes, capacity.disk_bytes))
+    let frac = |a: f64, c: f64| if c == 0.0 { 0.0 } else { a / c };
+    frac(after.cpu_millis as f64, capacity.cpu_millis as f64)
+        .max(frac(as_f64(after.memory), as_f64(capacity.memory)))
+        .max(frac(as_f64(after.disk), as_f64(capacity.disk)))
 }
 
 /// Borrowed-capacity key for a strict-backfill lend: the sum over dims of the
@@ -106,10 +117,10 @@ fn dominant_leftover_fraction(
 /// by capacity. A node lending less scores lower.
 fn borrowed_fraction(free: &Resources, requested: &Resources, capacity: &Resources) -> f64 {
     let borrow = requested.saturating_sub(free);
-    let frac = |b: u64, c: u64| if c == 0 { 0.0 } else { b as f64 / c as f64 };
-    frac(borrow.cpu_millis, capacity.cpu_millis)
-        + frac(borrow.memory_bytes, capacity.memory_bytes)
-        + frac(borrow.disk_bytes, capacity.disk_bytes)
+    let frac = |b: f64, c: f64| if c == 0.0 { 0.0 } else { b / c };
+    frac(borrow.cpu_millis as f64, capacity.cpu_millis as f64)
+        + frac(as_f64(borrow.memory), as_f64(capacity.memory))
+        + frac(as_f64(borrow.disk), as_f64(capacity.disk))
 }
 
 /// Accrual-opening key: the fraction of `requested` a node could immediately
@@ -117,10 +128,10 @@ fn borrowed_fraction(free: &Resources, requested: &Resources, capacity: &Resourc
 /// the opened accrual has the smallest remaining need.
 fn pledge_fraction(free: &Resources, requested: &Resources) -> f64 {
     let pledge = free.component_min(requested);
-    let frac = |a: u64, r: u64| if r == 0 { 1.0 } else { a as f64 / r as f64 };
-    frac(pledge.cpu_millis, requested.cpu_millis)
-        + frac(pledge.memory_bytes, requested.memory_bytes)
-        + frac(pledge.disk_bytes, requested.disk_bytes)
+    let frac = |a: f64, r: f64| if r == 0.0 { 1.0 } else { a / r };
+    frac(pledge.cpu_millis as f64, requested.cpu_millis as f64)
+        + frac(as_f64(pledge.memory), as_f64(requested.memory))
+        + frac(as_f64(pledge.disk), as_f64(requested.disk))
 }
 
 // ---- per-node working model ----
@@ -1159,11 +1170,11 @@ mod tests {
     use coppice_core::id::AttemptId;
     use coppice_state::{AllocationRecord, NodeRecord, PolicyConfig};
 
-    fn res(cpu: u64, mem: u64, disk: u64) -> Resources {
+    fn res(cpu: u64, mem: ByteSize, disk: ByteSize) -> Resources {
         Resources {
             cpu_millis: cpu,
-            memory_bytes: mem,
-            disk_bytes: disk,
+            memory: mem,
+            disk,
         }
     }
 
@@ -1203,17 +1214,29 @@ mod tests {
 
     #[test]
     fn best_fit_prefers_the_tighter_leftover() {
-        let req = res(8_000, 0, 0);
+        let req = res(8_000, ByteSize::ZERO, ByteSize::ZERO);
         // A big node leaves a large fraction free; a snug node leaves little.
-        let big = dominant_leftover_fraction(&res(64_000, 0, 0), &req, &res(64_000, 0, 0));
-        let snug = dominant_leftover_fraction(&res(10_000, 0, 0), &req, &res(16_000, 0, 0));
+        let big = dominant_leftover_fraction(
+            &res(64_000, ByteSize::ZERO, ByteSize::ZERO),
+            &req,
+            &res(64_000, ByteSize::ZERO, ByteSize::ZERO),
+        );
+        let snug = dominant_leftover_fraction(
+            &res(10_000, ByteSize::ZERO, ByteSize::ZERO),
+            &req,
+            &res(16_000, ByteSize::ZERO, ByteSize::ZERO),
+        );
         assert!(
             snug < big,
             "tighter packing must score lower: {snug} !< {big}"
         );
         // Empty dimensions never dominate the key.
         assert_eq!(
-            dominant_leftover_fraction(&res(0, 0, 0), &res(0, 0, 0), &res(0, 0, 0)),
+            dominant_leftover_fraction(
+                &res(0, ByteSize::ZERO, ByteSize::ZERO),
+                &res(0, ByteSize::ZERO, ByteSize::ZERO),
+                &res(0, ByteSize::ZERO, ByteSize::ZERO)
+            ),
             0.0
         );
     }
@@ -1224,9 +1247,9 @@ mod tests {
         let events = vec![ReleaseEvent {
             at: at(100),
             seq: 0,
-            freed: res(16_000, 0, 0),
+            freed: res(16_000, ByteSize::ZERO, ByteSize::ZERO),
         }];
-        let ready = sweep_projected_ready(&events, &[res(16_000, 0, 0)]);
+        let ready = sweep_projected_ready(&events, &[res(16_000, ByteSize::ZERO, ByteSize::ZERO)]);
         assert_eq!(ready, vec![Some(at(100))]);
     }
 
@@ -1236,9 +1259,9 @@ mod tests {
         let events = vec![ReleaseEvent {
             at: at(100),
             seq: 0,
-            freed: res(16_000, 0, 0),
+            freed: res(16_000, ByteSize::ZERO, ByteSize::ZERO),
         }];
-        let ready = sweep_projected_ready(&events, &[res(32_000, 0, 0)]);
+        let ready = sweep_projected_ready(&events, &[res(32_000, ByteSize::ZERO, ByteSize::ZERO)]);
         assert_eq!(ready, vec![None]);
     }
 
@@ -1250,16 +1273,22 @@ mod tests {
             ReleaseEvent {
                 at: at(100),
                 seq: 1,
-                freed: res(16_000, 0, 0),
+                freed: res(16_000, ByteSize::ZERO, ByteSize::ZERO),
             },
             ReleaseEvent {
                 at: at(50),
                 seq: 0,
-                freed: res(16_000, 0, 0),
+                freed: res(16_000, ByteSize::ZERO, ByteSize::ZERO),
             },
         ];
         sort_release_events(&mut events);
-        let ready = sweep_projected_ready(&events, &[res(16_000, 0, 0), res(16_000, 0, 0)]);
+        let ready = sweep_projected_ready(
+            &events,
+            &[
+                res(16_000, ByteSize::ZERO, ByteSize::ZERO),
+                res(16_000, ByteSize::ZERO, ByteSize::ZERO),
+            ],
+        );
         assert_eq!(ready, vec![Some(at(50)), Some(at(100))]);
     }
 
@@ -1291,20 +1320,20 @@ mod tests {
 
     #[test]
     fn simulator_funds_until_capacity_then_accrues() {
-        let sm = one_node_state(res(32_000, 0, 0));
+        let sm = one_node_state(res(32_000, ByteSize::ZERO, ByteSize::ZERO));
         let base = free_capacity_map(&sm);
         let node = NodeId(uuid::Uuid::from_u128(1));
         let placements = vec![
             ProposedPlacement {
                 job: JobId(uuid::Uuid::from_u128(10)),
                 node,
-                requested: res(20_000, 0, 0),
+                requested: res(20_000, ByteSize::ZERO, ByteSize::ZERO),
                 expect_funded: false,
             },
             ProposedPlacement {
                 job: JobId(uuid::Uuid::from_u128(11)),
                 node,
-                requested: res(20_000, 0, 0),
+                requested: res(20_000, ByteSize::ZERO, ByteSize::ZERO),
                 expect_funded: false,
             },
         ];
@@ -1317,7 +1346,7 @@ mod tests {
 
     #[test]
     fn simulator_flags_the_accrual_guard() {
-        let mut sm = one_node_state(res(1_000, 0, 0));
+        let mut sm = one_node_state(res(1_000, ByteSize::ZERO, ByteSize::ZERO));
         sm.policy.accrual_limit = 0;
         let base = free_capacity_map(&sm);
         let node = NodeId(uuid::Uuid::from_u128(1));
@@ -1326,7 +1355,7 @@ mod tests {
         let placements = vec![ProposedPlacement {
             job: JobId(uuid::Uuid::from_u128(10)),
             node,
-            requested: res(2_000, 0, 0),
+            requested: res(2_000, ByteSize::ZERO, ByteSize::ZERO),
             expect_funded: false,
         }];
         let sim = simulate_batch(&sm, &base, &[], &placements);
@@ -1338,7 +1367,7 @@ mod tests {
     fn simulator_revocation_frees_then_pledges_onward() {
         // Node cap 32; an existing accrual funded 16 (needs 32). Revoking it
         // returns 16, so a placement can then be fully funded from 32.
-        let mut sm = one_node_state(res(32_000, 0, 0));
+        let mut sm = one_node_state(res(32_000, ByteSize::ZERO, ByteSize::ZERO));
         let node = NodeId(uuid::Uuid::from_u128(1));
         let alloc = AllocationId(uuid::Uuid::from_u128(100));
         let attempt = AttemptId(uuid::Uuid::from_u128(101));
@@ -1351,8 +1380,8 @@ mod tests {
                     job,
                     attempt,
                     node,
-                    requested: res(32_000, 0, 0),
-                    funded: res(16_000, 0, 0),
+                    requested: res(32_000, ByteSize::ZERO, ByteSize::ZERO),
+                    funded: res(16_000, ByteSize::ZERO, ByteSize::ZERO),
                     state: AllocationState::Accruing,
                 },
                 seq: 0,
@@ -1360,11 +1389,15 @@ mod tests {
         );
         sm.accrual_queue.insert((node, 0), alloc);
         let base = free_capacity_map(&sm);
-        assert_eq!(base[&node], res(16_000, 0, 0), "16 funded ⇒ 16 free");
+        assert_eq!(
+            base[&node],
+            res(16_000, ByteSize::ZERO, ByteSize::ZERO),
+            "16 funded ⇒ 16 free"
+        );
         let placements = vec![ProposedPlacement {
             job: JobId(uuid::Uuid::from_u128(11)),
             node,
-            requested: res(32_000, 0, 0),
+            requested: res(32_000, ByteSize::ZERO, ByteSize::ZERO),
             expect_funded: false,
         }];
         let sim = simulate_batch(&sm, &base, &[alloc], &placements);

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState};
+use coppice_core::bytes::ByteSize;
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
 use coppice_core::quota::{
@@ -65,8 +66,8 @@ impl From<&Resources> for pb::Resources {
             }
         };
         push(pb::ResourceKind::CpuMillis, r.cpu_millis);
-        push(pb::ResourceKind::MemoryBytes, r.memory_bytes);
-        push(pb::ResourceKind::DiskBytes, r.disk_bytes);
+        push(pb::ResourceKind::MemoryBytes, r.memory.as_u64());
+        push(pb::ResourceKind::DiskBytes, r.disk.as_u64());
         pb::Resources { quantities }
     }
 }
@@ -82,10 +83,10 @@ impl TryFrom<pb::Resources> for Resources {
         let mut out = Resources::ZERO;
         let mut seen = [false; 3];
         for q in r.quantities {
-            let (slot, target) = match pb::ResourceKind::try_from(q.kind) {
-                Ok(pb::ResourceKind::CpuMillis) => (0, &mut out.cpu_millis),
-                Ok(pb::ResourceKind::MemoryBytes) => (1, &mut out.memory_bytes),
-                Ok(pb::ResourceKind::DiskBytes) => (2, &mut out.disk_bytes),
+            let slot = match pb::ResourceKind::try_from(q.kind) {
+                Ok(pb::ResourceKind::CpuMillis) => 0,
+                Ok(pb::ResourceKind::MemoryBytes) => 1,
+                Ok(pb::ResourceKind::DiskBytes) => 2,
                 _ => {
                     return Err(ConvertError::UnknownEnum {
                         field: "ResourceQuantity.kind",
@@ -97,7 +98,13 @@ impl TryFrom<pb::Resources> for Resources {
                 return Err(ConvertError::DuplicateEntry("Resources.quantities"));
             }
             seen[slot] = true;
-            *target = q.amount;
+            // The wire carries a bare `uint64` of bytes (ADR 0019 freezes the
+            // encoding); this is where it becomes a typed size.
+            match slot {
+                0 => out.cpu_millis = q.amount,
+                1 => out.memory = ByteSize::from_bytes(q.amount),
+                _ => out.disk = ByteSize::from_bytes(q.amount),
+            }
         }
         Ok(out)
     }

@@ -9,6 +9,7 @@ use common::*;
 
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::AllocationId;
 use coppice_core::job::JobState;
 use coppice_core::quota::PriorityMultiplier;
@@ -121,12 +122,12 @@ fn seats_a_fitting_job_and_emits_the_v1_shape() {
 fn rejects_a_job_that_exceeds_every_node_on_one_dimension() {
     // Node has plenty of CPU and disk but little memory; a memory-heavy job
     // fits no node and is never placed.
-    let mut sm = setup(res(32_000, 8 << 30, 1 << 40), 4);
+    let mut sm = setup(res(32_000, ByteSize::from_gib(8), ByteSize::from_tib(1)), 4);
     apply_ok(
         &mut sm,
         submit_cmd(
             jid(1),
-            res(1_000, 64 << 30, 0),
+            res(1_000, ByteSize::from_gib(64), ByteSize::ZERO),
             Some(600),
             PriorityMultiplier::ONE,
             base_ts(),
@@ -215,7 +216,7 @@ fn honours_the_effective_score_order_and_the_candidate_cap() {
 #[test]
 fn honours_the_placement_cap() {
     // Many fitting jobs, but the per-cycle placement cap bounds the batch.
-    let mut sm = setup(res(1_000_000, 0, 0), 4);
+    let mut sm = setup(res(1_000_000, ByteSize::ZERO, ByteSize::ZERO), 4);
     for i in 1..=10u128 {
         apply_ok(
             &mut sm,

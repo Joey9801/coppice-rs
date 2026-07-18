@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::NodeId;
 use coppice_core::resource::Resources;
 use serde::Deserialize;
@@ -210,10 +211,10 @@ pub struct TlsConfig {
 pub struct CapacityConfig {
     /// Milli-CPU units (1000 = one core).
     pub cpu_millis: u64,
-    /// Memory in bytes.
-    pub memory_bytes: u64,
-    /// Disk in bytes.
-    pub disk_bytes: u64,
+    /// Total RAM the node offers, before the system reservation.
+    pub memory: ByteSize,
+    /// Total scratch disk the node offers, before the system reservation.
+    pub disk: ByteSize,
 }
 
 /// Fixed resources withheld from scheduling (§6.4).
@@ -222,18 +223,18 @@ pub struct CapacityConfig {
 pub struct ReservationConfig {
     #[serde(default = "default_reservation_cpu_millis")]
     pub cpu_millis: u64,
-    #[serde(default = "default_reservation_memory_bytes")]
-    pub memory_bytes: u64,
-    #[serde(default = "default_reservation_disk_bytes")]
-    pub disk_bytes: u64,
+    #[serde(default = "default_reservation_memory")]
+    pub memory: ByteSize,
+    #[serde(default = "default_reservation_disk")]
+    pub disk: ByteSize,
 }
 
 impl Default for ReservationConfig {
     fn default() -> Self {
         Self {
             cpu_millis: default_reservation_cpu_millis(),
-            memory_bytes: default_reservation_memory_bytes(),
-            disk_bytes: default_reservation_disk_bytes(),
+            memory: default_reservation_memory(),
+            disk: default_reservation_disk(),
         }
     }
 }
@@ -243,8 +244,8 @@ impl Config {
     pub fn advertised_resources(&self) -> Resources {
         Resources {
             cpu_millis: self.capacity.cpu_millis - self.reservation.cpu_millis,
-            memory_bytes: self.capacity.memory_bytes - self.reservation.memory_bytes,
-            disk_bytes: self.capacity.disk_bytes - self.reservation.disk_bytes,
+            memory: self.capacity.memory - self.reservation.memory,
+            disk: self.capacity.disk - self.reservation.disk,
         }
     }
 
@@ -277,22 +278,20 @@ impl Config {
         if self.executor.disk_poll_interval.is_zero() {
             anyhow::bail!("executor.disk_poll_interval must be greater than zero");
         }
-        for (key, reservation, capacity) in [
-            (
-                "cpu_millis",
+        // The reservation must leave something to schedule on every dimension.
+        // CPU and the two sizes are checked separately because they are no
+        // longer the same type — the sizes report themselves in IEC units, so
+        // the error names the same quantity the operator wrote in the file.
+        if self.reservation.cpu_millis >= self.capacity.cpu_millis {
+            anyhow::bail!(
+                "reservation.cpu_millis ({}) must be less than capacity.cpu_millis ({})",
                 self.reservation.cpu_millis,
-                self.capacity.cpu_millis,
-            ),
-            (
-                "memory_bytes",
-                self.reservation.memory_bytes,
-                self.capacity.memory_bytes,
-            ),
-            (
-                "disk_bytes",
-                self.reservation.disk_bytes,
-                self.capacity.disk_bytes,
-            ),
+                self.capacity.cpu_millis
+            );
+        }
+        for (key, reservation, capacity) in [
+            ("memory", self.reservation.memory, self.capacity.memory),
+            ("disk", self.reservation.disk, self.capacity.disk),
         ] {
             if reservation >= capacity {
                 anyhow::bail!(
@@ -395,12 +394,12 @@ fn default_reservation_cpu_millis() -> u64 {
     1000
 }
 
-fn default_reservation_memory_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
+fn default_reservation_memory() -> ByteSize {
+    ByteSize::from_gib(2)
 }
 
-fn default_reservation_disk_bytes() -> u64 {
-    20 * 1024 * 1024 * 1024
+fn default_reservation_disk() -> ByteSize {
+    ByteSize::from_gib(20)
 }
 
 fn default_high_pct() -> u8 {
@@ -454,13 +453,13 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 
 [capacity]
 cpu_millis   = 32000
-memory_bytes = 137438953472
-disk_bytes   = 1099511627776
+memory     = "128GiB"
+disk       = "1TiB"
 
 [reservation]
 cpu_millis = 2000
-memory_bytes = 4294967296
-disk_bytes = 42949672960
+memory = "4GiB"
+disk = "40GiB"
 
 [labels]
 zone = "us-east-1a"
@@ -492,8 +491,8 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 
 [capacity]
 cpu_millis   = 8000
-memory_bytes = 17179869184
-disk_bytes   = 107374182400
+memory     = "16GiB"
+disk       = "100GiB"
 "#;
 
     #[test]
@@ -511,7 +510,10 @@ disk_bytes   = 107374182400
         assert_eq!(config.reconnect_backoff_min, Duration::from_millis(250));
         assert_eq!(config.reconnect_backoff_max, Duration::from_secs(30));
         assert_eq!(config.advertised_resources().cpu_millis, 30000);
-        assert_eq!(config.advertised_resources().memory_bytes, 133143986176);
+        assert_eq!(
+            config.advertised_resources().memory,
+            ByteSize::from_gib(124)
+        );
         assert_eq!(
             config.labels.get("zone").map(String::as_str),
             Some("us-east-1a")
@@ -558,8 +560,8 @@ disk_bytes   = 107374182400
         );
         assert_eq!(config.executor.disk_poll_interval, Duration::from_secs(30));
         assert_eq!(config.reservation.cpu_millis, 1000);
-        assert_eq!(config.reservation.memory_bytes, 2 * 1024 * 1024 * 1024);
-        assert_eq!(config.reservation.disk_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(config.reservation.memory, ByteSize::from_gib(2));
+        assert_eq!(config.reservation.disk, ByteSize::from_gib(20));
         assert_eq!(config.advertised_resources().cpu_millis, 7000);
         assert_eq!(config.pressure.high_pct, 85);
         assert_eq!(config.pressure.critical_pct, 95);
