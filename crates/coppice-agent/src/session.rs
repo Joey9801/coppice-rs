@@ -287,11 +287,18 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 Ok(Vec::new())
             }
             Body::PrepareCache(pc) => {
-                tracing::info!(node = %self.node, image = %pc.image, "prepare-cache hint accepted and ignored (ADR 0010)");
+                // Forwarded to the cache manager as an advisory warm pull (ADR
+                // 0010, §7): still freely ignorable — dropped under high disk
+                // pressure, and the fire-and-forget fetch may just fail.
+                tracing::debug!(node = %self.node, image = %pc.image, "forwarding prepare-cache hint to the executor (ADR 0010)");
+                self.executor.prepare_cache(pc.image);
                 Ok(Vec::new())
             }
             Body::EvictImageHint(e) => {
-                tracing::info!(node = %self.node, digest = %e.image_digest, "evict-image hint accepted and ignored (ADR 0010)");
+                // Forwarded as an advisory evict-if-unpinned (ADR 0010, §7):
+                // ignored when the digest is pinned or unknown.
+                tracing::debug!(node = %self.node, digest = %e.image_digest, "forwarding evict-image hint to the executor (ADR 0010)");
+                self.executor.evict_image(e.image_digest);
                 Ok(Vec::new())
             }
             // Handled before fencing dispatch; unreachable here.

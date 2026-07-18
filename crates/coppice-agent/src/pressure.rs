@@ -10,10 +10,10 @@
 //! telemetry retention sweep runs early (§8.4) and the image cache evicts
 //! ahead of TTL (§7); under [`DiskPressure::Critical`] both sweep to their
 //! floor and the agent refuses new `StartJob`s with a platform `StartError`
-//! rather than wedging the node. That last consumer is wired by the executor
-//! this session; the retention and cache consumers land in S5/S6. Job kills
-//! are **never** driven by host pressure — only by each job's own disk limit
-//! (§6.2).
+//! rather than wedging the node. The Critical start-refusal and the image-cache
+//! High/Critical eviction consumers ([`bytes_over_pct`], §7) are wired; the
+//! telemetry retention sweep lands in S6. Job kills are **never** driven by host
+//! pressure — only by each job's own disk limit (§6.2).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -91,19 +91,47 @@ fn bytes_from(raw: u128) -> ByteSize {
     ByteSize::from_bytes(u64::try_from(raw).unwrap_or(u64::MAX))
 }
 
-fn sample_path(path: &Path, high_pct: u8, critical_pct: u8) -> nix::Result<DiskPressure> {
+/// `statvfs` one path into `(total, available)` bytes the way `df` does for an
+/// unprivileged caller. Factored out so both [`sample_path`] (pressure level)
+/// and [`bytes_over_pct`] (the image cache's High-pressure eviction target, §7)
+/// share one reading and one set of platform-widening rules.
+///
+/// The block count times the fragment size is where a raw kernel number becomes
+/// a quantity of bytes, so that product is the crossing into `ByteSize`. Both
+/// factors are platform-specific (`fsblkcnt_t`/`c_ulong`, `u32` or `u64`
+/// depending on the target), so they are widened with `From` rather than `as` —
+/// the same code compiles warning-clean on 32- and 64-bit. The multiply happens
+/// in `u128` so a nonsense `statvfs` reading cannot wrap, and the result
+/// saturates on the way down into `ByteSize`.
+fn sample_bytes(path: &Path) -> nix::Result<(ByteSize, ByteSize)> {
     let stat = statvfs(path)?;
-    // The block count times the fragment size is where a raw kernel number
-    // becomes a quantity of bytes, so that product is the crossing into
-    // `ByteSize`. Both factors are platform-specific (`fsblkcnt_t`/`c_ulong`,
-    // `u32` or `u64` depending on the target), so they are widened with `From`
-    // rather than `as` — the same code compiles warning-clean on 32- and
-    // 64-bit. The multiply happens in `u128` so a nonsense `statvfs` reading
-    // cannot wrap, and the result saturates on the way down into `ByteSize`.
     let frsize = u128::from(stat.fragment_size());
     let total = bytes_from(u128::from(stat.blocks()) * frsize);
     let available = bytes_from(u128::from(stat.blocks_available()) * frsize);
+    Ok((total, available))
+}
+
+fn sample_path(path: &Path, high_pct: u8, critical_pct: u8) -> nix::Result<DiskPressure> {
+    let (total, available) = sample_bytes(path)?;
     Ok(classify(total, available, high_pct, critical_pct))
+}
+
+/// Bytes `path`'s filesystem holds *above* the `pct`-used high-water mark:
+/// `used − pct%·total`, clamped at zero (docker-executor.md §7, §9). This is
+/// how much the image cache must free under `High` pressure to bring the
+/// filesystem back below the mark. `None` on a `statvfs` error — the same
+/// "absence of a reading is never a signal" contract as [`sample_path`], which
+/// the cache reads as "no local reading" (drop every unpinned image).
+pub(crate) fn bytes_over_pct(path: &Path, pct: u8) -> Option<ByteSize> {
+    let (total, available) = sample_bytes(path).ok()?;
+    let used = total.saturating_sub(available).as_u128();
+    // `total × pct` needs the same u128 headroom the classifier uses — the
+    // product overflows a u64 past ~184 PiB.
+    let threshold = total.as_u128().saturating_mul(u128::from(pct)) / 100;
+    let over = used.saturating_sub(threshold);
+    Some(ByteSize::from_bytes(
+        u64::try_from(over).unwrap_or(u64::MAX),
+    ))
 }
 
 /// Spawn the §9 monitor over `paths` and return a [`watch::Receiver`] of the
@@ -256,6 +284,20 @@ mod tests {
         );
         assert!(DiskPressure::Ok < DiskPressure::High);
         assert!(DiskPressure::High < DiskPressure::Critical);
+    }
+
+    #[test]
+    fn bytes_over_pct_is_monotone_in_the_mark() {
+        // A real path samples without error, and a lower high-water mark can only
+        // leave *more* bytes "over" it than a higher one (the mark subtracts from
+        // used space). CI disks vary, so assert the ordering, not an absolute.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let over_low = bytes_over_pct(dir.path(), 10).expect("sampled");
+        let over_high = bytes_over_pct(dir.path(), 90).expect("sampled");
+        assert!(
+            over_low >= over_high,
+            "a lower mark leaves at least as much over it: {over_low} vs {over_high}"
+        );
     }
 
     #[test]

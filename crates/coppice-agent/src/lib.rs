@@ -79,6 +79,15 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     if let Some(root) = data_root {
         pressure_paths.push(root);
     }
+    // The image cache reads the same filesystems the pressure monitor watches
+    // for its High-pressure eviction target (§7, §9); clone the vec before it
+    // moves into `pressure::spawn`.
+    let cache_options = executor::docker::cache::CacheOptions {
+        config: config.image_cache.clone(),
+        state_path: Some(config.data_dir.join("image-cache.json")),
+        pressure_paths: pressure_paths.clone(),
+        high_pct: config.pressure.high_pct,
+    };
     let pressure_rx = pressure::spawn(pressure_paths, config.pressure);
     let docker_executor = executor::DockerExecutor::new(
         docker,
@@ -87,9 +96,10 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         config.reservation.cpu_millis,
         config.node(),
         pressure_rx,
+        cache_options,
     )
     .await
-    .context("initializing Docker CPU affinity")?;
+    .context("initializing the Docker executor")?;
 
     let session = session::Session::new(
         config.node(),

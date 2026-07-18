@@ -199,6 +199,22 @@ pub trait Executor: Send + Sync + 'static {
     fn cache_inventory(&self) -> pb::ImageCacheInventory {
         pb::ImageCacheInventory::default()
     }
+
+    /// Advisory `PrepareCache` hint (ADR 0010, docker-executor.md §7): warm
+    /// `image` if convenient. Freely ignorable, so the default is a no-op and
+    /// the signature is deliberately **sync** fire-and-forget — a hint carries
+    /// no result to await, and a sync default body also sidesteps the
+    /// async-fn-in-trait default-body `Send` hazard.
+    fn prepare_cache(&self, image: String) {
+        let _ = image;
+    }
+
+    /// Advisory eviction hint (ADR 0010, docker-executor.md §7): evict `digest`
+    /// if unpinned. Freely ignorable — same sync fire-and-forget rationale as
+    /// [`Executor::prepare_cache`].
+    fn evict_image(&self, digest: String) {
+        let _ = digest;
+    }
 }
 
 // ---- FakeExecutor -------------------------------------------------------

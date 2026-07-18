@@ -49,8 +49,9 @@ use bollard::query_parameters::ListContainersOptionsBuilder;
 use bollard::Docker;
 use tokio::sync::watch;
 
-use coppice_agent::config::{DiskEnforcement, ExecutorConfig};
+use coppice_agent::config::{DiskEnforcement, ExecutorConfig, ImageCacheConfig};
 use coppice_agent::executor::docker::api;
+use coppice_agent::executor::docker::cache::CacheOptions;
 use coppice_agent::executor::{
     classify_exit, ContainerState, DockerExecutor, Executor, ExitCause, ExitInfo,
     ObservedContainer, StartError, StartSpec, StopOutcome,
@@ -136,10 +137,26 @@ mod harness {
     ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
         let node = NodeId::new();
         let (tx, rx) = watch::channel(DiskPressure::Ok);
-        let exec = DockerExecutor::new(docker, &config, 1000, 0, node, rx)
+        let exec = DockerExecutor::new(docker, &config, 1000, 0, node, rx, cache_options())
             .await
             .expect("initialize Docker executor");
         (exec, tx)
+    }
+
+    /// A default in-memory [`CacheOptions`] for the harness (docker-executor.md
+    /// §7): no state file (`None`) since no cache test needs persistence across
+    /// an executor restart — the reconcile against `docker image ls` rebuilds
+    /// the inventory from reality on every construction — empty pressure paths
+    /// (the live janitor stays TTL-only under `Ok` pressure), high_pct 85, and
+    /// the default 30m TTL / 2-pull config. A tempdir-backed `state_path` would
+    /// add nothing a test asserts on, so it is deliberately omitted.
+    pub fn cache_options() -> CacheOptions {
+        CacheOptions {
+            config: ImageCacheConfig::default(),
+            state_path: None,
+            pressure_paths: Vec::new(),
+            high_pct: 85,
+        }
     }
 
     /// The busybox image's on-disk size, pulling it first if the daemon does not
@@ -214,9 +231,17 @@ mod harness {
         };
         let physical = physical_cores(&docker).await;
         let (tx, rx) = watch::channel(DiskPressure::Ok);
-        let exec = DockerExecutor::new(docker, &config, physical * 1000, 0, NodeId::new(), rx)
-            .await
-            .expect("initialize affinity executor");
+        let exec = DockerExecutor::new(
+            docker,
+            &config,
+            physical * 1000,
+            0,
+            NodeId::new(),
+            rx,
+            cache_options(),
+        )
+        .await
+        .expect("initialize affinity executor");
         (exec, tx)
     }
 
@@ -344,6 +369,38 @@ mod harness {
             .await
             .map_err(|e| anyhow!("list_containers: {e}"))?;
         Ok(list.len())
+    }
+
+    /// The `coppice.image-digest` label a container carries (§5) — the exact
+    /// digest the cache pinned for it (§7), so a cache test can name the pin/entry
+    /// without re-deriving `digest_of` (which is crate-internal).
+    pub async fn image_digest_label(
+        docker: &Docker,
+        alloc: AllocationId,
+    ) -> anyhow::Result<String> {
+        let inspect = docker
+            .inspect_container(
+                &format!("coppice-{alloc}"),
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| anyhow!("inspect: {e}"))?;
+        inspect
+            .config
+            .and_then(|config| config.labels)
+            .and_then(|labels| labels.get("coppice.image-digest").cloned())
+            .filter(|digest| !digest.is_empty())
+            .ok_or_else(|| anyhow!("container {alloc} has no coppice.image-digest label"))
+    }
+
+    /// Best-effort untag/remove of a dedicated test image, so a cache test that
+    /// asserts a *pull happened* starts from a known-absent reference. Ignores
+    /// every error (the image may not be present at all).
+    pub async fn remove_image_best_effort(docker: &Docker, reference: &str) {
+        let options = bollard::query_parameters::RemoveImageOptionsBuilder::new()
+            .force(true)
+            .build();
+        let _ = docker.remove_image(reference, Some(options), None).await;
     }
 
     /// Best-effort teardown: stop (tiny grace) then reap each allocation,
@@ -1051,5 +1108,205 @@ async fn disk_labels_present_on_started_container() {
     }
     .await;
 
+    r.unwrap();
+}
+
+// ---- 14. concurrent starts of one image pull it once (§7 singleflight) ---
+
+/// Three concurrent `start`s of the same image trigger exactly one pull: the
+/// cache manager's per-reference singleflight collapses them (§7). A dedicated
+/// tag (`busybox:musl`, used by no other test) is removed first so the pull is
+/// forced, and `cache_pulls_started()` is the witness.
+#[tokio::test]
+async fn concurrent_starts_pull_once() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    const IMAGE: &str = "busybox:musl";
+    // Force the pull: drop the tag before the executor exists so its recover
+    // reconcile never adopts it.
+    harness::remove_image_best_effort(&docker, IMAGE).await;
+
+    let (exec, _tx) = harness::executor(docker.clone()).await;
+    let sp1 = harness::spec(IMAGE, &["true"], Resources::ZERO);
+    let sp2 = harness::spec(IMAGE, &["true"], Resources::ZERO);
+    let sp3 = harness::spec(IMAGE, &["true"], Resources::ZERO);
+    let allocs = [sp1.allocation, sp2.allocation, sp3.allocation];
+
+    let r: anyhow::Result<()> = async {
+        let before = exec.cache_pulls_started();
+        // Concurrent (tokio::join! polls them on one task without spawning).
+        let (r1, r2, r3) = tokio::join!(exec.start(sp1), exec.start(sp2), exec.start(sp3));
+        r1?;
+        r2?;
+        r3?;
+        let delta = exec.cache_pulls_started() - before;
+        ensure!(
+            delta == 1,
+            "three concurrent starts of one image must pull exactly once, pulled {delta} times"
+        );
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &allocs).await;
+    r.unwrap();
+}
+
+// ---- 15. evict hint respects pins (§7, ADR 0010) ------------------------
+
+/// `EvictImageHint` is honored only when the image is unpinned (§7). A running
+/// container pins its image, so the hint is ignored; once the container is
+/// stopped and reaped (unpinning it), the same hint is honored. A dedicated tag
+/// (`busybox:uclibc`) keeps the eviction from disturbing the shared `busybox`
+/// image other tests use.
+#[tokio::test]
+async fn evict_hint_respects_pins() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    const IMAGE: &str = "busybox:uclibc";
+    let (exec, _tx) = harness::executor(docker.clone()).await;
+    let sp = harness::spec(IMAGE, &["sleep", "300"], Resources::ZERO);
+    let alloc = sp.allocation;
+
+    let r: anyhow::Result<()> = async {
+        exec.start(sp).await?;
+        harness::wait_observed_running(&exec, alloc, 30).await?;
+        let digest = harness::image_digest_label(&docker, alloc).await?;
+
+        // Pinned by the running container → the hint is ignored: the image must
+        // survive a full second of repeated hints.
+        exec.evict_image(digest.clone());
+        for _ in 0..5 {
+            tokio::time::sleep(StdDuration::from_millis(200)).await;
+            ensure!(
+                docker.inspect_image(IMAGE).await.is_ok(),
+                "a pinned image must not be evicted by a hint"
+            );
+        }
+
+        // Stop + reap → the pin drains → the hint is now honored.
+        exec.stop(alloc, CoreDuration::from_millis(1)).await?;
+        exec.reap(alloc).await?;
+        exec.evict_image(digest);
+
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(15);
+        loop {
+            if docker.inspect_image(IMAGE).await.is_err() {
+                break; // gone — the unpinned hint was honored
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "an unpinned evict hint was not honored within 15s"
+            );
+            tokio::time::sleep(StdDuration::from_millis(200)).await;
+        }
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[alloc]).await;
+    r.unwrap();
+}
+
+// ---- 16. TTL eviction removes an idle image (§7) ------------------------
+
+/// An unpinned image idle past the TTL is evicted by a janitor sweep (§7). The
+/// sweep is driven through the `cache_sweep_at` seam with an injected +31m
+/// `now` rather than a tiny live TTL: a sub-second live janitor TTL would evict
+/// other tests' shared images every 60s mid-suite, whereas one injected sweep is
+/// a single, controlled reclamation. A dedicated image (`hello-world:latest`)
+/// is the assertion target.
+///
+/// (Note: a `cache_sweep_at(+31m)` still evicts *every* idle unpinned image this
+/// executor's reconcile adopted — that is the cache manager doing its job, §7 —
+/// but images with a live container elsewhere are protected by the daemon's
+/// in-use `409`, and anything evicted is merely re-pulled on next use.)
+#[tokio::test]
+async fn ttl_eviction_removes_image() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    const IMAGE: &str = "hello-world:latest";
+    let (exec, _tx) = harness::executor(docker.clone()).await;
+    let sp = harness::spec(IMAGE, &["/hello"], Resources::ZERO);
+    let alloc = sp.allocation;
+
+    let r: anyhow::Result<()> = async {
+        exec.start(sp).await?;
+        // hello-world runs and exits at once; wait for the exit, then read its
+        // pinned digest before reaping removes the container.
+        harness::wait_observed_exit(&exec, alloc, 30).await?;
+        let digest = harness::image_digest_label(&docker, alloc).await?;
+        exec.reap(alloc).await?; // release stamps last_used_at
+
+        // One sweep 31 minutes in the future: past the 30m TTL for the idle,
+        // now-unpinned image.
+        let evicted = exec
+            .cache_sweep_at(Timestamp::now() + CoreDuration::from_mins(31))
+            .await;
+        ensure!(evicted >= 1, "the sweep evicted nothing");
+        ensure!(
+            docker.inspect_image(IMAGE).await.is_err(),
+            "the idle image must be gone after a past-TTL sweep"
+        );
+        let inventory = exec.cache_inventory();
+        ensure!(
+            !inventory.images.iter().any(|image| image.digest == digest),
+            "the evicted image must no longer appear in the inventory"
+        );
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[alloc]).await;
+    r.unwrap();
+}
+
+// ---- 17. inventory lists a pulled image (§7, ADR 0010) ------------------
+
+/// After a start the cache inventory lists the image with a real size and a sane
+/// last-used timestamp (§7) — the snapshot `cache_inventory()` returns for
+/// heartbeats (ADR 0010). A dedicated tag (`busybox:glibc`) keeps the assertion
+/// independent of whatever else the daemon holds.
+#[tokio::test]
+async fn inventory_lists_pulled_image() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    const IMAGE: &str = "busybox:glibc";
+    let (exec, _tx) = harness::executor(docker.clone()).await;
+    let sp = harness::spec(IMAGE, &["true"], Resources::ZERO);
+    let alloc = sp.allocation;
+
+    let before = Timestamp::now();
+    let r: anyhow::Result<()> = async {
+        exec.start(sp).await?;
+        let digest = harness::image_digest_label(&docker, alloc).await?;
+
+        let inventory = exec.cache_inventory();
+        let cached = inventory
+            .images
+            .iter()
+            .find(|image| image.digest == digest)
+            .ok_or_else(|| anyhow!("started image {digest} absent from the inventory"))?;
+        ensure!(
+            cached.size_bytes > 0,
+            "cached image reported a zero size: {}",
+            cached.size_bytes
+        );
+        // last_used_at was stamped at fetch, at or after we started timing.
+        let last_used = Timestamp::from_micros(cached.last_used_at_us)
+            .ok_or_else(|| anyhow!("last_used_at_us {} is out of range", cached.last_used_at_us))?;
+        ensure!(
+            last_used >= before,
+            "last_used_at {last_used} predates the start of the test"
+        );
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[alloc]).await;
     r.unwrap();
 }
