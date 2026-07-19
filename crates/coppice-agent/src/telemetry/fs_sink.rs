@@ -428,9 +428,19 @@ impl super::LogSink for FilesystemSink {
 impl FilesystemSink {
     /// Mark an attempt ended (docker-executor.md §8.4): close its open segment
     /// (if any) so no writer holds the file, then durably write the `ended`
-    /// marker (decimal µs). Idempotent — the first marker wins. The executor
-    /// wiring that calls this lands in a later slice.
-    pub async fn attempt_ended(&self, job: &JobId, attempt: &AttemptId, at: Timestamp) {
+    /// marker (decimal µs). Idempotent — the first marker wins.
+    ///
+    /// An `Err` means the marker did **not** persist (e.g. `ENOSPC`) and the
+    /// attempt still reads as live — which retention then protects rather than
+    /// reclaims — so the caller must retry until this succeeds. The segment
+    /// close is idempotent, so retrying is safe. The executor wiring that calls
+    /// this lands in a later slice.
+    pub async fn attempt_ended(
+        &self,
+        job: &JobId,
+        attempt: &AttemptId,
+        at: Timestamp,
+    ) -> std::io::Result<()> {
         {
             let mut map = self.inner.open.lock().await;
             if let Some(segment) = map.remove(&(*job, *attempt)) {
@@ -444,16 +454,9 @@ impl FilesystemSink {
             .join(attempt.to_string());
         let marker = dir.join("ended");
         if marker.exists() {
-            return; // first marker wins (idempotent)
+            return Ok(()); // first marker wins (idempotent)
         }
-        if let Err(err) = write_marker(&dir, &marker, at) {
-            tracing::error!(
-                %job,
-                %attempt,
-                error = %err,
-                "writing telemetry `ended` marker failed (§8.4)"
-            );
-        }
+        write_marker(&dir, &marker, at)
     }
 
     /// Run one retention sweep (docker-executor.md §8.4). Under `Ok` pressure
@@ -753,9 +756,12 @@ impl FilesystemSink {
     }
 
     /// The newest stored log timestamp for an attempt (docker-executor.md §8.2
-    /// resume input): the max `at` in the newest segment that has any log rows.
-    /// Metrics-only segments are skipped; `None` if no segment has log rows.
-    /// Whole-second flooring is the caller's job, not the store's.
+    /// resume input): `MAX(at)` over the attempt's log rows across **all**
+    /// segments — not just the newest log-bearing one, because a later segment
+    /// can hold only backdated (§8.2 replayed) rows while an earlier one holds
+    /// the true maximum. Metrics-only segments contribute nothing; `None` if no
+    /// segment has log rows. Whole-second flooring is the caller's job, not the
+    /// store's.
     pub async fn max_log_timestamp(
         &self,
         job: &JobId,
@@ -763,22 +769,23 @@ impl FilesystemSink {
     ) -> Result<Option<Timestamp>, StoreError> {
         let dir = self.attempt_dir_existing(job, attempt)?;
         let segments = list_segments(&dir);
-        for (_, path) in segments.iter().rev() {
+        let mut max: Option<Timestamp> = None;
+        for (_, path) in &segments {
             let Some(mut conn) = self.open_read(path).await? else {
                 continue;
             };
             let row = sqlx::query!(r#"SELECT MAX(at) AS "max_at: i64" FROM log_chunks"#)
                 .fetch_one(&mut conn)
                 .await?;
-            if let Some(max) = row.max_at {
+            if let Some(raw) = row.max_at {
                 // A corrupt out-of-range micros value is treated as "no reading"
                 // for this segment rather than failing the whole resume.
-                if let Some(timestamp) = Timestamp::from_micros(max) {
-                    return Ok(Some(timestamp));
+                if let Some(timestamp) = Timestamp::from_micros(raw) {
+                    max = Some(max.map_or(timestamp, |current| current.max(timestamp)));
                 }
             }
         }
-        Ok(None)
+        Ok(max)
     }
 
     /// The attempt's directory, or [`StoreError::UnknownAttempt`] if it does not
@@ -1830,7 +1837,7 @@ mod tests {
         let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
         sink.append_metrics_at(&[metric(job, attempt, alloc, at(0))], at(0))
             .await;
-        sink.attempt_ended(&job, &attempt, at(100)).await;
+        sink.attempt_ended(&job, &attempt, at(100)).await.unwrap();
         // Before retention elapses: nothing deleted.
         let deleted = sink.sweep(at(150), DiskPressure::Ok).await;
         assert_eq!(deleted, 0);
@@ -1855,10 +1862,10 @@ mod tests {
         let newer = AttemptId::new();
         sink.append_metrics_at(&[metric(job, older, alloc, at(0))], at(0))
             .await;
-        sink.attempt_ended(&job, &older, at(10)).await;
+        sink.attempt_ended(&job, &older, at(10)).await.unwrap();
         sink.append_metrics_at(&[metric(job, newer, alloc, at(0))], at(0))
             .await;
-        sink.attempt_ended(&job, &newer, at(20)).await;
+        sink.attempt_ended(&job, &newer, at(20)).await.unwrap();
 
         // Synthetic bytes-to-free: over the mark for the first deletion, below it
         // after — so exactly one (the oldest-ended) segment goes.
@@ -1967,6 +1974,44 @@ mod tests {
         );
     }
 
+    // The resume boundary is MAX(at) across ALL segments (§8.2): a later
+    // segment holding only backdated (replayed) rows must not shadow an
+    // earlier segment's true maximum.
+    #[tokio::test]
+    async fn max_log_timestamp_is_global_across_backdated_segments() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max = ByteSize::from_bytes(1); // roll each append
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // Segment 1 holds the true maximum (70); segment 2, created later, holds
+        // only an older replayed row (60).
+        sink.append_logs_at(
+            &[log(job, attempt, alloc, at(70), LogStream::Stdout, b"a")],
+            at(100),
+        )
+        .await;
+        sink.append_logs_at(
+            &[log(
+                job,
+                attempt,
+                alloc,
+                at(60),
+                LogStream::Stdout,
+                b"replay",
+            )],
+            at(200),
+        )
+        .await;
+        assert_eq!(segment_files(&attempt_dir(&sink, job, attempt)).len(), 2);
+        assert_eq!(
+            sink.max_log_timestamp(&job, &attempt).await.unwrap(),
+            Some(at(70)),
+            "global MAX(at), not the newest log-bearing segment's"
+        );
+    }
+
     #[tokio::test]
     async fn max_log_timestamp_is_none_without_log_rows() {
         let root = TempDir::new().unwrap();
@@ -1998,14 +2043,14 @@ mod tests {
         let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
         sink.append_metrics_at(&[metric(job, attempt, alloc, at(0))], at(0))
             .await;
-        sink.attempt_ended(&job, &attempt, at(500)).await;
+        sink.attempt_ended(&job, &attempt, at(500)).await.unwrap();
 
         let marker = attempt_dir(&sink, job, attempt).join("ended");
         let content = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(content, at(500).as_micros().to_string());
 
         // A second end never overwrites the first marker.
-        sink.attempt_ended(&job, &attempt, at(999)).await;
+        sink.attempt_ended(&job, &attempt, at(999)).await.unwrap();
         let content = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(
             content,
@@ -2024,6 +2069,36 @@ mod tests {
         sink.append_metrics_at(&[metric(job, attempt, alloc, at(600))], at(600))
             .await;
         assert!(!segment_files(&attempt_dir(&sink, job, attempt)).is_empty());
+    }
+
+    // A marker that cannot persist must surface as an `Err` (the attempt would
+    // otherwise read as live forever), and a retry after the obstruction clears
+    // must succeed.
+    #[tokio::test]
+    async fn attempt_ended_reports_marker_write_failure_and_retries() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt) = (JobId::new(), AttemptId::new());
+        // Obstruct the attempt *directory* path with a plain file so the marker
+        // write cannot create it.
+        let job_dir = sink.inner.root.join(job.to_string());
+        std::fs::create_dir_all(&job_dir).unwrap();
+        let obstruction = job_dir.join(attempt.to_string());
+        std::fs::write(&obstruction, b"in the way").unwrap();
+
+        sink.attempt_ended(&job, &attempt, at(500))
+            .await
+            .expect_err("an unpersisted marker must surface");
+        // Still live: no marker was recorded.
+        assert_eq!(read_ended_marker(&obstruction.clone()), None);
+
+        std::fs::remove_file(&obstruction).unwrap();
+        sink.attempt_ended(&job, &attempt, at(500))
+            .await
+            .expect("retry succeeds once the obstruction clears");
+        let attempts = sink.list_attempts(Some(&job)).await.unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].ended_at, Some(at(500)));
     }
 
     // The public `MetricsSink`/`LogSink` trait boundary (now-stamped) persists
