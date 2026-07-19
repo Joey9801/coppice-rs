@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT MAX(at) AS \"max_at: i64\" FROM log_chunks",
+  "describe": {
+    "columns": [
+      {
+        "name": "max_at: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "e77e4244f15f1bc9cf7026680e49044fc09361eb27fa752f215224a22ad6be04"
+}

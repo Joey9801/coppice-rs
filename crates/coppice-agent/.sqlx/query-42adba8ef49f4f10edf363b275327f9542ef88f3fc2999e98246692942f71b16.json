@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO log_chunks (at, allocation_id, stream, bytes) VALUES (?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "42adba8ef49f4f10edf363b275327f9542ef88f3fc2999e98246692942f71b16"
+}

@@ -48,12 +48,13 @@ CI. (`rust-version` in the root `Cargo.toml` is the separate MSRV claim.) The
 schema corpus is compiled in-process by `protox`, so no system `protoc` is
 needed.
 
-CI runs exactly these three checks — run them locally to match:
+CI runs exactly these four checks — run them locally to match:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
+scripts/sqlx-prepare.sh --check   # verifies the checked-in sqlx query cache is current
 ```
 
 ## Documentation

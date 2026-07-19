@@ -53,6 +53,11 @@ bollard = "0.19"
 # refused, neither of which the crate does on its own. Already in the tree as
 # a transitive dependency of openraft.
 byte-unit = "5"
+# Raw log-chunk payloads carried through the telemetry sink without re-framing
+# of user content (docker-executor.md §8.2): `bytes::Bytes` is a cheaply-cloned
+# refcounted buffer, and the segment store persists it straight into a SQLite
+# `BLOB`.
+bytes = "1"
 # Coordinator CLI surface — deliberately tiny per ADR 0020: `--config`, the
 # ADR 0016 intent flags, and the hidden admin verbs.
 clap = { version = "4", features = ["derive"] }
@@ -108,6 +113,19 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The telemetry segment store (docker-executor.md §8.4), and the convention for
+# all SQL in the repo: queries are compile-time-checked against the schema in
+# `migrations/`, verified offline through the checked-in `.sqlx/` prepare cache
+# so CI needs no live database. `default-features = false` drops the bundled
+# TLS/native drivers; `sqlite` bundles SQLite itself (no system libsqlite),
+# `migrate` embeds the schema migrations, `macros` provides the checked
+# `query!`/`migrate!` macros over the tokio runtime.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "migrate",
+    "macros",
+] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 # Adapts a bounded tokio mpsc receiver into a `Stream` for the client-streaming

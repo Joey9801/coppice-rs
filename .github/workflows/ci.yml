@@ -64,6 +64,25 @@ jobs:
       # `///`/`//!` fence is ```text), so there is no separate `--doc` gate.
       - run: cargo nextest run --workspace --all-features --locked
 
+  sqlx-prepare:
+    name: sqlx-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      # Pinned to the workspace's sqlx minor (0.8): the CLI and the crate's
+      # macros share the query-metadata format, and an unpinned `latest` here
+      # would let a CLI release break the check without any repo change.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli@0.8.6
+      # Regenerates a scratch sqlite database from the telemetry migrations
+      # and verifies the checked-in crates/coppice-agent/.sqlx/ cache matches
+      # what `cargo sqlx prepare` would produce today (docs/architecture/
+      # docker-executor.md §8.4).
+      - run: scripts/sqlx-prepare.sh --check
+
   web:
     name: web
     runs-on: ubuntu-latest
