@@ -2064,21 +2064,33 @@ mod tests {
         assert_eq!(attempts[0].ended_at, Some(at(500)));
         assert_eq!(attempts[0].segments, 1);
 
-        // After the end, a fresh append opens a new segment (never reopens the
-        // closed one).
+        // After the end, a fresh append opens a *second* segment (never reopens
+        // the closed one) and the new row is readable.
         sink.append_metrics_at(&[metric(job, attempt, alloc, at(600))], at(600))
             .await;
-        assert!(!segment_files(&attempt_dir(&sink, job, attempt)).is_empty());
+        assert_eq!(
+            segment_files(&attempt_dir(&sink, job, attempt)).len(),
+            2,
+            "a post-end append opens a fresh segment"
+        );
+        let rows = sink
+            .metric_samples(&job, &attempt, at(600), at(600))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the post-end row is readable");
     }
 
     // A marker that cannot persist must surface as an `Err` (the attempt would
-    // otherwise read as live forever), and a retry after the obstruction clears
-    // must succeed.
+    // otherwise read as live forever), a retry after the obstruction clears
+    // must succeed, and retention must then be able to reclaim the attempt.
     #[tokio::test]
     async fn attempt_ended_reports_marker_write_failure_and_retries() {
         let root = TempDir::new().unwrap();
-        let sink = sink_with(root.path().join("tel"), |_| {}).await;
-        let (job, attempt) = (JobId::new(), AttemptId::new());
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.retention = CoreDuration::from_secs(60);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
         // Obstruct the attempt *directory* path with a plain file so the marker
         // write cannot create it.
         let job_dir = sink.inner.root.join(job.to_string());
@@ -2092,13 +2104,297 @@ mod tests {
         // Still live: no marker was recorded.
         assert_eq!(read_ended_marker(&obstruction.clone()), None);
 
+        // Obstruction clears; the attempt accrues data and the retry lands.
         std::fs::remove_file(&obstruction).unwrap();
+        sink.append_metrics_at(&[metric(job, attempt, alloc, at(400))], at(400))
+            .await;
         sink.attempt_ended(&job, &attempt, at(500))
             .await
             .expect("retry succeeds once the obstruction clears");
         let attempts = sink.list_attempts(Some(&job)).await.unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].ended_at, Some(at(500)));
+
+        // With the marker persisted, retention can now reclaim the attempt.
+        let deleted = sink.sweep(at(561), DiskPressure::Ok).await;
+        assert_eq!(deleted, 1);
+        assert!(
+            !attempt_dir(&sink, job, attempt).exists(),
+            "the retried end unlocks retention reclaim"
+        );
+    }
+
+    // ---- restart contract (docker-executor.md §8.4) ------------------------
+
+    // A new sink over the same root (a process restart) must never reopen the
+    // previous open segment for writing: the first append creates a fresh
+    // segment with a strictly greater start — even under a regressed clock —
+    // the old segment's rows stay untouched, and reads span both.
+    #[tokio::test]
+    async fn restart_opens_a_fresh_segment_and_reads_span_old_and_new() {
+        let root = TempDir::new().unwrap();
+        let tel_root = root.path().join("tel");
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+
+        let sink1 = sink_with(tel_root.clone(), |_| {}).await;
+        sink1
+            .append_logs_at(
+                &[log(
+                    job,
+                    attempt,
+                    alloc,
+                    at(70),
+                    LogStream::Stdout,
+                    b"before",
+                )],
+                at(1000),
+            )
+            .await;
+        let dir = attempt_dir(&sink1, job, attempt);
+        let seg_a = segment_files(&dir)[0].clone();
+        drop(sink1); // the "crash": the writer goes away without attempt_ended
+
+        // Restart with a clock that regressed to *before* segment A's start.
+        let sink2 = sink_with(tel_root, |_| {}).await;
+        sink2
+            .append_logs_at(
+                &[log(
+                    job,
+                    attempt,
+                    alloc,
+                    at(75),
+                    LogStream::Stdout,
+                    b"after",
+                )],
+                at(500),
+            )
+            .await;
+
+        let segments = list_segments(&dir);
+        assert_eq!(segments.len(), 2, "restart opens a fresh segment");
+        assert_eq!(segments[0].1, seg_a, "the previous segment file remains");
+        assert!(
+            segments[0].0 < segments[1].0,
+            "starts stay strictly increasing under a regressed clock"
+        );
+
+        // The old segment still holds exactly its original row — the new write
+        // landed in the fresh segment, not in segment A.
+        let mut conn = super::SqliteConnectOptions::new()
+            .filename(&seg_a)
+            .journal_mode(super::SqliteJournalMode::Wal)
+            .connect()
+            .await
+            .unwrap();
+        let count = sqlx::query!(r#"SELECT COUNT(*) AS "n!: i64" FROM log_chunks"#)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+            .n;
+        assert_eq!(count, 1, "previous segment untouched by the restart");
+
+        // Reads merge both segments, and the resume boundary is the global max.
+        let rows = sink2
+            .log_chunks(
+                &job,
+                &attempt,
+                None,
+                LogQuery::Range {
+                    from: at(0),
+                    to: at(100),
+                },
+            )
+            .await
+            .unwrap();
+        let bytes: Vec<&[u8]> = rows.iter().map(|c| c.bytes.as_ref()).collect();
+        assert_eq!(bytes, vec![b"before".as_ref(), b"after".as_ref()]);
+        assert_eq!(
+            sink2.max_log_timestamp(&job, &attempt).await.unwrap(),
+            Some(at(75))
+        );
+    }
+
+    // ---- write-error isolation (docker-executor.md §8.3) -------------------
+
+    // A failing attempt in a mixed batch is dropped and accounted; the other
+    // attempt in the same batch persists — per-group flushes isolate faults.
+    #[tokio::test]
+    async fn write_errors_isolate_to_the_failing_attempt() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, alloc) = (JobId::new(), AllocationId::new());
+        let good = AttemptId::new();
+        let bad = AttemptId::new();
+        // Obstruct `bad`'s attempt-directory path so its segment cannot be
+        // created. `good` comes first in the batch so the error latch's final
+        // state reflects the failing group.
+        let job_dir = sink.inner.root.join(job.to_string());
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::write(job_dir.join(bad.to_string()), b"in the way").unwrap();
+
+        let batch = vec![
+            log(job, good, alloc, at(10), LogStream::Stdout, b"ok"),
+            log(job, bad, alloc, at(10), LogStream::Stdout, b"doomed"),
+        ];
+        sink.append_logs_at(&batch, at(10)).await; // must not panic or bail early
+
+        let rows = sink
+            .log_chunks(
+                &job,
+                &good,
+                None,
+                LogQuery::Range {
+                    from: at(0),
+                    to: at(100),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the healthy attempt's chunk persisted");
+        assert_eq!(rows[0].bytes.as_ref(), b"ok");
+        assert!(
+            job_dir.join(bad.to_string()).is_file(),
+            "the failing attempt wrote nothing"
+        );
+        assert!(
+            sink.inner.write_error_logged.load(Ordering::Relaxed),
+            "the dropped batch was accounted through the error path"
+        );
+    }
+
+    // ---- retention boundary (docker-executor.md §8.4) ----------------------
+
+    // The retention comparison is strict (`>`): an attempt is kept for its
+    // full retention window and reclaimed only strictly after it — pinned here
+    // so a change to `>=` shows up as a deliberate semantic choice.
+    #[tokio::test]
+    async fn retention_keeps_the_exact_boundary_and_reclaims_just_past_it() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.retention = CoreDuration::from_secs(60);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        sink.append_metrics_at(&[metric(job, attempt, alloc, at(0))], at(0))
+            .await;
+        sink.attempt_ended(&job, &attempt, at(100)).await.unwrap();
+
+        // Exactly ended_at + retention: still kept.
+        let deleted = sink.sweep(at(160), DiskPressure::Ok).await;
+        assert_eq!(deleted, 0, "kept at exactly ended_at + retention");
+        assert_eq!(segment_files(&attempt_dir(&sink, job, attempt)).len(), 1);
+
+        // One second past the boundary: reclaimed.
+        let deleted = sink.sweep(at(161), DiskPressure::Ok).await;
+        assert_eq!(deleted, 1, "reclaimed strictly after the boundary");
+        assert!(!attempt_dir(&sink, job, attempt).exists());
+    }
+
+    // ---- janitor (docker-executor.md §8.4, §9) -----------------------------
+
+    // A pressure transition wakes the janitor immediately (the next interval
+    // tick is 60s away, so a prompt deletion can only come from the watch),
+    // and the task exits cleanly when the watch sender closes.
+    #[tokio::test]
+    async fn janitor_wakes_on_pressure_and_exits_when_the_sender_closes() {
+        let root = TempDir::new().unwrap();
+        // Retention far in the future: only the pressure tier can reclaim. No
+        // pressure_paths means no local reading, so under High every ended
+        // segment goes (disk safety wins).
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.retention = CoreDuration::from_hours(24);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // The janitor sweeps with the real clock, so anchor the attempt at
+        // wall-clock now — an epoch-based synthetic time would sit 50+ years
+        // past retention and be reclaimed by the very first Ok sweep.
+        let now = Timestamp::now();
+        sink.append_metrics_at(&[metric(job, attempt, alloc, now)], now)
+            .await;
+        sink.attempt_ended(&job, &attempt, now).await.unwrap();
+
+        let (tx, rx) = watch::channel(DiskPressure::Ok);
+        let handle = spawn_retention_janitor(sink.clone(), rx);
+        // Let the interval's immediate first tick sweep under Ok: no deletion.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            attempt_dir(&sink, job, attempt).exists(),
+            "an Ok sweep leaves the within-retention attempt alone"
+        );
+
+        tx.send(DiskPressure::High).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while attempt_dir(&sink, job, attempt).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pressure transition must wake the janitor well before the 60s tick"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("the janitor exits once the pressure sender closes")
+            .unwrap();
+    }
+
+    // ---- read vs. sweep concurrency (docker-executor.md §8.4) --------------
+
+    // Readers must tolerate segments vanishing under them mid-call: reads
+    // racing a reclaiming sweep may see the full set, a partial set, or an
+    // UnknownAttempt — never any other error. Multi-threaded so the sync
+    // unlink loop genuinely overlaps the reads' awaits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reads_tolerate_a_concurrent_sweep() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max = ByteSize::from_bytes(1); // roll each append
+            opts.retention = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        for t in 0..8 {
+            sink.append_logs_at(
+                &[log(job, attempt, alloc, at(t), LogStream::Stdout, b"x")],
+                at(t),
+            )
+            .await;
+        }
+        sink.attempt_ended(&job, &attempt, at(10)).await.unwrap();
+
+        let reader = {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                for _ in 0..100 {
+                    match sink
+                        .log_chunks(
+                            &job,
+                            &attempt,
+                            None,
+                            LogQuery::Range {
+                                from: at(0),
+                                to: at(100),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) | Err(StoreError::UnknownAttempt { .. }) => {}
+                        Err(err) => panic!("read failed during concurrent sweep: {err}"),
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let sweeper = {
+            let sink = sink.clone();
+            tokio::spawn(async move { sink.sweep(at(1000), DiskPressure::Ok).await })
+        };
+        reader.await.unwrap();
+        let deleted = sweeper.await.unwrap();
+        assert_eq!(deleted, 8);
+        assert!(!attempt_dir(&sink, job, attempt).exists());
     }
 
     // The public `MetricsSink`/`LogSink` trait boundary (now-stamped) persists
