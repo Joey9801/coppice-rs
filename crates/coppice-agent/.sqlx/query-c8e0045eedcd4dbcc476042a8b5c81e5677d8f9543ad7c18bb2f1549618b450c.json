@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO metrics (at, allocation_id, cpu_usage_total_us, cpu_throttled_total_us, memory_used_bytes, memory_peak_bytes, disk_writable_bytes, disk_image_bytes, net_rx_bytes_total, net_tx_bytes_total, blkio_read_bytes_total, blkio_write_bytes_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 12
+    },
+    "nullable": []
+  },
+  "hash": "c8e0045eedcd4dbcc476042a8b5c81e5677d8f9543ad7c18bb2f1549618b450c"
+}

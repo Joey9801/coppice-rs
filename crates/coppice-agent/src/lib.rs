@@ -15,6 +15,7 @@ pub mod journal;
 pub mod observed;
 pub mod pressure;
 pub mod session;
+pub mod telemetry;
 
 use anyhow::{Context, Result};
 use coppice_consensus::fs::RealFs;
@@ -27,6 +28,7 @@ use coppice_proto::pb::core::v1 as pbcore;
 /// descriptions exist even before the endpoint lands.
 pub fn describe_metrics() {
     executor::docker::describe_metrics();
+    telemetry::describe_metrics();
 }
 
 /// Run any point-in-time sampling behind agent metrics, recursing the same
@@ -34,6 +36,7 @@ pub fn describe_metrics() {
 /// immediately before rendering each scrape.
 pub fn gather_metrics() {
     executor::docker::gather_metrics();
+    telemetry::gather_metrics();
 }
 
 /// Run the agent daemon from its config file: recover the journal, build the
