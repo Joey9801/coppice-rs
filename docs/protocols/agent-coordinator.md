@@ -167,6 +167,14 @@ attempt in `Dispatching` that is absent from a *heartbeat* is not lost
 post-registration *ObservedSet* is (the epoch bump already fenced any
 in-flight start).
 
+A heartbeat's running set is the agent's *accountability* set, not the
+raw runtime state: a container the runtime already observes as exited,
+whose exit the session has not yet journaled and reported, is still
+claimed as running — its terminal report is in flight, and disclaiming it
+would race the lost-verdict against that report (the exit would be
+misclassified as an `AgentError` loss). A genuinely lost container is
+absent from the runtime entirely and is never claimed.
+
 Node liveness is bookkept from report arrival times; the leader's
 housekeeping tick proposes `DeclareNodeLost` for a node silent past the
 deadline. If that node later reappears with a running container for a

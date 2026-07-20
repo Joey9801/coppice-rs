@@ -143,6 +143,21 @@ where
     let mut deadlines: BTreeMap<coppice_core::id::AllocationId, Instant> = BTreeMap::new();
 
     loop {
+        // Reaps deferred by the session (report-before-reap: a reap can stall
+        // seconds behind the telemetry drain barrier, and the terminal report
+        // must be queued ahead of the next heartbeat or the coordinator
+        // misclassifies the exit as a lost attempt). Spawned so the drain
+        // never delays command processing either; failures are logged and the
+        // janitor sweep retries.
+        for alloc in session.take_pending_reaps() {
+            let executor = session.executor().clone();
+            tokio::spawn(async move {
+                if let Err(e) = executor.reap(alloc).await {
+                    tracing::warn!(%alloc, error = %e, "deferred reap failed; janitor will retry");
+                }
+            });
+        }
+
         // The next watchdog to fire, if any.
         let next_deadline = deadlines.values().min().copied();
         let watchdog = async {

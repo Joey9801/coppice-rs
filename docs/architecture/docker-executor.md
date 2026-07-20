@@ -230,9 +230,14 @@ intent, runtime = evidence).
 Reaping: exited containers are *evidence* and must outlive the crash
 window, so the executor never auto-removes them — only the session
 decides removal, because only the session can see the journal. The trait
-gains `reap(allocation)` (§10), which the session calls after the exit
-is journaled (and after tombstoned stops resolve); recovery calls it too,
-for every observed-exited container whose exit is already journaled.
+gains `reap(allocation)` (§10), which the session queues after the exit
+is journaled (and after tombstoned stops resolve); recovery queues it
+too, for every observed-exited container whose exit is already
+journaled. The live loop performs queued reaps only *after* the
+accompanying reports have gone out: a reap waits on the telemetry drain
+barrier (§8.2), and a heartbeat sent while the terminal report waits
+behind it would omit the allocation from `running` — the coordinator
+would misclassify a clean exit as an `AgentError` loss.
 Reap also ends the log follower and decrements the image pin (§7). The
 safety net is likewise session-side: a periodic sweep diffs
 `observe()` against `JournalState.exits` and reaps exited containers

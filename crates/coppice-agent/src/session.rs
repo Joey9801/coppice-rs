@@ -82,6 +82,13 @@ pub struct Session<F: Fs, E: Executor> {
     /// Watchdogs armed by successful starts with a `max_runtime`, drained
     /// by the live loop which owns the timers.
     armed_watchdogs: Vec<ArmedWatchdog>,
+    /// Allocations whose journaled exits still need a runtime reap, drained by
+    /// the live loop which reaps only *after* the reports have gone out. A
+    /// reap waits on the telemetry drain barrier (§8.2) — seconds under a slow
+    /// daemon — and a heartbeat sent while the terminal report waits behind it
+    /// omits the allocation from `running`, so the coordinator would
+    /// misclassify the exit as an `AgentError` loss. Report first, reap after.
+    pending_reaps: Vec<AllocationId>,
     /// The advertised `NodeService` address (ADR 0034), echoed in every
     /// `Register` so coordinators can dial this node for job logs. `None` when
     /// no `[listen]` listener is configured — the node hosts no service.
@@ -111,6 +118,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             registered: false,
             drained: false,
             armed_watchdogs: Vec::new(),
+            pending_reaps: Vec::new(),
             service_addr: None,
         }
     }
@@ -153,6 +161,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
     /// the loop must set timers for.
     pub fn take_armed_watchdogs(&mut self) -> Vec<ArmedWatchdog> {
         std::mem::take(&mut self.armed_watchdogs)
+    }
+
+    /// Drain the reaps queued since the last call — journaled exits whose
+    /// containers are debris the loop should remove once the accompanying
+    /// reports are on the wire (see [`Session::pending_reaps`]). The janitor
+    /// sweep backstops any reap the loop never gets to.
+    pub fn take_pending_reaps(&mut self) -> Vec<AllocationId> {
+        std::mem::take(&mut self.pending_reaps)
     }
 
     // ---- fencing (ADR 0009) ----
@@ -257,7 +273,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             if matches!(c.state, ContainerState::Exited(_))
                 && self.state.exits.contains_key(&c.allocation)
             {
-                self.reap_journaled(c.allocation).await;
+                self.pending_reaps.push(c.allocation);
             }
         }
 
@@ -479,7 +495,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
                     ExitCause::OomKilled | ExitCause::DiskKilled => classify_exit(&exit),
                 };
                 self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;
-                self.reap_journaled(alloc).await;
+                self.pending_reaps.push(alloc);
                 Ok(vec![self.terminal_status(
                     alloc,
                     attempt,
@@ -491,7 +507,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             Ok(StopOutcome::AlreadyExited(exit)) => {
                 let outcome = classify_exit(&exit);
                 self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;
-                self.reap_journaled(alloc).await;
+                self.pending_reaps.push(alloc);
                 Ok(vec![self.terminal_status(
                     alloc,
                     attempt,
@@ -558,8 +574,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
             outcome.clone(),
             exit.runtime,
         )?;
-        // Exit is durable → the container is now just debris; reap it (§5).
-        self.reap_journaled(alloc).await;
+        // Exit is durable → the container is now just debris (§5); queue the
+        // reap for after the terminal report is out (see `pending_reaps`).
+        self.pending_reaps.push(alloc);
         Ok(vec![self.terminal_status(
             alloc,
             intent.attempt,
@@ -617,12 +634,24 @@ impl<F: Fs, E: Executor> Session<F, E> {
 
     /// A periodic heartbeat: capacity, the currently-running allocation set,
     /// and the (v1-empty) image-cache inventory.
+    ///
+    /// The `running` set is the agent's *accountability* set, not the raw
+    /// runtime state: a container observed `Exited` whose exit is not yet
+    /// journaled is still claimed — the exit event is in flight (docker events
+    /// delivery lags the daemon's own view by hundreds of ms on slow daemons)
+    /// and its terminal report will follow within the same cycle. Disclaiming
+    /// it here would make the coordinator's reverse reconciliation misclassify
+    /// the clean exit as an `AgentError` loss. A genuinely lost container is
+    /// absent from `observe()` entirely, so loss detection is unaffected.
     pub async fn heartbeat_report(&self) -> pb::AgentReport {
         use crate::executor::ContainerState;
         let running = match self.executor.observe().await {
             Ok(containers) => containers
                 .into_iter()
-                .filter(|c| matches!(c.state, ContainerState::Running { .. }))
+                .filter(|c| match c.state {
+                    ContainerState::Running { .. } => true,
+                    ContainerState::Exited(_) => !self.state.exits.contains_key(&c.allocation),
+                })
                 .map(|c| c.allocation.into())
                 .collect(),
             Err(e) => {
