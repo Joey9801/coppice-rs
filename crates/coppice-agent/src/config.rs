@@ -22,6 +22,8 @@ use coppice_core::id::NodeId;
 use coppice_core::resource::Resources;
 use serde::Deserialize;
 
+use crate::telemetry::{FilesystemSinkConfig, SinkConfig, SinkKind};
+
 /// The agent's fully-parsed configuration file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +90,15 @@ pub struct Config {
     /// config stays valid.
     #[serde(default)]
     pub image_cache: ImageCacheConfig,
+
+    /// Job-telemetry policy (docker-executor.md §8). A top-level `[telemetry]`
+    /// table per §10, not under `[executor]`: telemetry is executor-agnostic
+    /// (§2) — sampling cadence, drain backstop, segment roll bounds, live
+    /// retention, and the configured sinks are the same regardless of which
+    /// runtime executes a job, so they do not belong to `[executor]`. Defaulted
+    /// whole, so a bare v1 config stays valid.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 /// Container-executor configuration (docker-executor.md §10). Node-local knobs
@@ -233,6 +244,109 @@ impl Default for ImageCacheConfig {
     }
 }
 
+/// Job-telemetry policy (docker-executor.md §8, §10). Node-local operational
+/// tuning — sampling cadence, the forced-drain backstop, segment roll bounds,
+/// the live-attempt retention cap, per-sink queue depth, and the configured
+/// sinks. Executor-agnostic (§2), so it is a top-level `[telemetry]` table, not
+/// nested under `[executor]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// How often the collectors sample per-container resource usage
+    /// (docker-executor.md §8.1). Must be nonzero. Default 10s.
+    #[serde(default = "default_metrics_interval", with = "humantime_serde")]
+    pub metrics_interval: Duration,
+
+    /// The forced-drain backstop (docker-executor.md §8.2): past this age a
+    /// wedged log follower's reap proceeds without draining, metering the tail
+    /// loss (`agent_log_drain_forced_total`) rather than blocking reap forever.
+    /// Must be nonzero. Default 10m.
+    #[serde(default = "default_drain_force_after", with = "humantime_serde")]
+    pub drain_force_after: Duration,
+
+    /// Segment size at which the filesystem sink rolls to a fresh segment
+    /// (docker-executor.md §8.4) — retention deletes whole segments, never rows,
+    /// so this bounds the delete granularity. Must be nonzero. Default 256 MiB.
+    #[serde(default = "default_segment_max")]
+    pub segment_max: ByteSize,
+
+    /// Age at which the filesystem sink rolls to a fresh segment even below
+    /// [`Self::segment_max`] (docker-executor.md §8.4), so a low-volume attempt
+    /// still bounds how long a segment stays open. Must be nonzero. Default 6h.
+    #[serde(default = "default_segment_max_age", with = "humantime_serde")]
+    pub segment_max_age: Duration,
+
+    /// The live-attempt cap (docker-executor.md §8.4): the maximum age of a
+    /// *running* attempt's closed segments, measured from the successor
+    /// segment's start — the open segment is never swept. Must be nonzero.
+    /// Default 24h.
+    #[serde(default = "default_live_retention", with = "humantime_serde")]
+    pub live_retention: Duration,
+
+    /// Depth of each sink instance's bounded queue, in batches
+    /// (docker-executor.md §8.3). The hub gives every sink its own queue and
+    /// drain task so a slow sink never backpressures container execution; a full
+    /// queue drops oldest (a metered defect signal, never policy). Must be at
+    /// least 1. Default 1024.
+    #[serde(default = "default_queue_depth")]
+    pub queue_depth: usize,
+
+    /// The configured sink instances (docker-executor.md §8.3). Each
+    /// `[[telemetry.sinks]]` entry names its `type` and carries that variant's
+    /// own fields. Defaults to a single filesystem sink consuming both streams
+    /// with 60m retention under `<data_dir>/telemetry` — the documented default.
+    /// An empty array is valid: an operator may deliberately disable job
+    /// telemetry.
+    #[serde(default = "default_sinks")]
+    pub sinks: Vec<SinkConfig>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> TelemetryConfig {
+        TelemetryConfig {
+            metrics_interval: default_metrics_interval(),
+            drain_force_after: default_drain_force_after(),
+            segment_max: default_segment_max(),
+            segment_max_age: default_segment_max_age(),
+            live_retention: default_live_retention(),
+            queue_depth: default_queue_depth(),
+            sinks: default_sinks(),
+        }
+    }
+}
+
+impl TelemetryConfig {
+    /// Reject semantically invalid values `serde` alone cannot catch — zero
+    /// durations, a zero segment bound, a zero queue depth — and delegate each
+    /// sink entry to its own [`SinkConfig::validate`]. Errors name the offending
+    /// key, matching the rest of this module. An empty `sinks` array is valid
+    /// (job telemetry deliberately disabled).
+    fn validate(&self) -> Result<()> {
+        if self.metrics_interval.is_zero() {
+            anyhow::bail!("telemetry.metrics_interval must be greater than zero (§8.1)");
+        }
+        if self.drain_force_after.is_zero() {
+            anyhow::bail!("telemetry.drain_force_after must be greater than zero (§8.2)");
+        }
+        if self.segment_max.is_zero() {
+            anyhow::bail!("telemetry.segment_max must be greater than zero (§8.4)");
+        }
+        if self.segment_max_age.is_zero() {
+            anyhow::bail!("telemetry.segment_max_age must be greater than zero (§8.4)");
+        }
+        if self.live_retention.is_zero() {
+            anyhow::bail!("telemetry.live_retention must be greater than zero (§8.4)");
+        }
+        if self.queue_depth == 0 {
+            anyhow::bail!("telemetry.queue_depth must be at least 1 (§8.3)");
+        }
+        for sink in &self.sinks {
+            sink.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// mTLS material (ADR 0011). Secrets by path reference only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -352,6 +466,7 @@ impl Config {
                  got high_pct = {high_pct}, critical_pct = {critical_pct}"
             );
         }
+        self.telemetry.validate()?;
         Ok(())
     }
 
@@ -373,6 +488,7 @@ impl Config {
             executor = ?self.executor,
             pressure = ?self.pressure,
             image_cache = ?self.image_cache,
+            telemetry = ?self.telemetry,
             "effective agent configuration"
         );
     }
@@ -454,6 +570,42 @@ fn default_max_concurrent_pulls() -> usize {
     2
 }
 
+fn default_metrics_interval() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_drain_force_after() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
+fn default_segment_max() -> ByteSize {
+    ByteSize::from_mib(256)
+}
+
+fn default_segment_max_age() -> Duration {
+    Duration::from_secs(6 * 60 * 60)
+}
+
+fn default_live_retention() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+fn default_queue_depth() -> usize {
+    1024
+}
+
+/// The documented default sink (docker-executor.md §8.3, §10): a single
+/// filesystem sink consuming both streams with 60m retention under
+/// `<data_dir>/telemetry` (`dir = None`). `FilesystemSinkConfig::default_retention`
+/// is private to its module, so the 60m default is spelled explicitly here.
+fn default_sinks() -> Vec<SinkConfig> {
+    vec![SinkConfig::Filesystem(FilesystemSinkConfig {
+        kinds: vec![SinkKind::Metrics, SinkKind::Logs],
+        retention: Duration::from_secs(60 * 60),
+        dir: None,
+    })]
+}
+
 fn default_high_pct() -> u8 {
     85
 }
@@ -533,6 +685,25 @@ critical_pct = 90
 [image_cache]
 ttl = "45m"
 max_concurrent_pulls = 3
+
+[telemetry]
+metrics_interval = "5s"
+drain_force_after = "15m"
+segment_max = "512MiB"
+segment_max_age = "3h"
+live_retention = "12h"
+queue_depth = 2048
+
+[[telemetry.sinks]]
+type = "filesystem"
+kinds = ["metrics", "logs"]
+retention = "90m"
+dir = "/var/lib/coppice-agent/telemetry"
+
+[[telemetry.sinks]]
+type = "filesystem"
+kinds = ["logs"]
+retention = "30m"
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
@@ -588,6 +759,36 @@ disk       = "100GiB"
         assert_eq!(config.pressure.critical_pct, 90);
         assert_eq!(config.image_cache.ttl, Duration::from_secs(45 * 60));
         assert_eq!(config.image_cache.max_concurrent_pulls, 3);
+        assert_eq!(config.telemetry.metrics_interval, Duration::from_secs(5));
+        assert_eq!(
+            config.telemetry.drain_force_after,
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(config.telemetry.segment_max, ByteSize::from_mib(512));
+        assert_eq!(
+            config.telemetry.segment_max_age,
+            Duration::from_secs(3 * 60 * 60)
+        );
+        assert_eq!(
+            config.telemetry.live_retention,
+            Duration::from_secs(12 * 60 * 60)
+        );
+        assert_eq!(config.telemetry.queue_depth, 2048);
+        assert_eq!(
+            config.telemetry.sinks,
+            vec![
+                SinkConfig::Filesystem(FilesystemSinkConfig {
+                    kinds: vec![SinkKind::Metrics, SinkKind::Logs],
+                    retention: Duration::from_secs(90 * 60),
+                    dir: Some(PathBuf::from("/var/lib/coppice-agent/telemetry")),
+                }),
+                SinkConfig::Filesystem(FilesystemSinkConfig {
+                    kinds: vec![SinkKind::Logs],
+                    retention: Duration::from_secs(30 * 60),
+                    dir: None,
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -630,6 +831,44 @@ disk       = "100GiB"
             default_max_concurrent_pulls()
         );
         assert_eq!(config.image_cache.max_concurrent_pulls, 2);
+        // An omitted `[telemetry]` table yields every default, including the
+        // single documented filesystem sink over both streams.
+        assert_eq!(
+            config.telemetry.metrics_interval,
+            default_metrics_interval()
+        );
+        assert_eq!(config.telemetry.metrics_interval, Duration::from_secs(10));
+        assert_eq!(
+            config.telemetry.drain_force_after,
+            default_drain_force_after()
+        );
+        assert_eq!(
+            config.telemetry.drain_force_after,
+            Duration::from_secs(10 * 60)
+        );
+        assert_eq!(config.telemetry.segment_max, default_segment_max());
+        assert_eq!(config.telemetry.segment_max, ByteSize::from_mib(256));
+        assert_eq!(config.telemetry.segment_max_age, default_segment_max_age());
+        assert_eq!(
+            config.telemetry.segment_max_age,
+            Duration::from_secs(6 * 60 * 60)
+        );
+        assert_eq!(config.telemetry.live_retention, default_live_retention());
+        assert_eq!(
+            config.telemetry.live_retention,
+            Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(config.telemetry.queue_depth, default_queue_depth());
+        assert_eq!(config.telemetry.queue_depth, 1024);
+        assert_eq!(config.telemetry.sinks, default_sinks());
+        assert_eq!(
+            config.telemetry.sinks,
+            vec![SinkConfig::Filesystem(FilesystemSinkConfig {
+                kinds: vec![SinkKind::Metrics, SinkKind::Logs],
+                retention: Duration::from_secs(60 * 60),
+                dir: None,
+            })]
+        );
     }
 
     #[test]
@@ -824,5 +1063,94 @@ disk       = "100GiB"
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("typo'd executor key should fail");
         assert!(format!("{err:#}").contains("docker_hostt"));
+    }
+
+    #[test]
+    fn unknown_key_in_telemetry_table_is_rejected() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nmetrics_intervall = \"10s\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("typo'd telemetry key should fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("metrics_intervall"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn raw_integer_telemetry_duration_is_rejected() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nmetrics_interval = 10\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a bare integer duration should fail");
+        assert!(!format!("{err:#}").is_empty());
+    }
+
+    #[test]
+    fn zero_metrics_interval_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nmetrics_interval = \"0s\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero metrics interval should be rejected");
+        assert!(format!("{err:#}").contains("telemetry.metrics_interval"));
+    }
+
+    #[test]
+    fn zero_drain_force_after_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\ndrain_force_after = \"0s\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero drain backstop should be rejected");
+        assert!(format!("{err:#}").contains("telemetry.drain_force_after"));
+    }
+
+    #[test]
+    fn zero_segment_max_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nsegment_max = \"0B\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero segment bound should be rejected");
+        assert!(format!("{err:#}").contains("telemetry.segment_max"));
+    }
+
+    #[test]
+    fn zero_segment_max_age_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nsegment_max_age = \"0s\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero segment age should be rejected");
+        assert!(format!("{err:#}").contains("telemetry.segment_max_age"));
+    }
+
+    #[test]
+    fn zero_live_retention_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nlive_retention = \"0s\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero live retention should be rejected");
+        assert!(format!("{err:#}").contains("telemetry.live_retention"));
+    }
+
+    #[test]
+    fn zero_queue_depth_is_a_config_error() {
+        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nqueue_depth = 0\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero queue depth should be rejected");
+        assert!(format!("{err:#}").contains("telemetry.queue_depth"));
+    }
+
+    #[test]
+    fn empty_sinks_array_is_accepted() {
+        // An operator may deliberately disable job telemetry by configuring no
+        // sinks: an explicit empty array is valid.
+        let toml = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nsinks = []\n");
+        let (_guard, path) = write_config(&toml);
+        let config = load(&path).expect("an empty sinks array should be accepted");
+        assert!(config.telemetry.sinks.is_empty());
+    }
+
+    #[test]
+    fn invalid_sink_entry_is_rejected_through_config_validate() {
+        // An empty `kinds` list is shape-valid but meaning-invalid; the delegation
+        // to `SinkConfig::validate` must surface it through `Config::validate`.
+        let bad =
+            format!("{MINIMAL_EXAMPLE}\n[[telemetry.sinks]]\ntype = \"filesystem\"\nkinds = []\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a sink with empty kinds should be rejected");
+        assert!(format!("{err:#}").contains("kinds"));
     }
 }

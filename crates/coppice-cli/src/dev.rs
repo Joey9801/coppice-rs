@@ -333,6 +333,7 @@ ca_path = "{ca}"
         },
         pressure: Default::default(),
         image_cache: Default::default(),
+        telemetry: Default::default(),
     };
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
     // happens per concrete executor type rather than in a generic helper.

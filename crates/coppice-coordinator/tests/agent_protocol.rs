@@ -118,6 +118,7 @@ fn agent_config(
         executor: Default::default(),
         pressure: Default::default(),
         image_cache: Default::default(),
+        telemetry: Default::default(),
     }
 }
 
