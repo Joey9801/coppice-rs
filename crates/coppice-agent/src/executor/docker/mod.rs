@@ -187,13 +187,15 @@ pub(crate) enum CollectorSlot {
         /// When the exit was claimed while still initializing, if it was — carried
         /// forward onto the [`Active`](CollectorSlot::Active) entry at activation.
         exit_claimed_at: Option<Timestamp>,
-        /// Whether the container was confirmed **dead** while still initializing
-        /// ([`note_container_dead`](ExecutorState::note_container_dead) landed on
-        /// the reservation). Distinct from a claim: a disk kill claims *before*
-        /// its SIGKILL, so a claim alone is not proof of death. `spawn_collectors`
-        /// peeks this to seed the follower's fast-drain signal before the task
-        /// spawns, and activation fires the signal if it flipped later (§8.2).
-        dead: bool,
+        /// The confirmed-dead fast-drain signal (§8.2), created **with** the
+        /// reservation so [`note_container_dead`](ExecutorState::note_container_dead)
+        /// fires the very channel the follower will poll — a death confirmed at
+        /// any instant after the reservation is inserted reaches the follower,
+        /// with no window between a pre-spawn check and activation in which it
+        /// could be observed but not signalled. `spawn_collectors` keeps the
+        /// paired receiver for the follower it spawns; activation moves this
+        /// sender onto the [`Active`](CollectorSlot::Active) entry.
+        died_tx: watch::Sender<bool>,
         /// When the reservation was made. Activation normally follows within
         /// milliseconds (one store query); if the initializing caller was
         /// cancelled mid-await the reservation would otherwise leak and wedge
@@ -325,32 +327,18 @@ impl ExecutorState {
     /// terminal exit evidence from an inspect — never just a claim (a disk kill
     /// claims before its SIGKILL, and draining a still-running container would
     /// end its log collection early). Idempotent: watch keeps only the latest
-    /// value, and a [`Reserved`](CollectorSlot::Reserved) slot records the fact
-    /// so activation (or `spawn_collectors`' pre-spawn seed) fires the fresh
-    /// follower's signal. A no-op when telemetry is disabled or the collector
-    /// is gone.
+    /// value. Both slot variants hold the signal sender — the channel is
+    /// created with the reservation — so a death confirmed at any point after
+    /// the slot exists reaches the follower, spawned or not. A no-op when
+    /// telemetry is disabled or the collector is gone.
     pub(crate) fn note_container_dead(&mut self, allocation: AllocationId) {
         match self.collectors.get_mut(&allocation) {
-            Some(CollectorSlot::Active(collectors)) => {
-                collectors.died_tx.send_replace(true);
+            Some(CollectorSlot::Active(Collectors { died_tx, .. }))
+            | Some(CollectorSlot::Reserved { died_tx, .. }) => {
+                died_tx.send_replace(true);
             }
-            Some(CollectorSlot::Reserved { dead, .. }) => *dead = true,
             None => {}
         }
-    }
-
-    /// Whether `allocation`'s collector slot is a reservation already marked
-    /// dead ([`note_container_dead`](Self::note_container_dead) landed while the
-    /// collectors were initializing). `spawn_collectors` peeks this to seed the
-    /// follower's fast-drain signal *before* the task spawns: on a
-    /// multi-threaded runtime the fresh task can poll immediately, and a
-    /// dead-at-spawn container must drain via a single catch-up fetch, never
-    /// opening a follow stream (§8.2).
-    pub(crate) fn reservation_dead(&self, allocation: AllocationId) -> bool {
-        matches!(
-            self.collectors.get(&allocation),
-            Some(CollectorSlot::Reserved { dead: true, .. })
-        )
     }
 
     /// Activate a reserved collector slot with its freshly spawned tasks
@@ -358,14 +346,13 @@ impl ExecutorState {
     /// the state lock. Three cases:
     ///
     /// - slot is [`Reserved`](CollectorSlot::Reserved) → build [`Collectors`]
-    ///   carrying the reservation's `exit_claimed_at`; if that is `Some` (an exit
-    ///   claimed mid-initialization) abort the sampler immediately — a dead
-    ///   container's samples are noise (§8.1) — and store `sampler: None`. If the
-    ///   reservation is marked `dead` (death confirmed mid-initialization), fire
-    ///   `died_tx` so the fresh follower goes straight to the fast catch-up
-    ///   drain (§8.2) — this covers a death landing after `spawn_collectors`'
-    ///   pre-spawn seed peeked the reservation; insert
-    ///   [`Active`](CollectorSlot::Active).
+    ///   carrying the reservation's `exit_claimed_at` **and its `died_tx`** (the
+    ///   fast-drain sender lives in the slot from reservation on, so a death
+    ///   confirmed during initialization already fired the channel the follower
+    ///   polls — activation just moves the sender, §8.2); if the claim is `Some`
+    ///   (an exit claimed mid-initialization) abort the sampler immediately — a
+    ///   dead container's samples are noise (§8.1) — and store `sampler: None`;
+    ///   insert [`Active`](CollectorSlot::Active).
     /// - slot is **absent** (a reap completed and removed the reservation
     ///   meanwhile) → abort both fresh tasks, insert nothing.
     /// - slot is already [`Active`](CollectorSlot::Active) (impossible — we hold the
@@ -377,7 +364,6 @@ impl ExecutorState {
         sampler: Option<JoinHandle<()>>,
         follower: Option<JoinHandle<()>>,
         drained: watch::Receiver<bool>,
-        died_tx: watch::Sender<bool>,
         ids: ContainerIds,
     ) {
         let abort_fresh = |sampler: Option<JoinHandle<()>>, follower: Option<JoinHandle<()>>| {
@@ -391,12 +377,14 @@ impl ExecutorState {
         match self.collectors.remove(&allocation) {
             Some(CollectorSlot::Reserved {
                 exit_claimed_at,
-                dead,
+                died_tx,
                 ..
             }) => {
                 // A claim landed during initialization: the container's death is
                 // imminent at worst, so its sampler's samples are noise — abort
-                // it now.
+                // it now. (A death confirmed mid-initialization already fired
+                // `died_tx` in place — the sender lives in the slot — so there
+                // is nothing to propagate here; the sender just moves.)
                 let sampler = if exit_claimed_at.is_some() {
                     if let Some(sampler) = sampler {
                         sampler.abort();
@@ -405,13 +393,6 @@ impl ExecutorState {
                 } else {
                     sampler
                 };
-                // Death (not merely a claim) confirmed during initialization:
-                // fire the fresh follower's fast-drain signal (§8.2). Normally
-                // the pre-spawn seed already did; this covers a death landing
-                // between that peek and this activation.
-                if dead {
-                    died_tx.send_replace(true);
-                }
                 self.collectors.insert(
                     allocation,
                     CollectorSlot::Active(Collectors {
@@ -1039,21 +1020,30 @@ pub(crate) async fn spawn_collectors(
     // Reserve the slot synchronously before the async boundary query, and bail if
     // one is already present (either variant): the reservation both carries a
     // mid-initialization exit-claim and closes the concurrent double-spawn window
-    // more cheaply than a post-spawn re-check.
-    {
+    // more cheaply than a post-spawn re-check. The confirmed-dead fast-drain
+    // signal (§8.2) is created **with** the reservation: `note_container_dead`
+    // fires the sender stored in the slot, and the follower spawned below polls
+    // this same channel — so a death confirmed at any instant after this insert
+    // reaches the follower, with no seed-vs-activation window. A dead-at-spawn
+    // container therefore drains via a single catch-up fetch, never opening a
+    // follow stream. (Created even with no follower — firing into no receivers
+    // is a harmless no-op.)
+    let died_rx = {
         let mut state = lock_state(&inner.state);
         if state.collectors.contains_key(&ids.allocation) {
             return;
         }
+        let (died_tx, died_rx) = watch::channel(false);
         state.collectors.insert(
             ids.allocation,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
-                dead: false,
+                died_tx,
                 reserved_at: Timestamp::now(),
             },
         );
-    }
+        died_rx
+    };
 
     // The first log-consuming store is the §8.2 resume authority; a metrics-only
     // `stores[0]` never advances its log boundary (Fix 1).
@@ -1094,18 +1084,6 @@ pub(crate) async fn spawn_collectors(
             inner.disk.readings(),
         )
     });
-    // The confirmed-dead fast-drain signal (§8.2): `note_container_dead` fires
-    // it and the follower races it against the follow stream. Created even with
-    // no follower — firing into no receivers is a harmless no-op.
-    let (died_tx, died_rx) = watch::channel(false);
-    // Seed the signal with a death that already rode the reservation *before*
-    // the follower task spawns: on a multi-threaded runtime the fresh task can
-    // poll immediately, and a dead-at-spawn container must drain via a single
-    // catch-up fetch, never opening a follow stream (§8.2). A death landing
-    // after this peek is covered by `activate_collectors` firing the signal.
-    if lock_state(&inner.state).reservation_dead(ids.allocation) {
-        died_tx.send_replace(true);
-    }
     // No follower ⇒ pre-set `drained = true`: there is nothing for reap to wait on.
     let (follower, drained_rx) = if want_logs {
         let (drained_tx, drained_rx) = watch::channel(false);
@@ -1132,7 +1110,6 @@ pub(crate) async fn spawn_collectors(
         sampler,
         follower,
         drained_rx,
-        died_tx,
         ids,
     );
 }
@@ -1232,11 +1209,12 @@ mod tests {
     async fn reserve_then_claim_then_activate_aborts_sampler_and_carries_claim() {
         let mut st = ExecutorState::default();
         let ids = ids();
+        let (died_tx, died_rx) = watch::channel(false);
         st.collectors.insert(
             ids.allocation,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
-                dead: false,
+                died_tx,
                 reserved_at: ts(0),
             },
         );
@@ -1255,26 +1233,24 @@ mod tests {
             _ => panic!("still reserved before activation"),
         }
         assert!(
-            !st.reservation_dead(ids.allocation),
-            "a claim alone never marks the reservation dead (§8.2 — a disk \
+            !*died_rx.borrow(),
+            "a claim alone never fires the fast-drain signal (§8.2 — a disk \
              kill claims before its SIGKILL)"
         );
 
         let (sampler, sampler_flag) = flagged_handle();
         let (follower, _follower_flag) = flagged_handle();
-        let (died_tx, died_rx) = watch::channel(false);
         st.activate_collectors(
             ids.allocation,
             Some(sampler),
             Some(follower),
             watch::channel(true).1,
-            died_tx,
             ids,
         );
         assert!(
             !*died_rx.borrow(),
-            "a carried claim without confirmed death must NOT fire the \
-             fast-drain signal (§8.2)"
+            "activation of a claimed-but-not-dead reservation must NOT fire \
+             the fast-drain signal (§8.2)"
         );
         match st.collectors.get(&ids.allocation) {
             Some(CollectorSlot::Active(collectors)) => {
@@ -1299,40 +1275,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserve_then_dead_then_activate_fires_the_fast_drain() {
+    async fn dead_on_reservation_fires_the_channel_immediately_and_survives_activation() {
         let mut st = ExecutorState::default();
         let ids = ids();
+        let (died_tx, died_rx) = watch::channel(false);
         st.collectors.insert(
             ids.allocation,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
-                dead: false,
+                died_tx,
                 reserved_at: ts(0),
             },
         );
-        // Death is confirmed mid-initialization (a die event / resync listing):
-        // recorded on the reservation, and visible to the pre-spawn seed peek.
+        // Death is confirmed mid-initialization (a die event / resync listing).
+        // The sender lives in the reservation, so the channel — the very one
+        // the follower polls — fires at once: no seed-vs-activation window in
+        // which a death is observed but not signalled (§8.2).
         st.note_container_dead(ids.allocation);
         assert!(
-            st.reservation_dead(ids.allocation),
-            "the death rides the reservation for the pre-spawn seed (§8.2)"
+            *died_rx.borrow(),
+            "death on a reservation fires the follower's channel immediately, \
+             before activation (§8.2)"
         );
 
         let (follower, _follower_flag) = flagged_handle();
-        let (died_tx, died_rx) = watch::channel(false);
         st.activate_collectors(
             ids.allocation,
             None,
             Some(follower),
             watch::channel(false).1,
-            died_tx,
             ids,
         );
-        assert!(
-            *died_rx.borrow(),
-            "activation with a dead-marked reservation fires the fast-drain \
-             signal (§8.2)"
-        );
+        // The sender moved onto the Active entry: a (re-)confirmation still
+        // reaches the same channel.
+        assert!(matches!(
+            st.collectors.get(&ids.allocation),
+            Some(CollectorSlot::Active(_))
+        ));
+        st.note_container_dead(ids.allocation);
+        assert!(*died_rx.borrow(), "the channel survives activation");
     }
 
     #[tokio::test]
@@ -1343,7 +1324,7 @@ mod tests {
             ids.allocation,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
-                dead: false,
+                died_tx: watch::channel(false).0,
                 reserved_at: ts(0),
             },
         );
@@ -1357,7 +1338,6 @@ mod tests {
             Some(sampler),
             Some(follower),
             watch::channel(true).1,
-            watch::channel(false).0,
             ids,
         );
         assert!(
@@ -1379,7 +1359,7 @@ mod tests {
             reserved,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
-                dead: false,
+                died_tx: watch::channel(false).0,
                 reserved_at: ts(0),
             },
         );
@@ -1456,7 +1436,7 @@ mod tests {
                 alloc,
                 CollectorSlot::Reserved {
                     exit_claimed_at: None,
-                    dead: false,
+                    died_tx: watch::channel(false).0,
                     reserved_at: ts(0),
                 },
             );
