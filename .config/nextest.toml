@@ -1,0 +1,11 @@
+# Heavy integration suites each spawn full multi-threaded runtimes, mTLS
+# servers, and (docker_executor) real containers. Unbounded, enough of them
+# in flight exhausts the CI runner's thread budget — bootstrap fails with
+# EAGAIN ("Resource temporarily unavailable"). Cap how many run at once;
+# everything else keeps full parallelism.
+[test-groups]
+heavy-integration = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'binary(cluster) | binary(agent_protocol) | binary(submit_retry) | binary(job_logs) | binary(docker_executor)'
+test-group = 'heavy-integration'
