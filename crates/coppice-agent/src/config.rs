@@ -151,13 +151,16 @@ impl ListenConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
-    /// The Docker daemon endpoint the executor dials. A local Unix socket by
-    /// default; a `tcp://host:port` form reaches a remote daemon over
-    /// **plaintext** HTTP (`https://` is rejected until daemon TLS is wired),
-    /// in which case the daemon's data-root is not a local filesystem and the
-    /// §9 pressure monitor covers `data_dir` only.
-    #[serde(default = "default_docker_host")]
-    pub docker_host: String,
+    /// The Docker daemon endpoint the executor dials. Optional: when omitted the
+    /// endpoint is auto-discovered at startup, resolving in order an explicit
+    /// value here → the `DOCKER_HOST` environment variable → a probe of
+    /// well-known local sockets (`/var/run/docker.sock`, Docker Desktop, Colima,
+    /// Rancher Desktop, rootless dockerd). A `tcp://host:port` form reaches a
+    /// remote daemon over **plaintext** HTTP (`https://` is rejected until daemon
+    /// TLS is wired), in which case the daemon's data-root is not a local
+    /// filesystem and the §9 pressure monitor covers `data_dir` only.
+    #[serde(default)]
+    pub docker_host: Option<String>,
 
     /// The UID a container runs as when its image does not set a non-root
     /// `USER` (§6). `65534` (`nobody`) by default. UID 0 is rejected at load:
@@ -217,7 +220,7 @@ pub enum DiskEnforcement {
 impl Default for ExecutorConfig {
     fn default() -> ExecutorConfig {
         ExecutorConfig {
-            docker_host: default_docker_host(),
+            docker_host: None,
             default_uid: default_default_uid(),
             pids_limit: default_pids_limit(),
             reap_janitor_after: default_reap_janitor_after(),
@@ -586,10 +589,6 @@ fn default_reap_janitor_after() -> Duration {
     Duration::from_secs(24 * 60 * 60)
 }
 
-fn default_docker_host() -> String {
-    "unix:///var/run/docker.sock".to_string()
-}
-
 fn default_default_uid() -> u32 {
     65534
 }
@@ -737,6 +736,7 @@ zone = "us-east-1a"
 pool = "batch"
 
 [executor]
+# Optional — omit to auto-discover the daemon (DOCKER_HOST env, then well-known sockets).
 docker_host = "tcp://dockerd.internal:2375"
 default_uid = 1000
 pids_limit = 2048
@@ -820,7 +820,10 @@ disk       = "100GiB"
             config.executor.reap_janitor_after,
             Duration::from_secs(3600)
         );
-        assert_eq!(config.executor.docker_host, "tcp://dockerd.internal:2375");
+        assert_eq!(
+            config.executor.docker_host.as_deref(),
+            Some("tcp://dockerd.internal:2375")
+        );
         assert_eq!(config.executor.default_uid, 1000);
         assert_eq!(config.executor.pids_limit, 2048);
         assert!(!config.executor.whole_core_affinity);
@@ -943,7 +946,7 @@ disk       = "100GiB"
             config.executor.reap_janitor_after,
             Duration::from_secs(24 * 60 * 60)
         );
-        assert_eq!(config.executor.docker_host, default_docker_host());
+        assert_eq!(config.executor.docker_host, None);
         assert_eq!(config.executor.default_uid, 65534);
         assert_eq!(config.executor.pids_limit, 4096);
         assert!(config.executor.whole_core_affinity);

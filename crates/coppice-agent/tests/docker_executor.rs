@@ -89,10 +89,13 @@ mod harness {
     /// registry change never shifts test behaviour under us.
     pub const BUSYBOX: &str = "busybox:1.37.0";
 
-    /// The Docker endpoint under test. Honors `DOCKER_HOST` (so CI can point at
-    /// a specific socket/daemon), else the daemon default.
+    /// The Docker endpoint under test. Runs the production resolver (which honors
+    /// `DOCKER_HOST` and then probes well-known sockets, so CI and local Colima
+    /// both connect), falling back to the historical default when resolution
+    /// finds nothing — that way a daemonless machine still yields a host string
+    /// and the gate below skips silently rather than erroring here.
     pub fn docker_host() -> String {
-        std::env::var("DOCKER_HOST").unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string())
+        api::resolve_host(None).unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string())
     }
 
     /// The gate. Connects to the daemon and pings it under a 2s timeout; on any
@@ -122,8 +125,8 @@ mod harness {
     }
 
     /// Build a fresh executor over `docker` with a defaulted [`ExecutorConfig`]
-    /// (docker_host `unix:///var/run/docker.sock`, default_uid 65534, pids_limit
-    /// 4096 — overridden by nothing) and a fresh node identity. Returns the
+    /// (docker_host auto-discovered via [`docker_host`], default_uid 65534,
+    /// pids_limit 4096 — overridden by nothing) and a fresh node identity. Returns the
     /// pressure [`watch::Sender`] so a test can flip host disk pressure (§9).
     ///
     /// Must be called inside a tokio runtime: [`DockerExecutor::new`] spawns the
@@ -152,9 +155,19 @@ mod harness {
         let (tx, rx) = watch::channel(DiskPressure::Ok);
         // `None` telemetry: these lifecycle tests do not assert on collection, and
         // the docker-gated telemetry suite (a later phase) wires it explicitly.
-        let exec = DockerExecutor::new(docker, &config, 1000, 0, node, rx, cache_options(), None)
-            .await
-            .expect("initialize Docker executor");
+        let exec = DockerExecutor::new(
+            docker,
+            &config,
+            &docker_host(),
+            1000,
+            0,
+            node,
+            rx,
+            cache_options(),
+            None,
+        )
+        .await
+        .expect("initialize Docker executor");
         (exec, tx)
     }
 
@@ -240,8 +253,9 @@ mod harness {
         // The config's docker_host must describe the daemon actually under
         // test: on non-Linux hosts topology discovery gates its NCPU
         // fallback on the transport being local.
+        let host = docker_host();
         let config = ExecutorConfig {
-            docker_host: docker_host(),
+            docker_host: Some(host.clone()),
             ..Default::default()
         };
         let physical = physical_cores(&docker).await;
@@ -249,6 +263,7 @@ mod harness {
         let exec = DockerExecutor::new(
             docker,
             &config,
+            &host,
             physical * 1000,
             0,
             NodeId::new(),
@@ -539,6 +554,7 @@ mod harness {
         let exec = DockerExecutor::new(
             docker,
             &config,
+            &docker_host(),
             1000,
             0,
             NodeId::new(),
@@ -851,6 +867,7 @@ mod harness {
         let exec = DockerExecutor::new(
             docker,
             &config,
+            &docker_host(),
             1000,
             0,
             NodeId::new(),

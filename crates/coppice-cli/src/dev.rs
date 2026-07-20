@@ -376,13 +376,12 @@ ca_path = "{ca}"
             // Mirror `run_daemon`'s wiring: connect the daemon, spawn the shared
             // disk-pressure monitor over data_dir + the data-root, then build the
             // executor (docker-executor.md §9, §11).
-            let docker =
-                coppice_agent::executor::docker::api::connect(&agent_config.executor.docker_host)?;
-            let data_root = coppice_agent::executor::docker::api::data_root(
-                &docker,
-                &agent_config.executor.docker_host,
-            )
-            .await?;
+            let docker_host = coppice_agent::executor::docker::api::resolve_host(
+                agent_config.executor.docker_host.as_deref(),
+            )?;
+            let docker = coppice_agent::executor::docker::api::connect(&docker_host)?;
+            let data_root =
+                coppice_agent::executor::docker::api::data_root(&docker, &docker_host).await?;
             let mut pressure_paths = vec![agent_config.data_dir.clone()];
             if let Some(root) = data_root {
                 pressure_paths.push(root);
@@ -423,6 +422,7 @@ ca_path = "{ca}"
             let executor = DockerExecutor::new(
                 docker,
                 &agent_config.executor,
+                &docker_host,
                 agent_config.capacity.cpu_millis,
                 agent_config.reservation.cpu_millis,
                 agent_config.node(),
