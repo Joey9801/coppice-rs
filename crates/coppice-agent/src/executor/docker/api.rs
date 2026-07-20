@@ -83,6 +83,17 @@ pub async fn data_root(
         .info()
         .await
         .map_err(|err| ExecutorError::Other(format!("querying docker info: {err}")))?;
+    // Log collection and §8.2 restart-resume need the `local`/`json-file` driver;
+    // warn (never fail) if the daemon defaults to anything else, so telemetry is
+    // best-effort rather than silently empty.
+    if let Some(driver) = info.logging_driver.as_deref() {
+        if !matches!(driver, "json-file" | "local") {
+            tracing::warn!(
+                driver,
+                "Docker log driver is not local/json-file; log collection and §8.2 resume need those drivers"
+            );
+        }
+    }
     if !docker_host.starts_with("unix://") {
         tracing::debug!(
             docker_host,

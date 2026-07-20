@@ -23,7 +23,13 @@ pub mod lifecycle;
 pub mod limits;
 pub mod state;
 
-use std::collections::HashSet;
+// The per-container telemetry collectors (docker-executor.md §8.1/§8.2), private
+// to the executor: the metrics sampler and the log follower `spawn_collectors`
+// wires up at start/adoption.
+mod logs;
+mod stats;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bollard::models::{ContainerStateStatusEnum, ContainerUpdateBody};
@@ -33,6 +39,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use coppice_core::id::{AllocationId, NodeId};
+use coppice_core::time::Timestamp;
 use coppice_proto::pb::agent::v1 as pb;
 
 use crate::config::ExecutorConfig;
@@ -40,6 +47,7 @@ use crate::executor::{
     Executor, ExecutorError, ExitEvent, ObservedContainer, StartError, StartSpec, StopOutcome,
 };
 use crate::pressure::DiskPressure;
+use crate::telemetry::{FilesystemSink, SinkKind, TelemetryHub};
 
 // ---- container identity (docker-executor.md §5) -------------------------
 
@@ -55,6 +63,11 @@ pub(crate) const LABEL_NODE: &str = "coppice.node";
 /// The `coppice.image-digest` label — the resolved digest, for cache pinning
 /// across restart (§7).
 pub(crate) const LABEL_IMAGE_DIGEST: &str = "coppice.image-digest";
+/// The `coppice.image-bytes` label — the resolved image's on-disk size in bytes
+/// as a decimal string, stamped at create (§8.1). The metrics sampler reports it
+/// as `disk_image_bytes` (constant per attempt), and adoption/observe recover it
+/// from the surviving container rather than re-inspecting the image.
+pub(crate) const LABEL_IMAGE_BYTES: &str = "coppice.image-bytes";
 /// Marks containers whose `HostConfig.CpusetCpus` is an exclusive grant. The
 /// cpuset itself remains the source of truth rebuilt during recovery (§6.3).
 pub(crate) const LABEL_CPU_EXCLUSIVE: &str = "coppice.cpu-exclusive";
@@ -81,6 +94,21 @@ pub(crate) fn container_name(allocation: AllocationId) -> String {
 /// mutation of the `running` set (view.rs precedent) rather than sampled.
 const AGENT_RUNNING_JOBS: &str = "agent_running_jobs";
 
+/// Log chunks re-appended during a §8.2 restart-recovery replay: chunks whose
+/// `at` falls at or below the derived resume boundary, which may already exist in
+/// the store. An **error-level** signal only in aggregate — a small count is the
+/// unavoidable cost of the at-least-once contract, but sustained growth means the
+/// boundary is not advancing. Incremented by the follower (`logs.rs`) and the
+/// reap catch-up drain, only when the boundary came from stored data.
+pub(crate) const AGENT_LOG_RESUME_REPLAYED_CHUNKS_TOTAL: &str =
+    "agent_log_resume_replayed_chunks_total";
+
+/// Follower drains forced past `drain_force_after` (docker-executor.md §8.2): reap
+/// proceeded without the follower reaching end-of-stream, so tail logs may be
+/// lost. An **error-level** counter — forced tail loss is metered, never silent —
+/// incremented by `reap` alongside a `tracing::error!`.
+pub(crate) const AGENT_LOG_DRAIN_FORCED_TOTAL: &str = "agent_log_drain_forced_total";
+
 /// Register this module's metric names (docker-executor.md §8.1). Part of the
 /// crate-level `describe_metrics` fan-out.
 pub(crate) fn describe_metrics() {
@@ -88,6 +116,16 @@ pub(crate) fn describe_metrics() {
         AGENT_RUNNING_JOBS,
         metrics::Unit::Count,
         "Containers currently running under this agent's executor."
+    );
+    metrics::describe_counter!(
+        AGENT_LOG_RESUME_REPLAYED_CHUNKS_TOTAL,
+        metrics::Unit::Count,
+        "Log chunks re-appended during a §8.2 restart-recovery replay (at-least-once)."
+    );
+    metrics::describe_counter!(
+        AGENT_LOG_DRAIN_FORCED_TOTAL,
+        metrics::Unit::Count,
+        "Log follower drains forced past drain_force_after, risking tail loss (§8.2)."
     );
     disk::describe_metrics();
     cache::describe_metrics();
@@ -103,6 +141,95 @@ pub(crate) fn gather_metrics() {
 }
 
 // ---- shared state (docker-executor.md §11) ------------------------------
+
+/// The telemetry plumbing handed to the executor at construction (docker-executor.md
+/// §2, §8): the hub the collectors feed plus the knobs and stores the drain and
+/// resume logic need. `None` disables job-telemetry collection entirely — the
+/// unit-test executors, and production when **zero** sinks are configured (nothing
+/// consumes either stream, so nothing is collected, §8.3). Production passes `Some`
+/// whenever any sink is configured; per-kind suppression (`hub.consumes`) handles a
+/// partial config (metrics-only or logs-only) inside `spawn_collectors`.
+pub struct TelemetryWiring {
+    /// The fan-out hub the metrics/log collectors append to.
+    pub hub: TelemetryHub,
+    /// Every filesystem sink, in config order. The full set that all receive the
+    /// attempt-ended marker (§8.4); the §8.2 resume boundary is derived from
+    /// [`log_store`](Self::log_store), never `stores.first()`.
+    pub stores: Vec<FilesystemSink>,
+    /// The §8.2 resume authority: the first filesystem sink whose `kinds` include
+    /// [`SinkKind::Logs`](crate::telemetry::SinkKind::Logs), i.e. the first store
+    /// that consumes the log stream and so advances its `MAX(at)` boundary. `None`
+    /// when no sink consumes logs. Deriving the boundary from a metrics-only
+    /// `stores[0]` (whose log `MAX(at)` never advances) would replay the whole
+    /// retained history into the real log sink on every adoption/reconnect.
+    pub log_store: Option<FilesystemSink>,
+    /// How often the metrics sampler polls the Docker stats API (§8.1).
+    pub metrics_interval: std::time::Duration,
+    /// The forced-drain backstop: past this age since exit-claim, reap proceeds
+    /// without the follower's drain, metering the tail loss (§8.2).
+    pub drain_force_after: std::time::Duration,
+}
+
+/// One allocation's slot in [`ExecutorState::collectors`] (docker-executor.md
+/// §8.1/§8.2). `spawn_collectors` inserts a [`Reserved`](CollectorSlot::Reserved)
+/// placeholder *synchronously* before the async resume-boundary derivation, then
+/// [`activate`](ExecutorState::activate_collectors)s it to
+/// [`Active`](CollectorSlot::Active) once the tasks are spawned. The reservation
+/// is what lets an exit-claim or a reap that lands mid-initialization observe that
+/// a collector is coming: an exit-claim carries its timestamp on the reservation
+/// (so the forced-drain clock is never lost), and a reap either retries (the
+/// reservation is present) or, once activation removes it, sees `Active`.
+pub(crate) enum CollectorSlot {
+    /// A placeholder inserted synchronously before the async boundary derivation,
+    /// so exit-claim and reap observe that a collector is initializing; carries any
+    /// claim that lands mid-initialization.
+    Reserved {
+        /// When the exit was claimed while still initializing, if it was — carried
+        /// forward onto the [`Active`](CollectorSlot::Active) entry at activation.
+        exit_claimed_at: Option<Timestamp>,
+        /// When the reservation was made. Activation normally follows within
+        /// milliseconds (one store query); if the initializing caller was
+        /// cancelled mid-await the reservation would otherwise leak and wedge
+        /// reap in its retry loop forever, so reap treats a reservation older
+        /// than [`lifecycle::RESERVATION_STALE_AFTER`] as abandoned: it removes
+        /// the slot and falls through to the catch-up drain. A late activation
+        /// then finds its reservation gone and aborts its fresh tasks.
+        reserved_at: Timestamp,
+    },
+    /// The live collectors, once spawned.
+    Active(Collectors),
+}
+
+/// The per-container telemetry collectors and their drain bookkeeping
+/// (docker-executor.md §8.1/§8.2). The [`Active`](CollectorSlot::Active) payload of
+/// an [`ExecutorState::collectors`] slot; `spawn_collectors` activates one at
+/// start/adoption and `reap` removes it after the container is gone.
+pub(crate) struct Collectors {
+    /// The container's ids, so `reap` can finalise the attempt without a re-parse.
+    pub(crate) ids: ContainerIds,
+    /// The metrics sampler, aborted at exit-claim time — a dead container's
+    /// samples are noise (§8.1). `None` once aborted, or when no sink consumes
+    /// metrics (no sampler was spawned, §8.3).
+    pub(crate) sampler: Option<JoinHandle<()>>,
+    /// The log follower; kept until reap so it can drain to end-of-stream (§8.2).
+    /// `None` when no sink consumes logs — no follower is spawned and `drained` is
+    /// pre-set `true` (nothing to wait for, §8.3).
+    pub(crate) follower: Option<JoinHandle<()>>,
+    /// Set `true` by the follower after its final flush (EOF drain complete);
+    /// reap awaits it before removing the container (§8.2). A metrics-only config
+    /// (no follower) initialises it `true`.
+    pub(crate) drained: watch::Receiver<bool>,
+    /// When the exit was claimed — the §8.2 `drain_force_after` clock. The first
+    /// claim wins (idempotent), so repeated claims never reset it.
+    pub(crate) exit_claimed_at: Option<Timestamp>,
+    /// Set once reap has forced this follower's drain (docker-executor.md §8.2).
+    /// The Force arm aborts/meters/error-logs only on the **first** pass, so a
+    /// reap retry after a forced drain (e.g. a later flush timeout) cannot
+    /// double-count `agent_log_drain_forced_total`. After a forced abort the
+    /// follower's channel is closed, so the next reap hits the closed-channel
+    /// catch-up path (which recovers whatever the daemon still retains).
+    pub(crate) forced: bool,
+}
 
 /// The executor's shared mutable state, guarded by a plain `std::sync::Mutex`.
 ///
@@ -121,6 +248,11 @@ pub(crate) struct ExecutorState {
     /// Allocations with a running container, for the [`AGENT_RUNNING_JOBS`]
     /// gauge. A snapshot, replaced wholesale by `observe`.
     pub(crate) running: HashSet<AllocationId>,
+    /// The per-container telemetry collectors (§8), keyed by allocation. Each slot
+    /// is [`Reserved`](CollectorSlot::Reserved) during initialization then
+    /// [`Active`](CollectorSlot::Active). Absent when telemetry is disabled
+    /// (unit-test executors never populate it).
+    pub(crate) collectors: HashMap<AllocationId, CollectorSlot>,
 }
 
 impl ExecutorState {
@@ -128,6 +260,111 @@ impl ExecutorState {
     /// of `running`, so the pushed value never lags the set.
     pub(crate) fn push_running_gauge(&self) {
         metrics::gauge!(AGENT_RUNNING_JOBS).set(self.running.len() as f64);
+    }
+
+    /// Note that an allocation's exit was claimed (docker-executor.md §8.2): abort
+    /// and drop its metrics sampler (a dead container's samples are noise, §8.1)
+    /// and stamp the drain clock. Idempotent — the **first** claim time is kept,
+    /// so a re-claim from a later resync never moves the `drain_force_after`
+    /// deadline. A no-op when telemetry is disabled or the collector is gone.
+    ///
+    /// A [`Reserved`](CollectorSlot::Reserved) slot (the exit raced collector
+    /// initialization) records the first claim time on the reservation; activation
+    /// carries it forward and aborts the sampler then (§8.2), so the forced-drain
+    /// clock is never lost to the race.
+    pub(crate) fn note_exit_claimed(&mut self, allocation: AllocationId, now: Timestamp) {
+        match self.collectors.get_mut(&allocation) {
+            Some(CollectorSlot::Active(collectors)) => {
+                if let Some(sampler) = collectors.sampler.take() {
+                    sampler.abort();
+                }
+                if collectors.exit_claimed_at.is_none() {
+                    collectors.exit_claimed_at = Some(now);
+                }
+            }
+            // First claim wins: only stamp a reservation that has none yet.
+            Some(CollectorSlot::Reserved {
+                exit_claimed_at: exit_claimed_at @ None,
+                ..
+            }) => {
+                *exit_claimed_at = Some(now);
+            }
+            Some(CollectorSlot::Reserved { .. }) | None => {}
+        }
+    }
+
+    /// Activate a reserved collector slot with its freshly spawned tasks
+    /// (docker-executor.md §8.1/§8.2), the second half of `spawn_collectors` under
+    /// the state lock. Three cases:
+    ///
+    /// - slot is [`Reserved`](CollectorSlot::Reserved) → build [`Collectors`]
+    ///   carrying the reservation's `exit_claimed_at`; if that is `Some` (an exit
+    ///   claimed mid-initialization) abort the sampler immediately — a dead
+    ///   container's samples are noise (§8.1) — and store `sampler: None`; insert
+    ///   [`Active`](CollectorSlot::Active).
+    /// - slot is **absent** (a reap completed and removed the reservation
+    ///   meanwhile) → abort both fresh tasks, insert nothing.
+    /// - slot is already [`Active`](CollectorSlot::Active) (impossible — we hold the
+    ///   reservation; defensive) → warn, abort the fresh tasks, leave the existing
+    ///   entry.
+    pub(crate) fn activate_collectors(
+        &mut self,
+        allocation: AllocationId,
+        sampler: Option<JoinHandle<()>>,
+        follower: Option<JoinHandle<()>>,
+        drained: watch::Receiver<bool>,
+        ids: ContainerIds,
+    ) {
+        let abort_fresh = |sampler: Option<JoinHandle<()>>, follower: Option<JoinHandle<()>>| {
+            if let Some(sampler) = sampler {
+                sampler.abort();
+            }
+            if let Some(follower) = follower {
+                follower.abort();
+            }
+        };
+        match self.collectors.remove(&allocation) {
+            Some(CollectorSlot::Reserved {
+                exit_claimed_at, ..
+            }) => {
+                // A claim landed during initialization: the container is already
+                // dead, so its sampler's samples are noise — abort it now.
+                let sampler = if exit_claimed_at.is_some() {
+                    if let Some(sampler) = sampler {
+                        sampler.abort();
+                    }
+                    None
+                } else {
+                    sampler
+                };
+                self.collectors.insert(
+                    allocation,
+                    CollectorSlot::Active(Collectors {
+                        ids,
+                        sampler,
+                        follower,
+                        drained,
+                        exit_claimed_at,
+                        forced: false,
+                    }),
+                );
+            }
+            None => {
+                // A reap removed the reservation while we spawned: nothing to
+                // activate, and the fresh tasks have no home — abort them.
+                abort_fresh(sampler, follower);
+            }
+            Some(existing @ CollectorSlot::Active(_)) => {
+                // Impossible while we hold the reservation; defensive: keep the
+                // existing entry and drop the fresh tasks.
+                tracing::warn!(
+                    %allocation,
+                    "activate_collectors found an already-active slot; dropping the fresh tasks"
+                );
+                self.collectors.insert(allocation, existing);
+                abort_fresh(sampler, follower);
+            }
+        }
     }
 }
 
@@ -178,6 +415,11 @@ pub(crate) struct Inner {
     /// captures only a [`cache::ImageCache`] clone and a pressure receiver — the
     /// abort is what stops it, so `Inner::drop` leaves no orphaned sweeper.
     cache_task: JoinHandle<()>,
+    /// The telemetry plumbing (§8): the hub the collectors feed plus the stores
+    /// and knobs the drain/resume logic needs. `None` disables job telemetry
+    /// (unit-test executors, and production with zero configured sinks); `Some`
+    /// whenever any sink is configured (§8.3).
+    pub(crate) telemetry: Option<TelemetryWiring>,
 }
 
 impl Drop for Inner {
@@ -189,6 +431,20 @@ impl Drop for Inner {
             task.abort();
         }
         self.cache_task.abort();
+        // Abort every surviving per-container collector task (§8): the samplers
+        // and followers also hold only clones, so this is what stops them when
+        // the last executor handle drops. A `Reserved` slot holds no tasks yet.
+        let mut state = lock_state(&self.state);
+        for (_, slot) in state.collectors.drain() {
+            if let CollectorSlot::Active(collectors) = slot {
+                if let Some(sampler) = collectors.sampler {
+                    sampler.abort();
+                }
+                if let Some(follower) = collectors.follower {
+                    follower.abort();
+                }
+            }
+        }
     }
 }
 
@@ -218,6 +474,7 @@ impl DockerExecutor {
     /// task (§11), which live-tails `docker events` and resyncs via the daemon.
     /// The caller connects the client (`api::connect`) and spawns the pressure
     /// monitor (`pressure::spawn`) first; see `run_daemon`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         docker: Docker,
         config: &ExecutorConfig,
@@ -226,6 +483,7 @@ impl DockerExecutor {
         node: NodeId,
         pressure: watch::Receiver<DiskPressure>,
         cache: cache::CacheOptions,
+        telemetry: Option<TelemetryWiring>,
     ) -> Result<DockerExecutor, ExecutorError> {
         let state = Arc::new(Mutex::new(ExecutorState::default()));
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
@@ -279,6 +537,7 @@ impl DockerExecutor {
                 exit_tx.clone(),
                 config.disk_poll_interval,
                 node,
+                disk.readings(),
             )
         });
 
@@ -308,6 +567,7 @@ impl DockerExecutor {
                 events_task,
                 disk_task,
                 cache_task,
+                telemetry,
             }),
         })
     }
@@ -599,10 +859,25 @@ impl DockerExecutor {
     pub fn cache_pulls_started(&self) -> u64 {
         self.inner.cache.pulls_started()
     }
+
+    /// The number of per-container telemetry collector slots currently held —
+    /// [`Reserved`](CollectorSlot::Reserved) or [`Active`](CollectorSlot::Active)
+    /// (docker-executor.md §8.1/§8.2). An integration-test seam: it lets the
+    /// empty-sinks suppression test prove *positively* that no collector was ever
+    /// spawned (0 slots while a container runs), which the no-files assertion
+    /// alone cannot — a wasteful collector feeding an empty hub would also write
+    /// nothing.
+    #[doc(hidden)]
+    pub fn collector_slots(&self) -> usize {
+        lock_state(&self.inner.state).collectors.len()
+    }
 }
 
 /// A container's ids, recovered from its labels (§5). Foreign or malformed
-/// labels yield `None` at the call site (warn + skip).
+/// labels yield `None` at the call site (warn + skip). `Copy` so the collectors
+/// (§8) can thread one triple into the sampler, the follower, and the registry
+/// entry without cloning.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ContainerIds {
     pub(crate) allocation: AllocationId,
     pub(crate) attempt: coppice_core::id::AttemptId,
@@ -621,6 +896,149 @@ pub(crate) fn parse_container_ids(
         attempt: labels.get(LABEL_ATTEMPT)?.parse().ok()?,
         job: labels.get(LABEL_JOB)?.parse().ok()?,
     })
+}
+
+/// Read a container's [`LABEL_IMAGE_BYTES`] leniently (docker-executor.md §8.1):
+/// absent or garbage → 0. The image size is the sampler's constant per-attempt
+/// `disk_image_bytes`, and a missing/foreign label must not fail collection.
+pub(crate) fn image_bytes_from_labels(
+    labels: Option<&std::collections::HashMap<String, String>>,
+) -> u64 {
+    labels
+        .and_then(|labels| labels.get(LABEL_IMAGE_BYTES))
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Spawn the per-container telemetry collectors for one allocation
+/// (docker-executor.md §8.1/§8.2): a metrics sampler and a log follower, tracked
+/// in [`ExecutorState::collectors`]. A no-op when telemetry is disabled, when no
+/// sink consumes either stream (§8.3), or a collector already exists for the
+/// allocation.
+///
+/// **Reserve, derive, activate.** A [`CollectorSlot::Reserved`] placeholder is
+/// inserted *synchronously* under the lock before the async resume-boundary
+/// derivation, so an exit-claim or a reap that lands while we `await` the boundary
+/// query observes that a collector is initializing (the reservation carries any
+/// mid-flight claim; a reap retries while it is present). The boundary is derived
+/// **outside** the lock because on adoption it reads the log store's newest stored
+/// timestamp (`max_log_timestamp`, async); a fresh start (`resume == false`) has
+/// no earlier logs — boundary `None` (`since = 0`), no replay window — so it does
+/// no store I/O. Then, under the lock, [`ExecutorState::activate_collectors`]
+/// promotes the reservation to [`CollectorSlot::Active`] (or drops the fresh tasks
+/// if a reap removed the reservation meanwhile).
+///
+/// Per-kind suppression (§8.3): the sampler is spawned only when a sink consumes
+/// metrics and the follower only when one consumes logs. With no follower,
+/// `drained` is pre-set `true` (nothing to wait for) — reap's verdict then
+/// proceeds straight to flush + markers, correct for a metrics-only config (its
+/// segments still need the ended marker for retention).
+pub(crate) async fn spawn_collectors(
+    inner: &Inner,
+    ids: ContainerIds,
+    container_name: &str,
+    resume: bool,
+    image_bytes: u64,
+    started_at: Option<Timestamp>,
+) {
+    let Some(telemetry) = inner.telemetry.as_ref() else {
+        return;
+    };
+    // A stream nobody stores is never collected: with no logs consumer no follower
+    // is spawned, with no metrics consumer no sampler (§8.3). If neither stream is
+    // consumed, reserve nothing and spawn nothing — reap's drain barrier still runs
+    // its absent-entry catch-up path, which appends into a hub with no logs
+    // consumer (a no-op) and marks the (empty) stores ended, which is acceptable.
+    let want_metrics = telemetry.hub.consumes(SinkKind::Metrics);
+    let want_logs = telemetry.hub.consumes(SinkKind::Logs);
+    if !want_metrics && !want_logs {
+        return;
+    }
+
+    // Reserve the slot synchronously before the async boundary query, and bail if
+    // one is already present (either variant): the reservation both carries a
+    // mid-initialization exit-claim and closes the concurrent double-spawn window
+    // more cheaply than a post-spawn re-check.
+    {
+        let mut state = lock_state(&inner.state);
+        if state.collectors.contains_key(&ids.allocation) {
+            return;
+        }
+        state.collectors.insert(
+            ids.allocation,
+            CollectorSlot::Reserved {
+                exit_claimed_at: None,
+                reserved_at: Timestamp::now(),
+            },
+        );
+    }
+
+    // The first log-consuming store is the §8.2 resume authority; a metrics-only
+    // `stores[0]` never advances its log boundary (Fix 1).
+    let store = telemetry.log_store.clone();
+    let (boundary, replay_max) = if resume && want_logs {
+        // Adoption: the newest stored log timestamp is the boundary (floored),
+        // and its raw value the replay window; else the container's start time,
+        // with no replay window (nothing stored to replay against).
+        match &store {
+            Some(store) => match store.max_log_timestamp(&ids.job, &ids.attempt).await {
+                Ok(Some(max)) => (Some(logs::floor_to_second(max)), Some(max)),
+                Ok(None) => (started_at.map(logs::floor_to_second), None),
+                Err(err) => {
+                    tracing::debug!(
+                        job = %ids.job,
+                        attempt = %ids.attempt,
+                        error = %err,
+                        "deriving adoption log boundary from the store failed; using start time"
+                    );
+                    (started_at.map(logs::floor_to_second), None)
+                }
+            },
+            None => (started_at.map(logs::floor_to_second), None),
+        }
+    } else {
+        // Fresh start, or no logs consumer: no earlier logs to replay.
+        (None, None)
+    };
+
+    let sampler = want_metrics.then(|| {
+        stats::spawn_sampler(
+            inner.docker.clone(),
+            telemetry.hub.clone(),
+            ids,
+            container_name.to_string(),
+            telemetry.metrics_interval,
+            image_bytes,
+            inner.disk.readings(),
+        )
+    });
+    // No follower ⇒ pre-set `drained = true`: there is nothing for reap to wait on.
+    let (follower, drained_rx) = if want_logs {
+        let (drained_tx, drained_rx) = watch::channel(false);
+        let follower = logs::spawn_follower(
+            inner.docker.clone(),
+            telemetry.hub.clone(),
+            store,
+            ids,
+            container_name.to_string(),
+            boundary,
+            replay_max,
+            drained_tx,
+        );
+        (Some(follower), drained_rx)
+    } else {
+        (None, watch::channel(true).1)
+    };
+
+    // Promote the reservation to Active under the lock (or drop the fresh tasks if
+    // a reap removed the reservation meanwhile).
+    lock_state(&inner.state).activate_collectors(
+        ids.allocation,
+        sampler,
+        follower,
+        drained_rx,
+        ids,
+    );
 }
 
 #[cfg(test)]
@@ -664,5 +1082,256 @@ mod tests {
         labels.insert(LABEL_JOB.to_string(), "nope".to_string());
         assert!(parse_container_ids(Some(&labels)).is_none());
         assert!(parse_container_ids(None).is_none());
+    }
+
+    // ---- CollectorSlot state machine (docker-executor.md §8.1/§8.2) ---------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn ids() -> ContainerIds {
+        ContainerIds {
+            allocation: AllocationId::new(),
+            attempt: coppice_core::id::AttemptId::new(),
+            job: coppice_core::id::JobId::new(),
+        }
+    }
+
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::UNIX_EPOCH + coppice_core::time::Duration::from_secs(secs)
+    }
+
+    /// A never-completing spawned task plus a flag its drop guard sets, so a test
+    /// can observe that an `abort` actually cancelled and dropped the task's future.
+    fn flagged_handle() -> (JoinHandle<()>, Arc<AtomicBool>) {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        // Build the guard OUTSIDE the async block and move it in, so the future owns
+        // it and drops it even when aborted before its first poll (a guard built
+        // inside the body would never run).
+        let guard = DropFlag(flag.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        (handle, flag)
+    }
+
+    /// Poll `flag` until the aborted task has run its drop guard, or fail.
+    async fn wait_flag(flag: &Arc<AtomicBool>) {
+        for _ in 0..500 {
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("aborted task never ran its drop guard");
+    }
+
+    #[tokio::test]
+    async fn reserve_then_claim_then_activate_aborts_sampler_and_carries_claim() {
+        let mut st = ExecutorState::default();
+        let ids = ids();
+        st.collectors.insert(
+            ids.allocation,
+            CollectorSlot::Reserved {
+                exit_claimed_at: None,
+                reserved_at: ts(0),
+            },
+        );
+        // A claim lands mid-initialization: recorded on the reservation.
+        st.note_exit_claimed(ids.allocation, ts(5));
+        match st.collectors.get(&ids.allocation) {
+            Some(CollectorSlot::Reserved {
+                exit_claimed_at, ..
+            }) => {
+                assert_eq!(
+                    *exit_claimed_at,
+                    Some(ts(5)),
+                    "the claim rode the reservation"
+                )
+            }
+            _ => panic!("still reserved before activation"),
+        }
+
+        let (sampler, sampler_flag) = flagged_handle();
+        let (follower, _follower_flag) = flagged_handle();
+        st.activate_collectors(
+            ids.allocation,
+            Some(sampler),
+            Some(follower),
+            watch::channel(true).1,
+            ids,
+        );
+        match st.collectors.get(&ids.allocation) {
+            Some(CollectorSlot::Active(collectors)) => {
+                assert!(
+                    collectors.sampler.is_none(),
+                    "a claimed reservation aborts the sampler at activation (§8.1)"
+                );
+                assert_eq!(
+                    collectors.exit_claimed_at,
+                    Some(ts(5)),
+                    "claim carried forward"
+                );
+                assert!(
+                    collectors.follower.is_some(),
+                    "the follower survives activation"
+                );
+                assert!(!collectors.forced, "forced starts false");
+            }
+            _ => panic!("the reservation activated to Active"),
+        }
+        wait_flag(&sampler_flag).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_then_reap_removed_then_activate_drops_both_tasks() {
+        let mut st = ExecutorState::default();
+        let ids = ids();
+        st.collectors.insert(
+            ids.allocation,
+            CollectorSlot::Reserved {
+                exit_claimed_at: None,
+                reserved_at: ts(0),
+            },
+        );
+        // A reap completed and removed the reservation while we spawned.
+        st.collectors.remove(&ids.allocation);
+
+        let (sampler, sampler_flag) = flagged_handle();
+        let (follower, follower_flag) = flagged_handle();
+        st.activate_collectors(
+            ids.allocation,
+            Some(sampler),
+            Some(follower),
+            watch::channel(true).1,
+            ids,
+        );
+        assert!(
+            st.collectors.is_empty(),
+            "activation into an absent slot inserts nothing"
+        );
+        // Both fresh tasks were aborted.
+        wait_flag(&sampler_flag).await;
+        wait_flag(&follower_flag).await;
+    }
+
+    #[tokio::test]
+    async fn note_exit_claimed_first_wins_on_both_variants() {
+        let mut st = ExecutorState::default();
+
+        // Reserved: the first claim time is kept.
+        let reserved = AllocationId::new();
+        st.collectors.insert(
+            reserved,
+            CollectorSlot::Reserved {
+                exit_claimed_at: None,
+                reserved_at: ts(0),
+            },
+        );
+        st.note_exit_claimed(reserved, ts(1));
+        st.note_exit_claimed(reserved, ts(9));
+        match st.collectors.get(&reserved) {
+            Some(CollectorSlot::Reserved {
+                exit_claimed_at, ..
+            }) => {
+                assert_eq!(
+                    *exit_claimed_at,
+                    Some(ts(1)),
+                    "first claim wins on Reserved"
+                )
+            }
+            _ => panic!("still reserved"),
+        }
+
+        // Active: the first claim time is kept and the sampler is aborted once.
+        let active = ids();
+        let (sampler, sampler_flag) = flagged_handle();
+        st.collectors.insert(
+            active.allocation,
+            CollectorSlot::Active(Collectors {
+                ids: active,
+                sampler: Some(sampler),
+                follower: None,
+                drained: watch::channel(true).1,
+                exit_claimed_at: None,
+                forced: false,
+            }),
+        );
+        st.note_exit_claimed(active.allocation, ts(2));
+        st.note_exit_claimed(active.allocation, ts(8));
+        match st.collectors.get(&active.allocation) {
+            Some(CollectorSlot::Active(collectors)) => {
+                assert_eq!(
+                    collectors.exit_claimed_at,
+                    Some(ts(2)),
+                    "first claim wins on Active"
+                );
+                assert!(
+                    collectors.sampler.is_none(),
+                    "the sampler is aborted on first claim"
+                );
+            }
+            _ => panic!("still active"),
+        }
+        wait_flag(&sampler_flag).await;
+    }
+
+    #[test]
+    fn an_occupied_slot_blocks_a_second_reservation() {
+        // Mirrors `spawn_collectors`' guard: `contains_key` ⇒ bail, else reserve.
+        fn try_reserve(st: &mut ExecutorState, alloc: AllocationId) -> bool {
+            if st.collectors.contains_key(&alloc) {
+                return false;
+            }
+            st.collectors.insert(
+                alloc,
+                CollectorSlot::Reserved {
+                    exit_claimed_at: None,
+                    reserved_at: ts(0),
+                },
+            );
+            true
+        }
+
+        let mut st = ExecutorState::default();
+        // A Reserved slot blocks a second reservation.
+        let a = AllocationId::new();
+        assert!(try_reserve(&mut st, a), "first reservation succeeds");
+        assert!(
+            !try_reserve(&mut st, a),
+            "a Reserved slot blocks a re-reservation"
+        );
+        assert!(
+            matches!(st.collectors.get(&a), Some(CollectorSlot::Reserved { .. })),
+            "the existing reservation is untouched"
+        );
+
+        // An Active slot likewise blocks a reservation.
+        let b = ids();
+        st.collectors.insert(
+            b.allocation,
+            CollectorSlot::Active(Collectors {
+                ids: b,
+                sampler: None,
+                follower: None,
+                drained: watch::channel(true).1,
+                exit_claimed_at: None,
+                forced: false,
+            }),
+        );
+        assert!(
+            !try_reserve(&mut st, b.allocation),
+            "an Active slot blocks a reservation"
+        );
+        assert!(matches!(
+            st.collectors.get(&b.allocation),
+            Some(CollectorSlot::Active(_))
+        ));
     }
 }

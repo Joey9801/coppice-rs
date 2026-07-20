@@ -91,7 +91,34 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         pressure_paths: pressure_paths.clone(),
         high_pct: config.pressure.high_pct,
     };
-    let pressure_rx = pressure::spawn(pressure_paths, config.pressure);
+    let pressure_rx = pressure::spawn(pressure_paths.clone(), config.pressure);
+
+    // Build the telemetry subsystem (§8): open the configured filesystem sinks,
+    // spawn their retention janitors, and get the hub the collectors feed. The
+    // returned `Telemetry` is kept alive for the daemon's lifetime — dropping it
+    // would drop the janitor handles and stop them.
+    let telemetry = telemetry::build(
+        &config.telemetry,
+        &config.data_dir,
+        pressure_paths,
+        config.pressure.high_pct,
+        pressure_rx.clone(),
+    )
+    .await
+    .context("building the telemetry subsystem")?;
+
+    // `Some` whenever any sink is configured; per-kind suppression (§8.3) handles
+    // partial configs (metrics-only or logs-only). With **zero** sinks there is
+    // nothing to consume either stream, so pass `None` and collect nothing rather
+    // than stream logs and poll stats only for the hub to discard every batch.
+    let telemetry_wiring =
+        (!config.telemetry.sinks.is_empty()).then(|| executor::docker::TelemetryWiring {
+            hub: telemetry.hub.clone(),
+            stores: telemetry.stores.clone(),
+            log_store: telemetry.log_store.clone(),
+            metrics_interval: config.telemetry.metrics_interval,
+            drain_force_after: config.telemetry.drain_force_after,
+        });
     let docker_executor = executor::DockerExecutor::new(
         docker,
         &config.executor,
@@ -100,6 +127,7 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         config.node(),
         pressure_rx,
         cache_options,
+        telemetry_wiring,
     )
     .await
     .context("initializing the Docker executor")?;

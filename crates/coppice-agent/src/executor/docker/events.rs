@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use coppice_core::id::AllocationId;
+use coppice_core::time::Timestamp;
 
 use super::{classify, cpuset, lock_state, ExecutorState, LABEL_ALLOCATION};
 use crate::executor::ExitEvent;
@@ -206,6 +207,8 @@ async fn resync(
                 false
             } else {
                 st.claimed.insert(allocation);
+                // Stop this container's sampler and start its drain clock (§8.2).
+                st.note_exit_claimed(allocation, Timestamp::now());
                 st.running.remove(&allocation);
                 st.push_running_gauge();
                 true
@@ -259,6 +262,8 @@ async fn handle_die(
             false
         } else {
             st.claimed.insert(allocation);
+            // Stop this container's sampler and start its drain clock (§8.2).
+            st.note_exit_claimed(allocation, Timestamp::now());
             true
         }
     };

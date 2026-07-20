@@ -39,6 +39,7 @@ use tokio::task::JoinHandle;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::AllocationId;
 use coppice_core::resource::Resources;
+use coppice_core::time::Timestamp;
 
 use super::{
     classify, cpuset, lock_state, ExecutorState, LABEL_DISK_BUDGET, LABEL_DISK_MODE, LABEL_NODE,
@@ -222,11 +223,24 @@ pub(crate) struct DiskPlan {
 
 // ---- the enforcer -------------------------------------------------------
 
+/// The poll sweep's last per-allocation writable-layer reading (`SizeRw`), shared
+/// with the metrics samplers (docker-executor.md §8.1: `disk_writable_bytes`
+/// comes "from the disk poller's last reading").
+///
+/// Only the poll strategy writes this — it is the byproduct of a sweep already
+/// running. Under native quotas there is no poll sweep, so the map stays empty
+/// and quota-mode samplers read `None` and report `0` writable bytes: a
+/// documented v1 gap (the "disk poller's last reading" only exists in poll mode).
+pub(crate) type DiskReadings = Arc<Mutex<HashMap<AllocationId, u64>>>;
+
 /// Chooses a disk-enforcement strategy at startup and produces the per-job
 /// create-time wiring. Held on [`super::Inner`]; the lifecycle layer asks it for
 /// a [`DiskPlan`] and knows nothing else about disk enforcement (the seam, §6.2).
 pub(crate) struct DiskEnforcer {
     mode: DiskMode,
+    /// The poll sweep's last writable-layer readings, shared with the metrics
+    /// samplers (§8.1). Empty under native quotas (no sweep runs).
+    readings: DiskReadings,
 }
 
 /// A fixed, unique name for the startup storage-opt probe container. It carries
@@ -265,7 +279,10 @@ impl DiskEnforcer {
                 backing_filesystem = backing,
                 "disk enforcement forced to poll fallback (no probe run)"
             );
-            return Ok(DiskEnforcer { mode });
+            return Ok(DiskEnforcer {
+                mode,
+                readings: DiskReadings::default(),
+            });
         }
 
         let probe = run_probe(docker).await;
@@ -300,12 +317,21 @@ impl DiskEnforcer {
             backing_filesystem = backing,
             "disk-enforcement strategy selected"
         );
-        Ok(DiskEnforcer { mode })
+        Ok(DiskEnforcer {
+            mode,
+            readings: DiskReadings::default(),
+        })
     }
 
     /// The chosen strategy.
     pub(crate) fn mode(&self) -> DiskMode {
         self.mode
+    }
+
+    /// A clone of the shared writable-layer readings map (docker-executor.md
+    /// §8.1). The metrics samplers hold their own clone and read this per tick.
+    pub(crate) fn readings(&self) -> DiskReadings {
+        Arc::clone(&self.readings)
     }
 
     /// Produce the create-time [`DiskPlan`] for a job (docker-executor.md §6.2).
@@ -490,6 +516,7 @@ const INSPECT_OPTS: Option<bollard::query_parameters::InspectContainerOptions> =
 /// Spawn the poll-fallback disk enforcer, returning its handle (aborted on
 /// [`super::Inner`] drop). Captures only clones — never an `Arc<Inner>` — so the
 /// abort is what actually stops it, mirroring [`super::events::spawn`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     docker: Docker,
     state: Arc<Mutex<ExecutorState>>,
@@ -497,10 +524,14 @@ pub(crate) fn spawn(
     exit_tx: mpsc::UnboundedSender<ExitEvent>,
     interval: StdDuration,
     node: coppice_core::id::NodeId,
+    readings: DiskReadings,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(docker, state, cpuset, exit_tx, interval, node))
+    tokio::spawn(run(
+        docker, state, cpuset, exit_tx, interval, node, readings,
+    ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     docker: Docker,
     state: Arc<Mutex<ExecutorState>>,
@@ -508,6 +539,7 @@ async fn run(
     exit_tx: mpsc::UnboundedSender<ExitEvent>,
     interval: StdDuration,
     node: coppice_core::id::NodeId,
+    readings: DiskReadings,
 ) {
     let node = node.to_string();
     // A floor, not a deadline: the interval is measured from the *end* of the
@@ -521,7 +553,7 @@ async fn run(
             return;
         }
         let started = std::time::Instant::now();
-        if let Err(err) = sweep(&docker, &state, &cpuset, &exit_tx, &node).await {
+        if let Err(err) = sweep(&docker, &state, &cpuset, &exit_tx, &node, &readings).await {
             tracing::warn!(error = %err, "disk poll sweep failed; retrying next interval");
         }
         metrics::histogram!(AGENT_DISK_POLL_DURATION).record(started.elapsed().as_secs_f64());
@@ -541,9 +573,13 @@ async fn sweep(
     cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: &mpsc::UnboundedSender<ExitEvent>,
     node: &str,
+    readings: &DiskReadings,
 ) -> Result<(), bollard::errors::Error> {
     let usage = docker.df(None::<DataUsageOptions>).await?;
     let containers = usage.containers.unwrap_or_default();
+    // Rebuilt from scratch each sweep and swapped in at the end, so a departed
+    // container's stale reading never lingers for the samplers (§8.1).
+    let mut fresh: HashMap<AllocationId, u64> = HashMap::new();
     for summary in containers {
         let labels = summary.labels.as_ref();
         // Only our poll-enforced containers with a parseable budget.
@@ -555,6 +591,18 @@ async fn sweep(
             .is_some_and(|owner| owner == node);
         if !is_ours {
             continue;
+        }
+        let allocation = labels
+            .and_then(|labels| labels.get(super::LABEL_ALLOCATION))
+            .and_then(|raw| raw.parse::<AllocationId>().ok());
+        // Record this container's writable-layer reading for the metrics samplers
+        // (§8.1: `disk_writable_bytes` is "the disk poller's last reading"). A
+        // negative/absent `SizeRw` reads as 0.
+        if is_poll {
+            if let Some(allocation) = allocation {
+                let size = summary.size_rw.filter(|&rw| rw >= 0).unwrap_or(0) as u64;
+                fresh.insert(allocation, size);
+            }
         }
         // The label is the bare byte count `plan` stamped (see
         // `DiskPlan::budget_label`), so it parses as a `u64` and becomes a
@@ -569,10 +617,7 @@ async fn sweep(
         if !over_budget(summary.size_rw, budget) {
             continue;
         }
-        let Some(allocation) = labels
-            .and_then(|labels| labels.get(super::LABEL_ALLOCATION))
-            .and_then(|raw| raw.parse::<AllocationId>().ok())
-        else {
+        let Some(allocation) = allocation else {
             continue; // over budget but unidentifiable — not ours to kill
         };
         let target = summary.id.as_deref().unwrap_or_default();
@@ -602,6 +647,9 @@ async fn sweep(
 
         kill_over_budget(docker, state, cpuset, exit_tx, allocation, target, budget).await;
     }
+    // Replace the shared readings wholesale (§8.1): full rebuild, so departed
+    // containers drop out and each sampler sees only live per-allocation sizes.
+    *readings.lock().unwrap() = fresh;
     Ok(())
 }
 
@@ -627,6 +675,8 @@ async fn kill_over_budget(
             return;
         }
         st.claimed.insert(allocation);
+        // Stop this container's sampler and start its drain clock (§8.2).
+        st.note_exit_claimed(allocation, Timestamp::now());
     }
 
     // 2. Kill outright — SIGKILL, no pause-first. A 404/409/"not running" means
@@ -871,11 +921,18 @@ mod tests {
         }
     }
 
+    /// A test enforcer pinned to `mode` with an empty readings map — `plan` never
+    /// touches the readings, so the map's contents are irrelevant to these tests.
+    fn enforcer(mode: DiskMode) -> DiskEnforcer {
+        DiskEnforcer {
+            mode,
+            readings: DiskReadings::default(),
+        }
+    }
+
     #[test]
     fn quota_plan_sets_storage_opt_and_budget_label() {
-        let enforcer = DiskEnforcer {
-            mode: DiskMode::Quota,
-        };
+        let enforcer = enforcer(DiskMode::Quota);
         let plan = enforcer
             .plan(&resources(bytes(100)), bytes(30))
             .expect("under budget");
@@ -899,9 +956,7 @@ mod tests {
 
     #[test]
     fn poll_plan_stamps_budget_but_no_storage_opt() {
-        let enforcer = DiskEnforcer {
-            mode: DiskMode::Poll,
-        };
+        let enforcer = enforcer(DiskMode::Poll);
         let plan = enforcer
             .plan(&resources(bytes(100)), bytes(30))
             .expect("under budget");
@@ -913,7 +968,7 @@ mod tests {
     #[test]
     fn no_limit_plan_omits_budget_and_storage_opt() {
         for mode in [DiskMode::Quota, DiskMode::Poll] {
-            let enforcer = DiskEnforcer { mode };
+            let enforcer = enforcer(mode);
             // A disk request of zero → no enforcement in either mode.
             let plan = enforcer
                 .plan(&resources(ByteSize::ZERO), bytes(12345))
@@ -932,9 +987,7 @@ mod tests {
 
     #[test]
     fn plan_propagates_the_image_too_big_user_error() {
-        let enforcer = DiskEnforcer {
-            mode: DiskMode::Quota,
-        };
+        let enforcer = enforcer(DiskMode::Quota);
         let err = enforcer
             .plan(&resources(bytes(100)), bytes(200))
             .unwrap_err();

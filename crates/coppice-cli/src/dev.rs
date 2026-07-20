@@ -336,11 +336,14 @@ ca_path = "{ca}"
         telemetry: Default::default(),
     };
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
-    // happens per concrete executor type rather than in a generic helper.
-    let agent_join = match args.executor {
+    // happens per concrete executor type rather than in a generic helper. The
+    // second tuple element holds the telemetry handle (Docker executor only)
+    // alive for the dev cluster's lifetime, so its retention janitors are not
+    // dropped early (§8.4).
+    let (agent_join, _telemetry_guard) = match args.executor {
         DevExecutor::Fake => {
             let session = build_session(&agent_config, FakeExecutor::new())?;
-            tokio::spawn(run_agent(session, agent_config))
+            (tokio::spawn(run_agent(session, agent_config)), None)
         }
         DevExecutor::Docker => {
             // Mirror `run_daemon`'s wiring: connect the daemon, spawn the shared
@@ -366,7 +369,30 @@ ca_path = "{ca}"
                 pressure_paths: pressure_paths.clone(),
                 high_pct: agent_config.pressure.high_pct,
             };
-            let pressure_rx = coppice_agent::pressure::spawn(pressure_paths, agent_config.pressure);
+            let pressure_rx =
+                coppice_agent::pressure::spawn(pressure_paths.clone(), agent_config.pressure);
+            // Mirror `run_daemon`'s telemetry wiring (§8): build the sinks + hub
+            // and keep the returned handle alive for the agent task's lifetime.
+            let telemetry = coppice_agent::telemetry::build(
+                &agent_config.telemetry,
+                &agent_config.data_dir,
+                pressure_paths,
+                agent_config.pressure.high_pct,
+                pressure_rx.clone(),
+            )
+            .await?;
+            // `Some` whenever any sink is configured; per-kind suppression (§8.3)
+            // handles partial configs. Zero sinks ⇒ `None`: nothing consumes either
+            // stream, so collect nothing rather than discard every batch.
+            let telemetry_wiring = (!agent_config.telemetry.sinks.is_empty()).then(|| {
+                coppice_agent::executor::docker::TelemetryWiring {
+                    hub: telemetry.hub.clone(),
+                    stores: telemetry.stores.clone(),
+                    log_store: telemetry.log_store.clone(),
+                    metrics_interval: agent_config.telemetry.metrics_interval,
+                    drain_force_after: agent_config.telemetry.drain_force_after,
+                }
+            });
             let executor = DockerExecutor::new(
                 docker,
                 &agent_config.executor,
@@ -375,10 +401,14 @@ ca_path = "{ca}"
                 agent_config.node(),
                 pressure_rx,
                 cache_options,
+                telemetry_wiring,
             )
             .await?;
             let session = build_session(&agent_config, executor)?;
-            tokio::spawn(run_agent(session, agent_config))
+            (
+                tokio::spawn(run_agent(session, agent_config)),
+                Some(telemetry),
+            )
         }
     };
 
