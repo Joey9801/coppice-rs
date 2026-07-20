@@ -188,7 +188,14 @@ pub trait Executor: Send + Sync + 'static {
     /// to reap, and only *after* the exit is durably journaled: exited
     /// containers are evidence and must survive the crash window (§5). Reaping
     /// an allocation the runtime no longer knows about is a no-op (`Ok`).
-    async fn reap(&self, allocation: AllocationId) -> Result<(), ExecutorError>;
+    ///
+    /// Desugared with an explicit `Send` bound (like [`Executor::next_exit`]):
+    /// the live loop spawns reaps onto their own task so the telemetry drain
+    /// barrier never delays reports or command processing.
+    fn reap(
+        &self,
+        allocation: AllocationId,
+    ) -> impl std::future::Future<Output = Result<(), ExecutorError>> + Send;
 
     /// Await the next natural container exit. The session loop runs this on a
     /// dedicated task, so the returned future must be `Send`; for runtimes with

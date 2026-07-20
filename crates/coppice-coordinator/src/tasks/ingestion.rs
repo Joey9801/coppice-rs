@@ -913,6 +913,53 @@ mod tests {
         assert!(!rn.lost.iter().any(|l| l.attempt == att_disp));
     }
 
+    /// Regression for the heartbeat-exit race: once an attempt's terminal
+    /// report has been applied, a heartbeat that omits its allocation from
+    /// `running` must not mark it lost. The agent reports the exit before
+    /// reaping the container (session `pending_reaps`), and ingestion is
+    /// serial — each report's commands are applied before the next report is
+    /// normalized — so by the time the post-exit heartbeat arrives the attempt
+    /// has left `Running` and its absence is benign, even while the exited
+    /// container still awaits its reap behind the telemetry drain barrier.
+    #[test]
+    fn heartbeat_absence_after_terminal_report_is_not_lost() {
+        let node = NodeId::new();
+        let job = JobId::new();
+
+        for state in [
+            AttemptState::Finalizing,
+            AttemptState::Terminal(AttemptOutcome::Exited { code: 0 }),
+        ] {
+            let attempt = AttemptId::new();
+            let alloc = AllocationId::new();
+            let mut sm = StateMachine::default();
+            sm.nodes.insert(node, node_record(node, 5, true));
+            sm.attempts.insert(
+                attempt,
+                attempt_record(attempt, job, alloc, node, state.clone(), Some(now())),
+            );
+            sm.allocations.insert(
+                alloc,
+                allocation_record(
+                    alloc,
+                    job,
+                    attempt,
+                    node,
+                    requested(),
+                    AllocationState::Active,
+                ),
+            );
+
+            let out = normalize(&view_of(sm), &report(node, 5, heartbeat(&[])), now());
+            assert!(
+                out.commands.is_empty(),
+                "an exited-but-unreaped allocation absent from the heartbeat \
+                 must not be reconciled as lost (state {state:?})"
+            );
+            assert!(out.stops.is_empty());
+        }
+    }
+
     #[test]
     fn observed_set_diff_adopts_stops_loses_and_records_exits() {
         let node = NodeId::new();

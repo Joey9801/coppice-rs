@@ -492,6 +492,15 @@ async fn max_runtime_after_natural_exit_is_a_noop() {
 
 // ---- reaping (docker-executor.md §5) ----
 
+/// Perform the session's queued reaps — the live loop's job, done inline
+/// here. Exit paths only queue (see `Session::pending_reaps`), so tests
+/// asserting a reap happened must flush first.
+async fn flush_reaps(session: &mut TestSession) {
+    for alloc in session.take_pending_reaps() {
+        session.reap_journaled(alloc).await;
+    }
+}
+
 #[tokio::test]
 async fn exit_path_journals_then_reaps() {
     let (_dir, mut session, exec) = session();
@@ -510,6 +519,7 @@ async fn exit_path_journals_then_reaps() {
         session.state().exits.contains_key(&alloc),
         "the observed exit is journaled"
     );
+    flush_reaps(&mut session).await;
     assert!(
         !observes(&exec, alloc).await,
         "a journaled natural exit is reaped from the runtime"
@@ -534,9 +544,99 @@ async fn exit_path_journals_then_reaps() {
         session.state().exits.contains_key(&alloc2),
         "the stop-resolved exit is journaled"
     );
+    flush_reaps(&mut session).await;
     assert!(
         !observes(&exec, alloc2).await,
         "a journaled stop-resolved exit is reaped from the runtime"
+    );
+}
+
+/// Regression for the heartbeat-exit race: the terminal report must be
+/// produced BEFORE the container is reaped. A reap can stall for seconds
+/// behind the telemetry drain barrier, and a heartbeat sent in that window
+/// omits the allocation from `running` while the coordinator has seen no
+/// terminal report — reverse reconciliation would misclassify the clean exit
+/// as an `AgentError` loss and burn a retry.
+#[tokio::test]
+async fn observed_exit_reports_before_reaping() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+    let exit = natural_exit(0, Duration::from_micros(9), exec.now());
+    exec.finish(alloc, exit);
+
+    let reports = session.handle_observed_exit(alloc, exit).await.unwrap();
+    assert_eq!(
+        terminal_outcome(&reports),
+        Some(AttemptOutcome::Exited { code: 0 }),
+        "the exit is reported terminal without waiting on a reap"
+    );
+    assert!(
+        observes(&exec, alloc).await,
+        "the container is not reaped inline — the reap is queued so the \
+         terminal report never waits behind the drain barrier"
+    );
+
+    // The race shape this ordering defuses: a heartbeat in this window
+    // already omits the exited container from `running`; only the terminal
+    // report above, ordered ahead of it on the stream, keeps the coordinator
+    // from marking the attempt lost.
+    let hb = session.heartbeat_report().await;
+    let Some(pb::agent_report::Body::Heartbeat(hb)) = hb.body else {
+        panic!("heartbeat_report must produce a Heartbeat body");
+    };
+    assert!(
+        !hb.running.contains(&alloc.into()),
+        "an exited-but-unreaped container is absent from the heartbeat's running set"
+    );
+
+    assert_eq!(
+        session.take_pending_reaps(),
+        vec![alloc],
+        "the reap is queued for the loop to perform after the reports"
+    );
+}
+
+/// The other half of the heartbeat-exit race: the runtime can observe a
+/// container exited *before* the session has processed its exit event (docker
+/// events delivery lags the daemon's own view). A heartbeat in that gap must
+/// still claim the allocation as running — the session has journaled no exit,
+/// so its terminal report hasn't been sent, and disclaiming it would let the
+/// coordinator's reverse reconciliation mark the attempt lost (`AgentError`).
+#[tokio::test]
+async fn heartbeat_claims_exited_container_until_exit_is_journaled() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+
+    // The container exits in the runtime; the session has not seen the event.
+    let exit = natural_exit(0, Duration::from_micros(9), exec.now());
+    exec.finish(alloc, exit);
+    let Some(pb::agent_report::Body::Heartbeat(hb)) = session.heartbeat_report().await.body else {
+        panic!("heartbeat_report must produce a Heartbeat body");
+    };
+    assert!(
+        hb.running.contains(&alloc.into()),
+        "an exited container with no journaled exit is still claimed as running"
+    );
+
+    // Once the exit is journaled (and its terminal report produced), the
+    // claim drops and the heartbeat's absence is benign.
+    session.handle_observed_exit(alloc, exit).await.unwrap();
+    let Some(pb::agent_report::Body::Heartbeat(hb)) = session.heartbeat_report().await.body else {
+        panic!("heartbeat_report must produce a Heartbeat body");
+    };
+    assert!(
+        !hb.running.contains(&alloc.into()),
+        "a journaled exit is no longer claimed"
     );
 }
 
@@ -671,6 +771,7 @@ async fn recovery_reaps_journaled_survivors() {
         forked.clone(),
     );
     register(&mut s2, 1, 1, 1).await;
+    flush_reaps(&mut s2).await;
     assert!(
         !observes(&forked, alloc).await,
         "recovery reaps a container whose exit is already journaled"
@@ -744,6 +845,7 @@ async fn recovery_reports_journaled_stop_outcome_over_runtime_code() {
         AttemptOutcome::Aborted,
         "the journaled stop outcome wins over the runtime's bare exit code"
     );
+    flush_reaps(&mut s2).await;
     assert!(
         !observes(&forked, alloc).await,
         "recovery still reaps the journaled survivor"
