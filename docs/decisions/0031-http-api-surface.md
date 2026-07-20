@@ -99,7 +99,7 @@ mutations are `POST` with a request-message body. One route per
 | `POST /api/v1/jobs/{job}/abort` | `AbortJob*` (exists) | write |
 | `GET  /api/v1/jobs/{job}/timeline` | `GetJobTimeline*` | bounded |
 | `GET  /api/v1/jobs/{job}/usage?attempt=` | `GetJobUsage*` | eventual |
-| `GET  /api/v1/jobs/{job}/logs?cursor=&limit=` | `GetJobLogs*` | eventual, **provisional** |
+| `GET  /api/v1/jobs/{job}/logs?cursor=&limit=` | `GetJobLogs*` | eventual (shipped, ADR 0034) |
 | `GET  /api/v1/nodes` | `ListNodes*` | bounded |
 | `GET  /api/v1/nodes/{node}` | `GetNode*` | bounded |
 | `GET  /api/v1/nodes/{node}/utilization` | `GetNodeUtilization*` | eventual |
@@ -115,9 +115,15 @@ mutations are `POST` with a request-message body. One route per
 Path ids are the typed string forms (ADR 0024); a prefix/uuid that fails
 validation is `INVALID_ARGUMENT`, not `NOT_FOUND`. **Provisional** rows
 are routed now but return `UNIMPLEMENTED` until their backing store exists
-(no log storage yet — `LogChunk` in the web UI is a proposal, and these
-routes must be reconciled with the real log design before leaving
-provisional status). The events route is reserved so nothing else claims
+(these routes had to be reconciled with the real log design before leaving
+provisional status). `GetJobLogs` **left provisional status on 2026-07-20 per
+ADR 0034**: it is now served best-effort from the agent's telemetry segment
+store over the agent-hosted `NodeService`, and its response is the
+`GetJobLogsResponse` DTO (entries + per-attempt `sources` availability +
+cursor), not the sketched web-UI `LogChunk`. `GetNodeLogs` and
+`GetCoordinatorLogs` **stay provisional**: agent and coordinator *process*
+logs are a different substrate (nothing captures them as streams today, ADR
+0034 non-goals). The events route is reserved so nothing else claims
 the path; when built it is an SSE stream of server-throttled bounded
 batches with ADR 0008 cursors — never a raw firehose.
 
