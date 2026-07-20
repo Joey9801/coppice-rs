@@ -76,9 +76,11 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // fast if unreachable — an agent that cannot reach its daemon is useless),
     // spawn the shared disk-pressure monitor over data_dir + the data-root, then
     // construct the executor and its events task (docker-executor.md §9, §11).
-    let docker = executor::docker::api::connect(&config.executor.docker_host)
-        .context("connecting to the Docker daemon")?;
-    let data_root = executor::docker::api::data_root(&docker, &config.executor.docker_host)
+    let docker_host = executor::docker::api::resolve_host(config.executor.docker_host.as_deref())
+        .context("resolving the Docker daemon endpoint")?;
+    let docker =
+        executor::docker::api::connect(&docker_host).context("connecting to the Docker daemon")?;
+    let data_root = executor::docker::api::data_root(&docker, &docker_host)
         .await
         .context("querying the Docker daemon for its data-root")?;
     let mut pressure_paths = vec![config.data_dir.clone()];
@@ -125,6 +127,7 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     let docker_executor = executor::DockerExecutor::new(
         docker,
         &config.executor,
+        &docker_host,
         config.capacity.cpu_millis,
         config.reservation.cpu_millis,
         config.node(),

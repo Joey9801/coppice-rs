@@ -816,6 +816,9 @@ The complete list of changes outside the new modules:
 
    ```toml
    [executor]
+   # docker_host is optional; omit to auto-discover the daemon at startup,
+   # resolving DOCKER_HOST then probing well-known sockets (/var/run/docker.sock,
+   # Docker Desktop, Colima, Rancher Desktop, rootless dockerd).
    docker_host           = "unix:///var/run/docker.sock"
    disk_enforcement      = "auto"      # auto | quota | poll
    disk_poll_interval    = "30s"

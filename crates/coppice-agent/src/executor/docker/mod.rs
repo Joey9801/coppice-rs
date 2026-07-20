@@ -473,11 +473,16 @@ impl DockerExecutor {
     /// **Must be called from within a tokio runtime** — it spawns the events
     /// task (§11), which live-tails `docker events` and resyncs via the daemon.
     /// The caller connects the client (`api::connect`) and spawns the pressure
-    /// monitor (`pressure::spawn`) first; see `run_daemon`.
+    /// monitor (`pressure::spawn`) first; see `run_daemon`. `docker_host` is the
+    /// endpoint already resolved by [`api::resolve_host`] (config → `DOCKER_HOST`
+    /// → probed sockets) — the resolved *fact*, distinct from `config.docker_host`,
+    /// which is the operator's optional *input* — and is used only to gate the
+    /// non-Linux CPU-topology fallback on the transport being local.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         docker: Docker,
         config: &ExecutorConfig,
+        docker_host: &str,
         capacity_cpu_millis: u64,
         reservation_cpu_millis: u64,
         node: NodeId,
@@ -488,7 +493,7 @@ impl DockerExecutor {
         let state = Arc::new(Mutex::new(ExecutorState::default()));
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
         let cpuset = if config.whole_core_affinity {
-            let topology = cpuset::Topology::discover(&docker, &config.docker_host)
+            let topology = cpuset::Topology::discover(&docker, docker_host)
                 .await
                 .map_err(|err| {
                     ExecutorError::Other(format!("discovering daemon CPU topology: {err}"))
