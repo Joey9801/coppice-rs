@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT at AS \"at!: i64\", stream AS \"stream!: i64\",\n                      length(bytes) AS \"len!: i64\", substr(bytes, 1, ?) AS \"prefix!: Vec<u8>\"\n               FROM log_chunks WHERE at BETWEEN ? AND ? ORDER BY at DESC, id DESC LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "at!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "stream!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "len!: i64",
+        "ordinal": 2,
+        "type_info": "Null"
+      },
+      {
+        "name": "prefix!: Vec<u8>",
+        "ordinal": 3,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "0763320d69b7c1c7102485f0f84ba4fddf5e3d46bff90c3d52522bcd8b7f7d36"
+}

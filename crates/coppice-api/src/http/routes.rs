@@ -56,7 +56,7 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         )
         .route(
             "/api/v1/jobs/:job/logs",
-            get(unimplemented_id_read::<JobId>("GetJobLogs")),
+            get(super::logs::get_job_logs::<P>),
         )
         // Nodes. List/detail bounded; utilization/history eventual; logs
         // provisional.
@@ -526,6 +526,20 @@ mod tests {
         async fn read_state(&self, opts: ReadOptions) -> Result<ReadView, ApiError> {
             self.read_consistency.lock().unwrap().push(opts.consistency);
             Ok(ReadView::new(self.state.clone(), 1, 1))
+        }
+
+        async fn fetch_logs(
+            &self,
+            _node: coppice_core::id::NodeId,
+            _addr: &str,
+            _req: crate::LogFetchRequest,
+        ) -> Result<crate::LogFetchOutcome, crate::LogFetchError> {
+            // The log-endpoint walk is exercised against a dedicated fake in
+            // `super::super::logs`; this plane never advertises a reachable
+            // node, so it never reaches here.
+            Err(crate::LogFetchError::Unreachable {
+                reason: "stub plane serves no logs".to_string(),
+            })
         }
     }
 

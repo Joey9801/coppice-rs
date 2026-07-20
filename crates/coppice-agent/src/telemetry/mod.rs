@@ -34,8 +34,8 @@ use tokio::sync::watch;
 use crate::pressure::DiskPressure;
 
 pub use fs_sink::{
-    spawn_retention_janitor, AttemptTelemetry, FilesystemSink, FilesystemSinkOptions, LogQuery,
-    StoreError, StoredLogChunk,
+    spawn_retention_janitor, AttemptTelemetry, FilesystemSink, FilesystemSinkOptions, LogOrder,
+    LogPage, LogPageQuery, LogQuery, ResumeAt, StoreError, StoredLogChunk,
 };
 pub use hub::{HubSink, SinkInstance, TelemetryHub};
 pub use sink::{FilesystemSinkConfig, LogSink, MetricsSink, SinkConfig, SinkKind};

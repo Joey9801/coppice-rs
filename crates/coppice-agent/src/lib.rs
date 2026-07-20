@@ -12,6 +12,7 @@
 pub mod config;
 pub mod executor;
 pub mod journal;
+pub mod node_service;
 pub mod observed;
 pub mod pressure;
 pub mod session;
@@ -29,6 +30,7 @@ use coppice_proto::pb::core::v1 as pbcore;
 pub fn describe_metrics() {
     executor::docker::describe_metrics();
     telemetry::describe_metrics();
+    node_service::describe_metrics();
 }
 
 /// Run any point-in-time sampling behind agent metrics, recursing the same
@@ -37,6 +39,7 @@ pub fn describe_metrics() {
 pub fn gather_metrics() {
     executor::docker::gather_metrics();
     telemetry::gather_metrics();
+    node_service::gather_metrics();
 }
 
 /// Run the agent daemon from its config file: recover the journal, build the
@@ -132,6 +135,22 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     .await
     .context("initializing the Docker executor")?;
 
+    // Bind the NodeService listener eagerly (ADR 0034) before entering the
+    // session loop, so a port conflict fails the daemon here rather than after
+    // it has registered. Absent `[listen]` config = no listener, no
+    // advertisement — a legitimate posture (the agent's logs are unreachable
+    // off-node). The handler reads the first LOG-consuming store; with telemetry
+    // disabled that is `None` and every fetch answers UnknownAttempt.
+    if let Some(listen) = &config.listen {
+        let listener = node_service::prepare_listener(listen.addr, &config.tls)
+            .context("binding the NodeService listener")?;
+        tracing::info!(
+            service_addr = ?config.service_addr(),
+            "NodeService listener bound; coordinators can dial for job logs (ADR 0034)"
+        );
+        node_service::serve(listener, telemetry.log_store.clone());
+    }
+
     let session = session::Session::new(
         config.node(),
         config.advertised_resources(),
@@ -139,7 +158,8 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         journal,
         state,
         docker_executor,
-    );
+    )
+    .with_service_addr(config.service_addr());
 
     tracing::info!("coppice agent started; entering the session loop");
     session::run(session, &config).await

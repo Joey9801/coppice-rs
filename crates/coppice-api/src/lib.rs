@@ -225,6 +225,110 @@ pub enum ApiError {
     Unavailable(String),
 }
 
+// ---------------------------------------------------------------------------
+// Log-fetch seam (ADR 0034)
+// ---------------------------------------------------------------------------
+//
+// The one coordinator→agent RPC behind `GET /api/v1/jobs/{job}/logs`. These
+// types are deliberately proto-free plain structs: `coppice-api` does not
+// depend on `coppice-proto` (ADR 0031 — the crate "speaks DTOs"), so the seam
+// cannot name the generated `coppice.agent.v1.FetchLogs*` messages. The
+// coordinator's `ControlPlane` impl converts these to/from the wire types at
+// its boundary, exactly as the raft transport converts domain types to pb in
+// `coppice-consensus`. Page orchestration (the multi-attempt walk, the cursor,
+// the 4-RPC budget) lives in the HTTP handler; this seam is a single RPC.
+
+/// Which of an attempt's two streams to fetch. `None` on the request means
+/// both (the proto's `LOG_STREAM_UNSPECIFIED` filter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStreamSelector {
+    Stdout,
+    Stderr,
+}
+
+/// An exclusive resume position within one attempt's chunks. The store orders
+/// by `(at, insertion)`, so `at_us` alone cannot address a position when
+/// several chunks share a microsecond: `skip` counts the chunks already
+/// consumed at exactly `at_us`, and the walk resumes strictly after them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogResumePosition {
+    pub at_us: i64,
+    pub skip: u64,
+}
+
+/// One page request for a single attempt's logs (one `NodeService::FetchLogs`
+/// RPC). The coordinator has already resolved `(job, attempt)` to the target
+/// node from replicated state before dialing.
+#[derive(Debug, Clone)]
+pub struct LogFetchRequest {
+    pub job: coppice_core::id::JobId,
+    pub attempt: coppice_core::id::AttemptId,
+    /// Half-open `[from_us, until_us)` window; either bound may be open.
+    pub from_us: Option<i64>,
+    pub until_us: Option<i64>,
+    /// Stream filter; `None` returns both.
+    pub stream: Option<LogStreamSelector>,
+    /// Exclusive lower cursor; `None` starts from the window edge.
+    pub resume: Option<LogResumePosition>,
+    /// Direction: `false` walks newest-first (matches `order=desc`).
+    pub ascending: bool,
+    /// Hard caps on the page; the store stops at whichever trips first and
+    /// reports `exhausted = false`.
+    pub max_chunks: u32,
+    pub max_bytes: u32,
+}
+
+/// One stored log chunk: a run of bytes captured at one microsecond on one
+/// stream. Bytes are returned verbatim; UTF-8 decoding happens at the HTTP edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogChunk {
+    pub at_us: i64,
+    pub stream: LogStreamSelector,
+    pub payload: Vec<u8>,
+    /// True when the store cut `payload` down to the page's remaining byte
+    /// budget because the chunk alone exceeded it: the chunk still counts as
+    /// fully consumed, so the resume cursor advances past it whole and the
+    /// dropped bytes are never re-served (only ever set on a page's first chunk).
+    pub truncated: bool,
+}
+
+/// A page of chunks in the requested direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPage {
+    pub chunks: Vec<LogChunk>,
+    /// True when the walk reached the end of the requested range within this
+    /// page; false when a cap cut it short and a further page exists.
+    pub exhausted: bool,
+    /// The store's oldest/newest retained `at_us` for this attempt, when
+    /// known. A requested `from_us` earlier than `earliest_at_us` means older
+    /// chunks existed and were pruned (the API's `truncated` verdict).
+    pub earliest_at_us: Option<i64>,
+    pub latest_at_us: Option<i64>,
+}
+
+/// The result of one `FetchLogs`: a page, or the store holding no data for the
+/// attempt at all (segments pruned, or telemetry never written — the "gone"
+/// signal behind the `expired` availability verdict).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogFetchOutcome {
+    Chunks(LogPage),
+    UnknownAttempt,
+}
+
+/// Why a `fetch_logs` RPC could not be completed against the target node.
+///
+/// `UnknownAttempt` is *not* an error — it is a normal [`LogFetchOutcome`]. An
+/// error here means the RPC itself did not land: a dial failure, a deadline,
+/// or the absence of any reachable node service.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum LogFetchError {
+    /// The node could not be reached: no dialable channel, a connect/deadline
+    /// failure, or the agent hosts no service. `reason` is operator-readable
+    /// and surfaces verbatim in the `sources[].reason` of the response.
+    #[error("node unreachable: {reason}")]
+    Unreachable { reason: String },
+}
+
 /// The set of operations the API layer exposes. Implemented by the
 /// coordinator, which owns access to consensus and state.
 ///
@@ -295,4 +399,22 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// ring): the replicated-state reads still work, but this raft-level view
     /// cannot be produced.
     fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError>;
+
+    /// Fetch one bounded page of an attempt's stored logs from the agent that
+    /// ran it (ADR 0034's single coordinator→agent RPC, `NodeService::FetchLogs`).
+    ///
+    /// The HTTP handler for `GET /api/v1/jobs/{job}/logs` has already resolved
+    /// `(job, attempt)` to `node` and its advertised `addr` from replicated
+    /// state, and owns the page orchestration — the multi-attempt walk, the
+    /// cursor, and the at-most-4-RPCs-per-request budget. This method is one
+    /// RPC: it dials the node (any replica may, no leader involvement), applies
+    /// a 5 s deadline, and returns the store's answer or an [`LogFetchError`].
+    /// A pruned/never-written attempt is the normal
+    /// [`LogFetchOutcome::UnknownAttempt`], not an error.
+    fn fetch_logs(
+        &self,
+        node: coppice_core::id::NodeId,
+        addr: &str,
+        req: LogFetchRequest,
+    ) -> impl Future<Output = Result<LogFetchOutcome, LogFetchError>> + Send;
 }

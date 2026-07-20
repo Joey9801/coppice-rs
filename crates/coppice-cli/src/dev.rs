@@ -22,11 +22,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use coppice_agent::config::{
-    CapacityConfig, Config as AgentConfig, ExecutorConfig, TlsConfig as AgentTls,
+    CapacityConfig, Config as AgentConfig, ExecutorConfig, ListenConfig, TlsConfig as AgentTls,
 };
 use coppice_agent::executor::{DockerExecutor, Executor, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{self, Session};
+use coppice_agent::telemetry::FilesystemSink;
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, ConsensusError};
 use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, ClientListener};
@@ -60,6 +61,12 @@ pub struct DevArgs {
     /// Raft/admin port (0 picks a free one; logged at startup).
     #[arg(long, default_value_t = 0)]
     raft_port: u16,
+
+    /// Agent NodeService port for job-log retrieval (0 picks a free one;
+    /// logged at startup). The in-process coordinator dials this over mTLS to
+    /// serve `GET /api/v1/jobs/{job}/logs` (ADR 0034).
+    #[arg(long, default_value_t = 0)]
+    node_service_port: u16,
 
     /// Executor backing the in-process agent. `fake` runs the lifecycle
     /// without containers; `docker` is the production executor (not yet
@@ -114,11 +121,11 @@ fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
     ];
     let ca_cert = params.self_signed(&ca_key).context("self-sign dev CA")?;
 
-    let leaf = |cn: &str| -> Result<CertKey> {
+    let leaf = |cn: &str, extra_sans: &[String]| -> Result<CertKey> {
         let key = KeyPair::generate().context("generate dev leaf key")?;
-        let mut params =
-            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
-                .context("dev leaf params")?;
+        let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        sans.extend(extra_sans.iter().cloned());
+        let mut params = CertificateParams::new(sans).context("dev leaf params")?;
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![
             ExtendedKeyUsagePurpose::ServerAuth,
@@ -137,12 +144,16 @@ fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
         })
     };
 
+    let agent_cn = agent_node.to_string();
     Ok(DevPki {
         ca_pem: ca_cert.pem().into_bytes(),
-        coordinator: leaf("coppice-dev-coordinator")?,
+        coordinator: leaf("coppice-dev-coordinator", &[])?,
         // The gateway binds the client leaf's CN to the claimed NodeId
-        // (ADR 0011), so the agent leaf carries the typed id string.
-        agent: leaf(&agent_node.to_string())?,
+        // (ADR 0011), so the agent leaf carries the typed id string. The same
+        // leaf doubles as the NodeService server certificate; coordinators pin
+        // the typed node id as the TLS server-name, so it also carries that id
+        // as a dNSName SAN (ADR 0034).
+        agent: leaf(&agent_cn, std::slice::from_ref(&agent_cn))?,
     })
 }
 
@@ -212,6 +223,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
     let raft_port = resolve_port(args.raft_port)?;
     let agent_port = resolve_port(args.agent_port)?;
     let client_port = resolve_port(args.client_port)?;
+    let node_service_port = resolve_port(args.node_service_port)?;
 
     // -- Coordinator: the production config + bootstrap path. --------------
     let coord_data = root.join("coordinator");
@@ -262,6 +274,7 @@ ca_path = "{ca}"
         views,
         event_tap,
         handle,
+        node_log_client,
         raft_server_shutdown,
         raft_server,
     } = bootstrap::bootstrap(resolved)
@@ -295,6 +308,7 @@ ca_path = "{ca}"
         listener,
         client_listener,
         cluster_id,
+        node_log_client,
         Some(shutdown_rx),
     ));
 
@@ -334,6 +348,16 @@ ca_path = "{ca}"
         pressure: Default::default(),
         image_cache: Default::default(),
         telemetry: Default::default(),
+        // The agent-hosted NodeService (ADR 0034): bind 127.0.0.1:<port> and
+        // advertise 127.0.0.1, so the in-process coordinator can dial it for job
+        // logs. The node-id-SAN agent leaf (minted above) lets the id-pinned
+        // TLS dial validate. Bound and served below via `serve_node_service`.
+        listen: Some(ListenConfig {
+            addr: format!("127.0.0.1:{node_service_port}")
+                .parse()
+                .expect("node service socket addr"),
+            advertise_host: "127.0.0.1".to_string(),
+        }),
     };
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
     // happens per concrete executor type rather than in a generic helper. The
@@ -343,6 +367,9 @@ ca_path = "{ca}"
     let (agent_join, _telemetry_guard) = match args.executor {
         DevExecutor::Fake => {
             let session = build_session(&agent_config, FakeExecutor::new())?;
+            // The fake executor captures no container output, so the NodeService
+            // serves no log store: every fetch honestly answers UnknownAttempt.
+            serve_node_service(&agent_config, None)?;
             (tokio::spawn(run_agent(session, agent_config)), None)
         }
         DevExecutor::Docker => {
@@ -405,6 +432,9 @@ ca_path = "{ca}"
             )
             .await?;
             let session = build_session(&agent_config, executor)?;
+            // Serve the NodeService over the first LOG-consuming telemetry store
+            // (ADR 0034), so the in-process coordinator can dial for job logs.
+            serve_node_service(&agent_config, telemetry.log_store.clone())?;
             (
                 tokio::spawn(run_agent(session, agent_config)),
                 Some(telemetry),
@@ -431,6 +461,7 @@ ca_path = "{ca}"
             raft_port,
             agent_port,
             client_port,
+            node_service_port,
             ui_available: coppice_api::http::ui_available(),
             quota_entity,
             executor: args.executor,
@@ -473,7 +504,30 @@ fn build_session<E: Executor + Clone>(
         journal,
         state,
         executor,
-    ))
+    )
+    // Advertise the NodeService endpoint at registration (ADR 0034) so the
+    // coordinator learns where to dial for this node's job logs.
+    .with_service_addr(config.service_addr()))
+}
+
+/// Bind and serve the agent-hosted NodeService (ADR 0034) from the config's
+/// `[listen]` + `[tls]`, so the in-process coordinator can dial it for job logs.
+///
+/// `log_store` is the first LOG-consuming telemetry store; `None` disables it
+/// (the fake executor has no logs), in which case every fetch answers
+/// UnknownAttempt. Mirrors the daemon `run` path's wiring in `lib.rs`.
+fn serve_node_service(config: &AgentConfig, log_store: Option<FilesystemSink>) -> Result<()> {
+    let Some(listen) = &config.listen else {
+        return Ok(());
+    };
+    let listener = coppice_agent::node_service::prepare_listener(listen.addr, &config.tls)
+        .context("binding the dev NodeService listener")?;
+    tracing::info!(
+        service_addr = ?config.service_addr(),
+        "dev NodeService listener bound; the coordinator can dial for job logs (ADR 0034)"
+    );
+    coppice_agent::node_service::serve(listener, log_store);
+    Ok(())
 }
 
 /// The agent session loop as a task body (aborted at shutdown, like a
@@ -603,6 +657,7 @@ struct ReadySummary<'a> {
     raft_port: u16,
     agent_port: u16,
     client_port: u16,
+    node_service_port: u16,
     ui_available: bool,
     quota_entity: QuotaEntityId,
     executor: DevExecutor,
@@ -622,6 +677,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
          \x20 API             http://localhost:{client_port}/api/v1 (most reads still 501 UNIMPLEMENTED)\n\
          \x20 Raft/admin      https://localhost:{raft_port} (mTLS)\n\
          \x20 Agent gateway   https://localhost:{agent_port} (mTLS)\n\
+         \x20 Node service    127.0.0.1:{node_service_port} (mTLS; agent job logs)\n\
          \x20 Data            {data_dir} ({data_lifetime})\n\
          \x20 Executor        {executor}\n\
          \x20 Cluster         {cluster_id} (Raft node {coordinator_raft_id})\n\
@@ -638,6 +694,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
         raft_port = summary.raft_port,
         agent_port = summary.agent_port,
         client_port = summary.client_port,
+        node_service_port = summary.node_service_port,
         data_dir = summary.root.display(),
         executor = summary.executor,
         cluster_id = summary.cluster_id,
@@ -668,6 +725,7 @@ mod tests {
             raft_port: 7071,
             agent_port: 7072,
             client_port: 7070,
+            node_service_port: 7073,
             ui_available: false,
             quota_entity: DEV_QUOTA_ENTITY.parse().expect("quota entity id"),
             executor: DevExecutor::Fake,
@@ -678,6 +736,7 @@ mod tests {
         assert!(summary.contains("API             http://localhost:7070/api/v1"));
         assert!(summary.contains("Raft/admin      https://localhost:7071 (mTLS)"));
         assert!(summary.contains("Agent gateway   https://localhost:7072 (mTLS)"));
+        assert!(summary.contains("Node service    127.0.0.1:7073 (mTLS; agent job logs)"));
         assert!(summary.contains("/tmp/coppice-dev (temporary; deleted on exit)"));
         assert!(summary.contains(
             "Agent           node-00000000-0000-0000-0000-000000000002 (registered, epoch 1)"

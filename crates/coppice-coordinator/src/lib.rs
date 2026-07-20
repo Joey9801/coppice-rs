@@ -34,6 +34,12 @@ use anyhow::Result;
 // submit/abort path the (future) HTTP listener will host.
 pub use tasks::api_server::CoordinatorControlPlane;
 
+// The replica-local log-fetch client (ADR 0034). Exported so the end-to-end
+// best-effort job-log test can attach a real client to a `CoordinatorControlPlane`
+// and drive the full read path; the type already surfaces publicly through
+// `bootstrap::BootedCoordinator::node_log_client`.
+pub use tasks::node_client::NodeLogClient;
+
 /// Register descriptions for every metric a coordinator process can emit,
 /// recursing into each crate and module that exposes metrics. The future
 /// /metrics endpoint (ADR 0020's `observability.metrics_addr`) calls this
@@ -41,6 +47,7 @@ pub use tasks::api_server::CoordinatorControlPlane;
 pub fn describe_metrics() {
     coppice_consensus::describe_metrics();
     tasks::event_fanout::describe_metrics();
+    tasks::node_client::describe_metrics();
 }
 
 /// Run any point-in-time sampling behind coordinator metrics, recursing the
@@ -49,6 +56,7 @@ pub fn describe_metrics() {
 pub fn gather_metrics() {
     coppice_consensus::gather_metrics();
     tasks::event_fanout::gather_metrics();
+    tasks::node_client::gather_metrics();
 }
 
 /// Parse-and-dispatch entry point the binary calls.
