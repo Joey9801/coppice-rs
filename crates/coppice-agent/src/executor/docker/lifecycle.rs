@@ -1109,13 +1109,16 @@ async fn remove_best_effort(inner: &Inner, target: &str, force: bool) {
 }
 
 /// Mark an exit as surfaced: claim it (duplicate suppression, §4), drop it from
-/// the running set, and push the gauge. Called on both stop evidence paths.
+/// the running set, and push the gauge. Called on both stop evidence paths —
+/// each holds terminal exit evidence from an inspect, so the container is
+/// proven dead and the follower's fast drain fires here too (§8.2).
 async fn claim_exit(inner: &Inner, allocation: AllocationId) {
     {
         let mut st = lock_state(&inner.state);
         st.claimed.insert(allocation);
         // Stop this container's sampler and start its drain clock (§8.2).
         st.note_exit_claimed(allocation, Timestamp::now());
+        st.note_container_dead(allocation);
         st.running.remove(&allocation);
         st.push_running_gauge();
     }

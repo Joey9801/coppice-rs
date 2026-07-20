@@ -182,11 +182,18 @@ pub struct TelemetryWiring {
 pub(crate) enum CollectorSlot {
     /// A placeholder inserted synchronously before the async boundary derivation,
     /// so exit-claim and reap observe that a collector is initializing; carries any
-    /// claim that lands mid-initialization.
+    /// claim or confirmed death that lands mid-initialization.
     Reserved {
         /// When the exit was claimed while still initializing, if it was — carried
         /// forward onto the [`Active`](CollectorSlot::Active) entry at activation.
         exit_claimed_at: Option<Timestamp>,
+        /// Whether the container was confirmed **dead** while still initializing
+        /// ([`note_container_dead`](ExecutorState::note_container_dead) landed on
+        /// the reservation). Distinct from a claim: a disk kill claims *before*
+        /// its SIGKILL, so a claim alone is not proof of death. `spawn_collectors`
+        /// peeks this to seed the follower's fast-drain signal before the task
+        /// spawns, and activation fires the signal if it flipped later (§8.2).
+        dead: bool,
         /// When the reservation was made. Activation normally follows within
         /// milliseconds (one store query); if the initializing caller was
         /// cancelled mid-await the reservation would otherwise leak and wedge
@@ -219,12 +226,15 @@ pub(crate) struct Collectors {
     /// reap awaits it before removing the container (§8.2). A metrics-only config
     /// (no follower) initialises it `true`.
     pub(crate) drained: watch::Receiver<bool>,
-    /// The exit-claim fast-drain signal (§8.2), fired by
-    /// [`note_exit_claimed`](ExecutorState::note_exit_claimed): the follower
+    /// The confirmed-dead fast-drain signal (§8.2), fired by
+    /// [`note_container_dead`](ExecutorState::note_container_dead): the follower
     /// races it against the follow stream and, on the signal, abandons the
     /// stream for a single `follow=false` catch-up fetch instead of waiting out
-    /// the daemon's slow close of a dead stream. Firing with no follower (a
-    /// metrics-only config) is a harmless no-op.
+    /// the daemon's slow close of a dead stream. Deliberately **not** fired by
+    /// [`note_exit_claimed`](ExecutorState::note_exit_claimed) — a disk kill
+    /// claims before its SIGKILL, and draining a still-running container would
+    /// end log collection early. Firing with no follower (a metrics-only
+    /// config) is a harmless no-op.
     pub(crate) died_tx: watch::Sender<bool>,
     /// When the exit was claimed — the §8.2 `drain_force_after` clock. The first
     /// claim wins (idempotent), so repeated claims never reset it.
@@ -270,13 +280,17 @@ impl ExecutorState {
     }
 
     /// Note that an allocation's exit was claimed (docker-executor.md §8.2): abort
-    /// and drop its metrics sampler (a dead container's samples are noise, §8.1),
-    /// stamp the drain clock, and fire the follower's fast-drain signal (the
-    /// container is dead, so the follower switches from the follow stream to a
-    /// one-shot catch-up fetch). Idempotent — the **first** claim time is kept,
+    /// and drop its metrics sampler (a dead container's samples are noise, §8.1)
+    /// and stamp the drain clock. Idempotent — the **first** claim time is kept,
     /// so a re-claim from a later resync never moves the `drain_force_after`
-    /// deadline, and re-firing the signal is a no-op. A no-op when telemetry is
-    /// disabled or the collector is gone.
+    /// deadline. A no-op when telemetry is disabled or the collector is gone.
+    ///
+    /// A claim is **not** proof of death — `disk::kill_over_budget` claims
+    /// before its SIGKILL is even attempted — so this deliberately does not
+    /// fire the follower's fast-drain signal; that is
+    /// [`note_container_dead`](Self::note_container_dead), called only from
+    /// sites holding proof (a `die` event, an exited/dead listing, terminal
+    /// exit evidence).
     ///
     /// A [`Reserved`](CollectorSlot::Reserved) slot (the exit raced collector
     /// initialization) records the first claim time on the reservation; activation
@@ -291,9 +305,6 @@ impl ExecutorState {
                 if collectors.exit_claimed_at.is_none() {
                     collectors.exit_claimed_at = Some(now);
                 }
-                // Wake the follower's fast drain (§8.2); watch keeps only the
-                // latest value, so re-claims are no-ops.
-                collectors.died_tx.send_replace(true);
             }
             // First claim wins: only stamp a reservation that has none yet.
             Some(CollectorSlot::Reserved {
@@ -306,6 +317,42 @@ impl ExecutorState {
         }
     }
 
+    /// Note that an allocation's container is confirmed **dead** (docker-executor.md
+    /// §8.2): fire the follower's fast-drain signal so it abandons the follow
+    /// stream for a one-shot `follow=false` catch-up fetch instead of waiting
+    /// out the daemon's slow close of a dead stream. Callers must hold proof of
+    /// death — a `die` event, a listing filtered on exited/dead status, or
+    /// terminal exit evidence from an inspect — never just a claim (a disk kill
+    /// claims before its SIGKILL, and draining a still-running container would
+    /// end its log collection early). Idempotent: watch keeps only the latest
+    /// value, and a [`Reserved`](CollectorSlot::Reserved) slot records the fact
+    /// so activation (or `spawn_collectors`' pre-spawn seed) fires the fresh
+    /// follower's signal. A no-op when telemetry is disabled or the collector
+    /// is gone.
+    pub(crate) fn note_container_dead(&mut self, allocation: AllocationId) {
+        match self.collectors.get_mut(&allocation) {
+            Some(CollectorSlot::Active(collectors)) => {
+                collectors.died_tx.send_replace(true);
+            }
+            Some(CollectorSlot::Reserved { dead, .. }) => *dead = true,
+            None => {}
+        }
+    }
+
+    /// Whether `allocation`'s collector slot is a reservation already marked
+    /// dead ([`note_container_dead`](Self::note_container_dead) landed while the
+    /// collectors were initializing). `spawn_collectors` peeks this to seed the
+    /// follower's fast-drain signal *before* the task spawns: on a
+    /// multi-threaded runtime the fresh task can poll immediately, and a
+    /// dead-at-spawn container must drain via a single catch-up fetch, never
+    /// opening a follow stream (§8.2).
+    pub(crate) fn reservation_dead(&self, allocation: AllocationId) -> bool {
+        matches!(
+            self.collectors.get(&allocation),
+            Some(CollectorSlot::Reserved { dead: true, .. })
+        )
+    }
+
     /// Activate a reserved collector slot with its freshly spawned tasks
     /// (docker-executor.md §8.1/§8.2), the second half of `spawn_collectors` under
     /// the state lock. Three cases:
@@ -313,9 +360,11 @@ impl ExecutorState {
     /// - slot is [`Reserved`](CollectorSlot::Reserved) → build [`Collectors`]
     ///   carrying the reservation's `exit_claimed_at`; if that is `Some` (an exit
     ///   claimed mid-initialization) abort the sampler immediately — a dead
-    ///   container's samples are noise (§8.1) — store `sampler: None`, and fire
+    ///   container's samples are noise (§8.1) — and store `sampler: None`. If the
+    ///   reservation is marked `dead` (death confirmed mid-initialization), fire
     ///   `died_tx` so the fresh follower goes straight to the fast catch-up
-    ///   drain (§8.2, the claim fired before the follower existed); insert
+    ///   drain (§8.2) — this covers a death landing after `spawn_collectors`'
+    ///   pre-spawn seed peeked the reservation; insert
     ///   [`Active`](CollectorSlot::Active).
     /// - slot is **absent** (a reap completed and removed the reservation
     ///   meanwhile) → abort both fresh tasks, insert nothing.
@@ -341,21 +390,28 @@ impl ExecutorState {
         };
         match self.collectors.remove(&allocation) {
             Some(CollectorSlot::Reserved {
-                exit_claimed_at, ..
+                exit_claimed_at,
+                dead,
+                ..
             }) => {
-                // A claim landed during initialization: the container is already
-                // dead, so its sampler's samples are noise — abort it now — and
-                // the claim fired before the follower existed, so fire its
-                // fast-drain signal here (§8.2).
+                // A claim landed during initialization: the container's death is
+                // imminent at worst, so its sampler's samples are noise — abort
+                // it now.
                 let sampler = if exit_claimed_at.is_some() {
                     if let Some(sampler) = sampler {
                         sampler.abort();
                     }
-                    died_tx.send_replace(true);
                     None
                 } else {
                     sampler
                 };
+                // Death (not merely a claim) confirmed during initialization:
+                // fire the fresh follower's fast-drain signal (§8.2). Normally
+                // the pre-spawn seed already did; this covers a death landing
+                // between that peek and this activation.
+                if dead {
+                    died_tx.send_replace(true);
+                }
                 self.collectors.insert(
                     allocation,
                     CollectorSlot::Active(Collectors {
@@ -993,6 +1049,7 @@ pub(crate) async fn spawn_collectors(
             ids.allocation,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
+                dead: false,
                 reserved_at: Timestamp::now(),
             },
         );
@@ -1037,10 +1094,18 @@ pub(crate) async fn spawn_collectors(
             inner.disk.readings(),
         )
     });
-    // The exit-claim fast-drain signal (§8.2): `note_exit_claimed` fires it and
-    // the follower races it against the follow stream. Created even with no
-    // follower — firing into no receivers is a harmless no-op.
+    // The confirmed-dead fast-drain signal (§8.2): `note_container_dead` fires
+    // it and the follower races it against the follow stream. Created even with
+    // no follower — firing into no receivers is a harmless no-op.
     let (died_tx, died_rx) = watch::channel(false);
+    // Seed the signal with a death that already rode the reservation *before*
+    // the follower task spawns: on a multi-threaded runtime the fresh task can
+    // poll immediately, and a dead-at-spawn container must drain via a single
+    // catch-up fetch, never opening a follow stream (§8.2). A death landing
+    // after this peek is covered by `activate_collectors` firing the signal.
+    if lock_state(&inner.state).reservation_dead(ids.allocation) {
+        died_tx.send_replace(true);
+    }
     // No follower ⇒ pre-set `drained = true`: there is nothing for reap to wait on.
     let (follower, drained_rx) = if want_logs {
         let (drained_tx, drained_rx) = watch::channel(false);
@@ -1171,6 +1236,7 @@ mod tests {
             ids.allocation,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
+                dead: false,
                 reserved_at: ts(0),
             },
         );
@@ -1188,6 +1254,11 @@ mod tests {
             }
             _ => panic!("still reserved before activation"),
         }
+        assert!(
+            !st.reservation_dead(ids.allocation),
+            "a claim alone never marks the reservation dead (§8.2 — a disk \
+             kill claims before its SIGKILL)"
+        );
 
         let (sampler, sampler_flag) = flagged_handle();
         let (follower, _follower_flag) = flagged_handle();
@@ -1201,8 +1272,9 @@ mod tests {
             ids,
         );
         assert!(
-            *died_rx.borrow(),
-            "activation with a carried claim fires the fast-drain signal (§8.2)"
+            !*died_rx.borrow(),
+            "a carried claim without confirmed death must NOT fire the \
+             fast-drain signal (§8.2)"
         );
         match st.collectors.get(&ids.allocation) {
             Some(CollectorSlot::Active(collectors)) => {
@@ -1227,6 +1299,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserve_then_dead_then_activate_fires_the_fast_drain() {
+        let mut st = ExecutorState::default();
+        let ids = ids();
+        st.collectors.insert(
+            ids.allocation,
+            CollectorSlot::Reserved {
+                exit_claimed_at: None,
+                dead: false,
+                reserved_at: ts(0),
+            },
+        );
+        // Death is confirmed mid-initialization (a die event / resync listing):
+        // recorded on the reservation, and visible to the pre-spawn seed peek.
+        st.note_container_dead(ids.allocation);
+        assert!(
+            st.reservation_dead(ids.allocation),
+            "the death rides the reservation for the pre-spawn seed (§8.2)"
+        );
+
+        let (follower, _follower_flag) = flagged_handle();
+        let (died_tx, died_rx) = watch::channel(false);
+        st.activate_collectors(
+            ids.allocation,
+            None,
+            Some(follower),
+            watch::channel(false).1,
+            died_tx,
+            ids,
+        );
+        assert!(
+            *died_rx.borrow(),
+            "activation with a dead-marked reservation fires the fast-drain \
+             signal (§8.2)"
+        );
+    }
+
+    #[tokio::test]
     async fn reserve_then_reap_removed_then_activate_drops_both_tasks() {
         let mut st = ExecutorState::default();
         let ids = ids();
@@ -1234,6 +1343,7 @@ mod tests {
             ids.allocation,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
+                dead: false,
                 reserved_at: ts(0),
             },
         );
@@ -1269,6 +1379,7 @@ mod tests {
             reserved,
             CollectorSlot::Reserved {
                 exit_claimed_at: None,
+                dead: false,
                 reserved_at: ts(0),
             },
         );
@@ -1320,8 +1431,16 @@ mod tests {
             _ => panic!("still active"),
         }
         assert!(
+            !*died_rx.borrow(),
+            "a claim alone must NOT fire the fast-drain signal — the disk kill \
+             claims before its SIGKILL (§8.2)"
+        );
+        // Death confirmed (die event / exited listing / terminal evidence):
+        // only now does the fast drain fire.
+        st.note_container_dead(active.allocation);
+        assert!(
             *died_rx.borrow(),
-            "the claim fires the follower's fast-drain signal (§8.2)"
+            "confirmed death fires the follower's fast-drain signal (§8.2)"
         );
         wait_flag(&sampler_flag).await;
     }
@@ -1337,6 +1456,7 @@ mod tests {
                 alloc,
                 CollectorSlot::Reserved {
                     exit_claimed_at: None,
+                    dead: false,
                     reserved_at: ts(0),
                 },
             );

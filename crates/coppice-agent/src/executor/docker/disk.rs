@@ -730,9 +730,15 @@ async fn kill_over_budget(
     }
 
     // 4. The same cleanup a claimed exit does in events.rs: drop from running,
-    //    push the gauge, grow the fractional cpuset, then send the exit.
+    //    push the gauge, grow the fractional cpuset, then send the exit. The
+    //    exit evidence above is terminal, so death is confirmed only *now* —
+    //    not at the step-1 pre-kill claim — and this is where the follower's
+    //    fast drain fires (§8.2): firing at claim time would have drained a
+    //    still-running container's logs early. (The kill's own die event also
+    //    fires it via handle_die; both are idempotent.)
     {
         let mut st = lock_state(state);
+        st.note_container_dead(allocation);
         st.running.remove(&allocation);
         st.push_running_gauge();
     }
