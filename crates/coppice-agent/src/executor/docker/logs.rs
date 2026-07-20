@@ -9,10 +9,16 @@
 //! aligning, or deduplicating a returned chunk. Amplification of the boundary
 //! second is metered by [`AGENT_LOG_RESUME_REPLAYED_CHUNKS_TOTAL`].
 //!
-//! After an exit the stream ends (EOF); the follower makes its final flush and
-//! signals `drained`, which the session's `reap` awaits before removing the
-//! container (§8.2). [`catch_up`] is the same at-least-once drain applied *once*
-//! to an already-dead container that reap found without a live follower.
+//! After an exit the drain completes one of two ways (§8.2): the exit-claim
+//! signal (`died`, fired by `note_exit_claimed`) wins the race against the
+//! stream — the follower drops the follow stream and runs one `follow=false`
+//! [`catch_up`] fetch from the last forwarded second (some daemons hold a dead
+//! container's follow stream open for 1–2 s past the `die` event, and waiting
+//! that out delays reap) — or the stream EOFs on its own. Either way the
+//! follower makes its final flush and signals `drained`, which the session's
+//! `reap` awaits before removing the container. [`catch_up`] is the same
+//! at-least-once drain applied *once* to an already-dead container that reap
+//! found without a live follower.
 //!
 //! `parse_frame` (the timestamp-prefix split) and [`floor_to_second`] are pure
 //! and unit-tested without a daemon (§12).
@@ -133,7 +139,12 @@ fn chunk_from_frame(
 /// Spawn the log follower for one container (docker-executor.md §8.2), returning
 /// its handle. Captures only clones (the docker client, the hub, the store) —
 /// never an `Arc<Inner>` — so an abort is what stops it (the mod.rs no-cycle
-/// rule). `drained_tx` is set to `true` after the final EOF flush; reap awaits it.
+/// rule). `died` is the exit-claim signal (`note_exit_claimed` fires it): the
+/// follower races it against the follow stream and, once it fires, abandons the
+/// stream for a single `follow=false` [`catch_up`] fetch — the daemon can hold a
+/// dead container's follow stream open for 1–2 s past the `die` event, and the
+/// catch-up returns the same tail immediately. `drained_tx` is set to `true`
+/// after the final flush; reap awaits it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_follower(
     docker: Docker,
@@ -143,6 +154,7 @@ pub(crate) fn spawn_follower(
     container_name: String,
     initial_boundary: Option<Timestamp>,
     initial_replay_max: Option<Timestamp>,
+    mut died: watch::Receiver<bool>,
     drained_tx: watch::Sender<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -152,7 +164,49 @@ pub(crate) fn spawn_follower(
         // suffices inside one task): progress resets it, so a flapping daemon is
         // metered by the reconnect, not a log flood.
         let mut warned = false;
+        // Set when the `died` sender vanished without firing (the collector
+        // entry was dropped by reap or shutdown): disables the select arm so it
+        // cannot spin; the EOF path or the abort still ends the task.
+        let mut died_gone = false;
+        /// How one follow connection ended.
+        enum ConnEnd {
+            /// EOF: the container stopped and the drain is complete.
+            Eof,
+            /// A stream error: reconnect after re-deriving the boundary.
+            Reconnect,
+            /// The exit-claim signal fired: switch to the catch-up drain.
+            Died,
+        }
         loop {
+            // Fast drain (§8.2): once the exit is claimed, the follow stream's
+            // remaining life is only the daemon's slow close of a dead stream —
+            // a single `follow=false` fetch returns the same tail immediately.
+            // The boundary is the last forwarded chunk's second, so nothing
+            // already forwarded is dropped and at most that boundary second
+            // replays (the standard at-least-once rule).
+            if *died.borrow() {
+                match catch_up(&docker, &hub, ids, &container_name, boundary, replay_max).await {
+                    Ok(()) => {
+                        let _ = drained_tx.send(true);
+                        return;
+                    }
+                    Err(err) => {
+                        if !warned {
+                            tracing::warn!(
+                                container = %container_name,
+                                error = %err,
+                                "post-exit catch-up drain failed; retrying (§8.2)"
+                            );
+                            warned = true;
+                        }
+                        tokio::time::sleep(RECONNECT_BACKOFF).await;
+                        (boundary, replay_max) =
+                            re_derive_resume(&store, ids, None, boundary).await;
+                        continue;
+                    }
+                }
+            }
+
             let options = LogsOptionsBuilder::new()
                 .follow(true)
                 .stdout(true)
@@ -171,9 +225,7 @@ pub(crate) fn spawn_follower(
             tokio::pin!(flush);
             let mut flush_armed = false;
 
-            // `true` = the stream ended (EOF, drain complete); `false` = a stream
-            // error, reconnect after re-deriving the boundary.
-            let ended = loop {
+            let end = loop {
                 tokio::select! {
                     item = stream.next() => match item {
                         Some(Ok(output)) => {
@@ -218,15 +270,29 @@ pub(crate) fn spawn_follower(
                                 );
                                 warned = true;
                             }
-                            break false;
+                            break ConnEnd::Reconnect;
                         }
                         None => {
                             // EOF: the container stopped and the drain is complete.
                             if !buffer.is_empty() {
                                 hub.append_logs(std::mem::take(&mut buffer));
                             }
-                            break true;
+                            break ConnEnd::Eof;
                         }
+                    },
+                    result = died.wait_for(|dead| *dead), if !died_gone => match result {
+                        // The exit was claimed: flush and switch to the fast
+                        // catch-up drain instead of waiting out the daemon's
+                        // slow close of the dead follow stream.
+                        Ok(_) => {
+                            if !buffer.is_empty() {
+                                hub.append_logs(std::mem::take(&mut buffer));
+                            }
+                            break ConnEnd::Died;
+                        }
+                        // Sender gone without firing: reap or shutdown dropped
+                        // the collector entry. Keep draining to EOF.
+                        Err(_) => died_gone = true,
                     },
                     _ = flush.as_mut(), if flush_armed => {
                         if !buffer.is_empty() {
@@ -237,16 +303,28 @@ pub(crate) fn spawn_follower(
                 }
             };
 
-            if ended {
-                let _ = drained_tx.send(true);
-                return;
+            match end {
+                ConnEnd::Eof => {
+                    let _ = drained_tx.send(true);
+                    return;
+                }
+                ConnEnd::Died => {
+                    // Resume the catch-up from the last forwarded chunk's
+                    // second (§8.2): everything already forwarded stays put and
+                    // only the boundary second can replay. `replay_max` is kept
+                    // — it still marks what predates this attempt's adoption,
+                    // if anything.
+                    boundary = last_at.map(floor_to_second);
+                }
+                ConnEnd::Reconnect => {
+                    // Recovery (§8.2): sleep, then re-derive the resume point
+                    // from the store's newest stored timestamp, else the last
+                    // chunk we saw, else the boundary we started this
+                    // connection with — and reconnect.
+                    tokio::time::sleep(RECONNECT_BACKOFF).await;
+                    (boundary, replay_max) = re_derive_resume(&store, ids, last_at, boundary).await;
+                }
             }
-
-            // Recovery (§8.2): sleep, then re-derive the resume point from the
-            // store's newest stored timestamp, else the last chunk we saw, else
-            // the boundary we started this connection with — and reconnect.
-            tokio::time::sleep(RECONNECT_BACKOFF).await;
-            (boundary, replay_max) = re_derive_resume(&store, ids, last_at, boundary).await;
         }
     })
 }
@@ -637,6 +715,7 @@ mod tests {
 
         let docker = api::connect(&format!("tcp://127.0.0.1:{port}")).expect("connect");
         let (drained_tx, mut drained_rx) = watch::channel(false);
+        let (_died_tx, died_rx) = watch::channel(false);
         let follower = spawn_follower(
             docker,
             hub.clone(),
@@ -645,6 +724,7 @@ mod tests {
             name,
             None,
             None,
+            died_rx,
             drained_tx,
         );
 
@@ -734,6 +814,322 @@ mod tests {
                 .await
                 .is_err(),
             "exactly two connections; the follower does not reconnect after EOF"
+        );
+
+        stub.abort();
+        follower.abort();
+    }
+
+    // ---- died-signal fast drain (docker-executor.md §8.2) ---------------------
+
+    /// The `follow=` query value from a request line (missing ⇒ `None`).
+    fn parse_follow(request_line: &str) -> Option<bool> {
+        let start = request_line.find("follow=")? + "follow=".len();
+        let rest = &request_line[start..];
+        if rest.starts_with("true") {
+            Some(true)
+        } else if rest.starts_with("false") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// A Docker-logs stub with data-driven per-connection behavior: each entry
+    /// of `conns` is `(chunks, terminate)`. A terminated connection gets the
+    /// `0\r\n\r\n` chunked terminator and is closed (clean EOF); an unterminated
+    /// one is **held open** after its chunks — the daemon holding a dead
+    /// container's follow stream, the very behavior the died signal bypasses.
+    /// Reports each connection's index, `since`, `follow`, and path-match.
+    async fn stub_server_held(
+        listener: TcpListener,
+        name: String,
+        conns: Vec<(Vec<Vec<u8>>, bool)>,
+        events: mpsc::UnboundedSender<(usize, Option<i64>, Option<bool>, bool)>,
+    ) {
+        let mut held = Vec::new();
+        let mut index = 0usize;
+        loop {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            index += 1;
+            let head = read_head(&mut sock).await;
+            let first = head.lines().next().unwrap_or("");
+            let path_ok = first.contains(&format!("/containers/{name}/logs"));
+            let _ = events.send((index, parse_since(first), parse_follow(first), path_ok));
+
+            sock.write_all(RESP_HEAD).await.expect("write head");
+            match conns.get(index - 1) {
+                Some((chunks, terminate)) => {
+                    for chunk in chunks {
+                        sock.write_all(chunk).await.expect("write frame");
+                    }
+                    if *terminate {
+                        sock.write_all(b"0\r\n\r\n")
+                            .await
+                            .expect("write terminator");
+                    }
+                    sock.flush().await.expect("flush");
+                    if *terminate {
+                        drop(sock);
+                    } else {
+                        held.push(sock); // keep the stream open, no EOF
+                    }
+                }
+                None => drop(sock),
+            }
+        }
+    }
+
+    /// Poll the sink until at least `n` chunks are stored for the attempt (the
+    /// hub's drain task delivers asynchronously; an `UnknownAttempt` error just
+    /// means nothing has landed yet), or panic after ~10 s.
+    async fn wait_for_stored(sink: &FilesystemSink, ids: ContainerIds, n: usize) {
+        for _ in 0..500 {
+            if let Ok(stored) = sink
+                .log_chunks(&ids.job, &ids.attempt, None, LogQuery::Tail { n: 64 })
+                .await
+            {
+                if stored.len() >= n {
+                    return;
+                }
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        panic!("stored chunks never reached {n}");
+    }
+
+    /// §8.2 fast drain: the follower tails a follow stream the stub never
+    /// closes (the slow-EOF daemon), the died signal fires, and the follower
+    /// abandons the stream for one `follow=false` catch-up from the last
+    /// forwarded second — replaying only the boundary second (never deduped,
+    /// never dropping the tail) — then signals drained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn died_signal_switches_to_a_catch_up_drain_and_replays_the_boundary_second() {
+        let base = 1_600_000_000i64;
+        let (t1, t2, t3, t4) = (base + 1, base + 2, base + 3, base + 4);
+
+        let root = tempfile::TempDir::new().unwrap();
+        let sink = temp_sink(root.path().join("tel")).await;
+        let hub = TelemetryHub::new(
+            vec![HubSink {
+                sink: SinkInstance::Filesystem(sink.clone()),
+                kinds: vec![SinkKind::Logs],
+            }],
+            64,
+        );
+        let ids = ids();
+        let name = "cont-died".to_string();
+
+        // Connection 1 (follow=true): three lines, then held open forever.
+        // Connection 2 (the catch-up): the T3 boundary-second replay plus the
+        // tail line T4 the follower never saw, cleanly terminated.
+        let conns = vec![
+            (
+                vec![
+                    frame_chunk(t1, STDOUT, "line-1"),
+                    frame_chunk(t2, STDOUT, "line-2"),
+                    frame_chunk(t3, STDOUT, "line-3"),
+                ],
+                false,
+            ),
+            (
+                vec![
+                    frame_chunk(t3, STDOUT, "line-3"),
+                    frame_chunk(t4, STDOUT, "line-4"),
+                ],
+                true,
+            ),
+        ];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+        let stub = tokio::spawn(stub_server_held(listener, name.clone(), conns, evt_tx));
+
+        let docker = api::connect(&format!("tcp://127.0.0.1:{port}")).expect("connect");
+        let (drained_tx, mut drained_rx) = watch::channel(false);
+        let (died_tx, died_rx) = watch::channel(false);
+        let follower = spawn_follower(
+            docker,
+            hub.clone(),
+            Some(sink.clone()),
+            ids,
+            name,
+            None,
+            None,
+            died_rx,
+            drained_tx,
+        );
+
+        // Connection 1 is the live follow stream.
+        let (idx1, since1, follow1, ok1) =
+            tokio::time::timeout(StdDuration::from_secs(10), evt_rx.recv())
+                .await
+                .expect("connection 1 arrives")
+                .expect("event");
+        assert_eq!(idx1, 1);
+        assert!(ok1);
+        assert_eq!(since1.unwrap_or(0), 0);
+        assert_eq!(follow1, Some(true), "the live follower streams follow=true");
+
+        // Wait until the three lines are stored, so the follower's `last_at`
+        // has provably advanced to T3 before the exit is claimed.
+        wait_for_stored(&sink, ids, 3).await;
+
+        // The exit claim fires the fast-drain signal; the stub never closed
+        // connection 1, so only the signal can end the drain promptly.
+        died_tx.send(true).expect("follower listens");
+
+        // The catch-up: follow=false, resuming from the boundary second T3.
+        let (idx2, since2, follow2, ok2) =
+            tokio::time::timeout(StdDuration::from_secs(10), evt_rx.recv())
+                .await
+                .expect("the catch-up connection arrives")
+                .expect("event");
+        assert_eq!(idx2, 2);
+        assert!(ok2);
+        assert_eq!(
+            follow2,
+            Some(false),
+            "the fast drain is a follow=false fetch"
+        );
+        assert_eq!(
+            since2.unwrap_or(0),
+            t3,
+            "the catch-up resumes from the last forwarded second"
+        );
+
+        // The catch-up completing flips drained.
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            while !*drained_rx.borrow_and_update() {
+                drained_rx.changed().await.expect("drained sender lives");
+            }
+        })
+        .await
+        .expect("the follower signals drained after the catch-up");
+
+        tokio::time::timeout(StdDuration::from_secs(10), hub.flush())
+            .await
+            .expect("hub drains");
+
+        let stored = sink
+            .log_chunks(&ids.job, &ids.attempt, None, LogQuery::Tail { n: 64 })
+            .await
+            .expect("read stored chunks");
+        let got: Vec<(i64, Vec<u8>)> = stored
+            .iter()
+            .map(|chunk| (chunk.at.as_micros() / 1_000_000, chunk.bytes.to_vec()))
+            .collect();
+        // Everything forwarded live stays put, the boundary second replays once
+        // (§8.2 never dedupes), and the tail line is not lost.
+        let expected: Vec<(i64, Vec<u8>)> = vec![
+            (t1, b"line-1\n".to_vec()),
+            (t2, b"line-2\n".to_vec()),
+            (t3, b"line-3\n".to_vec()),
+            (t3, b"line-3\n".to_vec()),
+            (t4, b"line-4\n".to_vec()),
+        ];
+        assert_eq!(
+            got, expected,
+            "boundary-second replay only: nothing dropped, nothing beyond the boundary duplicated"
+        );
+
+        // The follower returned after the catch-up: no third connection.
+        assert!(
+            tokio::time::timeout(StdDuration::from_secs(2), evt_rx.recv())
+                .await
+                .is_err(),
+            "exactly two connections; the drain ends at the catch-up"
+        );
+
+        stub.abort();
+        follower.abort();
+    }
+
+    /// §8.2 fast drain when the exit was claimed before the follower connected
+    /// (a claim carried on the collector reservation): the follower skips the
+    /// follow stream entirely and drains via a single `follow=false` fetch from
+    /// its initial boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn died_before_connecting_drains_via_a_single_catch_up_fetch() {
+        let base = 1_600_000_000i64;
+        let t1 = base + 1;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let sink = temp_sink(root.path().join("tel")).await;
+        let hub = TelemetryHub::new(
+            vec![HubSink {
+                sink: SinkInstance::Filesystem(sink.clone()),
+                kinds: vec![SinkKind::Logs],
+            }],
+            64,
+        );
+        let ids = ids();
+        let name = "cont-dead-at-spawn".to_string();
+
+        // A single terminated connection: the whole drain.
+        let conns = vec![(vec![frame_chunk(t1, STDOUT, "only-line")], true)];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
+        let stub = tokio::spawn(stub_server_held(listener, name.clone(), conns, evt_tx));
+
+        let docker = api::connect(&format!("tcp://127.0.0.1:{port}")).expect("connect");
+        let (drained_tx, mut drained_rx) = watch::channel(false);
+        // The signal is already `true` at spawn: the claim rode the reservation
+        // and activation fired it before/as the follower started.
+        let (_died_tx, died_rx) = watch::channel(true);
+        let follower = spawn_follower(
+            docker,
+            hub.clone(),
+            Some(sink.clone()),
+            ids,
+            name,
+            None,
+            None,
+            died_rx,
+            drained_tx,
+        );
+
+        let (idx1, since1, follow1, ok1) =
+            tokio::time::timeout(StdDuration::from_secs(10), evt_rx.recv())
+                .await
+                .expect("the catch-up connection arrives")
+                .expect("event");
+        assert_eq!(idx1, 1);
+        assert!(ok1);
+        assert_eq!(since1.unwrap_or(0), 0, "no boundary: drain from the start");
+        assert_eq!(
+            follow1,
+            Some(false),
+            "a dead-at-spawn container is drained without a follow stream"
+        );
+
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            while !*drained_rx.borrow_and_update() {
+                drained_rx.changed().await.expect("drained sender lives");
+            }
+        })
+        .await
+        .expect("the follower signals drained");
+
+        tokio::time::timeout(StdDuration::from_secs(10), hub.flush())
+            .await
+            .expect("hub drains");
+        let stored = sink
+            .log_chunks(&ids.job, &ids.attempt, None, LogQuery::Tail { n: 64 })
+            .await
+            .expect("read stored chunks");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].bytes.as_ref(), b"only-line\n");
+
+        // One connection total: the follow stream was never opened.
+        assert!(
+            tokio::time::timeout(StdDuration::from_secs(2), evt_rx.recv())
+                .await
+                .is_err(),
+            "exactly one connection; the follow stream is skipped entirely"
         );
 
         stub.abort();
