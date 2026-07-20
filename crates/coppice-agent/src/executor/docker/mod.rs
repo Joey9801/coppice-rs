@@ -219,6 +219,13 @@ pub(crate) struct Collectors {
     /// reap awaits it before removing the container (§8.2). A metrics-only config
     /// (no follower) initialises it `true`.
     pub(crate) drained: watch::Receiver<bool>,
+    /// The exit-claim fast-drain signal (§8.2), fired by
+    /// [`note_exit_claimed`](ExecutorState::note_exit_claimed): the follower
+    /// races it against the follow stream and, on the signal, abandons the
+    /// stream for a single `follow=false` catch-up fetch instead of waiting out
+    /// the daemon's slow close of a dead stream. Firing with no follower (a
+    /// metrics-only config) is a harmless no-op.
+    pub(crate) died_tx: watch::Sender<bool>,
     /// When the exit was claimed — the §8.2 `drain_force_after` clock. The first
     /// claim wins (idempotent), so repeated claims never reset it.
     pub(crate) exit_claimed_at: Option<Timestamp>,
@@ -263,10 +270,13 @@ impl ExecutorState {
     }
 
     /// Note that an allocation's exit was claimed (docker-executor.md §8.2): abort
-    /// and drop its metrics sampler (a dead container's samples are noise, §8.1)
-    /// and stamp the drain clock. Idempotent — the **first** claim time is kept,
+    /// and drop its metrics sampler (a dead container's samples are noise, §8.1),
+    /// stamp the drain clock, and fire the follower's fast-drain signal (the
+    /// container is dead, so the follower switches from the follow stream to a
+    /// one-shot catch-up fetch). Idempotent — the **first** claim time is kept,
     /// so a re-claim from a later resync never moves the `drain_force_after`
-    /// deadline. A no-op when telemetry is disabled or the collector is gone.
+    /// deadline, and re-firing the signal is a no-op. A no-op when telemetry is
+    /// disabled or the collector is gone.
     ///
     /// A [`Reserved`](CollectorSlot::Reserved) slot (the exit raced collector
     /// initialization) records the first claim time on the reservation; activation
@@ -281,6 +291,9 @@ impl ExecutorState {
                 if collectors.exit_claimed_at.is_none() {
                     collectors.exit_claimed_at = Some(now);
                 }
+                // Wake the follower's fast drain (§8.2); watch keeps only the
+                // latest value, so re-claims are no-ops.
+                collectors.died_tx.send_replace(true);
             }
             // First claim wins: only stamp a reservation that has none yet.
             Some(CollectorSlot::Reserved {
@@ -300,7 +313,9 @@ impl ExecutorState {
     /// - slot is [`Reserved`](CollectorSlot::Reserved) → build [`Collectors`]
     ///   carrying the reservation's `exit_claimed_at`; if that is `Some` (an exit
     ///   claimed mid-initialization) abort the sampler immediately — a dead
-    ///   container's samples are noise (§8.1) — and store `sampler: None`; insert
+    ///   container's samples are noise (§8.1) — store `sampler: None`, and fire
+    ///   `died_tx` so the fresh follower goes straight to the fast catch-up
+    ///   drain (§8.2, the claim fired before the follower existed); insert
     ///   [`Active`](CollectorSlot::Active).
     /// - slot is **absent** (a reap completed and removed the reservation
     ///   meanwhile) → abort both fresh tasks, insert nothing.
@@ -313,6 +328,7 @@ impl ExecutorState {
         sampler: Option<JoinHandle<()>>,
         follower: Option<JoinHandle<()>>,
         drained: watch::Receiver<bool>,
+        died_tx: watch::Sender<bool>,
         ids: ContainerIds,
     ) {
         let abort_fresh = |sampler: Option<JoinHandle<()>>, follower: Option<JoinHandle<()>>| {
@@ -328,11 +344,14 @@ impl ExecutorState {
                 exit_claimed_at, ..
             }) => {
                 // A claim landed during initialization: the container is already
-                // dead, so its sampler's samples are noise — abort it now.
+                // dead, so its sampler's samples are noise — abort it now — and
+                // the claim fired before the follower existed, so fire its
+                // fast-drain signal here (§8.2).
                 let sampler = if exit_claimed_at.is_some() {
                     if let Some(sampler) = sampler {
                         sampler.abort();
                     }
+                    died_tx.send_replace(true);
                     None
                 } else {
                     sampler
@@ -344,6 +363,7 @@ impl ExecutorState {
                         sampler,
                         follower,
                         drained,
+                        died_tx,
                         exit_claimed_at,
                         forced: false,
                     }),
@@ -1017,6 +1037,10 @@ pub(crate) async fn spawn_collectors(
             inner.disk.readings(),
         )
     });
+    // The exit-claim fast-drain signal (§8.2): `note_exit_claimed` fires it and
+    // the follower races it against the follow stream. Created even with no
+    // follower — firing into no receivers is a harmless no-op.
+    let (died_tx, died_rx) = watch::channel(false);
     // No follower ⇒ pre-set `drained = true`: there is nothing for reap to wait on.
     let (follower, drained_rx) = if want_logs {
         let (drained_tx, drained_rx) = watch::channel(false);
@@ -1028,6 +1052,7 @@ pub(crate) async fn spawn_collectors(
             container_name.to_string(),
             boundary,
             replay_max,
+            died_rx,
             drained_tx,
         );
         (Some(follower), drained_rx)
@@ -1042,6 +1067,7 @@ pub(crate) async fn spawn_collectors(
         sampler,
         follower,
         drained_rx,
+        died_tx,
         ids,
     );
 }
@@ -1165,12 +1191,18 @@ mod tests {
 
         let (sampler, sampler_flag) = flagged_handle();
         let (follower, _follower_flag) = flagged_handle();
+        let (died_tx, died_rx) = watch::channel(false);
         st.activate_collectors(
             ids.allocation,
             Some(sampler),
             Some(follower),
             watch::channel(true).1,
+            died_tx,
             ids,
+        );
+        assert!(
+            *died_rx.borrow(),
+            "activation with a carried claim fires the fast-drain signal (§8.2)"
         );
         match st.collectors.get(&ids.allocation) {
             Some(CollectorSlot::Active(collectors)) => {
@@ -1215,6 +1247,7 @@ mod tests {
             Some(sampler),
             Some(follower),
             watch::channel(true).1,
+            watch::channel(false).0,
             ids,
         );
         assert!(
@@ -1257,6 +1290,7 @@ mod tests {
         // Active: the first claim time is kept and the sampler is aborted once.
         let active = ids();
         let (sampler, sampler_flag) = flagged_handle();
+        let (died_tx, died_rx) = watch::channel(false);
         st.collectors.insert(
             active.allocation,
             CollectorSlot::Active(Collectors {
@@ -1264,6 +1298,7 @@ mod tests {
                 sampler: Some(sampler),
                 follower: None,
                 drained: watch::channel(true).1,
+                died_tx,
                 exit_claimed_at: None,
                 forced: false,
             }),
@@ -1284,6 +1319,10 @@ mod tests {
             }
             _ => panic!("still active"),
         }
+        assert!(
+            *died_rx.borrow(),
+            "the claim fires the follower's fast-drain signal (§8.2)"
+        );
         wait_flag(&sampler_flag).await;
     }
 
@@ -1326,6 +1365,7 @@ mod tests {
                 sampler: None,
                 follower: None,
                 drained: watch::channel(true).1,
+                died_tx: watch::channel(false).0,
                 exit_claimed_at: None,
                 forced: false,
             }),
