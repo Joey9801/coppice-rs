@@ -1049,9 +1049,10 @@ mod tests {
     }
 
     /// §8.2 fast drain when death was confirmed before the follower connected
-    /// (a dead-marked collector reservation, seeded into the signal before the
-    /// spawn): the follower skips the follow stream entirely and drains via a
-    /// single `follow=false` fetch from its initial boundary.
+    /// (the signal channel is created with the collector reservation, so a
+    /// death landing before the spawn has already fired the channel the
+    /// follower polls): the follower skips the follow stream entirely and
+    /// drains via a single `follow=false` fetch from its initial boundary.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn died_before_connecting_drains_via_a_single_catch_up_fetch() {
         let base = 1_600_000_000i64;
@@ -1079,9 +1080,10 @@ mod tests {
 
         let docker = api::connect(&format!("tcp://127.0.0.1:{port}")).expect("connect");
         let (drained_tx, mut drained_rx) = watch::channel(false);
-        // The signal is already `true` at spawn: the death rode the reservation
-        // and `spawn_collectors` seeded the channel *before* spawning the task
-        // (the guarantee this test pins is that no follow stream is ever opened).
+        // The signal is already `true` at spawn: the channel was created with
+        // the collector reservation and a death confirmed before the spawn
+        // fired it in place (the guarantee this test pins is that no follow
+        // stream is ever opened).
         let (_died_tx, died_rx) = watch::channel(true);
         let follower = spawn_follower(
             docker,

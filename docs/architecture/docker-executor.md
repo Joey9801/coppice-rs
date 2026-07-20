@@ -660,10 +660,12 @@ already forwarded is dropped and at most the boundary second replays —
 then signals drained. A mere exit *claim* never fires it: the disk
 enforcer claims before its SIGKILL is attempted, and draining then would
 end a still-running container's log collection early (and could not be
-undone if the kill failed). A death confirmed before the follower exists
-rides the collector reservation and is seeded into the signal before the
-follower task spawns, so a dead-at-spawn container is drained the same
-way without ever opening a follow stream. Reap awaits
+undone if the kill failed). The signal channel is created with the
+collector reservation itself and its sender lives in the slot, so a
+death confirmed at any instant after the reservation — before or after
+the follower task spawns — fires the same channel the follower polls; a
+dead-at-spawn container is drained the same way without ever opening a
+follow stream. Reap awaits
 the drain with a bounded timeout, and on timeout **fails retryably,
 leaving the container intact** — the session's periodic sweep simply
 retries later, so a slow drain never costs tail logs in healthy
