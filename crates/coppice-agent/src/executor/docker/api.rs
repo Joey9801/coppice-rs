@@ -25,7 +25,10 @@ const DOCKER_TIMEOUT: u64 = 120;
 ///  1. `configured` — the explicit `[executor] docker_host` value, verbatim.
 ///  2. the `DOCKER_HOST` environment variable when set and non-empty, verbatim.
 ///  3. a probe of well-known local Unix sockets, yielding `unix://<path>` for
-///     the first candidate that exists **and** is a socket.
+///     the first candidate that exists, is a socket, **and accepts a
+///     connection** — a stale socket file left by an uninstalled daemon (or one
+///     this process may not open) must not shadow a usable one later in the
+///     list.
 ///  4. otherwise an error naming every probed path.
 ///
 /// The default socket (`/var/run/docker.sock`) is absent on macOS under Colima
@@ -90,7 +93,7 @@ fn resolve_host_core(
         return Ok(host.to_string());
     }
     for path in candidates {
-        if is_socket(path) {
+        if usable_socket(path) {
             let host = format!("unix://{}", path.display());
             tracing::info!(docker_host = %host, source = "probe", "resolved Docker endpoint");
             return Ok(host);
@@ -107,14 +110,19 @@ fn resolve_host_core(
     )))
 }
 
-/// Whether `path` exists and is a Unix socket. Follows symlinks (Docker
-/// Desktop's socket is often a link to the real one), so a link to a socket
-/// counts; a plain file or missing path does not.
-fn is_socket(path: &Path) -> bool {
+/// Whether `path` is a Unix socket that accepts a connection. Follows symlinks
+/// (Docker Desktop's socket is often a link to the real one). The connect
+/// check is what lets the probe walk past debris: a socket file whose daemon
+/// is gone (ECONNREFUSED) or that this process may not open (EACCES) would
+/// otherwise win on filesystem shape alone and abort startup at the first API
+/// call, with usable candidates still unprobed. Only the probe pays this cost
+/// — explicit config/`DOCKER_HOST` values are taken verbatim.
+fn usable_socket(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
-    std::fs::metadata(path)
+    let is_socket = std::fs::metadata(path)
         .map(|meta| meta.file_type().is_socket())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    is_socket && std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 /// Connect to the Docker daemon named by `docker_host`.
@@ -273,6 +281,18 @@ mod tests {
         let (second, _s) = bind(dir.path(), "second.sock");
         let host = resolve_host_core(None, None, &[missing, first.clone(), second]).unwrap();
         assert_eq!(host, format!("unix://{}", first.display()));
+    }
+
+    #[test]
+    fn dead_socket_file_is_skipped_for_a_live_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dead, listener) = bind(dir.path(), "dead.sock");
+        // Dropping the listener leaves the socket file behind with nothing
+        // accepting — the uninstalled-daemon shape the probe must walk past.
+        drop(listener);
+        let (live, _live_listener) = bind(dir.path(), "live.sock");
+        let host = resolve_host_core(None, None, &[dead, live.clone()]).unwrap();
+        assert_eq!(host, format!("unix://{}", live.display()));
     }
 
     #[test]

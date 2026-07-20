@@ -418,8 +418,12 @@ async fn run_logs(
     attempt: Option<AttemptId>,
     order: dto::LogOrder,
 ) -> Result<()> {
+    // Attempt multiplicity decides prefixing, and it must be known up front: a
+    // page can cover a single attempt even when the job has several (the server
+    // ends a page wherever the budget lands), so the walk itself is a late
+    // signal. The extra GET also surfaces NOT_FOUND before the first page.
+    let mut multi = initial_multi(&get_job(client, base, job).await?, attempt);
     let mut sources: Vec<dto::LogSourceRecord> = Vec::new();
-    let mut multi = false;
     let mut cursor: Option<String> = None;
     loop {
         let page = fetch_logs_page(
@@ -434,7 +438,7 @@ async fn run_logs(
         )
         .await?;
         merge_sources(&mut sources, page.sources);
-        multi = multi || sources.len() > 1;
+        multi = latch_multi(multi, &sources);
         for entry in &page.entries {
             print_entry(entry, multi);
         }
@@ -445,6 +449,29 @@ async fn run_logs(
     }
     print_source_notes(&sources);
     Ok(())
+}
+
+/// Whether lines need an attempt prefix, decided from the job's attempt list:
+/// more than one attempt, unless `--attempt` scopes the walk to a single one
+/// (scoped output is single-attempt by construction, so a prefix is noise).
+fn initial_multi(detail: &dto::JobDetail, attempt: Option<AttemptId>) -> bool {
+    attempt.is_none() && detail.attempts.len() > 1
+}
+
+/// Safety net behind [`initial_multi`]: if a second attempt appears mid-walk
+/// anyway (a retry landing during `--follow`), start prefixing and attribute
+/// the lines already printed — they all belong to the previously-sole attempt.
+fn latch_multi(multi: bool, sources: &[dto::LogSourceRecord]) -> bool {
+    if !multi && sources.len() > 1 {
+        if let Some(first) = sources.first() {
+            eprintln!(
+                "note: earlier lines without an attempt prefix are from attempt {}",
+                first.attempt
+            );
+        }
+        return true;
+    }
+    multi
 }
 
 /// Follow state carried across polls. A null cursor loses the exact resume
@@ -470,7 +497,12 @@ async fn run_follow(
     attempt: Option<AttemptId>,
     interval: Duration,
 ) -> Result<()> {
-    let mut state = FollowState::default();
+    let mut state = FollowState {
+        // Same up-front multiplicity decision as the non-follow walk (a page is
+        // a late signal); `latch_multi` covers retries that appear mid-follow.
+        multi: initial_multi(&get_job(client, base, job).await?, attempt),
+        ..FollowState::default()
+    };
     loop {
         drain_to_head(client, base, job, stream, attempt, &mut state).await?;
         let detail = get_job(client, base, job).await?;
@@ -515,7 +547,7 @@ async fn drain_to_head(
         )
         .await?;
         merge_sources(&mut state.sources, page.sources);
-        state.multi = state.multi || state.sources.len() > 1;
+        state.multi = latch_multi(state.multi, &state.sources);
 
         let mut skipped = 0usize;
         for entry in &page.entries {
@@ -589,6 +621,9 @@ fn stream_query(stream: dto::LogStreamName) -> &'static str {
 
 /// Print one log line to stdout, prefixing the attempt id only when the walk
 /// spans more than one attempt (so a single-attempt job stays uncluttered).
+/// An entry whose own text was cut to fit the page byte budget gets a stderr
+/// warning — the dropped tail is not retrievable, so silence would present
+/// corrupted output as complete.
 fn print_entry(entry: &dto::LogEntry, prefix_attempt: bool) {
     let text = entry.text.strip_suffix('\n').unwrap_or(&entry.text);
     let stream = stream_query(entry.stream);
@@ -597,16 +632,29 @@ fn print_entry(entry: &dto::LogEntry, prefix_attempt: bool) {
     } else {
         println!("{} {} {}", entry.at, stream, text);
     }
+    if entry.truncated {
+        eprintln!(
+            "note: the entry at {} (attempt {}) was cut to fit the page byte budget; \
+             its tail is not retrievable",
+            entry.at, entry.attempt
+        );
+    }
 }
 
 /// Merge a page's source records into the running set, keeping insertion order
-/// and letting a later record for the same attempt supersede an earlier one.
-/// The set stays deduplicated by attempt, so its length is the number of
-/// distinct attempts seen.
+/// and letting a later record for the same attempt supersede an earlier one —
+/// except `truncated`, which is sticky: it is evidence of loss, and a later
+/// page over a narrower range (a follow re-poll with `from=`) legitimately
+/// reports false without unsaying it. The set stays deduplicated by attempt,
+/// so its length is the number of distinct attempts seen.
 fn merge_sources(into: &mut Vec<dto::LogSourceRecord>, page: Vec<dto::LogSourceRecord>) {
     for record in page {
         match into.iter_mut().find(|s| s.attempt == record.attempt) {
-            Some(existing) => *existing = record,
+            Some(existing) => {
+                let truncated = existing.truncated || record.truncated;
+                *existing = record;
+                existing.truncated = truncated;
+            }
             None => into.push(record),
         }
     }
@@ -1224,6 +1272,22 @@ retry_user_errors = true
         }
     }
 
+    #[test]
+    fn merged_source_truncation_is_sticky() {
+        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let mut truncated = available_source(attempt);
+        truncated.truncated = true;
+        let mut sources = Vec::new();
+        merge_sources(&mut sources, vec![truncated]);
+        // A later record for the same attempt reports no truncation (e.g. a
+        // narrower follow re-poll) — the evidence of loss must survive it.
+        merge_sources(&mut sources, vec![available_source(attempt)]);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].truncated);
+    }
+
     #[tokio::test]
     async fn logs_paginate_across_two_pages() {
         let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
@@ -1261,6 +1325,18 @@ retry_user_errors = true
                         Json(serde_json::to_value(page).unwrap())
                     },
                 ),
+            )
+            // The walk fetches the job detail first (attempt multiplicity
+            // decides prefixing up front).
+            .route(
+                "/api/v1/jobs/:job",
+                get(|AxumPath(job): AxumPath<String>| async move {
+                    let id: JobId = job.parse().unwrap();
+                    Json(
+                        serde_json::to_value(sample_job_detail(id, dto::JobStateKind::Succeeded))
+                            .unwrap(),
+                    )
+                }),
             )
             .with_state(pages);
         let base = spawn(router).await;
