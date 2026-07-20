@@ -120,6 +120,7 @@ fn every_command() -> Vec<Command> {
             },
             labels: BTreeMap::from([("zone".into(), "a".into()), ("gpu".into(), "none".into())]),
             registered_at: ts(),
+            service_addr: Some("10.0.0.7:9443".into()),
         }),
         Command::DeclareNodeLost(DeclareNodeLost {
             node,

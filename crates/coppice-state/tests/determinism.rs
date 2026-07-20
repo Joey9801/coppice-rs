@@ -111,6 +111,7 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 capacity: cpu(cpu_millis),
                 labels: BTreeMap::new(),
                 registered_at: ts,
+                service_addr: None,
             })
         }),
         (0usize..NODES as usize, arb_ts()).prop_map(|(n, ts)| {

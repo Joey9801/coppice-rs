@@ -761,6 +761,7 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
                     capacity,
                     labels,
                     schedulable,
+                    service_addr: None,
                 },
                 epoch,
             },

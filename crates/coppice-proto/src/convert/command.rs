@@ -365,6 +365,7 @@ impl From<&RegisterNode> for pb::RegisterNode {
             capacity: Some((&c.capacity).into()),
             labels: labels_to_pb(&c.labels),
             registered_at_us: c.registered_at.as_micros(),
+            service_addr: c.service_addr.clone(),
         }
     }
 }
@@ -378,6 +379,8 @@ impl TryFrom<pb::RegisterNode> for RegisterNode {
             capacity: req(c.capacity, "RegisterNode.capacity")?.try_into()?,
             labels: labels_from_pb(c.labels)?,
             registered_at: timestamp(c.registered_at_us, "RegisterNode.registered_at_us")?,
+            // Empty string canonicalizes to None (see Node conversion).
+            service_addr: c.service_addr.filter(|s| !s.is_empty()),
         })
     }
 }

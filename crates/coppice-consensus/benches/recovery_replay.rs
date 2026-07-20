@@ -70,6 +70,7 @@ fn register_node_command() -> Command {
         },
         labels: BTreeMap::new(),
         registered_at: Timestamp::from_micros(1_700_000_000_000_000).expect("in range"),
+        service_addr: None,
     })
 }
 

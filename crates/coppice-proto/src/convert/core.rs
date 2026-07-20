@@ -471,6 +471,7 @@ impl From<&Node> for pb::Node {
             capacity: Some((&node.capacity).into()),
             labels: labels_to_pb(&node.labels),
             schedulable: node.schedulable,
+            service_addr: node.service_addr.clone(),
         }
     }
 }
@@ -484,6 +485,9 @@ impl TryFrom<pb::Node> for Node {
             capacity: req(node.capacity, "Node.capacity")?.try_into()?,
             labels: labels_from_pb(node.labels)?,
             schedulable: node.schedulable,
+            // Empty string is a second spelling of "no service"; canonicalize
+            // it to None so absent and present-but-empty read identically.
+            service_addr: node.service_addr.filter(|s| !s.is_empty()),
         })
     }
 }

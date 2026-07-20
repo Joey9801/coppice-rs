@@ -1288,6 +1288,7 @@ mod tests {
                 },
                 labels: BTreeMap::new(),
                 schedulable: true,
+                service_addr: None,
             },
             epoch: 1,
         }
