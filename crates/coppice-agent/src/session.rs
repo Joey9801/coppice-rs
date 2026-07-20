@@ -636,13 +636,23 @@ impl<F: Fs, E: Executor> Session<F, E> {
     /// and the (v1-empty) image-cache inventory.
     ///
     /// The `running` set is the agent's *accountability* set, not the raw
-    /// runtime state: a container observed `Exited` whose exit is not yet
-    /// journaled is still claimed — the exit event is in flight (docker events
-    /// delivery lags the daemon's own view by hundreds of ms on slow daemons)
-    /// and its terminal report will follow within the same cycle. Disclaiming
-    /// it here would make the coordinator's reverse reconciliation misclassify
-    /// the clean exit as an `AgentError` loss. A genuinely lost container is
-    /// absent from `observe()` entirely, so loss detection is unaffected.
+    /// runtime state: a container observed `Exited` under a journaled intent
+    /// whose exit is not yet journaled is still claimed — the exit event is in
+    /// flight (docker events delivery lags the daemon's own view by hundreds
+    /// of ms on slow daemons) and its terminal report will follow within the
+    /// same cycle. Disclaiming it here would make the coordinator's reverse
+    /// reconciliation misclassify the clean exit as an `AgentError` loss. A
+    /// genuinely lost container is absent from `observe()` entirely, so loss
+    /// detection is unaffected.
+    ///
+    /// The journaled-intent requirement keeps the claim off runtime-only
+    /// recovery survivors (containers with no intent record, observed.rs):
+    /// those were already reported terminal in the registration ObservedSet,
+    /// and claiming them would draw a `StopJob` the stop path cannot resolve
+    /// (no intent to classify, nothing to journal) — a permanent loop. An
+    /// *intent-holding* survivor whose exit went unjournaled is claimed, and
+    /// self-heals in one cycle: the resulting stop lands `AlreadyExited`,
+    /// journaling the exit and dropping the claim.
     pub async fn heartbeat_report(&self) -> pb::AgentReport {
         use crate::executor::ContainerState;
         let running = match self.executor.observe().await {
@@ -650,7 +660,10 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 .into_iter()
                 .filter(|c| match c.state {
                     ContainerState::Running { .. } => true,
-                    ContainerState::Exited(_) => !self.state.exits.contains_key(&c.allocation),
+                    ContainerState::Exited(_) => {
+                        self.state.intents.contains_key(&c.allocation)
+                            && !self.state.exits.contains_key(&c.allocation)
+                    }
                 })
                 .map(|c| c.allocation.into())
                 .collect(),

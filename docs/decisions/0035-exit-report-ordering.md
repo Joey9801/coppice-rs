@@ -42,7 +42,10 @@ the reap (`pending_reaps`, drained by the live loop via
 `take_pending_reaps`, mirroring the armed-watchdog pattern) and returns
 the terminal report immediately — the exit is already durably journaled,
 so the container is spent evidence and its removal can trail the report.
-The runner spawns queued reaps onto their own tasks after `send_all`, so
+The runner hands queued reaps to a dedicated reaper task (bounded
+concurrency — each reap can wait seconds on the drain barrier and hits
+the daemon and the telemetry store, so a burst of exits must not fan out
+into unbounded requests; queue overflow is dropped to the janitor), so
 the drain barrier no longer delays reports, heartbeats, or command
 processing (retry dispatch included). The janitor sweep remains the
 backstop for reaps that never complete; recovery reaps queue the same
@@ -50,12 +53,19 @@ way behind the ObservedSet.
 
 **Heartbeats claim unreported exits.** The heartbeat running set is the
 agent's *accountability* set, not the raw runtime state: a container
-observed `Exited` whose exit is **not yet journaled** is still claimed as
-running — its exit event is in flight and the terminal report will
-follow within the cycle. Once the exit is journaled (terminal report
-produced, and always queued on the stream ahead of any later heartbeat),
-the claim drops. A genuinely lost container is absent from `observe()`
-entirely and is never claimed, so loss-detection latency is unchanged.
+observed `Exited` under a **journaled intent** whose exit is **not yet
+journaled** is still claimed as running — its exit event is in flight
+and the terminal report will follow within the cycle. Once the exit is
+journaled (terminal report produced, and always queued on the stream
+ahead of any later heartbeat), the claim drops. A genuinely lost
+container is absent from `observe()` entirely and is never claimed, so
+loss-detection latency is unchanged. Runtime-only recovery survivors
+(exited, no intent record) are never claimed either: they are reported
+terminal once in the registration ObservedSet, and claiming them would
+draw a `StopJob` the stop path cannot resolve — a permanent loop. An
+intent-holding survivor whose exit went unjournaled *is* claimed and
+self-heals in one cycle (the stop lands `AlreadyExited`, journaling the
+exit).
 
 Ingestion needs no change: it is serial and `propose().await` completes
 apply, so a terminal report sent before a heartbeat is applied before

@@ -640,6 +640,57 @@ async fn heartbeat_claims_exited_container_until_exit_is_journaled() {
     );
 }
 
+/// A runtime-only recovery survivor — an exited container with NO journaled
+/// intent (a case observed.rs explicitly supports) — must never be claimed by
+/// heartbeats: registration already reported it terminal in the ObservedSet,
+/// and a claim would draw a `StopJob` the stop path cannot resolve (no intent
+/// to classify), looping forever.
+#[tokio::test]
+async fn heartbeat_does_not_claim_runtime_only_survivors() {
+    // Session 1 starts the container and "crashes"; its journal is not reused.
+    let dir1 = tempfile::tempdir().unwrap();
+    let (journal1, state1) = Journal::open(RealFs::new(dir1.path())).unwrap();
+    let exec = FakeExecutor::new();
+    let mut s1 = Session::new(
+        NodeId::new(),
+        Resources::ZERO,
+        Vec::new(),
+        journal1,
+        state1,
+        exec.clone(),
+    );
+    register(&mut s1, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    s1.handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+    exec.finish(alloc, natural_exit(0, Duration::from_micros(3), exec.now()));
+
+    // Session 2 recovers over the surviving runtime with a FRESH journal: the
+    // exited container has no intent record and no journaled exit.
+    let forked = exec.fork();
+    drop(s1);
+    let dir2 = tempfile::tempdir().unwrap();
+    let (journal2, state2) = Journal::open(RealFs::new(dir2.path())).unwrap();
+    let mut s2 = Session::new(
+        NodeId::new(),
+        Resources::ZERO,
+        Vec::new(),
+        journal2,
+        state2,
+        forked.clone(),
+    );
+    register(&mut s2, 1, 1, 1).await;
+
+    let Some(pb::agent_report::Body::Heartbeat(hb)) = s2.heartbeat_report().await.body else {
+        panic!("heartbeat_report must produce a Heartbeat body");
+    };
+    assert!(
+        !hb.running.contains(&alloc.into()),
+        "a runtime-only survivor (no journaled intent) is never claimed"
+    );
+}
+
 /// Start `alloc` (journaling intent), finish it in the fake with a controlled
 /// `finished_at`, and optionally journal the exit *without reaping* (via the
 /// private `record_exit`, accessible from this child module) — modelling a reap
