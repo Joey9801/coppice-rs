@@ -9,8 +9,9 @@
 //! aligning, or deduplicating a returned chunk. Amplification of the boundary
 //! second is metered by [`AGENT_LOG_RESUME_REPLAYED_CHUNKS_TOTAL`].
 //!
-//! After an exit the drain completes one of two ways (§8.2): the exit-claim
-//! signal (`died`, fired by `note_exit_claimed`) wins the race against the
+//! After an exit the drain completes one of two ways (§8.2): the
+//! confirmed-dead signal (`died`, fired by `note_container_dead` — never by a
+//! mere claim, which can precede a limit kill) wins the race against the
 //! stream — the follower drops the follow stream and runs one `follow=false`
 //! [`catch_up`] fetch from the last forwarded second (some daemons hold a dead
 //! container's follow stream open for 1–2 s past the `die` event, and waiting
@@ -139,11 +140,12 @@ fn chunk_from_frame(
 /// Spawn the log follower for one container (docker-executor.md §8.2), returning
 /// its handle. Captures only clones (the docker client, the hub, the store) —
 /// never an `Arc<Inner>` — so an abort is what stops it (the mod.rs no-cycle
-/// rule). `died` is the exit-claim signal (`note_exit_claimed` fires it): the
-/// follower races it against the follow stream and, once it fires, abandons the
-/// stream for a single `follow=false` [`catch_up`] fetch — the daemon can hold a
-/// dead container's follow stream open for 1–2 s past the `die` event, and the
-/// catch-up returns the same tail immediately. `drained_tx` is set to `true`
+/// rule). `died` is the confirmed-dead signal (`note_container_dead` fires it,
+/// only on proof of death — never on a mere claim, which can precede a limit
+/// kill): the follower races it against the follow stream and, once it fires,
+/// abandons the stream for a single `follow=false` [`catch_up`] fetch — the
+/// daemon can hold a dead container's follow stream open for 1–2 s past the
+/// `die` event, and the catch-up returns the same tail immediately. `drained_tx` is set to `true`
 /// after the final flush; reap awaits it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_follower(
@@ -174,11 +176,11 @@ pub(crate) fn spawn_follower(
             Eof,
             /// A stream error: reconnect after re-deriving the boundary.
             Reconnect,
-            /// The exit-claim signal fired: switch to the catch-up drain.
+            /// The confirmed-dead signal fired: switch to the catch-up drain.
             Died,
         }
         loop {
-            // Fast drain (§8.2): once the exit is claimed, the follow stream's
+            // Fast drain (§8.2): once death is confirmed, the follow stream's
             // remaining life is only the daemon's slow close of a dead stream —
             // a single `follow=false` fetch returns the same tail immediately.
             // The boundary is the last forwarded chunk's second, so nothing
@@ -281,7 +283,7 @@ pub(crate) fn spawn_follower(
                         }
                     },
                     result = died.wait_for(|dead| *dead), if !died_gone => match result {
-                        // The exit was claimed: flush and switch to the fast
+                        // Death was confirmed: flush and switch to the fast
                         // catch-up drain instead of waiting out the daemon's
                         // slow close of the dead follow stream.
                         Ok(_) => {
@@ -973,10 +975,10 @@ mod tests {
         assert_eq!(follow1, Some(true), "the live follower streams follow=true");
 
         // Wait until the three lines are stored, so the follower's `last_at`
-        // has provably advanced to T3 before the exit is claimed.
+        // has provably advanced to T3 before death is confirmed.
         wait_for_stored(&sink, ids, 3).await;
 
-        // The exit claim fires the fast-drain signal; the stub never closed
+        // Confirmed death fires the fast-drain signal; the stub never closed
         // connection 1, so only the signal can end the drain promptly.
         died_tx.send(true).expect("follower listens");
 
@@ -1046,10 +1048,10 @@ mod tests {
         follower.abort();
     }
 
-    /// §8.2 fast drain when the exit was claimed before the follower connected
-    /// (a claim carried on the collector reservation): the follower skips the
-    /// follow stream entirely and drains via a single `follow=false` fetch from
-    /// its initial boundary.
+    /// §8.2 fast drain when death was confirmed before the follower connected
+    /// (a dead-marked collector reservation, seeded into the signal before the
+    /// spawn): the follower skips the follow stream entirely and drains via a
+    /// single `follow=false` fetch from its initial boundary.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn died_before_connecting_drains_via_a_single_catch_up_fetch() {
         let base = 1_600_000_000i64;
@@ -1077,8 +1079,9 @@ mod tests {
 
         let docker = api::connect(&format!("tcp://127.0.0.1:{port}")).expect("connect");
         let (drained_tx, mut drained_rx) = watch::channel(false);
-        // The signal is already `true` at spawn: the claim rode the reservation
-        // and activation fired it before/as the follower started.
+        // The signal is already `true` at spawn: the death rode the reservation
+        // and `spawn_collectors` seeded the channel *before* spawning the task
+        // (the guarantee this test pins is that no follow stream is ever opened).
         let (_died_tx, died_rx) = watch::channel(true);
         let follower = spawn_follower(
             docker,

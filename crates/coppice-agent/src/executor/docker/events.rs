@@ -179,9 +179,17 @@ async fn resync(
         else {
             continue;
         };
-        // Cheap pre-check to skip already-claimed ones before inspecting.
-        if lock_state(state).claimed.contains(&allocation) {
-            continue;
+        // The listing filtered on exited/dead status, so this container is
+        // proven dead regardless of who holds the claim: fire the follower's
+        // fast drain (§8.2) — it also backstops a disk kill whose evidence
+        // gathering failed before it could fire. Then the cheap pre-check to
+        // skip already-claimed ones before inspecting.
+        {
+            let mut st = lock_state(state);
+            st.note_container_dead(allocation);
+            if st.claimed.contains(&allocation) {
+                continue;
+            }
         }
         let target = summary.id.as_deref().unwrap_or_default();
         if target.is_empty() {
@@ -258,6 +266,10 @@ async fn handle_die(
     // Claim first; a re-delivery of an already-claimed exit is suppressed (§4).
     let newly_claimed = {
         let mut st = lock_state(state);
+        // The die event is proof of death regardless of who holds the claim (a
+        // disk kill claims *before* its SIGKILL, then this event confirms it):
+        // fire the follower's fast drain unconditionally (§8.2).
+        st.note_container_dead(allocation);
         if st.claimed.contains(&allocation) {
             false
         } else {

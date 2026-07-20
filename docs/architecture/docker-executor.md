@@ -649,15 +649,21 @@ After an exit, the follower drains before the session's `reap` removes
 the container — but it does not wait for the daemon to close the follow
 stream. Some daemons hold a dead container's `follow=true` response open
 for 1–2 s past the `die` event, which would delay reap and finalization
-by that much on every exit. Instead, the exit claim (die event, resync)
-fires a per-container signal that the follower races against the stream:
-on the signal it drops the follow stream and runs one `follow=false`
-catch-up fetch from the last forwarded chunk's second — the same
-at-least-once boundary rule as recovery, so nothing already forwarded is
-dropped and at most the boundary second replays — then signals drained.
-A claim that lands before the follower exists rides the collector
-reservation and is fired at activation, so a dead-at-spawn container is
-drained the same way without ever opening a follow stream. Reap awaits
+by that much on every exit. Instead, **confirmation of death** — a `die`
+event, a resync listing filtered on exited/dead status, or terminal exit
+evidence from an inspect (a stop's evidence paths, a limit kill's
+post-kill evidence) — fires a per-container signal that the follower
+races against the stream: on the signal it drops the follow stream and
+runs one `follow=false` catch-up fetch from the last forwarded chunk's
+second — the same at-least-once boundary rule as recovery, so nothing
+already forwarded is dropped and at most the boundary second replays —
+then signals drained. A mere exit *claim* never fires it: the disk
+enforcer claims before its SIGKILL is attempted, and draining then would
+end a still-running container's log collection early (and could not be
+undone if the kill failed). A death confirmed before the follower exists
+rides the collector reservation and is seeded into the signal before the
+follower task spawns, so a dead-at-spawn container is drained the same
+way without ever opening a follow stream. Reap awaits
 the drain with a bounded timeout, and on timeout **fails retryably,
 leaving the container intact** — the session's periodic sweep simply
 retries later, so a slow drain never costs tail logs in healthy
