@@ -17,6 +17,7 @@
 pub mod dto;
 mod error;
 mod extract;
+mod logs;
 mod project;
 mod read;
 mod routes;

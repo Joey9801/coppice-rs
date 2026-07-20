@@ -22,11 +22,11 @@
 //! which is why a failed flush increments an error-level counter rather than
 //! disappearing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
@@ -52,6 +52,14 @@ const JANITOR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60)
 /// How long a new segment's SQLite connection waits on a locked database before
 /// giving up (§8.4). Generous: the store's writes are batched and infrequent.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The ceiling for [`log_page`](FilesystemSink::log_page)'s `substr` payload
+/// projection length. SQLite stores no blob longer than its compile-time
+/// `SQLITE_MAX_LENGTH` (default 1e9 bytes), so a `substr(bytes, 1, N)` with any
+/// `N` at or above this always returns the whole payload — and capping here
+/// keeps the bound integer well clear of the large-value range where a
+/// `substr` length near `i64::MAX` degenerates to an empty result.
+const MAX_PAYLOAD_PROJECTION: u64 = 1_000_000_000;
 
 // ---- construction (docker-executor.md §8.4) -----------------------------
 
@@ -121,10 +129,49 @@ struct Inner {
     /// single drain task per sink instance (§8.3) means no write contention, and
     /// the sweep only borrows it briefly to learn which files not to unlink.
     open: AsyncMutex<HashMap<(JobId, AttemptId), OpenSegment>>,
+    /// Per-attempt, per-segment **data-time bounds** for `log_chunks`, keyed by
+    /// segment start (ADR 0034 review — per-request work must not scale with
+    /// the number of retained segments). Closed segments are immutable, so
+    /// their bounds are probed **once per segment lifetime** (index-only
+    /// `MIN`/`MAX` per stream) and cached; the open segment's entry is extended
+    /// by the writer after every committed flush. [`log_page`] plans against
+    /// these bounds and opens only the segments that can contribute to the
+    /// page. The cache is derived state: a retention sweep that deletes
+    /// anything clears it wholesale, and the next read rebuilds it from the
+    /// survivors. A `std` mutex — never held across an await.
+    ///
+    /// [`log_page`]: FilesystemSink::log_page
+    log_bounds: StdMutex<HashMap<(JobId, AttemptId), BTreeMap<Timestamp, StreamBounds>>>,
     /// Warn-once latch for the write-error path (pressure.rs style): the first
     /// failure of a streak logs at error, subsequent ones only bump the counter,
     /// and a success resets it — so a wedged disk is metered, not a log flood.
     write_error_logged: AtomicBool,
+    /// Test-only instrumentation: how many `log_chunks` payload rows `log_page`
+    /// has decoded on this sink — the boundary/beyond page reads that actually
+    /// project `bytes`; the `MIN`/`MAX` bounds probes and the exact-µs `COUNT`
+    /// probes decode no payload and are excluded. Instance-scoped so a parallel
+    /// test cannot pollute it; the bounded-read and adversarial tests assert a
+    /// tiny page over a many-thousand-row multi-segment attempt decodes only a
+    /// handful, no matter what the cursor `skip` says — proof the caps bound the
+    /// input scan, not merely the returned page.
+    #[cfg(test)]
+    rows_decoded: std::sync::atomic::AtomicU64,
+    /// Test-only instrumentation companion to [`rows_decoded`](Inner::rows_decoded):
+    /// the total payload BYTES `log_page` has materialized on this sink — the sum
+    /// of every projected `substr(bytes, 1, ?)` prefix it read. Because the
+    /// projection is bounded to the page byte budget, an oversized stored row
+    /// never materializes beyond that budget; the oversized-row test asserts it.
+    #[cfg(test)]
+    bytes_materialized: std::sync::atomic::AtomicU64,
+    /// Test-only instrumentation: how many segment files [`log_page`] has
+    /// opened on this sink (bounds probes and page pulls alike). The
+    /// segment-scaling tests assert a warm-cache page over many retained
+    /// segments opens only the one or two that can contribute — proof that
+    /// per-request IO is bounded by the page, not by retention.
+    ///
+    /// [`log_page`]: FilesystemSink::log_page
+    #[cfg(test)]
+    segments_opened: std::sync::atomic::AtomicU64,
 }
 
 /// The filesystem sink (docker-executor.md §8.4). A cheap `Clone` handle; clones
@@ -153,7 +200,14 @@ impl FilesystemSink {
                 pressure_paths: opts.pressure_paths,
                 high_pct: opts.high_pct,
                 open: AsyncMutex::new(HashMap::new()),
+                log_bounds: StdMutex::new(HashMap::new()),
                 write_error_logged: AtomicBool::new(false),
+                #[cfg(test)]
+                rows_decoded: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                bytes_materialized: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                segments_opened: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -305,6 +359,18 @@ impl FilesystemSink {
             .await?;
         }
         tx.commit().await?;
+        // Extend the open segment's cached data-time bounds only *after* the
+        // commit: bounds must never claim rows that are not durable. A reader
+        // interleaving between commit and this note merely sees bounds a
+        // moment stale — the same read skew as querying an instant earlier.
+        {
+            let start = map.get(&key).expect("segment just ensured").start;
+            let mut cache = self.inner.log_bounds.lock().expect("log_bounds poisoned");
+            let bounds = cache.entry(key).or_default().entry(start).or_default();
+            for chunk in chunks {
+                bounds.note(chunk.stream, chunk.at.as_micros());
+            }
+        }
         if let Some(segment) = map.get_mut(&key) {
             segment.size = segment_size_on_disk(&segment.path);
         }
@@ -519,6 +585,19 @@ impl FilesystemSink {
             }
         }
         cleanup_empty_dirs(&self.inner.root);
+        if deleted > 0 {
+            // Coarse invalidation on any deletion: the bounds cache is derived
+            // state, and the next read of an affected attempt rebuilds it from
+            // the surviving segments (one probe per survivor). Sweeps that
+            // delete are rare (60s tick, only when retention/pressure trips),
+            // so wholesale clearing beats threading per-path attempt keys
+            // through the sweep plan.
+            self.inner
+                .log_bounds
+                .lock()
+                .expect("log_bounds poisoned")
+                .clear();
+        }
         deleted
     }
 
@@ -611,6 +690,82 @@ pub struct StoredLogChunk {
     pub stream: LogStream,
     /// The raw payload.
     pub bytes: bytes::Bytes,
+    /// True when [`log_page`](FilesystemSink::log_page) cut this chunk's payload
+    /// down to the remaining `max_bytes` budget because the chunk alone exceeded
+    /// it (ADR 0034). The chunk still counts as fully consumed for resume
+    /// arithmetic — the walk advances past it whole — so the truncated bytes are
+    /// dropped, never re-served. Always `false` for chunks read through the
+    /// unpaged [`log_chunks`](FilesystemSink::log_chunks) API.
+    pub truncated: bool,
+}
+
+/// Direction of a [`log_page`](FilesystemSink::log_page) walk. `Descending`
+/// (newest-first) is the exact reverse of the canonical `(at, insertion)`
+/// ascending order, so a chunk's position in a descending page is fully
+/// determined even when several chunks share a microsecond.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOrder {
+    /// Oldest chunk first.
+    Ascending,
+    /// Newest chunk first.
+    Descending,
+}
+
+/// An exclusive resume position within one attempt's chunks (ADR 0034). Because
+/// the store orders by `(at, insertion)`, a bare `at` cannot address a position
+/// when several chunks share a microsecond: `skip` is the number of chunks
+/// already consumed at exactly `at` *in the walk direction*, and the walk
+/// resumes strictly after them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeAt {
+    /// The microsecond the previous page stopped at.
+    pub at: Timestamp,
+    /// How many chunks at exactly `at` the previous page already returned.
+    pub skip: u64,
+}
+
+/// A paged log query for the `FetchLogs` RPC (ADR 0034). A bounded, directional
+/// walk over one attempt's chunks with an optional half-open time window, an
+/// optional stream filter, an optional exclusive resume position, and hard caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPageQuery {
+    /// Restrict to one stream; `None` returns both.
+    pub stream: Option<LogStream>,
+    /// Inclusive lower bound of the half-open `[from, until)` window; `None`
+    /// opens the window on the old side.
+    pub from: Option<Timestamp>,
+    /// Exclusive upper bound of the half-open `[from, until)` window; `None`
+    /// opens the window on the new side.
+    pub until: Option<Timestamp>,
+    /// Walk direction.
+    pub order: LogOrder,
+    /// Exclusive resume position; `None` starts from the window edge in the
+    /// walk direction.
+    pub resume: Option<ResumeAt>,
+    /// Never return more than this many chunks in the page.
+    pub max_chunks: usize,
+    /// Stop before the page's cumulative payload bytes would exceed this — but
+    /// always return at least the first chunk, so a single oversize chunk still
+    /// makes progress.
+    pub max_bytes: u64,
+}
+
+/// One page of a [`log_page`](FilesystemSink::log_page) walk (ADR 0034).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPage {
+    /// The chunks in the requested direction, after range, resume, and caps.
+    pub chunks: Vec<StoredLogChunk>,
+    /// True when the walk reached the end of the requested window within this
+    /// page; false when a cap (`max_chunks`/`max_bytes`) cut it short and a
+    /// further page exists.
+    pub exhausted: bool,
+    /// The oldest retained `at` for this attempt over the stream-filtered data,
+    /// independent of the query window — a requested `from` earlier than this
+    /// means older chunks existed and were pruned (the API's `truncated`
+    /// verdict). `None` when the attempt has no matching chunks.
+    pub earliest_at: Option<Timestamp>,
+    /// The newest retained `at`, the mirror of [`earliest_at`](LogPage::earliest_at).
+    pub latest_at: Option<Timestamp>,
 }
 
 /// The telemetry read API's error (docker-executor.md §8.4). Typed rather than
@@ -722,6 +877,352 @@ impl FilesystemSink {
                 Ok(collected)
             }
         }
+    }
+
+    /// Read one bounded page of an attempt's log chunks for the `FetchLogs` RPC
+    /// (ADR 0034). A directional walk over the half-open `[from, until)` window
+    /// with an optional stream filter, an optional exclusive resume position,
+    /// and `max_chunks`/`max_bytes` caps.
+    ///
+    /// Like [`log_chunks`](Self::log_chunks) this probes **every** segment — a
+    /// row's `at` can be older than its segment's filename start (§8.2 replay),
+    /// so filename pruning would silently hide rows — but the reads are
+    /// **bounded**, and bounded *independently of the untrusted cursor*: each
+    /// segment's page slice is an indexed `BETWEEN` range scan **streamed** with a
+    /// `LIMIT` of `max_chunks + 1` as the row backstop and a byte cutoff that
+    /// stops the cursor once its projected bytes reach `max_bytes` (plus one
+    /// look-ahead), the exclusive resume `skip` is applied through index-only
+    /// `COUNT`/`OFFSET` at the boundary microsecond (decoding no payload for the
+    /// skipped rows), each projected payload is capped to the byte budget via
+    /// `substr`, and the whole-attempt bounds come from cheap `MIN`/`MAX`
+    /// aggregates. A small page over a giant attempt therefore decodes only a
+    /// handful of rows per segment and materializes only ~`max_bytes` per segment
+    /// — never the full store, never `max_chunks × max_bytes` per segment, and
+    /// never more work for a crafted or accumulated `skip` — the input scan and
+    /// payload materialization are capped, not just the output page.
+    ///
+    /// `earliest_at`/`latest_at` span the whole stream-filtered attempt,
+    /// **independent** of the window/resume, so the caller can detect head
+    /// truncation. [`StoreError::UnknownAttempt`] when no directory exists for
+    /// the attempt (its telemetry has fallen out of retention, or none was
+    /// written) — the RPC maps that to its `UnknownAttempt` arm.
+    pub async fn log_page(
+        &self,
+        job: &JobId,
+        attempt: &AttemptId,
+        query: &LogPageQuery,
+    ) -> Result<LogPage, StoreError> {
+        let dir = self.attempt_dir_existing(job, attempt)?;
+        let segments = list_segments(&dir);
+        let stream_filter = query.stream.map(LogStream::to_i64);
+
+        // The per-segment data-time bounds cache (ADR 0034 review): closed
+        // segments are probed once per lifetime, the open segment's entry is
+        // writer-maintained, and everything below plans against these bounds so
+        // per-request IO touches only the segments that can contribute to the
+        // page — never all retained segments. §8.2 replay means a later segment
+        // can hold older rows; the bounds are true data-time extents, so that
+        // overlap is captured exactly.
+        let bounds = self.ensure_log_bounds(job, attempt, &segments).await?;
+
+        // Whole-attempt bounds for the head-truncation verdict, independent of
+        // the query window/resume — straight from the cache, no per-request
+        // segment probes.
+        let mut earliest_at: Option<Timestamp> = None;
+        let mut latest_at: Option<Timestamp> = None;
+        for seg_bounds in bounds.values() {
+            let Some((lo, hi)) = seg_bounds.for_filter(stream_filter) else {
+                continue;
+            };
+            if let Some(at) = Timestamp::from_micros(lo) {
+                earliest_at = Some(earliest_at.map_or(at, |cur| cur.min(at)));
+            }
+            if let Some(at) = Timestamp::from_micros(hi) {
+                latest_at = Some(latest_at.map_or(at, |cur| cur.max(at)));
+            }
+        }
+
+        // The half-open `[from, until)` window as an inclusive `[from_us,
+        // until_incl_us]` micro range: `until` is exclusive and `at` is
+        // µs-quantised, so `until - 1µs` closes it.
+        let from_us = query.from.map_or(i64::MIN, Timestamp::as_micros);
+        let until_incl_us = query
+            .until
+            .map_or(i64::MAX, |until| until.as_micros().saturating_sub(1));
+
+        // The resume `skip` is unsigned and *client-controlled* (an opaque HTTP
+        // cursor value that also legitimately accumulates across pages when many
+        // chunks share one microsecond). It must never inflate the decode work:
+        // a naive `LIMIT skip + max_chunks` would re-enable full-store payload
+        // materialization for a crafted `skip` near `u64::MAX`. So the walk is
+        // split into two disjoint reads whose *decoded* size is independent of
+        // `skip`:
+        //
+        //   * the **boundary** run — the rows at exactly `resume.at` — is skipped
+        //     with an index-only `COUNT` per segment (decoding nothing) to turn
+        //     the cross-segment `skip` into a per-segment `OFFSET`, then only the
+        //     surviving `max_chunks + 1` rows are projected;
+        //   * the **beyond** run — the rows strictly past `resume.at` in the walk
+        //     direction — needs no skip and reads a plain `LIMIT max_chunks + 1`.
+        //
+        // A `skip` at or beyond the total boundary count costs only the `COUNT`s.
+        let want = (query.max_chunks as u64)
+            .saturating_add(1)
+            .min(i64::MAX as u64) as i64;
+
+        // The payload projection bound: never materialize more than the page byte
+        // budget (+1, so the truncated verdict is exact) from any single row, so
+        // an oversized stored row cannot cause large input materialization even
+        // though the response is truncated to the budget. `length(bytes)` still
+        // gives the true size for the cumulative-budget arithmetic.
+        let proj = query
+            .max_bytes
+            .saturating_add(1)
+            .min(MAX_PAYLOAD_PROJECTION) as i64;
+
+        // Which exact microsecond, if any, carries an in-window boundary run. A
+        // `resume.at` outside `[from_us, until_incl_us]` has no boundary rows in
+        // the window, so `skip` is inert and the whole window is a beyond read.
+        let boundary_at = query.resume.and_then(|r| {
+            let b = r.at.as_micros();
+            (from_us <= b && b <= until_incl_us).then_some(b)
+        });
+        let skip = query.resume.map_or(0, |r| r.skip);
+
+        // The beyond range excludes the boundary microsecond in the walk
+        // direction. With no in-window boundary this is the whole window; the
+        // `saturating_add/sub(1)` on `resume.at` also correctly empties the range
+        // when `resume.at` sits on the already-consumed side of the window.
+        let (beyond_lo, beyond_hi) = match query.order {
+            LogOrder::Ascending => {
+                let lo = query
+                    .resume
+                    .map_or(from_us, |r| from_us.max(r.at.as_micros().saturating_add(1)));
+                (lo, until_incl_us)
+            }
+            LogOrder::Descending => {
+                let hi = query.resume.map_or(until_incl_us, |r| {
+                    until_incl_us.min(r.at.as_micros().saturating_sub(1))
+                });
+                (from_us, hi)
+            }
+        };
+
+        // The boundary run, already in walk order: segments are visited in
+        // cross-segment insertion order (ascending seg order, reversed for
+        // descending), each `COUNT`ed at exactly `resume.at`, and `skip` is spent
+        // against those counts to land on a per-segment `OFFSET`. Only once a
+        // segment holds surviving rows does a projected `LIMIT ? OFFSET ?` read
+        // decode anything — at most `want` rows total across the whole boundary.
+        let mut boundary_walk: Vec<PageRow> = Vec::new();
+        if let Some(b) = boundary_at {
+            let mut remaining_skip = skip;
+            let mut need = want;
+            // Only segments whose bounds span the boundary microsecond can hold
+            // boundary rows; the rest would `COUNT` to zero, so they are skipped
+            // without being opened. Bounds are exact for committed data, so the
+            // cross-segment `skip` arithmetic is unchanged.
+            let mut walk_segments: Vec<&PathBuf> = segments
+                .iter()
+                .filter(|(start, _)| {
+                    bounds
+                        .get(start)
+                        .and_then(|sb| sb.for_filter(stream_filter))
+                        .is_some_and(|(lo, hi)| lo <= b && b <= hi)
+                })
+                .map(|(_, p)| p)
+                .collect();
+            if matches!(query.order, LogOrder::Descending) {
+                walk_segments.reverse();
+            }
+            for path in walk_segments {
+                if need <= 0 {
+                    break;
+                }
+                let Some(mut conn) = self.open_read_counted(path).await? else {
+                    continue;
+                };
+                let count = log_boundary_count(&mut conn, b, stream_filter).await? as u64;
+                if remaining_skip >= count {
+                    remaining_skip -= count;
+                    continue;
+                }
+                let offset = remaining_skip as i64; // < count ≤ i64::MAX
+                remaining_skip = 0;
+                let rows = log_boundary_rows(
+                    &mut conn,
+                    b,
+                    stream_filter,
+                    query.order,
+                    need,
+                    offset,
+                    proj,
+                    query.max_bytes,
+                )
+                .await?;
+                #[cfg(test)]
+                {
+                    self.inner
+                        .rows_decoded
+                        .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                    self.inner.bytes_materialized.fetch_add(
+                        rows.iter().map(|r| r.prefix.len() as u64).sum(),
+                        Ordering::Relaxed,
+                    );
+                }
+                need -= rows.len() as i64;
+                boundary_walk.extend(rows);
+            }
+        }
+
+        // The beyond run, pruned by bounds: only candidates whose (filtered)
+        // bounds intersect the window are considered at all, and they are
+        // pulled in leading-edge order (descending: highest `max_at` first)
+        // with a top-k stopping rule — once `want` rows are collected in walk
+        // order, a candidate whose leading edge lies strictly beyond the
+        // want-th row's `at` cannot contribute to this page, and neither can
+        // any later candidate (the pull order sorts by that same edge). Ties
+        // at the want-th microsecond are still pulled so cross-segment
+        // insertion order stays exact. In the common case — segments rolling
+        // forward in time — this opens exactly one segment no matter how many
+        // are retained.
+        //
+        // `exhausted` stays exact under pruning: the rule only skips
+        // candidates once `want = max_chunks + 1` rows are collected, and such
+        // a page always ends on a cap with `exhausted = false`; with fewer
+        // rows every candidate is pulled, and non-candidates provably hold
+        // nothing in the window (bounds are exact).
+        let mut candidates: Vec<(Timestamp, &PathBuf, (i64, i64))> = segments
+            .iter()
+            .filter_map(|(start, path)| {
+                let sb = bounds.get(start)?.for_filter(stream_filter)?;
+                (sb.0 <= beyond_hi && sb.1 >= beyond_lo).then_some((*start, path, sb))
+            })
+            .collect();
+        match query.order {
+            LogOrder::Ascending => candidates.sort_by_key(|(_, _, sb)| sb.0),
+            LogOrder::Descending => candidates.sort_by_key(|(_, _, sb)| std::cmp::Reverse(sb.1)),
+        }
+
+        // Walk-order `at`s collected so far (boundary rows lead the walk),
+        // kept sorted so the want-th row's `at` is a direct index.
+        let sort_walk = |ats: &mut Vec<i64>| match query.order {
+            LogOrder::Ascending => ats.sort_unstable(),
+            LogOrder::Descending => ats.sort_unstable_by_key(|at| std::cmp::Reverse(*at)),
+        };
+        let mut collected: Vec<i64> = boundary_walk.iter().map(|r| r.at.as_micros()).collect();
+        sort_walk(&mut collected);
+
+        let mut pulled: BTreeMap<Timestamp, Vec<PageRow>> = BTreeMap::new();
+        for (start, path, sb) in candidates {
+            if collected.len() >= want as usize {
+                let kth = collected[want as usize - 1];
+                let beyond_kth = match query.order {
+                    LogOrder::Ascending => sb.0 > kth,
+                    LogOrder::Descending => sb.1 < kth,
+                };
+                if beyond_kth {
+                    break;
+                }
+            }
+            let Some(mut conn) = self.open_read_counted(path).await? else {
+                continue;
+            };
+            let rows = log_beyond_rows(
+                &mut conn,
+                beyond_lo,
+                beyond_hi,
+                stream_filter,
+                query.order,
+                want,
+                proj,
+                query.max_bytes,
+            )
+            .await?;
+            #[cfg(test)]
+            {
+                self.inner
+                    .rows_decoded
+                    .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                self.inner.bytes_materialized.fetch_add(
+                    rows.iter().map(|r| r.prefix.len() as u64).sum(),
+                    Ordering::Relaxed,
+                );
+            }
+            collected.extend(rows.iter().map(|r| r.at.as_micros()));
+            sort_walk(&mut collected);
+            pulled.insert(start, rows);
+        }
+
+        // Assemble the pulled slices exactly as before: segment-start order
+        // ascending (reversed for descending), stable-sorted by `at` so ties
+        // keep segment-then-rowid order. The pull set is a subset of the full
+        // segment list and every unpulled candidate was provably outside the
+        // page, so the merge semantics are unchanged.
+        let mut beyond_walk: Vec<PageRow> = match query.order {
+            LogOrder::Ascending => pulled.into_values().flatten().collect(),
+            LogOrder::Descending => pulled.into_values().rev().flatten().collect(),
+        };
+        match query.order {
+            LogOrder::Ascending => beyond_walk.sort_by_key(|row| row.at),
+            LogOrder::Descending => beyond_walk.sort_by_key(|row| std::cmp::Reverse(row.at)),
+        }
+
+        // The boundary rows all sit at exactly `resume.at`, the leading edge of
+        // the walk, so they precede every beyond row (strictly past it) in walk
+        // order — no cross-group sort is needed. `skip` was already consumed via
+        // the boundary `OFFSET`, so there is nothing further to drop here.
+        let walk: Vec<PageRow> = boundary_walk.into_iter().chain(beyond_walk).collect();
+
+        // Apply the caps: fill until `max_chunks`, or until the next chunk would
+        // push cumulative bytes past `max_bytes`. The first chunk always makes
+        // progress — if it alone exceeds `max_bytes` its (already projection-
+        // bounded) payload is cut to the budget and flagged, and it still counts
+        // as fully consumed for the cursor (the walk advances past it whole).
+        // `exhausted` is true only when the whole remaining walk fit.
+        let mut chunks = Vec::new();
+        let mut bytes = 0u64;
+        let mut exhausted = true;
+        for row in walk {
+            if chunks.len() >= query.max_chunks {
+                exhausted = false;
+                break;
+            }
+            let size = row.total_len;
+            if chunks.is_empty() {
+                if size > query.max_bytes {
+                    // Oversized first chunk: the projected prefix already holds at
+                    // most `max_bytes + 1` bytes, so cutting to the budget never
+                    // materialized the full stored row.
+                    let cut = (query.max_bytes as usize).min(row.prefix.len());
+                    chunks.push(StoredLogChunk {
+                        at: row.at,
+                        stream: row.stream,
+                        bytes: row.prefix.slice(0..cut),
+                        truncated: true,
+                    });
+                    bytes = cut as u64;
+                } else {
+                    // Fits whole: the row is within budget, so the projected
+                    // prefix is its complete payload.
+                    bytes += size;
+                    chunks.push(row.into_stored(false));
+                }
+            } else if bytes.saturating_add(size) > query.max_bytes {
+                exhausted = false;
+                break;
+            } else {
+                bytes += size;
+                chunks.push(row.into_stored(false));
+            }
+        }
+
+        Ok(LogPage {
+            chunks,
+            exhausted,
+            earliest_at,
+            latest_at,
+        })
     }
 
     /// Read an attempt's metric samples with `at` in the inclusive range
@@ -837,6 +1338,59 @@ impl FilesystemSink {
             }
         }
     }
+
+    /// [`open_read`](Self::open_read) plus the test-only opened-segments meter —
+    /// every segment open on the [`log_page`](Self::log_page) path goes through
+    /// here so the segment-scaling tests can count them.
+    async fn open_read_counted(&self, path: &Path) -> Result<Option<SqliteConnection>, StoreError> {
+        #[cfg(test)]
+        self.inner.segments_opened.fetch_add(1, Ordering::Relaxed);
+        self.open_read(path).await
+    }
+
+    /// Bring the attempt's cached per-segment bounds in sync with the on-disk
+    /// segment list and return a snapshot. Closed segments are immutable, so
+    /// any start already cached is trusted as-is; a start not yet cached (cold
+    /// cache after restart or sweep invalidation) is probed **once** with an
+    /// index-only `MIN`/`MAX` query. Entries for vanished segments are dropped.
+    /// The publish merges rather than overwrites, so a concurrent writer note
+    /// between probe and publish is never lost (bounds only widen).
+    async fn ensure_log_bounds(
+        &self,
+        job: &JobId,
+        attempt: &AttemptId,
+        segments: &[(Timestamp, PathBuf)],
+    ) -> Result<BTreeMap<Timestamp, StreamBounds>, StoreError> {
+        let key = (*job, *attempt);
+        let cached: BTreeMap<Timestamp, StreamBounds> = self
+            .inner
+            .log_bounds
+            .lock()
+            .expect("log_bounds poisoned")
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut probed: Vec<(Timestamp, StreamBounds)> = Vec::new();
+        for (start, path) in segments {
+            if cached.contains_key(start) {
+                continue;
+            }
+            let Some(mut conn) = self.open_read_counted(path).await? else {
+                continue;
+            };
+            probed.push((*start, log_segment_bounds(&mut conn).await?));
+        }
+
+        let live: HashSet<Timestamp> = segments.iter().map(|(start, _)| *start).collect();
+        let mut cache = self.inner.log_bounds.lock().expect("log_bounds poisoned");
+        let entry = cache.entry(key).or_default();
+        for (start, bounds) in probed {
+            entry.entry(start).or_default().merge(bounds);
+        }
+        entry.retain(|start, _| live.contains(start));
+        Ok(entry.clone())
+    }
 }
 
 /// Fetch a `Range` query's log rows from one segment, as `(at, stream, bytes)`
@@ -909,6 +1463,389 @@ async fn log_tail_rows(
         .collect(),
     };
     Ok(rows)
+}
+
+/// Per-stream data-time bounds `(min_at, max_at)` in µs for one segment's
+/// `log_chunks` — `None` when the segment holds no rows for that stream. These
+/// are **exact** (a bound is always some real row's `at`), which is what lets
+/// [`log_page`] prune segments and settle `exhausted` without opening them:
+/// a segment whose bounds miss the window provably holds nothing in it.
+///
+/// [`log_page`]: FilesystemSink::log_page
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamBounds {
+    stdout: Option<(i64, i64)>,
+    stderr: Option<(i64, i64)>,
+}
+
+impl StreamBounds {
+    /// Extend the bounds with one committed row (writer path).
+    fn note(&mut self, stream: LogStream, at: i64) {
+        let slot = match stream {
+            LogStream::Stdout => &mut self.stdout,
+            LogStream::Stderr => &mut self.stderr,
+        };
+        *slot = Some(match *slot {
+            None => (at, at),
+            Some((lo, hi)) => (lo.min(at), hi.max(at)),
+        });
+    }
+
+    /// Union with another observation of the same segment. Bounds only ever
+    /// widen, so merging a lazy probe with concurrent writer notes is safe in
+    /// either order.
+    fn merge(&mut self, other: StreamBounds) {
+        for (slot, incoming) in [
+            (&mut self.stdout, other.stdout),
+            (&mut self.stderr, other.stderr),
+        ] {
+            if let Some((lo, hi)) = incoming {
+                *slot = Some(match *slot {
+                    None => (lo, hi),
+                    Some((cur_lo, cur_hi)) => (cur_lo.min(lo), cur_hi.max(hi)),
+                });
+            }
+        }
+    }
+
+    /// The bounds relevant to a query's stream filter: the one stream's, or the
+    /// union when unfiltered. `None` = the segment holds nothing the query can
+    /// see.
+    fn for_filter(&self, filter: Option<i64>) -> Option<(i64, i64)> {
+        match filter.map(LogStream::from_i64) {
+            Some(LogStream::Stdout) => self.stdout,
+            Some(LogStream::Stderr) => self.stderr,
+            None => match (self.stdout, self.stderr) {
+                (None, b) => b,
+                (a, None) => a,
+                (Some((alo, ahi)), Some((blo, bhi))) => Some((alo.min(blo), ahi.max(bhi))),
+            },
+        }
+    }
+}
+
+/// Probe one segment's per-stream `MIN`/`MAX` data-time bounds — index-only,
+/// decodes no payload. Run **once per closed segment's lifetime** (they are
+/// immutable); the open segment's bounds are thereafter extended in memory by
+/// the writer.
+async fn log_segment_bounds(conn: &mut SqliteConnection) -> Result<StreamBounds, StoreError> {
+    let rows = sqlx::query!(
+        r#"SELECT stream AS "stream!: i64", MIN(at) AS "min_at!: i64", MAX(at) AS "max_at!: i64"
+           FROM log_chunks GROUP BY stream"#,
+    )
+    .fetch_all(conn)
+    .await?;
+    let mut bounds = StreamBounds::default();
+    for row in rows {
+        let stream = LogStream::from_i64(row.stream);
+        bounds.note(stream, row.min_at);
+        bounds.note(stream, row.max_at);
+    }
+    Ok(bounds)
+}
+
+/// One projected page row for [`log_page`]: its `at`/`stream`, the row's *true*
+/// payload length (for the cumulative byte-budget arithmetic and the truncated
+/// verdict), and a payload **prefix** bounded to the page byte budget. The full
+/// stored `bytes` is never materialized — an oversized row yields only its
+/// budget-sized prefix, so a crafted multi-MiB chunk cannot blow up input work.
+struct PageRow {
+    at: Timestamp,
+    stream: LogStream,
+    /// `length(bytes)` — the true stored size, possibly larger than `prefix`.
+    total_len: u64,
+    /// The first `min(total_len, max_bytes + 1)` bytes of the payload.
+    prefix: bytes::Bytes,
+}
+
+impl PageRow {
+    /// Rebuild a whole-payload [`StoredLogChunk`]. Only valid when the row fits
+    /// the budget (`total_len ≤ max_bytes`), so the projected `prefix` already
+    /// holds the complete payload; the oversized case cuts the prefix inline.
+    fn into_stored(self, truncated: bool) -> StoredLogChunk {
+        StoredLogChunk {
+            at: self.at,
+            stream: self.stream,
+            bytes: self.prefix,
+            truncated,
+        }
+    }
+}
+
+/// Rebuild a [`PageRow`] from a raw projected row, skipping one whose micros are
+/// out of range (corruption tolerance, §8.4). `total_len` floors at zero.
+fn page_row(at: i64, stream: i64, total_len: i64, prefix: Vec<u8>) -> Option<PageRow> {
+    Some(PageRow {
+        at: Timestamp::from_micros(at)?,
+        stream: LogStream::from_i64(stream),
+        total_len: total_len.max(0) as u64,
+        prefix: bytes::Bytes::from(prefix),
+    })
+}
+
+/// A raw projected page row as it streams out of SQLite: `(at, stream,
+/// length(bytes), substr(bytes, 1, proj))`. The tuple shape is shared across the
+/// eight direction × stream-filter queries so [`drain_projected`] can consume any
+/// of them through one boxed stream.
+type ProjectedRow = (i64, i64, i64, Vec<u8>);
+
+/// A boxed, `Send` stream of [`ProjectedRow`]s — sqlx's `.fetch()` cursor mapped
+/// to the shared tuple. Each static query has a distinct anonymous row type, so
+/// mapping to this common item lets one drain loop serve every arm.
+type ProjectedRowStream<'a> = std::pin::Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<ProjectedRow, sqlx::Error>> + Send + 'a>,
+>;
+
+/// Drain a projected-row cursor into `PageRow`s with a **byte-based early
+/// cutoff** (ADR 0034 review): SQLite computes each row's `substr` projection
+/// only as the cursor steps, so stopping the cursor stops the materialization.
+/// The cursor is stepped until whichever comes first:
+///
+///   * the SQL `LIMIT` backstop (`max_chunks + 1` rows) is exhausted, or
+///   * cumulative *projected* bytes pulled from this segment reach `budget`
+///     (the page's `max_bytes`) — after which exactly one further payload-bearing
+///     row is pulled as the merge's break/look-ahead, with any intervening
+///     zero-length (empty) chunks pulled too (the merge can consume a run of
+///     them after an exactly-fitting or oversized chunk before breaking).
+///
+/// This turns each segment's window from an eager O(`max_chunks` × `max_bytes`)
+/// pull into an O(`max_bytes`) one: a segment materializes at most
+/// `budget + 2·proj` projected bytes, independent of `max_chunks`. Correctness
+/// rests on the merge drawing only a *prefix* of each segment's ordered window,
+/// bounded to `max_bytes` total projected bytes — so no correct page can need
+/// rows past the first ~budget bytes (+ the one look-ahead) of a segment's
+/// window (see [`log_page`]).
+async fn drain_projected(
+    mut rows: ProjectedRowStream<'_>,
+    budget: u64,
+) -> Result<Vec<PageRow>, StoreError> {
+    use tokio_stream::StreamExt as _;
+    let mut out = Vec::new();
+    let mut projected = 0u64;
+    let mut over_budget = false;
+    while let Some(item) = rows.next().await {
+        let (at, stream, len, prefix) = item?;
+        let plen = prefix.len() as u64;
+        projected = projected.saturating_add(plen);
+        if let Some(row) = page_row(at, stream, len, prefix) {
+            out.push(row);
+        }
+        if over_budget {
+            // Past the budget: the merge may still consume a run of empty
+            // (zero-projection) chunks after an exactly-fitting or oversized
+            // chunk, then break on the next payload-bearing one — so keep
+            // stepping only while rows carry no payload, and stop once one does
+            // (that row is the merge's break/look-ahead row).
+            if plen > 0 {
+                break;
+            }
+        } else if projected >= budget {
+            // Cumulative projected bytes reached the page budget: a page bounded
+            // to `budget` total bytes can draw nothing more from this segment
+            // beyond one look-ahead row. The SQL `LIMIT` remains the row backstop.
+            over_budget = true;
+        }
+    }
+    Ok(out)
+}
+
+/// Stream one segment's **beyond** slice for [`log_page`] — the rows in the
+/// inclusive `[lo, hi]` range, in the walk direction, projecting `length(bytes)`
+/// plus a `substr(bytes, 1, proj)` prefix so payload materialization is bounded
+/// to `proj` per row. `limit` (`max_chunks + 1`) is the SQL row backstop and
+/// `budget` (`max_bytes`) the byte cutoff [`drain_projected`] applies as the
+/// cursor steps; four static queries keep the direction and optional stream
+/// filter compile-checked without runtime SQL assembly.
+#[allow(clippy::too_many_arguments)]
+async fn log_beyond_rows(
+    conn: &mut SqliteConnection,
+    lo: i64,
+    hi: i64,
+    stream: Option<i64>,
+    order: LogOrder,
+    limit: i64,
+    proj: i64,
+    budget: u64,
+) -> Result<Vec<PageRow>, StoreError> {
+    use tokio_stream::StreamExt as _;
+    // Bind the filter value at function scope: the streamed query holds a
+    // reference to its bound args for the cursor's whole lifetime, so a
+    // `Some(stream)` arm-local (dropped at the arm's end) would not live long
+    // enough. The unfiltered arms ignore it.
+    let stream_val = stream.unwrap_or_default();
+    let rows: ProjectedRowStream = match (order, stream) {
+        (LogOrder::Ascending, Some(_)) => Box::pin(
+            sqlx::query!(
+                r#"SELECT at AS "at!: i64", stream AS "stream!: i64",
+                      length(bytes) AS "len!: i64", substr(bytes, 1, ?) AS "prefix!: Vec<u8>"
+               FROM log_chunks WHERE at BETWEEN ? AND ? AND stream = ? ORDER BY at, id LIMIT ?"#,
+                proj,
+                lo,
+                hi,
+                stream_val,
+                limit,
+            )
+            .fetch(conn)
+            .map(|r| r.map(|row| (row.at, row.stream, row.len, row.prefix))),
+        ),
+        (LogOrder::Ascending, None) => Box::pin(
+            sqlx::query!(
+                r#"SELECT at AS "at!: i64", stream AS "stream!: i64",
+                      length(bytes) AS "len!: i64", substr(bytes, 1, ?) AS "prefix!: Vec<u8>"
+               FROM log_chunks WHERE at BETWEEN ? AND ? ORDER BY at, id LIMIT ?"#,
+                proj,
+                lo,
+                hi,
+                limit,
+            )
+            .fetch(conn)
+            .map(|r| r.map(|row| (row.at, row.stream, row.len, row.prefix))),
+        ),
+        (LogOrder::Descending, Some(_)) => Box::pin(
+            sqlx::query!(
+                r#"SELECT at AS "at!: i64", stream AS "stream!: i64",
+                      length(bytes) AS "len!: i64", substr(bytes, 1, ?) AS "prefix!: Vec<u8>"
+               FROM log_chunks WHERE at BETWEEN ? AND ? AND stream = ? ORDER BY at DESC, id DESC LIMIT ?"#,
+                proj,
+                lo,
+                hi,
+                stream_val,
+                limit,
+            )
+            .fetch(conn)
+            .map(|r| r.map(|row| (row.at, row.stream, row.len, row.prefix))),
+        ),
+        (LogOrder::Descending, None) => Box::pin(
+            sqlx::query!(
+                r#"SELECT at AS "at!: i64", stream AS "stream!: i64",
+                      length(bytes) AS "len!: i64", substr(bytes, 1, ?) AS "prefix!: Vec<u8>"
+               FROM log_chunks WHERE at BETWEEN ? AND ? ORDER BY at DESC, id DESC LIMIT ?"#,
+                proj,
+                lo,
+                hi,
+                limit,
+            )
+            .fetch(conn)
+            .map(|r| r.map(|row| (row.at, row.stream, row.len, row.prefix))),
+        ),
+    };
+    drain_projected(rows, budget).await
+}
+
+/// Count one segment's rows at exactly `at` — an index-only probe over the `at`
+/// index that decodes **no** payload, so an arbitrarily large cursor `skip` can
+/// be spent against these counts for free. Two static queries keep the optional
+/// stream filter compile-checked.
+async fn log_boundary_count(
+    conn: &mut SqliteConnection,
+    at: i64,
+    stream: Option<i64>,
+) -> Result<i64, StoreError> {
+    let n = match stream {
+        Some(stream) => {
+            sqlx::query!(
+                r#"SELECT COUNT(*) AS "n!: i64" FROM log_chunks WHERE at = ? AND stream = ?"#,
+                at,
+                stream,
+            )
+            .fetch_one(conn)
+            .await?
+            .n
+        }
+        None => {
+            sqlx::query!(
+                r#"SELECT COUNT(*) AS "n!: i64" FROM log_chunks WHERE at = ?"#,
+                at,
+            )
+            .fetch_one(conn)
+            .await?
+            .n
+        }
+    };
+    Ok(n)
+}
+
+/// Stream one segment's surviving **boundary** rows — those at exactly `at`,
+/// after `offset` (the per-segment share of the cursor `skip`), in the walk
+/// direction (`id` ascending / descending), projecting the same bounded prefix
+/// as [`log_beyond_rows`] and subject to the same byte cutoff via
+/// [`drain_projected`]. SQLite applies `OFFSET` over the `(at, id)` index
+/// without decoding payload for the skipped rows, so only the streamed rows
+/// materialize any `bytes` — and the cursor stops at the byte budget, so an
+/// enormous run of boundary rows costs at most `budget + 2·proj` per segment.
+/// Four static queries keep direction and stream filter compile-checked.
+#[allow(clippy::too_many_arguments)]
+async fn log_boundary_rows(
+    conn: &mut SqliteConnection,
+    at: i64,
+    stream: Option<i64>,
+    order: LogOrder,
+    limit: i64,
+    offset: i64,
+    proj: i64,
+    budget: u64,
+) -> Result<Vec<PageRow>, StoreError> {
+    use tokio_stream::StreamExt as _;
+    // Bind the filter value at function scope (see [`log_beyond_rows`]): the
+    // streamed cursor holds a reference to its bound args for its whole lifetime.
+    let stream_val = stream.unwrap_or_default();
+    let rows: ProjectedRowStream = match (order, stream) {
+        (LogOrder::Ascending, Some(_)) => Box::pin(
+            sqlx::query!(
+                r#"SELECT at AS "at!: i64", stream AS "stream!: i64",
+                      length(bytes) AS "len!: i64", substr(bytes, 1, ?) AS "prefix!: Vec<u8>"
+               FROM log_chunks WHERE at = ? AND stream = ? ORDER BY id LIMIT ? OFFSET ?"#,
+                proj,
+                at,
+                stream_val,
+                limit,
+                offset,
+            )
+            .fetch(conn)
+            .map(|r| r.map(|row| (row.at, row.stream, row.len, row.prefix))),
+        ),
+        (LogOrder::Ascending, None) => Box::pin(
+            sqlx::query!(
+                r#"SELECT at AS "at!: i64", stream AS "stream!: i64",
+                      length(bytes) AS "len!: i64", substr(bytes, 1, ?) AS "prefix!: Vec<u8>"
+               FROM log_chunks WHERE at = ? ORDER BY id LIMIT ? OFFSET ?"#,
+                proj,
+                at,
+                limit,
+                offset,
+            )
+            .fetch(conn)
+            .map(|r| r.map(|row| (row.at, row.stream, row.len, row.prefix))),
+        ),
+        (LogOrder::Descending, Some(_)) => Box::pin(
+            sqlx::query!(
+                r#"SELECT at AS "at!: i64", stream AS "stream!: i64",
+                      length(bytes) AS "len!: i64", substr(bytes, 1, ?) AS "prefix!: Vec<u8>"
+               FROM log_chunks WHERE at = ? AND stream = ? ORDER BY id DESC LIMIT ? OFFSET ?"#,
+                proj,
+                at,
+                stream_val,
+                limit,
+                offset,
+            )
+            .fetch(conn)
+            .map(|r| r.map(|row| (row.at, row.stream, row.len, row.prefix))),
+        ),
+        (LogOrder::Descending, None) => Box::pin(
+            sqlx::query!(
+                r#"SELECT at AS "at!: i64", stream AS "stream!: i64",
+                      length(bytes) AS "len!: i64", substr(bytes, 1, ?) AS "prefix!: Vec<u8>"
+               FROM log_chunks WHERE at = ? ORDER BY id DESC LIMIT ? OFFSET ?"#,
+                proj,
+                at,
+                limit,
+                offset,
+            )
+            .fetch(conn)
+            .map(|r| r.map(|row| (row.at, row.stream, row.len, row.prefix))),
+        ),
+    };
+    drain_projected(rows, budget).await
 }
 
 /// One metrics row as read back; the stored integer columns are widened back to
@@ -1005,6 +1942,7 @@ fn stored_chunk(at: i64, stream: i64, bytes: Vec<u8>) -> Option<StoredLogChunk> 
         at: Timestamp::from_micros(at)?,
         stream: LogStream::from_i64(stream),
         bytes: bytes::Bytes::from(bytes),
+        truncated: false,
     })
 }
 
@@ -2440,5 +3378,862 @@ mod tests {
         junk.write_all(b"junk").unwrap();
         let attempts = sink.list_attempts(None).await.unwrap();
         assert!(attempts.is_empty());
+    }
+
+    // ---- paged log query for FetchLogs (ADR 0034) --------------------------
+
+    /// An unfiltered, uncapped query in one direction — the base most tests tweak.
+    fn page_query(order: LogOrder) -> LogPageQuery {
+        LogPageQuery {
+            stream: None,
+            from: None,
+            until: None,
+            order,
+            resume: None,
+            max_chunks: 1000,
+            max_bytes: u64::MAX,
+        }
+    }
+
+    /// The `at` seconds of a page's chunks, in returned order (the test fixtures
+    /// stamp on whole-second boundaries via [`at`]).
+    fn ats(page: &LogPage) -> Vec<i64> {
+        page.chunks
+            .iter()
+            .map(|chunk| chunk.at.duration_since(Timestamp::UNIX_EPOCH).as_micros() / 1_000_000)
+            .collect()
+    }
+
+    /// One one-byte-cap segment per second `1..=n`, each holding a single
+    /// stdout chunk stamped at that second.
+    async fn one_segment_per_second(
+        sink: &FilesystemSink,
+        job: JobId,
+        attempt: AttemptId,
+        alloc: AllocationId,
+        n: i64,
+    ) {
+        for t in 1..=n {
+            sink.append_logs_at(
+                &[log(job, attempt, alloc, at(t), LogStream::Stdout, b"x")],
+                at(t),
+            )
+            .await;
+        }
+    }
+
+    /// ADR 0034 review (segment scaling): with warm bounds — which the writer
+    /// maintains for every segment it creates, so even a first read after the
+    /// writes is warm — a page opens only the segment(s) that can contribute,
+    /// no matter how many are retained. The one extra open is the top-k
+    /// look-ahead that proves more rows exist (`want = max_chunks + 1`).
+    #[tokio::test]
+    async fn log_page_opens_contributing_segments_not_all_retained() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |o| {
+            o.segment_max = ByteSize::from_bytes(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        const SEGMENTS: i64 = 8;
+        one_segment_per_second(&sink, job, attempt, alloc, SEGMENTS).await;
+
+        // Newest-first single-row page: the newest segment plus at most one
+        // look-ahead, out of eight retained.
+        let before = sink.inner.segments_opened.load(Ordering::Relaxed);
+        let mut query = page_query(LogOrder::Descending);
+        query.max_chunks = 1;
+        let page = sink.log_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(ats(&page), vec![SEGMENTS]);
+        assert!(!page.exhausted);
+        let opened = sink.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(opened <= 2, "opened {opened} of {SEGMENTS} segments");
+        // Whole-attempt bounds come from the cache, not per-request probes.
+        assert_eq!(page.earliest_at, Some(at(1)));
+        assert_eq!(page.latest_at, Some(at(SEGMENTS)));
+
+        // A time-window page over one old segment's range opens exactly that
+        // segment: the window bounds every other candidate out.
+        let before = sink.inner.segments_opened.load(Ordering::Relaxed);
+        let mut query = page_query(LogOrder::Ascending);
+        query.from = Some(at(3));
+        query.until = Some(at(4)); // half-open [3s, 4s) → only t=3
+        let page = sink.log_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(ats(&page), vec![3]);
+        assert!(page.exhausted);
+        let opened = sink.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert_eq!(opened, 1, "only the covering segment is opened");
+    }
+
+    /// A fresh sink handle over an existing tree (restart) probes each segment
+    /// once to rebuild the bounds cache, then pages stay O(contributing).
+    #[tokio::test]
+    async fn log_page_cold_cache_probes_once_then_stays_bounded() {
+        let root = TempDir::new().unwrap();
+        let tel = root.path().join("tel");
+        let writer = sink_with(tel.clone(), |o| {
+            o.segment_max = ByteSize::from_bytes(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        const SEGMENTS: i64 = 6;
+        one_segment_per_second(&writer, job, attempt, alloc, SEGMENTS).await;
+
+        // A separate handle shares nothing in memory with the writer.
+        let reader = sink_with(tel, |_| {}).await;
+        let mut query = page_query(LogOrder::Descending);
+        query.max_chunks = 1;
+
+        // Cold: every segment is probed once (index-only bounds), plus the
+        // bounded page pull itself.
+        let before = reader.inner.segments_opened.load(Ordering::Relaxed);
+        let page = reader.log_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(ats(&page), vec![SEGMENTS]);
+        let cold = reader.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(
+            (SEGMENTS as u64..=SEGMENTS as u64 + 2).contains(&cold),
+            "cold read probes each segment once (+bounded pull), opened {cold}"
+        );
+
+        // Warm: the cache carries the bounds; only the contributing tail opens.
+        let before = reader.inner.segments_opened.load(Ordering::Relaxed);
+        let page = reader.log_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(ats(&page), vec![SEGMENTS]);
+        let warm = reader.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(warm <= 2, "warm read opened {warm} of {SEGMENTS}");
+    }
+
+    /// The writer's post-commit bounds notes keep the cache fresh: rows landed
+    /// after the cache was built are served without re-probing the tree.
+    #[tokio::test]
+    async fn log_page_writer_notes_keep_warm_cache_fresh() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |o| {
+            o.segment_max = ByteSize::from_bytes(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        one_segment_per_second(&sink, job, attempt, alloc, 4).await;
+
+        let mut query = page_query(LogOrder::Descending);
+        query.max_chunks = 1;
+        let page = sink.log_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(ats(&page), vec![4]);
+
+        // A new row in a new segment after the cache is warm.
+        sink.append_logs_at(
+            &[log(job, attempt, alloc, at(5), LogStream::Stdout, b"x")],
+            at(5),
+        )
+        .await;
+        let before = sink.inner.segments_opened.load(Ordering::Relaxed);
+        let page = sink.log_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(ats(&page), vec![5], "the freshly written row is visible");
+        let opened = sink.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(opened <= 2, "no re-probe of old segments, opened {opened}");
+    }
+
+    #[tokio::test]
+    async fn log_page_walks_both_directions_and_reports_bounds() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let batch: Vec<LogChunk> = (1..=3)
+            .map(|s| log(job, attempt, alloc, at(s), LogStream::Stdout, b"x"))
+            .collect();
+        sink.append_logs_at(&batch, at(10)).await;
+
+        let asc = sink
+            .log_page(&job, &attempt, &page_query(LogOrder::Ascending))
+            .await
+            .unwrap();
+        assert_eq!(ats(&asc), vec![1, 2, 3]);
+        assert!(asc.exhausted, "the whole window fit");
+        assert_eq!(asc.earliest_at, Some(at(1)));
+        assert_eq!(asc.latest_at, Some(at(3)));
+
+        let desc = sink
+            .log_page(&job, &attempt, &page_query(LogOrder::Descending))
+            .await
+            .unwrap();
+        assert_eq!(ats(&desc), vec![3, 2, 1], "descending is the reverse walk");
+        // Bounds span the whole attempt regardless of direction.
+        assert_eq!(desc.earliest_at, Some(at(1)));
+        assert_eq!(desc.latest_at, Some(at(3)));
+    }
+
+    #[tokio::test]
+    async fn log_page_resume_is_exclusive_across_chunks_at_one_microsecond() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // Three chunks at exactly t=5 (a, b, c) plus one at t=6, one batch so the
+        // insertion order at t=5 is a<b<c.
+        let batch = vec![
+            log(job, attempt, alloc, at(5), LogStream::Stdout, b"a"),
+            log(job, attempt, alloc, at(5), LogStream::Stdout, b"b"),
+            log(job, attempt, alloc, at(5), LogStream::Stdout, b"c"),
+            log(job, attempt, alloc, at(6), LogStream::Stdout, b"d"),
+        ];
+        sink.append_logs_at(&batch, at(10)).await;
+
+        let payloads = |page: &LogPage| -> Vec<Vec<u8>> {
+            page.chunks.iter().map(|c| c.bytes.to_vec()).collect()
+        };
+
+        // Ascending resume at t=5 skipping 1 (consumed `a`) resumes strictly
+        // after it: b, c, then d.
+        let mut q = page_query(LogOrder::Ascending);
+        q.resume = Some(ResumeAt { at: at(5), skip: 1 });
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(
+            payloads(&page),
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+
+        // skip = 3 consumes the whole t=5 run; only d remains.
+        q.resume = Some(ResumeAt { at: at(5), skip: 3 });
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(payloads(&page), vec![b"d".to_vec()]);
+        assert!(page.exhausted);
+
+        // Descending walk is c, b, a, then d is already past; resume at t=6
+        // skip 1 consumes d, resuming at c, b, a.
+        let mut qd = page_query(LogOrder::Descending);
+        qd.resume = Some(ResumeAt { at: at(6), skip: 1 });
+        let page = sink.log_page(&job, &attempt, &qd).await.unwrap();
+        assert_eq!(
+            payloads(&page),
+            vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()],
+            "descending resume drops the t=6 run, then walks t=5 newest-insertion-first reversed"
+        );
+
+        // Descending resume within the t=5 run: skip 1 (consumed `c`) → b, a.
+        qd.resume = Some(ResumeAt { at: at(5), skip: 1 });
+        let page = sink.log_page(&job, &attempt, &qd).await.unwrap();
+        assert_eq!(payloads(&page), vec![b"b".to_vec(), b"a".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn log_page_range_is_half_open() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let batch: Vec<LogChunk> = (1..=4)
+            .map(|s| log(job, attempt, alloc, at(s), LogStream::Stdout, b"x"))
+            .collect();
+        sink.append_logs_at(&batch, at(10)).await;
+
+        let mut q = page_query(LogOrder::Ascending);
+        q.from = Some(at(2));
+        q.until = Some(at(4));
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(ats(&page), vec![2, 3], "from inclusive, until exclusive");
+        // Bounds still reflect the full attempt, so a `from` past the earliest
+        // signals head truncation to the caller.
+        assert_eq!(page.earliest_at, Some(at(1)));
+        assert_eq!(page.latest_at, Some(at(4)));
+    }
+
+    #[tokio::test]
+    async fn log_page_byte_cap_short_page_and_always_progresses() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // Three 4-byte chunks.
+        let batch: Vec<LogChunk> = (1..=3)
+            .map(|s| log(job, attempt, alloc, at(s), LogStream::Stdout, b"abcd"))
+            .collect();
+        sink.append_logs_at(&batch, at(10)).await;
+
+        // A 6-byte cap fits one 4-byte chunk; a second (total 8) would exceed it.
+        let mut q = page_query(LogOrder::Ascending);
+        q.max_bytes = 6;
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(ats(&page), vec![1], "stops before exceeding max_bytes");
+        assert!(!page.chunks[0].truncated, "a fitting first chunk is whole");
+        assert!(!page.exhausted, "a cap cut the page short");
+
+        // A cap below even one chunk still makes progress, but the oversized
+        // first chunk is TRUNCATED to the budget and flagged — never returned
+        // whole in violation of the hard cap (ADR 0034, the bypass fix).
+        q.max_bytes = 1;
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(ats(&page), vec![1], "the first chunk still makes progress");
+        assert_eq!(
+            page.chunks[0].bytes.as_ref(),
+            b"a",
+            "payload cut to the 1-byte budget, not served whole"
+        );
+        assert!(page.chunks[0].truncated, "and flagged as truncated");
+        assert!(!page.exhausted, "two whole chunks still remain");
+    }
+
+    #[tokio::test]
+    async fn log_page_max_chunks_cap_and_exhausted_flag() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let batch: Vec<LogChunk> = (1..=3)
+            .map(|s| log(job, attempt, alloc, at(s), LogStream::Stdout, b"x"))
+            .collect();
+        sink.append_logs_at(&batch, at(10)).await;
+
+        let mut q = page_query(LogOrder::Ascending);
+        q.max_chunks = 2;
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(ats(&page), vec![1, 2]);
+        assert!(!page.exhausted, "a third chunk remains");
+
+        // The follow-up page from the cursor position exhausts the walk.
+        q.resume = Some(ResumeAt { at: at(2), skip: 1 });
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(ats(&page), vec![3]);
+        assert!(page.exhausted, "the walk reached the end");
+    }
+
+    #[tokio::test]
+    async fn log_page_filters_by_stream() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let batch = vec![
+            log(job, attempt, alloc, at(1), LogStream::Stdout, b"out"),
+            log(job, attempt, alloc, at(2), LogStream::Stderr, b"err"),
+            log(job, attempt, alloc, at(3), LogStream::Stdout, b"out2"),
+        ];
+        sink.append_logs_at(&batch, at(10)).await;
+
+        let mut q = page_query(LogOrder::Ascending);
+        q.stream = Some(LogStream::Stderr);
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(ats(&page), vec![2], "only the stderr chunk");
+        // Bounds reflect the filtered stream: the only stderr chunk is its own
+        // earliest and latest.
+        assert_eq!(page.earliest_at, Some(at(2)));
+        assert_eq!(page.latest_at, Some(at(2)));
+    }
+
+    #[tokio::test]
+    async fn log_page_probes_every_segment_including_backdated_rows() {
+        let root = TempDir::new().unwrap();
+        // A 1s age bound forces the second append to roll to a fresh segment.
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max_age = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // Segment 1 (created at now=100) holds a row at t=100.
+        sink.append_logs_at(
+            &[log(
+                job,
+                attempt,
+                alloc,
+                at(100),
+                LogStream::Stdout,
+                b"newer",
+            )],
+            at(100),
+        )
+        .await;
+        // Segment 2 (created at now=200, so it rolls) holds a row at t=50 —
+        // OLDER than segment 1's filename start (the §8.2 replay caveat).
+        sink.append_logs_at(
+            &[log(
+                job,
+                attempt,
+                alloc,
+                at(50),
+                LogStream::Stdout,
+                b"older",
+            )],
+            at(200),
+        )
+        .await;
+        assert_eq!(
+            segment_files(&attempt_dir(&sink, job, attempt)).len(),
+            2,
+            "the second append rolled to a fresh segment"
+        );
+
+        let page = sink
+            .log_page(&job, &attempt, &page_query(LogOrder::Ascending))
+            .await
+            .unwrap();
+        assert_eq!(
+            ats(&page),
+            vec![50, 100],
+            "the backdated row in the newer segment is found and ordered by at"
+        );
+        assert_eq!(page.earliest_at, Some(at(50)));
+        assert_eq!(page.latest_at, Some(at(100)));
+    }
+
+    #[tokio::test]
+    async fn log_page_unknown_attempt_when_no_directory() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt) = (JobId::new(), AttemptId::new());
+        let err = sink
+            .log_page(&job, &attempt, &page_query(LogOrder::Ascending))
+            .await
+            .expect_err("an attempt with no telemetry directory is unknown");
+        assert!(matches!(err, StoreError::UnknownAttempt { .. }));
+    }
+
+    #[tokio::test]
+    async fn log_page_empty_when_directory_exists_but_holds_no_logs() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // A metrics-only attempt: the directory exists, but there are no log
+        // rows — a valid empty page, NOT UnknownAttempt.
+        sink.append_metrics_at(&[metric(job, attempt, alloc, at(1))], at(10))
+            .await;
+        let page = sink
+            .log_page(&job, &attempt, &page_query(LogOrder::Ascending))
+            .await
+            .unwrap();
+        assert!(page.chunks.is_empty());
+        assert!(page.exhausted, "an empty walk is exhausted");
+        assert_eq!(page.earliest_at, None);
+        assert_eq!(page.latest_at, None);
+    }
+
+    // An oversized first chunk is truncated to the byte budget and flagged, and
+    // the resume cursor advances past it *whole* — the next page continues at the
+    // following chunk, never re-serving the dropped tail (ADR 0034 bypass fix).
+    #[tokio::test]
+    async fn log_page_truncates_oversized_first_chunk_and_resume_continues_past_it() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let batch = vec![
+            log(job, attempt, alloc, at(1), LogStream::Stdout, b"0123456789"),
+            log(job, attempt, alloc, at(2), LogStream::Stdout, b"x"),
+            log(job, attempt, alloc, at(3), LogStream::Stdout, b"y"),
+        ];
+        sink.append_logs_at(&batch, at(10)).await;
+
+        // A 4-byte cap is smaller than the 10-byte first chunk: it comes back cut
+        // to 4 bytes and flagged, the page ends there (more remains).
+        let mut q = page_query(LogOrder::Ascending);
+        q.max_bytes = 4;
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(page.chunks.len(), 1);
+        assert_eq!(
+            page.chunks[0].bytes.as_ref(),
+            b"0123",
+            "payload cut to the 4-byte budget"
+        );
+        assert!(page.chunks[0].truncated, "and flagged truncated");
+        assert!(!page.exhausted, "the page stopped short with more to come");
+
+        // The cursor advances past the whole chunk: resume at (at(1), skip=1) —
+        // one chunk consumed at that microsecond — yields the *following* chunks,
+        // never the dropped tail of the truncated one.
+        q.resume = Some(ResumeAt { at: at(1), skip: 1 });
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        let payloads: Vec<&[u8]> = page.chunks.iter().map(|c| c.bytes.as_ref()).collect();
+        assert_eq!(
+            payloads,
+            vec![b"x".as_ref(), b"y".as_ref()],
+            "resume continues at the next chunk, tail of the truncated chunk is gone"
+        );
+        assert!(page.chunks.iter().all(|c| !c.truncated));
+        assert!(page.exhausted);
+    }
+
+    // A small page over a many-thousand-row, multi-segment attempt must decode
+    // only a bounded handful of rows — the caps bound the *input* scan, not just
+    // the returned page (ADR 0034 review: a 256 MiB segment must never be fully
+    // materialized to serve `limit=1`).
+    #[tokio::test]
+    async fn log_page_bounds_the_store_read_not_just_the_returned_page() {
+        let root = TempDir::new().unwrap();
+        // A 1s age bound rolls a fresh segment on each append batch.
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max_age = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+
+        // Three segments, ~2000 rows each (6000 total), disjoint ascending `at`
+        // ranges matching creation order so the global newest lives in the last.
+        const PER_SEGMENT: i64 = 2000;
+        const SEGMENTS: i64 = 3;
+        for seg in 0..SEGMENTS {
+            let base = seg * PER_SEGMENT;
+            let batch: Vec<LogChunk> = (0..PER_SEGMENT)
+                .map(|i| log(job, attempt, alloc, at(base + i), LogStream::Stdout, b"x"))
+                .collect();
+            // A creation `now` far in the future of every event time and 10s past
+            // the previous segment, so the age bound rolls a new segment each time.
+            sink.append_logs_at(&batch, at(1_000_000 + seg * 10)).await;
+        }
+        assert_eq!(
+            segment_files(&attempt_dir(&sink, job, attempt)).len(),
+            SEGMENTS as usize,
+            "one segment per rolled batch"
+        );
+
+        // Measure only the decode work of a single `limit=1` newest-first page.
+        sink.inner.rows_decoded.store(0, Ordering::Relaxed);
+        let mut q = page_query(LogOrder::Descending);
+        q.max_chunks = 1;
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        let decoded = sink.inner.rows_decoded.load(Ordering::Relaxed);
+
+        // Correctness: the one returned chunk is the global newest, and the
+        // whole-attempt bounds are exact (from the cheap MIN/MAX probes).
+        assert_eq!(page.chunks.len(), 1);
+        assert_eq!(page.chunks[0].at, at(SEGMENTS * PER_SEGMENT - 1));
+        assert_eq!(page.earliest_at, Some(at(0)));
+        assert_eq!(page.latest_at, Some(at(SEGMENTS * PER_SEGMENT - 1)));
+
+        // Boundedness: with `max_chunks = 1` and no resume, each segment reads at
+        // most `1 + 1` rows (the page row plus the single exhaustion-lookahead
+        // row), so the whole 6000-row attempt costs at most `2 * SEGMENTS` decoded
+        // rows — a handful, not the full store.
+        let total_rows = (SEGMENTS * PER_SEGMENT) as u64;
+        let ceiling = 2 * SEGMENTS as u64;
+        assert!(
+            decoded <= ceiling,
+            "decoded {decoded} rows for a limit=1 page; expected <= {ceiling} \
+             (a bounded handful across {SEGMENTS} segments), far below the \
+             {total_rows} stored"
+        );
+    }
+
+    // A cursor `skip` near `u64::MAX` must never re-enable payload decoding: the
+    // boundary microsecond is skipped through index-only `COUNT`s, so a populated
+    // multi-segment attempt with thousands of chunks at that microsecond costs
+    // *zero* payload decode there, and only the rows strictly beyond it are
+    // served (ADR 0034 review: the input bound must be independent of the
+    // untrusted, unsigned cursor).
+    #[tokio::test]
+    async fn log_page_adversarial_large_skip_decodes_nothing_at_the_boundary() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max_age = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+
+        // Three segments, each ~2000 chunks all at exactly t=5 (6000 at the one
+        // boundary microsecond), plus a lone chunk strictly beyond at t=6.
+        const PER_SEGMENT: i64 = 2000;
+        const SEGMENTS: i64 = 3;
+        for seg in 0..SEGMENTS {
+            let mut batch: Vec<LogChunk> = (0..PER_SEGMENT)
+                .map(|_| log(job, attempt, alloc, at(5), LogStream::Stdout, b"B"))
+                .collect();
+            if seg == SEGMENTS - 1 {
+                batch.push(log(
+                    job,
+                    attempt,
+                    alloc,
+                    at(6),
+                    LogStream::Stdout,
+                    b"beyond",
+                ));
+            }
+            sink.append_logs_at(&batch, at(1_000_000 + seg * 10)).await;
+        }
+        assert_eq!(
+            segment_files(&attempt_dir(&sink, job, attempt)).len(),
+            SEGMENTS as usize
+        );
+
+        // Ascending, resume at the boundary with a skip near u64::MAX: the whole
+        // t=5 run is consumed, so only the lone t=6 chunk survives.
+        sink.inner.rows_decoded.store(0, Ordering::Relaxed);
+        sink.inner.bytes_materialized.store(0, Ordering::Relaxed);
+        let mut q = page_query(LogOrder::Ascending);
+        q.max_chunks = 10;
+        q.resume = Some(ResumeAt {
+            at: at(5),
+            skip: u64::MAX,
+        });
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        let decoded = sink.inner.rows_decoded.load(Ordering::Relaxed);
+        let bytes = sink.inner.bytes_materialized.load(Ordering::Relaxed);
+
+        // Correct: the boundary is fully skipped, the beyond chunk is served whole.
+        assert_eq!(
+            page.chunks
+                .iter()
+                .map(|c| c.bytes.to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"beyond".to_vec()]
+        );
+        assert!(page.exhausted);
+        assert!(page.chunks.iter().all(|c| !c.truncated));
+
+        // Bounded: the 6000 boundary rows decoded NOTHING (COUNTs only); the sole
+        // decode is the single beyond chunk — exactly one row, six bytes — wholly
+        // independent of the u64::MAX skip. The boundary's 6000 stored bytes never
+        // materialized.
+        assert_eq!(
+            decoded, 1,
+            "only the lone beyond row decoded; the 6000 boundary rows cost only COUNTs"
+        );
+        assert_eq!(bytes, 6, "only the 6-byte beyond payload materialized");
+    }
+
+    // Thousands of chunks sharing ONE microsecond across segments, paged through
+    // with real cursors whose `skip` accumulates page by page. Each page's decode
+    // and byte materialization stay bounded — independent of the growing skip —
+    // while pagination is loss-free and correctly ordered (ADR 0034 review: a
+    // legitimate cursor can accumulate a large skip within one microsecond).
+    #[tokio::test]
+    async fn log_page_accumulated_skip_stays_bounded_and_lossless() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max_age = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+
+        // Three segments, every chunk at exactly t=5. Payloads are the global walk
+        // index (ascending walk = segment order then insertion order), so the
+        // paged-out concatenation must be exactly 0..TOTAL.
+        const PER_SEGMENT: u32 = 1500;
+        const SEGMENTS: u32 = 3;
+        const TOTAL: u32 = PER_SEGMENT * SEGMENTS;
+        for seg in 0..SEGMENTS {
+            let batch: Vec<LogChunk> = (0..PER_SEGMENT)
+                .map(|i| {
+                    let idx = seg * PER_SEGMENT + i;
+                    log(
+                        job,
+                        attempt,
+                        alloc,
+                        at(5),
+                        LogStream::Stdout,
+                        &idx.to_be_bytes(),
+                    )
+                })
+                .collect();
+            sink.append_logs_at(&batch, at(1_000_000 + seg as i64 * 10))
+                .await;
+        }
+        assert_eq!(
+            segment_files(&attempt_dir(&sink, job, attempt)).len(),
+            SEGMENTS as usize
+        );
+
+        const PAGE: usize = 100;
+        let want = PAGE as u64 + 1;
+        // Per page: at most `want` boundary survivors (total, however many
+        // segments they span) plus a `want`-capped beyond read per segment.
+        let ceiling = (1 + SEGMENTS as u64) * want;
+        let mut collected: Vec<u32> = Vec::new();
+        let mut skip = 0u64;
+        loop {
+            sink.inner.rows_decoded.store(0, Ordering::Relaxed);
+            sink.inner.bytes_materialized.store(0, Ordering::Relaxed);
+            let mut q = page_query(LogOrder::Ascending);
+            q.max_chunks = PAGE;
+            q.resume = Some(ResumeAt { at: at(5), skip });
+            let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+            let decoded = sink.inner.rows_decoded.load(Ordering::Relaxed);
+            let bytes = sink.inner.bytes_materialized.load(Ordering::Relaxed);
+
+            assert!(
+                decoded <= ceiling,
+                "page at skip={skip} decoded {decoded} rows; expected <= {ceiling} \
+                 (bounded regardless of the accumulated skip)"
+            );
+            assert!(
+                bytes <= ceiling * 4,
+                "page at skip={skip} materialized {bytes} bytes; expected <= {} \
+                 (each of the 4-byte rows projection-bounded)",
+                ceiling * 4
+            );
+
+            for c in &page.chunks {
+                collected.push(u32::from_be_bytes(c.bytes.as_ref().try_into().unwrap()));
+            }
+            skip += page.chunks.len() as u64;
+            if page.exhausted {
+                break;
+            }
+            assert!(
+                !page.chunks.is_empty(),
+                "a non-exhausted page must make progress"
+            );
+        }
+
+        // Loss-free and correctly ordered: exactly 0..TOTAL, in order, no gaps or
+        // duplicates.
+        assert_eq!(
+            collected.len(),
+            TOTAL as usize,
+            "every chunk returned exactly once across the paged walk"
+        );
+        assert!(
+            collected.iter().copied().eq(0..TOTAL),
+            "the paged walk reconstructs the in-order sequence with no gaps or dups"
+        );
+    }
+
+    // A multi-MiB stored chunk paged with a small `max_bytes` must NOT materialize
+    // the full row: the `substr` projection caps input bytes to the budget, and
+    // the response is truncated to the budget and flagged, exactly as the byte-cap
+    // contract requires (ADR 0034 review: bound payload projection before
+    // materialization).
+    #[tokio::test]
+    async fn log_page_oversized_row_materializes_only_the_budget() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+
+        const HUGE: usize = 4 * 1024 * 1024; // 4 MiB
+        let huge = vec![b'Z'; HUGE];
+        let batch = vec![
+            log(job, attempt, alloc, at(1), LogStream::Stdout, &huge),
+            log(job, attempt, alloc, at(2), LogStream::Stdout, b"tail"),
+        ];
+        sink.append_logs_at(&batch, at(10)).await;
+
+        const BUDGET: u64 = 1024; // 1 KiB
+        sink.inner.rows_decoded.store(0, Ordering::Relaxed);
+        sink.inner.bytes_materialized.store(0, Ordering::Relaxed);
+        let mut q = page_query(LogOrder::Ascending);
+        q.max_bytes = BUDGET;
+        q.max_chunks = 10;
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        let bytes = sink.inner.bytes_materialized.load(Ordering::Relaxed);
+
+        // The response honors the truncation contract: the oversized chunk is cut
+        // to the budget and flagged; the page stops there (more remains).
+        assert_eq!(page.chunks.len(), 1);
+        assert_eq!(
+            page.chunks[0].bytes.len(),
+            BUDGET as usize,
+            "cut to the byte budget"
+        );
+        assert!(page.chunks[0].bytes.iter().all(|&b| b == b'Z'));
+        assert!(page.chunks[0].truncated, "and flagged truncated");
+        assert!(!page.exhausted, "the tail chunk still remains");
+
+        // Bounded: the 4 MiB row never fully materialized. Every projected row is
+        // capped at BUDGET+1 bytes, so the whole page materialized only a few KiB,
+        // not 4 MiB.
+        let ceiling = (BUDGET + 1) * 4;
+        assert!(
+            bytes <= ceiling,
+            "materialized {bytes} bytes for a 4 MiB stored row; expected <= {ceiling} \
+             (projection bounded to the byte budget, not the stored size)"
+        );
+        assert!(
+            (bytes as usize) < HUGE,
+            "materialized {bytes} bytes, far below the {HUGE}-byte stored payload"
+        );
+    }
+
+    // The per-segment window is pulled with a byte-based early cutoff, not an
+    // eager `LIMIT max_chunks+1` fetch: a small `max_bytes` over an attempt of
+    // ~1000 medium rows across several segments must materialize only ~`max_bytes`
+    // per segment — O(segments × max_bytes) — NOT `max_chunks × max_bytes` per
+    // segment (ADR 0034 review: the LIMIT window would otherwise pull ~1001
+    // budget-sized rows per segment). `max_chunks` is set far above the row count
+    // so the byte budget is the sole binding cap.
+    #[tokio::test]
+    async fn log_page_window_pull_is_byte_bounded_per_segment_not_row_bounded() {
+        let root = TempDir::new().unwrap();
+        // A 1s age bound rolls a fresh segment on each append batch.
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max_age = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+
+        // Two segments, 500 rows each (1000 total), every row 64 KiB, disjoint
+        // ascending `at` ranges matching creation order (~64 MiB stored).
+        const ROW: usize = 64 * 1024;
+        const PER_SEGMENT: i64 = 500;
+        const SEGMENTS: i64 = 2;
+        const BUDGET: u64 = 64 * 1024; // small page byte budget = one row
+        for seg in 0..SEGMENTS {
+            let base = seg * PER_SEGMENT;
+            let payload = vec![b'x'; ROW];
+            let batch: Vec<LogChunk> = (0..PER_SEGMENT)
+                .map(|i| {
+                    log(
+                        job,
+                        attempt,
+                        alloc,
+                        at(base + i),
+                        LogStream::Stdout,
+                        &payload,
+                    )
+                })
+                .collect();
+            sink.append_logs_at(&batch, at(1_000_000 + seg * 10)).await;
+        }
+        assert_eq!(
+            segment_files(&attempt_dir(&sink, job, attempt)).len(),
+            SEGMENTS as usize,
+            "one segment per rolled batch"
+        );
+
+        sink.inner.rows_decoded.store(0, Ordering::Relaxed);
+        sink.inner.bytes_materialized.store(0, Ordering::Relaxed);
+        let mut q = page_query(LogOrder::Ascending);
+        q.max_bytes = BUDGET;
+        q.max_chunks = 10_000; // far above the 1000 stored rows: the byte cap binds
+        let page = sink.log_page(&job, &attempt, &q).await.unwrap();
+        let decoded = sink.inner.rows_decoded.load(Ordering::Relaxed);
+        let bytes = sink.inner.bytes_materialized.load(Ordering::Relaxed);
+
+        // Correct: the 64 KiB budget fits exactly one 64 KiB chunk (the global
+        // oldest), it is returned whole and un-truncated, and the page reports a
+        // further page exists. Whole-attempt bounds are exact.
+        assert_eq!(
+            page.chunks.len(),
+            1,
+            "one 64 KiB chunk fills the 64 KiB budget"
+        );
+        assert_eq!(page.chunks[0].at, at(0), "the global oldest, ascending");
+        assert_eq!(
+            page.chunks[0].bytes.len(),
+            ROW,
+            "returned whole, within budget"
+        );
+        assert!(
+            !page.chunks[0].truncated,
+            "a within-budget chunk is not truncated"
+        );
+        assert!(!page.exhausted, "999 rows remain");
+        assert_eq!(page.earliest_at, Some(at(0)));
+        assert_eq!(page.latest_at, Some(at(SEGMENTS * PER_SEGMENT - 1)));
+
+        // The net property: bytes materialized is O(segments × max_bytes), NOT
+        // O(segments × max_chunks × max_bytes). Each segment streams only until
+        // its projected bytes reach the budget (one row) plus a single look-ahead
+        // row, so it materializes ~2 × BUDGET; across the two segments that is
+        // ~4 × BUDGET, a couple hundred KiB — while an eager `LIMIT max_chunks+1`
+        // pull would have materialized all 1000 rows (~64 MiB).
+        let ceiling = SEGMENTS as u64 * 2 * (BUDGET + 1);
+        let stored = (SEGMENTS * PER_SEGMENT) as u64 * ROW as u64;
+        assert!(
+            bytes <= ceiling,
+            "materialized {bytes} bytes for a {BUDGET}-byte page over {SEGMENTS} \
+             segments; expected <= {ceiling} (~segments × 2 × max_bytes), NOT the \
+             per-segment max_chunks × max_bytes an eager LIMIT window would pull"
+        );
+        assert!(
+            bytes < stored / 100,
+            "materialized {bytes} bytes, orders of magnitude below the {stored} \
+             bytes stored across the 1000 rows"
+        );
+        // A bounded handful of rows decoded (two per segment), not the full store.
+        assert!(
+            decoded <= SEGMENTS as u64 * 2,
+            "decoded {decoded} rows; expected <= {} (a look-ahead pair per segment)",
+            SEGMENTS as u64 * 2
+        );
     }
 }

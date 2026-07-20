@@ -13,6 +13,7 @@
 //! path so the file stays safe to commit, diff, and attach to support bundles.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -99,6 +100,48 @@ pub struct Config {
     /// whole, so a bare v1 config stays valid.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// The agent-hosted `NodeService` listener (ADR 0034). Optional and absent
+    /// by default: an agent with no `[listen]` table hosts no service, advertises
+    /// no `service_addr` at registration, and its logs are simply unreachable
+    /// off-node — a legitimate deployment posture. When present, the agent binds
+    /// this listener eagerly at startup (fail-fast on a port conflict) and
+    /// advertises the derived address so coordinators can dial it for job logs.
+    #[serde(default)]
+    pub listen: Option<ListenConfig>,
+}
+
+/// Bind/advertise addresses for the agent-hosted `NodeService` listener
+/// (ADR 0034), mirroring the coordinator's `ListenConfig` split: a `0.0.0.0`
+/// bind is never a dialable address, so the advertise host is explicit and has
+/// no default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenConfig {
+    /// The address the `NodeService` mTLS listener binds. Defaults to
+    /// `0.0.0.0:7073` (any interface) — dialability is the advertise host's job,
+    /// not the bind address's.
+    #[serde(default = "default_service_addr")]
+    pub addr: SocketAddr,
+
+    /// The hostname coordinators dial. No default: `0.0.0.0` binds are never
+    /// dialable, so an operator enabling the listener must state the reachable
+    /// name explicitly. Composed with the bind port into the advertised
+    /// `service_addr` ([`ListenConfig::advertised_service_addr`]).
+    pub advertise_host: String,
+}
+
+impl ListenConfig {
+    /// The `NodeService` address this agent advertises at registration:
+    /// `advertise_host` combined with the port half of
+    /// [`addr`](ListenConfig::addr).
+    ///
+    /// A method rather than a stored field so bind and advertisement can never
+    /// silently drift when either is edited (the coordinator's
+    /// `advertised_raft_addr` precedent).
+    pub fn advertised_service_addr(&self) -> String {
+        format!("{}:{}", self.advertise_host, self.addr.port())
+    }
 }
 
 /// Container-executor configuration (docker-executor.md §10). Node-local knobs
@@ -412,6 +455,15 @@ impl Config {
         self.node_id
     }
 
+    /// The advertised `NodeService` address (ADR 0034), or `None` when no
+    /// `[listen]` table is configured — in which case nothing is advertised and
+    /// the agent hosts no service.
+    pub fn service_addr(&self) -> Option<String> {
+        self.listen
+            .as_ref()
+            .map(ListenConfig::advertised_service_addr)
+    }
+
     /// Reject semantically invalid values that `serde` alone cannot catch:
     /// bounds and cross-field ordering. `serde`'s `deny_unknown_fields` and
     /// the humane-duration codec handle shape and typos; this handles meaning.
@@ -467,6 +519,13 @@ impl Config {
             );
         }
         self.telemetry.validate()?;
+        if let Some(listen) = &self.listen {
+            if listen.advertise_host.trim().is_empty() {
+                anyhow::bail!(
+                    "listen.advertise_host must be a non-empty dialable hostname (ADR 0034)"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -489,6 +548,7 @@ impl Config {
             pressure = ?self.pressure,
             image_cache = ?self.image_cache,
             telemetry = ?self.telemetry,
+            service_addr = ?self.service_addr(),
             "effective agent configuration"
         );
     }
@@ -606,6 +666,13 @@ fn default_sinks() -> Vec<SinkConfig> {
     })]
 }
 
+fn default_service_addr() -> SocketAddr {
+    // Any interface, the agent's dedicated NodeService port. Dialability is the
+    // advertise host's job (0.0.0.0 is never dialable), so binding wide here is
+    // fine — the coordinator only ever reaches the advertised address.
+    SocketAddr::from(([0, 0, 0, 0], 7073))
+}
+
 fn default_high_pct() -> u8 {
     85
 }
@@ -704,6 +771,10 @@ dir = "/var/lib/coppice-agent/telemetry"
 type = "filesystem"
 kinds = ["logs"]
 retention = "30m"
+
+[listen]
+addr = "0.0.0.0:7085"
+advertise_host = "node-3.batch.example.com"
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
@@ -789,6 +860,70 @@ disk       = "100GiB"
                 }),
             ]
         );
+        // The `[listen]` table advertises the derived `service_addr`: the
+        // advertise host combined with the bind port (ADR 0034).
+        let listen = config.listen.as_ref().expect("listen table present");
+        assert_eq!(listen.addr, "0.0.0.0:7085".parse().unwrap());
+        assert_eq!(listen.advertise_host, "node-3.batch.example.com");
+        assert_eq!(
+            config.service_addr().as_deref(),
+            Some("node-3.batch.example.com:7085")
+        );
+    }
+
+    #[test]
+    fn absent_listen_table_advertises_nothing() {
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let config = load(&path).expect("minimal example should parse");
+        assert!(
+            config.listen.is_none(),
+            "no [listen] table ⇒ no hosted service"
+        );
+        assert_eq!(config.service_addr(), None, "nothing advertised");
+    }
+
+    #[test]
+    fn listen_addr_defaults_when_only_advertise_host_given() {
+        let toml = format!("{MINIMAL_EXAMPLE}\n[listen]\nadvertise_host = \"agent.internal\"\n");
+        let (_guard, path) = write_config(&toml);
+        let config = load(&path).expect("advertise_host alone should parse");
+        let listen = config.listen.as_ref().expect("listen table present");
+        assert_eq!(listen.addr, default_service_addr());
+        // The advertised address composes the host with the default bind port.
+        assert_eq!(
+            config.service_addr().as_deref(),
+            Some("agent.internal:7073")
+        );
+    }
+
+    #[test]
+    fn listen_table_without_advertise_host_is_rejected() {
+        // `advertise_host` has no default (0.0.0.0 binds are never dialable), so
+        // an operator enabling the listener must supply it — serde fail-stops.
+        let toml = format!("{MINIMAL_EXAMPLE}\n[listen]\naddr = \"0.0.0.0:7073\"\n");
+        let (_guard, path) = write_config(&toml);
+        assert!(
+            load(&path).is_err(),
+            "a [listen] table without advertise_host must fail"
+        );
+    }
+
+    #[test]
+    fn empty_advertise_host_is_a_config_error() {
+        let toml = format!("{MINIMAL_EXAMPLE}\n[listen]\nadvertise_host = \"\"\n");
+        let (_guard, path) = write_config(&toml);
+        let err = load(&path).expect_err("an empty advertise_host should be rejected");
+        assert!(format!("{err:#}").contains("listen.advertise_host"));
+    }
+
+    #[test]
+    fn unknown_key_in_listen_table_is_rejected() {
+        let toml = format!(
+            "{MINIMAL_EXAMPLE}\n[listen]\nadvertise_host = \"a\"\naddrr = \"0.0.0.0:7073\"\n"
+        );
+        let (_guard, path) = write_config(&toml);
+        let err = load(&path).expect_err("typo'd listen key should fail");
+        assert!(format!("{err:#}").contains("addrr"));
     }
 
     #[test]

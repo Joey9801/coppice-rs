@@ -20,6 +20,7 @@ use crate::liveness::NodeLiveness;
 use crate::tasks::agent_gateway::{AgentSessionService, Gateway};
 use crate::tasks::api_server::{self, CoordinatorControlPlane};
 use crate::tasks::housekeeping::StubHistoryStore;
+use crate::tasks::node_client::NodeLogClient;
 use crate::tasks::{
     agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver,
 };
@@ -44,6 +45,7 @@ pub async fn run<C>(
     agent_listener: AgentListener,
     client_listener: ClientListener,
     cluster_id: ClusterId,
+    node_log_client: Arc<NodeLogClient>,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -122,7 +124,8 @@ where
     let control_plane = Arc::new(
         CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
             .with_derived(queue_window, fanout.clone())
-            .with_node_handle(node_handle),
+            .with_node_handle(node_handle)
+            .with_log_client(node_log_client),
     );
     let api_join = tokio::spawn(api_server::run(
         client_listener,

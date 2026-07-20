@@ -38,6 +38,10 @@ uuid.workspace = true
 [dev-dependencies]
 coppice-testkit.workspace = true
 metrics-util.workspace = true
+# The in-process NodeService mTLS integration test mints a throwaway CA and
+# dual-EKU leaves (a dNSName SAN of the node id) to prove id-pinned dialing and
+# mandatory client certs (ADR 0034), mirroring `coppice dev`'s PKI.
+rcgen.workspace = true
 tempfile.workspace = true
 
 [lints]

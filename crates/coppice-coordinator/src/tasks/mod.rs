@@ -12,4 +12,5 @@ pub mod dispatch;
 pub mod event_fanout;
 pub mod housekeeping;
 pub mod ingestion;
+pub mod node_client;
 pub mod scheduler_driver;

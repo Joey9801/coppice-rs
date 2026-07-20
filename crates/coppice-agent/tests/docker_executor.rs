@@ -57,6 +57,7 @@ use coppice_agent::executor::{
     classify_exit, ContainerState, DockerExecutor, Executor, ExitCause, ExitInfo,
     ObservedContainer, StartError, StartSpec, StopOutcome,
 };
+use coppice_agent::node_service::{serve as serve_node_service, NodeServiceListener};
 use coppice_agent::pressure::DiskPressure;
 use coppice_agent::telemetry::{
     FilesystemSink, FilesystemSinkOptions, HubSink, LogQuery, LogStream, MetricSample,
@@ -67,6 +68,13 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration as CoreDuration, Timestamp};
+use coppice_net::node_service::Client as NodeServiceClient;
+use coppice_proto::pb::agent::v1 as node_pb;
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose,
+};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 use anyhow::{anyhow, ensure};
 
@@ -3123,6 +3131,195 @@ async fn poll_mode_disk_reading_reaches_metric_samples() {
             sample.disk_image_bytes > 0,
             "the same sample must carry the constant image size as disk_image_bytes, got {}",
             sample.disk_image_bytes
+        );
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[alloc]).await;
+    r.unwrap();
+}
+
+// ========================================================================
+// S6 whole-loop: a real container's logs, collected into the store, served
+// back over the agent-hosted NodeService (ADR 0034) via an id-pinned mTLS dial.
+//
+// This closes the loop the in-process `tests/node_service.rs` opens with a
+// hand-seeded sink: here the sink is populated by real telemetry collection off
+// a live container, and the same lines come back through `FetchLogs`.
+// ========================================================================
+
+/// A throwaway CA plus a NodeService server leaf (its dNSName SAN is the typed
+/// node id, so an id-pinned dial validates) and a coordinator client leaf, both
+/// dual-EKU — mirrors `coppice dev`'s `mint_pki` and `tests/node_service.rs`.
+struct ServicePki {
+    ca_pem: Vec<u8>,
+    server_cert: Vec<u8>,
+    server_key: Vec<u8>,
+    client_cert: Vec<u8>,
+    client_key: Vec<u8>,
+}
+
+fn mint_service_pki(node_id: NodeId) -> ServicePki {
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "coppice-test-ca");
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign ca");
+
+    let leaf = |cn: &str, sans: Vec<String>| -> (Vec<u8>, Vec<u8>) {
+        let key = KeyPair::generate().expect("leaf key");
+        let mut params = CertificateParams::new(sans).expect("leaf params");
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let cert = params
+            .signed_by(&key, &ca_cert, &ca_key)
+            .expect("sign leaf");
+        (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
+    };
+
+    let (server_cert, server_key) = leaf("node-service", vec![node_id.to_string()]);
+    let (client_cert, client_key) = leaf("coordinator", vec!["coordinator".to_string()]);
+    ServicePki {
+        ca_pem: ca_cert.pem().into_bytes(),
+        server_cert,
+        server_key,
+        client_cert,
+        client_key,
+    }
+}
+
+/// Dial `addr`'s NodeService with `pki`'s client identity, pinning the TLS
+/// server-name to the typed node id (matching the server leaf's SAN, ADR 0034).
+async fn dial_service(
+    pki: &ServicePki,
+    node_id: NodeId,
+    addr: std::net::SocketAddr,
+) -> anyhow::Result<Channel> {
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(&pki.ca_pem))
+        .identity(Identity::from_pem(&pki.client_cert, &pki.client_key))
+        .domain_name(node_id.to_string());
+    // The socket is bound before `serve` starts accepting; retry the handshake.
+    let mut last_err = None;
+    for _ in 0..50 {
+        match Channel::from_shared(format!("https://127.0.0.1:{}", addr.port()))
+            .expect("uri")
+            .tls_config(tls.clone())
+            .expect("client tls")
+            .connect()
+            .await
+        {
+            Ok(channel) => return Ok(channel),
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        }
+    }
+    Err(anyhow!("mTLS dial never connected: {:?}", last_err))
+}
+
+/// A live container's stdout reaches the store and is then served back verbatim
+/// over the NodeService: every daemon-returned line is retrievable through an
+/// id-pinned mTLS `FetchLogs` (§8.2 + ADR 0034).
+#[tokio::test]
+async fn node_service_serves_live_container_logs_over_mtls() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    let root = tempfile::TempDir::new().expect("telemetry tempdir");
+    let (exec, _tx, _hub, sink) =
+        harness::executor_with_telemetry(docker.clone(), root.path()).await;
+    let sp = harness::spec(harness::BUSYBOX, PRINTER, Resources::ZERO);
+    let alloc = sp.allocation;
+    let job = sp.job;
+    let attempt = sp.attempt;
+    let name = format!("coppice-{alloc}");
+
+    let r: anyhow::Result<()> = async {
+        exec.start(sp).await?;
+        // Let real telemetry collection populate the store off the live container.
+        harness::wait_for_chunks(&sink, job, attempt, 5, 60).await?;
+        // The daemon's retained lines — the oracle for what must come back —
+        // captured before the stop that fences further output.
+        let daemon = harness::daemon_log_lines(&docker, &name).await?;
+
+        // Stop→reap runs the §8.2/§8.4 drain barrier, so the store holds every
+        // daemon-returned line before we serve it (without this, collection lags
+        // the still-running container and the oracle races ahead of the store).
+        let outcome = exec.stop(alloc, CoreDuration::from_millis(1)).await?;
+        ensure!(
+            matches!(
+                outcome,
+                StopOutcome::Stopped(_) | StopOutcome::AlreadyExited(_)
+            ),
+            "unexpected stop outcome {outcome:?}"
+        );
+        exec.reap(alloc).await?;
+
+        // Stand up the NodeService over mTLS and dial it id-pinned.
+        let node_id = NodeId::new();
+        let pki = mint_service_pki(node_id);
+        let listener = NodeServiceListener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            &pki.server_cert,
+            &pki.server_key,
+            &pki.ca_pem,
+        )?;
+        let addr = listener.local_addr();
+        let _server = serve_node_service(listener, Some(sink.clone()));
+
+        let channel = dial_service(&pki, node_id, addr).await?;
+        let mut client = NodeServiceClient::new(channel);
+        let response = client
+            .fetch_logs(node_pb::FetchLogsRequest {
+                job: Some(job.into()),
+                attempt: Some(attempt.into()),
+                from_us: None,
+                until_us: None,
+                stream: node_pb::LogStream::Unspecified as i32,
+                resume: None,
+                ascending: true,
+                max_chunks: 10_000,
+                max_bytes: 1 << 20,
+            })
+            .await?
+            .into_inner();
+
+        let chunks = match response.outcome {
+            Some(node_pb::fetch_logs_response::Outcome::Chunks(c)) => c.chunks,
+            other => return Err(anyhow!("expected Chunks, got {other:?}")),
+        };
+        ensure!(!chunks.is_empty(), "NodeService returned no chunks");
+        // Reassemble the served payloads into lines and confirm every daemon line
+        // survives the collect→store→serve round-trip.
+        let mut blob = Vec::new();
+        for chunk in &chunks {
+            blob.extend_from_slice(&chunk.payload);
+        }
+        let served: Vec<String> = String::from_utf8_lossy(&blob)
+            .split('\n')
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        ensure!(
+            harness::is_subsequence(&daemon, &served),
+            "a daemon-returned line is missing from the NodeService answer\n daemon={daemon:?}\n served={served:?}"
         );
         Ok(())
     }

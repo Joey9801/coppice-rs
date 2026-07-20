@@ -119,6 +119,9 @@ fn agent_config(
         pressure: Default::default(),
         image_cache: Default::default(),
         telemetry: Default::default(),
+        // This protocol test exercises the session plane only, not the
+        // agent-hosted NodeService (ADR 0034), so no listener is configured.
+        listen: None,
     }
 }
 

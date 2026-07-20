@@ -1347,6 +1347,237 @@ pub struct CoordinatorMember {
     // invents both. Out of scope.
 }
 
+// ---------------------------------------------------------------------------
+// Job logs (GET /api/v1/jobs/{job}/logs) — ADR 0034
+// ---------------------------------------------------------------------------
+
+/// The scan direction, shared by the `order=` parameter and the cursor.
+/// `Desc` (the default) is newest-first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogOrder {
+    Asc,
+    Desc,
+}
+
+impl LogOrder {
+    /// The token spelling used inside a [`LogCursor`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogOrder::Asc => "asc",
+            LogOrder::Desc => "desc",
+        }
+    }
+
+    /// Parse the `order=` value (and the cursor's order segment); anything
+    /// else is a caller error.
+    pub fn parse(raw: &str) -> Result<LogOrder, String> {
+        match raw {
+            "asc" => Ok(LogOrder::Asc),
+            "desc" => Ok(LogOrder::Desc),
+            other => Err(format!("order must be `asc` or `desc`, got `{other}`")),
+        }
+    }
+
+    /// The RPC's `ascending` flag: ascending exactly when the order is `asc`.
+    pub fn ascending(self) -> bool {
+        matches!(self, LogOrder::Asc)
+    }
+}
+
+/// One of an attempt's two output streams, on both an entry and the `stream=`
+/// filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStreamName {
+    Stdout,
+    Stderr,
+}
+
+impl LogStreamName {
+    /// Parse the `stream=` filter value.
+    pub fn parse(raw: &str) -> Result<LogStreamName, String> {
+        match raw {
+            "stdout" => Ok(LogStreamName::Stdout),
+            "stderr" => Ok(LogStreamName::Stderr),
+            other => Err(format!(
+                "stream must be `stdout` or `stderr`, got `{other}`"
+            )),
+        }
+    }
+}
+
+/// The availability verdict for one attempt — the join of replicated state
+/// (which attempts exist and where they ran) with the agent's answer (what
+/// data still exists), per ADR 0034's honesty semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogAvailability {
+    /// Chunks returned (possibly zero within the range). See `truncated`.
+    Available,
+    /// The node answered `UnknownAttempt`: replicated state proves the attempt
+    /// ran there, so its telemetry has fallen out of retention (or was never
+    /// written — indistinguishable on-node, and the answer is the same: gone).
+    Expired,
+    /// No advertised endpoint, a dial/deadline failure, or the node record is
+    /// gone (decommissioned / autoscaled away). `reason` carries the detail.
+    Unreachable,
+    /// The attempt never reached `Running`; no RPC was made.
+    NotStarted,
+}
+
+/// One log line for the client (mirrors the future `web/src/api/types.ts`
+/// `LogChunk`, superseded by this contract). Bytes are decoded UTF-8-lossily
+/// into `text`; raw bytes are not recoverable through this API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub attempt: AttemptId,
+    pub at: Timestamp,
+    pub stream: LogStreamName,
+    pub text: String,
+    /// True when this entry's `text` was cut to fit the page's byte budget —
+    /// the underlying chunk alone exceeded it, so the store served a prefix and
+    /// advanced the cursor past the whole chunk (the dropped tail is not
+    /// retrievable through this API). Distinct from `sources[].truncated`, which
+    /// reports that older *lines* were pruned from the store.
+    pub truncated: bool,
+}
+
+/// One per attempt this page covered, in page order — the per-attempt
+/// availability accounting that makes a best-effort answer honest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogSourceRecord {
+    pub attempt: AttemptId,
+    /// The node the attempt ran on; `null` only when the attempt record
+    /// itself is missing from replicated state, so no node is known.
+    pub node: Option<NodeId>,
+    pub availability: LogAvailability,
+    /// True when older lines the client asked for have been pruned: the
+    /// store's `earliest_at` lies inside the requested range.
+    pub truncated: bool,
+    /// The store's oldest retained instant for this attempt, when known;
+    /// advisory.
+    pub earliest_available_at: Option<Timestamp>,
+    /// Human-readable detail for an `expired`/`unreachable`/`not_started`
+    /// verdict; `null` for a plain `available`.
+    pub reason: Option<String>,
+}
+
+/// `GET /api/v1/jobs/{job}/logs` — the never-bare-array envelope (ADR 0031).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetJobLogsResponse {
+    pub entries: Vec<LogEntry>,
+    pub sources: Vec<LogSourceRecord>,
+    /// Opaque continuation token ([`LogCursor`]); `null` iff the walk is truly
+    /// complete. A short page with a non-null cursor means "continue"
+    /// (ListJobs precedent).
+    pub next_cursor: Option<String>,
+}
+
+/// The log pagination cursor: `v1:<order>:<attempt-id>:<at_us>:<skip>`.
+///
+/// A content coordinate — `(attempt, at_us, skip)` — not a storage coordinate,
+/// so a token minted against a live agent read stays valid if the same range
+/// is one day served from a durable store (ADR 0034's forward-compatibility
+/// commitment). Formatted and parsed in exactly one place, like [`JobCursor`];
+/// a cursor whose `order` disagrees with the request's `order=` is a caller
+/// error, checked by the handler.
+///
+/// `at_us` may be the walk edge sentinel ([`LogCursor::EDGE_ASC`] /
+/// [`LogCursor::EDGE_DESC`]) meaning "resume `attempt` from its beginning" —
+/// the coordinator maps that to an absent RPC resume before dialing, so the
+/// sentinel never crosses the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogCursor {
+    pub order: LogOrder,
+    pub attempt: AttemptId,
+    pub at_us: i64,
+    pub skip: u64,
+}
+
+impl LogCursor {
+    const PREFIX: &'static str = "v1:";
+    /// Sentinel `at_us` for "the ascending edge" (oldest): resume from the start.
+    pub const EDGE_ASC: i64 = i64::MIN;
+    /// Sentinel `at_us` for "the descending edge" (newest): resume from the start.
+    pub const EDGE_DESC: i64 = i64::MAX;
+
+    /// The token for a resume position.
+    pub fn format(&self) -> String {
+        format!(
+            "{}{}:{}:{}:{}",
+            Self::PREFIX,
+            self.order.as_str(),
+            self.attempt,
+            self.at_us,
+            self.skip,
+        )
+    }
+
+    /// A cursor at the walk edge of `attempt` (resume from the beginning).
+    pub fn edge(order: LogOrder, attempt: AttemptId) -> LogCursor {
+        LogCursor {
+            order,
+            attempt,
+            at_us: match order {
+                LogOrder::Asc => Self::EDGE_ASC,
+                LogOrder::Desc => Self::EDGE_DESC,
+            },
+            skip: 0,
+        }
+    }
+
+    /// True when this cursor addresses an attempt's edge (no resume position),
+    /// rather than a chunk coordinate within it.
+    pub fn is_edge(&self) -> bool {
+        self.skip == 0
+            && self.at_us
+                == match self.order {
+                    LogOrder::Asc => Self::EDGE_ASC,
+                    LogOrder::Desc => Self::EDGE_DESC,
+                }
+    }
+
+    /// Parse a token; anything that is not `v1:<order>:<attempt-id>:<i64>:<u64>`
+    /// is a caller error.
+    pub fn parse(token: &str) -> Result<LogCursor, String> {
+        let rest = token
+            .strip_prefix(Self::PREFIX)
+            .ok_or_else(|| format!("cursor must begin with `{}`", Self::PREFIX))?;
+        // `splitn(4, ':')` keeps the attempt id whole — a typed id has no `:`,
+        // but pinning the field count rejects a token with extra segments.
+        let mut parts = rest.splitn(4, ':');
+        let order = parts
+            .next()
+            .ok_or_else(|| "cursor is missing its order segment".to_string())?;
+        let order = LogOrder::parse(order)?;
+        let attempt = parts
+            .next()
+            .ok_or_else(|| "cursor is missing its attempt segment".to_string())?;
+        let attempt = attempt
+            .parse::<AttemptId>()
+            .map_err(|e| format!("invalid cursor attempt id: {e}"))?;
+        let at_us = parts
+            .next()
+            .ok_or_else(|| "cursor is missing its at_us segment".to_string())?;
+        let at_us = at_us
+            .parse::<i64>()
+            .map_err(|e| format!("invalid cursor at_us: {e}"))?;
+        let skip = parts
+            .next()
+            .ok_or_else(|| "cursor is missing its skip segment".to_string())?;
+        let skip = skip
+            .parse::<u64>()
+            .map_err(|e| format!("invalid cursor skip: {e}"))?;
+        Ok(LogCursor {
+            order,
+            attempt,
+            at_us,
+            skip,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,11 +20,14 @@ use coppice_api::http::dto::{
     SubmitJobResponse,
 };
 use coppice_api::{
-    ApiError, Consistency, ControlPlane, CoordinatorMemberSummary, CoordinatorSummary, QueueWindow,
-    ReadOptions, ReadView, RecentClusterEvents, StampedEvent,
+    ApiError, Consistency, ControlPlane, CoordinatorMemberSummary, CoordinatorSummary,
+    LogFetchError, LogFetchOutcome, LogFetchRequest, QueueWindow, ReadOptions, ReadView,
+    RecentClusterEvents, StampedEvent,
 };
 use coppice_consensus::{Applied, Consensus, ConsensusError, NodeHandle, StateViews};
-use coppice_core::id::ClusterId;
+use coppice_core::id::{ClusterId, NodeId};
+
+use crate::tasks::node_client::NodeLogClient;
 use coppice_core::job::Job;
 use coppice_core::quota::CostUnits;
 use coppice_core::time::{Duration, Timestamp};
@@ -57,6 +60,14 @@ pub struct CoordinatorControlPlane<C> {
     ///
     /// [`with_node_handle`]: Self::with_node_handle
     node_handle: Option<NodeHandle>,
+    /// Dials agents' `NodeService` listeners for `fetch_logs` (ADR 0034).
+    /// `None` until [`with_log_client`] attaches it — a plane without it
+    /// answers every log fetch `Unreachable`, so `GET /api/v1/jobs/{job}/logs`
+    /// degrades to "no node is reachable" rather than failing. Every replica
+    /// dials identically; there is no leader gating.
+    ///
+    /// [`with_log_client`]: Self::with_log_client
+    node_log_client: Option<Arc<NodeLogClient>>,
 }
 
 impl<C> CoordinatorControlPlane<C> {
@@ -71,6 +82,7 @@ impl<C> CoordinatorControlPlane<C> {
             queue_window,
             fanout: None,
             node_handle: None,
+            node_log_client: None,
         }
     }
 
@@ -92,6 +104,14 @@ impl<C> CoordinatorControlPlane<C> {
     /// answers `GET /api/v1/coordinators` with `UNAVAILABLE`.
     pub fn with_node_handle(mut self, node_handle: NodeHandle) -> Self {
         self.node_handle = Some(node_handle);
+        self
+    }
+
+    /// Attach the log-fetch client backing `fetch_logs` (ADR 0034). The runtime
+    /// builds one from the coordinator's mTLS material and calls this; a plane
+    /// without it answers every log fetch `Unreachable`.
+    pub fn with_log_client(mut self, client: Arc<NodeLogClient>) -> Self {
+        self.node_log_client = Some(client);
         self
     }
 }
@@ -368,6 +388,24 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             snapshot_last_index: summary.snapshot_last_index,
             members,
         })
+    }
+
+    async fn fetch_logs(
+        &self,
+        node: NodeId,
+        addr: &str,
+        req: LogFetchRequest,
+    ) -> Result<LogFetchOutcome, LogFetchError> {
+        // No leadership gating: every replica dials agents identically so log
+        // traffic load-balances (ADR 0034). Without a client attached the honest
+        // answer is "unreachable", not an error page — the handler records it
+        // per attempt and the walk advances.
+        match &self.node_log_client {
+            Some(client) => client.fetch_logs(node, addr, req).await,
+            None => Err(LogFetchError::Unreachable {
+                reason: "log-fetch client not attached to this replica".to_string(),
+            }),
+        }
     }
 }
 

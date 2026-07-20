@@ -82,10 +82,20 @@ impl Ca {
     /// the claimed NodeId at session accept (ADR 0011), so the agent's client
     /// certificate must carry its node UUID string as its CN.
     pub fn leaf_with_cn(&self, cn: &str) -> Leaf {
+        self.leaf_with_cn_and_sans(cn, &[])
+    }
+
+    /// Issue a leaf as [`Ca::leaf_with_cn`] but with additional dNSName SANs
+    /// beyond `localhost`/`127.0.0.1`.
+    ///
+    /// The agent's `NodeService` server leaf must carry its typed node id as a
+    /// SAN so a coordinator's id-pinned dial (TLS server-name = `node-<uuid>`)
+    /// validates (ADR 0034).
+    pub fn leaf_with_cn_and_sans(&self, cn: &str, extra_sans: &[String]) -> Leaf {
         let key = KeyPair::generate().expect("generate leaf key pair");
-        let mut params =
-            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
-                .expect("leaf params");
+        let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        sans.extend(extra_sans.iter().cloned());
+        let mut params = CertificateParams::new(sans).expect("leaf params");
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![
             ExtendedKeyUsagePurpose::ServerAuth,
@@ -282,6 +292,7 @@ log_level = "warn"
             views,
             event_tap,
             handle,
+            node_log_client: _,
             raft_server_shutdown,
             raft_server,
         } = self.booted.take().expect("node booted");
@@ -303,6 +314,7 @@ log_level = "warn"
             views,
             event_tap,
             handle,
+            node_log_client: _,
             raft_server_shutdown,
             raft_server,
         } = self.booted.take().expect("node booted");
@@ -430,6 +442,7 @@ log_level = "warn"
             views,
             event_tap,
             handle,
+            node_log_client,
             raft_server_shutdown,
             raft_server,
         } = bootstrap::bootstrap(resolved)
@@ -458,6 +471,7 @@ log_level = "warn"
             listener,
             client_listener,
             cluster_id,
+            node_log_client,
             Some(shutdown_rx),
         ));
 

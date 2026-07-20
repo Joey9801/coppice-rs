@@ -53,6 +53,12 @@ rcgen.workspace = true
 # drive the end-to-end agent↔coordinator reconciliation protocol test
 # (`tests/agent_protocol.rs`) against the live coordinator runtime.
 coppice-agent.workspace = true
+# `tower::ServiceExt::oneshot` drives the real axum router in-process, and
+# `serde_json` decodes its JSON bodies, for the best-effort job-log e2e test
+# (`tests/job_logs.rs`, ADR 0034). `bytes` builds the seeded `LogChunk` payloads.
+tower.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
 
 [lints]
 workspace = true
