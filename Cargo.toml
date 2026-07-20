@@ -144,6 +144,12 @@ tonic-build = "0.12"
 # future /metrics endpoint (metrics-exporter-prometheus behind the public API)
 # only calls the crate roots without knowing any module's internals.
 metrics = "0.24"
+# Test-only: a thread-local `DebuggingRecorder` so unit tests can assert exact
+# counter values (`agent_telemetry_*`) without a global exporter. Only the
+# `debugging` feature is needed; kept in lockstep with the `metrics` pin above.
+metrics-util = { version = "0.19", default-features = false, features = [
+    "debugging",
+] }
 # Safe statvfs for the agent's host disk-pressure monitor
 # (docker-executor.md §9). The workspace forbids `unsafe_code`, so the raw
 # libc call is not an option; nix wraps it in a safe API.
