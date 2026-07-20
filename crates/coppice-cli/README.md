@@ -18,11 +18,93 @@ deployment ships exactly one artifact.
   ([coppice-api](../coppice-api)), the same surface the web UI is built on
   ([components](../../docs/architecture/components.md)).
 
-> **Status:** the daemon subcommands are fully wired; the `job` client
-> commands parse but fail with a clear error until the API network edge
-> exists (coppice-api has no transport yet). The client role below is the
-> intended shape; the doc links are the specification it will be built
+> **Status:** the daemon subcommands and the four `job` verbs
+> (`submit`/`status`/`logs`/`abort`) are wired against the coordinator's
+> public JSON HTTP API (ADR 0031). The wider client role below — retry,
+> streaming subscriptions, cluster views, policy administration — is the
+> intended shape; the doc links are the specification the rest will be built
 > against.
+
+## `coppice job`
+
+Client verbs against a running cluster's public API
+([ADR 0031](../../docs/decisions/0031-http-api-surface.md)). Every verb speaks
+the same JSON-over-HTTP surface the web UI is built on:
+
+```
+coppice job --api <URL> submit <spec.toml> [--job <job-id>]
+coppice job --api <URL> status <job>
+coppice job --api <URL> logs <job> [--stream stdout|stderr] [--attempt <id>] [--order asc|desc] [--follow]
+coppice job --api <URL> abort <job> [--reason <text>]
+```
+
+`--api` is a global flag (it may appear before or after the verb) and also reads
+from `COPPICE_API`; it defaults to `http://127.0.0.1:7070`. Both a bare base URL
+and one ending in `/api/v1` are accepted — the `coppice dev` banner prints the
+latter, so you can paste it verbatim.
+
+- **submit** loads and validates the spec, mints a job id (or reuses `--job` for
+  an idempotent resubmission — the client-minted id is the idempotency key,
+  [ADR 0026](../../docs/decisions/0026-client-minted-job-ids-idempotent-submission.md)), POSTs it, and
+  prints the id and the apply log index.
+- **status** renders the job's current phase, spec, requests, timings, and its
+  attempts.
+- **logs** streams the job's output best-effort
+  ([ADR 0034](../../docs/decisions/0034-best-effort-job-log-retrieval.md)),
+  chronologically by default. `--follow` polls until the job is terminal.
+  Attempts whose logs have expired or whose node is unreachable are noted on
+  stderr rather than silently dropped.
+- **abort** requests a desired-state transition (it does not synchronously stop
+  the container).
+
+### The job spec
+
+A spec file describes a single job. It uses the same TOML conventions as the
+daemon config files (`deny_unknown_fields`, humane duration strings, byte-size
+units), so a typo fail-stops naming the key:
+
+```toml
+image = "busybox:1.36"
+command = ["sh", "-c", "echo hello"]
+# entrypoint = ["/bin/sh", "-c"]   # optional override; the image default when absent
+quota_entity = "quota-00000000-0000-0000-0000-000000000001"
+priority = 0            # optional, default 0 (a multiplier index; dev seeds -2..=2)
+max_runtime = "1h"      # optional; whole seconds, positive
+
+[resources]
+cpu_millis = 500
+memory = "256MiB"
+disk = "1GiB"
+
+[retry]                   # optional
+max_retries = 3           # default 3
+retry_user_errors = false # default false
+```
+
+The format is deliberately **single-job** for now; batches, arrays, and gangs
+are future work.
+
+### A dev-cluster walkthrough
+
+```console
+$ coppice dev
+Coppice dev is ready
+  …
+  API             http://localhost:7070/api/v1 (coppice job --api http://localhost:7070 …)
+  Quota entity    quota-00000000-0000-0000-0000-000000000001 ("dev", seeded; priorities -2..=2)
+  …
+
+# In another shell (the spec above, saved as hello.toml):
+$ coppice job submit hello.toml
+submitted job-… (log index 12)
+
+$ coppice job status job-…
+$ coppice job logs job-… --follow
+$ coppice job abort job-…
+```
+
+The `--api` default already points at a local `coppice dev`, so `--api` is
+optional against one.
 
 ## Role
 

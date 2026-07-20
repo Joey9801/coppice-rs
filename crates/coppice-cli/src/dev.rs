@@ -69,8 +69,8 @@ pub struct DevArgs {
     node_service_port: u16,
 
     /// Executor backing the in-process agent. `fake` runs the lifecycle
-    /// without containers; `docker` is the production executor (not yet
-    /// implemented — every start fails).
+    /// without containers (and captures no logs); `docker` is the production
+    /// executor and needs a reachable Docker daemon.
     #[arg(long, value_enum, default_value_t = DevExecutor::Fake)]
     executor: DevExecutor,
 }
@@ -674,7 +674,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
         "\nCoppice dev is ready\n\
          \n\
          \x20 UI              {ui}\n\
-         \x20 API             http://localhost:{client_port}/api/v1 (most reads still 501 UNIMPLEMENTED)\n\
+         \x20 API             http://localhost:{client_port}/api/v1 (coppice job --api http://localhost:{client_port} …)\n\
          \x20 Raft/admin      https://localhost:{raft_port} (mTLS)\n\
          \x20 Agent gateway   https://localhost:{agent_port} (mTLS)\n\
          \x20 Node service    127.0.0.1:{node_service_port} (mTLS; agent job logs)\n\

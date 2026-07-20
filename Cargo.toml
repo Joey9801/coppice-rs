@@ -102,6 +102,11 @@ mime_guess = "2"
 # Test-only `ServiceExt::oneshot` for exercising the axum router without a
 # real listener; version tracks what axum 0.7/tonic 0.12 already depend on.
 tower = { version = "0.5", features = ["util"] }
+# HTTP client for the `coppice job` verbs (ADR 0031): they talk to the
+# coordinator's JSON-over-HTTP client API. `rustls-tls` so no OpenSSL toolchain
+# is dragged in; `json` for typed request/response bodies. Default features are
+# off to keep the surface (and the dependency tree) minimal.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 proptest = "1"
 prost = "0.13"
 prost-build = "0.13"
