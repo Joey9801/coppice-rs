@@ -14,7 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 coppice-coordinator.workspace = true
-# `coppice dev`'s ready banner asks whether a web UI build is embedded.
+# `coppice dev`'s ready banner asks whether a web UI build is embedded, and
+# `coppice job` reuses this crate's wire DTOs (request/response shapes) rather
+# than redefining the `/api/v1` contract.
 coppice-api.workspace = true
 coppice-agent.workspace = true
 coppice-core.workspace = true
@@ -33,6 +35,20 @@ tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# `coppice job` talks to the coordinator's JSON HTTP API (ADR 0031).
+reqwest.workspace = true
+# A job spec is one TOML file, parsed with the same conventions as the daemon
+# config files (ADR 0020): humane duration strings and byte-size units.
+toml.workspace = true
+humantime-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# In-process axum server for the `coppice job` HTTP round-trip tests: canned
+# handlers serving real DTO JSON, so the client tests exercise the wire path
+# without a live coordinator.
+axum.workspace = true
 
 [lints]
 workspace = true

@@ -10,11 +10,12 @@
 //! Shipping one binary keeps deployment to a single artifact: the same build
 //! runs as any component, so images and packaging never skew across roles.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod dev;
+mod job;
 
 #[derive(Debug, Parser)]
 #[command(name = "coppice", version, about = "Coppice batch scheduler")]
@@ -38,8 +39,7 @@ enum Command {
     Dev(dev::DevArgs),
 
     /// Job operations against a cluster's API.
-    #[command(subcommand)]
-    Job(JobCommand),
+    Job(job::JobArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -47,14 +47,6 @@ struct AgentArgs {
     /// Path to the agent configuration file (ADR 0020).
     #[arg(long)]
     config: PathBuf,
-}
-
-#[derive(Debug, Subcommand)]
-enum JobCommand {
-    /// Submit a job from a TOML spec file.
-    Submit { spec: PathBuf },
-    /// Abort a job by id (`job-<uuid>`).
-    Abort { job: String },
 }
 
 /// Plain env-filter tracing for the roles that don't configure their own
@@ -86,15 +78,9 @@ async fn main() -> Result<()> {
             init_tracing();
             dev::run(args).await
         }
-        Command::Job(_) => {
-            // The write-path logic exists (coppice-api's ControlPlane), but
-            // the API network edge does not yet — no service in api.proto and
-            // no server bound to `listen.client_addr`.
-            bail!(
-                "`coppice job` is not implemented yet: the coordinator does not \
-                 serve its client API over the network yet (coppice-api has no \
-                 transport)."
-            );
+        Command::Job(args) => {
+            init_tracing();
+            job::run(args).await
         }
     }
 }
@@ -155,10 +141,36 @@ mod tests {
     fn job_submit_parses() {
         let cli = Cli::parse_from(["coppice", "job", "submit", "job.toml"]);
         match cli.command {
-            Command::Job(JobCommand::Submit { spec }) => {
+            Command::Job(job::JobArgs {
+                command: job::JobCommand::Submit { spec, job },
+                ..
+            }) => {
                 assert_eq!(spec, PathBuf::from("job.toml"));
+                assert!(job.is_none());
             }
             other => panic!("expected job submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_api_flag_is_global_before_or_after_the_verb() {
+        // `--api` is a global arg: it parses on either side of the subcommand.
+        let id = "job-00000000-0000-0000-0000-000000000001";
+        for argv in [
+            ["coppice", "job", "--api", "http://h:1", "status", id],
+            ["coppice", "job", "status", id, "--api", "http://h:1"],
+        ] {
+            let cli = Cli::parse_from(argv);
+            assert!(
+                matches!(
+                    cli.command,
+                    Command::Job(job::JobArgs {
+                        command: job::JobCommand::Status { .. },
+                        ..
+                    })
+                ),
+                "expected job status for {argv:?}"
+            );
         }
     }
 }
