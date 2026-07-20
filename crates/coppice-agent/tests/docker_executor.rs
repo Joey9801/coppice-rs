@@ -137,7 +137,9 @@ mod harness {
     ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
         let node = NodeId::new();
         let (tx, rx) = watch::channel(DiskPressure::Ok);
-        let exec = DockerExecutor::new(docker, &config, 1000, 0, node, rx, cache_options())
+        // `None` telemetry: these lifecycle tests do not assert on collection, and
+        // the docker-gated telemetry suite (a later phase) wires it explicitly.
+        let exec = DockerExecutor::new(docker, &config, 1000, 0, node, rx, cache_options(), None)
             .await
             .expect("initialize Docker executor");
         (exec, tx)
@@ -239,6 +241,7 @@ mod harness {
             NodeId::new(),
             rx,
             cache_options(),
+            None,
         )
         .await
         .expect("initialize affinity executor");
