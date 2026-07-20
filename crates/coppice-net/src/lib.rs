@@ -28,7 +28,7 @@ pub mod pb {
     pub mod raft {
         include!(concat!(env!("OUT_DIR"), "/coppice.raft.v1.rs"));
     }
-    /// `coppice.agent.v1`: the agent session service.
+    /// `coppice.agent.v1`: the agent session and node services.
     pub mod agent {
         include!(concat!(env!("OUT_DIR"), "/coppice.agent.v1.rs"));
     }
@@ -57,4 +57,12 @@ pub mod admin {
 pub mod session {
     pub use crate::pb::agent::agent_service_client::AgentServiceClient as Client;
     pub use crate::pb::agent::agent_service_server::{AgentService, AgentServiceServer as Server};
+}
+
+/// The agent-hosted node service (`NodeService`, ADR 0034): coordinators dial
+/// *in* to fetch job logs (`FetchLogs`), the inverse direction of the agent's
+/// outbound [`session`] stream. Read-only; any replica may serve as client.
+pub mod node_service {
+    pub use crate::pb::agent::node_service_client::NodeServiceClient as Client;
+    pub use crate::pb::agent::node_service_server::{NodeService, NodeServiceServer as Server};
 }

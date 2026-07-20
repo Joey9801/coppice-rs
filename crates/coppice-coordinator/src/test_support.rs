@@ -35,6 +35,7 @@ pub fn node_record(id: NodeId, epoch: u64, schedulable: bool) -> NodeRecord {
             capacity: Resources::ZERO,
             labels: BTreeMap::new(),
             schedulable,
+            service_addr: None,
         },
         epoch,
     }

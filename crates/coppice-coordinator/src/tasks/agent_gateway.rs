@@ -500,6 +500,7 @@ mod tests {
                     capacity: Resources::ZERO,
                     labels: Map::new(),
                     schedulable: true,
+                    service_addr: None,
                 },
                 epoch,
             },

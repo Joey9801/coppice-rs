@@ -27,4 +27,8 @@ message Node {
   // Whether the scheduler may place new work here. Desired state owned by
   // the admin — an agent restart must not undo a drain (ADR 0009).
   bool schedulable = 4;
+  // Advertised `host:port` of the agent's `NodeService` listener (ADR 0034):
+  // authoritative addressing lives in replicated membership, and readers dial
+  // this to fetch job logs. Absent or empty means the agent hosts no service.
+  optional string service_addr = 5;
 }

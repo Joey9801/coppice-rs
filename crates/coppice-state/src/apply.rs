@@ -705,6 +705,10 @@ impl StateMachine {
                 rec.epoch += 1;
                 rec.node.capacity = c.capacity;
                 rec.node.labels = c.labels.clone();
+                // Overwrite the advertised address like capacity/labels: an
+                // agent restarting with a new NodeService address heals on
+                // reconnect (ADR 0034).
+                rec.node.service_addr = c.service_addr.clone();
                 events.push(Event::NodeEpochBumped {
                     node: c.node,
                     epoch: rec.epoch,
@@ -719,6 +723,7 @@ impl StateMachine {
                             capacity: c.capacity,
                             labels: c.labels.clone(),
                             schedulable: true,
+                            service_addr: c.service_addr.clone(),
                         },
                         epoch: 1,
                     },

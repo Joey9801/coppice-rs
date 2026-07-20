@@ -20,4 +20,8 @@ pub struct Node {
     pub labels: BTreeMap<String, String>,
     /// Whether the scheduler may place new work here.
     pub schedulable: bool,
+    /// Advertised `host:port` of the agent's `NodeService` listener
+    /// (ADR 0034); readers dial this to fetch job logs. `None` when the agent
+    /// hosts no service, so its logs are unreachable off-node.
+    pub service_addr: Option<String>,
 }

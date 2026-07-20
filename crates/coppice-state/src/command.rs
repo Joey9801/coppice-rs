@@ -230,6 +230,10 @@ pub struct RegisterNode {
     pub capacity: Resources,
     pub labels: BTreeMap<String, String>,
     pub registered_at: Timestamp,
+    /// Advertised `host:port` of the agent's `NodeService` listener
+    /// (ADR 0034), normalized from `Register.service_addr`. `None` when the
+    /// agent hosts no service; re-registration overwrites it.
+    pub service_addr: Option<String>,
 }
 
 /// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,

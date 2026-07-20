@@ -256,11 +256,15 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
             for label in &reg.labels {
                 labels.insert(label.key.clone(), label.value.clone());
             }
+            // Advertised NodeService address (ADR 0034); an empty string is a
+            // second spelling of "no service", canonicalized to None.
+            let service_addr = reg.service_addr.clone().filter(|addr| !addr.is_empty());
             out.commands.push(Command::RegisterNode(RegisterNode {
                 node,
                 capacity,
                 labels,
                 registered_at: now,
+                service_addr,
             }));
         }
 
@@ -706,6 +710,7 @@ mod tests {
                 key: "zone".into(),
                 value: "a".into(),
             }],
+            service_addr: Some("10.0.0.7:9443".into()),
         });
 
         let out = normalize(&view, &report(node, 0, reg), now());
@@ -719,6 +724,7 @@ mod tests {
                 assert_eq!(rn.capacity, requested());
                 assert_eq!(rn.labels.get("zone").map(String::as_str), Some("a"));
                 assert_eq!(rn.registered_at, now());
+                assert_eq!(rn.service_addr.as_deref(), Some("10.0.0.7:9443"));
             }
             other => panic!("expected RegisterNode, got {other:?}"),
         }
@@ -1086,6 +1092,7 @@ mod tests {
         let reg = Body::Register(Register {
             capacity: Some((&requested()).into()),
             labels: vec![],
+            service_addr: None,
         });
         let inbound = report(node, 0, reg);
 

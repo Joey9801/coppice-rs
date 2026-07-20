@@ -134,6 +134,11 @@ message Register {
   coppice.core.v1.Resources capacity = 1;
   // Canonical form: ascending key, unique keys.
   repeated coppice.core.v1.Label labels = 2;
+  // Advertised `host:port` of this agent's `NodeService` listener (ADR 0034)
+  // — authoritative addressing lives in replicated membership, so it rides
+  // registration and heals on reconnect. Absent or empty means the agent
+  // hosts no NodeService and its logs are unreachable off-node.
+  optional string service_addr = 3;
 }
 
 // Periodic liveness, inventory, and running-set signal. The coordinator

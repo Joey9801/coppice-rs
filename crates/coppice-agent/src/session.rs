@@ -82,6 +82,10 @@ pub struct Session<F: Fs, E: Executor> {
     /// Watchdogs armed by successful starts with a `max_runtime`, drained
     /// by the live loop which owns the timers.
     armed_watchdogs: Vec<ArmedWatchdog>,
+    /// The advertised `NodeService` address (ADR 0034), echoed in every
+    /// `Register` so coordinators can dial this node for job logs. `None` when
+    /// no `[listen]` listener is configured — the node hosts no service.
+    service_addr: Option<String>,
 }
 
 impl<F: Fs, E: Executor> Session<F, E> {
@@ -107,7 +111,16 @@ impl<F: Fs, E: Executor> Session<F, E> {
             registered: false,
             drained: false,
             armed_watchdogs: Vec::new(),
+            service_addr: None,
         }
+    }
+
+    /// Set the advertised `NodeService` address (ADR 0034) echoed in every
+    /// `Register`. A builder setter so the many call sites that host no service
+    /// need not thread a `None` through [`Session::new`].
+    pub fn with_service_addr(mut self, service_addr: Option<String>) -> Session<F, E> {
+        self.service_addr = service_addr;
+        self
     }
 
     // ---- test / loop accessors ----
@@ -595,6 +608,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
             body: Some(pb::agent_report::Body::Register(pb::Register {
                 capacity: Some((&self.capacity).into()),
                 labels: self.labels.clone(),
+                // The advertised NodeService endpoint (ADR 0034), from the agent
+                // `[listen]` config; `None` when the node hosts no service.
+                service_addr: self.service_addr.clone(),
             })),
         }
     }

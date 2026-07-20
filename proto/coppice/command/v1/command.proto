@@ -187,6 +187,10 @@ message RegisterNode {
   // Canonical form: ascending key, unique keys.
   repeated coppice.core.v1.Label labels = 3;
   int64 registered_at_us = 4;
+  // Advertised `host:port` of the agent's `NodeService` listener (ADR 0034),
+  // normalized from `Register.service_addr`. Re-registration overwrites it,
+  // so a restart with a new address heals. Absent or empty means no service.
+  optional string service_addr = 5;
 }
 
 // Node missed the replicated heartbeat deadline: epoch bump, unschedulable,
