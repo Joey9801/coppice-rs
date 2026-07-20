@@ -28,6 +28,13 @@ use coppice_net::session::Client;
 const LEADER_HINT: &str = "x-coppice-leader-hint";
 /// Bound on the outbound report channel — reports are small and infrequent.
 const OUTBOUND_CAPACITY: usize = 64;
+/// Bound on concurrently-running deferred reaps: each reap can spend seconds
+/// in the telemetry drain barrier plus Docker and store work, so a burst of
+/// exits must not fan out into unbounded daemon requests.
+const MAX_CONCURRENT_REAPS: usize = 4;
+/// Bound on deferred reaps queued for a worker slot. Overflow is dropped with
+/// a warning — the janitor sweep reclaims anything dropped.
+const REAP_QUEUE_CAPACITY: usize = 256;
 
 /// Run the agent session forever: connect, serve, reconnect. Returns only on
 /// an unrecoverable configuration error (e.g. unreadable TLS material).
@@ -53,6 +60,34 @@ where
         }
     });
 
+    // One reaper task performing the session's deferred reaps
+    // (report-before-reap, see `Session::pending_reaps`), at most
+    // MAX_CONCURRENT_REAPS at a time — each reap can wait seconds on the
+    // telemetry drain barrier, and a burst of exits must not fan out into
+    // unbounded daemon requests. Survives reconnects; failures are logged and
+    // the janitor sweep retries.
+    let (reap_tx, mut reap_rx) =
+        mpsc::channel::<coppice_core::id::AllocationId>(REAP_QUEUE_CAPACITY);
+    let reaper = session.executor().clone();
+    tokio::spawn(async move {
+        let mut inflight = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                next = reap_rx.recv(), if inflight.len() < MAX_CONCURRENT_REAPS => {
+                    let Some(alloc) = next else { break };
+                    let executor = reaper.clone();
+                    inflight.spawn(async move {
+                        if let Err(e) = executor.reap(alloc).await {
+                            tracing::warn!(%alloc, error = %e, "deferred reap failed; janitor will retry");
+                        }
+                    });
+                }
+                Some(_) = inflight.join_next(), if !inflight.is_empty() => {}
+            }
+        }
+        while inflight.join_next().await.is_some() {}
+    });
+
     let mut backoff = config.reconnect_backoff_min;
     let mut endpoint_idx = 0usize;
     loop {
@@ -67,6 +102,7 @@ where
             &key,
             config,
             &mut exit_rx,
+            &reap_tx,
         )
         .await
         {
@@ -102,6 +138,7 @@ async fn dial(endpoint: &str, ca: &[u8], cert: &[u8], key: &[u8]) -> anyhow::Res
     Ok(channel)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_once<F, E>(
     session: &mut Session<F, E>,
     endpoint: &str,
@@ -110,6 +147,7 @@ async fn serve_once<F, E>(
     key: &[u8],
     config: &Config,
     exit_rx: &mut mpsc::Receiver<crate::executor::ExitEvent>,
+    reap_tx: &mpsc::Sender<coppice_core::id::AllocationId>,
 ) -> anyhow::Result<()>
 where
     F: Fs,
@@ -146,16 +184,13 @@ where
         // Reaps deferred by the session (report-before-reap: a reap can stall
         // seconds behind the telemetry drain barrier, and the terminal report
         // must be queued ahead of the next heartbeat or the coordinator
-        // misclassifies the exit as a lost attempt). Spawned so the drain
-        // never delays command processing either; failures are logged and the
-        // janitor sweep retries.
+        // misclassifies the exit as a lost attempt). Handed to the bounded
+        // reaper task so the drain never delays command processing either; a
+        // full queue is dropped, the janitor sweep reclaims it.
         for alloc in session.take_pending_reaps() {
-            let executor = session.executor().clone();
-            tokio::spawn(async move {
-                if let Err(e) = executor.reap(alloc).await {
-                    tracing::warn!(%alloc, error = %e, "deferred reap failed; janitor will retry");
-                }
-            });
+            if reap_tx.try_send(alloc).is_err() {
+                tracing::warn!(%alloc, "deferred-reap queue full; janitor will reclaim the container");
+            }
         }
 
         // The next watchdog to fire, if any.

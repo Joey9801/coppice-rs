@@ -169,11 +169,15 @@ in-flight start).
 
 A heartbeat's running set is the agent's *accountability* set, not the
 raw runtime state: a container the runtime already observes as exited,
-whose exit the session has not yet journaled and reported, is still
-claimed as running — its terminal report is in flight, and disclaiming it
-would race the lost-verdict against that report (the exit would be
-misclassified as an `AgentError` loss). A genuinely lost container is
-absent from the runtime entirely and is never claimed.
+held under a journaled intent whose exit the session has not yet
+journaled and reported, is still claimed as running — its terminal
+report is in flight, and disclaiming it would race the lost-verdict
+against that report (the exit would be misclassified as an `AgentError`
+loss). A genuinely lost container is absent from the runtime entirely
+and is never claimed, and neither is a runtime-only recovery survivor
+(exited, no intent record): those are reported terminal once in the
+registration ObservedSet, and a claim would draw a `StopJob` the agent
+has no intent to resolve.
 
 Node liveness is bookkept from report arrival times; the leader's
 housekeeping tick proposes `DeclareNodeLost` for a node silent past the
