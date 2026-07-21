@@ -34,11 +34,12 @@ use anyhow::Result;
 // submit/abort path the (future) HTTP listener will host.
 pub use tasks::api_server::CoordinatorControlPlane;
 
-// The replica-local log-fetch client (ADR 0034). Exported so the end-to-end
-// best-effort job-log test can attach a real client to a `CoordinatorControlPlane`
-// and drive the full read path; the type already surfaces publicly through
+// The replica-local node-fetch client (ADR 0034), backing both `fetch_logs`
+// and `fetch_metrics`. Exported so the end-to-end best-effort telemetry tests
+// can attach a real client to a `CoordinatorControlPlane` and drive the full
+// read path; the type already surfaces publicly through
 // `bootstrap::BootedCoordinator::node_log_client`.
-pub use tasks::node_client::NodeLogClient;
+pub use tasks::node_client::NodeClient;
 
 /// Register descriptions for every metric a coordinator process can emit,
 /// recursing into each crate and module that exposes metrics. The future

@@ -1638,6 +1638,217 @@ impl LogCursor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Job usage metrics (GET /api/v1/jobs/{job}/usage) — ADR 0031's reserved
+// GetJobUsage, the metrics twin of the job-logs pipeline (ADR 0034)
+// ---------------------------------------------------------------------------
+//
+// The response mirrors GetJobLogs shape-for-shape — a samples list plus the
+// same per-attempt `sources` availability accounting — because the underlying
+// pipeline is identical: resolve the job's attempts from replicated state, walk
+// them under a 4-RPC budget, join "where it ran" with "what data survives" into
+// a per-attempt verdict. The scan direction reuses [`LogOrder`] (asc/desc), and
+// the exclusive resume coordinate is the same `(at_us, skip)`; only the cursor
+// type is distinct ([`UsageCursor`]), and the default `order` is `asc` (a
+// chart-ordered time series, not newest-first like logs — see [`UsageCursor`]).
+//
+// Supersedes the invented `JobUsage`/`UsageSample` proposal in
+// `web/src/api/types.ts`, exactly as the log DTOs superseded that file's
+// invented `LogChunk`.
+
+/// The availability verdict for one attempt's samples — the metrics twin of
+/// [`LogAvailability`], with the identical four verdicts and semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageAvailability {
+    /// Samples returned (possibly zero within the range). See `truncated`.
+    Available,
+    /// The node answered `UnknownAttempt`: replicated state proves the attempt
+    /// ran there, so its telemetry has fallen out of retention (or was never
+    /// written — indistinguishable on-node, and the answer is the same: gone).
+    Expired,
+    /// No advertised endpoint, a dial/deadline failure, or the node record is
+    /// gone (decommissioned / autoscaled away). `reason` carries the detail.
+    Unreachable,
+    /// The attempt never reached `Running`; no RPC was made.
+    NotStarted,
+}
+
+/// One resource sample for the client, mirroring the agent's stored row
+/// field-for-field. Counters are cumulative — a client derives rates by
+/// differencing consecutive samples, so a dropped sample loses resolution,
+/// never mass.
+///
+/// The CPU counters carry an `_us` (microsecond-integer) suffix, a deliberate
+/// divergence from the `_seconds` whole-second duration convention: these are
+/// cumulative CPU-time totals a reader differences to derive utilisation, and
+/// whole-second quantisation would erase sub-second deltas between adjacent
+/// samples. They are integers, not instants, so the string-instant rule does
+/// not apply.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct UsagePoint {
+    pub attempt: AttemptId,
+    pub at: Timestamp,
+    /// Cumulative CPU time consumed, µs.
+    pub cpu_usage_total_us: u64,
+    /// Cumulative CPU time the container was throttled, µs.
+    pub cpu_throttled_total_us: u64,
+    /// Current resident memory.
+    pub memory_used_bytes: u64,
+    /// Peak resident memory over the attempt so far.
+    pub memory_peak_bytes: u64,
+    /// Writable-layer bytes from the disk poller's last reading.
+    pub disk_writable_bytes: u64,
+    /// Image bytes — constant per attempt; writable + image = disk usage.
+    pub disk_image_bytes: u64,
+    /// Cumulative bytes received on the container network.
+    pub net_rx_bytes_total: u64,
+    /// Cumulative bytes transmitted on the container network.
+    pub net_tx_bytes_total: u64,
+    /// Cumulative block-I/O bytes read.
+    pub blkio_read_bytes_total: u64,
+    /// Cumulative block-I/O bytes written.
+    pub blkio_write_bytes_total: u64,
+}
+
+/// One per attempt this page covered, in page order — the metrics twin of
+/// [`LogSourceRecord`], with identical fields and semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSourceRecord {
+    pub attempt: AttemptId,
+    /// The node the attempt ran on; `null` only when the attempt record itself
+    /// is missing from replicated state, so no node is known.
+    pub node: Option<NodeId>,
+    pub availability: UsageAvailability,
+    /// True when older samples the client asked for have been pruned: the
+    /// store's `earliest_at` lies inside the requested range.
+    pub truncated: bool,
+    /// The store's oldest retained instant for this attempt, when known;
+    /// advisory.
+    pub earliest_available_at: Option<Timestamp>,
+    /// Human-readable detail for an `expired`/`unreachable`/`not_started`
+    /// verdict; `null` for a plain `available`.
+    pub reason: Option<String>,
+}
+
+/// `GET /api/v1/jobs/{job}/usage` — the never-bare-array envelope (ADR 0031),
+/// the metrics twin of [`GetJobLogsResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetJobUsageResponse {
+    pub samples: Vec<UsagePoint>,
+    pub sources: Vec<UsageSourceRecord>,
+    /// Opaque continuation token ([`UsageCursor`]); `null` iff the walk is
+    /// truly complete. A short page with a non-null cursor means "continue"
+    /// (ListJobs precedent).
+    pub next_cursor: Option<String>,
+}
+
+/// The usage pagination cursor: `v1:<order>:<attempt-id>:<at_us>:<skip>`.
+///
+/// A distinct type from [`LogCursor`] with the same wire format and the same
+/// content-coordinate `(attempt, at_us, skip)` design: a token minted against a
+/// live agent read stays valid if the same range is one day served from a
+/// durable store. Formatted and parsed in exactly one place; a cursor whose
+/// `order` disagrees with the request's `order=` is a caller error, checked by
+/// the handler.
+///
+/// `at_us` may be the walk edge sentinel ([`UsageCursor::EDGE_ASC`] /
+/// [`UsageCursor::EDGE_DESC`]) meaning "resume `attempt` from its beginning" —
+/// the coordinator maps that to an absent RPC resume before dialing, so the
+/// sentinel never crosses the wire. The `order` segment reuses [`LogOrder`],
+/// the shared scan direction; only the endpoint's *default* differs (usage
+/// defaults `asc`, logs `desc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageCursor {
+    pub order: LogOrder,
+    pub attempt: AttemptId,
+    pub at_us: i64,
+    pub skip: u64,
+}
+
+impl UsageCursor {
+    const PREFIX: &'static str = "v1:";
+    /// Sentinel `at_us` for "the ascending edge" (oldest): resume from the start.
+    pub const EDGE_ASC: i64 = i64::MIN;
+    /// Sentinel `at_us` for "the descending edge" (newest): resume from the start.
+    pub const EDGE_DESC: i64 = i64::MAX;
+
+    /// The token for a resume position.
+    pub fn format(&self) -> String {
+        format!(
+            "{}{}:{}:{}:{}",
+            Self::PREFIX,
+            self.order.as_str(),
+            self.attempt,
+            self.at_us,
+            self.skip,
+        )
+    }
+
+    /// A cursor at the walk edge of `attempt` (resume from the beginning).
+    pub fn edge(order: LogOrder, attempt: AttemptId) -> UsageCursor {
+        UsageCursor {
+            order,
+            attempt,
+            at_us: match order {
+                LogOrder::Asc => Self::EDGE_ASC,
+                LogOrder::Desc => Self::EDGE_DESC,
+            },
+            skip: 0,
+        }
+    }
+
+    /// True when this cursor addresses an attempt's edge (no resume position),
+    /// rather than a sample coordinate within it.
+    pub fn is_edge(&self) -> bool {
+        self.skip == 0
+            && self.at_us
+                == match self.order {
+                    LogOrder::Asc => Self::EDGE_ASC,
+                    LogOrder::Desc => Self::EDGE_DESC,
+                }
+    }
+
+    /// Parse a token; anything that is not `v1:<order>:<attempt-id>:<i64>:<u64>`
+    /// is a caller error.
+    pub fn parse(token: &str) -> Result<UsageCursor, String> {
+        let rest = token
+            .strip_prefix(Self::PREFIX)
+            .ok_or_else(|| format!("cursor must begin with `{}`", Self::PREFIX))?;
+        // `splitn(4, ':')` keeps the attempt id whole — a typed id has no `:`,
+        // but pinning the field count rejects a token with extra segments.
+        let mut parts = rest.splitn(4, ':');
+        let order = parts
+            .next()
+            .ok_or_else(|| "cursor is missing its order segment".to_string())?;
+        let order = LogOrder::parse(order)?;
+        let attempt = parts
+            .next()
+            .ok_or_else(|| "cursor is missing its attempt segment".to_string())?;
+        let attempt = attempt
+            .parse::<AttemptId>()
+            .map_err(|e| format!("invalid cursor attempt id: {e}"))?;
+        let at_us = parts
+            .next()
+            .ok_or_else(|| "cursor is missing its at_us segment".to_string())?;
+        let at_us = at_us
+            .parse::<i64>()
+            .map_err(|e| format!("invalid cursor at_us: {e}"))?;
+        let skip = parts
+            .next()
+            .ok_or_else(|| "cursor is missing its skip segment".to_string())?;
+        let skip = skip
+            .parse::<u64>()
+            .map_err(|e| format!("invalid cursor skip: {e}"))?;
+        Ok(UsageCursor {
+            order,
+            attempt,
+            at_us,
+            skip,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -50,7 +50,7 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         .route("/api/v1/jobs/:job/timeline", get(get_job_timeline::<P>))
         .route(
             "/api/v1/jobs/:job/usage",
-            get(unimplemented_id_read::<JobId>("GetJobUsage")),
+            get(super::usage::get_job_usage::<P>),
         )
         .route(
             "/api/v1/jobs/:job/logs",
@@ -637,6 +637,19 @@ mod tests {
             // node, so it never reaches here.
             Err(crate::LogFetchError::Unreachable {
                 reason: "stub plane serves no logs".to_string(),
+            })
+        }
+
+        async fn fetch_metrics(
+            &self,
+            _node: coppice_core::id::NodeId,
+            _addr: &str,
+            _req: crate::MetricsFetchRequest,
+        ) -> Result<crate::MetricsFetchOutcome, crate::MetricsFetchError> {
+            // Like `fetch_logs`: the usage walk is exercised against a dedicated
+            // fake in `super::super::usage`; this plane never reaches here.
+            Err(crate::MetricsFetchError::Unreachable {
+                reason: "stub plane serves no metrics".to_string(),
             })
         }
     }
