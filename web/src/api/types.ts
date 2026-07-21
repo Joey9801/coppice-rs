@@ -536,6 +536,62 @@ export interface JobUsage {
   samples: UsageSample[]
 }
 
+// ---------------------------------------------------------------------------
+// Job usage metrics — the real GET /api/v1/jobs/{job}/usage contract
+// ---------------------------------------------------------------------------
+// Mirrors the Rust DTOs in crates/coppice-api/src/http/dto.rs
+// (GetJobUsageResponse / UsagePoint / UsageSourceRecord / UsageAvailability),
+// the metrics twin of the job-logs pipeline. Supersedes the invented
+// `JobUsage`/`UsageSample` proposal above (kept for the mock world and its
+// tests) exactly as the real log DTOs superseded this file's invented
+// `LogChunk`. Cursor-paged over the job's attempts with a per-attempt
+// availability accounting; `order` defaults to `asc` (chart order).
+//
+// Counters are cumulative — a client differences consecutive samples to derive
+// rates. CPU totals are integer microseconds (`...Us`), not whole seconds: a
+// deliberate divergence from the `_seconds` duration convention so sub-second
+// deltas between adjacent samples survive.
+
+export type UsageAvailability =
+  | 'available'
+  | 'expired'
+  | 'unreachable'
+  | 'not_started'
+
+export interface UsagePoint {
+  attempt: AttemptId
+  at: Date
+  cpuUsageTotalUs: number
+  cpuThrottledTotalUs: number
+  memoryUsedBytes: number
+  memoryPeakBytes: number
+  diskWritableBytes: number
+  diskImageBytes: number
+  netRxBytesTotal: number
+  netTxBytesTotal: number
+  blkioReadBytesTotal: number
+  blkioWriteBytesTotal: number
+}
+
+export interface UsageSourceRecord {
+  attempt: AttemptId
+  /** Null only when the attempt record is missing from replicated state. */
+  node: NodeId | null
+  availability: UsageAvailability
+  /** True when older samples the client asked for had been pruned. */
+  truncated: boolean
+  earliestAvailableAt: Date | null
+  /** Detail for an expired/unreachable/not_started verdict; null when available. */
+  reason: string | null
+}
+
+export interface GetJobUsageResponse {
+  samples: UsagePoint[]
+  sources: UsageSourceRecord[]
+  /** Pass back to continue; null when the walk is complete. */
+  nextCursor: string | null
+}
+
 export interface UtilizationSample {
   t: Date
   /** Actually consumed. */

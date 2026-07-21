@@ -29,7 +29,7 @@ use coppice_state::Command;
 
 use crate::admin::AdminService;
 use crate::cli::RunArgs;
-use crate::tasks::node_client::NodeLogClient;
+use crate::tasks::node_client::NodeClient;
 use crate::{config, limits};
 
 /// A fully-assembled, running coordinator replica.
@@ -55,7 +55,7 @@ pub struct BootedCoordinator {
     /// Dials agents' `NodeService` listeners for job-log retrieval (ADR 0034),
     /// built from the same mTLS material as the raft mesh. Handed to the task
     /// runtime, which attaches it to the API control plane.
-    pub node_log_client: Arc<NodeLogClient>,
+    pub node_log_client: Arc<NodeClient>,
     /// Fires the raft/admin server's graceful shutdown.
     pub raft_server_shutdown: oneshot::Sender<()>,
     /// The raft/admin server task; join it after triggering shutdown.
@@ -158,7 +158,7 @@ pub async fn serve_runtime(
     agent_listener: AgentListener,
     client_listener: ClientListener,
     cluster_id: ClusterId,
-    node_log_client: Arc<NodeLogClient>,
+    node_log_client: Arc<NodeClient>,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -340,7 +340,7 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
     // The replica-local log-fetch client (ADR 0034): dials agents' NodeService
     // listeners with this node's leaf as the client identity and the cluster CA
     // as the trust root — the same material the raft mesh and agent gateway use.
-    let node_log_client = Arc::new(NodeLogClient::new(&ca, &cert, &key));
+    let node_log_client = Arc::new(NodeClient::new(&ca, &cert, &key));
 
     // Step 6: the mTLS server carrying both the Raft transport and the admin
     // surface. Client certs are REQUIRED — `client_ca_root` sets the trust

@@ -348,6 +348,99 @@ pub enum LogFetchError {
     Unreachable { reason: String },
 }
 
+// The metrics twin of the log-fetch seam above (`NodeService::FetchMetrics`).
+// Same single-RPC shape: page orchestration (the multi-attempt walk, the
+// cursor, the 4-RPC budget) lives in the HTTP handler for
+// `GET /api/v1/jobs/{job}/usage`; this seam is one RPC. Samples are fixed-size
+// rows, so there is no byte budget — only `max_samples` — the one structural
+// divergence from the log seam. `LogResumePosition` (the same `(at, insertion)`
+// coordinate the proto's shared `ResumePosition` carries) is reused rather than
+// re-declared.
+
+/// One page request for a single attempt's metric samples (one
+/// `NodeService::FetchMetrics` RPC). The coordinator has already resolved
+/// `(job, attempt)` to the target node from replicated state before dialing.
+#[derive(Debug, Clone)]
+pub struct MetricsFetchRequest {
+    pub job: coppice_core::id::JobId,
+    pub attempt: coppice_core::id::AttemptId,
+    /// Half-open `[from_us, until_us)` window; either bound may be open.
+    pub from_us: Option<i64>,
+    pub until_us: Option<i64>,
+    /// Exclusive lower cursor; `None` starts from the window edge.
+    pub resume: Option<LogResumePosition>,
+    /// Direction: `false` walks newest-first (matches `order=desc`).
+    pub ascending: bool,
+    /// Hard cap on the page; the store stops here and reports
+    /// `exhausted = false` when more rows remain. No byte cap: samples are
+    /// fixed-size rows.
+    pub max_samples: u32,
+}
+
+/// One stored metric sample, mirroring the agent's periodic resource row
+/// field-for-field (docker-executor.md §8.1). Counters are cumulative —
+/// readers derive rates, so a missed sample loses resolution, never mass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricSample {
+    pub at_us: i64,
+    /// Cumulative CPU time consumed, µs.
+    pub cpu_usage_total_us: u64,
+    /// Cumulative CPU time the container was throttled, µs.
+    pub cpu_throttled_total_us: u64,
+    /// Current resident memory.
+    pub memory_used_bytes: u64,
+    /// Peak resident memory over the attempt so far.
+    pub memory_peak_bytes: u64,
+    /// Writable-layer bytes from the disk poller's last reading.
+    pub disk_writable_bytes: u64,
+    /// Image bytes — constant per attempt; writable + image = usage.
+    pub disk_image_bytes: u64,
+    /// Cumulative bytes received on the container network.
+    pub net_rx_bytes_total: u64,
+    /// Cumulative bytes transmitted on the container network.
+    pub net_tx_bytes_total: u64,
+    /// Cumulative block-I/O bytes read.
+    pub blkio_read_bytes_total: u64,
+    /// Cumulative block-I/O bytes written.
+    pub blkio_write_bytes_total: u64,
+}
+
+/// A page of samples in the requested direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsPage {
+    pub samples: Vec<MetricSample>,
+    /// True when the walk reached the end of the requested range within this
+    /// page; false when `max_samples` cut it short and a further page exists.
+    pub exhausted: bool,
+    /// The store's oldest/newest retained sample `at_us` for this attempt, when
+    /// known. A requested `from_us` earlier than `earliest_at_us` means older
+    /// samples existed and were pruned (the API's `truncated` verdict).
+    pub earliest_at_us: Option<i64>,
+    pub latest_at_us: Option<i64>,
+}
+
+/// The result of one `FetchMetrics`: a page, or the store holding no data for
+/// the attempt at all (segments pruned, or telemetry never written — the
+/// "gone" signal behind the `expired` availability verdict).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricsFetchOutcome {
+    Samples(MetricsPage),
+    UnknownAttempt,
+}
+
+/// Why a `fetch_metrics` RPC could not be completed against the target node.
+/// The metrics twin of [`LogFetchError`]: `UnknownAttempt` is a normal
+/// [`MetricsFetchOutcome`], not an error — an error here means the RPC itself
+/// did not land.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum MetricsFetchError {
+    /// The node could not be reached: no dialable channel, a connect/deadline
+    /// failure, or the agent hosts no service. `reason` is operator-readable
+    /// and surfaces verbatim in the `sources[].reason` of the response.
+    #[error("node unreachable: {reason}")]
+    Unreachable { reason: String },
+}
+
 /// The set of operations the API layer exposes. Implemented by the
 /// coordinator, which owns access to consensus and state.
 ///
@@ -459,4 +552,23 @@ pub trait ControlPlane: Send + Sync + 'static {
         addr: &str,
         req: LogFetchRequest,
     ) -> impl Future<Output = Result<LogFetchOutcome, LogFetchError>> + Send;
+
+    /// Fetch one bounded page of an attempt's stored metric samples from the
+    /// agent that ran it (`NodeService::FetchMetrics`), the metrics twin of
+    /// [`fetch_logs`](ControlPlane::fetch_logs).
+    ///
+    /// The HTTP handler for `GET /api/v1/jobs/{job}/usage` has already resolved
+    /// `(job, attempt)` to `node` and its advertised `addr` from replicated
+    /// state, and owns the page orchestration — the multi-attempt walk, the
+    /// cursor, and the at-most-4-RPCs-per-request budget. This method is one
+    /// RPC: it dials the node (any replica may, no leader involvement), applies
+    /// a 5 s deadline, and returns the store's answer or a [`MetricsFetchError`].
+    /// A pruned/never-written attempt is the normal
+    /// [`MetricsFetchOutcome::UnknownAttempt`], not an error.
+    fn fetch_metrics(
+        &self,
+        node: coppice_core::id::NodeId,
+        addr: &str,
+        req: MetricsFetchRequest,
+    ) -> impl Future<Output = Result<MetricsFetchOutcome, MetricsFetchError>> + Send;
 }

@@ -22,6 +22,7 @@ mod project;
 mod read;
 mod routes;
 mod ui;
+mod usage;
 
 pub use error::{ErrorCode, HttpError};
 pub use extract::{IdPath, ReadIndexes, ReadQuery};

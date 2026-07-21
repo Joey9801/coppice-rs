@@ -20,7 +20,7 @@ use crate::liveness::NodeLiveness;
 use crate::tasks::agent_gateway::{AgentSessionService, Gateway};
 use crate::tasks::api_server::{self, CoordinatorControlPlane};
 use crate::tasks::housekeeping::StubHistoryStore;
-use crate::tasks::node_client::NodeLogClient;
+use crate::tasks::node_client::NodeClient;
 use crate::tasks::{
     agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver,
 };
@@ -45,7 +45,7 @@ pub async fn run<C>(
     agent_listener: AgentListener,
     client_listener: ClientListener,
     cluster_id: ClusterId,
-    node_log_client: Arc<NodeLogClient>,
+    node_log_client: Arc<NodeClient>,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where

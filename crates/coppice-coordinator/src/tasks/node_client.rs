@@ -1,10 +1,12 @@
-//! The replica-local log-fetch client (ADR 0034).
+//! The replica-local node-fetch client (ADR 0034).
 //!
-//! Backs `ControlPlane::fetch_logs`: dials an agent's advertised
-//! `NodeService` endpoint as an ordinary mTLS gRPC client and reads one bounded
-//! page of an attempt's logs. Every replica makes this call identically — there
-//! is **no leadership gating** — so log traffic load-balances across the
-//! cluster instead of concentrating on the leader.
+//! Backs `ControlPlane::fetch_logs` and `ControlPlane::fetch_metrics`: dials an
+//! agent's advertised `NodeService` endpoint as an ordinary mTLS gRPC client
+//! and reads one bounded page of an attempt's logs (`FetchLogs`) or metric
+//! samples (`FetchMetrics`). Both directions share the channel cache, per-node
+//! semaphore, and whole-fetch deadline below. Every replica makes these calls
+//! identically — there is **no leadership gating** — so the traffic
+//! load-balances across the cluster instead of concentrating on the leader.
 //!
 //! Identity mirrors the raft mesh (`coppice_consensus::net::client`): the
 //! coordinator's own leaf is the client certificate, the cluster CA is the
@@ -26,6 +28,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 
 use coppice_api::{
     LogChunk, LogFetchError, LogFetchOutcome, LogFetchRequest, LogPage, LogStreamSelector,
+    MetricSample, MetricsFetchError, MetricsFetchOutcome, MetricsFetchRequest, MetricsPage,
 };
 use coppice_core::id::NodeId;
 use coppice_net::node_service::Client;
@@ -49,7 +52,13 @@ const UNREACHABLE: &str = "coordinator_node_log_fetch_unreachable_total";
 const UNKNOWN_ATTEMPT: &str = "coordinator_node_log_unknown_attempt_total";
 const BYTES_FETCHED: &str = "coordinator_node_log_bytes_fetched_total";
 
-/// Register the log-fetch counters (wired into `crate::describe_metrics`).
+const METRIC_FETCHES: &str = "coordinator_node_metric_fetches_total";
+const METRIC_TIMEOUTS: &str = "coordinator_node_metric_fetch_timeouts_total";
+const METRIC_UNREACHABLE: &str = "coordinator_node_metric_fetch_unreachable_total";
+const METRIC_UNKNOWN_ATTEMPT: &str = "coordinator_node_metric_unknown_attempt_total";
+const SAMPLES_FETCHED: &str = "coordinator_node_metric_samples_fetched_total";
+
+/// Register the node-fetch counters (wired into `crate::describe_metrics`).
 pub(crate) fn describe_metrics() {
     metrics::describe_counter!(
         FETCHES,
@@ -68,35 +77,53 @@ pub(crate) fn describe_metrics() {
         "FetchLogs answers reporting the attempt's logs are gone (UnknownAttempt)."
     );
     metrics::describe_counter!(BYTES_FETCHED, "Chunk payload bytes returned by FetchLogs.");
+    metrics::describe_counter!(
+        METRIC_FETCHES,
+        "FetchMetrics RPCs attempted against agent node services."
+    );
+    metrics::describe_counter!(
+        METRIC_TIMEOUTS,
+        "FetchMetrics RPCs that failed with a deadline/timeout."
+    );
+    metrics::describe_counter!(
+        METRIC_UNREACHABLE,
+        "FetchMetrics RPCs that could not reach the node (dial failure or non-timeout error)."
+    );
+    metrics::describe_counter!(
+        METRIC_UNKNOWN_ATTEMPT,
+        "FetchMetrics answers reporting the attempt's metrics are gone (UnknownAttempt)."
+    );
+    metrics::describe_counter!(SAMPLES_FETCHED, "Metric samples returned by FetchMetrics.");
 }
 
-/// No point-in-time sampling behind the log-fetch counters; they are pushed as
+/// No point-in-time sampling behind the node-fetch counters; they are pushed as
 /// RPCs resolve.
 pub(crate) fn gather_metrics() {}
 
-/// Dials agents' `NodeService` listeners to fetch job logs.
-pub struct NodeLogClient {
+/// Dials agents' `NodeService` listeners to fetch an attempt's job logs
+/// (`FetchLogs`) or metric samples (`FetchMetrics`).
+pub struct NodeClient {
     /// The mTLS client config sans server-name; the SNI/verification name is
     /// stamped per dial with the target node's typed id.
     tls: ClientTlsConfig,
     /// Per-node `(dialed address, channel)`. A re-registration at a new address
     /// drops the stale channel and redials.
     channels: Mutex<HashMap<NodeId, (String, Channel)>>,
-    /// Per-node in-flight limiter.
+    /// Per-node in-flight limiter, shared by log and metric fetches.
     semaphores: Mutex<HashMap<NodeId, Arc<Semaphore>>>,
     /// The whole-fetch deadline (permit wait + dial + RPC). A field, not the
     /// bare const, so a test can shrink it to make the saturation bound fast.
     deadline: Duration,
 }
 
-impl NodeLogClient {
+impl NodeClient {
     /// Build from the coordinator's mTLS material (ADR 0011): its own leaf as
     /// client identity, the cluster CA as the trust root.
     pub fn new(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Self {
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
             .identity(Identity::from_pem(cert_pem, key_pem));
-        NodeLogClient {
+        NodeClient {
             tls,
             channels: Mutex::new(HashMap::new()),
             semaphores: Mutex::new(HashMap::new()),
@@ -205,6 +232,106 @@ impl NodeLogClient {
                 Err(LogFetchError::Unreachable {
                     reason: format!(
                         "fetching logs from node {node} at {addr} failed ({:?}): {}",
+                        status.code(),
+                        status.message()
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Fetch one page of `attempt`'s metric samples from `node` at `addr`, the
+    /// metrics twin of [`Self::fetch_logs`]. Shares the channel cache, per-node
+    /// semaphore, and whole-fetch deadline: a request that queues behind a
+    /// saturated per-node permit set surfaces as `Unreachable` at the deadline
+    /// rather than sitting for one full deadline batch per slow call ahead of
+    /// it (ADR 0034 isolation guarantee).
+    pub async fn fetch_metrics(
+        &self,
+        node: NodeId,
+        addr: &str,
+        req: MetricsFetchRequest,
+    ) -> Result<MetricsFetchOutcome, MetricsFetchError> {
+        metrics::counter!(METRIC_FETCHES).increment(1);
+
+        // `acquired` flips true the instant a permit is in hand, so a deadline
+        // expiry can name its cause: still false ⇒ we timed out *queueing* for a
+        // permit (the node is saturated); true ⇒ the dial/RPC itself overran.
+        let acquired = Arc::new(AtomicBool::new(false));
+        match tokio::time::timeout(
+            self.deadline,
+            self.metrics_guarded(node, addr, req, Arc::clone(&acquired)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                metrics::counter!(METRIC_TIMEOUTS).increment(1);
+                let reason = if acquired.load(Ordering::Acquire) {
+                    format!(
+                        "fetching metrics from node {node} at {addr} exceeded the {:?} \
+                         deadline (dial/RPC unresponsive)",
+                        self.deadline
+                    )
+                } else {
+                    // The permit was never granted: both in-flight slots stayed
+                    // held by slow calls for the whole deadline.
+                    format!(
+                        "node {node} at {addr} saturated: all {PER_NODE_INFLIGHT} in-flight \
+                         node-fetch slots stayed busy past the {:?} deadline",
+                        self.deadline
+                    )
+                };
+                Err(MetricsFetchError::Unreachable { reason })
+            }
+        }
+    }
+
+    /// The permit-guarded metrics fetch body, run *inside* the whole-fetch
+    /// deadline — the metrics twin of [`Self::fetch_guarded`].
+    async fn metrics_guarded(
+        &self,
+        node: NodeId,
+        addr: &str,
+        req: MetricsFetchRequest,
+        acquired: Arc<AtomicBool>,
+    ) -> Result<MetricsFetchOutcome, MetricsFetchError> {
+        let permit = self.semaphore(node);
+        let _permit = permit
+            .acquire()
+            .await
+            .expect("per-node fetch semaphore is never closed");
+        acquired.store(true, Ordering::Release);
+
+        let channel = self.channel_for(node, addr).map_err(|reason| {
+            metrics::counter!(METRIC_UNREACHABLE).increment(1);
+            MetricsFetchError::Unreachable { reason }
+        })?;
+
+        let mut client = Client::new(channel);
+        let pb_req = metrics_request_to_pb(req);
+        match client.fetch_metrics(tonic::Request::new(pb_req)).await {
+            Ok(response) => {
+                let outcome = metrics_response_from_pb(response.into_inner())?;
+                if let MetricsFetchOutcome::Samples(page) = &outcome {
+                    metrics::counter!(SAMPLES_FETCHED).increment(page.samples.len() as u64);
+                } else {
+                    metrics::counter!(METRIC_UNKNOWN_ATTEMPT).increment(1);
+                }
+                Ok(outcome)
+            }
+            Err(status) => {
+                // Any RPC failure evicts the channel so the next call redials.
+                self.evict(node);
+                let timed_out = status.code() == tonic::Code::DeadlineExceeded;
+                if timed_out {
+                    metrics::counter!(METRIC_TIMEOUTS).increment(1);
+                } else {
+                    metrics::counter!(METRIC_UNREACHABLE).increment(1);
+                }
+                Err(MetricsFetchError::Unreachable {
+                    reason: format!(
+                        "fetching metrics from node {node} at {addr} failed ({:?}): {}",
                         status.code(),
                         status.message()
                     ),
@@ -353,6 +480,62 @@ fn chunk_stream(stream: i32) -> LogStreamSelector {
     }
 }
 
+/// Convert the transport-neutral metrics request into the wire message.
+fn metrics_request_to_pb(req: MetricsFetchRequest) -> apb::FetchMetricsRequest {
+    apb::FetchMetricsRequest {
+        job: Some(req.job.into()),
+        attempt: Some(req.attempt.into()),
+        from_us: req.from_us,
+        until_us: req.until_us,
+        resume: req.resume.map(|r| apb::ResumePosition {
+            at_us: r.at_us,
+            skip: r.skip,
+        }),
+        ascending: req.ascending,
+        max_samples: req.max_samples,
+    }
+}
+
+/// Convert the wire metrics response into the seam outcome. A missing `oneof`
+/// arm is a malformed answer, surfaced as `Unreachable`.
+fn metrics_response_from_pb(
+    resp: apb::FetchMetricsResponse,
+) -> Result<MetricsFetchOutcome, MetricsFetchError> {
+    match resp.outcome {
+        Some(apb::fetch_metrics_response::Outcome::Samples(samples)) => {
+            Ok(MetricsFetchOutcome::Samples(MetricsPage {
+                samples: samples.samples.into_iter().map(sample_from_pb).collect(),
+                exhausted: samples.exhausted,
+                earliest_at_us: samples.earliest_at_us,
+                latest_at_us: samples.latest_at_us,
+            }))
+        }
+        Some(apb::fetch_metrics_response::Outcome::UnknownAttempt(_)) => {
+            Ok(MetricsFetchOutcome::UnknownAttempt)
+        }
+        None => Err(MetricsFetchError::Unreachable {
+            reason: "agent returned a FetchMetrics response with no outcome".to_string(),
+        }),
+    }
+}
+
+/// Convert one wire metric sample into the seam row (field-for-field).
+fn sample_from_pb(s: apb::MetricSample) -> MetricSample {
+    MetricSample {
+        at_us: s.at_us,
+        cpu_usage_total_us: s.cpu_usage_total_us,
+        cpu_throttled_total_us: s.cpu_throttled_total_us,
+        memory_used_bytes: s.memory_used_bytes,
+        memory_peak_bytes: s.memory_peak_bytes,
+        disk_writable_bytes: s.disk_writable_bytes,
+        disk_image_bytes: s.disk_image_bytes,
+        net_rx_bytes_total: s.net_rx_bytes_total,
+        net_tx_bytes_total: s.net_tx_bytes_total,
+        blkio_read_bytes_total: s.blkio_read_bytes_total,
+        blkio_write_bytes_total: s.blkio_write_bytes_total,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_address_reuses_the_cached_channel() {
-        let client = NodeLogClient::new(b"", b"", b"");
+        let client = NodeClient::new(b"", b"", b"");
         let node = NodeId::new();
         client.insert_channel(node, "10.0.0.1:9100", dummy_channel());
         // Cache hit: returns without a rebuild (a rebuild would fail on the
@@ -487,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn changed_address_does_not_reuse_the_stale_channel() {
-        let client = NodeLogClient::new(b"", b"", b"");
+        let client = NodeClient::new(b"", b"", b"");
         let node = NodeId::new();
         client.insert_channel(node, "10.0.0.1:9100", dummy_channel());
         // A re-registration at a new address must not reuse the stale channel:
@@ -498,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_drops_the_cached_channel() {
-        let client = NodeLogClient::new(b"", b"", b"");
+        let client = NodeClient::new(b"", b"", b"");
         let node = NodeId::new();
         client.insert_channel(node, "10.0.0.1:9100", dummy_channel());
         assert!(client.channels.lock().unwrap().contains_key(&node));
@@ -517,7 +700,7 @@ mod tests {
     async fn saturated_node_times_out_the_whole_fetch() {
         // A short deadline keeps the wall-clock assertion fast in CI.
         let deadline = Duration::from_millis(300);
-        let client = NodeLogClient::new(b"", b"", b"").with_deadline(deadline);
+        let client = NodeClient::new(b"", b"", b"").with_deadline(deadline);
         let node = NodeId::new();
 
         // Hold BOTH in-flight slots for the whole test (two slow fetches).
@@ -574,10 +757,13 @@ mod tests {
     // request/response conversion and the semaphore path against a live tonic
     // `NodeService`.
 
-    /// A stub `NodeService` that answers with whatever it was seeded with.
+    /// A stub `NodeService` answering both RPCs with whatever it was seeded
+    /// with, recording the requests it saw on each.
     struct StubNode {
-        outcome: apb::FetchLogsResponse,
-        seen: Arc<Mutex<Vec<apb::FetchLogsRequest>>>,
+        logs: apb::FetchLogsResponse,
+        metrics: apb::FetchMetricsResponse,
+        seen_logs: Arc<Mutex<Vec<apb::FetchLogsRequest>>>,
+        seen_metrics: Arc<Mutex<Vec<apb::FetchMetricsRequest>>>,
     }
 
     #[tonic::async_trait]
@@ -586,21 +772,72 @@ mod tests {
             &self,
             request: Request<apb::FetchLogsRequest>,
         ) -> Result<Response<apb::FetchLogsResponse>, Status> {
-            self.seen.lock().unwrap().push(request.into_inner());
-            Ok(Response::new(self.outcome.clone()))
+            self.seen_logs.lock().unwrap().push(request.into_inner());
+            Ok(Response::new(self.logs.clone()))
+        }
+
+        async fn fetch_metrics(
+            &self,
+            request: Request<apb::FetchMetricsRequest>,
+        ) -> Result<Response<apb::FetchMetricsResponse>, Status> {
+            self.seen_metrics.lock().unwrap().push(request.into_inner());
+            Ok(Response::new(self.metrics.clone()))
         }
     }
 
+    /// A metrics response the log stub answers with when a metrics RPC is never
+    /// expected (its `outcome` arm is unused by log tests).
+    fn empty_metrics_response() -> apb::FetchMetricsResponse {
+        apb::FetchMetricsResponse {
+            outcome: Some(apb::fetch_metrics_response::Outcome::UnknownAttempt(
+                apb::UnknownAttempt {},
+            )),
+        }
+    }
+
+    fn empty_logs_response() -> apb::FetchLogsResponse {
+        apb::FetchLogsResponse {
+            outcome: Some(apb::fetch_logs_response::Outcome::UnknownAttempt(
+                apb::UnknownAttempt {},
+            )),
+        }
+    }
+
+    /// Serve a stub answering `FetchLogs` with `outcome`; returns the log
+    /// request log.
     async fn spawn_stub(
         outcome: apb::FetchLogsResponse,
     ) -> (SocketAddr, Arc<Mutex<Vec<apb::FetchLogsRequest>>>) {
+        let seen_logs = Arc::new(Mutex::new(Vec::new()));
+        let addr = spawn_service(StubNode {
+            logs: outcome,
+            metrics: empty_metrics_response(),
+            seen_logs: seen_logs.clone(),
+            seen_metrics: Arc::new(Mutex::new(Vec::new())),
+        })
+        .await;
+        (addr, seen_logs)
+    }
+
+    /// Serve a stub answering `FetchMetrics` with `outcome`; returns the metric
+    /// request log.
+    async fn spawn_metrics_stub(
+        outcome: apb::FetchMetricsResponse,
+    ) -> (SocketAddr, Arc<Mutex<Vec<apb::FetchMetricsRequest>>>) {
+        let seen_metrics = Arc::new(Mutex::new(Vec::new()));
+        let addr = spawn_service(StubNode {
+            logs: empty_logs_response(),
+            metrics: outcome,
+            seen_logs: Arc::new(Mutex::new(Vec::new())),
+            seen_metrics: seen_metrics.clone(),
+        })
+        .await;
+        (addr, seen_metrics)
+    }
+
+    async fn spawn_service(service: StubNode) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let service = StubNode {
-            outcome,
-            seen: seen.clone(),
-        };
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(NodeServiceServer::new(service))
@@ -608,7 +845,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        (addr, seen)
+        addr
     }
 
     fn plaintext_channel(addr: SocketAddr) -> Channel {
@@ -634,7 +871,7 @@ mod tests {
         };
         let (addr, seen) = spawn_stub(outcome).await;
 
-        let client = NodeLogClient::new(b"", b"", b"");
+        let client = NodeClient::new(b"", b"", b"");
         let node = NodeId::new();
         let addr_str = addr.to_string();
         client.insert_channel(node, &addr_str, plaintext_channel(addr));
@@ -680,7 +917,7 @@ mod tests {
             )),
         };
         let (addr, _seen) = spawn_stub(outcome).await;
-        let client = NodeLogClient::new(b"", b"", b"");
+        let client = NodeClient::new(b"", b"", b"");
         let node = NodeId::new();
         let addr_str = addr.to_string();
         client.insert_channel(node, &addr_str, plaintext_channel(addr));
@@ -704,5 +941,186 @@ mod tests {
             .await
             .expect("fetch");
         assert_eq!(result, LogFetchOutcome::UnknownAttempt);
+    }
+
+    // ---- metrics: pure conversion round-trips ---------------------------
+
+    #[test]
+    fn metrics_request_maps_every_field_to_the_wire() {
+        let job = JobId::new();
+        let attempt = AttemptId::new();
+        let pb = metrics_request_to_pb(MetricsFetchRequest {
+            job,
+            attempt,
+            from_us: Some(10),
+            until_us: Some(99),
+            resume: Some(coppice_api::LogResumePosition { at_us: 42, skip: 3 }),
+            ascending: true,
+            max_samples: 7,
+        });
+        assert_eq!(JobId::try_from(pb.job.unwrap()).unwrap(), job);
+        assert_eq!(AttemptId::try_from(pb.attempt.unwrap()).unwrap(), attempt);
+        assert_eq!(pb.from_us, Some(10));
+        assert_eq!(pb.until_us, Some(99));
+        assert_eq!(pb.resume.as_ref().unwrap().at_us, 42);
+        assert_eq!(pb.resume.as_ref().unwrap().skip, 3);
+        assert!(pb.ascending);
+        assert_eq!(pb.max_samples, 7);
+    }
+
+    /// A wire sample with every counter set distinctly, to assert the
+    /// field-for-field decode.
+    fn pb_sample(at_us: i64) -> apb::MetricSample {
+        apb::MetricSample {
+            at_us,
+            cpu_usage_total_us: 1,
+            cpu_throttled_total_us: 2,
+            memory_used_bytes: 3,
+            memory_peak_bytes: 4,
+            disk_writable_bytes: 5,
+            disk_image_bytes: 6,
+            net_rx_bytes_total: 7,
+            net_tx_bytes_total: 8,
+            blkio_read_bytes_total: 9,
+            blkio_write_bytes_total: 10,
+        }
+    }
+
+    #[test]
+    fn samples_response_decodes_to_a_page() {
+        let resp = apb::FetchMetricsResponse {
+            outcome: Some(apb::fetch_metrics_response::Outcome::Samples(
+                apb::Samples {
+                    samples: vec![pb_sample(1), pb_sample(2)],
+                    exhausted: false,
+                    earliest_at_us: Some(1),
+                    latest_at_us: Some(2),
+                },
+            )),
+        };
+        let MetricsFetchOutcome::Samples(page) = metrics_response_from_pb(resp).unwrap() else {
+            panic!("expected samples");
+        };
+        assert_eq!(page.samples.len(), 2);
+        assert_eq!(page.samples[0].at_us, 1);
+        // Every counter maps by name.
+        assert_eq!(page.samples[0].cpu_usage_total_us, 1);
+        assert_eq!(page.samples[0].cpu_throttled_total_us, 2);
+        assert_eq!(page.samples[0].memory_used_bytes, 3);
+        assert_eq!(page.samples[0].memory_peak_bytes, 4);
+        assert_eq!(page.samples[0].disk_writable_bytes, 5);
+        assert_eq!(page.samples[0].disk_image_bytes, 6);
+        assert_eq!(page.samples[0].net_rx_bytes_total, 7);
+        assert_eq!(page.samples[0].net_tx_bytes_total, 8);
+        assert_eq!(page.samples[0].blkio_read_bytes_total, 9);
+        assert_eq!(page.samples[0].blkio_write_bytes_total, 10);
+        assert!(!page.exhausted);
+        assert_eq!(page.earliest_at_us, Some(1));
+    }
+
+    #[test]
+    fn metrics_unknown_attempt_response_decodes() {
+        let resp = apb::FetchMetricsResponse {
+            outcome: Some(apb::fetch_metrics_response::Outcome::UnknownAttempt(
+                apb::UnknownAttempt {},
+            )),
+        };
+        assert_eq!(
+            metrics_response_from_pb(resp).unwrap(),
+            MetricsFetchOutcome::UnknownAttempt
+        );
+    }
+
+    #[test]
+    fn empty_metrics_outcome_is_unreachable() {
+        let resp = apb::FetchMetricsResponse { outcome: None };
+        assert!(matches!(
+            metrics_response_from_pb(resp),
+            Err(MetricsFetchError::Unreachable { .. })
+        ));
+    }
+
+    // ---- metrics: end-to-end dial against a plaintext in-process server ---
+
+    #[tokio::test]
+    async fn fetch_metrics_round_trips_samples_over_the_wire() {
+        let outcome = apb::FetchMetricsResponse {
+            outcome: Some(apb::fetch_metrics_response::Outcome::Samples(
+                apb::Samples {
+                    samples: vec![pb_sample(5)],
+                    exhausted: true,
+                    earliest_at_us: Some(5),
+                    latest_at_us: Some(5),
+                },
+            )),
+        };
+        let (addr, seen) = spawn_metrics_stub(outcome).await;
+
+        let client = NodeClient::new(b"", b"", b"");
+        let node = NodeId::new();
+        let addr_str = addr.to_string();
+        client.insert_channel(node, &addr_str, plaintext_channel(addr));
+
+        let job = JobId::new();
+        let attempt = AttemptId::new();
+        let result = client
+            .fetch_metrics(
+                node,
+                &addr_str,
+                MetricsFetchRequest {
+                    job,
+                    attempt,
+                    from_us: None,
+                    until_us: None,
+                    resume: None,
+                    ascending: false,
+                    max_samples: 200,
+                },
+            )
+            .await
+            .expect("fetch");
+
+        let MetricsFetchOutcome::Samples(page) = result else {
+            panic!("expected samples");
+        };
+        assert_eq!(page.samples.len(), 1);
+        assert_eq!(page.samples[0].at_us, 5);
+        assert!(page.exhausted);
+        // The server saw the converted request with our ids.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(JobId::try_from(seen[0].job.clone().unwrap()).unwrap(), job);
+    }
+
+    #[tokio::test]
+    async fn fetch_metrics_maps_unknown_attempt() {
+        let outcome = apb::FetchMetricsResponse {
+            outcome: Some(apb::fetch_metrics_response::Outcome::UnknownAttempt(
+                apb::UnknownAttempt {},
+            )),
+        };
+        let (addr, _seen) = spawn_metrics_stub(outcome).await;
+        let client = NodeClient::new(b"", b"", b"");
+        let node = NodeId::new();
+        let addr_str = addr.to_string();
+        client.insert_channel(node, &addr_str, plaintext_channel(addr));
+
+        let result = client
+            .fetch_metrics(
+                node,
+                &addr_str,
+                MetricsFetchRequest {
+                    job: JobId::new(),
+                    attempt: AttemptId::new(),
+                    from_us: None,
+                    until_us: None,
+                    resume: None,
+                    ascending: false,
+                    max_samples: 10,
+                },
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(result, MetricsFetchOutcome::UnknownAttempt);
     }
 }
