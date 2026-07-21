@@ -3299,7 +3299,7 @@ async fn node_service_serves_live_container_logs_over_mtls() {
             &pki.ca_pem,
         )?;
         let addr = listener.local_addr();
-        let _server = serve_node_service(listener, Some(sink.clone()));
+        let _server = serve_node_service(listener, Some(sink.clone()), Some(sink.clone()));
 
         let channel = dial_service(&pki, node_id, addr).await?;
         let mut client = NodeServiceClient::new(channel);

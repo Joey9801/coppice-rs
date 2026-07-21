@@ -768,6 +768,47 @@ pub struct LogPage {
     pub latest_at: Option<Timestamp>,
 }
 
+/// A paged metric query for the `FetchMetrics` RPC (ADR 0034), the metrics twin
+/// of [`LogPageQuery`]. A bounded, directional walk over one attempt's samples
+/// with an optional half-open time window, an optional exclusive resume
+/// position, and a `max_samples` cap. Samples are fixed-size rows, so there is
+/// no byte budget and no stream filter — only the row cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricPageQuery {
+    /// Inclusive lower bound of the half-open `[from, until)` window; `None`
+    /// opens the window on the old side.
+    pub from: Option<Timestamp>,
+    /// Exclusive upper bound of the half-open `[from, until)` window; `None`
+    /// opens the window on the new side.
+    pub until: Option<Timestamp>,
+    /// Walk direction.
+    pub order: LogOrder,
+    /// Exclusive resume position; `None` starts from the window edge in the
+    /// walk direction.
+    pub resume: Option<ResumeAt>,
+    /// Never return more than this many samples in the page.
+    pub max_samples: usize,
+}
+
+/// One page of a [`metric_page`](FilesystemSink::metric_page) walk (ADR 0034),
+/// the metrics twin of [`LogPage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricPage {
+    /// The samples in the requested direction, after range, resume, and cap.
+    pub samples: Vec<MetricSample>,
+    /// True when the walk reached the end of the requested window within this
+    /// page; false when `max_samples` cut it short and a further page exists.
+    pub exhausted: bool,
+    /// The oldest retained sample `at` for this attempt, independent of the
+    /// query window — a requested `from` earlier than this means older samples
+    /// existed and were pruned (the API's `truncated` verdict). `None` when the
+    /// attempt has no samples.
+    pub earliest_at: Option<Timestamp>,
+    /// The newest retained sample `at`, the mirror of
+    /// [`earliest_at`](MetricPage::earliest_at).
+    pub latest_at: Option<Timestamp>,
+}
+
 /// The telemetry read API's error (docker-executor.md §8.4). Typed rather than
 /// `anyhow` so a caller can distinguish an unknown attempt from a storage
 /// fault; `anyhow` stays at the wiring layer.
@@ -1254,6 +1295,231 @@ impl FilesystemSink {
         }
         out.sort_by_key(|sample| sample.at); // stable: ties keep write order
         Ok(out)
+    }
+
+    /// Read one bounded page of an attempt's metric samples for the
+    /// `FetchMetrics` RPC (ADR 0034), the metrics twin of
+    /// [`log_page`](Self::log_page). A directional walk over the half-open
+    /// `[from, until)` window with an optional exclusive resume position and a
+    /// `max_samples` cap.
+    ///
+    /// Like [`metric_samples`](Self::metric_samples) this probes **every**
+    /// segment — a row's `at` can be older than its segment's filename start
+    /// (§8.2 replay), so filename pruning would silently hide rows — but the
+    /// reads are **bounded**, and bounded *independently of the untrusted
+    /// cursor*: the whole-attempt `earliest_at`/`latest_at` come from index-only
+    /// `MIN`/`MAX` aggregates (decoding no row), the exclusive resume `skip` is
+    /// spent through index-only `COUNT`/`OFFSET` at the boundary microsecond,
+    /// and each segment's window slice is an indexed `LIMIT max_samples + 1`
+    /// range scan. Fixed-size rows mean no byte budget: a page reads at most
+    /// `max_samples + 1` rows per contributing segment. Segments whose data-time
+    /// bounds miss the window (or the boundary microsecond) are pruned without a
+    /// row read, and the beyond walk stops opening candidates once the page is
+    /// provably full — so a small page over a giant attempt opens only the
+    /// segments that can contribute.
+    ///
+    /// `earliest_at`/`latest_at` span the whole attempt, **independent** of the
+    /// window/resume, so the caller can detect head truncation.
+    /// [`StoreError::UnknownAttempt`] when no directory exists for the attempt
+    /// (its telemetry has fallen out of retention, or none was written) — the
+    /// RPC maps that to its `UnknownAttempt` arm.
+    pub async fn metric_page(
+        &self,
+        job: &JobId,
+        attempt: &AttemptId,
+        query: &MetricPageQuery,
+    ) -> Result<MetricPage, StoreError> {
+        let dir = self.attempt_dir_existing(job, attempt)?;
+        let segments = list_segments(&dir);
+
+        // Per-segment data-time bounds `(min_at, max_at)` and the whole-attempt
+        // `earliest_at`/`latest_at` from cheap `MIN`/`MAX` aggregates — one
+        // index-only probe per segment (bounded by retention's segment cap, the
+        // same probe budget [`metric_samples`] already pays). A segment with no
+        // metric rows contributes no bounds and is dropped from the walk.
+        let mut seg_bounds: Vec<(Timestamp, &PathBuf, (i64, i64))> = Vec::new();
+        let mut earliest_at: Option<Timestamp> = None;
+        let mut latest_at: Option<Timestamp> = None;
+        for (start, path) in &segments {
+            let Some(mut conn) = self.open_read(path).await? else {
+                continue;
+            };
+            let Some((lo, hi)) = metric_segment_bounds(&mut conn).await? else {
+                continue;
+            };
+            if let Some(at) = Timestamp::from_micros(lo) {
+                earliest_at = Some(earliest_at.map_or(at, |cur| cur.min(at)));
+            }
+            if let Some(at) = Timestamp::from_micros(hi) {
+                latest_at = Some(latest_at.map_or(at, |cur| cur.max(at)));
+            }
+            seg_bounds.push((*start, path, (lo, hi)));
+        }
+
+        // The half-open `[from, until)` window as an inclusive `[from_us,
+        // until_incl_us]` micro range: `until` is exclusive and `at` is
+        // µs-quantised, so `until - 1µs` closes it.
+        let from_us = query.from.map_or(i64::MIN, Timestamp::as_micros);
+        let until_incl_us = query
+            .until
+            .map_or(i64::MAX, |until| until.as_micros().saturating_sub(1));
+
+        // `want = max_samples + 1` is the row backstop and the exhaustion
+        // look-ahead: a page that collects `want` rows always ends on the cap
+        // with `exhausted = false`.
+        let want = (query.max_samples as u64)
+            .saturating_add(1)
+            .min(i64::MAX as u64) as i64;
+
+        // Which exact microsecond, if any, carries an in-window boundary run. A
+        // `resume.at` outside the window has no boundary rows in it, so `skip`
+        // is inert and the whole window is a beyond read.
+        let boundary_at = query.resume.and_then(|r| {
+            let b = r.at.as_micros();
+            (from_us <= b && b <= until_incl_us).then_some(b)
+        });
+        let skip = query.resume.map_or(0, |r| r.skip);
+
+        // The beyond range excludes the boundary microsecond in the walk
+        // direction. With no in-window boundary this is the whole window; the
+        // `saturating_add/sub(1)` on `resume.at` also correctly empties the
+        // range when `resume.at` sits on the already-consumed side.
+        let (beyond_lo, beyond_hi) = match query.order {
+            LogOrder::Ascending => {
+                let lo = query
+                    .resume
+                    .map_or(from_us, |r| from_us.max(r.at.as_micros().saturating_add(1)));
+                (lo, until_incl_us)
+            }
+            LogOrder::Descending => {
+                let hi = query.resume.map_or(until_incl_us, |r| {
+                    until_incl_us.min(r.at.as_micros().saturating_sub(1))
+                });
+                (from_us, hi)
+            }
+        };
+
+        // The boundary run, already in walk order: segments spanning
+        // `resume.at` are visited in cross-segment insertion order (ascending
+        // seg order, reversed for descending), each `COUNT`ed at exactly
+        // `resume.at`, and `skip` is spent against those counts to land on a
+        // per-segment `OFFSET`. Only once a segment holds surviving rows does a
+        // `LIMIT ? OFFSET ?` read decode anything — at most `want` rows total.
+        let mut boundary_walk: Vec<MetricRow> = Vec::new();
+        if let Some(b) = boundary_at {
+            let mut remaining_skip = skip;
+            let mut need = want;
+            let mut walk_segments: Vec<&PathBuf> = seg_bounds
+                .iter()
+                .filter(|(_, _, (lo, hi))| *lo <= b && b <= *hi)
+                .map(|(_, p, _)| *p)
+                .collect();
+            if matches!(query.order, LogOrder::Descending) {
+                walk_segments.reverse();
+            }
+            for path in walk_segments {
+                if need <= 0 {
+                    break;
+                }
+                let Some(mut conn) = self.open_read(path).await? else {
+                    continue;
+                };
+                let count = metric_boundary_count(&mut conn, b).await? as u64;
+                if remaining_skip >= count {
+                    remaining_skip -= count;
+                    continue;
+                }
+                let offset = remaining_skip as i64; // < count ≤ i64::MAX
+                remaining_skip = 0;
+                let rows = metric_boundary_rows(&mut conn, b, query.order, need, offset).await?;
+                need -= rows.len() as i64;
+                boundary_walk.extend(rows);
+            }
+        }
+
+        // The beyond run, pruned by bounds and pulled in leading-edge order with
+        // a top-k stopping rule (see [`log_page`](Self::log_page)): once `want`
+        // rows are collected in walk order, a candidate whose leading edge lies
+        // strictly beyond the want-th row's `at` cannot contribute, and neither
+        // can any later candidate. In the common forward-rolling case this opens
+        // exactly one segment however many are retained.
+        let mut candidates: Vec<(Timestamp, &PathBuf, (i64, i64))> = seg_bounds
+            .iter()
+            .filter(|(_, _, (lo, hi))| *lo <= beyond_hi && *hi >= beyond_lo)
+            .map(|(start, path, sb)| (*start, *path, *sb))
+            .collect();
+        match query.order {
+            LogOrder::Ascending => candidates.sort_by_key(|(_, _, sb)| sb.0),
+            LogOrder::Descending => candidates.sort_by_key(|(_, _, sb)| std::cmp::Reverse(sb.1)),
+        }
+
+        let sort_walk = |ats: &mut Vec<i64>| match query.order {
+            LogOrder::Ascending => ats.sort_unstable(),
+            LogOrder::Descending => ats.sort_unstable_by_key(|at| std::cmp::Reverse(*at)),
+        };
+        let mut collected: Vec<i64> = boundary_walk.iter().map(|r| r.at).collect();
+        sort_walk(&mut collected);
+
+        let mut pulled: BTreeMap<Timestamp, Vec<MetricRow>> = BTreeMap::new();
+        for (start, path, sb) in candidates {
+            if collected.len() >= want as usize {
+                let kth = collected[want as usize - 1];
+                let beyond_kth = match query.order {
+                    LogOrder::Ascending => sb.0 > kth,
+                    LogOrder::Descending => sb.1 < kth,
+                };
+                if beyond_kth {
+                    break;
+                }
+            }
+            let Some(mut conn) = self.open_read(path).await? else {
+                continue;
+            };
+            let rows =
+                metric_beyond_rows(&mut conn, beyond_lo, beyond_hi, query.order, want).await?;
+            collected.extend(rows.iter().map(|r| r.at));
+            sort_walk(&mut collected);
+            pulled.insert(start, rows);
+        }
+
+        // Assemble the pulled slices in segment-start order (reversed for
+        // descending), stable-sorted by `at` so ties keep segment-then-rowid
+        // (insertion) order.
+        let mut beyond_walk: Vec<MetricRow> = match query.order {
+            LogOrder::Ascending => pulled.into_values().flatten().collect(),
+            LogOrder::Descending => pulled.into_values().rev().flatten().collect(),
+        };
+        match query.order {
+            LogOrder::Ascending => beyond_walk.sort_by_key(|row| row.at),
+            LogOrder::Descending => beyond_walk.sort_by_key(|row| std::cmp::Reverse(row.at)),
+        }
+
+        // Boundary rows all sit at exactly `resume.at`, the leading edge of the
+        // walk, so they precede every beyond row (strictly past it) in walk
+        // order — no cross-group sort is needed. `skip` was consumed via the
+        // boundary `OFFSET`, so there is nothing further to drop here.
+        let walk = boundary_walk.into_iter().chain(beyond_walk);
+
+        // Apply the cap: fill until `max_samples`, then `exhausted = false`.
+        // `exhausted` is true only when the whole remaining walk fit.
+        let mut samples = Vec::new();
+        let mut exhausted = true;
+        for row in walk {
+            if samples.len() >= query.max_samples {
+                exhausted = false;
+                break;
+            }
+            if let Some(sample) = row.into_sample(*job, *attempt) {
+                samples.push(sample);
+            }
+        }
+
+        Ok(MetricPage {
+            samples,
+            exhausted,
+            earliest_at,
+            latest_at,
+        })
     }
 
     /// The newest stored log timestamp for an attempt (docker-executor.md §8.2
@@ -1933,6 +2199,183 @@ async fn metric_range_rows(
         blkio_write_bytes_total: row.blkio_write_bytes_total,
     })
     .collect();
+    Ok(rows)
+}
+
+/// Build a [`MetricRow`] from any read query's row — every metrics read query
+/// aliases the same non-null column projection, so the field set is identical
+/// (the `id` rowid is never projected; insertion order rides `ORDER BY id`).
+macro_rules! metric_row {
+    ($row:expr) => {{
+        let row = $row;
+        MetricRow {
+            at: row.at,
+            allocation_id: row.allocation_id,
+            cpu_usage_total_us: row.cpu_usage_total_us,
+            cpu_throttled_total_us: row.cpu_throttled_total_us,
+            memory_used_bytes: row.memory_used_bytes,
+            memory_peak_bytes: row.memory_peak_bytes,
+            disk_writable_bytes: row.disk_writable_bytes,
+            disk_image_bytes: row.disk_image_bytes,
+            net_rx_bytes_total: row.net_rx_bytes_total,
+            net_tx_bytes_total: row.net_tx_bytes_total,
+            blkio_read_bytes_total: row.blkio_read_bytes_total,
+            blkio_write_bytes_total: row.blkio_write_bytes_total,
+        }
+    }};
+}
+
+/// One segment's metric data-time bounds `(min_at, max_at)` in µs — an
+/// index-only `MIN`/`MAX` probe that decodes no row. `None` when the segment
+/// holds no metric rows. Exact (each bound is some real row's `at`), which is
+/// what lets [`metric_page`](FilesystemSink::metric_page) prune segments and
+/// settle `exhausted` without opening them.
+async fn metric_segment_bounds(
+    conn: &mut SqliteConnection,
+) -> Result<Option<(i64, i64)>, StoreError> {
+    let row =
+        sqlx::query!(r#"SELECT MIN(at) AS "min_at: i64", MAX(at) AS "max_at: i64" FROM metrics"#,)
+            .fetch_one(conn)
+            .await?;
+    Ok(match (row.min_at, row.max_at) {
+        (Some(lo), Some(hi)) => Some((lo, hi)),
+        _ => None, // an empty (metrics-free) segment
+    })
+}
+
+/// Count one segment's metric rows at exactly `at` — an index-only probe over
+/// the `at` index that decodes no row, so an arbitrarily large cursor `skip` can
+/// be spent against these counts for free.
+async fn metric_boundary_count(conn: &mut SqliteConnection, at: i64) -> Result<i64, StoreError> {
+    Ok(sqlx::query!(
+        r#"SELECT COUNT(*) AS "n!: i64" FROM metrics WHERE at = ?"#,
+        at,
+    )
+    .fetch_one(conn)
+    .await?
+    .n)
+}
+
+/// One segment's surviving **boundary** metric rows — those at exactly `at`,
+/// after `offset` (the per-segment share of the cursor `skip`), in the walk
+/// direction (`id` ascending / descending), capped at `limit`. SQLite applies
+/// `OFFSET` over the `(at, id)` index, so the skipped rows are never read.
+async fn metric_boundary_rows(
+    conn: &mut SqliteConnection,
+    at: i64,
+    order: LogOrder,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<MetricRow>, StoreError> {
+    let rows = match order {
+        LogOrder::Ascending => sqlx::query!(
+            r#"SELECT
+                 at AS "at!: i64", allocation_id AS "allocation_id!: String",
+                 cpu_usage_total_us AS "cpu_usage_total_us!: i64",
+                 cpu_throttled_total_us AS "cpu_throttled_total_us!: i64",
+                 memory_used_bytes AS "memory_used_bytes!: i64",
+                 memory_peak_bytes AS "memory_peak_bytes!: i64",
+                 disk_writable_bytes AS "disk_writable_bytes!: i64",
+                 disk_image_bytes AS "disk_image_bytes!: i64",
+                 net_rx_bytes_total AS "net_rx_bytes_total!: i64",
+                 net_tx_bytes_total AS "net_tx_bytes_total!: i64",
+                 blkio_read_bytes_total AS "blkio_read_bytes_total!: i64",
+                 blkio_write_bytes_total AS "blkio_write_bytes_total!: i64"
+               FROM metrics WHERE at = ? ORDER BY id LIMIT ? OFFSET ?"#,
+            at,
+            limit,
+            offset,
+        )
+        .fetch_all(conn)
+        .await?
+        .into_iter()
+        .map(|row| metric_row!(row))
+        .collect(),
+        LogOrder::Descending => sqlx::query!(
+            r#"SELECT
+                 at AS "at!: i64", allocation_id AS "allocation_id!: String",
+                 cpu_usage_total_us AS "cpu_usage_total_us!: i64",
+                 cpu_throttled_total_us AS "cpu_throttled_total_us!: i64",
+                 memory_used_bytes AS "memory_used_bytes!: i64",
+                 memory_peak_bytes AS "memory_peak_bytes!: i64",
+                 disk_writable_bytes AS "disk_writable_bytes!: i64",
+                 disk_image_bytes AS "disk_image_bytes!: i64",
+                 net_rx_bytes_total AS "net_rx_bytes_total!: i64",
+                 net_tx_bytes_total AS "net_tx_bytes_total!: i64",
+                 blkio_read_bytes_total AS "blkio_read_bytes_total!: i64",
+                 blkio_write_bytes_total AS "blkio_write_bytes_total!: i64"
+               FROM metrics WHERE at = ? ORDER BY id DESC LIMIT ? OFFSET ?"#,
+            at,
+            limit,
+            offset,
+        )
+        .fetch_all(conn)
+        .await?
+        .into_iter()
+        .map(|row| metric_row!(row))
+        .collect(),
+    };
+    Ok(rows)
+}
+
+/// One segment's **beyond** metric rows — those in the inclusive `[lo, hi]`
+/// range, in the walk direction, capped at `limit` (`max_samples + 1`). Fixed-
+/// size rows mean the `LIMIT` alone bounds the read; no byte budget applies.
+async fn metric_beyond_rows(
+    conn: &mut SqliteConnection,
+    lo: i64,
+    hi: i64,
+    order: LogOrder,
+    limit: i64,
+) -> Result<Vec<MetricRow>, StoreError> {
+    let rows = match order {
+        LogOrder::Ascending => sqlx::query!(
+            r#"SELECT
+                 at AS "at!: i64", allocation_id AS "allocation_id!: String",
+                 cpu_usage_total_us AS "cpu_usage_total_us!: i64",
+                 cpu_throttled_total_us AS "cpu_throttled_total_us!: i64",
+                 memory_used_bytes AS "memory_used_bytes!: i64",
+                 memory_peak_bytes AS "memory_peak_bytes!: i64",
+                 disk_writable_bytes AS "disk_writable_bytes!: i64",
+                 disk_image_bytes AS "disk_image_bytes!: i64",
+                 net_rx_bytes_total AS "net_rx_bytes_total!: i64",
+                 net_tx_bytes_total AS "net_tx_bytes_total!: i64",
+                 blkio_read_bytes_total AS "blkio_read_bytes_total!: i64",
+                 blkio_write_bytes_total AS "blkio_write_bytes_total!: i64"
+               FROM metrics WHERE at BETWEEN ? AND ? ORDER BY at, id LIMIT ?"#,
+            lo,
+            hi,
+            limit,
+        )
+        .fetch_all(conn)
+        .await?
+        .into_iter()
+        .map(|row| metric_row!(row))
+        .collect(),
+        LogOrder::Descending => sqlx::query!(
+            r#"SELECT
+                 at AS "at!: i64", allocation_id AS "allocation_id!: String",
+                 cpu_usage_total_us AS "cpu_usage_total_us!: i64",
+                 cpu_throttled_total_us AS "cpu_throttled_total_us!: i64",
+                 memory_used_bytes AS "memory_used_bytes!: i64",
+                 memory_peak_bytes AS "memory_peak_bytes!: i64",
+                 disk_writable_bytes AS "disk_writable_bytes!: i64",
+                 disk_image_bytes AS "disk_image_bytes!: i64",
+                 net_rx_bytes_total AS "net_rx_bytes_total!: i64",
+                 net_tx_bytes_total AS "net_tx_bytes_total!: i64",
+                 blkio_read_bytes_total AS "blkio_read_bytes_total!: i64",
+                 blkio_write_bytes_total AS "blkio_write_bytes_total!: i64"
+               FROM metrics WHERE at BETWEEN ? AND ? ORDER BY at DESC, id DESC LIMIT ?"#,
+            lo,
+            hi,
+            limit,
+        )
+        .fetch_all(conn)
+        .await?
+        .into_iter()
+        .map(|row| metric_row!(row))
+        .collect(),
+    };
     Ok(rows)
 }
 
@@ -4311,5 +4754,278 @@ mod tests {
             "decoded {decoded} rows; expected <= {} (a look-ahead pair per segment)",
             SEGMENTS as u64 * 2
         );
+    }
+
+    // ---- paged metric query for FetchMetrics (ADR 0034) --------------------
+
+    /// An unfiltered, uncapped metric query in one direction — the base most
+    /// tests tweak.
+    fn metric_page_query(order: LogOrder) -> MetricPageQuery {
+        MetricPageQuery {
+            from: None,
+            until: None,
+            order,
+            resume: None,
+            max_samples: 1000,
+        }
+    }
+
+    /// The `at` seconds of a page's samples, in returned order.
+    fn m_ats(page: &MetricPage) -> Vec<i64> {
+        page.samples
+            .iter()
+            .map(|s| s.at.duration_since(Timestamp::UNIX_EPOCH).as_micros() / 1_000_000)
+            .collect()
+    }
+
+    /// A metric sample carrying a sequence marker in `memory_used_bytes`, so
+    /// same-microsecond samples stay distinguishable through the paged walk.
+    fn metric_seq(
+        job: JobId,
+        attempt: AttemptId,
+        alloc: AllocationId,
+        at: Timestamp,
+        seq: u64,
+    ) -> MetricSample {
+        let mut sample = metric(job, attempt, alloc, at);
+        sample.memory_used_bytes = seq;
+        sample
+    }
+
+    #[tokio::test]
+    async fn metric_page_walks_both_directions_and_reports_bounds() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let batch: Vec<MetricSample> = (1..=3)
+            .map(|s| metric(job, attempt, alloc, at(s)))
+            .collect();
+        sink.append_metrics_at(&batch, at(10)).await;
+
+        let asc = sink
+            .metric_page(&job, &attempt, &metric_page_query(LogOrder::Ascending))
+            .await
+            .unwrap();
+        assert_eq!(m_ats(&asc), vec![1, 2, 3]);
+        assert!(asc.exhausted, "the whole window fit");
+        assert_eq!(asc.earliest_at, Some(at(1)));
+        assert_eq!(asc.latest_at, Some(at(3)));
+
+        let desc = sink
+            .metric_page(&job, &attempt, &metric_page_query(LogOrder::Descending))
+            .await
+            .unwrap();
+        assert_eq!(
+            m_ats(&desc),
+            vec![3, 2, 1],
+            "descending is the reverse walk"
+        );
+        assert_eq!(desc.earliest_at, Some(at(1)));
+        assert_eq!(desc.latest_at, Some(at(3)));
+    }
+
+    #[tokio::test]
+    async fn metric_page_resume_is_exclusive_across_samples_at_one_microsecond() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // Three samples at exactly t=5 (seq 0,1,2) plus one at t=6 (seq 3), one
+        // batch so the insertion order at t=5 is 0<1<2.
+        let batch = vec![
+            metric_seq(job, attempt, alloc, at(5), 0),
+            metric_seq(job, attempt, alloc, at(5), 1),
+            metric_seq(job, attempt, alloc, at(5), 2),
+            metric_seq(job, attempt, alloc, at(6), 3),
+        ];
+        sink.append_metrics_at(&batch, at(10)).await;
+
+        let seqs = |page: &MetricPage| -> Vec<u64> {
+            page.samples.iter().map(|s| s.memory_used_bytes).collect()
+        };
+
+        // Ascending resume at t=5 skipping 1 (consumed seq 0) resumes strictly
+        // after it: 1, 2, then 3.
+        let mut q = metric_page_query(LogOrder::Ascending);
+        q.resume = Some(ResumeAt { at: at(5), skip: 1 });
+        let page = sink.metric_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(seqs(&page), vec![1, 2, 3]);
+
+        // skip = 3 consumes the whole t=5 run; only seq 3 (t=6) remains.
+        q.resume = Some(ResumeAt { at: at(5), skip: 3 });
+        let page = sink.metric_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(seqs(&page), vec![3]);
+        assert!(page.exhausted);
+
+        // Descending walk is 2,1,0 then 3 is already past; resume at t=6 skip 1
+        // consumes seq 3, resuming at 2, 1, 0.
+        let mut qd = metric_page_query(LogOrder::Descending);
+        qd.resume = Some(ResumeAt { at: at(6), skip: 1 });
+        let page = sink.metric_page(&job, &attempt, &qd).await.unwrap();
+        assert_eq!(
+            seqs(&page),
+            vec![2, 1, 0],
+            "descending resume drops the t=6 run, then walks t=5 newest-insertion-first reversed"
+        );
+
+        // Descending resume within the t=5 run: skip 1 (consumed seq 2) → 1, 0.
+        qd.resume = Some(ResumeAt { at: at(5), skip: 1 });
+        let page = sink.metric_page(&job, &attempt, &qd).await.unwrap();
+        assert_eq!(seqs(&page), vec![1, 0]);
+    }
+
+    #[tokio::test]
+    async fn metric_page_range_is_half_open() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let batch: Vec<MetricSample> = (1..=4)
+            .map(|s| metric(job, attempt, alloc, at(s)))
+            .collect();
+        sink.append_metrics_at(&batch, at(10)).await;
+
+        let mut q = metric_page_query(LogOrder::Ascending);
+        q.from = Some(at(2));
+        q.until = Some(at(4));
+        let page = sink.metric_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(m_ats(&page), vec![2, 3], "from inclusive, until exclusive");
+        // Bounds still reflect the full attempt, so a `from` past the earliest
+        // signals head truncation to the caller.
+        assert_eq!(page.earliest_at, Some(at(1)));
+        assert_eq!(page.latest_at, Some(at(4)));
+    }
+
+    #[tokio::test]
+    async fn metric_page_max_samples_cap_and_exhausted_flag() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let batch: Vec<MetricSample> = (1..=3)
+            .map(|s| metric(job, attempt, alloc, at(s)))
+            .collect();
+        sink.append_metrics_at(&batch, at(10)).await;
+
+        let mut q = metric_page_query(LogOrder::Ascending);
+        q.max_samples = 2;
+        let page = sink.metric_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(m_ats(&page), vec![1, 2]);
+        assert!(!page.exhausted, "a third sample remains");
+
+        // The follow-up page from the cursor position exhausts the walk.
+        q.resume = Some(ResumeAt { at: at(2), skip: 1 });
+        let page = sink.metric_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(m_ats(&page), vec![3]);
+        assert!(page.exhausted, "the walk reached the end");
+    }
+
+    #[tokio::test]
+    async fn metric_page_probes_every_segment_including_backdated_rows() {
+        let root = TempDir::new().unwrap();
+        // A 1s age bound forces the second append to roll to a fresh segment.
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max_age = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // Segment 1 (created at now=100) holds a sample at t=100.
+        sink.append_metrics_at(&[metric(job, attempt, alloc, at(100))], at(100))
+            .await;
+        // Segment 2 (created at now=200, so it rolls) holds a sample at t=50 —
+        // OLDER than segment 1's filename start (the §8.2 replay caveat).
+        sink.append_metrics_at(&[metric(job, attempt, alloc, at(50))], at(200))
+            .await;
+        assert_eq!(
+            segment_files(&attempt_dir(&sink, job, attempt)).len(),
+            2,
+            "the second append rolled to a fresh segment"
+        );
+
+        let page = sink
+            .metric_page(&job, &attempt, &metric_page_query(LogOrder::Ascending))
+            .await
+            .unwrap();
+        assert_eq!(
+            m_ats(&page),
+            vec![50, 100],
+            "the backdated sample in the newer segment is found and ordered by at"
+        );
+        // Whole-attempt bounds span both segments, independent of the window.
+        assert_eq!(page.earliest_at, Some(at(50)));
+        assert_eq!(page.latest_at, Some(at(100)));
+    }
+
+    #[tokio::test]
+    async fn metric_page_unknown_attempt_when_no_directory() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt) = (JobId::new(), AttemptId::new());
+        let err = sink
+            .metric_page(&job, &attempt, &metric_page_query(LogOrder::Ascending))
+            .await
+            .expect_err("an attempt with no telemetry directory is unknown");
+        assert!(matches!(err, StoreError::UnknownAttempt { .. }));
+    }
+
+    #[tokio::test]
+    async fn metric_page_empty_when_directory_exists_but_holds_no_metrics() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // A logs-only attempt: the directory exists, but there are no metric
+        // rows — a valid empty page, NOT UnknownAttempt.
+        sink.append_logs_at(
+            &[log(job, attempt, alloc, at(1), LogStream::Stdout, b"x")],
+            at(10),
+        )
+        .await;
+        let page = sink
+            .metric_page(&job, &attempt, &metric_page_query(LogOrder::Ascending))
+            .await
+            .unwrap();
+        assert!(page.samples.is_empty());
+        assert!(page.exhausted, "an empty walk is exhausted");
+        assert_eq!(page.earliest_at, None);
+        assert_eq!(page.latest_at, None);
+    }
+
+    #[tokio::test]
+    async fn metric_page_max_samples_cap_across_multiple_segments() {
+        let root = TempDir::new().unwrap();
+        // A 1s age bound rolls a fresh segment on each append batch.
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.segment_max_age = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // Three segments, disjoint ascending `at` ranges matching creation order.
+        const PER_SEGMENT: i64 = 5;
+        const SEGMENTS: i64 = 3;
+        for seg in 0..SEGMENTS {
+            let base = seg * PER_SEGMENT;
+            let batch: Vec<MetricSample> = (0..PER_SEGMENT)
+                .map(|i| metric(job, attempt, alloc, at(base + i)))
+                .collect();
+            sink.append_metrics_at(&batch, at(1_000 + seg * 10)).await;
+        }
+        assert_eq!(
+            segment_files(&attempt_dir(&sink, job, attempt)).len(),
+            SEGMENTS as usize
+        );
+
+        // A page smaller than one segment stops mid-first-segment, exhausted=false.
+        let mut q = metric_page_query(LogOrder::Ascending);
+        q.max_samples = 2;
+        let page = sink.metric_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(m_ats(&page), vec![0, 1], "capped within the first segment");
+        assert!(!page.exhausted);
+        // Whole-attempt bounds are exact across all three segments.
+        assert_eq!(page.earliest_at, Some(at(0)));
+        assert_eq!(page.latest_at, Some(at(SEGMENTS * PER_SEGMENT - 1)));
+
+        // Newest-first, a single-sample page is the global newest.
+        let mut q = metric_page_query(LogOrder::Descending);
+        q.max_samples = 1;
+        let page = sink.metric_page(&job, &attempt, &q).await.unwrap();
+        assert_eq!(m_ats(&page), vec![SEGMENTS * PER_SEGMENT - 1]);
+        assert!(!page.exhausted);
     }
 }

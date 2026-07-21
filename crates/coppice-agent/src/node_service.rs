@@ -4,10 +4,12 @@
 //! This is the inverse direction of the agent [`session`](crate::session): there
 //! the agent dials *out* to the leader over a fenced, push-only control stream;
 //! here the agent *listens*, and any coordinator replica dials *in* as an
-//! ordinary mTLS gRPC client to read a bounded page of an attempt's stored logs.
-//! The [`FetchLogsService`] handler is a pure translation layer over the
-//! telemetry store's [`log_page`](crate::telemetry::FilesystemSink::log_page)
-//! read API — it proposes nothing, journals nothing, and never touches the
+//! ordinary mTLS gRPC client to read a bounded page of an attempt's stored logs
+//! or metric samples. The [`NodeServiceImpl`] handler is a pure translation
+//! layer over the telemetry store's
+//! [`log_page`](crate::telemetry::FilesystemSink::log_page) /
+//! [`metric_page`](crate::telemetry::FilesystemSink::metric_page) read APIs — it
+//! proposes nothing, journals nothing, and never touches the
 //! session's fenced state, so it carries no `CommandHeader` and needs no leader
 //! involvement.
 //!
@@ -27,7 +29,9 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
-use crate::telemetry::{FilesystemSink, LogOrder, LogPageQuery, LogStream, ResumeAt, StoreError};
+use crate::telemetry::{
+    FilesystemSink, LogOrder, LogPageQuery, LogStream, MetricPageQuery, ResumeAt, StoreError,
+};
 use coppice_core::time::Timestamp;
 
 // ---- server-side ceilings (ADR 0034, "Bounded work per request") ---------
@@ -41,6 +45,11 @@ const MAX_CHUNKS_CEILING: usize = 10_000;
 /// request always makes progress.
 const MAX_BYTES_CEILING: u64 = 256 * 1024;
 
+/// The server-side ceiling on `max_samples`: a request asking for more (or for
+/// zero, which would make no progress) is clamped to this, never rejected.
+/// Metric rows are fixed-size, so a sample count alone bounds the page.
+const MAX_SAMPLES_CEILING: usize = 10_000;
+
 // ---- metrics (ADR 0034) --------------------------------------------------
 
 /// `FetchLogs` requests served (accepted at the handler, before the store read).
@@ -53,6 +62,19 @@ const AGENT_NODE_SERVICE_UNKNOWN_ATTEMPT_TOTAL: &str = "agent_node_service_unkno
 
 /// Cumulative chunk payload bytes returned across all `FetchLogs` pages.
 const AGENT_NODE_SERVICE_BYTES_SERVED_TOTAL: &str = "agent_node_service_bytes_served_total";
+
+/// `FetchMetrics` requests served (accepted at the handler, before the store
+/// read). The metrics twin of [`AGENT_NODE_SERVICE_FETCH_REQUESTS_TOTAL`].
+const AGENT_NODE_SERVICE_FETCH_METRICS_REQUESTS_TOTAL: &str =
+    "agent_node_service_fetch_metrics_requests_total";
+
+/// `FetchMetrics` requests answered with the `UnknownAttempt` arm — the store
+/// held no data for the attempt (indistinguishable on the agent by design).
+const AGENT_NODE_SERVICE_METRICS_UNKNOWN_ATTEMPT_TOTAL: &str =
+    "agent_node_service_metrics_unknown_attempt_total";
+
+/// Cumulative metric samples returned across all `FetchMetrics` pages.
+const AGENT_NODE_SERVICE_SAMPLES_SERVED_TOTAL: &str = "agent_node_service_samples_served_total";
 
 /// Register this module's metric names (ADR 0034). Part of the crate-level
 /// [`crate::describe_metrics`] fan-out.
@@ -71,6 +93,21 @@ pub fn describe_metrics() {
         AGENT_NODE_SERVICE_BYTES_SERVED_TOTAL,
         metrics::Unit::Bytes,
         "Cumulative log-chunk payload bytes served by the agent's NodeService (ADR 0034)."
+    );
+    metrics::describe_counter!(
+        AGENT_NODE_SERVICE_FETCH_METRICS_REQUESTS_TOTAL,
+        metrics::Unit::Count,
+        "FetchMetrics requests served by the agent's NodeService (ADR 0034)."
+    );
+    metrics::describe_counter!(
+        AGENT_NODE_SERVICE_METRICS_UNKNOWN_ATTEMPT_TOTAL,
+        metrics::Unit::Count,
+        "FetchMetrics requests answered UnknownAttempt — no data on this node (ADR 0034)."
+    );
+    metrics::describe_counter!(
+        AGENT_NODE_SERVICE_SAMPLES_SERVED_TOTAL,
+        metrics::Unit::Count,
+        "Cumulative metric samples served by the agent's NodeService (ADR 0034)."
     );
 }
 
@@ -141,15 +178,18 @@ impl NodeServiceListener {
 /// Serve the `NodeService` over the bound listener until the process stops,
 /// spawning the tonic server as a background task and returning its handle.
 ///
-/// `log_store` is the first LOG-consuming store (the `TelemetryWiring.log_store`
-/// precedent); `None` when telemetry is disabled, in which case every request is
-/// answered `UnknownAttempt` — data cannot exist.
+/// `log_store`/`metric_store` are the first LOG- and METRICS-consuming stores
+/// (the `Telemetry::log_store`/`metric_store` precedent); either is `None` when
+/// no sink consumes that stream, in which case that stream's reads all answer
+/// `UnknownAttempt` — data cannot exist.
 pub fn serve(
     listener: NodeServiceListener,
     log_store: Option<FilesystemSink>,
+    metric_store: Option<FilesystemSink>,
 ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
     let NodeServiceListener { incoming, tls, .. } = listener;
-    let service = coppice_net::node_service::Server::new(FetchLogsService::new(log_store));
+    let service =
+        coppice_net::node_service::Server::new(NodeServiceImpl::new(log_store, metric_store));
     tokio::spawn(async move {
         Server::builder()
             .tls_config(tls)?
@@ -175,24 +215,33 @@ pub fn prepare_listener(
     NodeServiceListener::bind(addr, &cert, &key, &ca)
 }
 
-// ---- the FetchLogs handler ----------------------------------------------
+// ---- the NodeService handler --------------------------------------------
 
 /// The `NodeService` implementation: a pure translation layer over the
-/// telemetry store. Holds only the log-consuming store handle (or `None` when
-/// telemetry is disabled) — never the session, journal, or executor.
-pub struct FetchLogsService {
+/// telemetry store. Holds only the log- and metrics-consuming store handles
+/// (either `None` when that stream is not consumed) — never the session,
+/// journal, or executor.
+pub struct NodeServiceImpl {
     log_store: Option<FilesystemSink>,
+    metric_store: Option<FilesystemSink>,
 }
 
-impl FetchLogsService {
-    /// Build the handler over the log-consuming store (`None` disables it).
-    pub fn new(log_store: Option<FilesystemSink>) -> FetchLogsService {
-        FetchLogsService { log_store }
+impl NodeServiceImpl {
+    /// Build the handler over the log- and metrics-consuming stores (`None`
+    /// disables that stream's reads).
+    pub fn new(
+        log_store: Option<FilesystemSink>,
+        metric_store: Option<FilesystemSink>,
+    ) -> NodeServiceImpl {
+        NodeServiceImpl {
+            log_store,
+            metric_store,
+        }
     }
 }
 
 #[tonic::async_trait]
-impl coppice_net::node_service::NodeService for FetchLogsService {
+impl coppice_net::node_service::NodeService for NodeServiceImpl {
     async fn fetch_logs(
         &self,
         request: Request<pb::FetchLogsRequest>,
@@ -256,6 +305,68 @@ impl coppice_net::node_service::NodeService for FetchLogsService {
             }
         }
     }
+
+    async fn fetch_metrics(
+        &self,
+        request: Request<pb::FetchMetricsRequest>,
+    ) -> Result<Response<pb::FetchMetricsResponse>, Status> {
+        metrics::counter!(AGENT_NODE_SERVICE_FETCH_METRICS_REQUESTS_TOTAL).increment(1);
+        let request = request.into_inner();
+
+        // The coordinator resolves `(job, attempt)` from replicated state before
+        // dialing, so a missing/malformed id is a caller bug, not a "gone"
+        // attempt — reject it honestly rather than masquerading as UnknownAttempt.
+        let job = request
+            .job
+            .ok_or_else(|| Status::invalid_argument("FetchMetricsRequest.job is required"))?
+            .try_into()
+            .map_err(|_| Status::invalid_argument("FetchMetricsRequest.job is malformed"))?;
+        let attempt = request
+            .attempt
+            .ok_or_else(|| Status::invalid_argument("FetchMetricsRequest.attempt is required"))?
+            .try_into()
+            .map_err(|_| Status::invalid_argument("FetchMetricsRequest.attempt is malformed"))?;
+
+        // No metrics-consuming store ⇒ data cannot exist on this node: every
+        // request is honestly UnknownAttempt.
+        let Some(store) = &self.metric_store else {
+            return Ok(Response::new(metrics_unknown_attempt()));
+        };
+
+        let query = MetricPageQuery {
+            from: request.from_us.and_then(Timestamp::from_micros),
+            until: request.until_us.and_then(Timestamp::from_micros),
+            order: if request.ascending {
+                LogOrder::Ascending
+            } else {
+                LogOrder::Descending
+            },
+            // A resume whose `at_us` is out of range is treated as absent rather
+            // than errored — the walk simply starts at the window edge.
+            resume: request.resume.and_then(|resume| {
+                Timestamp::from_micros(resume.at_us).map(|at| ResumeAt {
+                    at,
+                    skip: resume.skip,
+                })
+            }),
+            max_samples: clamp_max_samples(request.max_samples),
+        };
+
+        match store.metric_page(&job, &attempt, &query).await {
+            Ok(page) => {
+                metrics::counter!(AGENT_NODE_SERVICE_SAMPLES_SERVED_TOTAL)
+                    .increment(page.samples.len() as u64);
+                Ok(Response::new(samples_response(page)))
+            }
+            Err(StoreError::UnknownAttempt { .. }) => Ok(Response::new(metrics_unknown_attempt())),
+            // A real storage fault is not a "gone" verdict — surface it as an
+            // error so the coordinator records `unreachable`, not `expired`.
+            Err(err @ (StoreError::Io(_) | StoreError::Sql(_))) => {
+                tracing::warn!(%job, %attempt, error = %err, "FetchMetrics store read failed");
+                Err(Status::internal("telemetry store read failed"))
+            }
+        }
+    }
 }
 
 /// The `UnknownAttempt` response arm, also bumping its counter.
@@ -288,6 +399,50 @@ fn chunks_response(page: crate::telemetry::LogPage) -> pb::FetchLogsResponse {
             earliest_at_us: page.earliest_at.map(Timestamp::as_micros),
             latest_at_us: page.latest_at.map(Timestamp::as_micros),
         })),
+    }
+}
+
+/// The metrics `UnknownAttempt` response arm, also bumping its counter.
+fn metrics_unknown_attempt() -> pb::FetchMetricsResponse {
+    metrics::counter!(AGENT_NODE_SERVICE_METRICS_UNKNOWN_ATTEMPT_TOTAL).increment(1);
+    pb::FetchMetricsResponse {
+        outcome: Some(pb::fetch_metrics_response::Outcome::UnknownAttempt(
+            pb::UnknownAttempt {},
+        )),
+    }
+}
+
+/// Translate a store [`MetricPage`](crate::telemetry::MetricPage) into the
+/// `Samples` response arm, converting each stored sample to its wire form:
+/// `Duration` CPU counters become µs `uint64`, byte counters pass through.
+fn samples_response(page: crate::telemetry::MetricPage) -> pb::FetchMetricsResponse {
+    let samples = page.samples.into_iter().map(pb_metric_sample).collect();
+    pb::FetchMetricsResponse {
+        outcome: Some(pb::fetch_metrics_response::Outcome::Samples(pb::Samples {
+            samples,
+            exhausted: page.exhausted,
+            earliest_at_us: page.earliest_at.map(Timestamp::as_micros),
+            latest_at_us: page.latest_at.map(Timestamp::as_micros),
+        })),
+    }
+}
+
+/// Convert a stored [`MetricSample`](crate::telemetry::MetricSample) to its wire
+/// form. CPU counters are stored as `Duration` and go on the wire as µs
+/// `uint64`; the byte/count counters are already `u64` and pass through.
+fn pb_metric_sample(sample: crate::telemetry::MetricSample) -> pb::MetricSample {
+    pb::MetricSample {
+        at_us: sample.at.as_micros(),
+        cpu_usage_total_us: sample.cpu_usage_total.as_micros() as u64,
+        cpu_throttled_total_us: sample.cpu_throttled_total.as_micros() as u64,
+        memory_used_bytes: sample.memory_used_bytes,
+        memory_peak_bytes: sample.memory_peak_bytes,
+        disk_writable_bytes: sample.disk_writable_bytes,
+        disk_image_bytes: sample.disk_image_bytes,
+        net_rx_bytes_total: sample.net_rx_bytes_total,
+        net_tx_bytes_total: sample.net_tx_bytes_total,
+        blkio_read_bytes_total: sample.blkio_read_bytes_total,
+        blkio_write_bytes_total: sample.blkio_write_bytes_total,
     }
 }
 
@@ -329,5 +484,16 @@ fn clamp_max_bytes(requested: u32) -> u64 {
         MAX_BYTES_CEILING
     } else {
         requested.min(MAX_BYTES_CEILING)
+    }
+}
+
+/// Clamp `max_samples` into `1..=MAX_SAMPLES_CEILING`; `0` clamps up so a
+/// request always makes progress.
+fn clamp_max_samples(requested: u32) -> usize {
+    let requested = requested as usize;
+    if requested == 0 {
+        MAX_SAMPLES_CEILING
+    } else {
+        requested.min(MAX_SAMPLES_CEILING)
     }
 }

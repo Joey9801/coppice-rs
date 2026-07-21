@@ -35,7 +35,8 @@ use crate::pressure::DiskPressure;
 
 pub use fs_sink::{
     spawn_retention_janitor, AttemptTelemetry, FilesystemSink, FilesystemSinkOptions, LogOrder,
-    LogPage, LogPageQuery, LogQuery, ResumeAt, StoreError, StoredLogChunk,
+    LogPage, LogPageQuery, LogQuery, MetricPage, MetricPageQuery, ResumeAt, StoreError,
+    StoredLogChunk,
 };
 pub use hub::{HubSink, SinkInstance, TelemetryHub};
 pub use sink::{FilesystemSinkConfig, LogSink, MetricsSink, SinkConfig, SinkKind};
@@ -61,6 +62,13 @@ pub struct Telemetry {
     /// which is why the resume boundary is derived from *this* store, never
     /// `stores.first()`.
     pub log_store: Option<FilesystemSink>,
+    /// The `FetchMetrics` read authority (ADR 0034): the **first** filesystem
+    /// sink whose `kinds` include [`SinkKind::Metrics`], i.e. the first store
+    /// that consumes the metric stream. `None` when no sink consumes metrics, in
+    /// which case the agent's `NodeService` answers every metrics read
+    /// `UnknownAttempt`. The metrics twin of [`log_store`](Self::log_store);
+    /// picked the same "first consuming sink, not `stores[0]`" way.
+    pub metric_store: Option<FilesystemSink>,
     /// Retention janitor handles, one per filesystem sink; the caller keeps them
     /// alive for the process lifetime (dropping a handle stops its janitor).
     pub janitors: Vec<tokio::task::JoinHandle<()>>,
@@ -87,6 +95,7 @@ pub async fn build(
     let mut janitors = Vec::new();
     let mut hub_sinks = Vec::new();
     let mut log_store: Option<FilesystemSink> = None;
+    let mut metric_store: Option<FilesystemSink> = None;
     // Canonical roots seen so far, so two filesystem entries that resolve to the
     // same segment tree are rejected (§8.4): two independent writers + retention
     // janitors over one tree let a shorter-retention instance delete a
@@ -145,6 +154,11 @@ pub async fn build(
                 if log_store.is_none() && fs.kinds.contains(&SinkKind::Logs) {
                     log_store = Some(sink.clone());
                 }
+                // The first metrics-consuming store is the FetchMetrics read
+                // authority (ADR 0034), picked the same way.
+                if metric_store.is_none() && fs.kinds.contains(&SinkKind::Metrics) {
+                    metric_store = Some(sink.clone());
+                }
                 stores.push(sink.clone());
                 hub_sinks.push(HubSink {
                     sink: SinkInstance::Filesystem(sink),
@@ -158,6 +172,7 @@ pub async fn build(
         hub,
         stores,
         log_store,
+        metric_store,
         janitors,
     })
 }
