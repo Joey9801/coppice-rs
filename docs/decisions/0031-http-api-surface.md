@@ -98,7 +98,7 @@ mutations are `POST` with a request-message body. One route per
 | `GET  /api/v1/jobs/{job}` | `GetJob*` | bounded |
 | `POST /api/v1/jobs/{job}/abort` | `AbortJob*` (exists) | write |
 | `GET  /api/v1/jobs/{job}/timeline` | `GetJobTimeline*` | bounded |
-| `GET  /api/v1/jobs/{job}/usage?attempt=` | `GetJobUsage*` | eventual |
+| `GET  /api/v1/jobs/{job}/usage?attempt=` | `GetJobUsage*` | eventual (shipped, ADR 0036) |
 | `GET  /api/v1/jobs/{job}/logs?cursor=&limit=` | `GetJobLogs*` | eventual (shipped, ADR 0034) |
 | `GET  /api/v1/nodes` | `ListNodes*` | bounded |
 | `GET  /api/v1/nodes/{node}` | `GetNode*` | bounded |
@@ -120,7 +120,12 @@ provisional status). `GetJobLogs` **left provisional status on 2026-07-20 per
 ADR 0034**: it is now served best-effort from the agent's telemetry segment
 store over the agent-hosted `NodeService`, and its response is the
 `GetJobLogsResponse` DTO (entries + per-attempt `sources` availability +
-cursor), not the sketched web-UI `LogChunk`. `GetNodeLogs` and
+cursor), not the sketched web-UI `LogChunk`. `GetJobUsage` **left
+provisional status on 2026-07-21 per ADR 0036**, which extends the same
+`NodeService` with a `FetchMetrics` RPC over the same segment store; its
+response carries raw cumulative counter samples plus the identical
+`sources` availability shape, ascending by default (unlike `GetJobLogs`'
+newest-first). `GetNodeLogs` and
 `GetCoordinatorLogs` **stay provisional**: agent and coordinator *process*
 logs are a different substrate (nothing captures them as streams today, ADR
 0034 non-goals). The events route is reserved so nothing else claims
