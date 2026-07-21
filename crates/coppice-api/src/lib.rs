@@ -140,6 +140,25 @@ pub struct RecentClusterEvents {
     pub events: Vec<StampedEvent>,
 }
 
+/// One job's timeline window, ascending by `(index, ordinal)`, served from
+/// this replica's fanout ring (ADR 0032, tier 1) — the honestly-partial
+/// backstop behind `GetJobTimeline`.
+///
+/// `floor_index` is the same exclusive coverage cursor as
+/// [`RecentClusterEvents`]: the timeline is complete for every applied index
+/// *strictly above* it and claims nothing at or below it, so a window is
+/// complete-from-submission only when it actually contains the job's
+/// `job_submitted` event. `next` is the `(index, ordinal)` content coordinate
+/// to resume strictly after: `Some` means the ring held more past this page
+/// (continue), `None` means the caller has everything this replica currently
+/// retains.
+#[derive(Debug, Clone)]
+pub struct JobTimelineWindow {
+    pub floor_index: u64,
+    pub events: Vec<StampedEvent>,
+    pub next: Option<(u64, u32)>,
+}
+
 /// This replica's view of the raft cluster for `GET /api/v1/coordinators`
 /// (ADR 0031, local read) — the consensus/membership facts the raft layer
 /// knows, with no replicated-state counts (those come from a `read_state`
@@ -388,6 +407,29 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// (ADR 0032, tier 1), newest first, at most `limit` — derived class,
     /// replica-local, with the coverage floor.
     fn recent_events(&self, limit: usize) -> impl Future<Output = RecentClusterEvents> + Send;
+
+    /// One job's transition timeline (ADR 0032), ascending by `(index,
+    /// ordinal)`, resuming strictly after `after` and bounded by `limit`
+    /// matches — a derived, replica-local read with a coverage floor, served
+    /// identically by every replica (leader and follower alike).
+    ///
+    /// Today this is served entirely from this replica's per-replica fanout
+    /// ring (tier 1): the answer is honestly partial, truncated below
+    /// `floor_index`, and a job whose events aged out of the ring returns an
+    /// empty-but-floored window. When a durable history store (ADR 0032 tier
+    /// 2) exists **and** an operator has configured one, this same method
+    /// fuses the store's durable prefix below the ring's tail behind this
+    /// signature — the cursor is a content coordinate precisely so it survives
+    /// that fusion. The ring path stays permanently as the backstop for
+    /// deployments without a durable store (e.g. `coppice dev`); it is never
+    /// removed, only supplemented. That store, its writer, and any config
+    /// plumbing are out of scope here — this is only the seam.
+    fn job_timeline(
+        &self,
+        job: coppice_core::id::JobId,
+        after: Option<(u64, u32)>,
+        limit: usize,
+    ) -> impl Future<Output = JobTimelineWindow> + Send;
 
     /// This replica's view of the raft cluster for `GET /api/v1/coordinators`
     /// (ADR 0031, local read): leader/term/indexes and per-member membership,

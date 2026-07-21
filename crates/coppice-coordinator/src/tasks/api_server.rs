@@ -21,11 +21,11 @@ use coppice_api::http::dto::{
 };
 use coppice_api::{
     ApiError, Consistency, ControlPlane, CoordinatorMemberSummary, CoordinatorSummary,
-    LogFetchError, LogFetchOutcome, LogFetchRequest, QueueWindow, ReadOptions, ReadView,
-    RecentClusterEvents, StampedEvent,
+    JobTimelineWindow, LogFetchError, LogFetchOutcome, LogFetchRequest, QueueWindow, ReadOptions,
+    ReadView, RecentClusterEvents, StampedEvent,
 };
 use coppice_consensus::{Applied, Consensus, ConsensusError, NodeHandle, StateViews};
-use coppice_core::id::{ClusterId, NodeId};
+use coppice_core::id::{ClusterId, JobId, NodeId};
 
 use crate::tasks::node_client::NodeLogClient;
 use coppice_core::job::Job;
@@ -34,7 +34,7 @@ use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{AbortJob, ConfigureQuotaEntity, SubmitJob};
 use coppice_state::Command;
 
-use crate::tasks::event_fanout::FanoutHandle;
+use crate::tasks::event_fanout::{EventFilter, FanoutHandle};
 
 /// Implements [`ControlPlane`] by proposing through the consensus seam.
 #[allow(dead_code)] // fields are read by submit_job/abort_job, exercised in tests below.
@@ -352,6 +352,43 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         }
     }
 
+    async fn job_timeline(
+        &self,
+        job: JobId,
+        after: Option<(u64, u32)>,
+        limit: usize,
+    ) -> JobTimelineWindow {
+        // "No ring" and "ring unreachable at shutdown" both serve the same
+        // honest answer as `recent_events`: nothing covered — the exclusive
+        // floor sits at everything this replica has applied, with no events
+        // and no continuation (there is nothing to continue).
+        let uncovered = || JobTimelineWindow {
+            floor_index: self.views.latest().applied_index(),
+            events: Vec::new(),
+            next: None,
+        };
+        let Some(fanout) = &self.fanout else {
+            return uncovered();
+        };
+        match fanout.window(EventFilter::Job(job), after, limit).await {
+            Ok(window) => JobTimelineWindow {
+                floor_index: window.floor_index,
+                events: window
+                    .events
+                    .into_iter()
+                    .map(|e| StampedEvent {
+                        index: e.index,
+                        ordinal: e.ordinal,
+                        at: e.at,
+                        event: e.event,
+                    })
+                    .collect(),
+                next: window.next,
+            },
+            Err(_closed) => uncovered(),
+        }
+    }
+
     fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
         // No handle attached is "no coverage": the replicated-state reads still
         // work, but this raft-level view cannot be produced (mirrors the
@@ -629,5 +666,63 @@ mod tests {
             result,
             Err(ApiError::NotLeader { leader_hint: None })
         ));
+    }
+
+    #[tokio::test]
+    async fn job_timeline_without_a_fanout_is_honestly_empty() {
+        // No ring attached (the plane is built without `with_derived`): the
+        // honest answer is the same as `recent_events` — floor at everything
+        // applied (the publisher seeded index 1), no events, no continuation.
+        let cp = control_plane(ProposeOutcome::Accepted);
+        let window = cp.job_timeline(JobId::new(), None, 100).await;
+        assert_eq!(window.floor_index, 1);
+        assert!(window.events.is_empty());
+        assert_eq!(window.next, None);
+    }
+
+    #[tokio::test]
+    async fn job_timeline_serves_the_fanout_ring_filtered_to_the_job() {
+        use coppice_consensus::EventBatch;
+        use coppice_state::Event;
+
+        let (mut tap, tap_rx) = coppice_consensus::EventTap::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (fanout, join) = crate::tasks::event_fanout::spawn(tap_rx, 0, shutdown_rx);
+
+        let job = JobId::new();
+        let other = JobId::new();
+        // A mixed batch then a job-only batch; only `job`'s events return, and
+        // the filtered event keeps its batch ordinal (never renumbered).
+        tap.emit(EventBatch {
+            applied_index: 5,
+            at: Timestamp::UNIX_EPOCH,
+            events: vec![
+                Event::JobSubmitted { job: other },
+                Event::JobSubmitted { job },
+            ],
+        });
+        tap.emit(EventBatch {
+            applied_index: 9,
+            at: Timestamp::UNIX_EPOCH,
+            events: vec![Event::JobSubmitted { job }],
+        });
+        // Let the current-thread fanout drain the tap into its ring.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let (_tx, queue_window) = watch::channel(QueueWindow::default());
+        let cp = control_plane(ProposeOutcome::Accepted).with_derived(queue_window, fanout);
+
+        let window = cp.job_timeline(job, None, 100).await;
+        let ids: Vec<(u64, u32)> = window.events.iter().map(|e| (e.index, e.ordinal)).collect();
+        assert_eq!(ids, vec![(5, 1), (9, 0)]);
+        assert_eq!(window.floor_index, 0);
+        // Reached the newest retained event.
+        assert_eq!(window.next, None);
+
+        let _ = shutdown_tx.send(true);
+        drop(tap);
+        let _ = join.await;
     }
 }

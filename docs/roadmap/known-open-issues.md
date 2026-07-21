@@ -21,7 +21,7 @@ waive them.
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10; drop-and-gap completeness 2026-07-12) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, instrumentation, and apply latency resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
-| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open (design settled 2026-07-15, ADR 0032; stamps + tiers 1/3 + the overview's windowed fields landed the same day) | The durable half stays unserved: no job timeline or node history (tier 2 store + writer), and `SubscribeEvents` has no transport |
+| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open (design settled 2026-07-15, ADR 0032; stamps + tiers 1/3 + the overview's windowed fields landed the same day; `GetJobTimeline` ring-backed tier-1 half landed) | `GetJobTimeline` now serves its ring-backed (tier 1), honestly floor-truncated half; still unserved: the durable tier-2 store + writer (and node history), and `SubscribeEvents`' transport |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
 
@@ -440,10 +440,13 @@ and those bounds are enforced in CI or a required performance gate.
   in-memory half is implemented (same day): `Command::stamped_at_us()`,
   `EventBatch.at_us`, ordinal-preserving fanout with the `proposer_skew`
   metric, the tier-3 derived-stats task, and the overview's queue
-  rates/history and `recent_events` window (with its coverage floor). The
-  durable half — the tier-2 history event table and writer, and the
-  endpoints they serve (`GetJobTimeline`, `GetNodeHistory`,
-  `SubscribeEvents`) — is not
+  rates/history and `recent_events` window (with its coverage floor).
+  `GetJobTimeline` now serves its ring-backed (tier 1) half — every replica
+  answers with an honestly floor-truncated timeline scanned from the fanout
+  ring. The durable half — the tier-2 history event table and writer, the
+  node-history endpoint they also serve (`GetNodeHistory`), the durable
+  prefix that would extend the timeline below the ring's tail, and
+  `SubscribeEvents`' SSE transport — is not
 - **Affected capability:** every time-ranged read on the public API — the
   overview's queue rates and history and its recent-events window, the job
   timeline, job usage and node utilization series, and the ADR 0008 event
@@ -507,11 +510,17 @@ exactly when the window has no coverage), and a `recent_events` window in
 ADR 0032's shared `TimelineEvent` shape with the ring's coverage floor
 ([dto](../../crates/coppice-api/src/http/dto.rs)).
 
-`GetJobTimeline`, `GetJobUsage`, `GetNodeUtilization`, `GetNodeHistory`, and
-`SubscribeEvents` remain `501 UNIMPLEMENTED`: the timeline/history pair waits
-on the tier-2 store and writer, the subscription on its SSE transport, and
-the measured-usage series on the out-of-scope measurement pipeline (item 7
-of the ADR).
+`GetJobTimeline` is served ring-backed as of this change:
+`GET /api/v1/jobs/{job}/timeline`
+([routes](../../crates/coppice-api/src/http/routes.rs)) scans this replica's
+fanout ring filtered to the job, in ADR 0032's shared `TimelineEvent` shape,
+ascending by `(index, ordinal)`, with the ring's exclusive coverage floor and
+an opaque content-coordinate cursor — honestly partial (ring only, no durable
+prefix), and served identically by every replica. `GetJobUsage`,
+`GetNodeUtilization`, `GetNodeHistory`, and `SubscribeEvents` remain
+`501 UNIMPLEMENTED`: node history waits on the tier-2 store and writer, the
+subscription on its SSE transport, and the measured-usage series on the
+out-of-scope measurement pipeline (item 7 of the ADR).
 
 ### Impact
 
@@ -599,7 +608,8 @@ Questions the ADR still has to settle:
   their own event shape. Queue rates/history and the usage/utilization series
   are then projections over the retained record. (The shape exists —
   `dto::TimelineEvent`, `(index, ordinal, at_us)` + kind + scope keys — and
-  the overview serves it; the remaining endpoints must reuse it.)
+  the overview and `GetJobTimeline` both serve it; the remaining endpoints
+  must reuse it.)
 - ~~Keep failing honestly in the meantime: an endpoint with no retained window
   answers `null`/absent, never `0`.~~ Upheld: rates are `null` and buckets
   absent exactly when coverage is missing, and `recent_events` carries the

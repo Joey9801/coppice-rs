@@ -59,6 +59,15 @@ pub const SESSION_CONTROL_CAPACITY: usize = 64;
 /// The fanout task's own inbox. `send().await`, sized like the other small control channels.
 pub const SUBSCRIBE_REQUESTS_CAPACITY: usize = 64;
 
+/// Ring events examined per `GetJobTimeline` window request before the scan
+/// returns short with a resume cursor (ADR 0032, tier 1).
+///
+/// The window scan runs on the fanout task's own loop, so an unbounded
+/// filtered walk over a full ring (up to [`FANOUT_RING_MAX_EVENTS`]) would
+/// stall event delivery and every other pending read for one request. This
+/// bounds that stall; the caller continues from the returned `next`.
+pub const EVENT_WINDOW_SCAN_BUDGET: usize = 100_000;
+
 /// Fanout reconnection ring: max events retained ("fanout ring" row, ADR 0008).
 ///
 /// Evict-oldest when full — it is a reconnection buffer, not history.
