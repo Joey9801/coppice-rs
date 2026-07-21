@@ -552,11 +552,7 @@ export interface JobUsage {
 // deliberate divergence from the `_seconds` duration convention so sub-second
 // deltas between adjacent samples survive.
 
-export type UsageAvailability =
-  | 'available'
-  | 'expired'
-  | 'unreachable'
-  | 'not_started'
+export type UsageAvailability = 'available' | 'expired' | 'unreachable' | 'not_started'
 
 export interface UsagePoint {
   attempt: AttemptId
