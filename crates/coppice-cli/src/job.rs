@@ -366,8 +366,35 @@ async fn submit(
 
 async fn status(client: &reqwest::Client, base: &str, job: JobId) -> Result<()> {
     let detail = get_job(client, base, job).await?;
-    print!("{}", render_status(&detail));
+    // The event timeline (ADR 0032) is enrichment, not core status: a
+    // coordinator too old to serve the route answers 501, and `get_job` already
+    // proved the job exists, so a timeline failure degrades to a stderr warning
+    // rather than failing `job status`.
+    let timeline = fetch_timeline(client, base, job).await;
+    let (out, warning) = compose_status(&detail, timeline);
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
+    print!("{out}");
     Ok(())
+}
+
+/// Combine the always-present status render with the best-effort timeline into
+/// the text to print and an optional stderr warning. Factored out of
+/// [`status`] so the degradation contract — the status body renders even when
+/// the timeline errs — is unit-testable without capturing stdout.
+fn compose_status(
+    detail: &dto::JobDetail,
+    timeline: Result<Vec<dto::TimelineEvent>>,
+) -> (String, Option<String>) {
+    let mut out = render_status(detail);
+    match timeline {
+        Ok(events) => {
+            out.push_str(&render_timeline(&events));
+            (out, None)
+        }
+        Err(err) => (out, Some(format!("timeline unavailable: {err:#}"))),
+    }
 }
 
 async fn abort(
@@ -402,6 +429,43 @@ async fn get_job(client: &reqwest::Client, base: &str, job: JobId) -> Result<dto
         return Err(api_error(response).await);
     }
     response.json().await.context("reading job detail")
+}
+
+/// Walk a job's event timeline (ADR 0032), paging through `next_cursor` until
+/// it is null, and return the events in `(index, ordinal)` order. No `limit`
+/// is sent — the server's default page size governs — and `cursor` is passed
+/// only when continuing from a prior page. A non-2xx response (including the
+/// 501 an older coordinator gives) maps to a rich error.
+async fn fetch_timeline(
+    client: &reqwest::Client,
+    base: &str,
+    job: JobId,
+) -> Result<Vec<dto::TimelineEvent>> {
+    let mut events: Vec<dto::TimelineEvent> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(cursor) = &cursor {
+            query.push(("cursor", cursor.clone()));
+        }
+        let response = client
+            .get(format!("{base}/api/v1/jobs/{job}/timeline"))
+            .query(&query)
+            .send()
+            .await
+            .context("fetching job timeline")?;
+        if !response.status().is_success() {
+            return Err(api_error(response).await);
+        }
+        let page: dto::GetJobTimelineResponse =
+            response.json().await.context("reading job timeline")?;
+        events.extend(page.events);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(events)
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +888,75 @@ fn render_status(detail: &dto::JobDetail) -> String {
         }
     }
     out
+}
+
+/// Render a job's event timeline (ADR 0032) as the block appended after the
+/// attempts section: a `timeline:` header, then one indented `<at>  <desc>`
+/// line per event, in the `(index, ordinal)` order the server returns them.
+///
+/// The block states its own completeness, honouring ADR 0032's honest-absence
+/// vocabulary carried on the wire by [`dto::GetJobTimelineResponse`]: the ring
+/// retains a bounded window, so a job's earliest events may have aged out. The
+/// timeline is complete-from-submission exactly when a `JobSubmitted` event is
+/// present, so a non-empty window lacking one leads with an explicit
+/// truncation note, and an empty window says so outright rather than implying
+/// the job had no history.
+fn render_timeline(events: &[dto::TimelineEvent]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "timeline:");
+    if events.is_empty() {
+        let _ = writeln!(out, "  (no events retained on this replica)");
+        return out;
+    }
+    let complete_from_submission = events
+        .iter()
+        .any(|e| matches!(e.body, dto::TimelineEventBody::JobSubmitted { .. }));
+    if !complete_from_submission {
+        let _ = writeln!(out, "  (earlier events not retained on this replica)");
+    }
+    for event in events {
+        let _ = writeln!(out, "  {}  {}", event.at, timeline_description(&event.body));
+    }
+    out
+}
+
+/// One event's human description, reusing the shared state labels so the
+/// timeline speaks the same vocabulary as the status lines above it.
+fn timeline_description(body: &dto::TimelineEventBody) -> String {
+    use dto::TimelineEventBody as B;
+    match body {
+        B::JobSubmitted { .. } => "submitted".to_string(),
+        B::JobStateChanged { from, to, .. } => {
+            format!("job {} -> {}", job_state_label(*from), job_state_label(*to))
+        }
+        B::AttemptStateChanged {
+            attempt,
+            node,
+            state,
+            ..
+        } => format!(
+            "attempt {} {} on node {}",
+            attempt,
+            attempt_state_label(*state),
+            node
+        ),
+        B::AllocationFunded {
+            allocation, node, ..
+        } => format!("allocation {allocation} funded on node {node}"),
+        B::StopRequested {
+            allocation, node, ..
+        } => format!("stop requested for allocation {allocation} on node {node}"),
+        B::JobEvicted { .. } => "evicted".to_string(),
+        // The four cluster-scoped events never fall inside a job-filtered
+        // window, but the match stays exhaustive — this repo forbids wildcard
+        // arms on wire enums — with a plain generic description each.
+        B::NodeEpochBumped { .. } => "node epoch bumped".to_string(),
+        B::QuotaEntityConfigured { .. } => "quota entity configured".to_string(),
+        B::PolicyUpdated => "policy updated".to_string(),
+        B::ClusterVersionBumped { .. } => "cluster version bumped".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,5 +1535,210 @@ retry_user_errors = true
         .await
         .expect("follow terminates promptly")
         .expect("follow succeeds");
+    }
+
+    // -- Timeline -----------------------------------------------------------
+
+    /// A three-event window built from the real DTO types: a submission, a
+    /// job-state change, and an attempt-state change — enough to exercise the
+    /// three main descriptions and `(index, ordinal)` order.
+    fn sample_timeline_events(job: JobId) -> Vec<dto::TimelineEvent> {
+        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        vec![
+            dto::TimelineEvent {
+                index: 7,
+                ordinal: 0,
+                at: Timestamp::from_micros(1_000_000).unwrap(),
+                body: dto::TimelineEventBody::JobSubmitted { job },
+            },
+            dto::TimelineEvent {
+                index: 8,
+                ordinal: 0,
+                at: Timestamp::from_micros(2_000_000).unwrap(),
+                body: dto::TimelineEventBody::JobStateChanged {
+                    job,
+                    from: dto::JobStateKind::Submitted,
+                    to: dto::JobStateKind::Accepted,
+                },
+            },
+            dto::TimelineEvent {
+                index: 9,
+                ordinal: 0,
+                at: Timestamp::from_micros(3_000_000).unwrap(),
+                body: dto::TimelineEventBody::AttemptStateChanged {
+                    attempt,
+                    job,
+                    node: "node-00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                    state: dto::AttemptState::Running,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn timeline_renders_events_in_order() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let rendered = render_timeline(&sample_timeline_events(job));
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "timeline:", "{rendered}");
+        // Reuses the shared labels, in the order the events arrive.
+        assert!(lines[1].ends_with("  submitted"), "{rendered}");
+        assert!(
+            lines[2].ends_with("  job submitted -> accepted"),
+            "{rendered}"
+        );
+        assert!(
+            lines[3].ends_with(
+                "  attempt attempt-00000000-0000-0000-0000-000000000001 running on node \
+                 node-00000000-0000-0000-0000-000000000001"
+            ),
+            "{rendered}"
+        );
+        // Complete-from-submission: no truncation note.
+        assert!(
+            !rendered.contains("earlier events not retained"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn timeline_without_submission_leads_with_truncation_note() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        // Drop the JobSubmitted event: the window is honestly partial, so the
+        // truncation note must come first, before any event line.
+        let events = sample_timeline_events(job)[1..].to_vec();
+        let rendered = render_timeline(&events);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "timeline:", "{rendered}");
+        assert_eq!(
+            lines[1], "  (earlier events not retained on this replica)",
+            "{rendered}"
+        );
+        assert!(
+            lines[2].ends_with("  job submitted -> accepted"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn empty_timeline_states_no_events_retained() {
+        let rendered = render_timeline(&[]);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "timeline:", "{rendered}");
+        assert_eq!(
+            lines[1], "  (no events retained on this replica)",
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn compose_status_appends_timeline_after_the_attempts_block() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let (out, warning) = compose_status(&detail, Ok(sample_timeline_events(job)));
+        assert!(warning.is_none(), "{out}");
+        // The whole status body is preserved, and the timeline block follows it.
+        let attempts_at = out.find("attempts").expect("attempts block present");
+        let timeline_at = out.find("timeline:").expect("timeline block present");
+        assert!(attempts_at < timeline_at, "{out}");
+        assert!(out.contains("state           attempting"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn timeline_paginates_across_two_pages() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let all = sample_timeline_events(job);
+        let page_one = dto::GetJobTimelineResponse {
+            events: all[..2].to_vec(),
+            floor_index: 0,
+            next_cursor: Some("v1:9:0".to_string()),
+        };
+        let page_two = dto::GetJobTimelineResponse {
+            events: all[2..].to_vec(),
+            floor_index: 0,
+            next_cursor: None,
+        };
+        type SeenCursors = Arc<Mutex<Vec<Option<String>>>>;
+        let seen: SeenCursors = Arc::new(Mutex::new(Vec::new()));
+        let pages = Arc::new((page_one, page_two, seen.clone()));
+        let router = Router::new()
+            .route(
+                "/api/v1/jobs/:job/timeline",
+                get(
+                    #[allow(clippy::type_complexity)]
+                    |State(pages): State<
+                        Arc<(
+                            dto::GetJobTimelineResponse,
+                            dto::GetJobTimelineResponse,
+                            SeenCursors,
+                        )>,
+                    >,
+                     Query(params): Query<std::collections::HashMap<String, String>>| async move {
+                        let cursor = params.get("cursor").cloned();
+                        pages.2.lock().unwrap().push(cursor.clone());
+                        let page = if cursor.as_deref() == Some("v1:9:0") {
+                            &pages.1
+                        } else {
+                            &pages.0
+                        };
+                        Json(serde_json::to_value(page).unwrap())
+                    },
+                ),
+            )
+            .with_state(pages);
+        let base = spawn(router).await;
+
+        let events = fetch_timeline(&client(), &base, job)
+            .await
+            .expect("timeline walk completes");
+
+        // Two requests: the first with no cursor, the second resuming with the
+        // cursor page one returned.
+        let seen = seen.lock().unwrap();
+        assert_eq!(*seen, [None, Some("v1:9:0".to_string())]);
+        // Both pages' events, concatenated in order.
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0].body,
+            dto::TimelineEventBody::JobSubmitted { .. }
+        ));
+        assert!(matches!(
+            events[2].body,
+            dto::TimelineEventBody::AttemptStateChanged { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn timeline_501_degrades_to_a_warning() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        // The shape an older coordinator gives for the route it cannot serve.
+        let router = Router::new().route(
+            "/api/v1/jobs/:job/timeline",
+            get(|| async {
+                (
+                    AxumStatus::NOT_IMPLEMENTED,
+                    Json(error_body("UNIMPLEMENTED", "job timeline not supported")),
+                )
+            }),
+        );
+        let base = spawn(router).await;
+
+        // fetch_timeline surfaces the error code from the wire body.
+        let err = fetch_timeline(&client(), &base, job)
+            .await
+            .expect_err("501 errors");
+        assert!(format!("{err:#}").contains("UNIMPLEMENTED"), "{err:#}");
+
+        // compose_status keeps the full status body and routes the failure to a
+        // warning — the degradation contract that keeps `job status` working.
+        let detail = sample_job_detail(job, dto::JobStateKind::Succeeded);
+        let (out, warning) = compose_status(&detail, Err(anyhow::anyhow!("boom")));
+        assert!(out.contains("state           succeeded"), "{out}");
+        assert!(!out.contains("timeline:"), "{out}");
+        let warning = warning.expect("timeline error yields a warning");
+        assert!(warning.contains("timeline unavailable"), "{warning}");
+        assert!(warning.contains("boom"), "{warning}");
     }
 }
