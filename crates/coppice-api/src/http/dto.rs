@@ -544,6 +544,66 @@ pub struct RecentEventsWindow {
     pub events: Vec<TimelineEvent>,
 }
 
+/// `GET /api/v1/jobs/{job}/timeline` — one job's transition timeline
+/// (ADR 0032), served from this replica's fanout ring (tier 1) and honestly
+/// partial.
+///
+/// `events` are ascending by `(index, ordinal)` — the same identity and order
+/// as every other timeline surface, never re-sorted by the advisory `at`.
+/// `floor_index` is the **exclusive** coverage floor: nothing at or below it
+/// is claimed, so the timeline is complete-from-submission exactly when it
+/// contains the job's `job_submitted` event; an empty window with a high floor
+/// is a truncated (aged-out) job, not a nonexistent one. `next_cursor` is the
+/// opaque continuation token: non-null means "more may exist, continue from
+/// it", null means "you have everything this replica currently holds".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetJobTimelineResponse {
+    pub events: Vec<TimelineEvent>,
+    pub floor_index: u64,
+    /// Opaque [`TimelineCursor`]; `null` iff the ring scan reached its newest
+    /// retained event. A short page with a non-null cursor means "continue",
+    /// never "done".
+    pub next_cursor: Option<String>,
+}
+
+/// The timeline pagination cursor: the literal `v1:<index>:<ordinal>`.
+///
+/// Opaque by contract (the `v1:` tag lets the format change), so its
+/// parse/format lives in exactly one place — mirroring [`JobCursor`]. It
+/// encodes the event's `(index, ordinal)` **content coordinate** (the ADR
+/// 0034 convention), not a row offset, so a cursor minted against the ring
+/// today keeps resolving to the same position after the durable-store fusion
+/// (ADR 0032 tier 2) lands beneath it. Not base64: already URL-safe and
+/// human-legible.
+pub struct TimelineCursor;
+
+impl TimelineCursor {
+    const PREFIX: &'static str = "v1:";
+
+    /// The token for an `(index, ordinal)` content coordinate.
+    pub fn format((index, ordinal): (u64, u32)) -> String {
+        format!("{}{index}:{ordinal}", Self::PREFIX)
+    }
+
+    /// Parse a cursor token back to its `(index, ordinal)`; anything that is
+    /// not `v1:` + two non-negative integers is a caller error.
+    pub fn parse(token: &str) -> Result<(u64, u32), String> {
+        let rest = token
+            .strip_prefix(Self::PREFIX)
+            .ok_or_else(|| format!("cursor must begin with `{}`", Self::PREFIX))?;
+        let (index, ordinal) = rest
+            .split_once(':')
+            .ok_or_else(|| "cursor must be `v1:<index>:<ordinal>`".to_string())?;
+        let index = index
+            .parse::<u64>()
+            .map_err(|e| format!("invalid cursor index: {e}"))?;
+        let ordinal = ordinal
+            .parse::<u32>()
+            .map_err(|e| format!("invalid cursor ordinal: {e}"))?;
+        Ok((index, ordinal))
+    }
+}
+
 /// `GET /api/v1/overview` (mirrors `ClusterOverview` in `types.ts`).
 ///
 /// Consistency is per-field (ADR 0032 amending ADR 0031): `queue.depth`,
@@ -2010,6 +2070,22 @@ mod tests {
         assert!(JobCursor::parse("job-00000000-0000-0000-0000-000000000007").is_err());
         // Right prefix, unparseable id.
         assert!(JobCursor::parse("v1:not-a-job").is_err());
+    }
+
+    #[test]
+    fn timeline_cursor_round_trips_and_rejects_garbage() {
+        let token = TimelineCursor::format((42, 3));
+        assert_eq!(token, "v1:42:3");
+        assert_eq!(TimelineCursor::parse(&token).unwrap(), (42, 3));
+        // Missing version prefix.
+        assert!(TimelineCursor::parse("42:3").is_err());
+        // Right prefix, missing the ordinal separator.
+        assert!(TimelineCursor::parse("v1:42").is_err());
+        // Right shape, non-numeric components.
+        assert!(TimelineCursor::parse("v1:foo:3").is_err());
+        assert!(TimelineCursor::parse("v1:42:bar").is_err());
+        // A negative ordinal is not a u32.
+        assert!(TimelineCursor::parse("v1:42:-1").is_err());
     }
 
     #[test]

@@ -582,8 +582,8 @@ mod tests {
     use crate::http::dto::{AbortJobRequest, ConfigureQuotaEntityRequest, SubmitJobRequest};
     use crate::http::dto::{ConfigureQuotaEntityResponse, SubmitJobResponse};
     use crate::{
-        ApiError, CoordinatorSummary, LogChunk, LogPage, QueueWindow, ReadOptions, ReadView,
-        RecentClusterEvents,
+        ApiError, CoordinatorSummary, JobTimelineWindow, LogChunk, LogPage, QueueWindow,
+        ReadOptions, ReadView, RecentClusterEvents,
     };
 
     /// A `ControlPlane` that serves a seeded state and canned per-attempt log
@@ -629,6 +629,18 @@ mod tests {
             RecentClusterEvents {
                 floor_index: 1,
                 events: Vec::new(),
+            }
+        }
+        async fn job_timeline(
+            &self,
+            _job: JobId,
+            _after: Option<(u64, u32)>,
+            _limit: usize,
+        ) -> JobTimelineWindow {
+            JobTimelineWindow {
+                floor_index: 1,
+                events: Vec::new(),
+                next: None,
             }
         }
         fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {

@@ -20,7 +20,7 @@ use coppice_state::{
     AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
 
-use crate::{CoordinatorSummary, QueueWindow, RecentClusterEvents};
+use crate::{CoordinatorSummary, JobTimelineWindow, QueueWindow, RecentClusterEvents};
 
 use super::dto;
 
@@ -198,6 +198,28 @@ fn recent_events(recent: &RecentClusterEvents) -> dto::RecentEventsWindow {
                 body: (&e.event).into(),
             })
             .collect(),
+    }
+}
+
+/// `GET /api/v1/jobs/{job}/timeline` — project the ring window (ADR 0032,
+/// tier 1) onto the wire shape, ascending by `(index, ordinal)`. Pure over
+/// the window: the 404-vs-empty verdict and cursor parsing stay in the
+/// handler. Mirrors [`recent_events`], and the `next` content coordinate
+/// becomes the opaque [`dto::TimelineCursor`].
+pub fn job_timeline(window: &JobTimelineWindow) -> dto::GetJobTimelineResponse {
+    dto::GetJobTimelineResponse {
+        events: window
+            .events
+            .iter()
+            .map(|e| dto::TimelineEvent {
+                index: e.index,
+                ordinal: e.ordinal,
+                at: e.at,
+                body: (&e.event).into(),
+            })
+            .collect(),
+        floor_index: window.floor_index,
+        next_cursor: window.next.map(dto::TimelineCursor::format),
     }
 }
 

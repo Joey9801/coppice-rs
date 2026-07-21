@@ -39,17 +39,21 @@ pub(crate) fn gather_metrics() {
     // The histogram is pushed as batches arrive; nothing needs sampling.
 }
 
-/// What a subscriber wants to see.
+/// What a read or a subscriber wants to see.
 ///
 /// `Job`/`Node` scope by the entity carried on an event (ADR 0008); `All` is
-/// the unscoped stream dispatch subscribes with internally. `Job`/`Node` are
-/// for the future HTTP subscription endpoints (no transport built yet, so
-/// nothing constructs them today — see the module doc on `tasks::api_server`).
-#[allow(dead_code)]
+/// the unscoped stream dispatch subscribes with internally. `Job` is live for
+/// reads — [`Ring::window`] filters the ring by it to back `GetJobTimeline`
+/// (ADR 0032, tier 1) — while `Node` awaits its own read/subscription
+/// endpoints (no transport built yet — see the module doc on
+/// `tasks::api_server`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventFilter {
     All,
     Job(JobId),
+    /// Node scoping is matched by `event_matches` but awaits its own read and
+    /// subscription endpoints; nothing outside tests constructs it yet.
+    #[allow(dead_code)]
     Node(NodeId),
 }
 
@@ -109,6 +113,26 @@ pub struct RecentEvents {
     pub events: Vec<StampedEvent>,
 }
 
+/// An ascending, filtered slice of the ring for a point-in-time read — the
+/// tier-1 backstop behind `GetJobTimeline` (ADR 0032), served identically by
+/// every replica.
+///
+/// `floor_index` is the ring's exclusive coverage floor (see [`Ring::floor`]):
+/// the timeline is complete for every applied index *strictly above* it and
+/// claims nothing at or below it, so a job whose window predates the floor is
+/// honestly partial. `next` is the `(index, ordinal)` content coordinate to
+/// resume strictly after (the `TimelineCursor` convention, ADR 0034): `Some`
+/// means the scan stopped early (its `limit` or
+/// budget was reached) and more may exist above it; `None` means the scan
+/// reached the newest entry the ring holds — the caller has everything this
+/// replica currently retains.
+#[derive(Debug, Clone)]
+pub struct EventWindow {
+    pub floor_index: u64,
+    pub events: Vec<StampedEvent>,
+    pub next: Option<(u64, u32)>,
+}
+
 /// One item delivered to a subscriber.
 #[derive(Debug, Clone)]
 pub enum SubscriptionItem {
@@ -155,6 +179,15 @@ enum Request {
         limit: usize,
         reply: oneshot::Sender<RecentEvents>,
     },
+    /// An ascending, filtered window of the ring resuming after `after` — the
+    /// tier-1 backstop behind `GetJobTimeline` (ADR 0032). Like `Recent`, a
+    /// point-in-time copy with an HTTP handler blocked on its reply.
+    Window {
+        filter: EventFilter,
+        after: Option<(u64, u32)>,
+        limit: usize,
+        reply: oneshot::Sender<EventWindow>,
+    },
 }
 
 /// Cloneable handle to the fanout task's inbox.
@@ -192,6 +225,29 @@ impl FanoutHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Request::Recent {
+                limit,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| FanoutClosed)?;
+        reply_rx.await.map_err(|_| FanoutClosed)
+    }
+
+    /// An ascending, `filter`-scoped window of the ring resuming strictly after
+    /// `after`, bounded by `limit` matches (see [`EventWindow`]). The scan
+    /// budget is [`EVENT_WINDOW_SCAN_BUDGET`](crate::limits::EVENT_WINDOW_SCAN_BUDGET),
+    /// applied on the fanout task so one read cannot stall delivery unbounded.
+    pub async fn window(
+        &self,
+        filter: EventFilter,
+        after: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<EventWindow, FanoutClosed> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Request::Window {
+                filter,
+                after,
                 limit,
                 reply: reply_tx,
             })
@@ -306,6 +362,81 @@ impl Ring {
         RecentEvents {
             floor_index,
             events,
+        }
+    }
+
+    /// An ascending, `filter`-scoped window of the ring, resuming strictly
+    /// after the `after` content coordinate and bounded by `limit` matches and
+    /// `budget` events examined.
+    ///
+    /// Batches are walked oldest→newest (the ring's natural order and ADR
+    /// 0032's `(index, ordinal)` order). `after` is located with a
+    /// `partition_point` on `applied_index`, so batches wholly below the cursor
+    /// are skipped without a scan; within the resume batch, events at or before
+    /// the cursor are pure resume mechanics — not examined, not counted, never
+    /// re-served. An `after` below the ring's floor simply starts at the oldest
+    /// retained entry, and the returned `floor_index` tells the caller about
+    /// the gap below it.
+    ///
+    /// Every event strictly after the cursor counts against `budget`; matching
+    /// ones (per [`event_matches`]) are collected until `limit`. When the scan
+    /// stops early — `limit` filled or `budget` spent — `next` is the last
+    /// event examined, so a follow-up `window(after = next, …)` resumes with no
+    /// duplicate and no skip. `next` is `None` iff the walk reached the newest
+    /// entry the ring holds (the caller has everything this replica retains).
+    fn window(
+        &self,
+        filter: &EventFilter,
+        after: Option<(u64, u32)>,
+        limit: usize,
+        budget: usize,
+    ) -> EventWindow {
+        let mut events = Vec::new();
+        let mut examined = 0usize;
+        let mut last: Option<(u64, u32)> = None;
+        let mut next: Option<(u64, u32)> = None;
+
+        // Entries are sorted ascending by `applied_index`, so every batch below
+        // the cursor's index is fully consumed. A cursor below the floor lands
+        // at 0 (start from the oldest retained entry); one above every entry
+        // lands at the end (nothing to serve — the caller already has it).
+        let start = match after {
+            Some((index, _)) => self
+                .entries
+                .partition_point(|(_, batch)| batch.applied_index < index),
+            None => 0,
+        };
+
+        'outer: for (_, batch) in self.entries.iter().skip(start) {
+            for (ordinal, event) in batch.events.iter().enumerate() {
+                let id = (batch.applied_index, ordinal as u32);
+                // Resume strictly after the cursor: at-or-before it is resume
+                // mechanics, neither examined nor counted.
+                if matches!(after, Some(after) if id <= after) {
+                    continue;
+                }
+                if events.len() == limit || examined == budget {
+                    // Stopped early: content above `next` may exist.
+                    next = last;
+                    break 'outer;
+                }
+                last = Some(id);
+                examined += 1;
+                if event_matches(filter, event) {
+                    events.push(StampedEvent {
+                        index: batch.applied_index,
+                        ordinal: id.1,
+                        at: batch.at,
+                        event: event.clone(),
+                    });
+                }
+            }
+        }
+
+        EventWindow {
+            floor_index: self.floor(),
+            events,
+            next,
         }
     }
 }
@@ -436,6 +567,20 @@ fn handle_request(
         Request::Recent { limit, reply } => {
             // The caller may be gone already; nothing to do.
             let _ = reply.send(ring.recent(limit));
+        }
+        Request::Window {
+            filter,
+            after,
+            limit,
+            reply,
+        } => {
+            // The caller may be gone already; nothing to do.
+            let _ = reply.send(ring.window(
+                &filter,
+                after,
+                limit,
+                crate::limits::EVENT_WINDOW_SCAN_BUDGET,
+            ));
         }
     }
 }
@@ -926,6 +1071,175 @@ mod tests {
         let recent = ring.recent(10);
         assert!(recent.events.is_empty());
         assert_eq!(recent.floor_index, 42);
+    }
+
+    // ---- Ring::window (GetJobTimeline backstop, ADR 0032 tier 1) ---------
+
+    #[test]
+    fn window_filters_by_job_in_ascending_identity_order() {
+        let job = JobId::new();
+        let other = JobId::new();
+        let mut ring = Ring::new(0);
+        // A mixed batch (other, job) then a job-only batch, both retained.
+        ring.push(batch_of(5, vec![job_event(other), job_event(job)]));
+        ring.push(batch_of(9, vec![job_event(job)]));
+
+        let window = ring.window(&EventFilter::Job(job), None, 100, 1_000);
+        let ids: Vec<(u64, u32)> = window.events.iter().map(|e| (e.index, e.ordinal)).collect();
+        // Ascending order, and the filtered event at (5,0) is dropped while the
+        // surviving one keeps its batch-assigned ordinal 1 (never renumbered).
+        assert_eq!(ids, vec![(5, 1), (9, 0)]);
+        assert_eq!(window.floor_index, 0);
+        // The walk reached the newest entry, so the caller has everything.
+        assert_eq!(window.next, None);
+    }
+
+    #[test]
+    fn window_after_cursor_resumes_without_duplicates_or_skips() {
+        let job = JobId::new();
+        let mut ring = Ring::new(0);
+        ring.push(batch_of(5, vec![job_event(job), job_event(job)]));
+        ring.push(batch_of(9, vec![job_event(job)]));
+
+        // Page 1: `limit` 2 fills on batch 5, cutting before batch 9.
+        let page1 = ring.window(&EventFilter::Job(job), None, 2, 1_000);
+        assert_eq!(
+            page1
+                .events
+                .iter()
+                .map(|e| (e.index, e.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(5, 0), (5, 1)]
+        );
+        assert_eq!(page1.next, Some((5, 1)));
+
+        // Page 2: resume strictly after (5,1) — batch 9 only, no (5,*) repeat.
+        let page2 = ring.window(&EventFilter::Job(job), page1.next, 2, 1_000);
+        assert_eq!(
+            page2
+                .events
+                .iter()
+                .map(|e| (e.index, e.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(9, 0)]
+        );
+        assert_eq!(page2.next, None);
+    }
+
+    #[test]
+    fn window_limit_cuts_mid_batch_and_stays_resumable() {
+        let job = JobId::new();
+        let mut ring = Ring::new(0);
+        ring.push(batch_of(
+            7,
+            vec![job_event(job), job_event(job), job_event(job)],
+        ));
+
+        let page = ring.window(&EventFilter::Job(job), None, 2, 1_000);
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|e| (e.index, e.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(7, 0), (7, 1)]
+        );
+        assert_eq!(page.next, Some((7, 1)));
+
+        // Resuming inside the same batch yields only its tail.
+        let rest = ring.window(&EventFilter::Job(job), page.next, 100, 1_000);
+        assert_eq!(
+            rest.events
+                .iter()
+                .map(|e| (e.index, e.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(7, 2)]
+        );
+        assert_eq!(rest.next, None);
+    }
+
+    #[test]
+    fn window_budget_cut_counts_examined_events_and_stays_resumable() {
+        let job = JobId::new();
+        let other = JobId::new();
+        let mut ring = Ring::new(0);
+        // Non-matching events precede the match, so the budget is spent on
+        // events the filter never collects — `next` must still advance.
+        ring.push(batch_of(3, vec![job_event(other), job_event(other)]));
+        ring.push(batch_of(4, vec![job_event(job)]));
+
+        // Budget 2 examines (3,0) and (3,1), then stops before (4,0).
+        let page1 = ring.window(&EventFilter::Job(job), None, 100, 2);
+        assert!(page1.events.is_empty(), "no match within the budget");
+        assert_eq!(page1.next, Some((3, 1)));
+
+        // A follow-up with a fresh budget resumes past the examined span and
+        // reaches the match — no event skipped by the budget cut.
+        let page2 = ring.window(&EventFilter::Job(job), page1.next, 100, 2);
+        assert_eq!(
+            page2
+                .events
+                .iter()
+                .map(|e| (e.index, e.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(4, 0)]
+        );
+        assert_eq!(page2.next, None);
+    }
+
+    #[test]
+    fn window_reports_the_raised_floor_after_eviction() {
+        let job = JobId::new();
+        let mut ring = Ring::new(0);
+        ring.push(batch_of(5, vec![job_event(job)]));
+        // Eviction raises the floor to the evicted index (`raise_floor` is what
+        // `evict` calls); here a discontinuity raised it past index 4.
+        ring.raise_floor(4);
+
+        let window = ring.window(&EventFilter::Job(job), None, 100, 1_000);
+        // The floor rides through so the timeline is honestly partial below it,
+        // while the event still retained above it is served.
+        assert_eq!(window.floor_index, 4);
+        assert_eq!(
+            window
+                .events
+                .iter()
+                .map(|e| (e.index, e.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(5, 0)]
+        );
+    }
+
+    #[test]
+    fn window_after_below_the_floor_starts_at_the_oldest_and_reports_the_gap() {
+        let job = JobId::new();
+        let mut ring = Ring::new(10); // recovered at 10; nothing below retained
+        ring.push(batch_of(12, vec![job_event(job)]));
+
+        // A cursor below the floor is fine: the scan starts at the oldest
+        // retained entry and the floor tells the caller about the gap below.
+        let window = ring.window(&EventFilter::Job(job), Some((3, 0)), 100, 1_000);
+        assert_eq!(window.floor_index, 10);
+        assert_eq!(
+            window
+                .events
+                .iter()
+                .map(|e| (e.index, e.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(12, 0)]
+        );
+        assert_eq!(window.next, None);
+    }
+
+    #[test]
+    fn window_is_empty_for_a_job_with_no_ring_events() {
+        let mut ring = Ring::new(2);
+        ring.push(batch_of(5, vec![job_event(JobId::new())]));
+
+        let window = ring.window(&EventFilter::Job(JobId::new()), None, 100, 1_000);
+        assert!(window.events.is_empty());
+        // Honest floor even with no matches — distinguishable from index 0.
+        assert_eq!(window.floor_index, 2);
+        assert_eq!(window.next, None);
     }
 
     #[test]

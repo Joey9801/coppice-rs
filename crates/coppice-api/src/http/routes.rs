@@ -41,15 +41,13 @@ pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
         // Cluster overview — bounded reads.
         .route("/api/v1/overview", get(get_overview::<P>))
         .route("/api/v1/queue/stats", get(get_queue_stats::<P>))
-        // Jobs. List/detail/timeline are bounded; usage is eventual
-        // (derived samples); logs are provisional until log storage exists.
+        // Jobs. List/detail are bounded; timeline and usage are eventual
+        // (derived: ring events / samples); logs are provisional until log
+        // storage exists.
         .route("/api/v1/jobs", get(list_jobs::<P>).post(submit_job::<P>))
         .route("/api/v1/jobs/:job", get(get_job::<P>))
         .route("/api/v1/jobs/:job/abort", post(abort_job::<P>))
-        .route(
-            "/api/v1/jobs/:job/timeline",
-            get(unimplemented_id_read::<JobId>("GetJobTimeline")),
-        )
+        .route("/api/v1/jobs/:job/timeline", get(get_job_timeline::<P>))
         .route(
             "/api/v1/jobs/:job/usage",
             get(unimplemented_id_read::<JobId>("GetJobUsage")),
@@ -364,6 +362,93 @@ async fn get_job<P: ControlPlane>(
     ))
 }
 
+/// `GET /api/v1/jobs/{job}/timeline` query parameters, alongside the shared
+/// [`ReadQuery`]. A separate extractor for the same reason as
+/// [`ListJobsParams`]: `serde_urlencoded` cannot `#[serde(flatten)]` the
+/// non-string read params, so those ride [`ReadQuery`] and these ride here.
+#[derive(Debug, Default, Deserialize)]
+struct TimelineParams {
+    /// Opaque continuation token ([`dto::TimelineCursor`]) from a prior page.
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// `GET /api/v1/jobs/{job}/timeline` — one job's transition timeline, served
+/// from this replica's fanout ring (ADR 0032, tier 1) and honestly partial.
+///
+/// **Eventual** by default: ADR 0032 re-classes this endpoint from bounded to
+/// eventual — the events are a derived, replica-local read of the ring (and,
+/// later, the durable store), not a point-in-time read of replicated state.
+/// The read still honours `?consistency=`/`?min_index=` and carries the
+/// staleness headers like every other read; the point-in-time state view is
+/// used only for the 404-vs-empty verdict.
+///
+/// 404 only when a from-the-start scan (no `cursor`) exhausted the ring
+/// (`next` is none) finding nothing, for a job unknown to this replica's
+/// state: an evicted job with surviving ring events still answers 200, a
+/// known job whose events aged out of the ring answers 200 with `floor_index`
+/// telling the truncation story, and a budget-cut empty page answers 200 with
+/// its continuation cursor rather than 404ing while events may sit deeper in
+/// the ring — so pagination never dead-ends in a 404. A bad cursor or limit
+/// is `INVALID_ARGUMENT` (400), never 404.
+async fn get_job_timeline<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    IdPath(job): IdPath<JobId>,
+    ReadQuery(read): ReadQuery,
+    params: Result<Query<TimelineParams>, QueryRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let Query(params) = params.map_err(|e: QueryRejection| HttpError::invalid(e.body_text()))?;
+
+    // Same page-size contract as ListJobs (shared range + default); out of
+    // range is INVALID_ARGUMENT, never clamped.
+    let limit = match params.limit {
+        None => DEFAULT_JOB_LIMIT,
+        Some(n) if JOB_LIMIT_RANGE.contains(&(n as u64)) => n as u64,
+        Some(n) => {
+            return Err(HttpError::invalid(format!(
+                "limit {n} is out of range {}..={}",
+                JOB_LIMIT_RANGE.start(),
+                JOB_LIMIT_RANGE.end(),
+            )))
+        }
+    } as usize;
+
+    let after = match &params.cursor {
+        None => None,
+        Some(token) => Some(dto::TimelineCursor::parse(token).map_err(HttpError::invalid)?),
+    };
+
+    let view = plane
+        .read_state(read.into_options(Consistency::Eventual))
+        .await?;
+    let window = plane.job_timeline(job, after, limit).await;
+
+    // An empty page is only proof of absence when the whole ring was scanned
+    // from the start: a budget-cut page (`next` set) may have events deeper in
+    // the ring, and a continuation page (`after` set) may be the empty tail of
+    // a timeline already served — both answer 200, never a 404 dead-end. Only
+    // a from-the-start, ring-exhausted, empty scan for a job this replica's
+    // state has never heard of is NOT_FOUND.
+    if window.events.is_empty()
+        && window.next.is_none()
+        && after.is_none()
+        && !view.state().jobs.contains_key(&job)
+    {
+        return Err(HttpError::not_found(format!("job {job} not found")));
+    }
+
+    let response = super::project::job_timeline(&window);
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
 /// `GET /api/v1/quota-entities` — bounded by default (ADR 0031). `Timestamp::now()`
 /// decays each entity's usage to read time (a read-time figure, never stored).
 async fn list_quota_entities<P: ControlPlane>(
@@ -447,8 +532,8 @@ mod tests {
 
     use super::super::dto::SubmitJobResponse;
     use crate::{
-        ApiError, CoordinatorMemberSummary, CoordinatorSummary, QueueWindow, ReadOptions, ReadView,
-        RecentClusterEvents,
+        ApiError, CoordinatorMemberSummary, CoordinatorSummary, JobTimelineWindow, QueueWindow,
+        ReadOptions, ReadView, RecentClusterEvents, StampedEvent,
     };
 
     use crate::http::COPPICE_LEADER;
@@ -461,6 +546,10 @@ mod tests {
         fail_with: Option<fn() -> ApiError>,
         queue_window: QueueWindow,
         recent: RecentClusterEvents,
+        /// The ring window `job_timeline` serves, regardless of the job asked
+        /// (the tier-1 backstop is exercised for its envelope/paging, not its
+        /// filtering — that is unit-tested on the ring itself).
+        timeline: JobTimelineWindow,
         state: coppice_state::StateMachine,
         /// Every consistency class `read_state` was asked for, so a test can
         /// assert a route's default (e.g. the strong quota-entity detail).
@@ -485,6 +574,15 @@ mod tests {
             let mut recent = self.recent.clone();
             recent.events.truncate(limit);
             recent
+        }
+
+        async fn job_timeline(
+            &self,
+            _job: JobId,
+            _after: Option<(u64, u32)>,
+            _limit: usize,
+        ) -> JobTimelineWindow {
+            self.timeline.clone()
         }
 
         fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
@@ -560,12 +658,24 @@ mod tests {
                 floor_index: 1,
                 events: Vec::new(),
             },
+            timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
             // No handle by default: coordinator-status tests build their own
             // plane with a seeded summary.
             coordinator: None,
         }))
+    }
+
+    /// A `job_timeline` window covering nothing (a fresh replica), like the
+    /// default `recent`: floor at the ReadView's applied index 1, no events,
+    /// no continuation.
+    fn empty_timeline() -> JobTimelineWindow {
+        JobTimelineWindow {
+            floor_index: 1,
+            events: Vec::new(),
+            next: None,
+        }
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -652,6 +762,7 @@ mod tests {
                     event: coppice_state::Event::JobSubmitted { job },
                 }],
             },
+            timeline: empty_timeline(),
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),
             coordinator: None,
@@ -766,11 +877,14 @@ mod tests {
 
     #[tokio::test]
     async fn well_formed_stub_reads_answer_501() {
-        let job = JobId::new();
+        // A still-unimplemented id read (node utilization) with valid id and
+        // read params answers 501 with its endpoint name — the timeline route
+        // is now implemented and no longer part of this set.
+        let node = NodeId::new();
         let response = app(None)
             .oneshot(
                 Request::get(format!(
-                    "/api/v1/jobs/{job}/timeline?consistency=strong&min_index=3"
+                    "/api/v1/nodes/{node}/utilization?consistency=strong&min_index=3"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -779,7 +893,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
-        assert!(body["message"].as_str().unwrap().contains("GetJobTimeline"));
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("GetNodeUtilization"));
     }
 
     #[tokio::test]
@@ -1098,6 +1215,7 @@ mod tests {
                 floor_index: 1,
                 events: Vec::new(),
             },
+            timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
             coordinator: None,
@@ -1388,6 +1506,287 @@ mod tests {
         assert_eq!(body["state_since"], body["submitted_at"]);
     }
 
+    // ---- job timeline (GET /api/v1/jobs/{job}/timeline, ADR 0032) --------
+
+    /// An `Arc<StubPlane>` serving a seeded ring window and state, so a
+    /// timeline test can drive the route and inspect the read it defaulted to.
+    fn timeline_stub(
+        state: coppice_state::StateMachine,
+        timeline: JobTimelineWindow,
+    ) -> Arc<StubPlane> {
+        Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            recent: RecentClusterEvents {
+                floor_index: 1,
+                events: Vec::new(),
+            },
+            timeline,
+            state,
+            read_consistency: std::sync::Mutex::default(),
+            coordinator: None,
+        })
+    }
+
+    fn stamped(index: u64, ordinal: u32, job: JobId) -> StampedEvent {
+        StampedEvent {
+            index,
+            ordinal,
+            at: Timestamp::from_micros(0).unwrap(),
+            event: coppice_state::Event::JobSubmitted { job },
+        }
+    }
+
+    #[tokio::test]
+    async fn timeline_serves_events_ascending_with_the_floor_and_headers() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let plane = timeline_stub(
+            state_with_jobs(&[job]),
+            JobTimelineWindow {
+                floor_index: 5,
+                events: vec![stamped(7, 0, job), stamped(9, 1, job)],
+                next: None,
+            },
+        );
+        let response = router(plane)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}/timeline"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Every read carries the staleness headers.
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_APPLIED_INDEX));
+        assert!(response
+            .headers()
+            .contains_key(super::super::COPPICE_COMMITTED_INDEX));
+
+        let body = body_json(response).await;
+        assert_eq!(body["floor_index"], 5);
+        // Ascending by (index, ordinal), the shared timeline shape.
+        assert_eq!(body["events"][0]["index"], 7);
+        assert_eq!(body["events"][0]["ordinal"], 0);
+        assert_eq!(body["events"][0]["kind"], "job_submitted");
+        assert_eq!(body["events"][0]["job"], job.to_string());
+        assert_eq!(body["events"][1]["index"], 9);
+        assert_eq!(body["events"][1]["ordinal"], 1);
+        // Reached the newest retained event: explicit null, never omitted.
+        assert_eq!(body["next_cursor"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn timeline_reports_a_continuation_cursor_and_accepts_it() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let plane = timeline_stub(
+            state_with_jobs(&[job]),
+            JobTimelineWindow {
+                floor_index: 0,
+                events: vec![stamped(7, 1, job)],
+                next: Some((7, 1)),
+            },
+        );
+        // Page 1 advertises the opaque cursor for the last examined event.
+        let body = body_json(
+            router(plane.clone())
+                .oneshot(
+                    Request::get(format!("/api/v1/jobs/{job}/timeline"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["next_cursor"], "v1:7:1");
+
+        // That cursor is accepted verbatim on the follow-up (the route parses
+        // it to an `(index, ordinal)` before asking the plane to continue).
+        let response = router(plane)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}/timeline?cursor=v1:7:1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn timeline_is_not_found_for_an_unknown_job_with_an_empty_window() {
+        // A job this replica has never heard of, whose ring window is also
+        // empty, is the one 404 case.
+        let job = JobId::new();
+        let plane = timeline_stub(coppice_state::StateMachine::default(), empty_timeline());
+        let response = router(plane)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}/timeline"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn timeline_answers_200_when_an_empty_page_still_has_a_continuation() {
+        // The job is unknown to state and the page is empty, but the scan was
+        // budget-cut (`next` set): events may sit deeper in the ring, so the
+        // honest answer is 200 with the cursor — never a false 404 that
+        // discards the continuation.
+        let job = JobId::new();
+        let plane = timeline_stub(
+            coppice_state::StateMachine::default(),
+            JobTimelineWindow {
+                floor_index: 0,
+                events: Vec::new(),
+                next: Some((80_000, 3)),
+            },
+        );
+        let response = router(plane)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}/timeline"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["events"], serde_json::json!([]));
+        assert_eq!(body["next_cursor"], "v1:80000:3");
+    }
+
+    #[tokio::test]
+    async fn timeline_answers_200_for_an_empty_terminal_continuation_page() {
+        // Page 2 of an evicted job whose events were all served on page 1: the
+        // tail is empty and the ring is exhausted, but a resume (`cursor`
+        // supplied) never dead-ends pagination in a 404 — it is the normal
+        // terminal page.
+        let job = JobId::new();
+        let plane = timeline_stub(coppice_state::StateMachine::default(), empty_timeline());
+        let response = router(plane)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}/timeline?cursor=v1:7:1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["events"], serde_json::json!([]));
+        assert_eq!(body["next_cursor"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn timeline_answers_200_for_a_known_job_with_an_empty_window() {
+        // The job is in state but its events aged out of the ring: 200 with an
+        // empty list and the floor telling the truncation story, not a 404.
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let plane = timeline_stub(
+            state_with_jobs(&[job]),
+            JobTimelineWindow {
+                floor_index: 12,
+                events: Vec::new(),
+                next: None,
+            },
+        );
+        let response = router(plane)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}/timeline"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["events"], serde_json::json!([]));
+        assert_eq!(body["floor_index"], 12);
+        assert_eq!(body["next_cursor"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn timeline_answers_200_for_an_evicted_job_with_surviving_ring_events() {
+        // The job is gone from state (evicted) but the ring still holds its
+        // events: it answers, it is not a 404.
+        let job = JobId::new();
+        let plane = timeline_stub(
+            coppice_state::StateMachine::default(),
+            JobTimelineWindow {
+                floor_index: 3,
+                events: vec![stamped(4, 0, job)],
+                next: None,
+            },
+        );
+        let response = router(plane)
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}/timeline"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["events"][0]["index"], 4);
+        assert_eq!(body["events"][0]["job"], job.to_string());
+    }
+
+    #[tokio::test]
+    async fn timeline_rejects_bad_cursors_and_limits() {
+        // Bad cursor/limit is INVALID_ARGUMENT (400), never 404 — parsed
+        // before the job is ever looked up.
+        let job = JobId::new();
+        let cases = [
+            format!("/api/v1/jobs/{job}/timeline?cursor=garbage"),
+            format!("/api/v1/jobs/{job}/timeline?cursor=v2:7:1"),
+            format!("/api/v1/jobs/{job}/timeline?cursor=v1:7"),
+            format!("/api/v1/jobs/{job}/timeline?limit=0"),
+            format!("/api/v1/jobs/{job}/timeline?limit=1001"),
+        ];
+        for uri in cases {
+            let response = app(None)
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                body_json(response).await["code"],
+                "INVALID_ARGUMENT",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timeline_defaults_to_an_eventual_read() {
+        // ADR 0032 re-classes the timeline to eventual (derived, replica-local
+        // ring), unlike the bounded job detail.
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let plane = timeline_stub(state_with_jobs(&[job]), empty_timeline());
+        let response = router(plane.clone())
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}/timeline"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            plane.read_consistency.lock().unwrap().last(),
+            Some(&Consistency::Eventual)
+        );
+    }
+
     #[tokio::test]
     async fn not_leader_maps_to_421_with_a_leader_hint_header() {
         let job = JobId::new();
@@ -1420,6 +1819,7 @@ mod tests {
                 floor_index: 1,
                 events: Vec::new(),
             },
+            timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
             coordinator: Some(coordinator),
