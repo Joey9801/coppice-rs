@@ -62,7 +62,12 @@ jobs:
       # reported against the test that caused it rather than taking the whole
       # binary down. It does not run doctests — the workspace has none (every
       # `///`/`//!` fence is ```text), so there is no separate `--doc` gate.
-      - run: cargo nextest run --workspace --all-features --locked
+      #
+      # The `ci` profile (.config/nextest.toml) runs the complete suite,
+      # including the heavy integration binaries a plain local `cargo nextest
+      # run` skips by default. Docker ships preinstalled on GitHub-hosted
+      # ubuntu runners, which docker_executor needs.
+      - run: cargo nextest run --workspace --all-features --locked --profile ci
 
   sqlx-prepare:
     name: sqlx-prepare

@@ -1,11 +1,46 @@
-# Heavy integration suites each spawn full multi-threaded runtimes, mTLS
-# servers, and (docker_executor) real containers. Unbounded, enough of them
-# in flight exhausts the CI runner's thread budget — bootstrap fails with
-# EAGAIN ("Resource temporarily unavailable"). Cap how many run at once;
-# everything else keeps full parallelism.
 [test-groups]
 heavy-integration = { max-threads = 2 }
 
+# Ordinary local runs exclude the heavy integration binaries.
+[profile.default]
+default-filter = '''
+not (
+    binary(cluster)
+    | binary(agent_protocol)
+    | binary(submit_retry)
+    | binary(job_logs)
+    | binary(docker_executor)
+    | test(openraft_storage_compliance)
+)
+'''
+
+# Assign the heavy tests to the rate-limited group.
+#
+# Custom profiles inherit from profile.default, including its overrides, so this
+# applies to the default, ci, and heavy profiles.
 [[profile.default.overrides]]
-filter = 'binary(cluster) | binary(agent_protocol) | binary(submit_retry) | binary(job_logs) | binary(docker_executor)'
+filter = '''
+binary(cluster)
+| binary(agent_protocol)
+| binary(submit_retry)
+| binary(job_logs)
+| binary(docker_executor)
+| test(openraft_storage_compliance)
+'''
 test-group = 'heavy-integration'
+
+# CI runs the complete test suite.
+[profile.ci]
+default-filter = 'all()'
+fail-fast = false
+
+# Convenient opt-in profile for humans: run only the heavy tests.
+[profile.heavy]
+default-filter = '''
+binary(cluster)
+| binary(agent_protocol)
+| binary(submit_retry)
+| binary(job_logs)
+| binary(docker_executor)
+| test(openraft_storage_compliance)
+'''
