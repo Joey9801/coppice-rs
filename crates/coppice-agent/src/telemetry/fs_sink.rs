@@ -142,6 +142,21 @@ struct Inner {
     ///
     /// [`log_page`]: FilesystemSink::log_page
     log_bounds: StdMutex<HashMap<(JobId, AttemptId), BTreeMap<Timestamp, StreamBounds>>>,
+    /// The metrics twin of [`log_bounds`](Inner::log_bounds): per-attempt,
+    /// per-segment **data-time bounds** for the `metrics` table, keyed by
+    /// segment start. Logs and metrics share segments, so a log-heavy attempt
+    /// can accumulate thousands of segments that hold no metric rows; without
+    /// this cache [`metric_page`] would open and `MIN`/`MAX`-probe every one of
+    /// them on each request (ADR 0034 review). Closed segments are probed once
+    /// per lifetime, the open segment's entry is extended by the writer after
+    /// every committed flush, and [`metric_page`] plans against these bounds so
+    /// per-request IO touches only the segments that can contribute. Derived
+    /// state, invalidated wholesale by any deleting sweep exactly as
+    /// [`log_bounds`](Inner::log_bounds) is. A `std` mutex — never held across an
+    /// await.
+    ///
+    /// [`metric_page`]: FilesystemSink::metric_page
+    metric_bounds: StdMutex<HashMap<(JobId, AttemptId), BTreeMap<Timestamp, MetricBounds>>>,
     /// Warn-once latch for the write-error path (pressure.rs style): the first
     /// failure of a streak logs at error, subsequent ones only bump the counter,
     /// and a success resets it — so a wedged disk is metered, not a log flood.
@@ -163,13 +178,15 @@ struct Inner {
     /// never materializes beyond that budget; the oversized-row test asserts it.
     #[cfg(test)]
     bytes_materialized: std::sync::atomic::AtomicU64,
-    /// Test-only instrumentation: how many segment files [`log_page`] has
-    /// opened on this sink (bounds probes and page pulls alike). The
-    /// segment-scaling tests assert a warm-cache page over many retained
-    /// segments opens only the one or two that can contribute — proof that
-    /// per-request IO is bounded by the page, not by retention.
+    /// Test-only instrumentation: how many segment files the paged read paths
+    /// ([`log_page`] and [`metric_page`]) have opened on this sink (bounds
+    /// probes and page pulls alike). The segment-scaling tests assert a
+    /// warm-cache page over many retained segments opens only the one or two
+    /// that can contribute — proof that per-request IO is bounded by the page,
+    /// not by retention.
     ///
     /// [`log_page`]: FilesystemSink::log_page
+    /// [`metric_page`]: FilesystemSink::metric_page
     #[cfg(test)]
     segments_opened: std::sync::atomic::AtomicU64,
 }
@@ -201,6 +218,7 @@ impl FilesystemSink {
                 high_pct: opts.high_pct,
                 open: AsyncMutex::new(HashMap::new()),
                 log_bounds: StdMutex::new(HashMap::new()),
+                metric_bounds: StdMutex::new(HashMap::new()),
                 write_error_logged: AtomicBool::new(false),
                 #[cfg(test)]
                 rows_decoded: std::sync::atomic::AtomicU64::new(0),
@@ -324,6 +342,22 @@ impl FilesystemSink {
             .await?;
         }
         tx.commit().await?;
+        // Extend the open segment's cached data-time bounds only *after* the
+        // commit — bounds must never claim rows that are not durable — mirroring
+        // the [`flush_logs`](Self::flush_logs) note. A reader interleaving
+        // between commit and this note merely sees bounds a moment stale.
+        {
+            let start = map.get(&key).expect("segment just ensured").start;
+            let mut cache = self
+                .inner
+                .metric_bounds
+                .lock()
+                .expect("metric_bounds poisoned");
+            let bounds = cache.entry(key).or_default().entry(start).or_default();
+            for sample in samples {
+                bounds.note(sample.at.as_micros());
+            }
+        }
         if let Some(segment) = map.get_mut(&key) {
             segment.size = segment_size_on_disk(&segment.path);
         }
@@ -586,9 +620,9 @@ impl FilesystemSink {
         }
         cleanup_empty_dirs(&self.inner.root);
         if deleted > 0 {
-            // Coarse invalidation on any deletion: the bounds cache is derived
-            // state, and the next read of an affected attempt rebuilds it from
-            // the surviving segments (one probe per survivor). Sweeps that
+            // Coarse invalidation on any deletion: both bounds caches are
+            // derived state, and the next read of an affected attempt rebuilds
+            // from the surviving segments (one probe per survivor). Sweeps that
             // delete are rare (60s tick, only when retention/pressure trips),
             // so wholesale clearing beats threading per-path attempt keys
             // through the sweep plan.
@@ -596,6 +630,11 @@ impl FilesystemSink {
                 .log_bounds
                 .lock()
                 .expect("log_bounds poisoned")
+                .clear();
+            self.inner
+                .metric_bounds
+                .lock()
+                .expect("metric_bounds poisoned")
                 .clear();
         }
         deleted
@@ -1307,16 +1346,19 @@ impl FilesystemSink {
     /// segment — a row's `at` can be older than its segment's filename start
     /// (§8.2 replay), so filename pruning would silently hide rows — but the
     /// reads are **bounded**, and bounded *independently of the untrusted
-    /// cursor*: the whole-attempt `earliest_at`/`latest_at` come from index-only
-    /// `MIN`/`MAX` aggregates (decoding no row), the exclusive resume `skip` is
-    /// spent through index-only `COUNT`/`OFFSET` at the boundary microsecond,
-    /// and each segment's window slice is an indexed `LIMIT max_samples + 1`
-    /// range scan. Fixed-size rows mean no byte budget: a page reads at most
-    /// `max_samples + 1` rows per contributing segment. Segments whose data-time
-    /// bounds miss the window (or the boundary microsecond) are pruned without a
-    /// row read, and the beyond walk stops opening candidates once the page is
-    /// provably full — so a small page over a giant attempt opens only the
-    /// segments that can contribute.
+    /// cursor*: the whole-attempt `earliest_at`/`latest_at` and the per-segment
+    /// data-time extents come from a writer-maintained per-segment bounds cache
+    /// (closed segments probed once per lifetime with an index-only `MIN`/`MAX`,
+    /// the open segment extended in memory by the writer — never all retained
+    /// segments per request), the exclusive resume `skip` is spent through
+    /// index-only `COUNT`/`OFFSET` at the boundary microsecond, and each
+    /// segment's window slice is an indexed `LIMIT max_samples + 1` range scan.
+    /// Fixed-size rows mean no byte budget: a page reads at most `max_samples +
+    /// 1` rows per contributing segment. Segments whose cached bounds miss the
+    /// window (or the boundary microsecond) are pruned without an open, and the
+    /// beyond walk stops opening candidates once the page is provably full — so
+    /// a small page over a giant attempt opens only the segments that can
+    /// contribute, even when logs have accumulated thousands of shared segments.
     ///
     /// `earliest_at`/`latest_at` span the whole attempt, **independent** of the
     /// window/resume, so the caller can detect head truncation.
@@ -1332,19 +1374,26 @@ impl FilesystemSink {
         let dir = self.attempt_dir_existing(job, attempt)?;
         let segments = list_segments(&dir);
 
-        // Per-segment data-time bounds `(min_at, max_at)` and the whole-attempt
-        // `earliest_at`/`latest_at` from cheap `MIN`/`MAX` aggregates — one
-        // index-only probe per segment (bounded by retention's segment cap, the
-        // same probe budget [`metric_samples`] already pays). A segment with no
-        // metric rows contributes no bounds and is dropped from the walk.
+        // The per-segment metric data-time bounds cache (ADR 0034 review):
+        // closed segments are probed once per lifetime, the open segment's entry
+        // is writer-maintained, and everything below plans against these bounds
+        // so per-request IO touches only the segments that can contribute —
+        // never all retained segments. Logs and metrics share segments, so a
+        // log-heavy attempt can hold thousands of metric-free segments; the
+        // cache lets a page skip them without an open. §8.2 replay means a later
+        // segment can hold older rows; the bounds are true data-time extents, so
+        // that overlap is captured exactly.
+        let bounds = self.ensure_metric_bounds(job, attempt, &segments).await?;
+
+        // Per-segment `(min_at, max_at)` for segments that actually hold metric
+        // rows, in on-disk segment order, plus the whole-attempt
+        // `earliest_at`/`latest_at` — all from the cache, no per-request probes.
+        // A segment cached as empty contributes no bounds and is dropped.
         let mut seg_bounds: Vec<(Timestamp, &PathBuf, (i64, i64))> = Vec::new();
         let mut earliest_at: Option<Timestamp> = None;
         let mut latest_at: Option<Timestamp> = None;
         for (start, path) in &segments {
-            let Some(mut conn) = self.open_read(path).await? else {
-                continue;
-            };
-            let Some((lo, hi)) = metric_segment_bounds(&mut conn).await? else {
+            let Some((lo, hi)) = bounds.get(start).and_then(MetricBounds::range) else {
                 continue;
             };
             if let Some(at) = Timestamp::from_micros(lo) {
@@ -1421,7 +1470,7 @@ impl FilesystemSink {
                 if need <= 0 {
                     break;
                 }
-                let Some(mut conn) = self.open_read(path).await? else {
+                let Some(mut conn) = self.open_read_counted(path).await? else {
                     continue;
                 };
                 let count = metric_boundary_count(&mut conn, b).await? as u64;
@@ -1472,7 +1521,7 @@ impl FilesystemSink {
                     break;
                 }
             }
-            let Some(mut conn) = self.open_read(path).await? else {
+            let Some(mut conn) = self.open_read_counted(path).await? else {
                 continue;
             };
             let rows =
@@ -1606,8 +1655,9 @@ impl FilesystemSink {
     }
 
     /// [`open_read`](Self::open_read) plus the test-only opened-segments meter —
-    /// every segment open on the [`log_page`](Self::log_page) path goes through
-    /// here so the segment-scaling tests can count them.
+    /// every segment open on the paged read paths ([`log_page`](Self::log_page)
+    /// and [`metric_page`](Self::metric_page), bounds probes and page pulls
+    /// alike) goes through here so the segment-scaling tests can count them.
     async fn open_read_counted(&self, path: &Path) -> Result<Option<SqliteConnection>, StoreError> {
         #[cfg(test)]
         self.inner.segments_opened.fetch_add(1, Ordering::Relaxed);
@@ -1650,6 +1700,58 @@ impl FilesystemSink {
 
         let live: HashSet<Timestamp> = segments.iter().map(|(start, _)| *start).collect();
         let mut cache = self.inner.log_bounds.lock().expect("log_bounds poisoned");
+        let entry = cache.entry(key).or_default();
+        for (start, bounds) in probed {
+            entry.entry(start).or_default().merge(bounds);
+        }
+        entry.retain(|start, _| live.contains(start));
+        Ok(entry.clone())
+    }
+
+    /// The metrics twin of [`ensure_log_bounds`](Self::ensure_log_bounds):
+    /// bring the attempt's cached per-segment metric bounds in sync with the
+    /// on-disk segment list and return a snapshot. Closed segments are
+    /// immutable, so any start already cached — including one cached as "empty"
+    /// (no metric rows) — is trusted as-is; a start not yet cached (cold cache
+    /// after restart or sweep invalidation, or a segment written by an older
+    /// process) is probed **once** with an index-only `MIN`/`MAX`. Entries for
+    /// vanished segments are dropped. The publish merges rather than overwrites,
+    /// so a concurrent writer note between probe and publish is never lost
+    /// (bounds only widen).
+    async fn ensure_metric_bounds(
+        &self,
+        job: &JobId,
+        attempt: &AttemptId,
+        segments: &[(Timestamp, PathBuf)],
+    ) -> Result<BTreeMap<Timestamp, MetricBounds>, StoreError> {
+        let key = (*job, *attempt);
+        let cached: BTreeMap<Timestamp, MetricBounds> = self
+            .inner
+            .metric_bounds
+            .lock()
+            .expect("metric_bounds poisoned")
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut probed: Vec<(Timestamp, MetricBounds)> = Vec::new();
+        for (start, path) in segments {
+            if cached.contains_key(start) {
+                continue;
+            }
+            let Some(mut conn) = self.open_read_counted(path).await? else {
+                continue;
+            };
+            let at = metric_segment_bounds(&mut conn).await?;
+            probed.push((*start, MetricBounds { at }));
+        }
+
+        let live: HashSet<Timestamp> = segments.iter().map(|(start, _)| *start).collect();
+        let mut cache = self
+            .inner
+            .metric_bounds
+            .lock()
+            .expect("metric_bounds poisoned");
         let entry = cache.entry(key).or_default();
         for (start, bounds) in probed {
             entry.entry(start).or_default().merge(bounds);
@@ -2223,6 +2325,44 @@ macro_rules! metric_row {
             blkio_write_bytes_total: row.blkio_write_bytes_total,
         }
     }};
+}
+
+/// One segment's cached metric data-time bounds `(min_at, max_at)` in µs — the
+/// metrics analogue of [`StreamBounds`] (metrics carry no stream, so a single
+/// interval suffices). `None` = the segment holds no metric rows, which
+/// [`metric_page`](FilesystemSink::metric_page) treats as "cached and provably
+/// empty", so the segment is never re-probed and never opened for a page.
+#[derive(Clone, Copy, Debug, Default)]
+struct MetricBounds {
+    at: Option<(i64, i64)>,
+}
+
+impl MetricBounds {
+    /// Extend the bounds with one committed row (writer path).
+    fn note(&mut self, at: i64) {
+        self.at = Some(match self.at {
+            None => (at, at),
+            Some((lo, hi)) => (lo.min(at), hi.max(at)),
+        });
+    }
+
+    /// Union with another observation of the same segment. Bounds only ever
+    /// widen, so merging a lazy probe with concurrent writer notes is safe in
+    /// either order — the same rule [`StreamBounds::merge`] relies on.
+    fn merge(&mut self, other: MetricBounds) {
+        if let Some((lo, hi)) = other.at {
+            self.at = Some(match self.at {
+                None => (lo, hi),
+                Some((cur_lo, cur_hi)) => (cur_lo.min(lo), cur_hi.max(hi)),
+            });
+        }
+    }
+
+    /// The `(min_at, max_at)` interval, or `None` when the segment holds no
+    /// metric rows.
+    fn range(&self) -> Option<(i64, i64)> {
+        self.at
+    }
 }
 
 /// One segment's metric data-time bounds `(min_at, max_at)` in µs — an
@@ -5027,5 +5167,226 @@ mod tests {
         let page = sink.metric_page(&job, &attempt, &q).await.unwrap();
         assert_eq!(m_ats(&page), vec![SEGMENTS * PER_SEGMENT - 1]);
         assert!(!page.exhausted);
+    }
+
+    // ---- metric bounds cache (ADR 0034 review — the metrics twin of the
+    // log_page segment-scaling tests) --------------------------------------
+
+    /// One metric sample per segment: with `segment_max = 1` every append rolls,
+    /// so this leaves `n` metric-bearing segments with disjoint ascending `at`
+    /// ranges, the writer warming the bounds cache for each as it goes.
+    async fn metric_one_per_segment(
+        sink: &FilesystemSink,
+        job: JobId,
+        attempt: AttemptId,
+        alloc: AllocationId,
+        n: i64,
+    ) {
+        for t in 1..=n {
+            sink.append_metrics_at(&[metric(job, attempt, alloc, at(t))], at(t))
+                .await;
+        }
+    }
+
+    /// The metrics twin of `log_page_opens_contributing_segments_not_all_retained`:
+    /// with warm bounds a page opens only the segment(s) that can contribute,
+    /// no matter how many are retained. The one extra open is the top-k
+    /// look-ahead proving more rows exist (`want = max_samples + 1`).
+    #[tokio::test]
+    async fn metric_page_opens_contributing_segments_not_all_retained() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |o| {
+            o.segment_max = ByteSize::from_bytes(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        const SEGMENTS: i64 = 8;
+        metric_one_per_segment(&sink, job, attempt, alloc, SEGMENTS).await;
+
+        // Newest-first single-sample page: the newest segment plus at most one
+        // look-ahead, out of eight retained.
+        let before = sink.inner.segments_opened.load(Ordering::Relaxed);
+        let mut query = metric_page_query(LogOrder::Descending);
+        query.max_samples = 1;
+        let page = sink.metric_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(m_ats(&page), vec![SEGMENTS]);
+        assert!(!page.exhausted);
+        let opened = sink.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(opened <= 2, "opened {opened} of {SEGMENTS} segments");
+        // Whole-attempt bounds come from the cache, not per-request probes.
+        assert_eq!(page.earliest_at, Some(at(1)));
+        assert_eq!(page.latest_at, Some(at(SEGMENTS)));
+
+        // A time-window page over one old segment's range opens exactly that
+        // segment: the window bounds every other candidate out.
+        let before = sink.inner.segments_opened.load(Ordering::Relaxed);
+        let mut query = metric_page_query(LogOrder::Ascending);
+        query.from = Some(at(3));
+        query.until = Some(at(4)); // half-open [3s, 4s) → only t=3
+        let page = sink.metric_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(m_ats(&page), vec![3]);
+        assert!(page.exhausted);
+        let opened = sink.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert_eq!(opened, 1, "only the covering segment is opened");
+    }
+
+    /// The core of the PR-review scenario: logs and metrics share segments, so a
+    /// log-heavy attempt accumulates many metric-free segments. Once the bounds
+    /// cache is warm, a metric page must skip every one of them — opening only
+    /// the segment that actually holds metrics — rather than `MIN`/`MAX`-probing
+    /// thousands of segments per request.
+    #[tokio::test]
+    async fn metric_page_skips_metric_free_segments_when_warm() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |o| {
+            o.segment_max = ByteSize::from_bytes(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        // Six log-only segments (t=1..=6), then one metric-bearing segment (t=7).
+        const LOG_SEGMENTS: i64 = 6;
+        for t in 1..=LOG_SEGMENTS {
+            sink.append_logs_at(
+                &[log(job, attempt, alloc, at(t), LogStream::Stdout, b"x")],
+                at(t),
+            )
+            .await;
+        }
+        sink.append_metrics_at(&[metric(job, attempt, alloc, at(7))], at(7))
+            .await;
+
+        let query = metric_page_query(LogOrder::Descending);
+
+        // First (cold for the log-only segments) page: their bounds are lazily
+        // probed once and cached as empty; the result is exact.
+        let page = sink.metric_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(m_ats(&page), vec![7]);
+        assert_eq!(page.earliest_at, Some(at(7)));
+        assert_eq!(page.latest_at, Some(at(7)));
+
+        // Warm: the metric-free segments are cached-empty, so the page opens only
+        // the single metric-bearing segment — no matter how many log segments
+        // pile up.
+        let before = sink.inner.segments_opened.load(Ordering::Relaxed);
+        let page = sink.metric_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(m_ats(&page), vec![7]);
+        let opened = sink.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            opened, 1,
+            "only the metric-bearing segment opens; {LOG_SEGMENTS} log-only segments are pruned"
+        );
+    }
+
+    /// The metrics twin of `log_page_cold_cache_probes_once_then_stays_bounded`:
+    /// a fresh handle over an existing tree (restart / older process) probes each
+    /// segment once to rebuild the cache, then pages stay O(contributing).
+    #[tokio::test]
+    async fn metric_page_cold_cache_probes_once_then_stays_bounded() {
+        let root = TempDir::new().unwrap();
+        let tel = root.path().join("tel");
+        let writer = sink_with(tel.clone(), |o| {
+            o.segment_max = ByteSize::from_bytes(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        const SEGMENTS: i64 = 6;
+        metric_one_per_segment(&writer, job, attempt, alloc, SEGMENTS).await;
+
+        // A separate handle shares nothing in memory with the writer.
+        let reader = sink_with(tel, |_| {}).await;
+        let mut query = metric_page_query(LogOrder::Descending);
+        query.max_samples = 1;
+
+        // Cold: every segment is probed once (index-only bounds), plus the
+        // bounded page pull itself.
+        let before = reader.inner.segments_opened.load(Ordering::Relaxed);
+        let page = reader.metric_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(m_ats(&page), vec![SEGMENTS]);
+        let cold = reader.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(
+            (SEGMENTS as u64..=SEGMENTS as u64 + 2).contains(&cold),
+            "cold read probes each segment once (+bounded pull), opened {cold}"
+        );
+
+        // Warm: the cache carries the bounds; only the contributing tail opens.
+        let before = reader.inner.segments_opened.load(Ordering::Relaxed);
+        let page = reader.metric_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(m_ats(&page), vec![SEGMENTS]);
+        let warm = reader.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(warm <= 2, "warm read opened {warm} of {SEGMENTS}");
+    }
+
+    /// The metrics twin of `log_page_writer_notes_keep_warm_cache_fresh`: rows
+    /// landed after the cache was built are served without re-probing the tree.
+    #[tokio::test]
+    async fn metric_page_writer_notes_keep_warm_cache_fresh() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |o| {
+            o.segment_max = ByteSize::from_bytes(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        metric_one_per_segment(&sink, job, attempt, alloc, 4).await;
+
+        let mut query = metric_page_query(LogOrder::Descending);
+        query.max_samples = 1;
+        let page = sink.metric_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(m_ats(&page), vec![4]);
+
+        // A new sample in a new segment after the cache is warm.
+        sink.append_metrics_at(&[metric(job, attempt, alloc, at(5))], at(5))
+            .await;
+        let before = sink.inner.segments_opened.load(Ordering::Relaxed);
+        let page = sink.metric_page(&job, &attempt, &query).await.unwrap();
+        assert_eq!(
+            m_ats(&page),
+            vec![5],
+            "the freshly written sample is visible"
+        );
+        let opened = sink.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(opened <= 2, "no re-probe of old segments, opened {opened}");
+    }
+
+    /// A deleting retention sweep invalidates the metric bounds cache wholesale
+    /// (the coarse rule shared with `log_bounds`): a surviving attempt's next
+    /// page re-probes its segments rather than trusting stale cached bounds, and
+    /// still reads correctly.
+    #[tokio::test]
+    async fn metric_page_bounds_cache_invalidated_by_retention_sweep() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |o| {
+            o.segment_max = ByteSize::from_bytes(1);
+            o.retention = CoreDuration::from_secs(60);
+        })
+        .await;
+        let alloc = AllocationId::new();
+        let (job, doomed, kept) = (JobId::new(), AttemptId::new(), AttemptId::new());
+        // Two attempts; the writer warms both caches as it writes.
+        metric_one_per_segment(&sink, job, doomed, alloc, 3).await;
+        const KEPT_SEGMENTS: i64 = 4;
+        metric_one_per_segment(&sink, job, kept, alloc, KEPT_SEGMENTS).await;
+
+        // End + expire `doomed`, then sweep: its segments are deleted and, per
+        // the coarse rule, the whole metric_bounds map is cleared.
+        sink.attempt_ended(&job, &doomed, at(100)).await.unwrap();
+        let deleted = sink.sweep(at(200), DiskPressure::Ok).await;
+        assert!(deleted > 0, "the expired attempt's segments were deleted");
+
+        // `kept` was untouched on disk, but its cache was invalidated: the next
+        // page re-probes each of its segments (cold again).
+        let before = sink.inner.segments_opened.load(Ordering::Relaxed);
+        let page = sink
+            .metric_page(&job, &kept, &metric_page_query(LogOrder::Ascending))
+            .await
+            .unwrap();
+        let opened = sink.inner.segments_opened.load(Ordering::Relaxed) - before;
+        assert!(
+            opened >= KEPT_SEGMENTS as u64,
+            "the sweep invalidated the cache; the kept attempt re-probed, opened {opened}"
+        );
+        // ...and the result is still correct across the surviving segments.
+        assert_eq!(m_ats(&page), vec![1, 2, 3, 4]);
+        assert_eq!(page.earliest_at, Some(at(1)));
+        assert_eq!(page.latest_at, Some(at(KEPT_SEGMENTS)));
     }
 }
