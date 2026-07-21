@@ -45,6 +45,14 @@ const MAX_FETCH_RPCS: u32 = 4;
 /// Server-side cap on chunk bytes served per page (~256 KiB, ADR 0034). Fed to
 /// the RPC as `max_bytes`; when it trips, the page ends early with a cursor.
 const PAGE_BYTE_CAP: usize = 256 * 1024;
+/// At most this many source records (i.e. attempts examined) per response.
+/// The no-RPC branches (not-started, missing node/service, missing attempt
+/// record) append a source record without spending an RPC, so without this
+/// ceiling an uncapped retry history could make one response scan and
+/// serialize every attempt regardless of `limit`. Bounding the source count
+/// keeps a single response's work bounded; unexamined attempts stay reachable
+/// through the minted edge cursor.
+const MAX_SOURCES: usize = 32;
 
 /// The raw `?…` parameters, all optional strings/numbers so each can carry its
 /// own `INVALID_ARGUMENT` message (rather than a serde-flavored one).
@@ -285,6 +293,18 @@ async fn walk<P: ControlPlane>(
     let n = list.len();
     let mut i = start_index;
     while i < n {
+        // Bound the per-response source count so an uncapped retry history of
+        // no-RPC attempts cannot make this response's work unbounded. The
+        // current attempt `list[i]` is still unexamined, so mint an edge cursor
+        // for it and stop. Placed above the RPC-budget break (which resumes the
+        // current attempt too), the two bounds compose; and since the first
+        // iteration has an empty `sources`, every response examines at least one
+        // attempt — forward progress is guaranteed.
+        if sources.len() >= MAX_SOURCES {
+            next_cursor = Some(LogCursor::edge(order, list[i]));
+            break;
+        }
+
         let attempt_id = list[i];
         // Only the first attempt of the walk inherits the cursor's resume
         // position; later attempts start from their edge.
@@ -1225,6 +1245,119 @@ mod tests {
         assert_eq!(parsed.at_us, 7_000_000);
         assert_eq!(parsed.skip, 1);
         assert!(!parsed.is_edge());
+    }
+
+    #[tokio::test]
+    async fn source_bound_caps_no_rpc_attempts_and_mints_a_cursor() {
+        // A job with more no-RPC (not-started) attempts than MAX_SOURCES: the
+        // response returns exactly MAX_SOURCES source records, makes no RPCs,
+        // and carries an edge cursor to the first unexamined attempt.
+        let job = JobId::new();
+        let (node, node_rec) = good_node();
+        let mut state = StateMachine::default();
+        let mut attempts = Vec::new();
+        for _ in 0..(MAX_SOURCES + 5) {
+            let a = AttemptId::new();
+            attempts.push(a);
+            // `started = false` → not_started → no RPC.
+            state.attempts.insert(a, attempt_rec(a, job, node, false));
+        }
+        state.jobs.insert(job, job_rec(job, attempts.clone()));
+        state.nodes.insert(node, node_rec);
+        let plane = Arc::new(FakePlane::new(state));
+
+        let (status, body) =
+            get(plane.clone(), &format!("/api/v1/jobs/{job}/logs?order=asc")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(plane.fetch_count(), 0);
+        assert_eq!(body["sources"].as_array().unwrap().len(), MAX_SOURCES);
+        // The cursor points at the first unexamined attempt (index MAX_SOURCES).
+        let cursor = body["next_cursor"].as_str().unwrap();
+        assert!(cursor.contains(&attempts[MAX_SOURCES].to_string()));
+        let parsed = LogCursor::parse(cursor).unwrap();
+        assert!(parsed.is_edge());
+        assert_eq!(parsed.attempt, attempts[MAX_SOURCES]);
+    }
+
+    #[tokio::test]
+    async fn source_bound_cursor_walks_the_remainder() {
+        // Following the minted cursor examines the remaining attempts, all
+        // within a single further page (5 remain, under MAX_SOURCES).
+        let job = JobId::new();
+        let (node, node_rec) = good_node();
+        let mut state = StateMachine::default();
+        let mut attempts = Vec::new();
+        for _ in 0..(MAX_SOURCES + 5) {
+            let a = AttemptId::new();
+            attempts.push(a);
+            state.attempts.insert(a, attempt_rec(a, job, node, false));
+        }
+        state.jobs.insert(job, job_rec(job, attempts.clone()));
+        state.nodes.insert(node, node_rec);
+        let plane = Arc::new(FakePlane::new(state));
+
+        let (_s1, page1) = get(plane.clone(), &format!("/api/v1/jobs/{job}/logs?order=asc")).await;
+        let cursor = page1["next_cursor"].as_str().unwrap().to_string();
+
+        let (status, page2) = get(
+            plane.clone(),
+            &format!("/api/v1/jobs/{job}/logs?order=asc&cursor={cursor}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sources = page2["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 5);
+        assert_eq!(sources[0]["attempt"], attempts[MAX_SOURCES].to_string());
+        assert_eq!(sources[4]["attempt"], attempts[MAX_SOURCES + 4].to_string());
+        assert_eq!(page2["next_cursor"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn source_bound_composes_with_the_rpc_budget() {
+        // Mixed no-RPC + RPC attempts. A no-RPC prefix of MAX_SOURCES-2
+        // not-started attempts fills all but two source slots; two available
+        // attempts then consume the last two slots (two RPCs, under the 4-RPC
+        // budget), and the source ceiling ends the page before the RPC budget
+        // is spent. This proves the two bounds compose: no-RPC attempts do not
+        // count against the RPC budget but do count against the source ceiling.
+        let job = JobId::new();
+        let (node, node_rec) = good_node();
+        let mut state = StateMachine::default();
+        let mut attempts = Vec::new();
+        let not_started = MAX_SOURCES - 2;
+        for _ in 0..not_started {
+            let a = AttemptId::new();
+            attempts.push(a);
+            state.attempts.insert(a, attempt_rec(a, job, node, false));
+        }
+        // Three available attempts follow; only two fit before the ceiling.
+        for _ in 0..3 {
+            let a = AttemptId::new();
+            attempts.push(a);
+            state.attempts.insert(a, attempt_rec(a, job, node, true));
+        }
+        state.jobs.insert(job, job_rec(job, attempts.clone()));
+        state.nodes.insert(node, node_rec);
+        let plane = Arc::new(FakePlane::new(state));
+        for (i, a) in attempts.iter().enumerate().skip(not_started) {
+            plane.seed(
+                *a,
+                page(vec![chunk(1_000_000 + i as i64, &format!("a{i}"))]),
+            );
+        }
+
+        let (status, body) =
+            get(plane.clone(), &format!("/api/v1/jobs/{job}/logs?order=asc")).await;
+        assert_eq!(status, StatusCode::OK);
+        // Only the two available attempts that fit the ceiling were fetched —
+        // well under the RPC budget, so the source ceiling (not the budget)
+        // ended the page.
+        assert_eq!(plane.fetch_count(), 2);
+        assert_eq!(body["sources"].as_array().unwrap().len(), MAX_SOURCES);
+        // The cursor points at the third available attempt (the first unexamined
+        // one), so the remainder stays reachable.
+        let cursor = body["next_cursor"].as_str().unwrap();
+        assert!(cursor.contains(&attempts[MAX_SOURCES].to_string()));
     }
 
     // ---- parameter validation -------------------------------------------
