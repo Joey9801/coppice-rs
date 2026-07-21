@@ -2181,9 +2181,10 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Remove attempt directories left with no segment files after a sweep — drop
-/// the `ended` marker, then the now-empty attempt and job directories
-/// (docker-executor.md §8.4). Whole-file/dir unlinks only; every error is
-/// tolerated (a non-empty dir simply stays).
+/// the `ended` marker and any orphaned `-wal`/`-shm` journal files, then the
+/// now-empty attempt and job directories (docker-executor.md §8.4).
+/// Whole-file/dir unlinks only; every error is tolerated (a non-empty dir
+/// simply stays).
 fn cleanup_empty_dirs(root: &Path) {
     let Ok(jobs) = std::fs::read_dir(root) else {
         return;
@@ -2198,11 +2199,43 @@ fn cleanup_empty_dirs(root: &Path) {
                 let attempt_dir = attempt_entry.path();
                 if attempt_dir.is_dir() && list_segments(&attempt_dir).is_empty() {
                     let _ = std::fs::remove_file(attempt_dir.join("ended"));
+                    remove_orphan_journal_files(&attempt_dir);
                     let _ = std::fs::remove_dir(&attempt_dir);
                 }
             }
         }
         let _ = std::fs::remove_dir(&job_dir);
+    }
+}
+
+/// Unlink `seg-*.db-wal`/`-shm` files whose `seg-*.db` no longer exists. A
+/// reader that raced a sweep recreates them by path ([`open_read`] is
+/// read-write WAL, so its first query re-creates the journals of an
+/// already-unlinked segment), and a reader that dies without a clean close
+/// leaves them behind — either way they hold no recoverable data once the main
+/// file is gone, and they would block the attempt dir's removal on every
+/// future sweep. The `.db` absence is re-checked per file so a segment being
+/// created concurrently keeps its journal.
+///
+/// [`open_read`]: FilesystemSink::open_read
+fn remove_orphan_journal_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(db_name) = name
+            .strip_suffix("-wal")
+            .or_else(|| name.strip_suffix("-shm"))
+        else {
+            continue;
+        };
+        if parse_segment_start(db_name).is_some() && !dir.join(db_name).exists() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -3332,7 +3365,50 @@ mod tests {
         reader.await.unwrap();
         let deleted = sweeper.await.unwrap();
         assert_eq!(deleted, 8);
-        assert!(!attempt_dir(&sink, job, attempt).exists());
+        // The racing sweep's own cleanup pass may leave the attempt dir behind:
+        // a reader that opened a segment just before its unlink recreates the
+        // `-wal`/`-shm` by path on its first query (open_read is read-write
+        // WAL). The contract is convergence, not a spotless racing pass — once
+        // the readers are done, the next sweep reclaims the orphans and the
+        // dir.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while attempt_dir(&sink, job, attempt).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the attempt dir must be reclaimed once the readers finish"
+            );
+            sink.sweep(at(1000), DiskPressure::Ok).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    // Journal files orphaned by a reader that died without a clean close (their
+    // `seg-*.db` long gone) must not strand the attempt dir: they hold nothing
+    // recoverable, so the sweep reclaims them along with the dir.
+    #[tokio::test]
+    async fn sweep_reclaims_orphaned_journal_files() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |opts| {
+            opts.retention = CoreDuration::from_secs(1);
+        })
+        .await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        sink.append_logs_at(
+            &[log(job, attempt, alloc, at(1), LogStream::Stdout, b"x")],
+            at(1),
+        )
+        .await;
+        sink.attempt_ended(&job, &attempt, at(2)).await.unwrap();
+        let dir = attempt_dir(&sink, job, attempt);
+        std::fs::write(dir.join("seg-00000000000000000000.db-wal"), b"stale").unwrap();
+        std::fs::write(dir.join("seg-00000000000000000000.db-shm"), b"stale").unwrap();
+
+        let deleted = sink.sweep(at(1000), DiskPressure::Ok).await;
+        assert_eq!(deleted, 1);
+        assert!(
+            !dir.exists(),
+            "orphaned journals must not strand the attempt dir"
+        );
     }
 
     // The public `MetricsSink`/`LogSink` trait boundary (now-stamped) persists
