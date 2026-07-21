@@ -9,6 +9,9 @@
 - **Resolves:** [KOI-6](../roadmap/known-open-issues.md#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served)
   — the design half; the issue stays open until its closure criteria are met
   in code
+- **Amended by:** [ADR 0036](0036-best-effort-job-usage-retrieval.md) (item
+  7's scope cut is resolved for `GetJobUsage`; `GetNodeUtilization`'s `used`
+  half stays open)
 
 ## Context
 

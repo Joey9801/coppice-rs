@@ -787,14 +787,15 @@ the *only* sanctioned telemetry loss; steady-state loss is a defect
 (§8.3).
 
 **The read path is the point:** this sink is the backing store for
-coordinator-initiated reads over the existing command stream. The sink
-exposes a `TelemetryStore` read API (list attempts; read log chunks by
-`(attempt, stream?, time range | tail_n)`; read metric samples by time
-range) implemented as SQL over the segment set. The wire surface — new
-`AgentCommand` arms `FetchLogs { attempt, range } → LogChunks` report arms
-(chunked, flow-controlled) — is **deliberately out of scope for this
-component** and lands with the API-edge work; the store API is designed
-now so that RPC is a translation layer only.
+coordinator-initiated reads. The sink exposes a `TelemetryStore` read API
+(list attempts; read log chunks by `(attempt, stream?, time range |
+tail_n)`; read metric samples by time range) implemented as SQL over the
+segment set. Both are now served off-node: logs via the agent-hosted
+`NodeService.FetchLogs` RPC ([ADR 0034](../decisions/0034-best-effort-job-log-retrieval.md))
+and metrics via the analogous `NodeService.FetchMetrics`
+([ADR 0036](../decisions/0036-best-effort-job-usage-retrieval.md)) — each a
+thin translation layer over this store's read API, proposing and
+journaling nothing, with no leader involvement.
 
 ## 9. Shared host pressure signal
 
