@@ -151,7 +151,11 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
             service_addr = ?config.service_addr(),
             "NodeService listener bound; coordinators can dial for job logs (ADR 0034)"
         );
-        node_service::serve(listener, telemetry.log_store.clone());
+        node_service::serve(
+            listener,
+            telemetry.log_store.clone(),
+            telemetry.metric_store.clone(),
+        );
     }
 
     let session = session::Session::new(

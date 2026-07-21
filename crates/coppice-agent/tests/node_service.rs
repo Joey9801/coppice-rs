@@ -13,10 +13,10 @@ use std::time::Duration as StdDuration;
 
 use coppice_agent::node_service::{serve, NodeServiceListener};
 use coppice_agent::telemetry::{
-    FilesystemSink, FilesystemSinkOptions, LogChunk, LogSink, LogStream,
+    FilesystemSink, FilesystemSinkOptions, LogChunk, LogSink, LogStream, MetricSample, MetricsSink,
 };
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
-use coppice_core::time::Timestamp;
+use coppice_core::time::{Duration as CoreDuration, Timestamp};
 use coppice_net::node_service::Client;
 use coppice_proto::pb::agent::v1 as pb;
 use rcgen::{
@@ -98,6 +98,12 @@ struct Harness {
 /// Build a sink, seed it with `chunks`, bind the mTLS listener on an ephemeral
 /// port, and start serving.
 async fn spawn(chunks: Vec<LogChunk>) -> Harness {
+    spawn_with(chunks, Vec::new()).await
+}
+
+/// [`spawn`] plus a metric-sample seed, serving the one sink as both the log and
+/// metric store (a single [`FilesystemSink`] stores both streams).
+async fn spawn_with(chunks: Vec<LogChunk>, samples: Vec<MetricSample>) -> Harness {
     let node_id = NodeId::new();
     let pki = mint_pki(node_id);
 
@@ -108,6 +114,9 @@ async fn spawn(chunks: Vec<LogChunk>) -> Harness {
     if !chunks.is_empty() {
         LogSink::append(&sink, &chunks).await;
     }
+    if !samples.is_empty() {
+        MetricsSink::append(&sink, &samples).await;
+    }
 
     let listener = NodeServiceListener::bind(
         "127.0.0.1:0".parse().unwrap(),
@@ -117,7 +126,7 @@ async fn spawn(chunks: Vec<LogChunk>) -> Harness {
     )
     .expect("bind listener");
     let addr = listener.local_addr();
-    let server = serve(listener, Some(sink));
+    let server = serve(listener, Some(sink.clone()), Some(sink));
 
     Harness {
         node_id,
@@ -195,6 +204,39 @@ fn chunk(
     }
 }
 
+fn metrics_request(job: JobId, attempt: AttemptId) -> pb::FetchMetricsRequest {
+    pb::FetchMetricsRequest {
+        job: Some(job.into()),
+        attempt: Some(attempt.into()),
+        from_us: None,
+        until_us: None,
+        resume: None,
+        ascending: true,
+        max_samples: 100,
+    }
+}
+
+/// One metric sample stamped at `at`, with distinct counter values so the wire
+/// conversion (CPU `Duration` → µs, byte counters passthrough) is checkable.
+fn sample(job: JobId, attempt: AttemptId, alloc: AllocationId, at: Timestamp) -> MetricSample {
+    MetricSample {
+        allocation: alloc,
+        attempt,
+        job,
+        at,
+        cpu_usage_total: CoreDuration::from_micros(1_500),
+        cpu_throttled_total: CoreDuration::from_micros(250),
+        memory_used_bytes: 100,
+        memory_peak_bytes: 200,
+        disk_writable_bytes: 10,
+        disk_image_bytes: 20,
+        net_rx_bytes_total: 1,
+        net_tx_bytes_total: 2,
+        blkio_read_bytes_total: 3,
+        blkio_write_bytes_total: 4,
+    }
+}
+
 #[tokio::test]
 async fn happy_path_returns_the_stored_chunks() {
     let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
@@ -225,6 +267,67 @@ async fn happy_path_returns_the_stored_chunks() {
         }
         other => panic!("expected Chunks, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn fetch_metrics_returns_the_stored_samples_through_the_grpc_handler() {
+    let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+    let base = Timestamp::UNIX_EPOCH + CoreDuration::from_secs(100);
+    let samples = vec![
+        sample(job, attempt, alloc, base),
+        sample(job, attempt, alloc, base + CoreDuration::from_secs(1)),
+    ];
+    let harness = spawn_with(Vec::new(), samples).await;
+
+    let channel = dial(&harness, true).await.expect("id-pinned mTLS dial");
+    let mut client = Client::new(channel);
+    let response = client
+        .fetch_metrics(metrics_request(job, attempt))
+        .await
+        .expect("fetch_metrics")
+        .into_inner();
+
+    match response.outcome {
+        Some(pb::fetch_metrics_response::Outcome::Samples(samples)) => {
+            assert_eq!(samples.samples.len(), 2, "both stored samples returned");
+            assert!(samples.exhausted, "the whole attempt fit in one page");
+            assert_eq!(samples.earliest_at_us, Some(base.as_micros()));
+            let ats: Vec<i64> = samples.samples.iter().map(|s| s.at_us).collect();
+            assert_eq!(
+                ats,
+                vec![
+                    base.as_micros(),
+                    (base + CoreDuration::from_secs(1)).as_micros()
+                ],
+                "ascending (at, insertion) order"
+            );
+            // The CPU `Duration` counters crossed the wire as µs uint64.
+            assert_eq!(samples.samples[0].cpu_usage_total_us, 1_500);
+            assert_eq!(samples.samples[0].cpu_throttled_total_us, 250);
+            assert_eq!(samples.samples[0].blkio_write_bytes_total, 4);
+        }
+        other => panic!("expected Samples, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fetch_metrics_unknown_attempt_when_the_store_has_no_data() {
+    let harness = spawn(Vec::new()).await;
+    let channel = dial(&harness, true).await.expect("mTLS dial");
+    let mut client = Client::new(channel);
+
+    let response = client
+        .fetch_metrics(metrics_request(JobId::new(), AttemptId::new()))
+        .await
+        .expect("fetch_metrics")
+        .into_inner();
+    assert!(
+        matches!(
+            response.outcome,
+            Some(pb::fetch_metrics_response::Outcome::UnknownAttempt(_))
+        ),
+        "an attempt with no telemetry directory answers UnknownAttempt"
+    );
 }
 
 #[tokio::test]
@@ -301,7 +404,7 @@ async fn a_leaf_with_a_different_node_id_san_fails_id_pinning() {
     )
     .expect("bind listener");
     let addr = listener.local_addr();
-    let server = serve(listener, Some(sink));
+    let server = serve(listener, Some(sink.clone()), Some(sink));
 
     // The harness advertises `expected_id`, which `dial` pins as the server-name
     // — but the leaf only carries `actual_id` as its SAN.

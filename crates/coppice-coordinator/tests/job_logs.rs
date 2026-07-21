@@ -9,7 +9,7 @@
 //! - a real node registered through the live coordinator runtime, so its
 //!   advertised `service_addr` lands in replicated state;
 //! - `GET /api/v1/jobs/{job}/logs` driven through the real axum router, the real
-//!   [`CoordinatorControlPlane`], and the real [`NodeLogClient`] dialing that
+//!   [`CoordinatorControlPlane`], and the real [`NodeClient`] dialing that
 //!   listener id-pinned.
 //!
 //! One test shares the (expensive) bootstrap + register + run-to-Running setup
@@ -38,7 +38,7 @@ use coppice_agent::telemetry::{
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, ConsensusError, StateViews};
 use coppice_coordinator::config::CliOverrides;
-use coppice_coordinator::{CoordinatorControlPlane, NodeLogClient};
+use coppice_coordinator::{CoordinatorControlPlane, NodeClient};
 use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
@@ -361,7 +361,7 @@ async fn best_effort_job_logs_full_read_path() {
     )
     .expect("bind NodeService listener");
     let service_addr = format!("127.0.0.1:{}", listener.local_addr().port());
-    let mut server = serve(listener, Some(sink.clone()));
+    let mut server = serve(listener, Some(sink.clone()), Some(sink.clone()));
 
     // -- Boot the coordinator runtime and register the agent. --------------
     let cluster_id = ClusterId::new();
@@ -432,7 +432,7 @@ async fn best_effort_job_logs_full_read_path() {
 
     // -- Build the real read path: plane + log client + router. ------------
     let coord_leaf = ca.leaf();
-    let log_client = Arc::new(NodeLogClient::new(
+    let log_client = Arc::new(NodeClient::new(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
@@ -531,7 +531,7 @@ async fn best_effort_job_logs_full_read_path() {
     // fetch through a fresh client to observe genuine unreachability.
     server.abort();
     let _ = (&mut server).await;
-    let log_client2 = Arc::new(NodeLogClient::new(
+    let log_client2 = Arc::new(NodeClient::new(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
@@ -567,7 +567,7 @@ async fn best_effort_job_logs_full_read_path() {
 /// unchanged); then the read path is built against a **follower's** consensus +
 /// views and asserts (a) 200 + expected entries, (b) the `Coppice-Applied-Index`
 /// header comes from that follower's own view, and (c) the follower's own
-/// `NodeLogClient` dialed the agent (the entries came back).
+/// `NodeClient` dialed the agent (the entries came back).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_serves_job_logs_directly() {
     use coppice_api::http::dto::LogAvailability;
@@ -593,7 +593,7 @@ async fn follower_serves_job_logs_directly() {
     )
     .expect("bind NodeService listener");
     let service_addr = format!("127.0.0.1:{}", listener.local_addr().port());
-    let mut server = serve(listener, Some(sink.clone()));
+    let mut server = serve(listener, Some(sink.clone()), Some(sink.clone()));
 
     // -- Boot a three-voter cluster: leader + two followers. ----------------
     let cluster_id = ClusterId::new();
@@ -699,7 +699,7 @@ async fn follower_serves_job_logs_directly() {
     // involvement, and the fetch dials the agent with no leadership gating; the
     // leader's client listener is never touched by this request.
     let coord_leaf = ca.leaf();
-    let log_client = Arc::new(NodeLogClient::new(
+    let log_client = Arc::new(NodeClient::new(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
@@ -742,7 +742,7 @@ async fn follower_serves_job_logs_directly() {
 
     // (c) The follower dialed the agent directly: the source is the node that
     // ran the attempt and its data came back Available — only the follower's
-    // own NodeLogClient made that fetch.
+    // own NodeClient made that fetch.
     assert_eq!(body.sources.len(), 1, "one source for the single attempt");
     assert_eq!(body.sources[0].attempt, attempt);
     assert_eq!(body.sources[0].node, Some(node));

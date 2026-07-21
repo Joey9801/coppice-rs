@@ -368,8 +368,8 @@ ca_path = "{ca}"
         DevExecutor::Fake => {
             let session = build_session(&agent_config, FakeExecutor::new())?;
             // The fake executor captures no container output, so the NodeService
-            // serves no log store: every fetch honestly answers UnknownAttempt.
-            serve_node_service(&agent_config, None)?;
+            // serves no stores: every fetch honestly answers UnknownAttempt.
+            serve_node_service(&agent_config, None, None)?;
             (tokio::spawn(run_agent(session, agent_config)), None)
         }
         DevExecutor::Docker => {
@@ -432,9 +432,14 @@ ca_path = "{ca}"
             )
             .await?;
             let session = build_session(&agent_config, executor)?;
-            // Serve the NodeService over the first LOG-consuming telemetry store
-            // (ADR 0034), so the in-process coordinator can dial for job logs.
-            serve_node_service(&agent_config, telemetry.log_store.clone())?;
+            // Serve the NodeService over the first LOG- and METRICS-consuming
+            // telemetry stores (ADR 0034/0036), so the in-process coordinator
+            // can dial for job logs and usage.
+            serve_node_service(
+                &agent_config,
+                telemetry.log_store.clone(),
+                telemetry.metric_store.clone(),
+            )?;
             (
                 tokio::spawn(run_agent(session, agent_config)),
                 Some(telemetry),
@@ -510,13 +515,19 @@ fn build_session<E: Executor + Clone>(
     .with_service_addr(config.service_addr()))
 }
 
-/// Bind and serve the agent-hosted NodeService (ADR 0034) from the config's
-/// `[listen]` + `[tls]`, so the in-process coordinator can dial it for job logs.
+/// Bind and serve the agent-hosted NodeService (ADR 0034/0036) from the
+/// config's `[listen]` + `[tls]`, so the in-process coordinator can dial it
+/// for job logs and usage metrics.
 ///
-/// `log_store` is the first LOG-consuming telemetry store; `None` disables it
-/// (the fake executor has no logs), in which case every fetch answers
-/// UnknownAttempt. Mirrors the daemon `run` path's wiring in `lib.rs`.
-fn serve_node_service(config: &AgentConfig, log_store: Option<FilesystemSink>) -> Result<()> {
+/// `log_store`/`metric_store` are the first LOG- and METRICS-consuming
+/// telemetry stores; `None` disables that stream (the fake executor captures
+/// neither), in which case its fetches answer UnknownAttempt. Mirrors the
+/// daemon `run` path's wiring in `lib.rs`.
+fn serve_node_service(
+    config: &AgentConfig,
+    log_store: Option<FilesystemSink>,
+    metric_store: Option<FilesystemSink>,
+) -> Result<()> {
     let Some(listen) = &config.listen else {
         return Ok(());
     };
@@ -524,9 +535,9 @@ fn serve_node_service(config: &AgentConfig, log_store: Option<FilesystemSink>) -
         .context("binding the dev NodeService listener")?;
     tracing::info!(
         service_addr = ?config.service_addr(),
-        "dev NodeService listener bound; the coordinator can dial for job logs (ADR 0034)"
+        "dev NodeService listener bound; the coordinator can dial for job telemetry (ADR 0034/0036)"
     );
-    coppice_agent::node_service::serve(listener, log_store);
+    coppice_agent::node_service::serve(listener, log_store, metric_store);
     Ok(())
 }
 

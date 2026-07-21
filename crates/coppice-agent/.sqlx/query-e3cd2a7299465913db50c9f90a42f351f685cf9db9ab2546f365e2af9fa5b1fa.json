@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 at AS \"at!: i64\", allocation_id AS \"allocation_id!: String\",\n                 cpu_usage_total_us AS \"cpu_usage_total_us!: i64\",\n                 cpu_throttled_total_us AS \"cpu_throttled_total_us!: i64\",\n                 memory_used_bytes AS \"memory_used_bytes!: i64\",\n                 memory_peak_bytes AS \"memory_peak_bytes!: i64\",\n                 disk_writable_bytes AS \"disk_writable_bytes!: i64\",\n                 disk_image_bytes AS \"disk_image_bytes!: i64\",\n                 net_rx_bytes_total AS \"net_rx_bytes_total!: i64\",\n                 net_tx_bytes_total AS \"net_tx_bytes_total!: i64\",\n                 blkio_read_bytes_total AS \"blkio_read_bytes_total!: i64\",\n                 blkio_write_bytes_total AS \"blkio_write_bytes_total!: i64\"\n               FROM metrics WHERE at BETWEEN ? AND ? ORDER BY at DESC, id DESC LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "at!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "allocation_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "cpu_usage_total_us!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "cpu_throttled_total_us!: i64",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "memory_used_bytes!: i64",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "memory_peak_bytes!: i64",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "disk_writable_bytes!: i64",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "disk_image_bytes!: i64",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "net_rx_bytes_total!: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "net_tx_bytes_total!: i64",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "blkio_read_bytes_total!: i64",
+        "ordinal": 10,
+        "type_info": "Integer"
+      },
+      {
+        "name": "blkio_write_bytes_total!: i64",
+        "ordinal": 11,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e3cd2a7299465913db50c9f90a42f351f685cf9db9ab2546f365e2af9fa5b1fa"
+}

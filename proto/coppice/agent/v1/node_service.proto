@@ -18,13 +18,15 @@ package coppice.agent.v1;
 
 import "coppice/core/v1/ids.proto";
 
-// Read a bounded page of an attempt's stored log chunks from the agent's
-// local telemetry segment store (docker-executor.md §8). Best-effort by
-// construction: on-node retention deletes segments some time after an attempt
-// ends, and the store then answers `UnknownAttempt` — indistinguishable from
-// an attempt that never ran here.
+// Read a bounded page of an attempt's stored telemetry — log chunks or
+// metric samples — from the agent's local telemetry segment store
+// (docker-executor.md §8). Best-effort by construction: on-node retention
+// deletes segments some time after an attempt ends, and the store then
+// answers `UnknownAttempt` — indistinguishable from an attempt that never
+// ran here.
 service NodeService {
   rpc FetchLogs(FetchLogsRequest) returns (FetchLogsResponse);
+  rpc FetchMetrics(FetchMetricsRequest) returns (FetchMetricsResponse);
 }
 
 // One of an attempt's two output streams. Doubles as the request-side filter:
@@ -98,6 +100,77 @@ message Chunks {
 // retention, or telemetry was never written. Empty on purpose — presence of
 // this arm *is* the "gone" signal, and it may grow fields later.
 message UnknownAttempt {}
+
+// A page request for one attempt's stored metric samples, the metrics twin of
+// `FetchLogsRequest`. Same shape, same semantics: the coordinator has already
+// resolved the attempt to this node, the window is half-open `[from_us,
+// until_us)`, `resume` is an exclusive cursor into `(at, insertion)` order,
+// and the store is best-effort (retention answers `UnknownAttempt`). Samples
+// are fixed-size rows, so there is no byte budget — only `max_samples`.
+message FetchMetricsRequest {
+  coppice.core.v1.JobId job = 1;
+  coppice.core.v1.AttemptId attempt = 2;
+  optional int64 from_us = 3;
+  optional int64 until_us = 4;
+  // Exclusive resume cursor; absent starts from the window edge in
+  // `ascending` order.
+  ResumePosition resume = 5;
+  // Direction: false (default) walks newest-first.
+  bool ascending = 6;
+  // Hard cap on the page; the store stops here and sets
+  // `Samples.exhausted = false` when more rows remain.
+  uint32 max_samples = 7;
+}
+
+// The result of a `FetchMetrics`, a rich enum (schema-style.md): either a
+// page of samples or the store having no data for the attempt at all.
+message FetchMetricsResponse {
+  oneof outcome {
+    Samples samples = 1;
+    UnknownAttempt unknown_attempt = 2;
+  }
+}
+
+// A page of metric samples in the requested direction.
+message Samples {
+  repeated MetricSample samples = 1;
+  // True when the walk reached the end of the requested range within this
+  // page; false when `max_samples` cut it short and a further page exists.
+  bool exhausted = 2;
+  // The store's oldest/newest retained sample `at_us` for this attempt, when
+  // known. A requested `from_us` earlier than `earliest_at_us` means older
+  // samples existed and were pruned (the API's `truncated` verdict).
+  optional int64 earliest_at_us = 3;
+  optional int64 latest_at_us = 4;
+}
+
+// One periodic resource sample for a running container (docker-executor.md
+// §8.1), mirroring the agent's stored row field-for-field. Counters are
+// cumulative — readers derive rates, so a missed sample loses resolution,
+// never mass. Extended additively when GPU and friends land.
+message MetricSample {
+  int64 at_us = 1;
+  // Cumulative CPU time consumed, µs; readers derive utilisation.
+  uint64 cpu_usage_total_us = 2;
+  // Cumulative CPU time the container was throttled, µs.
+  uint64 cpu_throttled_total_us = 3;
+  // Current resident memory.
+  uint64 memory_used_bytes = 4;
+  // Peak resident memory over the attempt so far.
+  uint64 memory_peak_bytes = 5;
+  // Writable-layer bytes from the disk poller's last reading (§6.2).
+  uint64 disk_writable_bytes = 6;
+  // Image bytes — constant per attempt; writable + image = usage (§6.2).
+  uint64 disk_image_bytes = 7;
+  // Cumulative bytes received on the container network.
+  uint64 net_rx_bytes_total = 8;
+  // Cumulative bytes transmitted on the container network.
+  uint64 net_tx_bytes_total = 9;
+  // Cumulative block-I/O bytes read.
+  uint64 blkio_read_bytes_total = 10;
+  // Cumulative block-I/O bytes written.
+  uint64 blkio_write_bytes_total = 11;
+}
 
 // One stored log chunk: a run of bytes captured at one microsecond on one
 // stream. Bytes are returned verbatim; UTF-8 decoding happens at the edge.
