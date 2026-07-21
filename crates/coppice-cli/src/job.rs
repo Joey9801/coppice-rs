@@ -241,6 +241,18 @@ pub enum JobCommand {
         #[arg(long)]
         follow: bool,
     },
+    /// Print a job's resource-usage samples (best-effort, the metrics twin of
+    /// `logs`, ADR 0031).
+    Usage {
+        /// Job id (`job-<uuid>`).
+        job: JobId,
+        /// Restrict to one attempt (`attempt-<uuid>`).
+        #[arg(long)]
+        attempt: Option<AttemptId>,
+        /// Chronological (`asc`) or newest-first (`desc`); default `asc`.
+        #[arg(long, value_enum)]
+        order: Option<OrderArg>,
+    },
     /// Request a job's abort (a desired-state transition, not a synchronous
     /// stop).
     Abort {
@@ -300,6 +312,14 @@ pub async fn run(args: JobArgs) -> Result<()> {
                 run_logs(&client, &base, job, stream, attempt, order).await
             }
         }
+        JobCommand::Usage {
+            job,
+            attempt,
+            order,
+        } => {
+            let order = usage_order(order);
+            run_usage(&client, &base, job, attempt, order).await
+        }
         JobCommand::Abort { job, reason } => abort(&client, &base, job, reason).await,
     }
 }
@@ -331,6 +351,16 @@ fn resolve_order(order: Option<OrderArg>, follow: bool) -> Result<dto::LogOrder>
         // even though the server default is `desc`.
         Some(OrderArg::Asc) | None => dto::LogOrder::Asc,
     })
+}
+
+/// Resolve the effective usage order. Both the CLI and the usage endpoint
+/// default to `asc` (a chart-ordered time series), so this is a plain mapping
+/// with no `--follow` interaction to reconcile.
+fn usage_order(order: Option<OrderArg>) -> dto::LogOrder {
+    match order {
+        Some(OrderArg::Desc) => dto::LogOrder::Desc,
+        Some(OrderArg::Asc) | None => dto::LogOrder::Asc,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +783,278 @@ fn availability_label(availability: dto::LogAvailability) -> Option<&'static str
         dto::LogAvailability::Unreachable => Some("unreachable"),
         dto::LogAvailability::NotStarted => Some("not_started"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Usage metrics
+// ---------------------------------------------------------------------------
+
+/// The non-follow usage walk (there is no `--follow` in v1): page through
+/// `next_cursor` until it is null, collecting every sample and the running
+/// per-attempt source accounting, then render the table and the availability
+/// notes. Samples are fixed-size rows and a single job's telemetry window is
+/// bounded, so buffering the whole series lets rate derivation see each
+/// sample's chronological neighbour across page boundaries.
+async fn run_usage(
+    client: &reqwest::Client,
+    base: &str,
+    job: JobId,
+    attempt: Option<AttemptId>,
+    order: dto::LogOrder,
+) -> Result<()> {
+    let mut samples: Vec<dto::UsagePoint> = Vec::new();
+    let mut sources: Vec<dto::UsageSourceRecord> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = fetch_usage_page(client, base, job, attempt, order, cursor.as_deref()).await?;
+        merge_usage_sources(&mut sources, page.sources);
+        samples.extend(page.samples);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    print!("{}", render_usage(&samples, order));
+    print_usage_source_notes(&sources);
+    Ok(())
+}
+
+/// One usage GET, mapping a non-2xx response to a rich error. `limit` is left
+/// to the server default; `cursor` is passed only when continuing a walk.
+async fn fetch_usage_page(
+    client: &reqwest::Client,
+    base: &str,
+    job: JobId,
+    attempt: Option<AttemptId>,
+    order: dto::LogOrder,
+    cursor: Option<&str>,
+) -> Result<dto::GetJobUsageResponse> {
+    let mut query: Vec<(&str, String)> = vec![("order", order.as_str().to_string())];
+    if let Some(attempt) = attempt {
+        query.push(("attempt", attempt.to_string()));
+    }
+    if let Some(cursor) = cursor {
+        query.push(("cursor", cursor.to_string()));
+    }
+    let response = client
+        .get(format!("{base}/api/v1/jobs/{job}/usage"))
+        .query(&query)
+        .send()
+        .await
+        .context("fetching job usage")?;
+    if !response.status().is_success() {
+        return Err(api_error(response).await);
+    }
+    response.json().await.context("reading job usage")
+}
+
+/// Merge a page's source records into the running set — the usage twin of
+/// [`merge_sources`], with the same by-attempt dedup and sticky-`truncated`
+/// rule (evidence of pruning must survive a later, narrower record).
+fn merge_usage_sources(into: &mut Vec<dto::UsageSourceRecord>, page: Vec<dto::UsageSourceRecord>) {
+    for record in page {
+        match into.iter_mut().find(|s| s.attempt == record.attempt) {
+            Some(existing) => {
+                let truncated = existing.truncated || record.truncated;
+                *existing = record;
+                existing.truncated = truncated;
+            }
+            None => into.push(record),
+        }
+    }
+}
+
+/// After the walk, report to stderr any source that was not fully available,
+/// or whose older samples were pruned — the usage twin of
+/// [`print_source_notes`].
+fn print_usage_source_notes(sources: &[dto::UsageSourceRecord]) {
+    for source in sources {
+        if let Some(verdict) = usage_availability_label(source.availability) {
+            let reason = source
+                .reason
+                .as_deref()
+                .map(|r| format!(": {r}"))
+                .unwrap_or_default();
+            eprintln!("note: attempt {} usage {verdict}{reason}", source.attempt);
+        }
+        if source.truncated {
+            eprintln!(
+                "note: attempt {} usage truncated (older samples pruned)",
+                source.attempt
+            );
+        }
+    }
+}
+
+/// The stderr note word for a non-available verdict, or `None` when available.
+fn usage_availability_label(availability: dto::UsageAvailability) -> Option<&'static str> {
+    match availability {
+        dto::UsageAvailability::Available => None,
+        dto::UsageAvailability::Expired => Some("expired"),
+        dto::UsageAvailability::Unreachable => Some("unreachable"),
+        dto::UsageAvailability::NotStarted => Some("not_started"),
+    }
+}
+
+/// A derived per-sample rate pair (cpu%, throttled%); `None` where a rate is
+/// undefined — the chronologically first sample of an attempt, or a
+/// non-positive wall-time / negative-counter delta.
+type RatePair = (Option<f64>, Option<f64>);
+
+/// The utilisation percent between two consecutive (chronological) samples:
+/// `delta(counter) / delta(wall) * 100`. `None` when the wall-time delta is
+/// non-positive (cannot divide) or the counter went backwards (a reset can't
+/// happen within one cumulative-per-attempt series, so a negative delta is
+/// nonsense we decline to render).
+fn rate_percent(
+    prev: &dto::UsagePoint,
+    cur: &dto::UsagePoint,
+    counter: impl Fn(&dto::UsagePoint) -> u64,
+) -> Option<f64> {
+    let dt = cur.at.as_micros().checked_sub(prev.at.as_micros())?;
+    if dt <= 0 {
+        return None;
+    }
+    let delta = counter(cur).checked_sub(counter(prev))?;
+    Some(delta as f64 / dt as f64 * 100.0)
+}
+
+/// Compute the display-order rate pairs for one attempt's samples.
+///
+/// Rates are always derived against the *chronologically* previous sample,
+/// regardless of display order: for `asc` the response is already oldest-first,
+/// for `desc` it is reversed to a chronological view first, then the results
+/// are mapped back to display order. The chronologically first sample has no
+/// predecessor, so its rate is `None` (rendered `-`).
+fn attempt_rates(samples: &[dto::UsagePoint], order: dto::LogOrder) -> Vec<RatePair> {
+    let n = samples.len();
+    let chrono: Vec<&dto::UsagePoint> = match order {
+        dto::LogOrder::Asc => samples.iter().collect(),
+        dto::LogOrder::Desc => samples.iter().rev().collect(),
+    };
+    let mut rates: Vec<RatePair> = vec![(None, None); n];
+    for i in 1..n {
+        rates[i] = (
+            rate_percent(chrono[i - 1], chrono[i], |p| p.cpu_usage_total_us),
+            rate_percent(chrono[i - 1], chrono[i], |p| p.cpu_throttled_total_us),
+        );
+    }
+    match order {
+        dto::LogOrder::Asc => rates,
+        dto::LogOrder::Desc => rates.into_iter().rev().collect(),
+    }
+}
+
+/// Column headers for the sample table, in render order.
+const USAGE_HEADERS: [&str; 10] = [
+    "time", "cpu%", "thr%", "mem", "peak", "disk", "net_rx", "net_tx", "blk_r", "blk_w",
+];
+
+/// A percent value formatted to one decimal, or `-` when undefined.
+fn format_percent(pct: Option<f64>) -> String {
+    match pct {
+        Some(pct) => format!("{pct:.1}"),
+        None => "-".to_string(),
+    }
+}
+
+/// Humanize a byte count into the shared IEC form (`1.5 GiB`), reusing
+/// [`ByteSize`] — the same helper `render_status` uses for its resource line.
+fn humanize_bytes(bytes: u64) -> String {
+    ByteSize::from_bytes(bytes).to_string()
+}
+
+/// The ten cells for one sample row, in [`USAGE_HEADERS`] order.
+fn usage_row(sample: &dto::UsagePoint, rate: RatePair) -> [String; 10] {
+    [
+        sample.at.to_string(),
+        format_percent(rate.0),
+        format_percent(rate.1),
+        humanize_bytes(sample.memory_used_bytes),
+        humanize_bytes(sample.memory_peak_bytes),
+        // Total scratch usage is the writable layer plus the (constant) image.
+        humanize_bytes(sample.disk_writable_bytes + sample.disk_image_bytes),
+        humanize_bytes(sample.net_rx_bytes_total),
+        humanize_bytes(sample.net_tx_bytes_total),
+        humanize_bytes(sample.blkio_read_bytes_total),
+        humanize_bytes(sample.blkio_write_bytes_total),
+    ]
+}
+
+/// Render the collected samples as aligned columns. Samples arrive grouped by
+/// attempt (the server walks attempts in order and never interleaves them), so
+/// contiguous runs of one attempt become one block; when more than one attempt
+/// contributed samples, each block is blank-line separated and led by an
+/// `attempt: <id>` header. Rate columns (`cpu%`, `thr%`) are derived per
+/// attempt so a rate never spans an attempt boundary. An empty series says so
+/// rather than printing a bare header.
+fn render_usage(samples: &[dto::UsagePoint], order: dto::LogOrder) -> String {
+    use std::fmt::Write;
+
+    if samples.is_empty() {
+        return "(no samples)\n".to_string();
+    }
+
+    // Contiguous attempt blocks in encounter order.
+    let mut blocks: Vec<(AttemptId, Vec<&dto::UsagePoint>)> = Vec::new();
+    for sample in samples {
+        match blocks.last_mut() {
+            Some((attempt, group)) if *attempt == sample.attempt => group.push(sample),
+            _ => blocks.push((sample.attempt, vec![sample])),
+        }
+    }
+    let multi = blocks.len() > 1;
+
+    let mut out = String::new();
+    for (bi, (attempt, group)) in blocks.iter().enumerate() {
+        if multi {
+            if bi > 0 {
+                out.push('\n');
+            }
+            let _ = writeln!(out, "attempt: {attempt}");
+        }
+
+        // Rate derivation needs an owned slice; clone the (Copy) points back out.
+        let points: Vec<dto::UsagePoint> = group.iter().map(|p| **p).collect();
+        let rates = attempt_rates(&points, order);
+
+        // Header first, then one row per sample; column widths span all rows.
+        let mut rows: Vec<[String; 10]> = Vec::with_capacity(points.len() + 1);
+        rows.push(USAGE_HEADERS.map(str::to_string));
+        for (sample, rate) in points.iter().zip(rates) {
+            rows.push(usage_row(sample, rate));
+        }
+        let widths = column_widths(&rows);
+
+        for row in &rows {
+            let mut line = String::new();
+            for (ci, cell) in row.iter().enumerate() {
+                if ci > 0 {
+                    line.push_str("  ");
+                }
+                // The time column is left-aligned; the numeric columns are
+                // right-aligned so magnitudes line up on the decimal.
+                if ci == 0 {
+                    let _ = write!(line, "{cell:<width$}", width = widths[ci]);
+                } else {
+                    let _ = write!(line, "{cell:>width$}", width = widths[ci]);
+                }
+            }
+            let _ = writeln!(out, "{}", line.trim_end());
+        }
+    }
+    out
+}
+
+/// The maximum width of each column across every row (header included).
+fn column_widths(rows: &[[String; 10]]) -> [usize; 10] {
+    let mut widths = [0usize; 10];
+    for row in rows {
+        for (ci, cell) in row.iter().enumerate() {
+            widths[ci] = widths[ci].max(cell.len());
+        }
+    }
+    widths
 }
 
 // ---------------------------------------------------------------------------
@@ -1708,6 +2010,254 @@ retry_user_errors = true
             events[2].body,
             dto::TimelineEventBody::AttemptStateChanged { .. }
         ));
+    }
+
+    // -- Usage metrics ------------------------------------------------------
+
+    /// A usage sample whose counters rise with `at_us` so a test can assert
+    /// both order and derived rates. `cpu_usage_total_us` equals `at_us` (so a
+    /// one-second wall step over a one-second CPU step is 100%); memory and disk
+    /// carry distinguishable byte values.
+    fn usage_point(attempt: AttemptId, at_us: i64) -> dto::UsagePoint {
+        dto::UsagePoint {
+            attempt,
+            at: Timestamp::from_micros(at_us).unwrap(),
+            cpu_usage_total_us: at_us as u64,
+            cpu_throttled_total_us: 0,
+            memory_used_bytes: 256 * 1024 * 1024,
+            memory_peak_bytes: 512 * 1024 * 1024,
+            disk_writable_bytes: 1024 * 1024,
+            disk_image_bytes: 1024 * 1024,
+            net_rx_bytes_total: 2048,
+            net_tx_bytes_total: 4096,
+            blkio_read_bytes_total: 8192,
+            blkio_write_bytes_total: 16384,
+        }
+    }
+
+    fn usage_source(attempt: AttemptId) -> dto::UsageSourceRecord {
+        dto::UsageSourceRecord {
+            attempt,
+            node: Some("node-00000000-0000-0000-0000-000000000001".parse().unwrap()),
+            availability: dto::UsageAvailability::Available,
+            truncated: false,
+            earliest_available_at: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn usage_merge_truncation_is_sticky() {
+        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let mut truncated = usage_source(attempt);
+        truncated.truncated = true;
+        let mut sources = Vec::new();
+        merge_usage_sources(&mut sources, vec![truncated]);
+        merge_usage_sources(&mut sources, vec![usage_source(attempt)]);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].truncated);
+    }
+
+    #[test]
+    fn usage_rates_derive_from_the_chronological_predecessor_in_asc() {
+        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        // Three one-second-apart samples; cpu counter steps 1s each => 100%.
+        let samples = vec![
+            usage_point(attempt, 1_000_000),
+            usage_point(attempt, 2_000_000),
+            usage_point(attempt, 3_000_000),
+        ];
+        let rendered = render_usage(&samples, dto::LogOrder::Asc);
+        let lines: Vec<&str> = rendered.lines().collect();
+        // Header, then oldest-first rows. First data row's cpu% is `-`.
+        assert!(lines[0].starts_with("time"), "{rendered}");
+        assert!(lines[1].contains("00:00:01"), "{rendered}");
+        // The first sample has no predecessor: cpu% and thr% both `-`.
+        let first_cols: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(first_cols[1], "-", "{rendered}");
+        assert_eq!(first_cols[2], "-", "{rendered}");
+        // Later samples: 1s CPU over 1s wall = 100.0%.
+        assert!(lines[2].contains("100.0"), "{rendered}");
+        assert!(lines[3].contains("100.0"), "{rendered}");
+        // Byte columns are humanized, not raw integers.
+        assert!(rendered.contains("256 MiB"), "{rendered}");
+        assert!(rendered.contains("512 MiB"), "{rendered}");
+    }
+
+    #[test]
+    fn usage_rates_match_across_both_orders() {
+        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let asc = vec![
+            usage_point(attempt, 1_000_000),
+            usage_point(attempt, 2_000_000),
+            usage_point(attempt, 3_000_000),
+        ];
+        let mut desc = asc.clone();
+        desc.reverse();
+
+        let asc_lines: Vec<String> = render_usage(&asc, dto::LogOrder::Asc)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let desc_lines: Vec<String> = render_usage(&desc, dto::LogOrder::Desc)
+            .lines()
+            .map(str::to_string)
+            .collect();
+
+        // desc is newest-first: its first data row is the chronologically last
+        // sample (a defined 100.0% rate), and its last data row is the
+        // chronologically first (an undefined `-` rate).
+        let desc_first: Vec<&str> = desc_lines[1].split_whitespace().collect();
+        assert!(desc_lines[1].contains("00:00:03"), "{desc_lines:?}");
+        assert_eq!(desc_first[1], "100.0", "{desc_lines:?}");
+        let desc_last: Vec<&str> = desc_lines[3].split_whitespace().collect();
+        assert!(desc_lines[3].contains("00:00:01"), "{desc_lines:?}");
+        assert_eq!(desc_last[1], "-", "{desc_lines:?}");
+
+        // The chronologically-first sample is `-` in both orders (asc row 1,
+        // desc row 3).
+        let asc_first: Vec<&str> = asc_lines[1].split_whitespace().collect();
+        assert_eq!(asc_first[1], "-", "{asc_lines:?}");
+    }
+
+    #[test]
+    fn usage_negative_wall_delta_prints_dash() {
+        // A non-positive wall-time delta cannot yield a rate.
+        let a = usage_point(AttemptId::new(), 2_000_000);
+        let b = usage_point(a.attempt, 2_000_000); // same instant
+        assert!(rate_percent(&a, &b, |p| p.cpu_usage_total_us).is_none());
+    }
+
+    #[test]
+    fn usage_multi_attempt_blocks_get_headers() {
+        let a0: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let a1: AttemptId = "attempt-00000000-0000-0000-0000-000000000002"
+            .parse()
+            .unwrap();
+        let samples = vec![
+            usage_point(a0, 1_000_000),
+            usage_point(a0, 2_000_000),
+            usage_point(a1, 3_000_000),
+        ];
+        let rendered = render_usage(&samples, dto::LogOrder::Asc);
+        assert!(rendered.contains(&format!("attempt: {a0}")), "{rendered}");
+        assert!(rendered.contains(&format!("attempt: {a1}")), "{rendered}");
+        // The second block is blank-line separated from the first.
+        assert!(
+            rendered.contains(&format!("\n\nattempt: {a1}")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn usage_single_attempt_has_no_attempt_header() {
+        let attempt = AttemptId::new();
+        let samples = vec![usage_point(attempt, 1_000_000)];
+        let rendered = render_usage(&samples, dto::LogOrder::Asc);
+        assert!(!rendered.contains("attempt:"), "{rendered}");
+    }
+
+    #[test]
+    fn usage_empty_series_says_so() {
+        let rendered = render_usage(&[], dto::LogOrder::Asc);
+        assert_eq!(rendered, "(no samples)\n");
+    }
+
+    #[tokio::test]
+    async fn usage_encodes_attempt_and_order_and_paginates() {
+        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let page_one = dto::GetJobUsageResponse {
+            samples: vec![usage_point(attempt, 1_000_000)],
+            sources: vec![usage_source(attempt)],
+            next_cursor: Some("v1:desc:page2".to_string()),
+        };
+        let page_two = dto::GetJobUsageResponse {
+            samples: vec![usage_point(attempt, 2_000_000)],
+            sources: vec![usage_source(attempt)],
+            next_cursor: None,
+        };
+        // Capture the (cursor, order, attempt) each request carried.
+        type Seen = Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let pages = Arc::new((page_one, page_two, seen.clone()));
+        let router = Router::new()
+            .route(
+                "/api/v1/jobs/:job/usage",
+                get(
+                    #[allow(clippy::type_complexity)]
+                    |State(pages): State<
+                        Arc<(dto::GetJobUsageResponse, dto::GetJobUsageResponse, Seen)>,
+                    >,
+                     Query(params): Query<std::collections::HashMap<String, String>>| async move {
+                        let cursor = params.get("cursor").cloned();
+                        pages.2.lock().unwrap().push((
+                            cursor.clone(),
+                            params.get("order").cloned(),
+                            params.get("attempt").cloned(),
+                        ));
+                        let page = if cursor.as_deref() == Some("v1:desc:page2") {
+                            &pages.1
+                        } else {
+                            &pages.0
+                        };
+                        Json(serde_json::to_value(page).unwrap())
+                    },
+                ),
+            )
+            .with_state(pages);
+        let base = spawn(router).await;
+
+        run_usage(
+            &client(),
+            &base,
+            JobId::new(),
+            Some(attempt),
+            dto::LogOrder::Desc,
+        )
+        .await
+        .expect("usage walk completes");
+
+        let seen = seen.lock().unwrap();
+        // Two requests: the first without a cursor, the second resuming with it;
+        // both carried `order=desc` and the `attempt` scope.
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, None);
+        assert_eq!(seen[1].0, Some("v1:desc:page2".to_string()));
+        for (_, order, attempt_param) in seen.iter() {
+            assert_eq!(order.as_deref(), Some("desc"));
+            assert_eq!(attempt_param.as_deref(), Some(&attempt.to_string()[..]));
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_surfaces_an_api_error() {
+        let router = Router::new().route(
+            "/api/v1/jobs/:job/usage",
+            get(|| async {
+                (
+                    AxumStatus::NOT_FOUND,
+                    Json(error_body("NOT_FOUND", "job not found")),
+                )
+            }),
+        );
+        let base = spawn(router).await;
+
+        let err = run_usage(&client(), &base, JobId::new(), None, dto::LogOrder::Asc)
+            .await
+            .expect_err("usage fails");
+        let message = format!("{err:#}");
+        assert!(message.contains("NOT_FOUND"), "{message}");
+        assert!(message.contains("job not found"), "{message}");
     }
 
     #[tokio::test]

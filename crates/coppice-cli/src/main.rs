@@ -153,6 +153,59 @@ mod tests {
     }
 
     #[test]
+    fn job_usage_parses_with_attempt_and_order() {
+        let cli = Cli::parse_from([
+            "coppice",
+            "job",
+            "usage",
+            "job-00000000-0000-0000-0000-000000000001",
+            "--attempt",
+            "attempt-00000000-0000-0000-0000-000000000002",
+            "--order",
+            "desc",
+        ]);
+        match cli.command {
+            Command::Job(job::JobArgs {
+                command:
+                    job::JobCommand::Usage {
+                        job,
+                        attempt,
+                        order,
+                    },
+                ..
+            }) => {
+                assert_eq!(job.to_string(), "job-00000000-0000-0000-0000-000000000001");
+                assert_eq!(
+                    attempt.map(|a| a.to_string()).as_deref(),
+                    Some("attempt-00000000-0000-0000-0000-000000000002")
+                );
+                assert_eq!(order, Some(job::OrderArg::Desc));
+            }
+            other => panic!("expected job usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_usage_defaults_attempt_and_order_to_none() {
+        let cli = Cli::parse_from([
+            "coppice",
+            "job",
+            "usage",
+            "job-00000000-0000-0000-0000-000000000001",
+        ]);
+        match cli.command {
+            Command::Job(job::JobArgs {
+                command: job::JobCommand::Usage { attempt, order, .. },
+                ..
+            }) => {
+                assert!(attempt.is_none());
+                assert!(order.is_none());
+            }
+            other => panic!("expected job usage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn job_api_flag_is_global_before_or_after_the_verb() {
         // `--api` is a global arg: it parses on either side of the subcommand.
         let id = "job-00000000-0000-0000-0000-000000000001";
