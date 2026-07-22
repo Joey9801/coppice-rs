@@ -40,9 +40,21 @@ message LogId {
 }
 
 // One coordinator in the membership, with the address peers dial.
+//
+// The node record carries more than a dial address (ADR 0037 §6): every seat
+// is bound to a **machine identity** — the CA-attested subject of the mTLS
+// certificate the admission request arrived under — so the one-seat-per-
+// installation invariant and promotion-coupled removal are decided from
+// replicated state, not local memory. `superseded` marks a voter whose
+// machine identity has admitted a replacement learner; the promotion that
+// grants the replacement's vote retires the superseded predecessor in the
+// same joint change (§5). Both fields are additive (tags 3, 4): an older
+// record decodes them as empty/false, i.e. "unbound, not superseded".
 message RaftMember {
   uint64 node_id = 1;
   string address = 2;
+  string machine_identity = 3; // CA-attested cert subject bound at admission.
+  bool superseded = 4;         // marked when a replacement learner is admitted.
 }
 
 // A voting configuration: one set of voter node ids.

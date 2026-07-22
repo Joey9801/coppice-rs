@@ -16,7 +16,6 @@ use coppice_api::http::dto;
 use coppice_api::{ApiError, ControlPlane};
 use coppice_consensus::Consensus;
 use coppice_coordinator::admin;
-use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::CoordinatorControlPlane;
 use coppice_core::id::{ClusterId, JobId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
@@ -65,34 +64,26 @@ fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequ
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retried_submission_across_leader_change_creates_one_job() {
     let ca = Ca::new();
-    let admin_leaf = ca.leaf();
+    let admin_leaf = ca.operator_leaf();
     let cluster_id = ClusterId::new();
     let cluster_uuid = *cluster_id.0.as_bytes();
 
-    // -- Form a three-voter cluster (bootstrap + learner-join + promote). ---
+    // -- Form a three-voter cluster (form + learner-join + promote, ADR 0037). -
     let mut nodes: Vec<Node> = (1..=3).map(|id| Node::new(id, cluster_id, &ca)).collect();
-    nodes[0]
-        .boot(CliOverrides {
-            bootstrap: true,
-            join: false,
-        })
-        .await;
+    nodes[0].boot().await;
+    nodes[0].form("submit-retry-formation").await;
     wait_for_leader(&nodes, &[0], DEADLINE).await;
     for i in [1usize, 2] {
-        nodes[i]
-            .boot(CliOverrides {
-                bootstrap: false,
-                join: true,
-            })
-            .await;
+        nodes[i].boot().await;
     }
     {
         let target = nodes[0].advertise.clone();
-        let mut client =
-            admin::admin_channel(&target, &ca.pem, &admin_leaf.cert_pem, &admin_leaf.key_pem)
+        // Each replica self-joins under its own machine identity (ADR 0037 §6).
+        for i in [1usize, 2] {
+            let leaf = ca.machine_leaf(&nodes[i].machine);
+            let mut client = admin::admin_channel(&target, &ca.pem, &leaf.cert_pem, &leaf.key_pem)
                 .await
                 .expect("dial leader admin surface");
-        for i in [1usize, 2] {
             admin::add_learner(
                 &mut client,
                 cluster_uuid,
@@ -102,7 +93,11 @@ async fn retried_submission_across_leader_change_creates_one_job() {
             .await
             .unwrap_or_else(|e| panic!("add-learner {} failed: {e:#}", nodes[i].id));
         }
-        // promote_voter polls the catch-up gate itself.
+        // Promote through the operator client; promote_voter polls catch-up.
+        let mut client =
+            admin::admin_channel(&target, &ca.pem, &admin_leaf.cert_pem, &admin_leaf.key_pem)
+                .await
+                .expect("dial leader admin surface");
         for i in [1usize, 2] {
             admin::promote_voter(
                 &mut client,

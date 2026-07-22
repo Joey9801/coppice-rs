@@ -37,7 +37,6 @@ use coppice_agent::telemetry::{
 };
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, ConsensusError, StateViews};
-use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::{CoordinatorControlPlane, NodeClient};
 use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
@@ -296,7 +295,13 @@ async fn get_logs_with_applied_index(
 async fn add_voter(leader: &RunningCoordinator, follower: &Node, deadline: Duration) {
     leader
         .consensus()
-        .add_learner(follower.raft_id(), follower.advertise.clone())
+        .add_learner(
+            follower.raft_id(),
+            follower.advertise.clone(),
+            // A distinct machine identity per node (ADR 0037 §6) so each seat is
+            // bound to its own installation and no one-seat/replacement rule trips.
+            format!("test-machine-{}", follower.id),
+        )
         .await
         .unwrap_or_else(|e| panic!("add-learner node {} failed: {e:?}", follower.id));
     let start = Instant::now();
@@ -433,11 +438,11 @@ async fn best_effort_job_logs_full_read_path() {
 
     // -- Build the real read path: plane + log client + router. ------------
     let coord_leaf = ca.leaf();
-    let log_client = Arc::new(NodeClient::new(
+    let log_client = Arc::new(NodeClient::new(common::tls_store_from_pem(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
-    ));
+    )));
     let plane = Arc::new(
         CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
             .with_log_client(log_client),
@@ -445,6 +450,7 @@ async fn best_effort_job_logs_full_read_path() {
     let router = coppice_api::http::router(
         plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        None,
     );
 
     // -- 1. Content + order + `available`, in one ascending page. ----------
@@ -535,17 +541,18 @@ async fn best_effort_job_logs_full_read_path() {
     // fetch through a fresh client to observe genuine unreachability.
     server.abort();
     let _ = (&mut server).await;
-    let log_client2 = Arc::new(NodeClient::new(
+    let log_client2 = Arc::new(NodeClient::new(common::tls_store_from_pem(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
-    ));
+    )));
     let router2 = coppice_api::http::router(
         Arc::new(
             CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
                 .with_log_client(log_client2),
         ),
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        None,
     );
     let (status, body) = get_logs(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);
@@ -613,18 +620,8 @@ async fn follower_serves_job_logs_directly() {
 
     let mut follower_a = Node::new(2, cluster_id, &ca);
     let mut follower_b = Node::new(3, cluster_id, &ca);
-    follower_a
-        .boot(CliOverrides {
-            bootstrap: false,
-            join: true,
-        })
-        .await;
-    follower_b
-        .boot(CliOverrides {
-            bootstrap: false,
-            join: true,
-        })
-        .await;
+    follower_a.boot().await;
+    follower_b.boot().await;
     add_voter(&leader, &follower_a, DEADLINE).await;
     add_voter(&leader, &follower_b, DEADLINE).await;
 
@@ -706,11 +703,11 @@ async fn follower_serves_job_logs_directly() {
     // involvement, and the fetch dials the agent with no leadership gating; the
     // leader's client listener is never touched by this request.
     let coord_leaf = ca.leaf();
-    let log_client = Arc::new(NodeClient::new(
+    let log_client = Arc::new(NodeClient::new(common::tls_store_from_pem(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
-    ));
+    )));
     let follower_plane = Arc::new(
         CoordinatorControlPlane::new(follower_a.consensus(), follower_a.views(), cluster_id)
             .with_log_client(log_client),
@@ -718,6 +715,7 @@ async fn follower_serves_job_logs_directly() {
     let follower_router = coppice_api::http::router(
         follower_plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        None,
     );
 
     let applied_before = follower_a.views().latest().applied_index();

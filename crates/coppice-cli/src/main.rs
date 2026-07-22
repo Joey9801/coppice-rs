@@ -14,6 +14,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod cluster;
 mod dev;
 mod job;
 
@@ -40,6 +41,11 @@ enum Command {
 
     /// Job operations against a cluster's API.
     Job(job::JobArgs),
+
+    /// Cluster-lifecycle operations. `cluster init` forms a brand-new cluster
+    /// (ADR 0037 §3): the one deliberate operator act at cluster birth, run
+    /// against a parked coordinator with an operator-profile certificate.
+    Cluster(cluster::ClusterArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -82,6 +88,10 @@ async fn main() -> Result<()> {
             init_tracing();
             job::run(args).await
         }
+        Command::Cluster(args) => {
+            init_tracing();
+            cluster::run(args).await
+        }
     }
 }
 
@@ -90,20 +100,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coordinator_subcommand_parses_run_flags() {
-        let cli = Cli::parse_from([
-            "coppice",
-            "coordinator",
-            "--config",
-            "/etc/c.toml",
-            "--join",
-        ]);
+    fn coordinator_subcommand_parses_config() {
+        // ADR 0037 §1: the daemon takes just `--config`; intent is derived from
+        // the disk, so `--bootstrap`/`--join` no longer exist.
+        let cli = Cli::parse_from(["coppice", "coordinator", "--config", "/etc/c.toml"]);
         match cli.command {
             Command::Coordinator(c) => {
                 let run = c.run_args();
                 assert_eq!(run.config, PathBuf::from("/etc/c.toml"));
-                assert!(run.join);
-                assert!(!run.bootstrap);
             }
             other => panic!("expected coordinator, got {other:?}"),
         }
@@ -202,6 +206,89 @@ mod tests {
                 assert!(order.is_none());
             }
             other => panic!("expected job usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cluster_init_parses_with_required_tls_and_target() {
+        let cli = Cli::parse_from([
+            "coppice",
+            "cluster",
+            "init",
+            "--target",
+            "coord-1:7071",
+            "--ca",
+            "ca.crt",
+            "--cert",
+            "op.crt",
+            "--key",
+            "op.key",
+            "--formation-token",
+            "stack-42",
+        ]);
+        match cli.command {
+            Command::Cluster(cluster::ClusterArgs {
+                command: cluster::ClusterCommand::Init(a),
+            }) => {
+                assert_eq!(a.target, "coord-1:7071");
+                assert_eq!(a.ca, PathBuf::from("ca.crt"));
+                assert_eq!(a.cert, PathBuf::from("op.crt"));
+                assert_eq!(a.key, PathBuf::from("op.key"));
+                assert_eq!(a.formation_token.as_deref(), Some("stack-42"));
+                assert!(a.formation_token_file.is_none());
+                assert!(a.policy.is_none());
+            }
+            other => panic!("expected cluster init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cluster_init_requires_tls_material() {
+        // ADR 0037 §3: no config-file fallback — the TLS flags are required.
+        assert!(
+            Cli::try_parse_from(["coppice", "cluster", "init", "--target", "coord-1:7071",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cluster_init_token_flags_are_mutually_exclusive() {
+        // ADR 0037 §3: --formation-token XOR --formation-token-file.
+        assert!(Cli::try_parse_from([
+            "coppice",
+            "cluster",
+            "init",
+            "--target",
+            "coord-1:7071",
+            "--ca",
+            "ca.crt",
+            "--cert",
+            "op.crt",
+            "--key",
+            "op.key",
+            "--formation-token",
+            "stack-42",
+            "--formation-token-file",
+            "/run/token",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn cluster_init_accepts_neither_token_flag() {
+        // Neither token flag → interactive mint at runtime; parsing must allow it.
+        let cli = Cli::parse_from([
+            "coppice", "cluster", "init", "--target", "c:1", "--ca", "ca.crt", "--cert", "op.crt",
+            "--key", "op.key",
+        ]);
+        match cli.command {
+            Command::Cluster(cluster::ClusterArgs {
+                command: cluster::ClusterCommand::Init(a),
+            }) => {
+                assert!(a.formation_token.is_none());
+                assert!(a.formation_token_file.is_none());
+            }
+            other => panic!("expected cluster init, got {other:?}"),
         }
     }
 

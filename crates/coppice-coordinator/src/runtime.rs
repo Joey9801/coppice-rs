@@ -109,6 +109,7 @@ pub async fn run<C>(
     cluster_id: ClusterId,
     node_log_client: Arc<NodeClient>,
     metrics: coppice_api::http::MetricsEndpoint,
+    readyz: coppice_api::http::ReadyzEndpoint,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -164,13 +165,19 @@ where
 
     // Agent session mTLS server. The listener is bound early in `bootstrap`;
     // here it starts accepting and stops on shutdown (listeners drain first,
-    // `docs/architecture/coordinator-runtime.md`, "Shutdown order").
-    let AgentListener { incoming, tls } = agent_listener;
+    // `docs/architecture/coordinator-runtime.md`, "Shutdown order"). TLS is
+    // terminated by the connection-time acceptor ([`coppice_tls::serve`]), which
+    // resolves this node's leaf from the shared reload store at each handshake
+    // and enforces mandatory client auth — so `.tls_config` is deliberately
+    // absent and a rotated leaf reaches new agent sessions without a restart
+    // (ADR 0037 §6). `request.peer_certs()` (the gateway's CN check) still works
+    // via tonic's blanket `Connected` impl for the rustls `TlsStream`.
+    let AgentListener { listener, tls } = agent_listener;
+    let listener = tokio::net::TcpListener::from_std(listener)
+        .context("adopting the agent gateway listener into tokio")?;
+    let incoming = coppice_tls::serve(listener, tls);
     let agent_service = coppice_net::session::Server::new(AgentSessionService::new(authority));
-    let agent_router = Server::builder()
-        .tls_config(tls)
-        .context("configuring the agent gateway server TLS")?
-        .add_service(agent_service);
+    let agent_router = Server::builder().add_service(agent_service);
     let mut agent_shutdown = shutdown_rx.clone();
     let agent_server_join = tokio::spawn(async move {
         agent_router
@@ -195,6 +202,7 @@ where
         client_listener,
         control_plane,
         metrics,
+        readyz,
         shutdown_rx.clone(),
     ));
     tracing::debug!("runtime: API server up");
@@ -240,6 +248,12 @@ where
         "coordinator runtime started (agent sessions, scheduling, dispatch, and housekeeping)"
     );
 
+    // Listeners are serving: signal systemd `READY=1` (ADR 0037 §7). Node and
+    // cluster readiness remain `/readyz`'s job — a parked daemon is `READY=1`,
+    // phase `waiting`, HTTP 503. A silent no-op off systemd (`$NOTIFY_SOCKET`
+    // unset), so this is safe on the integration-test path too.
+    crate::systemd::notify_ready();
+
     // ---- Shutdown trigger ----
     // The daemon path installs the signal handler; an integration test owns the
     // trigger itself (`signal_tx` is `None`) and never raises a real signal.
@@ -267,6 +281,8 @@ where
                         signal = reason,
                         "runtime: shutdown signal received, shutting down"
                     );
+                    // Tell systemd the exit is intentional (ADR 0037 §7).
+                    crate::systemd::notify_stopping();
                     let _ = shutdown_tx.send(true);
                 }
             }

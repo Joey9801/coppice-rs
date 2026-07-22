@@ -217,7 +217,12 @@ impl Consensus for FakeConsensus {
         self.views.clone()
     }
 
-    async fn add_learner(&self, _node: CoordinatorId, _addr: String) -> Result<(), ConsensusError> {
+    async fn add_learner(
+        &self,
+        _node: CoordinatorId,
+        _addr: String,
+        _machine_identity: String,
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 

@@ -12,48 +12,25 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
+use coppice_tls::TlsStore;
 use openraft::error::{InitializeError, RaftError};
-use openraft::{BasicNode, Config, Raft, SnapshotPolicy};
+use openraft::{Config, Raft, SnapshotPolicy};
 
 use coppice_net::transport::Server;
 
 use crate::adapter::{OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY};
 use crate::events::{EventTap, EventTapReceiver};
 use crate::fs::{Fs, RealFs};
+use crate::membership::{CoordinatorNode, LivenessAttestor, MembershipPolicy};
 use crate::net::{GrpcNetworkFactory, RaftTransportHandler};
-use crate::storage::{self, StorageOptions};
+use crate::storage::{self, StorageCore, StorageOptions};
 use crate::view::{StateViews, ViewPublisher, ViewPublisherConfig};
 use crate::{apply_loop, status, ConsensusError, ConsensusStatus, CoordinatorId};
-
-/// PEM material for the mutual-TLS coordinator mesh (ADR 0011).
-pub struct NodeTls {
-    /// The cluster CA, used to verify peer certificates.
-    pub ca_pem: Vec<u8>,
-    /// This node's certificate chain.
-    pub cert_pem: Vec<u8>,
-    /// This node's private key.
-    pub key_pem: Vec<u8>,
-}
-
-/// How this process intends to join the cluster (ADR 0016).
-///
-/// The intent is the operator's assertion about the data directory, checked
-/// against what is actually on disk; a mismatch fail-stops rather than guessing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartIntent {
-    /// Resume an existing instance from an initialized directory.
-    Restart,
-    /// Form a brand-new single-voter cluster from an empty directory.
-    Bootstrap,
-    /// Start a fresh replacement instance (learner-join) from an empty directory.
-    Join,
-}
 
 /// Everything a coordinator supplies to bring up its consensus replica.
 ///
@@ -80,8 +57,22 @@ pub struct NodeOptions {
     pub snapshot_keep_log_entries: u64,
     /// Capacity of the derived event tap (ADR 0008).
     pub event_tap_capacity: usize,
-    /// mTLS material (ADR 0011).
-    pub tls: NodeTls,
+    /// The shared hot-reload mTLS store (ADR 0011/0037 §6). The raft peer mesh
+    /// reads the current client material from it at each (re)dial, so a rotated
+    /// leaf is used on reconnect without a restart; in-flight peer connections
+    /// finish on the old leaf.
+    pub tls: Arc<TlsStore>,
+    /// This replica's own machine identity — the CA-attested subject of its
+    /// configured `[tls]` leaf (ADR 0037 §6). Bound into the initial voter's
+    /// membership record at `raft.initialize` so no seat, including the first,
+    /// is ever unbound. `None` until the bootstrap package extracts it from the
+    /// leaf; the initial voter is then bound to the empty identity, which never
+    /// collides with a real one.
+    pub machine_identity: Option<String>,
+    /// Node-local membership policy (cluster size, grace periods; ADR 0037 §5).
+    /// Wired from config by a later package; [`MembershipPolicy::default`]
+    /// carries the ADR defaults (3 / 60s / 60s) until then.
+    pub membership_policy: MembershipPolicy,
 }
 
 /// A running consensus replica, assembled and ready to serve.
@@ -97,6 +88,130 @@ pub struct StartedNode {
     /// The Raft transport service, ready to mount on the coordinator's mTLS
     /// server.
     pub transport: Server<RaftTransportHandler>,
+    /// The instance UUID stamped in this directory's manifest (ADR 0025),
+    /// surfaced so the coordinator's `/readyz` can report it (ADR 0037 §7).
+    pub instance_uuid: [u8; 16],
+    /// The formation control surface (ADR 0037 §3): the durable, resumable
+    /// state machine that turns a parked (uninitialized) replica into the
+    /// founding single voter. Driven by `InitializeCluster` and by
+    /// crash-resume-on-restart.
+    pub formation: FormationControl,
+}
+
+/// The founding-formation control surface (ADR 0037 §3).
+///
+/// A replica always constructs its raft node at [`start`] (its identity is
+/// minted eagerly on an empty directory), but a genuinely new instance leaves
+/// raft **uninitialized** — it is *parked*. This handle drives the one
+/// deliberate act that seeds the first voter: durably record the operator's
+/// formation token into the manifest, then `raft.initialize` with this replica
+/// as the single voter, binding its own machine identity into the seat (ADR
+/// 0037 §6). Because the token is recorded before the irreversible
+/// `raft.initialize`, a crash in that window is repaired by re-running
+/// [`FormationControl::form`] with the same token on restart.
+#[derive(Clone)]
+pub struct FormationControl {
+    raft: Raft<TypeConfig>,
+    core: Arc<Mutex<StorageCore<RealFs>>>,
+    node_id: CoordinatorId,
+    advertise_addr: String,
+    machine_identity: String,
+}
+
+/// The result of a successful [`FormationControl::form`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormationOutcome {
+    /// This call performed formation: token recorded, `raft.initialize` ran.
+    Formed,
+    /// Raft was already initialized under the same token — idempotent success.
+    AlreadyFormed,
+}
+
+/// Why [`FormationControl::form`] could not proceed (ADR 0037 §3).
+#[derive(Debug, thiserror::Error)]
+pub enum FormationError {
+    /// A different formation token is already recorded in the manifest stamp;
+    /// recovery re-runs `cluster init` with `recorded`.
+    #[error("a different formation token is already recorded ({recorded})")]
+    ConflictingToken { recorded: String },
+    /// Durably recording the token failed.
+    #[error("recording the formation token: {0}")]
+    Storage(String),
+    /// `raft.initialize` failed for a reason other than already-initialized.
+    #[error("raft initialize failed: {0}")]
+    Raft(String),
+}
+
+impl FormationControl {
+    /// This replica's minted raft identity (ADR 0025).
+    pub fn node_id(&self) -> CoordinatorId {
+        self.node_id
+    }
+
+    /// Whether raft membership already exists here (i.e. formation completed or
+    /// this replica joined an existing cluster).
+    pub async fn is_initialized(&self) -> bool {
+        self.raft.is_initialized().await.unwrap_or(false)
+    }
+
+    /// The durable formation token recorded in the manifest, if any.
+    pub fn recorded_token(&self) -> Option<String> {
+        self.core
+            .lock()
+            .expect("storage core poisoned")
+            .formation_token()
+            .map(str::to_string)
+    }
+
+    /// Run the formation state machine for `token` (ADR 0037 §3, steps 1–3
+    /// minus the discovery probe guard, which the coordinator's admin handler
+    /// applies before calling this).
+    ///
+    /// - Already initialized: idempotent success when the recorded token matches
+    ///   (or none is recorded); a different recorded token is a conflict.
+    /// - Uninitialized with a recorded token: the same token resumes formation;
+    ///   a different one is a conflict.
+    /// - Uninitialized, no recorded token: record it durably, then
+    ///   `raft.initialize` with this replica as the single voter bound to its
+    ///   own machine identity (ADR 0037 §6).
+    pub async fn form(&self, token: &str) -> Result<FormationOutcome, FormationError> {
+        let recorded = self.recorded_token();
+        if let Some(recorded) = &recorded {
+            if recorded != token {
+                return Err(FormationError::ConflictingToken {
+                    recorded: recorded.clone(),
+                });
+            }
+        }
+        if self.is_initialized().await {
+            return Ok(FormationOutcome::AlreadyFormed);
+        }
+
+        // Record the operator's intent durably BEFORE the irreversible
+        // initialize, so a crash here completes formation on restart.
+        if recorded.is_none() {
+            self.core
+                .lock()
+                .expect("storage core poisoned")
+                .record_formation_token(token)
+                .map_err(|e| FormationError::Storage(e.to_string()))?;
+        }
+
+        let members = BTreeMap::from([(
+            self.node_id,
+            CoordinatorNode::new(self.advertise_addr.clone(), self.machine_identity.clone()),
+        )]);
+        match self.raft.initialize(members).await {
+            Ok(()) => Ok(FormationOutcome::Formed),
+            // A concurrent former (or a resumed one) already initialized: the
+            // recorded-token guard above proved it is the same intent, so this
+            // is an idempotent success, not a conflict.
+            Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
+                Ok(FormationOutcome::AlreadyFormed)
+            }
+            Err(other) => Err(FormationError::Raft(other.to_string())),
+        }
+    }
 }
 
 /// A cheap, cloneable admin handle to the running node.
@@ -141,6 +256,8 @@ impl NodeHandle {
                 id: *id,
                 addr: node.addr.clone(),
                 voter: false,
+                machine_identity: node.machine_identity.clone(),
+                superseded: node.superseded,
             });
         }
         for voter in m.membership_config.voter_ids() {
@@ -203,6 +320,12 @@ pub struct MemberSummary {
     pub addr: String,
     /// Whether the node is a voter (vs a learner).
     pub voter: bool,
+    /// The machine identity bound to this seat (ADR 0037 §6); empty for a
+    /// record written before identities were bound.
+    pub machine_identity: String,
+    /// Whether this voter has been superseded by a replacement learner
+    /// (ADR 0037 §5).
+    pub superseded: bool,
 }
 
 /// A fail-stop during [`start`]: each message names the data directory, the
@@ -227,11 +350,23 @@ pub enum NodeStartError {
     Raft(String),
 }
 
-/// Bring up a consensus replica per the intent (ADR 0016).
-pub async fn start(
-    options: NodeOptions,
-    intent: StartIntent,
-) -> Result<StartedNode, NodeStartError> {
+/// Bring up a consensus replica, deriving startup intent from the disk
+/// (ADR 0037 §1).
+///
+/// There are no operator-supplied intent flags. Intent is *derived*:
+///
+/// - **Manifest present** → resume this instance from its stamp (ADR 0016/0025);
+///   the cluster-UUID cross-check in `storage::open` still fail-stops a wrong
+///   volume. Raft is constructed and openraft replays the log — an already-formed
+///   replica comes back a member, an interrupted one comes back uninitialized.
+/// - **Manifest absent** → a brand-new instance. Its allocate-once identity is
+///   minted and stamped eagerly (ADR 0025), raft is constructed but left
+///   **uninitialized** (parked). It never seeds itself as a voter: the only
+///   paths to a first voter are the explicit [`FormationControl::form`] (ADR
+///   0037 §3) and joining an existing cluster as a learner (§4). The amnesiac-
+///   voter defense (ADR 0016) is therefore intact — an empty disk can only ever
+///   become a learner or the deliberately-formed founder.
+pub async fn start(options: NodeOptions) -> Result<StartedNode, NodeStartError> {
     let NodeOptions {
         cluster_uuid,
         data_dir,
@@ -243,6 +378,8 @@ pub async fn start(
         snapshot_keep_log_entries,
         event_tap_capacity,
         tls,
+        machine_identity,
+        membership_policy,
     } = options;
 
     // Step 1: the directory must exist (the caller owns creating it).
@@ -251,38 +388,19 @@ pub async fn start(
     }
     let fs = RealFs::new(data_dir.clone());
 
-    // Step 2 + 3: the ADR 0016 identity matrix. Each arm either proceeds to
-    // open, stamps a fresh directory, or fail-stops with an operator-actionable
-    // message.
-    let initialized = fs.exists(Path::new("manifest"))?;
-    match (intent, initialized) {
-        (StartIntent::Restart, true) => {}
-        (StartIntent::Restart, false) => {
-            return Err(NodeStartError::RefusedStart(format!(
-                "data directory {} has no manifest: refusing to start on an unexpectedly empty \
-                 directory — a failed mount is indistinguishable from a fresh disk; pass \
-                 --bootstrap (first node of a new cluster) or --join (fresh replacement instance) \
-                 if this is deliberate (ADR 0016)",
-                data_dir.display()
-            )));
-        }
-        (StartIntent::Bootstrap | StartIntent::Join, true) => {
-            return Err(NodeStartError::RefusedStart(format!(
-                "--bootstrap/--join was passed but {} is already initialized (manifest present); \
-                 intent flags are only legal on an empty directory (ADR 0016)",
-                data_dir.display()
-            )));
-        }
-        (StartIntent::Bootstrap | StartIntent::Join, false) => {
-            // Mints this replica's allocate-once Raft identity and a fresh
-            // instance UUID, both stamped into the manifest (ADR 0016 / 0025).
-            let minted = storage::init(&fs, &StorageOptions::new(cluster_uuid))?;
-            tracing::debug!(
-                node_id = minted,
-                "minted coordinator raft identity (stamped in the data directory; \
-                 pass it to `admin add-learner` when joining, ADR 0025)"
-            );
-        }
+    // Step 2 + 3: derive intent from the disk (ADR 0037 §1). A manifest present
+    // means "resume"; absent means "new instance" — mint and stamp the identity
+    // eagerly, but never seed a voter here (that is formation's or the join
+    // path's job). The old empty-directory fail-stop is gone: an empty disk is a
+    // new instance, and a failed mount is guarded at the unit/mount layer plus
+    // the cluster-UUID stamp check in `storage::open` below.
+    if !fs.exists(Path::new("manifest"))? {
+        let minted = storage::init(&fs, &StorageOptions::new(cluster_uuid))?;
+        tracing::info!(
+            node_id = minted,
+            "new instance: minted coordinator raft identity (stamped in the data \
+             directory; the replica is parked until it forms or joins, ADR 0037)"
+        );
     }
 
     // Step 4: recovery. The replica's identity comes back from the manifest
@@ -290,6 +408,10 @@ pub async fn start(
     // and rides out as `Storage`.
     let mut recovered = storage::open(fs, StorageOptions::new(cluster_uuid))?;
     let node_id = recovered.node_id;
+    let instance_uuid = recovered.instance_uuid;
+    // A clone of the storage-core handle for the formation control surface
+    // (ADR 0037 §3), captured before the stores consume `recovered`.
+    let core_handle = recovered.core_handle();
     let last_applied_index = recovered.last_applied.map(|id| id.index).unwrap_or(0);
 
     // Step 5: the publishing apply task. The recovered state moves into the
@@ -332,34 +454,43 @@ pub async fn start(
     .validate()
     .map_err(|e| NodeStartError::Raft(format!("invalid raft config: {e}")))?;
 
-    // Step 8: the network factory and the openraft node.
-    let client_tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(&tls.ca_pem))
-        .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem));
-    let factory = GrpcNetworkFactory::new(cluster_uuid, client_tls, rpc_timeout);
+    // Step 8: the network factory and the openraft node. The factory holds the
+    // shared TLS store and rebuilds its client config from the current material
+    // at each (re)dial, so a rotated leaf is picked up on reconnect (ADR 0037
+    // §6).
+    let factory = GrpcNetworkFactory::new(cluster_uuid, tls, rpc_timeout);
     let raft = Raft::new(node_id, Arc::new(config), factory, log_store, sm_store)
         .await
         .map_err(|e| NodeStartError::Raft(format!("raft node construction failed: {e}")))?;
 
-    // Step 9: single-voter cluster creation on bootstrap (ADR 0016).
-    if intent == StartIntent::Bootstrap {
-        let members = BTreeMap::from([(
-            node_id,
-            BasicNode {
-                addr: advertise_addr,
-            },
-        )]);
-        raft.initialize(members).await.map_err(|e| match e {
-            RaftError::APIError(InitializeError::NotAllowed(_)) => NodeStartError::RefusedStart(
-                format!("--bootstrap refused: this cluster is already initialized (ADR 0016): {e}"),
-            ),
-            other => NodeStartError::Raft(format!("raft initialize failed: {other}")),
-        })?;
-    }
+    // Step 9: NO automatic single-voter creation (ADR 0037 §1). A new instance
+    // is parked (raft uninitialized); the only paths to a first voter are the
+    // explicit `FormationControl::form` (§3) and joining an existing cluster as
+    // a learner (§4). The founding seat, when formation runs, binds this
+    // replica's own machine identity (§6); an unwired identity binds the empty
+    // string, which never collides with a real one.
+    let machine_identity = machine_identity.unwrap_or_default();
+    let formation = FormationControl {
+        raft: raft.clone(),
+        core: core_handle,
+        node_id,
+        advertise_addr,
+        machine_identity,
+    };
 
     // Step 10 + 11: status watch, seam, transport, handle.
     let status = status::spawn(raft.metrics(), committed_rx);
-    let consensus = OpenraftConsensus::new(raft.clone(), status.clone(), views.clone());
+    // No liveness attestor is wired here (ADR 0037 §5): the discovery backend
+    // that would provide one is the bootstrap/discovery package's concern, so
+    // the hook defaults to `None` and only replication evidence gates removal.
+    let attestor: Option<Arc<dyn LivenessAttestor>> = None;
+    let consensus = OpenraftConsensus::new(
+        raft.clone(),
+        status.clone(),
+        views.clone(),
+        membership_policy,
+        attestor,
+    );
     let transport = Server::new(RaftTransportHandler::new(raft.clone(), cluster_uuid));
     let handle = NodeHandle {
         raft,
@@ -374,6 +505,8 @@ pub async fn start(
         event_tap,
         handle,
         transport,
+        formation,
+        instance_uuid,
     })
 }
 

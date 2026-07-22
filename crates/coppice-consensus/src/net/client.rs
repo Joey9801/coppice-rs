@@ -21,8 +21,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::Code;
+
+use coppice_tls::TlsStore;
 
 use openraft::error::{
     Fatal, NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
@@ -31,13 +33,14 @@ use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, Snapshot, Vote};
+use openraft::{Snapshot, Vote};
 
 use coppice_core::bytes::ByteSize;
 use coppice_net::transport::Client;
 use coppice_proto::pb::raft::v1 as pb;
 
 use crate::adapter::TypeConfig;
+use crate::membership::CoordinatorNode;
 use crate::storage::raftpb;
 use crate::CoordinatorId;
 
@@ -57,11 +60,14 @@ const WIRE: &str = "raft-rpc";
 
 /// Creates one [`GrpcRaftNetwork`] per target, sharing a per-peer channel map.
 ///
-/// Cheap to hold: the TLS config is built once from PEM bytes and cloned per
-/// endpoint (only the SNI domain name differs), and channels are dialed lazily.
+/// Cheap to hold: it keeps the shared TLS store and rebuilds a
+/// [`ClientTlsConfig`] from the *current* material each time it dials a peer, so
+/// a rotated leaf is picked up on the next (re)dial without a restart (ADR 0037
+/// §6). Channels are dialed lazily and reused per peer; an address change drops
+/// and redials.
 pub struct GrpcNetworkFactory {
     cluster_uuid: [u8; 16],
-    tls: ClientTlsConfig,
+    tls: Arc<TlsStore>,
     rpc_timeout: Duration,
     /// Per-peer `(dialed address, channel)`. A membership change that moves a
     /// peer's address drops the stale channel and redials.
@@ -69,15 +75,26 @@ pub struct GrpcNetworkFactory {
 }
 
 impl GrpcNetworkFactory {
-    /// Build the factory from the mutual-TLS client config (ADR 0011), the
-    /// per-RPC timeout, and the cluster identity stamped into every request.
-    pub fn new(cluster_uuid: [u8; 16], tls: ClientTlsConfig, rpc_timeout: Duration) -> Self {
+    /// Build the factory from the shared hot-reload TLS store (ADR 0011/0037),
+    /// the per-RPC timeout, and the cluster identity stamped into every request.
+    pub fn new(cluster_uuid: [u8; 16], tls: Arc<TlsStore>, rpc_timeout: Duration) -> Self {
         GrpcNetworkFactory {
             cluster_uuid,
             tls,
             rpc_timeout,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The mutual-TLS client config built from the material current *right now*
+    /// (ADR 0037 §6): the cluster CA as the trust root, this node's leaf as the
+    /// client identity. Rebuilt per dial so a reconnect after a rotation uses
+    /// the fresh leaf.
+    fn client_tls(&self) -> ClientTlsConfig {
+        let material = self.tls.current();
+        ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(material.ca_pem()))
+            .identity(Identity::from_pem(material.cert_pem(), material.key_pem()))
     }
 
     /// Reuse the peer's channel, redialing if its address changed or it was
@@ -90,7 +107,7 @@ impl GrpcNetworkFactory {
                 return Ok(channel.clone());
             }
         }
-        let channel = build_channel(&self.tls, addr, self.rpc_timeout)
+        let channel = build_channel(&self.client_tls(), addr, self.rpc_timeout)
             .map_err(|e| format!("cannot dial coordinator {target} at {addr}: {e}"))?;
         map.insert(target, (addr.to_string(), channel.clone()));
         Ok(channel)
@@ -121,7 +138,11 @@ fn build_channel(
 impl RaftNetworkFactory<TypeConfig> for GrpcNetworkFactory {
     type Network = GrpcRaftNetwork;
 
-    async fn new_client(&mut self, target: CoordinatorId, node: &BasicNode) -> GrpcRaftNetwork {
+    async fn new_client(
+        &mut self,
+        target: CoordinatorId,
+        node: &CoordinatorNode,
+    ) -> GrpcRaftNetwork {
         // Per the trait contract, this must not fail even for a bad address; a
         // dial error is deferred into the per-RPC path as `Unreachable`.
         let channel = self.channel_for(target, &node.addr);
@@ -144,7 +165,9 @@ pub struct GrpcRaftNetwork {
 
 impl GrpcRaftNetwork {
     /// The channel, or an [`Unreachable`] RPC error if the peer never dialed.
-    fn dial<E: std::error::Error>(&self) -> Result<Channel, RPCError<CoordinatorId, BasicNode, E>> {
+    fn dial<E: std::error::Error>(
+        &self,
+    ) -> Result<Channel, RPCError<CoordinatorId, CoordinatorNode, E>> {
         self.channel
             .clone()
             .map_err(|msg| RPCError::Unreachable(Unreachable::new(&io::Error::other(msg))))
@@ -162,7 +185,7 @@ impl GrpcRaftNetwork {
 fn status_to_rpc<E: std::error::Error>(
     target: CoordinatorId,
     status: tonic::Status,
-) -> RPCError<CoordinatorId, BasicNode, E> {
+) -> RPCError<CoordinatorId, CoordinatorNode, E> {
     match status.code() {
         Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled => {
             RPCError::Unreachable(Unreachable::new(&io::Error::other(format!(
@@ -222,7 +245,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         AppendEntriesResponse<CoordinatorId>,
-        RPCError<CoordinatorId, BasicNode, RaftError<CoordinatorId>>,
+        RPCError<CoordinatorId, CoordinatorNode, RaftError<CoordinatorId>>,
     > {
         let channel = self.dial()?;
         let mut client = Client::new(channel);
@@ -241,7 +264,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         VoteResponse<CoordinatorId>,
-        RPCError<CoordinatorId, BasicNode, RaftError<CoordinatorId>>,
+        RPCError<CoordinatorId, CoordinatorNode, RaftError<CoordinatorId>>,
     > {
         let channel = self.dial()?;
         let mut client = Client::new(channel);

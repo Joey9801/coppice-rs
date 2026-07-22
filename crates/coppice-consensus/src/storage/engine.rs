@@ -99,6 +99,10 @@ struct ManifestState {
     logical_end: Option<FrameLogId>,
     snapshot_id: Option<String>,
     committed_index: Option<u64>,
+    /// The durable formation token (ADR 0037 §3), recorded before
+    /// `raft.initialize`; `None` on a directory never targeted by
+    /// `InitializeCluster`.
+    formation_token: Option<String>,
 }
 
 /// entry index -> (byte offset of frame, total frame length).
@@ -220,6 +224,7 @@ impl ManifestState {
                 .clone()
                 .map(|snapshot_id| pbstorage::SnapshotPointer { snapshot_id }),
             committed_index: self.committed_index,
+            formation_token: self.formation_token.clone(),
         }
     }
 
@@ -253,6 +258,7 @@ impl ManifestState {
                 .transpose()?,
             snapshot_id: manifest.snapshot.map(|p| p.snapshot_id),
             committed_index: manifest.committed_index,
+            formation_token: manifest.formation_token,
         })
     }
 }
@@ -290,6 +296,7 @@ impl<F: Fs> StorageCore<F> {
             logical_end: None,
             snapshot_id: None,
             committed_index: None,
+            formation_token: None,
         };
         write_manifest(fs, &manifest)
     }
@@ -460,6 +467,29 @@ impl<F: Fs> StorageCore<F> {
     /// manifest at init (ADR 0025).
     pub fn node_id(&self) -> u64 {
         self.manifest.node_id
+    }
+
+    /// The instance UUID stamped at init (ADR 0025): a fresh value per
+    /// directory life, so "same node id, different life" is distinguishable in
+    /// forensics. Reported by `/readyz` (ADR 0037 §7).
+    pub fn instance_uuid(&self) -> [u8; 16] {
+        self.manifest.instance_uuid
+    }
+
+    /// The durable formation token recorded in the manifest, if any (ADR 0037
+    /// §3). Read back at open so a daemon can complete or resume formation.
+    pub fn formation_token(&self) -> Option<&str> {
+        self.manifest.formation_token.as_deref()
+    }
+
+    /// Durably record the formation token in the manifest stamp (ADR 0037 §3),
+    /// through the same one-atomic-swap discipline as every structural fact.
+    /// Called once, before `raft.initialize`, so the operator's formation intent
+    /// survives a crash in the initialize window. Idempotent: recording the same
+    /// token twice is a no-op that still re-fsyncs the manifest.
+    pub fn record_formation_token(&mut self, token: &str) -> io::Result<()> {
+        self.manifest.formation_token = Some(token.to_string());
+        write_manifest(&self.fs, &self.manifest)
     }
 
     // ---- log reads ----------------------------------------------------

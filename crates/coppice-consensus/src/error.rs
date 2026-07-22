@@ -6,6 +6,7 @@
 //! never leak past it — see `crates/coppice-consensus/src/adapter.rs` and
 //! `docs/architecture/coordinator-runtime.md`.
 
+use crate::membership::PromotionRefusal;
 use crate::CoordinatorId;
 
 /// A failure of a consensus operation.
@@ -39,6 +40,29 @@ pub enum ConsensusError {
     /// made a voter (ADR 0016 step 3).
     #[error("learner is {lag} entries behind the promotion threshold")]
     LearnerNotCaughtUp { lag: u64 },
+
+    /// `AddLearner` named an id already in membership at a *different* address
+    /// (ADR 0037 §4). There is no silent repointing; a moved instance is a new
+    /// instance. Terminal — retrying the same request cannot succeed.
+    #[error("node is already in membership at a different address ({existing_addr})")]
+    SameIdDifferentAddress { existing_addr: String },
+
+    /// A different, still-live pending learner already holds this machine
+    /// identity's single replacement slot (ADR 0037 §6). Non-retryable while
+    /// `incumbent` stays reachable and makes progress: the loser watches
+    /// status rather than resubmitting.
+    #[error("machine seat is held by a pending learner (node {incumbent})")]
+    MachineSeatPending { incumbent: CoordinatorId },
+
+    /// A promotion could not fold in a removal that ADR 0037 §5 requires, and
+    /// growing the cluster is not permitted. Terminal — needs operator cleanup.
+    #[error("promotion refused: {0}")]
+    PromotionRefused(PromotionRefusal),
+
+    /// A membership verb named an id that is not in membership at all
+    /// (ADR 0037 §4 — `PromoteVoter` on an unknown id). Terminal.
+    #[error("node {id} is not in membership")]
+    UnknownNode { id: CoordinatorId },
 
     /// This handle's consensus node is shutting down; the operation will not
     /// complete and retrying against this handle will not help.

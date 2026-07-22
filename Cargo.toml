@@ -4,6 +4,7 @@ members = [
     "crates/coppice-core",
     "crates/coppice-proto",
     "crates/coppice-net",
+    "crates/coppice-tls",
     "crates/coppice-state",
     "crates/coppice-consensus",
     "crates/coppice-scheduler",
@@ -27,6 +28,7 @@ authors = ["The Coppice Authors"]
 coppice-core = { path = "crates/coppice-core" }
 coppice-proto = { path = "crates/coppice-proto" }
 coppice-net = { path = "crates/coppice-net" }
+coppice-tls = { path = "crates/coppice-tls" }
 coppice-agent = { path = "crates/coppice-agent" }
 coppice-state = { path = "crates/coppice-state" }
 coppice-consensus = { path = "crates/coppice-consensus" }
@@ -143,6 +145,26 @@ tokio-stream = "0.1"
 # (ADR 0011). tonic 0.12 matches the workspace's prost 0.13 pin.
 tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
+# Hot-reloadable coordinator TLS material (ADR 0037 §6): `coppice-tls` hand-rolls
+# a tokio-rustls acceptor whose per-connection `ServerConfig` is resolved from an
+# `ArcSwap` at handshake time, so a cert/key/CA rotation on disk is picked up
+# without a restart. Pinned to the exact rustls/tokio-rustls versions tonic 0.12
+# already resolves (ring provider only — the workspace deliberately avoids the
+# aws-lc-rs build toolchain, matching tonic's own feature selection) so the whole
+# graph shares one rustls.
+arc-swap = "1"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+rustls-pemfile = "2"
 # Metric emission facade. Each module that exposes metrics defines
 # `describe_metrics()` (describe_* calls plus recursion into submodules) and
 # `gather_metrics()` (point-in-time sampling plus the same recursion), so the
@@ -174,6 +196,17 @@ nix = { version = "0.30", features = ["fs"] }
 # duration strings ("1500ms") parsed at load.
 toml = "0.8"
 humantime-serde = "1"
+# Coordinator discovery (ADR 0037 §2): the `dns` backend resolves one name per
+# consultation. `system-config` reads `/etc/resolv.conf`; `tokio-runtime` runs
+# the async resolver on the workspace runtime. Default features are off to keep
+# the tree minimal — no DNSSEC, no bundled root hints.
+hickory-resolver = { version = "0.24", default-features = false, features = [
+    "system-config",
+    "tokio-runtime",
+] }
+# The `advertise_host` fallback chain (ADR 0037 §2) reads the OS-reported
+# hostname when no explicit value is configured. Tiny, cross-platform.
+gethostname = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # v7 for entity ids (time-ordered prefix -> btree locality, ADR 0024); v4

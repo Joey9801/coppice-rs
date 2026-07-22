@@ -23,6 +23,9 @@ coppice-core.workspace = true
 # The `dev` subcommand runs an in-process agent whose journal goes through
 # the consensus crate's filesystem seam, exactly like the real daemon.
 coppice-consensus.workspace = true
+# The hot-reload TLS store `coppice dev` builds for its in-process coordinator
+# (ADR 0037 §6).
+coppice-tls.workspace = true
 # `coppice dev` seeds the replicated policy and a dev quota entity by
 # proposing the same commands `coppice-cli policy` will use (ADR 0020).
 coppice-state.workspace = true
@@ -43,6 +46,10 @@ toml.workspace = true
 humantime-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `coppice cluster init` mints a fresh formation token (a UUID v4 string) when
+# the operator supplies neither `--formation-token` nor `--formation-token-file`
+# (ADR 0037 §3).
+uuid.workspace = true
 
 [dev-dependencies]
 # In-process axum server for the `coppice job` HTTP round-trip tests: canned

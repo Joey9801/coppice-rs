@@ -49,9 +49,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use openraft::storage::{RaftStateMachine, Snapshot, SnapshotMeta};
-use openraft::{
-    BasicNode, LogId, RaftSnapshotBuilder, StorageError, StorageIOError, StoredMembership,
-};
+use openraft::{LogId, RaftSnapshotBuilder, StorageError, StorageIOError, StoredMembership};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
 use coppice_proto::convert::state_from_records;
@@ -61,6 +59,7 @@ use coppice_state::StateMachine;
 
 use crate::adapter::{ApplyRequest, ApplyResult, TypeConfig};
 use crate::fs::{Fs, FsFile, RealFs};
+use crate::membership::CoordinatorNode;
 use crate::CoordinatorId;
 
 use super::engine::StorageCore;
@@ -146,7 +145,7 @@ impl fmt::Debug for SnapshotFile {
 #[derive(Debug, Clone, Default)]
 struct AppliedState {
     last_applied: Option<LogId<CoordinatorId>>,
-    membership: StoredMembership<CoordinatorId, BasicNode>,
+    membership: StoredMembership<CoordinatorId, CoordinatorNode>,
 }
 
 fn sm_read_err(e: &io::Error) -> StorageError<CoordinatorId> {
@@ -191,7 +190,7 @@ impl<F: Fs> StateMachineStore<F> {
         core: Arc<StdMutex<StorageCore<F>>>,
         apply_tx: mpsc::Sender<ApplyRequest>,
         last_applied: Option<LogId<CoordinatorId>>,
-        membership: StoredMembership<CoordinatorId, BasicNode>,
+        membership: StoredMembership<CoordinatorId, CoordinatorNode>,
         shards: u32,
         cluster_uuid: [u8; 16],
     ) -> Self {
@@ -216,7 +215,7 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
     ) -> Result<
         (
             Option<LogId<CoordinatorId>>,
-            StoredMembership<CoordinatorId, BasicNode>,
+            StoredMembership<CoordinatorId, CoordinatorNode>,
         ),
         StorageError<CoordinatorId>,
     > {
@@ -337,7 +336,7 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<CoordinatorId, BasicNode>,
+        meta: &SnapshotMeta<CoordinatorId, CoordinatorNode>,
         snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<CoordinatorId>> {
         // Decode first, streaming from the file: every section CRC is
@@ -502,7 +501,7 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
 /// Convert a durable snapshot meta record into openraft's.
 pub(super) fn openraft_meta(
     meta: &pbstorage::SnapshotMeta,
-) -> io::Result<SnapshotMeta<CoordinatorId, BasicNode>> {
+) -> io::Result<SnapshotMeta<CoordinatorId, CoordinatorNode>> {
     let path = std::path::Path::new("snap");
     let last_log_id = meta
         .last_applied

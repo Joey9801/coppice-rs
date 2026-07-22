@@ -81,7 +81,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use openraft::{BasicNode, LogId, StoredMembership};
+use openraft::{LogId, StoredMembership};
 use tokio::sync::mpsc;
 
 use coppice_proto::convert::state_from_records;
@@ -89,6 +89,7 @@ use coppice_state::StateMachine;
 
 use crate::adapter::{ApplyRequest, APPLY_CHANNEL_CAPACITY};
 use crate::fs::Fs;
+use crate::membership::CoordinatorNode;
 use crate::CoordinatorId;
 
 /// Initialize an empty data directory: `log/`, `snap/`, and an
@@ -127,6 +128,7 @@ pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
     let cluster_uuid = options.cluster_uuid;
     let core = StorageCore::open(fs, options)?;
     let node_id = core.node_id();
+    let instance_uuid = core.instance_uuid();
 
     // Rebuild from the snapshot file in bounded memory: streaming validation
     // already ran inside `current_snapshot_reader`, so only the per-section
@@ -152,6 +154,7 @@ pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
         shards,
         cluster_uuid,
         node_id,
+        instance_uuid,
     })
 }
 
@@ -165,15 +168,38 @@ pub struct Recovered<F: Fs> {
     /// Raft coordinates of `state` (from the snapshot meta).
     pub last_applied: Option<LogId<CoordinatorId>>,
     /// Membership as of `last_applied`.
-    pub membership: StoredMembership<CoordinatorId, BasicNode>,
+    pub membership: StoredMembership<CoordinatorId, CoordinatorNode>,
     /// The allocate-once Raft identity stamped in the manifest (ADR 0025):
     /// the directory, not config, is the authority on which replica this is.
     pub node_id: CoordinatorId,
+    /// The instance UUID stamped in the manifest at init (ADR 0025): a fresh
+    /// value per directory life. Surfaced through the node handle so `/readyz`
+    /// can report it (ADR 0037 §7).
+    pub instance_uuid: [u8; 16],
     shards: u32,
     cluster_uuid: [u8; 16],
 }
 
 impl<F: Fs> Recovered<F> {
+    /// A clone of the shared storage-core handle, so formation (ADR 0037 §3)
+    /// can durably record its token into the manifest before `raft.initialize`.
+    /// The core is a `Mutex` shared with the two openraft stores; a parked
+    /// (uninitialized) replica has no concurrent log activity, so the brief lock
+    /// this takes never contends with openraft's own writes.
+    pub fn core_handle(&self) -> Arc<Mutex<StorageCore<F>>> {
+        Arc::clone(&self.core)
+    }
+
+    /// The durable formation token recorded in this directory's manifest, read
+    /// back at open (ADR 0037 §3).
+    pub fn formation_token(&self) -> Option<String> {
+        self.core
+            .lock()
+            .expect("storage core poisoned")
+            .formation_token()
+            .map(str::to_string)
+    }
+
     /// Split into the openraft stores, wiring the state-machine store to an
     /// apply task the caller owns.
     ///

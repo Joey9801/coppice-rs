@@ -16,6 +16,10 @@ coppice-state.workspace = true
 coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
 coppice-api.workspace = true
+# Hot-reloadable mTLS store (ADR 0037 §6): the connection-time acceptor for the
+# two mTLS listeners and the shared material the raft mesh and node-fetch client
+# dial with.
+coppice-tls.workspace = true
 anyhow.workspace = true
 # The fanout's `proposer_skew` histogram (ADR 0032), registered through the
 # same describe/gather pattern as `coppice-consensus`.
@@ -37,12 +41,24 @@ tracing.workspace = true
 # below of enabling a feature purely from this crate.
 tracing-subscriber = { workspace = true, features = ["json"] }
 serde.workspace = true
+# `admin status --json` renders the cluster-wide view as stable JSON to stdout
+# (ADR 0037 §7).
+serde_json.workspace = true
 toml.workspace = true
 humantime-serde.workspace = true
 uuid.workspace = true
+# Coordinator discovery (ADR 0037 §2): the `dns` backend resolves candidate
+# raft addresses (A/AAAA + SRV) once per consultation.
+hickory-resolver.workspace = true
+# The `advertise_host` fallback chain reads the OS hostname when unset (ADR 0037).
+gethostname.workspace = true
 # Parses the agent's mTLS client-leaf certificate to enforce CN == NodeId at
 # session accept (ADR 0011); see `tasks::agent_gateway`.
 x509-parser.workspace = true
+# Encode the `MembershipRefusal` detail proto into a gRPC Status's binary
+# details for machine-readable membership refusals (ADR 0037 §4/§5/§6).
+prost.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -56,12 +72,15 @@ rcgen.workspace = true
 # drive the end-to-end agent↔coordinator reconciliation protocol test
 # (`tests/agent_protocol.rs`) against the live coordinator runtime.
 coppice-agent.workspace = true
-# `tower::ServiceExt::oneshot` drives the real axum router in-process, and
-# `serde_json` decodes its JSON bodies, for the best-effort job-log e2e test
-# (`tests/job_logs.rs`, ADR 0034). `bytes` builds the seeded `LogChunk` payloads.
+# `tower::ServiceExt::oneshot` drives the real axum router in-process for the
+# best-effort job-log e2e test (`tests/job_logs.rs`, ADR 0034); `serde_json`
+# (a normal dependency, above) decodes its JSON bodies. `bytes` builds the
+# seeded `LogChunk` payloads.
 tower.workspace = true
-serde_json.workspace = true
 bytes.workspace = true
+# Drives the plain-HTTP client listener (`/readyz`, ADR 0037 §7) end to end in
+# the readiness integration test.
+reqwest.workspace = true
 
 [lints]
 workspace = true

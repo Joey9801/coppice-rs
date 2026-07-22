@@ -12,6 +12,10 @@ authors.workspace = true
 coppice-core.workspace = true
 coppice-proto.workspace = true
 coppice-net.workspace = true
+# The shared hot-reload TLS store (ADR 0037 §6): the raft peer mesh reads the
+# current client material at (re)dial time, so a rotated leaf is picked up on
+# reconnect without a coordinator restart.
+coppice-tls.workspace = true
 coppice-state.workspace = true
 crc32c.workspace = true
 fs2.workspace = true

@@ -18,19 +18,24 @@
 //! by the coordinator runtime (`docs/architecture/coordinator-runtime.md`),
 //! which then assembles this adapter with [`OpenraftConsensus::new`].
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::{oneshot, watch, Semaphore};
 
 use openraft::error::{
     ChangeMembershipError, CheckIsLeaderError, ClientWriteError, Fatal, RaftError,
 };
-use openraft::{BasicNode, ChangeMembers, Raft};
+use openraft::{ChangeMembers, Raft, RaftMetrics};
 
 use coppice_state::{Command, StateMachine};
 
 use crate::error::ConsensusError;
+use crate::membership::{
+    decide_add_learner, decide_promotion_voters, AddLearnerDecision, CoordinatorNode,
+    LivenessAttestor, MembershipPolicy, NodeRecord, PromotionInputs,
+};
 use crate::view::StateViews;
 use crate::{Applied, Consensus, ConsensusStatus, CoordinatorId};
 
@@ -43,8 +48,10 @@ openraft::declare_raft_types!(
     /// The openraft type binding for the coordinator.
     ///
     /// `D` is a control-plane [`Command`], `R` is its [`ApplyResult`]; the
-    /// node id is [`CoordinatorId`] and nodes carry a dial address in a
-    /// [`BasicNode`]. Snapshots move as the file-backed
+    /// node id is [`CoordinatorId`] and nodes carry their dial address plus the
+    /// machine-identity binding and superseded marker in a
+    /// [`CoordinatorNode`](crate::membership::CoordinatorNode) (ADR 0037 §6,
+    /// replacing openraft's `BasicNode`). Snapshots move as the file-backed
     /// [`SnapshotFile`](crate::storage::SnapshotFile) — never an in-memory
     /// buffer — so an ADR 0018 container streams disk-to-disk through
     /// install-snapshot (openraft's `generic-snapshot-data` feature). The
@@ -54,6 +61,7 @@ openraft::declare_raft_types!(
     pub TypeConfig:
         D = Command,
         R = ApplyResult,
+        Node = CoordinatorNode,
         SnapshotData = crate::storage::SnapshotFile,
 );
 
@@ -119,12 +127,29 @@ pub const MAX_INFLIGHT_PROPOSALS: usize = 4096;
 /// admin caller polls until it passes.
 pub const PROMOTION_LAG_MAX: u64 = 256;
 
+/// Per-follower replication progress the leader tracks to reason about voter
+/// liveness (ADR 0037 §5). Updated lazily from the openraft metrics watch on
+/// each membership verb; `since` is when `matched` last advanced.
+#[derive(Debug, Clone, Copy)]
+struct FollowerProgress {
+    matched: u64,
+    since: Instant,
+}
+
 /// The openraft-backed [`Consensus`] implementation.
 pub struct OpenraftConsensus {
     raft: Raft<TypeConfig>,
     status: watch::Receiver<ConsensusStatus>,
     views: StateViews,
     proposal_permits: Arc<Semaphore>,
+    /// Node-local membership policy (cluster size, grace periods; ADR 0037 §5).
+    policy: MembershipPolicy,
+    /// Optional discovery-liveness attestation hook (ADR 0037 §5). `None`
+    /// contributes nothing to removal decisions.
+    attestor: Option<Arc<dyn LivenessAttestor>>,
+    /// Per-follower last-progress timestamps, updated lazily from the metrics
+    /// watch each time a membership verb runs (ADR 0037 §5).
+    progress: Arc<Mutex<HashMap<CoordinatorId, FollowerProgress>>>,
 }
 
 impl OpenraftConsensus {
@@ -138,19 +163,117 @@ impl OpenraftConsensus {
     /// storage layer. The runtime builds those, spawns the apply task to obtain
     /// `status`/`views`, then calls this.
     ///
+    /// `policy` is the node-local [`MembershipPolicy`] (ADR 0037 §5); `attestor`
+    /// is the optional discovery-liveness hook.
+    ///
     /// [`RaftLogStorage`]: openraft::storage::RaftLogStorage
     /// [`RaftStateMachine`]: openraft::storage::RaftStateMachine
     pub fn new(
         raft: Raft<TypeConfig>,
         status: watch::Receiver<ConsensusStatus>,
         views: StateViews,
+        policy: MembershipPolicy,
+        attestor: Option<Arc<dyn LivenessAttestor>>,
     ) -> Self {
         OpenraftConsensus {
             raft,
             status,
             views,
             proposal_permits: Arc::new(Semaphore::new(MAX_INFLIGHT_PROPOSALS)),
+            policy,
+            attestor,
+            progress: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Flatten the committed membership config into the decision core's
+    /// [`NodeRecord`] view.
+    fn membership_records(
+        metrics: &RaftMetrics<CoordinatorId, CoordinatorNode>,
+    ) -> Vec<NodeRecord> {
+        let voters: BTreeSet<CoordinatorId> = metrics.membership_config.voter_ids().collect();
+        metrics
+            .membership_config
+            .nodes()
+            .map(|(id, node)| NodeRecord {
+                id: *id,
+                addr: node.addr.clone(),
+                machine_identity: node.machine_identity.clone(),
+                superseded: node.superseded,
+                voter: voters.contains(id),
+            })
+            .collect()
+    }
+
+    /// Refresh the per-follower progress map from a metrics sample and return a
+    /// snapshot of each follower's last-progress instant (ADR 0037 §5).
+    fn refresh_progress(
+        &self,
+        metrics: &RaftMetrics<CoordinatorId, CoordinatorNode>,
+    ) -> HashMap<CoordinatorId, Instant> {
+        let now = Instant::now();
+        let mut map = self.progress.lock().expect("progress map poisoned");
+        if let Some(repl) = metrics.replication.as_ref() {
+            for (id, matched) in repl.iter() {
+                let m = matched.map(|l| l.index).unwrap_or(0);
+                let entry = map.entry(*id).or_insert(FollowerProgress {
+                    matched: m,
+                    since: now,
+                });
+                if m > entry.matched {
+                    entry.matched = m;
+                    entry.since = now;
+                }
+            }
+        }
+        map.iter().map(|(id, p)| (*id, p.since)).collect()
+    }
+
+    /// Admit `node` as a learner, binding `machine_identity` into its
+    /// replicated record (ADR 0037 §6). Non-blocking: returns once replication
+    /// to the learner is set up; it catches up via snapshot install plus log
+    /// replay with no quorum impact.
+    async fn admit_learner(
+        &self,
+        node: CoordinatorId,
+        addr: String,
+        machine_identity: String,
+    ) -> Result<(), ConsensusError> {
+        self.raft
+            .add_learner(node, CoordinatorNode::new(addr, machine_identity), false)
+            .await
+            .map(|_| ())
+            .map_err(map_client_write_error)
+    }
+
+    /// Mark `predecessor`'s node record superseded, as replicated state
+    /// (ADR 0037 §5/§6). Keeps the address unchanged — only the flag flips, so
+    /// this `SetNodes` cannot repoint a voter. Idempotent: a no-op if already
+    /// superseded or absent.
+    async fn mark_superseded(
+        &self,
+        predecessor: CoordinatorId,
+        records: &[NodeRecord],
+    ) -> Result<(), ConsensusError> {
+        let Some(rec) = records.iter().find(|m| m.id == predecessor) else {
+            return Ok(());
+        };
+        if rec.superseded {
+            return Ok(());
+        }
+        let node = CoordinatorNode {
+            addr: rec.addr.clone(),
+            machine_identity: rec.machine_identity.clone(),
+            superseded: true,
+        };
+        self.raft
+            .change_membership(
+                ChangeMembers::SetNodes(BTreeMap::from([(predecessor, node)])),
+                true,
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_client_write_error)
     }
 }
 
@@ -191,15 +314,63 @@ impl Consensus for OpenraftConsensus {
         self.views.clone()
     }
 
-    async fn add_learner(&self, node: CoordinatorId, addr: String) -> Result<(), ConsensusError> {
-        // Non-blocking: return once replication to the learner is set up. The
-        // learner catches up via snapshot install plus log replay with no
-        // quorum impact; the CLI polls health before promotion (ADR 0016).
-        self.raft
-            .add_learner(node, BasicNode { addr }, false)
-            .await
-            .map(|_| ())
-            .map_err(map_client_write_error)
+    async fn add_learner(
+        &self,
+        node: CoordinatorId,
+        addr: String,
+        machine_identity: String,
+    ) -> Result<(), ConsensusError> {
+        // Decide against the *current* membership state before any other gate
+        // (ADR 0037 §4): idempotent no-op / repoint refusal / seat rules (§6).
+        let (records, staleness) = {
+            let metrics = self.raft.metrics();
+            let staleness = self.refresh_progress(&metrics.borrow());
+            let records = Self::membership_records(&metrics.borrow());
+            (records, staleness)
+        };
+        let grace = self.policy.replacement_grace;
+        let now = Instant::now();
+        let is_stale = |id: CoordinatorId| {
+            // A pending learner is stale when the leader has seen no progress
+            // from it (or never has) for `replacement_grace` (§6). An id with
+            // no tracked progress at all is treated as reachable-until-proven,
+            // so a just-admitted learner is never immediately evicted.
+            staleness
+                .get(&id)
+                .map(|since| now.duration_since(*since) >= grace)
+                .unwrap_or(false)
+        };
+
+        match decide_add_learner(&records, node, &addr, &machine_identity, is_stale) {
+            AddLearnerDecision::Noop => Ok(()),
+            AddLearnerDecision::RefuseSameIdDifferentAddress { existing_addr } => {
+                Err(ConsensusError::SameIdDifferentAddress { existing_addr })
+            }
+            AddLearnerDecision::RefuseMachineSeatPending { incumbent } => {
+                Err(ConsensusError::MachineSeatPending { incumbent })
+            }
+            AddLearnerDecision::AdmitFresh => {
+                self.admit_learner(node, addr, machine_identity).await
+            }
+            AddLearnerDecision::AdmitReplacingVoter { predecessor } => {
+                // Mark the predecessor superseded as replicated state before
+                // admitting the replacement (§6): a separate committed
+                // membership change (openraft has no single change that both
+                // adds a learner and rewrites an existing node record). Both
+                // steps are idempotent, so a crash between them is repaired by
+                // re-running the convergence loop.
+                self.mark_superseded(predecessor, &records).await?;
+                self.admit_learner(node, addr, machine_identity).await
+            }
+            AddLearnerDecision::AdmitEvictingStaleLearner { stale } => {
+                self.raft
+                    .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([stale])), false)
+                    .await
+                    .map(|_| ())
+                    .map_err(map_client_write_error)?;
+                self.admit_learner(node, addr, machine_identity).await
+            }
+        }
     }
 
     async fn promote_voter(
@@ -207,12 +378,24 @@ impl Consensus for OpenraftConsensus {
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
     ) -> Result<(), ConsensusError> {
-        // ADR 0016 catch-up gate: refuse to raise a learner into the quorum
-        // until its replication lag is within the threshold. The check is
-        // best-effort — it needs leader replication metrics; if this node is
-        // not leader (no replication metrics) or the learner is not yet tracked
-        // the promotion is refused as not-caught-up, and a racing step-down
-        // still surfaces `NotLeader` from `change_membership` below.
+        // State short-circuit BEFORE the lag gate (ADR 0037 §4): an id that is
+        // already a voter is a no-op success (it has no learner replication
+        // entry to measure and must not be bounced with LearnerNotCaughtUp);
+        // an id absent from membership is refused.
+        {
+            let records = Self::membership_records(&self.raft.metrics().borrow());
+            match records.iter().find(|m| m.id == promote) {
+                Some(m) if m.voter => return Ok(()),
+                Some(_) => {}
+                None => return Err(ConsensusError::UnknownNode { id: promote }),
+            }
+        }
+
+        // ADR 0016 catch-up gate for an actual learner: refuse to raise it into
+        // the quorum until its replication lag is within the threshold. Needs
+        // leader replication metrics; if this node is not leader (no metrics)
+        // or the learner is not tracked, refuse as not-caught-up, and a racing
+        // step-down still surfaces `NotLeader` from `change_membership` below.
         {
             let metrics = self.raft.metrics();
             let metrics = metrics.borrow();
@@ -232,37 +415,130 @@ impl Consensus for OpenraftConsensus {
             }
         }
 
-        let changes = match remove {
-            // Pure promotion: raise one learner to voter, leaving the rest of
-            // the voter set untouched.
-            None => ChangeMembers::AddVoterIds(BTreeSet::from([promote])),
-            // Promotion plus removal in one joint change (ADR 0016 step 3):
-            // compute the new voter set from current membership. `promote` must
-            // already be a caught-up learner.
-            Some(departed) => {
-                let mut voters: BTreeSet<CoordinatorId> = self
-                    .raft
-                    .metrics()
-                    .borrow()
-                    .membership_config
-                    .voter_ids()
-                    .collect();
-                voters.insert(promote);
-                voters.remove(&departed);
-                ChangeMembers::ReplaceAllVoters(voters)
+        // Compute the final voter set. Two paths (ADR 0037 §5):
+        //   * `remove = Some(departed)` is the manual verb — remove exactly
+        //     that id, unconditionally, plus any superseded predecessor.
+        //   * `remove = None` is routine self-join — the leader folds in the
+        //     replacement/overflow removals automatically.
+        let final_voters = {
+            let metrics = self.raft.metrics();
+            let staleness_metrics = metrics.borrow();
+            let staleness = self.refresh_progress(&staleness_metrics);
+            let records = Self::membership_records(&staleness_metrics);
+            let current_voters: BTreeSet<CoordinatorId> =
+                staleness_metrics.membership_config.voter_ids().collect();
+            let leader = staleness_metrics.id;
+            let leader_last = staleness_metrics.last_log_index.unwrap_or(0);
+            let now = Instant::now();
+
+            // The promoting node's machine identity, and its superseded
+            // predecessor still in membership (a bound voter marked superseded).
+            let promoting_identity = records
+                .iter()
+                .find(|m| m.id == promote)
+                .map(|m| m.machine_identity.clone())
+                .unwrap_or_default();
+            let superseded_predecessor = if promoting_identity.is_empty() {
+                None
+            } else {
+                records
+                    .iter()
+                    .find(|m| {
+                        m.voter
+                            && m.superseded
+                            && m.id != promote
+                            && m.machine_identity == promoting_identity
+                    })
+                    .map(|m| m.id)
+            };
+
+            match remove {
+                Some(departed) => {
+                    let mut voters = current_voters.clone();
+                    voters.insert(promote);
+                    voters.remove(&departed);
+                    if let Some(pred) = superseded_predecessor {
+                        voters.remove(&pred);
+                    }
+                    voters
+                }
+                None => {
+                    // Voters whose replication has been failing longer than
+                    // `removal_grace` (§5), the leader's own observation; when a
+                    // liveness attestor applies, also require it attests absence.
+                    let dead_voters: BTreeSet<CoordinatorId> = current_voters
+                        .iter()
+                        .copied()
+                        .filter(|v| *v != leader && *v != promote)
+                        .filter(|v| {
+                            staleness
+                                .get(v)
+                                .map(|since| {
+                                    now.duration_since(*since) >= self.policy.removal_grace
+                                })
+                                .unwrap_or(false)
+                        })
+                        .filter(|v| {
+                            self.attestor
+                                .as_ref()
+                                .map(|a| a.is_absent(*v))
+                                .unwrap_or(true)
+                        })
+                        .collect();
+                    // Voters the leader currently reaches within the lag
+                    // threshold, plus the leader and the caught-up promoting
+                    // node — the live-majority postcondition vantage.
+                    let mut live_voters: BTreeSet<CoordinatorId> = current_voters
+                        .iter()
+                        .copied()
+                        .filter(|v| {
+                            *v == leader
+                                || staleness_metrics
+                                    .replication
+                                    .as_ref()
+                                    .and_then(|repl| repl.get(v).copied())
+                                    .map(|entry| {
+                                        leader_last
+                                            .saturating_sub(entry.map(|l| l.index).unwrap_or(0))
+                                            <= PROMOTION_LAG_MAX
+                                    })
+                                    .unwrap_or(false)
+                        })
+                        .collect();
+                    live_voters.insert(promote);
+
+                    decide_promotion_voters(PromotionInputs {
+                        cluster_size: self.policy.cluster_size,
+                        current_voters: &current_voters,
+                        promoting: promote,
+                        superseded_predecessor,
+                        dead_voters: &dead_voters,
+                        live_voters: &live_voters,
+                    })
+                    .map_err(ConsensusError::PromotionRefused)?
+                }
             }
         };
+
         // `retain = false`: a voter dropped by the change is removed outright,
         // not demoted to learner — the departed node id is never reused
         // (ADR 0016).
         self.raft
-            .change_membership(changes, false)
+            .change_membership(ChangeMembers::ReplaceAllVoters(final_voters), false)
             .await
             .map(|_| ())
             .map_err(map_client_write_error)
     }
 
     async fn remove_node(&self, node: CoordinatorId) -> Result<(), ConsensusError> {
+        // State short-circuit (ADR 0037 §4): an id already absent from
+        // membership is a no-op success.
+        {
+            let records = Self::membership_records(&self.raft.metrics().borrow());
+            if !records.iter().any(|m| m.id == node) {
+                return Ok(());
+            }
+        }
         // Removes the node entirely. openraft requires it be a non-voter first;
         // a departed voter is dropped through `promote_voter`'s removal path.
         self.raft
@@ -281,7 +557,7 @@ impl Consensus for OpenraftConsensus {
 /// requirement 5: a leadership loss (`ForwardToLeader`) becomes the retryable
 /// [`ConsensusError::NotLeader`] so an in-flight proposal never hangs.
 fn map_client_write_error(
-    error: RaftError<CoordinatorId, ClientWriteError<CoordinatorId, BasicNode>>,
+    error: RaftError<CoordinatorId, ClientWriteError<CoordinatorId, CoordinatorNode>>,
 ) -> ConsensusError {
     match error {
         RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
@@ -301,7 +577,7 @@ fn map_client_write_error(
 /// `QuorumNotEnough` means the leader could not confirm its lease within
 /// the round — surfaced as a retryable [`ConsensusError::Timeout`].
 fn map_check_leader_error(
-    error: RaftError<CoordinatorId, CheckIsLeaderError<CoordinatorId, BasicNode>>,
+    error: RaftError<CoordinatorId, CheckIsLeaderError<CoordinatorId, CoordinatorNode>>,
 ) -> ConsensusError {
     match error {
         RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)) => {

@@ -29,6 +29,7 @@ mod apply_loop;
 mod error;
 mod events;
 pub mod fs;
+mod membership;
 mod net;
 mod node;
 mod status;
@@ -41,9 +42,12 @@ pub use adapter::{
 };
 pub use error::{ConsensusError, ProposeError};
 pub use events::{EventBatch, EventTap, EventTapReceiver, TapItem};
+pub use membership::{
+    CoordinatorNode, LivenessAttestor, MembershipPolicy, NodeRecord, PromotionRefusal,
+};
 pub use node::{
-    start, ClusterSummary, MemberSummary, NodeHandle, NodeOptions, NodeStartError, NodeTls,
-    StartIntent, StartedNode,
+    start, ClusterSummary, FormationControl, FormationError, FormationOutcome, MemberSummary,
+    NodeHandle, NodeOptions, NodeStartError, StartedNode,
 };
 pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
 
@@ -154,17 +158,28 @@ pub trait Consensus: Send + Sync + 'static {
     /// Handle to published read views of applied state.
     fn views(&self) -> StateViews;
 
-    /// Add a fresh node as a non-voting learner (ADR 0016 step 2).
+    /// Add a fresh node as a non-voting learner (ADR 0016 step 2; ADR 0037 §4).
     ///
     /// `addr` is the network endpoint the Raft transport dials.
+    /// `machine_identity` is the CA-attested subject of the certificate the
+    /// admission arrived under (ADR 0037 §6); it is bound into the node's
+    /// replicated record and drives the one-seat-per-installation rules. The
+    /// verb is idempotent by contract: a re-admission of the same id at the
+    /// same address is a no-op success; a different address is refused.
     fn add_learner(
         &self,
         node: CoordinatorId,
         addr: String,
+        machine_identity: String,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
-    /// Promote a caught-up learner to voter, optionally removing a departed
-    /// voter in the same joint-consensus change (ADR 0016 step 3).
+    /// Promote a caught-up learner to voter (ADR 0016 step 3; ADR 0037 §4/§5).
+    ///
+    /// Idempotent by contract: an id that is already a voter is a no-op
+    /// success, checked *before* the replication-lag gate. `remove` is the
+    /// manual, explicit removal of a departed voter in the same joint change;
+    /// routine self-join leaves it `None` and lets the leader fold in the
+    /// replacement/overflow removals of §5 automatically.
     fn promote_voter(
         &self,
         promote: CoordinatorId,

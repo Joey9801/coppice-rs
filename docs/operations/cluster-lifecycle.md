@@ -81,9 +81,15 @@ lifetime, from any machine holding the operator certificate:
 
 ```
 uuidgen        # once; becomes cluster_id in the shared config
-coppice-cli cluster init --target coord-1:7071 \
+coppice cluster init --target coord-1:7071 \
+    --ca ca.crt --cert operator.crt --key operator.key \
     --formation-token <stable-token> [--policy policy.toml]
 ```
+
+`cluster init` runs away from any daemon config, so the operator-profile mTLS
+material is passed explicitly (`--ca`/`--cert`/`--key`); there is no
+config-file fallback. The target's cluster identity is discovered from the
+target itself, so nothing else need be supplied.
 
 The targeted daemon stamps itself, forms a single-voter cluster, and
 applies the supplied bootstrap policy; every other parked daemon observes
@@ -149,7 +155,8 @@ No workflow reads logs. Per node:
 
 ```
 curl -s https://coord-1:7070/readyz          # 200 iff caught-up voter
-curl -s "https://coord-1:7070/readyz?require=healthy"   # 200 iff formed AND redundant
+curl -s "https://coord-1:7070/readyz?require=formed"    # 200 also requires voters >= cluster_size
+curl -s "https://coord-1:7070/readyz?require=healthy"   # 200 also requires sustained live redundancy
 ```
 
 The JSON body carries `phase` (`waiting` | `joining` | `learner` |
@@ -173,14 +180,19 @@ requiring the operator-profile certificate for anything beyond status:
 coppice coordinator admin --config c.toml --target coord-1:7071 add-learner …
 coppice coordinator admin --config c.toml --target coord-1:7071 promote …
 coppice coordinator admin --config c.toml --target coord-1:7071 remove --node-id <id>
-coppice coordinator admin --config c.toml --target coord-1:7071 set-address …
 ```
 
-All verbs are idempotent by contract (re-running a completed step is a
-no-op success). `set-address` commits only after the leader verifies the
-new endpoint presents the target's bound machine identity and stamped
-node id. Admin requests against a follower are refused with the current
-leader named in the error.
+These verbs are idempotent by contract (re-running a completed step is a
+no-op success). Admin requests against a follower are refused with the
+current leader named in the error.
+
+`admin set-address` is **not yet implemented**: the verified leader-side
+repoint of ADR 0037 §4 (dial the new address, match its TLS subject to the
+target's machine-identity binding, confirm its stamped node id, only then
+commit) has no membership-repointing RPC, so the verb refuses rather than
+commit an unverified `SetNodes`. Under the immutable model an instance
+whose address changed is simply a new instance: let it self-join and
+retire the old identity through replacement promotion.
 
 ## Failure modes worth recognizing
 

@@ -66,10 +66,102 @@ message ReplicationProgress {
   uint64 matched_index = 2;
 }
 
-// The membership admin surface (ADR 0016), served over mTLS (ADR 0011).
+// Probe a candidate coordinator for whether a cluster exists behind it and,
+// if so, who to join through (ADR 0037 §3). Callable the moment the mTLS
+// server is up, before raft is initialized — a parked daemon answers it with
+// `initialized = false`. The request body is empty: the cluster identity is
+// not stamped here because the probe is precisely how a converging process
+// learns which cluster (if any) a candidate belongs to.
+message ProbeClusterRequest {}
+
+// A candidate's answer to ProbeCluster (ADR 0037 §3).
+message ProbeClusterResponse {
+  bytes cluster_uuid = 1;         // this candidate's stamped cluster identity.
+  bool initialized = 2;           // true once raft membership exists here.
+  optional uint64 node_id = 3;    // this candidate's stamped raft identity.
+  optional uint64 leader_hint = 4;// the leader this candidate last knew of.
+  repeated RaftMember voters = 5; // the voter set, when initialized; else empty.
+}
+
+// Form a brand-new single-voter cluster (ADR 0037 §3). The one deliberate
+// act at cluster birth, driven by the operator (`cluster init`) exactly once
+// per cluster lifetime; no automatic or discovery-driven path ever calls it.
+message InitializeClusterRequest {
+  bytes cluster_uuid = 1;      // 16-byte stamped cluster identity (ADR 0016).
+  // A client-supplied, durable-outside-the-CLI token that makes formation an
+  // idempotent, resumable state machine (§3): a rerun presenting the same
+  // token resumes/re-reports rather than conflicting.
+  string formation_token = 2;
+  // Optional bootstrap policy, applied idempotently as part of formation. A
+  // TOML document today; policy application may grow into a richer field
+  // (e.g. a repeated command payload) as a later, additive change.
+  optional bytes policy_toml = 3;
+}
+
+message InitializeClusterResponse {
+  uint64 node_id = 1;          // the forming replica's stamped raft identity.
+  bool already_initialized = 2;// true when a matching-token request resumed.
+}
+
+// ---------------------------------------------------------------------------
+// Machine-readable refusal details (ADR 0037 §4/§5/§6).
+//
+// Membership verbs refuse with FAILED_PRECONDITION; the human message is for
+// operators, and the machine-readable reason travels as a `MembershipRefusal`
+// serialized into the gRPC Status `details` so a converging daemon can branch
+// (watch-without-resubmitting, operator-cleanup, retry-after-grace) without
+// parsing prose. This is the single refusal idiom across the admin surface.
+// ---------------------------------------------------------------------------
+
+// A machine identity's replacement slot is already held by a different, still
+// live pending learner; the newcomer is refused rather than evicting it
+// (ADR 0037 §6). Non-retryable while `incumbent_id` stays reachable and makes
+// replication progress.
+message MachineSeatPending {
+  uint64 incumbent_id = 1;
+}
+
+// A promotion could not fold in a required removal (ADR 0037 §5).
+message PromotionRefused {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    VOTER_SET_FULL = 1;    // removing the one permitted peer still leaves > cluster_size.
+    NO_REMOVABLE_PEER = 2; // an overflow removal is needed but no dead voter qualifies.
+  }
+  Reason reason = 1;
+}
+
+// `InitializeCluster` was called with a token different from the one already
+// recorded in the manifest stamp (ADR 0037 §3); recovery re-runs the command
+// with `recorded_token`.
+message ConflictingFormationToken {
+  string recorded_token = 1;
+}
+
+// `AddLearner` named an id already in membership at a different address; there
+// is no silent repointing (ADR 0037 §4). `existing_address` is where the id
+// is currently bound.
+message SameIdDifferentAddress {
+  string existing_address = 1;
+}
+
+// The machine-readable reason carried in a refusal Status's `details`.
+message MembershipRefusal {
+  oneof reason {
+    MachineSeatPending machine_seat_pending = 1;
+    PromotionRefused promotion_refused = 2;
+    ConflictingFormationToken conflicting_formation_token = 3;
+    SameIdDifferentAddress same_id_different_address = 4;
+  }
+}
+
+// The membership admin surface (ADR 0016; extended by ADR 0037), served over
+// mTLS (ADR 0011).
 service RaftAdminService {
   rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
   rpc PromoteVoter(PromoteVoterRequest) returns (PromoteVoterResponse);
   rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  rpc ProbeCluster(ProbeClusterRequest) returns (ProbeClusterResponse);
+  rpc InitializeCluster(InitializeClusterRequest) returns (InitializeClusterResponse);
 }

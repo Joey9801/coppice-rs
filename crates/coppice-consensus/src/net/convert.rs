@@ -13,11 +13,11 @@ use std::path::Path;
 
 use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
 use openraft::storage::SnapshotMeta;
-use openraft::BasicNode;
 
 use coppice_proto::pb::raft::v1 as pb;
 
 use crate::adapter::TypeConfig;
+use crate::membership::CoordinatorNode;
 use crate::storage::raftpb;
 use crate::CoordinatorId;
 
@@ -176,7 +176,9 @@ pub fn vote_response_from_pb(resp: pb::VoteResponse) -> io::Result<VoteResponse<
 // ---- Snapshot meta ---------------------------------------------------------
 
 /// Convert snapshot metadata into the `InstallSnapshot` header's `SnapshotIdent`.
-pub fn snapshot_ident_to_pb(meta: &SnapshotMeta<CoordinatorId, BasicNode>) -> pb::SnapshotIdent {
+pub fn snapshot_ident_to_pb(
+    meta: &SnapshotMeta<CoordinatorId, CoordinatorNode>,
+) -> pb::SnapshotIdent {
     pb::SnapshotIdent {
         last_log_id: meta.last_log_id.as_ref().map(raftpb::log_id_to_pb),
         last_membership: Some(raftpb::stored_membership_to_pb(&meta.last_membership)),
@@ -187,7 +189,7 @@ pub fn snapshot_ident_to_pb(meta: &SnapshotMeta<CoordinatorId, BasicNode>) -> pb
 /// Convert a received `SnapshotIdent` back into snapshot metadata.
 pub fn snapshot_meta_from_pb(
     ident: pb::SnapshotIdent,
-) -> io::Result<SnapshotMeta<CoordinatorId, BasicNode>> {
+) -> io::Result<SnapshotMeta<CoordinatorId, CoordinatorNode>> {
     let path = Path::new(WIRE);
     let last_log_id = ident
         .last_log_id
@@ -309,13 +311,13 @@ mod tests {
 
     #[test]
     fn snapshot_meta_roundtrips() {
-        let meta = SnapshotMeta::<CoordinatorId, BasicNode> {
+        let meta = SnapshotMeta::<CoordinatorId, CoordinatorNode> {
             last_log_id: Some(log_id(3, 1, 42)),
             last_membership: StoredMembership::new(
                 Some(log_id(3, 1, 40)),
                 Membership::new(
                     vec![BTreeSet::from([1, 2, 3])],
-                    BTreeMap::from([(1, BasicNode { addr: "a:1".into() })]),
+                    BTreeMap::from([(1, CoordinatorNode::new("a:1", "coord-1"))]),
                 ),
             ),
             snapshot_id: "0000000000000005".to_string(),
