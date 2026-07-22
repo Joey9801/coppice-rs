@@ -153,6 +153,9 @@ done
 say "coppice job status (mid-flight)"
 run "$COPPICE" job status "$JOB_ID"
 
+say "coppice job usage (mid-flight)"
+run "$COPPICE" job usage "$JOB_ID"
+
 # --- 4. Logs ----------------------------------------------------------------
 
 # Give the container a few seconds of output before the first read, so the
@@ -182,6 +185,9 @@ done
 
 say "coppice job status (final)"
 run "$COPPICE" job status "$JOB_ID"
+
+say "coppice job usage (final)"
+run "$COPPICE" job usage "$JOB_ID"
 
 if [[ "$FINAL" != "succeeded" ]]; then
   echo "job ended in state '$FINAL' (expected succeeded)" >&2
