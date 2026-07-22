@@ -328,8 +328,11 @@ a bound on watch-channel churn, no longer as protection against clone cost.
 Publishing is **instrumented**, as originally promised: a
 `coordinator_view_clone_seconds` histogram, apply-batch and
 snapshot-capture stall histograms, and state-size gauges, all behind the
-`describe_metrics()`/`gather_metrics()` module pattern awaiting the /metrics
-endpoint. The original trigger — sustained
+`describe_metrics()`/`gather_metrics()` module pattern. These are served on the
+`/metrics` endpoint mounted on the client API listener (issue #46): the recorder
+is installed at bootstrap before consensus starts, so metrics accrue from the
+first apply, and a periodic upkeep task drains the histogram buckets on a timer
+independent of scrapes. The original trigger — sustained
 `p99(coordinator_view_clone_seconds) > 25 ms`, or clone time exceeding 10%
 of the interval between publishes — stands as the regression alarm for the
 new representation, alongside the ignored release-mode test that bounds a

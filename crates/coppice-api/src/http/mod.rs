@@ -18,6 +18,7 @@ pub mod dto;
 mod error;
 mod extract;
 mod logs;
+mod metrics;
 mod project;
 mod read;
 mod routes;
@@ -26,6 +27,7 @@ mod usage;
 
 pub use error::{ErrorCode, HttpError};
 pub use extract::{IdPath, ReadIndexes, ReadQuery};
+pub use metrics::MetricsEndpoint;
 pub use read::{Consistency, ReadParams};
 pub use routes::router;
 pub use ui::ui_available;

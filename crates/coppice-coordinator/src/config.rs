@@ -202,15 +202,13 @@ pub(crate) struct ObservabilityConfig {
     #[serde(default = "default_log_format")]
     pub(crate) log_format: String,
 
-    // Parsed now; the OTLP exporter and metrics endpoint are wired in a later
-    // change.
+    // Parsed now; the OTLP exporter is wired in a later change. The Prometheus
+    // `/metrics` endpoint is already live — it rides the client API listener at
+    // `/metrics` (issue #46) rather than a separate address, so there is no
+    // coordinator metrics-address knob here.
     #[serde(default)]
     #[allow(dead_code)]
     pub(crate) otlp_endpoint: Option<String>,
-
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub(crate) metrics_addr: Option<SocketAddr>,
 }
 
 impl Default for ObservabilityConfig {
@@ -219,7 +217,6 @@ impl Default for ObservabilityConfig {
             log_level: default_log_level(),
             log_format: default_log_format(),
             otlp_endpoint: None,
-            metrics_addr: None,
         }
     }
 }
@@ -385,7 +382,6 @@ client_secret_path = "/etc/coppice/oidc-secret"
 log_level  = "info"
 log_format = "json"
 otlp_endpoint = "https://otel-collector.example.com:4317"
-metrics_addr  = "127.0.0.1:9090"
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
@@ -457,10 +453,6 @@ ca_path   = "/etc/coppice/pki/ca.crt"
             config.observability.otlp_endpoint.as_deref(),
             Some("https://otel-collector.example.com:4317")
         );
-        assert_eq!(
-            config.observability.metrics_addr,
-            Some("127.0.0.1:9090".parse().unwrap())
-        );
     }
 
     #[test]
@@ -486,7 +478,6 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         assert_eq!(config.observability.log_level, "info");
         assert_eq!(config.observability.log_format, "text");
         assert!(config.observability.otlp_endpoint.is_none());
-        assert!(config.observability.metrics_addr.is_none());
     }
 
     #[test]

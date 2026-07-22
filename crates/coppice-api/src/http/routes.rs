@@ -29,70 +29,96 @@ use crate::{Consistency, ControlPlane};
 
 use super::error::HttpError;
 use super::extract::{IdPath, ReadIndexes, ReadQuery};
+use super::metrics::MetricsEndpoint;
 
-/// Build the client-listener router around a [`ControlPlane`].
+/// Build the client-listener router around a [`ControlPlane`] and the
+/// process's metrics endpoint (issue #46).
 ///
-/// Consistency defaults per route are the ADR 0031 table; they become code
-/// (`ReadParams::class(default)`) as each read handler is implemented.
-pub fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
+/// The `/api/v1` map is [`api_v1_routes`], nested under its prefix here. The
+/// top-level `/metrics` route is deliberately **not** under `/api/v1` — it is
+/// the Prometheus scrape target, not part of the JSON API — and carries its own
+/// captured [`MetricsEndpoint`], state that is entirely separate from the
+/// `ControlPlane`. Nested-router misses under `/api/v1` fall through to the
+/// outer [`fallback`](super::ui::fallback) with the full original path intact,
+/// so `/api/*` misses still answer the JSON 404 and everything else reaches the
+/// UI, exactly as before the nesting refactor.
+pub fn router<P: ControlPlane>(plane: Arc<P>, metrics: MetricsEndpoint) -> Router {
+    // The scrape handler captures its own `Arc<MetricsEndpoint>`, so it needs no
+    // router state and composes with the `Arc<P>` state the rest of the tree
+    // carries — it is merged in before `.with_state(plane)` closes the tree.
+    let metrics = Arc::new(metrics);
+    Router::new()
+        // Prometheus scrape target (issue #46): the `/metrics` render contract
+        // lives in `super::metrics`; this only marries it to the listener.
+        .route(
+            "/metrics",
+            get(move || {
+                let metrics = Arc::clone(&metrics);
+                async move { metrics.render().await }
+            }),
+        )
+        .nest("/api/v1", api_v1_routes::<P>())
+        // Everything unrouted: `/api/*` misses stay JSON 404s; anything
+        // else serves the embedded web UI (static assets + SPA fallback,
+        // ADR 0031 "Serving the UI").
+        .fallback(super::ui::fallback)
+        .with_state(plane)
+}
+
+/// The `/api/v1` route map (ADR 0031), nested under its prefix by [`router`].
+///
+/// Every path here is written **without** the `/api/v1` prefix — [`router`]
+/// restores it with `.nest("/api/v1", …)`. Consistency defaults per route are
+/// the ADR 0031 table; they become code (`ReadParams::class(default)`) as each
+/// read handler is implemented.
+fn api_v1_routes<P: ControlPlane>() -> Router<Arc<P>> {
     Router::new()
         // Session / auth (ADR 0022) — local read, no raft involvement.
-        .route("/api/v1/session", get(unimplemented_read("GetSession")))
+        .route("/session", get(unimplemented_read("GetSession")))
         // Cluster overview — bounded reads.
-        .route("/api/v1/overview", get(get_overview::<P>))
-        .route("/api/v1/queue/stats", get(get_queue_stats::<P>))
+        .route("/overview", get(get_overview::<P>))
+        .route("/queue/stats", get(get_queue_stats::<P>))
         // Jobs. List/detail are bounded; timeline and usage are eventual
         // (derived: ring events / samples); logs are provisional until log
         // storage exists.
-        .route("/api/v1/jobs", get(list_jobs::<P>).post(submit_job::<P>))
-        .route("/api/v1/jobs/:job", get(get_job::<P>))
-        .route("/api/v1/jobs/:job/abort", post(abort_job::<P>))
-        .route("/api/v1/jobs/:job/timeline", get(get_job_timeline::<P>))
-        .route(
-            "/api/v1/jobs/:job/usage",
-            get(super::usage::get_job_usage::<P>),
-        )
-        .route(
-            "/api/v1/jobs/:job/logs",
-            get(super::logs::get_job_logs::<P>),
-        )
+        .route("/jobs", get(list_jobs::<P>).post(submit_job::<P>))
+        .route("/jobs/:job", get(get_job::<P>))
+        .route("/jobs/:job/abort", post(abort_job::<P>))
+        .route("/jobs/:job/timeline", get(get_job_timeline::<P>))
+        .route("/jobs/:job/usage", get(super::usage::get_job_usage::<P>))
+        .route("/jobs/:job/logs", get(super::logs::get_job_logs::<P>))
         // Nodes. List/detail bounded; utilization/history eventual; logs
         // provisional.
-        .route("/api/v1/nodes", get(list_nodes::<P>))
-        .route("/api/v1/nodes/:node", get(get_node::<P>))
+        .route("/nodes", get(list_nodes::<P>))
+        .route("/nodes/:node", get(get_node::<P>))
         .route(
-            "/api/v1/nodes/:node/utilization",
+            "/nodes/:node/utilization",
             get(unimplemented_id_read::<NodeId>("GetNodeUtilization")),
         )
         .route(
-            "/api/v1/nodes/:node/history",
+            "/nodes/:node/history",
             get(unimplemented_id_read::<NodeId>("GetNodeHistory")),
         )
         .route(
-            "/api/v1/nodes/:node/logs",
+            "/nodes/:node/logs",
             get(unimplemented_id_read::<NodeId>("GetNodeLogs")),
         )
         // Coordinators — local status read; logs provisional.
-        .route("/api/v1/coordinators", get(get_coordinators::<P>))
+        .route("/coordinators", get(get_coordinators::<P>))
         .route(
-            "/api/v1/coordinators/:id/logs",
+            "/coordinators/:id/logs",
             // Coordinator ids are raft ids: plain u64, not typed uuids (ADR 0024).
             get(unimplemented_id_read::<u64>("GetCoordinatorLogs")),
         )
         // Quota entities. List bounded; detail defaults strong (ADR 0007:
         // configuration reads); configure is the ADR-0023-gated upsert.
         .route(
-            "/api/v1/quota-entities",
+            "/quota-entities",
             get(list_quota_entities::<P>).post(configure_quota_entity::<P>),
         )
-        .route("/api/v1/quota-entities/:entity", get(get_quota_entity::<P>))
+        .route("/quota-entities/:entity", get(get_quota_entity::<P>))
         // Reserved: ADR 0008 event subscription (SSE, cursor-resumed).
-        .route("/api/v1/events", get(unimplemented_read("SubscribeEvents")))
-        // Everything unrouted: `/api/*` misses stay JSON 404s; anything
-        // else serves the embedded web UI (static assets + SPA fallback,
-        // ADR 0031 "Serving the UI").
-        .fallback(super::ui::fallback)
-        .with_state(plane)
+        .route("/events", get(unimplemented_read("SubscribeEvents")))
 }
 
 /// Stub for an unimplemented read route. Extracting [`ReadQuery`] makes the
@@ -538,6 +564,15 @@ mod tests {
 
     use crate::http::COPPICE_LEADER;
 
+    /// Every test builds the router with a **detached** metrics endpoint: a
+    /// non-installing recorder handle (issue #46), so `/metrics` exists but no
+    /// global recorder is touched and parallel tests in one process never
+    /// conflict. This shadows the crate [`super::router`] for the whole tests
+    /// module so every existing call site stays a single `router(plane)`.
+    fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
+        super::router(plane, crate::http::MetricsEndpoint::detached_for_tests())
+    }
+
     /// A canned `ControlPlane`: submit echoes the request's job id with a
     /// fixed log index, or fails with the configured error. Reads serve an
     /// empty state, and the derived sources serve whatever the test seeded
@@ -950,6 +985,41 @@ mod tests {
     async fn unknown_routes_get_a_json_404() {
         let response = app(None)
             .oneshot(Request::get("/api/v1/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn metrics_is_served_at_the_top_level_beside_the_nested_api() {
+        // Issue #46: the scrape target rides the same listener as `/api/v1` but
+        // is a sibling of it, not nested under it. A detached recorder means the
+        // body may be empty here — the point is the route exists and answers the
+        // Prometheus content type.
+        let response = app(None)
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/plain; version=0.0.4"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_is_not_reachable_under_the_api_prefix() {
+        // `/api/v1/metrics` is not a route: it must fall through to the JSON 404
+        // (an `/api/*` miss), proving `/metrics` was mounted top-level and the
+        // nest did not accidentally absorb it.
+        let response = app(None)
+            .oneshot(Request::get("/api/v1/metrics").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

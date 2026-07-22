@@ -497,12 +497,19 @@ fn map_consensus_error(e: ConsensusError) -> ApiError {
 /// [`ControlPlane`] and the runtime's shutdown order. Most read routes are
 /// `UNIMPLEMENTED` stubs until their endpoints land — implementing one
 /// swaps a stub handler in `coppice-api`, not anything here.
+///
+/// The same listener also serves the Prometheus `/metrics` scrape target
+/// (issue #46): the runtime installs the recorder once at startup and passes
+/// its [`MetricsEndpoint`](coppice_api::http::MetricsEndpoint) here, so the
+/// coordinator has no separate metrics port — the endpoint rides the client
+/// API edge.
 pub async fn run<C: Consensus>(
     listener: crate::bootstrap::ClientListener,
     control_plane: Arc<CoordinatorControlPlane<C>>,
+    metrics: coppice_api::http::MetricsEndpoint,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let app = coppice_api::http::router(control_plane);
+    let app = coppice_api::http::router(control_plane, metrics);
     let graceful = async move {
         let _ = shutdown.wait_for(|s| *s).await;
     };

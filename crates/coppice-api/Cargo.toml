@@ -12,6 +12,11 @@ authors.workspace = true
 axum.workspace = true
 coppice-core.workspace = true
 coppice-state.workspace = true
+# The `/metrics` endpoint (issue #46): renders the process's Prometheus
+# recorder. The facade for the same, so the test-only local recorder can be
+# built without a global install.
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 mime_guess.workspace = true
 rust-embed.workspace = true
 serde.workspace = true

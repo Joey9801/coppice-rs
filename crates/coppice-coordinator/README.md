@@ -56,8 +56,10 @@ CLI surface ([`cli`](src/cli.rs)) is correspondingly tiny: `--config` plus the
 startup-intent flags `--bootstrap` / `--join`. See
 [configuration](../../docs/operations/configuration.md).
 
-Some parsed fields (SSO, the client API address, OTLP/metrics endpoints) are read
-now but consumed by later changes; they are marked as such in the source.
+The Prometheus `/metrics` endpoint is now served on the client API listener at
+`/metrics` (issue #46), alongside `/api/v1` — there is no dedicated coordinator
+metrics address. Of the parsed observability settings, `otlp_endpoint` is the
+remaining one read but not yet consumed (marked as such in the source).
 
 ## Bootstrap, membership, and rebuild
 

@@ -384,10 +384,10 @@ a bounded set of in-flight section buffers.
 apply-stall measurement to trigger the structural-sharing escape hatch; those
 metrics are not implemented.~~ **Resolved 2026-07-10.** The histogram,
 apply-batch and snapshot-capture/build stall timings, and state-size gauges
-exist behind the `describe_metrics()`/`gather_metrics()` module pattern; a
-/metrics endpoint to export them is still future work. The million-job tests
-remain ignored in the normal test suite, and no release-mode performance job
-runs them — this half stays open.
+exist behind the `describe_metrics()`/`gather_metrics()` module pattern and are
+now exported on the `/metrics` endpoint served on the client API listener (issue
+#46). The million-job tests remain ignored in the normal test suite, and no
+release-mode performance job runs them — this half stays open.
 
 ~~Applying a proposal at target scale stalls serial apply on its own, before
 any publication cost: `free_capacity` scanned every allocation, so a full

@@ -118,6 +118,7 @@ fn agent_config(
         image_cache: Default::default(),
         telemetry: Default::default(),
         listen: None,
+        metrics_addr: None,
     }
 }
 
@@ -441,7 +442,10 @@ async fn best_effort_job_logs_full_read_path() {
         CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
             .with_log_client(log_client),
     );
-    let router = coppice_api::http::router(plane);
+    let router = coppice_api::http::router(
+        plane,
+        coppice_api::http::MetricsEndpoint::detached_for_tests(),
+    );
 
     // -- 1. Content + order + `available`, in one ascending page. ----------
     let (status, body) = get_logs(&router, job, "order=asc&limit=200").await;
@@ -536,10 +540,13 @@ async fn best_effort_job_logs_full_read_path() {
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
     ));
-    let router2 = coppice_api::http::router(Arc::new(
-        CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
-            .with_log_client(log_client2),
-    ));
+    let router2 = coppice_api::http::router(
+        Arc::new(
+            CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
+                .with_log_client(log_client2),
+        ),
+        coppice_api::http::MetricsEndpoint::detached_for_tests(),
+    );
     let (status, body) = get_logs(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.entries.is_empty());
@@ -708,7 +715,10 @@ async fn follower_serves_job_logs_directly() {
         CoordinatorControlPlane::new(follower_a.consensus(), follower_a.views(), cluster_id)
             .with_log_client(log_client),
     );
-    let follower_router = coppice_api::http::router(follower_plane);
+    let follower_router = coppice_api::http::router(
+        follower_plane,
+        coppice_api::http::MetricsEndpoint::detached_for_tests(),
+    );
 
     let applied_before = follower_a.views().latest().applied_index();
     let (status, served_applied_index, body) =

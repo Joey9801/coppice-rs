@@ -129,6 +129,7 @@ fn agent_config(
         image_cache: Default::default(),
         telemetry: Default::default(),
         listen: None,
+        metrics_addr: None,
     }
 }
 
@@ -520,7 +521,10 @@ async fn best_effort_job_usage_full_read_path() {
         CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
             .with_log_client(node_client),
     );
-    let router = coppice_api::http::router(plane);
+    let router = coppice_api::http::router(
+        plane,
+        coppice_api::http::MetricsEndpoint::detached_for_tests(),
+    );
 
     // -- 1. Exact round-trip, ascending default order, two `available`. ----
     let (status, body) = get_usage(&router, job, "order=asc&limit=200").await;
@@ -640,10 +644,13 @@ async fn best_effort_job_usage_full_read_path() {
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
     ));
-    let router2 = coppice_api::http::router(Arc::new(
-        CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
-            .with_log_client(node_client2),
-    ));
+    let router2 = coppice_api::http::router(
+        Arc::new(
+            CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
+                .with_log_client(node_client2),
+        ),
+        coppice_api::http::MetricsEndpoint::detached_for_tests(),
+    );
     let (status, body) = get_usage(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.samples.is_empty());

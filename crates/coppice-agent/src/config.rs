@@ -109,6 +109,16 @@ pub struct Config {
     /// advertises the derived address so coordinators can dial it for job logs.
     #[serde(default)]
     pub listen: Option<ListenConfig>,
+
+    /// The address the agent's Prometheus `/metrics` server binds (issue #46).
+    /// Optional and absent by default, mirroring [`listen`](Self::listen): an
+    /// agent with no `metrics_addr` starts no metrics server. Unlike the
+    /// `NodeService` listener this is a plain, unauthenticated HTTP endpoint (a
+    /// scrape target, never a control surface), so it is a bare `SocketAddr`
+    /// rather than a table — nothing here needs advertising or TLS. When set,
+    /// the server binds eagerly at startup (fail-fast on a port conflict).
+    #[serde(default)]
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 /// Bind/advertise addresses for the agent-hosted `NodeService` listener
@@ -552,6 +562,7 @@ impl Config {
             image_cache = ?self.image_cache,
             telemetry = ?self.telemetry,
             service_addr = ?self.service_addr(),
+            metrics_addr = ?self.metrics_addr,
             "effective agent configuration"
         );
     }
@@ -711,6 +722,7 @@ mod tests {
 node_id = "node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice-agent"
 coordinators = ["coord-1.example.com:7072", "coord-2.example.com:7072"]
+metrics_addr = "127.0.0.1:9464"
 
 heartbeat_interval = "5s"
 reconnect_backoff_min = "250ms"
@@ -872,6 +884,8 @@ disk       = "100GiB"
             config.service_addr().as_deref(),
             Some("node-3.batch.example.com:7085")
         );
+        // The optional Prometheus scrape address (issue #46).
+        assert_eq!(config.metrics_addr, Some("127.0.0.1:9464".parse().unwrap()));
     }
 
     #[test]
@@ -883,6 +897,8 @@ disk       = "100GiB"
             "no [listen] table ⇒ no hosted service"
         );
         assert_eq!(config.service_addr(), None, "nothing advertised");
+        // No `metrics_addr` ⇒ no metrics server (issue #46).
+        assert_eq!(config.metrics_addr, None, "no metrics server");
     }
 
     #[test]

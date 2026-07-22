@@ -16,12 +16,21 @@ coppice-net.workspace = true
 # through it so the crash harness can hammer it (ADR 0009).
 coppice-consensus.workspace = true
 anyhow.workspace = true
+# Serves the agent's optional Prometheus `/metrics` scrape endpoint (issue #46);
+# a single-route axum router in `metrics_server`, the same 0.7 stack the rest of
+# the workspace uses.
+axum.workspace = true
 bollard.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 crc32c.workspace = true
 humantime-serde.workspace = true
 metrics.workspace = true
+# Installs the process-wide Prometheus recorder at startup and renders it at
+# `/metrics` (issue #46). Deliberately not via a `coppice-api` dependency: that
+# would drag its `coppice-state`/`rust-embed` (embedded web UI) tree into the
+# agent, so `metrics_server` duplicates the ~30-line handler instead.
+metrics-exporter-prometheus.workspace = true
 nix.workspace = true
 prost.workspace = true
 serde.workspace = true
@@ -38,6 +47,9 @@ uuid.workspace = true
 [dev-dependencies]
 coppice-testkit.workspace = true
 metrics-util.workspace = true
+# `tower::ServiceExt::oneshot` drives the `/metrics` router in-process (issue
+# #46), scraping it without binding a real socket.
+tower.workspace = true
 # The in-process NodeService mTLS integration test mints a throwaway CA and
 # dual-EKU leaves (a dNSName SAN of the node id) to prove id-pinned dialing and
 # mandatory client certs (ADR 0034), mirroring `coppice dev`'s PKI.

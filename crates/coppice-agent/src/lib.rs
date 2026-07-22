@@ -12,6 +12,7 @@
 pub mod config;
 pub mod executor;
 pub mod journal;
+pub mod metrics_server;
 pub mod node_service;
 pub mod observed;
 pub mod pressure;
@@ -23,10 +24,12 @@ use coppice_consensus::fs::RealFs;
 use coppice_proto::pb::core::v1 as pbcore;
 
 /// Register descriptions for every metric the agent process can emit, recursing
-/// into each module that exposes metrics (docker-executor.md §8.1). The future
-/// /metrics endpoint calls this once after installing its recorder, without
-/// knowing any module's internals; [`run_daemon`] also calls it at startup so
-/// descriptions exist even before the endpoint lands.
+/// into each module that exposes metrics (docker-executor.md §8.1). The
+/// optional `/metrics` server (issue #46, [`metrics_server`]) calls this once
+/// after [`run_daemon`] installs the Prometheus recorder, without knowing any
+/// module's internals. [`run_daemon`] calls it at startup regardless — even
+/// with no `metrics_addr` configured (no server), the descriptions are cheap
+/// and harmless.
 pub fn describe_metrics() {
     executor::docker::describe_metrics();
     telemetry::describe_metrics();
@@ -34,12 +37,53 @@ pub fn describe_metrics() {
 }
 
 /// Run any point-in-time sampling behind agent metrics, recursing the same
-/// modules as [`describe_metrics`]. The /metrics endpoint calls this
+/// modules as [`describe_metrics`]. The `/metrics` server calls this
 /// immediately before rendering each scrape.
 pub fn gather_metrics() {
     executor::docker::gather_metrics();
     telemetry::gather_metrics();
     node_service::gather_metrics();
+}
+
+/// How often the detached upkeep task drains the recorder's histogram buckets.
+/// Matches the exporter's own default upkeep timeout in its `install` path (and
+/// the coordinator's `install_metrics_recorder`), so a scrape never sees buckets
+/// older than this regardless of scrape cadence.
+const METRICS_UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Install the process-wide Prometheus recorder and return its scrape handle
+/// (issue #46).
+///
+/// [`run_daemon`] calls this once, before any counter is emitted. On success it
+/// describes every agent metric ([`describe_metrics`]) and spawns a detached
+/// task that runs `run_upkeep` on a fixed [`METRICS_UPKEEP_INTERVAL`], so the
+/// histogram buckets drain on a timer whether or not anything scrapes — the
+/// recorder records from startup even when no `metrics_addr` is configured.
+///
+/// `set_global_recorder` is a once-per-process operation: a lost race means a
+/// recorder was already installed, which is a startup bug that must fail rather
+/// than warn-and-continue. **Must be called from within a Tokio runtime** — it
+/// `tokio::spawn`s the upkeep task ([`run_daemon`] is `async`). `coppice dev`
+/// does not call this: it installs one shared recorder via the coordinator's
+/// helper and describes the agent tree explicitly.
+fn install_metrics_recorder() -> Result<metrics_exporter_prometheus::PrometheusHandle> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::set_global_recorder(recorder)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("a metrics recorder was already installed in this process")?;
+    describe_metrics();
+    let upkeep_handle = handle.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(METRICS_UPKEEP_INTERVAL);
+        loop {
+            // `interval` ticks immediately on its first `tick`; upkeep on a
+            // fresh recorder is a no-op, so that first tick is harmless.
+            ticker.tick().await;
+            upkeep_handle.run_upkeep();
+        }
+    });
+    Ok(handle)
 }
 
 /// Run the agent daemon from its config file: recover the journal, build the
@@ -52,10 +96,14 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     let config = config::load(config_path)?;
     config.log_effective();
 
-    // Register metric descriptions once at startup (§8.1). The agent has no
-    // /metrics endpoint yet, so this is the sole call site for now; when the
-    // endpoint lands it calls the same fan-out after installing its recorder.
-    describe_metrics();
+    // Install the process-wide Prometheus recorder before any counter is
+    // emitted, so the descriptions (§8.1) and every counter after land in the
+    // recorder the `/metrics` server renders (issue #46). This also describes
+    // every metric and spawns the periodic upkeep task. Keep its handle for the
+    // server below. The server itself is bound later, only when `metrics_addr`
+    // is configured, but the recorder is installed unconditionally so metrics
+    // accrue (and upkeep drains histograms) from the start regardless.
+    let metrics_handle = install_metrics_recorder()?;
 
     // The journal lives directly under the data directory; anchor RealFs there.
     std::fs::create_dir_all(&config.data_dir)
@@ -156,6 +204,19 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
             telemetry.log_store.clone(),
             telemetry.metric_store.clone(),
         );
+    }
+
+    // Bind and serve the Prometheus `/metrics` server when configured (issue
+    // #46), eagerly like the NodeService listener so a port conflict fails the
+    // daemon here rather than after registration. Absent `metrics_addr` = no
+    // server (the recorder still runs; nothing scrapes it) — a legitimate
+    // posture for an agent whose metrics are pulled another way or not at all.
+    if let Some(metrics_addr) = config.metrics_addr {
+        let listener = metrics_server::prepare_listener(metrics_addr)
+            .await
+            .context("binding the metrics server listener")?;
+        tracing::info!(%metrics_addr, "Prometheus metrics server bound at /metrics (issue #46)");
+        metrics_server::serve(listener, metrics_handle, gather_metrics);
     }
 
     let session = session::Session::new(

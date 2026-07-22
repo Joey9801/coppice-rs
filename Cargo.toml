@@ -145,10 +145,21 @@ tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
 # Metric emission facade. Each module that exposes metrics defines
 # `describe_metrics()` (describe_* calls plus recursion into submodules) and
-# `gather_metrics()` (point-in-time sampling plus the same recursion), so a
-# future /metrics endpoint (metrics-exporter-prometheus behind the public API)
-# only calls the crate roots without knowing any module's internals.
+# `gather_metrics()` (point-in-time sampling plus the same recursion), so the
+# /metrics endpoint (metrics-exporter-prometheus behind the public API) only
+# calls the crate roots without knowing any module's internals. That endpoint
+# is now wired (issue #46): the coordinator installs the Prometheus recorder at
+# startup and serves `/metrics` on the client API listener (ADR 0031); the
+# agent serves it on its own optional `metrics_addr`. See
+# `coppice_api::http::metrics`.
 metrics = "0.24"
+# The production Prometheus recorder behind `/metrics` (issue #46). Only the
+# recorder + `PrometheusHandle::render` are used — `default-features = false`
+# drops the crate's bundled hyper HTTP listener and push-gateway machinery, as
+# the endpoint rides the crate's own axum routers. 0.16 tracks the `metrics`
+# 0.24 pin above (a mismatched pair would install a recorder the facade's
+# global slot cannot see).
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # Test-only: a thread-local `DebuggingRecorder` so unit tests can assert exact
 # counter values (`agent_telemetry_*`) without a global exporter. Only the
 # `debugging` feature is needed; kept in lockstep with the `metrics` pin above.
