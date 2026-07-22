@@ -25,9 +25,71 @@ use crate::tasks::{
     agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver,
 };
 
+/// How often the detached upkeep task drains the recorder's histogram buckets.
+/// Matches the exporter's own default upkeep timeout in its `install` path, so
+/// a scrape never sees buckets older than this regardless of scrape cadence.
+const METRICS_UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Install the process-wide Prometheus recorder and return its scrape handle
+/// (issue #46).
+///
+/// The embedder that owns the process lifecycle calls this once, before any
+/// task emits a metric, and hands the returned handle to every `/metrics`
+/// endpoint it serves. On success this describes every coordinator metric
+/// ([`crate::describe_metrics`]) and spawns a detached task that runs
+/// `run_upkeep` on a fixed [`METRICS_UPKEEP_INTERVAL`], so histogram buckets
+/// drain on a timer rather than only when something scrapes — the recorder
+/// records from the first apply whether or not any scraper is connected.
+///
+/// `set_global_recorder` is a once-per-process operation: installing a second
+/// recorder in the same process is a startup bug (a real daemon and `coppice
+/// dev` each install exactly one), so a lost race is a hard error, not a
+/// warning. The integration tests never call this — they build detached
+/// endpoints ([`MetricsEndpoint::detached_for_tests`](coppice_api::http::MetricsEndpoint::detached_for_tests))
+/// and local recorders instead.
+///
+/// **Must be called from within a Tokio runtime**: it `tokio::spawn`s the
+/// upkeep task. Both callers (`bootstrap::run` and `dev::run`) are `async`, so
+/// this holds even though the function itself is synchronous.
+///
+/// The returned [`PrometheusHandle`](metrics_exporter_prometheus::PrometheusHandle)
+/// is `Clone`, so one install can feed several scrape endpoints — as `coppice
+/// dev` does, sharing this handle between its coordinator- and agent-side
+/// `/metrics` routes.
+pub fn install_metrics_recorder() -> anyhow::Result<metrics_exporter_prometheus::PrometheusHandle> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::set_global_recorder(recorder)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("a metrics recorder was already installed in this process")?;
+    crate::describe_metrics();
+    spawn_upkeep(handle.clone());
+    Ok(handle)
+}
+
+/// Spawn the detached task that drains the recorder's histogram buckets on a
+/// fixed interval (issue #46), independent of scrapes. `tokio::time::interval`
+/// ticks immediately on its first `tick`, which is harmless — an upkeep on a
+/// fresh recorder is a no-op.
+fn spawn_upkeep(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(METRICS_UPKEEP_INTERVAL);
+        loop {
+            ticker.tick().await;
+            handle.run_upkeep();
+        }
+    });
+}
+
 /// Wire up and run every coordinator task.
 ///
 /// Returns once shutdown has fully drained.
+///
+/// `metrics` is the `/metrics` endpoint the API server hosts on the client
+/// listener (issue #46); the caller builds it over a recorder it installed with
+/// [`install_metrics_recorder`], so the runtime never touches the process-global
+/// recorder slot itself (that lets `coppice dev` install one shared recorder for
+/// its co-hosted coordinator and agent).
 ///
 /// `external_shutdown` selects how the runtime is stopped. `None` is the
 /// daemon path: the runtime owns its own shutdown watch and flips it from the
@@ -46,6 +108,7 @@ pub async fn run<C>(
     client_listener: ClientListener,
     cluster_id: ClusterId,
     node_log_client: Arc<NodeClient>,
+    metrics: coppice_api::http::MetricsEndpoint,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -53,6 +116,7 @@ where
 {
     let consensus = Arc::new(consensus);
     let status = consensus.status();
+
     // The daemon path owns the watch and drives it from signals; a test passes
     // its own receiver and keeps the sender, so `signal_tx` is `None` and no
     // signal handler is installed.
@@ -130,6 +194,7 @@ where
     let api_join = tokio::spawn(api_server::run(
         client_listener,
         control_plane,
+        metrics,
         shutdown_rx.clone(),
     ));
     tracing::debug!("runtime: API server up");

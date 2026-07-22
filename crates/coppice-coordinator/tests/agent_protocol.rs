@@ -122,6 +122,7 @@ fn agent_config(
         // This protocol test exercises the session plane only, not the
         // agent-hosted NodeService (ADR 0034), so no listener is configured.
         listen: None,
+        metrics_addr: None,
     }
 }
 

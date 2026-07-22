@@ -20,6 +20,9 @@ anyhow.workspace = true
 # The fanout's `proposer_skew` histogram (ADR 0032), registered through the
 # same describe/gather pattern as `coppice-consensus`.
 metrics.workspace = true
+# Installs the process-wide Prometheus recorder at startup and hands its
+# handle to the `/metrics` endpoint on the client API listener (issue #46).
+metrics-exporter-prometheus.workspace = true
 # Serves the `coppice_api::http` router on the client listener (ADR 0031).
 axum.workspace = true
 clap.workspace = true

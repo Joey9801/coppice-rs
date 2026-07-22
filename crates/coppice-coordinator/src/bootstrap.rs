@@ -81,6 +81,18 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     tracing::info!("coppice-coordinator starting");
 
+    // Install the process-wide Prometheus recorder here (issue #46), BEFORE
+    // `bootstrap` starts consensus: consensus emits counters/gauges/histograms
+    // from its first apply, so the recorder must already exist or those startup
+    // metrics land in no recorder and are lost. This also builds the `/metrics`
+    // endpoint the API server hosts on the client listener. The daemon owns this
+    // process, so it owns the once-per-process recorder install (`runtime::run`
+    // itself no longer touches the global slot); a lost race fails startup.
+    let metrics = coppice_api::http::MetricsEndpoint::new(
+        crate::install_metrics_recorder()?,
+        crate::gather_metrics,
+    );
+
     // Bind the agent gateway listener early (fail-fast on a port conflict),
     // before consensus starts. Only the daemon path binds it — the integration
     // test drives `bootstrap` directly and runs several replicas in one
@@ -111,6 +123,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         client_listener,
         cluster_id,
         node_log_client,
+        metrics,
         None,
     )
     .await?;
@@ -144,11 +157,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
 /// seam.
 ///
 /// `runtime::run` takes ownership of a `Consensus`; the wrapper delegates to
-/// the shared [`Arc`] so the admin service keeps its own reference. `shutdown`
-/// selects the stop mechanism: `None` lets the runtime install its own
-/// signal handler (the daemon path); `Some(rx)` hands it a caller-owned trigger
-/// so an integration test can drive [`bootstrap`] and this runtime directly and
-/// shut them down without raising a real signal.
+/// the shared [`Arc`] so the admin service keeps its own reference. `metrics`
+/// is the client-listener `/metrics` endpoint the caller built over a recorder
+/// it installed with [`crate::install_metrics_recorder`] (issue #46) — passed
+/// through so `coppice dev` can hand its co-hosted coordinator and agent one
+/// shared recorder. `shutdown` selects the stop mechanism: `None` lets the
+/// runtime install its own signal handler (the daemon path); `Some(rx)` hands
+/// it a caller-owned trigger so an integration test can drive [`bootstrap`] and
+/// this runtime directly and shut them down without raising a real signal.
 #[allow(clippy::too_many_arguments)] // thin wiring seam over `runtime::run`
 pub async fn serve_runtime(
     consensus: Arc<OpenraftConsensus>,
@@ -159,6 +175,7 @@ pub async fn serve_runtime(
     client_listener: ClientListener,
     cluster_id: ClusterId,
     node_log_client: Arc<NodeClient>,
+    metrics: coppice_api::http::MetricsEndpoint,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -170,6 +187,7 @@ pub async fn serve_runtime(
         client_listener,
         cluster_id,
         node_log_client,
+        metrics,
         shutdown,
     )
     .await

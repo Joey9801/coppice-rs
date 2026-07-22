@@ -463,6 +463,9 @@ log_level = "warn"
             .expect("bind client API listener");
 
         let (runtime_shutdown, shutdown_rx) = watch::channel(false);
+        // A detached (non-installing) recorder, so several replicas in one test
+        // process never race on the process-global recorder slot (issue #46).
+        let metrics = coppice_api::http::MetricsEndpoint::detached_for_tests();
         let runtime_join = tokio::spawn(bootstrap::serve_runtime(
             Arc::clone(&consensus),
             views.clone(),
@@ -472,6 +475,7 @@ log_level = "warn"
             client_listener,
             cluster_id,
             node_log_client,
+            metrics,
             Some(shutdown_rx),
         ));
 

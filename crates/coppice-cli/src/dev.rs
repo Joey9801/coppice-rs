@@ -68,6 +68,12 @@ pub struct DevArgs {
     #[arg(long, default_value_t = 0)]
     node_service_port: u16,
 
+    /// Agent Prometheus `/metrics` port (0 picks a free one; logged at
+    /// startup). Dev serves the agent scrape endpoint here (issue #46); the
+    /// coordinator's `/metrics` rides the client API port instead.
+    #[arg(long, default_value_t = 0)]
+    metrics_port: u16,
+
     /// Executor backing the in-process agent. `fake` runs the lifecycle
     /// without containers (and captures no logs); `docker` is the production
     /// executor and needs a reachable Docker daemon.
@@ -186,6 +192,20 @@ fn resolve_port(requested: u16) -> Result<u16> {
     Ok(listener.local_addr().context("local addr")?.port())
 }
 
+/// Sample every metric tree the dev cluster's single global recorder holds
+/// (issue #46).
+///
+/// A one-process dev cluster has exactly one global Prometheus recorder, so
+/// every scrape endpoint — the coordinator's on the client listener and the
+/// agent's own — renders the union of both daemons' metrics. A scrape must
+/// therefore sample BOTH trees before rendering, unlike production where each
+/// daemon owns its own recorder and gathers only its own tree. This is the
+/// shared `gather` behind both dev `/metrics` endpoints.
+fn dev_gather() {
+    coppice_coordinator::gather_metrics();
+    coppice_agent::gather_metrics();
+}
+
 pub async fn run(args: DevArgs) -> Result<()> {
     // -- Layout: everything under one root. --------------------------------
     let (root, _tempdir) = match &args.data_dir {
@@ -224,6 +244,16 @@ pub async fn run(args: DevArgs) -> Result<()> {
     let agent_port = resolve_port(args.agent_port)?;
     let client_port = resolve_port(args.client_port)?;
     let node_service_port = resolve_port(args.node_service_port)?;
+    let metrics_port = resolve_port(args.metrics_port)?;
+
+    // Install the one process-wide Prometheus recorder this dev cluster shares
+    // (issue #46). `coppice dev` runs a coordinator AND an agent in one process,
+    // so there is a single global recorder: install it here, describe both
+    // daemons' metric trees into it (the coordinator helper describes the
+    // coordinator tree; the agent's is described explicitly), and hand the one
+    // handle to every `/metrics` endpoint below.
+    let metrics_handle = coppice_coordinator::install_metrics_recorder()?;
+    coppice_agent::describe_metrics();
 
     // -- Coordinator: the production config + bootstrap path. --------------
     let coord_data = root.join("coordinator");
@@ -309,6 +339,9 @@ ca_path = "{ca}"
         client_listener,
         cluster_id,
         node_log_client,
+        // The coordinator's `/metrics` on the client listener renders over the
+        // shared recorder; `dev_gather` samples BOTH daemons' trees (issue #46).
+        coppice_api::http::MetricsEndpoint::new(metrics_handle.clone(), dev_gather),
         Some(shutdown_rx),
     ));
 
@@ -358,7 +391,30 @@ ca_path = "{ca}"
                 .expect("node service socket addr"),
             advertise_host: "127.0.0.1".to_string(),
         }),
+        // The agent's Prometheus `/metrics` endpoint (issue #46): bind
+        // 127.0.0.1:<port> so dev mirrors production's two-endpoint shape (agent
+        // scrape here, coordinator scrape on the client listener). Bound and
+        // served below over the shared recorder, mirroring how `listen` is bound
+        // by `serve_node_service`.
+        metrics_addr: Some(
+            format!("127.0.0.1:{metrics_port}")
+                .parse()
+                .expect("agent metrics socket addr"),
+        ),
     };
+
+    // Bind and serve the agent's `/metrics` endpoint before the executor match
+    // moves `agent_config` into the session task (issue #46). Both dev scrape
+    // URLs — this one and the coordinator's client-listener `/metrics` — share
+    // the SAME recorder handle and `dev_gather`, so both render the identical
+    // union of coordinator + agent metrics; the second endpoint exists only so
+    // dev exercises the real agent scrape path, not because the views differ.
+    if let Some(metrics_addr) = agent_config.metrics_addr {
+        let listener = coppice_agent::metrics_server::prepare_listener(metrics_addr)
+            .await
+            .context("binding the dev agent metrics server")?;
+        coppice_agent::metrics_server::serve(listener, metrics_handle.clone(), dev_gather);
+    }
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
     // happens per concrete executor type rather than in a generic helper. The
     // second tuple element holds the telemetry handle (Docker executor only)
@@ -467,6 +523,7 @@ ca_path = "{ca}"
             agent_port,
             client_port,
             node_service_port,
+            metrics_port,
             ui_available: coppice_api::http::ui_available(),
             quota_entity,
             executor: args.executor,
@@ -669,6 +726,7 @@ struct ReadySummary<'a> {
     agent_port: u16,
     client_port: u16,
     node_service_port: u16,
+    metrics_port: u16,
     ui_available: bool,
     quota_entity: QuotaEntityId,
     executor: DevExecutor,
@@ -689,6 +747,8 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
          \x20 Raft/admin      https://localhost:{raft_port} (mTLS)\n\
          \x20 Agent gateway   https://localhost:{agent_port} (mTLS)\n\
          \x20 Node service    127.0.0.1:{node_service_port} (mTLS; agent job logs)\n\
+         \x20 Metrics (coord) http://127.0.0.1:{client_port}/metrics\n\
+         \x20 Metrics (agent) http://127.0.0.1:{metrics_port}/metrics\n\
          \x20 Data            {data_dir} ({data_lifetime})\n\
          \x20 Executor        {executor}\n\
          \x20 Cluster         {cluster_id} (Raft node {coordinator_raft_id})\n\
@@ -706,6 +766,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
         agent_port = summary.agent_port,
         client_port = summary.client_port,
         node_service_port = summary.node_service_port,
+        metrics_port = summary.metrics_port,
         data_dir = summary.root.display(),
         executor = summary.executor,
         cluster_id = summary.cluster_id,
@@ -737,6 +798,7 @@ mod tests {
             agent_port: 7072,
             client_port: 7070,
             node_service_port: 7073,
+            metrics_port: 7074,
             ui_available: false,
             quota_entity: DEV_QUOTA_ENTITY.parse().expect("quota entity id"),
             executor: DevExecutor::Fake,
@@ -748,6 +810,8 @@ mod tests {
         assert!(summary.contains("Raft/admin      https://localhost:7071 (mTLS)"));
         assert!(summary.contains("Agent gateway   https://localhost:7072 (mTLS)"));
         assert!(summary.contains("Node service    127.0.0.1:7073 (mTLS; agent job logs)"));
+        assert!(summary.contains("Metrics (coord) http://127.0.0.1:7070/metrics"));
+        assert!(summary.contains("Metrics (agent) http://127.0.0.1:7074/metrics"));
         assert!(summary.contains("/tmp/coppice-dev (temporary; deleted on exit)"));
         assert!(summary.contains(
             "Agent           node-00000000-0000-0000-0000-000000000002 (registered, epoch 1)"

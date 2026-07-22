@@ -634,6 +634,7 @@ name = "coppice-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "axum",
  "bollard",
  "bytes",
  "chrono",
@@ -645,6 +646,7 @@ dependencies = [
  "crc32c",
  "humantime-serde",
  "metrics",
+ "metrics-exporter-prometheus",
  "metrics-util",
  "nix",
  "prost",
@@ -658,6 +660,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower 0.5.3",
  "tracing",
  "uuid",
 ]
@@ -669,6 +672,8 @@ dependencies = [
  "axum",
  "coppice-core",
  "coppice-state",
+ "metrics",
+ "metrics-exporter-prometheus",
  "mime_guess",
  "rust-embed",
  "serde",
@@ -746,6 +751,7 @@ dependencies = [
  "coppice-state",
  "humantime-serde",
  "metrics",
+ "metrics-exporter-prometheus",
  "rcgen",
  "serde",
  "serde_json",
@@ -2041,6 +2047,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics-exporter-prometheus"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd7399781913e5393588a8d8c6a2867bf85fb38eaf2502fdce465aad2dc6f034"
+dependencies = [
+ "base64",
+ "indexmap 2.14.0",
+ "metrics",
+ "metrics-util",
+ "quanta",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "metrics-util"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2052,6 +2072,7 @@ dependencies = [
  "indexmap 2.14.0",
  "metrics",
  "ordered-float",
+ "quanta",
  "rand 0.9.4",
  "rand_xoshiro",
  "sketches-ddsketch",
@@ -2622,6 +2643,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "quanta"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
+dependencies = [
+ "crossbeam-utils",
+ "libc",
+ "once_cell",
+ "raw-cpuid",
+ "wasi",
+ "web-sys",
+ "winapi",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2820,6 +2856,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags",
 ]
 
 [[package]]

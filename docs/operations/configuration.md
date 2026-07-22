@@ -121,8 +121,12 @@ client_secret_path = "/etc/coppice/oidc-secret"
 log_level  = "info"
 log_format = "json"
 otlp_endpoint = "https://otel-collector.example.com:4317"
-metrics_addr  = "127.0.0.1:9090"
 ```
+
+The coordinator's Prometheus `/metrics` endpoint has no address of its own:
+it is served on the client API listener at `/metrics` (issue #46), alongside
+`/api/v1`, so there is no coordinator `metrics_addr` knob. (The agent daemon,
+which has no such listener, keeps its own optional `metrics_addr`.)
 
 The agent's file follows the same conventions with its own schema
 (coordinator endpoints, enrollment token path, image-cache and workdir

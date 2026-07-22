@@ -41,10 +41,23 @@ pub use tasks::api_server::CoordinatorControlPlane;
 // `bootstrap::BootedCoordinator::node_log_client`.
 pub use tasks::node_client::NodeClient;
 
+// The process-wide Prometheus recorder install (issue #46). Re-exported from
+// the otherwise-private `runtime` module so an embedder that owns the process
+// lifecycle — the daemon `bootstrap::run`, and `coppice dev`, which runs a
+// coordinator and an agent in ONE process off a single shared recorder — can
+// install it once and hand the returned handle to every `/metrics` endpoint.
+pub use runtime::install_metrics_recorder;
+
 /// Register descriptions for every metric a coordinator process can emit,
-/// recursing into each crate and module that exposes metrics. The future
-/// /metrics endpoint (ADR 0020's `observability.metrics_addr`) calls this
-/// once after installing its recorder, without knowing any module's internals.
+/// recursing into each crate and module that exposes metrics. The `/metrics`
+/// endpoint (issue #46) — served on the client API listener at `/metrics`, not
+/// a dedicated port — calls this once as [`install_metrics_recorder`] installs
+/// the Prometheus recorder, without knowing any module's internals.
+///
+/// There is deliberately no coordinator metrics-address config knob: the
+/// endpoint rides the existing client listener rather than a separate address,
+/// so of ADR 0020's `[observability]` fields only `otlp_endpoint` stays
+/// parsed-but-unused.
 pub fn describe_metrics() {
     coppice_consensus::describe_metrics();
     tasks::event_fanout::describe_metrics();
@@ -52,7 +65,7 @@ pub fn describe_metrics() {
 }
 
 /// Run any point-in-time sampling behind coordinator metrics, recursing the
-/// same modules as [`describe_metrics`]. The /metrics endpoint calls this
+/// same modules as [`describe_metrics`]. The `/metrics` endpoint calls this
 /// immediately before rendering each scrape.
 pub fn gather_metrics() {
     coppice_consensus::gather_metrics();
