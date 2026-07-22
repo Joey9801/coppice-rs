@@ -1,10 +1,12 @@
 # Deployment story: plan
 
-Status: **plan**, written 2026-07-10. This is the working plan for making
-both control-plane and compute deployment operable with minimal human
-ceremony. Decisions that need settling before implementation are registered
-as [OD-14 and OD-15](open-decisions.md); once settled they become ADRs and
-this doc is updated to describe the then-current intent.
+Status: **plan**, written 2026-07-10; Part 1 updated 2026-07-22. This is
+the working plan for making both control-plane and compute deployment
+operable with minimal human ceremony. The coordinator half is now decided:
+[OD-14](open-decisions.md) is resolved by
+[ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md),
+and Part 1 below describes that settled intent awaiting implementation.
+The agent half ([OD-15](open-decisions.md)) remains open.
 
 Two goals, one per audience:
 
@@ -34,59 +36,41 @@ Two goals, one per audience:
   claimed node id (ADR 0011 binding, ADR 0009 epochs). There is no
   allowlist to maintain — the trust anchor is solely cert issuance.
 
-## Part 1 — Coordinator deployment
+## Part 1 — Coordinator deployment (decided: ADR 0037)
 
-### Remaining friction
+The C1–C4 friction items this section originally tracked are all resolved
+by [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md);
+the operational workflow is described in
+[cluster-lifecycle](../operations/cluster-lifecycle.md). In brief:
 
-| # | Friction | Today |
-| --- | --- | --- |
-| C1 | Certificate provisioning | out-of-band PKI; the ADR 0011 enrollment/CSR flow is an unimplemented stub |
-| C2 | Finding the cluster | static `peers` seed list in each config file |
-| C3 | Join choreography | operator runs `--join`, reads the minted id from the log, then `admin add-learner` + `admin promote` by hand |
-| C4 | Rolling upgrade | the serial replace loop in [cluster-lifecycle](../operations/cluster-lifecycle.md) is documented but manual |
+- **C3, join choreography** → the daemon runs one flagless command in
+  every situation (`--bootstrap`/`--join` are gone). A new instance
+  discovers and probes for the cluster, self-joins (learner admission →
+  catch-up → promotion) through an idempotent convergence loop, or
+  *parks* if no cluster exists; first-ever formation is an explicit,
+  formation-token-keyed `coppice-cli cluster init`, never emergent. The
+  authorization question is settled as a machine self-service grant
+  amending ADRs 0022/0023: one vote per CA-attested installation
+  identity, self-scoped verbs only; removal/init/set-address require the
+  operator-profile certificate.
+- **C2, finding the cluster** → a seed-only `Discovery` trait behind a
+  uniform `[discovery]` config section: `static`, `dns`, `file` (local
+  multi-process clusters), `ec2-asg`. Consul remains a possible future
+  backend, deliberately unbuilt. Membership stays the sole authority.
+- **C1, PKI** → as planned: issuance stays external (Vault-style
+  short-lived leaves or config-managed certs), the coordinator gains
+  cert reload without restart, and ADR 0037 adds one hard requirement —
+  a stable, unique certificate subject per coordinator installation,
+  since the subject now anchors the membership grant.
+- **C4, rolling upgrade** → replacement is "start the new machine";
+  removal rides the promotion joint change. Serial fleet replacement is
+  gated on the new machine-readable `/readyz` (an ASG instance refresh
+  with a launch lifecycle hook polling it implements the loop; no
+  further coordinator code needed).
 
-### Plan
-
-**C3 first — join automation (no new dependencies).** Add
-`coppice coordinator join --config …` (or extend `--join`) so the new
-replica, after stamping its identity, *itself* drives the ADR 0016 dance
-against the seed list: request add-learner for its own id/address, wait for
-catch-up, request promotion (optionally `--replace <old-id>` for rebuilds).
-The admin RPCs already exist; what is new is the client loop running inside
-the joining node and an authorization question — today any CA-signed cert
-may drive membership RPCs, which is exactly the "possession of a cert is
-admin" posture ADRs 0022/0023 (authn/z, settled but unwritten) must
-formalize before self-join ships. `coppice coordinator replace` then
-becomes a one-command rolling-upgrade primitive, and a systemd unit that
-runs `join-or-restart` makes coordinator ASGs/instance-groups viable.
-
-**C2 — discovery feeds the seed list, never membership.** Authoritative
-addressing already lives in replicated membership (`BasicNode.addr`); only
-the *seed list* (whom to dial first) needs discovery. Plan: make `peers`
-resolvable from pluggable sources — static list (today), DNS (SRV or
-round-robin A records in front of the coordinators), and Consul as an
-optional backend. Resolution happens at process start and on admin-CLI
-invocation only; no runtime dependency on the discovery system. DNS is the
-default recommendation (every environment has it; an internal LB or
-headless-service record is enough). Consul adds health-checked entries but
-also an operational dependency — see OD-14.
-
-**C1 — PKI.** Intra-cluster mTLS stays mandatory (ADR 0011). The plan is
-*not* to build a bespoke CA into the coordinator for coordinator↔coordinator
-trust; control-plane nodes are few and provisioned deliberately. Instead:
-document and template the two mainstream paths — (a) Vault PKI engine (or
-cert-manager in k8s) issuing short-lived leaves at boot via the machine's
-cloud identity (IAM auth method), with a config-file `tls` section pointing
-at the Vault-agent-rendered paths; (b) plain long-lived certs from
-config management for small static clusters. What the coordinator itself
-must gain is **cert reload without restart** (tonic listener rebind or
-connection-time reload) so short-lived certs are usable; that is the only
-code change this item needs. Agent-facing PKI is different — see Part 2,
-because agents are numerous and automatic.
-
-**C4 — rolling upgrade** falls out of C3: serially, per replica, `replace`
-(spot instance) or drain-restart (in-place upgrade), gated on `admin
-status` convergence. Ship it as a documented loop first, automation later.
+Implementation of all of the above is tracked as issue #47 and has not
+landed yet; until it does, the pre-0037 manual sequence continues to work
+via the retained admin verbs.
 
 ## Part 2 — Agent lifecycle (autoscaling to zero-touch)
 
@@ -175,9 +159,10 @@ No ids, no certs, no capacity numbers, no coordinator-side pre-registration.
 
 ## Sequencing against the critical path
 
-The MVP critical path (Docker executor → API server → CLI) is not displaced
-by any of this. Recommended interleaving: A1 (hours, unblocks nothing but
-removes ceremony) and C3 (small, pure client-side loop) can land any time;
-A2/A4 want ADRs 0022/0023 written first since both are authorization
-surfaces; C2/C1 are documentation-plus-small-code and can trail. A5 stays
-first among everything.
+The MVP critical path landed 2026-07-20 (Docker executor → API server →
+CLI), so nothing here competes with it any more. Remaining sequencing:
+the Part 1 implementation (issue #47) is fully specified by ADR 0037 and
+can proceed now; on the agent side, A1 (hours, removes ceremony) can land
+any time, while A2/A4 still wait on the OD-15 signer/decommission
+decisions — ADRs 0022/0023 are written, so authorization is no longer the
+blocker there.
