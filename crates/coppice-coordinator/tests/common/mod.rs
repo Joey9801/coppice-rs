@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use coppice_core::id::ClusterId;
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose,
 };
 use tempfile::TempDir;
 use tokio::sync::{oneshot, watch};
@@ -100,6 +100,37 @@ impl Ca {
     /// service grant keys on this profile, so a self-join must present one.
     pub fn machine_leaf(&self, machine_identity: &str) -> Leaf {
         self.profiled_leaf(machine_identity, Some("coppice-coordinator"), &[])
+    }
+
+    /// Issue a coordinator-profile leaf (`OU=coppice-coordinator`) that
+    /// deliberately carries **no Common Name** — the invalid machine-identity
+    /// case a coordinator boot must refuse (ADR 0037 §6): an empty CN would
+    /// persist an unbound seat. Mirrors [`Ca::profiled_leaf`] minus the CN.
+    pub fn machine_leaf_without_cn(&self) -> Leaf {
+        let key = KeyPair::generate().expect("generate leaf key pair");
+        let sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        let mut params = CertificateParams::new(sans).expect("leaf params");
+        // rcgen's default DN carries a placeholder CN; start from an empty DN
+        // so this leaf genuinely has no Common Name.
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::OrganizationalUnitName, "coppice-coordinator");
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let cert = params
+            .signed_by(&key, &self.cert, &self.key)
+            .expect("sign leaf");
+        Leaf {
+            cert_pem: cert.pem().into_bytes(),
+            key_pem: key.serialize_pem().into_bytes(),
+        }
     }
 
     /// Issue an **operator-profile** leaf (ADR 0037 §6): `OU=coppice-operator`,
@@ -225,6 +256,15 @@ pub struct NodeSpec {
     pub discovery: DiscoverySpec,
     pub removal_grace: Option<Duration>,
     pub replacement_grace: Option<Duration>,
+    /// Expected voter count (`[discovery] cluster_size`, ADR 0037 §2/§5).
+    /// `None` leaves the config field unset so it takes its default (3).
+    pub cluster_size: Option<usize>,
+    /// Bind `raft_addr` on port 0 rather than a pre-allocated free port
+    /// (ADR 0037 §2 multi-process dev case): bootstrap resolves the real bound
+    /// port and advertises/registers *that*. Only meaningful with `file`
+    /// discovery, where peers dial the registered address rather than
+    /// `Node::advertise`.
+    pub raft_port_zero: bool,
 }
 
 impl NodeSpec {
@@ -236,7 +276,21 @@ impl NodeSpec {
             discovery,
             removal_grace: None,
             replacement_grace: None,
+            cluster_size: None,
+            raft_port_zero: false,
         }
+    }
+
+    /// Set the expected voter count (`[discovery] cluster_size`).
+    pub fn with_cluster_size(mut self, cluster_size: usize) -> NodeSpec {
+        self.cluster_size = Some(cluster_size);
+        self
+    }
+
+    /// Bind the raft listener on port 0 (ADR 0037 §2 port-0 dev case).
+    pub fn with_raft_port_zero(mut self) -> NodeSpec {
+        self.raft_port_zero = true;
+        self
     }
 }
 
@@ -275,8 +329,14 @@ impl Node {
             discovery,
             removal_grace,
             replacement_grace,
+            cluster_size,
+            raft_port_zero,
         } = spec;
-        let port = free_port();
+        // A pre-allocated free port for the normal case; port 0 lets bootstrap
+        // resolve the real bound port itself (ADR 0037 §2). `advertise`/`port`
+        // are then only meaningful for the non-zero case — a `file`-discovery
+        // port-0 node is reached through its registration, not `Node::advertise`.
+        let port = if raft_port_zero { 0 } else { free_port() };
         let dir = tempfile::tempdir().expect("create node tempdir");
         let root = dir.path();
 
@@ -316,6 +376,9 @@ impl Node {
         };
         let grace_toml = {
             let mut s = String::new();
+            if let Some(n) = cluster_size {
+                s.push_str(&format!("cluster_size = {n}\n"));
+            }
             if let Some(g) = removal_grace {
                 s.push_str(&format!("removal_grace = \"{}ms\"\n", g.as_millis()));
             }
@@ -399,6 +462,15 @@ log_level = "warn"
             .form(token)
             .await
             .unwrap_or_else(|e| panic!("form node {}: {e:#}", self.id));
+    }
+
+    /// Overwrite this replica's on-disk serving leaf (`node.crt`/`node.key`)
+    /// with `leaf`, so a subsequent [`Node::try_boot`] exercises a different
+    /// certificate profile than the harness default machine leaf — e.g. a
+    /// coordinator leaf with no CN, which bootstrap must refuse (ADR 0037 §6).
+    pub fn overwrite_leaf(&self, leaf: &Leaf) {
+        std::fs::write(self.dir.path().join("node.crt"), &leaf.cert_pem).expect("write cert");
+        std::fs::write(self.dir.path().join("node.key"), &leaf.key_pem).expect("write key");
     }
 
     /// Boot expecting failure; returns the error for assertion (identity
@@ -514,6 +586,29 @@ log_level = "warn"
         assert_ne!(raw, replaced, "cluster_id line not found to rewrite");
         std::fs::write(&self.config_path, replaced).expect("rewrite config");
         self.cluster_id = new_cluster_id;
+    }
+
+    /// Rewrite this stopped replica's `raft_addr` to a fresh free port, so a
+    /// re-boot from the same disk serves the SAME stamped identity and machine
+    /// leaf at a NEW address (ADR 0037 §4 `admin set-address` fixture). Only the
+    /// port changes; `advertise_host` stays `localhost`, so the new advertised
+    /// address is `localhost:<new port>`. Must be called while stopped.
+    pub fn rebind(&mut self) {
+        assert!(
+            self.booted.is_none(),
+            "node {} must be stopped before rebind",
+            self.id
+        );
+        let new_port = free_port();
+        let raw = std::fs::read_to_string(&self.config_path).expect("read config");
+        let replaced = raw.replace(
+            &format!("raft_addr = \"127.0.0.1:{}\"", self.port),
+            &format!("raft_addr = \"127.0.0.1:{new_port}\""),
+        );
+        assert_ne!(raw, replaced, "raft_addr line not found to rewrite");
+        std::fs::write(&self.config_path, replaced).expect("rewrite config");
+        self.port = new_port;
+        self.advertise = format!("localhost:{new_port}");
     }
 
     /// Ordered graceful shutdown mirroring the daemon's shutdown tail: stop the
@@ -657,8 +752,10 @@ impl RunningCoordinator {
         let root = dir.path();
 
         // One leaf serves the Raft/admin transport AND the agent gateway (both
-        // reuse the node's identity, ADR 0011).
-        let leaf = ca.leaf();
+        // reuse the node's identity, ADR 0011). It must be a coordinator machine
+        // leaf (OU=coppice-coordinator + a CN) — bootstrap now refuses a
+        // coordinator boot leaf without the profile and CN (ADR 0037 §6).
+        let leaf = ca.machine_leaf("coord-running");
         let cert_path = root.join("node.crt");
         let key_path = root.join("node.key");
         let ca_path = root.join("ca.crt");

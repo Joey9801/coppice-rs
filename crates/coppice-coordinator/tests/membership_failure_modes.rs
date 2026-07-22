@@ -34,19 +34,20 @@ use std::time::Duration;
 use prost::Message as _;
 use tonic::Code;
 
-use coppice_consensus::{Consensus, MemberSummary};
+use coppice_consensus::MemberSummary;
 use coppice_coordinator::admin;
 use coppice_coordinator::convergence::Phase;
 use coppice_coordinator::readyz::{evaluate, ReadyzInputs, Require};
 use coppice_core::id::ClusterId;
-use coppice_core::time::Timestamp;
 use coppice_proto::pb::raft::v1 as pb;
-use coppice_state::command::BumpClusterVersion;
-use coppice_state::Command;
 
 use common::{poll, Ca, DiscoverySpec, Node, NodeSpec};
 
 const DEADLINE: Duration = Duration::from_secs(30);
+
+/// For waits that include a deliberate grace period (stale-learner eviction,
+/// a killed voter aging past `removal_grace`).
+const LONG_DEADLINE: Duration = Duration::from_secs(45);
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -101,11 +102,9 @@ fn assert_seat_invariant(node: &Node, max: usize) {
 /// shortened to `grace` (ADR 0037 §5/§6) so overflow/eviction is reachable fast.
 fn spec_with_grace(id: u64, cluster_id: ClusterId, seeds: &[String], grace: Duration) -> NodeSpec {
     NodeSpec {
-        id,
-        cluster_id,
-        discovery: DiscoverySpec::Static(seeds.to_vec()),
         removal_grace: Some(grace),
         replacement_grace: Some(grace),
+        ..NodeSpec::new(id, cluster_id, DiscoverySpec::Static(seeds.to_vec()))
     }
 }
 
@@ -317,6 +316,15 @@ async fn overflow_removal_folds_dead_voter() {
     })
     .await;
 
+    // node 2 is the LIVE idle voter this test guards: after the cluster stops
+    // converging it does no more work, so its `matched` stops advancing. Under
+    // the old "last matched-increase" evidence it would have aged into
+    // `dead_voters` exactly like a genuinely dead node — an idle cluster could
+    // then evict a healthy voter. With affirmative evidence (ADR 0037 §5) a
+    // caught-up follower keeps resetting its clock, so no background proposer is
+    // needed to keep node 2 distinguishable from the dead node 3.
+    let live_idle_id = node2.raft_id();
+
     // Kill node 3 dead; a genuinely NEW machine identity (coord-4) joins.
     let dead_id = node3.raft_id();
     node3.kill().await;
@@ -324,43 +332,31 @@ async fn overflow_removal_folds_dead_voter() {
     node4.boot().await;
     let new_id = node4.raft_id();
 
-    // Keep the cluster non-idle while node 4 converges. `removal_grace` is
-    // "no replication PROGRESS for the grace" — the leader's own observation —
-    // and `matched` only advances when there is new log traffic. A real
-    // coordinator applies a steady stream of commands (agent heartbeats, job
-    // events), so a live follower's progress keeps advancing while a dead one's
-    // freezes; an idle test cluster would instead freeze *every* follower's
-    // progress and make a live-but-idle voter indistinguishable from a dead one.
-    // A background proposer reproduces that steady traffic so only the genuinely
-    // dead node 3 qualifies for overflow removal.
-    let proposer_consensus = node1.consensus();
-    let proposer = tokio::spawn(async move {
-        for to in 1.. {
-            let _ = proposer_consensus
-                .propose(Command::BumpClusterVersion(BumpClusterVersion {
-                    to,
-                    bumped_at: Timestamp::from_micros(to as i64).expect("in range"),
-                }))
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
-
-    // Its promotion is refused (voter set would be 4) until `removal_grace`
-    // elapses and the dead voter qualifies; then the removal folds in and node 4
-    // becomes the third voter. The convergence loop retries across that window.
+    // node 4's promotion is refused (the voter set would be 4) until
+    // `removal_grace` elapses and only the genuinely dead node 3 qualifies for
+    // overflow removal; then the removal folds in and node 4 becomes the third
+    // voter. The idle-but-live node 2 must never be the one removed. The
+    // convergence loop retries across that window with no external traffic.
     poll(DEADLINE, "overflow folds the dead voter", || async {
+        // node 2 is live and idle — it must remain a voter at every sample.
+        assert!(
+            voters(&node1).iter().any(|m| m.id == live_idle_id),
+            "the live idle voter was evicted"
+        );
         let vs: BTreeSet<u64> = voters(&node1).iter().map(|m| m.id).collect();
         vs.contains(&new_id) && !vs.contains(&dead_id) && vs.len() == 3
     })
     .await;
-    proposer.abort();
 
     let vs = voters(&node1);
     assert_eq!(vs.len(), 3, "exactly three voters: {vs:?}");
     assert!(
         !vs.iter().any(|m| m.id == dead_id),
         "dead voter removed: {vs:?}"
+    );
+    assert!(
+        vs.iter().any(|m| m.id == live_idle_id),
+        "the live idle voter (node 2) is retained, never evicted: {vs:?}"
     );
 
     node4.graceful_stop().await;
@@ -468,10 +464,19 @@ async fn poll_promotion_refusal(
     }
 }
 
-/// (e) Seat conflict: two concurrent fresh learners with the SAME machine
-/// identity race for one seat. One is admitted; the other is refused
-/// `MachineSeatPending` and enters the `SeatConflict` phase. After the incumbent
-/// is killed and `replacement_grace` passes, the loser converges (ADR 0037 §6).
+/// (e) Seat conflict: two fresh learners with the SAME machine identity contend
+/// for one seat. The first committed admission holds the pending slot; the
+/// second is refused `MachineSeatPending` and enters the `SeatConflict` phase.
+/// After the incumbent is killed and `replacement_grace` passes, the loser's
+/// single retry evicts the stale pending learner, takes over the slot, and
+/// ultimately converges to a voter (ADR 0037 §6).
+///
+/// Determinism: the incumbent is HELD as a pending learner semantically — the
+/// base cluster has `cluster_size` live voters, so its promotion is refused
+/// (voter set full, no removable peer) for as long as the test needs. This
+/// pins the §6 pending-slot semantics without racing the incumbent's own
+/// promotion; two live instances sharing an identity beyond that window is an
+/// issuance-contract violation the ADR does not defend against.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn seat_conflict_loser_converges_after_incumbent_gone() {
     init_tracing();
@@ -479,78 +484,95 @@ async fn seat_conflict_loser_converges_after_incumbent_gone() {
     let cluster_id = ClusterId::new();
     let grace = Duration::from_millis(1000);
 
-    // A two-voter base {coord-1, coord-3} so that killing the coord-2 incumbent
-    // later still leaves a quorum.
+    // A full three-voter base {coord-1, coord-3, coord-4} (cluster_size 3): a
+    // coord-2 learner can be ADMITTED but never promoted while all three are
+    // alive, holding it deterministically in the pending slot.
     let mut node1 = Node::with_spec(spec_with_grace(1, cluster_id, &[], grace), &ca);
     node1.boot().await;
     node1.form("seat-conflict-formation").await;
     poll(DEADLINE, "node 1 formed", || async { node1.is_leader() }).await;
     let seeds = [node1.advertise.clone()];
     let mut node3 = Node::with_spec(spec_with_grace(3, cluster_id, &seeds, grace), &ca);
+    let mut node4 = Node::with_spec(spec_with_grace(4, cluster_id, &seeds, grace), &ca);
     node3.boot().await;
-    poll(DEADLINE, "two voters", || async {
-        voters(&node1).len() == 2
+    node4.boot().await;
+    poll(DEADLINE, "three voters", || async {
+        voters(&node1).len() == 3
     })
     .await;
 
-    // Two fresh instances under the SAME machine identity coord-2 race.
+    // Incumbent: the first coord-2 instance is admitted into the pending slot
+    // and HELD there (promotion refused while the voter set is full).
     let mut a = Node::with_spec(spec_with_grace(2, cluster_id, &seeds, grace), &ca);
-    let mut b = Node::with_spec(spec_with_grace(2, cluster_id, &seeds, grace), &ca);
     a.boot().await;
-    b.boot().await;
+    let a_id = a.raft_id();
+    poll(DEADLINE, "incumbent holds the pending slot", || async {
+        node1
+            .summary()
+            .members
+            .iter()
+            .any(|m| m.id == a_id && !m.voter)
+    })
+    .await;
+    assert!(!a.is_voter(), "the incumbent is held as a pending learner");
 
-    // Exactly one wins the seat (becomes a voter); the other is in SeatConflict.
+    // Challenger: a second coord-2 instance is refused `MachineSeatPending`
+    // while the incumbent is live and enters `SeatConflict`, watching without
+    // resubmitting.
+    let mut b = Node::with_spec(spec_with_grace(2, cluster_id, &seeds, grace), &ca);
+    b.boot().await;
+    let b_id = b.raft_id();
+    poll(DEADLINE, "challenger enters seat-conflict", || async {
+        b.convergence_phase() == Phase::SeatConflict
+    })
+    .await;
+    assert!(
+        node1
+            .summary()
+            .members
+            .iter()
+            .any(|m| m.id == a_id && !m.voter),
+        "the incumbent still holds the pending slot"
+    );
+
+    // The incumbent dies. After `replacement_grace` the challenger's single
+    // retry evicts the stale pending learner and takes over the slot.
+    a.kill().await;
     poll(
-        DEADLINE,
-        "one wins the seat, the other is in seat-conflict",
+        LONG_DEADLINE,
+        "challenger takes over the pending slot",
         || async {
-            (a.is_voter() && b.convergence_phase() == Phase::SeatConflict)
-                || (b.is_voter() && a.convergence_phase() == Phase::SeatConflict)
+            let members = node1.summary().members;
+            members.iter().any(|m| m.id == b_id && !m.voter)
+                && !members.iter().any(|m| m.id == a_id)
         },
     )
     .await;
-    let (winner, loser): (&mut Node, &mut Node) = if a.is_voter() {
-        (&mut a, &mut b)
-    } else {
-        (&mut b, &mut a)
-    };
-    let winner_id = winner.raft_id();
-    let loser_id = loser.raft_id();
-    assert_eq!(
-        loser.convergence_phase(),
-        Phase::SeatConflict,
-        "the loser watches without resubmitting while the incumbent is live"
-    );
 
-    // The incumbent disappears; after `replacement_grace` the loser retries and
-    // converges as the replacement, retiring the dead incumbent's seat in the
-    // same joint change — wait for that change to fully settle (loser in, dead
-    // incumbent out, back to three voters), not just for the loser's vote to
-    // appear mid-joint.
-    winner.kill().await;
+    // Open a vacancy: kill a base voter. The challenger's held promotion now
+    // folds the dead voter's overflow removal into its joint change and seats
+    // the challenger (ADR 0037 §5) — the loser converges end to end.
+    let node4_id = node4.raft_id();
+    node4.kill().await;
     poll(
-        DEADLINE,
-        "loser converges once the incumbent is gone",
+        LONG_DEADLINE,
+        "challenger converges once a seat opens",
         || async {
             assert_seat_invariant(&node1, 3);
             let vs: BTreeSet<u64> = voters(&node1).iter().map(|m| m.id).collect();
-            vs.contains(&loser_id) && !vs.contains(&winner_id) && vs.len() == 3
+            vs.contains(&b_id) && !vs.contains(&node4_id) && vs.len() == 3
         },
     )
     .await;
 
     let vs: BTreeSet<u64> = voters(&node1).iter().map(|m| m.id).collect();
-    assert!(vs.contains(&loser_id), "loser is a voter: {vs:?}");
-    assert!(
-        !vs.contains(&winner_id),
-        "the dead incumbent seat is gone: {vs:?}"
-    );
+    assert!(vs.contains(&b_id), "challenger is a voter: {vs:?}");
+    assert!(!vs.contains(&node4_id), "the dead voter is retired: {vs:?}");
     assert_eq!(vs.len(), 3, "back to three voters: {vs:?}");
     assert_seat_invariant(&node1, 3);
 
-    // The winner was killed above (its `booted` is already taken), so stop only
-    // the loser and the base cluster; the winner's Node drops with the fn.
-    loser.graceful_stop().await;
+    // a and node4 were killed above; stop the rest.
+    b.graceful_stop().await;
     node3.graceful_stop().await;
     node1.graceful_stop().await;
 }

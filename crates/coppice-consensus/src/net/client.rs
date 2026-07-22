@@ -69,10 +69,19 @@ pub struct GrpcNetworkFactory {
     cluster_uuid: [u8; 16],
     tls: Arc<TlsStore>,
     rpc_timeout: Duration,
-    /// Per-peer `(dialed address, channel)`. A membership change that moves a
-    /// peer's address drops the stale channel and redials.
-    channels: Arc<Mutex<HashMap<CoordinatorId, (String, Channel)>>>,
+    /// Per-peer `(dialed address, TLS generation, channel)`. A membership change
+    /// that moves a peer's address drops the stale channel and redials; a TLS
+    /// rotation (the store's [`generation`] advancing) does the same, so a
+    /// reconnect after a rotation presents the fresh leaf instead of the leaf
+    /// captured in the cached channel's [`ClientTlsConfig`] (ADR 0037 §6).
+    ///
+    /// [`generation`]: coppice_tls::TlsStore::generation
+    channels: Arc<Mutex<PeerChannels>>,
 }
+
+/// Per-peer cache value: the dialed address, the TLS material generation it was
+/// built at, and the lazily-connected channel itself.
+type PeerChannels = HashMap<CoordinatorId, (String, u64, Channel)>;
 
 impl GrpcNetworkFactory {
     /// Build the factory from the shared hot-reload TLS store (ADR 0011/0037),
@@ -97,39 +106,44 @@ impl GrpcNetworkFactory {
             .identity(Identity::from_pem(material.cert_pem(), material.key_pem()))
     }
 
-    /// Reuse the peer's channel, redialing if its address changed or it was
-    /// never dialed. `Err` carries an operator-readable reason the RPC layer
-    /// surfaces as [`Unreachable`].
+    /// Reuse the peer's channel, redialing if its address changed, the TLS
+    /// material rotated since it was dialed, or it was never dialed. `Err`
+    /// carries an operator-readable reason the RPC layer surfaces as
+    /// [`Unreachable`].
+    ///
+    /// The generation check is what closes the rotation gap: the cached
+    /// `Channel` froze its `ClientTlsConfig` at creation, so after a rotation an
+    /// internal tonic reconnect would keep presenting the old leaf. Evicting on
+    /// a generation bump forces a re-dial that rebuilds the config from the
+    /// current material.
     fn channel_for(&self, target: CoordinatorId, addr: &str) -> Result<Channel, String> {
+        let generation = self.tls.generation();
         let mut map = self.channels.lock().expect("network channel map poisoned");
-        if let Some((existing, channel)) = map.get(&target) {
-            if existing == addr {
+        if let Some((existing, gen, channel)) = map.get(&target) {
+            if existing == addr && *gen == generation {
                 return Ok(channel.clone());
             }
         }
         let channel = build_channel(&self.client_tls(), addr, self.rpc_timeout)
             .map_err(|e| format!("cannot dial coordinator {target} at {addr}: {e}"))?;
-        map.insert(target, (addr.to_string(), channel.clone()));
+        map.insert(target, (addr.to_string(), generation, channel.clone()));
         Ok(channel)
     }
 }
 
-/// Construct a lazily-connecting mTLS channel to `addr` (`host:port`).
+/// Construct a lazily-connecting mTLS channel to `addr` (`host:port` or
+/// `[v6]:port`).
 ///
 /// `connect_lazy` hands reconnection to tonic; per-peer reuse is the factory's
-/// channel map. The SNI domain name is the host part of the dial address.
-fn build_channel(
-    tls: &ClientTlsConfig,
-    addr: &str,
-    timeout: Duration,
-) -> Result<Channel, tonic::transport::Error> {
-    let host = addr
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(addr)
-        .to_string();
-    let endpoint = Endpoint::from_shared(format!("https://{addr}"))?
-        .tls_config(tls.clone().domain_name(host))?
+/// channel map. The SNI domain name is the unbracketed host part of the dial
+/// address (an IPv6 SAN identity carries no brackets); the `https://{addr}`
+/// authority keeps the original brackets. `Err` is an operator-readable string.
+fn build_channel(tls: &ClientTlsConfig, addr: &str, timeout: Duration) -> Result<Channel, String> {
+    let (host, _port) = coppice_tls::split_host_port(addr).map_err(|e| e.to_string())?;
+    let endpoint = Endpoint::from_shared(format!("https://{addr}"))
+        .map_err(|e| e.to_string())?
+        .tls_config(tls.clone().domain_name(host))
+        .map_err(|e| e.to_string())?
         .connect_timeout(timeout)
         .timeout(timeout);
     Ok(endpoint.connect_lazy())
@@ -377,4 +391,123 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
     }
 
     // `backoff()` keeps openraft's default (a constant 500 ms) — no config.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coppice_tls::{TlsPaths, TlsStore};
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+    fn paths_in(dir: &std::path::Path) -> TlsPaths {
+        TlsPaths {
+            cert: dir.join("node.crt"),
+            key: dir.join("node.key"),
+            ca: dir.join("ca.crt"),
+        }
+    }
+
+    /// (Re)issue a leaf under a fresh CA and lay cert/key/ca into `dir`, so a
+    /// following `force_reload` observes a real change (and a bumped generation).
+    fn write_material(dir: &std::path::Path) -> TlsPaths {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "consensus-test-ca");
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut leaf_params =
+            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "coordinator-1");
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let paths = paths_in(dir);
+        std::fs::write(&paths.cert, leaf_cert.pem().into_bytes()).unwrap();
+        std::fs::write(&paths.key, leaf_key.serialize_pem().into_bytes()).unwrap();
+        std::fs::write(&paths.ca, ca_cert.pem().into_bytes()).unwrap();
+        paths
+    }
+
+    fn factory(tls: Arc<TlsStore>) -> GrpcNetworkFactory {
+        GrpcNetworkFactory::new([7u8; 16], tls, Duration::from_secs(1))
+    }
+
+    /// The recorded (address, generation) for a cached peer channel, or `None`.
+    fn cached(f: &GrpcNetworkFactory, target: CoordinatorId) -> Option<(String, u64)> {
+        f.channels
+            .lock()
+            .unwrap()
+            .get(&target)
+            .map(|(addr, gen, _)| (addr.clone(), *gen))
+    }
+
+    #[tokio::test]
+    async fn same_address_and_generation_reuses_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TlsStore::load(write_material(dir.path())).unwrap();
+        let f = factory(store);
+        let target: CoordinatorId = 1;
+
+        f.channel_for(target, "127.0.0.1:7071").unwrap();
+        let first = cached(&f, target).unwrap();
+        // A second lookup with no rotation must not re-dial: same recorded gen.
+        f.channel_for(target, "127.0.0.1:7071").unwrap();
+        let second = cached(&f, target).unwrap();
+        assert_eq!(
+            first, second,
+            "unchanged store must reuse the cached channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tls_rotation_evicts_and_redials_the_cached_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TlsStore::load(write_material(dir.path())).unwrap();
+        let f = factory(Arc::clone(&store));
+        let target: CoordinatorId = 1;
+
+        f.channel_for(target, "127.0.0.1:7071").unwrap();
+        let (_, gen_before) = cached(&f, target).unwrap();
+        assert_eq!(gen_before, store.generation());
+
+        // Rotate the material (onto a fresh CA + leaf) and force a swap: the
+        // store's generation advances.
+        std::thread::sleep(Duration::from_millis(10));
+        write_material(dir.path());
+        assert!(store.force_reload().unwrap(), "rotation must swap");
+        let gen_after = store.generation();
+        assert!(
+            gen_after > gen_before,
+            "generation must advance on rotation"
+        );
+
+        // The next lookup, same address, must re-dial and record the new
+        // generation — the eviction that stops a stale-leaf channel from
+        // outliving a rotation (ADR 0037 §6, finding 7).
+        f.channel_for(target, "127.0.0.1:7071").unwrap();
+        let (_, gen_cached) = cached(&f, target).unwrap();
+        assert_eq!(
+            gen_cached, gen_after,
+            "post-rotation lookup must re-dial at the new generation"
+        );
+        assert_ne!(gen_cached, gen_before);
+    }
+
+    #[tokio::test]
+    async fn an_address_change_still_redials() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TlsStore::load(write_material(dir.path())).unwrap();
+        let f = factory(store);
+        let target: CoordinatorId = 1;
+
+        f.channel_for(target, "127.0.0.1:7071").unwrap();
+        f.channel_for(target, "127.0.0.1:7072").unwrap();
+        let (addr, _) = cached(&f, target).unwrap();
+        assert_eq!(addr, "127.0.0.1:7072", "an address change must re-dial");
+    }
 }

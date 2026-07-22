@@ -34,6 +34,8 @@ uuid.workspace = true
 # because dev-dependencies sit outside the library's own build graph.
 coppice-testkit.workspace = true
 criterion.workspace = true
+# Cert fixtures for the peer-channel TLS-generation-eviction test (ADR 0037 §6).
+rcgen.workspace = true
 tempfile.workspace = true
 
 [lints]

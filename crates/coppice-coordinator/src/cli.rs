@@ -129,13 +129,17 @@ pub enum AdminVerb {
         node_id: u64,
     },
 
-    /// Operator break-glass: repoint a voter's membership address (ADR 0037 §4).
+    /// Operator break-glass: repoint an existing node's membership address
+    /// (ADR 0037 §4).
     ///
-    /// NOT IMPLEMENTED. The ADR requires the leader to dial the *new* address and
-    /// verify by probe that its TLS subject matches the target's machine-identity
-    /// binding and that `ProbeCluster` reports the target's stamped node id before
-    /// committing the repoint — no membership-repointing RPC exists yet, so this
-    /// verb refuses locally rather than committing an unverified `SetNodes`.
+    /// Operator-credential only. The leader commits the repoint only after
+    /// dialing the *new* address and verifying by probe that its TLS subject
+    /// matches the target's machine-identity binding and that `ProbeCluster`
+    /// reports the target's stamped node id — a claimed node id without the
+    /// matching CA-attested subject is refused. Unknown id is refused (no silent
+    /// creation); a no-op when the address already matches. For the immutable
+    /// model an instance whose address changed is normally just a new instance;
+    /// this verb is the rare pet-deployment escape hatch.
     SetAddress {
         /// The node whose address to repoint.
         #[arg(long)]

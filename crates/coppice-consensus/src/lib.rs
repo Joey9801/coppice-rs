@@ -192,6 +192,38 @@ pub trait Consensus: Send + Sync + 'static {
         node: CoordinatorId,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
+    /// Evict a stale PENDING LEARNER so its machine identity's slot can be
+    /// retaken (ADR 0037 §6). The caller supplies the evidence that the
+    /// incumbent is gone (continuous unreachability for `replacement_grace`,
+    /// observed leader-side); this op only revalidates shape under the
+    /// membership lock — the incumbent must still be a non-voter bound to
+    /// `machine_identity` — and never touches the voter set. An incumbent
+    /// already absent is a no-op success.
+    fn evict_stale_learner(
+        &self,
+        incumbent: CoordinatorId,
+        machine_identity: &str,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// Repoint an existing node's membership address (ADR 0037 §4, operator
+    /// break-glass `admin set-address`).
+    ///
+    /// Rewrites ONLY the `addr` of the target's node record via
+    /// `ChangeMembers::SetNodes`; the machine-identity binding and the
+    /// superseded marking are preserved, and the voter set is untouched. The
+    /// endpoint verification the ADR requires (dial the new address, match its
+    /// serving-cert subject to the target's bound machine identity, confirm its
+    /// stamped node id by probe) is the *caller's* responsibility, done before
+    /// this is invoked — this seam performs only the committed membership edit.
+    /// Idempotent by contract: an id already at `new_addr` is a no-op success;
+    /// an id absent from membership is refused
+    /// ([`ConsensusError::UnknownNode`]) with no silent creation.
+    fn set_node_address(
+        &self,
+        node: CoordinatorId,
+        new_addr: String,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
     /// Ask consensus to build a snapshot now (housekeeping trigger; sealed
     /// segments become deletable once covered — ADR 0002/0017).
     fn trigger_snapshot(&self) -> impl Future<Output = Result<(), ConsensusError>> + Send;

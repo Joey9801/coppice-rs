@@ -89,8 +89,8 @@ mod discovery {
         #[serde(default)]
         pub(crate) file: Option<FileBackend>,
 
-        /// `[discovery.ec2_asg]` — present iff `backend = "ec2-asg"`. Parsed
-        /// now; the backend itself is not built in this PR (ADR 0037 §2).
+        /// `[discovery.ec2_asg]` — present iff `backend = "ec2-asg"`
+        /// (ADR 0037 §2).
         #[serde(default)]
         pub(crate) ec2_asg: Option<Ec2AsgBackend>,
     }
@@ -137,11 +137,30 @@ mod discovery {
         pub(crate) dir: PathBuf,
     }
 
-    /// `[discovery.ec2_asg]`: reserved for the EC2 ASG backend (ADR 0037 §2),
-    /// not built in this PR. Empty for now.
-    #[derive(Debug, Clone, Default, Deserialize)]
+    /// `[discovery.ec2_asg]`: the EC2 auto-scaling-group backend (ADR 0037 §2).
+    ///
+    /// The instance id and region are read from EC2 instance metadata (IMDSv2)
+    /// at each consultation, so neither is configured here. `port` is required:
+    /// discovery composes `private-ip:port` candidates and the raft listen port
+    /// is not plumbed into the discovery builder, so the operator names it
+    /// explicitly (the same shape as `[discovery.dns].port`).
+    #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
-    pub(crate) struct Ec2AsgBackend {}
+    pub(crate) struct Ec2AsgBackend {
+        /// The raft port composed onto every discovered instance's private IP.
+        pub(crate) port: u16,
+        /// Explicit AWS region override. Optional: when unset the region is
+        /// taken from this instance's IMDS document, which is the normal case
+        /// for a coordinator running inside the group it discovers.
+        #[serde(default)]
+        pub(crate) region: Option<String>,
+        /// Per-AWS-call timeout. Discovery must never hang startup (ADR 0037 §2
+        /// contract), so each IMDS/ASG/EC2 call is bounded by this and a slow or
+        /// unreachable control plane degrades to an empty candidate list with a
+        /// warning rather than blocking convergence.
+        #[serde(default = "default_ec2_asg_timeout", with = "humantime_serde")]
+        pub(crate) timeout: Duration,
+    }
 
     impl Default for DiscoveryConfig {
         fn default() -> Self {
@@ -201,6 +220,12 @@ mod discovery {
                          with `dir` (ADR 0037 §2)"
                     );
                 }
+                BackendKind::Ec2Asg if self.ec2_asg.is_none() => {
+                    anyhow::bail!(
+                        "[discovery] backend = \"ec2-asg\" requires a [discovery.ec2_asg] \
+                         table with `port` (ADR 0037 §2)"
+                    );
+                }
                 _ => {}
             }
             Ok(())
@@ -247,6 +272,10 @@ mod discovery {
 
     fn default_grace() -> Duration {
         Duration::from_secs(60)
+    }
+
+    fn default_ec2_asg_timeout() -> Duration {
+        Duration::from_secs(3)
     }
 }
 
@@ -337,12 +366,24 @@ impl ListenConfig {
     /// Kept as a method rather than a stored field so the two can never
     /// silently drift apart when either is edited. [`load`] guarantees
     /// `advertise_host` is resolved to `Some` before any reader calls this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn advertised_raft_addr(&self) -> String {
+        self.advertised_raft_addr_on_port(self.raft_addr.port())
+    }
+
+    /// The Raft address this replica advertises on a *specific* bound port: the
+    /// resolved `advertise_host` combined with `port`.
+    ///
+    /// Used when `raft_addr` requests port 0 (the multi-process dev case, ADR
+    /// 0037 §2): bootstrap binds the listener first, learns the real port, and
+    /// advertises *that* — so a `:0` config never publishes `host:0` to
+    /// discovery, membership, or the convergence loop.
+    pub(crate) fn advertised_raft_addr_on_port(&self, port: u16) -> String {
         let host = self
             .advertise_host
             .as_deref()
             .expect("advertise_host resolved by config::load before use");
-        format!("{}:{}", host, self.raft_addr.port())
+        format!("{host}:{port}")
     }
 }
 
@@ -844,15 +885,61 @@ ca_path   = "/etc/coppice/pki/ca.crt"
     #[test]
     fn ec2_asg_backend_parses() {
         let contents = format!(
-            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n\n[discovery.ec2_asg]\n"
+            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n\n\
+             [discovery.ec2_asg]\nport = 7071\nregion = \"us-east-1\"\ntimeout = \"5s\"\n"
         );
         let (_guard, path) = write_config(&contents);
         let config = read_config(&path).expect("ec2-asg discovery should parse");
         assert_eq!(config.discovery.backend, BackendKind::Ec2Asg);
+        let ec2 = config
+            .discovery
+            .ec2_asg
+            .as_ref()
+            .expect("ec2_asg table present");
+        assert_eq!(ec2.port, 7071);
+        assert_eq!(ec2.region.as_deref(), Some("us-east-1"));
+        assert_eq!(ec2.timeout, Duration::from_secs(5));
         config
             .discovery
             .validate()
             .expect("ec2-asg config is valid");
+    }
+
+    #[test]
+    fn ec2_asg_backend_defaults_region_and_timeout() {
+        // `port` is the only required field; region defaults to the IMDS value
+        // (None here) and timeout to 3s.
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n\n\
+             [discovery.ec2_asg]\nport = 7071\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("ec2-asg with only a port should parse");
+        let ec2 = config
+            .discovery
+            .ec2_asg
+            .as_ref()
+            .expect("ec2_asg table present");
+        assert_eq!(ec2.port, 7071);
+        assert_eq!(ec2.region, None);
+        assert_eq!(ec2.timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn ec2_asg_backend_without_table_is_rejected() {
+        // Selecting the backend without its table (hence without `port`) is a
+        // validation error, mirroring the dns/file required-table rule.
+        let contents = format!("{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n");
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("parses; validation is separate");
+        let err = config
+            .discovery
+            .validate()
+            .expect_err("ec2-asg without a [discovery.ec2_asg] table must be rejected");
+        assert!(
+            format!("{err:#}").contains("requires a [discovery.ec2_asg] table"),
+            "{err:#}"
+        );
     }
 
     #[test]

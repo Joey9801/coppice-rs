@@ -64,6 +64,18 @@ pub enum ConsensusError {
     #[error("node {id} is not in membership")]
     UnknownNode { id: CoordinatorId },
 
+    /// A stale-learner eviction named a node that is a VOTER — the voter set is
+    /// never touched by learner replacement (ADR 0037 §6). Terminal.
+    #[error("node {node} is a voter, not a pending learner")]
+    NotALearner { node: CoordinatorId },
+
+    /// A stale-learner eviction's revalidation found the incumbent bound to a
+    /// different machine identity than the contested slot (ADR 0037 §6) — the
+    /// membership changed under the caller's evidence. Terminal for this
+    /// attempt; a retry observes the current incumbent.
+    #[error("node {node} is bound to machine identity {bound:?}, not the contested slot")]
+    MachineMismatch { node: CoordinatorId, bound: String },
+
     /// This handle's consensus node is shutting down; the operation will not
     /// complete and retrying against this handle will not help.
     #[error("consensus is shutting down")]

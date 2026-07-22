@@ -186,13 +186,25 @@ These verbs are idempotent by contract (re-running a completed step is a
 no-op success). Admin requests against a follower are refused with the
 current leader named in the error.
 
-`admin set-address` is **not yet implemented**: the verified leader-side
-repoint of ADR 0037 §4 (dial the new address, match its TLS subject to the
-target's machine-identity binding, confirm its stamped node id, only then
-commit) has no membership-repointing RPC, so the verb refuses rather than
-commit an unverified `SetNodes`. Under the immutable model an instance
-whose address changed is simply a new instance: let it self-join and
-retire the old identity through replacement promotion.
+`admin set-address` is the operator break-glass repoint for the rare pet
+deployment (ADR 0037 §4). It is **operator-credential only** — a machine or
+agent certificate is refused — and the leader commits the repoint only after
+verifying the new endpoint: it dials the new address over mTLS, requires the
+serving certificate's subject CN to equal the machine identity already bound
+to the target node id, and requires `ProbeCluster` there to report the
+target's stamped node id. A claimed node id without the matching CA-attested
+subject is refused; an unknown or absent node id is refused (no silent
+creation); repointing to the address already held is an idempotent no-op.
+
+```
+coppice coordinator admin --config c.toml --target coord-1:7071 \
+  set-address --node-id <id> --addr <new-host:port>
+```
+
+Under the immutable model an instance whose address changed is normally
+simply a new instance — let it self-join and retire the old identity through
+replacement promotion — so reach for `set-address` only when the same durable
+instance must keep its node id at a new address.
 
 ## Failure modes worth recognizing
 

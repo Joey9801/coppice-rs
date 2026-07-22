@@ -112,10 +112,13 @@ impl Default for MembershipPolicy {
 /// contributes nothing to removal decisions, so a stale registration file or
 /// an unedited static list can never block a legitimate removal.
 pub trait LivenessAttestor: Send + Sync {
-    /// Whether the backend can attest that `node` is genuinely gone from the
-    /// group. `false` means present-or-unknown; only `true` strengthens an
-    /// overflow-removal decision.
-    fn is_absent(&self, node: CoordinatorId) -> bool;
+    /// Whether the backend can attest that `node` — whose membership record
+    /// advertises `addr` — is genuinely gone from the group. `false` means
+    /// present-or-unknown; only `true` strengthens an overflow-removal
+    /// decision. The address comes from the leader's own membership record, so
+    /// backends keyed on network location (e.g. `ec2-asg` private IPs) need no
+    /// side-channel id mapping.
+    fn is_absent(&self, node: CoordinatorId, addr: &str) -> bool;
 }
 
 /// One membership seat, as the decision core sees it — a flattened view of a

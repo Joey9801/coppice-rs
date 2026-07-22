@@ -73,6 +73,12 @@ pub struct NodeOptions {
     /// Wired from config by a later package; [`MembershipPolicy::default`]
     /// carries the ADR defaults (3 / 60s / 60s) until then.
     pub membership_policy: MembershipPolicy,
+    /// Optional discovery-liveness attestor (ADR 0037 §5). `Some` only for a
+    /// discovery backend with liveness semantics (`ec2-asg`), which lets the
+    /// leader's evidence-gated overflow removal require positive absence; `None`
+    /// (the default for `static`/`dns`/`file`) contributes nothing, so a stale
+    /// registration or unedited list can never block a legitimate removal.
+    pub attestor: Option<Arc<dyn LivenessAttestor>>,
 }
 
 /// A running consensus replica, assembled and ready to serve.
@@ -116,6 +122,13 @@ pub struct FormationControl {
     node_id: CoordinatorId,
     advertise_addr: String,
     machine_identity: String,
+    /// Serializes the whole read→record→initialize sequence (ADR 0037 §3;
+    /// finding: concurrent InitializeCluster). Two `InitializeCluster` requests
+    /// with different tokens arriving at one parked daemon must not both read
+    /// "empty token, uninitialized", both record a token, and both treat the
+    /// loser's `raft.initialize` `NotAllowed` as idempotent success. Shared
+    /// across clones so every admin-handler clone contends on one lock.
+    form_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The result of a successful [`FormationControl::form`].
@@ -134,6 +147,15 @@ pub enum FormationError {
     /// recovery re-runs `cluster init` with `recorded`.
     #[error("a different formation token is already recorded ({recorded})")]
     ConflictingToken { recorded: String },
+    /// Raft is already initialized here, but this replica holds no founding
+    /// formation record (ADR 0037 §3): it is a normally-joined replica, so
+    /// there is no recorded token to compare against and no bootstrap policy may
+    /// be applied. Refused as a plain "already initialized" — the supplied token
+    /// is neither confirmed nor allowed to seed anything. Only a replica holding
+    /// the recorded token may report [`FormationOutcome::AlreadyFormed`], and
+    /// only on an exact match.
+    #[error("already initialized; this replica holds no formation record")]
+    AlreadyInitializedNoRecord,
     /// Durably recording the token failed.
     #[error("recording the formation token: {0}")]
     Storage(String),
@@ -167,34 +189,72 @@ impl FormationControl {
     /// minus the discovery probe guard, which the coordinator's admin handler
     /// applies before calling this).
     ///
-    /// - Already initialized: idempotent success when the recorded token matches
-    ///   (or none is recorded); a different recorded token is a conflict.
+    /// - Already initialized with the recorded token matching: idempotent
+    ///   success ([`FormationOutcome::AlreadyFormed`]).
+    /// - Already initialized with a *different* recorded token: a conflict.
+    /// - Already initialized but *no* recorded token (a normally-joined
+    ///   replica): refused [`FormationError::AlreadyInitializedNoRecord`] — no
+    ///   token comparison is possible and no policy is applied.
     /// - Uninitialized with a recorded token: the same token resumes formation;
     ///   a different one is a conflict.
     /// - Uninitialized, no recorded token: record it durably, then
     ///   `raft.initialize` with this replica as the single voter bound to its
     ///   own machine identity (ADR 0037 §6).
     pub async fn form(&self, token: &str) -> Result<FormationOutcome, FormationError> {
+        // Serialize the whole read→record→initialize sequence (finding:
+        // concurrent InitializeCluster). Held across the recorded-token read,
+        // the durable record, and `raft.initialize` so two racing tokens cannot
+        // both record and both claim success.
+        let _guard = self.form_lock.lock().await;
+
         let recorded = self.recorded_token();
-        if let Some(recorded) = &recorded {
-            if recorded != token {
+        let initialized = self.is_initialized().await;
+
+        if initialized {
+            return match &recorded {
+                // Only the founding replica holds the recorded token; it alone
+                // reports the idempotent success, and only on an exact match.
+                Some(rec) if rec == token => Ok(FormationOutcome::AlreadyFormed),
+                Some(rec) => Err(FormationError::ConflictingToken {
+                    recorded: rec.clone(),
+                }),
+                // A normally-joined replica has no founding record: it can
+                // neither compare tokens nor apply a bootstrap policy (ADR 0037
+                // §3). Refuse as a plain "already initialized" — never
+                // `AlreadyFormed`, so the caller's token is not silently
+                // confirmed and the supplied policy is not applied.
+                None => Err(FormationError::AlreadyInitializedNoRecord),
+            };
+        }
+
+        // Uninitialized. A recorded token from an interrupted former must match
+        // (a crash between stamp and initialize resumes with the same token).
+        if let Some(rec) = &recorded {
+            if rec != token {
                 return Err(FormationError::ConflictingToken {
-                    recorded: recorded.clone(),
+                    recorded: rec.clone(),
                 });
             }
         }
-        if self.is_initialized().await {
-            return Ok(FormationOutcome::AlreadyFormed);
-        }
 
         // Record the operator's intent durably BEFORE the irreversible
-        // initialize, so a crash here completes formation on restart.
-        if recorded.is_none() {
-            self.core
-                .lock()
-                .expect("storage core poisoned")
-                .record_formation_token(token)
-                .map_err(|e| FormationError::Storage(e.to_string()))?;
+        // initialize, so a crash here completes formation on restart. The
+        // storage layer refuses to overwrite a *different* existing token, so a
+        // racing former that somehow slipped past the lock is still caught here;
+        // on that refusal we surface the recorded winner rather than a raw IO
+        // error.
+        if let Err(e) = self
+            .core
+            .lock()
+            .expect("storage core poisoned")
+            .record_formation_token(token)
+        {
+            if let Some(rec) = self.recorded_token() {
+                if rec != token {
+                    return Err(FormationError::ConflictingToken { recorded: rec });
+                }
+            }
+            return Err(FormationError::Storage(e.to_string()));
         }
 
         let members = BTreeMap::from([(
@@ -203,11 +263,16 @@ impl FormationControl {
         )]);
         match self.raft.initialize(members).await {
             Ok(()) => Ok(FormationOutcome::Formed),
-            // A concurrent former (or a resumed one) already initialized: the
-            // recorded-token guard above proved it is the same intent, so this
-            // is an idempotent success, not a conflict.
+            // Lost the initialize race, or resumed after a crash: raft is now
+            // initialized by someone. It is only an idempotent success if the
+            // recorded token is ours; if a different token won, name it, and if
+            // no record survives, refuse as a plain already-initialized.
             Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
-                Ok(FormationOutcome::AlreadyFormed)
+                match self.recorded_token() {
+                    Some(rec) if rec == token => Ok(FormationOutcome::AlreadyFormed),
+                    Some(rec) => Err(FormationError::ConflictingToken { recorded: rec }),
+                    None => Err(FormationError::AlreadyInitializedNoRecord),
+                }
             }
             Err(other) => Err(FormationError::Raft(other.to_string())),
         }
@@ -380,6 +445,7 @@ pub async fn start(options: NodeOptions) -> Result<StartedNode, NodeStartError> 
         tls,
         machine_identity,
         membership_policy,
+        attestor,
     } = options;
 
     // Step 1: the directory must exist (the caller owns creating it).
@@ -476,14 +542,15 @@ pub async fn start(options: NodeOptions) -> Result<StartedNode, NodeStartError> 
         node_id,
         advertise_addr,
         machine_identity,
+        form_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // Step 10 + 11: status watch, seam, transport, handle.
     let status = status::spawn(raft.metrics(), committed_rx);
-    // No liveness attestor is wired here (ADR 0037 §5): the discovery backend
-    // that would provide one is the bootstrap/discovery package's concern, so
-    // the hook defaults to `None` and only replication evidence gates removal.
-    let attestor: Option<Arc<dyn LivenessAttestor>> = None;
+    // The optional liveness attestor (ADR 0037 §5) is supplied by the caller
+    // from the discovery backend: `Some` for backends with liveness semantics
+    // (`ec2-asg`), `None` otherwise, in which case only replication evidence
+    // gates the leader's overflow removal.
     let consensus = OpenraftConsensus::new(
         raft.clone(),
         status.clone(),

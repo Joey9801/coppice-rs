@@ -238,6 +238,22 @@ impl Consensus for FakeConsensus {
         Ok(())
     }
 
+    async fn evict_stale_learner(
+        &self,
+        _incumbent: CoordinatorId,
+        _machine_identity: &str,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    async fn set_node_address(
+        &self,
+        _node: CoordinatorId,
+        _new_addr: String,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
     async fn trigger_snapshot(&self) -> Result<(), ConsensusError> {
         Ok(())
     }

@@ -344,17 +344,37 @@ pub async fn bootstrap(
 
     let cluster_uuid = *cfg.cluster_id.0.as_bytes();
     let raft_addr = cfg.listen.raft_addr;
-    let advertise_addr = cfg.listen.advertised_raft_addr();
+
+    // Bind the raft/admin listener FIRST, before anything publishes an address
+    // (ADR 0037 §2/§6). A `raft_addr` with port 0 (the multi-process dev case)
+    // must resolve to its real bound port here so the *same* concrete address
+    // reaches the advertised address, the `file`-discovery registration,
+    // NodeOptions, and the convergence loop — never `host:0`. Binding now also
+    // means a port conflict fails at bootstrap, naming the address, rather than
+    // surfacing only when the server task is later awaited.
+    let listener = TcpListener::bind(raft_addr)
+        .await
+        .map_err(|e| anyhow!("binding raft/admin listener on {raft_addr}: {e}"))?;
+    let bound_raft_port = listener
+        .local_addr()
+        .map_err(|e| anyhow!("reading the bound raft/admin listener address: {e}"))?
+        .port();
+    let advertise_addr = cfg.listen.advertised_raft_addr_on_port(bound_raft_port);
+    tracing::info!(bind = %raft_addr, advertised = %advertise_addr, "raft/admin listener bound");
 
     // This replica's machine identity (ADR 0037 §6): the CA-attested CN of its
     // own configured `[tls]` leaf, bound into the founding voter's seat at
-    // formation and presented on every self-join. A startup lint warns if the
-    // leaf lacks the coordinator profile or a CN — a deployment that violates
-    // "one installation, one stable subject" loses the one-seat-per-credential
-    // property (ADR 0037 §6 consequences).
+    // formation and presented on every self-join. A coordinator leaf that lacks
+    // the coordinator profile or a CN is a fail-fast startup error, not a
+    // warning: an empty machine identity would be persisted into the founding
+    // voter's seat binding, violating "no seat is ever unbound" (§6), and such a
+    // leaf could never pass endpoint verification.
     let leaf_subject = tls_store.current().leaf_subject();
-    let machine_identity = leaf_subject.common_name.clone().unwrap_or_default();
-    lint_leaf_profile(&leaf_subject);
+    require_coordinator_leaf(&leaf_subject, &cfg.tls.cert_path)?;
+    let machine_identity = leaf_subject
+        .common_name
+        .clone()
+        .expect("require_coordinator_leaf guarantees a non-empty CN");
 
     // The discovery backend (ADR 0037 §2): seeds candidate addresses for the
     // convergence loop and the formation probe guard.
@@ -386,8 +406,11 @@ pub async fn bootstrap(
         snapshot_keep_log_entries: cfg.raft.snapshot_keep_log_entries,
         event_tap_capacity: limits::EVENT_TAP_CAPACITY,
         tls: Arc::clone(&tls_store),
-        machine_identity: (!machine_identity.is_empty()).then(|| machine_identity.clone()),
+        machine_identity: Some(machine_identity.clone()),
         membership_policy: cfg.discovery.membership_policy(),
+        // The discovery backend's liveness attestor (ADR 0037 §5): `Some` for
+        // `ec2-asg`, `None` for the other backends.
+        attestor: discovery.liveness_attestor(),
     };
 
     // Step 5: bring up the replica. Intent is derived from the disk inside
@@ -448,13 +471,11 @@ pub async fn bootstrap(
         Arc::clone(&tls_store),
         formation.clone(),
         Arc::clone(&discovery),
+        cfg.discovery.membership_policy(),
     ));
 
-    // Bind now so a failure names the address at bootstrap rather than surfacing
-    // only when the server task is later awaited.
-    let listener = TcpListener::bind(raft_addr)
-        .await
-        .map_err(|e| anyhow!("binding raft/admin listener on {raft_addr}: {e}"))?;
+    // Serve on the listener bound up front (before any address was published):
+    // TLS is terminated by the connection-time acceptor over the shared store.
     let incoming = coppice_tls::serve(listener, Arc::clone(&tls_store));
 
     let router = Server::builder().add_service(transport).add_service(admin);
@@ -467,7 +488,7 @@ pub async fn bootstrap(
             })
             .await
     });
-    tracing::info!(addr = %raft_addr, "raft/admin mTLS listener bound");
+    tracing::info!(bind = %raft_addr, advertised = %advertise_addr, "raft/admin mTLS server serving");
 
     // Spawn the convergence loop (ADR 0037 §4): it drives self-join against the
     // cluster as a client and no-ops when this identity is already a caught-up
@@ -514,19 +535,29 @@ pub async fn bootstrap(
     })
 }
 
-/// Startup lint for the local leaf's certificate profile (ADR 0037 §6): warn if
-/// it is not a coordinator-profile leaf or carries no common name, since a
-/// deployment that violates "one installation, one stable subject, unique across
-/// the fleet" loses the one-seat-per-credential property.
-fn lint_leaf_profile(subject: &coppice_tls::LeafSubject) {
-    match subject.org_unit.as_deref() {
-        Some(OU_COORDINATOR) => {}
-        other => tracing::warn!(
-            org_unit = ?other,
-            "this coordinator's TLS leaf does not carry OU={OU_COORDINATOR}: the machine \
-             self-service grant keys on the leaf profile, so membership self-join may be refused \
-             (ADR 0037 §6)"
-        ),
+/// Enforce the local leaf's coordinator certificate profile (ADR 0037 §6) as a
+/// fail-fast startup requirement.
+///
+/// A coordinator leaf MUST carry both `OU=coppice-coordinator` (the profile
+/// marker the machine self-service grant keys on) and a non-empty Common Name
+/// (its stable machine identity). This is not a lint: the CN is bound into the
+/// founding voter's seat at formation and into every self-join's admission
+/// record, so an empty or missing CN would persist an *unbound* seat —
+/// violating §6's "no seat is ever unbound" — and a leaf without the marker
+/// could never pass the leader's endpoint verification. Either defect is a
+/// startup error naming the offending cert path and the required subject form.
+fn require_coordinator_leaf(
+    subject: &coppice_tls::LeafSubject,
+    cert_path: &std::path::Path,
+) -> Result<()> {
+    if subject.org_unit.as_deref() != Some(OU_COORDINATOR) {
+        bail!(
+            "coordinator TLS leaf {} is not a coordinator-profile certificate: its subject must \
+             carry Organizational Unit OU={OU_COORDINATOR} and a Common Name (CN) naming this \
+             installation's stable machine identity (ADR 0037 §6). Found OU={:?}.",
+            cert_path.display(),
+            subject.org_unit,
+        );
     }
     if subject
         .common_name
@@ -534,11 +565,15 @@ fn lint_leaf_profile(subject: &coppice_tls::LeafSubject) {
         .unwrap_or_default()
         .is_empty()
     {
-        tracing::warn!(
-            "this coordinator's TLS leaf has no common name: the machine identity would be empty, \
-             which never collides and so cannot hold a seat (ADR 0037 §6)"
+        bail!(
+            "coordinator TLS leaf {} has no Common Name (CN): a coordinator leaf's CN is its \
+             machine identity, bound into the founding voter's seat and every self-join, so it \
+             must be a non-empty name unique across the fleet and stable across rotation \
+             (ADR 0037 §6). Expected subject form: CN=<machine-identity>, OU={OU_COORDINATOR}.",
+            cert_path.display(),
         );
     }
+    Ok(())
 }
 
 /// Install the global tracing subscriber from the observability config.
@@ -611,6 +646,22 @@ impl Consensus for SharedConsensus {
         node: CoordinatorId,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
         self.0.remove_node(node)
+    }
+
+    fn evict_stale_learner(
+        &self,
+        incumbent: CoordinatorId,
+        machine_identity: &str,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
+        self.0.evict_stale_learner(incumbent, machine_identity)
+    }
+
+    fn set_node_address(
+        &self,
+        node: CoordinatorId,
+        new_addr: String,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
+        self.0.set_node_address(node, new_addr)
     }
 
     fn trigger_snapshot(&self) -> impl Future<Output = Result<(), ConsensusError>> + Send {

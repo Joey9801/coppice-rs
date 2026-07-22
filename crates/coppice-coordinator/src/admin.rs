@@ -18,7 +18,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
@@ -26,7 +26,7 @@ use tonic::{Code, Request, Response, Status};
 
 use coppice_consensus::{
     ClusterSummary, Consensus, ConsensusError, CoordinatorId, FormationControl, FormationError,
-    FormationOutcome, NodeHandle,
+    FormationOutcome, MembershipPolicy, NodeHandle,
 };
 use coppice_net::admin::{Client, RaftAdminService};
 use coppice_proto::pb::raft::v1 as pb;
@@ -107,6 +107,16 @@ pub struct AdminService<C: Consensus> {
     /// The discovery backend (ADR 0037 §2), consulted by the formation probe
     /// guard to refuse a double-init against an already-initialized cluster.
     discovery: Arc<dyn Discovery>,
+    /// Membership grace periods (ADR 0037 §5/§6); `replacement_grace` bounds
+    /// how long a pending learner's seat survives continuous unreachability.
+    policy: MembershipPolicy,
+    /// Leader-side unreachability evidence for contested pending learners
+    /// (ADR 0037 §6 "unreachable … for `replacement_grace`"): incumbent id →
+    /// first probe failure of the CURRENT unbroken failure streak. Entries are
+    /// cleared the moment a probe succeeds, so only continuous unreachability
+    /// accumulates. Progress-based staleness cannot see a dead-but-caught-up
+    /// learner in an idle cluster; this affirmative check can.
+    seat_unreachable: tokio::sync::Mutex<std::collections::HashMap<CoordinatorId, Instant>>,
 }
 
 impl<C: Consensus> AdminService<C> {
@@ -119,6 +129,7 @@ impl<C: Consensus> AdminService<C> {
         tls: Arc<TlsStore>,
         formation: FormationControl,
         discovery: Arc<dyn Discovery>,
+        policy: MembershipPolicy,
     ) -> Self {
         AdminService {
             consensus,
@@ -127,6 +138,8 @@ impl<C: Consensus> AdminService<C> {
             tls,
             formation,
             discovery,
+            policy,
+            seat_unreachable: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -186,11 +199,43 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
                 .await?;
         }
 
-        self.consensus
-            .add_learner(req.node_id, req.address, machine_identity)
+        match self
+            .consensus
+            .add_learner(req.node_id, req.address.clone(), machine_identity.clone())
             .await
-            .map_err(consensus_error_to_status)?;
-        Ok(Response::new(pb::AddLearnerResponse {}))
+        {
+            Ok(()) => Ok(Response::new(pb::AddLearnerResponse {})),
+            Err(ConsensusError::MachineSeatPending { incumbent }) => {
+                // The pending slot is held. Progress-based staleness cannot see
+                // a dead-but-caught-up incumbent in an idle cluster, so gather
+                // the ADR's other evidence arm here (§6 "unreachable … for
+                // `replacement_grace`"): probe the incumbent's endpoint and
+                // evict only after a continuous failure streak spanning the
+                // grace, revalidated under the membership lock.
+                if self
+                    .incumbent_unreachable_past_grace(incumbent)
+                    .await
+                    .is_some()
+                {
+                    self.consensus
+                        .evict_stale_learner(incumbent, &machine_identity)
+                        .await
+                        .map_err(consensus_error_to_status)?;
+                    self.seat_unreachable.lock().await.remove(&incumbent);
+                    // Retake the slot; a racing challenger may have beaten us
+                    // here, in which case this surfaces the NEW incumbent.
+                    self.consensus
+                        .add_learner(req.node_id, req.address, machine_identity)
+                        .await
+                        .map_err(consensus_error_to_status)?;
+                    return Ok(Response::new(pb::AddLearnerResponse {}));
+                }
+                Err(consensus_error_to_status(
+                    ConsensusError::MachineSeatPending { incumbent },
+                ))
+            }
+            Err(other) => Err(consensus_error_to_status(other)),
+        }
     }
 
     async fn promote_voter(
@@ -219,11 +264,37 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
                 ))
             }
         }
-        self.consensus
+        match self
+            .consensus
             .promote_voter(req.promote_node_id, req.remove_node_id)
             .await
-            .map_err(consensus_error_to_status)?;
-        Ok(Response::new(pb::PromoteVoterResponse {}))
+        {
+            Ok(()) => Ok(Response::new(pb::PromoteVoterResponse {})),
+            Err(ConsensusError::PromotionRefused(
+                coppice_consensus::PromotionRefusal::NoRemovablePeer,
+            )) if req.remove_node_id.is_none() => {
+                // Overflow removal needs a dead voter, but progress-based
+                // aging cannot see a dead-but-caught-up voter in an idle
+                // cluster. Gather the leader's affirmative evidence (ADR 0037
+                // §5: "the leader's replication to it has been failing"):
+                // probe the other voters' endpoints, and once ONE has been
+                // continuously unreachable past `removal_grace`, fold exactly
+                // that voter's removal into the promotion — the leader's own
+                // conservative choice, not the caller's.
+                if let Some(dead) = self.dead_voter_by_probe(req.promote_node_id).await {
+                    self.consensus
+                        .promote_voter(req.promote_node_id, Some(dead))
+                        .await
+                        .map_err(consensus_error_to_status)?;
+                    self.seat_unreachable.lock().await.remove(&dead);
+                    return Ok(Response::new(pb::PromoteVoterResponse {}));
+                }
+                Err(consensus_error_to_status(ConsensusError::PromotionRefused(
+                    coppice_consensus::PromotionRefusal::NoRemovablePeer,
+                )))
+            }
+            Err(other) => Err(consensus_error_to_status(other)),
+        }
     }
 
     async fn remove_node(
@@ -244,6 +315,62 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
             .await
             .map_err(consensus_error_to_status)?;
         Ok(Response::new(pb::RemoveNodeResponse {}))
+    }
+
+    async fn set_node_address(
+        &self,
+        request: Request<pb::SetNodeAddressRequest>,
+    ) -> Result<Response<pb::SetNodeAddressResponse>, Status> {
+        // Operator-only break-glass (ADR 0037 §4/§6): repointing a voter can
+        // split-brain, so no machine (or agent) credential may drive it — this
+        // is the whole of the "there is no self-service address repair" contract.
+        if !matches!(peer_profile(&request), CertProfile::Operator) {
+            return Err(permission_denied(
+                "set-address requires an operator-profile certificate",
+            ));
+        }
+        let req = request.into_inner();
+        self.check_cluster(&req.cluster_uuid)?;
+
+        // Locate the target in current membership and read the machine identity
+        // already bound to it. Unknown id → refused (no silent creation). The
+        // binding is the CA-attested subject recorded at admission, never
+        // claimed in the body — it is what the new endpoint must prove it owns.
+        let Some(record) = self
+            .handle
+            .cluster_summary()
+            .members
+            .into_iter()
+            .find(|m| m.id == req.node_id)
+        else {
+            return Err(Status::failed_precondition(format!(
+                "node {} is not in membership; set-address refuses to create a node (ADR 0037 §4)",
+                req.node_id
+            )));
+        };
+
+        // Idempotent: the new address equals the current one → Ok no-op, with no
+        // dial and no committed membership change (ADR 0037 §4).
+        if record.addr == req.address {
+            return Ok(Response::new(pb::SetNodeAddressResponse {}));
+        }
+
+        // Only the leader commits the repoint, and only after verifying the NEW
+        // endpoint (ADR 0037 §4/§6): dial it over mTLS and require its serving
+        // leaf's CN to equal the machine identity bound to the target, then
+        // `ProbeCluster` there and require the target's stamped node id. On a
+        // follower, skip the dial and let `set_node_address` return NotLeader so
+        // the operator retargets — an unverified `SetNodes` is never committed.
+        if self.is_leader() {
+            self.verify_endpoint(&req.address, &record.machine_identity, req.node_id)
+                .await?;
+        }
+
+        self.consensus
+            .set_node_address(req.node_id, req.address)
+            .await
+            .map_err(consensus_error_to_status)?;
+        Ok(Response::new(pb::SetNodeAddressResponse {}))
     }
 
     async fn cluster_status(
@@ -353,6 +480,12 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
             Err(FormationError::ConflictingToken { recorded }) => {
                 Err(conflicting_formation_token_status(recorded))
             }
+            // A normally-joined replica (initialized, no founding record):
+            // refuse as a plain already-initialized, applying no policy and
+            // confirming no token (ADR 0037 §3).
+            Err(e @ FormationError::AlreadyInitializedNoRecord) => {
+                Err(Status::failed_precondition(e.to_string()))
+            }
             Err(e) => Err(Status::internal(e.to_string())),
         }
     }
@@ -389,6 +522,82 @@ impl<C: Consensus> AdminService<C> {
     /// Endpoint verification before admission (ADR 0037 §6): dial `addr` over
     /// mTLS and require its serving leaf's CN to equal `identity`, then
     /// `ProbeCluster` there and require the claimed `node_id`.
+    /// Leader-side affirmative dead-voter evidence for an overflow removal
+    /// (ADR 0037 §5): probe every voter other than the one being promoted and
+    /// return the single lowest-id voter whose endpoint has been CONTINUOUSLY
+    /// unreachable for at least `removal_grace`. Streaks share the same
+    /// evidence map as pending-learner arbitration; a successful probe clears
+    /// its entry, so a blip never accumulates. At most one id is returned —
+    /// the ADR permits at most one overflow removal per promotion.
+    async fn dead_voter_by_probe(&self, promoting: CoordinatorId) -> Option<CoordinatorId> {
+        let voters: Vec<_> = self
+            .handle
+            .cluster_summary()
+            .members
+            .into_iter()
+            .filter(|m| m.voter && m.id != promoting)
+            .collect();
+        let mut dead = None;
+        for member in voters {
+            let reachable = matches!(
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let mut client = admin_channel_from_store(&member.addr, &self.tls)
+                        .await
+                        .ok()?;
+                    client.probe_cluster(pb::ProbeClusterRequest {}).await.ok()
+                })
+                .await,
+                Ok(Some(_))
+            );
+            let mut map = self.seat_unreachable.lock().await;
+            if reachable {
+                map.remove(&member.id);
+                continue;
+            }
+            let since = *map.entry(member.id).or_insert_with(Instant::now);
+            if since.elapsed() >= self.policy.removal_grace {
+                dead = match dead {
+                    Some(prior) if prior < member.id => Some(prior),
+                    _ => Some(member.id),
+                };
+            }
+        }
+        dead
+    }
+
+    /// Leader-side unreachability evidence for a contested pending learner
+    /// (ADR 0037 §6): probe the incumbent's advertised endpoint now, and return
+    /// `Some(streak)` only when probes have been failing CONTINUOUSLY for at
+    /// least `replacement_grace`. A successful probe clears the streak — a
+    /// blip never accumulates into eviction evidence. Returns `None` when the
+    /// incumbent is reachable, unknown to membership, or its streak is younger
+    /// than the grace.
+    async fn incumbent_unreachable_past_grace(&self, incumbent: CoordinatorId) -> Option<Duration> {
+        let addr = self
+            .handle
+            .cluster_summary()
+            .members
+            .into_iter()
+            .find(|m| m.id == incumbent)?
+            .addr;
+        let reachable = matches!(
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let mut client = admin_channel_from_store(&addr, &self.tls).await.ok()?;
+                client.probe_cluster(pb::ProbeClusterRequest {}).await.ok()
+            })
+            .await,
+            Ok(Some(_))
+        );
+        let mut map = self.seat_unreachable.lock().await;
+        if reachable {
+            map.remove(&incumbent);
+            return None;
+        }
+        let since = *map.entry(incumbent).or_insert_with(Instant::now);
+        let streak = since.elapsed();
+        (streak >= self.policy.replacement_grace).then_some(streak)
+    }
+
     async fn verify_endpoint(
         &self,
         addr: &str,
@@ -580,6 +789,15 @@ fn consensus_error_to_status(err: ConsensusError) -> Status {
         ConsensusError::UnknownNode { id } => {
             Status::failed_precondition(format!("node {id} is not in membership (ADR 0037 §4)"))
         }
+        ConsensusError::NotALearner { node } => Status::failed_precondition(format!(
+            "node {node} is a voter, not a pending learner — the voter set is never touched by \
+             learner replacement (ADR 0037 §6)"
+        )),
+        ConsensusError::MachineMismatch { node, bound } => Status::failed_precondition(format!(
+            "node {node} is bound to machine identity {bound:?}, not the contested slot; \
+             membership changed under the eviction evidence — retry observes the current \
+             incumbent (ADR 0037 §6)"
+        )),
     }
 }
 
@@ -660,22 +878,21 @@ fn hex(bytes: &[u8]) -> String {
 // Client side
 // ---------------------------------------------------------------------------
 
-/// Dial the admin surface of `target` (`host:port`) over mTLS (ADR 0011).
+/// Dial the admin surface of `target` (`host:port` or `[v6]:port`) over mTLS
+/// (ADR 0011).
 ///
 /// The client presents this node's certificate and trusts the cluster CA; the
-/// TLS domain is the host half of `target`, which must match the peer
-/// certificate's SAN.
+/// TLS domain is the unbracketed host half of `target`, which must match the
+/// peer certificate's SAN. The `https://{target}` authority keeps the original
+/// brackets an IPv6 literal needs.
 pub async fn admin_channel(
     target: &str,
     ca_pem: &[u8],
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> Result<Client<Channel>> {
-    let host = target
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(target)
-        .to_string();
+    let (host, _port) = coppice_tls::split_host_port(target)
+        .with_context(|| format!("invalid admin target {target}"))?;
 
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(ca_pem))
@@ -737,6 +954,30 @@ pub async fn remove_node(
         .remove_node(pb::RemoveNodeRequest {
             cluster_uuid: cluster_uuid.to_vec(),
             node_id,
+        })
+        .await
+        .map_err(status_to_anyhow)?;
+    Ok(())
+}
+
+/// Repoint an existing node's membership address (ADR 0037 §4 operator
+/// break-glass `admin set-address`).
+///
+/// The leader verifies the new endpoint (its serving-cert subject and stamped
+/// node id) before committing the `SetNodes`, so a wrong or unowned address is
+/// refused rather than committed. The caller presents operator-profile material;
+/// machine certificates are refused this verb server-side (§6).
+pub async fn set_node_address(
+    client: &mut Client<Channel>,
+    cluster_uuid: [u8; 16],
+    node_id: CoordinatorId,
+    addr: String,
+) -> Result<()> {
+    client
+        .set_node_address(pb::SetNodeAddressRequest {
+            cluster_uuid: cluster_uuid.to_vec(),
+            node_id,
+            address: addr,
         })
         .await
         .map_err(status_to_anyhow)?;
@@ -874,17 +1115,14 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
             println!("removed node {node_id} from membership");
         }
         AdminVerb::SetAddress { node_id, addr } => {
-            // Deliberately not implemented (ADR 0037 §4): the leader-side
-            // verified repoint (dial the new address, match its TLS subject to
-            // the target's machine-identity binding, confirm its stamped node id
-            // by probe) has no RPC yet. Refuse rather than commit an unverified
-            // `SetNodes`, which openraft warns can split-brain.
-            bail!(
-                "admin set-address (node {node_id} -> {addr}) is not implemented: the verified \
-                 leader-side repoint of ADR 0037 §4 has no membership-repointing RPC yet. Under \
-                 the immutable model an instance whose address changed is a new instance — let it \
-                 self-join and retire the old identity via replacement promotion."
-            );
+            // Operator break-glass repoint (ADR 0037 §4): the leader verifies the
+            // new endpoint (dial it, match its serving-cert subject to the
+            // target's machine-identity binding, confirm its stamped node id by
+            // probe) before committing the `SetNodes`. This CLI presents the
+            // operator's own configured leaf; a machine cert is refused this verb
+            // server-side (§6).
+            set_node_address(&mut client, cluster_uuid, node_id, addr.clone()).await?;
+            println!("repointed node {node_id} to {addr}");
         }
         AdminVerb::Status { json } => {
             let status = cluster_status(&mut client, cluster_uuid).await?;

@@ -120,6 +120,80 @@ fn client_config(ca_pem: &[u8], client: Option<(&[u8], &[u8])>) -> ClientConfig 
     }
 }
 
+// ---- host:port parsing ----------------------------------------------------
+
+#[test]
+fn split_host_port_ipv4_hostname_and_srv_names() {
+    assert_eq!(
+        split_host_port("10.0.0.1:7071").unwrap(),
+        ("10.0.0.1".to_string(), 7071)
+    );
+    assert_eq!(
+        split_host_port("localhost:7071").unwrap(),
+        ("localhost".to_string(), 7071)
+    );
+    // An SRV-style dotted name:port.
+    assert_eq!(
+        split_host_port("coord-1.coppice.internal:7071").unwrap(),
+        ("coord-1.coppice.internal".to_string(), 7071)
+    );
+}
+
+#[test]
+fn split_host_port_bracketed_ipv6_is_unbracketed() {
+    // The TLS domain/SAN identity is the inner literal, with no brackets.
+    assert_eq!(
+        split_host_port("[2001:db8::1]:7071").unwrap(),
+        ("2001:db8::1".to_string(), 7071)
+    );
+    assert_eq!(
+        split_host_port("[::1]:443").unwrap(),
+        ("::1".to_string(), 443)
+    );
+}
+
+#[test]
+fn split_host_port_rejects_bare_ipv6_and_garbage() {
+    // A bare (unbracketed) IPv6 literal is ambiguous — must be rejected, not
+    // silently mis-split by a naive rsplit_once(':').
+    assert!(matches!(
+        split_host_port("2001:db8::1"),
+        Err(HostPortError::BareIpv6(_))
+    ));
+    // No port at all.
+    assert!(matches!(
+        split_host_port("garbage"),
+        Err(HostPortError::MissingPort(_))
+    ));
+    // Non-numeric / out-of-range port.
+    assert!(matches!(
+        split_host_port("host:notaport"),
+        Err(HostPortError::BadPort { .. })
+    ));
+    assert!(matches!(
+        split_host_port("host:70000"),
+        Err(HostPortError::BadPort { .. })
+    ));
+    // Unclosed bracket and empty host.
+    assert!(matches!(
+        split_host_port("[2001:db8::1:7071"),
+        Err(HostPortError::UnclosedBracket(_))
+    ));
+    assert!(matches!(
+        split_host_port(":7071"),
+        Err(HostPortError::EmptyHost(_))
+    ));
+    assert!(matches!(
+        split_host_port("[]:7071"),
+        Err(HostPortError::EmptyHost(_))
+    ));
+    // A bracketed literal with no port.
+    assert!(matches!(
+        split_host_port("[2001:db8::1]"),
+        Err(HostPortError::MissingPort(_))
+    ));
+}
+
 // ---- reload semantics -----------------------------------------------------
 
 #[test]
@@ -183,6 +257,97 @@ fn broken_pem_keeps_the_old_material() {
     std::fs::write(&paths.key, &key2).unwrap();
     assert!(store.reload().unwrap());
     assert_eq!(store.current().cert_pem(), cert2.as_slice());
+}
+
+#[test]
+fn force_reload_swaps_even_when_mtime_and_len_are_unchanged() {
+    // Finding 8(a): SIGHUP must actually re-read, not fingerprint-gate. Leave the
+    // files completely untouched — the on-disk (mtime, len) is exactly what the
+    // store loaded — so `reload()` no-ops but `force_reload()` re-reads and
+    // swaps regardless, bumping the generation.
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new();
+    let (cert, key) = ca.leaf("node-a");
+    let paths = write_material(dir.path(), &cert, &key, &ca.pem);
+
+    let store = TlsStore::load(paths).unwrap();
+    let gen0 = store.generation();
+    let served = store.current().cert_pem().to_vec();
+
+    // The fingerprint gate sees no change: plain reload is a no-op.
+    assert!(
+        !store.reload().unwrap(),
+        "reload must fingerprint-gate an unchanged (mtime,len)"
+    );
+    assert_eq!(store.generation(), gen0, "a no-op reload must not bump gen");
+
+    // SIGHUP's force path skips the gate, re-reads, and swaps.
+    assert!(
+        store.force_reload().unwrap(),
+        "force_reload must swap despite an unchanged fingerprint"
+    );
+    assert!(
+        store.generation() > gen0,
+        "force_reload swap must bump the generation"
+    );
+    // Same bytes on disk, so the freshly-parsed material still serves that leaf.
+    assert_eq!(store.current().cert_pem(), served.as_slice());
+}
+
+#[test]
+fn generation_advances_only_on_a_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new();
+    let (cert1, key1) = ca.leaf("node-a");
+    let paths = write_material(dir.path(), &cert1, &key1, &ca.pem);
+
+    let store = TlsStore::load(paths.clone()).unwrap();
+    assert_eq!(store.generation(), 0);
+
+    // A no-op reload leaves the generation put.
+    assert!(!store.reload().unwrap());
+    assert_eq!(store.generation(), 0);
+
+    // A real rotation bumps it once.
+    std::thread::sleep(Duration::from_millis(10));
+    let (cert2, key2) = ca.leaf("node-a");
+    std::fs::write(&paths.cert, &cert2).unwrap();
+    std::fs::write(&paths.key, &key2).unwrap();
+    assert!(store.reload().unwrap());
+    assert_eq!(store.generation(), 1);
+    assert!(!store.reload().unwrap());
+    assert_eq!(store.generation(), 1);
+}
+
+#[test]
+fn a_torn_read_is_skipped_and_leaves_the_store_untouched() {
+    // Finding 8(b): the lost-update guard. A read whose pre/post fingerprints
+    // disagree (a writer raced the read) must be judged unstable and skipped,
+    // even though the bytes themselves parse — otherwise straddled material
+    // latches under the post fingerprint forever. Directly exercise the factored
+    // read-with-fingerprints step with an injected pre/post mismatch.
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new();
+    let (cert, key) = ca.leaf("node-a");
+    let paths = write_material(dir.path(), &cert, &key, &ca.pem);
+
+    // A perfectly valid, parseable read...
+    let mut read = ReadWithFingerprints::capture(&paths).unwrap();
+    assert!(read.is_stable(), "an uncontended read must be stable");
+    // ...but with the post fingerprint perturbed as if a writer raced us.
+    read.post.cert.1 = read.post.cert.1.wrapping_add(1);
+    assert!(!read.is_stable(), "a pre/post mismatch must be unstable");
+    // The bytes still parse — proving the skip is the guard, not a parse error.
+    assert!(
+        read.into_material(&paths).is_ok(),
+        "the torn bytes are themselves valid PEM"
+    );
+
+    // And the store survives a torn poll un-poisoned: a subsequent honest reload
+    // still works.
+    let store = TlsStore::load(paths.clone()).unwrap();
+    assert!(!store.reload().unwrap());
+    assert!(store.force_reload().unwrap());
 }
 
 #[test]

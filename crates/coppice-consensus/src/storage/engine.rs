@@ -485,9 +485,24 @@ impl<F: Fs> StorageCore<F> {
     /// Durably record the formation token in the manifest stamp (ADR 0037 §3),
     /// through the same one-atomic-swap discipline as every structural fact.
     /// Called once, before `raft.initialize`, so the operator's formation intent
-    /// survives a crash in the initialize window. Idempotent: recording the same
-    /// token twice is a no-op that still re-fsyncs the manifest.
+    /// survives a crash in the initialize window.
+    ///
+    /// **Conditional on "unset or equal"** (finding: concurrent InitializeCluster
+    /// with different tokens): recording the same token twice is an idempotent
+    /// no-op that still re-fsyncs the manifest, but overwriting a *different*
+    /// already-recorded token is refused with [`io::ErrorKind::AlreadyExists`].
+    /// This makes the storage layer, not just the in-process form lock, the
+    /// final arbiter of which token founds the cluster — a racing former that
+    /// slipped past the lock cannot clobber the recorded intent.
     pub fn record_formation_token(&mut self, token: &str) -> io::Result<()> {
+        if let Some(existing) = &self.manifest.formation_token {
+            if existing != token {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("a different formation token is already recorded ({existing})"),
+                ));
+            }
+        }
         self.manifest.formation_token = Some(token.to_string());
         write_manifest(&self.fs, &self.manifest)
     }

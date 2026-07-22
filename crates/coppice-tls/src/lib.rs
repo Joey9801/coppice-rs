@@ -37,6 +37,7 @@
 
 use std::io::{self, Cursor};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -115,6 +116,93 @@ pub enum TlsError {
     /// rustls rejected the assembled server config (bad key/cert pairing, etc).
     #[error("building the rustls server config: {0}")]
     RustlsConfig(String),
+}
+
+// ---------------------------------------------------------------------------
+// Host:port parsing (shared by every TLS dial seam)
+// ---------------------------------------------------------------------------
+
+/// A `host:port` authority that could not be split into a TLS domain and port.
+#[derive(Debug, thiserror::Error)]
+pub enum HostPortError {
+    /// No `:port` suffix at all (`host` with no port, or plain garbage).
+    #[error("address {0:?} has no port (expected host:port or [ipv6]:port)")]
+    MissingPort(String),
+    /// A `[` opened an IPv6 literal that was never closed with `]`.
+    #[error("address {0:?} has an unclosed '[' in its IPv6 literal")]
+    UnclosedBracket(String),
+    /// A bare IPv6 address with no brackets: its colons are indistinguishable
+    /// from a `host:port` split, so it must be written `[addr]:port`.
+    #[error("address {0:?} looks like a bare IPv6 address; write it as [addr]:port")]
+    BareIpv6(String),
+    /// The host half was empty (e.g. `:7071` or `[]:7071`).
+    #[error("address {0:?} has an empty host")]
+    EmptyHost(String),
+    /// The port half was not a `u16`.
+    #[error("port {port:?} in address {addr:?} is not a valid 1..=65535 port: {source}")]
+    BadPort {
+        addr: String,
+        port: String,
+        source: std::num::ParseIntError,
+    },
+}
+
+/// Split a `host:port` authority into an **unbracketed** host (a TLS SNI/domain
+/// name or SAN identity) and its numeric port (ADR 0037 §6).
+///
+/// Accepts three forms and rejects the ambiguous one:
+/// - `host:port` / `10.0.0.1:7071` / `name:7071` — split on the final colon.
+/// - `[2001:db8::1]:7071` — the IPv6 literal is returned **without** its
+///   brackets, which is the form a SAN / `ServerName` expects.
+/// - a bare `2001:db8::1` (no brackets, no port) is **rejected**: a naive
+///   `rsplit_once(':')` would treat `db8::1` as a port and hand back a bogus
+///   host, so an unbracketed multi-colon address is an error, not a guess.
+///
+/// The returned host is always unbracketed. When composing a URI authority
+/// (`https://{addr}` dial strings, `TcpStream::connect(addr)`) keep the caller's
+/// **original** `addr`, which already carries the brackets an IPv6 literal
+/// needs — do not rebuild the authority from the returned host.
+pub fn split_host_port(addr: &str) -> Result<(String, u16), HostPortError> {
+    // Bracketed IPv6: `[<v6>]:<port>`.
+    if let Some(rest) = addr.strip_prefix('[') {
+        let close = rest
+            .find(']')
+            .ok_or_else(|| HostPortError::UnclosedBracket(addr.to_string()))?;
+        let host = &rest[..close];
+        let after = &rest[close + 1..];
+        let port_str = after
+            .strip_prefix(':')
+            .ok_or_else(|| HostPortError::MissingPort(addr.to_string()))?;
+        if host.is_empty() {
+            return Err(HostPortError::EmptyHost(addr.to_string()));
+        }
+        let port = parse_port(addr, port_str)?;
+        return Ok((host.to_string(), port));
+    }
+
+    // Unbracketed: split on the final colon. A host half that still contains a
+    // colon means a bare (unbracketed) IPv6 literal — ambiguous, so reject it.
+    let (host, port_str) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| HostPortError::MissingPort(addr.to_string()))?;
+    if host.contains(':') {
+        return Err(HostPortError::BareIpv6(addr.to_string()));
+    }
+    if host.is_empty() {
+        return Err(HostPortError::EmptyHost(addr.to_string()));
+    }
+    let port = parse_port(addr, port_str)?;
+    Ok((host.to_string(), port))
+}
+
+fn parse_port(addr: &str, port_str: &str) -> Result<u16, HostPortError> {
+    port_str
+        .parse::<u16>()
+        .map_err(|source| HostPortError::BadPort {
+            addr: addr.to_string(),
+            port: port_str.to_string(),
+            source,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +434,13 @@ pub struct TlsStore {
     /// successful swap (or an initial load), so a broken write is retried every
     /// poll until it parses cleanly.
     fingerprint: Mutex<Fingerprint>,
+    /// Monotonic counter bumped on every successful material swap. Long-lived
+    /// consumers that cache a connection built from this store's material (the
+    /// raft peer-channel map, ADR 0037 §6) record the generation they dialed at
+    /// and evict when [`generation`](Self::generation) advances, so a rotated
+    /// leaf is presented on the next (re)dial rather than being pinned to a
+    /// cached channel until restart.
+    generation: AtomicU64,
 }
 
 impl TlsStore {
@@ -353,12 +448,18 @@ impl TlsStore {
     /// missing or unparseable — a coordinator with no valid TLS material must
     /// not start (ADR 0011: no insecure fallback).
     pub fn load(paths: TlsPaths) -> Result<Arc<TlsStore>, TlsError> {
-        let (material, fingerprint) = Self::read_and_parse(&paths)?;
+        // Initial load is fail-fast startup, not a polling loop: read once and
+        // parse. A writer racing this single read is transient and reconciled by
+        // the first poll (the stored fingerprint is the post-read stat).
+        let read = ReadWithFingerprints::capture(&paths)?;
+        let fingerprint = read.post.clone();
+        let material = read.into_material(&paths)?;
         set_expiry_gauge(&material);
         Ok(Arc::new(TlsStore {
             paths,
             current: ArcSwap::from_pointee(material),
             fingerprint: Mutex::new(fingerprint),
+            generation: AtomicU64::new(0),
         }))
     }
 
@@ -381,6 +482,7 @@ impl TlsStore {
             paths,
             current: ArcSwap::from_pointee(material),
             fingerprint: Mutex::new(fingerprint),
+            generation: AtomicU64::new(0),
         }))
     }
 
@@ -395,41 +497,114 @@ impl TlsStore {
         self.current.load_full()
     }
 
-    /// Re-read the source files and swap in freshly-parsed material.
+    /// The current material generation: a monotonic counter bumped on every
+    /// successful swap ([`reload`](Self::reload) / [`force_reload`]). A cached
+    /// connection built from this store records the generation it dialed at and
+    /// re-dials when this advances (ADR 0037 §6), so a rotation is never pinned
+    /// to a stale channel.
+    ///
+    /// [`force_reload`]: TlsStore::force_reload
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Re-read the source files and swap in freshly-parsed material *when the
+    /// on-disk fingerprint changed*.
     ///
     /// Returns `Ok(true)` when new material was swapped in, `Ok(false)` when
-    /// nothing on disk changed since the last successful load, and `Err` when a
-    /// file could not be read or parsed. On `Err` the previous material keeps
-    /// serving and the fingerprint is left unchanged, so the next poll retries
-    /// the same (still-broken, or now-fixed) files rather than latching a bad
-    /// state. This is the guarantee that a half-written cert can never take
-    /// down serving.
+    /// nothing on disk changed since the last successful load (or a concurrent
+    /// write tore the read — see below), and `Err` when a file could not be read
+    /// or parsed. On `Err` the previous material keeps serving and the
+    /// fingerprint is left unchanged, so the next poll retries the same
+    /// (still-broken, or now-fixed) files rather than latching a bad state. This
+    /// is the guarantee that a half-written cert can never take down serving.
     pub fn reload(&self) -> Result<bool, TlsError> {
-        let fingerprint = fingerprint_of(&self.paths);
-        if *self.fingerprint.lock().expect("tls fingerprint poisoned") == fingerprint {
-            return Ok(false);
+        self.reload_inner(false)
+    }
+
+    /// Like [`reload`](Self::reload) but skips the fingerprint gate: it re-reads
+    /// and re-parses even when `(mtime, len)` is unchanged, then swaps. This is
+    /// the `SIGHUP` path — an operator forcing a reload means "I changed the
+    /// bytes, trust me", which a coarse-mtime filesystem or an in-place rewrite
+    /// can hide from the stat-based gate. It still honours the lost-update guard
+    /// (a torn read is skipped, not swapped).
+    pub fn force_reload(&self) -> Result<bool, TlsError> {
+        self.reload_inner(true)
+    }
+
+    fn reload_inner(&self, force: bool) -> Result<bool, TlsError> {
+        // Cheap gate: on the polling path, skip the file reads entirely when the
+        // fingerprint is unchanged. `force` (SIGHUP) always reads.
+        if !force {
+            let fingerprint = fingerprint_of(&self.paths);
+            if *self.fingerprint.lock().expect("tls fingerprint poisoned") == fingerprint {
+                return Ok(false);
+            }
         }
 
-        let (material, fingerprint) = Self::read_and_parse(&self.paths)?;
+        let read = ReadWithFingerprints::capture(&self.paths)?;
+        // Lost-update guard: if a writer raced between the pre- and post-read
+        // fingerprints, the bytes we hold may straddle two generations. Skip the
+        // swap and let the next poll (or SIGHUP) retry against a settled file,
+        // rather than latching intermediate material under a fingerprint that
+        // says "current".
+        if !read.is_stable() {
+            return Ok(false);
+        }
+        let fingerprint = read.post.clone();
+        let material = read.into_material(&self.paths)?;
         set_expiry_gauge(&material);
         self.current.store(Arc::new(material));
         *self.fingerprint.lock().expect("tls fingerprint poisoned") = fingerprint;
+        self.generation.fetch_add(1, Ordering::Release);
         metrics::counter!(RELOADS).increment(1);
         Ok(true)
     }
+}
 
-    /// Read the three files and parse them into material plus the fingerprint
-    /// captured at read time.
-    fn read_and_parse(paths: &TlsPaths) -> Result<(TlsMaterial, Fingerprint), TlsError> {
+/// The three PEM blobs read together with a `(mtime, len)` fingerprint captured
+/// immediately *before* and *after* the reads.
+///
+/// Factored out so the lost-update guard is directly testable: a mismatched
+/// pre/post pair (a writer racing the read) makes [`is_stable`](Self::is_stable)
+/// return `false`, and the store skips the swap instead of storing straddled
+/// bytes under the post fingerprint forever.
+struct ReadWithFingerprints {
+    pre: Fingerprint,
+    post: Fingerprint,
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    ca_pem: Vec<u8>,
+}
+
+impl ReadWithFingerprints {
+    /// Capture the pre fingerprint, read all three files, capture the post
+    /// fingerprint.
+    fn capture(paths: &TlsPaths) -> Result<ReadWithFingerprints, TlsError> {
+        let pre = fingerprint_of(paths);
         let cert_pem = read(&paths.cert, "certificate")?;
         let key_pem = read(&paths.key, "private key")?;
         let ca_pem = read(&paths.ca, "CA certificate")?;
-        // Fingerprint after reading, so a write racing between stat and read is
-        // caught on the next poll (the fingerprint we store reflects the bytes
-        // we actually parsed).
-        let fingerprint = fingerprint_of(paths);
-        let material = TlsMaterial::from_pem(paths, ca_pem, cert_pem, key_pem)?;
-        Ok((material, fingerprint))
+        let post = fingerprint_of(paths);
+        Ok(ReadWithFingerprints {
+            pre,
+            post,
+            cert_pem,
+            key_pem,
+            ca_pem,
+        })
+    }
+
+    /// The read is stable — no writer changed any file between the pre- and
+    /// post-read stats — so the bytes are a single coherent generation.
+    fn is_stable(&self) -> bool {
+        self.pre == self.post
+    }
+
+    /// Parse the read bytes into material. Callers must check
+    /// [`is_stable`](Self::is_stable) first when latching a fingerprint.
+    fn into_material(self, paths: &TlsPaths) -> Result<TlsMaterial, TlsError> {
+        TlsMaterial::from_pem(paths, self.ca_pem, self.cert_pem, self.key_pem)
     }
 }
 
@@ -540,7 +715,15 @@ pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandl
             if forced {
                 tracing::info!("tls reload: SIGHUP received, re-reading cert/key/CA");
             }
-            match store.reload() {
+            // SIGHUP forces a re-read+swap even when the stat-based fingerprint
+            // is unchanged (an in-place rewrite or coarse-mtime filesystem can
+            // hide a real change); the poll path keeps the cheap gate.
+            let outcome = if forced {
+                store.force_reload()
+            } else {
+                store.reload()
+            };
+            match outcome {
                 Ok(true) => {
                     last_failure = None;
                     let not_after = store.current().not_after_unix();
@@ -552,8 +735,11 @@ pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandl
                 }
                 Ok(false) => {
                     if forced {
+                        // force_reload only reports false on a torn read (a
+                        // writer racing our read); the next pass retries.
                         tracing::info!(
-                            "tls reload: SIGHUP forced a reload but files were unchanged"
+                            "tls reload: SIGHUP reload skipped — a concurrent write raced the \
+                             read; will retry"
                         );
                     }
                 }
@@ -589,11 +775,9 @@ pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandl
 /// peer chain is validated by rustls against the CA before we read its subject.
 pub async fn read_serving_leaf(store: &TlsStore, addr: &str) -> Result<LeafSubject, String> {
     let material = store.current();
-    let host = addr
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(addr)
-        .to_string();
+    // Unbracketed host for the SNI/`ServerName` (an IPv6 literal arrives
+    // bracketed as `[..]:port`); `addr` keeps its brackets for `connect`.
+    let (host, _port) = split_host_port(addr).map_err(|e| e.to_string())?;
 
     let mut roots = RootCertStore::empty();
     for ca in rustls_pemfile::certs(&mut Cursor::new(material.ca_pem()))

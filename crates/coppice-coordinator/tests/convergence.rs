@@ -31,9 +31,13 @@ use coppice_coordinator::convergence::Phase;
 use coppice_core::id::ClusterId;
 use coppice_proto::pb::raft::v1 as pb;
 
-use common::{poll, Ca, Node};
+use common::{poll, Ca, DiscoverySpec, Node, NodeSpec};
 
 const DEADLINE: Duration = Duration::from_secs(20);
+
+/// For waits that include a deliberate grace period (e.g. a killed leader
+/// aging past `removal_grace` before an overflow removal can fold it out).
+const LONG_DEADLINE: Duration = Duration::from_secs(40);
 
 /// GET `<base><path>` and return the status code plus parsed JSON body.
 async fn get_readyz(base: &str, path: &str) -> (reqwest::StatusCode, Value) {
@@ -488,6 +492,23 @@ async fn authz_matrix() {
             err.message()
         );
 
+        // set-address is operator-only too (ADR 0037 §4/§6): a machine cert can
+        // never repoint a voter — refused before any endpoint dial.
+        let err = client
+            .set_node_address(pb::SetNodeAddressRequest {
+                cluster_uuid: cluster_uuid.to_vec(),
+                node_id,
+                address: "localhost:1".into(),
+            })
+            .await
+            .expect_err("machine cert refused SetNodeAddress");
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "SetNodeAddress: {}",
+            err.message()
+        );
+
         // Promotion of node 1 (bound to coord-1) by the coord-99 machine cert is
         // a foreign-id promotion → refused.
         let err = client
@@ -517,6 +538,393 @@ async fn authz_matrix() {
         admin::remove_node(&mut client, cluster_uuid, 123_456_789)
             .await
             .expect("operator RemoveNode of an absent id is an allowed no-op");
+    }
+
+    node.graceful_stop().await;
+}
+
+/// ADR 0037 §6 (finding #10): a coordinator whose serving leaf carries the
+/// coordinator profile marker but NO Common Name must FAIL to boot, not warn.
+/// An empty CN would be persisted as the founding voter's machine identity —
+/// an unbound seat, which the ADR forbids ("no seat is ever unbound") and which
+/// could never pass endpoint verification. The refusal names the cert path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_refuses_coordinator_leaf_without_cn() {
+    init_tracing();
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+
+    // Lay down a normal node, then replace its serving leaf with a
+    // coordinator-profile leaf that has no CN before booting.
+    let node = Node::new(1, cluster_id, &ca);
+    node.overwrite_leaf(&ca.machine_leaf_without_cn());
+
+    let err = node
+        .try_boot()
+        .await
+        .expect_err("a coordinator leaf without a CN must be refused at boot");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("Common Name") || msg.contains("CN"),
+        "the refusal names the missing CN: {msg}"
+    );
+    assert!(
+        msg.contains("node.crt"),
+        "the refusal names the offending cert path: {msg}"
+    );
+}
+
+/// The single registration file's first line in a `file`-discovery directory,
+/// asserting there is exactly one (call before any second process registers).
+fn only_registration(dir: &std::path::Path) -> String {
+    let files: Vec<_> = std::fs::read_dir(dir)
+        .expect("read discovery dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "expected exactly one registration file, found {}",
+        files.len()
+    );
+    let contents = std::fs::read_to_string(files[0].path()).expect("read registration");
+    contents
+        .lines()
+        .next()
+        .expect("first line")
+        .trim()
+        .to_string()
+}
+
+/// Remove every registration file from a `file`-discovery directory, so a later
+/// `candidates()` yields nothing — the way a test proves the convergence loop is
+/// NOT leaning on discovery.
+fn clear_discovery_dir(dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir)
+        .expect("read discovery dir")
+        .flatten()
+    {
+        if entry.path().is_file() {
+            std::fs::remove_file(entry.path()).expect("remove registration");
+        }
+    }
+}
+
+/// ADR 0037 §2 port-0 dev case (finding #6): a coordinator booted with
+/// `raft_addr` port 0 must resolve its real bound port BEFORE publishing any
+/// address, so its `file`-discovery registration carries `host:<real-port>`
+/// (never `host:0`) and a second node can self-join through it. Before the fix,
+/// registration happened ahead of the bind and permanently published `host:0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn port_zero_registration_publishes_real_port() {
+    init_tracing();
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let discovery_dir = tempfile::tempdir().expect("discovery dir");
+
+    // Node 1 binds raft_addr :0 and registers in the shared file-discovery dir.
+    let mut n1 = Node::with_spec(
+        NodeSpec::new(
+            1,
+            cluster_id,
+            DiscoverySpec::File(discovery_dir.path().to_path_buf()),
+        )
+        .with_raft_port_zero(),
+        &ca,
+    );
+    n1.boot().await;
+    n1.form("port-zero-formation").await;
+    poll(DEADLINE, "node 1 forms as a voter", || async {
+        n1.is_leader() && n1.is_voter()
+    })
+    .await;
+
+    // The registration file names the REAL bound port, not :0.
+    let advertised = only_registration(discovery_dir.path());
+    let port: u16 = advertised
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("registration {advertised:?} has no parseable port"));
+    assert_ne!(
+        port, 0,
+        "registration must carry the real bound port, got {advertised:?}"
+    );
+
+    // A second node self-joins purely by discovering node 1 through that file —
+    // proving the published address is actually dialable.
+    let mut n2 = Node::new_file_discovery(2, cluster_id, &ca, discovery_dir.path().to_path_buf());
+    n2.boot().await;
+    poll(
+        DEADLINE,
+        "node 2 joins via the port-0 node's real-port registration",
+        || async { n2.is_voter() },
+    )
+    .await;
+
+    n2.graceful_stop().await;
+    n1.graceful_stop().await;
+}
+
+/// ADR 0037 §2/§4 (finding #5) + issue #47 leader-change-mid-join: once a
+/// joiner's `AddLearner` has committed, the admitted learner carries replicated
+/// membership + leader info, so it must keep converging by routing from its
+/// LOCAL membership view — even if discovery goes empty AND the leader it joined
+/// through dies. Before the fix, the loop still required discovery to yield a
+/// reachable leader, so an admitted learner wedged forever when discovery went
+/// empty or named only the dead leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn leader_change_mid_join_converges_via_local_membership() {
+    init_tracing();
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let discovery_dir = tempfile::tempdir().expect("discovery dir");
+
+    // cluster_size = 3 with three live voters: the fourth identity is ADMITTED
+    // as a learner but its promotion is refused (voter set full, no removable
+    // peer while all voters are alive) — a semantic, race-free hold in the
+    // Learner phase. removal_grace is shortened so that once the leader is
+    // killed, its corpse qualifies for overflow removal quickly and the held
+    // promotion can complete against the successor.
+    let grace = Duration::from_millis(1500);
+    let mk = |id: u64| {
+        Node::with_spec(
+            NodeSpec {
+                removal_grace: Some(grace),
+                ..NodeSpec::new(
+                    id,
+                    cluster_id,
+                    DiscoverySpec::File(discovery_dir.path().to_path_buf()),
+                )
+            },
+            &ca,
+        )
+    };
+    let mut n1 = mk(1);
+    let mut n2 = mk(2);
+    let mut n3 = mk(3);
+    for n in [&mut n1, &mut n2, &mut n3] {
+        n.boot().await;
+    }
+
+    // One formation act; the other two self-join. n1 is the founding voter and
+    // the stable leader (it initialized as the single voter).
+    n1.form("leader-change-formation").await;
+    for (i, n) in [&n1, &n2, &n3].iter().enumerate() {
+        poll(DEADLINE, "initial three voters", || async { n.is_voter() }).await;
+        assert!(n.is_voter(), "node {} is a voter", i + 1);
+    }
+    poll(DEADLINE, "n1 is the leader", || async { n1.is_leader() }).await;
+
+    // The joiner boots and self-joins THROUGH n1 (found via discovery,
+    // pre-admission). Its AddLearner commits, but promotion is refused while
+    // all three seats are held by live voters, so it is deterministically
+    // parked in the Learner phase.
+    let mut d = mk(4);
+    d.boot().await;
+    let d_id = d.raft_id();
+    poll(DEADLINE, "joiner committed as a held learner", || async {
+        n1.summary()
+            .members
+            .iter()
+            .any(|m| m.id == d_id && !m.voter)
+            && d.convergence_phase() == Phase::Learner
+    })
+    .await;
+    assert!(
+        !d.is_voter(),
+        "promotion is refused while the voter set is full"
+    );
+
+    // Sabotage discovery AND kill the join-leader together: clearing the
+    // file-discovery directory proves the joiner cannot lean on discovery, and
+    // killing n1 forces a leader change while the joiner is mid-join.
+    clear_discovery_dir(discovery_dir.path());
+    let n1_id = n1.raft_id();
+    n1.kill().await;
+
+    // A live successor is elected among the survivors (n1 is gone).
+    poll(DEADLINE, "a live successor leads", || async {
+        n2.is_leader() || n3.is_leader()
+    })
+    .await;
+
+    // The joiner — routing purely from its LOCAL membership view now that
+    // discovery is empty and the leader it joined through is dead — finds the
+    // successor and keeps re-issuing its idempotent promotion. Once the dead
+    // leader has been unreachable for removal_grace, the promotion folds its
+    // removal into the same joint change and the joiner becomes a voter.
+    poll(
+        LONG_DEADLINE,
+        "joiner converges to voter via the new leader",
+        || async { d.convergence_phase() == Phase::Voter && d.is_voter() },
+    )
+    .await;
+    let survivor = if n2.is_leader() { &n2 } else { &n3 };
+    let members = survivor.summary().members;
+    assert!(
+        members.iter().all(|m| m.id != n1_id),
+        "the dead join-leader was retired in the promotion's joint change"
+    );
+    assert_eq!(
+        members.iter().filter(|m| m.voter).count(),
+        3,
+        "cluster back at its intended size with the joiner seated"
+    );
+
+    for mut n in [n2, n3, d] {
+        n.graceful_stop().await;
+    }
+}
+
+/// Finding #3 (formation token on joined replicas). A normally-JOINED replica
+/// holds no founding formation record, so `is_initialized()` is true while its
+/// recorded token is `None`. `InitializeCluster` against it must be refused as
+/// a plain "already initialized" for ANY supplied token — never the idempotent
+/// `AlreadyFormed`, and never applying the supplied bootstrap policy (ADR 0037
+/// §3). Both paths are asserted: the FOUNDER re-reports already-initialized for
+/// its recorded token; the JOINED replica refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn joined_replica_without_formation_record_refuses_init() {
+    init_tracing();
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let cluster_uuid = *cluster_id.0.as_bytes();
+
+    // Node 1 forms; node 2 self-joins and becomes a voter with no formation
+    // record of its own.
+    let mut node1 = Node::new(1, cluster_id, &ca);
+    node1.boot().await;
+    node1.form("founder-token").await;
+    poll(DEADLINE, "node 1 formed", || async {
+        node1.is_leader() && node1.is_voter()
+    })
+    .await;
+
+    let mut node2 = Node::new_with_seeds(2, cluster_id, &ca, &[node1.advertise.clone()]);
+    node2.boot().await;
+    poll(DEADLINE, "node 2 joins as a voter", || async {
+        node2.is_voter()
+    })
+    .await;
+
+    let op = ca.operator_leaf();
+
+    // Path A — the founder holds the recorded token: its exact token re-reports
+    // already-initialized success (idempotent formation).
+    let mut c1 = admin::admin_channel(&node1.advertise, &ca.pem, &op.cert_pem, &op.key_pem)
+        .await
+        .expect("dial node 1 admin surface");
+    let founder = c1
+        .initialize_cluster(pb::InitializeClusterRequest {
+            cluster_uuid: cluster_uuid.to_vec(),
+            formation_token: "founder-token".into(),
+            policy_toml: None,
+        })
+        .await
+        .expect("founder re-init with its recorded token succeeds")
+        .into_inner();
+    assert!(
+        founder.already_initialized,
+        "the founder re-reports already-initialized for its recorded token"
+    );
+
+    // Path B — the joined replica holds no record: refused for ANY token,
+    // never AlreadyFormed, no policy applied.
+    let mut c2 = admin::admin_channel(&node2.advertise, &ca.pem, &op.cert_pem, &op.key_pem)
+        .await
+        .expect("dial node 2 admin surface");
+    let status = c2
+        .initialize_cluster(pb::InitializeClusterRequest {
+            cluster_uuid: cluster_uuid.to_vec(),
+            formation_token: "any-token-at-all".into(),
+            policy_toml: None,
+        })
+        .await
+        .expect_err("a joined replica with no formation record refuses InitializeCluster");
+    assert_eq!(
+        status.code(),
+        Code::FailedPrecondition,
+        "plain already-initialized refusal, not a server error: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("already initialized"),
+        "refusal names the already-initialized condition: {}",
+        status.message()
+    );
+
+    node2.graceful_stop().await;
+    node1.graceful_stop().await;
+}
+
+/// Finding #4 (concurrent InitializeCluster). Two requests with DIFFERENT
+/// tokens race against one parked daemon. The formation lock plus the storage
+/// layer's "unset or equal" token guard let exactly one win; the loser is
+/// refused `ConflictingFormationToken` naming the winner's token, never a false
+/// idempotent success from the loser's `raft.initialize` `NotAllowed` (ADR 0037
+/// §3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_init_different_tokens_one_wins() {
+    init_tracing();
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let cluster_uuid = *cluster_id.0.as_bytes();
+
+    // A parked node with NO discovery seeds: the probe guard finds nothing, so
+    // both requests reach `form` and race there.
+    let mut node = Node::new(1, cluster_id, &ca);
+    node.boot().await;
+    let target = node.advertise.clone();
+
+    let op = ca.operator_leaf();
+    let mut c_alpha = admin::admin_channel(&target, &ca.pem, &op.cert_pem, &op.key_pem)
+        .await
+        .expect("dial admin surface (alpha)");
+    let mut c_beta = admin::admin_channel(&target, &ca.pem, &op.cert_pem, &op.key_pem)
+        .await
+        .expect("dial admin surface (beta)");
+
+    let req_alpha = pb::InitializeClusterRequest {
+        cluster_uuid: cluster_uuid.to_vec(),
+        formation_token: "alpha".into(),
+        policy_toml: None,
+    };
+    let req_beta = pb::InitializeClusterRequest {
+        cluster_uuid: cluster_uuid.to_vec(),
+        formation_token: "beta".into(),
+        policy_toml: None,
+    };
+
+    let (r_alpha, r_beta) = tokio::join!(
+        c_alpha.initialize_cluster(req_alpha),
+        c_beta.initialize_cluster(req_beta),
+    );
+
+    // Exactly one wins; the loser is refused, naming the winner's token.
+    let (winner_token, loser_status) = match (r_alpha, r_beta) {
+        (Ok(_), Err(status)) => ("alpha", status),
+        (Err(status), Ok(_)) => ("beta", status),
+        (Ok(_), Ok(_)) => panic!("both init calls succeeded — formation forked into two histories"),
+        (Err(a), Err(b)) => panic!("both init calls failed — none formed: {a:?} / {b:?}"),
+    };
+    assert_eq!(
+        loser_status.code(),
+        Code::FailedPrecondition,
+        "the loser gets a conflict, not a server error: {}",
+        loser_status.message()
+    );
+    let refusal =
+        pb::MembershipRefusal::decode(loser_status.details()).expect("decodable refusal detail");
+    match refusal.reason {
+        Some(pb::membership_refusal::Reason::ConflictingFormationToken(c)) => {
+            assert_eq!(
+                c.recorded_token, winner_token,
+                "the refusal names the winning token"
+            );
+        }
+        other => panic!("expected ConflictingFormationToken, got {other:?}"),
     }
 
     node.graceful_stop().await;

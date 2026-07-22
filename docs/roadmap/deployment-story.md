@@ -70,24 +70,19 @@ the operational workflow is described in
 
 The coordinator half of this (issue #47) has landed: the flagless daemon
 with derived intent; the seed-only `Discovery` trait with the `static`,
-`dns`, and `file` backends; explicit token-keyed `cluster init` with
-durable, resumable formation; the self-converging membership loop with
+`dns`, `file`, and `ec2-asg` backends; explicit token-keyed `cluster init`
+with durable, resumable formation; the self-converging membership loop with
 idempotent verbs and promotion-coupled removal; the machine self-service
 authorization grant with TLS reload; and the `/readyz` readiness surface.
-The pre-0037 admin verbs are retained as the break-glass surface.
+The `ec2-asg` backend reads this instance's id and region from IMDSv2, lists
+its Auto Scaling group's members (lifecycle states Pending/Pending:Wait/
+Pending:Proceed/InService), and resolves their private IPs; its
+`LivenessAttestor` lets discovery absence strengthen an overflow removal
+(ADR 0037 §5). The pre-0037 admin verbs are retained as the break-glass
+surface.
 
 Deliberately **not** in this landing, and still deferred:
 
-- the **`ec2-asg` discovery backend** and its `LivenessAttestor` — the
-  config variant is reserved and selecting it is a clear startup error;
-  the seam (one `Discovery` impl, plus the attestor that lets discovery
-  absence strengthen an overflow removal) is in place, the AWS-SDK adapter
-  is not built;
-- **`admin set-address`** — the verified leader-side repoint of §4 has no
-  membership-repointing RPC yet, so the CLI verb refuses rather than commit
-  an unverified `SetNodes`. Under the immutable model an instance whose
-  address changed is a new instance that self-joins and retires the old
-  identity via replacement promotion;
 - **platform-CAS auto-formation** — the opt-in, per-platform
   `BootstrapAuthority` behind the same `InitializeCluster` seam;
 - **agent-side enrollment and drain** — Part 2 below, still OD-15.
@@ -182,8 +177,8 @@ No ids, no certs, no capacity numbers, no coordinator-side pre-registration.
 The MVP critical path landed 2026-07-20 (Docker executor → API server →
 CLI), so nothing here competes with it any more. Remaining sequencing:
 the Part 1 coordinator implementation (issue #47) has landed per ADR 0037
-(the `ec2-asg` backend, `set-address` repoint, and platform-CAS
-auto-formation remain the deferred follow-ups above); on the agent side,
+(platform-CAS auto-formation remains the deferred follow-up above); on the
+agent side,
 A1 (hours, removes ceremony) can land any time, while A2/A4 still wait on
 the OD-15 signer/decommission decisions — ADRs 0022/0023 are written, so
 authorization is no longer the blocker there.

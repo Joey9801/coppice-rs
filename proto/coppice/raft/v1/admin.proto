@@ -43,6 +43,25 @@ message RemoveNodeRequest {
 
 message RemoveNodeResponse {}
 
+// Operator break-glass: repoint an existing node's membership address
+// (ADR 0037 §4). There is no self-service address repair — a machine
+// credential can never call this (operator-profile only, §6) — and the leader
+// commits the `ChangeMembers::SetNodes` (addr only; machine_identity and the
+// superseded marking preserved) only after VERIFYING the new endpoint: it
+// dials `address` over mTLS and requires both that the serving leaf's subject
+// CN equals the machine identity already bound to `node_id` in membership and
+// that `ProbeCluster` there reports `node_id`. A claimed node id without the
+// matching CA-attested subject is not sufficient proof of endpoint ownership.
+// Unknown id → refused; node absent → refused (no silent creation); idempotent:
+// `address` == the current address → success no-op.
+message SetNodeAddressRequest {
+  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  uint64 node_id = 8;
+  string address = 9; // the new address peers dial to reach it.
+}
+
+message SetNodeAddressResponse {}
+
 // Poll a coordinator for its view of cluster state.
 message ClusterStatusRequest {
   bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
@@ -161,6 +180,7 @@ service RaftAdminService {
   rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
   rpc PromoteVoter(PromoteVoterRequest) returns (PromoteVoterResponse);
   rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
+  rpc SetNodeAddress(SetNodeAddressRequest) returns (SetNodeAddressResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
   rpc ProbeCluster(ProbeClusterRequest) returns (ProbeClusterResponse);
   rpc InitializeCluster(InitializeClusterRequest) returns (InitializeClusterResponse);

@@ -7,13 +7,19 @@
 //! promotes itself once caught up — and a restart re-enters the same loop, which
 //! no-ops when this identity is already a caught-up voter.
 //!
-//! The loop is deliberately **seed-driven**: it only ever acts on candidates
-//! returned by [`Discovery`] (ADR 0037 §2). With an empty discovery view it
-//! reports `waiting`/`learner` and takes no action — discovery being stale,
-//! partial, or empty can delay convergence but can never wedge it, and it can
-//! never drive a membership change on its own. The membership verbs it calls are
-//! idempotent by contract (ADR 0037 §4), so a process killed at any step
-//! converges after respawn with no cleanup.
+//! Discovery is **seed-only** (ADR 0037 §2): it answers "whom might I dial
+//! first?" *before* this replica is in the cluster. The moment the replica has a
+//! membership view — admitted as a learner, or resumed with replicated state —
+//! the loop routes from LOCAL knowledge instead (the replicated current leader,
+//! then all known members), consulting discovery only when local knowledge is
+//! empty. This is what guarantees discovery can never *wedge* convergence: an
+//! admitted learner already carries replicated membership + leader info, so it
+//! keeps converging even if discovery goes empty or names only a since-dead
+//! leader, and a leader change mid-join is handled by re-consulting local
+//! membership each tick. Discovery being stale, partial, or empty can delay a
+//! pre-admission join but can never drive a membership change on its own. The
+//! membership verbs the loop calls are idempotent by contract (ADR 0037 §4), so
+//! a process killed at any step converges after respawn with no cleanup.
 //!
 //! The published [`ConvergenceStatus`] (a `watch`) is the machine-readable phase
 //! the later `/readyz` package consumes; this module only produces it.
@@ -145,9 +151,18 @@ impl Convergence {
             return SETTLED_INTERVAL;
         }
 
-        // Find the cluster to converge against — seed-driven only (ADR 0037 §2).
-        let candidates = self.discovery.candidates().await;
-        let leader_addr = self.find_leader(&candidates).await;
+        // Find the cluster to converge against. Once this replica has any local
+        // membership view — it has been admitted, or resumed from replicated
+        // state — the dial targets come from LOCAL knowledge (current leader,
+        // then all known members), and discovery is consulted only when local
+        // knowledge is empty (pre-admission). This is what makes discovery
+        // "seed-only": after admission it can go empty or name only a dead
+        // leader without wedging convergence, because the admitted learner
+        // already carries replicated membership + leader info and re-derives its
+        // targets from it every tick — so a leader change mid-join is handled by
+        // simply re-consulting local membership (ADR 0037 §2/§4).
+        let targets = self.dial_targets(&summary).await;
+        let leader_addr = self.find_leader(&targets).await;
         let Some(leader_addr) = leader_addr else {
             // No initialized cluster visible in discovery. If we are already a
             // learner (someone else admitted us, or discovery went dark after we
@@ -211,7 +226,45 @@ impl Convergence {
         }
     }
 
-    /// Probe discovered candidates and return the dial address of a leader of an
+    /// The ordered set of addresses to probe for the leader this tick.
+    ///
+    /// **Local knowledge first** (ADR 0037 §2/§4): if this replica already has a
+    /// membership view — meaning it has been admitted, or resumed with
+    /// replicated state — the targets are the currently-believed leader (from
+    /// the replicated membership view) followed by every other known member, so
+    /// convergence routes through the cluster's own record of itself and can
+    /// never be wedged by discovery going empty or naming a since-dead leader. A
+    /// stale leader belief costs only a skipped unreachable dial: the next
+    /// member probed reports the real current leader, and the next tick
+    /// re-derives from the (by then updated) local view.
+    ///
+    /// Discovery is the fallback, consulted only when local knowledge is empty —
+    /// the genuinely pre-admission case, where seeding a first dial is exactly
+    /// what discovery is for.
+    async fn dial_targets(&self, summary: &coppice_consensus::ClusterSummary) -> Vec<String> {
+        let mut targets: Vec<String> = Vec::new();
+
+        // The currently-believed leader's advertised address, first.
+        if let Some(leader) = summary.leader {
+            if let Some(m) = summary.members.iter().find(|m| m.id == leader) {
+                targets.push(m.addr.clone());
+            }
+        }
+        // Then every other known member (skip self and duplicates).
+        for m in &summary.members {
+            if m.id != self.node_id && !targets.contains(&m.addr) {
+                targets.push(m.addr.clone());
+            }
+        }
+
+        // Pre-admission only: no local membership yet — seed from discovery.
+        if targets.is_empty() {
+            targets = self.discovery.candidates().await;
+        }
+        targets
+    }
+
+    /// Probe candidate addresses and return the dial address of a leader of an
     /// initialized cluster with our `cluster_uuid`, if any (ADR 0037 §3/§4).
     async fn find_leader(&self, candidates: &[String]) -> Option<String> {
         for candidate in candidates {

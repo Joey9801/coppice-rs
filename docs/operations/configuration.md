@@ -103,7 +103,17 @@ addrs = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
 #   [discovery.file]
 #   dir = "/var/run/coppice/discovery" # one file per candidate, first line = addr
 #
-#   [discovery.ec2_asg]                # reserved; not yet implemented
+#   [discovery.ec2_asg]                # Auto Scaling group membership (ADR 0037 §2/§5)
+#   port = 7071                        # raft port composed onto each private IP (required)
+#   region = "us-east-1"               # optional; defaults to this instance's IMDS region
+#   timeout = "3s"                     # optional; per-AWS-call bound (default 3s)
+# The instance id and region are read from EC2 instance metadata (IMDSv2) at
+# each consultation; the group's members in lifecycle states Pending,
+# Pending:Wait, Pending:Proceed, and InService are resolved to their private
+# IPs. This is the only backend with liveness semantics: a departed voter
+# absent from the group strengthens the leader's overflow-removal decision
+# (ADR 0037 §5). Every AWS call is timeout-bounded and degrades to an empty
+# candidate list on failure, so a slow control plane never wedges startup.
 
 [listen]
 client_addr = "0.0.0.0:7070"    # user/CLI API

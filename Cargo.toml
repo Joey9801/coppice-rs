@@ -207,6 +207,31 @@ hickory-resolver = { version = "0.24", default-features = false, features = [
 # The `advertise_host` fallback chain (ADR 0037 §2) reads the OS-reported
 # hostname when no explicit value is configured. Tiny, cross-platform.
 gethostname = "0.4"
+# The `ec2-asg` discovery backend (ADR 0037 §2/§5): read this instance's id and
+# region from IMDSv2, then list its Auto Scaling group's members and resolve
+# their private IPs. A deliberately heavy dep tree (accepted in review) confined
+# to `coppice-coordinator`'s `discovery::ec2_asg` module. `default-features`
+# trimmed to the `rustls` HTTP client (ring provider, matching the workspace's
+# rustls pin) plus the tokio runtime — no aws-lc build toolchain, no bundled
+# hyper client feature. Pinned to exact versions: the newer SDK releases raise
+# their own MSRV above the workspace's `rust-version = "1.79"` and default their
+# rustls client to aws-lc-rs, so we hold the last releases that keep 1.79 and the
+# ring provider.
+aws-config = { version = "=1.5.10", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+aws-sdk-ec2 = { version = "=1.97.0", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+aws-sdk-autoscaling = { version = "=1.58.0", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # v7 for entity ids (time-ordered prefix -> btree locality, ADR 0024); v4

@@ -16,20 +16,24 @@
 //!
 //! Backends at this stage: [`static_backend`] (a literal list), [`dns`] (one
 //! name resolved per consultation), [`file`] (a directory of run-scoped
-//! registration files), and `ec2-asg` (config variant reserved; the backend is
-//! not built in this PR — [`build`] returns a clear error).
+//! registration files), and [`ec2_asg`] (Auto Scaling group membership — the
+//! one platform-specific backend, with liveness semantics for the leader's
+//! removal rule, ADR 0037 §5).
 
 use std::sync::Arc;
 
 use anyhow::Result;
+use coppice_consensus::LivenessAttestor;
 
 use crate::config::{BackendKind, DiscoveryConfig};
 
 mod dns;
+mod ec2_asg;
 mod file;
 mod static_backend;
 
 pub(crate) use dns::DnsDiscovery;
+pub(crate) use ec2_asg::Ec2AsgDiscovery;
 pub(crate) use file::FileDiscovery;
 pub use file::FileRegistration;
 pub(crate) use static_backend::StaticDiscovery;
@@ -45,14 +49,23 @@ pub trait Discovery: Send + Sync {
     /// The current candidate raft addresses. May be empty (nothing found, or
     /// the source is unreachable) or partial; never an error.
     async fn candidates(&self) -> Vec<String>;
+
+    /// The backend's liveness attestor (ADR 0037 §5), if it has liveness
+    /// semantics. Only backends that can attest an instance is *genuinely gone*
+    /// (e.g. [`ec2_asg`]) return `Some`; `static`/`dns`/`file` return the
+    /// default `None` and contribute nothing to the leader's evidence-gated
+    /// overflow removal, so a stale registration or unedited list can never
+    /// block a legitimate removal.
+    fn liveness_attestor(&self) -> Option<Arc<dyn LivenessAttestor>> {
+        None
+    }
 }
 
 /// Construct the discovery backend named by `config`.
 ///
-/// The `ec2-asg` variant is reserved but deliberately not built in this PR
-/// (heavy AWS SDK dependencies, ADR 0037 §2): selecting it is a clear
-/// startup-time error rather than a silent no-op. The seam for a future
-/// `Ec2AsgDiscovery` — a thin adapter over this same trait — is this match arm.
+/// The `ec2-asg` variant is a thin adapter over the same [`Discovery`] trait
+/// (ADR 0037 §2); its real AWS client is built lazily on the first consultation,
+/// so `build` never touches IMDS or the network and cannot hang startup.
 pub(crate) fn build(config: &DiscoveryConfig) -> Result<Arc<dyn Discovery>> {
     match config.backend {
         BackendKind::Static => Ok(Arc::new(StaticDiscovery::new(
@@ -72,13 +85,16 @@ pub(crate) fn build(config: &DiscoveryConfig) -> Result<Arc<dyn Discovery>> {
                 .expect("validated: file backend has a [discovery.file] table");
             Ok(Arc::new(FileDiscovery::new(file.dir.clone())))
         }
-        // ADR 0037 §2 seam: the EC2 ASG backend is a thin adapter over this same
-        // trait, deferred out of this PR to avoid the AWS SDK dependency weight.
         BackendKind::Ec2Asg => {
-            anyhow::bail!(
-                "discovery backend \"ec2-asg\" is not yet implemented; \
-                 use \"static\", \"dns\", or \"file\" (ADR 0037 §2)"
-            )
+            let ec2 = config
+                .ec2_asg
+                .as_ref()
+                .expect("validated: ec2-asg backend has a [discovery.ec2_asg] table");
+            Ok(Ec2AsgDiscovery::new(
+                ec2.port,
+                ec2.region.clone(),
+                ec2.timeout,
+            ))
         }
     }
 }
