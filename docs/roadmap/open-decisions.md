@@ -35,7 +35,7 @@ re-deriving it from the whole design.
 | [OD-11](#od-11-data-retention-policy) | Data retention policy | Low | Resolved — [ADR 0012](../decisions/0012-data-retention.md) |
 | [OD-12](#od-12-abort-semantics-partial-scheduling-and-job-groups) | Abort semantics, partial scheduling & job groups | High | Resolved — [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md), [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) |
 | [OD-13](#od-13-base-score-and-the-exact-job-costing-formula) | Base score and the exact job-costing formula | High | Resolved — [ADR 0021](../decisions/0021-effective-score-ranking.md) |
-| [OD-14](#od-14-coordinator-discovery-and-control-plane-pki) | Coordinator discovery & control-plane PKI | Medium | Open — plan in [deployment-story.md](deployment-story.md) |
+| [OD-14](#od-14-coordinator-discovery-and-control-plane-pki) | Coordinator discovery & control-plane PKI | Medium | Resolved — [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md) |
 | [OD-15](#od-15-agent-enrollment-signer-and-decommission-protocol) | Agent enrollment signer & decommission protocol | High — gates zero-touch autoscaling | Open — plan in [deployment-story.md](deployment-story.md) |
 | [OD-16](#od-16-user-authentication-and-principal-model) | User authentication & principal model | High | Resolved — [ADR 0022](../decisions/0022-oidc-identity-and-authentication.md) |
 | [OD-17](#od-17-authorization-model-and-enforcement) | Authorization model & enforcement | High | Resolved — [ADR 0023](../decisions/0023-scoped-role-bindings.md) |
@@ -375,6 +375,19 @@ budget faster) but is silent on its effect on *rank*.
 [scheduling/quotas-and-priorities.md](../scheduling/quotas-and-priorities.md).
 
 ## OD-14: Coordinator discovery and control-plane PKI
+
+**Status: Resolved** —
+[ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)
+(2026-07-22). Discovery is a pluggable, strictly seed-only trait
+(`static`/`dns`/`file`/`ec2-asg`; Consul deferred as just another impl);
+the daemon runs one flagless command with derived intent, parks when no
+cluster exists, and self-joins via an idempotent loop; first-ever
+formation is an explicit, token-keyed, resumable `coppice-cli cluster
+init`. PKI stays externally issued, with in-process cert reload (mtime
+watch + SIGHUP) as the one code change, plus a new hard requirement: one
+stable, unique certificate subject per coordinator installation, which
+anchors the machine self-service membership grant amending
+ADRs 0022/0023.
 
 **Question.** (a) Which discovery backends feed the coordinator seed list —
 static config (today), DNS, Consul — and is any of them load-bearing beyond
