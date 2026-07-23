@@ -20,7 +20,7 @@
 //! (the applied-command count the scheduler uses for `expected_version`).
 //! [`StateView`] exposes both.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::future::Future;
 
 use coppice_state::Command;
@@ -197,7 +197,7 @@ pub trait Consensus: Send + Sync + 'static {
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
-        probe_dead: BTreeSet<CoordinatorId>,
+        probe_dead: BTreeMap<CoordinatorId, String>,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Remove a node from membership.
@@ -217,6 +217,7 @@ pub trait Consensus: Send + Sync + 'static {
         &self,
         incumbent: CoordinatorId,
         machine_identity: &str,
+        addr: &str,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Repoint an existing node's membership address (ADR 0037 §4, operator

@@ -187,14 +187,26 @@ fn age_follower(
 fn dead_voter_candidates(
     current_voters: &BTreeSet<CoordinatorId>,
     progress_aged: &BTreeSet<CoordinatorId>,
-    probe_dead: &BTreeSet<CoordinatorId>,
+    probe_dead: &BTreeMap<CoordinatorId, String>,
+    records: &[NodeRecord],
     leader: CoordinatorId,
     promoting: CoordinatorId,
 ) -> BTreeSet<CoordinatorId> {
+    // Probe evidence is bound to the ADDRESS it was gathered at: a candidate
+    // qualifies only if the re-read membership record still advertises exactly
+    // that address. A voter repointed (set-address) after its old endpoint's
+    // streak expired is NOT removable on that stale evidence — its new address
+    // must accumulate its own continuous grace first.
+    let probe_confirmed = probe_dead.iter().filter_map(|(id, addr)| {
+        records
+            .iter()
+            .any(|m| m.id == *id && m.addr == *addr)
+            .then_some(*id)
+    });
     progress_aged
         .iter()
         .copied()
-        .chain(probe_dead.iter().copied())
+        .chain(probe_confirmed)
         .filter(|v| current_voters.contains(v))
         .filter(|v| *v != leader && *v != promoting)
         .collect()
@@ -494,7 +506,7 @@ impl Consensus for OpenraftConsensus {
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
-        probe_dead: BTreeSet<CoordinatorId>,
+        probe_dead: BTreeMap<CoordinatorId, String>,
     ) -> Result<(), ConsensusError> {
         // Serialize with every other membership mutation (finding: seat TOCTOU):
         // the promotion's replacement/overflow removal is decided from a
@@ -619,6 +631,7 @@ impl Consensus for OpenraftConsensus {
                         &current_voters,
                         &progress_aged,
                         &probe_dead,
+                        &records,
                         leader,
                         promote,
                     )
@@ -707,12 +720,16 @@ impl Consensus for OpenraftConsensus {
         &self,
         incumbent: CoordinatorId,
         machine_identity: &str,
+        addr: &str,
     ) -> Result<(), ConsensusError> {
         // Serialized with every other membership mutation; revalidate under the
         // lock so the eviction evidence gathered outside cannot act on a stale
         // view (ADR 0037 §6): the incumbent must still be a pending LEARNER
-        // bound to the contested machine identity. The voter set is never
-        // touched here — a bound voter is retired only through promotion.
+        // bound to the contested machine identity AND still advertised at the
+        // exact address the unreachability streak was observed against — a
+        // repointed incumbent needs fresh evidence at its new address. The
+        // voter set is never touched here — a bound voter is retired only
+        // through promotion.
         let _guard = self.membership_lock.lock().await;
         let record = {
             let records = Self::membership_records(&self.raft.metrics().borrow());
@@ -728,6 +745,11 @@ impl Consensus for OpenraftConsensus {
             return Err(ConsensusError::MachineMismatch {
                 node: incumbent,
                 bound: record.machine_identity,
+            });
+        }
+        if record.addr != addr {
+            return Err(ConsensusError::SameIdDifferentAddress {
+                existing_addr: record.addr,
             });
         }
         let resp = self
@@ -786,6 +808,19 @@ impl Consensus for OpenraftConsensus {
             .await
             .map_err(map_client_write_error)?;
         self.settle_metrics(resp.log_id.index).await;
+        // The verified repoint just PROVED this node alive at its new address
+        // (the caller's endpoint verification dialed it and matched subject +
+        // stamped id), so any replication-failure streak accumulated against
+        // the OLD address is stale evidence: reset the progress clock. The new
+        // address must independently fail for the full grace before this node
+        // can age toward an overflow removal (round-3 finding: evidence is
+        // bound to the address it was gathered at, in BOTH evidence arms).
+        {
+            let mut progress = self.progress.lock().expect("progress mutex");
+            if let Some(entry) = progress.get_mut(&node) {
+                entry.since = Instant::now();
+            }
+        }
         Ok(())
     }
 
@@ -876,6 +911,28 @@ mod tests {
         v.iter().copied().collect()
     }
 
+    /// Probe evidence: each id observed continuously unreachable at `addr(id)`.
+    fn probed(v: &[u64]) -> BTreeMap<CoordinatorId, String> {
+        v.iter().map(|id| (*id, addr_of(*id))).collect()
+    }
+
+    fn addr_of(id: u64) -> String {
+        format!("coord-{id}:7071")
+    }
+
+    /// Voter records whose addresses match `addr_of`, for probe revalidation.
+    fn voter_records(v: &[u64]) -> Vec<crate::membership::NodeRecord> {
+        v.iter()
+            .map(|id| crate::membership::NodeRecord {
+                id: *id,
+                addr: addr_of(*id),
+                machine_identity: format!("m{id}"),
+                superseded: false,
+                voter: true,
+            })
+            .collect()
+    }
+
     #[test]
     fn dead_candidates_union_intersects_current_voters() {
         // Progress-aging names {2}, the probe names {3,4}. Voter 4 is NOT a
@@ -884,9 +941,10 @@ mod tests {
         let out = dead_voter_candidates(
             &ids(&[1, 2, 3]), // current voters (leader 1)
             &ids(&[2]),       // progress-aged
-            &ids(&[3, 4]),    // probe_dead (4 is stale/removed)
-            1,                // leader
-            5,                // promoting (a learner, not yet a voter)
+            &probed(&[3, 4]), // probe_dead (4 is stale/removed)
+            &voter_records(&[1, 2, 3]),
+            1, // leader
+            5, // promoting (a learner, not yet a voter)
         );
         assert_eq!(out, ids(&[2, 3]), "union ∩ current, stale probe id dropped");
     }
@@ -898,10 +956,11 @@ mod tests {
         // node just caught up, so it is excluded too.
         let out = dead_voter_candidates(
             &ids(&[1, 2, 3]),
-            &ids(&[1]),    // progress-aging somehow named the leader
-            &ids(&[1, 3]), // and so did the probe
-            1,             // leader
-            3,             // promoting is already a voter here
+            &ids(&[1]),       // progress-aging somehow named the leader
+            &probed(&[1, 3]), // and so did the probe
+            &voter_records(&[1, 2, 3]),
+            1, // leader
+            3, // promoting is already a voter here
         );
         assert_eq!(
             out,
@@ -921,7 +980,14 @@ mod tests {
         // leader's vantage (1 and 2 are also unreachable), so the live-majority
         // postcondition fails.
         let current = ids(&[1, 2, 3]);
-        let dead = dead_voter_candidates(&current, &ids(&[]), &ids(&[3]), 1, 4);
+        let dead = dead_voter_candidates(
+            &current,
+            &ids(&[]),
+            &probed(&[3]),
+            &voter_records(&[1, 2, 3]),
+            1,
+            4,
+        );
         assert_eq!(dead, ids(&[3]), "the probed dead voter is a candidate");
         let err = decide_promotion_voters(PromotionInputs {
             cluster_size: 3,
@@ -942,13 +1008,44 @@ mod tests {
     }
 
     #[test]
+    fn probe_evidence_at_a_stale_address_is_not_a_candidate() {
+        // Round-3 finding: evidence is bound to the address it was gathered at.
+        // Voter 3's streak was earned at its OLD address, but the re-read
+        // membership record now shows it repointed (set-address) to a new one —
+        // the stale-address evidence must not make it removable; the new
+        // address needs its own continuous grace.
+        let mut records = voter_records(&[1, 2, 3]);
+        records[2].addr = "coord-3-new:7071".to_string(); // repointed
+        let dead = dead_voter_candidates(
+            &ids(&[1, 2, 3]),
+            &ids(&[]),
+            &probed(&[3]), // streak observed at the OLD coord-3:7071
+            &records,
+            1,
+            4,
+        );
+        assert_eq!(
+            dead,
+            ids(&[]),
+            "a repointed voter is not removable on stale-address evidence"
+        );
+    }
+
+    #[test]
     fn probe_evidence_race_yields_no_unchecked_growth() {
         // Finding 3, check (ii): the probe named voter 3 dead, but by the time
         // the promotion commits, 3 is already gone (removed by a racing change),
         // so the revalidation drops it and no dead voter remains. The automatic
         // selection then refuses the overflow rather than growing the voter set.
         let current_after_race = ids(&[1, 2]); // 3 already removed
-        let dead = dead_voter_candidates(&current_after_race, &ids(&[]), &ids(&[3]), 1, 4);
+        let dead = dead_voter_candidates(
+            &current_after_race,
+            &ids(&[]),
+            &probed(&[3]),
+            &voter_records(&[1, 2]),
+            1,
+            4,
+        );
         assert_eq!(dead, ids(&[]), "the removed voter is not a candidate");
         // Promoting 4 into {1,2} is underfilled at cluster_size 3 — allowed with
         // no removal and, crucially, the set never exceeds cluster_size.

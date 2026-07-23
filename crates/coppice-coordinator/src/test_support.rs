@@ -230,7 +230,7 @@ impl Consensus for FakeConsensus {
         &self,
         _promote: CoordinatorId,
         _remove: Option<CoordinatorId>,
-        _probe_dead: std::collections::BTreeSet<CoordinatorId>,
+        _probe_dead: std::collections::BTreeMap<CoordinatorId, String>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
@@ -243,6 +243,7 @@ impl Consensus for FakeConsensus {
         &self,
         _incumbent: CoordinatorId,
         _machine_identity: &str,
+        _addr: &str,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }

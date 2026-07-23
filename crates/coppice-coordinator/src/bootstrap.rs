@@ -637,7 +637,7 @@ impl Consensus for SharedConsensus {
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
-        probe_dead: std::collections::BTreeSet<CoordinatorId>,
+        probe_dead: std::collections::BTreeMap<CoordinatorId, String>,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
         self.0.promote_voter(promote, remove, probe_dead)
     }
@@ -653,8 +653,10 @@ impl Consensus for SharedConsensus {
         &self,
         incumbent: CoordinatorId,
         machine_identity: &str,
+        addr: &str,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
-        self.0.evict_stale_learner(incumbent, machine_identity)
+        self.0
+            .evict_stale_learner(incumbent, machine_identity, addr)
     }
 
     fn set_node_address(

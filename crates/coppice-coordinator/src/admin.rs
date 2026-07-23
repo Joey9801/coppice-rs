@@ -15,7 +15,7 @@
 // large error type, and the signatures here are dictated by that trait.
 #![allow(clippy::result_large_err)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -111,13 +111,18 @@ pub struct AdminService<C: Consensus> {
     /// Membership grace periods (ADR 0037 §5/§6); `replacement_grace` bounds
     /// how long a pending learner's seat survives continuous unreachability.
     policy: MembershipPolicy,
-    /// Leader-side unreachability evidence for contested pending learners
-    /// (ADR 0037 §6 "unreachable … for `replacement_grace`"): incumbent id →
-    /// first probe failure of the CURRENT unbroken failure streak. Entries are
-    /// cleared the moment a probe succeeds, so only continuous unreachability
-    /// accumulates. Progress-based staleness cannot see a dead-but-caught-up
-    /// learner in an idle cluster; this affirmative check can.
-    seat_unreachable: tokio::sync::Mutex<std::collections::HashMap<CoordinatorId, Instant>>,
+    /// Leader-side unreachability evidence for contested pending learners and
+    /// probed voters (ADR 0037 §5/§6 "unreachable … for the grace"): keyed by
+    /// `(node id, PROBED ADDRESS)` → first probe failure of the CURRENT
+    /// unbroken failure streak at that address. Address-keying is load-bearing:
+    /// a streak earned at address A is no evidence against the same node after
+    /// a verified `set-address` repoint to B — B must accumulate its own
+    /// continuous grace — and an in-flight probe of A that lands after the
+    /// repoint records harmlessly under the stale (id, A) key. A confirming
+    /// probe clears every entry for its node id, so only continuous
+    /// unreachability at the CURRENT address accumulates.
+    seat_unreachable:
+        tokio::sync::Mutex<std::collections::HashMap<(CoordinatorId, String), Instant>>,
 }
 
 impl<C: Consensus> AdminService<C> {
@@ -213,16 +218,16 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
                 // `replacement_grace`"): probe the incumbent's endpoint and
                 // evict only after a continuous failure streak spanning the
                 // grace, revalidated under the membership lock.
-                if self
-                    .incumbent_unreachable_past_grace(incumbent)
-                    .await
-                    .is_some()
+                if let Some(evidence_addr) = self.incumbent_unreachable_past_grace(incumbent).await
                 {
                     self.consensus
-                        .evict_stale_learner(incumbent, &machine_identity)
+                        .evict_stale_learner(incumbent, &machine_identity, &evidence_addr)
                         .await
                         .map_err(consensus_error_to_status)?;
-                    self.seat_unreachable.lock().await.remove(&incumbent);
+                    self.seat_unreachable
+                        .lock()
+                        .await
+                        .retain(|(mid, _), _| *mid != incumbent);
                     // Retake the slot; a racing challenger may have beaten us
                     // here, in which case this surfaces the NEW incumbent.
                     self.consensus
@@ -267,7 +272,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         }
         match self
             .consensus
-            .promote_voter(req.promote_node_id, req.remove_node_id, BTreeSet::new())
+            .promote_voter(req.promote_node_id, req.remove_node_id, BTreeMap::new())
             .await
         {
             Ok(()) => Ok(Response::new(pb::PromoteVoterResponse {})),
@@ -304,11 +309,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
                         .map(|m| m.id)
                         .collect();
                     let mut map = self.seat_unreachable.lock().await;
-                    for id in &dead {
-                        if !still_voters.contains(id) {
-                            map.remove(id);
-                        }
-                    }
+                    map.retain(|(id, _), _| !dead.contains_key(id) || still_voters.contains(id));
                     return Ok(Response::new(pb::PromoteVoterResponse {}));
                 }
                 Err(consensus_error_to_status(ConsensusError::PromotionRefused(
@@ -555,20 +556,25 @@ impl<C: Consensus> AdminService<C> {
     /// nor be a removal candidate); the automatic promotion path excludes it a
     /// second time. The returned set feeds the automatic path, which picks at
     /// most one — the ADR permits at most one overflow removal per promotion.
-    async fn dead_voter_by_probe(&self, promoting: CoordinatorId) -> BTreeSet<CoordinatorId> {
+    async fn dead_voter_by_probe(
+        &self,
+        promoting: CoordinatorId,
+    ) -> std::collections::BTreeMap<CoordinatorId, String> {
         let summary = self.handle.cluster_summary();
         let targets = probe_targets(&summary.members, promoting, summary.local_id);
-        let mut dead = BTreeSet::new();
+        let mut dead = std::collections::BTreeMap::new();
         for (id, addr) in targets {
             let reachable = self.probe_confirms(&addr, id).await;
             let mut map = self.seat_unreachable.lock().await;
             if reachable {
-                map.remove(&id);
+                // A confirming probe at the current address is liveness for the
+                // node itself: clear every address's streak for this id.
+                map.retain(|(mid, _), _| *mid != id);
                 continue;
             }
-            let since = *map.entry(id).or_insert_with(Instant::now);
+            let since = *map.entry((id, addr.clone())).or_insert_with(Instant::now);
             if since.elapsed() >= self.policy.removal_grace {
-                dead.insert(id);
+                dead.insert(id, addr);
             }
         }
         dead
@@ -604,7 +610,10 @@ impl<C: Consensus> AdminService<C> {
     /// blip never accumulates into eviction evidence. Returns `None` when the
     /// incumbent is reachable, unknown to membership, or its streak is younger
     /// than the grace.
-    async fn incumbent_unreachable_past_grace(&self, incumbent: CoordinatorId) -> Option<Duration> {
+    /// On an expired streak, returns the ADDRESS the evidence was gathered at,
+    /// which the eviction revalidates against the incumbent's current record —
+    /// a repointed incumbent needs a fresh streak at its new address.
+    async fn incumbent_unreachable_past_grace(&self, incumbent: CoordinatorId) -> Option<String> {
         let addr = self
             .handle
             .cluster_summary()
@@ -619,12 +628,13 @@ impl<C: Consensus> AdminService<C> {
         let reachable = self.probe_confirms(&addr, incumbent).await;
         let mut map = self.seat_unreachable.lock().await;
         if reachable {
-            map.remove(&incumbent);
+            map.retain(|(mid, _), _| *mid != incumbent);
             return None;
         }
-        let since = *map.entry(incumbent).or_insert_with(Instant::now);
-        let streak = since.elapsed();
-        (streak >= self.policy.replacement_grace).then_some(streak)
+        let since = *map
+            .entry((incumbent, addr.clone()))
+            .or_insert_with(Instant::now);
+        (since.elapsed() >= self.policy.replacement_grace).then_some(addr)
     }
 
     async fn verify_endpoint(

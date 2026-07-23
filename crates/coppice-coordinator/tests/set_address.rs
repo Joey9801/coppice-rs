@@ -18,6 +18,7 @@ mod common;
 
 use std::time::Duration;
 
+use prost::Message as _;
 use tonic::Code;
 
 use coppice_consensus::Consensus;
@@ -28,9 +29,13 @@ use coppice_proto::pb::raft::v1 as pb;
 use coppice_state::command::BumpClusterVersion;
 use coppice_state::Command;
 
-use common::{poll, Ca, Node};
+use common::{poll, Ca, DiscoverySpec, Node, NodeSpec};
 
 const DEADLINE: Duration = Duration::from_secs(30);
+
+/// For waits that include a deliberate grace period (a repointed address aging
+/// past `removal_grace`).
+const LONG_DEADLINE: Duration = Duration::from_secs(45);
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -343,6 +348,208 @@ async fn set_address_repoints_and_replication_resumes() {
     .await;
 
     node3.graceful_stop().await;
+    node2.graceful_stop().await;
+    node1.graceful_stop().await;
+}
+
+/// Round-3 finding regression: unreachability evidence is bound to the ADDRESS
+/// it was gathered at. A voter whose OLD address accumulated a full
+/// `removal_grace` failure streak, then was verifiably repointed
+/// (`set-address`) to a NEW address, must NOT be removable on the stale
+/// evidence — even when the new address fails a probe once. Only a fresh
+/// continuous grace observed at the NEW address makes it removable.
+///
+/// Determinism notes: the aging phase runs while node 3's process is fully
+/// stopped, so leadership stays with node 1/2 and the streak accumulates on the
+/// acting leader; node 3 is rebooted only long enough to pass the repoint's
+/// endpoint verification, then killed. (If an election shuffles leadership
+/// mid-test, the leader-following promote below still converges; the
+/// stale-address binding itself is additionally unit-tested in
+/// `coppice-consensus::adapter::probe_evidence_at_a_stale_address_is_not_a_candidate`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn repointed_voter_requires_fresh_grace_at_new_address() {
+    init_tracing();
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let cluster_uuid = *cluster_id.0.as_bytes();
+    // Generous grace: after the kill below, a re-election (~1.5s) plus the
+    // settling promote must all fit INSIDE the grace window, or node 3 becomes
+    // legitimately removable at B (its own fresh streak / progress aging) and
+    // the "must not remove yet" assertion races real evidence.
+    let grace = Duration::from_secs(5);
+    let spec = |id: u64, seeds: &[String]| NodeSpec {
+        removal_grace: Some(grace),
+        replacement_grace: Some(grace),
+        ..NodeSpec::new(id, cluster_id, DiscoverySpec::Static(seeds.to_vec()))
+    };
+
+    // Three voters (cluster_size 3), short graces.
+    let mut node1 = Node::with_spec(spec(1, &[]), &ca);
+    node1.boot().await;
+    node1.form("repoint-grace-formation").await;
+    poll(DEADLINE, "node 1 formed", || async { node1.is_leader() }).await;
+    let seeds = [node1.advertise.clone()];
+    let mut node2 = Node::with_spec(spec(2, &seeds), &ca);
+    let mut node3 = Node::with_spec(spec(3, &seeds), &ca);
+    node2.boot().await;
+    node3.boot().await;
+    poll(DEADLINE, "three voters", || async {
+        node1.summary().members.iter().filter(|m| m.voter).count() == 3
+    })
+    .await;
+    let node3_id = node3.raft_id();
+
+    // A fourth identity is admitted but unpromotable (voter set full). Its
+    // convergence loop is stopped so ONLY this test's manual promotions drive
+    // the leader's probe evidence — the timeline stays deterministic.
+    let mut node4 = Node::with_spec(spec(4, &seeds), &ca);
+    node4.boot().await;
+    let node4_id = node4.raft_id();
+    poll(DEADLINE, "node 4 admitted as a learner", || async {
+        node1.summary().members.iter().any(|m| m.id == node4_id)
+    })
+    .await;
+    node4.stop_convergence();
+
+    let operator = ca.operator_leaf();
+
+    // One leader-following promotion attempt: dials whichever of 1/2 currently
+    // leads and retries through catch-up lag, elections, and leader changes
+    // until the promotion SETTLES — Ok, or a terminal refusal.
+    async fn settle_promote(
+        ca: &Ca,
+        operator: &common::Leaf,
+        node1: &Node,
+        node2: &Node,
+        cluster_uuid: [u8; 16],
+        promote: u64,
+    ) -> Result<(), tonic::Status> {
+        let start = std::time::Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "promotion never settled within the deadline"
+            );
+            let target = if node2.is_leader() {
+                node2.advertise.clone()
+            } else {
+                node1.advertise.clone()
+            };
+            let mut client = dial(ca, operator, &target).await;
+            let result = client
+                .promote_voter(pb::PromoteVoterRequest {
+                    cluster_uuid: cluster_uuid.to_vec(),
+                    promote_node_id: promote,
+                    remove_node_id: None,
+                })
+                .await;
+            match result {
+                Ok(_) => return Ok(()),
+                Err(status)
+                    if status.code() == Code::FailedPrecondition
+                        && (status.message().contains("behind")
+                            || status.message().contains("leader")) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(status) => return Err(status),
+            }
+        }
+    }
+
+    // node 3 goes fully dark at its OLD address (A): the process stops, so
+    // leadership stays with node 1/2 and the acting leader's failure streak
+    // for (3, A) starts on the next promotion attempt, then ages past the
+    // grace with nothing acting on it.
+    let old_addr = node3.advertise.clone();
+    node3.graceful_stop().await;
+    let refusal = settle_promote(&ca, &operator, &node1, &node2, cluster_uuid, node4_id)
+        .await
+        .expect_err("voter set full: promotion refused while all seats are held");
+    assert_eq!(refusal.code(), Code::FailedPrecondition);
+    tokio::time::sleep(grace + Duration::from_millis(500)).await;
+
+    // node 3 briefly serves at a NEW address (B) — just long enough for the
+    // verified repoint — then dies: B has now "failed once" while the stale
+    // (3, A) streak is far past the grace.
+    node3.rebind();
+    node3.boot().await;
+    let new_addr = node3.advertise.clone();
+    assert_ne!(new_addr, old_addr);
+    poll(DEADLINE, "a live leader for the repoint", || async {
+        node1.is_leader() || node2.is_leader() || node3.is_leader()
+    })
+    .await;
+    let repoint_target = if node3.is_leader() {
+        node3.advertise.clone()
+    } else if node2.is_leader() {
+        node2.advertise.clone()
+    } else {
+        node1.advertise.clone()
+    };
+    let mut client = dial(&ca, &operator, &repoint_target).await;
+    admin::set_node_address(&mut client, cluster_uuid, node3_id, new_addr.clone())
+        .await
+        .expect("verified repoint succeeds");
+    node3.kill().await;
+    poll(
+        DEADLINE,
+        "a live leader among 1/2 after the kill",
+        || async { node1.is_leader() || node2.is_leader() },
+    )
+    .await;
+
+    // The stale (3, A) streak is past the grace and B has failed a probe — but
+    // B has NOT been failing for ITS OWN grace, so node 3 must not be removable.
+    let refusal = settle_promote(&ca, &operator, &node1, &node2, cluster_uuid, node4_id)
+        .await
+        .expect_err("stale-address evidence must not remove the repointed voter");
+    assert_eq!(refusal.code(), Code::FailedPrecondition);
+    let decoded = pb::MembershipRefusal::decode(refusal.details()).expect("decodable refusal");
+    assert!(
+        matches!(
+            decoded.reason,
+            Some(pb::membership_refusal::Reason::PromotionRefused(_))
+        ),
+        "refused as no-removable-peer, not removed: {decoded:?}"
+    );
+    assert!(
+        node1
+            .summary()
+            .members
+            .iter()
+            .any(|m| m.id == node3_id && m.voter),
+        "node 3 is still a voter on stale-address evidence"
+    );
+
+    // Once B itself has been continuously unreachable for the grace, the
+    // legitimate removal proceeds: the promotion folds node 3 out and seats 4.
+    let start = std::time::Instant::now();
+    loop {
+        let seated = settle_promote(&ca, &operator, &node1, &node2, cluster_uuid, node4_id)
+            .await
+            .is_ok()
+            && {
+                let members = node1.summary().members;
+                members.iter().any(|m| m.id == node4_id && m.voter)
+                    && !members.iter().any(|m| m.id == node3_id)
+            };
+        if seated {
+            break;
+        }
+        assert!(
+            start.elapsed() < LONG_DEADLINE,
+            "timed out waiting for the fresh grace at B to expire and node 4 to seat"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(
+        node1.summary().members.iter().filter(|m| m.voter).count(),
+        3,
+        "back to three voters with node 4 seated"
+    );
+
+    node4.graceful_stop().await;
     node2.graceful_stop().await;
     node1.graceful_stop().await;
 }
