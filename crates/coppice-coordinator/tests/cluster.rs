@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use coppice_consensus::{Consensus, OpenraftConsensus};
 use coppice_coordinator::admin;
-use coppice_coordinator::config::CliOverrides;
 use coppice_core::id::ClusterId;
 use coppice_core::time::Timestamp;
 use coppice_state::command::BumpClusterVersion;
@@ -141,51 +140,59 @@ async fn three_node_cluster_lifecycle() {
     init_tracing();
 
     let ca = Ca::new();
-    // A dedicated admin-client identity signed by the same CA (ADR 0011): the
-    // test acts as an operator presenting a valid client cert.
-    let admin_leaf: Leaf = ca.leaf();
+    // A dedicated operator-profile admin-client identity signed by the same CA
+    // (ADR 0037 §6): the test acts as an operator for promote/status verbs.
+    let admin_leaf: Leaf = ca.operator_leaf();
     let cluster_id = ClusterId::new();
     let cluster_uuid = uuid_bytes(cluster_id);
 
     // Three replicas, ids 1..=3, each its own tempdir/port/cert.
     let mut nodes: Vec<Node> = (1..=3).map(|id| Node::new(id, cluster_id, &ca)).collect();
 
-    // -- Step 1: bootstrap node 1, wait until it is leader. -----------------
-    nodes[0]
-        .boot(CliOverrides {
-            bootstrap: true,
-            join: false,
-        })
-        .await;
+    // -- Step 1: boot node 1 and form the cluster (ADR 0037 §3), wait for leader.
+    nodes[0].boot().await;
+    nodes[0].form("cluster-lifecycle-formation").await;
     let leader0 = wait_for_leader(&nodes, &[0], DEADLINE).await;
-    assert_eq!(leader0, 0, "the bootstrap node must be the initial leader");
+    assert_eq!(leader0, 0, "the forming node must be the initial leader");
 
-    // -- Step 2: join nodes 2 and 3 as learners, then promote to voters. ----
+    // -- Step 2: boot nodes 2 and 3 (they park), self-join as learners, promote.
     for i in [1usize, 2] {
-        nodes[i]
-            .boot(CliOverrides {
-                bootstrap: false,
-                join: true,
-            })
-            .await;
+        nodes[i].boot().await;
     }
 
     let target = nodes[0].advertise.clone();
-    {
-        let mut client =
-            admin::admin_channel(&target, &ca.pem, &admin_leaf.cert_pem, &admin_leaf.key_pem)
-                .await
-                .expect("dial leader admin surface");
-        for i in [1usize, 2] {
-            admin::add_learner(
-                &mut client,
-                cluster_uuid,
-                nodes[i].raft_id(),
-                nodes[i].advertise.clone(),
-            )
+    for i in [1usize, 2] {
+        // Each replica self-joins under its own machine identity — a distinct
+        // coordinator-profile cert whose CN matches its serving leaf (endpoint
+        // verification, ADR 0037 §6) — so the one-seat-per-installation rules
+        // admit each as a fresh learner rather than colliding.
+        let leaf = ca.machine_leaf(&nodes[i].machine);
+        let mut client = admin::admin_channel(&target, &ca.pem, &leaf.cert_pem, &leaf.key_pem)
             .await
-            .unwrap_or_else(|e| panic!("add-learner {} failed: {e:#}", nodes[i].id));
-        }
+            .expect("dial leader admin surface");
+        admin::add_learner(
+            &mut client,
+            cluster_uuid,
+            nodes[i].raft_id(),
+            nodes[i].advertise.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("add-learner {} failed: {e:#}", nodes[i].id));
+        // Idempotency (ADR 0037 §4): re-adding the same id at the same address
+        // is a no-op success, not a conflict.
+        admin::add_learner(
+            &mut client,
+            cluster_uuid,
+            nodes[i].raft_id(),
+            nodes[i].advertise.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "idempotent re-add of {} must be a no-op: {e:#}",
+                nodes[i].id
+            )
+        });
     }
 
     wait_learners_caught_up(
@@ -222,6 +229,25 @@ async fn three_node_cluster_lifecycle() {
         voter_ids(&nodes[0]).len() == 3
     })
     .await;
+
+    // Idempotency (ADR 0037 §4): promoting a node that is already a voter is a
+    // no-op success, checked *before* the replication-lag gate — the spurious
+    // `LearnerNotCaughtUp` bounce the ADR names must not happen.
+    {
+        let mut client =
+            admin::admin_channel(&target, &ca.pem, &admin_leaf.cert_pem, &admin_leaf.key_pem)
+                .await
+                .expect("dial leader admin surface");
+        admin::promote_voter(
+            &mut client,
+            cluster_uuid,
+            nodes[1].raft_id(),
+            None,
+            DEADLINE,
+        )
+        .await
+        .expect("re-promoting an existing voter must be a no-op success");
+    }
 
     // -- Step 3: converged commits across all three replicas. ---------------
     let mut last_index = 0;
@@ -292,13 +318,9 @@ async fn three_node_cluster_lifecycle() {
         idx
     });
 
-    // Restart the follower from its own disk (Restart intent: neither flag).
-    nodes[follower]
-        .boot(CliOverrides {
-            bootstrap: false,
-            join: false,
-        })
-        .await;
+    // Restart the follower from its own disk (intent derived: manifest present
+    // → resume).
+    nodes[follower].boot().await;
 
     last_index = proposer.await.expect("offline-window proposer joins");
     for &i in &survivors {
@@ -335,24 +357,17 @@ async fn three_node_cluster_lifecycle() {
         .expect("re-trigger snapshot");
 
     let mut node4 = Node::new(4, cluster_id, &ca);
-    node4
-        .boot(CliOverrides {
-            bootstrap: false,
-            join: true,
-        })
-        .await;
+    node4.boot().await;
     let dead_id = nodes[dead_idx].raft_id();
 
     let leader_target = nodes[leader_idx].advertise.clone();
     {
-        let mut client = admin::admin_channel(
-            &leader_target,
-            &ca.pem,
-            &admin_leaf.cert_pem,
-            &admin_leaf.key_pem,
-        )
-        .await
-        .expect("dial leader admin surface");
+        // Node 4 self-joins under its own machine identity (ADR 0037 §6).
+        let leaf4 = ca.machine_leaf(&node4.machine);
+        let mut client =
+            admin::admin_channel(&leader_target, &ca.pem, &leaf4.cert_pem, &leaf4.key_pem)
+                .await
+                .expect("dial leader admin surface");
         admin::add_learner(
             &mut client,
             cluster_uuid,
@@ -496,11 +511,8 @@ async fn strong_read_resolves_at_a_leader_noop() {
     let ca = Ca::new();
     let cluster_id = ClusterId::new();
     let mut node = Node::new(1, cluster_id, &ca);
-    node.boot(CliOverrides {
-        bootstrap: true,
-        join: false,
-    })
-    .await;
+    node.boot().await;
+    node.form("strong-read-formation").await;
     wait_for_leader(std::slice::from_ref(&node), &[0], DEADLINE).await;
 
     // The strong-read barrier — deliberately taken with no normal command in
@@ -528,68 +540,62 @@ async fn strong_read_resolves_at_a_leader_noop() {
     node.graceful_stop().await;
 }
 
-/// The ADR 0016 startup identity matrix — fast, no cluster needed.
+/// The ADR 0037 §1 derived-intent startup matrix — fast, no cluster needed.
+///
+/// This replaces the ADR 0016 flag matrix: startup intent is now derived from
+/// the disk. An empty directory no longer fail-stops — it is a new instance that
+/// parks (and converges); a manifest present resumes. The identity-stamp
+/// cross-check is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_matrix() {
     init_tracing();
     let ca = Ca::new();
     let cluster_id = ClusterId::new();
 
-    // (a) Restart intent on an empty directory must fail-stop, pointing the
-    //     operator at the intent flags.
+    // (a) An empty directory is a NEW INSTANCE: it boots, parks (raft
+    //     uninitialized), and does not fail-stop. It is not a leader (no
+    //     formation), and its convergence status is `waiting`.
     {
-        let node = Node::new(10, cluster_id, &ca);
-        let err = node
-            .try_boot(CliOverrides::default())
-            .await
-            .expect_err("Restart on an empty dir must refuse");
-        let msg = format!("{err:#}");
+        let mut node = Node::new(10, cluster_id, &ca);
+        node.boot().await;
         assert!(
-            msg.contains("--bootstrap") && msg.contains("--join"),
-            "error should point at the intent flags, got: {msg}"
+            !node.is_leader(),
+            "a parked new instance must not be a leader without formation"
         );
+        assert!(
+            node.summary().members.is_empty(),
+            "a parked new instance has no membership until it forms or joins"
+        );
+        node.graceful_stop().await;
     }
 
-    // (b) Bootstrap intent on an already-initialized directory must fail-stop.
+    // (b) A directory with a manifest RESUMES. Boot, form, stop; re-boot from the
+    //     same disk must come back up (resume), not refuse.
     {
         let mut node = Node::new(11, cluster_id, &ca);
-        node.boot(CliOverrides {
-            bootstrap: true,
-            join: false,
-        })
-        .await;
+        node.boot().await;
+        node.form("identity-matrix-formation").await;
+        wait_for_leader(std::slice::from_ref(&node), &[0], DEADLINE).await;
         node.graceful_stop().await;
 
-        let err = node
-            .try_boot(CliOverrides {
-                bootstrap: true,
-                join: false,
-            })
-            .await
-            .expect_err("Bootstrap on an initialized dir must refuse");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("already initialized"),
-            "error should mention the directory is already initialized, got: {msg}"
-        );
+        node.boot().await; // resume from the stamped disk
+        wait_for_leader(std::slice::from_ref(&node), &[0], DEADLINE).await;
+        node.graceful_stop().await;
     }
 
-    // (c) Restart with a DIFFERENT cluster_id than the disk was stamped with
-    //     must fail-stop on the identity mismatch.
+    // (c) Resume with a DIFFERENT cluster_id than the disk was stamped with must
+    //     fail-stop on the identity mismatch (unchanged, ADR 0016).
     {
         let mut node = Node::new(12, cluster_id, &ca);
-        node.boot(CliOverrides {
-            bootstrap: true,
-            join: false,
-        })
-        .await;
+        node.boot().await;
+        node.form("identity-matrix-mismatch-formation").await;
         node.graceful_stop().await;
 
         node.rewrite_cluster_id(ClusterId::new());
         let err = node
-            .try_boot(CliOverrides::default())
+            .try_boot()
             .await
-            .expect_err("Restart with a different cluster_id must refuse");
+            .expect_err("resume with a different cluster_id must refuse");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("identity") || msg.contains("cluster"),

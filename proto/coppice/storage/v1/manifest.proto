@@ -50,6 +50,16 @@ message Manifest {
   // Best-effort committed index, recorded at rotation, snapshot, and clean
   // shutdown. Recovery may replay past it; correctness never depends on it.
   optional uint64 committed_index = 8;
+
+  // The durable formation token (ADR 0037 §3). Recorded together with the
+  // minted identity, before `raft.initialize`, so that first-ever formation is
+  // a resumable, idempotent state machine that survives a crash between stamp
+  // and initialize: a daemon holding a recorded token but an uninitialized raft
+  // completes formation itself on restart, and a re-run `cluster init` bearing
+  // the same token resumes rather than conflicting. Absent on directories that
+  // have never been the target of `InitializeCluster` (a pure learner join
+  // never records one — only the founding voter does).
+  optional string formation_token = 9;
 }
 
 // One claimed log segment.

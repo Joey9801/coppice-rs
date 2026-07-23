@@ -512,11 +512,11 @@ async fn best_effort_job_usage_full_read_path() {
 
     // -- Build the real read path: plane + node client (shared with logs). --
     let coord_leaf = ca.leaf();
-    let node_client = Arc::new(NodeClient::new(
+    let node_client = Arc::new(NodeClient::new(common::tls_store_from_pem(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
-    ));
+    )));
     let plane = Arc::new(
         CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
             .with_log_client(node_client),
@@ -524,6 +524,7 @@ async fn best_effort_job_usage_full_read_path() {
     let router = coppice_api::http::router(
         plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        None,
     );
 
     // -- 1. Exact round-trip, ascending default order, two `available`. ----
@@ -639,17 +640,18 @@ async fn best_effort_job_usage_full_read_path() {
     // fetch through a fresh client to observe genuine unreachability.
     server.abort();
     let _ = (&mut server).await;
-    let node_client2 = Arc::new(NodeClient::new(
+    let node_client2 = Arc::new(NodeClient::new(common::tls_store_from_pem(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
-    ));
+    )));
     let router2 = coppice_api::http::router(
         Arc::new(
             CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
                 .with_log_client(node_client2),
         ),
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        None,
     );
     let (status, body) = get_usage(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);

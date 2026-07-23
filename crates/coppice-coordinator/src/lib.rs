@@ -19,10 +19,30 @@ pub mod admin;
 pub mod bootstrap;
 pub mod cli;
 pub mod config;
+// The self-converging membership loop (ADR 0037 §4). Published so the later
+// `/readyz` package can consume its `ConvergenceStatus`/`Phase`.
+pub mod convergence;
+// Coordinator discovery backends (ADR 0037 §2): the trait, the static/dns/file
+// backends, and the file-registration helper. Consumed by `bootstrap`,
+// `convergence`, and the `admin` formation probe guard; public because the
+// trait and the run-scoped `FileRegistration` appear in `bootstrap` and
+// `convergence` signatures.
+pub mod discovery;
 mod leadership;
 mod limits;
+// The bootstrap-policy TOML schema and its idempotent command proposals
+// (ADR 0037 §3): parsed by the formation handler and reused by `coppice dev`'s
+// seeding, so the two never drift.
 mod liveness;
+pub mod policy;
+// The machine-readable readiness surface (ADR 0037 §7): `GET /readyz` and its
+// pure gate. Public so the daemon builds a `ReadyzState` in `bootstrap` and the
+// gate matrix can be exercised directly.
+pub mod readyz;
 mod runtime;
+// Minimal systemd `Type=notify` client (ADR 0037 §7): READY=1 when listeners
+// serve, STOPPING=1 at shutdown. Silent no-op off systemd.
+mod systemd;
 mod tasks;
 
 #[cfg(test)]
@@ -60,6 +80,7 @@ pub use runtime::install_metrics_recorder;
 /// parsed-but-unused.
 pub fn describe_metrics() {
     coppice_consensus::describe_metrics();
+    coppice_tls::describe_metrics();
     tasks::event_fanout::describe_metrics();
     tasks::node_client::describe_metrics();
 }
@@ -69,6 +90,7 @@ pub fn describe_metrics() {
 /// immediately before rendering each scrape.
 pub fn gather_metrics() {
     coppice_consensus::gather_metrics();
+    coppice_tls::gather_metrics();
     tasks::event_fanout::gather_metrics();
     tasks::node_client::gather_metrics();
 }

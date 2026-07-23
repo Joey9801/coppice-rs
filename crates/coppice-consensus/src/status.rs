@@ -8,12 +8,16 @@
 
 use tokio::sync::watch;
 
-use openraft::{BasicNode, RaftMetrics, ServerState};
+use crate::membership::CoordinatorNode;
+use openraft::{RaftMetrics, ServerState};
 
 use crate::{ConsensusStatus, CoordinatorId, Role};
 
 /// Fold one metrics sample and committed index into a [`ConsensusStatus`].
-fn compute(metrics: &RaftMetrics<CoordinatorId, BasicNode>, committed: u64) -> ConsensusStatus {
+fn compute(
+    metrics: &RaftMetrics<CoordinatorId, CoordinatorNode>,
+    committed: u64,
+) -> ConsensusStatus {
     let role = match metrics.state {
         ServerState::Leader => Role::Leader {
             term: metrics.current_term,
@@ -48,7 +52,7 @@ fn compute(metrics: &RaftMetrics<CoordinatorId, BasicNode>, committed: u64) -> C
 /// tasks that key off the term still wake). It exits when either input watch
 /// closes — i.e. at openraft shutdown or when the log store is dropped.
 pub(crate) fn spawn(
-    mut metrics_rx: watch::Receiver<RaftMetrics<CoordinatorId, BasicNode>>,
+    mut metrics_rx: watch::Receiver<RaftMetrics<CoordinatorId, CoordinatorNode>>,
     mut committed_rx: watch::Receiver<u64>,
 ) -> watch::Receiver<ConsensusStatus> {
     let initial = compute(&metrics_rx.borrow(), *committed_rx.borrow());
@@ -98,7 +102,7 @@ mod tests {
         state: ServerState,
         term: u64,
         applied: Option<u64>,
-    ) -> RaftMetrics<CoordinatorId, BasicNode> {
+    ) -> RaftMetrics<CoordinatorId, CoordinatorNode> {
         RaftMetrics {
             running_state: Ok(()),
             id: 1,

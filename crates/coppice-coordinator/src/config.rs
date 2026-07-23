@@ -18,11 +18,9 @@
 //! which rejects bare integers by construction — deliberately, so an
 //! unlabelled `1500` cannot silently mean milliseconds, seconds, or a bug.
 //!
-//! Precedence is `CLI > file > built-in defaults`. The CLI surface is
-//! deliberately tiny — `--config` plus the ADR 0016 startup-intent flags,
-//! [`CliOverrides::bootstrap`] and [`CliOverrides::join`] — so every other
-//! knob resolves file-over-default via `serde` defaults, and [`load`] is the
-//! single place the two layers merge.
+//! The CLI surface is now just `--config` (ADR 0037 §1: startup intent is
+//! derived from the disk, not declared), so every knob resolves file-over-default
+//! via `serde` defaults and [`load`] simply parses and validates.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -32,6 +30,254 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use coppice_core::id::ClusterId;
 use serde::Deserialize;
+
+pub(crate) use discovery::{BackendKind, DiscoveryConfig};
+
+mod discovery {
+    //! The `[discovery]` config section (ADR 0037 §2).
+    //!
+    //! Discovery answers "whom might I dial first?", never "who are the
+    //! voters?"; its output is advisory seed addresses only. The section names
+    //! a `backend` and carries exactly one matching backend table. It also
+    //! carries `cluster_size` and the two membership grace periods, which
+    //! convergence and the leader's removal decisions consult before replicated
+    //! state is reachable — the same node-local justification as `cluster_id`.
+
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use coppice_consensus::MembershipPolicy;
+    use serde::Deserialize;
+
+    /// The `[discovery]` section: which backend seeds candidate raft addresses,
+    /// the expected voter count, and the two membership grace periods.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct DiscoveryConfig {
+        /// Which backend supplies candidate raft addresses. Exactly one
+        /// matching backend table must be present (validated in
+        /// [`DiscoveryConfig::validate`]).
+        #[serde(default)]
+        pub(crate) backend: BackendKind,
+
+        /// Expected voter count. Node-local config (ADR 0037 §2): consulted by
+        /// convergence and the leader's removal rule (§5) and the
+        /// formation-complete signal (§7) before replicated state is reachable.
+        #[serde(default = "default_cluster_size")]
+        pub(crate) cluster_size: usize,
+
+        /// How long the leader's replication to a voter must have been failing
+        /// before that voter qualifies for overflow removal (ADR 0037 §5).
+        /// Consumed by the leader's removal rule (ADR 0037 §5).
+        #[serde(default = "default_grace", with = "humantime_serde")]
+        pub(crate) removal_grace: Duration,
+
+        /// How long a pending learner's incumbent must be unreachable or make no
+        /// progress before a losing joiner may retry its seat (ADR 0037 §6).
+        #[serde(default = "default_grace", with = "humantime_serde")]
+        pub(crate) replacement_grace: Duration,
+
+        /// `[discovery.static]` — present iff `backend = "static"`.
+        #[serde(default, rename = "static")]
+        pub(crate) static_backend: Option<StaticBackend>,
+
+        /// `[discovery.dns]` — present iff `backend = "dns"`.
+        #[serde(default)]
+        pub(crate) dns: Option<DnsBackend>,
+
+        /// `[discovery.file]` — present iff `backend = "file"`.
+        #[serde(default)]
+        pub(crate) file: Option<FileBackend>,
+
+        /// `[discovery.ec2_asg]` — present iff `backend = "ec2-asg"`
+        /// (ADR 0037 §2).
+        #[serde(default)]
+        pub(crate) ec2_asg: Option<Ec2AsgBackend>,
+    }
+
+    /// The discovery backend selector. TOML spelling matches ADR 0037 §2.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub(crate) enum BackendKind {
+        /// The literal seed list — today's `peers`, under a new roof.
+        #[default]
+        Static,
+        /// Resolve one DNS name per consultation (A/AAAA + SRV).
+        Dns,
+        /// Enumerate a well-known directory of run-scoped registration files.
+        File,
+        /// EC2 auto-scaling-group membership. Config variant reserved; the
+        /// backend is not built in this PR (ADR 0037 §2).
+        Ec2Asg,
+    }
+
+    /// `[discovery.static]`: the literal list of dialable raft addresses.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct StaticBackend {
+        #[serde(default)]
+        pub(crate) addrs: Vec<String>,
+    }
+
+    /// `[discovery.dns]`: one name resolved per consultation. SRV records
+    /// supply their own ports; A/AAAA records use `port`.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct DnsBackend {
+        pub(crate) name: String,
+        /// Fallback port for A/AAAA records that carry none.
+        pub(crate) port: u16,
+    }
+
+    /// `[discovery.file]`: a directory of run-scoped registration files, each
+    /// naming one candidate on its first line.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct FileBackend {
+        pub(crate) dir: PathBuf,
+    }
+
+    /// `[discovery.ec2_asg]`: the EC2 auto-scaling-group backend (ADR 0037 §2).
+    ///
+    /// The instance id and region are read from EC2 instance metadata (IMDSv2)
+    /// at each consultation, so neither is configured here. `port` is required:
+    /// discovery composes `private-ip:port` candidates and the raft listen port
+    /// is not plumbed into the discovery builder, so the operator names it
+    /// explicitly (the same shape as `[discovery.dns].port`).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct Ec2AsgBackend {
+        /// The raft port composed onto every discovered instance's private IP.
+        pub(crate) port: u16,
+        /// Explicit AWS region override. Optional: when unset the region is
+        /// taken from this instance's IMDS document, which is the normal case
+        /// for a coordinator running inside the group it discovers.
+        #[serde(default)]
+        pub(crate) region: Option<String>,
+        /// Per-AWS-call timeout. Discovery must never hang startup (ADR 0037 §2
+        /// contract), so each IMDS/ASG/EC2 call is bounded by this and a slow or
+        /// unreachable control plane degrades to an empty candidate list with a
+        /// warning rather than blocking convergence.
+        #[serde(default = "default_ec2_asg_timeout", with = "humantime_serde")]
+        pub(crate) timeout: Duration,
+    }
+
+    impl Default for DiscoveryConfig {
+        fn default() -> Self {
+            // The whole section absent → an empty static backend. Admin tooling
+            // then simply requires an explicit `--target`.
+            DiscoveryConfig {
+                backend: BackendKind::Static,
+                cluster_size: default_cluster_size(),
+                removal_grace: default_grace(),
+                replacement_grace: default_grace(),
+                static_backend: None,
+                dns: None,
+                file: None,
+                ec2_asg: None,
+            }
+        }
+    }
+
+    impl DiscoveryConfig {
+        /// Reject a section whose backend tables do not match `backend`: the
+        /// required table must be present (except `static`, which defaults to
+        /// an empty list), and no foreign backend table may appear.
+        pub(crate) fn validate(&self) -> anyhow::Result<()> {
+            // No foreign tables.
+            let foreign = [
+                (self.backend != BackendKind::Static && self.static_backend.is_some())
+                    .then_some("static"),
+                (self.backend != BackendKind::Dns && self.dns.is_some()).then_some("dns"),
+                (self.backend != BackendKind::File && self.file.is_some()).then_some("file"),
+                (self.backend != BackendKind::Ec2Asg && self.ec2_asg.is_some())
+                    .then_some("ec2_asg"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if !foreign.is_empty() {
+                anyhow::bail!(
+                    "[discovery] backend = \"{}\" but unrelated table(s) present: {} — \
+                     keep exactly the one matching table (ADR 0037 §2)",
+                    self.backend.as_str(),
+                    foreign.join(", "),
+                );
+            }
+
+            // Required table present (static tolerates absence → empty list).
+            match self.backend {
+                BackendKind::Static => {}
+                BackendKind::Dns if self.dns.is_none() => {
+                    anyhow::bail!(
+                        "[discovery] backend = \"dns\" requires a [discovery.dns] table \
+                         with `name` and `port` (ADR 0037 §2)"
+                    );
+                }
+                BackendKind::File if self.file.is_none() => {
+                    anyhow::bail!(
+                        "[discovery] backend = \"file\" requires a [discovery.file] table \
+                         with `dir` (ADR 0037 §2)"
+                    );
+                }
+                BackendKind::Ec2Asg if self.ec2_asg.is_none() => {
+                    anyhow::bail!(
+                        "[discovery] backend = \"ec2-asg\" requires a [discovery.ec2_asg] \
+                         table with `port` (ADR 0037 §2)"
+                    );
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        /// The node-local [`MembershipPolicy`] (ADR 0037 §5) this config carries:
+        /// the expected voter count and the two membership grace periods,
+        /// consulted by convergence and the leader's removal rule before
+        /// replicated state is reachable.
+        pub(crate) fn membership_policy(&self) -> MembershipPolicy {
+            MembershipPolicy {
+                cluster_size: self.cluster_size,
+                removal_grace: self.removal_grace,
+                replacement_grace: self.replacement_grace,
+            }
+        }
+
+        /// The static seed list, if this config selects the `static` backend —
+        /// the successor to the old top-level `peers`, consulted by admin
+        /// tooling for a default `--target`.
+        pub(crate) fn static_addrs(&self) -> &[String] {
+            match (self.backend, &self.static_backend) {
+                (BackendKind::Static, Some(s)) => &s.addrs,
+                _ => &[],
+            }
+        }
+    }
+
+    impl BackendKind {
+        /// The TOML spelling, for operator-facing messages.
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                BackendKind::Static => "static",
+                BackendKind::Dns => "dns",
+                BackendKind::File => "file",
+                BackendKind::Ec2Asg => "ec2-asg",
+            }
+        }
+    }
+
+    fn default_cluster_size() -> usize {
+        3
+    }
+
+    fn default_grace() -> Duration {
+        Duration::from_secs(60)
+    }
+
+    fn default_ec2_asg_timeout() -> Duration {
+        Duration::from_secs(3)
+    }
+}
 
 /// The coordinator's fully-parsed node configuration file.
 ///
@@ -51,14 +297,15 @@ pub(crate) struct Config {
     /// Root of this replica's on-disk state (segment storage, manifest).
     pub(crate) data_dir: PathBuf,
 
-    /// Seed list of peer Raft addresses (`"host:port"`), used by admin
-    /// tooling to locate the cluster. Not authoritative: the addresses that
-    /// matter for consensus live in replicated membership, not here.
+    /// Coordinator discovery (ADR 0037 §2): which backend seeds candidate raft
+    /// addresses, the expected voter count, and the membership grace periods.
+    /// Subsumes the old top-level `peers` list (now `[discovery.static]`).
+    /// Optional: an absent section defaults to an empty `static` backend, so
+    /// admin tooling then requires an explicit `--target`.
     #[serde(default)]
-    pub(crate) peers: Vec<String>,
+    pub(crate) discovery: DiscoveryConfig,
 
-    /// Listen and advertise addresses. Required: every deployment needs at
-    /// least `advertise_host`, which has no sane default.
+    /// Listen and advertise addresses. Required.
     pub(crate) listen: ListenConfig,
 
     /// Raft liveness timing. Optional: the defaults suit ordinary
@@ -101,20 +348,95 @@ pub(crate) struct ListenConfig {
     #[serde(default = "default_agent_addr")]
     pub(crate) agent_addr: SocketAddr,
 
-    /// The hostname peers and agents dial. No default: `0.0.0.0` binds are
-    /// never dialable addresses, so this must be supplied explicitly.
-    pub(crate) advertise_host: String,
+    /// The hostname peers and agents dial. Optional (ADR 0037 §2): when unset
+    /// it is resolved via the fallback chain in [`resolve_advertise_host`]
+    /// (explicit value ▸ system hostname ▸ default-route local address), so a
+    /// production fleet can ship one byte-identical config artifact. [`load`]
+    /// resolves it once and stores the result back here; every reader after
+    /// load sees the concrete value.
+    #[serde(default)]
+    pub(crate) advertise_host: Option<String>,
 }
 
 impl ListenConfig {
-    /// The Raft address this replica advertises to peers: `advertise_host`
-    /// combined with the port half of [`raft_addr`](ListenConfig::raft_addr).
+    /// The Raft address this replica advertises to peers: the resolved
+    /// `advertise_host` combined with the port half of
+    /// [`raft_addr`](ListenConfig::raft_addr).
     ///
     /// Kept as a method rather than a stored field so the two can never
-    /// silently drift apart when either is edited.
+    /// silently drift apart when either is edited. [`load`] guarantees
+    /// `advertise_host` is resolved to `Some` before any reader calls this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn advertised_raft_addr(&self) -> String {
-        format!("{}:{}", self.advertise_host, self.raft_addr.port())
+        self.advertised_raft_addr_on_port(self.raft_addr.port())
     }
+
+    /// The Raft address this replica advertises on a *specific* bound port: the
+    /// resolved `advertise_host` combined with `port`.
+    ///
+    /// Used when `raft_addr` requests port 0 (the multi-process dev case, ADR
+    /// 0037 §2): bootstrap binds the listener first, learns the real port, and
+    /// advertises *that* — so a `:0` config never publishes `host:0` to
+    /// discovery, membership, or the convergence loop.
+    pub(crate) fn advertised_raft_addr_on_port(&self, port: u16) -> String {
+        let host = self
+            .advertise_host
+            .as_deref()
+            .expect("advertise_host resolved by config::load before use");
+        format!("{host}:{port}")
+    }
+}
+
+/// Resolve the address peers dial, per ADR 0037 §2's fallback chain:
+/// explicit config value ▸ the OS-reported system hostname ▸ the local
+/// address of the default route.
+///
+/// The default-route step opens a UDP socket and `connect`s it to a public
+/// address to learn which local interface the kernel would route through; no
+/// packets are sent (UDP `connect` only records the peer). It is the reliable
+/// last resort — the hostname step depends on host DNS/`/etc/hosts` setup.
+fn resolve_advertise_host(explicit: Option<&str>) -> Result<String> {
+    if let Some(host) = explicit {
+        return Ok(host.to_string());
+    }
+    if let Some(host) = system_hostname() {
+        tracing::info!(advertise_host = %host, source = "system-hostname", "resolved advertise_host");
+        return Ok(host);
+    }
+    if let Some(addr) = default_route_local_addr() {
+        tracing::info!(advertise_host = %addr, source = "default-route", "resolved advertise_host");
+        return Ok(addr);
+    }
+    bail!(
+        "advertise_host is unset and could not be resolved: the system hostname was \
+         unavailable and no default route was found. Set `listen.advertise_host` \
+         explicitly to the address peers and agents should dial (ADR 0037 §2)."
+    );
+}
+
+/// The OS-reported hostname, or `None` if it is empty or not valid UTF-8.
+///
+/// This is the "system FQDN" step of the fallback chain: on a correctly
+/// configured host `gethostname` returns the FQDN, but a bare short name is
+/// still returned as-is (and is often resolvable on the local network); full
+/// FQDN canonicalization is deliberately left to host DNS configuration.
+fn system_hostname() -> Option<String> {
+    let name = gethostname::gethostname().into_string().ok()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// The local address of the default route: bind an unconnected UDP socket and
+/// `connect` it toward a public address so the kernel selects the egress
+/// interface, then read back the socket's local address. No traffic is sent.
+fn default_route_local_addr() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local = socket.local_addr().ok()?;
+    Some(local.ip().to_string())
 }
 
 /// Raft liveness tuning.
@@ -267,26 +589,12 @@ fn default_log_format() -> String {
     "text".to_string()
 }
 
-/// The entire CLI override surface (ADR 0020: the flag set stays
-/// deliberately tiny). These are the ADR 0016 startup-intent flags; they
-/// never appear in the config file, so the CLI layer is their sole
-/// authority.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CliOverrides {
-    /// `--bootstrap`: this is the first coordinator of a brand-new cluster.
-    pub bootstrap: bool,
-    /// `--join`: this is a fresh replica joining an existing cluster.
-    pub join: bool,
-}
-
-/// The fully-resolved configuration for this process: the parsed file plus
-/// the CLI startup-intent flags layered on top (ADR 0020 precedence,
-/// `CLI > file > built-in defaults`).
+/// The fully-resolved configuration for this process: the parsed file with
+/// `advertise_host` resolved in place (ADR 0037 §1 removes the CLI intent flags,
+/// so there is no override layer left to merge).
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub(crate) config: Config,
-    pub(crate) bootstrap: bool,
-    pub(crate) join: bool,
 }
 
 impl ResolvedConfig {
@@ -297,30 +605,29 @@ impl ResolvedConfig {
     pub(crate) fn log_effective(&self) {
         tracing::info!(
             cluster_id = %self.config.cluster_id,
-            bootstrap = self.bootstrap,
-            join = self.join,
             config = ?self.config,
             "effective coordinator configuration"
         );
     }
 }
 
-/// Load the node configuration file and merge it with CLI overrides.
+/// Load and validate the node configuration file (ADR 0020/0037 §1).
 ///
-/// Precedence is `CLI > file > built-in defaults` (ADR 0020): `cli` is
-/// authoritative for the startup-intent flags, which never appear in the
-/// file; every other value resolves file-over-default via `serde` field
-/// defaults. `--bootstrap` and `--join` are mutually exclusive.
-pub fn load(path: &Path, cli: CliOverrides) -> Result<ResolvedConfig> {
-    if cli.bootstrap && cli.join {
-        bail!("--bootstrap and --join are mutually exclusive; pass at most one");
-    }
-    let config = read_config(path)?;
-    Ok(ResolvedConfig {
-        config,
-        bootstrap: cli.bootstrap,
-        join: cli.join,
-    })
+/// Startup intent is no longer declared on the command line — it is derived
+/// from the data directory at start (ADR 0037 §1) — so this just parses, checks
+/// `[discovery]`, and resolves `advertise_host` in place so every later reader
+/// (bootstrap, discovery registration, convergence) sees a concrete value.
+pub fn load(path: &Path) -> Result<ResolvedConfig> {
+    let mut config = read_config(path)?;
+    config.discovery.validate().with_context(|| {
+        format!(
+            "validating [discovery] in coordinator config {}",
+            path.display()
+        )
+    })?;
+    let resolved_host = resolve_advertise_host(config.listen.advertise_host.as_deref())?;
+    config.listen.advertise_host = Some(resolved_host);
+    Ok(ResolvedConfig { config })
 }
 
 /// Read and parse the config file, wrapping any I/O or deserialization
@@ -348,12 +655,20 @@ mod tests {
     }
 
     /// The full documented example from `docs/operations/configuration.md`,
-    /// extended with `cluster_id`, `peers`, and `[raft].rpc_timeout` (fields
-    /// this module adds ahead of the doc pass).
+    /// extended with `cluster_id`, `[discovery]`, and `[raft].rpc_timeout`
+    /// (fields this module adds ahead of the doc pass).
     const FULL_EXAMPLE: &str = r#"
 cluster_id = "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice"
-peers = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
+
+[discovery]
+backend = "static"
+cluster_size = 3
+removal_grace = "60s"
+replacement_grace = "60s"
+
+[discovery.static]
+addrs = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
 
 [listen]
 client_addr = "0.0.0.0:7070"
@@ -409,9 +724,13 @@ ca_path   = "/etc/coppice/pki/ca.crt"
                 .unwrap()
         );
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/coppice"));
+        assert_eq!(config.discovery.backend, BackendKind::Static);
+        assert_eq!(config.discovery.cluster_size, 3);
+        assert_eq!(config.discovery.removal_grace, Duration::from_secs(60));
+        assert_eq!(config.discovery.replacement_grace, Duration::from_secs(60));
         assert_eq!(
-            config.peers,
-            vec![
+            config.discovery.static_addrs(),
+            [
                 "coord-1.batch.example.com:7071".to_string(),
                 "coord-2.batch.example.com:7071".to_string(),
             ]
@@ -420,7 +739,10 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         assert_eq!(config.listen.client_addr, default_client_addr());
         assert_eq!(config.listen.raft_addr, default_raft_addr());
         assert_eq!(config.listen.agent_addr, default_agent_addr());
-        assert_eq!(config.listen.advertise_host, "coord-3.batch.example.com");
+        assert_eq!(
+            config.listen.advertise_host.as_deref(),
+            Some("coord-3.batch.example.com")
+        );
 
         assert_eq!(config.raft.election_timeout, Duration::from_millis(1500));
         assert_eq!(config.raft.heartbeat_interval, Duration::from_millis(300));
@@ -460,7 +782,10 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         let (_guard, path) = write_config(MINIMAL_EXAMPLE);
         let config = read_config(&path).expect("minimal example should parse");
 
-        assert!(config.peers.is_empty());
+        // Absent [discovery] → empty static backend with defaults.
+        assert_eq!(config.discovery.backend, BackendKind::Static);
+        assert_eq!(config.discovery.cluster_size, 3);
+        assert!(config.discovery.static_addrs().is_empty());
 
         assert_eq!(config.listen.client_addr, default_client_addr());
         assert_eq!(config.listen.raft_addr, default_raft_addr());
@@ -506,22 +831,6 @@ ca_path   = "/etc/coppice/pki/ca.crt"
     }
 
     #[test]
-    fn bootstrap_and_join_together_fail() {
-        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
-        let err = load(
-            &path,
-            CliOverrides {
-                bootstrap: true,
-                join: true,
-            },
-        )
-        .expect_err("bootstrap and join together should be rejected");
-        let message = format!("{err:#}");
-        assert!(message.contains("--bootstrap"));
-        assert!(message.contains("--join"));
-    }
-
-    #[test]
     fn file_overrides_default_and_absent_value_takes_default() {
         let contents = format!("{MINIMAL_EXAMPLE}\n[observability]\nlog_level = \"debug\"\n");
         let (_guard, path) = write_config(&contents);
@@ -540,6 +849,145 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         assert_eq!(
             config.listen.advertised_raft_addr(),
             "coord-1.example.com:7071"
+        );
+    }
+
+    #[test]
+    fn dns_backend_parses_and_validates() {
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"dns\"\n\n\
+             [discovery.dns]\nname = \"coord.batch.example.com\"\nport = 7071\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("dns discovery should parse");
+        assert_eq!(config.discovery.backend, BackendKind::Dns);
+        config.discovery.validate().expect("dns config is valid");
+        let dns = config.discovery.dns.expect("dns table present");
+        assert_eq!(dns.name, "coord.batch.example.com");
+        assert_eq!(dns.port, 7071);
+    }
+
+    #[test]
+    fn file_backend_parses_and_validates() {
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"file\"\n\n\
+             [discovery.file]\ndir = \"/var/run/coppice/discovery\"\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("file discovery should parse");
+        config.discovery.validate().expect("file config is valid");
+        assert_eq!(
+            config.discovery.file.expect("file table").dir,
+            PathBuf::from("/var/run/coppice/discovery")
+        );
+    }
+
+    #[test]
+    fn ec2_asg_backend_parses() {
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n\n\
+             [discovery.ec2_asg]\nport = 7071\nregion = \"us-east-1\"\ntimeout = \"5s\"\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("ec2-asg discovery should parse");
+        assert_eq!(config.discovery.backend, BackendKind::Ec2Asg);
+        let ec2 = config
+            .discovery
+            .ec2_asg
+            .as_ref()
+            .expect("ec2_asg table present");
+        assert_eq!(ec2.port, 7071);
+        assert_eq!(ec2.region.as_deref(), Some("us-east-1"));
+        assert_eq!(ec2.timeout, Duration::from_secs(5));
+        config
+            .discovery
+            .validate()
+            .expect("ec2-asg config is valid");
+    }
+
+    #[test]
+    fn ec2_asg_backend_defaults_region_and_timeout() {
+        // `port` is the only required field; region defaults to the IMDS value
+        // (None here) and timeout to 3s.
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n\n\
+             [discovery.ec2_asg]\nport = 7071\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("ec2-asg with only a port should parse");
+        let ec2 = config
+            .discovery
+            .ec2_asg
+            .as_ref()
+            .expect("ec2_asg table present");
+        assert_eq!(ec2.port, 7071);
+        assert_eq!(ec2.region, None);
+        assert_eq!(ec2.timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn ec2_asg_backend_without_table_is_rejected() {
+        // Selecting the backend without its table (hence without `port`) is a
+        // validation error, mirroring the dns/file required-table rule.
+        let contents = format!("{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n");
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("parses; validation is separate");
+        let err = config
+            .discovery
+            .validate()
+            .expect_err("ec2-asg without a [discovery.ec2_asg] table must be rejected");
+        assert!(
+            format!("{err:#}").contains("requires a [discovery.ec2_asg] table"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn backend_mismatch_with_foreign_table_is_rejected() {
+        // backend = dns but a [discovery.static] table is present.
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"dns\"\n\n\
+             [discovery.dns]\nname = \"coord.example.com\"\nport = 7071\n\n\
+             [discovery.static]\naddrs = [\"a:1\"]\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("parses; validation catches the mismatch");
+        let err = config
+            .discovery
+            .validate()
+            .expect_err("foreign table rejected");
+        assert!(format!("{err:#}").contains("static"), "{err:#}");
+    }
+
+    #[test]
+    fn missing_required_backend_table_is_rejected() {
+        let contents = format!("{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"dns\"\n");
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("parses; validation catches the missing table");
+        let err = config
+            .discovery
+            .validate()
+            .expect_err("missing dns table rejected");
+        assert!(format!("{err:#}").contains("[discovery.dns]"), "{err:#}");
+    }
+
+    #[test]
+    fn load_resolves_and_validates() {
+        // A minimal config with an explicit advertise_host: load() must resolve
+        // it in place and pass discovery validation.
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let resolved = load(&path).expect("load succeeds");
+        assert_eq!(
+            resolved.config.listen.advertise_host.as_deref(),
+            Some("coord-1.example.com")
+        );
+    }
+
+    #[test]
+    fn resolve_advertise_host_prefers_explicit_value() {
+        assert_eq!(
+            resolve_advertise_host(Some("coord-7.example.com")).expect("explicit resolves"),
+            "coord-7.example.com"
         );
     }
 }

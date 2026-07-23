@@ -1,0 +1,39 @@
+[package]
+name = "coppice-tls"
+description = "Hot-reloadable coordinator mTLS material: an ArcSwap store, a connection-time rustls acceptor, and a mtime/SIGHUP reload task (ADR 0037 §6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The lock-free swap cell the whole crate is built around: reads (every
+# handshake, every outbound dial) never block, and a reload publishes a fresh
+# `Arc<TlsMaterial>` atomically.
+arc-swap.workspace = true
+# rustls + tokio-rustls give the hand-rolled server acceptor and the
+# `tokio_rustls::server::TlsStream<TcpStream>` that tonic's blanket `Connected`
+# impl turns into a `TlsConnectInfo` (so `request.peer_certs()` keeps working).
+rustls.workspace = true
+tokio-rustls.workspace = true
+# PEM → DER parsing for the cert chain, private key, and CA roots.
+rustls-pemfile.workspace = true
+# Reading the leaf's `notAfter` for the expiry gauge; the TLS layer already
+# validates chains, so only the validity field is read here.
+x509-parser.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+metrics.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Mints throwaway CAs and leaves for the reload/rotation tests.
+rcgen.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -480,3 +480,47 @@ fn crash_during_install_with_floor_advance() {
         }
     }
 }
+
+/// The durable formation token (ADR 0037 §3) survives a reopen: a daemon that
+/// crashes after recording the token but before `raft.initialize` reads the
+/// same token back on restart, so it completes formation itself with the same
+/// operator intent (never a fresh, conflicting one).
+#[test]
+fn formation_token_persists_across_reopen() {
+    let engine = RealEngine::default();
+    let fs = SimFs::new(SimConfig::default());
+
+    // A freshly-stamped directory carries no token yet.
+    StorageCore::init(&fs, &engine.options(), NODE_ID, INSTANCE_UUID).expect("init");
+    {
+        let core = StorageCore::open(fs.clone(), engine.options()).expect("open fresh");
+        assert_eq!(core.formation_token(), None, "fresh directory has no token");
+    }
+
+    // Record the operator's formation intent durably (the pre-initialize stamp).
+    {
+        let mut core = StorageCore::open(fs.clone(), engine.options()).expect("reopen to record");
+        core.record_formation_token("stack-42")
+            .expect("record formation token");
+        assert_eq!(core.formation_token(), Some("stack-42"));
+    }
+
+    // "Crash" and reopen: the token is read back, so restart resumes the SAME
+    // formation rather than manufacturing a conflict.
+    {
+        let core = StorageCore::open(fs.clone(), engine.options()).expect("reopen after crash");
+        assert_eq!(core.formation_token(), Some("stack-42"));
+        assert_eq!(
+            core.node_id(),
+            NODE_ID,
+            "identity is unchanged across the crash"
+        );
+    }
+
+    // Recording the same token again is an idempotent no-op that still persists.
+    {
+        let mut core = StorageCore::open(fs.clone(), engine.options()).expect("reopen idempotent");
+        core.record_formation_token("stack-42").expect("re-record");
+        assert_eq!(core.formation_token(), Some("stack-42"));
+    }
+}

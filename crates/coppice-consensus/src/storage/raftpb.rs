@@ -21,13 +21,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 
-use openraft::{BasicNode, CommittedLeaderId, LeaderId, LogId, Membership, StoredMembership, Vote};
+use openraft::{CommittedLeaderId, LeaderId, LogId, Membership, StoredMembership, Vote};
 use prost::Message;
 
 use coppice_proto::convert::{command_from_pb, command_to_pb};
 use coppice_proto::pb::raft::v1 as pb;
 
 use crate::adapter::TypeConfig;
+use crate::membership::CoordinatorNode;
 use crate::CoordinatorId;
 
 use super::container::fail_stop;
@@ -81,7 +82,7 @@ pub fn log_id_from_pb(path: &Path, id: &pb::LogId) -> io::Result<LogId<Coordinat
     })
 }
 
-pub fn membership_to_pb(membership: &Membership<CoordinatorId, BasicNode>) -> pb::Membership {
+pub fn membership_to_pb(membership: &Membership<CoordinatorId, CoordinatorNode>) -> pb::Membership {
     pb::Membership {
         configs: membership
             .get_joint_config()
@@ -92,11 +93,16 @@ pub fn membership_to_pb(membership: &Membership<CoordinatorId, BasicNode>) -> pb
                 voters: config.iter().copied().collect(),
             })
             .collect(),
+        // The node record carries the machine-identity binding and superseded
+        // marker (ADR 0037 §6) — a deliberate, additive change to the durable
+        // membership format (see `crate::membership::CoordinatorNode`).
         members: membership
             .nodes()
             .map(|(id, node)| pb::RaftMember {
                 node_id: *id,
                 address: node.addr.clone(),
+                machine_identity: node.machine_identity.clone(),
+                superseded: node.superseded,
             })
             .collect(),
     }
@@ -105,18 +111,22 @@ pub fn membership_to_pb(membership: &Membership<CoordinatorId, BasicNode>) -> pb
 pub fn membership_from_pb(
     path: &Path,
     membership: &pb::Membership,
-) -> io::Result<Membership<CoordinatorId, BasicNode>> {
+) -> io::Result<Membership<CoordinatorId, CoordinatorNode>> {
     let configs: Vec<BTreeSet<CoordinatorId>> = membership
         .configs
         .iter()
         .map(|config| config.voters.iter().copied().collect())
         .collect();
-    let mut nodes: BTreeMap<CoordinatorId, BasicNode> = BTreeMap::new();
+    let mut nodes: BTreeMap<CoordinatorId, CoordinatorNode> = BTreeMap::new();
     for member in &membership.members {
+        // Records written before these fields decode them as empty/false, i.e.
+        // "unbound, not superseded" (ADR 0037 §6).
         let prev = nodes.insert(
             member.node_id,
-            BasicNode {
+            CoordinatorNode {
                 addr: member.address.clone(),
+                machine_identity: member.machine_identity.clone(),
+                superseded: member.superseded,
             },
         );
         if prev.is_some() {
@@ -131,7 +141,7 @@ pub fn membership_from_pb(
 }
 
 pub fn stored_membership_to_pb(
-    stored: &StoredMembership<CoordinatorId, BasicNode>,
+    stored: &StoredMembership<CoordinatorId, CoordinatorNode>,
 ) -> pb::StoredMembership {
     pb::StoredMembership {
         log_id: stored.log_id().as_ref().map(log_id_to_pb),
@@ -142,7 +152,7 @@ pub fn stored_membership_to_pb(
 pub fn stored_membership_from_pb(
     path: &Path,
     stored: &pb::StoredMembership,
-) -> io::Result<StoredMembership<CoordinatorId, BasicNode>> {
+) -> io::Result<StoredMembership<CoordinatorId, CoordinatorNode>> {
     let log_id = stored
         .log_id
         .as_ref()
@@ -264,9 +274,16 @@ mod tests {
         let vote = Vote::<CoordinatorId>::new_committed(7, 3);
         assert_eq!(vote_from_pb(path, &vote_to_pb(&vote)).unwrap(), vote);
 
-        let membership = Membership::<CoordinatorId, BasicNode>::new(
+        let membership = Membership::<CoordinatorId, CoordinatorNode>::new(
             vec![BTreeSet::from([1, 2, 3])],
-            BTreeMap::from([(4, BasicNode { addr: "b:1".into() })]),
+            BTreeMap::from([(
+                4,
+                CoordinatorNode {
+                    addr: "b:1".into(),
+                    machine_identity: "coord-4".into(),
+                    superseded: true,
+                },
+            )]),
         );
         assert_eq!(
             membership_from_pb(path, &membership_to_pb(&membership)).unwrap(),
@@ -275,7 +292,8 @@ mod tests {
 
         // The suite's `Membership::new(configs, None)` shape (voters filled
         // with default nodes) must survive the round trip exactly.
-        let bare = Membership::<CoordinatorId, BasicNode>::new(vec![BTreeSet::from([1, 2])], None);
+        let bare =
+            Membership::<CoordinatorId, CoordinatorNode>::new(vec![BTreeSet::from([1, 2])], None);
         assert_eq!(
             membership_from_pb(path, &membership_to_pb(&bare)).unwrap(),
             bare

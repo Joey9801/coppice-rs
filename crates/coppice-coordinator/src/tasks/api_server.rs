@@ -502,14 +502,18 @@ fn map_consensus_error(e: ConsensusError) -> ApiError {
 /// (issue #46): the runtime installs the recorder once at startup and passes
 /// its [`MetricsEndpoint`](coppice_api::http::MetricsEndpoint) here, so the
 /// coordinator has no separate metrics port — the endpoint rides the client
-/// API edge.
+/// API edge. Beside it sits `/readyz` (ADR 0037 §7): the captured
+/// [`ReadyzEndpoint`](coppice_api::http::ReadyzEndpoint) bootstrap built over
+/// this replica's `ReadyzState`, mounted the same top-level, control-plane-free
+/// way as `/metrics`.
 pub async fn run<C: Consensus>(
     listener: crate::bootstrap::ClientListener,
     control_plane: Arc<CoordinatorControlPlane<C>>,
     metrics: coppice_api::http::MetricsEndpoint,
+    readyz: coppice_api::http::ReadyzEndpoint,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let app = coppice_api::http::router(control_plane, metrics);
+    let app = coppice_api::http::router(control_plane, metrics, Some(readyz));
     let graceful = async move {
         let _ = shutdown.wait_for(|s| *s).await;
     };

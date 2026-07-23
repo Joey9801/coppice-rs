@@ -68,9 +68,24 @@ the operational workflow is described in
   with a launch lifecycle hook polling it implements the loop; no
   further coordinator code needed).
 
-Implementation of all of the above is tracked as issue #47 and has not
-landed yet; until it does, the pre-0037 manual sequence continues to work
-via the retained admin verbs.
+The coordinator half of this (issue #47) has landed: the flagless daemon
+with derived intent; the seed-only `Discovery` trait with the `static`,
+`dns`, `file`, and `ec2-asg` backends; explicit token-keyed `cluster init`
+with durable, resumable formation; the self-converging membership loop with
+idempotent verbs and promotion-coupled removal; the machine self-service
+authorization grant with TLS reload; and the `/readyz` readiness surface.
+The `ec2-asg` backend reads this instance's id and region from IMDSv2, lists
+its Auto Scaling group's members (lifecycle states Pending/Pending:Wait/
+Pending:Proceed/InService), and resolves their private IPs; its
+`LivenessAttestor` lets discovery absence strengthen an overflow removal
+(ADR 0037 §5). The pre-0037 admin verbs are retained as the break-glass
+surface.
+
+Deliberately **not** in this landing, and still deferred:
+
+- **platform-CAS auto-formation** — the opt-in, per-platform
+  `BootstrapAuthority` behind the same `InitializeCluster` seam;
+- **agent-side enrollment and drain** — Part 2 below, still OD-15.
 
 ## Part 2 — Agent lifecycle (autoscaling to zero-touch)
 
@@ -161,8 +176,9 @@ No ids, no certs, no capacity numbers, no coordinator-side pre-registration.
 
 The MVP critical path landed 2026-07-20 (Docker executor → API server →
 CLI), so nothing here competes with it any more. Remaining sequencing:
-the Part 1 implementation (issue #47) is fully specified by ADR 0037 and
-can proceed now; on the agent side, A1 (hours, removes ceremony) can land
-any time, while A2/A4 still wait on the OD-15 signer/decommission
-decisions — ADRs 0022/0023 are written, so authorization is no longer the
-blocker there.
+the Part 1 coordinator implementation (issue #47) has landed per ADR 0037
+(platform-CAS auto-formation remains the deferred follow-up above); on the
+agent side,
+A1 (hours, removes ceremony) can land any time, while A2/A4 still wait on
+the OD-15 signer/decommission decisions — ADRs 0022/0023 are written, so
+authorization is no longer the blocker there.

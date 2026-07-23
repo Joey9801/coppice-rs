@@ -30,6 +30,7 @@ use crate::{Consistency, ControlPlane};
 use super::error::HttpError;
 use super::extract::{IdPath, ReadIndexes, ReadQuery};
 use super::metrics::MetricsEndpoint;
+use super::readyz::ReadyzEndpoint;
 
 /// Build the client-listener router around a [`ControlPlane`] and the
 /// process's metrics endpoint (issue #46).
@@ -42,12 +43,16 @@ use super::metrics::MetricsEndpoint;
 /// outer [`fallback`](super::ui::fallback) with the full original path intact,
 /// so `/api/*` misses still answer the JSON 404 and everything else reaches the
 /// UI, exactly as before the nesting refactor.
-pub fn router<P: ControlPlane>(plane: Arc<P>, metrics: MetricsEndpoint) -> Router {
+pub fn router<P: ControlPlane>(
+    plane: Arc<P>,
+    metrics: MetricsEndpoint,
+    readyz: Option<ReadyzEndpoint>,
+) -> Router {
     // The scrape handler captures its own `Arc<MetricsEndpoint>`, so it needs no
     // router state and composes with the `Arc<P>` state the rest of the tree
     // carries — it is merged in before `.with_state(plane)` closes the tree.
     let metrics = Arc::new(metrics);
-    Router::new()
+    let mut router = Router::new()
         // Prometheus scrape target (issue #46): the `/metrics` render contract
         // lives in `super::metrics`; this only marries it to the listener.
         .route(
@@ -56,13 +61,59 @@ pub fn router<P: ControlPlane>(plane: Arc<P>, metrics: MetricsEndpoint) -> Route
                 let metrics = Arc::clone(&metrics);
                 async move { metrics.render().await }
             }),
-        )
+        );
+
+    // Readiness (ADR 0037 §7): a top-level sibling of `/metrics`, carrying its
+    // own captured endpoint — state entirely separate from the `ControlPlane`.
+    // Only the daemon attaches one; a router served without a coordinator (the
+    // in-crate tests, mocks) simply omits it, so a `/readyz` request there
+    // falls through to the same JSON/UI fallback any other unrouted path does.
+    if let Some(readyz) = readyz {
+        let readyz = Arc::new(readyz);
+        router = router.route(
+            "/readyz",
+            get(move |query: Query<ReadyzQuery>| {
+                let readyz = Arc::clone(&readyz);
+                async move { readyz.handle(query.0.require).await }
+            }),
+        );
+    }
+
+    router
         .nest("/api/v1", api_v1_routes::<P>())
         // Everything unrouted: `/api/*` misses stay JSON 404s; anything
         // else serves the embedded web UI (static assets + SPA fallback,
         // ADR 0031 "Serving the UI").
         .fallback(super::ui::fallback)
         .with_state(plane)
+}
+
+/// Build a standalone `/readyz`-only router around a captured
+/// [`ReadyzEndpoint`] (ADR 0037 §7), with no `ControlPlane` state.
+///
+/// The daemon's full [`router`] already mounts `/readyz` beside the JSON API;
+/// this is the same route in isolation, for a minimal readiness server that
+/// needs none of the API surface — the multi-node coordinator integration
+/// tests bind one per replica to exercise the real HTTP `/readyz` gate on a
+/// live cluster without standing up the whole control plane.
+pub fn readyz_router(readyz: ReadyzEndpoint) -> Router {
+    let readyz = Arc::new(readyz);
+    Router::new().route(
+        "/readyz",
+        get(move |query: Query<ReadyzQuery>| {
+            let readyz = Arc::clone(&readyz);
+            async move { readyz.handle(query.0.require).await }
+        }),
+    )
+}
+
+/// The `?require=` query on `/readyz` (ADR 0037 §7). The value is passed
+/// through raw to the coordinator's handler, which decides whether it names a
+/// stricter gate (`formed` / `healthy`) or is a `400`.
+#[derive(Debug, Default, Deserialize)]
+struct ReadyzQuery {
+    #[serde(default)]
+    require: Option<String>,
 }
 
 /// The `/api/v1` route map (ADR 0031), nested under its prefix by [`router`].
@@ -570,7 +621,14 @@ mod tests {
     /// conflict. This shadows the crate [`super::router`] for the whole tests
     /// module so every existing call site stays a single `router(plane)`.
     fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
-        super::router(plane, crate::http::MetricsEndpoint::detached_for_tests())
+        // No `/readyz` endpoint in the in-crate tests: it is the daemon's to
+        // attach (it needs consensus state this crate cannot see), so the tests
+        // serve the router without one.
+        super::router(
+            plane,
+            crate::http::MetricsEndpoint::detached_for_tests(),
+            None,
+        )
     }
 
     /// A canned `ControlPlane`: submit echoes the request's job id with a

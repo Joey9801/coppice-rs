@@ -217,7 +217,12 @@ impl Consensus for FakeConsensus {
         self.views.clone()
     }
 
-    async fn add_learner(&self, _node: CoordinatorId, _addr: String) -> Result<(), ConsensusError> {
+    async fn add_learner(
+        &self,
+        _node: CoordinatorId,
+        _addr: String,
+        _machine_identity: String,
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
@@ -225,11 +230,29 @@ impl Consensus for FakeConsensus {
         &self,
         _promote: CoordinatorId,
         _remove: Option<CoordinatorId>,
+        _probe_dead: std::collections::BTreeMap<CoordinatorId, String>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
     async fn remove_node(&self, _node: CoordinatorId) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    async fn evict_stale_learner(
+        &self,
+        _incumbent: CoordinatorId,
+        _machine_identity: &str,
+        _addr: &str,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    async fn set_node_address(
+        &self,
+        _node: CoordinatorId,
+        _new_addr: String,
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 

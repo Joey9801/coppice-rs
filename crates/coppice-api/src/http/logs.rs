@@ -817,7 +817,11 @@ mod tests {
     // ---- request helpers -------------------------------------------------
 
     async fn get(plane: Arc<FakePlane>, uri: &str) -> (StatusCode, serde_json::Value) {
-        let router = crate::http::router(plane, crate::http::MetricsEndpoint::detached_for_tests());
+        let router = crate::http::router(
+            plane,
+            crate::http::MetricsEndpoint::detached_for_tests(),
+            None,
+        );
         let response = router
             .oneshot(Request::get(uri).body(Body::empty()).unwrap())
             .await

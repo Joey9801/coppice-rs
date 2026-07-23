@@ -20,6 +20,7 @@
 //! (the applied-command count the scheduler uses for `expected_version`).
 //! [`StateView`] exposes both.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 
 use coppice_state::Command;
@@ -29,6 +30,7 @@ mod apply_loop;
 mod error;
 mod events;
 pub mod fs;
+mod membership;
 mod net;
 mod node;
 mod status;
@@ -41,9 +43,12 @@ pub use adapter::{
 };
 pub use error::{ConsensusError, ProposeError};
 pub use events::{EventBatch, EventTap, EventTapReceiver, TapItem};
+pub use membership::{
+    CoordinatorNode, LivenessAttestor, MembershipPolicy, NodeRecord, PromotionRefusal,
+};
 pub use node::{
-    start, ClusterSummary, MemberSummary, NodeHandle, NodeOptions, NodeStartError, NodeTls,
-    StartIntent, StartedNode,
+    start, ClusterSummary, FormationControl, FormationError, FormationOutcome, MemberSummary,
+    NodeHandle, NodeOptions, NodeStartError, StartedNode,
 };
 pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
 
@@ -154,27 +159,84 @@ pub trait Consensus: Send + Sync + 'static {
     /// Handle to published read views of applied state.
     fn views(&self) -> StateViews;
 
-    /// Add a fresh node as a non-voting learner (ADR 0016 step 2).
+    /// Add a fresh node as a non-voting learner (ADR 0016 step 2; ADR 0037 §4).
     ///
     /// `addr` is the network endpoint the Raft transport dials.
+    /// `machine_identity` is the CA-attested subject of the certificate the
+    /// admission arrived under (ADR 0037 §6); it is bound into the node's
+    /// replicated record and drives the one-seat-per-installation rules. The
+    /// verb is idempotent by contract: a re-admission of the same id at the
+    /// same address is a no-op success; a different address is refused.
     fn add_learner(
         &self,
         node: CoordinatorId,
         addr: String,
+        machine_identity: String,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
-    /// Promote a caught-up learner to voter, optionally removing a departed
-    /// voter in the same joint-consensus change (ADR 0016 step 3).
+    /// Promote a caught-up learner to voter (ADR 0016 step 3; ADR 0037 §4/§5).
+    ///
+    /// Idempotent by contract: an id that is already a voter is a no-op
+    /// success, checked *before* the replication-lag gate. `remove` is the
+    /// manual, explicit removal of a departed voter in the same joint change
+    /// (the operator verb); routine self-join leaves it `None` and lets the
+    /// leader fold in the replacement/overflow removals of §5 automatically.
+    ///
+    /// `probe_dead` carries the leader's affirmative unreachability evidence
+    /// for the *automatic* (`remove = None`) path (ADR 0037 §5): voter ids the
+    /// admin surface has just found continuously unreachable by direct probe.
+    /// They are folded in as additional dead-voter *candidates* alongside the
+    /// leader's own progress-aging, then run through the UNCHANGED automatic
+    /// selection — leader/promote exclusion, at-most-one removal, the
+    /// cluster_size and live-majority postconditions, and the liveness-attestor
+    /// gate — against membership re-read under the membership lock. A candidate
+    /// that is no longer a voter by then is simply not selected; that atomic
+    /// revalidation is why the evidence feeds this path rather than a separate
+    /// unchecked manual removal. Ignored on the manual (`remove = Some`) path.
     fn promote_voter(
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
+        probe_dead: BTreeMap<CoordinatorId, String>,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Remove a node from membership.
     fn remove_node(
         &self,
         node: CoordinatorId,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// Evict a stale PENDING LEARNER so its machine identity's slot can be
+    /// retaken (ADR 0037 §6). The caller supplies the evidence that the
+    /// incumbent is gone (continuous unreachability for `replacement_grace`,
+    /// observed leader-side); this op only revalidates shape under the
+    /// membership lock — the incumbent must still be a non-voter bound to
+    /// `machine_identity` — and never touches the voter set. An incumbent
+    /// already absent is a no-op success.
+    fn evict_stale_learner(
+        &self,
+        incumbent: CoordinatorId,
+        machine_identity: &str,
+        addr: &str,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// Repoint an existing node's membership address (ADR 0037 §4, operator
+    /// break-glass `admin set-address`).
+    ///
+    /// Rewrites ONLY the `addr` of the target's node record via
+    /// `ChangeMembers::SetNodes`; the machine-identity binding and the
+    /// superseded marking are preserved, and the voter set is untouched. The
+    /// endpoint verification the ADR requires (dial the new address, match its
+    /// serving-cert subject to the target's bound machine identity, confirm its
+    /// stamped node id by probe) is the *caller's* responsibility, done before
+    /// this is invoked — this seam performs only the committed membership edit.
+    /// Idempotent by contract: an id already at `new_addr` is a no-op success;
+    /// an id absent from membership is refused
+    /// ([`ConsensusError::UnknownNode`]) with no silent creation.
+    fn set_node_address(
+        &self,
+        node: CoordinatorId,
+        new_addr: String,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Ask consensus to build a snapshot now (housekeeping trigger; sealed

@@ -80,15 +80,49 @@ Conventions (all from ADR 0020):
 # Typed string form per ADR 0024.
 cluster_id = "cluster-6fa1e2c4-9b0d-4c1e-8f6a-2d3b5a7c9e01"
 data_dir = "/var/lib/coppice"
-# Seed list for admin tooling to find the cluster; authoritative addresses
-# live in replicated membership.
-peers = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
+
+[discovery]
+# How this replica finds candidate coordinators to dial when converging
+# (ADR 0037 §2). Advisory seed addresses only — never authoritative; the
+# addresses that matter for consensus live in replicated membership. One of
+# "static" | "dns" | "file" | "ec2-asg", with exactly one matching table.
+backend = "static"
+cluster_size = 3            # expected voter count; used by removal + readiness
+removal_grace = "60s"       # replication-failure grace before overflow removal
+replacement_grace = "60s"   # stale pending-learner grace before a retry
+
+[discovery.static]
+# The literal seed list — the successor to the old top-level `peers`.
+addrs = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
+
+# Alternatives (pick exactly one backend table, matching `backend` above):
+#   [discovery.dns]
+#   name = "coord.batch.example.com"   # A/AAAA or SRV; SRV supplies ports
+#   port = 7071                        # fallback port for A/AAAA records
+#
+#   [discovery.file]
+#   dir = "/var/run/coppice/discovery" # one file per candidate, first line = addr
+#
+#   [discovery.ec2_asg]                # Auto Scaling group membership (ADR 0037 §2/§5)
+#   port = 7071                        # raft port composed onto each private IP (required)
+#   region = "us-east-1"               # optional; defaults to this instance's IMDS region
+#   timeout = "3s"                     # optional; per-AWS-call bound (default 3s)
+# The instance id and region are read from EC2 instance metadata (IMDSv2) at
+# each consultation; the group's members in lifecycle states Pending,
+# Pending:Wait, Pending:Proceed, and InService are resolved to their private
+# IPs. This is the only backend with liveness semantics: a departed voter
+# absent from the group strengthens the leader's overflow-removal decision
+# (ADR 0037 §5). Every AWS call is timeout-bounded and degrades to an empty
+# candidate list on failure, so a slow control plane never wedges startup.
 
 [listen]
 client_addr = "0.0.0.0:7070"    # user/CLI API
 raft_addr   = "0.0.0.0:7071"    # coordinator peer traffic
 agent_addr  = "0.0.0.0:7072"    # agent heartbeats and reports
-advertise_host = "coord-3.batch.example.com"   # what peers and agents dial
+# What peers and agents dial. Optional (ADR 0037 §2): when omitted it is
+# resolved as explicit value ▸ system hostname ▸ default-route local address,
+# so a fleet can ship one byte-identical config artifact.
+advertise_host = "coord-3.batch.example.com"
 
 [raft]
 # Liveness tuning only — never affects safety. The defaults are right for

@@ -14,7 +14,6 @@
 //! `--data-dir` to keep state across runs (the coordinator restarts from its
 //! manifest stamp and the agent keeps its journal and node identity).
 
-use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,15 +28,12 @@ use coppice_agent::journal::Journal;
 use coppice_agent::session::{self, Session};
 use coppice_agent::telemetry::FilesystemSink;
 use coppice_consensus::fs::RealFs;
-use coppice_consensus::{Consensus, ConsensusError};
+use coppice_consensus::Consensus;
 use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, ClientListener};
-use coppice_coordinator::config::{self as coord_config, CliOverrides};
+use coppice_coordinator::config as coord_config;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{ClusterId, NodeId, QuotaEntityId};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::Timestamp;
-use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
-use coppice_state::Command;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -127,12 +123,20 @@ fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
     ];
     let ca_cert = params.self_signed(&ca_key).context("self-sign dev CA")?;
 
-    let leaf = |cn: &str, extra_sans: &[String]| -> Result<CertKey> {
+    let leaf = |cn: &str, ou: Option<&str>, extra_sans: &[String]| -> Result<CertKey> {
         let key = KeyPair::generate().context("generate dev leaf key")?;
         let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
         sans.extend(extra_sans.iter().cloned());
         let mut params = CertificateParams::new(sans).context("dev leaf params")?;
         params.distinguished_name.push(DnType::CommonName, cn);
+        // ADR 0037 §6 profile convention: the coordinator leaf carries
+        // OU=coppice-coordinator (its CN is the machine identity); the agent leaf
+        // carries no OU (unchanged CN=NodeId behavior).
+        if let Some(ou) = ou {
+            params
+                .distinguished_name
+                .push(DnType::OrganizationalUnitName, ou);
+        }
         params.extended_key_usages = vec![
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
@@ -153,13 +157,21 @@ fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
     let agent_cn = agent_node.to_string();
     Ok(DevPki {
         ca_pem: ca_cert.pem().into_bytes(),
-        coordinator: leaf("coppice-dev-coordinator", &[])?,
+        // The dev coordinator's machine identity (ADR 0037 §6). Dev is one
+        // process running one coordinator, so a single stable identity; it forms
+        // its single-node cluster in-process (below), bypassing the operator-only
+        // authz on `InitializeCluster`.
+        coordinator: leaf(
+            "coppice-dev-coordinator",
+            Some(coppice_coordinator::admin::OU_COORDINATOR),
+            &[],
+        )?,
         // The gateway binds the client leaf's CN to the claimed NodeId
-        // (ADR 0011), so the agent leaf carries the typed id string. The same
-        // leaf doubles as the NodeService server certificate; coordinators pin
-        // the typed node id as the TLS server-name, so it also carries that id
-        // as a dNSName SAN (ADR 0034).
-        agent: leaf(&agent_cn, std::slice::from_ref(&agent_cn))?,
+        // (ADR 0011), so the agent leaf carries the typed id string with NO OU
+        // (agent profile). The same leaf doubles as the NodeService server
+        // certificate; coordinators pin the typed node id as the TLS server-name,
+        // so it also carries that id as a dNSName SAN (ADR 0034).
+        agent: leaf(&agent_cn, None, std::slice::from_ref(&agent_cn))?,
     })
 }
 
@@ -240,6 +252,19 @@ pub async fn run(args: DevArgs) -> Result<()> {
     std::fs::write(&agent_key, &pki.agent.key)?;
     std::fs::write(&ca_path, &pki.ca_pem)?;
 
+    // The coordinator's hot-reload mTLS store (ADR 0037 §6), shared by its raft
+    // and agent listeners, the raft peer mesh, and the node-fetch client. `dev`
+    // is one process running one coordinator, so no SIGHUP install — an mtime
+    // poll is enough (and harmless) for a dev loop that regenerates certs.
+    let coord_tls = coppice_tls::TlsStore::load(coppice_tls::TlsPaths {
+        cert: coord_cert.clone(),
+        key: coord_key.clone(),
+        ca: ca_path.clone(),
+    })
+    .context("loading dev coordinator TLS material")?;
+    let _coord_tls_reload =
+        coppice_tls::spawn_reload_task(std::sync::Arc::clone(&coord_tls), Default::default());
+
     let raft_port = resolve_port(args.raft_port)?;
     let agent_port = resolve_port(args.agent_port)?;
     let client_port = resolve_port(args.client_port)?;
@@ -257,13 +282,17 @@ pub async fn run(args: DevArgs) -> Result<()> {
 
     // -- Coordinator: the production config + bootstrap path. --------------
     let coord_data = root.join("coordinator");
-    let bootstrap_intent = !coord_data.join("manifest").exists();
     let config_path = root.join("coordinator.toml");
     let toml = format!(
         r#"# Generated by `coppice dev` on every run; edits are overwritten.
 cluster_id = "{cluster_id}"
 data_dir = "{data_dir}"
-peers = []
+
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = []
 
 [listen]
 raft_addr = "127.0.0.1:{raft_port}"
@@ -287,14 +316,7 @@ ca_path = "{ca}"
     );
     std::fs::write(&config_path, toml).context("writing dev coordinator config")?;
 
-    let resolved = coord_config::load(
-        &config_path,
-        CliOverrides {
-            bootstrap: bootstrap_intent,
-            join: false,
-        },
-    )
-    .context("loading dev coordinator config")?;
+    let resolved = coord_config::load(&config_path).context("loading dev coordinator config")?;
 
     let BootedCoordinator {
         // The same id `dev` minted (or loaded) above and wrote into the config
@@ -307,20 +329,29 @@ ca_path = "{ca}"
         node_log_client,
         raft_server_shutdown,
         raft_server,
-    } = bootstrap::bootstrap(resolved)
+        formation,
+        convergence_status: _,
+        convergence,
+        readyz,
+        file_registration: _,
+    } = bootstrap::bootstrap(resolved, std::sync::Arc::clone(&coord_tls))
         .await
         .context("bootstrapping the dev coordinator")?;
+
+    // Dev forms its single-node cluster via the ADR 0037 §3 formation path
+    // (in-process, so it bypasses the operator-only authz on the RPC). A fixed
+    // token makes a restart against a persistent `--data-dir` idempotent: the
+    // recorded token matches and `form` returns `AlreadyFormed`.
+    formation
+        .form(DEV_FORMATION_TOKEN)
+        .await
+        .context("forming the dev single-node cluster")?;
 
     let agent_addr = format!("127.0.0.1:{agent_port}")
         .parse()
         .expect("agent socket addr");
-    let listener = AgentListener::bind(
-        agent_addr,
-        &pki.coordinator.cert,
-        &pki.coordinator.key,
-        &pki.ca_pem,
-    )
-    .context("binding the dev agent listener")?;
+    let listener = AgentListener::bind(agent_addr, std::sync::Arc::clone(&coord_tls))
+        .context("binding the dev agent listener")?;
 
     let client_addr = format!("127.0.0.1:{client_port}")
         .parse()
@@ -342,6 +373,7 @@ ca_path = "{ca}"
         // The coordinator's `/metrics` on the client listener renders over the
         // shared recorder; `dev_gather` samples BOTH daemons' trees (issue #46).
         coppice_api::http::MetricsEndpoint::new(metrics_handle.clone(), dev_gather),
+        readyz,
         Some(shutdown_rx),
     ));
 
@@ -539,6 +571,8 @@ ca_path = "{ca}"
     // task runtime, raft/admin transport, consensus.
     agent_join.abort();
     let _ = agent_join.await;
+    convergence.abort();
+    let _ = convergence.await;
     let _ = runtime_shutdown.send(true);
     let _ = runtime_join.await;
     let _ = raft_server_shutdown.send(());
@@ -610,89 +644,64 @@ async fn run_agent<E: Executor + Clone>(session: Session<RealFs, E>, config: Age
 /// so submit examples keep working verbatim across dev clusters.
 const DEV_QUOTA_ENTITY: &str = "quota-00000000-0000-0000-0000-000000000001";
 
-/// Dev priorities `-2..=2` mapped to cost multipliers 0.25×..4× (doubling
-/// per step — monotone in priority, as ADR 0021's ranking expects).
-fn dev_priority_table() -> BTreeMap<i32, PriorityMultiplier> {
-    (-2i32..=2)
-        .map(|p| (p, PriorityMultiplier(1u64 << (32 + p))))
-        .collect()
-}
+/// The fixed formation token dev uses (ADR 0037 §3). Stable so a restart against
+/// a persistent `--data-dir` resumes formation idempotently rather than
+/// conflicting on a fresh token.
+const DEV_FORMATION_TOKEN: &str = "coppice-dev-formation";
 
 /// Seed the replicated state a fresh dev cluster needs to accept a job.
 ///
 /// A new cluster's policy has an **empty** priority-multiplier table, so
 /// every `SubmitJob` fails synchronous validation until an `UpdatePolicy`
 /// commits. In production that is deliberate: policy is replicated state an
-/// operator configures explicitly through the admin tooling, and the node
-/// config file never seeds it (ADR 0020). Dev has no operator, so propose
-/// the same commands the tooling will use: multipliers for priorities
-/// `-2..=2` and the well-known "dev" quota entity. Each seed is skipped
-/// when already present, so policy or quota edits made against a persistent
+/// operator configures explicitly (`cluster init --policy`, ADR 0037 §3), and
+/// the node config file never seeds it (ADR 0020). Dev has no operator, so it
+/// expresses the same intent through the SAME bootstrap-policy schema — a
+/// [`coppice_coordinator::policy::FormationPolicy`] — and applies it through
+/// the same idempotent path formation uses: multipliers for priorities
+/// `-2..=2` and the well-known "dev" quota entity. Each put is skipped when
+/// already present, so policy or quota edits made against a persistent
 /// `--data-dir` survive restarts.
 async fn seed_dev_state<C: Consensus>(
     consensus: &C,
     views: &coppice_consensus::StateViews,
 ) -> Result<QuotaEntityId> {
     let entity: QuotaEntityId = DEV_QUOTA_ENTITY.parse().expect("dev quota entity id");
-    let view = views.latest();
-    let state = view.state();
-
-    if state.policy.priority_multipliers.is_empty() {
-        // UpdatePolicy is a full replacement: change only the table, keep
-        // the booted defaults for everything else.
-        let mut policy = state.policy.clone();
-        policy.priority_multipliers = dev_priority_table();
-        propose_seed(
-            consensus,
-            Command::UpdatePolicy(UpdatePolicy {
-                policy,
-                updated_at: Timestamp::now(),
-            }),
-            "seeding the dev priority-multiplier table",
-        )
-        .await?;
-    }
-
-    if !state.quota_entities.contains_key(&entity) {
-        propose_seed(
-            consensus,
-            Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
-                entity,
-                parent: None,
-                name: "dev".to_string(),
-                // ~1e6 CU: deep enough that dev jobs never starve on quota,
-                // far enough from u64::MAX to stay clear of saturation.
-                quota: CostUnits(1_000_000_000_000),
-                updated_at: Timestamp::now(),
-            }),
-            "seeding the dev quota entity",
-        )
-        .await?;
-    }
-
+    let policy = dev_formation_policy(entity);
+    let commands = {
+        let view = views.latest();
+        policy.commands(view.state(), Timestamp::now())
+    };
+    coppice_coordinator::policy::propose_all(consensus, commands)
+        .await
+        .context("seeding the dev replicated state")?;
     Ok(entity)
 }
 
-/// Propose one seed command, riding out the single node's initial election
-/// (`NotLeader`/`Timeout` right after bootstrap) for up to 10 seconds.
-async fn propose_seed<C: Consensus>(consensus: &C, command: Command, what: &str) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match consensus.propose(command.clone()).await {
-            Ok(applied) => {
-                applied
-                    .outcome
-                    .with_context(|| format!("{what}: rejected at apply"))?;
-                return Ok(());
-            }
-            Err(e @ (ConsensusError::NotLeader { .. } | ConsensusError::Timeout)) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(e).context(what.to_string());
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => return Err(e).context(what.to_string()),
-        }
+/// The dev bootstrap policy, expressed through the shared `cluster init`
+/// schema: priorities `-2..=2` mapped to doubling cost multipliers 0.25×..4×
+/// (monotone in priority, as ADR 0021's ranking expects) and the well-known
+/// "dev" quota entity. Building the same [`FormationPolicy`] the server parses
+/// from operator TOML keeps dev and formation from drifting.
+fn dev_formation_policy(entity: QuotaEntityId) -> coppice_coordinator::policy::FormationPolicy {
+    use coppice_coordinator::policy::{FormationPolicy, PriorityMultiplierSpec, QuotaEntitySpec};
+    FormationPolicy {
+        priority_multipliers: (-2i32..=2)
+            .map(|p| PriorityMultiplierSpec {
+                index: p,
+                // 2^p: 0.25× .. 4× (all exact in binary, so the Q32.32
+                // conversion round-trips exactly).
+                multiplier: 2f64.powi(p),
+            })
+            .collect(),
+        quota_entities: vec![QuotaEntitySpec {
+            id: entity,
+            name: "dev".to_string(),
+            // ~1e6 CU: deep enough that dev jobs never starve on quota, far
+            // enough from u64::MAX to stay clear of saturation.
+            quota: 1_000_000_000_000,
+            parent: None,
+        }],
     }
 }
 

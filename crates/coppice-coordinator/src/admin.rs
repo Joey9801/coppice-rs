@@ -15,44 +15,137 @@
 // large error type, and the signatures here are dictated by that trait.
 #![allow(clippy::result_large_err)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic::{Code, Request, Response, Status};
 
-use coppice_consensus::{ClusterSummary, Consensus, ConsensusError, CoordinatorId, NodeHandle};
+use coppice_consensus::{
+    ClusterSummary, Consensus, ConsensusError, CoordinatorId, FormationControl, FormationError,
+    FormationOutcome, MembershipPolicy, NodeHandle,
+};
 use coppice_net::admin::{Client, RaftAdminService};
 use coppice_proto::pb::raft::v1 as pb;
+use coppice_tls::TlsStore;
 
 use crate::cli::{AdminArgs, AdminVerb};
 use crate::config;
+use crate::discovery::Discovery;
 
 /// How often the promotion wrapper retries while a learner is still catching up.
 const PROMOTE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The organizational-unit marker on a coordinator *machine* leaf (ADR 0037 §6):
+/// its common name is the stable machine identity.
+pub const OU_COORDINATOR: &str = "coppice-coordinator";
+/// The organizational-unit marker on an operator-profile leaf (ADR 0037 §6):
+/// the break-glass credential ADR 0022 already defines. Authorizes the
+/// operator-only membership verbs.
+pub const OU_OPERATOR: &str = "coppice-operator";
+
+// ---------------------------------------------------------------------------
+// Certificate profiles (ADR 0037 §6)
+// ---------------------------------------------------------------------------
+
+/// Which certificate profile a request arrived under (ADR 0037 §6). The profile
+/// is decided from the CA-attested subject of the mTLS leaf — its `OU` marker —
+/// never from anything in the request body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CertProfile {
+    /// `OU=coppice-operator`: the break-glass credential; may call every verb,
+    /// including `InitializeCluster` and `RemoveNode`.
+    Operator,
+    /// `OU=coppice-coordinator`: a machine leaf whose `CN` is the stable machine
+    /// identity. The narrow self-service grant: probe/status, `AddLearner` for
+    /// its own identity, `PromoteVoter` for the node bound to it.
+    Machine { identity: String },
+    /// No recognized OU (an agent leaf, or anything else): none of the
+    /// membership surface is reachable.
+    Agent,
+}
+
+/// Extract the certificate profile from a request's mTLS peer certificate
+/// (ADR 0037 §6). No client certificate, or an unrecognized `OU`, is
+/// [`CertProfile::Agent`] — refused from the whole membership surface.
+fn peer_profile<T>(request: &Request<T>) -> CertProfile {
+    let Some(subject) = request
+        .peer_certs()
+        .and_then(|certs| certs.first().cloned())
+        .and_then(|leaf| coppice_tls::parse_leaf_subject_der(leaf.as_ref()))
+    else {
+        return CertProfile::Agent;
+    };
+    match subject.org_unit.as_deref() {
+        Some(OU_OPERATOR) => CertProfile::Operator,
+        Some(OU_COORDINATOR) => CertProfile::Machine {
+            identity: subject.common_name.unwrap_or_default(),
+        },
+        _ => CertProfile::Agent,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Server side
 // ---------------------------------------------------------------------------
 
-/// Serves the membership admin RPCs over the local consensus seam (ADR 0016).
+/// Serves the membership admin RPCs over the local consensus seam (ADR 0016),
+/// enforcing the ADR 0037 §6 authorization matrix and driving formation.
 pub struct AdminService<C: Consensus> {
     consensus: Arc<C>,
     handle: NodeHandle,
     cluster_uuid: [u8; 16],
+    /// The shared hot-reload mTLS store (ADR 0037 §6): the leader dials the
+    /// advertised endpoint through it for admission-time verification, and the
+    /// formation probe guard dials candidates through it.
+    tls: Arc<TlsStore>,
+    /// The formation control surface (ADR 0037 §3), backing `InitializeCluster`.
+    formation: FormationControl,
+    /// The discovery backend (ADR 0037 §2), consulted by the formation probe
+    /// guard to refuse a double-init against an already-initialized cluster.
+    discovery: Arc<dyn Discovery>,
+    /// Membership grace periods (ADR 0037 §5/§6); `replacement_grace` bounds
+    /// how long a pending learner's seat survives continuous unreachability.
+    policy: MembershipPolicy,
+    /// Leader-side unreachability evidence for contested pending learners and
+    /// probed voters (ADR 0037 §5/§6 "unreachable … for the grace"): keyed by
+    /// `(node id, PROBED ADDRESS)` → first probe failure of the CURRENT
+    /// unbroken failure streak at that address. Address-keying is load-bearing:
+    /// a streak earned at address A is no evidence against the same node after
+    /// a verified `set-address` repoint to B — B must accumulate its own
+    /// continuous grace — and an in-flight probe of A that lands after the
+    /// repoint records harmlessly under the stale (id, A) key. A confirming
+    /// probe clears every entry for its node id, so only continuous
+    /// unreachability at the CURRENT address accumulates.
+    seat_unreachable:
+        tokio::sync::Mutex<std::collections::HashMap<(CoordinatorId, String), Instant>>,
 }
 
 impl<C: Consensus> AdminService<C> {
-    /// Bind the service to the local consensus seam, admin handle, and this
-    /// node's stamped cluster identity.
-    pub fn new(consensus: Arc<C>, handle: NodeHandle, cluster_uuid: [u8; 16]) -> Self {
+    /// Bind the service to the local consensus seam, admin handle, stamped
+    /// cluster identity, mTLS store, formation control, and discovery backend.
+    pub fn new(
+        consensus: Arc<C>,
+        handle: NodeHandle,
+        cluster_uuid: [u8; 16],
+        tls: Arc<TlsStore>,
+        formation: FormationControl,
+        discovery: Arc<dyn Discovery>,
+        policy: MembershipPolicy,
+    ) -> Self {
         AdminService {
             consensus,
             handle,
             cluster_uuid,
+            tls,
+            formation,
+            discovery,
+            policy,
+            seat_unreachable: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -83,32 +176,161 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         &self,
         request: Request<pb::AddLearnerRequest>,
     ) -> Result<Response<pb::AddLearnerResponse>, Status> {
+        // Authz (ADR 0037 §6): an operator may add any learner; a machine leaf
+        // may add only a learner bound to ITS OWN identity. The binding is
+        // always the CA-attested subject of the mTLS session, never claimed in
+        // the body — so a machine leaf can only ever bind its own CN, and an
+        // agent leaf is refused outright.
+        let profile = peer_profile(&request);
+        let machine_identity = match &profile {
+            CertProfile::Operator => peer_common_name(&request).unwrap_or_default(),
+            CertProfile::Machine { identity } => identity.clone(),
+            CertProfile::Agent => {
+                return Err(permission_denied(
+                    "AddLearner requires an operator- or coordinator-profile certificate",
+                ))
+            }
+        };
         let req = request.into_inner();
         self.check_cluster(&req.cluster_uuid)?;
-        self.consensus
-            .add_learner(req.node_id, req.address)
+
+        // Endpoint verification (ADR 0037 §6), leader-side only: the advertised
+        // endpoint must actually present the requester's machine identity and
+        // report the claimed stamped node id, so a claimed id without the
+        // matching CA-attested subject cannot occupy a seat. Only the leader
+        // admits; on a follower this is skipped and consensus returns NotLeader.
+        // Operator-driven admissions are exempt: the operator vouches directly.
+        if matches!(profile, CertProfile::Machine { .. }) && self.is_leader() {
+            self.verify_endpoint(&req.address, &machine_identity, req.node_id)
+                .await?;
+        }
+
+        match self
+            .consensus
+            .add_learner(req.node_id, req.address.clone(), machine_identity.clone())
             .await
-            .map_err(consensus_error_to_status)?;
-        Ok(Response::new(pb::AddLearnerResponse {}))
+        {
+            Ok(()) => Ok(Response::new(pb::AddLearnerResponse {})),
+            Err(ConsensusError::MachineSeatPending { incumbent }) => {
+                // The pending slot is held. Progress-based staleness cannot see
+                // a dead-but-caught-up incumbent in an idle cluster, so gather
+                // the ADR's other evidence arm here (§6 "unreachable … for
+                // `replacement_grace`"): probe the incumbent's endpoint and
+                // evict only after a continuous failure streak spanning the
+                // grace, revalidated under the membership lock.
+                if let Some(evidence_addr) = self.incumbent_unreachable_past_grace(incumbent).await
+                {
+                    self.consensus
+                        .evict_stale_learner(incumbent, &machine_identity, &evidence_addr)
+                        .await
+                        .map_err(consensus_error_to_status)?;
+                    self.seat_unreachable
+                        .lock()
+                        .await
+                        .retain(|(mid, _), _| *mid != incumbent);
+                    // Retake the slot; a racing challenger may have beaten us
+                    // here, in which case this surfaces the NEW incumbent.
+                    self.consensus
+                        .add_learner(req.node_id, req.address, machine_identity)
+                        .await
+                        .map_err(consensus_error_to_status)?;
+                    return Ok(Response::new(pb::AddLearnerResponse {}));
+                }
+                Err(consensus_error_to_status(
+                    ConsensusError::MachineSeatPending { incumbent },
+                ))
+            }
+            Err(other) => Err(consensus_error_to_status(other)),
+        }
     }
 
     async fn promote_voter(
         &self,
         request: Request<pb::PromoteVoterRequest>,
     ) -> Result<Response<pb::PromoteVoterResponse>, Status> {
+        // Authz (ADR 0037 §6): operator may promote any node; a machine leaf may
+        // promote only the node id bound to its own machine identity, and may
+        // never drive the manual `remove` half (that is an operator verb).
+        let profile = peer_profile(&request);
         let req = request.into_inner();
         self.check_cluster(&req.cluster_uuid)?;
-        self.consensus
-            .promote_voter(req.promote_node_id, req.remove_node_id)
+        match &profile {
+            CertProfile::Operator => {}
+            CertProfile::Machine { identity } => {
+                if req.remove_node_id.is_some() {
+                    return Err(permission_denied(
+                        "a machine certificate may not drive a manual removal in PromoteVoter",
+                    ));
+                }
+                self.require_bound_to(req.promote_node_id, identity)?;
+            }
+            CertProfile::Agent => {
+                return Err(permission_denied(
+                    "PromoteVoter requires an operator- or coordinator-profile certificate",
+                ))
+            }
+        }
+        match self
+            .consensus
+            .promote_voter(req.promote_node_id, req.remove_node_id, BTreeMap::new())
             .await
-            .map_err(consensus_error_to_status)?;
-        Ok(Response::new(pb::PromoteVoterResponse {}))
+        {
+            Ok(()) => Ok(Response::new(pb::PromoteVoterResponse {})),
+            Err(ConsensusError::PromotionRefused(
+                coppice_consensus::PromotionRefusal::NoRemovablePeer,
+            )) if req.remove_node_id.is_none() => {
+                // Overflow removal needs a dead voter, but progress-based
+                // aging cannot see a dead-but-caught-up voter in an idle
+                // cluster. Gather the leader's affirmative evidence (ADR 0037
+                // §5: "the leader's replication to it has been failing"):
+                // probe the other voters' endpoints for those continuously
+                // unreachable past `removal_grace`, then RETRY through the same
+                // AUTOMATIC path, feeding the evidence in. The automatic path
+                // re-reads membership under its lock and runs the full check
+                // set (cardinality, live-majority, attestor) against it, so a
+                // named voter removed by a racing change is simply not selected
+                // — the evidence never bypasses those guards the way a manual
+                // `remove = Some` would.
+                let dead = self.dead_voter_by_probe(req.promote_node_id).await;
+                if !dead.is_empty() {
+                    self.consensus
+                        .promote_voter(req.promote_node_id, None, dead.clone())
+                        .await
+                        .map_err(consensus_error_to_status)?;
+                    // Drop streak entries for any probed voter the promotion
+                    // actually removed; a still-present voter keeps its streak
+                    // so a later promotion can act on it without re-aging.
+                    let still_voters: BTreeSet<CoordinatorId> = self
+                        .handle
+                        .cluster_summary()
+                        .members
+                        .iter()
+                        .filter(|m| m.voter)
+                        .map(|m| m.id)
+                        .collect();
+                    let mut map = self.seat_unreachable.lock().await;
+                    map.retain(|(id, _), _| !dead.contains_key(id) || still_voters.contains(id));
+                    return Ok(Response::new(pb::PromoteVoterResponse {}));
+                }
+                Err(consensus_error_to_status(ConsensusError::PromotionRefused(
+                    coppice_consensus::PromotionRefusal::NoRemovablePeer,
+                )))
+            }
+            Err(other) => Err(consensus_error_to_status(other)),
+        }
     }
 
     async fn remove_node(
         &self,
         request: Request<pb::RemoveNodeRequest>,
     ) -> Result<Response<pb::RemoveNodeResponse>, Status> {
+        // RemoveNode is operator-only (ADR 0037 §6): a machine credential can
+        // never remove, repoint, or occupy a second seat.
+        if !matches!(peer_profile(&request), CertProfile::Operator) {
+            return Err(permission_denied(
+                "RemoveNode requires an operator-profile certificate",
+            ));
+        }
         let req = request.into_inner();
         self.check_cluster(&req.cluster_uuid)?;
         self.consensus
@@ -118,16 +340,466 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         Ok(Response::new(pb::RemoveNodeResponse {}))
     }
 
+    async fn set_node_address(
+        &self,
+        request: Request<pb::SetNodeAddressRequest>,
+    ) -> Result<Response<pb::SetNodeAddressResponse>, Status> {
+        // Operator-only break-glass (ADR 0037 §4/§6): repointing a voter can
+        // split-brain, so no machine (or agent) credential may drive it — this
+        // is the whole of the "there is no self-service address repair" contract.
+        if !matches!(peer_profile(&request), CertProfile::Operator) {
+            return Err(permission_denied(
+                "set-address requires an operator-profile certificate",
+            ));
+        }
+        let req = request.into_inner();
+        self.check_cluster(&req.cluster_uuid)?;
+
+        // Locate the target in current membership and read the machine identity
+        // already bound to it. Unknown id → refused (no silent creation). The
+        // binding is the CA-attested subject recorded at admission, never
+        // claimed in the body — it is what the new endpoint must prove it owns.
+        let Some(record) = self
+            .handle
+            .cluster_summary()
+            .members
+            .into_iter()
+            .find(|m| m.id == req.node_id)
+        else {
+            return Err(Status::failed_precondition(format!(
+                "node {} is not in membership; set-address refuses to create a node (ADR 0037 §4)",
+                req.node_id
+            )));
+        };
+
+        // Idempotent: the new address equals the current one → Ok no-op, with no
+        // dial and no committed membership change (ADR 0037 §4).
+        if record.addr == req.address {
+            return Ok(Response::new(pb::SetNodeAddressResponse {}));
+        }
+
+        // Only the leader commits the repoint, and only after verifying the NEW
+        // endpoint (ADR 0037 §4/§6): dial it over mTLS and require its serving
+        // leaf's CN to equal the machine identity bound to the target, then
+        // `ProbeCluster` there and require the target's stamped node id. On a
+        // follower, skip the dial and let `set_node_address` return NotLeader so
+        // the operator retargets — an unverified `SetNodes` is never committed.
+        if self.is_leader() {
+            self.verify_endpoint(&req.address, &record.machine_identity, req.node_id)
+                .await?;
+        }
+
+        self.consensus
+            .set_node_address(req.node_id, req.address)
+            .await
+            .map_err(consensus_error_to_status)?;
+        Ok(Response::new(pb::SetNodeAddressResponse {}))
+    }
+
     async fn cluster_status(
         &self,
         request: Request<pb::ClusterStatusRequest>,
     ) -> Result<Response<pb::ClusterStatusResponse>, Status> {
+        // ClusterStatus is reachable by operator + machine profiles only.
+        if matches!(peer_profile(&request), CertProfile::Agent) {
+            return Err(permission_denied(
+                "ClusterStatus requires an operator- or coordinator-profile certificate",
+            ));
+        }
         let req = request.into_inner();
         self.check_cluster(&req.cluster_uuid)?;
         Ok(Response::new(cluster_summary_to_pb(
             self.handle.cluster_summary(),
         )))
     }
+
+    async fn probe_cluster(
+        &self,
+        request: Request<pb::ProbeClusterRequest>,
+    ) -> Result<Response<pb::ProbeClusterResponse>, Status> {
+        // ProbeCluster is reachable by operator + machine profiles only
+        // (ADR 0037 §6): agents can call none of the membership surface. The
+        // request carries no cluster identity — it is precisely how a converging
+        // process learns which cluster (if any) is behind this candidate — so
+        // there is no cross-cluster check. A parked daemon (no membership yet)
+        // answers `initialized = false`.
+        if matches!(peer_profile(&request), CertProfile::Agent) {
+            return Err(permission_denied(
+                "ProbeCluster requires an operator- or coordinator-profile certificate",
+            ));
+        }
+        let summary = self.handle.cluster_summary();
+        let voters: Vec<pb::RaftMember> = cluster_summary_to_pb(summary.clone())
+            .membership
+            .map(|m| {
+                let voter_ids: std::collections::BTreeSet<u64> = m
+                    .configs
+                    .first()
+                    .map(|c| c.voters.iter().copied().collect())
+                    .unwrap_or_default();
+                m.members
+                    .into_iter()
+                    .filter(|member| voter_ids.contains(&member.node_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Response::new(pb::ProbeClusterResponse {
+            cluster_uuid: self.cluster_uuid.to_vec(),
+            initialized: !summary.members.is_empty(),
+            // The stamped raft identity is always reported. (Deviation from the
+            // ADR's "a parked replica advertises no id": this implementation
+            // mints identity eagerly on an empty directory, so the id always
+            // exists — and endpoint verification, ADR 0037 §6, requires a
+            // joining-but-uninitialized node to report the id it claims.)
+            node_id: Some(summary.local_id),
+            leader_hint: summary.leader,
+            voters,
+        }))
+    }
+
+    async fn initialize_cluster(
+        &self,
+        request: Request<pb::InitializeClusterRequest>,
+    ) -> Result<Response<pb::InitializeClusterResponse>, Status> {
+        // InitializeCluster is operator-profile ONLY (ADR 0037 §6): at day zero
+        // the replicated role bindings that would confer OIDC admin are part of
+        // the very policy being created, and machine credentials must never form
+        // a cluster.
+        if !matches!(peer_profile(&request), CertProfile::Operator) {
+            return Err(permission_denied(
+                "InitializeCluster requires an operator-profile certificate (ADR 0037 §6)",
+            ));
+        }
+        let req = request.into_inner();
+        self.check_cluster(&req.cluster_uuid)?;
+        if req.formation_token.is_empty() {
+            return Err(Status::invalid_argument(
+                "InitializeCluster requires a non-empty formation_token (ADR 0037 §3)",
+            ));
+        }
+
+        // The formation probe guard (ADR 0037 §3 case c): only when genuinely
+        // parked (raft uninitialized AND no token recorded) do we run one round
+        // of discovery+probe and refuse a double-init against an already-live
+        // cluster. Cases (a) already-initialized and (b) crash-resume are decided
+        // inside `formation.form` from the recorded token, with no probe.
+        if !self.formation.is_initialized().await && self.formation.recorded_token().is_none() {
+            self.formation_probe_guard().await?;
+        }
+
+        match self.formation.form(&req.formation_token).await {
+            Ok(outcome) => {
+                // Policy seeding rides along idempotently (ADR 0037 §3). The
+                // concrete TOML schema is owned by the `coppice-cli cluster init`
+                // package; this handler accepts and routes the bytes.
+                if let Some(policy) = req.policy_toml.filter(|p| !p.is_empty()) {
+                    self.apply_formation_policy(&policy).await?;
+                }
+                Ok(Response::new(pb::InitializeClusterResponse {
+                    node_id: self.formation.node_id(),
+                    already_initialized: matches!(outcome, FormationOutcome::AlreadyFormed),
+                }))
+            }
+            Err(FormationError::ConflictingToken { recorded }) => {
+                Err(conflicting_formation_token_status(recorded))
+            }
+            // A normally-joined replica (initialized, no founding record):
+            // refuse as a plain already-initialized, applying no policy and
+            // confirming no token (ADR 0037 §3).
+            Err(e @ FormationError::AlreadyInitializedNoRecord) => {
+                Err(Status::failed_precondition(e.to_string()))
+            }
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
+    }
+}
+
+impl<C: Consensus> AdminService<C> {
+    /// Whether this replica currently believes it is the leader (from its own
+    /// cluster summary). Used to gate leader-side endpoint verification.
+    fn is_leader(&self) -> bool {
+        let summary = self.handle.cluster_summary();
+        summary.leader == Some(summary.local_id)
+    }
+
+    /// Refuse unless node `id` is currently bound to `identity` in membership
+    /// (ADR 0037 §6): a machine leaf may only promote the seat its own subject
+    /// names.
+    fn require_bound_to(&self, id: CoordinatorId, identity: &str) -> Result<(), Status> {
+        let bound = self
+            .handle
+            .cluster_summary()
+            .members
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.machine_identity.clone());
+        match bound {
+            Some(bound) if bound == identity => Ok(()),
+            _ => Err(permission_denied(
+                "a machine certificate may only promote the node id bound to its own machine \
+                 identity (ADR 0037 §6)",
+            )),
+        }
+    }
+
+    /// Endpoint verification before admission (ADR 0037 §6): dial `addr` over
+    /// mTLS and require its serving leaf's CN to equal `identity`, then
+    /// `ProbeCluster` there and require the claimed `node_id`.
+    /// Leader-side affirmative dead-voter evidence for an overflow removal
+    /// (ADR 0037 §5): probe every voter other than the one being promoted AND
+    /// other than this leader itself, and return the set of those whose
+    /// endpoint has been CONTINUOUSLY unreachable for at least `removal_grace`.
+    /// Streaks share the same evidence map as pending-learner arbitration; a
+    /// successful, IDENTITY-CONFIRMED probe clears its entry, so a blip never
+    /// accumulates. The leader is excluded (finding: a leader that cannot
+    /// hairpin-dial its own advertised address must never accumulate a streak
+    /// nor be a removal candidate); the automatic promotion path excludes it a
+    /// second time. The returned set feeds the automatic path, which picks at
+    /// most one — the ADR permits at most one overflow removal per promotion.
+    async fn dead_voter_by_probe(
+        &self,
+        promoting: CoordinatorId,
+    ) -> std::collections::BTreeMap<CoordinatorId, String> {
+        let summary = self.handle.cluster_summary();
+        let targets = probe_targets(&summary.members, promoting, summary.local_id);
+        let mut dead = std::collections::BTreeMap::new();
+        for (id, addr) in targets {
+            let reachable = self.probe_confirms(&addr, id).await;
+            let mut map = self.seat_unreachable.lock().await;
+            if reachable {
+                // A confirming probe at the current address is liveness for the
+                // node itself: clear every address's streak for this id.
+                map.retain(|(mid, _), _| *mid != id);
+                continue;
+            }
+            let since = *map.entry((id, addr.clone())).or_insert_with(Instant::now);
+            if since.elapsed() >= self.policy.removal_grace {
+                dead.insert(id, addr);
+            }
+        }
+        dead
+    }
+
+    /// Probe `addr` and decide whether it is affirmative liveness evidence for
+    /// the member `expected_id` in THIS cluster (ADR 0037 §6). A dial/probe
+    /// failure is "not reachable"; a *successful* probe counts as reachable
+    /// only when [`probe_confirms_member`] holds — it reports this cluster's
+    /// uuid and the expected node id. A CA-valid answer from a different
+    /// cluster or a different node (address reuse) is NOT evidence the member
+    /// is alive, so it is treated as a failed probe and the streak continues.
+    async fn probe_confirms(&self, addr: &str, expected_id: CoordinatorId) -> bool {
+        let resp = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client = admin_channel_from_store(addr, &self.tls).await.ok()?;
+            client
+                .probe_cluster(pb::ProbeClusterRequest {})
+                .await
+                .ok()
+                .map(|r| r.into_inner())
+        })
+        .await;
+        matches!(
+            resp,
+            Ok(Some(resp)) if probe_confirms_member(&resp, &self.cluster_uuid, expected_id)
+        )
+    }
+
+    /// Leader-side unreachability evidence for a contested pending learner
+    /// (ADR 0037 §6): probe the incumbent's advertised endpoint now, and return
+    /// `Some(streak)` only when probes have been failing CONTINUOUSLY for at
+    /// least `replacement_grace`. A successful probe clears the streak — a
+    /// blip never accumulates into eviction evidence. Returns `None` when the
+    /// incumbent is reachable, unknown to membership, or its streak is younger
+    /// than the grace.
+    /// On an expired streak, returns the ADDRESS the evidence was gathered at,
+    /// which the eviction revalidates against the incumbent's current record —
+    /// a repointed incumbent needs a fresh streak at its new address.
+    async fn incumbent_unreachable_past_grace(&self, incumbent: CoordinatorId) -> Option<String> {
+        let addr = self
+            .handle
+            .cluster_summary()
+            .members
+            .into_iter()
+            .find(|m| m.id == incumbent)?
+            .addr;
+        // Only a probe that confirms THIS cluster's uuid and the incumbent's own
+        // node id clears the streak (ADR 0037 §6); a CA-valid answer from a
+        // different cluster/node at a reused address is not evidence the
+        // incumbent is alive, so it is treated as a failed probe.
+        let reachable = self.probe_confirms(&addr, incumbent).await;
+        let mut map = self.seat_unreachable.lock().await;
+        if reachable {
+            map.retain(|(mid, _), _| *mid != incumbent);
+            return None;
+        }
+        let since = *map
+            .entry((incumbent, addr.clone()))
+            .or_insert_with(Instant::now);
+        (since.elapsed() >= self.policy.replacement_grace).then_some(addr)
+    }
+
+    async fn verify_endpoint(
+        &self,
+        addr: &str,
+        identity: &str,
+        node_id: CoordinatorId,
+    ) -> Result<(), Status> {
+        let subject = coppice_tls::read_serving_leaf(&self.tls, addr)
+            .await
+            .map_err(|e| {
+                Status::failed_precondition(format!(
+                    "endpoint verification failed: could not read the serving certificate at \
+                     {addr}: {e} (ADR 0037 §6)"
+                ))
+            })?;
+        if subject.common_name.as_deref() != Some(identity) {
+            return Err(Status::failed_precondition(format!(
+                "endpoint verification failed: {addr} presents machine identity {:?}, not the \
+                 claimed {identity} (ADR 0037 §6)",
+                subject.common_name
+            )));
+        }
+        let mut client = admin_channel_from_store(addr, &self.tls)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("endpoint verification dial: {e}")))?;
+        let probe = client
+            .probe_cluster(pb::ProbeClusterRequest {})
+            .await
+            .map_err(|s| {
+                Status::failed_precondition(format!("endpoint verification probe: {}", s.message()))
+            })?
+            .into_inner();
+        if probe.node_id != Some(node_id) {
+            return Err(Status::failed_precondition(format!(
+                "endpoint verification failed: {addr} reports node id {:?}, not the claimed \
+                 {node_id} (ADR 0037 §6)",
+                probe.node_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// The formation double-init guard (ADR 0037 §3 case c): one round of
+    /// discovery+probe; refuse if any reachable candidate already reports an
+    /// initialized cluster with this `cluster_uuid`.
+    async fn formation_probe_guard(&self) -> Result<(), Status> {
+        for candidate in self.discovery.candidates().await {
+            let Ok(mut client) = admin_channel_from_store(&candidate, &self.tls).await else {
+                continue; // unreachable candidate: skip, this is a guard not a census
+            };
+            if let Ok(resp) = client.probe_cluster(pb::ProbeClusterRequest {}).await {
+                let resp = resp.into_inner();
+                if resp.initialized && resp.cluster_uuid == self.cluster_uuid {
+                    return Err(Status::failed_precondition(format!(
+                        "refusing to initialize: candidate {candidate} already reports an \
+                         initialized cluster with this cluster id — this would fork formation \
+                         (ADR 0037 §3)"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the optional formation policy (ADR 0037 §3).
+    ///
+    /// Parses the operator-supplied bootstrap-policy TOML
+    /// ([`crate::policy::FormationPolicy`]) and proposes its idempotent puts —
+    /// the priority-multiplier table and the quota entities a fresh cluster
+    /// needs. Applied against the current applied state so a same-token re-init
+    /// (or a crash-resumed formation) proposes nothing already present. Runs
+    /// immediately after `raft.initialize`, so it rides out the leaderless
+    /// window before the founding voter wins its first election.
+    async fn apply_formation_policy(&self, policy_toml: &[u8]) -> Result<(), Status> {
+        let policy = crate::policy::FormationPolicy::parse_toml(policy_toml).map_err(|e| {
+            Status::invalid_argument(format!(
+                "invalid formation policy TOML: {e:#} (ADR 0037 §3)"
+            ))
+        })?;
+        // Read the current applied state so the puts skip anything already
+        // present (idempotent re-init). The view is a cheap Arc snapshot.
+        let commands = {
+            let view = self.consensus.views().latest();
+            policy.commands(view.state(), coppice_core::time::Timestamp::now())
+        };
+        if commands.is_empty() {
+            return Ok(());
+        }
+        crate::policy::propose_all(self.consensus.as_ref(), commands)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "applying the formation policy: {e:#} (ADR 0037 §3)"
+                ))
+            })?;
+        Ok(())
+    }
+}
+
+/// The subject CN a request arrived under (ADR 0037 §6), or `None` when there is
+/// no client certificate or it carries no CN.
+fn peer_common_name<T>(request: &Request<T>) -> Option<String> {
+    request
+        .peer_certs()
+        .and_then(|certs| certs.first().cloned())
+        .and_then(|leaf| coppice_tls::parse_leaf_subject_der(leaf.as_ref()))
+        .and_then(|s| s.common_name)
+}
+
+/// The voters this leader should probe for dead-voter evidence (ADR 0037 §5):
+/// every voter EXCEPT the node being promoted and the leader itself. Pure so
+/// the exclusions are unit-testable.
+///
+/// Excluding `local_id` is finding 4: a leader that cannot hairpin-dial its own
+/// advertised address must never accumulate a failure streak against itself nor
+/// be selected for removal. It is never a probe target regardless of any streak
+/// the map might hold.
+fn probe_targets(
+    members: &[coppice_consensus::MemberSummary],
+    promoting: CoordinatorId,
+    local_id: CoordinatorId,
+) -> Vec<(CoordinatorId, String)> {
+    members
+        .iter()
+        .filter(|m| m.voter && m.id != promoting && m.id != local_id)
+        .map(|m| (m.id, m.addr.clone()))
+        .collect()
+}
+
+/// Whether a `ProbeCluster` response is affirmative liveness evidence for the
+/// member `expected_id` in the cluster stamped `cluster_uuid` (ADR 0037 §6).
+///
+/// Pure so the classification is unit-testable without a live endpoint. The
+/// mTLS session already proves the responder holds a CA-valid leaf; this adds
+/// that it is the RIGHT member of the RIGHT cluster. Both must hold: a response
+/// from a different cluster's coordinator, or from a different node id that
+/// happens to serve a reused address, is not evidence `expected_id` is alive.
+fn probe_confirms_member(
+    resp: &pb::ProbeClusterResponse,
+    cluster_uuid: &[u8; 16],
+    expected_id: CoordinatorId,
+) -> bool {
+    resp.cluster_uuid.as_slice() == cluster_uuid.as_slice() && resp.node_id == Some(expected_id)
+}
+
+/// A `PERMISSION_DENIED` refusal for the ADR 0037 §6 authorization matrix.
+fn permission_denied(reason: &str) -> Status {
+    Status::permission_denied(format!("{reason} (ADR 0037 §6)"))
+}
+
+/// Build a `FAILED_PRECONDITION` status carrying a decodable
+/// [`ConflictingFormationToken`](pb::ConflictingFormationToken) refusal detail
+/// (ADR 0037 §3), naming the recorded token so recovery re-runs `cluster init`
+/// with it.
+fn conflicting_formation_token_status(recorded: String) -> Status {
+    refusal_status(
+        pb::membership_refusal::Reason::ConflictingFormationToken(pb::ConflictingFormationToken {
+            recorded_token: recorded.clone(),
+        }),
+        format!(
+            "a different formation token is already recorded ({recorded}); re-run `cluster init` \
+             with that token to resume (ADR 0037 §3)"
+        ),
+    )
 }
 
 /// Map a consensus-seam failure onto the gRPC status the admin RPC returns.
@@ -155,7 +827,68 @@ fn consensus_error_to_status(err: ConsensusError) -> Status {
         }
         ConsensusError::Shutdown => Status::unavailable("consensus is shutting down"),
         ConsensusError::Fatal(msg) => Status::internal(format!("consensus fault: {msg}")),
+        // ADR 0037 refusals: FAILED_PRECONDITION with a machine-readable
+        // `MembershipRefusal` in the Status details so a converging daemon can
+        // branch without parsing prose (see admin.proto).
+        ConsensusError::SameIdDifferentAddress { existing_addr } => refusal_status(
+            pb::membership_refusal::Reason::SameIdDifferentAddress(pb::SameIdDifferentAddress {
+                existing_address: existing_addr.clone(),
+            }),
+            format!(
+                "node is already in membership at a different address ({existing_addr}); \
+                 a moved instance is a new instance — no silent repointing (ADR 0037 §4)"
+            ),
+        ),
+        ConsensusError::MachineSeatPending { incumbent } => refusal_status(
+            pb::membership_refusal::Reason::MachineSeatPending(pb::MachineSeatPending {
+                incumbent_id: incumbent,
+            }),
+            format!(
+                "this machine's replacement seat is held by pending learner {incumbent}; \
+                 watch status rather than resubmitting (ADR 0037 §6)"
+            ),
+        ),
+        ConsensusError::PromotionRefused(reason) => {
+            use coppice_consensus::PromotionRefusal;
+            let pb_reason = match reason {
+                PromotionRefusal::VoterSetFull => pb::promotion_refused::Reason::VoterSetFull,
+                PromotionRefusal::NoRemovablePeer => pb::promotion_refused::Reason::NoRemovablePeer,
+            };
+            refusal_status(
+                pb::membership_refusal::Reason::PromotionRefused(pb::PromotionRefused {
+                    reason: pb_reason as i32,
+                }),
+                format!("promotion refused: {reason} (ADR 0037 §5)"),
+            )
+        }
+        ConsensusError::UnknownNode { id } => {
+            Status::failed_precondition(format!("node {id} is not in membership (ADR 0037 §4)"))
+        }
+        ConsensusError::NotALearner { node } => Status::failed_precondition(format!(
+            "node {node} is a voter, not a pending learner — the voter set is never touched by \
+             learner replacement (ADR 0037 §6)"
+        )),
+        ConsensusError::MachineMismatch { node, bound } => Status::failed_precondition(format!(
+            "node {node} is bound to machine identity {bound:?}, not the contested slot; \
+             membership changed under the eviction evidence — retry observes the current \
+             incumbent (ADR 0037 §6)"
+        )),
     }
+}
+
+/// Build a `FAILED_PRECONDITION` status carrying a machine-readable
+/// [`MembershipRefusal`](pb::MembershipRefusal) in its binary details
+/// (ADR 0037 §4/§5/§6). The single refusal idiom across the admin surface: the
+/// message is for operators, the details for automation.
+fn refusal_status(reason: pb::membership_refusal::Reason, human: String) -> Status {
+    let detail = pb::MembershipRefusal {
+        reason: Some(reason),
+    };
+    Status::with_details(
+        Code::FailedPrecondition,
+        human,
+        bytes::Bytes::from(prost::Message::encode_to_vec(&detail)),
+    )
 }
 
 /// Convert a [`ClusterSummary`] into the `ClusterStatus` response wire form.
@@ -177,6 +910,8 @@ pub fn cluster_summary_to_pb(summary: ClusterSummary) -> pb::ClusterStatusRespon
         .map(|m| pb::RaftMember {
             node_id: m.id,
             address: m.addr.clone(),
+            machine_identity: m.machine_identity.clone(),
+            superseded: m.superseded,
         })
         .collect();
     members.sort_by_key(|m| m.node_id);
@@ -218,22 +953,21 @@ fn hex(bytes: &[u8]) -> String {
 // Client side
 // ---------------------------------------------------------------------------
 
-/// Dial the admin surface of `target` (`host:port`) over mTLS (ADR 0011).
+/// Dial the admin surface of `target` (`host:port` or `[v6]:port`) over mTLS
+/// (ADR 0011).
 ///
 /// The client presents this node's certificate and trusts the cluster CA; the
-/// TLS domain is the host half of `target`, which must match the peer
-/// certificate's SAN.
+/// TLS domain is the unbracketed host half of `target`, which must match the
+/// peer certificate's SAN. The `https://{target}` authority keeps the original
+/// brackets an IPv6 literal needs.
 pub async fn admin_channel(
     target: &str,
     ca_pem: &[u8],
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> Result<Client<Channel>> {
-    let host = target
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(target)
-        .to_string();
+    let (host, _port) = coppice_tls::split_host_port(target)
+        .with_context(|| format!("invalid admin target {target}"))?;
 
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(ca_pem))
@@ -249,6 +983,22 @@ pub async fn admin_channel(
         .with_context(|| format!("connecting to admin target {target}"))?;
 
     Ok(Client::new(channel))
+}
+
+/// Dial the admin surface of `target` over mTLS using a [`TlsStore`]'s current
+/// material (ADR 0037 §6), so a rotated leaf is used on the next dial. This is
+/// the seam the daemon's own convergence loop, the formation probe guard, and
+/// endpoint verification dial through — all present the daemon's own machine
+/// certificate rather than PEM read from config paths.
+pub async fn admin_channel_from_store(target: &str, store: &TlsStore) -> Result<Client<Channel>> {
+    let material = store.current();
+    admin_channel(
+        target,
+        material.ca_pem(),
+        material.cert_pem(),
+        material.key_pem(),
+    )
+    .await
 }
 
 /// Add a learner (ADR 0016 step 2).
@@ -279,6 +1029,30 @@ pub async fn remove_node(
         .remove_node(pb::RemoveNodeRequest {
             cluster_uuid: cluster_uuid.to_vec(),
             node_id,
+        })
+        .await
+        .map_err(status_to_anyhow)?;
+    Ok(())
+}
+
+/// Repoint an existing node's membership address (ADR 0037 §4 operator
+/// break-glass `admin set-address`).
+///
+/// The leader verifies the new endpoint (its serving-cert subject and stamped
+/// node id) before committing the `SetNodes`, so a wrong or unowned address is
+/// refused rather than committed. The caller presents operator-profile material;
+/// machine certificates are refused this verb server-side (§6).
+pub async fn set_node_address(
+    client: &mut Client<Channel>,
+    cluster_uuid: [u8; 16],
+    node_id: CoordinatorId,
+    addr: String,
+) -> Result<()> {
+    client
+        .set_node_address(pb::SetNodeAddressRequest {
+            cluster_uuid: cluster_uuid.to_vec(),
+            node_id,
+            address: addr,
         })
         .await
         .map_err(status_to_anyhow)?;
@@ -362,18 +1136,30 @@ fn status_to_anyhow(status: Status) -> anyhow::Error {
 /// Run one `admin` invocation: load config for TLS material and the default
 /// target, dial the admin surface, and execute the verb.
 pub async fn run_cli(args: AdminArgs) -> Result<()> {
-    let resolved = config::load(&args.config, config::CliOverrides::default())
+    let resolved = config::load(&args.config)
         .with_context(|| format!("reading config {}", args.config.display()))?;
     let cfg = &resolved.config;
 
+    // Default `--target` to the first `static` discovery seed (ADR 0037 §2:
+    // `[discovery.static] addrs` subsumes the old top-level `peers`). Any other
+    // backend (dns/file/ec2-asg) carries no literal seed usable as a default, so
+    // `--target` is then required.
     let target = match &args.target {
         Some(t) => t.clone(),
-        None => cfg.peers.first().cloned().ok_or_else(|| {
-            anyhow!(
-                "no --target given and the config's `peers` list is empty; \
-                 pass --target <host:port>"
-            )
-        })?,
+        None => cfg
+            .discovery
+            .static_addrs()
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "no --target given and no default is available: the config's \
+                     discovery backend is \"{}\" with no usable seed address \
+                     (only backend = \"static\" with a non-empty \
+                     [discovery.static] addrs provides one). Pass --target <host:port>",
+                    cfg.discovery.backend.as_str()
+                )
+            })?,
     };
 
     let cluster_uuid = *cfg.cluster_id.0.as_bytes();
@@ -403,12 +1189,126 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
             remove_node(&mut client, cluster_uuid, node_id).await?;
             println!("removed node {node_id} from membership");
         }
-        AdminVerb::Status => {
+        AdminVerb::SetAddress { node_id, addr } => {
+            // Operator break-glass repoint (ADR 0037 §4): the leader verifies the
+            // new endpoint (dial it, match its serving-cert subject to the
+            // target's machine-identity binding, confirm its stamped node id by
+            // probe) before committing the `SetNodes`. This CLI presents the
+            // operator's own configured leaf; a machine cert is refused this verb
+            // server-side (§6).
+            set_node_address(&mut client, cluster_uuid, node_id, addr.clone()).await?;
+            println!("repointed node {node_id} to {addr}");
+        }
+        AdminVerb::Status { json } => {
             let status = cluster_status(&mut client, cluster_uuid).await?;
-            print!("{}", render_status(&status));
+            if json {
+                println!("{}", render_status_json(&status));
+            } else {
+                print!("{}", render_status(&status));
+            }
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cluster init` (ADR 0037 §3)
+// ---------------------------------------------------------------------------
+
+/// The result of a successful `cluster init` (ADR 0037 §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterInitOutcome {
+    /// The forming replica's stamped raft identity.
+    pub node_id: u64,
+    /// True when a matching-token request resumed/re-reported a formation that
+    /// had already completed; false when this call performed formation.
+    pub already_initialized: bool,
+}
+
+/// Drive `InitializeCluster` against one parked coordinator over mTLS
+/// (ADR 0037 §3), the server half of `coppice cluster init`.
+///
+/// The caller presents operator-profile material (`ca`/`cert`/`key`); machine
+/// certificates are refused this verb server-side (§6). `target` is the
+/// coordinator's raft/admin listener. The stamped cluster identity is learned
+/// from the target itself via `ProbeCluster` — the operator need not know the
+/// cluster UUID — and then supplied to `InitializeCluster`. `token` is the
+/// durable formation token; `policy_toml` is the optional bootstrap policy,
+/// applied idempotently as part of formation.
+///
+/// A conflicting-token refusal is decoded from its machine-readable detail into
+/// an error whose message names the recorded token and the recovery step.
+pub async fn cluster_init(
+    target: &str,
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    token: &str,
+    policy_toml: Option<Vec<u8>>,
+) -> Result<ClusterInitOutcome> {
+    let mut client = admin_channel(target, ca_pem, cert_pem, key_pem).await?;
+
+    // Learn the target's stamped cluster identity (the InitializeCluster body
+    // carries it, but the operator running away from any daemon config does not
+    // have it to hand). ProbeCluster's body is empty precisely so a caller can
+    // discover it; an operator cert may call it.
+    let probe = client
+        .probe_cluster(pb::ProbeClusterRequest {})
+        .await
+        .map_err(|s| {
+            anyhow!(
+                "probing {target} for its cluster identity failed ({:?}): {}",
+                s.code(),
+                s.message()
+            )
+        })?
+        .into_inner();
+
+    match client
+        .initialize_cluster(pb::InitializeClusterRequest {
+            cluster_uuid: probe.cluster_uuid,
+            formation_token: token.to_string(),
+            policy_toml,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            Ok(ClusterInitOutcome {
+                node_id: resp.node_id,
+                already_initialized: resp.already_initialized,
+            })
+        }
+        Err(status) => Err(cluster_init_error(status)),
+    }
+}
+
+/// Turn an `InitializeCluster` failure [`Status`] into an operator-facing
+/// error. A conflicting-token refusal (ADR 0037 §3) is decoded from its
+/// `MembershipRefusal` detail into a recovery message naming the recorded
+/// token; every other failure surfaces its code and message.
+fn cluster_init_error(status: Status) -> anyhow::Error {
+    if status.code() == Code::FailedPrecondition {
+        if let Ok(refusal) = <pb::MembershipRefusal as prost::Message>::decode(status.details()) {
+            if let Some(pb::membership_refusal::Reason::ConflictingFormationToken(conflict)) =
+                refusal.reason
+            {
+                return anyhow!(
+                    "cluster init refused: a different formation token is already recorded for \
+                     this cluster.\n  recorded token: {}\nRe-run `coppice cluster init` with that \
+                     token — pass it as `--formation-token <token>`, or write it into your \
+                     `--formation-token-file` — to resume or report the existing formation \
+                     (ADR 0037 §3).",
+                    conflict.recorded_token
+                );
+            }
+        }
+    }
+    anyhow!(
+        "cluster init failed ({:?}): {}",
+        status.code(),
+        status.message()
+    )
 }
 
 /// Read a PEM file, naming the path on failure (ADR 0011).
@@ -467,10 +1367,176 @@ fn render_status(s: &pb::ClusterStatusResponse) -> String {
     out
 }
 
+/// Render a `ClusterStatus` response as stable JSON for `admin status --json`
+/// (ADR 0037 §7): the cluster-wide view — membership (with machine-identity
+/// bindings and the superseded marking), per-follower matched/lag, leader,
+/// term, applied/committed — as a single object for scripting. The human table
+/// ([`render_status`]) remains the default; this is a parallel, additive
+/// surface whose field names are a contract.
+fn render_status_json(s: &pb::ClusterStatusResponse) -> String {
+    let voters: std::collections::BTreeSet<u64> = s
+        .membership
+        .as_ref()
+        .and_then(|m| m.configs.first())
+        .map(|c| c.voters.iter().copied().collect())
+        .unwrap_or_default();
+
+    let members: Vec<serde_json::Value> = s
+        .membership
+        .as_ref()
+        .map(|m| {
+            m.members
+                .iter()
+                .map(|member| {
+                    serde_json::json!({
+                        "node_id": member.node_id,
+                        "addr": member.address,
+                        "role": if voters.contains(&member.node_id) { "voter" } else { "learner" },
+                        "machine_identity": member.machine_identity,
+                        "superseded": member.superseded,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Per-follower replication is the leader's view only; empty on a follower.
+    let replication: Vec<serde_json::Value> = s
+        .replication
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "node_id": r.node_id,
+                "matched_index": r.matched_index,
+                "lag": s.last_applied_index.saturating_sub(r.matched_index),
+            })
+        })
+        .collect();
+
+    let view = serde_json::json!({
+        "node_id": s.local_node_id,
+        "leader": s.leader_node_id,
+        "is_leader": s.leader_node_id == Some(s.local_node_id),
+        "term": s.term,
+        "applied_index": s.last_applied_index,
+        "committed_index": s.known_committed_index,
+        "members": members,
+        "replication": replication,
+    });
+    // Pretty-print: `admin status` is an operator/script surface, and a stable
+    // key order (serde_json preserves insertion order) keeps diffs readable.
+    serde_json::to_string_pretty(&view).expect("cluster status JSON is always serializable")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use coppice_consensus::MemberSummary;
+
+    fn member(id: u64, addr: &str, voter: bool) -> MemberSummary {
+        MemberSummary {
+            id,
+            addr: addr.into(),
+            voter,
+            machine_identity: format!("coord-{id}"),
+            superseded: false,
+        }
+    }
+
+    // ---- Finding #5: a probe only clears a streak when it confirms the member ----
+
+    #[test]
+    fn probe_confirms_member_requires_matching_cluster_and_node() {
+        let uuid = *b"cluster-uuid-016";
+        let ok = pb::ProbeClusterResponse {
+            cluster_uuid: uuid.to_vec(),
+            initialized: true,
+            node_id: Some(7),
+            leader_hint: Some(1),
+            voters: vec![],
+        };
+        assert!(
+            probe_confirms_member(&ok, &uuid, 7),
+            "right cluster and node is affirmative liveness"
+        );
+    }
+
+    #[test]
+    fn probe_from_wrong_node_is_not_liveness_evidence() {
+        // Finding 5: a CA-valid answer from a DIFFERENT node id at a reused
+        // address does not clear member 7's streak.
+        let uuid = *b"cluster-uuid-016";
+        let wrong_node = pb::ProbeClusterResponse {
+            cluster_uuid: uuid.to_vec(),
+            initialized: true,
+            node_id: Some(9),
+            leader_hint: Some(1),
+            voters: vec![],
+        };
+        assert!(
+            !probe_confirms_member(&wrong_node, &uuid, 7),
+            "a different node id is not evidence member 7 is alive"
+        );
+        // And a missing node id is likewise not confirmation.
+        let no_node = pb::ProbeClusterResponse {
+            node_id: None,
+            ..wrong_node
+        };
+        assert!(!probe_confirms_member(&no_node, &uuid, 7));
+    }
+
+    #[test]
+    fn probe_from_wrong_cluster_is_not_liveness_evidence() {
+        // Finding 5: the right node id but a DIFFERENT cluster uuid is not
+        // evidence — cross-cluster IP reuse must not clear the streak.
+        let uuid = *b"cluster-uuid-016";
+        let other = *b"cluster-uuid-999";
+        let resp = pb::ProbeClusterResponse {
+            cluster_uuid: other.to_vec(),
+            initialized: true,
+            node_id: Some(7),
+            leader_hint: Some(1),
+            voters: vec![],
+        };
+        assert!(
+            !probe_confirms_member(&resp, &uuid, 7),
+            "a different cluster uuid is not evidence"
+        );
+    }
+
+    // ---- Finding #4: the leader is never a probe target ----
+
+    #[test]
+    fn probe_targets_excludes_leader_and_promoting() {
+        // Voters {1 (leader), 2, 3}; a learner 4 is being promoted. The leader
+        // must never probe itself (finding 4) and the promoting node is not a
+        // voter here anyway; only 2 and 3 are probed.
+        let members = vec![
+            member(1, "c1:7071", true),
+            member(2, "c2:7071", true),
+            member(3, "c3:7071", true),
+            member(4, "c4:7071", false),
+        ];
+        let targets = probe_targets(&members, 4, 1);
+        let target_ids: Vec<u64> = targets.iter().map(|(id, _)| *id).collect();
+        assert_eq!(target_ids, vec![2, 3], "leader 1 is never a probe target");
+        assert!(
+            !target_ids.contains(&1),
+            "the leader is excluded even though it is a voter"
+        );
+    }
+
+    #[test]
+    fn probe_targets_excludes_leader_when_it_is_also_the_promotion_context() {
+        // A degenerate single-voter leader promoting a fresh learner: there is
+        // no voter to probe, and the leader (1) is never returned.
+        let members = vec![member(1, "c1:7071", true), member(2, "c2:7071", false)];
+        let targets = probe_targets(&members, 2, 1);
+        assert!(
+            targets.is_empty(),
+            "no voter other than the leader to probe"
+        );
+    }
 
     #[test]
     fn not_leader_maps_to_failed_precondition_naming_leader() {
@@ -533,16 +1599,22 @@ mod tests {
                     id: 3,
                     addr: "c3:7071".into(),
                     voter: false,
+                    machine_identity: "coord-3".into(),
+                    superseded: false,
                 },
                 MemberSummary {
                     id: 1,
                     addr: "c1:7071".into(),
                     voter: true,
+                    machine_identity: "coord-1".into(),
+                    superseded: false,
                 },
                 MemberSummary {
                     id: 2,
                     addr: "c2:7071".into(),
                     voter: true,
+                    machine_identity: "coord-2".into(),
+                    superseded: false,
                 },
             ],
             replication: vec![(1, 100), (3, 40)],
@@ -565,8 +1637,128 @@ mod tests {
     }
 
     #[test]
+    fn status_json_has_the_stable_scripting_shape() {
+        // A leader (node 1) with one caught-up voter (2), one lagging voter (3
+        // marked superseded), rendered as `admin status --json`.
+        let summary = ClusterSummary {
+            local_id: 1,
+            leader: Some(1),
+            term: 5,
+            last_applied: 100,
+            known_committed: 100,
+            snapshot_last_index: Some(64),
+            members: vec![
+                MemberSummary {
+                    id: 1,
+                    addr: "c1:7071".into(),
+                    voter: true,
+                    machine_identity: "coord-1".into(),
+                    superseded: false,
+                },
+                MemberSummary {
+                    id: 2,
+                    addr: "c2:7071".into(),
+                    voter: true,
+                    machine_identity: "coord-2".into(),
+                    superseded: false,
+                },
+                MemberSummary {
+                    id: 3,
+                    addr: "c3:7071".into(),
+                    voter: true,
+                    machine_identity: "coord-3".into(),
+                    superseded: true,
+                },
+            ],
+            replication: vec![(2, 100), (3, 40)],
+        };
+
+        let pbm = cluster_summary_to_pb(summary);
+        let json: serde_json::Value =
+            serde_json::from_str(&render_status_json(&pbm)).expect("valid JSON");
+
+        assert_eq!(json["node_id"], 1);
+        assert_eq!(json["leader"], 1);
+        assert_eq!(json["is_leader"], true);
+        assert_eq!(json["term"], 5);
+        assert_eq!(json["applied_index"], 100);
+        assert_eq!(json["committed_index"], 100);
+
+        let members = json["members"].as_array().expect("members array");
+        assert_eq!(members.len(), 3);
+        // Members carry role, machine identity, and the superseded marking.
+        let m3 = members.iter().find(|m| m["node_id"] == 3).unwrap();
+        assert_eq!(m3["role"], "voter");
+        assert_eq!(m3["machine_identity"], "coord-3");
+        assert_eq!(m3["superseded"], true);
+        assert_eq!(m3["addr"], "c3:7071");
+
+        // Per-follower replication carries matched + derived lag (leader view).
+        let repl = json["replication"].as_array().expect("replication array");
+        let r3 = repl.iter().find(|r| r["node_id"] == 3).unwrap();
+        assert_eq!(r3["matched_index"], 40);
+        assert_eq!(r3["lag"], 60);
+    }
+
+    #[test]
     fn a_generic_failed_precondition_is_not_a_behind_signal() {
         let status = Status::failed_precondition("not the leader; current leader is node 3");
         assert!(!is_learner_behind(&status));
+    }
+
+    #[test]
+    fn machine_seat_pending_carries_a_decodable_refusal_detail() {
+        // ADR 0037 §6: refusals are FAILED_PRECONDITION with a machine-readable
+        // `MembershipRefusal` in the Status details a converging daemon decodes.
+        let status = consensus_error_to_status(ConsensusError::MachineSeatPending { incumbent: 7 });
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        let refusal = <pb::MembershipRefusal as prost::Message>::decode(status.details())
+            .expect("details decode as MembershipRefusal");
+        assert_eq!(
+            refusal.reason,
+            Some(pb::membership_refusal::Reason::MachineSeatPending(
+                pb::MachineSeatPending { incumbent_id: 7 }
+            ))
+        );
+    }
+
+    #[test]
+    fn cluster_init_conflict_renders_a_recovery_message_naming_the_recorded_token() {
+        // ADR 0037 §3: a conflicting-token refusal is decoded from its
+        // machine-readable detail into an operator recovery message.
+        let status = conflicting_formation_token_status("stack-42".to_string());
+        let err = cluster_init_error(status);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stack-42"), "names the recorded token: {msg}");
+        assert!(
+            msg.contains("Re-run `coppice cluster init`"),
+            "gives the recovery step: {msg}"
+        );
+    }
+
+    #[test]
+    fn cluster_init_generic_failure_surfaces_code_and_message() {
+        let status = Status::unavailable("connection reset");
+        let msg = format!("{:#}", cluster_init_error(status));
+        assert!(msg.contains("Unavailable"), "{msg}");
+        assert!(msg.contains("connection reset"), "{msg}");
+    }
+
+    #[test]
+    fn promotion_refused_details_name_the_reason() {
+        use coppice_consensus::PromotionRefusal;
+        let status = consensus_error_to_status(ConsensusError::PromotionRefused(
+            PromotionRefusal::VoterSetFull,
+        ));
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        let refusal = <pb::MembershipRefusal as prost::Message>::decode(status.details())
+            .expect("details decode as MembershipRefusal");
+        let Some(pb::membership_refusal::Reason::PromotionRefused(pr)) = refusal.reason else {
+            panic!(
+                "expected a PromotionRefused reason, got {:?}",
+                refusal.reason
+            );
+        };
+        assert_eq!(pr.reason(), pb::promotion_refused::Reason::VoterSetFull);
     }
 }
