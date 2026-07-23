@@ -32,11 +32,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use coppice_consensus::{CoordinatorId, LivenessAttestor};
+use coppice_tls::split_host_port;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
@@ -300,8 +302,62 @@ struct Snapshot {
     fetched_at: Option<Instant>,
 }
 
+/// Canonicalize a membership `host:port` to `canonical-ip:port` for snapshot
+/// comparison, **without any network resolution** (ADR 0037 §5). Returns `None`
+/// when the address cannot be canonicalized offline — the conservative
+/// `Unknown` answer, which never attests absence.
+///
+/// Membership normally advertises `advertise_host`, which defaults to the
+/// system FQDN; on EC2 that is typically an `ip-A-B-C-D.<region>.compute.internal`
+/// (or `ip-A-B-C-D.ec2.internal`) private DNS name, whereas the snapshot holds
+/// the raw `private-ip:port` from `DescribeInstances`. A raw string compare would
+/// call a live voter absent, so the host is reduced to its IPv4 first.
+fn canonicalize_addr(addr: &str) -> Option<String> {
+    let (host, port) = split_host_port(addr).ok()?;
+    let ip = canonicalize_host(&host)?;
+    Some(format!("{ip}:{port}"))
+}
+
+/// Reduce a host to its IPv4 dotted-quad **textually**, or `None` if that cannot
+/// be done offline (ADR 0037 §5). Two forms canonicalize:
+/// - an IPv4 literal is itself;
+/// - an EC2 private DNS name `ip-A-B-C-D.<anything>` reduces to `A.B.C.D`, with
+///   the label shape checked exactly (`ip-` + four dash-separated decimal
+///   octets, each a valid `u8`).
+///
+/// Everything else — an arbitrary hostname or an IPv6 literal — is
+/// non-canonicalizable. IPv6 is deliberately *not* kept as-is: the snapshot is
+/// IPv4 private addresses, so an IPv6-advertised host could never match and must
+/// stay `Unknown` rather than be spuriously judged `Absent`.
+fn canonicalize_host(host: &str) -> Option<String> {
+    // (a) An IPv4 literal is itself.
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return Some(ip.to_string());
+    }
+    // (b) An EC2 private DNS name `ip-A-B-C-D.<anything>`: reduce the first label
+    //     to a dotted quad, validating the shape exactly (no lookup).
+    let first_label = host.split('.').next()?;
+    let digits = first_label.strip_prefix("ip-")?;
+    let octets: Vec<&str> = digits.split('-').collect();
+    if octets.len() != 4 {
+        return None;
+    }
+    let mut quad = [0u8; 4];
+    for (slot, octet) in quad.iter_mut().zip(octets) {
+        // Plain decimal only (reject empty, signs, whitespace), and in `u8` range.
+        if octet.is_empty() || !octet.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *slot = octet.parse::<u8>().ok()?;
+    }
+    Some(Ipv4Addr::from(quad).to_string())
+}
+
 /// Pure presence decision (ADR 0037 §5): fresh-and-contains → `Present`,
-/// fresh-and-missing → `Absent`, otherwise → `Unknown`.
+/// fresh-and-missing → `Absent`, otherwise → `Unknown`. The `addr` is the
+/// already-canonicalized `ip:port`; the snapshot entries are the
+/// `DescribeInstances` private IPs composed by [`compose_candidates`], which are
+/// IPv4 literals and so already canonical (no per-entry conversion needed).
 fn presence(snapshot: &Snapshot, ttl: Duration, now: Instant, addr: &str) -> Presence {
     match snapshot.fetched_at {
         Some(fetched_at) if now.duration_since(fetched_at) <= ttl => {
@@ -323,6 +379,15 @@ fn presence(snapshot: &Snapshot, ttl: Duration, now: Instant, addr: &str) -> Pre
 /// *fresh* snapshot that positively lacks the address attests absence; a stale
 /// snapshot or a present address answers "not absent", which keeps the leader
 /// from removing a maybe-live voter on weak evidence.
+///
+/// **Address canonicalization limit.** The membership record advertises
+/// `advertise_host`, but the snapshot holds `DescribeInstances` private IPs, so
+/// the record is first reduced to an IPv4 offline (an IPv4 literal, or an EC2
+/// `ip-A-B-C-D.<anything>` private DNS name) before comparison — no blocking DNS
+/// happens under the membership lock. A deployment whose `advertise_host` is
+/// neither an IP nor an EC2 private DNS name (an arbitrary hostname, or an IPv6
+/// address) gets **no** ec2-asg absence attestation: `is_absent` answers "not
+/// absent" (`Unknown`), and evidence-gated removal simply waits.
 pub struct Ec2AsgAttestor {
     ttl: Duration,
     snapshot: StdMutex<Snapshot>,
@@ -346,9 +411,15 @@ impl Ec2AsgAttestor {
 
 impl LivenessAttestor for Ec2AsgAttestor {
     fn is_absent(&self, _node: CoordinatorId, addr: &str) -> bool {
+        // Reduce the membership address to `ip:port` offline; a host that cannot
+        // be canonicalized without DNS (arbitrary hostname or IPv6) is Unknown,
+        // never Absent — the conservative default that waits rather than removes.
+        let Some(canonical) = canonicalize_addr(addr) else {
+            return false;
+        };
         let snapshot = self.snapshot.lock().expect("attestor snapshot mutex");
         matches!(
-            presence(&snapshot, self.ttl, Instant::now(), addr),
+            presence(&snapshot, self.ttl, Instant::now(), &canonical),
             Presence::Absent
         )
     }
@@ -723,5 +794,95 @@ mod tests {
                 Some(Instant::now() - (ATTESTOR_SNAPSHOT_TTL + Duration::from_secs(1)));
         }
         assert!(!attestor.is_absent(42, "10.9.9.9:7071"));
+    }
+
+    // ---- Address canonicalization (ADR 0037 §5, finding 6) ----
+
+    #[test]
+    fn canonicalize_ipv4_literal_is_itself() {
+        assert_eq!(canonicalize_host("10.0.0.1").as_deref(), Some("10.0.0.1"));
+        assert_eq!(
+            canonicalize_addr("10.0.0.1:7071").as_deref(),
+            Some("10.0.0.1:7071")
+        );
+    }
+
+    #[test]
+    fn canonicalize_ec2_private_dns_reduces_to_dotted_quad() {
+        // Both the `ec2.internal` (us-east-1) and regional `compute.internal`
+        // forms reduce to the same private IPv4.
+        assert_eq!(
+            canonicalize_host("ip-10-0-0-1.ec2.internal").as_deref(),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            canonicalize_host("ip-10-0-0-1.us-east-1.compute.internal").as_deref(),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            canonicalize_addr("ip-10-9-9-9.ec2.internal:7071").as_deref(),
+            Some("10.9.9.9:7071")
+        );
+    }
+
+    #[test]
+    fn canonicalize_rejects_arbitrary_hostname_and_ipv6() {
+        assert_eq!(canonicalize_host("coord-1.example.com"), None);
+        assert_eq!(canonicalize_host("localhost"), None);
+        // IPv6 is deliberately non-canonicalizable (snapshot is IPv4).
+        assert_eq!(canonicalize_host("2001:db8::1"), None);
+        assert_eq!(canonicalize_addr("[2001:db8::1]:7071"), None);
+    }
+
+    #[test]
+    fn canonicalize_rejects_malformed_ec2ish_names() {
+        // Three octets, not four.
+        assert_eq!(canonicalize_host("ip-10-0-0.ec2.internal"), None);
+        // Octet out of `u8` range.
+        assert_eq!(canonicalize_host("ip-10-0-0-999.ec2.internal"), None);
+        // Non-numeric octets.
+        assert_eq!(canonicalize_host("ip-x-y-z-w.ec2.internal"), None);
+        // Five octets.
+        assert_eq!(canonicalize_host("ip-10-0-0-1-2.ec2.internal"), None);
+        // Missing `ip-` prefix.
+        assert_eq!(canonicalize_host("10-0-0-1.ec2.internal"), None);
+        // Empty octet.
+        assert_eq!(canonicalize_host("ip-10--0-1.ec2.internal"), None);
+    }
+
+    #[test]
+    fn is_absent_canonicalizes_live_voter_advertised_by_ec2_dns() {
+        let attestor = Ec2AsgAttestor::new(ATTESTOR_SNAPSHOT_TTL);
+        attestor.update_snapshot(&["10.0.0.1:7071".to_string()]);
+        // A LIVE voter advertised as its EC2 private DNS name must NOT be
+        // attested absent against the equivalent IPv4 in a fresh snapshot.
+        assert!(
+            !attestor.is_absent(1, "ip-10-0-0-1.ec2.internal:7071"),
+            "ip-10-0-0-1 canonicalizes to 10.0.0.1, which is present"
+        );
+        // A departed voter advertised by EC2 DNS, absent from the snapshot, IS
+        // attested absent.
+        assert!(
+            attestor.is_absent(2, "ip-10-9-9-9.ec2.internal:7071"),
+            "10.9.9.9 is gone from the group"
+        );
+    }
+
+    #[test]
+    fn is_absent_never_attests_uncanonicalizable_hosts() {
+        let attestor = Ec2AsgAttestor::new(ATTESTOR_SNAPSHOT_TTL);
+        attestor.update_snapshot(&["10.0.0.1:7071".to_string()]);
+        // Arbitrary hostname → Unknown → not absent, regardless of the snapshot.
+        assert!(!attestor.is_absent(3, "coord-1.example.com:7071"));
+        // IPv6-advertised host → Unknown → not absent.
+        assert!(!attestor.is_absent(4, "[2001:db8::1]:7071"));
+    }
+
+    #[test]
+    fn is_absent_ip_literal_behavior_unchanged() {
+        let attestor = Ec2AsgAttestor::new(ATTESTOR_SNAPSHOT_TTL);
+        attestor.update_snapshot(&["10.0.0.1:7071".to_string()]);
+        assert!(!attestor.is_absent(5, "10.0.0.1:7071"));
+        assert!(attestor.is_absent(6, "10.9.9.9:7071"));
     }
 }

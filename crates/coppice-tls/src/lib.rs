@@ -116,6 +116,17 @@ pub enum TlsError {
     /// rustls rejected the assembled server config (bad key/cert pairing, etc).
     #[error("building the rustls server config: {0}")]
     RustlsConfig(String),
+
+    /// The initial load kept observing a writer racing the read: every attempt
+    /// straddled a rotation (pre/post fingerprints disagreed), so no coherent
+    /// generation could be captured. Startup fails loudly rather than serving
+    /// possibly-straddled material under a fingerprint that says "current".
+    #[error(
+        "TLS material under {} kept changing under {attempts} reads at startup; \
+         a writer is rotating the files faster than they can be read",
+        cert.display()
+    )]
+    Unstable { cert: PathBuf, attempts: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -447,11 +458,27 @@ impl TlsStore {
     /// Load the initial material from `paths`. Fails fast if any file is
     /// missing or unparseable — a coordinator with no valid TLS material must
     /// not start (ADR 0011: no insecure fallback).
+    ///
+    /// Unlike a poll, startup has no "previous material" to fall back on, so a
+    /// writer rotating the files *during* this read must not be latched: the
+    /// read is repeated (bounded, with a small backoff) until its pre/post
+    /// fingerprints agree ([`ReadWithFingerprints::is_stable`]). A straddled
+    /// read that never settles returns [`TlsError::Unstable`] so startup fails
+    /// loudly rather than installing possibly-torn bytes under a post fingerprint
+    /// the first poll would then see as "unchanged" and never repair.
     pub fn load(paths: TlsPaths) -> Result<Arc<TlsStore>, TlsError> {
-        // Initial load is fail-fast startup, not a polling loop: read once and
-        // parse. A writer racing this single read is transient and reconciled by
-        // the first poll (the stored fingerprint is the post-read stat).
-        let read = ReadWithFingerprints::capture(&paths)?;
+        Self::load_with(paths, ReadWithFingerprints::capture)
+    }
+
+    /// [`load`](Self::load) with the read step injected, so a test can force the
+    /// first attempts to observe a pre/post mismatch and assert the retry-to-
+    /// stable (and the give-up `Err`). Production calls
+    /// [`ReadWithFingerprints::capture`].
+    fn load_with(
+        paths: TlsPaths,
+        capture: impl FnMut(&TlsPaths) -> Result<ReadWithFingerprints, TlsError>,
+    ) -> Result<Arc<TlsStore>, TlsError> {
+        let read = stable_read(&paths, capture)?;
         let fingerprint = read.post.clone();
         let material = read.into_material(&paths)?;
         set_expiry_gauge(&material);
@@ -575,6 +602,37 @@ struct ReadWithFingerprints {
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
     ca_pem: Vec<u8>,
+}
+
+/// How many times [`stable_read`] re-reads before giving up on a straddled
+/// startup read, and how long it backs off between attempts. Small: a writer
+/// rotating files takes microseconds to settle, so a handful of quick retries
+/// covers the race without stalling startup.
+const LOAD_STABILITY_ATTEMPTS: usize = 5;
+const LOAD_STABILITY_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Repeat `capture` until it yields a stable read (pre/post fingerprints agree),
+/// bounded by [`LOAD_STABILITY_ATTEMPTS`]. Returns [`TlsError::Unstable`] if
+/// every attempt straddled a write. Used only by the initial
+/// [`load`](TlsStore::load), which — unlike a poll — has no previous material to
+/// fall back on, so it cannot simply skip a torn read and retry next tick.
+fn stable_read(
+    paths: &TlsPaths,
+    mut capture: impl FnMut(&TlsPaths) -> Result<ReadWithFingerprints, TlsError>,
+) -> Result<ReadWithFingerprints, TlsError> {
+    for attempt in 0..LOAD_STABILITY_ATTEMPTS {
+        let read = capture(paths)?;
+        if read.is_stable() {
+            return Ok(read);
+        }
+        if attempt + 1 < LOAD_STABILITY_ATTEMPTS {
+            std::thread::sleep(LOAD_STABILITY_BACKOFF);
+        }
+    }
+    Err(TlsError::Unstable {
+        cert: paths.cert.clone(),
+        attempts: LOAD_STABILITY_ATTEMPTS,
+    })
 }
 
 impl ReadWithFingerprints {

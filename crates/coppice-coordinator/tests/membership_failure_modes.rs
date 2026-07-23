@@ -88,6 +88,25 @@ fn assert_seat_invariant(node: &Node, max: usize) {
         "active voter count {} exceeded {max}: {active:?}",
         active.len()
     );
+    assert_one_active_voter_per_identity(node);
+}
+
+/// The continuously-true half of the seat invariant (ADR 0037 §5): at most one
+/// *non-superseded* voter is ever bound to a given machine identity. Safe to
+/// assert at every poll sample, INCLUDING mid-membership-change.
+///
+/// The cardinality bound `assert_seat_invariant` also checks is NOT continuously
+/// true: an overflow removal is one `ReplaceAllVoters`, but openraft applies it
+/// through a *joint* configuration that transiently unions the old and new voter
+/// sets, and — unlike a replacement — the overflow-removed voter is not marked
+/// `superseded`, so it briefly appears as a fourth active voter. That transient
+/// is raft mechanics, not a logic violation: our code asked for exactly
+/// `cluster_size` voters, which the settled (non-joint) configuration the
+/// terminal assertion observes confirms. So the overflow poll loop asserts only
+/// this identity-uniqueness invariant and defers the cardinality check to the
+/// post-convergence terminal assertion.
+fn assert_one_active_voter_per_identity(node: &Node) {
+    let active: Vec<MemberSummary> = voters(node).into_iter().filter(|m| !m.superseded).collect();
     let mut seen = BTreeSet::new();
     for m in &active {
         assert!(
@@ -558,7 +577,11 @@ async fn seat_conflict_loser_converges_after_incumbent_gone() {
         LONG_DEADLINE,
         "challenger converges once a seat opens",
         || async {
-            assert_seat_invariant(&node1, 3);
+            // In-loop: only the continuously-true identity-uniqueness invariant
+            // (an overflow removal's joint config transiently shows a fourth,
+            // non-superseded voter — see `assert_one_active_voter_per_identity`).
+            // The exact cardinality is asserted at the terminal check below.
+            assert_one_active_voter_per_identity(&node1);
             let vs: BTreeSet<u64> = voters(&node1).iter().map(|m| m.id).collect();
             vs.contains(&b_id) && !vs.contains(&node4_id) && vs.len() == 3
         },

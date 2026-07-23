@@ -243,12 +243,16 @@ impl FormationControl {
         // racing former that somehow slipped past the lock is still caught here;
         // on that refusal we surface the recorded winner rather than a raw IO
         // error.
-        if let Err(e) = self
+        // Take the record result in its own statement: an `if let` scrutinee's
+        // temporary guard lives through the whole body (Rust 2021), and the
+        // error arm below re-locks this same non-reentrant mutex via
+        // `recorded_token()` — binding first drops the guard before the body.
+        let recorded = self
             .core
             .lock()
             .expect("storage core poisoned")
-            .record_formation_token(token)
-        {
+            .record_formation_token(token);
+        if let Err(e) = recorded {
             if let Some(rec) = self.recorded_token() {
                 if rec != token {
                     return Err(FormationError::ConflictingToken { recorded: rec });

@@ -15,6 +15,7 @@
 // large error type, and the signatures here are dictated by that trait.
 #![allow(clippy::result_large_err)]
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -266,7 +267,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         }
         match self
             .consensus
-            .promote_voter(req.promote_node_id, req.remove_node_id)
+            .promote_voter(req.promote_node_id, req.remove_node_id, BTreeSet::new())
             .await
         {
             Ok(()) => Ok(Response::new(pb::PromoteVoterResponse {})),
@@ -277,16 +278,37 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
                 // aging cannot see a dead-but-caught-up voter in an idle
                 // cluster. Gather the leader's affirmative evidence (ADR 0037
                 // §5: "the leader's replication to it has been failing"):
-                // probe the other voters' endpoints, and once ONE has been
-                // continuously unreachable past `removal_grace`, fold exactly
-                // that voter's removal into the promotion — the leader's own
-                // conservative choice, not the caller's.
-                if let Some(dead) = self.dead_voter_by_probe(req.promote_node_id).await {
+                // probe the other voters' endpoints for those continuously
+                // unreachable past `removal_grace`, then RETRY through the same
+                // AUTOMATIC path, feeding the evidence in. The automatic path
+                // re-reads membership under its lock and runs the full check
+                // set (cardinality, live-majority, attestor) against it, so a
+                // named voter removed by a racing change is simply not selected
+                // — the evidence never bypasses those guards the way a manual
+                // `remove = Some` would.
+                let dead = self.dead_voter_by_probe(req.promote_node_id).await;
+                if !dead.is_empty() {
                     self.consensus
-                        .promote_voter(req.promote_node_id, Some(dead))
+                        .promote_voter(req.promote_node_id, None, dead.clone())
                         .await
                         .map_err(consensus_error_to_status)?;
-                    self.seat_unreachable.lock().await.remove(&dead);
+                    // Drop streak entries for any probed voter the promotion
+                    // actually removed; a still-present voter keeps its streak
+                    // so a later promotion can act on it without re-aging.
+                    let still_voters: BTreeSet<CoordinatorId> = self
+                        .handle
+                        .cluster_summary()
+                        .members
+                        .iter()
+                        .filter(|m| m.voter)
+                        .map(|m| m.id)
+                        .collect();
+                    let mut map = self.seat_unreachable.lock().await;
+                    for id in &dead {
+                        if !still_voters.contains(id) {
+                            map.remove(id);
+                        }
+                    }
                     return Ok(Response::new(pb::PromoteVoterResponse {}));
                 }
                 Err(consensus_error_to_status(ConsensusError::PromotionRefused(
@@ -523,46 +545,56 @@ impl<C: Consensus> AdminService<C> {
     /// mTLS and require its serving leaf's CN to equal `identity`, then
     /// `ProbeCluster` there and require the claimed `node_id`.
     /// Leader-side affirmative dead-voter evidence for an overflow removal
-    /// (ADR 0037 §5): probe every voter other than the one being promoted and
-    /// return the single lowest-id voter whose endpoint has been CONTINUOUSLY
-    /// unreachable for at least `removal_grace`. Streaks share the same
-    /// evidence map as pending-learner arbitration; a successful probe clears
-    /// its entry, so a blip never accumulates. At most one id is returned —
-    /// the ADR permits at most one overflow removal per promotion.
-    async fn dead_voter_by_probe(&self, promoting: CoordinatorId) -> Option<CoordinatorId> {
-        let voters: Vec<_> = self
-            .handle
-            .cluster_summary()
-            .members
-            .into_iter()
-            .filter(|m| m.voter && m.id != promoting)
-            .collect();
-        let mut dead = None;
-        for member in voters {
-            let reachable = matches!(
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    let mut client = admin_channel_from_store(&member.addr, &self.tls)
-                        .await
-                        .ok()?;
-                    client.probe_cluster(pb::ProbeClusterRequest {}).await.ok()
-                })
-                .await,
-                Ok(Some(_))
-            );
+    /// (ADR 0037 §5): probe every voter other than the one being promoted AND
+    /// other than this leader itself, and return the set of those whose
+    /// endpoint has been CONTINUOUSLY unreachable for at least `removal_grace`.
+    /// Streaks share the same evidence map as pending-learner arbitration; a
+    /// successful, IDENTITY-CONFIRMED probe clears its entry, so a blip never
+    /// accumulates. The leader is excluded (finding: a leader that cannot
+    /// hairpin-dial its own advertised address must never accumulate a streak
+    /// nor be a removal candidate); the automatic promotion path excludes it a
+    /// second time. The returned set feeds the automatic path, which picks at
+    /// most one — the ADR permits at most one overflow removal per promotion.
+    async fn dead_voter_by_probe(&self, promoting: CoordinatorId) -> BTreeSet<CoordinatorId> {
+        let summary = self.handle.cluster_summary();
+        let targets = probe_targets(&summary.members, promoting, summary.local_id);
+        let mut dead = BTreeSet::new();
+        for (id, addr) in targets {
+            let reachable = self.probe_confirms(&addr, id).await;
             let mut map = self.seat_unreachable.lock().await;
             if reachable {
-                map.remove(&member.id);
+                map.remove(&id);
                 continue;
             }
-            let since = *map.entry(member.id).or_insert_with(Instant::now);
+            let since = *map.entry(id).or_insert_with(Instant::now);
             if since.elapsed() >= self.policy.removal_grace {
-                dead = match dead {
-                    Some(prior) if prior < member.id => Some(prior),
-                    _ => Some(member.id),
-                };
+                dead.insert(id);
             }
         }
         dead
+    }
+
+    /// Probe `addr` and decide whether it is affirmative liveness evidence for
+    /// the member `expected_id` in THIS cluster (ADR 0037 §6). A dial/probe
+    /// failure is "not reachable"; a *successful* probe counts as reachable
+    /// only when [`probe_confirms_member`] holds — it reports this cluster's
+    /// uuid and the expected node id. A CA-valid answer from a different
+    /// cluster or a different node (address reuse) is NOT evidence the member
+    /// is alive, so it is treated as a failed probe and the streak continues.
+    async fn probe_confirms(&self, addr: &str, expected_id: CoordinatorId) -> bool {
+        let resp = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client = admin_channel_from_store(addr, &self.tls).await.ok()?;
+            client
+                .probe_cluster(pb::ProbeClusterRequest {})
+                .await
+                .ok()
+                .map(|r| r.into_inner())
+        })
+        .await;
+        matches!(
+            resp,
+            Ok(Some(resp)) if probe_confirms_member(&resp, &self.cluster_uuid, expected_id)
+        )
     }
 
     /// Leader-side unreachability evidence for a contested pending learner
@@ -580,14 +612,11 @@ impl<C: Consensus> AdminService<C> {
             .into_iter()
             .find(|m| m.id == incumbent)?
             .addr;
-        let reachable = matches!(
-            tokio::time::timeout(Duration::from_secs(2), async {
-                let mut client = admin_channel_from_store(&addr, &self.tls).await.ok()?;
-                client.probe_cluster(pb::ProbeClusterRequest {}).await.ok()
-            })
-            .await,
-            Ok(Some(_))
-        );
+        // Only a probe that confirms THIS cluster's uuid and the incumbent's own
+        // node id clears the streak (ADR 0037 §6); a CA-valid answer from a
+        // different cluster/node at a reused address is not evidence the
+        // incumbent is alive, so it is treated as a failed probe.
+        let reachable = self.probe_confirms(&addr, incumbent).await;
         let mut map = self.seat_unreachable.lock().await;
         if reachable {
             map.remove(&incumbent);
@@ -704,6 +733,42 @@ fn peer_common_name<T>(request: &Request<T>) -> Option<String> {
         .and_then(|certs| certs.first().cloned())
         .and_then(|leaf| coppice_tls::parse_leaf_subject_der(leaf.as_ref()))
         .and_then(|s| s.common_name)
+}
+
+/// The voters this leader should probe for dead-voter evidence (ADR 0037 §5):
+/// every voter EXCEPT the node being promoted and the leader itself. Pure so
+/// the exclusions are unit-testable.
+///
+/// Excluding `local_id` is finding 4: a leader that cannot hairpin-dial its own
+/// advertised address must never accumulate a failure streak against itself nor
+/// be selected for removal. It is never a probe target regardless of any streak
+/// the map might hold.
+fn probe_targets(
+    members: &[coppice_consensus::MemberSummary],
+    promoting: CoordinatorId,
+    local_id: CoordinatorId,
+) -> Vec<(CoordinatorId, String)> {
+    members
+        .iter()
+        .filter(|m| m.voter && m.id != promoting && m.id != local_id)
+        .map(|m| (m.id, m.addr.clone()))
+        .collect()
+}
+
+/// Whether a `ProbeCluster` response is affirmative liveness evidence for the
+/// member `expected_id` in the cluster stamped `cluster_uuid` (ADR 0037 §6).
+///
+/// Pure so the classification is unit-testable without a live endpoint. The
+/// mTLS session already proves the responder holds a CA-valid leaf; this adds
+/// that it is the RIGHT member of the RIGHT cluster. Both must hold: a response
+/// from a different cluster's coordinator, or from a different node id that
+/// happens to serve a reused address, is not evidence `expected_id` is alive.
+fn probe_confirms_member(
+    resp: &pb::ProbeClusterResponse,
+    cluster_uuid: &[u8; 16],
+    expected_id: CoordinatorId,
+) -> bool {
+    resp.cluster_uuid.as_slice() == cluster_uuid.as_slice() && resp.node_id == Some(expected_id)
 }
 
 /// A `PERMISSION_DENIED` refusal for the ADR 0037 §6 authorization matrix.
@@ -1357,6 +1422,111 @@ fn render_status_json(s: &pb::ClusterStatusResponse) -> String {
 mod tests {
     use super::*;
     use coppice_consensus::MemberSummary;
+
+    fn member(id: u64, addr: &str, voter: bool) -> MemberSummary {
+        MemberSummary {
+            id,
+            addr: addr.into(),
+            voter,
+            machine_identity: format!("coord-{id}"),
+            superseded: false,
+        }
+    }
+
+    // ---- Finding #5: a probe only clears a streak when it confirms the member ----
+
+    #[test]
+    fn probe_confirms_member_requires_matching_cluster_and_node() {
+        let uuid = *b"cluster-uuid-016";
+        let ok = pb::ProbeClusterResponse {
+            cluster_uuid: uuid.to_vec(),
+            initialized: true,
+            node_id: Some(7),
+            leader_hint: Some(1),
+            voters: vec![],
+        };
+        assert!(
+            probe_confirms_member(&ok, &uuid, 7),
+            "right cluster and node is affirmative liveness"
+        );
+    }
+
+    #[test]
+    fn probe_from_wrong_node_is_not_liveness_evidence() {
+        // Finding 5: a CA-valid answer from a DIFFERENT node id at a reused
+        // address does not clear member 7's streak.
+        let uuid = *b"cluster-uuid-016";
+        let wrong_node = pb::ProbeClusterResponse {
+            cluster_uuid: uuid.to_vec(),
+            initialized: true,
+            node_id: Some(9),
+            leader_hint: Some(1),
+            voters: vec![],
+        };
+        assert!(
+            !probe_confirms_member(&wrong_node, &uuid, 7),
+            "a different node id is not evidence member 7 is alive"
+        );
+        // And a missing node id is likewise not confirmation.
+        let no_node = pb::ProbeClusterResponse {
+            node_id: None,
+            ..wrong_node
+        };
+        assert!(!probe_confirms_member(&no_node, &uuid, 7));
+    }
+
+    #[test]
+    fn probe_from_wrong_cluster_is_not_liveness_evidence() {
+        // Finding 5: the right node id but a DIFFERENT cluster uuid is not
+        // evidence — cross-cluster IP reuse must not clear the streak.
+        let uuid = *b"cluster-uuid-016";
+        let other = *b"cluster-uuid-999";
+        let resp = pb::ProbeClusterResponse {
+            cluster_uuid: other.to_vec(),
+            initialized: true,
+            node_id: Some(7),
+            leader_hint: Some(1),
+            voters: vec![],
+        };
+        assert!(
+            !probe_confirms_member(&resp, &uuid, 7),
+            "a different cluster uuid is not evidence"
+        );
+    }
+
+    // ---- Finding #4: the leader is never a probe target ----
+
+    #[test]
+    fn probe_targets_excludes_leader_and_promoting() {
+        // Voters {1 (leader), 2, 3}; a learner 4 is being promoted. The leader
+        // must never probe itself (finding 4) and the promoting node is not a
+        // voter here anyway; only 2 and 3 are probed.
+        let members = vec![
+            member(1, "c1:7071", true),
+            member(2, "c2:7071", true),
+            member(3, "c3:7071", true),
+            member(4, "c4:7071", false),
+        ];
+        let targets = probe_targets(&members, 4, 1);
+        let target_ids: Vec<u64> = targets.iter().map(|(id, _)| *id).collect();
+        assert_eq!(target_ids, vec![2, 3], "leader 1 is never a probe target");
+        assert!(
+            !target_ids.contains(&1),
+            "the leader is excluded even though it is a voter"
+        );
+    }
+
+    #[test]
+    fn probe_targets_excludes_leader_when_it_is_also_the_promotion_context() {
+        // A degenerate single-voter leader promoting a fresh learner: there is
+        // no voter to probe, and the leader (1) is never returned.
+        let members = vec![member(1, "c1:7071", true), member(2, "c2:7071", false)];
+        let targets = probe_targets(&members, 2, 1);
+        assert!(
+            targets.is_empty(),
+            "no voter other than the leader to probe"
+        );
+    }
 
     #[test]
     fn not_leader_maps_to_failed_precondition_naming_leader() {

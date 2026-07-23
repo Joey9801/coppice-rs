@@ -637,8 +637,9 @@ impl Consensus for SharedConsensus {
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
+        probe_dead: std::collections::BTreeSet<CoordinatorId>,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
-        self.0.promote_voter(promote, remove)
+        self.0.promote_voter(promote, remove, probe_dead)
     }
 
     fn remove_node(

@@ -20,6 +20,7 @@
 //! (the applied-command count the scheduler uses for `expected_version`).
 //! [`StateView`] exposes both.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 
 use coppice_state::Command;
@@ -177,13 +178,26 @@ pub trait Consensus: Send + Sync + 'static {
     ///
     /// Idempotent by contract: an id that is already a voter is a no-op
     /// success, checked *before* the replication-lag gate. `remove` is the
-    /// manual, explicit removal of a departed voter in the same joint change;
-    /// routine self-join leaves it `None` and lets the leader fold in the
-    /// replacement/overflow removals of §5 automatically.
+    /// manual, explicit removal of a departed voter in the same joint change
+    /// (the operator verb); routine self-join leaves it `None` and lets the
+    /// leader fold in the replacement/overflow removals of §5 automatically.
+    ///
+    /// `probe_dead` carries the leader's affirmative unreachability evidence
+    /// for the *automatic* (`remove = None`) path (ADR 0037 §5): voter ids the
+    /// admin surface has just found continuously unreachable by direct probe.
+    /// They are folded in as additional dead-voter *candidates* alongside the
+    /// leader's own progress-aging, then run through the UNCHANGED automatic
+    /// selection — leader/promote exclusion, at-most-one removal, the
+    /// cluster_size and live-majority postconditions, and the liveness-attestor
+    /// gate — against membership re-read under the membership lock. A candidate
+    /// that is no longer a voter by then is simply not selected; that atomic
+    /// revalidation is why the evidence feeds this path rather than a separate
+    /// unchecked manual removal. Ignored on the manual (`remove = Some`) path.
     fn promote_voter(
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
+        probe_dead: BTreeSet<CoordinatorId>,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Remove a node from membership.

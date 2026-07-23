@@ -171,6 +171,35 @@ fn age_follower(
     }
 }
 
+/// Fold the automatic promotion path's two dead-voter evidence sources into a
+/// single candidate set (ADR 0037 §5), revalidated against the CURRENT voter
+/// set. Pure so finding 3's union + revalidation is unit-testable without a
+/// live raft.
+///
+/// The candidates are `progress_aged` ∪ `probe_dead`, each intersected with
+/// `current_voters` — a candidate the membership re-read no longer shows as a
+/// voter (removed by a racing change) is dropped, which is precisely why probe
+/// evidence feeds this checked path rather than a separate unchecked manual
+/// removal. The `leader` and the node being `promoted` are always excluded: the
+/// leader is live by definition (finding 4's second exclusion layer), and the
+/// promoting node just caught up. The attestor gate, which needs live records,
+/// is applied by the caller on top of this set.
+fn dead_voter_candidates(
+    current_voters: &BTreeSet<CoordinatorId>,
+    progress_aged: &BTreeSet<CoordinatorId>,
+    probe_dead: &BTreeSet<CoordinatorId>,
+    leader: CoordinatorId,
+    promoting: CoordinatorId,
+) -> BTreeSet<CoordinatorId> {
+    progress_aged
+        .iter()
+        .copied()
+        .chain(probe_dead.iter().copied())
+        .filter(|v| current_voters.contains(v))
+        .filter(|v| *v != leader && *v != promoting)
+        .collect()
+}
+
 /// The openraft-backed [`Consensus`] implementation.
 pub struct OpenraftConsensus {
     raft: Raft<TypeConfig>,
@@ -465,6 +494,7 @@ impl Consensus for OpenraftConsensus {
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
+        probe_dead: BTreeSet<CoordinatorId>,
     ) -> Result<(), ConsensusError> {
         // Serialize with every other membership mutation (finding: seat TOCTOU):
         // the promotion's replacement/overflow removal is decided from a
@@ -558,13 +588,22 @@ impl Consensus for OpenraftConsensus {
                     voters
                 }
                 None => {
-                    // Voters whose replication has been failing longer than
-                    // `removal_grace` (§5), the leader's own observation; when a
-                    // liveness attestor applies, also require it attests absence.
-                    let dead_voters: BTreeSet<CoordinatorId> = current_voters
+                    // Dead-voter *candidates* are the union of two affirmative
+                    // unreachability signals (§5), both revalidated against
+                    // membership re-read under the lock (see
+                    // [`dead_voter_candidates`]):
+                    //   * the leader's own progress-aging — voters whose
+                    //     replication has been failing longer than
+                    //     `removal_grace`; and
+                    //   * `probe_dead` — voters the admin surface has just found
+                    //     continuously unreachable by direct probe.
+                    // Both are intersected with the CURRENT voter set (a
+                    // candidate no longer a voter is simply dropped — that is the
+                    // atomic revalidation that replaces the old unchecked manual
+                    // removal) and the leader/promote are excluded.
+                    let progress_aged: BTreeSet<CoordinatorId> = current_voters
                         .iter()
                         .copied()
-                        .filter(|v| *v != leader && *v != promote)
                         .filter(|v| {
                             staleness
                                 .get(v)
@@ -573,16 +612,27 @@ impl Consensus for OpenraftConsensus {
                                 })
                                 .unwrap_or(false)
                         })
-                        .filter(|v| {
-                            let Some(attestor) = self.attestor.as_ref() else {
-                                return true; // no liveness semantics: evidence stands alone
-                            };
-                            records
-                                .iter()
-                                .find(|m| m.id == *v)
-                                .is_some_and(|m| attestor.is_absent(*v, &m.addr))
-                        })
                         .collect();
+                    // Where a liveness attestor applies it must ALSO attest
+                    // absence; the pure candidate set stands alone otherwise.
+                    let dead_voters: BTreeSet<CoordinatorId> = dead_voter_candidates(
+                        &current_voters,
+                        &progress_aged,
+                        &probe_dead,
+                        leader,
+                        promote,
+                    )
+                    .into_iter()
+                    .filter(|v| {
+                        let Some(attestor) = self.attestor.as_ref() else {
+                            return true; // no liveness semantics: evidence stands alone
+                        };
+                        records
+                            .iter()
+                            .find(|m| m.id == *v)
+                            .is_some_and(|m| attestor.is_absent(*v, &m.addr))
+                    })
+                    .collect();
                     // Voters the leader currently reaches within the lag
                     // threshold, plus the leader and the caught-up promoting
                     // node — the live-majority postcondition vantage.
@@ -817,6 +867,103 @@ mod tests {
     use crate::storage;
     use crate::view::{ViewPublisher, ViewPublisherConfig};
     use crate::Role;
+
+    // ---- Finding #3/#4: probe evidence feeds the checked automatic path ----
+
+    use crate::membership::PromotionRefusal;
+
+    fn ids(v: &[u64]) -> BTreeSet<CoordinatorId> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn dead_candidates_union_intersects_current_voters() {
+        // Progress-aging names {2}, the probe names {3,4}. Voter 4 is NOT a
+        // current voter (a racing removal beat us here), so it drops out — the
+        // atomic revalidation. The union is {2,3}.
+        let out = dead_voter_candidates(
+            &ids(&[1, 2, 3]), // current voters (leader 1)
+            &ids(&[2]),       // progress-aged
+            &ids(&[3, 4]),    // probe_dead (4 is stale/removed)
+            1,                // leader
+            5,                // promoting (a learner, not yet a voter)
+        );
+        assert_eq!(out, ids(&[2, 3]), "union ∩ current, stale probe id dropped");
+    }
+
+    #[test]
+    fn dead_candidates_never_selects_leader_or_promoting() {
+        // Finding 4: even if the probe names the leader (1) — e.g. it could not
+        // hairpin-dial itself — the leader is never a candidate. The promoting
+        // node just caught up, so it is excluded too.
+        let out = dead_voter_candidates(
+            &ids(&[1, 2, 3]),
+            &ids(&[1]),    // progress-aging somehow named the leader
+            &ids(&[1, 3]), // and so did the probe
+            1,             // leader
+            3,             // promoting is already a voter here
+        );
+        assert_eq!(
+            out,
+            ids(&[]),
+            "leader and promoting node are never removal candidates"
+        );
+    }
+
+    #[test]
+    fn probe_evidence_flow_still_enforces_live_majority() {
+        // Finding 3, check (i): probe evidence names a dead voter, and its
+        // removal satisfies cardinality — but the resulting set would lack a
+        // live majority, so the UNCHANGED automatic selection refuses rather
+        // than commit a config that cannot make progress. cluster_size 3,
+        // current {1,2,3}, promote 4 → the probe names 3 dead; removing it
+        // leaves {1,2,4}, but only the promoting node (4) is live from the
+        // leader's vantage (1 and 2 are also unreachable), so the live-majority
+        // postcondition fails.
+        let current = ids(&[1, 2, 3]);
+        let dead = dead_voter_candidates(&current, &ids(&[]), &ids(&[3]), 1, 4);
+        assert_eq!(dead, ids(&[3]), "the probed dead voter is a candidate");
+        let err = decide_promotion_voters(PromotionInputs {
+            cluster_size: 3,
+            current_voters: &current,
+            promoting: 4,
+            superseded_predecessor: None,
+            dead_voters: &dead,
+            // Only the caught-up promoting node is live — removing 3 still
+            // leaves {1,2,4} without a live majority.
+            live_voters: &ids(&[4]),
+        })
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PromotionRefusal::NoRemovablePeer,
+            "evidence never bypasses the live-majority postcondition"
+        );
+    }
+
+    #[test]
+    fn probe_evidence_race_yields_no_unchecked_growth() {
+        // Finding 3, check (ii): the probe named voter 3 dead, but by the time
+        // the promotion commits, 3 is already gone (removed by a racing change),
+        // so the revalidation drops it and no dead voter remains. The automatic
+        // selection then refuses the overflow rather than growing the voter set.
+        let current_after_race = ids(&[1, 2]); // 3 already removed
+        let dead = dead_voter_candidates(&current_after_race, &ids(&[]), &ids(&[3]), 1, 4);
+        assert_eq!(dead, ids(&[]), "the removed voter is not a candidate");
+        // Promoting 4 into {1,2} is underfilled at cluster_size 3 — allowed with
+        // no removal and, crucially, the set never exceeds cluster_size.
+        let out = decide_promotion_voters(PromotionInputs {
+            cluster_size: 3,
+            current_voters: &current_after_race,
+            promoting: 4,
+            superseded_predecessor: None,
+            dead_voters: &dead,
+            live_voters: &ids(&[1, 2, 4]),
+        })
+        .expect("underfilled promotion allowed");
+        assert!(out.len() <= 3, "voter set never grows beyond cluster_size");
+        assert_eq!(out, ids(&[1, 2, 4]));
+    }
 
     // ---- Finding #2: dead-voter evidence is affirmative, not idleness ----
 

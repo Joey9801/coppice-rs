@@ -351,6 +351,62 @@ fn a_torn_read_is_skipped_and_leaves_the_store_untouched() {
 }
 
 #[test]
+fn load_retries_a_straddled_read_until_it_stabilises() {
+    // Finding: the initial load() (unlike a poll) has no previous material to
+    // fall back on, so a writer racing startup must be retried to a stable read
+    // rather than latched. Inject a capture that reports a pre/post mismatch on
+    // the first two attempts, then a clean read — load() must retry and succeed.
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new();
+    let (cert, key) = ca.leaf("node-a");
+    let paths = write_material(dir.path(), &cert, &key, &ca.pem);
+
+    let attempts = std::cell::Cell::new(0usize);
+    let store = TlsStore::load_with(paths.clone(), |p| {
+        let n = attempts.get();
+        attempts.set(n + 1);
+        let mut read = ReadWithFingerprints::capture(p)?;
+        if n < 2 {
+            // Perturb the post fingerprint as if a writer raced this read.
+            read.post.cert.1 = read.post.cert.1.wrapping_add(1);
+            assert!(!read.is_stable());
+        }
+        Ok(read)
+    })
+    .expect("load must retry to a stable read");
+    assert_eq!(attempts.get(), 3, "two torn reads then one clean read");
+    assert_eq!(store.current().cert_pem(), cert.as_slice());
+}
+
+#[test]
+fn load_errors_when_the_read_never_stabilises() {
+    // Every attempt straddles a write: load() exhausts its bounded retries and
+    // fails loudly with `Unstable` rather than serving torn material.
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new();
+    let (cert, key) = ca.leaf("node-a");
+    let paths = write_material(dir.path(), &cert, &key, &ca.pem);
+
+    let attempts = std::cell::Cell::new(0usize);
+    let result = TlsStore::load_with(paths.clone(), |p| {
+        attempts.set(attempts.get() + 1);
+        let mut read = ReadWithFingerprints::capture(p)?;
+        read.post.cert.1 = read.post.cert.1.wrapping_add(1);
+        Ok(read)
+    });
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("a never-stable read must fail load"),
+    };
+    assert!(matches!(err, TlsError::Unstable { .. }), "got {err:?}");
+    assert_eq!(
+        attempts.get(),
+        super::LOAD_STABILITY_ATTEMPTS,
+        "load must exhaust its bounded retries"
+    );
+}
+
+#[test]
 fn not_after_is_parsed_for_the_gauge() {
     let dir = tempfile::tempdir().unwrap();
     let ca = Ca::new();

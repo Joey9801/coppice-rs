@@ -230,6 +230,7 @@ impl Consensus for FakeConsensus {
         &self,
         _promote: CoordinatorId,
         _remove: Option<CoordinatorId>,
+        _probe_dead: std::collections::BTreeSet<CoordinatorId>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }

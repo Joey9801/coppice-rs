@@ -308,7 +308,7 @@ async fn add_voter(leader: &RunningCoordinator, follower: &Node, deadline: Durat
     loop {
         match leader
             .consensus()
-            .promote_voter(follower.raft_id(), None)
+            .promote_voter(follower.raft_id(), None, std::collections::BTreeSet::new())
             .await
         {
             Ok(()) => return,
