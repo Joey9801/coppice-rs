@@ -79,7 +79,7 @@ pub struct GrpcNetworkFactory {
 /// identity, the hot-reload TLS store, the per-RPC timeout, and the per-peer
 /// channel map consulted on every dial.
 struct Shared {
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
     tls: Arc<TlsStore>,
     rpc_timeout: Duration,
     /// Per-peer `(dialed address, TLS generation, channel)`. A membership change
@@ -99,10 +99,10 @@ type PeerChannels = HashMap<CoordinatorId, (String, u64, Channel)>;
 impl GrpcNetworkFactory {
     /// Build the factory from the shared hot-reload TLS store (ADR 0011/0037),
     /// the per-RPC timeout, and the cluster identity stamped into every request.
-    pub fn new(cluster_uuid: [u8; 16], tls: Arc<TlsStore>, rpc_timeout: Duration) -> Self {
+    pub fn new(history_id: [u8; 16], tls: Arc<TlsStore>, rpc_timeout: Duration) -> Self {
         GrpcNetworkFactory {
             shared: Arc::new(Shared {
-                cluster_uuid,
+                history_id,
                 tls,
                 rpc_timeout,
                 channels: Mutex::new(HashMap::new()),
@@ -220,7 +220,7 @@ impl GrpcRaftNetwork {
 ///
 /// `UNAVAILABLE`/`DEADLINE_EXCEEDED`/`CANCELLED` mean the peer is down or
 /// partitioned → [`Unreachable`], which drives openraft's `backoff()`. Every
-/// other status (including a cluster-UUID mismatch's `FAILED_PRECONDITION`) is
+/// other status (including a history-id mismatch's `FAILED_PRECONDITION`) is
 /// a [`NetworkError`]: retry soon but do not treat the peer as healthy. A
 /// `FAILED_PRECONDITION` is logged at error level — it means cross-cluster
 /// contact (ADR 0016).
@@ -291,7 +291,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
     > {
         let channel = self.dial()?;
         let mut client = Client::new(channel);
-        let req = convert::append_entries_to_pb(&rpc, self.shared.cluster_uuid);
+        let req = convert::append_entries_to_pb(&rpc, self.shared.history_id);
         let resp = client
             .append_entries(req)
             .await
@@ -310,7 +310,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
     > {
         let channel = self.dial()?;
         let mut client = Client::new(channel);
-        let req = convert::vote_request_to_pb(&rpc, self.shared.cluster_uuid);
+        let req = convert::vote_request_to_pb(&rpc, self.shared.history_id);
         let resp = client
             .vote(req)
             .await
@@ -342,7 +342,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         // `SnapshotData` binding is the file-backed `SnapshotFile`): one wire
         // chunk in memory at a time, however large the snapshot.
         let header = pb::InstallSnapshotHeader {
-            cluster_uuid: self.shared.cluster_uuid.to_vec(),
+            history_id: self.shared.history_id.to_vec(),
             vote: Some(raftpb::vote_to_pb(&vote)),
             meta: Some(convert::snapshot_ident_to_pb(&snapshot.meta)),
         };

@@ -17,7 +17,7 @@ use coppice_consensus::{CoordinatorId, TypeConfig};
 /// a snapshot on one store and installs it on another, and the engine
 /// refuses cross-cluster snapshots (ADR 0016), so every built store must
 /// belong to the same "cluster".
-const CLUSTER_UUID: [u8; 16] = *b"compliance-suite";
+const HISTORY_ID: [u8; 16] = *b"compliance-suite";
 
 struct SegmentStoreBuilder;
 
@@ -31,7 +31,7 @@ impl StoreBuilder<TypeConfig, SegmentLogStorage, StateMachineStore, tempfile::Te
         StorageError<CoordinatorId>,
     > {
         let dir = tempfile::tempdir().expect("tempdir for compliance suite");
-        let options = StorageOptions::new(CLUSTER_UUID);
+        let options = StorageOptions::new(HISTORY_ID);
         storage::init(&RealFs::new(dir.path()), &options).expect("init data dir");
         let recovered =
             storage::open(RealFs::new(dir.path()), options).expect("open through recovery");

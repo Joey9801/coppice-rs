@@ -106,7 +106,8 @@ A `container.rs` header (`MANIFEST_MAGIC`) followed by one plain record
 frame carrying `coppice.storage.v1.Manifest` (protobuf, evolves under
 ADR 0003 rules). It records:
 
-- **Identity stamps** (ADR 0016): cluster UUID, node ID, instance UUID.
+- **Identity stamps** (ADR 0016): history id (ADR 0037 §3), node ID,
+  instance UUID.
 - **The segment list**: ascending start indices, `log/<start>.seg`.
 - **The purge floor**: the last purged `LogId`, or absent if nothing has
   been purged.
@@ -166,9 +167,9 @@ without decoding the world (ADR 0018).
 
 1. **Lock, then the manifest.** `fs.lock("LOCK")` — a second opener of the
    same directory fails here. Read the manifest, validate its header and
-   record CRC, decode it, and check its identity stamps (cluster UUID, node
+   record CRC, decode it, and check its identity stamps (history id, node
    ID) against `StorageOptions`; a mismatch fails stop naming the mismatch
-   (ADR 0016: wrong volume or cross-cluster mixup).
+   (ADR 0016: wrong volume or a stale pre-re-formation directory).
 
 2. **Orphan sweep.** Delete anything in `log/`, `snap/`, and the directory
    root that the manifest does not claim (segments not in its list, a

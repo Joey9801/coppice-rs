@@ -34,13 +34,13 @@ use super::convert;
 /// server (ADR 0011); see `node.rs`.
 pub struct RaftTransportHandler {
     raft: Raft<TypeConfig>,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
 }
 
 impl RaftTransportHandler {
     /// Bind the handler to the local Raft node and its stamped cluster identity.
-    pub fn new(raft: Raft<TypeConfig>, cluster_uuid: [u8; 16]) -> Self {
-        RaftTransportHandler { raft, cluster_uuid }
+    pub fn new(raft: Raft<TypeConfig>, history_id: [u8; 16]) -> Self {
+        RaftTransportHandler { raft, history_id }
     }
 
     /// Refuse a request stamped for a different cluster (ADR 0016).
@@ -48,14 +48,14 @@ impl RaftTransportHandler {
     /// Names both identities in hex so an operator can see the cross-cluster
     /// mixup at a glance.
     fn check_cluster(&self, incoming: &[u8]) -> Result<(), Status> {
-        if incoming == self.cluster_uuid {
+        if incoming == self.history_id {
             return Ok(());
         }
         Err(Status::failed_precondition(format!(
-            "request is from cluster {}, this node is stamped for cluster {} — \
-             cross-cluster contact refused (ADR 0016)",
+            "request is from history {}, this node is stamped for history {} — \
+             cross-history contact refused (ADR 0016)",
             hex(incoming),
-            hex(&self.cluster_uuid),
+            hex(&self.history_id),
         )))
     }
 }
@@ -77,7 +77,7 @@ impl RaftTransportService for RaftTransportHandler {
         request: Request<pb::AppendEntriesRequest>,
     ) -> Result<Response<pb::AppendEntriesResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.cluster_uuid)?;
+        self.check_cluster(&req.history_id)?;
         let rpc = convert::append_entries_from_pb(req)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let resp = self
@@ -93,7 +93,7 @@ impl RaftTransportService for RaftTransportHandler {
         request: Request<pb::VoteRequest>,
     ) -> Result<Response<pb::VoteResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.cluster_uuid)?;
+        self.check_cluster(&req.history_id)?;
         let rpc = convert::vote_request_from_pb(req)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let resp = self
@@ -123,7 +123,7 @@ impl RaftTransportService for RaftTransportHandler {
                 ))
             }
         };
-        self.check_cluster(&header.cluster_uuid)?;
+        self.check_cluster(&header.history_id)?;
         let vote_pb = header
             .vote
             .ok_or_else(|| Status::invalid_argument("install_snapshot header missing vote"))?;

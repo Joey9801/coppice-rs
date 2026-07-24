@@ -21,7 +21,7 @@ use coppice_state::{Command, StateMachine};
 
 fn bare_meta() -> SnapshotMeta {
     SnapshotMeta {
-        cluster_uuid: vec![7; 16],
+        history_id: vec![7; 16],
         snapshot_id: "secrecy".to_string(),
         last_applied: None,
         membership: None,

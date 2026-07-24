@@ -88,7 +88,7 @@ async fn wait_learners_caught_up(
     admin_cert: &[u8],
     admin_key: &[u8],
     leader_target: &str,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
     expect: &[u64],
     deadline: Duration,
 ) {
@@ -97,7 +97,7 @@ async fn wait_learners_caught_up(
         .expect("dial admin surface");
     let start = Instant::now();
     loop {
-        let status = admin::cluster_status(&mut client, cluster_uuid)
+        let status = admin::cluster_status(&mut client, history_id)
             .await
             .expect("cluster_status RPC");
 
@@ -145,7 +145,7 @@ async fn three_node_cluster_lifecycle() {
     // test acts as an operator presenting a valid client cert.
     let admin_leaf: Leaf = ca.leaf();
     let cluster_id = ClusterId::new();
-    let cluster_uuid = uuid_bytes(cluster_id);
+    let history_id = uuid_bytes(cluster_id);
 
     // Three replicas, ids 1..=3, each its own tempdir/port/cert.
     let mut nodes: Vec<Node> = (1..=3).map(|id| Node::new(id, cluster_id, &ca)).collect();
@@ -179,7 +179,7 @@ async fn three_node_cluster_lifecycle() {
         for i in [1usize, 2] {
             admin::add_learner(
                 &mut client,
-                cluster_uuid,
+                history_id,
                 nodes[i].raft_id(),
                 nodes[i].advertise.clone(),
             )
@@ -193,7 +193,7 @@ async fn three_node_cluster_lifecycle() {
         &admin_leaf.cert_pem,
         &admin_leaf.key_pem,
         &target,
-        cluster_uuid,
+        history_id,
         &[nodes[1].raft_id(), nodes[2].raft_id()],
         DEADLINE,
     )
@@ -206,15 +206,9 @@ async fn three_node_cluster_lifecycle() {
                 .expect("dial leader admin surface");
         // No removal: pure promotions. The helper polls the catch-up gate.
         for i in [1usize, 2] {
-            admin::promote_voter(
-                &mut client,
-                cluster_uuid,
-                nodes[i].raft_id(),
-                None,
-                DEADLINE,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
+            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), None, DEADLINE)
+                .await
+                .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
         }
     }
 
@@ -355,7 +349,7 @@ async fn three_node_cluster_lifecycle() {
         .expect("dial leader admin surface");
         admin::add_learner(
             &mut client,
-            cluster_uuid,
+            history_id,
             node4.raft_id(),
             node4.advertise.clone(),
         )
@@ -368,7 +362,7 @@ async fn three_node_cluster_lifecycle() {
         &admin_leaf.cert_pem,
         &admin_leaf.key_pem,
         &leader_target,
-        cluster_uuid,
+        history_id,
         &[node4.raft_id()],
         DEADLINE,
     )
@@ -386,7 +380,7 @@ async fn three_node_cluster_lifecycle() {
         // Promote node 4 and drop the dead node in one joint change (ADR 0016 step 3).
         admin::promote_voter(
             &mut client,
-            cluster_uuid,
+            history_id,
             node4.raft_id(),
             Some(dead_id),
             DEADLINE,

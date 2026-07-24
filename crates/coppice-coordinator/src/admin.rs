@@ -42,17 +42,17 @@ const PROMOTE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub struct AdminService<C: Consensus> {
     consensus: Arc<C>,
     handle: NodeHandle,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
 }
 
 impl<C: Consensus> AdminService<C> {
     /// Bind the service to the local consensus seam, admin handle, and this
     /// node's stamped cluster identity.
-    pub fn new(consensus: Arc<C>, handle: NodeHandle, cluster_uuid: [u8; 16]) -> Self {
+    pub fn new(consensus: Arc<C>, handle: NodeHandle, history_id: [u8; 16]) -> Self {
         AdminService {
             consensus,
             handle,
-            cluster_uuid,
+            history_id,
         }
     }
 
@@ -61,16 +61,16 @@ impl<C: Consensus> AdminService<C> {
     fn check_cluster(&self, incoming: &[u8]) -> Result<(), Status> {
         if incoming.len() != 16 {
             return Err(Status::invalid_argument(format!(
-                "cluster_uuid must be 16 bytes, got {} (ADR 0016)",
+                "history_id must be 16 bytes, got {} (ADR 0016)",
                 incoming.len()
             )));
         }
-        if incoming != self.cluster_uuid {
+        if incoming != self.history_id {
             return Err(Status::failed_precondition(format!(
                 "request is from cluster {}, this node is stamped for cluster {} — \
                  cross-cluster admin contact refused (ADR 0016)",
                 hex(incoming),
-                hex(&self.cluster_uuid),
+                hex(&self.history_id),
             )));
         }
         Ok(())
@@ -84,7 +84,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         request: Request<pb::AddLearnerRequest>,
     ) -> Result<Response<pb::AddLearnerResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.cluster_uuid)?;
+        self.check_cluster(&req.history_id)?;
         self.consensus
             .add_learner(req.node_id, req.address)
             .await
@@ -97,7 +97,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         request: Request<pb::PromoteVoterRequest>,
     ) -> Result<Response<pb::PromoteVoterResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.cluster_uuid)?;
+        self.check_cluster(&req.history_id)?;
         self.consensus
             .promote_voter(req.promote_node_id, req.remove_node_id)
             .await
@@ -110,7 +110,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         request: Request<pb::RemoveNodeRequest>,
     ) -> Result<Response<pb::RemoveNodeResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.cluster_uuid)?;
+        self.check_cluster(&req.history_id)?;
         self.consensus
             .remove_node(req.node_id)
             .await
@@ -123,7 +123,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         request: Request<pb::ClusterStatusRequest>,
     ) -> Result<Response<pb::ClusterStatusResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.cluster_uuid)?;
+        self.check_cluster(&req.history_id)?;
         Ok(Response::new(cluster_summary_to_pb(
             self.handle.cluster_summary(),
         )))
@@ -254,13 +254,13 @@ pub async fn admin_channel(
 /// Add a learner (ADR 0016 step 2).
 pub async fn add_learner(
     client: &mut Client<Channel>,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
     node_id: CoordinatorId,
     addr: String,
 ) -> Result<()> {
     client
         .add_learner(pb::AddLearnerRequest {
-            cluster_uuid: cluster_uuid.to_vec(),
+            history_id: history_id.to_vec(),
             node_id,
             address: addr,
         })
@@ -272,12 +272,12 @@ pub async fn add_learner(
 /// Remove a node from membership (ADR 0016).
 pub async fn remove_node(
     client: &mut Client<Channel>,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
     node_id: CoordinatorId,
 ) -> Result<()> {
     client
         .remove_node(pb::RemoveNodeRequest {
-            cluster_uuid: cluster_uuid.to_vec(),
+            history_id: history_id.to_vec(),
             node_id,
         })
         .await
@@ -288,11 +288,11 @@ pub async fn remove_node(
 /// Fetch a coordinator's cluster-status view (ADR 0016).
 pub async fn cluster_status(
     client: &mut Client<Channel>,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
 ) -> Result<pb::ClusterStatusResponse> {
     let resp = client
         .cluster_status(pb::ClusterStatusRequest {
-            cluster_uuid: cluster_uuid.to_vec(),
+            history_id: history_id.to_vec(),
         })
         .await
         .map_err(status_to_anyhow)?;
@@ -308,7 +308,7 @@ pub async fn cluster_status(
 /// operable end to end. Any other failure returns immediately.
 pub async fn promote_voter(
     client: &mut Client<Channel>,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
     promote: CoordinatorId,
     remove: Option<CoordinatorId>,
     wait: Duration,
@@ -317,7 +317,7 @@ pub async fn promote_voter(
     loop {
         let result = client
             .promote_voter(pb::PromoteVoterRequest {
-                cluster_uuid: cluster_uuid.to_vec(),
+                history_id: history_id.to_vec(),
                 promote_node_id: promote,
                 remove_node_id: remove,
             })
@@ -391,7 +391,7 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
         }
     };
 
-    let cluster_uuid = *cfg.cluster_id.0.as_bytes();
+    let history_id = *cfg.cluster_id.0.as_bytes();
     let ca = read_pem(&cfg.tls.ca_path)?;
     let cert = read_pem(&cfg.tls.cert_path)?;
     let key = read_pem(&cfg.tls.key_path)?;
@@ -400,7 +400,7 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
 
     match args.verb {
         AdminVerb::AddLearner { node_id, addr } => {
-            add_learner(&mut client, cluster_uuid, node_id, addr.clone()).await?;
+            add_learner(&mut client, history_id, node_id, addr.clone()).await?;
             println!("added node {node_id} as a learner ({addr})");
         }
         AdminVerb::Promote {
@@ -408,18 +408,18 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
             remove,
             wait,
         } => {
-            promote_voter(&mut client, cluster_uuid, node_id, remove, wait).await?;
+            promote_voter(&mut client, history_id, node_id, remove, wait).await?;
             match remove {
                 Some(r) => println!("promoted node {node_id} to voter, removed node {r}"),
                 None => println!("promoted node {node_id} to voter"),
             }
         }
         AdminVerb::Remove { node_id } => {
-            remove_node(&mut client, cluster_uuid, node_id).await?;
+            remove_node(&mut client, history_id, node_id).await?;
             println!("removed node {node_id} from membership");
         }
         AdminVerb::Status => {
-            let status = cluster_status(&mut client, cluster_uuid).await?;
+            let status = cluster_status(&mut client, history_id).await?;
             print!("{}", render_status(&status));
         }
     }

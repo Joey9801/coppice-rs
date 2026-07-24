@@ -22,8 +22,10 @@ message Manifest {
   // instance.
   //
   // Generated once at `coppice-cli cluster init`; identical on every
-  // replica. 16 raw UUID bytes.
-  bytes cluster_uuid = 1;
+  // replica. 16 raw UUID bytes. Names one raft *history* (ADR 0037 §3);
+  // renamed from `cluster_uuid` with the wire tag unchanged, so
+  // directories stamped under the old name decode identically.
+  bytes history_id = 1;
   // This instance's Raft identity (allocate-once integer, ADR 0016).
   uint64 node_id = 2;
   // Generated at directory initialization; distinguishes "same node id,

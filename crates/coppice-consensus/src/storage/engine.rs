@@ -58,8 +58,10 @@ use super::snapshot;
 /// (ADR 0025).
 #[derive(Debug, Clone)]
 pub struct StorageOptions {
-    /// The cluster this replica belongs to; stamped at `cluster init`.
-    pub cluster_uuid: [u8; 16],
+    /// The raft history this replica belongs to (ADR 0037 §3); stamped at
+    /// `cluster init`. A wiped-and-re-formed cluster keeps its `cluster_id`
+    /// but mints a fresh history id, so old-history volumes fail-stop.
+    pub history_id: [u8; 16],
     /// Size threshold past which the active segment is sealed and the next
     /// append opens a fresh one.
     pub segment_max: ByteSize,
@@ -68,9 +70,9 @@ pub struct StorageOptions {
 }
 
 impl StorageOptions {
-    pub fn new(cluster_uuid: [u8; 16]) -> StorageOptions {
+    pub fn new(history_id: [u8; 16]) -> StorageOptions {
         StorageOptions {
-            cluster_uuid,
+            history_id,
             segment_max: ByteSize::from_mib(64),
             snapshot_shards: 4,
         }
@@ -90,7 +92,7 @@ pub struct EncodedEntry {
 /// What the manifest claims (the domain view of `coppice.storage.v1.Manifest`).
 #[derive(Debug, Clone)]
 struct ManifestState {
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
     node_id: u64,
     instance_uuid: [u8; 16],
     /// Ascending start indices; `log/<start>.seg`.
@@ -205,7 +207,7 @@ fn check_snapshot_id(id: &str) -> io::Result<()> {
 impl ManifestState {
     fn to_pb(&self) -> pbstorage::Manifest {
         pbstorage::Manifest {
-            cluster_uuid: self.cluster_uuid.to_vec(),
+            history_id: self.history_id.to_vec(),
             node_id: self.node_id,
             instance_uuid: self.instance_uuid.to_vec(),
             segments: self
@@ -237,7 +239,7 @@ impl ManifestState {
             ));
         }
         Ok(ManifestState {
-            cluster_uuid: uuid(&manifest.cluster_uuid, "cluster_uuid")?,
+            history_id: uuid(&manifest.history_id, "history_id")?,
             node_id: manifest.node_id,
             instance_uuid: uuid(&manifest.instance_uuid, "instance_uuid")?,
             segments,
@@ -282,7 +284,7 @@ impl<F: Fs> StorageCore<F> {
         fs.create_dir_all(Path::new("snap"))?;
         fs.sync_dir(Path::new(""))?;
         let manifest = ManifestState {
-            cluster_uuid: options.cluster_uuid,
+            history_id: options.history_id,
             node_id,
             instance_uuid,
             segments: Vec::new(),
@@ -322,14 +324,14 @@ impl<F: Fs> StorageCore<F> {
         let manifest = pbstorage::Manifest::decode(payload)
             .map_err(|e| fail_stop_file(manifest_path, format!("manifest does not decode: {e}")))?;
         let manifest = ManifestState::from_pb(manifest_path, manifest)?;
-        if manifest.cluster_uuid != options.cluster_uuid {
+        if manifest.history_id != options.history_id {
             return Err(fail_stop_file(
                 manifest_path,
                 format!(
-                    "identity stamp mismatch: directory is stamped for cluster {:02x?}, this \
-                     process is configured for cluster {:02x?} (wrong volume or cross-cluster \
-                     mixup, ADR 0016)",
-                    manifest.cluster_uuid, options.cluster_uuid
+                    "identity stamp mismatch: directory is stamped for history {:02x?}, this \
+                     process is configured for history {:02x?} (wrong volume, or a stale \
+                     data directory from a previous formation — ADR 0016, ADR 0037 §3)",
+                    manifest.history_id, options.history_id
                 ),
             ));
         }
@@ -1089,10 +1091,10 @@ impl<F: Fs> StorageCore<F> {
         label: &Path,
         meta: &pbstorage::SnapshotMeta,
     ) -> io::Result<(String, PathBuf, PathBuf)> {
-        if meta.cluster_uuid != self.options.cluster_uuid {
+        if meta.history_id != self.options.history_id {
             return Err(fail_stop_file(
                 label,
-                "snapshot carries another cluster's uuid; refusing to adopt it (ADR 0016)",
+                "snapshot carries another history's id; refusing to adopt it (ADR 0016)",
             ));
         }
         let id = meta.snapshot_id.clone();

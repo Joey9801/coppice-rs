@@ -39,7 +39,7 @@ use coppice_testkit::synth::{check_consistency, synth_state, SynthConfig};
 /// the container header carries and validates on decode.
 fn bare_meta(snapshot_id: &str, shards: u32) -> SnapshotMeta {
     SnapshotMeta {
-        cluster_uuid: vec![7; 16],
+        history_id: vec![7; 16],
         snapshot_id: snapshot_id.to_string(),
         last_applied: None,
         membership: None,

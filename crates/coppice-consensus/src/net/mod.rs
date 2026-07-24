@@ -14,7 +14,7 @@
 //!   converters the durable log uses ([`convert`] reuses them), so openraft's
 //!   serde forms never travel and the wire/disk encodings cannot drift.
 //! - **Cluster identity on every request (ADR 0016).** The client stamps the
-//!   16-byte cluster UUID; the server refuses a mismatch before touching Raft
+//!   16-byte history id; the server refuses a mismatch before touching Raft
 //!   state. The mTLS channel underneath is mutually authenticated (ADR 0011).
 //!
 //! Only the two endpoints and the wire chunk size are exported; the

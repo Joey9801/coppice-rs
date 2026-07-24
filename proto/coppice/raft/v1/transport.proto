@@ -17,7 +17,7 @@ import "coppice/raft/v1/raft.proto";
 // openraft AppendEntriesRequest: the leader replicating log to a follower,
 // and the heartbeat that carries no entries.
 message AppendEntriesRequest {
-  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   Vote vote = 2;
   LogId prev_log_id = 3; // absent = replicating from the log start.
   LogId leader_commit = 4; // absent = the leader knows no committed entry.
@@ -49,7 +49,7 @@ message AppendConflict {}
 
 // openraft VoteRequest: a candidate soliciting a vote.
 message VoteRequest {
-  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   Vote vote = 2;
   LogId last_log_id = 3; // absent = the candidate has an empty log.
 }
@@ -75,7 +75,7 @@ message InstallSnapshotRequest {
 // The opening frame of an InstallSnapshot stream (openraft's full-snapshot
 // protocol): the sending leader's identity and the snapshot's metadata.
 message InstallSnapshotHeader {
-  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   Vote vote = 2; // the sending leader's vote.
   SnapshotIdent meta = 3;
 }

@@ -64,9 +64,9 @@ Four identities exist around any coordinator:
   carries a new history id, so volumes from the old history fail-stop
   instead of merging into the new one. A mismatch fail-stops: wrong
   volume, cross-cluster mixup, or a pre-re-formation volume. (Earlier
-  ADRs and the storage manifest call this the cluster UUID; ADR 0037
-  renames the design surface to keep it visibly distinct from
-  `cluster_id`.)
+  ADRs call this the cluster UUID; ADR 0037 renames the design surface —
+  code, proto field names, and the manifest — to keep it visibly
+  distinct from `cluster_id`.)
 - **Node ID** — minted automatically when the data directory is first
   initialized, stamped into the manifest, read back on every restart
   (ADR 0025). It never appears in config, in logs-you-must-scrape, or in
