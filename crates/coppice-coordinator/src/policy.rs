@@ -142,9 +142,16 @@ impl FormationPolicy {
     /// (the current applied state), stamped `now` (ADR 0037 §3).
     ///
     /// Returns an empty vec when everything the policy describes is already
-    /// present — a same-token re-init therefore proposes nothing and has no
-    /// duplicate effect.
-    pub fn commands(&self, state: &StateMachine, now: Timestamp) -> Vec<Command> {
+    /// present — a re-run therefore proposes nothing and has no duplicate
+    /// effect.
+    ///
+    /// Quota entities are emitted **parent before child** regardless of their
+    /// document order: the state machine rejects a child whose parent does not
+    /// exist yet, so a valid hierarchy listed child-first must not fail midway
+    /// through seeding. A parent that is neither in the document nor already in
+    /// `state`, or a parent cycle within the document, is an error here — at
+    /// the seeding edge — rather than a mid-apply rejection.
+    pub fn commands(&self, state: &StateMachine, now: Timestamp) -> Result<Vec<Command>> {
         let mut commands = Vec::new();
 
         // Priority table: seed only while the replicated table is still empty.
@@ -159,10 +166,10 @@ impl FormationPolicy {
             }));
         }
 
-        // Quota entities: create only those not already present. An existing
-        // entity is left untouched — reconfiguration is not an amnesty, and a
-        // re-init must not reset accumulated usage.
-        for qe in &self.quota_entities {
+        // Quota entities: create only those not already present, parent before
+        // child. An existing entity is left untouched — reconfiguration is not
+        // an amnesty, and a re-run must not reset accumulated usage.
+        for qe in self.ordered_entities(state)? {
             if !state.quota_entities.contains_key(&qe.id) {
                 commands.push(Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
                     entity: qe.id,
@@ -174,7 +181,67 @@ impl FormationPolicy {
             }
         }
 
-        commands
+        Ok(commands)
+    }
+
+    /// The document's quota entities in parent-before-child order.
+    ///
+    /// Kahn-style: an entity is ready once its parent is `None`, already in
+    /// `state`, or already emitted. A pass that emits nothing means every
+    /// remaining entity waits on a parent that can never appear — either a
+    /// reference to an entity that exists nowhere, or a cycle within the
+    /// document — and both are reported naming the entities involved.
+    fn ordered_entities(&self, state: &StateMachine) -> Result<Vec<&QuotaEntitySpec>> {
+        let in_doc: std::collections::BTreeSet<_> =
+            self.quota_entities.iter().map(|qe| qe.id).collect();
+        let mut emitted = std::collections::BTreeSet::new();
+        let mut remaining: Vec<&QuotaEntitySpec> = self.quota_entities.iter().collect();
+        let mut ordered = Vec::with_capacity(remaining.len());
+
+        while !remaining.is_empty() {
+            let emitted_before = ordered.len();
+            let mut stuck = Vec::with_capacity(remaining.len());
+            for qe in remaining {
+                let ready = match qe.parent {
+                    None => true,
+                    Some(parent) => {
+                        emitted.contains(&parent) || state.quota_entities.contains_key(&parent)
+                    }
+                };
+                if ready {
+                    emitted.insert(qe.id);
+                    ordered.push(qe);
+                } else {
+                    stuck.push(qe);
+                }
+            }
+
+            // A pass that emitted nothing can never make progress: every stuck
+            // entity waits on a parent that will never appear. A parent outside
+            // the document (and absent from state) is a dangling reference;
+            // otherwise the stuck set forms a cycle within the document.
+            if ordered.len() == emitted_before {
+                for qe in &stuck {
+                    let parent = qe.parent.expect("unparented entities are never stuck");
+                    if !in_doc.contains(&parent) {
+                        bail!(
+                            "quota entity {} references parent {} which is neither in this \
+                             policy document nor already in cluster state",
+                            qe.id,
+                            parent
+                        );
+                    }
+                }
+                let ids: Vec<String> = stuck.iter().map(|qe| qe.id.to_string()).collect();
+                bail!(
+                    "quota entity parent cycle in policy document involving: {}",
+                    ids.join(", ")
+                );
+            }
+            remaining = stuck;
+        }
+
+        Ok(ordered)
     }
 }
 
@@ -288,14 +355,19 @@ quota = 1000000000000
     fn empty_document_parses_to_no_commands() {
         let policy = FormationPolicy::parse_toml(b"").expect("empty parses");
         let state = StateMachine::default();
-        assert!(policy.commands(&state, Timestamp::now()).is_empty());
+        assert!(policy
+            .commands(&state, Timestamp::now())
+            .expect("valid policy")
+            .is_empty());
     }
 
     #[test]
     fn commands_seed_table_and_entities_on_a_fresh_state() {
         let policy = FormationPolicy::parse_toml(SAMPLE.as_bytes()).unwrap();
         let state = StateMachine::default();
-        let commands = policy.commands(&state, Timestamp::now());
+        let commands = policy
+            .commands(&state, Timestamp::now())
+            .expect("valid policy");
         // One UpdatePolicy (table) + one ConfigureQuotaEntity.
         assert_eq!(commands.len(), 2);
         assert!(matches!(commands[0], Command::UpdatePolicy(_)));
@@ -322,7 +394,10 @@ quota = 1000000000000
                 updated_at: now,
             },
         );
-        assert!(policy.commands(&state, now).is_empty());
+        assert!(policy
+            .commands(&state, now)
+            .expect("valid policy")
+            .is_empty());
     }
 
     #[test]
@@ -338,6 +413,125 @@ quota = 1000000000000
             .policy
             .priority_multipliers
             .insert(0, PriorityMultiplier(9 << 32));
-        assert!(policy.commands(&state, Timestamp::now()).is_empty());
+        assert!(policy
+            .commands(&state, Timestamp::now())
+            .expect("valid policy")
+            .is_empty());
+    }
+
+    // ---- entity ordering (parent before child) ---------------------------
+
+    const PARENT: &str = "quota-00000000-0000-0000-0000-00000000000a";
+    const CHILD: &str = "quota-00000000-0000-0000-0000-00000000000b";
+    const GRANDCHILD: &str = "quota-00000000-0000-0000-0000-00000000000c";
+
+    fn entity_toml(id: &str, parent: Option<&str>) -> String {
+        let parent_line = parent
+            .map(|p| format!("parent = \"{p}\"\n"))
+            .unwrap_or_default();
+        format!("[[quota_entity]]\nid = \"{id}\"\nname = \"x\"\nquota = 1\n{parent_line}\n")
+    }
+
+    /// The quota-entity id each `ConfigureQuotaEntity` command creates, in
+    /// emission order.
+    fn configured_ids(commands: &[Command]) -> Vec<QuotaEntityId> {
+        commands
+            .iter()
+            .map(|c| match c {
+                Command::ConfigureQuotaEntity(cfg) => cfg.entity,
+                other => panic!("expected ConfigureQuotaEntity, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn entities_listed_child_first_are_emitted_parent_first() {
+        // Grandchild, child, parent — reverse hierarchy order in the document.
+        let toml = format!(
+            "{}{}{}",
+            entity_toml(GRANDCHILD, Some(CHILD)),
+            entity_toml(CHILD, Some(PARENT)),
+            entity_toml(PARENT, None),
+        );
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+        let state = StateMachine::default();
+        let commands = policy
+            .commands(&state, Timestamp::now())
+            .expect("valid hierarchy");
+        assert_eq!(
+            configured_ids(&commands),
+            vec![
+                PARENT.parse().unwrap(),
+                CHILD.parse().unwrap(),
+                GRANDCHILD.parse().unwrap(),
+            ],
+            "commands must run parent before child regardless of document order"
+        );
+    }
+
+    #[test]
+    fn child_of_a_parent_already_in_state_needs_no_document_parent() {
+        // The parent exists only in replicated state (e.g. operator-created or
+        // a prior seeding run); the document lists just the child.
+        let toml = entity_toml(CHILD, Some(PARENT));
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+        let now = Timestamp::now();
+        let mut state = StateMachine::default();
+        state.quota_entities.insert(
+            PARENT.parse().unwrap(),
+            coppice_state::QuotaEntity {
+                parent: None,
+                name: "parent".to_string(),
+                quota: CostUnits(1),
+                usage: coppice_core::quota::UsageState::new(now),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        let commands = policy.commands(&state, now).expect("parent found in state");
+        assert_eq!(configured_ids(&commands), vec![CHILD.parse().unwrap()]);
+    }
+
+    #[test]
+    fn missing_parent_is_rejected_before_any_command_is_emitted() {
+        let toml = entity_toml(CHILD, Some(PARENT)); // PARENT nowhere
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+        let state = StateMachine::default();
+        let err = policy
+            .commands(&state, Timestamp::now())
+            .expect_err("dangling parent must be rejected");
+        let message = format!("{err:#}");
+        assert!(message.contains(CHILD), "{message}");
+        assert!(message.contains(PARENT), "{message}");
+        assert!(
+            message.contains("neither in this policy document nor already in cluster state"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn parent_cycle_is_rejected() {
+        let toml = format!(
+            "{}{}",
+            entity_toml(PARENT, Some(CHILD)),
+            entity_toml(CHILD, Some(PARENT)),
+        );
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+        let state = StateMachine::default();
+        let err = policy
+            .commands(&state, Timestamp::now())
+            .expect_err("parent cycle must be rejected");
+        assert!(format!("{err:#}").contains("cycle"), "{err:#}");
+    }
+
+    #[test]
+    fn self_parent_is_rejected_as_a_cycle() {
+        let toml = entity_toml(PARENT, Some(PARENT));
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+        let state = StateMachine::default();
+        let err = policy
+            .commands(&state, Timestamp::now())
+            .expect_err("self-parent must be rejected");
+        assert!(format!("{err:#}").contains("cycle"), "{err:#}");
     }
 }
