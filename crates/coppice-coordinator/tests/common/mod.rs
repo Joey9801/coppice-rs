@@ -183,6 +183,12 @@ impl Node {
             r#"cluster_id = "{cluster_id}"
 data_dir = "{data_dir}"
 
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = []
+
 [listen]
 raft_addr = "127.0.0.1:{port}"
 advertise_host = "localhost"
@@ -434,6 +440,12 @@ impl RunningCoordinator {
             r#"cluster_id = "{cluster_id}"
 data_dir = "{data_dir}"
 
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = []
+
 [listen]
 raft_addr = "127.0.0.1:{raft_port}"
 advertise_host = "localhost"
@@ -497,8 +509,7 @@ log_level = "warn"
         let agent_addr = format!("127.0.0.1:{agent_port}")
             .parse()
             .expect("agent socket addr");
-        let listener =
-            AgentListener::bind(agent_addr, tls_store).expect("bind agent listener");
+        let listener = AgentListener::bind(agent_addr, tls_store).expect("bind agent listener");
         // Client API listener on an ephemeral port so parallel tests never
         // collide on the default.
         let client_listener = ClientListener::bind("127.0.0.1:0".parse().expect("client addr"))

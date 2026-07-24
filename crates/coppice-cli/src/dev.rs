@@ -264,6 +264,15 @@ pub async fn run(args: DevArgs) -> Result<()> {
 cluster_id = "{cluster_id}"
 data_dir = "{data_dir}"
 
+# Single-node dev cluster: nothing to discover, but the section (and its
+# matching backend table) is required — an explicit empty seed list is the
+# `peers = []` successor (ADR 0037).
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = []
+
 [listen]
 raft_addr = "127.0.0.1:{raft_port}"
 advertise_host = "localhost"

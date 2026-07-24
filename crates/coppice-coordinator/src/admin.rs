@@ -376,13 +376,18 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
         None => {
             let discovery = crate::discovery::build(&cfg.discovery)
                 .context("building the discovery backend for the default --target")?;
-            discovery.candidates().await.first().cloned().ok_or_else(|| {
-                anyhow!(
-                    "no --target given and the config's \"{}\" discovery backend \
+            discovery
+                .candidates()
+                .await
+                .first()
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no --target given and the config's \"{}\" discovery backend \
                      found no candidates; pass --target <host:port>",
-                    cfg.discovery.backend.as_str()
-                )
-            })?
+                        cfg.discovery.backend.as_str()
+                    )
+                })?
         }
     };
 

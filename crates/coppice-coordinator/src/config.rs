@@ -152,25 +152,13 @@ mod discovery {
         pub(crate) timeout: Duration,
     }
 
-    impl Default for DiscoveryConfig {
-        fn default() -> Self {
-            // The whole section absent → an empty static backend. Admin tooling
-            // then simply requires an explicit `--target`.
-            DiscoveryConfig {
-                backend: BackendKind::Static,
-                cluster_size: default_cluster_size(),
-                static_backend: None,
-                dns: None,
-                file: None,
-                ec2_asg: None,
-            }
-        }
-    }
-
     impl DiscoveryConfig {
-        /// Reject a section whose backend tables do not match `backend`: the
-        /// required table must be present (except `static`, which defaults to
-        /// an empty list), and no foreign backend table may appear.
+        /// Reject a section whose backend tables do not match `backend`:
+        /// exactly the one table matching `backend` must be present — no
+        /// foreign backend table, and no absent table (`static` included: an
+        /// operator with no seeds writes an explicit empty `addrs`, so the
+        /// migration off the old top-level `peers` is always visible in the
+        /// file, ADR 0037 §2).
         pub(crate) fn validate(&self) -> anyhow::Result<()> {
             // No foreign tables.
             let foreign = [
@@ -193,8 +181,14 @@ mod discovery {
                 );
             }
 
-            // Required table present (static tolerates absence → empty list).
+            // Required table present, for every backend including static.
             match self.backend {
+                BackendKind::Static if self.static_backend.is_none() => {
+                    anyhow::bail!(
+                        "[discovery] backend = \"static\" requires a [discovery.static] table \
+                         with `addrs` (an explicit empty list is valid, ADR 0037 §2)"
+                    );
+                }
                 BackendKind::Static => {}
                 BackendKind::Dns if self.dns.is_none() => {
                     anyhow::bail!(
@@ -270,9 +264,11 @@ pub(crate) struct Config {
 
     /// Coordinator discovery (ADR 0037 §2): which backend seeds candidate
     /// raft addresses. Subsumes the old top-level `peers` list (now
-    /// `[discovery.static] addrs`). Seed-only, never authoritative: the
-    /// addresses that matter for consensus live in replicated membership.
-    #[serde(default)]
+    /// `[discovery.static] addrs`). Required, with exactly one backend table
+    /// matching `backend` — an old config still carrying `peers` fail-stops
+    /// naming the key rather than silently discovering nothing. Seed-only,
+    /// never authoritative: the addresses that matter for consensus live in
+    /// replicated membership.
     pub(crate) discovery: DiscoveryConfig,
 
     /// Listen and advertise addresses.
@@ -320,7 +316,8 @@ pub(crate) struct ListenConfig {
 
     /// The hostname peers and agents dial. Optional (ADR 0037 §2): when unset
     /// it is resolved via the fallback chain in [`resolve_advertise_host`]
-    /// (explicit value ▸ system hostname ▸ default-route local address), so a
+    /// (explicit value ▸ resolvable system FQDN ▸ default-route local
+    /// address), so a
     /// production fleet can ship one byte-identical config artifact. [`load`]
     /// resolves it once and stores the result back here; every reader after
     /// load sees the concrete value.
@@ -347,49 +344,78 @@ impl ListenConfig {
     /// Used when `raft_addr` requests port 0 (the multi-process dev case):
     /// bootstrap binds the listener first, learns the real port, and advertises
     /// *that* — so a `:0` config never publishes `host:0` to discovery or
-    /// membership.
+    /// membership. An IPv6 `advertise_host` is bracketed into the valid
+    /// `[v6]:port` authority form (the form `coppice_tls::split_host_port` and
+    /// every dial seam expect).
     pub(crate) fn advertised_raft_addr_on_port(&self, port: u16) -> String {
         let host = self
             .advertise_host
             .as_deref()
             .expect("advertise_host resolved by config::load before use");
-        format!("{host}:{port}")
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
     }
 }
 
 /// Resolve the address peers dial, per ADR 0037 §2's fallback chain:
-/// explicit config value ▸ the OS-reported system hostname ▸ the local
-/// address of the default route.
-///
-/// The default-route step opens a UDP socket and `connect`s it to a public
-/// address to learn which local interface the kernel would route through; no
-/// packets are sent (UDP `connect` only records the peer). It is the reliable
-/// last resort — the hostname step depends on host DNS/`/etc/hosts` setup.
+/// explicit config value ▸ the system FQDN ▸ the local address of the
+/// default route — through the production seams. See
+/// [`resolve_advertise_host_with`] for the rules.
 fn resolve_advertise_host(explicit: Option<&str>) -> Result<String> {
+    resolve_advertise_host_with(
+        explicit,
+        system_hostname,
+        host_resolves,
+        default_route_local_addr,
+    )
+}
+
+/// [`resolve_advertise_host`] with injectable hostname/resolution/route seams
+/// (the fallback chain is behavior worth unit-testing; the seams are I/O).
+///
+/// The hostname step accepts only a **dialable FQDN**: the OS-reported name
+/// must be FQDN-shaped (contain a dot — `gethostname` on a plainly-configured
+/// host returns a bare short name, which peers on other hosts generally cannot
+/// resolve) AND actually resolve on this host. Anything else falls through to
+/// the default-route address, so a non-resolvable name is never published into
+/// discovery or Raft membership. This is what keeps the byte-identical-config
+/// story honest: a fleet whose hosts carry proper FQDNs advertises them; any
+/// other fleet advertises a routable IP instead of a broken name.
+fn resolve_advertise_host_with(
+    explicit: Option<&str>,
+    hostname: impl FnOnce() -> Option<String>,
+    resolves: impl FnOnce(&str) -> bool,
+    default_route: impl FnOnce() -> Option<String>,
+) -> Result<String> {
     if let Some(host) = explicit {
         return Ok(host.to_string());
     }
-    if let Some(host) = system_hostname() {
-        tracing::info!(advertise_host = %host, source = "system-hostname", "resolved advertise_host");
-        return Ok(host);
+    if let Some(name) = hostname() {
+        if name.contains('.') && resolves(&name) {
+            tracing::info!(advertise_host = %name, source = "system-fqdn", "resolved advertise_host");
+            return Ok(name);
+        }
+        tracing::info!(
+            hostname = %name,
+            "system hostname is not a resolvable FQDN; falling back to the default route"
+        );
     }
-    if let Some(addr) = default_route_local_addr() {
+    if let Some(addr) = default_route() {
         tracing::info!(advertise_host = %addr, source = "default-route", "resolved advertise_host");
         return Ok(addr);
     }
     bail!(
-        "advertise_host is unset and could not be resolved: the system hostname was \
-         unavailable and no default route was found. Set `listen.advertise_host` \
+        "advertise_host is unset and could not be resolved: the system hostname is not a \
+         resolvable FQDN and no default route was found. Set `listen.advertise_host` \
          explicitly to the address peers and agents should dial (ADR 0037 §2)."
     );
 }
 
 /// The OS-reported hostname, or `None` if it is empty or not valid UTF-8.
-///
-/// This is the "system FQDN" step of the fallback chain: on a correctly
-/// configured host `gethostname` returns the FQDN, but a bare short name is
-/// still returned as-is (and is often resolvable on the local network); full
-/// FQDN canonicalization is deliberately left to host DNS configuration.
+/// Acceptance (FQDN shape + resolvability) is judged by the caller.
 fn system_hostname() -> Option<String> {
     let name = gethostname::gethostname().into_string().ok()?;
     if name.is_empty() {
@@ -399,14 +425,41 @@ fn system_hostname() -> Option<String> {
     }
 }
 
+/// Whether `host` resolves to at least one address on this host (getaddrinfo
+/// via `ToSocketAddrs`). Blocking, but `load` runs once at startup before any
+/// runtime exists.
+fn host_resolves(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    (host, 0u16)
+        .to_socket_addrs()
+        .map(|mut addrs| addrs.next().is_some())
+        .unwrap_or(false)
+}
+
 /// The local address of the default route: bind an unconnected UDP socket and
 /// `connect` it toward a public address so the kernel selects the egress
-/// interface, then read back the socket's local address. No traffic is sent.
+/// interface, then read back the socket's local address. No traffic is sent
+/// (UDP `connect` only records the peer). IPv4 is probed first; an
+/// IPv6-only host falls back to the IPv6 probe (the composed authority is
+/// bracketed by [`ListenConfig::advertised_raft_addr_on_port`]).
 fn default_route_local_addr() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let local = socket.local_addr().ok()?;
-    Some(local.ip().to_string())
+    for (bind, probe) in [
+        ("0.0.0.0:0", "8.8.8.8:80"),
+        ("[::]:0", "[2001:4860:4860::8888]:80"),
+    ] {
+        let Ok(socket) = std::net::UdpSocket::bind(bind) else {
+            continue;
+        };
+        if socket.connect(probe).is_err() {
+            continue;
+        }
+        if let Ok(local) = socket.local_addr() {
+            if !local.ip().is_unspecified() {
+                return Some(local.ip().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Raft liveness tuning.
@@ -688,6 +741,21 @@ log_format = "json"
 otlp_endpoint = "https://otel-collector.example.com:4317"
 "#;
 
+    /// Everything but `[discovery]`, which the backend-specific tests append
+    /// themselves (a document may carry only one `[discovery]` table).
+    const BASE_WITHOUT_DISCOVERY: &str = r#"
+cluster_id = "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
+data_dir = "/var/lib/coppice"
+
+[listen]
+advertise_host = "coord-1.example.com"
+
+[tls]
+cert_path = "/etc/coppice/pki/node.crt"
+key_path  = "/etc/coppice/pki/node.key"
+ca_path   = "/etc/coppice/pki/ca.crt"
+"#;
+
     const MINIMAL_EXAMPLE: &str = r#"
 cluster_id = "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice"
@@ -699,6 +767,12 @@ advertise_host = "coord-1.example.com"
 cert_path = "/etc/coppice/pki/node.crt"
 key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"
+
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = []
 "#;
 
     #[test]
@@ -769,10 +843,11 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         let (_guard, path) = write_config(MINIMAL_EXAMPLE);
         let config = read_config(&path).expect("minimal example should parse");
 
-        // Absent [discovery] section → empty static backend.
+        // Explicit empty static backend; cluster_size defaults.
         assert_eq!(config.discovery.backend, BackendKind::Static);
         assert!(config.discovery.static_addrs().is_empty());
         assert_eq!(config.discovery.cluster_size, 3);
+        config.discovery.validate().expect("empty static is valid");
 
         assert_eq!(config.listen.client_addr, default_client_addr());
         assert_eq!(config.listen.raft_addr, default_raft_addr());
@@ -790,6 +865,36 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         assert_eq!(config.observability.log_level, "info");
         assert_eq!(config.observability.log_format, "text");
         assert!(config.observability.otlp_endpoint.is_none());
+    }
+
+    #[test]
+    fn missing_discovery_section_is_rejected() {
+        // The section is required — an un-migrated config (or one still
+        // carrying the old top-level `peers`) must fail-stop, not silently
+        // discover nothing.
+        let (_guard, path) = write_config(BASE_WITHOUT_DISCOVERY);
+        let err = read_config(&path).expect_err("missing [discovery] must be rejected");
+        assert!(format!("{err:#}").contains("discovery"), "{err:#}");
+    }
+
+    #[test]
+    fn old_top_level_peers_key_is_rejected_by_name() {
+        let bad = format!("{MINIMAL_EXAMPLE}\npeers = []\n");
+        let (_guard, path) = write_config(&bad);
+        let err = read_config(&path).expect_err("removed `peers` key must be rejected");
+        assert!(format!("{err:#}").contains("peers"), "{err:#}");
+    }
+
+    #[test]
+    fn static_backend_without_table_is_rejected() {
+        let contents = format!("{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"static\"\n");
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("parses; validation is separate");
+        let err = config
+            .discovery
+            .validate()
+            .expect_err("static without a [discovery.static] table must be rejected");
+        assert!(format!("{err:#}").contains("[discovery.static]"), "{err:#}");
     }
 
     #[test]
@@ -858,7 +963,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
     #[test]
     fn dns_backend_parses_and_validates() {
         let contents = format!(
-            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"dns\"\n\n\
+            "{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"dns\"\n\n\
              [discovery.dns]\nname = \"coord.batch.example.com\"\nport = 7071\n"
         );
         let (_guard, path) = write_config(&contents);
@@ -873,7 +978,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
     #[test]
     fn file_backend_parses_and_validates() {
         let contents = format!(
-            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"file\"\n\n\
+            "{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"file\"\n\n\
              [discovery.file]\ndir = \"/var/run/coppice/discovery\"\n"
         );
         let (_guard, path) = write_config(&contents);
@@ -888,7 +993,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
     #[test]
     fn ec2_asg_backend_parses() {
         let contents = format!(
-            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n\n\
+            "{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"ec2-asg\"\n\n\
              [discovery.ec2_asg]\nport = 7071\nregion = \"us-east-1\"\ntimeout = \"5s\"\n"
         );
         let (_guard, path) = write_config(&contents);
@@ -913,7 +1018,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         // `port` is the only required field; region defaults to the IMDS value
         // (None here) and timeout to 3s.
         let contents = format!(
-            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n\n\
+            "{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"ec2-asg\"\n\n\
              [discovery.ec2_asg]\nport = 7071\n"
         );
         let (_guard, path) = write_config(&contents);
@@ -932,7 +1037,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
     fn ec2_asg_backend_without_table_is_rejected() {
         // Selecting the backend without its table (hence without `port`) is a
         // validation error, mirroring the dns/file required-table rule.
-        let contents = format!("{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"ec2-asg\"\n");
+        let contents = format!("{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"ec2-asg\"\n");
         let (_guard, path) = write_config(&contents);
         let config = read_config(&path).expect("parses; validation is separate");
         let err = config
@@ -949,7 +1054,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
     fn backend_mismatch_with_foreign_table_is_rejected() {
         // backend = dns but a [discovery.static] table is present.
         let contents = format!(
-            "{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"dns\"\n\n\
+            "{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"dns\"\n\n\
              [discovery.dns]\nname = \"coord.example.com\"\nport = 7071\n\n\
              [discovery.static]\naddrs = [\"a:1\"]\n"
         );
@@ -964,7 +1069,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 
     #[test]
     fn missing_required_backend_table_is_rejected() {
-        let contents = format!("{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"dns\"\n");
+        let contents = format!("{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"dns\"\n");
         let (_guard, path) = write_config(&contents);
         let config = read_config(&path).expect("parses; validation catches the missing table");
         let err = config
@@ -988,7 +1093,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 
     #[test]
     fn load_rejects_invalid_discovery_section() {
-        let contents = format!("{MINIMAL_EXAMPLE}\n[discovery]\nbackend = \"dns\"\n");
+        let contents = format!("{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"dns\"\n");
         let (_guard, path) = write_config(&contents);
         let err = load(&path, CliOverrides::default())
             .expect_err("load must surface discovery validation errors");
@@ -1001,5 +1106,93 @@ ca_path   = "/etc/coppice/pki/ca.crt"
             resolve_advertise_host(Some("coord-7.example.com")).expect("explicit resolves"),
             "coord-7.example.com"
         );
+    }
+
+    // ---- the fallback chain, through injectable seams --------------------
+
+    #[test]
+    fn explicit_value_short_circuits_every_seam() {
+        let got = resolve_advertise_host_with(
+            Some("coord-7.example.com"),
+            || panic!("hostname seam must not be consulted"),
+            |_| panic!("resolution seam must not be consulted"),
+            || panic!("route seam must not be consulted"),
+        )
+        .expect("explicit resolves");
+        assert_eq!(got, "coord-7.example.com");
+    }
+
+    #[test]
+    fn resolvable_fqdn_hostname_is_chosen() {
+        let got = resolve_advertise_host_with(
+            None,
+            || Some("coord-1.batch.example.com".to_string()),
+            |host| {
+                assert_eq!(host, "coord-1.batch.example.com");
+                true
+            },
+            || panic!("route seam must not be consulted when the FQDN resolves"),
+        )
+        .expect("fqdn resolves");
+        assert_eq!(got, "coord-1.batch.example.com");
+    }
+
+    #[test]
+    fn short_hostname_falls_through_to_the_default_route() {
+        // A bare short name (no dot) is never published, even if it would
+        // resolve locally — peers on other hosts generally cannot resolve it.
+        let got = resolve_advertise_host_with(
+            None,
+            || Some("coord-1".to_string()),
+            |_| panic!("a short name must not even be looked up"),
+            || Some("10.0.0.7".to_string()),
+        )
+        .expect("route fallback");
+        assert_eq!(got, "10.0.0.7");
+    }
+
+    #[test]
+    fn unresolvable_fqdn_falls_through_to_the_default_route() {
+        let got = resolve_advertise_host_with(
+            None,
+            || Some("ghost.internal.example".to_string()),
+            |_| false,
+            || Some("10.0.0.7".to_string()),
+        )
+        .expect("route fallback");
+        assert_eq!(got, "10.0.0.7");
+    }
+
+    #[test]
+    fn nothing_resolvable_is_an_error_naming_the_fix() {
+        let err =
+            resolve_advertise_host_with(None, || Some("coord-1".to_string()), |_| true, || None)
+                .expect_err("no fallback left");
+        assert!(
+            format!("{err:#}").contains("listen.advertise_host"),
+            "{err:#}"
+        );
+    }
+
+    // ---- IPv6 advertised-address composition ------------------------------
+
+    #[test]
+    fn ipv6_advertise_host_is_bracketed_in_the_advertised_addr() {
+        let contents = MINIMAL_EXAMPLE.replace(
+            "advertise_host = \"coord-1.example.com\"",
+            "advertise_host = \"2001:db8::1\"",
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("ipv6 advertise_host parses");
+        assert_eq!(
+            config.listen.advertised_raft_addr(),
+            "[2001:db8::1]:7071",
+            "IPv6 hosts must compose the bracketed authority form"
+        );
+        // Round-trips through the shared host:port parser.
+        let (host, port) =
+            coppice_tls::split_host_port(&config.listen.advertised_raft_addr()).expect("parses");
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 7071);
     }
 }

@@ -54,7 +54,6 @@ where
     F: Fs,
     E: Executor + Clone,
 {
-
     // One watcher task, shared executor state, forwarding natural exits into a
     // channel the serve loop selects on. Survives reconnects.
     let (exit_tx, mut exit_rx) = mpsc::channel(OUTBOUND_CAPACITY);
@@ -102,16 +101,7 @@ where
         let endpoint = &config.coordinators[endpoint_idx % config.coordinators.len()];
         endpoint_idx += 1;
 
-        match serve_once(
-            &mut session,
-            endpoint,
-            &tls,
-            config,
-            &mut exit_rx,
-            &reap_tx,
-        )
-        .await
-        {
+        match serve_once(&mut session, endpoint, &tls, config, &mut exit_rx, &reap_tx).await {
             Ok(()) => {
                 tracing::info!(endpoint, "session closed; reconnecting");
                 backoff = config.reconnect_backoff_min;

@@ -225,6 +225,61 @@ mod tests {
         assert!(backend.candidates().await.is_empty());
     }
 
+    /// The consumer-level property behind "a stale file from a crash costs
+    /// only a failed dial" (ADR 0037 §2): a crashed process's leftover
+    /// registration yields a candidate whose dial fails, and that failure is
+    /// local to the one candidate — the live candidate from the same
+    /// enumeration still dials fine. No protocol step requires every
+    /// discovered candidate to respond.
+    #[tokio::test]
+    async fn stale_registration_costs_one_failed_dial_not_the_enumeration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileDiscovery::new(dir.path().to_path_buf());
+
+        // A live process: registered, with a real listener behind its address.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind live listener");
+        let live_addr = listener.local_addr().expect("local addr").to_string();
+        let _live = FileRegistration::register(dir.path(), &live_addr).expect("register live");
+
+        // A crashed process: its registration file survived (`Drop` never ran)
+        // but nothing listens at its address. Grab a port and release it so
+        // the dial deterministically fails.
+        let stale_addr = {
+            let doomed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind doomed");
+            doomed.local_addr().expect("local addr").to_string()
+        };
+        std::fs::write(dir.path().join("stale-run-id"), format!("{stale_addr}\n"))
+            .expect("write stale registration");
+
+        // Both candidates are enumerated — discovery does not pre-filter.
+        let mut candidates = backend.candidates().await;
+        candidates.sort();
+        let mut expected = vec![live_addr.clone(), stale_addr.clone()];
+        expected.sort();
+        assert_eq!(candidates, expected);
+
+        // Dial every candidate the way a converging consumer would: the stale
+        // one fails, the live one connects — one failed dial, nothing more.
+        let dial = |addr: String| async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            .expect("dial decided within the timeout")
+        };
+        assert!(
+            dial(stale_addr).await.is_err(),
+            "the stale candidate's dial must fail"
+        );
+        assert!(
+            dial(live_addr).await.is_ok(),
+            "the stale candidate must not prevent dialing the live one"
+        );
+    }
+
     #[test]
     fn first_line_only_is_the_address() {
         let dir = tempfile::tempdir().expect("tempdir");

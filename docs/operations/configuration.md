@@ -95,7 +95,9 @@ data_dir = "/var/lib/coppice"
 [discovery]
 # Seed-only: feeds first-dial and admin tooling; authoritative addresses
 # live in replicated membership (ADR 0037). Backends: static | dns |
-# file | ec2-asg — exactly one backend table, matching `backend`.
+# file | ec2-asg — exactly one backend table, matching `backend`. The
+# section and its table are required, `static` included: with no seeds,
+# write an explicit `[discovery.static]` with `addrs = []`.
 backend = "dns"
 cluster_size = 3            # intended voter count (removal + `formed` gates)
 [discovery.dns]

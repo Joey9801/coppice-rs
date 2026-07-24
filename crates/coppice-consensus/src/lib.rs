@@ -42,8 +42,8 @@ pub use adapter::{
 pub use error::{ConsensusError, ProposeError};
 pub use events::{EventBatch, EventTap, EventTapReceiver, TapItem};
 pub use node::{
-    start, ClusterSummary, MemberSummary, NodeHandle, NodeOptions, NodeStartError,
-    StartIntent, StartedNode,
+    start, ClusterSummary, MemberSummary, NodeHandle, NodeOptions, NodeStartError, StartIntent,
+    StartedNode,
 };
 pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
 
