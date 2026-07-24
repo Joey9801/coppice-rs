@@ -173,7 +173,7 @@ pub struct StateMachineStore<F: Fs = RealFs> {
     /// Snapshot sharding degree and the cluster identity stamped into every
     /// built snapshot (ADR 0016/0018).
     shards: u32,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
 }
 
 /// Snapshot builder: captures a coherent `(state, log id, membership)` and
@@ -183,7 +183,7 @@ pub struct SegmentSnapshotBuilder<F: Fs = RealFs> {
     apply_tx: mpsc::Sender<ApplyRequest>,
     applied: Arc<AsyncMutex<AppliedState>>,
     shards: u32,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
 }
 
 impl<F: Fs> StateMachineStore<F> {
@@ -193,7 +193,7 @@ impl<F: Fs> StateMachineStore<F> {
         last_applied: Option<LogId<CoordinatorId>>,
         membership: StoredMembership<CoordinatorId, BasicNode>,
         shards: u32,
-        cluster_uuid: [u8; 16],
+        history_id: [u8; 16],
     ) -> Self {
         StateMachineStore {
             core,
@@ -203,7 +203,7 @@ impl<F: Fs> StateMachineStore<F> {
                 membership,
             })),
             shards,
-            cluster_uuid,
+            history_id,
         }
     }
 }
@@ -313,7 +313,7 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
             apply_tx: self.apply_tx.clone(),
             applied: Arc::clone(&self.applied),
             shards: self.shards,
-            cluster_uuid: self.cluster_uuid,
+            history_id: self.history_id,
         }
     }
 
@@ -447,7 +447,7 @@ impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
             .expect("storage engine poisoned")
             .mint_snapshot_id();
         let meta = pbstorage::SnapshotMeta {
-            cluster_uuid: self.cluster_uuid.to_vec(),
+            history_id: self.history_id.to_vec(),
             snapshot_id: snapshot_id.clone(),
             last_applied: last_applied.as_ref().map(raftpb::log_id_to_pb),
             membership: Some(raftpb::stored_membership_to_pb(&membership)),

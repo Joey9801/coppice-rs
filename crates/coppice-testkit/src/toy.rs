@@ -49,7 +49,7 @@ const SNAP_FOOTER_LEN: u64 = 20;
 /// rotation threshold. Doubles as the harness [`CrashSubject`].
 #[derive(Debug, Clone)]
 pub struct ToyConfig {
-    pub cluster_uuid: u128,
+    pub history_id: u128,
     pub node_id: u64,
     pub instance_uuid: u128,
     /// Appending past this many payload bytes in the active segment triggers
@@ -61,7 +61,7 @@ pub struct ToyConfig {
 impl Default for ToyConfig {
     fn default() -> ToyConfig {
         ToyConfig {
-            cluster_uuid: 0x_1111_2222_3333_4444_5555_6666_7777_8888,
+            history_id: 0x_1111_2222_3333_4444_5555_6666_7777_8888,
             node_id: 1,
             instance_uuid: 0x_9999_AAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000,
             rotation_threshold: 64 * 1024,
@@ -75,7 +75,7 @@ impl Default for ToyConfig {
 /// (best-effort replay shortcut, never correctness).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Manifest {
-    cluster_uuid: u128,
+    history_id: u128,
     node_id: u64,
     instance_uuid: u128,
     purge_floor: u64,
@@ -211,7 +211,7 @@ fn snap_tmp_path(no: u64) -> PathBuf {
 impl Manifest {
     fn encode(&self) -> Vec<u8> {
         let mut body = Vec::with_capacity(96 + 8 * self.segments.len());
-        put_u128(&mut body, self.cluster_uuid);
+        put_u128(&mut body, self.history_id);
         put_u64(&mut body, self.node_id);
         put_u128(&mut body, self.instance_uuid);
         put_u64(&mut body, self.purge_floor);
@@ -245,7 +245,7 @@ impl Manifest {
             return Err(fail_stop("manifest: body CRC mismatch"));
         }
         let mut r = Reader::new(body);
-        let cluster_uuid = r.u128()?;
+        let history_id = r.u128()?;
         let node_id = r.u64()?;
         let instance_uuid = r.u128()?;
         let purge_floor = r.u64()?;
@@ -261,7 +261,7 @@ impl Manifest {
             segments.push(r.u64()?);
         }
         Ok(Manifest {
-            cluster_uuid,
+            history_id,
             node_id,
             instance_uuid,
             purge_floor,
@@ -422,7 +422,7 @@ impl ToyConfig {
         swap_manifest(
             fs,
             &Manifest {
-                cluster_uuid: self.cluster_uuid,
+                history_id: self.history_id,
                 node_id: self.node_id,
                 instance_uuid: self.instance_uuid,
                 purge_floor: 0,
@@ -447,7 +447,7 @@ impl ToyConfig {
             ));
         }
         let manifest = Manifest::decode(&read_to_vec(fs, Path::new("manifest"))?)?;
-        if manifest.cluster_uuid != self.cluster_uuid
+        if manifest.history_id != self.history_id
             || manifest.node_id != self.node_id
             || manifest.instance_uuid != self.instance_uuid
         {

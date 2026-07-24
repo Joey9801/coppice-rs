@@ -218,7 +218,7 @@ const SHARD_COUNTS: [u32; 2] = [1, 4];
 /// `membership` are legitimately absent on a from-scratch snapshot.
 fn container_meta(shards: u32) -> pb::SnapshotMeta {
     pb::SnapshotMeta {
-        cluster_uuid: vec![0u8; 16],
+        history_id: vec![0u8; 16],
         snapshot_id: "bench".into(),
         last_applied: None,
         membership: None,

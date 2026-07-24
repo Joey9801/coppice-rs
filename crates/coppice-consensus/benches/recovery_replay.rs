@@ -42,7 +42,7 @@ use coppice_state::command::RegisterNode;
 use coppice_state::{Command, StateMachine};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
-const CLUSTER_UUID: [u8; 16] = *b"replay-bench-clu";
+const HISTORY_ID: [u8; 16] = *b"replay-bench-clu";
 const INSTANCE_UUID: [u8; 16] = [0x77; 16];
 const NODE_ID: u64 = 1;
 
@@ -137,7 +137,7 @@ fn build_fixture(fs_root: &Path, options: &StorageOptions) {
 fn bench_recovery_replay(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let fs_root: PathBuf = dir.path().to_path_buf();
-    let options = StorageOptions::new(CLUSTER_UUID);
+    let options = StorageOptions::new(HISTORY_ID);
 
     build_fixture(&fs_root, &options);
 

@@ -33,8 +33,8 @@ import "coppice/raft/v1/raft.proto";
 message SnapshotMeta {
   // Identity stamp (ADR 0016), 16 raw UUID bytes — snapshots cross node
   // boundaries via install-snapshot, and a receiver must be able to refuse
-  // another cluster's state.
-  bytes cluster_uuid = 1;
+  // another history's state.
+  bytes history_id = 1;
   string snapshot_id = 2;
   coppice.raft.v1.LogId last_applied = 3;
   coppice.raft.v1.StoredMembership membership = 4;

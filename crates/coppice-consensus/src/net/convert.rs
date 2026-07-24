@@ -36,10 +36,10 @@ fn missing(field: &str) -> io::Error {
 /// Convert an outgoing `AppendEntries`, stamping the cluster identity (ADR 0016).
 pub fn append_entries_to_pb(
     rpc: &AppendEntriesRequest<TypeConfig>,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
 ) -> pb::AppendEntriesRequest {
     pb::AppendEntriesRequest {
-        cluster_uuid: cluster_uuid.to_vec(),
+        history_id: history_id.to_vec(),
         vote: Some(raftpb::vote_to_pb(&rpc.vote)),
         prev_log_id: rpc.prev_log_id.as_ref().map(raftpb::log_id_to_pb),
         leader_commit: rpc.leader_commit.as_ref().map(raftpb::log_id_to_pb),
@@ -128,10 +128,10 @@ pub fn append_response_from_pb(
 /// Convert an outgoing `Vote` request, stamping the cluster identity (ADR 0016).
 pub fn vote_request_to_pb(
     rpc: &VoteRequest<CoordinatorId>,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
 ) -> pb::VoteRequest {
     pb::VoteRequest {
-        cluster_uuid: cluster_uuid.to_vec(),
+        history_id: history_id.to_vec(),
         vote: Some(raftpb::vote_to_pb(&rpc.vote)),
         last_log_id: rpc.last_log_id.as_ref().map(raftpb::log_id_to_pb),
     }
@@ -248,7 +248,7 @@ mod tests {
         };
         let cluster = [7u8; 16];
         let pb = append_entries_to_pb(&rpc, cluster);
-        assert_eq!(pb.cluster_uuid, cluster.to_vec());
+        assert_eq!(pb.history_id, cluster.to_vec());
         let back = append_entries_from_pb(pb).unwrap();
         assert_eq!(back.vote, rpc.vote);
         assert_eq!(back.prev_log_id, rpc.prev_log_id);
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn missing_vote_is_a_decode_error() {
         let pb = pb::VoteRequest {
-            cluster_uuid: vec![0u8; 16],
+            history_id: vec![0u8; 16],
             vote: None,
             last_log_id: None,
         };

@@ -67,7 +67,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
     let ca = Ca::new();
     let admin_leaf = ca.leaf();
     let cluster_id = ClusterId::new();
-    let cluster_uuid = *cluster_id.0.as_bytes();
+    let history_id = *cluster_id.0.as_bytes();
 
     // -- Form a three-voter cluster (bootstrap + learner-join + promote). ---
     let mut nodes: Vec<Node> = (1..=3).map(|id| Node::new(id, cluster_id, &ca)).collect();
@@ -95,7 +95,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
         for i in [1usize, 2] {
             admin::add_learner(
                 &mut client,
-                cluster_uuid,
+                history_id,
                 nodes[i].raft_id(),
                 nodes[i].advertise.clone(),
             )
@@ -104,15 +104,9 @@ async fn retried_submission_across_leader_change_creates_one_job() {
         }
         // promote_voter polls the catch-up gate itself.
         for i in [1usize, 2] {
-            admin::promote_voter(
-                &mut client,
-                cluster_uuid,
-                nodes[i].raft_id(),
-                None,
-                DEADLINE,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
+            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), None, DEADLINE)
+                .await
+                .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
         }
     }
 

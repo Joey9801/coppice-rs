@@ -326,7 +326,7 @@ pub async fn bootstrap(
         )
     })?;
 
-    let cluster_uuid = *cfg.cluster_id.0.as_bytes();
+    let history_id = *cfg.cluster_id.0.as_bytes();
     let raft_addr = cfg.listen.raft_addr;
 
     // Step 3: bind the raft/admin listener FIRST, before anything publishes an
@@ -361,7 +361,7 @@ pub async fn bootstrap(
     // consensus mesh shares the same hot-reload store, so a rotation reaches
     // outbound peer dials too (ADR 0037 §4).
     let options = NodeOptions {
-        cluster_uuid,
+        history_id,
         data_dir: cfg.data_dir.clone(),
         advertise_addr,
         election_timeout: cfg.raft.election_timeout,
@@ -414,7 +414,7 @@ pub async fn bootstrap(
     let admin = AdminServer::new(AdminService::new(
         Arc::clone(&consensus),
         handle.clone(),
-        cluster_uuid,
+        history_id,
     ));
 
     // Serve on the listener bound up front (before any address was published):

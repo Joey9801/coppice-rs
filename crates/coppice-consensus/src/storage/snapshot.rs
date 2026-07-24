@@ -1102,7 +1102,7 @@ mod tests {
 
     fn meta() -> pb::SnapshotMeta {
         pb::SnapshotMeta {
-            cluster_uuid: vec![7u8; 16],
+            history_id: vec![7u8; 16],
             snapshot_id: "000000000000002a".into(),
             last_applied: None,
             membership: None,

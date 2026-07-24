@@ -24,7 +24,7 @@ use coppice_testkit::harness::{
 use coppice_testkit::rng::Rng;
 use coppice_testkit::simfs::{is_sim_crash, SimConfig, SimFs};
 
-const CLUSTER_UUID: [u8; 16] = *b"crash-suite-clst";
+const HISTORY_ID: [u8; 16] = *b"crash-suite-clst";
 const INSTANCE_UUID: [u8; 16] = [0x42; 16];
 const NODE_ID: u64 = 1;
 
@@ -47,7 +47,7 @@ impl Default for RealEngine {
 
 impl RealEngine {
     fn options(&self) -> StorageOptions {
-        let mut options = StorageOptions::new(CLUSTER_UUID);
+        let mut options = StorageOptions::new(HISTORY_ID);
         options.segment_max = self.segment_max;
         options
     }
@@ -59,7 +59,7 @@ impl RealEngine {
 /// durable install path never needs.
 fn opaque_snapshot(core: &mut StorageCore<SimFs>, upto_index: u64, payload: &[u8]) -> Vec<u8> {
     let meta = pbstorage::SnapshotMeta {
-        cluster_uuid: CLUSTER_UUID.to_vec(),
+        history_id: HISTORY_ID.to_vec(),
         snapshot_id: core.mint_snapshot_id(),
         last_applied: Some(pbraft::LogId {
             leader_id: Some(pbraft::LeaderId {

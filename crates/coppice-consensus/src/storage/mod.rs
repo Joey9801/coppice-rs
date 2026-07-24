@@ -124,7 +124,7 @@ fn mint_node_id() -> CoordinatorId {
 /// path, not two.
 pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
     let shards = options.snapshot_shards;
-    let cluster_uuid = options.cluster_uuid;
+    let history_id = options.history_id;
     let core = StorageCore::open(fs, options)?;
     let node_id = core.node_id();
 
@@ -150,7 +150,7 @@ pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
         last_applied,
         membership,
         shards,
-        cluster_uuid,
+        history_id,
         node_id,
     })
 }
@@ -170,7 +170,7 @@ pub struct Recovered<F: Fs> {
     /// the directory, not config, is the authority on which replica this is.
     pub node_id: CoordinatorId,
     shards: u32,
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
 }
 
 impl<F: Fs> Recovered<F> {
@@ -190,7 +190,7 @@ impl<F: Fs> Recovered<F> {
             self.last_applied,
             self.membership,
             self.shards,
-            self.cluster_uuid,
+            self.history_id,
         );
         (log, sm)
     }

@@ -50,8 +50,8 @@ pub enum StartIntent {
 /// minted at init and read back from the data directory's manifest stamp on
 /// every restart (ADR 0025) — operators never choose one.
 pub struct NodeOptions {
-    /// The cluster this replica belongs to (ADR 0016).
-    pub cluster_uuid: [u8; 16],
+    /// The raft history this replica belongs to (ADR 0016, ADR 0037 §3).
+    pub history_id: [u8; 16],
     /// The data directory; must already exist.
     pub data_dir: std::path::PathBuf,
     /// The `host:port` peers dial to reach this node (used at bootstrap).
@@ -96,7 +96,7 @@ pub struct NodeHandle {
     raft: Raft<TypeConfig>,
     node_id: CoordinatorId,
     #[allow(dead_code)]
-    cluster_uuid: [u8; 16],
+    history_id: [u8; 16],
     status: watch::Receiver<ConsensusStatus>,
 }
 
@@ -224,7 +224,7 @@ pub async fn start(
     intent: StartIntent,
 ) -> Result<StartedNode, NodeStartError> {
     let NodeOptions {
-        cluster_uuid,
+        history_id,
         data_dir,
         advertise_addr,
         election_timeout,
@@ -267,7 +267,7 @@ pub async fn start(
         (StartIntent::Bootstrap | StartIntent::Join, false) => {
             // Mints this replica's allocate-once Raft identity and a fresh
             // instance UUID, both stamped into the manifest (ADR 0016 / 0025).
-            let minted = storage::init(&fs, &StorageOptions::new(cluster_uuid))?;
+            let minted = storage::init(&fs, &StorageOptions::new(history_id))?;
             tracing::debug!(
                 node_id = minted,
                 "minted coordinator raft identity (stamped in the data directory; \
@@ -279,7 +279,7 @@ pub async fn start(
     // Step 4: recovery. The replica's identity comes back from the manifest
     // stamp; a cluster-stamp mismatch fail-stops inside `open` with context
     // and rides out as `Storage`.
-    let mut recovered = storage::open(fs, StorageOptions::new(cluster_uuid))?;
+    let mut recovered = storage::open(fs, StorageOptions::new(history_id))?;
     let node_id = recovered.node_id;
     let last_applied_index = recovered.last_applied.map(|id| id.index).unwrap_or(0);
 
@@ -311,7 +311,7 @@ pub async fn start(
     let election_min = duration_ms(election_timeout);
     let install_snapshot_timeout = duration_ms(rpc_timeout).max(20_000);
     let config = Config {
-        cluster_name: hex(&cluster_uuid),
+        cluster_name: hex(&history_id),
         election_timeout_min: election_min,
         election_timeout_max: election_min.saturating_mul(2),
         heartbeat_interval: duration_ms(heartbeat_interval),
@@ -326,7 +326,7 @@ pub async fn start(
     // Step 8: the network factory and the openraft node. The factory holds the
     // shared hot-reload store and rebuilds per-peer channels when the material's
     // generation advances (ADR 0037 §4).
-    let factory = GrpcNetworkFactory::new(cluster_uuid, tls, rpc_timeout);
+    let factory = GrpcNetworkFactory::new(history_id, tls, rpc_timeout);
     let raft = Raft::new(node_id, Arc::new(config), factory, log_store, sm_store)
         .await
         .map_err(|e| NodeStartError::Raft(format!("raft node construction failed: {e}")))?;
@@ -350,11 +350,11 @@ pub async fn start(
     // Step 10 + 11: status watch, seam, transport, handle.
     let status = status::spawn(raft.metrics(), committed_rx);
     let consensus = OpenraftConsensus::new(raft.clone(), status.clone(), views.clone());
-    let transport = Server::new(RaftTransportHandler::new(raft.clone(), cluster_uuid));
+    let transport = Server::new(RaftTransportHandler::new(raft.clone(), history_id));
     let handle = NodeHandle {
         raft,
         node_id,
-        cluster_uuid,
+        history_id,
         status,
     };
 

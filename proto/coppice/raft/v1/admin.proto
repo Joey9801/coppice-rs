@@ -18,7 +18,7 @@ import "coppice/raft/v1/raft.proto";
 // Add a coordinator to membership as a non-voting learner so it can catch
 // up on the log before any voter change (ADR 0016 step 1).
 message AddLearnerRequest {
-  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   uint64 node_id = 8;
   string address = 9; // the address peers dial to reach it.
 }
@@ -28,7 +28,7 @@ message AddLearnerResponse {}
 // Promote a caught-up learner to voter, optionally dropping a departed
 // voter in the same joint change (ADR 0016 step 3).
 message PromoteVoterRequest {
-  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   uint64 promote_node_id = 8;
   optional uint64 remove_node_id = 9; // absent = pure addition, no removal.
 }
@@ -37,7 +37,7 @@ message PromoteVoterResponse {}
 
 // Remove a node from membership entirely.
 message RemoveNodeRequest {
-  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   uint64 node_id = 8;
 }
 
@@ -45,7 +45,7 @@ message RemoveNodeResponse {}
 
 // Poll a coordinator for its view of cluster state.
 message ClusterStatusRequest {
-  bytes cluster_uuid = 1; // 16-byte stamped cluster identity (ADR 0016).
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
 }
 
 // A coordinator's answer to ClusterStatus. The replication list is populated
