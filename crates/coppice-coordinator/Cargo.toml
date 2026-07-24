@@ -16,6 +16,10 @@ coppice-state.workspace = true
 coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
 coppice-api.workspace = true
+# Hot-reloadable mTLS store (ADR 0037 §4): the connection-time acceptor for the
+# two mTLS listeners and the shared material the raft mesh and node-fetch client
+# dial with.
+coppice-tls.workspace = true
 anyhow.workspace = true
 # The fanout's `proposer_skew` histogram (ADR 0032), registered through the
 # same describe/gather pattern as `coppice-consensus`.
@@ -40,6 +44,17 @@ serde.workspace = true
 toml.workspace = true
 humantime-serde.workspace = true
 uuid.workspace = true
+# Coordinator discovery (ADR 0037 §2): the `dns` backend resolves candidate
+# raft addresses (A/AAAA + SRV) once per consultation.
+hickory-resolver.workspace = true
+# The `advertise_host` fallback chain reads the OS hostname when unset (ADR 0037).
+gethostname.workspace = true
+# The `ec2-asg` discovery backend (ADR 0037 §2): IMDSv2 for this instance's
+# id/region, Auto Scaling for group membership, EC2 for private IPs. Confined to
+# `discovery::ec2_asg` behind the internal `AsgApi` seam.
+aws-config.workspace = true
+aws-sdk-ec2.workspace = true
+aws-sdk-autoscaling.workspace = true
 # Parses the agent's mTLS client-leaf certificate to enforce CN == NodeId at
 # session accept (ADR 0011); see `tasks::agent_gateway`.
 x509-parser.workspace = true

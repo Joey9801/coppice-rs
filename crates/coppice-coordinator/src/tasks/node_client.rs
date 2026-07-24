@@ -33,6 +33,7 @@ use coppice_api::{
 use coppice_core::id::NodeId;
 use coppice_net::node_service::Client;
 use coppice_proto::pb::agent::v1 as apb;
+use coppice_tls::TlsStore;
 
 /// Whole-fetch deadline. Bounds the entire fetch — waiting for a per-node
 /// permit, the dial, and the RPC together — so a slow, gone, or *saturated*
@@ -103,12 +104,16 @@ pub(crate) fn gather_metrics() {}
 /// Dials agents' `NodeService` listeners to fetch an attempt's job logs
 /// (`FetchLogs`) or metric samples (`FetchMetrics`).
 pub struct NodeClient {
-    /// The mTLS client config sans server-name; the SNI/verification name is
-    /// stamped per dial with the target node's typed id.
-    tls: ClientTlsConfig,
-    /// Per-node `(dialed address, channel)`. A re-registration at a new address
-    /// drops the stale channel and redials.
-    channels: Mutex<HashMap<NodeId, (String, Channel)>>,
+    /// The shared hot-reload mTLS store (ADR 0037 §4). The client config —
+    /// sans server-name; the SNI/verification name is stamped per dial with
+    /// the target node's typed id — is rebuilt from the *current* material at
+    /// each (re)dial, so a rotation reaches these fetches without a restart.
+    tls: Arc<TlsStore>,
+    /// Per-node `(dialed address, TLS generation, channel)`. A re-registration
+    /// at a new address drops the stale channel and redials; so does a TLS
+    /// rotation (the store's generation advancing), mirroring the raft mesh's
+    /// factory (ADR 0037 §4).
+    channels: Mutex<HashMap<NodeId, (String, u64, Channel)>>,
     /// Per-node in-flight limiter, shared by log and metric fetches.
     semaphores: Mutex<HashMap<NodeId, Arc<Semaphore>>>,
     /// The whole-fetch deadline (permit wait + dial + RPC). A field, not the
@@ -117,18 +122,26 @@ pub struct NodeClient {
 }
 
 impl NodeClient {
-    /// Build from the coordinator's mTLS material (ADR 0011): its own leaf as
-    /// client identity, the cluster CA as the trust root.
-    pub fn new(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Self {
-        let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(ca_pem))
-            .identity(Identity::from_pem(cert_pem, key_pem));
+    /// Build over the coordinator's shared hot-reload mTLS store (ADR 0011,
+    /// ADR 0037 §4): its own leaf as client identity, the cluster CA as the
+    /// trust root, both re-read from the store at each (re)dial.
+    pub fn new(tls: Arc<TlsStore>) -> Self {
         NodeClient {
             tls,
             channels: Mutex::new(HashMap::new()),
             semaphores: Mutex::new(HashMap::new()),
             deadline: RPC_DEADLINE,
         }
+    }
+
+    /// The mutual-TLS client config built from the material current *right
+    /// now* (ADR 0037 §4). Rebuilt per dial so a reconnect after a rotation
+    /// presents the fresh leaf.
+    fn client_tls(&self) -> ClientTlsConfig {
+        let material = self.tls.current();
+        ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(material.ca_pem()))
+            .identity(Identity::from_pem(material.cert_pem(), material.key_pem()))
     }
 
     /// Fetch one page of `attempt`'s logs from `node` at `addr`.
@@ -340,22 +353,24 @@ impl NodeClient {
         }
     }
 
-    /// The cached channel for `node`, redialing if its address changed or it
-    /// was never dialed. The dial is lazy (`connect_lazy`), so a bad address
-    /// surfaces on the RPC as an `Unreachable` status rather than here.
+    /// The cached channel for `node`, redialing if its address changed, the
+    /// TLS material rotated since it was dialed, or it was never dialed. The
+    /// dial is lazy (`connect_lazy`), so a bad address surfaces on the RPC as
+    /// an `Unreachable` status rather than here.
     fn channel_for(&self, node: NodeId, addr: &str) -> Result<Channel, String> {
+        let generation = self.tls.generation();
         let mut map = self
             .channels
             .lock()
             .expect("log-fetch channel map poisoned");
-        if let Some((existing, channel)) = map.get(&node) {
-            if existing == addr {
+        if let Some((existing, gen, channel)) = map.get(&node) {
+            if existing == addr && *gen == generation {
                 return Ok(channel.clone());
             }
         }
-        let channel = build_channel(&self.tls, addr, &node.to_string(), self.deadline)
+        let channel = build_channel(&self.client_tls(), addr, &node.to_string(), self.deadline)
             .map_err(|e| format!("cannot dial node {node} at {addr}: {e}"))?;
-        map.insert(node, (addr.to_string(), channel.clone()));
+        map.insert(node, (addr.to_string(), generation, channel.clone()));
         Ok(channel)
     }
 
@@ -390,7 +405,7 @@ impl NodeClient {
         self.channels
             .lock()
             .expect("log-fetch channel map poisoned")
-            .insert(node, (addr.to_string(), channel));
+            .insert(node, (addr.to_string(), self.tls.generation(), channel));
     }
 }
 
@@ -545,9 +560,41 @@ mod tests {
 
     use coppice_core::id::{AttemptId, JobId};
     use coppice_net::node_service::{NodeService, Server as NodeServiceServer};
+    use coppice_tls::TlsPaths;
+    use rcgen::{CertificateParams, DnType, KeyPair};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
+
+    /// A [`TlsStore`] over throwaway self-signed material — enough for the
+    /// channel-cache tests (the cached plaintext channel is what the RPC tests
+    /// actually dial; the store only backs the redial path). Not a real chain;
+    /// these tests never complete a TLS handshake.
+    fn dummy_store() -> Arc<TlsStore> {
+        let key = KeyPair::generate().expect("key");
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]).expect("params");
+        params.distinguished_name.push(DnType::CommonName, "test");
+        let cert = params.self_signed(&key).expect("self-signed");
+        let cert_pem = cert.pem().into_bytes();
+        let key_pem = key.serialize_pem().into_bytes();
+        // Self-signed leaf doubles as its own CA trust root for the store.
+        TlsStore::from_pem(
+            TlsPaths {
+                cert: "unused-cert".into(),
+                key: "unused-key".into(),
+                ca: "unused-ca".into(),
+            },
+            cert_pem.clone(),
+            cert_pem,
+            key_pem,
+        )
+        .expect("build dummy tls store")
+    }
+
+    /// A [`NodeClient`] over [`dummy_store`] for the cache/round-trip tests.
+    fn test_client() -> NodeClient {
+        NodeClient::new(dummy_store())
+    }
 
     // ---- pure conversion round-trips ------------------------------------
 
@@ -656,11 +703,11 @@ mod tests {
 
     #[tokio::test]
     async fn same_address_reuses_the_cached_channel() {
-        let client = NodeClient::new(b"", b"", b"");
+        let client = test_client();
         let node = NodeId::new();
         client.insert_channel(node, "10.0.0.1:9100", dummy_channel());
-        // Cache hit: returns without a rebuild (a rebuild would fail on the
-        // empty TLS material).
+        // Cache hit: same address and TLS generation, so the stored entry is
+        // returned as-is.
         assert!(client.channel_for(node, "10.0.0.1:9100").is_ok());
         assert_eq!(
             client.channels.lock().unwrap().get(&node).unwrap().0,
@@ -670,18 +717,23 @@ mod tests {
 
     #[tokio::test]
     async fn changed_address_does_not_reuse_the_stale_channel() {
-        let client = NodeClient::new(b"", b"", b"");
+        let client = test_client();
         let node = NodeId::new();
         client.insert_channel(node, "10.0.0.1:9100", dummy_channel());
         // A re-registration at a new address must not reuse the stale channel:
-        // `channel_for` redials, which here fails on the fake TLS — the proof
-        // it did not hand back the cached channel keyed at the old address.
-        assert!(client.channel_for(node, "10.0.0.2:9100").is_err());
+        // `channel_for` redials (lazily, so the dial itself succeeds) and the
+        // cache entry is re-keyed at the new address — the proof it did not
+        // hand back the channel cached under the old one.
+        assert!(client.channel_for(node, "10.0.0.2:9100").is_ok());
+        assert_eq!(
+            client.channels.lock().unwrap().get(&node).unwrap().0,
+            "10.0.0.2:9100"
+        );
     }
 
     #[tokio::test]
     async fn eviction_drops_the_cached_channel() {
-        let client = NodeClient::new(b"", b"", b"");
+        let client = test_client();
         let node = NodeId::new();
         client.insert_channel(node, "10.0.0.1:9100", dummy_channel());
         assert!(client.channels.lock().unwrap().contains_key(&node));
@@ -700,7 +752,7 @@ mod tests {
     async fn saturated_node_times_out_the_whole_fetch() {
         // A short deadline keeps the wall-clock assertion fast in CI.
         let deadline = Duration::from_millis(300);
-        let client = NodeClient::new(b"", b"", b"").with_deadline(deadline);
+        let client = test_client().with_deadline(deadline);
         let node = NodeId::new();
 
         // Hold BOTH in-flight slots for the whole test (two slow fetches).
@@ -871,7 +923,7 @@ mod tests {
         };
         let (addr, seen) = spawn_stub(outcome).await;
 
-        let client = NodeClient::new(b"", b"", b"");
+        let client = test_client();
         let node = NodeId::new();
         let addr_str = addr.to_string();
         client.insert_channel(node, &addr_str, plaintext_channel(addr));
@@ -917,7 +969,7 @@ mod tests {
             )),
         };
         let (addr, _seen) = spawn_stub(outcome).await;
-        let client = NodeClient::new(b"", b"", b"");
+        let client = test_client();
         let node = NodeId::new();
         let addr_str = addr.to_string();
         client.insert_channel(node, &addr_str, plaintext_channel(addr));
@@ -1056,7 +1108,7 @@ mod tests {
         };
         let (addr, seen) = spawn_metrics_stub(outcome).await;
 
-        let client = NodeClient::new(b"", b"", b"");
+        let client = test_client();
         let node = NodeId::new();
         let addr_str = addr.to_string();
         client.insert_channel(node, &addr_str, plaintext_channel(addr));
@@ -1100,7 +1152,7 @@ mod tests {
             )),
         };
         let (addr, _seen) = spawn_metrics_stub(outcome).await;
-        let client = NodeClient::new(b"", b"", b"");
+        let client = test_client();
         let node = NodeId::new();
         let addr_str = addr.to_string();
         client.insert_channel(node, &addr_str, plaintext_channel(addr));

@@ -21,12 +21,13 @@
 //! so the leaf must carry `node-<uuid>` as a dNSName SAN; a stolen advertised
 //! address is useless without the node's key.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use coppice_proto::pb::agent::v1 as pb;
-use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use coppice_tls::TlsStore;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use crate::telemetry::{
@@ -117,37 +118,28 @@ pub fn gather_metrics() {}
 
 // ---- the mTLS listener (mirrors coordinator's AgentListener::bind) --------
 
-/// The bound `NodeService` mTLS listener and its TLS config. Bound eagerly at
-/// daemon start (fail-fast on a port conflict), then served by [`serve`].
+/// The bound `NodeService` mTLS listener and its hot-reload TLS store. Bound
+/// eagerly at daemon start (fail-fast on a port conflict), then served by
+/// [`serve`].
 pub struct NodeServiceListener {
-    incoming: TcpIncoming,
-    tls: ServerTlsConfig,
+    listener: tokio::net::TcpListener,
+    tls: Arc<TlsStore>,
     local_addr: SocketAddr,
 }
 
 impl NodeServiceListener {
-    /// Bind the `NodeService` mTLS listener on `addr` from PEM material already
-    /// in memory (ADR 0011/0034).
+    /// Bind the `NodeService` mTLS listener on `addr`, resolving its server
+    /// certificate from `tls` at each handshake (ADR 0011/0034, ADR 0037 §4).
     ///
-    /// The same cert/key/ca as the agent's session client identity; client certs
-    /// are REQUIRED (`client_auth_optional(false)`), so chain validation under
-    /// the trust root is the sole gate — no CN or role binding in v1. A `:0` bind
-    /// resolves to a concrete port, readable via [`local_addr`](Self::local_addr)
-    /// (the in-process integration test relies on this).
-    pub fn bind(
-        addr: SocketAddr,
-        cert_pem: &[u8],
-        key_pem: &[u8],
-        ca_pem: &[u8],
-    ) -> Result<NodeServiceListener> {
-        let tls = ServerTlsConfig::new()
-            .identity(Identity::from_pem(cert_pem, key_pem))
-            .client_ca_root(Certificate::from_pem(ca_pem))
-            .client_auth_optional(false);
-
-        // Bind eagerly so a port conflict fails the daemon here, then hand the
-        // listener to tonic. Own the std bind so the resolved `:0` port is
-        // readable (`TcpIncoming::new` hides it).
+    /// The same store as the agent's session client identity; client certs are
+    /// REQUIRED (the store's server config is built with a mandatory
+    /// client-cert verifier), so chain validation under the trust root is the
+    /// sole gate — no CN or role binding in v1. A `:0` bind resolves to a
+    /// concrete port, readable via [`local_addr`](Self::local_addr) (the
+    /// in-process integration test relies on this).
+    pub fn bind(addr: SocketAddr, tls: Arc<TlsStore>) -> Result<NodeServiceListener> {
+        // Bind eagerly so a port conflict fails the daemon here. Own the std
+        // bind so the resolved `:0` port is readable before serving starts.
         let std_listener = std::net::TcpListener::bind(addr)
             .map_err(|e| anyhow!("binding NodeService listener on {addr}: {e}"))?;
         std_listener
@@ -156,14 +148,12 @@ impl NodeServiceListener {
         let local_addr = std_listener
             .local_addr()
             .map_err(|e| anyhow!("reading NodeService listener address: {e}"))?;
-        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+        let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| anyhow!("adopting NodeService listener into tokio: {e}"))?;
-        let incoming = TcpIncoming::from_listener(tokio_listener, true, None)
-            .map_err(|e| anyhow!("wrapping NodeService listener for tonic: {e}"))?;
         tracing::info!(%local_addr, "NodeService mTLS listener bound (ADR 0034)");
 
         Ok(NodeServiceListener {
-            incoming,
+            listener,
             tls,
             local_addr,
         })
@@ -178,6 +168,11 @@ impl NodeServiceListener {
 /// Serve the `NodeService` over the bound listener until the process stops,
 /// spawning the tonic server as a background task and returning its handle.
 ///
+/// TLS is terminated by the connection-time acceptor ([`coppice_tls::serve`]),
+/// which resolves the serving leaf from the shared store at each handshake —
+/// so a rotation on disk reaches new connections without a restart
+/// (ADR 0037 §4) and `.tls_config` is deliberately absent from the builder.
+///
 /// `log_store`/`metric_store` are the first LOG- and METRICS-consuming stores
 /// (the `Telemetry::log_store`/`metric_store` precedent); either is `None` when
 /// no sink consumes that stream, in which case that stream's reads all answer
@@ -187,32 +182,16 @@ pub fn serve(
     log_store: Option<FilesystemSink>,
     metric_store: Option<FilesystemSink>,
 ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
-    let NodeServiceListener { incoming, tls, .. } = listener;
+    let NodeServiceListener { listener, tls, .. } = listener;
+    let incoming = coppice_tls::serve(listener, tls);
     let service =
         coppice_net::node_service::Server::new(NodeServiceImpl::new(log_store, metric_store));
     tokio::spawn(async move {
         Server::builder()
-            .tls_config(tls)?
             .add_service(service)
             .serve_with_incoming(incoming)
             .await
     })
-}
-
-/// Bind the `NodeService` listener from the config's `[tls]` paths (ADR
-/// 0011/0034), naming each path on a read failure. Reads the same cert/key/ca
-/// the session client uses.
-pub fn prepare_listener(
-    addr: SocketAddr,
-    tls: &crate::config::TlsConfig,
-) -> Result<NodeServiceListener> {
-    let cert = std::fs::read(&tls.cert_path)
-        .with_context(|| format!("reading TLS certificate {}", tls.cert_path.display()))?;
-    let key = std::fs::read(&tls.key_path)
-        .with_context(|| format!("reading TLS private key {}", tls.key_path.display()))?;
-    let ca = std::fs::read(&tls.ca_path)
-        .with_context(|| format!("reading TLS CA certificate {}", tls.ca_path.display()))?;
-    NodeServiceListener::bind(addr, &cert, &key, &ca)
 }
 
 // ---- the NodeService handler --------------------------------------------

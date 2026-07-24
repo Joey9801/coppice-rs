@@ -86,12 +86,14 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct AdminArgs {
     /// Path to the node configuration file — read for TLS material and the
-    /// default `--target` (the first `peers` entry).
+    /// default `--target` (the first candidate from the configured
+    /// `[discovery]` backend).
     #[arg(long)]
     pub config: PathBuf,
 
     /// The `host:port` of the coordinator to contact. Defaults to the first
-    /// entry of the config's `peers` list; an error results if neither is set.
+    /// candidate from the config's `[discovery]` backend; an error results if
+    /// neither yields a target.
     #[arg(long)]
     pub target: Option<String>,
 

@@ -13,6 +13,10 @@ coppice-core.workspace = true
 coppice-proto.workspace = true
 coppice-net.workspace = true
 coppice-state.workspace = true
+# Hot-reloadable mTLS store (ADR 0037 §4): `NodeOptions.tls` carries the shared
+# store; the raft network factory rebuilds outbound channels from the current
+# material when its generation advances.
+coppice-tls.workspace = true
 crc32c.workspace = true
 fs2.workspace = true
 metrics.workspace = true

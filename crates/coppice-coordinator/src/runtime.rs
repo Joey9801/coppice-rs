@@ -165,12 +165,12 @@ where
     // Agent session mTLS server. The listener is bound early in `bootstrap`;
     // here it starts accepting and stops on shutdown (listeners drain first,
     // `docs/architecture/coordinator-runtime.md`, "Shutdown order").
-    let AgentListener { incoming, tls } = agent_listener;
+    let AgentListener { listener, tls } = agent_listener;
+    let listener = tokio::net::TcpListener::from_std(listener)
+        .context("adopting the agent gateway listener into tokio")?;
+    let incoming = coppice_tls::serve(listener, tls);
     let agent_service = coppice_net::session::Server::new(AgentSessionService::new(authority));
-    let agent_router = Server::builder()
-        .tls_config(tls)
-        .context("configuring the agent gateway server TLS")?
-        .add_service(agent_service);
+    let agent_router = Server::builder().add_service(agent_service);
     let mut agent_shutdown = shutdown_rx.clone();
     let agent_server_join = tokio::spawn(async move {
         agent_router
@@ -239,6 +239,10 @@ where
     tracing::info!(
         "coordinator runtime started (agent sessions, scheduling, dispatch, and housekeeping)"
     );
+    // Listeners are serving: signal systemd `READY=1` (ADR 0037 §9). Unit
+    // ordering keys off this; cluster/node readiness stays a later concern.
+    // Silent no-op when `$NOTIFY_SOCKET` is unset (every non-systemd launch).
+    crate::systemd::notify_ready();
 
     // ---- Shutdown trigger ----
     // The daemon path installs the signal handler; an integration test owns the
@@ -267,6 +271,8 @@ where
                         signal = reason,
                         "runtime: shutdown signal received, shutting down"
                     );
+                    // Tell systemd the exit is intentional (ADR 0037 §9).
+                    crate::systemd::notify_stopping();
                     let _ = shutdown_tx.send(true);
                 }
             }
@@ -274,6 +280,7 @@ where
             {
                 if tokio::signal::ctrl_c().await.is_ok() {
                     tracing::info!("runtime: ctrl-c received, shutting down");
+                    crate::systemd::notify_stopping();
                     let _ = shutdown_tx.send(true);
                 }
             }

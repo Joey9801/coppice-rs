@@ -366,14 +366,24 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
         .with_context(|| format!("reading config {}", args.config.display()))?;
     let cfg = &resolved.config;
 
+    // Default `--target` to the first candidate from the configured discovery
+    // backend (ADR 0037 §2: `[discovery.static] addrs` subsumes the old
+    // top-level `peers`; the other backends answer the same question through
+    // one consultation). Discovery is advisory and non-blocking, so a backend
+    // that finds nothing degrades to the explicit-target error below.
     let target = match &args.target {
         Some(t) => t.clone(),
-        None => cfg.peers.first().cloned().ok_or_else(|| {
-            anyhow!(
-                "no --target given and the config's `peers` list is empty; \
-                 pass --target <host:port>"
-            )
-        })?,
+        None => {
+            let discovery = crate::discovery::build(&cfg.discovery)
+                .context("building the discovery backend for the default --target")?;
+            discovery.candidates().await.first().cloned().ok_or_else(|| {
+                anyhow!(
+                    "no --target given and the config's \"{}\" discovery backend \
+                     found no candidates; pass --target <host:port>",
+                    cfg.discovery.backend.as_str()
+                )
+            })?
+        }
     };
 
     let cluster_uuid = *cfg.cluster_id.0.as_bytes();
