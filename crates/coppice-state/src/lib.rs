@@ -16,13 +16,15 @@
 //! [`RejectionReason`] — it was already committed to the log on every
 //! replica, so refusing it must be just as reproducible as applying it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use imbl::OrdMap;
 
 use coppice_core::allocation::Allocation;
 use coppice_core::attempt::{Attempt, AttemptState};
-use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
+use coppice_core::id::{
+    AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
+};
 use coppice_core::job::{Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::quota::{
@@ -79,11 +81,238 @@ pub struct StateMachine {
     pub policy: PolicyConfig,
     /// Semantic feature gate (ADR 0003), bumped only by `BumpClusterVersion`.
     pub cluster_version: u32,
+    /// The cluster CA certificate bundle (ADR 0037 §4), or `None` before the
+    /// cluster is formed. Deliberately **not** in [`PolicyConfig`]: that type
+    /// is pure scheduler/accounting policy, whereas these are cluster-identity
+    /// facts (see the `Cluster PKI / identity` catalog section). The CA
+    /// *private key* never lives in replicated state — no field of
+    /// [`CaCertificate`] could hold it.
+    pub ca: Option<CaCertificate>,
+    /// Coordinator machine identity → raft seat bindings (ADR 0037 §7).
+    /// Bounded (~cluster size), so a plain `BTreeMap`, not `imbl::OrdMap`.
+    pub machine_bindings: BTreeMap<MachineId, MachineBinding>,
+    /// Live and revoked enrollment tokens by id (ADR 0037 §5). Bounded.
+    pub enroll_tokens: BTreeMap<EnrollTokenId, EnrollToken>,
+    /// Identities refused renewal (ADR 0037 §5 eviction). Bounded set.
+    pub revoked_identities: BTreeSet<RevokedIdentity>,
+    /// Raft node id → the instant that node confirmed durable receipt of the
+    /// CA key (ADR 0037 §4). The replicated *fact* of possession; the key
+    /// itself is never replicated. Bounded (~cluster size).
+    pub key_confirmations: BTreeMap<u64, Timestamp>,
     /// Count of applied log entries, accepted or rejected.
     ///
     /// Bumped on every applied command so it is a stable coordinate for
     /// `expected_version` and read-consistency cursors.
     pub version: u64,
+}
+
+impl StateMachine {
+    /// The raft seat a machine identity is bound to, if any (ADR 0037 §7).
+    pub fn machine_binding(&self, machine: &MachineId) -> Option<&MachineBinding> {
+        self.machine_bindings.get(machine)
+    }
+
+    /// The machine identity bound to a raft node id, if any. A linear scan —
+    /// bindings are bounded (~cluster size), so this stays cheap.
+    pub fn machine_for_raft_node(&self, raft_node_id: u64) -> Option<&MachineId> {
+        self.machine_bindings
+            .iter()
+            .find(|(_, b)| b.raft_node_id == raft_node_id)
+            .map(|(id, _)| id)
+    }
+
+    /// Whether an identity has been revoked (ADR 0037 §5).
+    pub fn is_identity_revoked(&self, identity: &RevokedIdentity) -> bool {
+        self.revoked_identities.contains(identity)
+    }
+
+    /// Enrollment tokens that are usable at `now`: not revoked and not expired
+    /// (a token with no `expires_at` never expires). Iterates in id order.
+    pub fn live_enroll_tokens(
+        &self,
+        now: Timestamp,
+    ) -> impl Iterator<Item = (&EnrollTokenId, &EnrollToken)> {
+        self.enroll_tokens
+            .iter()
+            .filter(move |(_, t)| !t.revoked && t.expires_at.map_or(true, |exp| exp > now))
+    }
+
+    /// Whether a node has confirmed durable receipt of the CA key (ADR 0037
+    /// §4).
+    pub fn has_key_confirmation(&self, raft_node_id: u64) -> bool {
+        self.key_confirmations.contains_key(&raft_node_id)
+    }
+}
+
+/// A validated PEM bundle of X.509 **CA certificates** — public material only
+/// (ADR 0037 §4).
+///
+/// The CA private key must never enter replicated state, and this type
+/// enforces that *by construction*: the only way in is [`CaCertBundle::parse`],
+/// which requires every PEM block to carry the `CERTIFICATE` label **and**
+/// DER-parse as a real X.509 certificate with the CA basic constraint — so a
+/// private-key PEM, a bundle with a key appended, or key DER relabeled as a
+/// certificate are all refused before they can ride a command into the Raft
+/// log (validating at apply would be too late; the payload would already be
+/// replicated and snapshotted). The inner string is private so no other
+/// construction path exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaCertBundle {
+    pem: String,
+}
+
+/// A candidate CA bundle failed [`CaCertBundle::parse`] validation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidCaBundle {
+    #[error("bundle contains no CERTIFICATE PEM block")]
+    Empty,
+    #[error("bundle contains a non-certificate PEM block: {0:?}")]
+    ForbiddenBlock(String),
+    #[error("malformed PEM structure: {0}")]
+    Malformed(&'static str),
+    #[error("CERTIFICATE block {index} does not parse as an X.509 certificate")]
+    NotACertificate { index: usize },
+    #[error("certificate {index} is not a CA (missing the CA basic constraint)")]
+    NotACa { index: usize },
+}
+
+impl CaCertBundle {
+    /// Validate `pem` as one-or-more CA-certificate PEM blocks (a chain is one
+    /// bundle) with nothing else in the payload: no other block types, no
+    /// content outside blocks, and every block's body must base64-decode and
+    /// DER-parse as an X.509 certificate whose basic constraints say CA — the
+    /// bundle is the cluster's trust-anchor set, so a leaf has no business
+    /// here, and a private key relabeled `CERTIFICATE` fails the DER parse.
+    pub fn parse(pem: impl Into<String>) -> Result<CaCertBundle, InvalidCaBundle> {
+        use base64::Engine as _;
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let pem = pem.into();
+        let mut blocks = 0usize;
+        let mut body: Option<String> = None;
+        for raw in pem.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("-----BEGIN ") {
+                if body.is_some() {
+                    return Err(InvalidCaBundle::Malformed("BEGIN inside an open block"));
+                }
+                let label = rest
+                    .strip_suffix("-----")
+                    .ok_or(InvalidCaBundle::Malformed("unterminated BEGIN marker"))?;
+                if label != "CERTIFICATE" {
+                    return Err(InvalidCaBundle::ForbiddenBlock(label.to_string()));
+                }
+                body = Some(String::new());
+            } else if let Some(rest) = line.strip_prefix("-----END ") {
+                let label = rest
+                    .strip_suffix("-----")
+                    .ok_or(InvalidCaBundle::Malformed("unterminated END marker"))?;
+                let base64_body = match body.take() {
+                    Some(b) if label == "CERTIFICATE" => b,
+                    _ => return Err(InvalidCaBundle::Malformed("END without matching BEGIN")),
+                };
+                // The label is only a claim; the DER is the fact. Decode and
+                // parse the block as a whole X.509 certificate (no trailing
+                // bytes), then require the CA basic constraint.
+                let der = base64::engine::general_purpose::STANDARD
+                    .decode(base64_body)
+                    .map_err(|_| InvalidCaBundle::NotACertificate { index: blocks })?;
+                let cert = match X509Certificate::from_der(&der) {
+                    Ok(([], cert)) => cert,
+                    _ => return Err(InvalidCaBundle::NotACertificate { index: blocks }),
+                };
+                let is_ca = matches!(cert.basic_constraints(), Ok(Some(bc)) if bc.value.ca);
+                if !is_ca {
+                    return Err(InvalidCaBundle::NotACa { index: blocks });
+                }
+                blocks += 1;
+            } else {
+                match body.as_mut() {
+                    None => return Err(InvalidCaBundle::Malformed("content outside a PEM block")),
+                    Some(b) => b.push_str(line),
+                }
+            }
+        }
+        if body.is_some() {
+            return Err(InvalidCaBundle::Malformed("unterminated CERTIFICATE block"));
+        }
+        if blocks == 0 {
+            return Err(InvalidCaBundle::Empty);
+        }
+        Ok(CaCertBundle { pem })
+    }
+
+    /// The validated PEM text.
+    pub fn pem(&self) -> &str {
+        &self.pem
+    }
+}
+
+/// The cluster CA certificate bundle — **public** material only (ADR 0037 §4).
+///
+/// A [`CaCertBundle`] can hold a chain (a future re-root). The CA private key
+/// is created on the forming voter's disk and normally resides only on voter
+/// disks; it never enters replicated state, and this type is shaped so it
+/// *cannot* — the bundle newtype refuses anything but certificate blocks, and
+/// there is no other field it could occupy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaCertificate {
+    /// Validated public certificate material (never a private key).
+    pub bundle: CaCertBundle,
+    pub recorded_at: Timestamp,
+}
+
+/// One coordinator installation's binding to a raft seat (ADR 0037 §7).
+///
+/// Invariant: one machine identity is bound to at most one raft node id, ever
+/// — a binding is never rewritten to a different node id. A re-admission of
+/// the same `(machine, raft_node_id)` pair at the same address is an accepted
+/// no-op; at a different address it is refused (ADR 0037 §7 — address changes
+/// go through the operator set-address path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineBinding {
+    /// The u64 openraft node id (minted by coppice-consensus; distinct from a
+    /// compute [`NodeId`]).
+    pub raft_node_id: u64,
+    pub address: String,
+    /// When the identity was first bound; preserved verbatim across a same-pair
+    /// re-admission.
+    pub bound_at: Timestamp,
+}
+
+/// The role an enrollment token grants (ADR 0037 §5) — never both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollRole {
+    Coordinator,
+    Agent,
+}
+
+/// A replicated enrollment-token record (ADR 0037 §5).
+///
+/// `hash` is the opaque PHC string produced by `coppice-tls::pki::token`; the
+/// hashing lives there, not here (this crate takes no argon2 dependency), and
+/// the secret is never derivable from the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollToken {
+    pub hash: String,
+    pub role: EnrollRole,
+    pub label: String,
+    /// `None` means the token never expires.
+    pub expires_at: Option<Timestamp>,
+    pub minted_at: Timestamp,
+    pub revoked: bool,
+}
+
+/// An identity refused renewal (ADR 0037 §5 eviction).
+///
+/// `Ord` so it can key a `BTreeSet`; the derived order is (variant, inner id).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RevokedIdentity {
+    Machine(MachineId),
+    Node(NodeId),
 }
 
 /// A job's replicated record: the submitted spec plus lifecycle bookkeeping
@@ -299,6 +528,23 @@ pub enum RejectionReason {
     InvalidPolicy(String),
     #[error("cluster version {requested} is not above current {current}")]
     ClusterVersionNotMonotonic { current: u32, requested: u32 },
+    #[error("machine {machine} / raft node {raft_node_id} binding conflicts with an existing one")]
+    MachineIdentityConflict {
+        machine: MachineId,
+        raft_node_id: u64,
+    },
+    #[error(
+        "machine {machine} / raft node {raft_node_id} is already bound at a different address; \
+         address changes go through the operator set-address path (ADR 0037 §7)"
+    )]
+    MachineAddressConflict {
+        machine: MachineId,
+        raft_node_id: u64,
+    },
+    #[error("enrollment token {0} already exists")]
+    DuplicateEnrollToken(EnrollTokenId),
+    #[error("enrollment token {0} not found")]
+    UnknownEnrollToken(EnrollTokenId),
     #[error("command shape invalid: {0}")]
     InvalidCommand(String),
     #[error("batch rejected; per-item diagnostics attached")]

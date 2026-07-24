@@ -1,0 +1,40 @@
+// Cluster-owned PKI / identity vocabulary shared by the command log and the
+// snapshot (ADR 0037 §4/§5/§7). These types name *public* facts only: the CA
+// certificate bundle, the role an enrollment token grants, and the identity a
+// revocation names. The CA *private key* is never represented here — no field
+// in this file, in a command, or in a snapshot record can hold it (ADR 0037
+// §4: the fact of key possession is replicated, the key never is).
+
+syntax = "proto3";
+
+package coppice.core.v1;
+
+import "coppice/core/v1/ids.proto";
+
+// The cluster CA certificate bundle — PUBLIC material every node needs
+// (ADR 0037 §4). A PEM bundle string can hold a future chain (re-root). The
+// private key is created and kept on voter disks only, never in this message.
+message CaCertificate {
+  string cert_pem = 1;
+  int64 recorded_at_us = 2;
+}
+
+// The role an enrollment token grants (ADR 0037 §5). Closed set with the
+// mandatory zero value: a token is a coordinator token or an agent token,
+// never both. Treated as closed at the boundary — an unspecified or unknown
+// value in a committed payload is a decode failure, not a silent default.
+enum EnrollRole {
+  ENROLL_ROLE_UNSPECIFIED = 0;
+  ENROLL_ROLE_COORDINATOR = 1;
+  ENROLL_ROLE_AGENT = 2;
+}
+
+// An identity refused renewal (ADR 0037 §5 eviction): either a coordinator
+// machine identity or a compute node id. A rich enum, so it is a oneof of
+// per-variant messages per schema-style.md.
+message RevokedIdentity {
+  oneof identity {
+    MachineId machine = 1;
+    NodeId node = 2;
+  }
+}

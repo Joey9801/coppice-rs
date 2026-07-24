@@ -33,8 +33,9 @@ mod snapshot;
 
 pub use command::{command_from_pb, command_to_pb};
 pub use snapshot::{
-    allocation_records, attempt_records, cluster_record, job_records, node_records,
-    quota_entity_records, record_counts, state_from_records, state_to_records, RecordCounts,
+    allocation_records, attempt_records, cluster_record, enroll_token_records, job_records,
+    key_confirmation_records, machine_binding_records, node_records, quota_entity_records,
+    record_counts, revoked_identity_records, state_from_records, state_to_records, RecordCounts,
     StateRecords,
 };
 

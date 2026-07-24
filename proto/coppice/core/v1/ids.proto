@@ -46,3 +46,17 @@ message GroupId {
 message QuotaEntityId {
   string value = 1;
 }
+
+// Identifies one coordinator *installation*: a cluster-minted machine
+// identity bound to at most one raft node id, ever (ADR 0037 §7).
+// `machine-<uuid>`.
+message MachineId {
+  string value = 1;
+}
+
+// Identifies an enrollment token (ADR 0037 §5); names the replicated
+// salted-hash record for list/revoke, never derivable from the secret.
+// `token-<uuid>`.
+message EnrollTokenId {
+  string value = 1;
+}

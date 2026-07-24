@@ -1,12 +1,25 @@
 //! # coppice-tls
 //!
-//! Hot-reloadable mutual-TLS material for the coordinator control plane
-//! (ADR 0037 §4, "cert reload"). Certificate issuance stays external — the two
-//! documented deployment paths mint short-lived platform leaves or long-lived
-//! config-management leaves — but the coordinator must pick a rotated
-//! cert/key/CA up *without a restart*: short-lived externally-rotated
-//! certificates then require no process choreography, and in-flight connections
-//! finish on the old leaf.
+//! Cluster-owned PKI plus hot-reloadable mutual-TLS material for the coordinator
+//! control plane (ADR 0037 §4).
+//!
+//! **Certificate issuance is the cluster's own, not external.** ADR 0037 §4
+//! decided the trust root's provenance left open by ADR 0022: the cluster owns
+//! its CA by default, and a minimal deployment provisions no certificates at
+//! all. That issuance lives in the [`pki`] module — minting the cluster root CA,
+//! signing the coordinator/agent/operator leaf profiles, and the enrollment,
+//! machine-identity, and CA-key-custody primitives the convergence loop needs.
+//! **All production certificate/CA minting in the workspace lives under [`pki`],
+//! and only coordinator code paths call its signing entry points** (signing runs
+//! on the leader, which always holds the CA key). External PKI stays a supported
+//! *substitution* — a deployment may supply its own leaves through the `[tls]`
+//! paths and bypass enrollment — never a requirement.
+//!
+//! The reload half below is unchanged: whatever mints the material — cluster
+//! enrollment or an external issuer — the coordinator must pick a rotated
+//! cert/key/CA up *without a restart*, so short-lived rotated certificates
+//! require no process choreography, and in-flight connections finish on the old
+//! leaf.
 //!
 //! The crate is a small shared dependency of both `coppice-coordinator` (the
 //! two mTLS listeners) and `coppice-consensus` (the outbound raft peer mesh),
@@ -52,6 +65,8 @@ use tokio_rustls::server::TlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
+
+pub mod pki;
 
 // ---------------------------------------------------------------------------
 // Metrics (crate-root describe/gather pair, mounted into the coordinator's own
@@ -379,10 +394,11 @@ fn leaf_not_after_unix(leaf: &CertificateDer<'_>) -> Option<i64> {
 /// A certificate leaf's subject fields relevant to the ADR 0037 §4 profile
 /// convention: the common name (`CN`) and organizational unit (`OU`).
 ///
-/// The profile convention as implemented: coordinator *machine* leaves carry
-/// `OU=coppice-coordinator` with `CN` = the stable machine identity;
-/// operator-profile leaves carry `OU=coppice-operator`; agent leaves carry no
-/// `OU` (their `CN` remains the compute-node id).
+/// The profile convention as implemented (ADR 0037 §4, minted by [`pki`]):
+/// coordinator *machine* leaves carry `OU=coppice-coordinator` with `CN` = the
+/// stable machine identity; operator-profile leaves carry `OU=coppice-operators`
+/// (ADR 0022, plural); agent leaves carry no `OU` (their `CN` remains the
+/// compute-node id).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LeafSubject {
     /// The subject common name, if present.

@@ -13,13 +13,15 @@
 use std::collections::BTreeMap;
 
 use coppice_core::attempt::AttemptOutcome;
-use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
+use coppice_core::id::{
+    AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
+};
 use coppice_core::job::Job;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 
-use crate::PolicyConfig;
+use crate::{CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity};
 
 /// A committed mutation to the authoritative state. One arm of the versioned
 /// proto envelope; every command here is cluster-version 1.
@@ -46,6 +48,13 @@ pub enum Command {
     ConfigureQuotaEntity(ConfigureQuotaEntity),
     UpdatePolicy(UpdatePolicy),
     BumpClusterVersion(BumpClusterVersion),
+    // Cluster PKI / identity (ADR 0037).
+    RecordCaCertificate(RecordCaCertificate),
+    BindMachineIdentity(BindMachineIdentity),
+    MintEnrollToken(MintEnrollToken),
+    RevokeEnrollToken(RevokeEnrollToken),
+    RevokeIdentity(RevokeIdentity),
+    ConfirmKeyPossession(ConfirmKeyPossession),
 }
 
 impl Command {
@@ -74,6 +83,12 @@ impl Command {
             Command::ConfigureQuotaEntity(c) => c.updated_at,
             Command::UpdatePolicy(c) => c.updated_at,
             Command::BumpClusterVersion(c) => c.bumped_at,
+            Command::RecordCaCertificate(c) => c.recorded_at,
+            Command::BindMachineIdentity(c) => c.bound_at,
+            Command::MintEnrollToken(c) => c.minted_at,
+            Command::RevokeEnrollToken(c) => c.revoked_at,
+            Command::RevokeIdentity(c) => c.revoked_at,
+            Command::ConfirmKeyPossession(c) => c.confirmed_at,
         }
     }
 }
@@ -303,6 +318,80 @@ pub struct BumpClusterVersion {
     pub bumped_at: Timestamp,
 }
 
+/// Set or replace the replicated CA certificate bundle (ADR 0037 §4).
+///
+/// PUBLIC material only — the CA private key never rides a command: the
+/// [`CaCertBundle`] newtype refuses anything but `CERTIFICATE` PEM blocks at
+/// construction, so a key cannot even enter the Raft log. Replacement is
+/// re-rooting (the §4 re-root runbook).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordCaCertificate {
+    pub bundle: CaCertBundle,
+    pub recorded_at: Timestamp,
+}
+
+/// Bind a coordinator machine identity to a raft seat (ADR 0037 §7).
+///
+/// One machine identity ↔ at most one raft node id, ever; apply rejects a
+/// machine already bound to a different node id and a node id already bound to
+/// a different machine. An exact same `(machine, raft_node_id, address)`
+/// replay is an accepted no-op; the same pair at a different address is
+/// refused — address changes go through the operator set-address path
+/// (ADR 0037 §7), never re-admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindMachineIdentity {
+    pub machine: MachineId,
+    /// The u64 openraft node id (distinct from a compute [`NodeId`]).
+    pub raft_node_id: u64,
+    pub address: String,
+    pub bound_at: Timestamp,
+}
+
+/// Mint an enrollment token (ADR 0037 §5).
+///
+/// `hash` is the opaque PHC string produced by `coppice-tls::pki::token`; the
+/// secret is never replicated. Apply rejects a duplicate token id or an empty
+/// hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintEnrollToken {
+    pub token: EnrollTokenId,
+    pub hash: String,
+    pub role: EnrollRole,
+    pub label: String,
+    pub expires_at: Option<Timestamp>,
+    pub minted_at: Timestamp,
+}
+
+/// Revoke an enrollment token (ADR 0037 §5).
+///
+/// Unknown token rejects; an already-revoked token is an accepted no-op (first
+/// revocation wins, mirroring `AbortJob`'s idempotency).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeEnrollToken {
+    pub token: EnrollTokenId,
+    pub revoked_at: Timestamp,
+}
+
+/// Revoke an identity — renewal-refusal input for the §5 eviction path.
+///
+/// Set insert; an already-revoked identity is an accepted no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeIdentity {
+    pub identity: RevokedIdentity,
+    pub revoked_at: Timestamp,
+}
+
+/// Record the replicated fact that a node confirmed durable receipt of the CA
+/// key (ADR 0037 §4).
+///
+/// The key itself is never replicated; re-confirmation overwrites the
+/// timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmKeyPossession {
+    pub raft_node_id: u64,
+    pub confirmed_at: Timestamp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +430,61 @@ mod tests {
             bumped_at: ts(13),
         });
         assert_eq!(bump.stamped_at(), ts(13));
+    }
+
+    /// The PKI/identity commands each carry exactly one proposer stamp; pin
+    /// that `stamped_at` reads it for every new variant (ADR 0032/0037).
+    #[test]
+    fn stamped_at_reads_the_pki_command_stamps() {
+        let ts = |micros| Timestamp::from_micros(micros).expect("in range");
+
+        let ca_pem = {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.self_signed(&key).unwrap().pem()
+        };
+        let ca = Command::RecordCaCertificate(RecordCaCertificate {
+            bundle: CaCertBundle::parse(ca_pem).unwrap(),
+            recorded_at: ts(21),
+        });
+        assert_eq!(ca.stamped_at(), ts(21));
+
+        let bind = Command::BindMachineIdentity(BindMachineIdentity {
+            machine: MachineId::new(),
+            raft_node_id: 7,
+            address: "10.0.0.1:9000".into(),
+            bound_at: ts(23),
+        });
+        assert_eq!(bind.stamped_at(), ts(23));
+
+        let mint = Command::MintEnrollToken(MintEnrollToken {
+            token: EnrollTokenId::new(),
+            hash: "$argon2id$...".into(),
+            role: EnrollRole::Agent,
+            label: "fleet".into(),
+            expires_at: Some(ts(99)),
+            minted_at: ts(25),
+        });
+        assert_eq!(mint.stamped_at(), ts(25));
+
+        let revoke_token = Command::RevokeEnrollToken(RevokeEnrollToken {
+            token: EnrollTokenId::new(),
+            revoked_at: ts(27),
+        });
+        assert_eq!(revoke_token.stamped_at(), ts(27));
+
+        let revoke_id = Command::RevokeIdentity(RevokeIdentity {
+            identity: RevokedIdentity::Node(NodeId::new()),
+            revoked_at: ts(29),
+        });
+        assert_eq!(revoke_id.stamped_at(), ts(29));
+
+        let confirm = Command::ConfirmKeyPossession(ConfirmKeyPossession {
+            raft_node_id: 7,
+            confirmed_at: ts(31),
+        });
+        assert_eq!(confirm.stamped_at(), ts(31));
     }
 }

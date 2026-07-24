@@ -17,6 +17,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 prost-types.workspace = true
+# Real CA/key material for the CaCertBundle conversion-boundary tests.
+rcgen.workspace = true
+base64.workspace = true
 
 [build-dependencies]
 prost.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "coppice-tls"
-description = "Hot-reloadable coordinator mTLS material: an ArcSwap store, a connection-time rustls acceptor, and a mtime/SIGHUP reload task (ADR 0037 §4)."
+description = "Cluster-owned PKI plus hot-reloadable coordinator mTLS material (ADR 0037 §4): the `pki` module mints the cluster CA and issues the coordinator/agent/operator leaf profiles, and the reload store hand-rolls a connection-time rustls acceptor with a mtime/SIGHUP reload task."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,18 +20,34 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 # PEM → DER parsing for the cert chain, private key, and CA roots.
 rustls-pemfile.workspace = true
-# Reading the leaf's `notAfter` for the expiry gauge; the TLS layer already
-# validates chains, so only the validity field is read here.
+# Reading the leaf's `notAfter` for the expiry gauge, and — in `pki` — the leaf
+# subject and the CA public key (for the key/cert-match custody check).
 x509-parser.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 metrics.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+# `pki` (ADR 0037 §4): the cluster-owned CA and leaf issuer. ALL production
+# certificate/CA minting in the workspace lives behind this module — see the
+# crate docs. rcgen mints/signs; rustls-webpki does the offline chain check in
+# `verify_leaf`; `time` sets the validity windows.
+rcgen.workspace = true
+rustls-webpki.workspace = true
+time.workspace = true
+coppice-core.workspace = true
+# Unique temp-file names for the durable owner-only writer: a fixed temp
+# name could pre-exist with loose permissions (or as a symlink) and defeat
+# the create-time 0600.
+uuid.workspace = true
+# `pki::token` (ADR 0037 §5): argon2id hashing of enrollment-token secrets and
+# URL-safe base64 for the high-entropy secret itself.
+# `std` propagates through `password-hash` to `rand_core/getrandom`, which is
+# what supplies the OS CSPRNG (`OsRng`) for the token secret and salt.
+argon2 = { workspace = true, features = ["std"] }
+base64.workspace = true
 
 [dev-dependencies]
-# Mints throwaway CAs and leaves for the reload/rotation tests.
-rcgen.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

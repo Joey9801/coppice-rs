@@ -25,6 +25,7 @@ import "coppice/core/v1/attempt.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
 import "coppice/core/v1/node.proto";
+import "coppice/core/v1/pki.proto";
 import "coppice/core/v1/quota.proto";
 import "coppice/raft/v1/raft.proto";
 
@@ -77,6 +78,12 @@ enum SectionKind {
   SECTION_KIND_QUOTA_ENTITY = 5;
   // Exactly one record (ClusterStateRecord) in exactly one shard.
   SECTION_KIND_CLUSTER_STATE = 6;
+  // Cluster PKI / identity facts (ADR 0037); bounded-cardinality sections
+  // that mirror the node/quota-entity ones.
+  SECTION_KIND_MACHINE_BINDING = 7;
+  SECTION_KIND_ENROLL_TOKEN = 8;
+  SECTION_KIND_REVOKED_IDENTITY = 9;
+  SECTION_KIND_KEY_CONFIRMATION = 10;
 }
 
 enum Compression {
@@ -174,4 +181,42 @@ message ClusterStateRecord {
   // Commit-order sequence for allocations; replicated so it is a pure
   // function of the command history.
   uint64 next_allocation_seq = 4;
+  // The cluster CA certificate bundle (ADR 0037 §4), a singleton like the
+  // policy above — PUBLIC material only; the private key is never here.
+  // Absent on a pre-0037 snapshot and on a cluster that has not been formed.
+  optional coppice.core.v1.CaCertificate ca = 5;
+}
+
+// One coordinator installation's binding to a raft seat (ADR 0037 §7). Keyed
+// by `machine`. Bindings are never rewritten to a different raft node id.
+message MachineBindingRecord {
+  coppice.core.v1.MachineId machine = 1;
+  uint64 raft_node_id = 2;
+  string address = 3;
+  int64 bound_at_us = 4;
+}
+
+// A replicated enrollment-token record (ADR 0037 §5). Keyed by `token`.
+// `hash` is the opaque PHC string; the secret is never derivable from it.
+message EnrollTokenRecord {
+  coppice.core.v1.EnrollTokenId token = 1;
+  string hash = 2;
+  coppice.core.v1.EnrollRole role = 3;
+  string label = 4;
+  optional int64 expires_at_us = 5;
+  int64 minted_at_us = 6;
+  bool revoked = 7;
+}
+
+// One revoked identity (ADR 0037 §5). The record is the identity itself; the
+// set has no other per-entry state.
+message RevokedIdentityRecord {
+  coppice.core.v1.RevokedIdentity identity = 1;
+}
+
+// The replicated fact that a node confirmed durable CA-key receipt (ADR 0037
+// §4). Keyed by `raft_node_id`; the key itself is never replicated.
+message KeyConfirmationRecord {
+  uint64 raft_node_id = 1;
+  int64 confirmed_at_us = 2;
 }

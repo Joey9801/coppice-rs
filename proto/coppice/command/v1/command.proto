@@ -17,6 +17,7 @@ import "coppice/core/v1/attempt.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
 import "coppice/core/v1/node.proto";
+import "coppice/core/v1/pki.proto";
 import "coppice/core/v1/quota.proto";
 import "coppice/core/v1/resource.proto";
 
@@ -33,9 +34,10 @@ import "coppice/core/v1/resource.proto";
 //   50–59   node lifecycle
 //   60–69   housekeeping
 //   70–89   admin / policy
-//   90+     unallocated
+//   90–99   cluster PKI / identity (ADR 0037)
+//   100+    unallocated
 //
-// New arms take the next tag in their range; a full range spills into 90+.
+// New arms take the next tag in their range; a full range spills into 100+.
 message Command {
   // The ClusterVersion the proposer wrote this command under. All commands
   // in this file are cluster-version 1; version-gated arms may be *read* by
@@ -63,6 +65,13 @@ message Command {
     ConfigureQuotaEntity configure_quota_entity = 70;
     UpdatePolicy update_policy = 71;
     BumpClusterVersion bump_cluster_version = 72;
+
+    RecordCaCertificate record_ca_certificate = 90;
+    BindMachineIdentity bind_machine_identity = 91;
+    MintEnrollToken mint_enroll_token = 92;
+    RevokeEnrollToken revoke_enroll_token = 93;
+    RevokeIdentity revoke_identity = 94;
+    ConfirmKeyPossession confirm_key_possession = 95;
   }
 }
 
@@ -240,4 +249,62 @@ message UpdatePolicy {
 message BumpClusterVersion {
   uint32 to = 1;
   int64 bumped_at_us = 2;
+}
+
+// ---- Cluster PKI / identity (ADR 0037) ----
+
+// Set or replace the replicated CA certificate bundle (ADR 0037 §4). PUBLIC
+// material only — the CA private key never rides a command. Replacement is
+// re-rooting (the §4 re-root runbook); apply rejects an empty bundle.
+message RecordCaCertificate {
+  string cert_pem = 1;
+  int64 recorded_at_us = 2;
+}
+
+// Bind a coordinator machine identity to a raft seat (ADR 0037 §7). One
+// machine identity maps to at most one raft node id, ever, and one raft node
+// id to at most one machine — apply rejects either conflict. The same
+// (machine, raft_node_id) pair again is an accepted re-admission that may
+// update `address`.
+message BindMachineIdentity {
+  coppice.core.v1.MachineId machine = 1;
+  // The u64 openraft node id (coppice-consensus mints it; distinct from a
+  // compute NodeId).
+  uint64 raft_node_id = 2;
+  string address = 3;
+  int64 bound_at_us = 4;
+}
+
+// Mint an enrollment token (ADR 0037 §5). `hash` is the opaque PHC string
+// produced by coppice-tls::pki::token — the secret itself is never
+// replicated. Apply rejects a duplicate token id or an empty hash.
+message MintEnrollToken {
+  coppice.core.v1.EnrollTokenId token = 1;
+  string hash = 2;
+  coppice.core.v1.EnrollRole role = 3;
+  string label = 4;
+  optional int64 expires_at_us = 5;
+  int64 minted_at_us = 6;
+}
+
+// Revoke an enrollment token (ADR 0037 §5). Unknown token rejects; an
+// already-revoked token is an accepted no-op (first revocation wins).
+message RevokeEnrollToken {
+  coppice.core.v1.EnrollTokenId token = 1;
+  int64 revoked_at_us = 2;
+}
+
+// Revoke an identity — renewal-refusal input for the §5 eviction path. Set
+// insert; an already-revoked identity is an accepted no-op.
+message RevokeIdentity {
+  coppice.core.v1.RevokedIdentity identity = 1;
+  int64 revoked_at_us = 2;
+}
+
+// Record the replicated FACT that a node confirmed durable receipt of the CA
+// key (ADR 0037 §4 key custody). The key itself is never replicated;
+// re-confirmation overwrites the timestamp.
+message ConfirmKeyPossession {
+  uint64 raft_node_id = 1;
+  int64 confirmed_at_us = 2;
 }

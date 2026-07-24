@@ -14,12 +14,17 @@
 //! disagree with the allocation records.
 
 use coppice_core::allocation::AllocationState;
+use coppice_core::id::{EnrollTokenId, MachineId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::time::Timestamp;
 use coppice_state::{
-    AllocationRecord, AttemptRecord, JobRecord, NodeRecord, QuotaEntity, StateMachine,
+    AllocationRecord, AttemptRecord, CaCertBundle, CaCertificate, EnrollToken, JobRecord,
+    MachineBinding, NodeRecord, QuotaEntity, RevokedIdentity, StateMachine,
 };
 
+use super::command::{enroll_role_from_pb, enroll_role_to_pb};
 use super::{req, timestamp, ConvertError};
+use crate::pb::core::v1 as pbcore;
 use crate::pb::storage::v1 as pb;
 
 // ---- Per-record conversions ----
@@ -169,6 +174,136 @@ impl TryFrom<pb::QuotaEntityRecord> for (coppice_core::id::QuotaEntityId, QuotaE
     }
 }
 
+// ---- Cluster PKI / identity records (ADR 0037) ----
+
+impl From<&CaCertificate> for pbcore::CaCertificate {
+    fn from(ca: &CaCertificate) -> Self {
+        pbcore::CaCertificate {
+            cert_pem: ca.bundle.pem().to_string(),
+            recorded_at_us: ca.recorded_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pbcore::CaCertificate> for CaCertificate {
+    type Error = ConvertError;
+
+    fn try_from(ca: pbcore::CaCertificate) -> Result<Self, ConvertError> {
+        Ok(CaCertificate {
+            // Same gate as the command path: a snapshot section is another
+            // door into replicated state, and it gets the same lock.
+            bundle: CaCertBundle::parse(ca.cert_pem).map_err(|_| ConvertError::Invalid {
+                field: "CaCertificate.cert_pem",
+                reason: "not a sequence of X.509 CA certificate PEM blocks",
+            })?,
+            recorded_at: timestamp(ca.recorded_at_us, "CaCertificate.recorded_at_us")?,
+        })
+    }
+}
+
+// Bindings are keyed externally (`StateMachine.machine_bindings`), so the
+// record carries the key and converts as a (key, binding) pair.
+
+impl From<(&MachineId, &MachineBinding)> for pb::MachineBindingRecord {
+    fn from((machine, b): (&MachineId, &MachineBinding)) -> Self {
+        pb::MachineBindingRecord {
+            machine: Some((*machine).into()),
+            raft_node_id: b.raft_node_id,
+            address: b.address.clone(),
+            bound_at_us: b.bound_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::MachineBindingRecord> for (MachineId, MachineBinding) {
+    type Error = ConvertError;
+
+    fn try_from(r: pb::MachineBindingRecord) -> Result<Self, ConvertError> {
+        Ok((
+            req(r.machine, "MachineBindingRecord.machine")?.try_into()?,
+            MachineBinding {
+                raft_node_id: r.raft_node_id,
+                address: r.address,
+                bound_at: timestamp(r.bound_at_us, "MachineBindingRecord.bound_at_us")?,
+            },
+        ))
+    }
+}
+
+impl From<(&EnrollTokenId, &EnrollToken)> for pb::EnrollTokenRecord {
+    fn from((token, t): (&EnrollTokenId, &EnrollToken)) -> Self {
+        pb::EnrollTokenRecord {
+            token: Some((*token).into()),
+            hash: t.hash.clone(),
+            role: enroll_role_to_pb(t.role) as i32,
+            label: t.label.clone(),
+            expires_at_us: t.expires_at.map(|e| e.as_micros()),
+            minted_at_us: t.minted_at.as_micros(),
+            revoked: t.revoked,
+        }
+    }
+}
+
+impl TryFrom<pb::EnrollTokenRecord> for (EnrollTokenId, EnrollToken) {
+    type Error = ConvertError;
+
+    fn try_from(r: pb::EnrollTokenRecord) -> Result<Self, ConvertError> {
+        Ok((
+            req(r.token, "EnrollTokenRecord.token")?.try_into()?,
+            EnrollToken {
+                hash: r.hash,
+                role: enroll_role_from_pb(r.role, "EnrollTokenRecord.role")?,
+                label: r.label,
+                expires_at: r
+                    .expires_at_us
+                    .map(|us| timestamp(us, "EnrollTokenRecord.expires_at_us"))
+                    .transpose()?,
+                minted_at: timestamp(r.minted_at_us, "EnrollTokenRecord.minted_at_us")?,
+                revoked: r.revoked,
+            },
+        ))
+    }
+}
+
+impl From<&RevokedIdentity> for pb::RevokedIdentityRecord {
+    fn from(identity: &RevokedIdentity) -> Self {
+        pb::RevokedIdentityRecord {
+            identity: Some(identity.into()),
+        }
+    }
+}
+
+impl TryFrom<pb::RevokedIdentityRecord> for RevokedIdentity {
+    type Error = ConvertError;
+
+    fn try_from(r: pb::RevokedIdentityRecord) -> Result<Self, ConvertError> {
+        req(r.identity, "RevokedIdentityRecord.identity")?.try_into()
+    }
+}
+
+// Key confirmations are keyed by the raft node id, so the record carries the
+// key and converts as a (raft_node_id, confirmed_at) pair.
+
+impl From<(&u64, &Timestamp)> for pb::KeyConfirmationRecord {
+    fn from((raft_node_id, confirmed_at): (&u64, &Timestamp)) -> Self {
+        pb::KeyConfirmationRecord {
+            raft_node_id: *raft_node_id,
+            confirmed_at_us: confirmed_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::KeyConfirmationRecord> for (u64, Timestamp) {
+    type Error = ConvertError;
+
+    fn try_from(r: pb::KeyConfirmationRecord) -> Result<Self, ConvertError> {
+        Ok((
+            r.raft_node_id,
+            timestamp(r.confirmed_at_us, "KeyConfirmationRecord.confirmed_at_us")?,
+        ))
+    }
+}
+
 // ---- Whole-state assembly ----
 
 /// A `StateMachine` flattened into snapshot records, grouped per entity
@@ -180,6 +315,10 @@ pub struct StateRecords {
     pub allocations: Vec<pb::AllocationRecord>,
     pub nodes: Vec<pb::NodeRecord>,
     pub quota_entities: Vec<pb::QuotaEntityRecord>,
+    pub machine_bindings: Vec<pb::MachineBindingRecord>,
+    pub enroll_tokens: Vec<pb::EnrollTokenRecord>,
+    pub revoked_identities: Vec<pb::RevokedIdentityRecord>,
+    pub key_confirmations: Vec<pb::KeyConfirmationRecord>,
     pub cluster: Option<pb::ClusterStateRecord>,
 }
 
@@ -195,6 +334,10 @@ pub struct RecordCounts {
     pub allocations: usize,
     pub nodes: usize,
     pub quota_entities: usize,
+    pub machine_bindings: usize,
+    pub enroll_tokens: usize,
+    pub revoked_identities: usize,
+    pub key_confirmations: usize,
 }
 
 /// Count each entity kind without touching a record.
@@ -205,6 +348,10 @@ pub fn record_counts(state: &StateMachine) -> RecordCounts {
         allocations: state.allocations.len(),
         nodes: state.nodes.len(),
         quota_entities: state.quota_entities.len(),
+        machine_bindings: state.machine_bindings.len(),
+        enroll_tokens: state.enroll_tokens.len(),
+        revoked_identities: state.revoked_identities.len(),
+        key_confirmations: state.key_confirmations.len(),
     }
 }
 
@@ -284,14 +431,76 @@ pub fn quota_entity_records(
         .map(Into::into)
 }
 
+/// Machine-binding records for the window `[start, start + count)`. Each
+/// record carries its own key, so the stream is `(&id, &binding)` pairs.
+pub fn machine_binding_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::MachineBindingRecord> + '_ {
+    state
+        .machine_bindings
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
+/// Enroll-token records for the window `[start, start + count)`, `(&id, &token)`
+/// pairs.
+pub fn enroll_token_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::EnrollTokenRecord> + '_ {
+    state
+        .enroll_tokens
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
+/// Revoked-identity records for the window `[start, start + count)`. The record
+/// *is* the identity, so the stream is `&RevokedIdentity`.
+pub fn revoked_identity_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::RevokedIdentityRecord> + '_ {
+    state
+        .revoked_identities
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
+/// Key-confirmation records for the window `[start, start + count)`,
+/// `(&raft_node_id, &confirmed_at)` pairs.
+pub fn key_confirmation_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::KeyConfirmationRecord> + '_ {
+    state
+        .key_confirmations
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
 /// The single `ClusterStateRecord` — the state's scalar tail (policy,
-/// versions, allocation sequence). Not sharded: exactly one per snapshot.
+/// versions, allocation sequence, and the singleton CA bundle). Not sharded:
+/// exactly one per snapshot.
 pub fn cluster_record(state: &StateMachine) -> pb::ClusterStateRecord {
     pb::ClusterStateRecord {
         policy: Some((&state.policy).into()),
         cluster_version: state.cluster_version,
         version: state.version,
         next_allocation_seq: state.next_allocation_seq,
+        ca: state.ca.as_ref().map(Into::into),
     }
 }
 
@@ -308,6 +517,10 @@ pub fn state_to_records(state: &StateMachine) -> StateRecords {
         allocations: allocation_records(state, 0, counts.allocations).collect(),
         nodes: node_records(state, 0, counts.nodes).collect(),
         quota_entities: quota_entity_records(state, 0, counts.quota_entities).collect(),
+        machine_bindings: machine_binding_records(state, 0, counts.machine_bindings).collect(),
+        enroll_tokens: enroll_token_records(state, 0, counts.enroll_tokens).collect(),
+        revoked_identities: revoked_identity_records(state, 0, counts.revoked_identities).collect(),
+        key_confirmations: key_confirmation_records(state, 0, counts.key_confirmations).collect(),
         cluster: Some(cluster_record(state)),
     }
 }
@@ -360,12 +573,47 @@ pub fn state_from_records(records: StateRecords) -> Result<StateMachine, Convert
             return Err(ConvertError::DuplicateEntry("StateRecords.quota_entities"));
         }
     }
+    for r in records.machine_bindings {
+        let (machine, binding) = r.try_into()?;
+        if state.machine_bindings.insert(machine, binding).is_some() {
+            return Err(ConvertError::DuplicateEntry(
+                "StateRecords.machine_bindings",
+            ));
+        }
+    }
+    for r in records.enroll_tokens {
+        let (token, record) = r.try_into()?;
+        if state.enroll_tokens.insert(token, record).is_some() {
+            return Err(ConvertError::DuplicateEntry("StateRecords.enroll_tokens"));
+        }
+    }
+    for r in records.revoked_identities {
+        let identity: RevokedIdentity = r.try_into()?;
+        if !state.revoked_identities.insert(identity) {
+            return Err(ConvertError::DuplicateEntry(
+                "StateRecords.revoked_identities",
+            ));
+        }
+    }
+    for r in records.key_confirmations {
+        let (raft_node_id, confirmed_at) = r.try_into()?;
+        if state
+            .key_confirmations
+            .insert(raft_node_id, confirmed_at)
+            .is_some()
+        {
+            return Err(ConvertError::DuplicateEntry(
+                "StateRecords.key_confirmations",
+            ));
+        }
+    }
 
     let cluster = req(records.cluster, "StateRecords.cluster")?;
     state.policy = req(cluster.policy, "ClusterStateRecord.policy")?.try_into()?;
     state.cluster_version = cluster.cluster_version;
     state.version = cluster.version;
     state.next_allocation_seq = cluster.next_allocation_seq;
+    state.ca = cluster.ca.map(TryInto::try_into).transpose()?;
 
     Ok(state)
 }

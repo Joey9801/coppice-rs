@@ -125,6 +125,21 @@ typed_id!(
     ClusterId,
     "cluster"
 );
+typed_id!(
+    /// Identifies one coordinator *installation*: a cluster-minted opaque
+    /// machine identity carried in the coordinator leaf's subject and bound
+    /// to at most one raft node id, ever (ADR 0037 §7). Persisted in the
+    /// installation's data directory; fresh persistent state mints a fresh
+    /// identity.
+    MachineId,
+    "machine"
+);
+typed_id!(
+    /// Identifies an enrollment token (ADR 0037 §5). Names the replicated
+    /// salted-hash record for list/revoke; never derivable from the secret.
+    EnrollTokenId,
+    "token"
+);
 
 #[cfg(test)]
 mod tests {
