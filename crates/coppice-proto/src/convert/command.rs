@@ -10,12 +10,13 @@
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::Duration;
 use coppice_state::command::{
-    AbortJob, AllocationSpec, BumpClusterVersion, Command, CommitPlacements, ConfigureQuotaEntity,
-    DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, LostAttempt, Placement, ReconcileNode,
-    RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RegisterNode,
-    SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
+    ConfigureQuotaEntity, ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt,
+    EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement, ReconcileNode, RecordAttemptExited,
+    RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate, RegisterNode,
+    RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
 };
-use coppice_state::PolicyConfig;
+use coppice_state::{CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity};
 
 use super::core::{labels_from_pb, labels_to_pb, multipliers_from_pb, multipliers_to_pb};
 use super::{nonnegative_duration, req, timestamp, ConvertError};
@@ -44,6 +45,12 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::ConfigureQuotaEntity(c) => Body::ConfigureQuotaEntity(c.into()),
         Command::UpdatePolicy(c) => Body::UpdatePolicy(c.into()),
         Command::BumpClusterVersion(c) => Body::BumpClusterVersion(c.into()),
+        Command::RecordCaCertificate(c) => Body::RecordCaCertificate(c.into()),
+        Command::BindMachineIdentity(c) => Body::BindMachineIdentity(c.into()),
+        Command::MintEnrollToken(c) => Body::MintEnrollToken(c.into()),
+        Command::RevokeEnrollToken(c) => Body::RevokeEnrollToken(c.into()),
+        Command::RevokeIdentity(c) => Body::RevokeIdentity(c.into()),
+        Command::ConfirmKeyPossession(c) => Body::ConfirmKeyPossession(c.into()),
     };
     pb::Command {
         version: cluster_version,
@@ -74,6 +81,12 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::ConfigureQuotaEntity(c) => Command::ConfigureQuotaEntity(c.try_into()?),
         Body::UpdatePolicy(c) => Command::UpdatePolicy(c.try_into()?),
         Body::BumpClusterVersion(c) => Command::BumpClusterVersion(c.try_into()?),
+        Body::RecordCaCertificate(c) => Command::RecordCaCertificate(c.try_into()?),
+        Body::BindMachineIdentity(c) => Command::BindMachineIdentity(c.try_into()?),
+        Body::MintEnrollToken(c) => Command::MintEnrollToken(c.try_into()?),
+        Body::RevokeEnrollToken(c) => Command::RevokeEnrollToken(c.try_into()?),
+        Body::RevokeIdentity(c) => Command::RevokeIdentity(c.try_into()?),
+        Body::ConfirmKeyPossession(c) => Command::ConfirmKeyPossession(c.try_into()?),
     };
     Ok((command_version, body))
 }
@@ -517,6 +530,195 @@ impl TryFrom<pb::BumpClusterVersion> for BumpClusterVersion {
         Ok(BumpClusterVersion {
             to: c.to,
             bumped_at: timestamp(c.bumped_at_us, "BumpClusterVersion.bumped_at_us")?,
+        })
+    }
+}
+
+// ---- Cluster PKI / identity (ADR 0037) ----
+
+/// The `EnrollRole` domain enum ↔ its closed proto enum. Shared with the
+/// snapshot's `EnrollTokenRecord`.
+pub(crate) fn enroll_role_to_pb(role: EnrollRole) -> pbcore::EnrollRole {
+    match role {
+        EnrollRole::Coordinator => pbcore::EnrollRole::Coordinator,
+        EnrollRole::Agent => pbcore::EnrollRole::Agent,
+    }
+}
+
+/// Decode an `EnrollRole` from its `i32` wire value. The enum is closed:
+/// `UNSPECIFIED` and any unknown value are rejected, never defaulted.
+pub(crate) fn enroll_role_from_pb(
+    value: i32,
+    field: &'static str,
+) -> Result<EnrollRole, ConvertError> {
+    match pbcore::EnrollRole::try_from(value) {
+        Ok(pbcore::EnrollRole::Coordinator) => Ok(EnrollRole::Coordinator),
+        Ok(pbcore::EnrollRole::Agent) => Ok(EnrollRole::Agent),
+        _ => Err(ConvertError::UnknownEnum { field, value }),
+    }
+}
+
+impl From<&RevokedIdentity> for pbcore::RevokedIdentity {
+    fn from(identity: &RevokedIdentity) -> Self {
+        use crate::pb::core::v1::revoked_identity as ri;
+        let identity = match identity {
+            RevokedIdentity::Machine(m) => ri::Identity::Machine((*m).into()),
+            RevokedIdentity::Node(n) => ri::Identity::Node((*n).into()),
+        };
+        pbcore::RevokedIdentity {
+            identity: Some(identity),
+        }
+    }
+}
+
+impl TryFrom<pbcore::RevokedIdentity> for RevokedIdentity {
+    type Error = ConvertError;
+
+    fn try_from(identity: pbcore::RevokedIdentity) -> Result<Self, ConvertError> {
+        use crate::pb::core::v1::revoked_identity as ri;
+        Ok(match req(identity.identity, "RevokedIdentity.identity")? {
+            ri::Identity::Machine(m) => RevokedIdentity::Machine(m.try_into()?),
+            ri::Identity::Node(n) => RevokedIdentity::Node(n.try_into()?),
+        })
+    }
+}
+
+impl From<&RecordCaCertificate> for pb::RecordCaCertificate {
+    fn from(c: &RecordCaCertificate) -> Self {
+        pb::RecordCaCertificate {
+            cert_pem: c.bundle.pem().to_string(),
+            recorded_at_us: c.recorded_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RecordCaCertificate> for RecordCaCertificate {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RecordCaCertificate) -> Result<Self, ConvertError> {
+        Ok(RecordCaCertificate {
+            // The wire carries a plain string; the domain refuses anything but
+            // certificate blocks here, before the command can be proposed.
+            bundle: CaCertBundle::parse(c.cert_pem).map_err(|_| ConvertError::Invalid {
+                field: "RecordCaCertificate.cert_pem",
+                reason: "not a sequence of X.509 CA certificate PEM blocks",
+            })?,
+            recorded_at: timestamp(c.recorded_at_us, "RecordCaCertificate.recorded_at_us")?,
+        })
+    }
+}
+
+impl From<&BindMachineIdentity> for pb::BindMachineIdentity {
+    fn from(c: &BindMachineIdentity) -> Self {
+        pb::BindMachineIdentity {
+            machine: Some(c.machine.into()),
+            raft_node_id: c.raft_node_id,
+            address: c.address.clone(),
+            bound_at_us: c.bound_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::BindMachineIdentity> for BindMachineIdentity {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::BindMachineIdentity) -> Result<Self, ConvertError> {
+        Ok(BindMachineIdentity {
+            machine: req(c.machine, "BindMachineIdentity.machine")?.try_into()?,
+            raft_node_id: c.raft_node_id,
+            address: c.address,
+            bound_at: timestamp(c.bound_at_us, "BindMachineIdentity.bound_at_us")?,
+        })
+    }
+}
+
+impl From<&MintEnrollToken> for pb::MintEnrollToken {
+    fn from(c: &MintEnrollToken) -> Self {
+        pb::MintEnrollToken {
+            token: Some(c.token.into()),
+            hash: c.hash.clone(),
+            role: enroll_role_to_pb(c.role) as i32,
+            label: c.label.clone(),
+            expires_at_us: c.expires_at.map(|t| t.as_micros()),
+            minted_at_us: c.minted_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::MintEnrollToken> for MintEnrollToken {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::MintEnrollToken) -> Result<Self, ConvertError> {
+        Ok(MintEnrollToken {
+            token: req(c.token, "MintEnrollToken.token")?.try_into()?,
+            hash: c.hash,
+            role: enroll_role_from_pb(c.role, "MintEnrollToken.role")?,
+            label: c.label,
+            expires_at: c
+                .expires_at_us
+                .map(|us| timestamp(us, "MintEnrollToken.expires_at_us"))
+                .transpose()?,
+            minted_at: timestamp(c.minted_at_us, "MintEnrollToken.minted_at_us")?,
+        })
+    }
+}
+
+impl From<&RevokeEnrollToken> for pb::RevokeEnrollToken {
+    fn from(c: &RevokeEnrollToken) -> Self {
+        pb::RevokeEnrollToken {
+            token: Some(c.token.into()),
+            revoked_at_us: c.revoked_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RevokeEnrollToken> for RevokeEnrollToken {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RevokeEnrollToken) -> Result<Self, ConvertError> {
+        Ok(RevokeEnrollToken {
+            token: req(c.token, "RevokeEnrollToken.token")?.try_into()?,
+            revoked_at: timestamp(c.revoked_at_us, "RevokeEnrollToken.revoked_at_us")?,
+        })
+    }
+}
+
+impl From<&RevokeIdentity> for pb::RevokeIdentity {
+    fn from(c: &RevokeIdentity) -> Self {
+        pb::RevokeIdentity {
+            identity: Some((&c.identity).into()),
+            revoked_at_us: c.revoked_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RevokeIdentity> for RevokeIdentity {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RevokeIdentity) -> Result<Self, ConvertError> {
+        Ok(RevokeIdentity {
+            identity: req(c.identity, "RevokeIdentity.identity")?.try_into()?,
+            revoked_at: timestamp(c.revoked_at_us, "RevokeIdentity.revoked_at_us")?,
+        })
+    }
+}
+
+impl From<&ConfirmKeyPossession> for pb::ConfirmKeyPossession {
+    fn from(c: &ConfirmKeyPossession) -> Self {
+        pb::ConfirmKeyPossession {
+            raft_node_id: c.raft_node_id,
+            confirmed_at_us: c.confirmed_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::ConfirmKeyPossession> for ConfirmKeyPossession {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::ConfirmKeyPossession) -> Result<Self, ConvertError> {
+        Ok(ConfirmKeyPossession {
+            raft_node_id: c.raft_node_id,
+            confirmed_at: timestamp(c.confirmed_at_us, "ConfirmKeyPossession.confirmed_at_us")?,
         })
     }
 }

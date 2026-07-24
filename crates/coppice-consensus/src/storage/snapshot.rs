@@ -35,8 +35,9 @@ use prost::Message;
 
 use coppice_core::bytes::ByteSize;
 use coppice_proto::convert::{
-    allocation_records, attempt_records, cluster_record, job_records, node_records,
-    quota_entity_records, record_counts, RecordCounts, StateRecords,
+    allocation_records, attempt_records, cluster_record, enroll_token_records, job_records,
+    key_confirmation_records, machine_binding_records, node_records, quota_entity_records,
+    record_counts, revoked_identity_records, RecordCounts, StateRecords,
 };
 use coppice_proto::pb::storage::v1 as pb;
 use coppice_state::StateMachine;
@@ -337,6 +338,10 @@ enum SectionRecords<'a> {
     Allocations(&'a [pb::AllocationRecord]),
     Nodes(&'a [pb::NodeRecord]),
     QuotaEntities(&'a [pb::QuotaEntityRecord]),
+    MachineBindings(&'a [pb::MachineBindingRecord]),
+    EnrollTokens(&'a [pb::EnrollTokenRecord]),
+    RevokedIdentities(&'a [pb::RevokedIdentityRecord]),
+    KeyConfirmations(&'a [pb::KeyConfirmationRecord]),
     Cluster(&'a pb::ClusterStateRecord),
 }
 
@@ -405,6 +410,34 @@ fn section_jobs(records: &StateRecords, shards: usize) -> Vec<SectionJob<'_>> {
         SectionRecords::QuotaEntities,
         &mut jobs,
     );
+    shard(
+        pb::SectionKind::MachineBinding,
+        &records.machine_bindings,
+        shards,
+        SectionRecords::MachineBindings,
+        &mut jobs,
+    );
+    shard(
+        pb::SectionKind::EnrollToken,
+        &records.enroll_tokens,
+        shards,
+        SectionRecords::EnrollTokens,
+        &mut jobs,
+    );
+    shard(
+        pb::SectionKind::RevokedIdentity,
+        &records.revoked_identities,
+        shards,
+        SectionRecords::RevokedIdentities,
+        &mut jobs,
+    );
+    shard(
+        pb::SectionKind::KeyConfirmation,
+        &records.key_confirmations,
+        shards,
+        SectionRecords::KeyConfirmations,
+        &mut jobs,
+    );
     if let Some(cluster) = &records.cluster {
         jobs.push(SectionJob {
             kind: pb::SectionKind::ClusterState,
@@ -433,6 +466,10 @@ fn encode_job(job: &SectionJob) -> RawSection {
         SectionRecords::Allocations(records) => encode(records, &mut bytes),
         SectionRecords::Nodes(records) => encode(records, &mut bytes),
         SectionRecords::QuotaEntities(records) => encode(records, &mut bytes),
+        SectionRecords::MachineBindings(records) => encode(records, &mut bytes),
+        SectionRecords::EnrollTokens(records) => encode(records, &mut bytes),
+        SectionRecords::RevokedIdentities(records) => encode(records, &mut bytes),
+        SectionRecords::KeyConfirmations(records) => encode(records, &mut bytes),
         SectionRecords::Cluster(record) => encode(std::slice::from_ref(record), &mut bytes),
     };
     RawSection {
@@ -710,6 +747,30 @@ fn state_section_jobs(counts: &RecordCounts, shards: usize) -> Vec<StateSectionJ
         shards,
         &mut jobs,
     );
+    shard(
+        pb::SectionKind::MachineBinding,
+        counts.machine_bindings,
+        shards,
+        &mut jobs,
+    );
+    shard(
+        pb::SectionKind::EnrollToken,
+        counts.enroll_tokens,
+        shards,
+        &mut jobs,
+    );
+    shard(
+        pb::SectionKind::RevokedIdentity,
+        counts.revoked_identities,
+        shards,
+        &mut jobs,
+    );
+    shard(
+        pb::SectionKind::KeyConfirmation,
+        counts.key_confirmations,
+        shards,
+        &mut jobs,
+    );
     jobs.push(StateSectionJob {
         kind: pb::SectionKind::ClusterState,
         shard: 0,
@@ -743,6 +804,18 @@ fn encode_state_job(state: &StateMachine, job: &StateSectionJob) -> RawSection {
         pb::SectionKind::Node => encode(node_records(state, start, count), &mut bytes),
         pb::SectionKind::QuotaEntity => {
             encode(quota_entity_records(state, start, count), &mut bytes)
+        }
+        pb::SectionKind::MachineBinding => {
+            encode(machine_binding_records(state, start, count), &mut bytes)
+        }
+        pb::SectionKind::EnrollToken => {
+            encode(enroll_token_records(state, start, count), &mut bytes)
+        }
+        pb::SectionKind::RevokedIdentity => {
+            encode(revoked_identity_records(state, start, count), &mut bytes)
+        }
+        pb::SectionKind::KeyConfirmation => {
+            encode(key_confirmation_records(state, start, count), &mut bytes)
         }
         pb::SectionKind::ClusterState => encode(std::iter::once(cluster_record(state)), &mut bytes),
         pb::SectionKind::Unspecified => 0,
@@ -952,6 +1025,18 @@ fn decode_entry(path: &Path, entry: &pb::SectionEntry, section: &[u8]) -> io::Re
         pb::SectionKind::QuotaEntity => {
             Decoded::QuotaEntities(decode_section(path, entry, section)?)
         }
+        pb::SectionKind::MachineBinding => {
+            Decoded::MachineBindings(decode_section(path, entry, section)?)
+        }
+        pb::SectionKind::EnrollToken => {
+            Decoded::EnrollTokens(decode_section(path, entry, section)?)
+        }
+        pb::SectionKind::RevokedIdentity => {
+            Decoded::RevokedIdentities(decode_section(path, entry, section)?)
+        }
+        pb::SectionKind::KeyConfirmation => {
+            Decoded::KeyConfirmations(decode_section(path, entry, section)?)
+        }
         pb::SectionKind::ClusterState => Decoded::Cluster(decode_section(path, entry, section)?),
         pb::SectionKind::Unspecified => {
             Err(fail_stop(path, entry.offset, "section kind is unspecified"))?
@@ -967,6 +1052,10 @@ fn merge_decoded(path: &Path, records: &mut StateRecords, part: Decoded) -> io::
         Decoded::Allocations(mut v) => records.allocations.append(&mut v),
         Decoded::Nodes(mut v) => records.nodes.append(&mut v),
         Decoded::QuotaEntities(mut v) => records.quota_entities.append(&mut v),
+        Decoded::MachineBindings(mut v) => records.machine_bindings.append(&mut v),
+        Decoded::EnrollTokens(mut v) => records.enroll_tokens.append(&mut v),
+        Decoded::RevokedIdentities(mut v) => records.revoked_identities.append(&mut v),
+        Decoded::KeyConfirmations(mut v) => records.key_confirmations.append(&mut v),
         Decoded::Cluster(v) => {
             if records.cluster.is_some() || v.len() != 1 {
                 return Err(fail_stop(
@@ -1000,6 +1089,10 @@ enum Decoded {
     Allocations(Vec<pb::AllocationRecord>),
     Nodes(Vec<pb::NodeRecord>),
     QuotaEntities(Vec<pb::QuotaEntityRecord>),
+    MachineBindings(Vec<pb::MachineBindingRecord>),
+    EnrollTokens(Vec<pb::EnrollTokenRecord>),
+    RevokedIdentities(Vec<pb::RevokedIdentityRecord>),
+    KeyConfirmations(Vec<pb::KeyConfirmationRecord>),
     Cluster(Vec<pb::ClusterStateRecord>),
 }
 

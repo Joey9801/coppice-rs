@@ -50,6 +50,8 @@ convert_id!(AllocationId);
 convert_id!(AttemptId);
 convert_id!(GroupId);
 convert_id!(QuotaEntityId);
+convert_id!(MachineId);
+convert_id!(EnrollTokenId);
 
 // ---- Resources ----
 

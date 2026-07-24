@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
+use coppice_core::id::{
+    AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
+};
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
@@ -14,7 +16,7 @@ use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{command_from_pb, command_to_pb, ConvertError};
 use coppice_proto::pb;
 use coppice_state::command::*;
-use coppice_state::PolicyConfig;
+use coppice_state::{EnrollRole, PolicyConfig, RevokedIdentity};
 use prost::Message;
 use uuid::Uuid;
 
@@ -156,6 +158,58 @@ fn every_command() -> Vec<Command> {
             to: 2,
             bumped_at: ts(),
         }),
+        // ---- Cluster PKI / identity (ADR 0037) ----
+        Command::RecordCaCertificate(RecordCaCertificate {
+            bundle: {
+                // parse DER-validates, so the fixture must be a real CA cert.
+                use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+                let key = KeyPair::generate().unwrap();
+                let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+                params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                coppice_state::CaCertBundle::parse(params.self_signed(&key).unwrap().pem()).unwrap()
+            },
+            recorded_at: ts(),
+        }),
+        Command::BindMachineIdentity(BindMachineIdentity {
+            machine: MachineId(Uuid::from_u128(0x11)),
+            raft_node_id: 3,
+            address: "10.0.0.3:7000".into(),
+            bound_at: ts(),
+        }),
+        // Both an expiring and (below) a never-expiring token, and both roles.
+        Command::MintEnrollToken(MintEnrollToken {
+            token: EnrollTokenId(Uuid::from_u128(0x22)),
+            hash: "$argon2id$v=19$m=19456,t=2,p=1$coord".into(),
+            role: EnrollRole::Coordinator,
+            label: "coord".into(),
+            expires_at: Some(ts() + Duration::from_micros(9)),
+            minted_at: ts(),
+        }),
+        Command::MintEnrollToken(MintEnrollToken {
+            token: EnrollTokenId(Uuid::from_u128(0x23)),
+            hash: "$argon2id$v=19$m=19456,t=2,p=1$agent".into(),
+            role: EnrollRole::Agent,
+            label: "agent".into(),
+            expires_at: None,
+            minted_at: ts(),
+        }),
+        Command::RevokeEnrollToken(RevokeEnrollToken {
+            token: EnrollTokenId(Uuid::from_u128(0x22)),
+            revoked_at: ts(),
+        }),
+        // Both RevokedIdentity variants.
+        Command::RevokeIdentity(RevokeIdentity {
+            identity: RevokedIdentity::Machine(MachineId(Uuid::from_u128(0x24))),
+            revoked_at: ts(),
+        }),
+        Command::RevokeIdentity(RevokeIdentity {
+            identity: RevokedIdentity::Node(node),
+            revoked_at: ts(),
+        }),
+        Command::ConfirmKeyPossession(ConfirmKeyPossession {
+            raft_node_id: 3,
+            confirmed_at: ts(),
+        }),
     ]
 }
 
@@ -272,6 +326,101 @@ fn empty_envelope_is_an_error_not_a_skip() {
     assert_eq!(
         command_from_pb(envelope),
         Err(ConvertError::MissingField("Command.body"))
+    );
+}
+
+#[test]
+fn ca_bundle_carrying_key_material_is_rejected_at_the_boundary() {
+    // The CA private key must never enter replicated state (ADR 0037 §4).
+    // The wire field is a plain string, so the conversion boundary is where
+    // the CaCertBundle newtype refuses non-certificate payloads — before the
+    // command can be proposed into the Raft log.
+    // Private-key DER hidden under a CERTIFICATE label: the label is a claim,
+    // the DER parse is the fact.
+    let relabeled_key = {
+        use base64::Engine as _;
+        let key_der = rcgen::KeyPair::generate().unwrap().serialize_der();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key_der);
+        format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n")
+    };
+    let cases = [
+        // A private key alone.
+        "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n".to_string(),
+        // A certificate with the key appended.
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n\
+         -----BEGIN EC PRIVATE KEY-----\nBBBB\n-----END EC PRIVATE KEY-----\n"
+            .to_string(),
+        relabeled_key,
+        // Empty.
+        String::new(),
+    ];
+    for cert_pem in cases {
+        let envelope = pb::command::v1::Command {
+            version: 1,
+            body: Some(pb::command::v1::command::Body::RecordCaCertificate(
+                pb::command::v1::RecordCaCertificate {
+                    cert_pem: cert_pem.clone(),
+                    recorded_at_us: ts().as_micros(),
+                },
+            )),
+        };
+        assert_eq!(
+            command_from_pb(envelope),
+            Err(ConvertError::Invalid {
+                field: "RecordCaCertificate.cert_pem",
+                reason: "not a sequence of X.509 CA certificate PEM blocks",
+            }),
+            "payload must not decode: {cert_pem:?}"
+        );
+    }
+}
+
+#[test]
+fn unspecified_enroll_role_is_rejected_at_the_boundary() {
+    // EnrollRole is a closed enum: the zero (UNSPECIFIED) value and any
+    // unknown value must fail to decode, never silently default (ADR 0037 §5).
+    for role in [0i32, 99] {
+        let envelope = pb::command::v1::Command {
+            version: 1,
+            body: Some(pb::command::v1::command::Body::MintEnrollToken(
+                pb::command::v1::MintEnrollToken {
+                    token: Some(pb::core::v1::EnrollTokenId {
+                        value: EnrollTokenId(Uuid::from_u128(1)).to_string(),
+                    }),
+                    hash: "h".into(),
+                    role,
+                    label: "l".into(),
+                    expires_at_us: None,
+                    minted_at_us: ts().as_micros(),
+                },
+            )),
+        };
+        assert_eq!(
+            command_from_pb(envelope),
+            Err(ConvertError::UnknownEnum {
+                field: "MintEnrollToken.role",
+                value: role,
+            })
+        );
+    }
+}
+
+#[test]
+fn unset_revoked_identity_oneof_is_rejected_at_the_boundary() {
+    // An unset RevokedIdentity oneof is malformed, exactly like an empty
+    // command envelope.
+    let envelope = pb::command::v1::Command {
+        version: 1,
+        body: Some(pb::command::v1::command::Body::RevokeIdentity(
+            pb::command::v1::RevokeIdentity {
+                identity: Some(pb::core::v1::RevokedIdentity { identity: None }),
+                revoked_at_us: ts().as_micros(),
+            },
+        )),
+    };
+    assert_eq!(
+        command_from_pb(envelope),
+        Err(ConvertError::MissingField("RevokedIdentity.identity"))
     );
 }
 

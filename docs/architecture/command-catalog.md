@@ -481,6 +481,80 @@ same commands.
 | Apply effects | Set `ClusterVersion`. Version-gated command forms become writable; all commands in this catalog are version 1. |
 | Rejections | `ClusterVersionNotMonotonic`, `PermissionDenied` |
 
+### Cluster PKI / identity
+
+The five ADR 0037 fact groups these commands write — the CA certificate, the
+machine-identity bindings, the enrollment tokens, the revoked identities, and
+the key-possession confirmations — live in **`StateMachine`, not
+`PolicyConfig`**. `PolicyConfig` is pure scheduler/accounting policy that would
+diverge scheduling if replicas disagreed (ADR 0020); cluster identity is a
+different concern with a different lifecycle, so the placement is deliberate.
+These are administrative identity facts with no event subscribers in v1 — the
+consuming flows read the replicated state directly — so, like
+`SetNodeSchedulable`, an accepted apply emits **no events**. The CA *private
+key* never appears in any of these payloads or in replicated state (ADR 0037
+§4): only the *fact* of key possession is replicated.
+
+#### `RecordCaCertificate`
+
+| | |
+| --- | --- |
+| Proposer | Formation (chunk 03) at cluster birth; re-root runbook (ADR 0037 §4) thereafter |
+| Payload | `bundle: CaCertBundle` (a validated PEM bundle of **public** certificate material — a chain is allowed for re-root; on the wire, `cert_pem: string`), `recorded_at_us` |
+| Validation | Enforced *before proposal*, at the wire→domain conversion boundary: the `CaCertBundle` newtype base64-decodes and DER-parses every PEM block as a real X.509 certificate and requires the CA basic constraint, so a private key — alone, appended to a certificate, or relabeled as one — and non-CA leaves can never enter the Raft log (ADR 0037 §4; apply-time validation would be too late). |
+| Apply effects | Set or replace `ca`. Replacement **is** re-rooting: the new bundle wholly supersedes the old (ADR 0037 §4 re-root runbook). |
+| Rejections | none at apply (an invalid bundle cannot exist as a domain command; the conversion boundary rejects it as a decode error) |
+
+#### `BindMachineIdentity`
+
+| | |
+| --- | --- |
+| Proposer | Formation / self-join (chunk 03) when a coordinator installation takes a raft seat (ADR 0037 §7) |
+| Payload | `machine: MachineId`, `raft_node_id: u64` (the openraft node id — distinct from a compute `NodeId`), `address: string`, `bound_at_us` |
+| Validation | One machine identity ↔ at most one raft node id, ever (ADR 0037 §7): reject if this machine is already bound to a *different* node id, or this node id already carries a *different* machine. The same `(machine, raft_node_id)` pair at the same address is an accepted no-op (exact replay); the same pair at a *different* address is refused and surfaced — address changes go through the operator-only set-address path (§7), never re-admission. |
+| Apply effects | Insert the binding; an exact same-pair, same-address replay changes nothing (`bound_at` keeps the first-binding instant). |
+| Rejections | `MachineIdentityConflict`, `MachineAddressConflict` |
+
+#### `MintEnrollToken`
+
+| | |
+| --- | --- |
+| Proposer | Enrollment administration (chunk 04) — `coppice-cli` mints a token (ADR 0037 §5) |
+| Payload | `token: EnrollTokenId`, `hash: string` (the opaque PHC string from `coppice-tls::pki::token`; the secret is never replicated), `role: EnrollRole` (`Coordinator` \| `Agent` — never both), `label: string`, `expires_at_us: optional int64`, `minted_at_us` |
+| Validation | Fresh token id; `hash` non-empty (ADR 0037 §5) |
+| Apply effects | Insert the token record with `revoked = false`. |
+| Rejections | `DuplicateEnrollToken`, `InvalidCommand` (empty hash) |
+
+#### `RevokeEnrollToken`
+
+| | |
+| --- | --- |
+| Proposer | Enrollment administration (chunk 04) |
+| Payload | `token: EnrollTokenId`, `revoked_at_us` |
+| Validation | Token exists (ADR 0037 §5) |
+| Apply effects | Set `revoked = true`. An already-revoked token is an accepted no-op (first revocation wins, mirroring `AbortJob`). |
+| Rejections | `UnknownEnrollToken` |
+
+#### `RevokeIdentity`
+
+| | |
+| --- | --- |
+| Proposer | Eviction / administration (chunk 04) — renewal-refusal input for the §5 eviction path |
+| Payload | `identity: RevokedIdentity` (`Machine(MachineId)` \| `Node(NodeId)`), `revoked_at_us` |
+| Validation | None — a set insert (ADR 0037 §5) |
+| Apply effects | Insert the identity into the revoked set. An already-present identity is an accepted no-op. |
+| Rejections | — |
+
+#### `ConfirmKeyPossession`
+
+| | |
+| --- | --- |
+| Proposer | Key transfer (chunk 06): the leader records a learner's acknowledged, durable receipt of the CA key (ADR 0037 §4) |
+| Payload | `raft_node_id: u64`, `confirmed_at_us` |
+| Validation | None (ADR 0037 §4) |
+| Apply effects | Insert / overwrite `key_confirmations[raft_node_id] = confirmed_at`. The replicated **fact** of possession; the key itself is never replicated. Re-confirmation overwrites the timestamp. |
+| Rejections | — |
+
 ---
 
 ## RejectionReason taxonomy
@@ -507,7 +581,10 @@ same commands.
 | `InvalidAuthorization` | Bindings payload failed validation (unknown role, empty subject) |
 | `AuthorizationLockout` | Bindings replacement would leave no unscoped admin |
 | `ClusterVersionNotMonotonic` | Bump not strictly increasing |
-| `InvalidCommand` | Shape violation (e.g. outcome `Revoked` outside `CommitPlacements`) |
+| `MachineIdentityConflict` | Machine↔raft-node binding would break the one-machine-one-seat invariant (ADR 0037 §7) |
+| `DuplicateEnrollToken` | Enrollment token id already exists |
+| `UnknownEnrollToken` | Revocation of a token not in state |
+| `InvalidCommand` | Shape violation (e.g. outcome `Revoked` outside `CommitPlacements`, empty CA bundle, empty token hash) |
 | `InvalidBatch[(index, reason)]` | All-or-nothing batch rejection with per-item diagnostics |
 
 Rejections are terminal for the command, invisible in state (beyond the

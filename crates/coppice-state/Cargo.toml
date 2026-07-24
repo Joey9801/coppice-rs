@@ -12,8 +12,15 @@ authors.workspace = true
 coppice-core.workspace = true
 imbl.workspace = true
 thiserror.workspace = true
+# `CaCertBundle` validation (ADR 0037 §4): every PEM block is base64-decoded
+# and DER-parsed as a real X.509 CA certificate before it can enter the Raft
+# log — a private key relabeled `CERTIFICATE` must not pass.
+base64.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
+# Real CA/leaf/key material for the CaCertBundle validation tests.
+rcgen.workspace = true
 # Dev-only cycle: the determinism harness roundtrips snapshots through the
 # real proto record path.
 coppice-proto.workspace = true

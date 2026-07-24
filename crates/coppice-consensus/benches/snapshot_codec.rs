@@ -47,6 +47,10 @@ struct SectionBuffers {
     allocations: Vec<u8>,
     nodes: Vec<u8>,
     quota_entities: Vec<u8>,
+    machine_bindings: Vec<u8>,
+    enroll_tokens: Vec<u8>,
+    revoked_identities: Vec<u8>,
+    key_confirmations: Vec<u8>,
     cluster: Vec<u8>,
 }
 
@@ -70,6 +74,10 @@ fn encode_all(records: &StateRecords, bufs: &mut SectionBuffers) -> u64 {
     encode_section(&records.allocations, &mut bufs.allocations);
     encode_section(&records.nodes, &mut bufs.nodes);
     encode_section(&records.quota_entities, &mut bufs.quota_entities);
+    encode_section(&records.machine_bindings, &mut bufs.machine_bindings);
+    encode_section(&records.enroll_tokens, &mut bufs.enroll_tokens);
+    encode_section(&records.revoked_identities, &mut bufs.revoked_identities);
+    encode_section(&records.key_confirmations, &mut bufs.key_confirmations);
     bufs.cluster.clear();
     if let Some(cluster) = &records.cluster {
         cluster
@@ -81,6 +89,10 @@ fn encode_all(records: &StateRecords, bufs: &mut SectionBuffers) -> u64 {
         + bufs.allocations.len()
         + bufs.nodes.len()
         + bufs.quota_entities.len()
+        + bufs.machine_bindings.len()
+        + bufs.enroll_tokens.len()
+        + bufs.revoked_identities.len()
+        + bufs.key_confirmations.len()
         + bufs.cluster.len()) as u64
 }
 
@@ -103,6 +115,10 @@ fn decode_all(bufs: &SectionBuffers) -> StateRecords {
         allocations: decode_section(&bufs.allocations),
         nodes: decode_section(&bufs.nodes),
         quota_entities: decode_section(&bufs.quota_entities),
+        machine_bindings: decode_section(&bufs.machine_bindings),
+        enroll_tokens: decode_section(&bufs.enroll_tokens),
+        revoked_identities: decode_section(&bufs.revoked_identities),
+        key_confirmations: decode_section(&bufs.key_confirmations),
         cluster: if bufs.cluster.is_empty() {
             None
         } else {

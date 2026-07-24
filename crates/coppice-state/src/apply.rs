@@ -19,14 +19,16 @@ use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 
 use crate::command::{
-    AbortJob, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity, DeclareNodeLost,
-    DispatchAttempt, EvictTerminalJobs, Placement, ReconcileNode, RecordAttemptExited,
-    RecordAttemptOutcome, RecordAttemptStarted, RegisterNode, SetNodeSchedulable, SubmitJob,
-    UpdatePolicy,
+    AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
+    ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, MintEnrollToken,
+    Placement, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
+    RecordCaCertificate, RegisterNode, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable,
+    SubmitJob, UpdatePolicy,
 };
 use crate::{
-    AllocationRecord, Applied, AttemptRecord, Command, Event, JobRecord, NodeRecord, QuotaEntity,
-    Rejection, RejectionReason, StateMachine, QUOTA_TREE_DEPTH_CAP,
+    AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
+    JobRecord, MachineBinding, NodeRecord, QuotaEntity, Rejection, RejectionReason, StateMachine,
+    QUOTA_TREE_DEPTH_CAP,
 };
 
 type ApplyResult = Result<Applied, RejectionReason>;
@@ -55,6 +57,12 @@ impl StateMachine {
             Command::ConfigureQuotaEntity(c) => self.configure_quota_entity(c),
             Command::UpdatePolicy(c) => self.update_policy(c),
             Command::BumpClusterVersion(c) => self.bump_cluster_version(c),
+            Command::RecordCaCertificate(c) => self.record_ca_certificate(c),
+            Command::BindMachineIdentity(c) => self.bind_machine_identity(c),
+            Command::MintEnrollToken(c) => self.mint_enroll_token(c),
+            Command::RevokeEnrollToken(c) => self.revoke_enroll_token(c),
+            Command::RevokeIdentity(c) => self.revoke_identity(c),
+            Command::ConfirmKeyPossession(c) => self.confirm_key_possession(c),
         };
         self.version += 1;
         result
@@ -926,6 +934,121 @@ impl StateMachine {
         Ok(Applied {
             events: vec![Event::ClusterVersionBumped { to: c.to }],
         })
+    }
+
+    // ---- Cluster PKI / identity (ADR 0037) ----
+    //
+    // These commit administrative identity facts with no event subscribers in
+    // v1 — the consuming flows (formation chunk 03, enrollment chunk 04, key
+    // transfer chunk 06) read the replicated state directly, not the event
+    // fanout — so, like `SetNodeSchedulable`, they emit no events.
+
+    fn record_ca_certificate(&mut self, c: &RecordCaCertificate) -> ApplyResult {
+        // Bundle validity (certificate blocks only, never a key) is enforced
+        // by the `CaCertBundle` newtype before the command can exist —
+        // apply-time validation would be too late, the payload would already
+        // be in the Raft log. Replacement is re-rooting (ADR 0037 §4 re-root
+        // runbook): the new bundle wholly supersedes the old.
+        self.ca = Some(CaCertificate {
+            bundle: c.bundle.clone(),
+            recorded_at: c.recorded_at,
+        });
+        Ok(Applied::default())
+    }
+
+    fn bind_machine_identity(&mut self, c: &BindMachineIdentity) -> ApplyResult {
+        // One machine identity ↔ at most one raft node id, ever (ADR 0037 §7).
+        // Reject in both directions: this raft node id already carrying a
+        // different machine, or this machine already carrying a different node.
+        if let Some(existing) = self.machine_for_raft_node(c.raft_node_id) {
+            if *existing != c.machine {
+                return Err(RejectionReason::MachineIdentityConflict {
+                    machine: c.machine,
+                    raft_node_id: c.raft_node_id,
+                });
+            }
+        }
+        match self.machine_bindings.get_mut(&c.machine) {
+            Some(binding) => {
+                if binding.raft_node_id != c.raft_node_id {
+                    return Err(RejectionReason::MachineIdentityConflict {
+                        machine: c.machine,
+                        raft_node_id: c.raft_node_id,
+                    });
+                }
+                // Same (machine, node) pair at the same address: an exact
+                // replay, accepted as a no-op (`bound_at` keeps the original
+                // first-binding instant). The same pair at a *different*
+                // address is refused and surfaced (ADR 0037 §7) — address
+                // changes go through the operator-only set-address path, never
+                // through re-admission.
+                if binding.address != c.address {
+                    return Err(RejectionReason::MachineAddressConflict {
+                        machine: c.machine,
+                        raft_node_id: c.raft_node_id,
+                    });
+                }
+            }
+            None => {
+                self.machine_bindings.insert(
+                    c.machine,
+                    MachineBinding {
+                        raft_node_id: c.raft_node_id,
+                        address: c.address.clone(),
+                        bound_at: c.bound_at,
+                    },
+                );
+            }
+        }
+        Ok(Applied::default())
+    }
+
+    fn mint_enroll_token(&mut self, c: &MintEnrollToken) -> ApplyResult {
+        if self.enroll_tokens.contains_key(&c.token) {
+            return Err(RejectionReason::DuplicateEnrollToken(c.token));
+        }
+        if c.hash.is_empty() {
+            return Err(RejectionReason::InvalidCommand(
+                "enrollment token hash is empty".into(),
+            ));
+        }
+        self.enroll_tokens.insert(
+            c.token,
+            EnrollToken {
+                hash: c.hash.clone(),
+                role: c.role,
+                label: c.label.clone(),
+                expires_at: c.expires_at,
+                minted_at: c.minted_at,
+                revoked: false,
+            },
+        );
+        Ok(Applied::default())
+    }
+
+    fn revoke_enroll_token(&mut self, c: &RevokeEnrollToken) -> ApplyResult {
+        match self.enroll_tokens.get_mut(&c.token) {
+            None => Err(RejectionReason::UnknownEnrollToken(c.token)),
+            // Already-revoked is an accepted no-op: first revocation wins,
+            // mirroring `AbortJob`'s idempotency.
+            Some(t) => {
+                t.revoked = true;
+                Ok(Applied::default())
+            }
+        }
+    }
+
+    fn revoke_identity(&mut self, c: &RevokeIdentity) -> ApplyResult {
+        // Set insert; re-revoking an already-present identity is a no-op.
+        self.revoked_identities.insert(c.identity.clone());
+        Ok(Applied::default())
+    }
+
+    fn confirm_key_possession(&mut self, c: &ConfirmKeyPossession) -> ApplyResult {
+        // Re-confirmation overwrites the timestamp (ADR 0037 §4).
+        self.key_confirmations
+            .insert(c.raft_node_id, c.confirmed_at);
+        Ok(Applied::default())
     }
 
     // ---- Shared effect helpers (infallible; validation happened first) ----

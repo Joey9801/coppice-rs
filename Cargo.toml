@@ -114,9 +114,13 @@ prost = "0.13"
 prost-build = "0.13"
 prost-types = "0.13"
 protox = "0.7"
-# Test-only certificate generation (ring provider, avoiding the aws-lc build
-# toolchain) for the mTLS the Raft transport requires (ADR 0011).
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+# Certificate and CSR generation/signing (ring provider, avoiding the aws-lc
+# build toolchain). Used both as test-only mTLS material for the Raft transport
+# (ADR 0011) and — from `coppice-tls::pki` only — as the cluster-owned CA and
+# leaf issuer (ADR 0037 §4). The `x509-parser` feature is what unseals
+# `CertificateSigningRequestParams::from_pem`/`CertificateParams::from_ca_cert_pem`,
+# i.e. parsing a submitted CSR and loading a CA to sign under.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -244,6 +248,25 @@ uuid = { version = "1", features = ["v4", "v7"] }
 # the enrollment/CSR issuance flow is future work. Default features are empty,
 # so this pulls in no crypto verification backend.
 x509-parser = { version = "0.18", default-features = false }
+# Offline certificate-chain verification for `coppice-tls::pki::verify_leaf`
+# (ADR 0037 §4/§7 authz): a real webpki signature+validity check against the
+# cluster CA, not an issuer-name comparison. Pinned to the exact rustls-webpki
+# rustls 0.23 already resolves so the whole graph shares one copy; `ring`
+# provider only, matching the workspace's aws-lc-free posture.
+rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
+# Certificate validity windows (`not_before`/`not_after`) for the cluster CA and
+# leaf issuance in `coppice-tls::pki` (ADR 0037 §4). rcgen already speaks
+# `time::OffsetDateTime` on `CertificateParams`; pinned here so the whole
+# workspace shares rcgen's resolved `time`.
+time = "0.3"
+# Enrollment-token secret hashing for `coppice-tls::pki::token` (ADR 0037 §5):
+# argon2id in PHC-string form with a random salt, stored as replicated policy.
+# Default features give the `password-hash` traits plus an OS-CSPRNG salt.
+argon2 = "0.5"
+# URL-safe base64 for the high-entropy enrollment-token secret
+# (`coppice-tls::pki::token`, ADR 0037 §5). Already in the tree via `pem`; pinned
+# here for a direct, minimal use of the `URL_SAFE_NO_PAD` engine.
+base64 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

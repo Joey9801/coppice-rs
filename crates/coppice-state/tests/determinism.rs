@@ -203,12 +203,108 @@ fn snapshot_roundtrip(state: &StateMachine) -> StateMachine {
         allocations: recode(records.allocations),
         nodes: recode(records.nodes),
         quota_entities: recode(records.quota_entities),
+        machine_bindings: recode(records.machine_bindings),
+        enroll_tokens: recode(records.enroll_tokens),
+        revoked_identities: recode(records.revoked_identities),
+        key_confirmations: recode(records.key_confirmations),
         cluster: records.cluster.map(|c| {
             let mut recoded = recode(vec![c]);
             recoded.pop().expect("one cluster record")
         }),
     })
     .expect("snapshot records must rebuild")
+}
+
+/// A state carrying all five ADR 0037 PKI/identity fact groups survives the
+/// encoded snapshot round trip exactly — the four bounded sections plus the
+/// singleton CA bundle in the cluster record.
+#[test]
+fn pki_facts_survive_snapshot_roundtrip() {
+    use coppice_core::id::{EnrollTokenId, MachineId};
+    use coppice_state::command::{
+        BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RecordCaCertificate,
+        RevokeEnrollToken, RevokeIdentity,
+    };
+    use coppice_state::{EnrollRole, RevokedIdentity};
+
+    let mid = |n: u128| MachineId(uuid::Uuid::from_u128(n));
+    let tok = |n: u128| EnrollTokenId(uuid::Uuid::from_u128(n));
+
+    let mut sm = StateMachine::default();
+    let cmds = vec![
+        Command::RecordCaCertificate(RecordCaCertificate {
+            bundle: {
+                // parse DER-validates, so the fixture must be a real CA cert.
+                use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+                let key = KeyPair::generate().unwrap();
+                let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+                params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                coppice_state::CaCertBundle::parse(params.self_signed(&key).unwrap().pem()).unwrap()
+            },
+            recorded_at: base_ts(),
+        }),
+        Command::BindMachineIdentity(BindMachineIdentity {
+            machine: mid(1),
+            raft_node_id: 1,
+            address: "10.0.0.1:7000".into(),
+            bound_at: base_ts(),
+        }),
+        Command::BindMachineIdentity(BindMachineIdentity {
+            machine: mid(2),
+            raft_node_id: 2,
+            address: "10.0.0.2:7000".into(),
+            bound_at: base_ts(),
+        }),
+        Command::MintEnrollToken(MintEnrollToken {
+            token: tok(1),
+            hash: "$argon2id$v=19$coordinator".into(),
+            role: EnrollRole::Coordinator,
+            label: "coord".into(),
+            expires_at: Some(ts(TS_US + 1_000_000)),
+            minted_at: base_ts(),
+        }),
+        Command::MintEnrollToken(MintEnrollToken {
+            token: tok(2),
+            hash: "$argon2id$v=19$agent".into(),
+            role: EnrollRole::Agent,
+            label: "agent".into(),
+            expires_at: None,
+            minted_at: base_ts(),
+        }),
+        Command::RevokeEnrollToken(RevokeEnrollToken {
+            token: tok(2),
+            revoked_at: base_ts(),
+        }),
+        Command::RevokeIdentity(RevokeIdentity {
+            identity: RevokedIdentity::Machine(mid(9)),
+            revoked_at: base_ts(),
+        }),
+        Command::RevokeIdentity(RevokeIdentity {
+            identity: RevokedIdentity::Node(nid(9)),
+            revoked_at: base_ts(),
+        }),
+        Command::ConfirmKeyPossession(ConfirmKeyPossession {
+            raft_node_id: 1,
+            confirmed_at: base_ts(),
+        }),
+        Command::ConfirmKeyPossession(ConfirmKeyPossession {
+            raft_node_id: 2,
+            confirmed_at: base_ts(),
+        }),
+    ];
+    for cmd in &cmds {
+        sm.apply(cmd).expect("PKI command accepted");
+    }
+
+    // Every fact group is non-empty, so the round trip has teeth.
+    assert!(sm.ca.is_some());
+    assert_eq!(sm.machine_bindings.len(), 2);
+    assert_eq!(sm.enroll_tokens.len(), 2);
+    assert_eq!(sm.revoked_identities.len(), 2);
+    assert_eq!(sm.key_confirmations.len(), 2);
+
+    let restored = snapshot_roundtrip(&sm);
+    assert_eq!(restored, sm, "PKI facts must round-trip losslessly");
 }
 
 /// Merge chains preserving intra-chain order; the pick sequence chooses
