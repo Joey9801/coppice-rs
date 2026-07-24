@@ -15,6 +15,9 @@ coppice-net.workspace = true
 # The filesystem seam (`coppice_consensus::fs`) only: the journal is written
 # through it so the crash harness can hammer it (ADR 0009).
 coppice-consensus.workspace = true
+# Hot-reloadable mTLS store (ADR 0037 §4): one store shared by the NodeService
+# listener and the session client, so a rotation on disk re-arms both.
+coppice-tls.workspace = true
 anyhow.workspace = true
 # Serves the agent's optional Prometheus `/metrics` scrape endpoint (issue #46);
 # a single-route axum router in `metrics_server`, the same 0.7 stack the rest of

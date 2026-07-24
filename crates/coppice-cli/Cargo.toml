@@ -14,6 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 coppice-coordinator.workspace = true
+# `coppice dev` builds the shared hot-reload TLS stores (ADR 0037 §4) for its
+# in-process coordinator and agent halves.
+coppice-tls.workspace = true
 # `coppice dev`'s ready banner asks whether a web UI build is embedded, and
 # `coppice job` reuses this crate's wire DTOs (request/response shapes) rather
 # than redefining the `/api/v1` contract.

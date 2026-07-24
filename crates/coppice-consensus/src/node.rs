@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 use openraft::error::{InitializeError, RaftError};
 use openraft::{BasicNode, Config, Raft, SnapshotPolicy};
@@ -30,16 +29,6 @@ use crate::net::{GrpcNetworkFactory, RaftTransportHandler};
 use crate::storage::{self, StorageOptions};
 use crate::view::{StateViews, ViewPublisher, ViewPublisherConfig};
 use crate::{apply_loop, status, ConsensusError, ConsensusStatus, CoordinatorId};
-
-/// PEM material for the mutual-TLS coordinator mesh (ADR 0011).
-pub struct NodeTls {
-    /// The cluster CA, used to verify peer certificates.
-    pub ca_pem: Vec<u8>,
-    /// This node's certificate chain.
-    pub cert_pem: Vec<u8>,
-    /// This node's private key.
-    pub key_pem: Vec<u8>,
-}
 
 /// How this process intends to join the cluster (ADR 0016).
 ///
@@ -80,8 +69,10 @@ pub struct NodeOptions {
     pub snapshot_keep_log_entries: u64,
     /// Capacity of the derived event tap (ADR 0008).
     pub event_tap_capacity: usize,
-    /// mTLS material (ADR 0011).
-    pub tls: NodeTls,
+    /// The hot-reload mTLS store for the coordinator mesh (ADR 0011,
+    /// ADR 0037 §4): outbound peer channels re-read the current material on
+    /// every (re)dial, so a rotation reaches the raft mesh without a restart.
+    pub tls: Arc<coppice_tls::TlsStore>,
 }
 
 /// A running consensus replica, assembled and ready to serve.
@@ -332,11 +323,10 @@ pub async fn start(
     .validate()
     .map_err(|e| NodeStartError::Raft(format!("invalid raft config: {e}")))?;
 
-    // Step 8: the network factory and the openraft node.
-    let client_tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(&tls.ca_pem))
-        .identity(Identity::from_pem(&tls.cert_pem, &tls.key_pem));
-    let factory = GrpcNetworkFactory::new(cluster_uuid, client_tls, rpc_timeout);
+    // Step 8: the network factory and the openraft node. The factory holds the
+    // shared hot-reload store and rebuilds per-peer channels when the material's
+    // generation advances (ADR 0037 §4).
+    let factory = GrpcNetworkFactory::new(cluster_uuid, tls, rpc_timeout);
     let raft = Raft::new(node_id, Arc::new(config), factory, log_store, sm_store)
         .await
         .map_err(|e| NodeStartError::Raft(format!("raft node construction failed: {e}")))?;

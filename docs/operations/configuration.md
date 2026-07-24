@@ -106,7 +106,10 @@ port = 7071
 client_addr = "0.0.0.0:7070"    # user/CLI API
 raft_addr   = "0.0.0.0:7071"    # coordinator peer traffic
 agent_addr  = "0.0.0.0:7072"    # agent heartbeats and reports
-advertise_host = "coord-3.batch.example.com"   # what peers and agents dial
+# What peers and agents dial. Optional (ADR 0037 §2): when unset it resolves
+# via explicit value ▸ the system hostname ▸ the local address of the default
+# route, so a fleet can ship one byte-identical config artifact.
+advertise_host = "coord-3.batch.example.com"
 
 [raft]
 # Liveness tuning only — never affects safety. The defaults are right for

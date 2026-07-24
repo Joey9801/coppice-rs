@@ -148,7 +148,8 @@ fn build_session(config: &Config, executor: FakeExecutor) -> Session<RealFs, Fak
 fn spawn_agent(config: Config, executor: FakeExecutor) -> JoinHandle<()> {
     let session = build_session(&config, executor);
     tokio::spawn(async move {
-        let _ = run(session, &config).await;
+        let tls = coppice_agent::load_tls_store(&config.tls).expect("load agent tls store");
+        let _ = run(session, &config, tls).await;
     })
 }
 

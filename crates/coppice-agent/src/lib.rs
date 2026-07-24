@@ -19,9 +19,26 @@ pub mod pressure;
 pub mod session;
 pub mod telemetry;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use coppice_consensus::fs::RealFs;
 use coppice_proto::pb::core::v1 as pbcore;
+use coppice_tls::{TlsPaths, TlsStore};
+
+/// Load the agent's shared hot-reload TLS store from its config's `[tls]`
+/// paths (ADR 0011, ADR 0037 §4). Fails fast, naming the offending path, if
+/// any file is missing or unparseable. Shared by the `NodeService` listener
+/// and the session client, so one rotation on disk re-arms both; `coppice
+/// dev` builds its agent half through this too.
+pub fn load_tls_store(tls: &config::TlsConfig) -> Result<Arc<TlsStore>> {
+    let paths = TlsPaths {
+        cert: tls.cert_path.clone(),
+        key: tls.key_path.clone(),
+        ca: tls.ca_path.clone(),
+    };
+    TlsStore::load(paths).context("loading agent TLS material (config [tls])")
+}
 
 /// Register descriptions for every metric the agent process can emit, recursing
 /// into each module that exposes metrics (docker-executor.md §8.1). The
@@ -31,6 +48,7 @@ use coppice_proto::pb::core::v1 as pbcore;
 /// with no `metrics_addr` configured (no server), the descriptions are cheap
 /// and harmless.
 pub fn describe_metrics() {
+    coppice_tls::describe_metrics();
     executor::docker::describe_metrics();
     telemetry::describe_metrics();
     node_service::describe_metrics();
@@ -40,6 +58,7 @@ pub fn describe_metrics() {
 /// modules as [`describe_metrics`]. The `/metrics` server calls this
 /// immediately before rendering each scrape.
 pub fn gather_metrics() {
+    coppice_tls::gather_metrics();
     executor::docker::gather_metrics();
     telemetry::gather_metrics();
     node_service::gather_metrics();
@@ -104,6 +123,19 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // is configured, but the recorder is installed unconditionally so metrics
     // accrue (and upkeep drains histograms) from the start regardless.
     let metrics_handle = install_metrics_recorder()?;
+
+    // Load the shared hot-reload TLS store up front (fail-fast on missing or
+    // unparseable material, ADR 0011) and drive reloads from an mtime poll plus
+    // SIGHUP. Shared by the NodeService listener and the session client, so one
+    // rotation on disk re-arms both (ADR 0037 §4).
+    let tls_store = load_tls_store(&config.tls)?;
+    let _tls_reload = coppice_tls::spawn_reload_task(
+        Arc::clone(&tls_store),
+        coppice_tls::ReloadOptions {
+            sighup: true,
+            ..Default::default()
+        },
+    );
 
     // The journal lives directly under the data directory; anchor RealFs there.
     std::fs::create_dir_all(&config.data_dir)
@@ -193,7 +225,7 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // off-node). The handler reads the first LOG-consuming store; with telemetry
     // disabled that is `None` and every fetch answers UnknownAttempt.
     if let Some(listen) = &config.listen {
-        let listener = node_service::prepare_listener(listen.addr, &config.tls)
+        let listener = node_service::NodeServiceListener::bind(listen.addr, Arc::clone(&tls_store))
             .context("binding the NodeService listener")?;
         tracing::info!(
             service_addr = ?config.service_addr(),
@@ -230,5 +262,5 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     .with_service_addr(config.service_addr());
 
     tracing::info!("coppice agent started; entering the session loop");
-    session::run(session, &config).await
+    session::run(session, &config, tls_store).await
 }

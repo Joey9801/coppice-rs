@@ -3294,9 +3294,16 @@ async fn node_service_serves_live_container_logs_over_mtls() {
         let pki = mint_service_pki(node_id);
         let listener = NodeServiceListener::bind(
             "127.0.0.1:0".parse().expect("addr"),
-            &pki.server_cert,
-            &pki.server_key,
-            &pki.ca_pem,
+            coppice_tls::TlsStore::from_pem(
+                coppice_tls::TlsPaths {
+                    cert: "unused-cert".into(),
+                    key: "unused-key".into(),
+                    ca: "unused-ca".into(),
+                },
+                pki.ca_pem.clone(),
+                pki.server_cert.clone(),
+                pki.server_key.clone(),
+            )?,
         )?;
         let addr = listener.local_addr();
         let _server = serve_node_service(listener, Some(sink.clone()), Some(sink.clone()));

@@ -8,10 +8,12 @@
 //! delegates to a [`Session`] method that is.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use coppice_consensus::fs::Fs;
 use coppice_proto::pb::agent::v1 as pb;
+use coppice_tls::TlsStore;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
@@ -37,15 +39,21 @@ const MAX_CONCURRENT_REAPS: usize = 4;
 const REAP_QUEUE_CAPACITY: usize = 256;
 
 /// Run the agent session forever: connect, serve, reconnect. Returns only on
-/// an unrecoverable configuration error (e.g. unreadable TLS material).
-pub async fn run<F, E>(mut session: Session<F, E>, config: &Config) -> anyhow::Result<()>
+/// an unrecoverable configuration error.
+///
+/// `tls` is the process's shared hot-reload store (ADR 0037 §4): each
+/// (re)connect builds its client config from the *current* material, so a
+/// rotation on disk reaches the next dial without a restart while the live
+/// session finishes on the leaf it connected with.
+pub async fn run<F, E>(
+    mut session: Session<F, E>,
+    config: &Config,
+    tls: Arc<TlsStore>,
+) -> anyhow::Result<()>
 where
     F: Fs,
     E: Executor + Clone,
 {
-    let ca = std::fs::read(&config.tls.ca_path)?;
-    let cert = std::fs::read(&config.tls.cert_path)?;
-    let key = std::fs::read(&config.tls.key_path)?;
 
     // One watcher task, shared executor state, forwarding natural exits into a
     // channel the serve loop selects on. Survives reconnects.
@@ -97,9 +105,7 @@ where
         match serve_once(
             &mut session,
             endpoint,
-            &ca,
-            &cert,
-            &key,
+            &tls,
             config,
             &mut exit_rx,
             &reap_tx,
@@ -121,15 +127,16 @@ where
     }
 }
 
-async fn dial(endpoint: &str, ca: &[u8], cert: &[u8], key: &[u8]) -> anyhow::Result<Channel> {
-    let host = endpoint
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(endpoint)
-        .to_string();
+/// Dial `endpoint` with a client config built from the store's *current*
+/// material (ADR 0037 §4): the cluster CA as trust root, this node's leaf as
+/// the client identity. Rebuilt per dial so a reconnect after a rotation
+/// presents the fresh leaf.
+async fn dial(endpoint: &str, store: &TlsStore) -> anyhow::Result<Channel> {
+    let (host, _port) = coppice_tls::split_host_port(endpoint)?;
+    let material = store.current();
     let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(ca))
-        .identity(Identity::from_pem(cert, key))
+        .ca_certificate(Certificate::from_pem(material.ca_pem()))
+        .identity(Identity::from_pem(material.cert_pem(), material.key_pem()))
         .domain_name(host);
     let channel = Channel::from_shared(format!("https://{endpoint}"))?
         .tls_config(tls)?
@@ -138,13 +145,10 @@ async fn dial(endpoint: &str, ca: &[u8], cert: &[u8], key: &[u8]) -> anyhow::Res
     Ok(channel)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn serve_once<F, E>(
     session: &mut Session<F, E>,
     endpoint: &str,
-    ca: &[u8],
-    cert: &[u8],
-    key: &[u8],
+    tls: &TlsStore,
     config: &Config,
     exit_rx: &mut mpsc::Receiver<crate::executor::ExitEvent>,
     reap_tx: &mpsc::Sender<coppice_core::id::AllocationId>,
@@ -153,7 +157,7 @@ where
     F: Fs,
     E: Executor + Clone,
 {
-    let channel = dial(endpoint, ca, cert, key).await?;
+    let channel = dial(endpoint, tls).await?;
     let mut client = Client::new(channel);
 
     let (tx, rx) = mpsc::channel::<pb::AgentReport>(OUTBOUND_CAPACITY);

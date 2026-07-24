@@ -19,10 +19,23 @@ pub mod admin;
 pub mod bootstrap;
 pub mod cli;
 pub mod config;
+// Coordinator discovery backends (ADR 0037 §2): the trait, the
+// static/dns/file/ec2-asg backends, and the file-registration helper. Public
+// because the trait and the run-scoped `FileRegistration` appear in
+// `bootstrap` signatures.
+pub mod discovery;
 mod leadership;
 mod limits;
 mod liveness;
+// The bootstrap-policy TOML schema and its idempotent command proposals
+// (ADR 0037 §3): a library for the formation handler and `coppice dev`'s
+// seeding, so the two never drift. No CLI surface yet — `cluster init` wires
+// it up in a later chunk.
+pub mod policy;
 mod runtime;
+// Minimal systemd `Type=notify` client (ADR 0037 §9): READY=1 when listeners
+// serve, STOPPING=1 at shutdown. Silent no-op off systemd.
+mod systemd;
 mod tasks;
 
 #[cfg(test)]
@@ -60,6 +73,7 @@ pub use runtime::install_metrics_recorder;
 /// parsed-but-unused.
 pub fn describe_metrics() {
     coppice_consensus::describe_metrics();
+    coppice_tls::describe_metrics();
     tasks::event_fanout::describe_metrics();
     tasks::node_client::describe_metrics();
 }
@@ -69,6 +83,7 @@ pub fn describe_metrics() {
 /// immediately before rendering each scrape.
 pub fn gather_metrics() {
     coppice_consensus::gather_metrics();
+    coppice_tls::gather_metrics();
     tasks::event_fanout::gather_metrics();
     tasks::node_client::gather_metrics();
 }

@@ -84,6 +84,23 @@ fn mint_pki(node_id: NodeId) -> Pki {
     }
 }
 
+/// A [`coppice_tls::TlsStore`] over in-memory PEM material, for the
+/// store-based listener bind (ADR 0037 §4). The paths are placeholders; these
+/// tests never trigger a disk reload.
+fn tls_store(ca_pem: &[u8], leaf: &CertKey) -> std::sync::Arc<coppice_tls::TlsStore> {
+    coppice_tls::TlsStore::from_pem(
+        coppice_tls::TlsPaths {
+            cert: "unused-cert".into(),
+            key: "unused-key".into(),
+            ca: "unused-ca".into(),
+        },
+        ca_pem.to_vec(),
+        leaf.cert.clone(),
+        leaf.key.clone(),
+    )
+    .expect("build tls store")
+}
+
 /// A running `NodeService` and everything a client needs to dial it.
 struct Harness {
     node_id: NodeId,
@@ -120,9 +137,7 @@ async fn spawn_with(chunks: Vec<LogChunk>, samples: Vec<MetricSample>) -> Harnes
 
     let listener = NodeServiceListener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        &pki.server.cert,
-        &pki.server.key,
-        &pki.ca_pem,
+        tls_store(&pki.ca_pem, &pki.server),
     )
     .expect("bind listener");
     let addr = listener.local_addr();
@@ -398,9 +413,7 @@ async fn a_leaf_with_a_different_node_id_san_fails_id_pinning() {
         .expect("build sink");
     let listener = NodeServiceListener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        &pki.server.cert,
-        &pki.server.key,
-        &pki.ca_pem,
+        tls_store(&pki.ca_pem, &pki.server),
     )
     .expect("bind listener");
     let addr = listener.local_addr();

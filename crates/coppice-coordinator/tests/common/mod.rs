@@ -33,6 +33,25 @@ use coppice_consensus::{
 };
 use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, ClientListener};
 use coppice_coordinator::config::{self, CliOverrides};
+use coppice_tls::{TlsPaths, TlsStore};
+
+/// A hot-reload [`TlsStore`] over in-memory PEM material (ADR 0037 §4), the
+/// store-based equivalent of handing raw PEM slices to the old bind/new
+/// signatures. The paths are placeholders; these tests never trigger a disk
+/// reload.
+pub fn tls_store_from_pem(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Arc<TlsStore> {
+    TlsStore::from_pem(
+        TlsPaths {
+            cert: "unused-cert".into(),
+            key: "unused-key".into(),
+            ca: "unused-ca".into(),
+        },
+        ca_pem.to_vec(),
+        cert_pem.to_vec(),
+        key_pem.to_vec(),
+    )
+    .expect("build tls store from pem")
+}
 
 /// A test CA plus one issued leaf's PEM material.
 pub struct Leaf {
@@ -163,7 +182,6 @@ impl Node {
         let toml = format!(
             r#"cluster_id = "{cluster_id}"
 data_dir = "{data_dir}"
-peers = []
 
 [listen]
 raft_addr = "127.0.0.1:{port}"
@@ -203,12 +221,24 @@ log_level = "warn"
         }
     }
 
+    /// The node's hot-reload TLS store, loaded from the cert/key/ca files laid
+    /// down in [`Node::new`] — the same disk-based path the daemon takes.
+    fn tls_store(&self) -> Arc<TlsStore> {
+        let root = self.dir.path();
+        TlsStore::load(TlsPaths {
+            cert: root.join("node.crt"),
+            key: root.join("node.key"),
+            ca: root.join("ca.crt"),
+        })
+        .unwrap_or_else(|e| panic!("load tls store for node {}: {e:#}", self.id))
+    }
+
     /// Boot (or re-boot) this replica through the real config + bootstrap path.
     pub async fn boot(&mut self, overrides: CliOverrides) {
         assert!(self.booted.is_none(), "node {} already booted", self.id);
         let resolved = config::load(&self.config_path, overrides)
             .unwrap_or_else(|e| panic!("load config for node {}: {e:#}", self.id));
-        let booted = bootstrap::bootstrap(resolved)
+        let booted = bootstrap::bootstrap(resolved, self.tls_store())
             .await
             .unwrap_or_else(|e| panic!("bootstrap node {}: {e:#}", self.id));
         // Cache the minted/stamped raft identity: it survives kill/stop so
@@ -222,7 +252,9 @@ log_level = "warn"
     /// without `BootedCoordinator: Debug`.
     pub async fn try_boot(&self, overrides: CliOverrides) -> anyhow::Result<()> {
         let resolved = config::load(&self.config_path, overrides)?;
-        bootstrap::bootstrap(resolved).await.map(|_| ())
+        bootstrap::bootstrap(resolved, self.tls_store())
+            .await
+            .map(|_| ())
     }
 
     pub fn is_booted(&self) -> bool {
@@ -295,6 +327,7 @@ log_level = "warn"
             node_log_client: _,
             raft_server_shutdown,
             raft_server,
+            file_registration: _,
         } = self.booted.take().expect("node booted");
         let _ = raft_server_shutdown.send(());
         let _ = raft_server.await;
@@ -317,6 +350,7 @@ log_level = "warn"
             node_log_client: _,
             raft_server_shutdown,
             raft_server,
+            file_registration: _,
         } = self.booted.take().expect("node booted");
         raft_server.abort();
         drop(raft_server_shutdown);
@@ -399,7 +433,6 @@ impl RunningCoordinator {
         let toml = format!(
             r#"cluster_id = "{cluster_id}"
 data_dir = "{data_dir}"
-peers = []
 
 [listen]
 raft_addr = "127.0.0.1:{raft_port}"
@@ -436,6 +469,15 @@ log_level = "warn"
         )
         .expect("load coordinator config");
 
+        // One shared hot-reload store for the raft/admin server and the agent
+        // gateway (both reuse the node's identity, ADR 0011 / ADR 0037 §4).
+        let tls_store = TlsStore::load(TlsPaths {
+            cert: cert_path.clone(),
+            key: key_path.clone(),
+            ca: ca_path.clone(),
+        })
+        .expect("load coordinator tls store");
+
         let BootedCoordinator {
             cluster_id,
             consensus,
@@ -445,7 +487,8 @@ log_level = "warn"
             node_log_client,
             raft_server_shutdown,
             raft_server,
-        } = bootstrap::bootstrap(resolved)
+            file_registration: _,
+        } = bootstrap::bootstrap(resolved, Arc::clone(&tls_store))
             .await
             .expect("bootstrap coordinator");
 
@@ -454,8 +497,8 @@ log_level = "warn"
         let agent_addr = format!("127.0.0.1:{agent_port}")
             .parse()
             .expect("agent socket addr");
-        let listener = AgentListener::bind(agent_addr, &leaf.cert_pem, &leaf.key_pem, &ca.pem)
-            .expect("bind agent listener");
+        let listener =
+            AgentListener::bind(agent_addr, tls_store).expect("bind agent listener");
         // Client API listener on an ephemeral port so parallel tests never
         // collide on the default.
         let client_listener = ClientListener::bind("127.0.0.1:0".parse().expect("client addr"))

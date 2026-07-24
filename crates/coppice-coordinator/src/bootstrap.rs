@@ -14,21 +14,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
+use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 
 use coppice_consensus::{
     Applied, Consensus, ConsensusError, ConsensusStatus, CoordinatorId, EventTapReceiver,
-    NodeHandle, NodeOptions, NodeTls, OpenraftConsensus, StartIntent, StartedNode, StateViews,
+    NodeHandle, NodeOptions, OpenraftConsensus, StartIntent, StartedNode, StateViews,
 };
 use coppice_core::id::ClusterId;
 use coppice_net::admin::Server as AdminServer;
 use coppice_state::Command;
+use coppice_tls::{TlsPaths, TlsStore};
 
 use crate::admin::AdminService;
 use crate::cli::RunArgs;
+use crate::discovery::FileRegistration;
 use crate::tasks::node_client::NodeClient;
 use crate::{config, limits};
 
@@ -60,6 +62,10 @@ pub struct BootedCoordinator {
     pub raft_server_shutdown: oneshot::Sender<()>,
     /// The raft/admin server task; join it after triggering shutdown.
     pub raft_server: JoinHandle<Result<(), tonic::transport::Error>>,
+    /// This process's registration in the `file` discovery directory
+    /// (ADR 0037 §2), when that backend is configured. Removed explicitly at
+    /// graceful shutdown; `Drop` is the best-effort backstop.
+    pub file_registration: Option<FileRegistration>,
 }
 
 /// Run a coordinator replica end to end: load, boot, serve, shut down.
@@ -93,11 +99,28 @@ pub async fn run(args: RunArgs) -> Result<()> {
         crate::gather_metrics,
     );
 
+    // Load the hot-reload mTLS store up front (fail-fast on a missing or
+    // unparseable cert/key/CA — a coordinator with no valid material must not
+    // start, ADR 0011) and drive reloads from an mtime poll plus SIGHUP. The
+    // store is shared by both mTLS listeners, the raft peer mesh, and the
+    // node-fetch client, so one rotation on disk re-arms them all (ADR 0037 §4).
+    // Only the daemon path installs SIGHUP, mirroring how `runtime` gates its
+    // own signal handler; the integration test drives `bootstrap` directly.
+    let tls_store = load_tls_store(&resolved.config)?;
+    let _tls_reload = coppice_tls::spawn_reload_task(
+        Arc::clone(&tls_store),
+        coppice_tls::ReloadOptions {
+            sighup: true,
+            ..Default::default()
+        },
+    );
+
     // Bind the agent gateway listener early (fail-fast on a port conflict),
     // before consensus starts. Only the daemon path binds it — the integration
     // test drives `bootstrap` directly and runs several replicas in one
     // process, so binding a shared default agent port there would collide.
-    let agent_listener = prepare_agent_listener(&resolved.config)?;
+    let agent_listener =
+        AgentListener::bind(resolved.config.listen.agent_addr, Arc::clone(&tls_store))?;
     let client_listener = ClientListener::bind(resolved.config.listen.client_addr).await?;
 
     let BootedCoordinator {
@@ -109,7 +132,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
         node_log_client,
         raft_server_shutdown,
         raft_server,
-    } = bootstrap(resolved).await?;
+        file_registration,
+    } = bootstrap(resolved, tls_store).await?;
 
     // The task runtime owns steps 1–4 of the shutdown order and returns once
     // its own signal-driven shutdown has fully drained (`None`: the daemon path
@@ -129,6 +153,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
     .await?;
 
     // Shutdown tail (coordinator-runtime.md steps 5–6), in dependency order.
+    // Remove this process's file-discovery registration first, while the
+    // process can still do so gracefully (a leftover file is tolerated but
+    // costs peers a failed dial, ADR 0037 §2).
+    if let Some(registration) = file_registration {
+        registration.remove().await;
+    }
+
     tracing::info!("shutdown: stopping raft/admin transport (no new peer traffic)");
     let _ = raft_server_shutdown.send(());
     match raft_server.await {
@@ -225,61 +256,53 @@ impl ClientListener {
     }
 }
 
-/// The bound agent gateway listener and its mTLS config, handed to
-/// `runtime::run` which starts the tonic server after creating the session
+/// The bound agent gateway listener and its hot-reload TLS store, handed to
+/// `runtime::run` which stands up the mTLS server after creating the session
 /// channels.
 ///
 /// Bound eagerly in [`run`] (fail-fast) but served inside the runtime so the
-/// listener stops accepting first on shutdown, alongside the API server.
+/// listener stops accepting first on shutdown, alongside the API server. Holds
+/// the raw std listener (bound synchronously, so a port conflict fails fast) and
+/// the reload store: the runtime converts the listener to tokio and runs the
+/// connection-time acceptor from [`coppice_tls::serve`], so a rotated leaf is
+/// served to new agent sessions without a restart (ADR 0037 §4).
 pub struct AgentListener {
-    pub(crate) incoming: TcpIncoming,
-    pub(crate) tls: ServerTlsConfig,
+    pub(crate) listener: std::net::TcpListener,
+    pub(crate) tls: Arc<TlsStore>,
 }
 
 impl AgentListener {
-    /// Bind the agent gateway's dedicated mTLS listener on `addr` from PEM
-    /// material already in memory (ADR 0009/0011).
+    /// Bind the agent gateway's dedicated mTLS listener on `addr`, resolving its
+    /// server certificate from `tls` at each handshake (ADR 0009/0011/0037).
     ///
-    /// The same cert/key/ca as the Raft/admin server; client certs are REQUIRED
-    /// (`client_auth_optional(false)`) so the gateway can bind the agent's leaf
-    /// CN to its NodeId at session accept. The daemon path reaches this through
-    /// [`prepare_agent_listener`], which reads the PEM from the config's
-    /// `[tls]` paths; the integration test calls it directly on a free port so
-    /// several replicas can run in one process without colliding on the default
-    /// agent port.
-    pub fn bind(
-        addr: SocketAddr,
-        cert_pem: &[u8],
-        key_pem: &[u8],
-        ca_pem: &[u8],
-    ) -> Result<AgentListener> {
-        let tls = ServerTlsConfig::new()
-            .identity(Identity::from_pem(cert_pem, key_pem))
-            .client_ca_root(Certificate::from_pem(ca_pem))
-            .client_auth_optional(false);
-
-        let incoming = TcpIncoming::new(addr, true, None)
+    /// Client certs stay REQUIRED (the store's server config is built with a
+    /// mandatory client-cert verifier) so the gateway can bind the agent's leaf
+    /// CN to its NodeId at session accept. The integration test and `coppice
+    /// dev` call this directly with their own store on a free port so several
+    /// listeners can coexist in one process.
+    pub fn bind(addr: SocketAddr, tls: Arc<TlsStore>) -> Result<AgentListener> {
+        let listener = std::net::TcpListener::bind(addr)
             .map_err(|e| anyhow!("binding agent gateway listener on {addr}: {e}"))?;
+        // Non-blocking so `runtime` can adopt it as a tokio listener.
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| anyhow!("setting agent gateway listener non-blocking: {e}"))?;
         tracing::info!(%addr, "agent gateway mTLS listener bound");
 
-        Ok(AgentListener { incoming, tls })
+        Ok(AgentListener { listener, tls })
     }
 }
 
-/// Bind the agent gateway's dedicated mTLS listener from the config's `[tls]`
-/// paths (ADR 0009/0011).
-///
-/// Reads the same cert/key/ca the Raft/admin server uses and hands them to
-/// [`AgentListener::bind`], naming each path on a read failure.
-fn prepare_agent_listener(cfg: &config::Config) -> Result<AgentListener> {
-    let cert = std::fs::read(&cfg.tls.cert_path)
-        .with_context(|| format!("reading TLS certificate {}", cfg.tls.cert_path.display()))?;
-    let key = std::fs::read(&cfg.tls.key_path)
-        .with_context(|| format!("reading TLS private key {}", cfg.tls.key_path.display()))?;
-    let ca = std::fs::read(&cfg.tls.ca_path)
-        .with_context(|| format!("reading TLS CA certificate {}", cfg.tls.ca_path.display()))?;
-
-    AgentListener::bind(cfg.listen.agent_addr, &cert, &key, &ca)
+/// Load the shared hot-reload TLS store from the config's `[tls]` paths
+/// (ADR 0011/0037 §4). Fails fast, naming the offending path, if any file is
+/// missing or unparseable.
+fn load_tls_store(cfg: &config::Config) -> Result<Arc<TlsStore>> {
+    let paths = TlsPaths {
+        cert: cfg.tls.cert_path.clone(),
+        key: cfg.tls.key_path.clone(),
+        ca: cfg.tls.ca_path.clone(),
+    };
+    TlsStore::load(paths).context("loading coordinator TLS material (config [tls])")
 }
 
 /// Assemble and start a coordinator replica (does not run the task runtime).
@@ -287,7 +310,10 @@ fn prepare_agent_listener(cfg: &config::Config) -> Result<AgentListener> {
 /// Each step fails with operator-actionable context. On success the returned
 /// [`BootedCoordinator`] owns a live consensus replica and a running mTLS
 /// server; the caller is responsible for the shutdown tail.
-pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordinator> {
+pub async fn bootstrap(
+    resolved: config::ResolvedConfig,
+    tls_store: Arc<TlsStore>,
+) -> Result<BootedCoordinator> {
     let cfg = &resolved.config;
 
     // Step 2: the data directory. Creating an empty dir is safe — the ADR 0016
@@ -300,34 +326,51 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
         )
     })?;
 
-    // Step 3: the mTLS PEM material (ADR 0011), each path named on failure.
-    let cert = std::fs::read(&cfg.tls.cert_path)
-        .with_context(|| format!("reading TLS certificate {}", cfg.tls.cert_path.display()))?;
-    let key = std::fs::read(&cfg.tls.key_path)
-        .with_context(|| format!("reading TLS private key {}", cfg.tls.key_path.display()))?;
-    let ca = std::fs::read(&cfg.tls.ca_path)
-        .with_context(|| format!("reading TLS CA certificate {}", cfg.tls.ca_path.display()))?;
-
     let cluster_uuid = *cfg.cluster_id.0.as_bytes();
     let raft_addr = cfg.listen.raft_addr;
 
-    // Step 4: node options from config. No node id: the replica's identity
-    // is minted at init and read from the manifest stamp thereafter (ADR 0025).
+    // Step 3: bind the raft/admin listener FIRST, before anything publishes an
+    // address (ADR 0037 §2). A `raft_addr` with port 0 (the multi-process dev
+    // case) must resolve to its real bound port here so the *same* concrete
+    // address reaches the advertised address, the `file`-discovery
+    // registration, and NodeOptions — never `host:0`. Binding now also means a
+    // port conflict fails at bootstrap, naming the address, rather than
+    // surfacing only when the server task is later awaited.
+    let listener = TcpListener::bind(raft_addr)
+        .await
+        .map_err(|e| anyhow!("binding raft/admin listener on {raft_addr}: {e}"))?;
+    let bound_raft_port = listener
+        .local_addr()
+        .map_err(|e| anyhow!("reading the bound raft/admin listener address: {e}"))?
+        .port();
+    let advertise_addr = cfg.listen.advertised_raft_addr_on_port(bound_raft_port);
+    tracing::info!(bind = %raft_addr, advertised = %advertise_addr, "raft/admin listener bound");
+
+    // The `file` discovery backend needs this process registered so peers can
+    // discover it (ADR 0037 §2); other backends need no registration.
+    let file_registration = match &cfg.discovery.file {
+        Some(file) => Some(
+            FileRegistration::register(&file.dir, &advertise_addr)
+                .context("registering in the file-discovery directory")?,
+        ),
+        None => None,
+    };
+
+    // Step 4: node options from config. No node id: the replica's identity is
+    // minted at init and read from the manifest stamp thereafter (ADR 0025). The
+    // consensus mesh shares the same hot-reload store, so a rotation reaches
+    // outbound peer dials too (ADR 0037 §4).
     let options = NodeOptions {
         cluster_uuid,
         data_dir: cfg.data_dir.clone(),
-        advertise_addr: cfg.listen.advertised_raft_addr(),
+        advertise_addr,
         election_timeout: cfg.raft.election_timeout,
         heartbeat_interval: cfg.raft.heartbeat_interval,
         rpc_timeout: cfg.raft.rpc_timeout,
         snapshot_log_entries: cfg.raft.snapshot_log_entries,
         snapshot_keep_log_entries: cfg.raft.snapshot_keep_log_entries,
         event_tap_capacity: limits::EVENT_TAP_CAPACITY,
-        tls: NodeTls {
-            ca_pem: ca.clone(),
-            cert_pem: cert.clone(),
-            key_pem: key.clone(),
-        },
+        tls: Arc::clone(&tls_store),
     };
 
     // Step 5: intent (the ADR 0016 matrix is enforced inside `start`).
@@ -357,34 +400,28 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
 
     // The replica-local log-fetch client (ADR 0034): dials agents' NodeService
     // listeners with this node's leaf as the client identity and the cluster CA
-    // as the trust root — the same material the raft mesh and agent gateway use.
-    let node_log_client = Arc::new(NodeClient::new(&ca, &cert, &key));
+    // as the trust root — the same hot-reload store the raft mesh and agent
+    // gateway use, so a rotation reaches these dials too (ADR 0037 §4).
+    let node_log_client = Arc::new(NodeClient::new(Arc::clone(&tls_store)));
 
     // Step 6: the mTLS server carrying both the Raft transport and the admin
-    // surface. Client certs are REQUIRED — `client_ca_root` sets the trust
-    // root and `client_auth_optional(false)` makes presenting a client cert
-    // mandatory (ADR 0011: no unauthenticated peer or admin traffic).
-    let tls = ServerTlsConfig::new()
-        .identity(Identity::from_pem(&cert, &key))
-        .client_ca_root(Certificate::from_pem(&ca))
-        .client_auth_optional(false);
-
+    // surface. TLS is terminated by the connection-time acceptor
+    // ([`coppice_tls::serve`]), which resolves this node's leaf from the shared
+    // store at each handshake and enforces mandatory client auth against the
+    // current CA — so the server config is NOT frozen on the tonic builder and
+    // `.tls_config` is deliberately absent (ADR 0037 §4). Client certs stay
+    // REQUIRED (ADR 0011: no unauthenticated peer or admin traffic).
     let admin = AdminServer::new(AdminService::new(
         Arc::clone(&consensus),
         handle.clone(),
         cluster_uuid,
     ));
 
-    // Bind now so a failure names the address at bootstrap rather than surfacing
-    // only when the server task is later awaited.
-    let incoming = TcpIncoming::new(raft_addr, true, None)
-        .map_err(|e| anyhow!("binding raft/admin listener on {raft_addr}: {e}"))?;
+    // Serve on the listener bound up front (before any address was published):
+    // TLS is terminated by the connection-time acceptor over the shared store.
+    let incoming = coppice_tls::serve(listener, Arc::clone(&tls_store));
 
-    let router = Server::builder()
-        .tls_config(tls)
-        .context("configuring the raft/admin server TLS")?
-        .add_service(transport)
-        .add_service(admin);
+    let router = Server::builder().add_service(transport).add_service(admin);
 
     let (raft_server_shutdown, shutdown_rx) = oneshot::channel::<()>();
     let raft_server = tokio::spawn(async move {
@@ -394,7 +431,7 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
             })
             .await
     });
-    tracing::info!(addr = %raft_addr, "raft/admin mTLS listener bound");
+    tracing::info!(bind = %raft_addr, "raft/admin mTLS server serving");
 
     Ok(BootedCoordinator {
         cluster_id: cfg.cluster_id,
@@ -405,6 +442,7 @@ pub async fn bootstrap(resolved: config::ResolvedConfig) -> Result<BootedCoordin
         node_log_client,
         raft_server_shutdown,
         raft_server,
+        file_registration,
     })
 }
 

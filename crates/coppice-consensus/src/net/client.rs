@@ -21,8 +21,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::Code;
+
+use coppice_tls::TlsStore;
 
 use openraft::error::{
     Fatal, NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
@@ -57,62 +59,111 @@ const WIRE: &str = "raft-rpc";
 
 /// Creates one [`GrpcRaftNetwork`] per target, sharing a per-peer channel map.
 ///
-/// Cheap to hold: the TLS config is built once from PEM bytes and cloned per
-/// endpoint (only the SNI domain name differs), and channels are dialed lazily.
+/// Cheap to hold: it keeps the shared TLS store and rebuilds a
+/// [`ClientTlsConfig`] from the *current* material each time it dials a peer, so
+/// a rotated leaf is picked up on the next (re)dial without a restart (ADR 0037
+/// §4). Channels are dialed lazily and reused per peer; an address change drops
+/// and redials.
+///
+/// The factory and every [`GrpcRaftNetwork`] it hands out share one [`Shared`]
+/// (an `Arc`), so a network's per-dial `channel_for` consults the *same*
+/// generation-checked channel map. This is what makes a rotation reach a
+/// long-lived replication worker: the worker holds a `GrpcRaftNetwork`, and each
+/// of its RPCs re-resolves the channel through the shared map rather than
+/// cloning a frozen `Channel` captured at `new_client` time (ADR 0037 §4).
 pub struct GrpcNetworkFactory {
-    cluster_uuid: [u8; 16],
-    tls: ClientTlsConfig,
-    rpc_timeout: Duration,
-    /// Per-peer `(dialed address, channel)`. A membership change that moves a
-    /// peer's address drops the stale channel and redials.
-    channels: Arc<Mutex<HashMap<CoordinatorId, (String, Channel)>>>,
+    shared: Arc<Shared>,
 }
 
+/// State shared by the factory and every network it creates: the cluster
+/// identity, the hot-reload TLS store, the per-RPC timeout, and the per-peer
+/// channel map consulted on every dial.
+struct Shared {
+    cluster_uuid: [u8; 16],
+    tls: Arc<TlsStore>,
+    rpc_timeout: Duration,
+    /// Per-peer `(dialed address, TLS generation, channel)`. A membership change
+    /// that moves a peer's address drops the stale channel and redials; a TLS
+    /// rotation (the store's [`generation`] advancing) does the same, so a
+    /// reconnect after a rotation presents the fresh leaf instead of the leaf
+    /// captured in the cached channel's [`ClientTlsConfig`] (ADR 0037 §4).
+    ///
+    /// [`generation`]: coppice_tls::TlsStore::generation
+    channels: Mutex<PeerChannels>,
+}
+
+/// Per-peer cache value: the dialed address, the TLS material generation it was
+/// built at, and the lazily-connected channel itself.
+type PeerChannels = HashMap<CoordinatorId, (String, u64, Channel)>;
+
 impl GrpcNetworkFactory {
-    /// Build the factory from the mutual-TLS client config (ADR 0011), the
-    /// per-RPC timeout, and the cluster identity stamped into every request.
-    pub fn new(cluster_uuid: [u8; 16], tls: ClientTlsConfig, rpc_timeout: Duration) -> Self {
+    /// Build the factory from the shared hot-reload TLS store (ADR 0011/0037),
+    /// the per-RPC timeout, and the cluster identity stamped into every request.
+    pub fn new(cluster_uuid: [u8; 16], tls: Arc<TlsStore>, rpc_timeout: Duration) -> Self {
         GrpcNetworkFactory {
-            cluster_uuid,
-            tls,
-            rpc_timeout,
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            shared: Arc::new(Shared {
+                cluster_uuid,
+                tls,
+                rpc_timeout,
+                channels: Mutex::new(HashMap::new()),
+            }),
         }
     }
+}
 
-    /// Reuse the peer's channel, redialing if its address changed or it was
-    /// never dialed. `Err` carries an operator-readable reason the RPC layer
-    /// surfaces as [`Unreachable`].
+impl Shared {
+    /// The mutual-TLS client config built from the material current *right now*
+    /// (ADR 0037 §4): the cluster CA as the trust root, this node's leaf as the
+    /// client identity. Rebuilt per dial so a reconnect after a rotation uses
+    /// the fresh leaf.
+    fn client_tls(&self) -> ClientTlsConfig {
+        let material = self.tls.current();
+        ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(material.ca_pem()))
+            .identity(Identity::from_pem(material.cert_pem(), material.key_pem()))
+    }
+
+    /// Reuse the peer's channel, redialing if its address changed, the TLS
+    /// material rotated since it was dialed, or it was never dialed. `Err`
+    /// carries an operator-readable reason the RPC layer surfaces as
+    /// [`Unreachable`].
+    ///
+    /// Called on **every** dial (each RPC), not just at `new_client`: it is a
+    /// map lookup plus an atomic generation read under a short-lived mutex,
+    /// released before any await, so replication is never serialized on it. The
+    /// generation check is what closes the rotation gap: the cached `Channel`
+    /// froze its `ClientTlsConfig` at creation, so after a rotation an internal
+    /// tonic reconnect (or a retained network's next RPC) would keep presenting
+    /// the old leaf. Evicting on a generation bump forces a re-dial that rebuilds
+    /// the config from the current material.
     fn channel_for(&self, target: CoordinatorId, addr: &str) -> Result<Channel, String> {
+        let generation = self.tls.generation();
         let mut map = self.channels.lock().expect("network channel map poisoned");
-        if let Some((existing, channel)) = map.get(&target) {
-            if existing == addr {
+        if let Some((existing, gen, channel)) = map.get(&target) {
+            if existing == addr && *gen == generation {
                 return Ok(channel.clone());
             }
         }
-        let channel = build_channel(&self.tls, addr, self.rpc_timeout)
+        let channel = build_channel(&self.client_tls(), addr, self.rpc_timeout)
             .map_err(|e| format!("cannot dial coordinator {target} at {addr}: {e}"))?;
-        map.insert(target, (addr.to_string(), channel.clone()));
+        map.insert(target, (addr.to_string(), generation, channel.clone()));
         Ok(channel)
     }
 }
 
-/// Construct a lazily-connecting mTLS channel to `addr` (`host:port`).
+/// Construct a lazily-connecting mTLS channel to `addr` (`host:port` or
+/// `[v6]:port`).
 ///
 /// `connect_lazy` hands reconnection to tonic; per-peer reuse is the factory's
-/// channel map. The SNI domain name is the host part of the dial address.
-fn build_channel(
-    tls: &ClientTlsConfig,
-    addr: &str,
-    timeout: Duration,
-) -> Result<Channel, tonic::transport::Error> {
-    let host = addr
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(addr)
-        .to_string();
-    let endpoint = Endpoint::from_shared(format!("https://{addr}"))?
-        .tls_config(tls.clone().domain_name(host))?
+/// channel map. The SNI domain name is the unbracketed host part of the dial
+/// address (an IPv6 SAN identity carries no brackets); the `https://{addr}`
+/// authority keeps the original brackets. `Err` is an operator-readable string.
+fn build_channel(tls: &ClientTlsConfig, addr: &str, timeout: Duration) -> Result<Channel, String> {
+    let (host, _port) = coppice_tls::split_host_port(addr).map_err(|e| e.to_string())?;
+    let endpoint = Endpoint::from_shared(format!("https://{addr}"))
+        .map_err(|e| e.to_string())?
+        .tls_config(tls.clone().domain_name(host))
+        .map_err(|e| e.to_string())?
         .connect_timeout(timeout)
         .timeout(timeout);
     Ok(endpoint.connect_lazy())
@@ -122,31 +173,45 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetworkFactory {
     type Network = GrpcRaftNetwork;
 
     async fn new_client(&mut self, target: CoordinatorId, node: &BasicNode) -> GrpcRaftNetwork {
-        // Per the trait contract, this must not fail even for a bad address; a
-        // dial error is deferred into the per-RPC path as `Unreachable`.
-        let channel = self.channel_for(target, &node.addr);
+        // No dial here: the network resolves its channel through the shared,
+        // generation-checked map on every RPC, so a rotation reaches even a
+        // long-lived replication worker that keeps this object (ADR 0037 §4).
+        // A membership address change makes openraft build a new network with
+        // the new node, so the captured `addr` need never mutate in place.
         GrpcRaftNetwork {
+            shared: Arc::clone(&self.shared),
             target,
-            cluster_uuid: self.cluster_uuid,
-            channel,
+            addr: node.addr.clone(),
         }
     }
 }
 
-/// A single-target Raft client over a shared, lazily-connected mTLS channel.
+/// A single-target Raft client that resolves its mTLS channel through the shared
+/// factory map on **every** RPC.
+///
+/// It holds no frozen `Channel`: [`dial`](Self::dial) calls
+/// [`Shared::channel_for`] each time, so a TLS rotation (generation bump) or an
+/// internal tonic reconnect always presents the current leaf, not the one
+/// captured when openraft first created this network (ADR 0037 §4). openraft
+/// keeps this object alive for the life of a replication stream, which is
+/// exactly why the per-dial resolution — rather than a captured channel — is
+/// required.
 pub struct GrpcRaftNetwork {
+    shared: Arc<Shared>,
     target: CoordinatorId,
-    cluster_uuid: [u8; 16],
-    /// The dial result captured at `new_client`. `Err` means the address could
-    /// not be turned into a channel — treated as `Unreachable` on every RPC.
-    channel: Result<Channel, String>,
+    /// The peer's dial address, captured at `new_client`. A membership change
+    /// that moves the peer spawns a fresh network, so this stays fixed for the
+    /// object's life.
+    addr: String,
 }
 
 impl GrpcRaftNetwork {
-    /// The channel, or an [`Unreachable`] RPC error if the peer never dialed.
+    /// Resolve the peer's channel through the shared generation-checked map, or
+    /// an [`Unreachable`] RPC error if it cannot be dialed. Consulted per RPC so
+    /// a rotation is never pinned to a stale channel.
     fn dial<E: std::error::Error>(&self) -> Result<Channel, RPCError<CoordinatorId, BasicNode, E>> {
-        self.channel
-            .clone()
+        self.shared
+            .channel_for(self.target, &self.addr)
             .map_err(|msg| RPCError::Unreachable(Unreachable::new(&io::Error::other(msg))))
     }
 }
@@ -226,7 +291,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
     > {
         let channel = self.dial()?;
         let mut client = Client::new(channel);
-        let req = convert::append_entries_to_pb(&rpc, self.cluster_uuid);
+        let req = convert::append_entries_to_pb(&rpc, self.shared.cluster_uuid);
         let resp = client
             .append_entries(req)
             .await
@@ -245,7 +310,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
     > {
         let channel = self.dial()?;
         let mut client = Client::new(channel);
-        let req = convert::vote_request_to_pb(&rpc, self.cluster_uuid);
+        let req = convert::vote_request_to_pb(&rpc, self.shared.cluster_uuid);
         let resp = client
             .vote(req)
             .await
@@ -267,8 +332,8 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
     ) -> Result<SnapshotResponse<CoordinatorId>, StreamingError<TypeConfig, Fatal<CoordinatorId>>>
     {
         let channel = self
-            .channel
-            .clone()
+            .shared
+            .channel_for(self.target, &self.addr)
             .map_err(|msg| StreamingError::Unreachable(Unreachable::new(&io::Error::other(msg))))?;
         let mut client = Client::new(channel);
 
@@ -277,7 +342,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         // `SnapshotData` binding is the file-backed `SnapshotFile`): one wire
         // chunk in memory at a time, however large the snapshot.
         let header = pb::InstallSnapshotHeader {
-            cluster_uuid: self.cluster_uuid.to_vec(),
+            cluster_uuid: self.shared.cluster_uuid.to_vec(),
             vote: Some(raftpb::vote_to_pb(&vote)),
             meta: Some(convert::snapshot_ident_to_pb(&snapshot.meta)),
         };

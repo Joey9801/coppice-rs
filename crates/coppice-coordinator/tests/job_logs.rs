@@ -142,7 +142,8 @@ fn spawn_agent(
     )
     .with_service_addr(Some(service_addr));
     tokio::spawn(async move {
-        let _ = run(session, &config).await;
+        let tls = coppice_agent::load_tls_store(&config.tls).expect("load agent tls store");
+        let _ = run(session, &config, tls).await;
     })
 }
 
@@ -356,9 +357,7 @@ async fn best_effort_job_logs_full_read_path() {
     let server_leaf = ca.leaf_with_cn_and_sans("node-service", &[node.to_string()]);
     let listener = NodeServiceListener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        &server_leaf.cert_pem,
-        &server_leaf.key_pem,
-        &ca.pem,
+        common::tls_store_from_pem(&ca.pem, &server_leaf.cert_pem, &server_leaf.key_pem),
     )
     .expect("bind NodeService listener");
     let service_addr = format!("127.0.0.1:{}", listener.local_addr().port());
@@ -433,11 +432,11 @@ async fn best_effort_job_logs_full_read_path() {
 
     // -- Build the real read path: plane + log client + router. ------------
     let coord_leaf = ca.leaf();
-    let log_client = Arc::new(NodeClient::new(
+    let log_client = Arc::new(NodeClient::new(common::tls_store_from_pem(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
-    ));
+    )));
     let plane = Arc::new(
         CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
             .with_log_client(log_client),
@@ -535,11 +534,11 @@ async fn best_effort_job_logs_full_read_path() {
     // fetch through a fresh client to observe genuine unreachability.
     server.abort();
     let _ = (&mut server).await;
-    let log_client2 = Arc::new(NodeClient::new(
+    let log_client2 = Arc::new(NodeClient::new(common::tls_store_from_pem(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
-    ));
+    )));
     let router2 = coppice_api::http::router(
         Arc::new(
             CoordinatorControlPlane::new(coord.consensus(), coord.views(), cluster_id)
@@ -594,9 +593,7 @@ async fn follower_serves_job_logs_directly() {
     let server_leaf = ca.leaf_with_cn_and_sans("node-service", &[node.to_string()]);
     let listener = NodeServiceListener::bind(
         "127.0.0.1:0".parse().unwrap(),
-        &server_leaf.cert_pem,
-        &server_leaf.key_pem,
-        &ca.pem,
+        common::tls_store_from_pem(&ca.pem, &server_leaf.cert_pem, &server_leaf.key_pem),
     )
     .expect("bind NodeService listener");
     let service_addr = format!("127.0.0.1:{}", listener.local_addr().port());
@@ -706,11 +703,11 @@ async fn follower_serves_job_logs_directly() {
     // involvement, and the fetch dials the agent with no leadership gating; the
     // leader's client listener is never touched by this request.
     let coord_leaf = ca.leaf();
-    let log_client = Arc::new(NodeClient::new(
+    let log_client = Arc::new(NodeClient::new(common::tls_store_from_pem(
         &ca.pem,
         &coord_leaf.cert_pem,
         &coord_leaf.key_pem,
-    ));
+    )));
     let follower_plane = Arc::new(
         CoordinatorControlPlane::new(follower_a.consensus(), follower_a.views(), cluster_id)
             .with_log_client(log_client),
