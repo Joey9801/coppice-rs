@@ -42,14 +42,22 @@ authorization-shaped are replicated policy**
 ### Operator certificates (break-glass and day 0)
 
 The client API listener also accepts mutual TLS with client certificates
-carrying the operator profile (`OU=coppice-operators`), issued via
-`coppice-cli pki issue-operator-cert` under the control-plane trust root
-(whose provenance — cluster-held vs. external PKI — is OD-14/OD-15). They
-authenticate as principal `cert:<CN>` with implicit unscoped admin — usable
-when the IdP is down, and the authentication under which
-`coppice-cli cluster init --policy` commits the first bindings. Operator
-actions are ordinary actor-carrying commands: break-glass is audited, not
-exempt.
+carrying the operator profile (`OU=coppice-operators`) under the
+control-plane trust root — the **cluster-owned CA** minted at formation
+([ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)).
+The first operator certificate is signed by the local
+`coppice coordinator init` at formation; later ones come from
+`coppice-cli pki issue-operator-cert` authorized by an existing operator
+credential, and the local-socket `admin issue-operator-cert` verb
+(authority: filesystem access on a coordinator host) recovers from
+losing them all. They authenticate as principal `cert:<CN>` with
+implicit unscoped admin — usable when the IdP is down. Day-0 authority
+is *not* this certificate: the initial policy bindings are committed by
+`init` itself under local Unix-socket authority (the operator
+certificate is minted during that same operation, so it cannot
+authenticate the act that creates it); the certificate is for everything
+*after* formation. Operator actions are ordinary actor-carrying
+commands: break-glass is audited, not exempt.
 
 ### IdP outage posture
 
@@ -118,17 +126,36 @@ default-deny.
 - Stronger runtime isolation (gVisor/Kata) is out of scope for v1, but the
   agent design must not preclude swapping the container runtime later.
 
-## Node identity
+## Node identity and the control-plane PKI
 
 Coordinator↔agent communication uses mutual TLS: a node bootstraps with a
-one-time enrollment token, submits a CSR, and receives a per-node certificate.
-`NodeId` is bound to that certificate identity, which also underpins the
-fencing protocol's authenticity assumptions
+role-scoped enrollment token, submits a CSR, and receives a per-node
+certificate. `NodeId` is bound to that certificate identity, which also
+underpins the fencing protocol's authenticity assumptions
 ([ADR 0009](../decisions/0009-fencing-and-reconciliation.md)).
 Coordinator↔coordinator (Raft) traffic uses the same mutual-TLS posture
-under the same trust root; where coordinator certificates come from in a
-templated deployment is OD-14
-([open-decisions](../roadmap/open-decisions.md)).
+under the same trust root, and coordinators obtain their leaves through
+the same enrollment flow.
+
+The trust root is decided
+([ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)):
+**the cluster owns its CA**, minted at formation. The CA certificate is
+replicated; the private key never enters replicated state — it normally
+resides on voter disks and may also reside on a promotion candidate past
+the key-transfer gate, and every disk that has ever received it is
+root-equivalent (compromise response: re-rooting; the runbook is a
+required pre-production deliverable). Enrollment transport is explicitly
+secure or explicitly insecure — clients verify the server against a
+pinned cluster-CA fingerprint/bundle or system roots, never
+trust-on-first-use. Enrollment tokens are salted hashes in replicated
+policy, revocable by policy write, with the stated limits: token
+revocation stops future enrollments but does not recall issued leaves
+(renewal refusal plus short leaf lifetimes is v1's certificate
+revocation), the long-lived agent launch-template token is the supported
+default, and the coordinator token is classified root-equivalent — the
+long-lived variant is an explicitly accepted risk, short-lived
+per-refresh minting the recommended stronger posture. External PKI
+remains a supported substitution behind the same `[tls]` paths.
 
 ## Secrets
 
@@ -137,7 +164,8 @@ secrets**: job environment comes only from the job spec, which is treated as
 non-secret, and the platform says so. Secret-manager integration
 (reference-only injection at container start) is future work; nothing in v1
 may create a place where secret values land in logs, events, snapshots, or UI.
-The only credentials Coppice itself issues are X.509 certificates (node and
-operator) under the control-plane trust root; user and service credentials
-live in the IdP
+The only credentials Coppice itself issues are X.509 certificates
+(coordinator, agent, and operator, under the cluster-owned control-plane
+trust root) and enrollment tokens; user and service credentials live in
+the IdP
 ([ADR 0022](../decisions/0022-oidc-identity-and-authentication.md)).
