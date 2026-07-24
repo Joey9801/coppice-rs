@@ -381,13 +381,24 @@ budget faster) but is silent on its effect on *rank*.
 (2026-07-22). Discovery is a pluggable, strictly seed-only trait
 (`static`/`dns`/`file`/`ec2-asg`; Consul deferred as just another impl);
 the daemon runs one flagless command with derived intent, parks when no
-cluster exists, and self-joins via an idempotent loop; first-ever
-formation is an explicit, token-keyed, resumable `coppice-cli cluster
-init`. PKI stays externally issued, with in-process cert reload (mtime
-watch + SIGHUP) as the one code change, plus a new hard requirement: one
-stable, unique certificate subject per coordinator installation, which
-anchors the machine self-service membership grant amending
-ADRs 0022/0023.
+cluster exists, and self-joins via an idempotent loop. First-ever
+formation is `coppice coordinator init`, a local-only verb on the
+daemon's root-owned Unix socket — no network formation, no formation
+token, no resumability: a `formation_complete` marker bounds a fail-stop
+over every partial-formation state, and recovery is wipe-and-rerun. PKI
+is **cluster-owned**: the root is minted at formation; the key never
+enters replicated state — it resides on voter disks plus any promotion
+candidate past the key-transfer gate, every recipient root-equivalent,
+under an explicit custody invariant — and coordinators and agents
+obtain leaves via one token-based
+enrollment endpoint with explicit transport trust (pinned cluster CA or
+external cert — never TOFU); external PKI is a substitution, not a
+requirement. Cluster-minted subjects anchor the machine self-service
+membership grant amending ADRs 0022/0023 (one seat per installation
+identity); replacing a live voter is the explicit operator verb
+`ReplaceVoter{old,new}`, dead voters are removed on the leader's own
+replication evidence inside the newcomer's promotion. In-process cert
+reload (mtime watch + SIGHUP) lands as planned.
 
 **Question.** (a) Which discovery backends feed the coordinator seed list —
 static config (today), DNS, Consul — and is any of them load-bearing beyond
@@ -418,6 +429,17 @@ is gated on ADRs 0022/0023 formalizing who may drive membership RPCs.
 [ADR 0011](../decisions/0011-container-security-posture.md).
 
 ## OD-15: Agent enrollment signer and decommission protocol
+
+**Status: half (a) resolved** —
+[ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)
+decides the signer: the **cluster-owned CA** (root minted at formation;
+CA certificate replicated; the key never in replicated state, residing
+on voter disks plus any promotion candidate past the key-transfer gate,
+every recipient root-equivalent; the leader signs). Agents share the coordinators' enrollment endpoint,
+role-scoped revocable tokens, explicit transport trust anchors, and
+renewal-as-revocation-lever; Vault-style external issuance remains a
+substitution behind the same `[tls]` paths. **Half (b) — drain and
+decommission — remains open.**
 
 **Question.** (a) Who signs agent leaves in the ADR 0011 enrollment flow —
 a coordinator-held CA (key on the leader, cert in replicated policy) or an

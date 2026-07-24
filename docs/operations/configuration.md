@@ -20,7 +20,9 @@ node want a different value than its peers?* → config file.
 | --- | --- |
 | Listen/advertise addresses, ports | config file |
 | Data directory | config file (the raft node id is *not* config: minted at init and read from the disk stamp, [ADR 0025](../decisions/0025-self-minted-coordinator-identity.md)) |
-| TLS cert/key/CA paths, enrollment token path | config file |
+| Machine-plane TLS paths (`[tls]`); client-listener TLS paths (`[client_tls]`); enrollment token path and trust anchor | config file |
+| Discovery backend and `cluster_size` | config file (seed-only; consulted before replicated state is reachable — [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)) |
+| Enrollment tokens (hashes), issued-identity revocations | replicated policy (ADR 0037) |
 | SSO issuer, client id, client-secret path | config file |
 | Log level/format, OTLP endpoint, metrics address | config file |
 | Raft election timeout, Raft heartbeat interval, snapshot thresholds | config file (liveness-only; safe to vary per node) |
@@ -60,11 +62,16 @@ Conventions (all from ADR 0020):
 - **No inline secrets, ever** — the file holds *paths* to key material, so
   the file itself is safe to commit to config management, diff, and attach
   to support bundles.
-- **Precedence:** CLI flags > file > built-in defaults. The only flags are
-  `--config` and the startup-intent flags `--bootstrap` / `--join`.
+- **Precedence:** CLI flags > file > built-in defaults. The daemon's only
+  flag is `--config` — startup intent is derived from the data directory
+  ([ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)).
   There is no environment-variable layer.
-- **No hot reload.** Changes take effect on restart; coordinator restarts
-  are designed to be cheap (rolling restart with learner catch-up).
+- **No hot reload of the config file.** Changes take effect on restart;
+  coordinator restarts are designed to be cheap (rolling restart with
+  learner catch-up). The one deliberate exception is the key material the
+  file *points to*: files under `[tls]` paths reload without restart
+  (mtime watch, or SIGHUP to force — ADR 0037), so certificate rotation
+  never recycles processes.
 - The effective configuration is logged in full at startup.
 
 ### Annotated coordinator example
@@ -75,14 +82,25 @@ Conventions (all from ADR 0020):
 # Node-local configuration only. Cluster-wide behaviour — quotas, decay,
 # retention, authorization — is replicated policy: see `coppice-cli policy`.
 
-# Generated once per cluster, identical in every replica's file, and
-# cross-checked against the data directory's stamp at startup (ADR 0016).
-# Typed string form per ADR 0024.
+# Operator-chosen *logical* cluster name (a uuid is a convenient choice),
+# identical in every replica's file; probing and joining match on it.
+# Deliberately distinct from the history id, which `init` mints at
+# formation and stamps into data directories to name one raft history —
+# a wiped-and-re-formed cluster keeps this cluster_id but gets a new
+# history id, so stale volumes fail-stop (ADRs 0016/0037). Typed string
+# form per ADR 0024.
 cluster_id = "cluster-6fa1e2c4-9b0d-4c1e-8f6a-2d3b5a7c9e01"
 data_dir = "/var/lib/coppice"
-# Seed list for admin tooling to find the cluster; authoritative addresses
-# live in replicated membership.
-peers = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
+
+[discovery]
+# Seed-only: feeds first-dial and admin tooling; authoritative addresses
+# live in replicated membership (ADR 0037). Backends: static | dns |
+# file | ec2-asg — exactly one backend table, matching `backend`.
+backend = "dns"
+cluster_size = 3            # intended voter count (removal + `formed` gates)
+[discovery.dns]
+name = "coord.batch.example.com"
+port = 7071
 
 [listen]
 client_addr = "0.0.0.0:7070"    # user/CLI API
@@ -102,12 +120,33 @@ snapshot_log_entries = 50_000
 snapshot_keep_log_entries = 1_000
 
 [tls]
-# One trust root anchors node certs, Raft peer certs, and operator
-# client certs (the client listener accepts the latter as break-glass
-# admin authentication — ADR 0022; root provenance is OD-14/15).
+# MACHINE PLANE ONLY: the leaf served on the raft, agent-gateway, and
+# enrollment listeners, and this node's client identity toward peers.
+# The trust root is the cluster-owned CA minted at formation (ADR 0037);
+# these files are written by enrollment, hot-reloaded on change, and
+# externally-issued certs are a supported substitution at the same
+# paths. This cert is never served on the user-facing listener below.
 cert_path = "/etc/coppice/pki/node.crt"
 key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"
+
+[client_tls]
+# USER-FACING HTTP API listener (ADR 0037 §4): an externally signed
+# serving certificate (browsers won't trust the cluster's private root),
+# or sit behind a TLS-terminating LB, or `insecure = true` (conspicuous
+# dev-only opt-in; mutually exclusive with the paths). Independent of
+# this serving cert, operator-profile *client* certificates presented
+# here are verified against the cluster CA from [tls] (ADR 0022
+# break-glass).
+cert_path = "/etc/coppice/pki/api.example.com.crt"
+key_path  = "/etc/coppice/pki/api.example.com.key"
+
+[enrollment]
+# How a certless new installation obtains its leaf (ADR 0037 §§4-5).
+# Exactly one trust anchor, or a conspicuous `insecure = true` (dev
+# only); a token with no anchor is a startup error.
+token_path = "/etc/coppice/enroll-token"
+trust = { fingerprint_path = "/etc/coppice/ca-fingerprint" }
 
 [sso]
 # Connection identity only — the groups-claim name and all role bindings
@@ -129,17 +168,18 @@ it is served on the client API listener at `/metrics` (issue #46), alongside
 which has no such listener, keeps its own optional `metrics_addr`.)
 
 The agent's file follows the same conventions with its own schema
-(coordinator endpoints, enrollment token path, image-cache and workdir
-paths, resource-advertisement overrides).
+(coordinator endpoints, the same `[enrollment]` table, image-cache and
+workdir paths, resource-advertisement overrides).
 
 ## Replicated policy
 
 Policy is inspected and changed through the CLI, which converts
 human-friendly forms into the exact replicated representations:
 
-- `coppice-cli cluster init --policy policy.toml` — supplies *initial*
-  policy exactly once, at cluster creation. The node config file never seeds
-  policy, even on first boot.
+- `coppice coordinator init --policy policy.toml` — supplies *initial*
+  policy exactly once, at cluster formation, over the daemon's local
+  admin socket (ADR 0037: formation is local-only). The node config file
+  never seeds policy, even on first boot.
 - `coppice-cli policy …` — reads and updates policy at runtime; every change
   is a committed Raft command, ordered in the log and applied identically on
   every replica.

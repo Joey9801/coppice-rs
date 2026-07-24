@@ -6,7 +6,9 @@ operable with minimal human ceremony. The coordinator half is now decided:
 [OD-14](open-decisions.md) is resolved by
 [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md),
 and Part 1 below describes that settled intent awaiting implementation.
-The agent half ([OD-15](open-decisions.md)) remains open.
+ADR 0037 also settles the *signer* half of [OD-15](open-decisions.md)
+(the cluster-owned CA signs agent leaves); the decommission/scale-in half
+remains open.
 
 Two goals, one per audience:
 
@@ -45,28 +47,43 @@ the operational workflow is described in
 
 - **C3, join choreography** → the daemon runs one flagless command in
   every situation (`--bootstrap`/`--join` are gone). A new instance
-  discovers and probes for the cluster, self-joins (learner admission →
-  catch-up → promotion) through an idempotent convergence loop, or
-  *parks* if no cluster exists; first-ever formation is an explicit,
-  formation-token-keyed `coppice-cli cluster init`, never emergent. The
-  authorization question is settled as a machine self-service grant
-  amending ADRs 0022/0023: one vote per CA-attested installation
-  identity, self-scoped verbs only; removal/init/set-address require the
+  enrolls for its certificate, discovers and probes for the cluster,
+  self-joins (learner admission → catch-up → promotion) through an
+  idempotent convergence loop, or *parks* if no cluster exists.
+  First-ever formation is `coppice coordinator init`, a **local-only**
+  verb on the daemon's root-owned Unix socket (SSH/SSM/cloud-init run
+  it), never emergent and never a network RPC; a `formation_complete`
+  marker bounds a fail-stop covering every partial-formation state, and
+  the forming daemon serves nothing until it exists. The authorization
+  question is settled as a machine self-service grant amending
+  ADRs 0022/0023: one seat per cluster-minted installation identity,
+  self-scoped verbs only; removal/replacement/set-address require the
   operator-profile certificate.
 - **C2, finding the cluster** → a seed-only `Discovery` trait behind a
   uniform `[discovery]` config section: `static`, `dns`, `file` (local
   multi-process clusters), `ec2-asg`. Consul remains a possible future
   backend, deliberately unbuilt. Membership stays the sole authority.
-- **C1, PKI** → as planned: issuance stays external (Vault-style
-  short-lived leaves or config-managed certs), the coordinator gains
-  cert reload without restart, and ADR 0037 adds one hard requirement —
-  a stable, unique certificate subject per coordinator installation,
-  since the subject now anchors the membership grant.
-- **C4, rolling upgrade** → replacement is "start the new machine";
-  removal rides the promotion joint change. Serial fleet replacement is
-  gated on the new machine-readable `/readyz` (an ASG instance refresh
-  with a launch lifecycle hook polling it implements the loop; no
-  further coordinator code needed).
+- **C1, PKI** → decided the other way from the original plan: **the
+  cluster owns its CA**. The root is minted at formation; the CA key
+  never enters replicated state (it normally resides on voter disks,
+  plus a promotion candidate past the key-transfer gate, under an
+  explicit custody invariant and a root-equivalence threat model);
+  coordinators and agents obtain leaves through one token-based
+  enrollment endpoint with an explicit transport trust anchor (pinned
+  cluster CA or externally-verified cert — never TOFU). Subjects are
+  cluster-minted, so stability and uniqueness hold by construction. The
+  coordinator gains cert reload without restart; external PKI
+  (Vault-style leaves, config-managed certs) remains a supported
+  substitution, never a requirement.
+- **C4, rolling upgrade** → replacement is "start the new machine".
+  A dead predecessor's removal rides the newcomer's promotion joint
+  change on the leader's own replication evidence
+  (terminate-before-launch: fully hands-off); replacing a *live* voter
+  is the explicit, operator-authenticated `ReplaceVoter{old,new}`
+  (launch-before-terminate rollouts drive it). Serial fleet replacement
+  is gated on the new machine-readable `/readyz` (an ASG instance
+  refresh with a launch lifecycle hook polling it implements the loop;
+  no further coordinator code needed).
 
 Implementation of all of the above is tracked as issue #47 and has not
 landed yet; until it does, the pre-0037 manual sequence continues to work
@@ -92,25 +109,40 @@ dir (`coppice dev` already does exactly this); `node_id` leaves
 `agent.toml`. The CN↔NodeId binding then inverts: identity exists first,
 the cert is issued *for* it — which is the enrollment flow's shape anyway.
 
-**A2 — enrollment (the keystone).** Implement ADR 0011's flow:
+**A2 — enrollment (the keystone).** Implement ADR 0011's flow, whose
+signer ADR 0037 has now decided (resolving OD-15a):
 
-1. The launch template carries one secret: a scoped, expiring
-   **enrollment token** (minted by `coppice node enroll-token`, stored in
-   the ASG's secret manager / instance metadata).
+1. The launch template carries a **role-scoped enrollment token**
+   (agent role; reusable and long-lived is the supported default — no
+   secrets manager or minting service required; short-lived per-refresh
+   minting via `coppice node enroll-token` is the recommended stronger
+   posture where automation exists) plus the enrollment **trust
+   anchor** (the pinned cluster-CA fingerprint/bundle emitted at
+   formation, or system roots against an externally-signed cert).
 2. First boot: agent mints its NodeId, generates a keypair, sends
-   CSR + token to a coordinator **enrollment endpoint** (server-TLS-only;
-   it is the one endpoint a certless client may call).
+   CSR + token to the coordinator **enrollment endpoint** — with
+   `ProbeCluster`, the entire network surface a certless client may
+   call — after verifying the server against the configured trust
+   anchor (a token with no anchor and no explicit `insecure` opt-in is
+   a startup error).
 3. The coordinator validates the token, signs a leaf with CN = the typed
    node id, and returns it with the cluster CA bundle. The agent persists
    both and from then on speaks ordinary mTLS.
 4. Renewal uses the same endpoint authenticated by the *current* cert
-   (re-issue before expiry), giving short-lived agent certs for free.
+   (re-issue before expiry), giving short-lived agent certs for free —
+   and renewal refusal for operator-revoked identities is v1's
+   certificate revocation.
 
-Where the signing key lives is the OD-15 decision: a coordinator-held CA
-(replicated policy holds the CA cert, the leader holds the key — simplest,
-no new infra) versus delegating signing to Vault (better key hygiene,
-external dependency). The protocol above is identical either way, so the
-endpoint can ship with the built-in signer and grow a Vault backend.
+The signer is the **cluster-owned CA** (ADR 0037 §4): the CA certificate
+is replicated; the key never enters replicated state — it normally
+resides on voter disks and may also reside on a promotion candidate past
+the key-transfer gate, with every disk that has ever received it
+accounted root-equivalent — and the leader signs. Tokens are salted
+hashes in replicated
+policy — listable and revocable with a policy write, with the stated
+caveat that token revocation stops future enrollments but does not
+recall already-issued leaves. Vault-style external issuance remains a
+substitution behind the same `[tls]` paths, not a dependency.
 
 **A3 — capacity autodetect.** Detect cpu/memory/disk at startup
 (`available_parallelism`, cgroup/sysinfo limits, statvfs on the workdir)
@@ -149,13 +181,16 @@ curl -o /usr/local/bin/coppice …   # or baked into the AMI
 cat > /etc/coppice/agent.toml <<EOF
 data_dir = "/var/lib/coppice-agent"
 coordinators = ["coord.batch.example.com:7072"]   # DNS, per Part 1 C2
-[tls]
-enrollment_token_path = "/run/coppice/enroll-token"   # from secrets manager
+[enrollment]
+token_path = "/etc/coppice/enroll-token"          # baked into user-data
+trust = { fingerprint_path = "/etc/coppice/ca-fingerprint" }  # ditto
 EOF
 systemctl start coppice-agent   # ExecStart=coppice agent --config …
 ```
 
-No ids, no certs, no capacity numbers, no coordinator-side pre-registration.
+No ids, no certs, no capacity numbers, no coordinator-side
+pre-registration, no secrets manager — the token and the CA pin travel
+in the same provisioning channel.
 
 ## Sequencing against the critical path
 
@@ -163,6 +198,7 @@ The MVP critical path landed 2026-07-20 (Docker executor → API server →
 CLI), so nothing here competes with it any more. Remaining sequencing:
 the Part 1 implementation (issue #47) is fully specified by ADR 0037 and
 can proceed now; on the agent side, A1 (hours, removes ceremony) can land
-any time, while A2/A4 still wait on the OD-15 signer/decommission
-decisions — ADRs 0022/0023 are written, so authorization is no longer the
-blocker there.
+any time, and A2 is now fully specified too (ADR 0037 decided the
+signer, resolving OD-15a). Only A4 still waits on the OD-15
+decommission/scale-in decision — ADRs 0022/0023 are written, so
+authorization is no longer the blocker there.
