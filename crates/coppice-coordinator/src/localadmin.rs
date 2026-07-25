@@ -295,7 +295,7 @@ impl LocalAdmin {
                      sign with (ADR 0037 §3). Run `coppice coordinator init` first."
                 )
             })?;
-        let (signer, ca_pem) = formation::load_cluster_ca(&self.data_dir, &consensus)?;
+        let (signer, ca_pem) = formation::load_cluster_ca(&self.data_dir, consensus.as_ref())?;
         formation::issue_operator_credential(&signer, &ca_pem, &request)
     }
 }

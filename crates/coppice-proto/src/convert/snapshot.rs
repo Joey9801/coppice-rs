@@ -304,6 +304,29 @@ impl TryFrom<pb::KeyConfirmationRecord> for (u64, Timestamp) {
     }
 }
 
+// Enrolled identities are keyed by the machine id, so the record carries the
+// key and converts as a (machine, recorded_at) pair.
+
+impl From<(&MachineId, &Timestamp)> for pb::EnrolledIdentityRecord {
+    fn from((machine, recorded_at): (&MachineId, &Timestamp)) -> Self {
+        pb::EnrolledIdentityRecord {
+            machine: Some((*machine).into()),
+            recorded_at_us: recorded_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::EnrolledIdentityRecord> for (MachineId, Timestamp) {
+    type Error = ConvertError;
+
+    fn try_from(r: pb::EnrolledIdentityRecord) -> Result<Self, ConvertError> {
+        Ok((
+            req(r.machine, "EnrolledIdentityRecord.machine")?.try_into()?,
+            timestamp(r.recorded_at_us, "EnrolledIdentityRecord.recorded_at_us")?,
+        ))
+    }
+}
+
 // ---- Whole-state assembly ----
 
 /// A `StateMachine` flattened into snapshot records, grouped per entity
@@ -319,6 +342,7 @@ pub struct StateRecords {
     pub enroll_tokens: Vec<pb::EnrollTokenRecord>,
     pub revoked_identities: Vec<pb::RevokedIdentityRecord>,
     pub key_confirmations: Vec<pb::KeyConfirmationRecord>,
+    pub enrolled_identities: Vec<pb::EnrolledIdentityRecord>,
     pub cluster: Option<pb::ClusterStateRecord>,
 }
 
@@ -338,6 +362,7 @@ pub struct RecordCounts {
     pub enroll_tokens: usize,
     pub revoked_identities: usize,
     pub key_confirmations: usize,
+    pub enrolled_identities: usize,
 }
 
 /// Count each entity kind without touching a record.
@@ -352,6 +377,7 @@ pub fn record_counts(state: &StateMachine) -> RecordCounts {
         enroll_tokens: state.enroll_tokens.len(),
         revoked_identities: state.revoked_identities.len(),
         key_confirmations: state.key_confirmations.len(),
+        enrolled_identities: state.enrolled_identities.len(),
     }
 }
 
@@ -491,6 +517,21 @@ pub fn key_confirmation_records(
         .map(Into::into)
 }
 
+/// Enrolled-identity records for the window `[start, start + count)`,
+/// `(&machine, &recorded_at)` pairs.
+pub fn enrolled_identity_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::EnrolledIdentityRecord> + '_ {
+    state
+        .enrolled_identities
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
 /// The single `ClusterStateRecord` — the state's scalar tail (policy,
 /// versions, allocation sequence, and the singleton CA bundle). Not sharded:
 /// exactly one per snapshot.
@@ -521,6 +562,8 @@ pub fn state_to_records(state: &StateMachine) -> StateRecords {
         enroll_tokens: enroll_token_records(state, 0, counts.enroll_tokens).collect(),
         revoked_identities: revoked_identity_records(state, 0, counts.revoked_identities).collect(),
         key_confirmations: key_confirmation_records(state, 0, counts.key_confirmations).collect(),
+        enrolled_identities: enrolled_identity_records(state, 0, counts.enrolled_identities)
+            .collect(),
         cluster: Some(cluster_record(state)),
     }
 }
@@ -604,6 +647,18 @@ pub fn state_from_records(records: StateRecords) -> Result<StateMachine, Convert
         {
             return Err(ConvertError::DuplicateEntry(
                 "StateRecords.key_confirmations",
+            ));
+        }
+    }
+    for r in records.enrolled_identities {
+        let (machine, recorded_at) = r.try_into()?;
+        if state
+            .enrolled_identities
+            .insert(machine, recorded_at)
+            .is_some()
+        {
+            return Err(ConvertError::DuplicateEntry(
+                "StateRecords.enrolled_identities",
             ));
         }
     }

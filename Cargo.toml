@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/coppice-core",
+    "crates/coppice-enroll",
     "crates/coppice-proto",
     "crates/coppice-net",
     "crates/coppice-tls",
@@ -26,6 +27,7 @@ authors = ["The Coppice Authors"]
 [workspace.dependencies]
 # Internal crates
 coppice-core = { path = "crates/coppice-core" }
+coppice-enroll = { path = "crates/coppice-enroll" }
 coppice-proto = { path = "crates/coppice-proto" }
 coppice-net = { path = "crates/coppice-net" }
 coppice-tls = { path = "crates/coppice-tls" }
@@ -101,14 +103,29 @@ axum = "0.7"
 # up a fresh `npm run build` without recompiling.
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
-# Test-only `ServiceExt::oneshot` for exercising the axum router without a
-# real listener; version tracks what axum 0.7/tonic 0.12 already depend on.
+# `ServiceExt::oneshot` drives the axum router: in tests without a listener,
+# and in the coordinator's own TLS serving path, where each accepted connection
+# hands hyper a service over the shared router. Version tracks what axum
+# 0.7/tonic 0.12 already depend on.
 tower = { version = "0.5", features = ["util"] }
+# The HTTP/1+2 server behind the client listener's TLS posture (ADR 0037 §4).
+# `axum::serve` only accepts a bare `TcpListener`, so a listener that terminates
+# TLS itself must drive hyper directly: `hyper-util`'s auto builder negotiates
+# h2/http1 per connection and `TokioIo` adapts the rustls stream. Same hyper-1
+# stack axum 0.7 and tonic 0.12 already resolve — no second HTTP
+# implementation enters the tree.
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio"] }
 # HTTP client for the `coppice job` verbs (ADR 0031): they talk to the
 # coordinator's JSON-over-HTTP client API. `rustls-tls` so no OpenSSL toolchain
 # is dragged in; `json` for typed request/response bodies. Default features are
 # off to keep the surface (and the dependency tree) minimal.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `rustls-tls-native-roots` alongside the webpki bundle so enrollment's
+# "ordinary system-root verification" (ADR 0037 §4) really means the platform
+# trust store: a cluster fronted by a corporate or private-PKI certificate is an
+# explicitly supported posture, and those roots live in the OS store, not in
+# Mozilla's bundle. Both sets are loaded; neither alone covers the field.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 proptest = "1"
 prost = "0.13"
 prost-build = "0.13"

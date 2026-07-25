@@ -32,9 +32,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use coppice_api::http::{ReadyzPhase, ReadyzReport, ReadyzVoter};
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::storage::{self, StorageOptions};
-use coppice_consensus::{
-    Consensus, NodeHandle, OpenraftConsensus, StartIntent, StartedNode, StateViews,
-};
+use coppice_consensus::{Consensus, NodeHandle, StartIntent, StartedNode, StateViews};
 use coppice_core::id::{ClusterId, MachineId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{BindMachineIdentity, RecordCaCertificate};
@@ -648,7 +646,7 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
     )
     .map_err(|e| anyhow!("the minted cluster CA is not a valid CA bundle: {e}"))?;
     let recorded_at = Timestamp::now();
-    crate::policy::propose_all(
+    let mut last_index = crate::policy::propose_all(
         &started.consensus,
         vec![
             Command::RecordCaCertificate(RecordCaCertificate {
@@ -671,22 +669,34 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
 
     // --- Step 6: the bootstrap policy (idempotent puts). -----------------
     //
-    // Enrollment tokens are the other thing a `--policy` file will carry
-    // (ADR 0037 §5). The replicated command exists, but the token schema and
-    // its "print the secret exactly once" semantics belong with the
-    // enrollment endpoint, so `[[enroll_token]]` is deliberately not accepted
-    // yet: `FormationPolicy` rejects unknown tables, which means a file
-    // written for it fails loudly here rather than being silently ignored.
+    // `[[enroll_token]]` (ADR 0037 §5) rides this same path: the launch
+    // template's secret is hashed at the seeding edge and minted only when no
+    // live token already carries its label, so re-running formation seeds
+    // nothing twice.
     if let Some(policy) = policy {
         let commands = {
             let view = started.views.latest();
             policy.commands(view.state(), Timestamp::now())?
         };
         let count = commands.len();
-        crate::policy::propose_all(&started.consensus, commands)
+        let policy_index = crate::policy::propose_all(&started.consensus, commands)
             .await
             .context("applying the bootstrap policy")?;
+        last_index = policy_index.or(last_index);
         tracing::info!(commands = count, "formation: bootstrap policy applied");
+    }
+
+    // Everything formation wrote must be *visible* before formation is over:
+    // the formed surfaces read the published views (`views().latest()`), so a
+    // caller acting the instant `init` returns — issuing an operator cert,
+    // redeeming a seeded enrollment token — must find the CA, the binding,
+    // and the policy there, not race the view-refresh cadence.
+    if let Some(index) = last_index {
+        started
+            .views
+            .at_least(index)
+            .await
+            .context("waiting for the formation writes to publish")?;
     }
 
     // --- Step 7: the marker. Formation has happened only now. ------------
@@ -737,9 +747,9 @@ pub(crate) fn issue_operator_credential(
 /// Load the cluster CA for signing on a formed node: the certificate from
 /// replicated state (public material every node has), the key from this
 /// node's own disk (ADR 0037 §4 — it is never replicated).
-pub(crate) fn load_cluster_ca(
+pub(crate) fn load_cluster_ca<C: Consensus>(
     data_dir: &Path,
-    consensus: &OpenraftConsensus,
+    consensus: &C,
 ) -> Result<(pki::CaSigner, Vec<u8>)> {
     let ca_pem = consensus
         .views()
@@ -1003,6 +1013,11 @@ heartbeat_interval = "100ms"
 cert_path = "{cert}"
 key_path = "{key}"
 ca_path = "{ca}"
+
+[client_tls]
+# Plain HTTP on the client listener (ADR 0037 §4: the posture is always
+# explicit, never implied).
+insecure = true
 
 [observability]
 log_level = "warn"

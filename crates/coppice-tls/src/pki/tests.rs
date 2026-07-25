@@ -411,6 +411,56 @@ async fn mtls_round_trip_with_pki_minted_leaves() {
     assert_eq!(client_saw, Profile::Coordinator(machine));
 }
 
+// ---- enrollee-generated CSRs ----------------------------------------------
+
+#[test]
+fn generated_csr_round_trips_through_agent_issuance() {
+    let ca = mint_root_ca().unwrap();
+    let signer = CaSigner::load(&ca.cert_pem, &ca.key_pem).unwrap();
+    let (key_pem, csr_pem) = generate_key_and_csr().unwrap();
+
+    let node = NodeId::new();
+    let leaf = issue_agent(&signer, &csr_pem, &node, &[]).unwrap();
+    let verified = verify_leaf(&ca.cert_pem, &leaf).unwrap();
+    assert_eq!(verified.profile, Profile::Agent(node));
+
+    // The private key the enrollee kept must pair with the leaf it got back.
+    let key = String::from_utf8(key_pem).unwrap();
+    assert!(key.contains("PRIVATE KEY"), "{key}");
+    let paths = TlsPaths {
+        cert: "cert.pem".into(),
+        key: "key.pem".into(),
+        ca: "ca.pem".into(),
+    };
+    crate::TlsMaterial::from_pem(
+        &paths,
+        ca.cert_pem.clone(),
+        leaf.clone(),
+        key.clone().into_bytes(),
+    )
+    .expect("issued leaf pairs with the generated key");
+}
+
+#[test]
+fn generated_csr_round_trips_through_coordinator_issuance() {
+    let ca = mint_root_ca().unwrap();
+    let signer = CaSigner::load(&ca.cert_pem, &ca.key_pem).unwrap();
+    let (_key_pem, csr_pem) = generate_key_and_csr().unwrap();
+
+    let machine = mint_machine_identity();
+    let leaf = issue_coordinator(&signer, &csr_pem, &machine, &local_sans()).unwrap();
+    let verified = verify_leaf(&ca.cert_pem, &leaf).unwrap();
+    assert_eq!(verified.profile, Profile::Coordinator(machine));
+}
+
+#[test]
+fn each_generated_csr_carries_a_fresh_key() {
+    let (a_key, a_csr) = generate_key_and_csr().unwrap();
+    let (b_key, b_csr) = generate_key_and_csr().unwrap();
+    assert_ne!(a_key, b_key);
+    assert_ne!(a_csr, b_csr);
+}
+
 // Keep an explicit reference to MachineId's Display form the classifier relies
 // on, so a change to the id prefix breaks here rather than silently.
 #[test]

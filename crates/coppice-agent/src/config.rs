@@ -49,6 +49,19 @@ pub struct Config {
     /// no insecure fallback.
     pub tls: TlsConfig,
 
+    /// How this agent obtains the `[tls]` material when it has none
+    /// (ADR 0037 §4/§8). Optional and absent by default: an agent whose leaf
+    /// is provisioned out of band — `coppice dev`, an external PKI, a
+    /// configuration-management drop — needs no `[enrollment]` table and never
+    /// contacts the enrollment endpoint. When present, the daemon enrolls at
+    /// startup if and only if the `[tls]` files are not already usable.
+    ///
+    /// The table's shape and its posture rules live in `coppice-enroll` rather
+    /// than here: the coordinator parses the identical table, and `insecure`
+    /// must mean exactly one thing on both sides.
+    #[serde(default)]
+    pub enrollment: Option<coppice_enroll::EnrollmentConfig>,
+
     /// Full physical capacity. The system reservation is deducted before this
     /// vector is advertised upstream.
     pub capacity: CapacityConfig,
@@ -532,6 +545,14 @@ impl Config {
             );
         }
         self.telemetry.validate()?;
+        // The enrollment endpoint's transport posture is a startup decision, not
+        // a first-enrollment one (ADR 0037 §4): an `http://` endpoint without
+        // the opt-in fails here, with no fallback.
+        if let Some(enrollment) = &self.enrollment {
+            enrollment
+                .validate()
+                .map_err(|e| anyhow::anyhow!("[enrollment]: {e}"))?;
+        }
         if let Some(listen) = &self.listen {
             if listen.advertise_host.trim().is_empty() {
                 anyhow::bail!(
@@ -544,9 +565,21 @@ impl Config {
 
     /// Emit the effective configuration at startup.
     ///
-    /// Safe to log in full: TLS material is referenced by path, never inline
-    /// (ADR 0020), so there is nothing to redact.
+    /// Safe to log in full with one exception, which is why `[enrollment]` is
+    /// summarised by hand below rather than `Debug`-printed: TLS material is
+    /// referenced by path (ADR 0020), but an inline `enrollment.token` is a
+    /// live credential sitting in the config struct. Only the endpoint, the
+    /// declared posture, and *which kind* of token source is configured are
+    /// logged — never the secret, from either source (ADR 0037 §4).
     pub fn log_effective(&self) {
+        if let Some(enrollment) = &self.enrollment {
+            tracing::info!(
+                endpoint = %enrollment.endpoint,
+                insecure = enrollment.insecure,
+                token_source = enrollment.token_kind(),
+                "enrollment configured; a missing [tls] leaf will be obtained at startup"
+            );
+        }
         tracing::info!(
             node_id = %self.node_id,
             data_dir = %self.data_dir.display(),

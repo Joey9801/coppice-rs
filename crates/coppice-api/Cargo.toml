@@ -11,6 +11,10 @@ authors.workspace = true
 [dependencies]
 axum.workspace = true
 coppice-core.workspace = true
+# The `/enroll` wire contract (ADR 0037 §4). The DTOs are defined once, in the
+# crate both this server and the enrolling daemons depend on, so the two halves
+# cannot drift.
+coppice-enroll.workspace = true
 coppice-state.workspace = true
 # The `/metrics` endpoint (issue #46): renders the process's Prometheus
 # recorder. The facade for the same, so the test-only local recorder can be
@@ -22,6 +26,9 @@ rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# `/enroll`'s concurrency cap is a `tokio::sync::Semaphore` (ADR 0037 §4
+# ingress hardening); the rest of the crate stays runtime-agnostic.
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

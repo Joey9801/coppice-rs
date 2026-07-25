@@ -370,6 +370,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         enroll_tokens: Default::default(),
         revoked_identities: Default::default(),
         key_confirmations: Default::default(),
+        enrolled_identities: Default::default(),
         version: cfg.jobs as u64 * 8,
     }
 }

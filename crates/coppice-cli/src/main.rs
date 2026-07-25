@@ -5,6 +5,8 @@
 //!   hidden `admin` membership verbs);
 //! - `coppice agent --config …` — run a node agent;
 //! - `coppice dev …` — a self-contained single-node dev cluster;
+//! - `coppice node …` — enrollment-token and identity administration
+//!   (ADR 0037 §5);
 //! - `coppice job …` — client commands against a cluster's API.
 //!
 //! Shipping one binary keeps deployment to a single artifact: the same build
@@ -37,6 +39,10 @@ enum Command {
     /// authentication), and a temp data directory unless --data-dir is set.
     /// For local development and integration tests only.
     Dev(dev::DevArgs),
+
+    /// Enrollment-token and identity administration over a coordinator's
+    /// admin channel (ADR 0037 §5).
+    Node(coppice_coordinator::cli::NodeArgs),
 
     /// Job operations against a cluster's API.
     Job(job::JobArgs),
@@ -77,6 +83,10 @@ async fn main() -> Result<()> {
         Command::Dev(args) => {
             init_tracing();
             dev::run(args).await
+        }
+        Command::Node(args) => {
+            init_tracing();
+            coppice_coordinator::node::run_cli(args).await
         }
         Command::Job(args) => {
             init_tracing();
@@ -134,6 +144,138 @@ mod tests {
         match cli.command {
             Command::Agent(a) => assert_eq!(a.config, PathBuf::from("/etc/a.toml")),
             other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_enroll_token_mint_parses() {
+        use coppice_coordinator::cli::{EnrollTokenVerb, NodeVerb, RoleArg};
+        let cli = Cli::parse_from([
+            "coppice",
+            "node",
+            "--target",
+            "coord-1:7071",
+            "--ca",
+            "ca.crt",
+            "--cert",
+            "op.crt",
+            "--key",
+            "op.key",
+            "enroll-token",
+            "mint",
+            "--role",
+            "agent",
+            "--ttl",
+            "15m",
+            "--label",
+            "fleet",
+        ]);
+        match cli.command {
+            Command::Node(args) => {
+                assert_eq!(args.target, "coord-1:7071");
+                assert_eq!(args.ca, PathBuf::from("ca.crt"));
+                let NodeVerb::EnrollToken {
+                    verb: EnrollTokenVerb::Mint { role, ttl, label },
+                } = args.verb
+                else {
+                    panic!("expected enroll-token mint");
+                };
+                assert_eq!(role, RoleArg::Agent);
+                assert_eq!(ttl, Some(std::time::Duration::from_secs(900)));
+                assert_eq!(label, "fleet");
+            }
+            other => panic!("expected node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_enroll_token_list_and_revoke_parse() {
+        use coppice_coordinator::cli::{EnrollTokenVerb, NodeVerb};
+        let base = [
+            "coppice",
+            "node",
+            "--target",
+            "h:1",
+            "--ca",
+            "ca",
+            "--cert",
+            "c",
+            "--key",
+            "k",
+            "enroll-token",
+        ];
+        let cli = Cli::parse_from(base.iter().copied().chain(["list"]));
+        assert!(matches!(
+            cli.command,
+            Command::Node(args) if matches!(
+                args.verb,
+                NodeVerb::EnrollToken { verb: EnrollTokenVerb::List }
+            )
+        ));
+
+        let id = "token-00000000-0000-0000-0000-000000000001";
+        let cli = Cli::parse_from(base.iter().copied().chain(["revoke", "--id", id]));
+        match cli.command {
+            Command::Node(args) => {
+                let NodeVerb::EnrollToken {
+                    verb: EnrollTokenVerb::Revoke { id: parsed },
+                } = args.verb
+                else {
+                    panic!("expected enroll-token revoke");
+                };
+                assert_eq!(parsed.to_string(), id);
+            }
+            other => panic!("expected node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_revoke_identity_requires_exactly_one_target() {
+        let base = [
+            "coppice",
+            "node",
+            "--target",
+            "h:1",
+            "--ca",
+            "ca",
+            "--cert",
+            "c",
+            "--key",
+            "k",
+            "revoke-identity",
+        ];
+        // Neither, and both, are refused; a malformed id is refused at parse.
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.iter().copied().chain([
+            "--machine",
+            "machine-00000000-0000-0000-0000-000000000001",
+            "--node",
+            "node-00000000-0000-0000-0000-000000000002",
+        ]))
+        .is_err());
+        assert!(
+            Cli::try_parse_from(base.iter().copied().chain(["--node", "not-a-node-id"])).is_err()
+        );
+
+        let cli = Cli::parse_from(
+            base.iter()
+                .copied()
+                .chain(["--machine", "machine-00000000-0000-0000-0000-000000000001"]),
+        );
+        match cli.command {
+            Command::Node(args) => {
+                let coppice_coordinator::cli::NodeVerb::RevokeIdentity { machine, node } =
+                    args.verb
+                else {
+                    panic!("expected revoke-identity");
+                };
+                assert!(node.is_none());
+                assert_eq!(
+                    machine.expect("machine parsed").to_string(),
+                    "machine-00000000-0000-0000-0000-000000000001"
+                );
+            }
+            other => panic!("expected node, got {other:?}"),
         }
     }
 

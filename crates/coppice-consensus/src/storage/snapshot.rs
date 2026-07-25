@@ -35,9 +35,10 @@ use prost::Message;
 
 use coppice_core::bytes::ByteSize;
 use coppice_proto::convert::{
-    allocation_records, attempt_records, cluster_record, enroll_token_records, job_records,
-    key_confirmation_records, machine_binding_records, node_records, quota_entity_records,
-    record_counts, revoked_identity_records, RecordCounts, StateRecords,
+    allocation_records, attempt_records, cluster_record, enroll_token_records,
+    enrolled_identity_records, job_records, key_confirmation_records, machine_binding_records,
+    node_records, quota_entity_records, record_counts, revoked_identity_records, RecordCounts,
+    StateRecords,
 };
 use coppice_proto::pb::storage::v1 as pb;
 use coppice_state::StateMachine;
@@ -342,6 +343,7 @@ enum SectionRecords<'a> {
     EnrollTokens(&'a [pb::EnrollTokenRecord]),
     RevokedIdentities(&'a [pb::RevokedIdentityRecord]),
     KeyConfirmations(&'a [pb::KeyConfirmationRecord]),
+    EnrolledIdentities(&'a [pb::EnrolledIdentityRecord]),
     Cluster(&'a pb::ClusterStateRecord),
 }
 
@@ -438,6 +440,13 @@ fn section_jobs(records: &StateRecords, shards: usize) -> Vec<SectionJob<'_>> {
         SectionRecords::KeyConfirmations,
         &mut jobs,
     );
+    shard(
+        pb::SectionKind::EnrolledIdentity,
+        &records.enrolled_identities,
+        shards,
+        SectionRecords::EnrolledIdentities,
+        &mut jobs,
+    );
     if let Some(cluster) = &records.cluster {
         jobs.push(SectionJob {
             kind: pb::SectionKind::ClusterState,
@@ -470,6 +479,7 @@ fn encode_job(job: &SectionJob) -> RawSection {
         SectionRecords::EnrollTokens(records) => encode(records, &mut bytes),
         SectionRecords::RevokedIdentities(records) => encode(records, &mut bytes),
         SectionRecords::KeyConfirmations(records) => encode(records, &mut bytes),
+        SectionRecords::EnrolledIdentities(records) => encode(records, &mut bytes),
         SectionRecords::Cluster(record) => encode(std::slice::from_ref(record), &mut bytes),
     };
     RawSection {
@@ -771,6 +781,12 @@ fn state_section_jobs(counts: &RecordCounts, shards: usize) -> Vec<StateSectionJ
         shards,
         &mut jobs,
     );
+    shard(
+        pb::SectionKind::EnrolledIdentity,
+        counts.enrolled_identities,
+        shards,
+        &mut jobs,
+    );
     jobs.push(StateSectionJob {
         kind: pb::SectionKind::ClusterState,
         shard: 0,
@@ -816,6 +832,9 @@ fn encode_state_job(state: &StateMachine, job: &StateSectionJob) -> RawSection {
         }
         pb::SectionKind::KeyConfirmation => {
             encode(key_confirmation_records(state, start, count), &mut bytes)
+        }
+        pb::SectionKind::EnrolledIdentity => {
+            encode(enrolled_identity_records(state, start, count), &mut bytes)
         }
         pb::SectionKind::ClusterState => encode(std::iter::once(cluster_record(state)), &mut bytes),
         pb::SectionKind::Unspecified => 0,
@@ -1037,6 +1056,9 @@ fn decode_entry(path: &Path, entry: &pb::SectionEntry, section: &[u8]) -> io::Re
         pb::SectionKind::KeyConfirmation => {
             Decoded::KeyConfirmations(decode_section(path, entry, section)?)
         }
+        pb::SectionKind::EnrolledIdentity => {
+            Decoded::EnrolledIdentities(decode_section(path, entry, section)?)
+        }
         pb::SectionKind::ClusterState => Decoded::Cluster(decode_section(path, entry, section)?),
         pb::SectionKind::Unspecified => {
             Err(fail_stop(path, entry.offset, "section kind is unspecified"))?
@@ -1056,6 +1078,7 @@ fn merge_decoded(path: &Path, records: &mut StateRecords, part: Decoded) -> io::
         Decoded::EnrollTokens(mut v) => records.enroll_tokens.append(&mut v),
         Decoded::RevokedIdentities(mut v) => records.revoked_identities.append(&mut v),
         Decoded::KeyConfirmations(mut v) => records.key_confirmations.append(&mut v),
+        Decoded::EnrolledIdentities(mut v) => records.enrolled_identities.append(&mut v),
         Decoded::Cluster(v) => {
             if records.cluster.is_some() || v.len() != 1 {
                 return Err(fail_stop(
@@ -1093,6 +1116,7 @@ enum Decoded {
     EnrollTokens(Vec<pb::EnrollTokenRecord>),
     RevokedIdentities(Vec<pb::RevokedIdentityRecord>),
     KeyConfirmations(Vec<pb::KeyConfirmationRecord>),
+    EnrolledIdentities(Vec<pb::EnrolledIdentityRecord>),
     Cluster(Vec<pb::ClusterStateRecord>),
 }
 

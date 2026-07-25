@@ -205,6 +205,11 @@ cert_path = "{cert}"
 key_path = "{key}"
 ca_path = "{ca}"
 
+[client_tls]
+# Plain HTTP on the client listener (ADR 0037 §4: the posture is always
+# explicit, never implied).
+insecure = true
+
 [observability]
 log_level = "warn"
 "#,
@@ -412,9 +417,13 @@ pub struct RunningCoordinator {
     pub views: StateViews,
     /// `localhost:PORT` the agent dials for its `AgentService` session.
     pub agent_endpoint: String,
+    /// The coordinator's data directory (CA key + machine identity land here
+    /// in tests that manufacture a cluster-owned PKI on this harness).
+    pub data_dir: std::path::PathBuf,
     runtime_shutdown: watch::Sender<bool>,
     runtime_join: JoinHandle<anyhow::Result<()>>,
-    handle: NodeHandle,
+    /// The runtime's node handle (leadership + membership summaries).
+    pub handle: NodeHandle,
     raft_server_shutdown: Option<oneshot::Sender<()>>,
     raft_server: JoinHandle<Result<(), tonic::transport::Error>>,
 }
@@ -467,6 +476,11 @@ snapshot_keep_log_entries = 0
 cert_path = "{cert}"
 key_path = "{key}"
 ca_path = "{ca}"
+
+[client_tls]
+# Plain HTTP on the client listener (ADR 0037 §4: the posture is always
+# explicit, never implied).
+insecure = true
 
 [observability]
 log_level = "warn"
@@ -539,6 +553,7 @@ log_level = "warn"
             client_listener,
             cluster_id,
             node_log_client,
+            data_dir.clone(),
             metrics,
             readyz,
             Some(shutdown_rx),
@@ -546,6 +561,7 @@ log_level = "warn"
 
         RunningCoordinator {
             _dir: dir,
+            data_dir: data_dir.clone(),
             consensus,
             views,
             agent_endpoint: format!("localhost:{agent_port}"),
@@ -626,6 +642,7 @@ pub struct Daemon {
     ca_pem: Vec<u8>,
     client_port: u16,
     raft_port: u16,
+    agent_port: u16,
     running: Option<RunningDaemon>,
 }
 
@@ -697,6 +714,11 @@ cert_path = "{cert}"
 key_path = "{key}"
 ca_path = "{ca}"
 
+[client_tls]
+# Plain HTTP on the client listener (ADR 0037 §4: the posture is always
+# explicit, never implied).
+insecure = true
+
 [observability]
 log_level = "warn"
 "#,
@@ -715,6 +737,7 @@ log_level = "warn"
             ca_pem: ca.pem.clone(),
             client_port,
             raft_port,
+            agent_port,
             running: None,
         }
     }
@@ -767,6 +790,22 @@ log_level = "warn"
         format!("localhost:{}", self.raft_port)
     }
 
+    /// `localhost:PORT` for the agent session listener — what an agent dials.
+    pub fn agent_target(&self) -> String {
+        format!("localhost:{}", self.agent_port)
+    }
+
+    /// The `[tls]` paths this daemon serves from: a certless daemon's
+    /// formation writes its own minted leaf here (ADR 0037 §3 step 3).
+    pub fn tls_material(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let root = self.dir.path();
+        (
+            std::fs::read(root.join("ca.crt")).expect("read cluster ca"),
+            std::fs::read(root.join("node.crt")).expect("read node cert"),
+            std::fs::read(root.join("node.key")).expect("read node key"),
+        )
+    }
+
     /// The bound client-listener address, for tests that need a raw socket.
     pub fn client_addr(&self) -> String {
         format!("127.0.0.1:{}", self.client_port)
@@ -774,6 +813,36 @@ log_level = "warn"
 
     pub fn api(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.client_port)
+    }
+
+    /// Switch this daemon's client listener to TLS (ADR 0037 §4
+    /// `[client_tls]`): write a serving leaf signed by `ca` and rewrite the
+    /// config's posture from `insecure` to those paths. Returns the CA bundle a
+    /// client must trust, and the `https://` base URL.
+    ///
+    /// Call before [`Daemon::start`]: the posture is resolved at config load.
+    pub fn set_client_tls(&self, ca: &Ca) -> (Vec<u8>, String) {
+        let leaf = ca.leaf();
+        let cert = self.dir.path().join("api.crt");
+        let key = self.dir.path().join("api.key");
+        std::fs::write(&cert, &leaf.cert_pem).expect("write client-tls cert");
+        std::fs::write(&key, &leaf.key_pem).expect("write client-tls key");
+
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        let updated = toml.replace(
+            "insecure = true",
+            &format!(
+                "cert_path = \"{}\"\nkey_path = \"{}\"",
+                cert.display(),
+                key.display()
+            ),
+        );
+        assert_ne!(toml, updated, "no [client_tls] posture line to rewrite");
+        std::fs::write(&self.config_path, updated).expect("write config");
+        (
+            ca.pem.clone(),
+            format!("https://localhost:{}", self.client_port),
+        )
     }
 
     /// Wipe the data directory, the documented recovery from a failed
@@ -907,4 +976,104 @@ log_level = "warn"
         )
         .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// A control plane that answers nothing
+// ---------------------------------------------------------------------------
+
+/// A [`ControlPlane`](coppice_api::ControlPlane) with no cluster behind it.
+///
+/// The `/enroll` route (ADR 0037 §4) captures its own endpoint and never
+/// touches the control plane, so a test that drives *only* that route can serve
+/// the real router over this — which is exactly what proves the route's
+/// independence from the trait.
+pub struct NoopPlane;
+
+impl coppice_api::ControlPlane for NoopPlane {
+    fn cluster_id(&self) -> ClusterId {
+        ClusterId::new()
+    }
+
+    async fn submit_job(
+        &self,
+        _req: coppice_api::http::dto::SubmitJobRequest,
+    ) -> Result<coppice_api::http::dto::SubmitJobResponse, coppice_api::ApiError> {
+        Err(unattached())
+    }
+
+    async fn abort_job(
+        &self,
+        _req: coppice_api::http::dto::AbortJobRequest,
+    ) -> Result<(), coppice_api::ApiError> {
+        Err(unattached())
+    }
+
+    async fn configure_quota_entity(
+        &self,
+        _req: coppice_api::http::dto::ConfigureQuotaEntityRequest,
+    ) -> Result<coppice_api::http::dto::ConfigureQuotaEntityResponse, coppice_api::ApiError> {
+        Err(unattached())
+    }
+
+    async fn read_state(
+        &self,
+        _opts: coppice_api::ReadOptions,
+    ) -> Result<coppice_api::ReadView, coppice_api::ApiError> {
+        Err(unattached())
+    }
+
+    fn queue_window(&self) -> coppice_api::QueueWindow {
+        coppice_api::QueueWindow::default()
+    }
+
+    async fn recent_events(&self, _limit: usize) -> coppice_api::RecentClusterEvents {
+        coppice_api::RecentClusterEvents {
+            floor_index: 0,
+            events: Vec::new(),
+        }
+    }
+
+    async fn job_timeline(
+        &self,
+        _job: coppice_core::id::JobId,
+        _after: Option<(u64, u32)>,
+        _limit: usize,
+    ) -> coppice_api::JobTimelineWindow {
+        coppice_api::JobTimelineWindow {
+            floor_index: 0,
+            events: Vec::new(),
+            next: None,
+        }
+    }
+
+    fn coordinator_status(&self) -> Result<coppice_api::CoordinatorSummary, coppice_api::ApiError> {
+        Err(unattached())
+    }
+
+    async fn fetch_logs(
+        &self,
+        _node: coppice_core::id::NodeId,
+        _addr: &str,
+        _req: coppice_api::LogFetchRequest,
+    ) -> Result<coppice_api::LogFetchOutcome, coppice_api::LogFetchError> {
+        Err(coppice_api::LogFetchError::Unreachable {
+            reason: "no control plane attached".to_string(),
+        })
+    }
+
+    async fn fetch_metrics(
+        &self,
+        _node: coppice_core::id::NodeId,
+        _addr: &str,
+        _req: coppice_api::MetricsFetchRequest,
+    ) -> Result<coppice_api::MetricsFetchOutcome, coppice_api::MetricsFetchError> {
+        Err(coppice_api::MetricsFetchError::Unreachable {
+            reason: "no control plane attached".to_string(),
+        })
+    }
+}
+
+fn unattached() -> coppice_api::ApiError {
+    coppice_api::ApiError::Unavailable("no control plane attached to this listener".to_string())
 }

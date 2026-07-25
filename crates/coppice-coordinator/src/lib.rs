@@ -18,12 +18,25 @@
 pub mod admin;
 pub mod bootstrap;
 pub mod cli;
+// The public client listener's serving path (ADR 0037 §4 `[client_tls]`):
+// plain HTTP, or a per-accept rustls acceptor that surfaces the peer
+// certificate to handlers. Public because both serving surfaces —
+// pre-formation and post-formation — and the integration suite drive it.
+pub mod clientedge;
 pub mod config;
 // Coordinator discovery backends (ADR 0037 §2): the trait, the
 // static/dns/file/ec2-asg backends, and the file-registration helper. Public
 // because the trait and the run-scoped `FileRegistration` appear in
 // `bootstrap` signatures.
 pub mod discovery;
+
+/// The leader-side enrollment and renewal core (ADR 0037 §4/§5), shared by the
+/// `ForwardEnroll` admin RPC and the public `POST /api/v1/enroll` route.
+mod enroll;
+
+// The follower's proxy of `/enroll` to the leader, as a standalone endpoint
+// (ADR 0037 §4). Public so the same production hop can be driven directly.
+pub use enroll::proxying_enroll_endpoint;
 // Explicit formation (ADR 0037 §3): the seven steps `coppice coordinator
 // init` runs, the `formation_complete` marker semantics, and the phase every
 // surface reads to decide what it may answer.
@@ -43,12 +56,19 @@ pub mod localadmin;
 pub mod policy;
 // The client half of `ProbeCluster` (ADR 0037 §3): formation's double-init
 // guard today, the convergence loop's search for the cluster later.
+/// `coppice node` — the operator-facing enrollment-token and identity verbs
+/// (ADR 0037 §5), over the same admin channel `coordinator admin` uses.
+pub mod node;
 mod probe;
 mod runtime;
 // Minimal systemd `Type=notify` client (ADR 0037 §9): READY=1 when listeners
 // serve, STOPPING=1 at shutdown. Silent no-op off systemd.
 mod systemd;
 mod tasks;
+// The real coordinator renewal attempt (leader-local branch included),
+// exposed so integration tests can drive it without waiting out the timer.
+#[doc(hidden)]
+pub use tasks::renewal::renew_once as coordinator_renew_once;
 
 #[cfg(test)]
 mod test_support;

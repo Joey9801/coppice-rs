@@ -167,6 +167,51 @@ long-lived variant is an explicitly accepted risk, short-lived
 per-refresh minting the recommended stronger posture. External PKI
 remains a supported substitution behind the same `[tls]` paths.
 
+### Token custody on the enrolling machine
+
+The enrolling side is configured by an `[enrollment]` table (identical on
+coordinators and agents): `endpoint`, exactly one of `token_path` or
+`token`, and `insecure`. **Prefer `token_path`.** An inline `token` puts a
+live credential in a file that gets committed, diffed, and attached to
+support bundles; a path keeps it in whatever the platform already uses for
+secret delivery (an instance-metadata drop, a mounted secret, a 0600 file
+written by configuration management). Neither form is ever logged: the
+startup line names the endpoint, the posture, and whether the token is
+inline or a path — never the secret.
+
+Enrollment is idempotent, and that is the strongest custody control
+available: a machine with a usable leaf already in its `[tls]` paths makes
+no network call and never reads the token, so the token is needed **only
+on first boot**. A launch template may therefore delete the token file
+after the first successful start, and a restart, an image rebake, or a
+config reload will not go looking for it. What a machine cannot do is
+recover from a *lost* leaf without a token — replacing the disk means
+enrolling again.
+
+Note that `[enrollment].insecure` and `[client_tls].insecure` are separate
+settings that mean different things: the first is the *client's* consent to
+send its token over cleartext, the second is the *listener's* choice to
+serve without TLS. Setting one never implies the other, and neither
+weakens `https` — an `https` endpoint is always verified against system
+roots, with `insecure` having no effect on it at all.
+
+### Renewal in operation
+
+Each machine renews its own leaf roughly two-thirds of the way through its
+lifetime, jittered so a fleet enrolled from one template does not renew in
+unison. Agents renew over the session they already hold; coordinators over
+the admin channel. Failures retry with backoff and are logged as warnings,
+escalating to errors inside the final tenth of the leaf's life — an
+agent logging renewal errors is an agent that is about to drop out of the
+cluster, and the log line says so.
+
+The operational consequence of renewal-refusal-as-revocation is a
+**bounded delay, not an immediate cutoff**: after `revoke-identity`, the
+revoked machine keeps working until its current leaf expires, which is why
+leaf lifetimes are short. If a compromise requires an immediate cutoff,
+revoking the identity is not sufficient on its own — re-rooting is the
+only mechanism that invalidates an issued leaf before its expiry.
+
 ## Secrets
 
 Secrets should not be stored casually in job definitions. **v1 stores no

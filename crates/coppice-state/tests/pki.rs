@@ -11,7 +11,7 @@ use coppice_core::id::{EnrollTokenId, MachineId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{
     BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RecordCaCertificate,
-    RevokeEnrollToken, RevokeIdentity,
+    RecordEnrolledIdentity, RevokeEnrollToken, RevokeIdentity,
 };
 use coppice_state::{
     CaCertBundle, Command, EnrollRole, RejectionReason, RevokedIdentity, StateMachine,
@@ -356,6 +356,44 @@ fn confirm_key_possession_inserts_and_reconfirmation_overwrites() {
     );
 }
 
+// ---- RecordEnrolledIdentity ----
+
+#[test]
+fn record_enrolled_identity_inserts_and_reenrollment_keeps_the_first_stamp() {
+    let mut sm = StateMachine::default();
+    assert!(!sm.is_identity_enrolled(&mid(4)));
+    apply_ok(
+        &mut sm,
+        Command::RecordEnrolledIdentity(RecordEnrolledIdentity {
+            machine: mid(4),
+            recorded_at: base_ts(),
+        }),
+    );
+    assert!(sm.is_identity_enrolled(&mid(4)));
+    assert_eq!(sm.enrolled_identities[&mid(4)], base_ts());
+
+    // Unlike ConfirmKeyPossession, first write wins: a re-enrollment is an
+    // accepted no-op that still bumps version.
+    let before = sm.version;
+    apply_ok(
+        &mut sm,
+        Command::RecordEnrolledIdentity(RecordEnrolledIdentity {
+            machine: mid(4),
+            recorded_at: ts(TS_US + 9_000_000),
+        }),
+    );
+    assert_eq!(sm.enrolled_identities.len(), 1);
+    assert_eq!(
+        sm.enrolled_identities[&mid(4)],
+        base_ts(),
+        "re-enrollment keeps the first stamp"
+    );
+    assert_eq!(sm.version, before + 1);
+
+    // Enrollment is per identity, not global.
+    assert!(!sm.is_identity_enrolled(&mid(5)));
+}
+
 // ---- No events ----
 
 #[test]
@@ -370,4 +408,13 @@ fn pki_commands_emit_no_events() {
             .events
             .is_empty()
     );
+    assert!(apply_ok(
+        &mut sm,
+        Command::RecordEnrolledIdentity(RecordEnrolledIdentity {
+            machine: mid(2),
+            recorded_at: base_ts(),
+        })
+    )
+    .events
+    .is_empty());
 }

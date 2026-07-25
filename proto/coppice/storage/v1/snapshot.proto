@@ -84,6 +84,7 @@ enum SectionKind {
   SECTION_KIND_ENROLL_TOKEN = 8;
   SECTION_KIND_REVOKED_IDENTITY = 9;
   SECTION_KIND_KEY_CONFIRMATION = 10;
+  SECTION_KIND_ENROLLED_IDENTITY = 11;
 }
 
 enum Compression {
@@ -219,4 +220,12 @@ message RevokedIdentityRecord {
 message KeyConfirmationRecord {
   uint64 raft_node_id = 1;
   int64 confirmed_at_us = 2;
+}
+
+// The replicated fact that a coordinator machine identity enrolled and
+// received a leaf (ADR 0037 §4). Keyed by `machine`; the timestamp is the
+// first enrollment's, never overwritten.
+message EnrolledIdentityRecord {
+  coppice.core.v1.MachineId machine = 1;
+  int64 recorded_at_us = 2;
 }

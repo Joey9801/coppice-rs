@@ -22,6 +22,7 @@ use tonic::Request;
 
 use crate::config::Config;
 use crate::executor::Executor;
+use crate::session::renewal::Renewal;
 use crate::session::Session;
 
 use coppice_net::session::Client;
@@ -174,6 +175,12 @@ where
     // A monotonic map of pending watchdog deadlines.
     let mut deadlines: BTreeMap<coppice_core::id::AllocationId, Instant> = BTreeMap::new();
 
+    // Leaf renewal (ADR 0037 §4) rides this channel, so its deadline is
+    // recomputed here on every reconnect: a session that resumes near expiry
+    // renews at once rather than waiting out a timer set before the break.
+    let mut renewal = Renewal::new();
+    let mut renew_at = Instant::now() + renewal.delay(tls);
+
     loop {
         // Reaps deferred by the session (report-before-reap: a reap can stall
         // seconds behind the telemetry drain barrier, and the terminal report
@@ -226,6 +233,9 @@ where
                     let hb = session.heartbeat_report().await;
                     send_all(&tx, vec![hb]).await?;
                 }
+            }
+            _ = tokio::time::sleep_until(renew_at) => {
+                renew_at = Instant::now() + renewal.attempt(&mut client, tls).await;
             }
             _ = janitor.tick() => {
                 // Clock read at the edge (workspace convention).

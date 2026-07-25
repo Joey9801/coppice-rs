@@ -16,11 +16,17 @@ coppice-state.workspace = true
 coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
 coppice-api.workspace = true
+# The `/enroll` wire contract (ADR 0037 §4): the response this coordinator
+# hands back is the DTO both halves share.
+coppice-enroll.workspace = true
 # Hot-reloadable mTLS store (ADR 0037 §4): the connection-time acceptor for the
 # two mTLS listeners and the shared material the raft mesh and node-fetch client
 # dial with.
 coppice-tls.workspace = true
 anyhow.workspace = true
+# The enrollment core's error type (ADR 0037 §4) is matched on by its callers
+# to decide a status code, so it is a typed enum rather than an `anyhow` chain.
+thiserror.workspace = true
 # The fanout's `proposer_skew` histogram (ADR 0032), registered through the
 # same describe/gather pattern as `coppice-consensus`.
 metrics.workspace = true
@@ -29,6 +35,13 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 # Serves the `coppice_api::http` router on the client listener (ADR 0031).
 axum.workspace = true
+# The client listener's TLS posture (ADR 0037 §4): `axum::serve` takes a bare
+# TCP listener, so the TLS path accepts, handshakes with tokio-rustls, and
+# hands each connection to hyper's auto (h2/http1) server over the same router.
+hyper.workspace = true
+hyper-util.workspace = true
+tokio-rustls.workspace = true
+tower.workspace = true
 clap.workspace = true
 tokio.workspace = true
 # Wraps the per-session outbound mpsc as a `Stream` for the tonic bidi
@@ -79,16 +92,19 @@ rcgen.workspace = true
 # drive the end-to-end agent↔coordinator reconciliation protocol test
 # (`tests/agent_protocol.rs`) against the live coordinator runtime.
 coppice-agent.workspace = true
-# `tower::ServiceExt::oneshot` drives the real axum router in-process, and
-# `serde_json` decodes its JSON bodies, for the best-effort job-log e2e test
-# (`tests/job_logs.rs`, ADR 0034). `bytes` builds the seeded `LogChunk` payloads.
-tower.workspace = true
+# `serde_json` decodes JSON bodies and `bytes` builds the seeded `LogChunk`
+# payloads for the best-effort job-log e2e test (`tests/job_logs.rs`, ADR 0034);
+# `tower::ServiceExt::oneshot` drives the real axum router in-process there and
+# is already a normal dependency above.
 bytes.workspace = true
 # Drives the real client listener over the loopback for the ADR 0037 §9
 # `/readyz` gate and the closed-until-formed API surface (`tests/formation.rs`),
 # where an in-process `oneshot` against the router would not exercise the
 # listener handover a parked daemon performs.
 reqwest.workspace = true
+# In-memory tracing capture for the ADR 0037 §4 assertion that an enrollment
+# token secret never reaches a log line (`tests/enrollment_logging.rs`).
+coppice-testkit.workspace = true
 
 [lints]
 workspace = true

@@ -21,7 +21,9 @@
 //!   a no-op and an operator's later edits survive;
 //! - each quota entity is created **only when absent** by id — an existing
 //!   entity is left untouched (reconfiguration is not an amnesty, and re-init
-//!   must not reset accumulated usage).
+//!   must not reset accumulated usage);
+//! - each `[[enroll_token]]` is minted **only when no live token carries its
+//!   label** (ADR 0037 §5), which is why labels are required and unique here.
 //!
 //! Human-facing multipliers are floats in the TOML; they are converted to the
 //! replicated Q32.32 fixed-point [`PriorityMultiplier`] here, at the parse
@@ -33,11 +35,12 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use coppice_core::id::QuotaEntityId;
+use coppice_core::id::{EnrollTokenId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
-use coppice_core::time::Timestamp;
-use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
-use coppice_state::{Command, StateMachine};
+use coppice_core::time::{Duration, Timestamp};
+use coppice_state::command::{ConfigureQuotaEntity, MintEnrollToken, UpdatePolicy};
+use coppice_state::{Command, EnrollRole, StateMachine};
+use coppice_tls::pki;
 
 /// `2^32`, the scale of the Q32.32 fixed-point [`PriorityMultiplier`].
 const Q32_SCALE: f64 = 4_294_967_296.0;
@@ -57,6 +60,66 @@ pub struct FormationPolicy {
     /// The quota entities to create, as `[[quota_entity]]` array entries.
     #[serde(default, rename = "quota_entity")]
     pub quota_entities: Vec<QuotaEntitySpec>,
+    /// The enrollment tokens to seed, as `[[enroll_token]]` array entries
+    /// (ADR 0037 §5). This is the launch-template story: bake a secret into
+    /// user-data, name it here, form, and the fleet enrolls.
+    #[serde(default, rename = "enroll_token")]
+    pub enroll_tokens: Vec<EnrollTokenSpec>,
+}
+
+/// One `[[enroll_token]]` entry: an operator-supplied secret, the role it
+/// grants, and the label that identifies it (ADR 0037 §5).
+///
+/// The secret is operator-chosen here rather than cluster-minted precisely
+/// because this is the *seeding* path: the value is already in the launch
+/// template when the cluster forms, so the cluster cannot be the one to choose
+/// it. `mint` (the admin verb) is the other direction and generates its own.
+///
+/// `Debug` is hand-written and redacts the secret.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollTokenSpec {
+    /// The bearer secret enrolling machines will present. Only its salted hash
+    /// is replicated.
+    pub secret: String,
+    /// `"agent"` or `"coordinator"` — never both (ADR 0037 §5).
+    pub role: EnrollRoleSpec,
+    /// A non-empty label, unique within the document. It is the **idempotency
+    /// key**: re-applying the policy mints nothing when a live token already
+    /// carries this label.
+    pub label: String,
+    /// Optional time-to-live (`"15m"`, `"720h"`). Absent = never expires, the
+    /// supported long-lived launch-template default (ADR 0037 §5).
+    #[serde(default, with = "humantime_serde::option")]
+    pub ttl: Option<std::time::Duration>,
+}
+
+impl std::fmt::Debug for EnrollTokenSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollTokenSpec")
+            .field("secret", &"<redacted>")
+            .field("role", &self.role)
+            .field("label", &self.label)
+            .field("ttl", &self.ttl)
+            .finish()
+    }
+}
+
+/// The TOML spelling of an enrollment token's role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollRoleSpec {
+    Agent,
+    Coordinator,
+}
+
+impl From<EnrollRoleSpec> for EnrollRole {
+    fn from(spec: EnrollRoleSpec) -> EnrollRole {
+        match spec {
+            EnrollRoleSpec::Agent => EnrollRole::Agent,
+            EnrollRoleSpec::Coordinator => EnrollRole::Coordinator,
+        }
+    }
 }
 
 /// One `[[priority_multiplier]]` entry: a user-facing `priority: i32` index and
@@ -121,6 +184,23 @@ impl FormationPolicy {
                 bail!("duplicate quota entity {}", qe.id);
             }
         }
+        // Labels carry idempotency for token seeding, so they must be present
+        // and distinct or a re-apply cannot tell two entries apart.
+        let mut seen_label = std::collections::BTreeSet::new();
+        for token in &self.enroll_tokens {
+            if token.label.trim().is_empty() {
+                bail!(
+                    "every [[enroll_token]] needs a non-empty label: it is what makes \
+                       re-applying the policy idempotent (ADR 0037 §5)"
+                );
+            }
+            if !seen_label.insert(token.label.as_str()) {
+                bail!("duplicate enrollment token label {:?}", token.label);
+            }
+            if token.secret.trim().is_empty() {
+                bail!("enrollment token {:?} has an empty secret", token.label);
+            }
+        }
         Ok(())
     }
 
@@ -179,6 +259,39 @@ impl FormationPolicy {
                     updated_at: now,
                 }));
             }
+        }
+
+        // Enrollment tokens: mint only those whose label is not already
+        // carried by a LIVE token (ADR 0037 §5). Label, not id and not hash, is
+        // the natural key here — the id would have to be minted fresh on every
+        // apply to stay unpredictable, and the hash is salted, so neither can
+        // be derived deterministically from the document. A revoked or expired
+        // token with the same label does not block a re-mint: that is exactly
+        // the rotation an operator performs by revoking and re-running.
+        let live_labels: std::collections::BTreeSet<&str> = state
+            .live_enroll_tokens(now)
+            .map(|(_, t)| t.label.as_str())
+            .collect();
+        for spec in &self.enroll_tokens {
+            if live_labels.contains(spec.label.as_str()) {
+                continue;
+            }
+            let hash = pki::hash_secret(&spec.secret).with_context(|| {
+                format!("hashing the enrollment token secret for {:?}", spec.label)
+            })?;
+            let expires_at = spec.ttl.map(|ttl| {
+                now.saturating_add(Duration::from_micros(
+                    i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX),
+                ))
+            });
+            commands.push(Command::MintEnrollToken(MintEnrollToken {
+                token: EnrollTokenId::new(),
+                hash,
+                role: spec.role.into(),
+                label: spec.label.clone(),
+                expires_at,
+                minted_at: now,
+            }));
         }
 
         Ok(commands)
@@ -252,13 +365,17 @@ impl FormationPolicy {
 /// seeding: both propose idempotent puts immediately after a single-node
 /// cluster forms, when the initial election may still be in flight. A
 /// rejection at apply, or any non-retryable consensus error, fails fast.
+/// Returns the log index of the last command applied (`None` for an empty
+/// batch), so callers can wait for the published views to include the batch
+/// before acting on "it is written".
 pub async fn propose_all<C: coppice_consensus::Consensus>(
     consensus: &C,
     commands: Vec<Command>,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     use coppice_consensus::ConsensusError;
     use std::time::Duration;
 
+    let mut last_index = None;
     for command in commands {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -267,6 +384,7 @@ pub async fn propose_all<C: coppice_consensus::Consensus>(
                     applied
                         .outcome
                         .map_err(|reason| anyhow::anyhow!("policy command rejected: {reason}"))?;
+                    last_index = Some(applied.log_index);
                     break;
                 }
                 Err(e @ (ConsensusError::NotLeader { .. } | ConsensusError::Timeout)) => {
@@ -285,7 +403,7 @@ pub async fn propose_all<C: coppice_consensus::Consensus>(
             }
         }
     }
-    Ok(())
+    Ok(last_index)
 }
 
 #[cfg(test)]
@@ -417,6 +535,136 @@ quota = 1000000000000
             .commands(&state, Timestamp::now())
             .expect("valid policy")
             .is_empty());
+    }
+
+    // ---- enrollment token seeding (ADR 0037 §5) --------------------------
+
+    const TOKEN_DOC: &str = r#"
+[[enroll_token]]
+secret = "cpk_launch-template-secret"
+role = "agent"
+label = "fleet-agents"
+
+[[enroll_token]]
+secret = "cpk_coordinator-secret"
+role = "coordinator"
+label = "coordinators"
+ttl = "15m"
+"#;
+
+    /// The `MintEnrollToken` commands a policy emits, in order.
+    fn minted(commands: &[Command]) -> Vec<&MintEnrollToken> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::MintEnrollToken(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn enroll_tokens_are_hashed_at_the_seeding_edge() {
+        let policy = FormationPolicy::parse_toml(TOKEN_DOC.as_bytes()).expect("parses");
+        let now = Timestamp::now();
+        let commands = policy
+            .commands(&StateMachine::default(), now)
+            .expect("valid policy");
+        let tokens = minted(&commands);
+        assert_eq!(tokens.len(), 2);
+
+        let agent = tokens.iter().find(|t| t.label == "fleet-agents").unwrap();
+        assert_eq!(agent.role, EnrollRole::Agent);
+        assert!(agent.expires_at.is_none(), "no ttl means never expires");
+        // The clear secret is nowhere in the command; only its salted hash is.
+        assert!(agent.hash.starts_with("$argon2id$"), "{}", agent.hash);
+        assert!(pki::verify_secret(
+            "cpk_launch-template-secret",
+            &agent.hash
+        ));
+
+        let coord = tokens.iter().find(|t| t.label == "coordinators").unwrap();
+        assert_eq!(coord.role, EnrollRole::Coordinator);
+        assert_eq!(
+            coord.expires_at,
+            Some(now.saturating_add(Duration::from_secs(900)))
+        );
+    }
+
+    #[test]
+    fn re_seeding_mints_nothing_when_a_live_token_carries_the_label() {
+        let policy = FormationPolicy::parse_toml(TOKEN_DOC.as_bytes()).unwrap();
+        let now = Timestamp::now();
+        let mut state = StateMachine::default();
+        // Apply once, then fold the results into state as the apply loop would.
+        for command in policy.commands(&state, now).unwrap() {
+            if let Command::MintEnrollToken(m) = command {
+                state.enroll_tokens.insert(
+                    m.token,
+                    coppice_state::EnrollToken {
+                        hash: m.hash,
+                        role: m.role,
+                        label: m.label,
+                        expires_at: m.expires_at,
+                        minted_at: m.minted_at,
+                        revoked: false,
+                    },
+                );
+            }
+        }
+        assert!(
+            minted(&policy.commands(&state, now).unwrap()).is_empty(),
+            "a re-apply must mint nothing — labels are the idempotency key"
+        );
+    }
+
+    #[test]
+    fn a_revoked_label_is_re_minted() {
+        // Revoke-and-reseed is how an operator rotates a launch-template
+        // secret, so a revoked token must NOT block its label.
+        let policy = FormationPolicy::parse_toml(TOKEN_DOC.as_bytes()).unwrap();
+        let now = Timestamp::now();
+        let mut state = StateMachine::default();
+        state.enroll_tokens.insert(
+            EnrollTokenId::new(),
+            coppice_state::EnrollToken {
+                hash: pki::hash_secret("old").unwrap(),
+                role: EnrollRole::Agent,
+                label: "fleet-agents".to_string(),
+                expires_at: None,
+                minted_at: now,
+                revoked: true,
+            },
+        );
+        let commands = policy.commands(&state, now).unwrap();
+        let labels: Vec<&str> = minted(&commands).iter().map(|m| m.label.as_str()).collect();
+        assert!(labels.contains(&"fleet-agents"), "{labels:?}");
+    }
+
+    #[test]
+    fn duplicate_and_empty_labels_are_rejected() {
+        let dup = "[[enroll_token]]\nsecret = \"a\"\nrole = \"agent\"\nlabel = \"x\"\n\
+                   [[enroll_token]]\nsecret = \"b\"\nrole = \"agent\"\nlabel = \"x\"\n";
+        let err = FormationPolicy::parse_toml(dup.as_bytes()).expect_err("duplicate label");
+        assert!(format!("{err:#}").contains("duplicate"), "{err:#}");
+
+        let empty = "[[enroll_token]]\nsecret = \"a\"\nrole = \"agent\"\nlabel = \"\"\n";
+        let err = FormationPolicy::parse_toml(empty.as_bytes()).expect_err("empty label");
+        assert!(format!("{err:#}").contains("non-empty label"), "{err:#}");
+    }
+
+    #[test]
+    fn an_unknown_role_is_rejected() {
+        let bad = "[[enroll_token]]\nsecret = \"a\"\nrole = \"admin\"\nlabel = \"x\"\n";
+        assert!(FormationPolicy::parse_toml(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn the_spec_debug_never_prints_the_secret() {
+        let policy = FormationPolicy::parse_toml(TOKEN_DOC.as_bytes()).unwrap();
+        let rendered = format!("{:?}", policy.enroll_tokens);
+        assert!(!rendered.contains("cpk_"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     // ---- entity ordering (parent before child) ---------------------------

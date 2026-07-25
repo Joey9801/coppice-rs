@@ -99,6 +99,11 @@ pub struct StateMachine {
     /// CA key (ADR 0037 §4). The replicated *fact* of possession; the key
     /// itself is never replicated. Bounded (~cluster size).
     pub key_confirmations: BTreeMap<u64, Timestamp>,
+    /// Coordinator machine identity → the instant it first enrolled and
+    /// received a leaf (ADR 0037 §4). Records enrollment only; binding to a
+    /// raft seat is [`machine_bindings`](Self::machine_bindings). Bounded
+    /// (~cluster size), so a plain `BTreeMap`.
+    pub enrolled_identities: BTreeMap<MachineId, Timestamp>,
     /// Count of applied log entries, accepted or rejected.
     ///
     /// Bumped on every applied command so it is a stable coordinate for
@@ -141,6 +146,11 @@ impl StateMachine {
     /// §4).
     pub fn has_key_confirmation(&self, raft_node_id: u64) -> bool {
         self.key_confirmations.contains_key(&raft_node_id)
+    }
+
+    /// Whether a coordinator machine identity has enrolled (ADR 0037 §4).
+    pub fn is_identity_enrolled(&self, machine: &MachineId) -> bool {
+        self.enrolled_identities.contains_key(machine)
     }
 }
 

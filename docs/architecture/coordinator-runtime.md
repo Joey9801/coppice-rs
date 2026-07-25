@@ -79,6 +79,7 @@ followers, which is what lets followers serve reads and event streams.
 | Dispatch loop | `coppice-coordinator` | yes | in-flight dispatch bookkeeping | the event stream |
 | Scheduler driver | `coppice-coordinator` | yes | the current scheduling pass | its own loop + view updates |
 | Housekeeping | `coppice-coordinator` | yes | the eviction/snapshot cadence | a 60 s tick |
+| Leaf renewal | `coppice-coordinator` | no | this replica's own `[tls]` material ([ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md) §4) | a timer at ~2/3 of the served leaf's remaining lifetime |
 | Snapshot builder | `coppice-consensus` | no | snapshot serialization/IO | snapshot requests |
 
 1. **openraft core + replication + election.** A black box. Its internal

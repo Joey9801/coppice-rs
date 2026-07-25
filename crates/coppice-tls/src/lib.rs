@@ -66,7 +66,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 
+pub mod client_tls;
 pub mod pki;
+
+pub use client_tls::{ClientTlsPaths, ClientTlsStore};
 
 // ---------------------------------------------------------------------------
 // Metrics (crate-root describe/gather pair, mounted into the coordinator's own
@@ -257,6 +260,8 @@ pub struct TlsMaterial {
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
     server_config: Arc<ServerConfig>,
+    /// The leaf's `notBefore` as a Unix timestamp (seconds), when parseable.
+    not_before_unix: Option<i64>,
     /// The leaf's `notAfter` as a Unix timestamp (seconds), when parseable.
     not_after_unix: Option<i64>,
 }
@@ -285,6 +290,18 @@ impl TlsMaterial {
     /// The served leaf's `notAfter` (Unix seconds), when parseable.
     pub fn not_after_unix(&self) -> Option<i64> {
         self.not_after_unix
+    }
+
+    /// The served leaf's `notBefore` (Unix seconds), when parseable.
+    ///
+    /// Together with [`not_after_unix`](Self::not_after_unix) this gives the
+    /// leaf's whole validity span, which is what a renewal timer needs: ADR 0037
+    /// §4 renews at a *fraction of the lifetime*, and the lifetime is only
+    /// knowable from both ends. Reading it off the certificate rather than
+    /// assuming [`pki::LEAF_LIFETIME`] keeps the cadence correct for externally
+    /// supplied leaves too.
+    pub fn not_before_unix(&self) -> Option<i64> {
+        self.not_before_unix
     }
 
     /// The subject of this material's own leaf certificate (ADR 0037 §4): the
@@ -371,24 +388,30 @@ impl TlsMaterial {
             .map_err(|e| TlsError::RustlsConfig(e.to_string()))?;
         config.alpn_protocols.push(b"h2".to_vec());
 
-        let not_after_unix = leaf_not_after_unix(&cert_chain[0]);
+        let (not_before_unix, not_after_unix) = leaf_validity_unix(&cert_chain[0]);
 
         Ok(TlsMaterial {
             ca_pem,
             cert_pem,
             key_pem,
             server_config: Arc::new(config),
+            not_before_unix,
             not_after_unix,
         })
     }
 }
 
-/// Read the leaf's `notAfter` as Unix seconds. Best-effort: the TLS layer has
-/// already validated the chain, so a parse miss here only skips the gauge.
-fn leaf_not_after_unix(leaf: &CertificateDer<'_>) -> Option<i64> {
-    x509_parser::parse_x509_certificate(leaf.as_ref())
-        .ok()
-        .map(|(_, cert)| cert.validity().not_after.timestamp())
+/// Read the leaf's `(notBefore, notAfter)` as Unix seconds. Best-effort: the
+/// TLS layer has already validated the chain, so a parse miss here only skips
+/// the expiry gauge and falls the renewal timer back to a fixed recheck.
+fn leaf_validity_unix(leaf: &CertificateDer<'_>) -> (Option<i64>, Option<i64>) {
+    match x509_parser::parse_x509_certificate(leaf.as_ref()) {
+        Ok((_, cert)) => (
+            Some(cert.validity().not_before.timestamp()),
+            Some(cert.validity().not_after.timestamp()),
+        ),
+        Err(_) => (None, None),
+    }
 }
 
 /// A certificate leaf's subject fields relevant to the ADR 0037 §4 profile
@@ -405,6 +428,16 @@ pub struct LeafSubject {
     pub common_name: Option<String>,
     /// The subject organizational unit, if present — the profile marker.
     pub org_unit: Option<String>,
+}
+
+/// Read a PEM leaf's `notAfter` as Unix seconds — `None` when the PEM or the
+/// certificate does not parse. For callers deciding whether on-disk material
+/// is still a live credential (e.g. enrollment's "usable leaf" check).
+pub fn leaf_not_after_unix_pem(cert_pem: &[u8]) -> Option<i64> {
+    let leaf = rustls_pemfile::certs(&mut Cursor::new(cert_pem))
+        .next()?
+        .ok()?;
+    leaf_validity_unix(&leaf).1
 }
 
 /// Parse the `CN`/`OU` out of a leaf certificate chain's first (leaf) cert.
@@ -738,13 +771,60 @@ impl Default for ReloadOptions {
     }
 }
 
+/// What [`spawn_reload_task`] needs of a store: how to re-read it, what to
+/// name in a log line, and what the currently-served leaf expires at.
+///
+/// Two implementors, deliberately separate stores (ADR 0037 §4): the
+/// machine-plane [`TlsStore`] and the public listener's
+/// [`ClientTlsStore`](client_tls::ClientTlsStore). They share the reload
+/// *mechanism* — mtime poll, SIGHUP force, never let a half-written file take
+/// down serving — and nothing else.
+pub trait ReloadableMaterial: Send + Sync + 'static {
+    /// How this store is named in its log lines.
+    fn label(&self) -> &'static str;
+    /// The certificate path, for the swap log line.
+    fn cert_path(&self) -> &std::path::Path;
+    /// The currently-served leaf's `notAfter`, when parseable.
+    fn not_after_unix(&self) -> Option<i64>;
+    /// Re-read if the on-disk fingerprint changed. See [`TlsStore::reload`].
+    fn reload(&self) -> Result<bool, TlsError>;
+    /// Re-read unconditionally. See [`TlsStore::force_reload`].
+    fn force_reload(&self) -> Result<bool, TlsError>;
+}
+
+impl ReloadableMaterial for TlsStore {
+    fn label(&self) -> &'static str {
+        "tls"
+    }
+
+    fn cert_path(&self) -> &std::path::Path {
+        &self.paths.cert
+    }
+
+    fn not_after_unix(&self) -> Option<i64> {
+        self.current().not_after_unix()
+    }
+
+    fn reload(&self) -> Result<bool, TlsError> {
+        TlsStore::reload(self)
+    }
+
+    fn force_reload(&self) -> Result<bool, TlsError> {
+        TlsStore::force_reload(self)
+    }
+}
+
 /// Spawn the background task that keeps `store` fresh: an mtime poll every
 /// `opts.poll_interval` and, when `opts.sighup` is set on a Unix daemon, a
 /// `SIGHUP` that forces an immediate reload. A read/parse failure is logged and
 /// the old material keeps serving; identical consecutive failures are logged
 /// once to avoid flooding while a cert stays broken.
-pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandle<()> {
+pub fn spawn_reload_task<R: ReloadableMaterial>(
+    store: Arc<R>,
+    opts: ReloadOptions,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let plane = store.label();
         let mut ticker = tokio::time::interval(opts.poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -753,7 +833,7 @@ pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandl
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    tracing::error!(error = %e, "tls reload: failed to install SIGHUP handler");
+                    tracing::error!(%plane, error = %e, "tls reload: failed to install SIGHUP handler");
                     None
                 }
             }
@@ -787,7 +867,7 @@ pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandl
             };
 
             if forced {
-                tracing::info!("tls reload: SIGHUP received, re-reading cert/key/CA");
+                tracing::info!(%plane, "tls reload: SIGHUP received, re-reading material");
             }
             // SIGHUP forces a re-read+swap even when the stat-based fingerprint
             // is unchanged (an in-place rewrite or coarse-mtime filesystem can
@@ -800,9 +880,10 @@ pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandl
             match outcome {
                 Ok(true) => {
                     last_failure = None;
-                    let not_after = store.current().not_after_unix();
+                    let not_after = store.not_after_unix();
                     tracing::info!(
-                        cert = %store.paths().cert.display(),
+                        %plane,
+                        cert = %store.cert_path().display(),
                         not_after_unix = ?not_after,
                         "tls reload: swapped in new certificate material"
                     );
@@ -812,6 +893,7 @@ pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandl
                         // force_reload only reports false on a torn read (a
                         // writer racing our read); the next pass retries.
                         tracing::info!(
+                            %plane,
                             "tls reload: SIGHUP reload skipped — a concurrent write raced the \
                              read; will retry"
                         );
@@ -822,6 +904,7 @@ pub fn spawn_reload_task(store: Arc<TlsStore>, opts: ReloadOptions) -> JoinHandl
                     let msg = e.to_string();
                     if last_failure.as_deref() != Some(msg.as_str()) {
                         tracing::warn!(
+                            %plane,
                             error = %msg,
                             "tls reload: could not load new material; keeping the current \
                              certificate (a half-written file is retried on the next poll)"

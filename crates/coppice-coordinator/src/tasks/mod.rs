@@ -13,4 +13,7 @@ pub mod event_fanout;
 pub mod housekeeping;
 pub mod ingestion;
 pub mod node_client;
+// This replica's own leaf renewal (ADR 0037 §4): re-issue at ~2/3 lifetime,
+// locally while leader and over the admin channel otherwise.
+pub mod renewal;
 pub mod scheduler_driver;
