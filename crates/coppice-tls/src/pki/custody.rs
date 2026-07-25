@@ -63,6 +63,39 @@ pub fn write_ca_key(dir: &Path, key_pem: &[u8]) -> Result<(), CustodyError> {
     atomic_write_private(&path, key_pem).map_err(|source| CustodyError::Write { path, source })
 }
 
+/// Install cluster-minted machine-plane material into the `[tls]` paths a
+/// [`TlsStore`](crate::TlsStore) watches (ADR 0037 §4).
+///
+/// Formation (§3 step 3) and, from chunk 04, enrollment are the two producers
+/// of that material; both land it here rather than writing the three files by
+/// hand, so the private key is never momentarily group-readable and a
+/// half-written trio is never observable by the reload poll. Each file is an
+/// owner-only `tmp + fsync + rename + dir fsync`, and the **key is written
+/// last**: the store's fingerprint gate only advances once all three agree, and
+/// a crash mid-install leaves the previous key in place rather than a leaf
+/// whose key is missing.
+///
+/// The caller triggers the pickup — [`TlsStore::force_reload`](crate::TlsStore::force_reload)
+/// for an immediate swap, or nothing at all to let the mtime poll find it.
+pub fn install_leaf_material(
+    paths: &crate::TlsPaths,
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<(), CustodyError> {
+    for (path, bytes) in [
+        (&paths.ca, ca_pem),
+        (&paths.cert, cert_pem),
+        (&paths.key, key_pem),
+    ] {
+        atomic_write_private(path, bytes).map_err(|source| CustodyError::Write {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 /// Load `<dir>/ca.key`, enforcing the custody invariants (ADR 0037 §4):
 ///
 /// - the file must exist ([`CustodyError::NotFound`] otherwise);

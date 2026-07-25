@@ -109,6 +109,7 @@ pub async fn run<C>(
     cluster_id: ClusterId,
     node_log_client: Arc<NodeClient>,
     metrics: coppice_api::http::MetricsEndpoint,
+    readyz: coppice_api::http::ReadyzEndpoint,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -195,6 +196,7 @@ where
         client_listener,
         control_plane,
         metrics,
+        readyz,
         shutdown_rx.clone(),
     ));
     tracing::debug!("runtime: API server up");

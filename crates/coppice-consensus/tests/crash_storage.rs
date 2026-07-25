@@ -14,7 +14,9 @@
 use std::cell::RefCell;
 use std::io;
 
-use coppice_consensus::storage::{raw, EncodedEntry, FrameLogId, StorageCore, StorageOptions};
+use coppice_consensus::storage::{
+    raw, EncodedEntry, FormationMarks, FrameLogId, StorageCore, StorageOptions,
+};
 use coppice_core::bytes::ByteSize;
 use coppice_proto::pb::raft::v1 as pbraft;
 use coppice_proto::pb::storage::v1 as pbstorage;
@@ -171,7 +173,13 @@ impl CrashSubject for RealEngine {
     type Store = RefCell<StorageCore<SimFs>>;
 
     fn init(&self, fs: &SimFs) -> io::Result<()> {
-        StorageCore::init(fs, &self.options(), NODE_ID, INSTANCE_UUID)
+        StorageCore::init(
+            fs,
+            &self.options(),
+            NODE_ID,
+            INSTANCE_UUID,
+            FormationMarks::default(),
+        )
     }
 
     fn open(&self, fs: &SimFs) -> io::Result<Self::Store> {

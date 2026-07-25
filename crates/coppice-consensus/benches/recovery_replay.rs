@@ -31,7 +31,9 @@ use std::time::Instant;
 use prost::Message;
 
 use coppice_consensus::fs::{Fs, FsFile, RealFs};
-use coppice_consensus::storage::{EncodedEntry, FrameLogId, StorageCore, StorageOptions};
+use coppice_consensus::storage::{
+    EncodedEntry, FormationMarks, FrameLogId, StorageCore, StorageOptions,
+};
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::NodeId;
 use coppice_core::resource::Resources;
@@ -120,7 +122,14 @@ fn decode_fixture_entry(bytes: &[u8]) -> Command {
 /// function, releasing the data directory's `LOCK` for the benches.
 fn build_fixture(fs_root: &Path, options: &StorageOptions) {
     let fs = RealFs::new(fs_root);
-    StorageCore::init(&fs, options, NODE_ID, INSTANCE_UUID).expect("init");
+    StorageCore::init(
+        &fs,
+        options,
+        NODE_ID,
+        INSTANCE_UUID,
+        FormationMarks::default(),
+    )
+    .expect("init");
     let mut core = StorageCore::open(fs, options.clone()).expect("open");
 
     let mut index = 0u64;

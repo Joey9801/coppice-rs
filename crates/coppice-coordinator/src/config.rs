@@ -253,10 +253,15 @@ mod discovery {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    /// The cluster identity every replica shares, generated once at
-    /// `coppice-cli cluster init` and cross-checked against the data
-    /// directory's stamp at startup (ADR 0016). Parsed from the typed
-    /// string form `cluster-<uuid>` (ADR 0024).
+    /// The operator-chosen **logical** cluster name every replica shares
+    /// (ADR 0020/0037): the value a fresh daemon matches on when probing, and
+    /// the one identity that survives a wipe-and-re-form. Deliberately
+    /// distinct from the `history_id` formation mints and stamps into data
+    /// directories (ADR 0037 §3) — that one names a single raft lifetime.
+    /// For directories the legacy `--bootstrap`/`--join` flags created, the
+    /// stamp is derived from this value and cross-checked at startup
+    /// (ADR 0016). Parsed from the typed string form `cluster-<uuid>`
+    /// (ADR 0024).
     pub(crate) cluster_id: ClusterId,
 
     /// Root of this replica's on-disk state (segment storage, manifest).
@@ -323,6 +328,25 @@ pub(crate) struct ListenConfig {
     /// load sees the concrete value.
     #[serde(default)]
     pub(crate) advertise_host: Option<String>,
+
+    /// The local admin socket (ADR 0037 §3): the Unix-domain-socket surface
+    /// `coppice coordinator init` and `admin issue-operator-cert` speak to.
+    ///
+    /// Defaults to `<data_dir>/admin.sock`. The data directory is the
+    /// honest default home for it: it is the one path an operator already
+    /// configures per replica, it already holds owner-only key material, and
+    /// it is created before any listener binds. A deployment that wants the
+    /// socket in a systemd `RuntimeDirectory` sets this explicitly.
+    ///
+    /// Local access to this socket **is** the authority for the verbs it
+    /// carries — there is no further authentication on it. The daemon
+    /// tightens the socket to owner-only at bind, and the directory too when
+    /// it is the daemon's own data directory (the default). An explicitly
+    /// configured directory is **verified**, not chmodded — it must already
+    /// be owned by the daemon's user with mode 0700, or the bind is refused
+    /// (for a systemd `RuntimeDirectory`, set `RuntimeDirectoryMode=0700`).
+    #[serde(default)]
+    pub(crate) admin_socket: Option<PathBuf>,
 }
 
 impl ListenConfig {
@@ -634,7 +658,27 @@ pub struct ResolvedConfig {
     pub(crate) join: bool,
 }
 
+impl Config {
+    /// The local admin socket path (ADR 0037 §3): the explicit
+    /// `[listen] admin_socket`, or `<data_dir>/admin.sock`.
+    ///
+    /// Resolved from config alone so the `init` CLI, which never starts a
+    /// daemon, reaches the same path the daemon binds.
+    pub(crate) fn admin_socket_path(&self) -> PathBuf {
+        self.listen
+            .admin_socket
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("admin.sock"))
+    }
+}
+
 impl ResolvedConfig {
+    /// The parsed configuration, dropping the startup-intent flags.
+    #[cfg(test)]
+    pub(crate) fn into_config(self) -> Config {
+        self.config
+    }
+
     /// Emit the fully-resolved effective configuration.
     ///
     /// Safe to log in full: the file holds secrets by path reference only,

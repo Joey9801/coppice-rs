@@ -101,6 +101,31 @@ struct ManifestState {
     logical_end: Option<FrameLogId>,
     snapshot_id: Option<String>,
     committed_index: Option<u64>,
+    /// The ADR 0037 §3 formation markers; both absent on any directory
+    /// `coppice coordinator init` did not create.
+    formation: FormationMarks,
+}
+
+/// The two formation markers a data directory can carry (ADR 0037 §3).
+///
+/// Read standalone by [`read_formation_marks`] before the store is opened,
+/// because the intent-without-completion case must fail-stop the daemon
+/// *without* bringing consensus up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FormationMarks {
+    /// Stamped by formation step 2, alongside the identity mint.
+    pub intent_at_us: Option<i64>,
+    /// Stamped by formation step 7, the last durable act of `init`.
+    pub complete_at_us: Option<i64>,
+}
+
+impl FormationMarks {
+    /// Whether this directory records a formation that never completed —
+    /// the `formation-failed` fail-stop (ADR 0037 §1/§3). There is no resume
+    /// path: recovery is wipe and re-run `init`.
+    pub fn failed(&self) -> bool {
+        self.intent_at_us.is_some() && self.complete_at_us.is_none()
+    }
 }
 
 /// entry index -> (byte offset of frame, total frame length).
@@ -222,6 +247,8 @@ impl ManifestState {
                 .clone()
                 .map(|snapshot_id| pbstorage::SnapshotPointer { snapshot_id }),
             committed_index: self.committed_index,
+            formation_intent_at_us: self.formation.intent_at_us,
+            formation_complete_at_us: self.formation.complete_at_us,
         }
     }
 
@@ -255,8 +282,65 @@ impl ManifestState {
                 .transpose()?,
             snapshot_id: manifest.snapshot.map(|p| p.snapshot_id),
             committed_index: manifest.committed_index,
+            formation: FormationMarks {
+                intent_at_us: manifest.formation_intent_at_us,
+                complete_at_us: manifest.formation_complete_at_us,
+            },
         })
     }
+}
+
+/// The identity a manifest stamps, readable before the store is opened
+/// (ADR 0037 §3): the raft history this directory belongs to, and the
+/// formation markers.
+///
+/// The resume path consults this to learn `history_id` — the stamp, not
+/// config, is the authority on a formed directory, because formation mints a
+/// fresh history per cluster lifetime while config carries only the stable
+/// logical `cluster_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestStamp {
+    /// The raft history stamped at initialization (ADR 0037 §3).
+    pub history_id: [u8; 16],
+    /// The ADR 0037 §3 formation markers.
+    pub formation: FormationMarks,
+}
+
+/// Read a data directory's identity stamp without opening the store
+/// (ADR 0037 §3).
+///
+/// `Ok(None)` means there is no manifest at all — a fresh or wiped
+/// directory, which parks. Deliberately does not take the `LOCK` and does
+/// not run recovery: the daemon consults this *before* deciding whether it
+/// may bring consensus up, and a directory in the failed phase must never
+/// be opened.
+pub fn read_manifest_stamp<F: Fs>(fs: &F) -> io::Result<Option<ManifestStamp>> {
+    let path = Path::new("manifest");
+    if !fs.exists(path)? {
+        return Ok(None);
+    }
+    let bytes = read_to_vec(fs, path)?;
+    check_header(path, &bytes, MANIFEST_MAGIC)?;
+    let (payload, _) = read_record(path, &bytes, HEADER_LEN)?;
+    let manifest = pbstorage::Manifest::decode(payload)
+        .map_err(|e| fail_stop_file(path, format!("manifest does not decode: {e}")))?;
+    let history_id: [u8; 16] = manifest
+        .history_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| fail_stop_file(path, "history_id is not 16 raw UUID bytes"))?;
+    Ok(Some(ManifestStamp {
+        history_id,
+        formation: FormationMarks {
+            intent_at_us: manifest.formation_intent_at_us,
+            complete_at_us: manifest.formation_complete_at_us,
+        },
+    }))
+}
+
+/// Read only the formation markers; see [`read_manifest_stamp`].
+pub fn read_formation_marks<F: Fs>(fs: &F) -> io::Result<Option<FormationMarks>> {
+    Ok(read_manifest_stamp(fs)?.map(|stamp| stamp.formation))
 }
 
 impl<F: Fs> StorageCore<F> {
@@ -264,7 +348,9 @@ impl<F: Fs> StorageCore<F> {
     /// identity-stamped manifest claiming nothing (ADR 0016 / 0017).
     ///
     /// `node_id` is the freshly-minted allocate-once identity this directory
-    /// will carry for its whole life (ADR 0025).
+    /// will carry for its whole life (ADR 0025). `formation` carries the
+    /// ADR 0037 §3 markers: `init` stamps an intent here and nothing else
+    /// does, so every other caller passes the default (both absent).
     ///
     /// Refuses a directory that already has a manifest. Not crash-armed by
     /// the crash suite (initialization precedes any acknowledged state).
@@ -273,6 +359,7 @@ impl<F: Fs> StorageCore<F> {
         options: &StorageOptions,
         node_id: u64,
         instance_uuid: [u8; 16],
+        formation: FormationMarks,
     ) -> io::Result<()> {
         if fs.exists(Path::new("manifest"))? {
             return Err(io::Error::new(
@@ -292,6 +379,7 @@ impl<F: Fs> StorageCore<F> {
             logical_end: None,
             snapshot_id: None,
             committed_index: None,
+            formation,
         };
         write_manifest(fs, &manifest)
     }
@@ -462,6 +550,42 @@ impl<F: Fs> StorageCore<F> {
     /// manifest at init (ADR 0025).
     pub fn node_id(&self) -> u64 {
         self.manifest.node_id
+    }
+
+    /// The instance UUID minted when this directory was initialized (ADR
+    /// 0025): "same node id, different life" in forensics, and the
+    /// `instance_uuid` field of `/readyz` (ADR 0037 §9).
+    pub fn instance_uuid(&self) -> [u8; 16] {
+        self.manifest.instance_uuid
+    }
+
+    /// This directory's ADR 0037 §3 formation markers.
+    pub fn formation_marks(&self) -> FormationMarks {
+        self.manifest.formation
+    }
+
+    /// Stamp the `formation_complete` marker (ADR 0037 §3 step 7).
+    ///
+    /// Goes through the open engine rather than rewriting the manifest file
+    /// from outside, because the engine is the single writer: a
+    /// read-modify-write behind its back would race a rotation or a snapshot
+    /// pointer flip. Idempotent — re-stamping keeps the first timestamp.
+    ///
+    /// Refuses a directory that records no formation intent: only the `init`
+    /// path may complete a formation, and only the one it started.
+    pub fn mark_formation_complete(&mut self, at_us: i64) -> io::Result<()> {
+        if self.manifest.formation.intent_at_us.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to stamp formation_complete on a directory that records no \
+                 formation intent (ADR 0037 §3)",
+            ));
+        }
+        if self.manifest.formation.complete_at_us.is_some() {
+            return Ok(());
+        }
+        self.manifest.formation.complete_at_us = Some(at_us);
+        write_manifest(&self.fs, &self.manifest)
     }
 
     // ---- log reads ----------------------------------------------------
@@ -1375,3 +1499,67 @@ fn sweep_dir<F: Fs>(fs: &F, dir: &Path, keep: impl Fn(&str) -> bool) -> io::Resu
 // this module writes; the readable floor is also 1. Both move only by ADR.
 #[allow(unused)]
 const READABLE_CONTAINER_FLOOR: u32 = container::CONTAINER_VERSION;
+
+#[cfg(test)]
+mod formation_marker_tests {
+    use super::*;
+    use crate::fs::RealFs;
+    use crate::storage;
+
+    fn open_fs(dir: &tempfile::TempDir) -> RealFs {
+        RealFs::new(dir.path().to_path_buf())
+    }
+
+    /// A directory stamped by anything other than `coppice coordinator init`
+    /// — the legacy `--bootstrap`/`--join` flags, and every directory written
+    /// before the markers existed — carries neither field, decodes as "no
+    /// formation", and therefore resumes normally rather than fail-stopping.
+    #[test]
+    fn a_directory_without_formation_markers_is_not_a_failed_formation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs = open_fs(&dir);
+        storage::init(&fs, &StorageOptions::new([9u8; 16])).expect("init");
+
+        let marks = storage::read_formation_marks(&fs)
+            .expect("read marks")
+            .expect("manifest");
+        assert_eq!(marks, FormationMarks::default());
+        assert!(!marks.failed());
+    }
+
+    #[test]
+    fn the_marker_can_only_complete_a_formation_that_was_started() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fs = open_fs(&dir);
+        storage::init(&fs, &StorageOptions::new([9u8; 16])).expect("init");
+
+        let mut core = StorageCore::open(fs, StorageOptions::new([9u8; 16])).expect("open");
+        let err = core
+            .mark_formation_complete(1_000)
+            .expect_err("no intent was ever stamped");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn stamping_the_marker_twice_keeps_the_first_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        storage::init_forming(&open_fs(&dir), &StorageOptions::new([9u8; 16]), 111)
+            .expect("init_forming");
+
+        {
+            let mut core =
+                StorageCore::open(open_fs(&dir), StorageOptions::new([9u8; 16])).expect("open");
+            core.mark_formation_complete(222).expect("first stamp");
+            // Re-running `init` against a formed daemon must not rewrite the
+            // record of when this cluster was born.
+            core.mark_formation_complete(333).expect("second stamp");
+        }
+
+        let marks = storage::read_formation_marks(&open_fs(&dir))
+            .expect("read marks")
+            .expect("manifest");
+        assert_eq!(marks.intent_at_us, Some(111));
+        assert_eq!(marks.complete_at_us, Some(222));
+        assert!(!marks.failed());
+    }
+}

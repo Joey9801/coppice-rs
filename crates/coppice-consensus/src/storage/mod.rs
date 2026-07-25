@@ -48,7 +48,10 @@ mod sm;
 mod snapshot;
 
 pub use container::{FrameLogId, CONTAINER_VERSION};
-pub use engine::{EncodedEntry, StorageCore, StorageOptions};
+pub use engine::{
+    read_formation_marks, read_manifest_stamp, EncodedEntry, FormationMarks, ManifestStamp,
+    StorageCore, StorageOptions,
+};
 pub use log::{SegmentLogReader, SegmentLogStorage};
 pub use sm::{run_apply_task, SegmentSnapshotBuilder, SnapshotFile, StateMachineStore};
 
@@ -100,9 +103,68 @@ use crate::CoordinatorId;
 /// instance UUID — a new one for every directory life, so "same node id,
 /// different life" is distinguishable in forensics.
 pub fn init<F: Fs>(fs: &F, options: &StorageOptions) -> io::Result<CoordinatorId> {
+    init_with_formation(fs, options, FormationMarks::default())
+}
+
+/// Initialize an empty data directory *and* record a formation intent
+/// (ADR 0037 §3 step 2).
+///
+/// The intent is the first durable act of `coppice coordinator init` and is
+/// what makes every later crash identifiable: until step 7 stamps the
+/// completion marker, this directory restarts into the `formation-failed`
+/// phase rather than into a plausible-looking cluster missing its day-0
+/// state. `at_us` is the wall-clock stamp the failed phase reports.
+pub fn init_forming<F: Fs>(
+    fs: &F,
+    options: &StorageOptions,
+    at_us: i64,
+) -> io::Result<CoordinatorId> {
+    init_with_formation(
+        fs,
+        options,
+        FormationMarks {
+            intent_at_us: Some(at_us),
+            complete_at_us: None,
+        },
+    )
+}
+
+fn init_with_formation<F: Fs>(
+    fs: &F,
+    options: &StorageOptions,
+    formation: FormationMarks,
+) -> io::Result<CoordinatorId> {
     let node_id = mint_node_id();
-    StorageCore::init(fs, options, node_id, *uuid::Uuid::new_v4().as_bytes())?;
+    StorageCore::init(
+        fs,
+        options,
+        node_id,
+        *uuid::Uuid::new_v4().as_bytes(),
+        formation,
+    )?;
     Ok(node_id)
+}
+
+/// Stamps the ADR 0037 §3 `formation_complete` marker through the open
+/// store.
+///
+/// Handed out by [`Recovered::formation_stamp`] before the stores move into
+/// openraft, so formation's last step reaches the same engine instance that
+/// owns the manifest — see
+/// [`StorageCore::mark_formation_complete`](engine::StorageCore::mark_formation_complete).
+pub trait FormationStamp: Send + Sync {
+    /// Stamp the marker; idempotent, and refused on a directory recording no
+    /// formation intent.
+    fn mark_formation_complete(&self, at_us: i64) -> io::Result<()>;
+}
+
+impl<F: Fs + Send + 'static> FormationStamp for Mutex<StorageCore<F>> {
+    fn mark_formation_complete(&self, at_us: i64) -> io::Result<()> {
+        let mut core = self
+            .lock()
+            .map_err(|_| io::Error::other("storage engine mutex poisoned"))?;
+        core.mark_formation_complete(at_us)
+    }
 }
 
 /// Mint a random allocate-once Raft identity (ADR 0025).
@@ -127,6 +189,7 @@ pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
     let history_id = options.history_id;
     let core = StorageCore::open(fs, options)?;
     let node_id = core.node_id();
+    let instance_uuid = core.instance_uuid();
 
     // Rebuild from the snapshot file in bounded memory: streaming validation
     // already ran inside `current_snapshot_reader`, so only the per-section
@@ -152,6 +215,7 @@ pub fn open<F: Fs>(fs: F, options: StorageOptions) -> io::Result<Recovered<F>> {
         shards,
         history_id,
         node_id,
+        instance_uuid,
     })
 }
 
@@ -169,11 +233,27 @@ pub struct Recovered<F: Fs> {
     /// The allocate-once Raft identity stamped in the manifest (ADR 0025):
     /// the directory, not config, is the authority on which replica this is.
     pub node_id: CoordinatorId,
+    /// The instance UUID stamped when this directory was initialized (ADR
+    /// 0025); surfaced through `/readyz` (ADR 0037 §9).
+    pub instance_uuid: [u8; 16],
     shards: u32,
     history_id: [u8; 16],
 }
 
 impl<F: Fs> Recovered<F> {
+    /// A handle that stamps the `formation_complete` marker through this
+    /// open engine (ADR 0037 §3 step 7).
+    ///
+    /// Taken before [`into_stores`](Recovered::into_stores) consumes the
+    /// recovered store, so formation's last step still reaches the engine
+    /// once openraft owns it.
+    pub fn formation_stamp(&self) -> Arc<dyn FormationStamp>
+    where
+        F: Send + 'static,
+    {
+        Arc::clone(&self.core) as Arc<dyn FormationStamp>
+    }
+
     /// Split into the openraft stores, wiring the state-machine store to an
     /// apply task the caller owns.
     ///

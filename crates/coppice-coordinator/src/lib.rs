@@ -24,14 +24,26 @@ pub mod config;
 // because the trait and the run-scoped `FileRegistration` appear in
 // `bootstrap` signatures.
 pub mod discovery;
+// Explicit formation (ADR 0037 §3): the seven steps `coppice coordinator
+// init` runs, the `formation_complete` marker semantics, and the phase every
+// surface reads to decide what it may answer.
+mod formation;
 mod leadership;
 mod limits;
 mod liveness;
+// The local admin socket (ADR 0037 §3): formation's authority, and the
+// `issue-operator-cert` day-0 recovery verb. Both halves live here; the
+// module is public for the client half ([`localadmin::call`] and its wire
+// types), which the CLI verbs and the integration suite both speak.
+pub mod localadmin;
 // The bootstrap-policy TOML schema and its idempotent command proposals
 // (ADR 0037 §3): a library for the formation handler and `coppice dev`'s
 // seeding, so the two never drift. No CLI surface yet — `cluster init` wires
 // it up in a later chunk.
 pub mod policy;
+// The client half of `ProbeCluster` (ADR 0037 §3): formation's double-init
+// guard today, the convergence loop's search for the cluster later.
+mod probe;
 mod runtime;
 // Minimal systemd `Type=notify` client (ADR 0037 §9): READY=1 when listeners
 // serve, STOPPING=1 at shutdown. Silent no-op off systemd.
@@ -95,6 +107,7 @@ pub fn gather_metrics() {
 /// membership admin surface through [`admin::run_cli`].
 pub async fn run(cli: cli::Cli) -> Result<()> {
     match cli.command {
+        Some(cli::Command::Init(args)) => localadmin::run_init(args).await,
         Some(cli::Command::Admin(admin)) => admin::run_cli(admin).await,
         None => bootstrap::run(cli.run_args()).await,
     }

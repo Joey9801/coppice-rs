@@ -303,6 +303,12 @@ log_level = "warn"
         self.status_rx().borrow().role.is_leader()
     }
 
+    /// This replica's `/readyz` document (ADR 0037 §9), straight from the
+    /// booted coordinator's phase — no HTTP involved.
+    pub fn readyz(&self) -> coppice_api::http::ReadyzReport {
+        self.booted().readyz()
+    }
+
     pub fn summary(&self) -> ClusterSummary {
         self.booted().handle.cluster_summary()
     }
@@ -333,7 +339,7 @@ log_level = "warn"
             node_log_client: _,
             raft_server_shutdown,
             raft_server,
-            file_registration: _,
+            ..
         } = self.booted.take().expect("node booted");
         let _ = raft_server_shutdown.send(());
         let _ = raft_server.await;
@@ -356,7 +362,7 @@ log_level = "warn"
             node_log_client: _,
             raft_server_shutdown,
             raft_server,
-            file_registration: _,
+            ..
         } = self.booted.take().expect("node booted");
         raft_server.abort();
         drop(raft_server_shutdown);
@@ -490,6 +496,12 @@ log_level = "warn"
         })
         .expect("load coordinator tls store");
 
+        let booted = bootstrap::bootstrap(resolved, Arc::clone(&tls_store))
+            .await
+            .expect("bootstrap coordinator");
+        // The real readiness endpoint over this replica's published phase, so
+        // `/readyz` in these tests answers what the daemon's would.
+        let readyz = booted.readyz_endpoint();
         let BootedCoordinator {
             cluster_id,
             consensus,
@@ -499,10 +511,8 @@ log_level = "warn"
             node_log_client,
             raft_server_shutdown,
             raft_server,
-            file_registration: _,
-        } = bootstrap::bootstrap(resolved, Arc::clone(&tls_store))
-            .await
-            .expect("bootstrap coordinator");
+            ..
+        } = booted;
 
         // Bind the agent gateway listener on our own free port (bootstrap
         // itself never binds it — only the daemon `run` path does).
@@ -530,6 +540,7 @@ log_level = "warn"
             cluster_id,
             node_log_client,
             metrics,
+            readyz,
             Some(shutdown_rx),
         ));
 
@@ -590,4 +601,310 @@ pub async fn wait_converged(
         }
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// A whole daemon, for the ADR 0037 §1 lifecycle
+// ---------------------------------------------------------------------------
+
+/// A coordinator daemon driven through [`bootstrap::run_with`] — the same code
+/// the binary runs, minus the process-global recorder and the signal handler.
+///
+/// [`Node`] and [`RunningCoordinator`] hand-assemble a replica that already has
+/// a cluster; this one does not assume there is one. It is what the formation
+/// tests need: a daemon that can park, be `init`ed over its admin socket, and
+/// keep serving on the same ports afterwards — plus one that can be stopped,
+/// have its data directory tampered with, and restarted, which is how the
+/// crash-mid-formation cases are staged.
+pub struct Daemon {
+    pub cluster_id: ClusterId,
+    dir: TempDir,
+    config_path: PathBuf,
+    /// The CA whose leaf this daemon starts with. Formation replaces the
+    /// `[tls]` material with cluster-minted material, so a client that dialed
+    /// with this CA before `init` must re-dial with the cluster's afterwards.
+    ca_pem: Vec<u8>,
+    client_port: u16,
+    raft_port: u16,
+    running: Option<RunningDaemon>,
+}
+
+struct RunningDaemon {
+    shutdown: watch::Sender<bool>,
+    join: JoinHandle<anyhow::Result<()>>,
+}
+
+impl Daemon {
+    /// Lay down a fresh daemon's tempdir (certs + config) without starting it.
+    ///
+    /// Every port is allocated explicitly rather than with `:0`, because these
+    /// tests dial the daemon from outside and must know where it is before it
+    /// has told anyone anything.
+    pub fn new(cluster_id: ClusterId, ca: &Ca) -> Daemon {
+        Daemon::with_material(cluster_id, ca, true)
+    }
+
+    /// A daemon with **no TLS material on disk** — the ADR 0037 §4 minimal
+    /// deployment, where nothing is provisioned and formation mints the first
+    /// certificates. The config still names the `[tls]` paths; formation
+    /// writes into them.
+    pub fn new_certless(cluster_id: ClusterId, ca: &Ca) -> Daemon {
+        Daemon::with_material(cluster_id, ca, false)
+    }
+
+    fn with_material(cluster_id: ClusterId, ca: &Ca, write_material: bool) -> Daemon {
+        let dir = tempfile::tempdir().expect("create daemon tempdir");
+        let root = dir.path();
+        if write_material {
+            let leaf = ca.leaf();
+            std::fs::write(root.join("node.crt"), &leaf.cert_pem).expect("write cert");
+            std::fs::write(root.join("node.key"), &leaf.key_pem).expect("write key");
+            std::fs::write(root.join("ca.crt"), &ca.pem).expect("write ca");
+        }
+
+        let client_port = free_port();
+        let raft_port = free_port();
+        let agent_port = free_port();
+        let config_path = root.join("coordinator.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"cluster_id = "{cluster_id}"
+data_dir = "{data_dir}"
+
+[discovery]
+backend = "static"
+cluster_size = 1
+
+[discovery.static]
+addrs = []
+
+[listen]
+client_addr = "127.0.0.1:{client_port}"
+raft_addr = "127.0.0.1:{raft_port}"
+agent_addr = "127.0.0.1:{agent_port}"
+advertise_host = "localhost"
+
+[raft]
+election_timeout = "300ms"
+heartbeat_interval = "100ms"
+rpc_timeout = "2s"
+snapshot_log_entries = 32
+snapshot_keep_log_entries = 0
+
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ca_path = "{ca}"
+
+[observability]
+log_level = "warn"
+"#,
+                data_dir = root.join("data").display(),
+                cert = root.join("node.crt").display(),
+                key = root.join("node.key").display(),
+                ca = root.join("ca.crt").display(),
+            ),
+        )
+        .expect("write config");
+
+        Daemon {
+            cluster_id,
+            dir,
+            config_path,
+            ca_pem: ca.pem.clone(),
+            client_port,
+            raft_port,
+            running: None,
+        }
+    }
+
+    /// Point this daemon's `[discovery.static]` at `addrs`, so its
+    /// pre-formation probe round has somewhere to look.
+    pub fn set_static_discovery(&self, addrs: &[String]) {
+        let quoted: Vec<String> = addrs.iter().map(|a| format!("\"{a}\"")).collect();
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        let updated = toml.replace("addrs = []", &format!("addrs = [{}]", quoted.join(", ")));
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
+    /// Start (or restart) the daemon. Returns once `run_with` has been spawned;
+    /// callers poll a surface to learn when it is serving.
+    pub fn start(&mut self, overrides: CliOverrides) {
+        assert!(self.running.is_none(), "daemon already running");
+        let resolved = config::load(&self.config_path, overrides).expect("load daemon config");
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let join = tokio::spawn(bootstrap::run_with(
+            resolved,
+            coppice_api::http::MetricsEndpoint::detached_for_tests(),
+            Some(shutdown_rx),
+        ));
+        self.running = Some(RunningDaemon { shutdown, join });
+    }
+
+    /// Stop the daemon and return what `run_with` returned — `Err` for the
+    /// `formation-failed` fail-stop, `Ok` otherwise.
+    pub async fn stop(&mut self) -> anyhow::Result<()> {
+        let running = self.running.take().expect("daemon is not running");
+        let _ = running.shutdown.send(true);
+        running.join.await.expect("daemon task joined")
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.dir.path().join("data")
+    }
+
+    pub fn admin_socket(&self) -> PathBuf {
+        self.data_dir().join("admin.sock")
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.config_path.clone()
+    }
+
+    /// `localhost:PORT` for the raft/admin listener — what a peer would dial.
+    pub fn raft_target(&self) -> String {
+        format!("localhost:{}", self.raft_port)
+    }
+
+    /// The bound client-listener address, for tests that need a raw socket.
+    pub fn client_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.client_port)
+    }
+
+    pub fn api(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.client_port)
+    }
+
+    /// Wipe the data directory, the documented recovery from a failed
+    /// formation (ADR 0037 §3).
+    pub fn wipe_data_dir(&self) {
+        let dir = self.data_dir();
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).expect("wipe data dir");
+        }
+    }
+
+    /// The CA the daemon trusted before formation.
+    pub fn bootstrap_ca_pem(&self) -> Vec<u8> {
+        self.ca_pem.clone()
+    }
+
+    /// Poll `/readyz` until it answers, returning `(status, body)`.
+    pub async fn readyz(&self) -> (u16, serde_json::Value) {
+        let client = reqwest::Client::new();
+        let url = self.api("/readyz");
+        let mut last = None;
+        for _ in 0..200 {
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body: serde_json::Value = resp.json().await.expect("readyz json");
+                    return (status, body);
+                }
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+        panic!("/readyz never answered: {last:?}");
+    }
+
+    /// Wait until `/readyz` reports `phase`, returning the body.
+    pub async fn await_phase(&self, phase: &str) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (_, body) = self.readyz().await;
+            if body["phase"] == phase {
+                return body;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon never reached phase {phase}; last body: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// One call on the daemon's admin socket, retrying while it binds.
+    pub async fn admin(
+        &self,
+        call: coppice_coordinator::localadmin::AdminCall,
+    ) -> coppice_coordinator::localadmin::AdminReply {
+        let socket = self.admin_socket();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match coppice_coordinator::localadmin::call(&socket, call.clone()).await {
+                Ok(reply) => return reply,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "admin socket {} never answered: {e:#}",
+                        socket.display()
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+    }
+
+    /// Probe this daemon over the mTLS admin plane, presenting `cert`/`key`
+    /// against `ca`.
+    pub async fn probe(
+        &self,
+        ca_pem: &[u8],
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> anyhow::Result<coppice_proto::pb::raft::v1::ProbeClusterResponse> {
+        // Bounded: a certless daemon's raft port is bound but unserved, so an
+        // unbounded dial sits in the accept backlog forever waiting for a TLS
+        // handshake no one performs — the same reason the real probe client
+        // (`probe.rs`) carries a deadline.
+        let attempt = async {
+            let mut client = coppice_coordinator::admin::admin_channel(
+                &self.raft_target(),
+                ca_pem,
+                cert_pem,
+                key_pem,
+            )
+            .await?;
+            let resp = client
+                .probe_cluster(coppice_proto::pb::raft::v1::ProbeClusterRequest {
+                    cluster_id: self.cluster_id.to_string(),
+                })
+                .await
+                .map_err(|s| {
+                    anyhow::anyhow!("ProbeCluster failed ({:?}): {}", s.code(), s.message())
+                })?;
+            anyhow::Ok(resp.into_inner())
+        };
+        tokio::time::timeout(Duration::from_secs(3), attempt)
+            .await
+            .map_err(|_| anyhow::anyhow!("probe timed out"))?
+    }
+
+    /// Attempt a membership verb, so a test can assert the ADR 0037 §3
+    /// refusal directly rather than inferring it.
+    pub async fn try_add_learner(
+        &self,
+        ca_pem: &[u8],
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut client = coppice_coordinator::admin::admin_channel(
+            &self.raft_target(),
+            ca_pem,
+            cert_pem,
+            key_pem,
+        )
+        .await?;
+        coppice_coordinator::admin::add_learner(
+            &mut client,
+            *self.cluster_id.0.as_bytes(),
+            42,
+            "localhost:1".to_string(),
+        )
+        .await
+    }
 }

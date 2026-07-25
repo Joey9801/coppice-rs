@@ -66,10 +66,59 @@ message ReplicationProgress {
   uint64 matched_index = 2;
 }
 
+// Ask a discovered candidate what it is (ADR 0037 §3).
+//
+// The one verb a converging coordinator can issue before it knows anything
+// about the cluster it is looking for: it stamps the operator-chosen logical
+// `cluster_id` from config (ADR 0020) rather than a history id, because a
+// fresh daemon has no stamp of its own yet. The answer decides everything
+// that follows — join an initialized cluster, park, or (for `init`) refuse
+// to form a second one.
+message ProbeClusterRequest {
+  // The logical cluster name this prober intends to reach (ADR 0020),
+  // identical across a fleet's config. Tag 1 carries cluster identity on
+  // this plane exactly as `history_id` does on the other verbs.
+  string cluster_id = 1;
+}
+
+// One voter in a probe answer: enough to dial it.
+message ProbeVoter {
+  uint64 node_id = 1;
+  string address = 2;
+}
+
+// A candidate's answer to ProbeCluster.
+//
+// `initialized` is the load-bearing field and it is deliberately narrow: it
+// is true only once the responder carries the local `formation_complete`
+// marker (ADR 0037 §3). A daemon that is parked, mid-formation, or in
+// `formation-failed` answers false, which is what confines a failed
+// formation to the one node that attempted it.
+message ProbeClusterResponse {
+  // The responder's own configured cluster id; a prober compares it with
+  // its own before treating the rest of the answer as relevant.
+  string cluster_id = 1;
+  // The responder's stamped history id (ADR 0037 §3), empty when it has no
+  // manifest yet. Names the raft history, not the logical cluster.
+  bytes history_id = 2;
+  // True only when this responder is serving a formed cluster.
+  bool initialized = 8;
+  // The responder's raft identity; absent until its directory is stamped.
+  optional uint64 node_id = 9;
+  // The leader the responder last saw, for a prober choosing whom to ask
+  // next; absent when unknown or uninitialized.
+  optional uint64 leader_hint = 10;
+  // Current voters, ascending by node_id; empty when uninitialized.
+  repeated ProbeVoter voters = 11;
+}
+
 // The membership admin surface (ADR 0016), served over mTLS (ADR 0011).
 service RaftAdminService {
   rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
   rpc PromoteVoter(PromoteVoterRequest) returns (PromoteVoterResponse);
   rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  // Answered in every daemon state, including parked and formation-failed
+  // (ADR 0037 §3) — the one verb that is not gated on a formed cluster.
+  rpc ProbeCluster(ProbeClusterRequest) returns (ProbeClusterResponse);
 }

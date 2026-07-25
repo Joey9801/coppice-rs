@@ -87,9 +87,20 @@ the operational workflow is described in
   refresh with a launch lifecycle hook polling it implements the loop;
   no further coordinator code needed).
 
-Implementation of all of the above is tracked as issue #47 and has not
-landed yet; until it does, the pre-0037 manual sequence continues to work
-via the retained admin verbs.
+Implementation of all of the above is tracked as issue #47 and is landing
+in pieces. Already in the tree: the discovery backends and hot-reload TLS
+store; the cluster-owned PKI primitives and the replicated identity
+facts; and the **formation half of C1** — the local admin socket,
+`coppice coordinator init` with its `formation_complete` marker and
+fail-stop, the parked daemon, `ProbeCluster`, and the `/readyz` phases
+that exist before self-join (`waiting`, `formation-failed`, `voter`).
+Still outstanding: enrollment (`POST /api/v1/enroll` and the token
+lifecycle), the convergence loop that turns a parked daemon into a
+learner and then a voter, the evidence-gated removal and `ReplaceVoter`
+of C4, and the `?require=healthy` gate. Until those land the pre-0037
+manual sequence continues to work via the retained admin verbs and the
+`--bootstrap`/`--join` flags, which are removed with the convergence
+loop.
 
 ## Part 2 — Agent lifecycle (autoscaling to zero-touch)
 

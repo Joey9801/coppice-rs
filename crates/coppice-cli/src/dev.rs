@@ -315,6 +315,12 @@ ca_path = "{ca}"
     })
     .context("loading dev coordinator TLS material")?;
 
+    let booted = bootstrap::bootstrap(resolved, Arc::clone(&coord_tls))
+        .await
+        .context("bootstrapping the dev coordinator")?;
+    // `dev` never parks: it boots with `--bootstrap`, so the readiness
+    // endpoint reports a formed single voter from the first scrape.
+    let readyz = booted.readyz_endpoint();
     let BootedCoordinator {
         // The same id `dev` minted (or loaded) above and wrote into the config
         // bootstrap just read back.
@@ -326,10 +332,8 @@ ca_path = "{ca}"
         node_log_client,
         raft_server_shutdown,
         raft_server,
-        file_registration: _,
-    } = bootstrap::bootstrap(resolved, Arc::clone(&coord_tls))
-        .await
-        .context("bootstrapping the dev coordinator")?;
+        ..
+    } = booted;
 
     let agent_addr = format!("127.0.0.1:{agent_port}")
         .parse()
@@ -357,6 +361,7 @@ ca_path = "{ca}"
         // The coordinator's `/metrics` on the client listener renders over the
         // shared recorder; `dev_gather` samples BOTH daemons' trees (issue #46).
         coppice_api::http::MetricsEndpoint::new(metrics_handle.clone(), dev_gather),
+        readyz,
         Some(shutdown_rx),
     ));
 

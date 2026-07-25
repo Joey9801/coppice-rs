@@ -112,6 +112,14 @@ agent_addr  = "0.0.0.0:7072"    # agent heartbeats and reports
 # via explicit value ▸ the system hostname ▸ the local address of the default
 # route, so a fleet can ship one byte-identical config artifact.
 advertise_host = "coord-3.batch.example.com"
+# The local admin socket (ADR 0037 §3): where `coppice coordinator init` and
+# `admin issue-operator-cert` are served. Optional; defaults to
+# `<data_dir>/admin.sock`, whose directory the daemon tightens to owner-only
+# at bind — being able to open the socket IS the authorization for the verbs
+# it carries. An explicitly configured directory is verified instead of
+# chmodded: it must be owned by the daemon's user with mode 0700 or the bind
+# is refused (systemd: RuntimeDirectory=coppice RuntimeDirectoryMode=0700).
+admin_socket = "/run/coppice/admin.sock"
 
 [raft]
 # Liveness tuning only — never affects safety. The defaults are right for
@@ -128,9 +136,12 @@ snapshot_keep_log_entries = 1_000
 # MACHINE PLANE ONLY: the leaf served on the raft and agent-gateway
 # listeners, and this node's client identity toward peers. The trust
 # root is the cluster-owned CA minted at formation (ADR 0037); these
-# files are written by enrollment, hot-reloaded on change, and
-# externally-issued certs are a supported substitution at the same
-# paths. This cert is never served on the user-facing listener below.
+# files are written by formation (the forming node) or enrollment (every
+# other machine), hot-reloaded on change, and externally-issued certs
+# are a supported substitution at the same paths. They may be ABSENT on
+# a fresh installation: a daemon with no material still parks and
+# accepts `coordinator init`, which mints the first certificates. This
+# cert is never served on the user-facing listener below.
 cert_path = "/etc/coppice/pki/node.crt"
 key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"

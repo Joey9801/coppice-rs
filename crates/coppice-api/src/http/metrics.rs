@@ -33,6 +33,12 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 /// `/metrics` route (mounted next to `/api/v1`) and the agent's standalone
 /// metrics server, so the render logic lives here once rather than in each
 /// daemon's router wiring.
+///
+/// Cloneable, because one process can serve the same recorder on more than
+/// one router — a coordinator serves the pre-formation closed surface and
+/// then the full client API on the same listener (ADR 0037 §3), and both
+/// scrape the one recorder the daemon installed.
+#[derive(Clone)]
 pub struct MetricsEndpoint {
     /// Renders the installed recorder's registry to Prometheus text.
     handle: PrometheusHandle,

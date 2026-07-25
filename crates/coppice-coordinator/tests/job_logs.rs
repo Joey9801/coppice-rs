@@ -444,6 +444,7 @@ async fn best_effort_job_logs_full_read_path() {
     let router = coppice_api::http::router(
         plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        coppice_api::http::ReadyzEndpoint::detached_for_tests(),
     );
 
     // -- 1. Content + order + `available`, in one ascending page. ----------
@@ -545,6 +546,7 @@ async fn best_effort_job_logs_full_read_path() {
                 .with_log_client(log_client2),
         ),
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        coppice_api::http::ReadyzEndpoint::detached_for_tests(),
     );
     let (status, body) = get_logs(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);
@@ -715,6 +717,7 @@ async fn follower_serves_job_logs_directly() {
     let follower_router = coppice_api::http::router(
         follower_plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        coppice_api::http::ReadyzEndpoint::detached_for_tests(),
     );
 
     let applied_before = follower_a.views().latest().applied_index();
