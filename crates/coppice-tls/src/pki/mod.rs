@@ -29,6 +29,7 @@
 //!   an in-process keypair (`mint_*_local`, the no-CSR formation path, §3 step 5).
 //! - [`verify`] — [`verify_leaf`], a real webpki chain check plus profile
 //!   classification, for later chunks' authorization.
+//! - [`csr`] — [`generate_key_and_csr`], the enrollee's pre-credential half.
 //! - [`machine`] — [`mint_machine_identity`] and its data-directory persistence.
 //! - [`token`] — enrollment-token secret generation, hashing, and verification (§5).
 //! - [`custody`] — the local CA-key file: durable owner-only write, and a load
@@ -42,6 +43,7 @@ use coppice_core::id::{MachineId, NodeId};
 use crate::LeafSubject;
 
 pub mod ca;
+pub mod csr;
 pub mod custody;
 pub mod issue;
 pub mod machine;
@@ -49,6 +51,7 @@ pub mod token;
 pub mod verify;
 
 pub use ca::{mint_root_ca, CaError, CaMaterial, CaSigner};
+pub use csr::{generate_key_and_csr, CsrError};
 pub use custody::{install_leaf_material, load_ca_key, write_ca_key, CustodyError, CA_KEY_FILE};
 pub use issue::{
     issue_agent, issue_coordinator, issue_operator, mint_agent_local, mint_coordinator_local,
@@ -58,7 +61,7 @@ pub use machine::{
     load_machine_identity, mint_machine_identity, persist_machine_identity, MachineIdentityError,
     MACHINE_IDENTITY_FILE,
 };
-pub use token::{generate_secret, hash_secret, verify_secret, TokenError};
+pub use token::{generate_secret, hash_secret, verify_secret, TokenError, TOKEN_PREFIX};
 pub use verify::{verify_leaf, VerifyError};
 
 // ---------------------------------------------------------------------------

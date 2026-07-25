@@ -114,6 +114,8 @@ fn agent_config(
             key_path,
             ca_path,
         },
+        // The harness provisions the leaf directly; no enrollment.
+        enrollment: None,
         capacity: CapacityConfig {
             cpu_millis: 16_000,
             memory: ByteSize::from_gib(16),
@@ -524,6 +526,7 @@ async fn best_effort_job_usage_full_read_path() {
         plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
+        coppice_api::http::EnrollEndpoint::detached_for_tests(),
     );
 
     // -- 1. Exact round-trip, ascending default order, two `available`. ----
@@ -651,6 +654,7 @@ async fn best_effort_job_usage_full_read_path() {
         ),
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
+        coppice_api::http::EnrollEndpoint::detached_for_tests(),
     );
     let (status, body) = get_usage(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);

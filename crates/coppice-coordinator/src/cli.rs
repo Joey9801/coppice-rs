@@ -212,6 +212,100 @@ pub enum AdminVerb {
     },
 }
 
+// ---------------------------------------------------------------------------
+// `coppice node` — enrollment tokens and identity revocation (ADR 0037 §5)
+// ---------------------------------------------------------------------------
+
+/// Common arguments plus the verb for a `coppice node` invocation.
+///
+/// Unlike `admin`, the mTLS material is named explicitly: these verbs are run
+/// with an operator certificate from a machine that has no coordinator config
+/// file, which is exactly the audience ADR 0022's operator profile exists for.
+#[derive(Debug, Args)]
+pub struct NodeArgs {
+    /// The `host:port` of a coordinator's admin surface.
+    #[arg(long)]
+    pub target: String,
+
+    /// The cluster CA bundle (PEM) that verifies the target.
+    #[arg(long)]
+    pub ca: PathBuf,
+
+    /// The operator certificate (PEM) to present.
+    #[arg(long)]
+    pub cert: PathBuf,
+
+    /// The operator private key (PEM).
+    #[arg(long)]
+    pub key: PathBuf,
+
+    /// The logical cluster id the target must serve. Optional: the target was
+    /// named explicitly, so this is a guard, not a lookup.
+    #[arg(long)]
+    pub cluster_id: Option<String>,
+
+    #[command(subcommand)]
+    pub verb: NodeVerb,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NodeVerb {
+    /// Mint, list, and revoke enrollment tokens (ADR 0037 §5).
+    EnrollToken {
+        #[command(subcommand)]
+        verb: EnrollTokenVerb,
+    },
+
+    /// Mark an issued identity revoked, so the leader refuses its renewals.
+    ///
+    /// This is the other half of evicting an illegitimate enrollment: revoking
+    /// the *token* stops future enrollments but leaves already-issued leaves
+    /// renewing (ADR 0037 §5).
+    #[command(group = clap::ArgGroup::new("identity").required(true))]
+    RevokeIdentity {
+        /// A coordinator machine identity (`machine-<uuid>`).
+        #[arg(long, value_parser = crate::node::parse_machine_id, group = "identity")]
+        machine: Option<coppice_core::id::MachineId>,
+        /// A compute node id (`node-<uuid>`).
+        #[arg(long, value_parser = crate::node::parse_node_id, group = "identity")]
+        node: Option<coppice_core::id::NodeId>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EnrollTokenVerb {
+    /// Mint a token for one role. The secret is printed to stdout exactly
+    /// once — nothing stores it and no verb can recover it.
+    Mint {
+        /// The role the token grants; never both (ADR 0037 §5).
+        #[arg(long, value_enum)]
+        role: RoleArg,
+        /// How long the token stays usable (`"15m"`, `"720h"`). Omit for a
+        /// long-lived launch-template token, the supported v1 default.
+        #[arg(long, value_parser = parse_duration)]
+        ttl: Option<Duration>,
+        /// A human label, unique among live tokens by convention.
+        #[arg(long)]
+        label: String,
+    },
+
+    /// List the enrollment tokens. Never prints hashes.
+    List,
+
+    /// Revoke a token: future enrollments stop, issued leaves are untouched.
+    Revoke {
+        #[arg(long, value_parser = crate::node::parse_enroll_token_id)]
+        id: coppice_core::id::EnrollTokenId,
+    },
+}
+
+/// The `--role` values, spelled as an operator types them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RoleArg {
+    Agent,
+    Coordinator,
+}
+
 /// Parse a humane duration string (`"60s"`, `"2m"`) for `--wait`.
 ///
 /// Reuses `humantime`'s parser (the same grammar the config file's durations

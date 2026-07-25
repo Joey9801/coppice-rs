@@ -15,6 +15,7 @@
 //! lands.
 
 pub mod dto;
+mod enroll;
 mod error;
 mod extract;
 mod logs;
@@ -26,6 +27,9 @@ mod routes;
 mod ui;
 mod usage;
 
+pub use enroll::{
+    EnrollCall, EnrollEndpoint, EnrollRefusal, PeerCertificates, MAX_ENROLL_BODY, REFUSED_BODY,
+};
 pub use error::{ErrorCode, HttpError};
 pub use extract::{IdPath, ReadIndexes, ReadQuery};
 pub use metrics::MetricsEndpoint;

@@ -555,6 +555,16 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | Apply effects | Insert / overwrite `key_confirmations[raft_node_id] = confirmed_at`. The replicated **fact** of possession; the key itself is never replicated. Re-confirmation overwrites the timestamp. |
 | Rejections | — |
 
+#### `RecordEnrolledIdentity`
+
+| | |
+| --- | --- |
+| Proposer | Enrollment (chunk 04): the leader records that a coordinator machine identity enrolled and received a leaf (ADR 0037 §4) |
+| Payload | `machine: MachineId`, `recorded_at_us` |
+| Validation | None (ADR 0037 §4) |
+| Apply effects | Insert `enrolled_identities[machine] = recorded_at` if absent. First write wins — unlike `ConfirmKeyPossession`, the fact recorded is *that* the identity enrolled, so the useful instant is its first admission; a re-enrollment or a replay is an accepted no-op that keeps the earlier stamp. Enrollment alone claims no raft seat — that is `BindMachineIdentity`. |
+| Rejections | — |
+
 ---
 
 ## RejectionReason taxonomy

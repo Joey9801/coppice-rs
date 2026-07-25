@@ -821,5 +821,7 @@ fn observed_to_pb(o: &ObservedAllocation) -> pb::ObservedAllocation {
 #[cfg(test)]
 mod tests;
 
+pub mod renewal;
+
 mod runner;
 pub use runner::run;

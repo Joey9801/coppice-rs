@@ -22,8 +22,8 @@ use crate::command::{
     AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
     ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, MintEnrollToken,
     Placement, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RecordCaCertificate, RegisterNode, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable,
-    SubmitJob, UpdatePolicy,
+    RecordCaCertificate, RecordEnrolledIdentity, RegisterNode, RevokeEnrollToken, RevokeIdentity,
+    SetNodeSchedulable, SubmitJob, UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -63,6 +63,7 @@ impl StateMachine {
             Command::RevokeEnrollToken(c) => self.revoke_enroll_token(c),
             Command::RevokeIdentity(c) => self.revoke_identity(c),
             Command::ConfirmKeyPossession(c) => self.confirm_key_possession(c),
+            Command::RecordEnrolledIdentity(c) => self.record_enrolled_identity(c),
         };
         self.version += 1;
         result
@@ -1048,6 +1049,17 @@ impl StateMachine {
         // Re-confirmation overwrites the timestamp (ADR 0037 §4).
         self.key_confirmations
             .insert(c.raft_node_id, c.confirmed_at);
+        Ok(Applied::default())
+    }
+
+    fn record_enrolled_identity(&mut self, c: &RecordEnrolledIdentity) -> ApplyResult {
+        // First write wins, unlike `ConfirmKeyPossession`: the fact recorded
+        // is *that* this machine identity enrolled, so the useful timestamp is
+        // its first admission. A re-enrollment or a replay is an accepted
+        // no-op that leaves the earlier stamp in place.
+        self.enrolled_identities
+            .entry(c.machine)
+            .or_insert(c.recorded_at);
         Ok(Applied::default())
     }
 

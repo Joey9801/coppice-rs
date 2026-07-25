@@ -508,22 +508,18 @@ pub async fn run<C: Consensus>(
     control_plane: Arc<CoordinatorControlPlane<C>>,
     metrics: coppice_api::http::MetricsEndpoint,
     readyz: coppice_api::http::ReadyzEndpoint,
-    mut shutdown: watch::Receiver<bool>,
+    enroll: coppice_api::http::EnrollEndpoint,
+    cluster_ca: crate::clientedge::ClusterCa,
+    shutdown: watch::Receiver<bool>,
 ) {
-    let app = coppice_api::http::router(control_plane, metrics, readyz);
-    let graceful = async move {
-        let _ = shutdown.wait_for(|s| *s).await;
-    };
+    let app = coppice_api::http::router(control_plane, metrics, readyz, enroll);
+    let (socket, tls) = listener.into_parts();
     tracing::debug!("API server ready");
-    if let Err(e) = axum::serve(listener.into_inner(), app)
-        .with_graceful_shutdown(graceful)
-        .await
-    {
-        // axum::serve only errors on accept-loop failure; the runtime keeps
-        // running (the cluster is still healthy without its API edge) and
-        // the operator sees why the port went dark.
-        tracing::error!(error = %e, "API server terminated with an error");
-    }
+    // The serving posture (`[client_tls]`, ADR 0037 §4) was decided at config
+    // load and carried on the listener; the cluster CA is the client-cert trust
+    // anchor, read per accept because it appears at formation and changes on a
+    // re-root.
+    crate::clientedge::serve(socket, app, tls.map(|store| (store, cluster_ca)), shutdown).await;
     tracing::debug!("API server shut down");
 }
 

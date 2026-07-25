@@ -32,12 +32,46 @@ use coppice_tls::{TlsPaths, TlsStore};
 /// and the session client, so one rotation on disk re-arms both; `coppice
 /// dev` builds its agent half through this too.
 pub fn load_tls_store(tls: &config::TlsConfig) -> Result<Arc<TlsStore>> {
-    let paths = TlsPaths {
+    let paths = tls_paths(tls);
+    TlsStore::load(paths).with_context(|| {
+        "loading agent TLS material (config [tls]); provision the three files out of band, or \
+         configure [enrollment] to obtain them from the cluster at startup (ADR 0037 §4)"
+    })
+}
+
+/// The `[tls]` trio as the store and the enrollment installer both see them.
+fn tls_paths(tls: &config::TlsConfig) -> TlsPaths {
+    TlsPaths {
         cert: tls.cert_path.clone(),
         key: tls.key_path.clone(),
         ca: tls.ca_path.clone(),
+    }
+}
+
+/// Obtain the `[tls]` material from the cluster if `[enrollment]` is configured
+/// and there is not already a usable leaf on disk (ADR 0037 §4/§8).
+///
+/// Runs before [`load_tls_store`], which is what makes an agent's minimal
+/// deployment a token and an address: boot with neither certificate nor key,
+/// enroll for a leaf whose CN is this node's configured id (ADR 0011), and
+/// register exactly as an out-of-band-provisioned agent does. With a usable
+/// leaf already installed this makes no network call at all and never reads the
+/// token — restarts are free, and a compromised endpoint sees nothing from an
+/// already-enrolled fleet.
+async fn ensure_enrolled(config: &config::Config) -> Result<()> {
+    let Some(enrollment) = &config.enrollment else {
+        return Ok(());
     };
-    TlsStore::load(paths).context("loading agent TLS material (config [tls])")
+    let paths = tls_paths(&config.tls);
+    let outcome = coppice_enroll::ensure_enrolled(
+        &paths,
+        enrollment,
+        coppice_enroll::Claim::Node(config.node_id),
+    )
+    .await
+    .context("enrolling for a cluster-signed agent leaf (config [enrollment])")?;
+    tracing::info!(?outcome, "startup enrollment settled");
+    Ok(())
 }
 
 /// Register descriptions for every metric the agent process can emit, recursing
@@ -123,6 +157,12 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // is configured, but the recorder is installed unconditionally so metrics
     // accrue (and upkeep drains histograms) from the start regardless.
     let metrics_handle = install_metrics_recorder()?;
+
+    // Obtain the machine-plane leaf before anything tries to load it (ADR 0037
+    // §4/§8). A no-op when `[enrollment]` is absent, and a no-op when a usable
+    // leaf is already installed — so this is safe on every restart, not just
+    // the first boot.
+    ensure_enrolled(&config).await?;
 
     // Load the shared hot-reload TLS store up front (fail-fast on missing or
     // unparseable material, ADR 0011) and drive reloads from an mtime poll plus

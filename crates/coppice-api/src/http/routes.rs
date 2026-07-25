@@ -27,6 +27,7 @@ use super::dto::{
 };
 use crate::{Consistency, ControlPlane};
 
+use super::enroll::EnrollEndpoint;
 use super::error::HttpError;
 use super::extract::{IdPath, ReadIndexes, ReadQuery};
 use super::metrics::MetricsEndpoint;
@@ -47,12 +48,16 @@ pub fn router<P: ControlPlane>(
     plane: Arc<P>,
     metrics: MetricsEndpoint,
     readyz: ReadyzEndpoint,
+    enroll: EnrollEndpoint,
 ) -> Router {
     // The scrape and readiness handlers capture their own state, so they need
     // no router state and compose with the `Arc<P>` state the rest of the tree
     // carries — they are merged in before `.with_state(plane)` closes the tree.
+    // `/enroll` captures its own [`EnrollEndpoint`] the same way, for the same
+    // reason: certificate issuance is not a `ControlPlane` operation
+    // (ADR 0037 §4).
     operational_routes(metrics, readyz)
-        .nest("/api/v1", api_v1_routes::<P>())
+        .nest("/api/v1", api_v1_routes::<P>(enroll))
         // Everything unrouted: `/api/*` misses stay JSON 404s; anything
         // else serves the embedded web UI (static assets + SPA fallback,
         // ADR 0031 "Serving the UI").
@@ -111,8 +116,25 @@ fn operational_routes<S: Clone + Send + Sync + 'static>(
 /// restores it with `.nest("/api/v1", …)`. Consistency defaults per route are
 /// the ADR 0031 table; they become code (`ReadParams::class(default)`) as each
 /// read handler is implemented.
-fn api_v1_routes<P: ControlPlane>() -> Router<Arc<P>> {
+fn api_v1_routes<P: ControlPlane>(enroll: EnrollEndpoint) -> Router<Arc<P>> {
     Router::new()
+        // Enrollment (ADR 0037 §4): certless first contact, authenticated
+        // solely by a role-scoped bearer token, and served only here — the
+        // pre-formation `closed_router` has no `/api/v1` tree at all, which is
+        // what keeps "enrollment is refused until formation_complete" true
+        // without a second check on this side. The body limit is a route layer
+        // so an oversized request is refused by the framework before the
+        // handler's own guards ever see it.
+        .route(
+            "/enroll",
+            post(move |request: axum::extract::Request| {
+                let enroll = enroll.clone();
+                async move { enroll.handle(request).await }
+            })
+            .layer(axum::extract::DefaultBodyLimit::max(
+                super::enroll::MAX_ENROLL_BODY,
+            )),
+        )
         // Session / auth (ADR 0022) — local read, no raft involvement.
         .route("/session", get(unimplemented_read("GetSession")))
         // Cluster overview — bounded reads.
@@ -614,6 +636,7 @@ mod tests {
             plane,
             crate::http::MetricsEndpoint::detached_for_tests(),
             crate::http::ReadyzEndpoint::detached_for_tests(),
+            crate::http::EnrollEndpoint::detached_for_tests(),
         )
     }
 
@@ -2128,5 +2151,334 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+    // -----------------------------------------------------------------------
+    // POST /api/v1/enroll (ADR 0037 §4)
+    // -----------------------------------------------------------------------
+
+    /// A router whose `/enroll` is backed by `issue`, with an otherwise
+    /// canned control plane (nothing on this route touches it).
+    fn enroll_app<F, Fut>(issue: F) -> Router
+    where
+        F: Fn(crate::http::EnrollCall) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<
+                Output = Result<coppice_enroll::EnrollResponse, crate::http::EnrollRefusal>,
+            > + Send
+            + 'static,
+    {
+        super::router(
+            Arc::new(StubPlane {
+                fail_with: None,
+                queue_window: QueueWindow::default(),
+                recent: RecentClusterEvents {
+                    floor_index: 1,
+                    events: Vec::new(),
+                },
+                timeline: empty_timeline(),
+                state: coppice_state::StateMachine::default(),
+                read_consistency: std::sync::Mutex::default(),
+                coordinator: None,
+            }),
+            crate::http::MetricsEndpoint::detached_for_tests(),
+            crate::http::ReadyzEndpoint::detached_for_tests(),
+            crate::http::EnrollEndpoint::new(issue),
+        )
+    }
+
+    /// An endpoint that issues a canned leaf for any token.
+    fn issuing_app() -> Router {
+        enroll_app(|_call| async {
+            Ok(coppice_enroll::EnrollResponse {
+                cert_pem: "LEAF".to_string(),
+                ca_pem: "CA".to_string(),
+            })
+        })
+    }
+
+    fn enroll_request(token: Option<&str>, body: &str) -> Request<Body> {
+        let mut builder =
+            Request::post("/api/v1/enroll").header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    const CSR_BODY: &str = r#"{"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----"}"#;
+
+    /// The refusal every failed credential renders, captured once so the tests
+    /// below compare against the same bytes the endpoint promises.
+    async fn refusal_parts(response: axum::response::Response) -> (StatusCode, Vec<u8>) {
+        let status = response.status();
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "the enrollment route never sets a cookie"
+        );
+        assert!(
+            !response
+                .headers()
+                .keys()
+                .any(|k| k.as_str().starts_with("access-control-")),
+            "the enrollment route never emits CORS headers"
+        );
+        assert!(
+            !status.is_redirection(),
+            "a token-carrying client is never redirected (ADR 0037 §4)"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn a_bearer_token_enrolls_and_the_response_carries_the_leaf_and_ca() {
+        let response = issuing_app()
+            .oneshot(enroll_request(Some("cpk_good"), CSR_BODY))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        let body = body_json(response).await;
+        assert_eq!(body["cert_pem"], "LEAF");
+        assert_eq!(body["ca_pem"], "CA");
+    }
+
+    #[tokio::test]
+    async fn the_body_token_field_is_accepted_when_no_header_is_present() {
+        let app = enroll_app(|call| async move {
+            assert_eq!(call.token, "cpk_body");
+            Ok(coppice_enroll::EnrollResponse {
+                cert_pem: "LEAF".to_string(),
+                ca_pem: "CA".to_string(),
+            })
+        });
+        let response = app
+            .oneshot(enroll_request(
+                None,
+                r#"{"csr_pem":"csr","token":"cpk_body"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_header_wins_over_the_body_token() {
+        let app = enroll_app(|call| async move {
+            assert_eq!(call.token, "cpk_header");
+            Ok(coppice_enroll::EnrollResponse {
+                cert_pem: "LEAF".to_string(),
+                ca_pem: "CA".to_string(),
+            })
+        });
+        let response = app
+            .oneshot(enroll_request(
+                Some("cpk_header"),
+                r#"{"csr_pem":"csr","token":"cpk_body"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Every credential failure — none supplied, one the core refused, and a
+    /// query parameter that is never read — is one indistinguishable response.
+    #[tokio::test]
+    async fn every_authentication_failure_is_byte_identical() {
+        let refusing =
+            || enroll_app(|_call| async { Err(crate::http::EnrollRefusal::Unauthorized) });
+
+        let no_token = refusal_parts(
+            refusing()
+                .oneshot(enroll_request(None, CSR_BODY))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let refused_token = refusal_parts(
+            refusing()
+                .oneshot(enroll_request(Some("cpk_unknown"), CSR_BODY))
+                .await
+                .unwrap(),
+        )
+        .await;
+        // A token in the query string is not a credential: the route never
+        // looks there, so this is simply a request with no token.
+        let query_token = refusal_parts(
+            refusing()
+                .oneshot(
+                    Request::post("/api/v1/enroll?token=cpk_query")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(CSR_BODY))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        // A malformed bearer scheme is also just "no credential".
+        let bad_scheme = refusal_parts(
+            refusing()
+                .oneshot(
+                    Request::post("/api/v1/enroll")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, "Basic cpk_unknown")
+                        .body(Body::from(CSR_BODY))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(no_token.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(no_token, refused_token);
+        assert_eq!(no_token, query_token);
+        assert_eq!(no_token, bad_scheme);
+        assert_eq!(
+            String::from_utf8(no_token.1).unwrap(),
+            crate::http::REFUSED_BODY
+        );
+    }
+
+    /// A request that presented a client certificate is refused with the same
+    /// response: `/enroll` is certless first contact, and a machine holding a
+    /// leaf renews on the machine plane instead.
+    #[tokio::test]
+    async fn a_certificate_bearing_request_is_refused_identically() {
+        let mut request = enroll_request(Some("cpk_good"), CSR_BODY);
+        request
+            .extensions_mut()
+            .insert(crate::http::PeerCertificates(Arc::new(vec![vec![0u8; 4]])));
+
+        let (status, body) = refusal_parts(issuing_app().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(String::from_utf8(body).unwrap(), crate::http::REFUSED_BODY);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_refused_before_anything_parses_it() {
+        let issued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&issued);
+        let app = enroll_app(move |_call| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                Ok(coppice_enroll::EnrollResponse {
+                    cert_pem: "LEAF".to_string(),
+                    ca_pem: "CA".to_string(),
+                })
+            }
+        });
+
+        let huge = format!(
+            r#"{{"csr_pem":"{}"}}"#,
+            "A".repeat(crate::http::MAX_ENROLL_BODY + 1)
+        );
+        let response = app
+            .oneshot(enroll_request(Some("cpk_good"), &huge))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            issued.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the CSR must never reach the issuer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_concurrency_cap_sheds_the_ninth_in_flight_request() {
+        // Eight enrollments park inside the issuer; the ninth must be shed
+        // rather than queued, because each in-flight one holds real CPU.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::clone(&gate);
+        let app = enroll_app(move |_call| {
+            let gate = Arc::clone(&gate);
+            async move {
+                gate.notified().await;
+                Ok(coppice_enroll::EnrollResponse {
+                    cert_pem: "LEAF".to_string(),
+                    ca_pem: "CA".to_string(),
+                })
+            }
+        });
+
+        let mut parked = Vec::new();
+        for _ in 0..8 {
+            let app = app.clone();
+            parked.push(tokio::spawn(async move {
+                app.oneshot(enroll_request(Some("cpk_good"), CSR_BODY))
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+        // Let all eight reach the issuer and take their permits.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        let shed = app
+            .clone()
+            .oneshot(enroll_request(Some("cpk_good"), CSR_BODY))
+            .await
+            .unwrap();
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(shed).await["code"], "UNAVAILABLE");
+
+        release.notify_waiters();
+        for handle in parked {
+            assert_eq!(handle.await.unwrap(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_rate_limiter_sheds_a_flood_with_429() {
+        let app = issuing_app();
+        // The burst is 20 and refills at 10/s; 21 back-to-back requests in one
+        // test tick cannot all be admitted.
+        let mut statuses = Vec::new();
+        for _ in 0..21 {
+            statuses.push(
+                app.clone()
+                    .oneshot(enroll_request(Some("cpk_good"), CSR_BODY))
+                    .await
+                    .unwrap()
+                    .status(),
+            );
+        }
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+                .count(),
+            1,
+            "exactly the over-burst request is shed: {statuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_body_is_an_invalid_argument_not_a_credential_verdict() {
+        let response = issuing_app()
+            .oneshot(enroll_request(Some("cpk_good"), "not json"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn enrollment_is_absent_from_the_pre_formation_surface() {
+        // The closed router has no `/api/v1` tree at all, so enrollment is
+        // refused until `formation_complete` exists (ADR 0037 §3) without a
+        // second gate on this side.
+        let closed = super::closed_router(
+            crate::http::MetricsEndpoint::detached_for_tests(),
+            crate::http::ReadyzEndpoint::detached_for_tests(),
+        );
+        let response = closed
+            .oneshot(enroll_request(Some("cpk_good"), CSR_BODY))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -207,6 +207,7 @@ fn snapshot_roundtrip(state: &StateMachine) -> StateMachine {
         enroll_tokens: recode(records.enroll_tokens),
         revoked_identities: recode(records.revoked_identities),
         key_confirmations: recode(records.key_confirmations),
+        enrolled_identities: recode(records.enrolled_identities),
         cluster: records.cluster.map(|c| {
             let mut recoded = recode(vec![c]);
             recoded.pop().expect("one cluster record")
@@ -215,15 +216,15 @@ fn snapshot_roundtrip(state: &StateMachine) -> StateMachine {
     .expect("snapshot records must rebuild")
 }
 
-/// A state carrying all five ADR 0037 PKI/identity fact groups survives the
-/// encoded snapshot round trip exactly — the four bounded sections plus the
+/// A state carrying all six ADR 0037 PKI/identity fact groups survives the
+/// encoded snapshot round trip exactly — the five bounded sections plus the
 /// singleton CA bundle in the cluster record.
 #[test]
 fn pki_facts_survive_snapshot_roundtrip() {
     use coppice_core::id::{EnrollTokenId, MachineId};
     use coppice_state::command::{
         BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RecordCaCertificate,
-        RevokeEnrollToken, RevokeIdentity,
+        RecordEnrolledIdentity, RevokeEnrollToken, RevokeIdentity,
     };
     use coppice_state::{EnrollRole, RevokedIdentity};
 
@@ -291,6 +292,14 @@ fn pki_facts_survive_snapshot_roundtrip() {
             raft_node_id: 2,
             confirmed_at: base_ts(),
         }),
+        Command::RecordEnrolledIdentity(RecordEnrolledIdentity {
+            machine: mid(1),
+            recorded_at: base_ts(),
+        }),
+        Command::RecordEnrolledIdentity(RecordEnrolledIdentity {
+            machine: mid(2),
+            recorded_at: base_ts(),
+        }),
     ];
     for cmd in &cmds {
         sm.apply(cmd).expect("PKI command accepted");
@@ -302,6 +311,7 @@ fn pki_facts_survive_snapshot_roundtrip() {
     assert_eq!(sm.enroll_tokens.len(), 2);
     assert_eq!(sm.revoked_identities.len(), 2);
     assert_eq!(sm.key_confirmations.len(), 2);
+    assert_eq!(sm.enrolled_identities.len(), 2);
 
     let restored = snapshot_roundtrip(&sm);
     assert_eq!(restored, sm, "PKI facts must round-trip losslessly");

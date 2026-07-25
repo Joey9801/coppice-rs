@@ -185,7 +185,12 @@ pub async fn run_with(
     // drives `bootstrap` directly and runs several replicas in one process,
     // so binding a shared default agent port there would collide.
     let agent_raw = AgentListener::bind_raw(resolved.config.listen.agent_addr)?;
-    let client_listener = ClientListener::bind(resolved.config.listen.client_addr).await?;
+    let client_listener = bind_client_listener(
+        &resolved.config,
+        resolved.config.listen.client_addr,
+        daemon_owned,
+    )
+    .await?;
 
     // Bind the raft/admin listener and the local admin socket next. Both are
     // needed *before* the daemon knows whether it has a cluster: a parked
@@ -232,7 +237,8 @@ pub async fn run_with(
     let admin_socket_join =
         tokio::spawn(admin_socket.serve(Arc::clone(&local_admin), shutdown_rx.clone()));
 
-    let admin_service: AdminService<OpenraftConsensus> = AdminService::unformed(Arc::clone(&phase));
+    let admin_service: AdminService<OpenraftConsensus> =
+        AdminService::unformed(Arc::clone(&phase), resolved.config.data_dir.clone());
 
     let (started, tls_store) = match startup {
         // Fail-stop (ADR 0037 §3): serve the closed surface so the operator
@@ -392,6 +398,7 @@ pub async fn run_with(
         client_listener,
         cluster_id,
         node_log_client,
+        resolved.config.data_dir.clone(),
         metrics,
         readyz,
         Some(shutdown_rx),
@@ -454,6 +461,9 @@ pub async fn serve_runtime(
     client_listener: ClientListener,
     cluster_id: ClusterId,
     node_log_client: Arc<NodeClient>,
+    // This daemon's data directory: the agent gateway's renewal RPC signs from
+    // the CA key it holds (ADR 0037 §4).
+    data_dir: std::path::PathBuf,
     metrics: coppice_api::http::MetricsEndpoint,
     readyz: ReadyzEndpoint,
     shutdown: Option<watch::Receiver<bool>>,
@@ -467,6 +477,7 @@ pub async fn serve_runtime(
         client_listener,
         cluster_id,
         node_log_client,
+        data_dir,
         metrics,
         readyz,
         shutdown,
@@ -485,23 +496,36 @@ pub(crate) fn readyz_endpoint(phase: Arc<PhaseState>) -> ReadyzEndpoint {
 /// The bound public client-API listener (`listen.client_addr`, ADR 0031),
 /// handed to `runtime::run` which serves `coppice_api::http` on it.
 ///
-/// Bound eagerly (fail-fast on a port conflict) like [`AgentListener`].
-/// Plain HTTP: unlike the fenced mTLS planes, this edge serves browsers
-/// and CLIs — TLS termination here or in front of it is deployment
-/// posture (the ADR's "config, not contract"), and authn is the bearer
-/// token contract of ADR 0022, not transport identity.
+/// Bound eagerly (fail-fast on a port conflict) like [`AgentListener`]. Its
+/// serving posture rides with it: `None` is the conspicuous
+/// `[client_tls].insecure` plain-HTTP mode, and a store is an
+/// externally-signed certificate served with per-accept resolution
+/// (ADR 0037 §4). Unlike the fenced mTLS planes this edge serves browsers and
+/// CLIs, so the cluster CA never serves here — it is only the trust anchor for
+/// *client* certificates presented to it, and user authn remains the bearer
+/// token contract of ADR 0022.
 pub struct ClientListener {
     listener: tokio::net::TcpListener,
+    tls: Option<Arc<coppice_tls::ClientTlsStore>>,
 }
 
 impl ClientListener {
-    /// Bind the client API listener on `addr`.
+    /// Bind the client API listener on `addr`, serving plain HTTP.
     pub async fn bind(addr: SocketAddr) -> Result<ClientListener> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| anyhow!("binding client API listener on {addr}: {e}"))?;
         tracing::info!(%addr, "client API listener bound");
-        Ok(ClientListener { listener })
+        Ok(ClientListener {
+            listener,
+            tls: None,
+        })
+    }
+
+    /// Serve this listener over TLS from `store`'s material.
+    pub fn with_tls(mut self, store: Arc<coppice_tls::ClientTlsStore>) -> ClientListener {
+        self.tls = Some(store);
+        self
     }
 
     /// The actual bound address (which resolves a `:0` request).
@@ -509,8 +533,14 @@ impl ClientListener {
         Ok(self.listener.local_addr()?)
     }
 
-    pub(crate) fn into_inner(self) -> tokio::net::TcpListener {
-        self.listener
+    /// The socket and the posture, for the serving path.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        tokio::net::TcpListener,
+        Option<Arc<coppice_tls::ClientTlsStore>>,
+    ) {
+        (self.listener, self.tls)
     }
 }
 
@@ -558,6 +588,50 @@ impl AgentListener {
             .map_err(|e| anyhow!("setting agent gateway listener non-blocking: {e}"))?;
         tracing::info!(%addr, "agent gateway mTLS listener bound");
         Ok(listener)
+    }
+}
+
+/// Bind the client listener under the configured `[client_tls]` posture
+/// (ADR 0037 §4).
+///
+/// The posture is resolved (and its "say which mode this is" error raised) at
+/// config load; here it only decides whether a serving store is loaded — which
+/// itself fails fast, naming the path, if the certificate or key is missing.
+/// A daemon configured for TLS never silently serves plain HTTP.
+async fn bind_client_listener(
+    cfg: &config::Config,
+    addr: SocketAddr,
+    daemon_owned: bool,
+) -> Result<ClientListener> {
+    let listener = ClientListener::bind(addr).await?;
+    match cfg.client_tls_posture()? {
+        config::ClientTlsPosture::Insecure => {
+            tracing::warn!(
+                %addr,
+                "client listener is serving PLAIN HTTP ([client_tls] insecure = true): \
+                 enrollment tokens and bearer credentials cross this listener in the clear \
+                 (ADR 0037 §4 — development/test only)"
+            );
+            Ok(listener)
+        }
+        config::ClientTlsPosture::Tls { cert, key } => {
+            let store = coppice_tls::ClientTlsStore::load(coppice_tls::ClientTlsPaths {
+                cert: cert.clone(),
+                key: key.clone(),
+            })
+            .context("loading the client listener's serving certificate (config [client_tls])")?;
+            // Rotations of the public serving certificate are picked up the
+            // same way the machine plane's are: mtime poll, SIGHUP force.
+            let _reload = coppice_tls::spawn_reload_task(
+                Arc::clone(&store),
+                coppice_tls::ReloadOptions {
+                    sighup: daemon_owned,
+                    ..Default::default()
+                },
+            );
+            tracing::info!(%addr, cert = %cert.display(), "client listener serving TLS");
+            Ok(listener.with_tls(store))
+        }
     }
 }
 
@@ -832,7 +906,8 @@ pub async fn bootstrap(
         contact_staleness(&resolved.config),
         marks,
     );
-    let admin_service = AdminService::unformed(Arc::clone(&phase));
+    let admin_service =
+        AdminService::unformed(Arc::clone(&phase), resolved.config.data_dir.clone());
 
     assemble(
         &resolved.config,
@@ -890,17 +965,17 @@ impl ClosedSurface {
         let http_listener = dup_listener(&client_listener.listener)
             .context("duplicating the client listener for the pre-formation surface")?;
         let app = coppice_api::http::closed_router(metrics, readyz);
-        let mut http_stop = stop_rx.clone();
+        // The same posture the formed daemon will serve under: an operator's
+        // `curl https://…/readyz` must not have to change at formation. A
+        // pre-formation daemon has no cluster CA, so it asks for no client
+        // certificate ([`ClusterCa::none`]).
+        let http_tls = client_listener
+            .tls
+            .clone()
+            .map(|store| (store, crate::clientedge::ClusterCa::none()));
+        let http_stop = stop_rx.clone();
         let http = tokio::spawn(async move {
-            let graceful = async move {
-                let _ = http_stop.wait_for(|s| *s).await;
-            };
-            if let Err(e) = axum::serve(http_listener, app)
-                .with_graceful_shutdown(graceful)
-                .await
-            {
-                tracing::error!(error = %e, "pre-formation client listener terminated with an error");
-            }
+            crate::clientedge::serve(http_listener, app, http_tls, http_stop).await;
         });
 
         let grpc = match tls_store {

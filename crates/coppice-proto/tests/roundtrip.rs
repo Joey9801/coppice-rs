@@ -210,6 +210,10 @@ fn every_command() -> Vec<Command> {
             raft_node_id: 3,
             confirmed_at: ts(),
         }),
+        Command::RecordEnrolledIdentity(RecordEnrolledIdentity {
+            machine: MachineId(Uuid::from_u128(0x26)),
+            recorded_at: ts(),
+        }),
     ]
 }
 

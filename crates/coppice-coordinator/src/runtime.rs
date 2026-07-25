@@ -22,7 +22,8 @@ use crate::tasks::api_server::{self, CoordinatorControlPlane};
 use crate::tasks::housekeeping::StubHistoryStore;
 use crate::tasks::node_client::NodeClient;
 use crate::tasks::{
-    agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, scheduler_driver,
+    agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, renewal,
+    scheduler_driver,
 };
 
 /// How often the detached upkeep task drains the recorder's histogram buckets.
@@ -108,6 +109,9 @@ pub async fn run<C>(
     client_listener: ClientListener,
     cluster_id: ClusterId,
     node_log_client: Arc<NodeClient>,
+    // This daemon's data directory: the agent gateway's renewal RPC signs from
+    // the CA key it holds (ADR 0037 §4).
+    data_dir: std::path::PathBuf,
     metrics: coppice_api::http::MetricsEndpoint,
     readyz: coppice_api::http::ReadyzEndpoint,
     external_shutdown: Option<watch::Receiver<bool>>,
@@ -159,6 +163,11 @@ where
         inbound_tx,
         views.clone(),
         status.clone(),
+        crate::enroll::Issuer::new(
+            data_dir.clone(),
+            views.clone(),
+            Arc::clone(&consensus) as Arc<dyn crate::enroll::ReadBarrier>,
+        ),
         shutdown_rx.clone(),
     );
     tracing::debug!("runtime: agent gateway up");
@@ -167,6 +176,10 @@ where
     // here it starts accepting and stops on shutdown (listeners drain first,
     // `docs/architecture/coordinator-runtime.md`, "Shutdown order").
     let AgentListener { listener, tls } = agent_listener;
+    // This replica's machine-plane identity, shared with two more consumers:
+    // the `/enroll` proxy hop to the leader, and the renewal task that keeps
+    // this very material from expiring (ADR 0037 §4).
+    let machine_tls = Arc::clone(&tls);
     let listener = tokio::net::TcpListener::from_std(listener)
         .context("adopting the agent gateway listener into tokio")?;
     let incoming = coppice_tls::serve(listener, tls);
@@ -189,17 +202,41 @@ where
     let control_plane = Arc::new(
         CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
             .with_derived(queue_window, fanout.clone())
-            .with_node_handle(node_handle)
+            .with_node_handle(node_handle.clone())
             .with_log_client(node_log_client),
     );
+    // `POST /api/v1/enroll` (ADR 0037 §4). Captured by the router directly,
+    // not reached through the `ControlPlane`: issuing a certificate needs the
+    // CA key on this disk, the leader's address, and this node's own identity
+    // for the proxy hop — none of which belong in that trait.
+    let enroll = crate::enroll::EnrollService::new(
+        Arc::clone(&consensus),
+        data_dir.clone(),
+        node_handle.clone(),
+        Arc::clone(&machine_tls),
+    )
+    .endpoint();
     let api_join = tokio::spawn(api_server::run(
         client_listener,
         control_plane,
         metrics,
         readyz,
+        enroll,
+        crate::clientedge::ClusterCa::from_views(views.clone()),
         shutdown_rx.clone(),
     ));
     tracing::debug!("runtime: API server up");
+
+    // Keeps this replica's own machine leaf alive (ADR 0037 §4): renew at ~2/3
+    // of its lifetime, signing locally while leader and over the admin channel
+    // otherwise. Short leaf lifetimes are only free if this never stops.
+    let renewal_join = tokio::spawn(renewal::run(
+        machine_tls,
+        data_dir,
+        Arc::clone(&consensus),
+        node_handle,
+        shutdown_rx.clone(),
+    ));
 
     // ---- Leader-only tasks (every replica runs the loop; each self-gates
     // on the status watch per `crate::leadership`) ----
@@ -299,6 +336,7 @@ where
     let _ = api_join.await;
     let _ = agent_server_join.await;
     let _ = router_join.await;
+    let _ = renewal_join.await;
     tracing::debug!("runtime: API control plane and agent gateway down");
 
     let _ = ingestion_join.await;

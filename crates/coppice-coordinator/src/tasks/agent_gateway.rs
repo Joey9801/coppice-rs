@@ -33,7 +33,12 @@ use tonic::{Request, Response, Status, Streaming};
 use coppice_consensus::{ConsensusStatus, Role, StateViews};
 use coppice_core::id::NodeId;
 use coppice_net::session::AgentService;
-use coppice_proto::pb::agent::v1::{AgentCommand, AgentReport, CommandHeader, FencingToken};
+use coppice_proto::pb::agent::v1::{
+    AgentCommand, AgentReport, CommandHeader, FencingToken, RenewRequest, RenewResponse,
+};
+use coppice_tls::pki;
+
+use crate::enroll::{self, EnrollError, Issuer};
 
 use crate::limits::{AGENT_OUTBOUND_CAPACITY, COMMAND_ROUTER_CAPACITY, SESSION_CONTROL_CAPACITY};
 
@@ -128,6 +133,9 @@ pub struct SessionAuthority {
     control: mpsc::Sender<SessionControl>,
     status: watch::Receiver<ConsensusStatus>,
     next_session_id: Arc<AtomicU64>,
+    /// The signing half of the renewal RPC (ADR 0037 §4): the replicated CA
+    /// certificate plus this voter's on-disk CA key, resolved per request.
+    issuer: Issuer,
 }
 
 /// Spawn the session manager.
@@ -141,6 +149,7 @@ pub fn spawn(
     inbound: mpsc::Sender<InboundReport>,
     views: StateViews,
     status: watch::Receiver<ConsensusStatus>,
+    issuer: Issuer,
     shutdown: watch::Receiver<bool>,
 ) -> Gateway {
     let (router_tx, router_rx) = mpsc::channel(COMMAND_ROUTER_CAPACITY);
@@ -151,6 +160,7 @@ pub fn spawn(
         control: control_tx,
         status: status.clone(),
         next_session_id: Arc::new(AtomicU64::new(1)),
+        issuer,
     };
     let join = tokio::spawn(run_manager(router_rx, control_rx, views, status, shutdown));
     Gateway {
@@ -314,6 +324,13 @@ impl AgentService for AgentSessionService {
     ) -> Result<Response<Self::SessionStream>, Status> {
         self.authority.accept(request).await
     }
+
+    async fn renew(
+        &self,
+        request: Request<RenewRequest>,
+    ) -> Result<Response<RenewResponse>, Status> {
+        self.authority.renew(request).await
+    }
 }
 
 impl SessionAuthority {
@@ -397,6 +414,87 @@ impl SessionAuthority {
         // Outbound half: the session's command queue as the response stream.
         let stream = ReceiverStream::new(outbound_rx).map(Ok::<AgentCommand, Status>);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    /// Re-issue the caller's agent leaf (ADR 0037 §4 renewal).
+    ///
+    /// Three things make this safe to expose on the session plane. The node id
+    /// comes from the **verified** client certificate, never the request, so a
+    /// renewal cannot change subject or borrow another node's identity. An
+    /// identity an operator has marked revoked is refused — with short leaf
+    /// lifetimes that refusal *is* revocation (§5), and it has to happen where
+    /// revocations are known. And it is leader-only, the same posture
+    /// [`accept`](Self::accept) takes: the CA key lives on voters, and the
+    /// leader is always one.
+    async fn renew(
+        &self,
+        request: Request<RenewRequest>,
+    ) -> Result<Response<RenewResponse>, Status> {
+        let role = self.status.borrow().role.clone();
+        if !role.is_leader() {
+            let mut status = Status::failed_precondition("not leader");
+            if let Role::Follower { leader: Some(id) } = role {
+                if let Ok(hint) = MetadataValue::try_from(id.to_string()) {
+                    status.metadata_mut().insert("x-coppice-leader-hint", hint);
+                }
+            }
+            return Err(status);
+        }
+
+        let (signer, ca_pem) = self.issuer.load_ca().map_err(renew_error_to_status)?;
+        let node = {
+            let peer = request.peer_certs();
+            let leaf = peer
+                .as_ref()
+                .and_then(|certs| certs.first())
+                .ok_or_else(|| {
+                    Status::unauthenticated("renewal requires the current client certificate")
+                })?;
+            match pki::verify_leaf(&ca_pem, leaf.as_ref())
+                .map_err(|_| Status::unauthenticated("client certificate does not verify"))?
+                .profile
+            {
+                pki::Profile::Agent(node) => node,
+                _ => {
+                    return Err(Status::permission_denied(
+                        "only an agent leaf may renew an agent identity (ADR 0037 §4)",
+                    ))
+                }
+            }
+        };
+
+        // A strong read: revocation is the eviction lever, so a just-revoked
+        // node must not renew once more off a stale published view.
+        let view = self
+            .issuer
+            .strong_view()
+            .await
+            .map_err(renew_error_to_status)?;
+        let issued = enroll::renew_agent(
+            view.state(),
+            &signer,
+            &ca_pem,
+            node,
+            request.into_inner().csr_pem.as_bytes(),
+        )
+        .map_err(renew_error_to_status)?;
+
+        Ok(Response::new(RenewResponse {
+            cert_pem: String::from_utf8(issued.cert_pem)
+                .map_err(|_| Status::internal("issued certificate is not UTF-8"))?,
+            ca_pem: String::from_utf8(issued.ca_pem)
+                .map_err(|_| Status::internal("cluster CA bundle is not UTF-8"))?,
+        }))
+    }
+}
+
+/// Map a renewal failure onto its gRPC status. A revoked identity is
+/// deliberately indistinguishable from an unauthenticated one.
+fn renew_error_to_status(err: EnrollError) -> Status {
+    match err {
+        EnrollError::Unauthorized => Status::unauthenticated("renewal refused"),
+        EnrollError::BadRequest(msg) => Status::invalid_argument(msg),
+        other => Status::internal(other.to_string()),
     }
 }
 

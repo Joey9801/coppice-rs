@@ -23,6 +23,9 @@
 //!   replaces it in the suite when it lands.
 //! - [`synth`] — the synthetic `StateMachine` generator shared by the
 //!   snapshot benchmarks and the determinism suite.
+//! - [`tracing_capture`] — an in-memory `tracing` subscriber for asserting
+//!   what did (or, per ADR 0037, did not — enrollment token secrets) reach
+//!   the logs.
 //!
 //! This crate is test infrastructure: it appears only in `[dev-dependencies]`
 //! of other crates, never in a shipping dependency graph.
@@ -32,3 +35,4 @@ pub mod rng;
 pub mod simfs;
 pub mod synth;
 pub mod toy;
+pub mod tracing_capture;

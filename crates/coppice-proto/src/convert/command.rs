@@ -13,8 +13,8 @@ use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
     ConfigureQuotaEntity, ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt,
     EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement, ReconcileNode, RecordAttemptExited,
-    RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate, RegisterNode,
-    RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity,
+    RegisterNode, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
 };
 use coppice_state::{CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity};
 
@@ -51,6 +51,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::RevokeEnrollToken(c) => Body::RevokeEnrollToken(c.into()),
         Command::RevokeIdentity(c) => Body::RevokeIdentity(c.into()),
         Command::ConfirmKeyPossession(c) => Body::ConfirmKeyPossession(c.into()),
+        Command::RecordEnrolledIdentity(c) => Body::RecordEnrolledIdentity(c.into()),
     };
     pb::Command {
         version: cluster_version,
@@ -87,6 +88,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::RevokeEnrollToken(c) => Command::RevokeEnrollToken(c.try_into()?),
         Body::RevokeIdentity(c) => Command::RevokeIdentity(c.try_into()?),
         Body::ConfirmKeyPossession(c) => Command::ConfirmKeyPossession(c.try_into()?),
+        Body::RecordEnrolledIdentity(c) => Command::RecordEnrolledIdentity(c.try_into()?),
     };
     Ok((command_version, body))
 }
@@ -538,7 +540,7 @@ impl TryFrom<pb::BumpClusterVersion> for BumpClusterVersion {
 
 /// The `EnrollRole` domain enum ↔ its closed proto enum. Shared with the
 /// snapshot's `EnrollTokenRecord`.
-pub(crate) fn enroll_role_to_pb(role: EnrollRole) -> pbcore::EnrollRole {
+pub fn enroll_role_to_pb(role: EnrollRole) -> pbcore::EnrollRole {
     match role {
         EnrollRole::Coordinator => pbcore::EnrollRole::Coordinator,
         EnrollRole::Agent => pbcore::EnrollRole::Agent,
@@ -547,10 +549,7 @@ pub(crate) fn enroll_role_to_pb(role: EnrollRole) -> pbcore::EnrollRole {
 
 /// Decode an `EnrollRole` from its `i32` wire value. The enum is closed:
 /// `UNSPECIFIED` and any unknown value are rejected, never defaulted.
-pub(crate) fn enroll_role_from_pb(
-    value: i32,
-    field: &'static str,
-) -> Result<EnrollRole, ConvertError> {
+pub fn enroll_role_from_pb(value: i32, field: &'static str) -> Result<EnrollRole, ConvertError> {
     match pbcore::EnrollRole::try_from(value) {
         Ok(pbcore::EnrollRole::Coordinator) => Ok(EnrollRole::Coordinator),
         Ok(pbcore::EnrollRole::Agent) => Ok(EnrollRole::Agent),
@@ -719,6 +718,26 @@ impl TryFrom<pb::ConfirmKeyPossession> for ConfirmKeyPossession {
         Ok(ConfirmKeyPossession {
             raft_node_id: c.raft_node_id,
             confirmed_at: timestamp(c.confirmed_at_us, "ConfirmKeyPossession.confirmed_at_us")?,
+        })
+    }
+}
+
+impl From<&RecordEnrolledIdentity> for pb::RecordEnrolledIdentity {
+    fn from(c: &RecordEnrolledIdentity) -> Self {
+        pb::RecordEnrolledIdentity {
+            machine: Some(c.machine.into()),
+            recorded_at_us: c.recorded_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RecordEnrolledIdentity> for RecordEnrolledIdentity {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RecordEnrolledIdentity) -> Result<Self, ConvertError> {
+        Ok(RecordEnrolledIdentity {
+            machine: req(c.machine, "RecordEnrolledIdentity.machine")?.try_into()?,
+            recorded_at: timestamp(c.recorded_at_us, "RecordEnrolledIdentity.recorded_at_us")?,
         })
     }
 }

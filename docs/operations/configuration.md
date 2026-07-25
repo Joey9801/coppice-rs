@@ -147,6 +147,9 @@ key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"
 
 [client_tls]
+# REQUIRED — there is no default posture. A missing table, a half-filled
+# one (cert without key), or one claiming both modes is a startup error
+# naming both options.
 # USER-FACING HTTP API listener (ADR 0037 §4): an externally signed
 # serving certificate (browsers won't trust the cluster's private root),
 # or sit behind a TLS-terminating LB, or `insecure = true` (conspicuous

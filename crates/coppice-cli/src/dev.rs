@@ -287,6 +287,11 @@ rpc_timeout = "2s"
 cert_path = "{cert}"
 key_path = "{key}"
 ca_path = "{ca}"
+
+[client_tls]
+# Plain HTTP on the client listener (ADR 0037 §4: the posture is always
+# explicit, never implied).
+insecure = true
 "#,
         data_dir = coord_data.display(),
         cert = coord_cert.display(),
@@ -358,6 +363,7 @@ ca_path = "{ca}"
         client_listener,
         cluster_id,
         node_log_client,
+        coord_data.clone(),
         // The coordinator's `/metrics` on the client listener renders over the
         // shared recorder; `dev_gather` samples BOTH daemons' trees (issue #46).
         coppice_api::http::MetricsEndpoint::new(metrics_handle.clone(), dev_gather),
@@ -380,6 +386,8 @@ ca_path = "{ca}"
             key_path: agent_key,
             ca_path,
         },
+        // `coppice dev` mints its own PKI, so there is nothing to enroll for.
+        enrollment: None,
         // Generous static capacity: dev jobs should never be capacity-bound.
         capacity: CapacityConfig {
             cpu_millis: 16_000,

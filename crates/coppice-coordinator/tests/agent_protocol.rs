@@ -103,6 +103,8 @@ fn agent_config(
             key_path,
             ca_path,
         },
+        // The harness provisions the leaf directly; no enrollment.
+        enrollment: None,
         // Generous, so a job's request always fits.
         capacity: CapacityConfig {
             cpu_millis: 16_000,
@@ -486,6 +488,18 @@ struct ScriptedCoordinator {
 #[tonic::async_trait]
 impl AgentService for ScriptedCoordinator {
     type SessionStream = CommandStream;
+
+    /// The scripted coordinator serves sessions only; renewal (ADR 0037 §4)
+    /// belongs to the real gateway and is exercised in the coordinator's own
+    /// suite.
+    async fn renew(
+        &self,
+        _request: Request<pb::RenewRequest>,
+    ) -> Result<Response<pb::RenewResponse>, Status> {
+        Err(Status::unimplemented(
+            "the scripted test coordinator does not renew certificates",
+        ))
+    }
 
     async fn session(
         &self,

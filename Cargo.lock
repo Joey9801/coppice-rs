@@ -1145,6 +1145,7 @@ dependencies = [
  "chrono",
  "coppice-consensus",
  "coppice-core",
+ "coppice-enroll",
  "coppice-net",
  "coppice-proto",
  "coppice-testkit",
@@ -1177,6 +1178,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "coppice-core",
+ "coppice-enroll",
  "coppice-state",
  "metrics",
  "metrics-exporter-prometheus",
@@ -1257,14 +1259,18 @@ dependencies = [
  "coppice-api",
  "coppice-consensus",
  "coppice-core",
+ "coppice-enroll",
  "coppice-net",
  "coppice-proto",
  "coppice-scheduler",
  "coppice-state",
+ "coppice-testkit",
  "coppice-tls",
  "gethostname",
  "hickory-resolver",
  "humantime-serde",
+ "hyper 1.10.1",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
  "nix",
@@ -1273,7 +1279,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-stream",
  "toml",
  "tonic",
@@ -1295,6 +1303,26 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "coppice-enroll"
+version = "0.0.1"
+dependencies = [
+ "coppice-core",
+ "coppice-testkit",
+ "coppice-tls",
+ "rcgen",
+ "reqwest",
+ "rustls 0.23.41",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tracing",
 ]
 
 [[package]]
@@ -1361,6 +1389,8 @@ dependencies = [
  "coppice-state",
  "crc32c",
  "imbl",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -2337,6 +2367,7 @@ dependencies = [
  "hyper 1.10.1",
  "hyper-util",
  "rustls 0.23.41",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls 0.26.4",
  "tower-service",
@@ -3817,6 +3848,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls 0.23.41",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",

@@ -212,4 +212,21 @@ message CachedImage {
 // fail closed at the agent on the term check (ADR 0009).
 service AgentService {
   rpc Session(stream AgentReport) returns (stream AgentCommand);
+  // Re-issue the caller's own agent leaf (ADR 0037 §4 renewal). Leader-only,
+  // authenticated by the current leaf the request arrived on; the subject is
+  // taken from that certificate, never from the request, so renewal cannot
+  // change identity. The leader refuses a revoked identity — that refusal is
+  // v1's revocation mechanism (ADR 0037 §5).
+  rpc Renew(RenewRequest) returns (RenewResponse);
+}
+
+// A renewal request: the CSR contributes only its public key.
+message RenewRequest {
+  string csr_pem = 1;
+}
+
+message RenewResponse {
+  string cert_pem = 1;
+  // The cluster CA bundle, so a renewing agent also picks up a re-root.
+  string ca_pem = 2;
 }

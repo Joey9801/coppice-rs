@@ -33,7 +33,98 @@ use anyhow::{bail, Context, Result};
 use coppice_core::id::ClusterId;
 use serde::Deserialize;
 
+pub(crate) use client_tls::{ClientTlsConfig, ClientTlsPosture};
 pub(crate) use discovery::{BackendKind, DiscoveryConfig};
+// The `[enrollment]` table is the SHARED definition in `coppice-enroll` — the
+// same type the agent parses, so the two daemons cannot disagree about what
+// `insecure` means, and its `Secret` token field redacts itself from every
+// `Debug` rendering (the whole config is logged at startup).
+#[allow(unused_imports)] // consumed by the convergence loop (chunk 05)
+pub(crate) use coppice_enroll::EnrollmentConfig;
+
+mod client_tls {
+    //! The `[client_tls]` section (ADR 0037 §4): the **public** listener's own
+    //! serving posture.
+    //!
+    //! Two honest modes and no third: an externally-signed certificate (or a
+    //! TLS-terminating load balancer in front of one), or plain HTTP under a
+    //! conspicuous opt-in. A cluster-issued leaf was considered and rejected —
+    //! browsers will never trust a private root — so the cluster CA's only role
+    //! on this listener is verifying *client* certificates. Nothing here
+    //! defaults: a deployment states which of the two it is, because the
+    //! difference is whether enrollment tokens cross the network in the clear.
+
+    use std::path::PathBuf;
+
+    use serde::Deserialize;
+
+    /// The `[client_tls]` section as written.
+    ///
+    /// The invariant is a XOR, which serde cannot express, so the fields are
+    /// individually optional and [`ClientTlsConfig::posture`] is the only way
+    /// to read them — it either yields one of the two modes or an error naming
+    /// both.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct ClientTlsConfig {
+        #[serde(default)]
+        pub(crate) cert_path: Option<PathBuf>,
+        #[serde(default)]
+        pub(crate) key_path: Option<PathBuf>,
+        /// Serve plain HTTP. Development/test only: it exposes enrollment
+        /// tokens on the wire (ADR 0037 §4).
+        #[serde(default)]
+        pub(crate) insecure: bool,
+    }
+
+    /// The resolved posture of the client listener.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum ClientTlsPosture {
+        /// Serve HTTPS from these paths, hot-reloaded like `[tls]`.
+        Tls { cert: PathBuf, key: PathBuf },
+        /// Serve plain HTTP, explicitly and conspicuously.
+        Insecure,
+    }
+
+    /// The one error message, shared by "neither configured" and every partial
+    /// combination, because the fix is the same: say which of the two modes
+    /// this deployment is in.
+    fn ambiguous(detail: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "[client_tls] {detail}. The public listener's posture is explicit, never implied: \
+             set BOTH `cert_path` and `key_path` to an externally-signed serving certificate \
+             (the production posture — or terminate TLS in a load balancer in front), OR set \
+             `insecure = true` to serve plain HTTP, which is development/test only because it \
+             exposes enrollment tokens on the wire (ADR 0037 §4)"
+        )
+    }
+
+    impl ClientTlsConfig {
+        /// Resolve the section into exactly one posture, or fail naming both
+        /// options.
+        pub(crate) fn posture(&self) -> anyhow::Result<ClientTlsPosture> {
+            match (&self.cert_path, &self.key_path, self.insecure) {
+                (Some(cert), Some(key), false) => Ok(ClientTlsPosture::Tls {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                }),
+                (None, None, true) => Ok(ClientTlsPosture::Insecure),
+                (Some(_), Some(_), true) => Err(ambiguous(
+                    "names a serving certificate AND sets `insecure = true`",
+                )),
+                (Some(_), None, _) => Err(ambiguous("has `cert_path` but no `key_path`")),
+                (None, Some(_), _) => Err(ambiguous("has `key_path` but no `cert_path`")),
+                (None, None, false) => Err(ambiguous("configures neither mode")),
+            }
+        }
+
+        /// The posture for a section that is absent entirely — the same
+        /// "neither" error, so a missing table and an empty one read alike.
+        pub(crate) fn absent() -> anyhow::Error {
+            ambiguous("is missing")
+        }
+    }
+}
 
 mod discovery {
     //! The `[discovery]` config section (ADR 0037 §2).
@@ -287,6 +378,22 @@ pub(crate) struct Config {
     /// mTLS material for intra-cluster traffic (ADR 0011, day one). Required:
     /// there is no insecure fallback.
     pub(crate) tls: TlsConfig,
+
+    /// The public client listener's own serving posture (ADR 0037 §4).
+    /// **Required** — an absent section is the "neither mode configured"
+    /// error, not a default. Optional to *serde* only so that error can name
+    /// both options instead of reading "missing field `client_tls`"; every
+    /// reader goes through [`Config::client_tls_posture`].
+    #[serde(default)]
+    client_tls: Option<ClientTlsConfig>,
+
+    /// How this installation enrolls for its own machine leaf when it has none
+    /// (ADR 0037 §4). Optional: a formed voter, or one whose material is
+    /// supplied by an external PKI, never enrolls. Parsed and validated here;
+    /// the convergence loop that acts on it lands in the next chunk.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) enrollment: Option<EnrollmentConfig>,
 
     /// SSO connection parameters, if this deployment uses SSO. `None` when
     /// the section is absent entirely. Only the *connection* shape lives
@@ -664,6 +771,15 @@ impl Config {
     ///
     /// Resolved from config alone so the `init` CLI, which never starts a
     /// daemon, reaches the same path the daemon binds.
+    /// The client listener's posture (ADR 0037 §4), or the error naming both
+    /// options — for an absent section as much as a half-configured one.
+    pub(crate) fn client_tls_posture(&self) -> Result<ClientTlsPosture> {
+        match &self.client_tls {
+            Some(section) => section.posture(),
+            None => Err(ClientTlsConfig::absent()),
+        }
+    }
+
     pub(crate) fn admin_socket_path(&self) -> PathBuf {
         self.listen
             .admin_socket
@@ -681,8 +797,10 @@ impl ResolvedConfig {
 
     /// Emit the fully-resolved effective configuration.
     ///
-    /// Safe to log in full: the file holds secrets by path reference only,
-    /// never inline material (ADR 0020), so there is nothing to redact.
+    /// Safe to log in full: secrets are held by path reference (ADR 0020) —
+    /// with one exception, the dev-only inline `[enrollment].token`, whose
+    /// `Secret` type redacts itself from every `Debug` rendering. A test
+    /// below holds this line: the rendered config must never contain a token.
     pub(crate) fn log_effective(&self) {
         tracing::info!(
             cluster_id = %self.config.cluster_id,
@@ -709,6 +827,18 @@ pub fn load(path: &Path, cli: CliOverrides) -> Result<ResolvedConfig> {
         .discovery
         .validate()
         .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    // Both postures are resolved at load, not at first use: a deployment that
+    // has not said whether its public listener is TLS or plainly insecure must
+    // fail before it binds anything (ADR 0037 §4), and an enrollment section
+    // pointed at an unverifiable endpoint must fail before it sends a token.
+    config
+        .client_tls_posture()
+        .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    if let Some(enrollment) = &config.enrollment {
+        enrollment
+            .validate()
+            .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    }
     let resolved_host = resolve_advertise_host(config.listen.advertise_host.as_deref())?;
     config.listen.advertise_host = Some(resolved_host);
     Ok(ResolvedConfig {
@@ -774,6 +904,14 @@ cert_path = "/etc/coppice/pki/node.crt"
 key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"
 
+[client_tls]
+cert_path = "/etc/coppice/pki/api.example.com.crt"
+key_path  = "/etc/coppice/pki/api.example.com.key"
+
+[enrollment]
+endpoint = "https://coord.batch.example.com:7070"
+token_path = "/etc/coppice/enroll-token"
+
 [sso]
 issuer = "https://sso.example.com/oidc"
 client_id = "coppice"
@@ -811,6 +949,9 @@ advertise_host = "coord-1.example.com"
 cert_path = "/etc/coppice/pki/node.crt"
 key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"
+
+[client_tls]
+insecure = true
 
 [discovery]
 backend = "static"
@@ -1238,5 +1379,143 @@ addrs = []
             coppice_tls::split_host_port(&config.listen.advertised_raft_addr()).expect("parses");
         assert_eq!(host, "2001:db8::1");
         assert_eq!(port, 7071);
+    }
+    // ---- [client_tls]: the public listener's posture (ADR 0037 §4) --------
+
+    #[test]
+    fn client_tls_paths_resolve_to_the_tls_posture() {
+        let (_guard, path) = write_config(FULL_EXAMPLE);
+        let config = read_config(&path).expect("full example parses");
+        assert_eq!(
+            config
+                .client_tls_posture()
+                .expect("cert + key is a posture"),
+            ClientTlsPosture::Tls {
+                cert: PathBuf::from("/etc/coppice/pki/api.example.com.crt"),
+                key: PathBuf::from("/etc/coppice/pki/api.example.com.key"),
+            }
+        );
+    }
+
+    #[test]
+    fn client_tls_insecure_resolves_to_the_plain_posture() {
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let config = read_config(&path).expect("minimal example parses");
+        assert_eq!(
+            config.client_tls_posture().expect("insecure is a posture"),
+            ClientTlsPosture::Insecure
+        );
+    }
+
+    /// Every way of not choosing — the table absent, empty, half-filled, or
+    /// claiming both modes — fails with a message naming both options.
+    #[test]
+    fn an_unstated_client_tls_posture_fails_naming_both_options() {
+        let without = MINIMAL_EXAMPLE.replace("[client_tls]\ninsecure = true\n", "");
+        let cases = [
+            ("absent", without.clone()),
+            ("empty", format!("{without}\n[client_tls]\n")),
+            (
+                "cert only",
+                format!("{without}\n[client_tls]\ncert_path = \"/x.crt\"\n"),
+            ),
+            (
+                "key only",
+                format!("{without}\n[client_tls]\nkey_path = \"/x.key\"\n"),
+            ),
+            (
+                "both modes",
+                format!(
+                    "{without}\n[client_tls]\ncert_path = \"/x.crt\"\nkey_path = \"/x.key\"\n\
+                     insecure = true\n"
+                ),
+            ),
+        ];
+        for (label, contents) in cases {
+            let (_guard, path) = write_config(&contents);
+            let err = match load(&path, CliOverrides::default()) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("{label}: an unstated posture must fail startup"),
+            };
+            assert!(err.contains("cert_path"), "{label}: {err}");
+            assert!(err.contains("key_path"), "{label}: {err}");
+            assert!(err.contains("insecure = true"), "{label}: {err}");
+        }
+    }
+
+    #[test]
+    fn enrollment_https_is_valid_and_http_needs_the_opt_in() {
+        let base = MINIMAL_EXAMPLE;
+
+        let https = format!(
+            "{base}\n[enrollment]\nendpoint = \"https://coord.example.com:7070\"\n\
+             token_path = \"/etc/coppice/enroll-token\"\n"
+        );
+        let (_guard, path) = write_config(&https);
+        load(&path, CliOverrides::default()).expect("an https endpoint needs no opt-in");
+
+        let http = format!(
+            "{base}\n[enrollment]\nendpoint = \"http://coord.example.com:7070\"\n\
+             token_path = \"/etc/coppice/enroll-token\"\n"
+        );
+        let (_guard, path) = write_config(&http);
+        let err = load(&path, CliOverrides::default())
+            .expect_err("plain http without the opt-in fails at startup");
+        let message = format!("{err:#}");
+        assert!(message.contains("insecure = true"), "{message}");
+
+        let opted_in = format!("{http}insecure = true\n");
+        let (_guard, path) = write_config(&opted_in);
+        load(&path, CliOverrides::default()).expect("the opt-in accepts plain http");
+    }
+
+    #[test]
+    fn enrollment_needs_exactly_one_token_form() {
+        let both = format!(
+            "{MINIMAL_EXAMPLE}\n[enrollment]\nendpoint = \"https://c:7070\"\n\
+             token = \"cpk_x\"\ntoken_path = \"/t\"\n"
+        );
+        let (_guard, path) = write_config(&both);
+        let err = load(&path, CliOverrides::default()).expect_err("both token forms is an error");
+        assert!(format!("{err:#}").contains("exactly one"), "{err:#}");
+
+        let neither = format!("{MINIMAL_EXAMPLE}\n[enrollment]\nendpoint = \"https://c:7070\"\n");
+        let (_guard, path) = write_config(&neither);
+        let err = load(&path, CliOverrides::default()).expect_err("no token is an error");
+        assert!(format!("{err:#}").contains("token_path"), "{err:#}");
+    }
+
+    /// The startup log renders the whole resolved config; an inline
+    /// enrollment token must never survive that rendering (ADR 0037 §4: the
+    /// token never appears in logs or traces).
+    #[test]
+    fn an_inline_enrollment_token_never_reaches_the_startup_log() {
+        let inline = format!(
+            "{MINIMAL_EXAMPLE}\n[enrollment]\nendpoint = \"https://c:7070\"\n\
+             token = \"cpk_inline_startup_secret\"\ninsecure = false\n"
+        );
+        let (_guard, path) = write_config(&inline);
+        let resolved = load(&path, CliOverrides::default()).expect("load");
+
+        let ((), rendered) = coppice_testkit::tracing_capture::capture(|| resolved.log_effective());
+        assert!(
+            rendered.contains("effective coordinator configuration"),
+            "the startup line was captured: {rendered}"
+        );
+        coppice_testkit::tracing_capture::assert_no_secret(&rendered, "cpk_");
+
+        // The same guarantee for ad-hoc Debug renderings of the config.
+        let debugged = format!("{:?}", resolved.into_config());
+        assert!(!debugged.contains("cpk_"), "{debugged}");
+        assert!(debugged.contains("redacted"), "{debugged}");
+    }
+
+    #[test]
+    fn an_absent_enrollment_section_is_fine() {
+        // A formed voter, or one whose material comes from an external PKI,
+        // never enrolls.
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let resolved = load(&path, CliOverrides::default()).expect("load");
+        assert!(resolved.config.enrollment.is_none());
     }
 }

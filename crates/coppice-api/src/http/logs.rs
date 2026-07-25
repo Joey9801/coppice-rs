@@ -821,6 +821,7 @@ mod tests {
             plane,
             crate::http::MetricsEndpoint::detached_for_tests(),
             crate::http::ReadyzEndpoint::detached_for_tests(),
+            crate::http::EnrollEndpoint::detached_for_tests(),
         );
         let response = router
             .oneshot(Request::get(uri).body(Body::empty()).unwrap())

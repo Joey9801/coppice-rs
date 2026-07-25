@@ -13,6 +13,8 @@ syntax = "proto3";
 
 package coppice.raft.v1;
 
+import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/pki.proto";
 import "coppice/raft/v1/raft.proto";
 
 // Add a coordinator to membership as a non-voting learner so it can catch
@@ -121,4 +123,111 @@ service RaftAdminService {
   // Answered in every daemon state, including parked and formation-failed
   // (ADR 0037 §3) — the one verb that is not gated on a formed cluster.
   rpc ProbeCluster(ProbeClusterRequest) returns (ProbeClusterResponse);
+
+  // Enrollment-token and identity administration (ADR 0037 §5), plus the
+  // leader-side halves of enrollment and coordinator renewal (§4). Every one
+  // is leader-only and served only once the cluster is formed.
+  rpc MintEnrollToken(MintEnrollTokenRequest) returns (MintEnrollTokenResponse);
+  rpc ListEnrollTokens(ListEnrollTokensRequest) returns (ListEnrollTokensResponse);
+  rpc RevokeEnrollToken(RevokeEnrollTokenRequest) returns (RevokeEnrollTokenResponse);
+  rpc RevokeIdentity(RevokeIdentityRequest) returns (RevokeIdentityResponse);
+  // A follower's internal proxy of `POST /api/v1/enroll` — never a redirect
+  // to a token-carrying client (ADR 0037 §4).
+  rpc ForwardEnroll(ForwardEnrollRequest) returns (ForwardEnrollResponse);
+  // Re-issue the caller's own coordinator leaf, authenticated by the current
+  // leaf it presented (ADR 0037 §4 renewal).
+  rpc RenewCoordinator(RenewCoordinatorRequest) returns (RenewCoordinatorResponse);
+}
+
+// ---- Enrollment tokens and identity revocation (ADR 0037 §5) -------------
+
+// Mint an enrollment token for one role. The secret is generated on the
+// leader, hashed into replicated policy, and returned in the response
+// EXACTLY ONCE — it is not recoverable afterwards and must never be logged.
+message MintEnrollTokenRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  coppice.core.v1.EnrollRole role = 8;
+  // A human label, unique per live token by convention; it is what
+  // `[[enroll_token]]` policy seeding keys idempotency on.
+  string label = 9;
+  // Time-to-live in seconds; absent = a token that never expires (the
+  // supported launch-template default, ADR 0037 §5).
+  optional uint64 ttl_seconds = 10;
+}
+
+message MintEnrollTokenResponse {
+  coppice.core.v1.EnrollTokenId token_id = 1;
+  // The bearer secret, returned once and never stored in the clear.
+  string secret = 2;
+  optional int64 expires_at_us = 3;
+}
+
+message ListEnrollTokensRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+}
+
+// One listed token. Deliberately carries NO hash: listing is an operator
+// inventory, not a credential export.
+message EnrollTokenSummary {
+  coppice.core.v1.EnrollTokenId token_id = 1;
+  coppice.core.v1.EnrollRole role = 2;
+  string label = 3;
+  int64 minted_at_us = 4;
+  optional int64 expires_at_us = 5;
+  bool revoked = 6;
+}
+
+message ListEnrollTokensResponse {
+  repeated EnrollTokenSummary tokens = 1; // ascending by token id.
+}
+
+message RevokeEnrollTokenRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  coppice.core.v1.EnrollTokenId token_id = 8;
+}
+
+message RevokeEnrollTokenResponse {}
+
+// Mark an issued identity revoked: the leader then refuses its renewals,
+// which with short leaf lifetimes is v1's revocation mechanism (ADR 0037 §5).
+message RevokeIdentityRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  coppice.core.v1.RevokedIdentity identity = 8;
+}
+
+message RevokeIdentityResponse {}
+
+// ---- Enrollment and renewal (ADR 0037 §4) --------------------------------
+
+// A follower's proxy of an enrollment request to the leader, where the CA key
+// lives. `token` is the enrollee's bearer secret in transit on an already
+// mutually-authenticated channel; like every other carrier of it, it must
+// never be logged.
+message ForwardEnrollRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  string token = 8;
+  string csr_pem = 9;
+  // The identity the enrollee claims: a node id for the agent role, a
+  // self-minted machine id for the coordinator role. The token's role decides
+  // which is required.
+  optional coppice.core.v1.NodeId node_id = 10;
+  optional coppice.core.v1.MachineId machine_id = 11;
+}
+
+message ForwardEnrollResponse {
+  string cert_pem = 1;
+  string ca_pem = 2;
+}
+
+// Renew the caller's own coordinator leaf. There is no subject field by
+// design: the subject comes from the verified client certificate the request
+// arrived on, so renewal cannot change identity (ADR 0037 §4).
+message RenewCoordinatorRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  string csr_pem = 8;
+}
+
+message RenewCoordinatorResponse {
+  string cert_pem = 1;
+  string ca_pem = 2;
 }

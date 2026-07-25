@@ -103,6 +103,8 @@ fn agent_config(
             key_path,
             ca_path,
         },
+        // The harness provisions the leaf directly; no enrollment.
+        enrollment: None,
         capacity: CapacityConfig {
             cpu_millis: 16_000,
             memory: ByteSize::from_gib(16),
@@ -445,6 +447,7 @@ async fn best_effort_job_logs_full_read_path() {
         plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
+        coppice_api::http::EnrollEndpoint::detached_for_tests(),
     );
 
     // -- 1. Content + order + `available`, in one ascending page. ----------
@@ -547,6 +550,7 @@ async fn best_effort_job_logs_full_read_path() {
         ),
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
+        coppice_api::http::EnrollEndpoint::detached_for_tests(),
     );
     let (status, body) = get_logs(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);
@@ -718,6 +722,7 @@ async fn follower_serves_job_logs_directly() {
         follower_plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
+        coppice_api::http::EnrollEndpoint::detached_for_tests(),
     );
 
     let applied_before = follower_a.views().latest().applied_index();

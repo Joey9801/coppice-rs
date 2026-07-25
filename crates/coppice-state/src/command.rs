@@ -55,6 +55,7 @@ pub enum Command {
     RevokeEnrollToken(RevokeEnrollToken),
     RevokeIdentity(RevokeIdentity),
     ConfirmKeyPossession(ConfirmKeyPossession),
+    RecordEnrolledIdentity(RecordEnrolledIdentity),
 }
 
 impl Command {
@@ -89,6 +90,7 @@ impl Command {
             Command::RevokeEnrollToken(c) => c.revoked_at,
             Command::RevokeIdentity(c) => c.revoked_at,
             Command::ConfirmKeyPossession(c) => c.confirmed_at,
+            Command::RecordEnrolledIdentity(c) => c.recorded_at,
         }
     }
 }
@@ -392,6 +394,20 @@ pub struct ConfirmKeyPossession {
     pub confirmed_at: Timestamp,
 }
 
+/// Record the replicated fact that a coordinator machine identity enrolled
+/// and received a leaf (ADR 0037 §4).
+///
+/// First write wins: a re-enrollment (or a replayed command) keeps the
+/// earliest `recorded_at`, so the record dates the identity's first
+/// admission rather than its latest certificate — unlike
+/// [`ConfirmKeyPossession`], where the freshest confirmation is the useful
+/// one. Re-apply is an accepted no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordEnrolledIdentity {
+    pub machine: MachineId,
+    pub recorded_at: Timestamp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +502,11 @@ mod tests {
             confirmed_at: ts(31),
         });
         assert_eq!(confirm.stamped_at(), ts(31));
+
+        let enrolled = Command::RecordEnrolledIdentity(RecordEnrolledIdentity {
+            machine: MachineId::new(),
+            recorded_at: ts(33),
+        });
+        assert_eq!(enrolled.stamped_at(), ts(33));
     }
 }

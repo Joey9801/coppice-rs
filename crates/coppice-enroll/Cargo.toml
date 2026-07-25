@@ -1,0 +1,34 @@
+[package]
+name = "coppice-enroll"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# The enrollment wire contract and client (ADR 0037 §4).
+#
+# The DTOs here are the single definition of `POST /api/v1/enroll`'s request
+# and response bodies: `coppice-api` serves them, and the client half of this
+# crate (used by the agent daemon and, from chunk 05, the coordinator
+# convergence loop) sends them — so the two sides can never drift.
+
+[dependencies]
+coppice-core = { workspace = true }
+coppice-tls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+# The posture matrix stands up real endpoints rather than mocking the client:
+# a throwaway CA and server certificates (rcgen) behind a rustls acceptor
+# (tokio-rustls), plus a byte-recording socket wrapper that proves an untrusted
+# endpoint never receives the token.
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+coppice-testkit = { workspace = true }
