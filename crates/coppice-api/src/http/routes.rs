@@ -30,6 +30,7 @@ use crate::{Consistency, ControlPlane};
 use super::error::HttpError;
 use super::extract::{IdPath, ReadIndexes, ReadQuery};
 use super::metrics::MetricsEndpoint;
+use super::readyz::ReadyzEndpoint;
 
 /// Build the client-listener router around a [`ControlPlane`] and the
 /// process's metrics endpoint (issue #46).
@@ -42,10 +43,46 @@ use super::metrics::MetricsEndpoint;
 /// outer [`fallback`](super::ui::fallback) with the full original path intact,
 /// so `/api/*` misses still answer the JSON 404 and everything else reaches the
 /// UI, exactly as before the nesting refactor.
-pub fn router<P: ControlPlane>(plane: Arc<P>, metrics: MetricsEndpoint) -> Router {
-    // The scrape handler captures its own `Arc<MetricsEndpoint>`, so it needs no
-    // router state and composes with the `Arc<P>` state the rest of the tree
-    // carries — it is merged in before `.with_state(plane)` closes the tree.
+pub fn router<P: ControlPlane>(
+    plane: Arc<P>,
+    metrics: MetricsEndpoint,
+    readyz: ReadyzEndpoint,
+) -> Router {
+    // The scrape and readiness handlers capture their own state, so they need
+    // no router state and compose with the `Arc<P>` state the rest of the tree
+    // carries — they are merged in before `.with_state(plane)` closes the tree.
+    operational_routes(metrics, readyz)
+        .nest("/api/v1", api_v1_routes::<P>())
+        // Everything unrouted: `/api/*` misses stay JSON 404s; anything
+        // else serves the embedded web UI (static assets + SPA fallback,
+        // ADR 0031 "Serving the UI").
+        .fallback(super::ui::fallback)
+        .with_state(plane)
+}
+
+/// The pre-formation client-listener router (ADR 0037 §3).
+///
+/// Until the `formation_complete` marker exists — a parked daemon, one
+/// mid-formation, one in `formation-failed` — the client API is **not
+/// served**: that closure is what confines a failed formation to the node
+/// that attempted it. What remains is exactly what an operator and their
+/// automation need to see the daemon and know why it is not ready:
+/// `/readyz` and `/metrics`. Everything else, `/api/v1` included, answers
+/// the JSON 404 through the same fallback the full router uses, so no
+/// client mistakes a parked daemon for a broken one.
+pub fn closed_router(metrics: MetricsEndpoint, readyz: ReadyzEndpoint) -> Router {
+    operational_routes(metrics, readyz).fallback(super::ui::fallback)
+}
+
+/// The two operational routes both surfaces carry: the Prometheus scrape
+/// target (issue #46) and the ADR 0037 §9 readiness gate. Neither is under
+/// `/api/v1` — they are not part of the JSON API — and neither touches the
+/// [`ControlPlane`], which is what lets a daemon with no consensus replica
+/// serve them.
+fn operational_routes<S: Clone + Send + Sync + 'static>(
+    metrics: MetricsEndpoint,
+    readyz: ReadyzEndpoint,
+) -> Router<S> {
     let metrics = Arc::new(metrics);
     Router::new()
         // Prometheus scrape target (issue #46): the `/metrics` render contract
@@ -57,12 +94,15 @@ pub fn router<P: ControlPlane>(plane: Arc<P>, metrics: MetricsEndpoint) -> Route
                 async move { metrics.render().await }
             }),
         )
-        .nest("/api/v1", api_v1_routes::<P>())
-        // Everything unrouted: `/api/*` misses stay JSON 404s; anything
-        // else serves the embedded web UI (static assets + SPA fallback,
-        // ADR 0031 "Serving the UI").
-        .fallback(super::ui::fallback)
-        .with_state(plane)
+        // Readiness (ADR 0037 §9): served in every daemon state, including
+        // parked and formation-failed.
+        .route(
+            "/readyz",
+            get(move || {
+                let readyz = readyz.clone();
+                async move { readyz.handle().await }
+            }),
+        )
 }
 
 /// The `/api/v1` route map (ADR 0031), nested under its prefix by [`router`].
@@ -570,7 +610,11 @@ mod tests {
     /// conflict. This shadows the crate [`super::router`] for the whole tests
     /// module so every existing call site stays a single `router(plane)`.
     fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
-        super::router(plane, crate::http::MetricsEndpoint::detached_for_tests())
+        super::router(
+            plane,
+            crate::http::MetricsEndpoint::detached_for_tests(),
+            crate::http::ReadyzEndpoint::detached_for_tests(),
+        )
     }
 
     /// A canned `ControlPlane`: submit echoes the request's job id with a

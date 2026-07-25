@@ -45,7 +45,9 @@ use std::path::Path;
 
 use coppice_consensus::fs::{Fs, FsFile, RealFs};
 use coppice_consensus::storage::raw::{self, ENTRY_OVERHEAD};
-use coppice_consensus::storage::{EncodedEntry, FrameLogId, StorageCore, StorageOptions};
+use coppice_consensus::storage::{
+    EncodedEntry, FormationMarks, FrameLogId, StorageCore, StorageOptions,
+};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 
 /// Representative size of one log entry's command payload.
@@ -189,7 +191,7 @@ fn bench_engine_append(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     let fs = RealFs::new(dir.path());
     let options = StorageOptions::new([0x13; 16]);
-    StorageCore::init(&fs, &options, 1, [0x14; 16]).expect("init");
+    StorageCore::init(&fs, &options, 1, [0x14; 16], FormationMarks::default()).expect("init");
     let mut core = StorageCore::open(fs, options).expect("open");
 
     // Shared across every group size and every sample: the index counter

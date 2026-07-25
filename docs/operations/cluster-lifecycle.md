@@ -118,16 +118,34 @@ SSH, SSM, cloud-init, or a test harness):
 ```
 uuidgen        # once; becomes the logical cluster_id in the shared config
                # (init separately mints the history id)
-coppice coordinator init [--policy policy.toml] [--operator-csr csr.pem]
+coppice coordinator init --config /etc/coppice/coordinator.toml \
+  [--policy policy.toml] [--operator-csr csr.pem] [--operator-cn NAME] \
+  [--out-dir /root/coppice-day0]
 ```
 
-The daemon runs a probe round as a double-init guard, stamps itself,
+`--config` is read only to find the socket — `<data_dir>/admin.sock`, or
+the explicit `[listen] admin_socket` — and never for a target or TLS
+material: there is nothing to authenticate to. Without `--operator-csr`
+the cluster mints the operator keypair and prints **both halves plus the
+CA bundle** to this terminal; that private key exists nowhere else, so
+collect it (or pass `--out-dir`, which writes `operator.crt`,
+`operator.key`, and `ca.crt` owner-only).
+
+The daemon runs a probe round as a double-init guard (its own address
+excluded), stamps itself,
 mints the cluster root CA, forms a single-voter cluster, applies the
 supplied bootstrap policy, signs (or mints) the first operator-profile
 certificate, prints it with the CA bundle, and stamps the
 `formation_complete` marker. Until the marker exists the daemon serves no
 enrollment, membership, or client traffic and does not answer probes as
 initialized — a partial formation can never acquire a second member.
+
+The guard **fails closed**: a daemon holding no TLS material cannot ask
+discovered candidates anything, and `init` refuses rather than treating
+"cannot probe" as "no cluster exists". A certless first formation is
+still one command — run it with an empty discovery seed set — and once
+enrollment lands, a parked daemon acquires a leaf before formation, so
+the guard runs as designed in every configuration.
 
 A crash anywhere in formation restarts into phase `formation-failed`:
 wipe that one data directory, restart the daemon (it parks), and re-run
@@ -213,6 +231,14 @@ No workflow reads logs. Per node:
 ```
 curl -s https://coord-1:7070/readyz          # 200 iff caught-up voter
 curl -s "https://coord-1:7070/readyz?require=healthy"   # 200 iff formed AND redundant
+```
+
+The same document is available on the local admin socket, which matters
+when the client listener is not being served at all — a parked daemon, or
+one in `formation-failed`:
+
+```
+coppice coordinator admin --config coordinator.toml status
 ```
 
 The JSON body carries `phase` (`waiting` | `formation-failed` |

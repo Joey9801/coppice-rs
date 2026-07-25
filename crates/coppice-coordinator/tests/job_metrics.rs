@@ -523,6 +523,7 @@ async fn best_effort_job_usage_full_read_path() {
     let router = coppice_api::http::router(
         plane,
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        coppice_api::http::ReadyzEndpoint::detached_for_tests(),
     );
 
     // -- 1. Exact round-trip, ascending default order, two `available`. ----
@@ -649,6 +650,7 @@ async fn best_effort_job_usage_full_read_path() {
                 .with_log_client(node_client2),
         ),
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        coppice_api::http::ReadyzEndpoint::detached_for_tests(),
     );
     let (status, body) = get_usage(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);

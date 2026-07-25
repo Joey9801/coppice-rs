@@ -88,6 +88,9 @@ pub struct StartedNode {
     /// The Raft transport service, ready to mount on the coordinator's mTLS
     /// server.
     pub transport: Server<RaftTransportHandler>,
+    /// Stamps the ADR 0037 §3 `formation_complete` marker through this
+    /// replica's open storage engine. Only the `init` path uses it.
+    pub formation: Arc<dyn storage::FormationStamp>,
 }
 
 /// A cheap, cloneable admin handle to the running node.
@@ -95,7 +98,7 @@ pub struct StartedNode {
 pub struct NodeHandle {
     raft: Raft<TypeConfig>,
     node_id: CoordinatorId,
-    #[allow(dead_code)]
+    instance_uuid: [u8; 16],
     history_id: [u8; 16],
     status: watch::Receiver<ConsensusStatus>,
 }
@@ -105,6 +108,48 @@ impl NodeHandle {
     /// directory's manifest stamp at start (ADR 0025).
     pub fn node_id(&self) -> CoordinatorId {
         self.node_id
+    }
+
+    /// The instance UUID stamped when this data directory was initialized
+    /// (ADR 0025), reported through `/readyz` (ADR 0037 §9).
+    pub fn instance_uuid(&self) -> [u8; 16] {
+        self.instance_uuid
+    }
+
+    /// The raft history this replica serves (ADR 0037 §3): minted at
+    /// formation, stamped in the manifest, and read back from it on resume.
+    /// The stamp is the authority — config carries only the logical
+    /// `cluster_id`, which deliberately survives a wipe-and-re-form while
+    /// this value does not.
+    pub fn history_id(&self) -> [u8; 16] {
+        self.history_id
+    }
+
+    /// Create the single-voter cluster this node is the sole member of
+    /// (ADR 0037 §3 step 4).
+    ///
+    /// Separated from [`start`]'s `--bootstrap` arm so the `init` path can
+    /// stamp its formation intent, mint the cluster CA, and open the store
+    /// *before* the history exists — and so a crash on either side of this
+    /// call is a distinguishable, testable point. Idempotent in the only way
+    /// that matters: a second call against an already-initialized raft is
+    /// refused by openraft and surfaces as [`NodeStartError::RefusedStart`].
+    pub async fn initialize_single_voter(
+        &self,
+        advertise_addr: String,
+    ) -> Result<(), NodeStartError> {
+        let members = BTreeMap::from([(
+            self.node_id,
+            BasicNode {
+                addr: advertise_addr,
+            },
+        )]);
+        self.raft.initialize(members).await.map_err(|e| match e {
+            RaftError::APIError(InitializeError::NotAllowed(_)) => NodeStartError::RefusedStart(
+                format!("refusing to form: this raft history is already initialized: {e}"),
+            ),
+            other => NodeStartError::Raft(format!("raft initialize failed: {other}")),
+        })
     }
 
     /// Shut the replica down (coordinator-runtime.md shutdown step 5): the apply
@@ -159,6 +204,7 @@ impl NodeHandle {
             snapshot_last_index: m.snapshot.map(|id| id.index),
             members,
             replication,
+            millis_since_quorum_ack: m.millis_since_quorum_ack,
         }
     }
 }
@@ -183,6 +229,11 @@ pub struct ClusterSummary {
     pub members: Vec<MemberSummary>,
     /// Per-follower matched index; empty when this node is not leader.
     pub replication: Vec<(CoordinatorId, u64)>,
+    /// For a leader, milliseconds since a quorum last acknowledged it
+    /// (openraft's leader-lease metric); `None` on non-leaders and on a
+    /// leader no quorum has acknowledged yet. The readiness gate uses it to
+    /// notice a leader that has lost its cluster (ADR 0037 §9).
+    pub millis_since_quorum_ack: Option<u64>,
 }
 
 /// One membership entry in a [`ClusterSummary`].
@@ -281,6 +332,10 @@ pub async fn start(
     // and rides out as `Storage`.
     let mut recovered = storage::open(fs, StorageOptions::new(history_id))?;
     let node_id = recovered.node_id;
+    let instance_uuid = recovered.instance_uuid;
+    // Taken before the stores move into openraft: formation's last step
+    // (ADR 0037 §3 step 7) stamps its marker through this same engine.
+    let formation = recovered.formation_stamp();
     let last_applied_index = recovered.last_applied.map(|id| id.index).unwrap_or(0);
 
     // Step 5: the publishing apply task. The recovered state moves into the
@@ -354,6 +409,7 @@ pub async fn start(
     let handle = NodeHandle {
         raft,
         node_id,
+        instance_uuid,
         history_id,
         status,
     };
@@ -364,6 +420,7 @@ pub async fn start(
         event_tap,
         handle,
         transport,
+        formation,
     })
 }
 

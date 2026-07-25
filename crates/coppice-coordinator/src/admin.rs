@@ -17,7 +17,7 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,39 +38,93 @@ const PROMOTE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 // Server side
 // ---------------------------------------------------------------------------
 
-/// Serves the membership admin RPCs over the local consensus seam (ADR 0016).
+/// Serves the membership admin RPCs over the local consensus seam (ADR 0016),
+/// plus `ProbeCluster` (ADR 0037 §3).
+///
+/// The service is mounted **before** a cluster exists, because a parked or
+/// fail-stopped daemon must still answer `ProbeCluster` — that is how a peer
+/// learns it is not the cluster, and how the closed pre-formation surface is
+/// visible without being joinable. Every membership verb is therefore gated
+/// on formation having completed: until then they are refused, which is the
+/// ADR's "membership verbs are refused" made concrete in one place.
+///
+/// Cheaply cloneable: the daemon keeps one handle to attach the consensus
+/// seam through and hands another to the mounted tonic server, so the service
+/// can be mounted before the thing it serves exists.
 pub struct AdminService<C: Consensus> {
+    inner: Arc<AdminInner<C>>,
+}
+
+impl<C: Consensus> Clone for AdminService<C> {
+    fn clone(&self) -> Self {
+        AdminService {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+struct AdminInner<C: Consensus> {
+    /// `None` until formation completes; the membership verbs need it.
+    seam: RwLock<Option<Seam<C>>>,
+    phase: Arc<crate::formation::PhaseState>,
+}
+
+/// The consensus-backed half of [`AdminService`], present only once formed.
+struct Seam<C: Consensus> {
     consensus: Arc<C>,
     handle: NodeHandle,
-    history_id: [u8; 16],
 }
 
 impl<C: Consensus> AdminService<C> {
-    /// Bind the service to the local consensus seam, admin handle, and this
-    /// node's stamped cluster identity.
-    pub fn new(consensus: Arc<C>, handle: NodeHandle, history_id: [u8; 16]) -> Self {
+    /// A service on a daemon with no cluster yet: `ProbeCluster` answers from
+    /// `phase`, every membership verb is refused.
+    pub(crate) fn unformed(phase: Arc<crate::formation::PhaseState>) -> Self {
         AdminService {
-            consensus,
-            handle,
-            history_id,
+            inner: Arc::new(AdminInner {
+                seam: RwLock::new(None),
+                phase,
+            }),
         }
     }
 
-    /// Refuse a request that is malformed or stamped for a different cluster
-    /// (ADR 0016), before any Raft state is touched.
-    fn check_cluster(&self, incoming: &[u8]) -> Result<(), Status> {
+    /// Attach the consensus seam once the cluster is formed. Called exactly
+    /// once per process, from the formation path or straight after a normal
+    /// start.
+    pub(crate) fn attach(&self, consensus: Arc<C>, handle: NodeHandle) {
+        *self.inner.seam.write().expect("admin seam lock") = Some(Seam { consensus, handle });
+    }
+
+    /// The consensus seam, or the ADR 0037 §3 refusal.
+    fn formed(&self) -> Result<(Arc<C>, NodeHandle), Status> {
+        match &*self.inner.seam.read().expect("admin seam lock") {
+            Some(seam) => Ok((Arc::clone(&seam.consensus), seam.handle.clone())),
+            None => Err(Status::failed_precondition(
+                "this coordinator has not formed a cluster: membership verbs are not served \
+                 until the formation_complete marker exists (ADR 0037 §3)",
+            )),
+        }
+    }
+
+    /// Refuse a request that is malformed or stamped for a different raft
+    /// history (ADR 0016), before any Raft state is touched.
+    ///
+    /// The expected value comes from the running replica's own stamp — for a
+    /// formed cluster that is the history `init` minted, which config cannot
+    /// derive (ADR 0037 §3) — so the check runs after [`formed`](Self::formed)
+    /// has produced a handle.
+    fn check_cluster(incoming: &[u8], handle: &NodeHandle) -> Result<(), Status> {
         if incoming.len() != 16 {
             return Err(Status::invalid_argument(format!(
                 "history_id must be 16 bytes, got {} (ADR 0016)",
                 incoming.len()
             )));
         }
-        if incoming != self.history_id {
+        if incoming != handle.history_id() {
             return Err(Status::failed_precondition(format!(
-                "request is from cluster {}, this node is stamped for cluster {} — \
+                "request is from history {}, this node is stamped for history {} — \
                  cross-cluster admin contact refused (ADR 0016)",
                 hex(incoming),
-                hex(&self.history_id),
+                hex(&handle.history_id()),
             )));
         }
         Ok(())
@@ -84,8 +138,9 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         request: Request<pb::AddLearnerRequest>,
     ) -> Result<Response<pb::AddLearnerResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.history_id)?;
-        self.consensus
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+        consensus
             .add_learner(req.node_id, req.address)
             .await
             .map_err(consensus_error_to_status)?;
@@ -97,8 +152,9 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         request: Request<pb::PromoteVoterRequest>,
     ) -> Result<Response<pb::PromoteVoterResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.history_id)?;
-        self.consensus
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+        consensus
             .promote_voter(req.promote_node_id, req.remove_node_id)
             .await
             .map_err(consensus_error_to_status)?;
@@ -110,8 +166,9 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         request: Request<pb::RemoveNodeRequest>,
     ) -> Result<Response<pb::RemoveNodeResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.history_id)?;
-        self.consensus
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+        consensus
             .remove_node(req.node_id)
             .await
             .map_err(consensus_error_to_status)?;
@@ -123,10 +180,38 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         request: Request<pb::ClusterStatusRequest>,
     ) -> Result<Response<pb::ClusterStatusResponse>, Status> {
         let req = request.into_inner();
-        self.check_cluster(&req.history_id)?;
+        let (_, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
         Ok(Response::new(cluster_summary_to_pb(
-            self.handle.cluster_summary(),
+            handle.cluster_summary(),
         )))
+    }
+
+    /// Answer a probe (ADR 0037 §3).
+    ///
+    /// Deliberately **not** gated on formation, and deliberately stamped with
+    /// the logical `cluster_id` rather than a history id: the caller is
+    /// typically a daemon with no stamp of its own yet. A mismatched
+    /// `cluster_id` is answered rather than refused — the prober asked "which
+    /// cluster are you?", and the honest answer to a stranger is this node's
+    /// own name, which the prober compares itself.
+    async fn probe_cluster(
+        &self,
+        _request: Request<pb::ProbeClusterRequest>,
+    ) -> Result<Response<pb::ProbeClusterResponse>, Status> {
+        let answer = self.inner.phase.probe();
+        Ok(Response::new(pb::ProbeClusterResponse {
+            cluster_id: answer.cluster_id,
+            history_id: answer.history_id,
+            initialized: answer.initialized,
+            node_id: answer.node_id,
+            leader_hint: answer.leader_hint,
+            voters: answer
+                .voters
+                .into_iter()
+                .map(|(node_id, address)| pb::ProbeVoter { node_id, address })
+                .collect(),
+        }))
     }
 }
 
@@ -362,6 +447,25 @@ fn status_to_anyhow(status: Status) -> anyhow::Error {
 /// Run one `admin` invocation: load config for TLS material and the default
 /// target, dial the admin surface, and execute the verb.
 pub async fn run_cli(args: AdminArgs) -> Result<()> {
+    // `issue-operator-cert` rides the local admin socket, not the network
+    // (ADR 0037 §3): it is the recovery for having lost the very credential
+    // the network path would authenticate with, and the CA key it signs from
+    // is on this host's disk. Dispatched before anything dials.
+    if let AdminVerb::IssueOperatorCert {
+        operator_csr,
+        operator_cn,
+        out_dir,
+    } = &args.verb
+    {
+        return crate::localadmin::run_issue_operator_cert(
+            &args.config,
+            operator_csr.as_deref(),
+            operator_cn.clone(),
+            out_dir.as_deref(),
+        )
+        .await;
+    }
+
     let resolved = config::load(&args.config, config::CliOverrides::default())
         .with_context(|| format!("reading config {}", args.config.display()))?;
     let cfg = &resolved.config;
@@ -391,12 +495,46 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
         }
     };
 
-    let history_id = *cfg.cluster_id.0.as_bytes();
     let ca = read_pem(&cfg.tls.ca_path)?;
     let cert = read_pem(&cfg.tls.cert_path)?;
     let key = read_pem(&cfg.tls.key_path)?;
 
     let mut client = admin_channel(&target, &ca, &cert, &key).await?;
+
+    // Learn the target's stamped history before any verb: a cluster formed
+    // by `coppice coordinator init` carries a history the config cannot
+    // derive (ADR 0037 §3 mints it), and every membership RPC cross-checks
+    // it. `ProbeCluster` is the verb that exists for exactly this — it
+    // matches on the logical `cluster_id` and answers with the history. A
+    // legacy cluster answers its config-derived value, so this also covers
+    // directories the `--bootstrap`/`--join` flags stamped.
+    let probe = client
+        .probe_cluster(pb::ProbeClusterRequest {
+            cluster_id: cfg.cluster_id.to_string(),
+        })
+        .await
+        .map_err(status_to_anyhow)?
+        .into_inner();
+    if probe.cluster_id != cfg.cluster_id.to_string() {
+        bail!(
+            "{target} serves cluster {:?}, this config names {:?} — wrong target or wrong \
+             config",
+            probe.cluster_id,
+            cfg.cluster_id.to_string(),
+        );
+    }
+    if !probe.initialized {
+        bail!(
+            "{target} has not formed a cluster (it is parked or mid-formation); membership \
+             verbs are served only once the formation_complete marker exists (ADR 0037 §3)"
+        );
+    }
+    let history_id: [u8; 16] = probe.history_id.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "{target} answered a malformed history id ({} bytes)",
+            probe.history_id.len()
+        )
+    })?;
 
     match args.verb {
         AdminVerb::AddLearner { node_id, addr } => {
@@ -422,6 +560,8 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
             let status = cluster_status(&mut client, history_id).await?;
             print!("{}", render_status(&status));
         }
+        // Dispatched above, before any network client was built.
+        AdminVerb::IssueOperatorCert { .. } => unreachable!("handled on the local socket"),
     }
     Ok(())
 }
@@ -561,6 +701,7 @@ mod tests {
                 },
             ],
             replication: vec![(1, 100), (3, 40)],
+            millis_since_quorum_ack: Some(0),
         };
 
         let pbm = cluster_summary_to_pb(summary);

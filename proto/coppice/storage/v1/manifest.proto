@@ -52,6 +52,18 @@ message Manifest {
   // Best-effort committed index, recorded at rotation, snapshot, and clean
   // shutdown. Recovery may replay past it; correctness never depends on it.
   optional uint64 committed_index = 8;
+
+  // The ADR 0037 §3 formation markers, written only by `coppice coordinator
+  // init`. Formation stamps the intent as its first durable act (step 2) and
+  // the completion marker as its last (step 7); a directory carrying an
+  // intent without a completion marker restarts into the `formation-failed`
+  // phase and is never resumed. Both absent on every directory formation did
+  // not create — a joiner's, and one stamped by the legacy `--bootstrap` /
+  // `--join` flags — which therefore restart normally.
+  //
+  // Unix microseconds, for the diagnostics the failed phase reports.
+  optional int64 formation_intent_at_us = 9;
+  optional int64 formation_complete_at_us = 10;
 }
 
 // One claimed log segment.

@@ -74,12 +74,56 @@ pub struct RunArgs {
     pub join: bool,
 }
 
-/// The top-level subcommands. Only `admin` exists, and it is hidden.
+/// The top-level subcommands: the one-per-cluster-lifetime `init` ceremony,
+/// and the hidden `admin` plumbing.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Form this cluster (ADR 0037 §3).
+    ///
+    /// Run exactly once per cluster lifetime, against a parked daemon on the
+    /// local machine. Formation is not a network verb: this talks to the
+    /// daemon's Unix socket in its data directory, and local access to that
+    /// socket is the authority. Re-running it against a formed cluster is
+    /// harmless and reports `already-initialized`, so automation may retry.
+    Init(InitArgs),
+
     /// Membership administration against a running cluster (ADR 0016).
     #[command(hide = true)]
     Admin(AdminArgs),
+}
+
+/// Arguments for `coppice coordinator init` (ADR 0037 §3).
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Path to the node configuration file — read for the data directory,
+    /// which is where the daemon's admin socket lives. No `--target` and no
+    /// TLS flags: the socket is local, and being able to open it *is* the
+    /// authorization.
+    #[arg(long)]
+    pub config: PathBuf,
+
+    /// Bootstrap policy TOML to apply as part of formation (ADR 0020):
+    /// priority multipliers and quota entities. Idempotent puts, so a re-run
+    /// against an already-seeded cluster changes nothing.
+    #[arg(long)]
+    pub policy: Option<PathBuf>,
+
+    /// A PEM certificate-signing request to sign into the first
+    /// operator-profile certificate (ADR 0022's break-glass credential).
+    /// Without one the cluster mints the keypair and prints both halves —
+    /// collect them from this terminal, they are not stored.
+    #[arg(long)]
+    pub operator_csr: Option<PathBuf>,
+
+    /// The common name the operator certificate carries.
+    #[arg(long)]
+    pub operator_cn: Option<String>,
+
+    /// Write the issued material to files under this directory
+    /// (`operator.crt`, `operator.key`, `ca.crt`) instead of printing the PEM
+    /// blocks to stdout.
+    #[arg(long)]
+    pub out_dir: Option<PathBuf>,
 }
 
 /// Common arguments plus the verb for an `admin` invocation.
@@ -143,6 +187,29 @@ pub enum AdminVerb {
 
     /// Print this coordinator's view of cluster state.
     Status,
+
+    /// Sign a new operator certificate on the local admin socket (ADR 0037
+    /// §3).
+    ///
+    /// The documented day-0 recovery for "the `init` output was lost" and for
+    /// "all operator certificates lost" — which is why it cannot be the
+    /// network path: that path authorizes with an existing operator
+    /// certificate, the very thing this recovers. It grants nothing local
+    /// disk access did not already confer, since the CA key is on this disk.
+    /// Unlike the other verbs here, `--target` does not apply.
+    IssueOperatorCert {
+        /// A PEM CSR to sign. Without one the cluster mints the keypair and
+        /// prints both halves.
+        #[arg(long)]
+        operator_csr: Option<PathBuf>,
+        /// The common name the certificate carries.
+        #[arg(long)]
+        operator_cn: Option<String>,
+        /// Write the issued material to files under this directory instead of
+        /// printing the PEM blocks to stdout.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
 }
 
 /// Parse a humane duration string (`"60s"`, `"2m"`) for `--wait`.

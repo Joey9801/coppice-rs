@@ -507,9 +507,10 @@ pub async fn run<C: Consensus>(
     listener: crate::bootstrap::ClientListener,
     control_plane: Arc<CoordinatorControlPlane<C>>,
     metrics: coppice_api::http::MetricsEndpoint,
+    readyz: coppice_api::http::ReadyzEndpoint,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let app = coppice_api::http::router(control_plane, metrics);
+    let app = coppice_api::http::router(control_plane, metrics, readyz);
     let graceful = async move {
         let _ = shutdown.wait_for(|s| *s).await;
     };
