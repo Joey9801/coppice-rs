@@ -619,9 +619,85 @@ pub(crate) async fn run_issue_operator_cert(
     }
 }
 
+/// `coppice coordinator admin local-status`: this daemon's own readiness
+/// document over the local socket (ADR 0037 §3/§9).
+///
+/// A verb of its own, distinct from `admin status`, because the two answer
+/// different questions with different stable JSON shapes: `status` is the
+/// *cluster's* membership/bindings document over the network, and this is
+/// the *daemon's* readiness document — the only status a parked or
+/// formation-failed daemon can serve, since there is no formed cluster
+/// behind the network verbs and possibly no TLS material to dial with. It
+/// therefore never touches the network path at all. The document is the same
+/// [`ReadyzReport`] `GET /readyz` serves; `--json` prints it verbatim (it is
+/// already the documented stable JSON of ADR 0037 §9), and the default
+/// renders the same fields as a human table.
+pub(crate) async fn run_status(config: &Path, json: bool) -> Result<()> {
+    let socket = socket_path(config)?;
+    let status = match call(&socket, AdminCall::Status).await? {
+        AdminReply::Status { status } => status,
+        AdminReply::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply to status: {other:?}"),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).context("encoding the status document")?
+        );
+    } else {
+        print!("{}", render_local_status(&status));
+    }
+    Ok(())
+}
+
+/// The human table for the local `status` verb: the readiness document's
+/// fields, one per line, `-` for the ones this phase does not have.
+fn render_local_status(s: &ReadyzReport) -> String {
+    use std::fmt::Write as _;
+    let opt = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
+
+    let mut out = String::new();
+    let _ = writeln!(out, "phase         {}", phase_name(s));
+    let _ = writeln!(out, "cluster       {}", s.cluster_id);
+    let _ = writeln!(out, "history       {}", opt(s.history_id.clone()));
+    let _ = writeln!(
+        out,
+        "node          {}",
+        opt(s.node_id.map(|n| n.to_string()))
+    );
+    let leader = match s.leader {
+        Some(id) if s.is_leader => format!("{id} (this node)"),
+        Some(id) => id.to_string(),
+        None => "-".to_string(),
+    };
+    let _ = writeln!(out, "leader        {leader}");
+    let _ = writeln!(out, "applied       {}", s.applied_index);
+    let _ = writeln!(out, "committed     {}", s.committed_index);
+    let _ = writeln!(out, "lag           {}", s.replication_lag);
+    let _ = writeln!(
+        out,
+        "formed        {} ({}/{} voters)",
+        s.formed,
+        s.voters.len(),
+        s.cluster_size
+    );
+    for voter in &s.voters {
+        let _ = writeln!(out, "  voter {:<6} {}", voter.node_id, voter.address);
+    }
+    if let Some(refusal) = &s.last_admission_refusal {
+        let _ = writeln!(out, "last admission refusal:");
+        let _ = writeln!(out, "  {refusal}");
+    }
+    if let Some(reason) = &s.reason {
+        let _ = writeln!(out, "note: {reason}");
+    }
+    out
+}
+
 /// The admin socket a config file's daemon serves on.
 fn socket_path(config: &Path) -> Result<PathBuf> {
-    let resolved = crate::config::load(config, crate::config::CliOverrides::default())
+    let resolved = crate::config::load(config)
         .with_context(|| format!("reading config {}", config.display()))?;
     Ok(resolved.config.admin_socket_path())
 }

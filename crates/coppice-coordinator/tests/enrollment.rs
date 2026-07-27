@@ -14,7 +14,6 @@
 
 mod common;
 
-use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::id::ClusterId;
 use coppice_core::id::{MachineId, NodeId};
@@ -24,16 +23,11 @@ use coppice_tls::pki;
 
 use common::{Ca, Daemon};
 
-const PARKED: CliOverrides = CliOverrides {
-    bootstrap: false,
-    join: false,
-};
-
 /// A formed, certless single-node cluster plus the operator credential `init`
 /// printed — the two things every test here starts from.
 async fn formed(ca: &Ca) -> (Daemon, OperatorPem) {
     let mut daemon = Daemon::new_certless(ClusterId::new(), ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
     let reply = daemon
         .admin(AdminCall::Init {
@@ -215,6 +209,7 @@ async fn a_revoked_token_no_longer_enrolls() {
             csr_pem: String::from_utf8(csr.clone()).unwrap(),
             node_id: Some(NodeId::new().into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect("a live token enrolls");
@@ -235,6 +230,7 @@ async fn a_revoked_token_no_longer_enrolls() {
             csr_pem: String::from_utf8(csr.clone()).unwrap(),
             node_id: Some(NodeId::new().into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect_err("a revoked token is refused");
@@ -245,6 +241,7 @@ async fn a_revoked_token_no_longer_enrolls() {
             csr_pem: String::from_utf8(csr).unwrap(),
             node_id: Some(NodeId::new().into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect_err("an unknown token is refused");
@@ -291,6 +288,7 @@ async fn an_agent_token_issues_a_node_leaf_and_writes_no_state() {
             csr_pem: String::from_utf8(csr_pem).unwrap(),
             node_id: Some(node.into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect("enroll")
@@ -329,6 +327,7 @@ async fn an_agent_token_cannot_enroll_a_coordinator_identity() {
             csr_pem: String::from_utf8(csr).unwrap(),
             node_id: None,
             machine_id: Some(MachineId::new().into()),
+            sans: Vec::new(),
         })
         .await
         .expect_err("an agent token cannot mint a coordinator leaf");
@@ -361,6 +360,7 @@ async fn a_coordinator_token_issues_a_machine_leaf_and_records_the_enrollment() 
             csr_pem: String::from_utf8(csr.clone()).unwrap(),
             node_id: None,
             machine_id: Some(machine.into()),
+            sans: Vec::new(),
         })
         .await
         .expect("enroll")
@@ -379,6 +379,7 @@ async fn a_coordinator_token_issues_a_machine_leaf_and_records_the_enrollment() 
             csr_pem: String::from_utf8(csr).unwrap(),
             node_id: None,
             machine_id: Some(machine.into()),
+            sans: Vec::new(),
         })
         .await
         .expect("re-enrollment is accepted");
@@ -423,6 +424,7 @@ async fn a_coordinator_renews_its_own_leaf_and_keeps_its_subject() {
         .renew_coordinator(pb::RenewCoordinatorRequest {
             history_id: history_id.clone(),
             csr_pem: String::from_utf8(csr).unwrap(),
+            sans: Vec::new(),
         })
         .await
         .expect("renew")
@@ -455,6 +457,7 @@ async fn an_operator_certificate_cannot_renew_a_coordinator_identity() {
         .renew_coordinator(pb::RenewCoordinatorRequest {
             history_id,
             csr_pem: String::from_utf8(csr).unwrap(),
+            sans: Vec::new(),
         })
         .await
         .expect_err("an operator leaf is not a coordinator identity");
@@ -495,6 +498,7 @@ async fn a_revoked_coordinator_is_refused_renewal() {
         .renew_coordinator(pb::RenewCoordinatorRequest {
             history_id,
             csr_pem: String::from_utf8(csr).unwrap(),
+            sans: Vec::new(),
         })
         .await
         .expect_err("a revoked identity is refused renewal");
@@ -524,6 +528,7 @@ async fn an_agent_enrolls_then_renews_over_the_session_plane_until_revoked() {
             csr_pem: String::from_utf8(csr).unwrap(),
             node_id: Some(node.into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect("enroll")
@@ -598,6 +603,7 @@ async fn the_agent_runner_rewrites_its_leaf_files_and_rearms_the_store() {
             csr_pem: String::from_utf8(csr).unwrap(),
             node_id: Some(node.into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect("enroll")
@@ -764,6 +770,7 @@ async fn a_revoked_leader_refuses_to_renew_itself_locally() {
         &rc.data_dir,
         rc.consensus().as_ref(),
         &rc.handle,
+        None,
     )
     .await
     .expect("an unrevoked leader renews itself");
@@ -789,6 +796,7 @@ async fn a_revoked_leader_refuses_to_renew_itself_locally() {
         &rc.data_dir,
         rc.consensus().as_ref(),
         &rc.handle,
+        None,
     )
     .await
     .expect_err("a revoked leader must not renew itself locally (ADR 0037 §5)");
@@ -839,6 +847,7 @@ async fn a_revoked_identity_cannot_re_enroll_under_either_role() {
             csr_pem: String::from_utf8(csr.clone()).unwrap(),
             node_id: Some(node.into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect("the agent subject enrolls while unrevoked");
@@ -849,6 +858,7 @@ async fn a_revoked_identity_cannot_re_enroll_under_either_role() {
             csr_pem: String::from_utf8(csr.clone()).unwrap(),
             node_id: None,
             machine_id: Some(machine.into()),
+            sans: Vec::new(),
         })
         .await
         .expect("the coordinator subject enrolls while unrevoked");
@@ -879,6 +889,7 @@ async fn a_revoked_identity_cannot_re_enroll_under_either_role() {
             csr_pem: String::from_utf8(csr2.clone()).unwrap(),
             node_id: Some(node.into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect_err("a revoked node cannot re-enroll (ADR 0037 §5)");
@@ -889,6 +900,7 @@ async fn a_revoked_identity_cannot_re_enroll_under_either_role() {
             csr_pem: String::from_utf8(csr2.clone()).unwrap(),
             node_id: None,
             machine_id: Some(machine.into()),
+            sans: Vec::new(),
         })
         .await
         .expect_err("a revoked machine cannot re-enroll (ADR 0037 §5)");
@@ -899,6 +911,7 @@ async fn a_revoked_identity_cannot_re_enroll_under_either_role() {
             csr_pem: String::from_utf8(csr2).unwrap(),
             node_id: Some(NodeId::new().into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect_err("an unknown token is refused");
@@ -918,6 +931,7 @@ async fn a_revoked_identity_cannot_re_enroll_under_either_role() {
             csr_pem: String::from_utf8(csr3).unwrap(),
             node_id: Some(NodeId::new().into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect("an unrevoked subject still enrolls");

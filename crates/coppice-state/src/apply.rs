@@ -21,9 +21,9 @@ use coppice_core::time::{Duration, Timestamp};
 use crate::command::{
     AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
     ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, MintEnrollToken,
-    Placement, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RecordCaCertificate, RecordEnrolledIdentity, RegisterNode, RevokeEnrollToken, RevokeIdentity,
-    SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
+    RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RegisterNode,
+    RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -64,6 +64,7 @@ impl StateMachine {
             Command::RevokeIdentity(c) => self.revoke_identity(c),
             Command::ConfirmKeyPossession(c) => self.confirm_key_possession(c),
             Command::RecordEnrolledIdentity(c) => self.record_enrolled_identity(c),
+            Command::RebindMachineAddress(c) => self.rebind_machine_address(c),
         };
         self.version += 1;
         result
@@ -1049,6 +1050,26 @@ impl StateMachine {
         // Re-confirmation overwrites the timestamp (ADR 0037 §4).
         self.key_confirmations
             .insert(c.raft_node_id, c.confirmed_at);
+        Ok(Applied::default())
+    }
+
+    fn rebind_machine_address(&mut self, c: &RebindMachineAddress) -> ApplyResult {
+        // Repoints only, never creates (ADR 0037 §6): a seat with no binding
+        // has nothing to verify a new endpoint against, and admission — not
+        // this operator break-glass — is what creates bindings.
+        let Some(machine) = self.machine_for_raft_node(c.raft_node_id).copied() else {
+            return Err(RejectionReason::UnknownMachineBinding {
+                raft_node_id: c.raft_node_id,
+            });
+        };
+        let binding = self
+            .machine_bindings
+            .get_mut(&machine)
+            .expect("machine_for_raft_node answered from machine_bindings");
+        // Setting the same address again is the exact-replay no-op the
+        // command contract promises; `bound_at` stays the original admission
+        // instant either way, because the fact it dates is the binding.
+        binding.address = c.address.clone();
         Ok(Applied::default())
     }
 

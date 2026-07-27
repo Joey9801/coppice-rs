@@ -1,12 +1,18 @@
 //! The coordinator command-line surface (ADR 0020).
 //!
-//! Deliberately tiny: the default invocation takes `--config` plus the ADR
-//! 0016 startup-intent flags (`--bootstrap` / `--join`), and everything else
-//! resolves file-over-default inside [`crate::config`]. A single hidden `admin`
-//! subcommand carries the membership operations an operator runs against a
-//! live cluster (ADR 0016) — hidden because it is plumbing for
-//! runbooks/automation, not part of the daemon's day-to-day surface. The
-//! `coppice` binary mounts this surface as the `coordinator` subcommand.
+//! Deliberately tiny: the default invocation takes `--config` and nothing
+//! else. There are no startup-intent flags — ADR 0037 §1 is "one command,
+//! derived intent": what a daemon does at boot is read from what is on its
+//! disk (a stamped manifest resumes; a formation intent without its completion
+//! marker fail-stops; an empty directory converges or parks), never from an
+//! operator remembering which flag this machine needs. Everything else
+//! resolves file-over-default inside [`crate::config`].
+//!
+//! A single hidden `admin` subcommand carries the membership operations an
+//! operator runs against a live cluster (ADR 0016/0037 §7) — hidden because it
+//! is plumbing for runbooks and automation, not part of the daemon's
+//! day-to-day surface. The `coppice` binary mounts this surface as the
+//! `coordinator` subcommand.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,17 +41,13 @@ pub struct Cli {
 
     /// Path to the node configuration file (ADR 0020). Required on the default
     /// run path; negated when a subcommand is present.
+    ///
+    /// The only run-path argument there is. Startup intent is derived from the
+    /// data directory, not declared here (ADR 0037 §1), so every coordinator
+    /// in a fleet is launched by a byte-identical command line — which is what
+    /// lets one launch template serve founders, joiners and restarts alike.
     #[arg(long, required = true)]
     pub config: Option<PathBuf>,
-
-    /// This is the first coordinator of a brand-new cluster (ADR 0016).
-    #[arg(long)]
-    pub bootstrap: bool,
-
-    /// This is a fresh replacement replica joining an existing cluster
-    /// (ADR 0016). Mutually exclusive with `--bootstrap`.
-    #[arg(long, conflicts_with = "bootstrap")]
-    pub join: bool,
 }
 
 impl Cli {
@@ -57,21 +59,20 @@ impl Cli {
     pub fn run_args(self) -> RunArgs {
         RunArgs {
             config: self.config.expect("--config is required on the run path"),
-            bootstrap: self.bootstrap,
-            join: self.join,
         }
     }
 }
 
 /// The resolved arguments for the default (run-a-replica) invocation.
+///
+/// One field, and that is the design: ADR 0037 §1 removed `--bootstrap` and
+/// `--join` outright rather than defaulting them, because a startup intent
+/// that config can express is a startup intent an operator can get wrong on
+/// the one machine that matters.
 #[derive(Debug, Clone)]
 pub struct RunArgs {
     /// Path to the node configuration file (ADR 0020).
     pub config: PathBuf,
-    /// First coordinator of a brand-new cluster (ADR 0016).
-    pub bootstrap: bool,
-    /// Fresh replacement replica joining an existing cluster (ADR 0016).
-    pub join: bool,
 }
 
 /// The top-level subcommands: the one-per-cluster-lifetime `init` ceremony,
@@ -178,15 +179,68 @@ pub enum AdminVerb {
         wait: Duration,
     },
 
-    /// Remove a node from membership entirely.
+    /// Remove a node from membership entirely. Operator credential only
+    /// (ADR 0037 §7): removal is the one membership change that can shrink a
+    /// quorum, so no machine certificate may reach it.
     Remove {
         /// The node to remove.
         #[arg(long)]
         node_id: u64,
     },
 
-    /// Print this coordinator's view of cluster state.
-    Status,
+    /// Repoint an existing member's dial address (ADR 0037 §6).
+    ///
+    /// Operator-credential break-glass for the pet deployment whose address
+    /// moved. There is deliberately no self-service form: a wrong address can
+    /// split-brain a raft, and under the immutable model an instance whose
+    /// address changed is simply a new instance. The leader commits only after
+    /// dialing the *new* address and confirming both that its serving
+    /// certificate carries the machine identity already bound to this seat and
+    /// that `ProbeCluster` there reports this node id.
+    SetAddress {
+        /// The member to repoint. Must already be in membership — this verb
+        /// never creates a seat.
+        #[arg(long)]
+        node_id: u64,
+        /// The `host:port` peers should dial instead.
+        #[arg(long)]
+        addr: String,
+    },
+
+    /// Print cluster-wide status (ADR 0037 §9).
+    ///
+    /// Always the *cluster's* view — membership with roles, machine-identity
+    /// bindings, replication and health — never this daemon's local readiness
+    /// document (that is `local-status`). Without `--target` the first
+    /// candidate from the config's `[discovery]` backend is dialed, exactly
+    /// as for the other network verbs; either way, if the answering replica
+    /// is a follower the CLI re-dials the leader it names once, so the
+    /// rendered document carries the leader-only fields (health, per-follower
+    /// lag) whenever a leader is reachable.
+    Status {
+        /// Emit the stable JSON of ADR 0037 §9 instead of the human table:
+        /// membership with roles and machine-identity bindings, per-follower
+        /// replication lag and health (leader-only; `null`, never fabricated,
+        /// when no leader answered), and leadership. This is the scripting
+        /// surface; the table is for people.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print this daemon's own readiness document over the local admin
+    /// socket (ADR 0037 §3/§9).
+    ///
+    /// The `GET /readyz` body, without needing the client listener — the only
+    /// status a parked or formation-failed daemon can serve, which is exactly
+    /// when an operator most needs one. Like `issue-operator-cert`, this
+    /// rides the Unix socket in the daemon's data directory; `--target` does
+    /// not apply.
+    LocalStatus {
+        /// Print the readiness document verbatim as JSON (it is already the
+        /// documented stable shape of ADR 0037 §9) instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Sign a new operator certificate on the local admin socket (ADR 0037
     /// §3).
@@ -325,21 +379,13 @@ mod tests {
     }
 
     #[test]
-    fn default_run_requires_config() {
-        let cli = parse(&[
-            "coppice-coordinator",
-            "--config",
-            "/etc/c.toml",
-            "--bootstrap",
-        ]);
+    fn default_run_takes_only_config() {
+        let cli = parse(&["coppice-coordinator", "--config", "/etc/c.toml"]);
         assert!(cli.command.is_none());
         assert_eq!(cli.config, Some(PathBuf::from("/etc/c.toml")));
-        assert!(cli.bootstrap);
-        assert!(!cli.join);
         // The run-path extraction yields the same config.
         let run = cli.run_args();
         assert_eq!(run.config, PathBuf::from("/etc/c.toml"));
-        assert!(run.bootstrap);
     }
 
     #[test]
@@ -347,16 +393,19 @@ mod tests {
         assert!(Cli::try_parse_from(["coppice-coordinator"]).is_err());
     }
 
+    /// ADR 0037 §1: startup intent is derived from the data directory, so the
+    /// flags that used to declare it are gone — and gone loudly, because a
+    /// launch template still passing `--bootstrap` must fail to start rather
+    /// than silently mean something new.
     #[test]
-    fn bootstrap_and_join_conflict() {
-        assert!(Cli::try_parse_from([
-            "coppice-coordinator",
-            "--config",
-            "/etc/c.toml",
-            "--bootstrap",
-            "--join",
-        ])
-        .is_err());
+    fn the_removed_intent_flags_are_rejected() {
+        for flag in ["--bootstrap", "--join"] {
+            assert!(
+                Cli::try_parse_from(["coppice-coordinator", "--config", "/etc/c.toml", flag])
+                    .is_err(),
+                "{flag} must no longer parse"
+            );
+        }
     }
 
     #[test]
@@ -467,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_status_parses() {
+    fn admin_status_defaults_to_the_human_table() {
         let cli = parse(&[
             "coppice-coordinator",
             "admin",
@@ -478,7 +527,80 @@ mod tests {
         let Some(Command::Admin(a)) = cli.command else {
             panic!("expected admin subcommand");
         };
-        assert!(matches!(a.verb, AdminVerb::Status));
+        assert!(matches!(a.verb, AdminVerb::Status { json: false }));
+    }
+
+    #[test]
+    fn admin_status_json_parses() {
+        let cli = parse(&[
+            "coppice-coordinator",
+            "admin",
+            "--config",
+            "/etc/c.toml",
+            "status",
+            "--json",
+        ]);
+        let Some(Command::Admin(a)) = cli.command else {
+            panic!("expected admin subcommand");
+        };
+        assert!(matches!(a.verb, AdminVerb::Status { json: true }));
+    }
+
+    /// `local-status` is a distinct verb from `status`: one is the daemon's
+    /// own readiness document over the Unix socket, the other the cluster-wide
+    /// membership document — collapsing them is exactly the schema instability
+    /// ADR 0037 §9 forbids.
+    #[test]
+    fn admin_local_status_parses_as_its_own_verb() {
+        let cli = parse(&[
+            "coppice-coordinator",
+            "admin",
+            "--config",
+            "/etc/c.toml",
+            "local-status",
+        ]);
+        let Some(Command::Admin(a)) = cli.command else {
+            panic!("expected admin subcommand");
+        };
+        assert!(matches!(a.verb, AdminVerb::LocalStatus { json: false }));
+
+        let cli = parse(&[
+            "coppice-coordinator",
+            "admin",
+            "--config",
+            "/etc/c.toml",
+            "local-status",
+            "--json",
+        ]);
+        let Some(Command::Admin(a)) = cli.command else {
+            panic!("expected admin subcommand");
+        };
+        assert!(matches!(a.verb, AdminVerb::LocalStatus { json: true }));
+    }
+
+    #[test]
+    fn admin_set_address_parses() {
+        let cli = parse(&[
+            "coppice-coordinator",
+            "admin",
+            "--config",
+            "/etc/c.toml",
+            "set-address",
+            "--node-id",
+            "3",
+            "--addr",
+            "coord-3:7071",
+        ]);
+        let Some(Command::Admin(a)) = cli.command else {
+            panic!("expected admin subcommand");
+        };
+        match a.verb {
+            AdminVerb::SetAddress { node_id, addr } => {
+                assert_eq!(node_id, 3);
+                assert_eq!(addr, "coord-3:7071");
+            }
+            other => panic!("wrong verb: {other:?}"),
+        }
     }
 
     #[test]

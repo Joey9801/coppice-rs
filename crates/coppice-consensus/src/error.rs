@@ -40,6 +40,40 @@ pub enum ConsensusError {
     #[error("learner is {lag} entries behind the promotion threshold")]
     LearnerNotCaughtUp { lag: u64 },
 
+    /// The verb named a node id membership has never heard of (ADR 0037 §6).
+    ///
+    /// Distinct from [`LearnerNotCaughtUp`](ConsensusError::LearnerNotCaughtUp)
+    /// on purpose: "promote a node that was never admitted" is an operator or
+    /// caller error that no amount of waiting fixes, and the convergence loop
+    /// must not poll on it.
+    #[error("node {node} is not in membership")]
+    UnknownNode { node: CoordinatorId },
+
+    /// An `AddLearner` named a node id already in membership at a *different*
+    /// address (ADR 0037 §6). There is no silent repointing: an instance whose
+    /// address changed is a new instance, and a deliberate move goes through
+    /// the operator-only `set-address` verb.
+    #[error(
+        "node {node} is already in membership at {current}; refusing to repoint it to \
+         {requested} (ADR 0037 §6 — there is no silent address repair)"
+    )]
+    AddressConflict {
+        node: CoordinatorId,
+        current: String,
+        requested: String,
+    },
+
+    /// The voter set is already at `cluster_size` and the candidate is not in
+    /// it (ADR 0037 §7). The learner stays a caught-up learner and keeps
+    /// polling; it is then either the `new_node_id` of a pending
+    /// ReplaceVoter or waiting on evidence-gated removal — both chunk 06.
+    #[error("voter set is full ({voters}/{cluster_size} voters); node {node} remains a learner")]
+    VoterSetFull {
+        node: CoordinatorId,
+        voters: usize,
+        cluster_size: usize,
+    },
+
     /// This handle's consensus node is shutting down; the operation will not
     /// complete and retrying against this handle will not help.
     #[error("consensus is shutting down")]
@@ -57,9 +91,13 @@ impl ConsensusError {
     /// Retryable errors resolve by redirecting ([`NotLeader`](ConsensusError::NotLeader)),
     /// waiting ([`Timeout`](ConsensusError::Timeout),
     /// [`MembershipInProgress`](ConsensusError::MembershipInProgress),
-    /// [`LearnerNotCaughtUp`](ConsensusError::LearnerNotCaughtUp)), or both.
+    /// [`LearnerNotCaughtUp`](ConsensusError::LearnerNotCaughtUp),
+    /// [`VoterSetFull`](ConsensusError::VoterSetFull)), or both.
     /// [`Shutdown`](ConsensusError::Shutdown) and [`Fatal`](ConsensusError::Fatal)
-    /// are terminal for this handle.
+    /// are terminal for this handle, and
+    /// [`UnknownNode`](ConsensusError::UnknownNode) /
+    /// [`AddressConflict`](ConsensusError::AddressConflict) are terminal-not-fatal
+    /// caller errors no amount of waiting fixes.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -67,6 +105,7 @@ impl ConsensusError {
                 | ConsensusError::Timeout
                 | ConsensusError::MembershipInProgress
                 | ConsensusError::LearnerNotCaughtUp { .. }
+                | ConsensusError::VoterSetFull { .. }
         )
     }
 }

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use coppice_core::id::ClusterId;
+use coppice_core::id::{ClusterId, MachineId, NodeId};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -32,8 +32,8 @@ use coppice_consensus::{
     ClusterSummary, Consensus, ConsensusStatus, NodeHandle, OpenraftConsensus, StateViews,
 };
 use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, ClientListener};
-use coppice_coordinator::config::{self, CliOverrides};
-use coppice_tls::{TlsPaths, TlsStore};
+use coppice_coordinator::config;
+use coppice_tls::{pki, TlsPaths, TlsStore};
 
 /// A hot-reload [`TlsStore`] over in-memory PEM material (ADR 0037 §4), the
 /// store-based equivalent of handing raw PEM slices to the old bind/new
@@ -111,11 +111,47 @@ impl Ca {
     /// SAN so a coordinator's id-pinned dial (TLS server-name = `node-<uuid>`)
     /// validates (ADR 0034).
     pub fn leaf_with_cn_and_sans(&self, cn: &str, extra_sans: &[String]) -> Leaf {
+        self.leaf_with_subject(cn, None, extra_sans)
+    }
+
+    /// Issue an **operator** leaf: `OU=coppice-operators` (ADR 0022), which is
+    /// the profile the admin surface's membership verbs require (ADR 0037 §7).
+    ///
+    /// [`Ca::leaf`] carries no `OU` at all, so the classifier reads it as an
+    /// agent leaf and then fails to parse its CN as a node id — correct, and
+    /// the reason a fixture that administers membership must ask for this one.
+    pub fn operator_leaf(&self) -> Leaf {
+        self.leaf_with_subject("coppice-test-operator", Some(pki::OPERATOR_OU), &[])
+    }
+
+    /// Issue a **coordinator machine** leaf: `OU=coppice-coordinator` with a
+    /// [`MachineId`] CN, which is what `verify_leaf` classifies as
+    /// `Profile::Coordinator` (ADR 0037 §4) and therefore what the §7 machine
+    /// self-service grant is keyed on. The refusal-matrix tests mint these to
+    /// present a machine identity of their choosing — one the cluster has
+    /// bound, or one it has never seen.
+    pub fn coordinator_leaf(&self, machine: &MachineId) -> Leaf {
+        self.leaf_with_subject(&machine.to_string(), Some(pki::COORDINATOR_OU), &[])
+    }
+
+    /// Issue an **agent** leaf: no `OU`, CN = a node id — classified as
+    /// `Profile::Agent`. Agents hold none of the membership surface (ADR 0037
+    /// §7), which is exactly what the refusal matrix asserts with one of these.
+    pub fn agent_leaf(&self, node: &NodeId) -> Leaf {
+        self.leaf_with_cn(&node.to_string())
+    }
+
+    fn leaf_with_subject(&self, cn: &str, ou: Option<&str>, extra_sans: &[String]) -> Leaf {
         let key = KeyPair::generate().expect("generate leaf key pair");
         let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
         sans.extend(extra_sans.iter().cloned());
         let mut params = CertificateParams::new(sans).expect("leaf params");
         params.distinguished_name.push(DnType::CommonName, cn);
+        if let Some(ou) = ou {
+            params
+                .distinguished_name
+                .push(DnType::OrganizationalUnitName, ou);
+        }
         params.extended_key_usages = vec![
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
@@ -156,6 +192,12 @@ pub struct Node {
     /// `localhost:PORT` — the address peers dial and admin tooling targets.
     pub advertise: String,
     pub cluster_id: ClusterId,
+    /// The machine identity this node's serving leaf presents, when it serves
+    /// a coordinator-profile leaf (the [`Node::new`] default). Dial-back
+    /// verification (ADR 0037 §6 step 3) classifies the serving certificate,
+    /// so an admissible fixture node must present one; `None` only for a node
+    /// built via [`Node::new_with_leaf`] around some other subject.
+    pub machine: Option<MachineId>,
     #[allow(dead_code)]
     dir: TempDir,
     config_path: PathBuf,
@@ -164,12 +206,39 @@ pub struct Node {
 
 impl Node {
     /// Lay down a fresh replica's tempdir (certs + config), without booting.
+    ///
+    /// The node serves a **coordinator-profile** leaf carrying a fresh machine
+    /// identity (ADR 0037 §4): admission dial-back-verifies the serving
+    /// certificate at a joiner's advertised address and binds the identity it
+    /// presents (§6/§7), so the default fixture must be an admissible one.
     pub fn new(id: u64, cluster_id: ClusterId, ca: &Ca) -> Node {
+        let machine = MachineId::new();
+        Node::with_leaf(
+            id,
+            cluster_id,
+            ca,
+            ca.coordinator_leaf(&machine),
+            Some(machine),
+        )
+    }
+
+    /// As [`Node::new`], but serving an explicit leaf — e.g. the profile-less
+    /// [`Ca::leaf`], for tests that need an endpoint whose serving certificate
+    /// classifies as no coordinator identity at all.
+    pub fn new_with_leaf(id: u64, cluster_id: ClusterId, ca: &Ca, leaf: Leaf) -> Node {
+        Node::with_leaf(id, cluster_id, ca, leaf, None)
+    }
+
+    fn with_leaf(
+        id: u64,
+        cluster_id: ClusterId,
+        ca: &Ca,
+        leaf: Leaf,
+        machine: Option<MachineId>,
+    ) -> Node {
         let port = free_port();
         let dir = tempfile::tempdir().expect("create node tempdir");
         let root = dir.path();
-
-        let leaf = ca.leaf();
         let cert_path = root.join("node.crt");
         let key_path = root.join("node.key");
         let ca_path = root.join("ca.crt");
@@ -226,6 +295,7 @@ log_level = "warn"
             port,
             advertise: format!("localhost:{port}"),
             cluster_id,
+            machine,
             dir,
             config_path,
             booted: None,
@@ -245,11 +315,32 @@ log_level = "warn"
     }
 
     /// Boot (or re-boot) this replica through the real config + bootstrap path.
-    pub async fn boot(&mut self, overrides: CliOverrides) {
+    ///
+    /// Intent is derived from the data directory (ADR 0037 §1): the first call
+    /// on a fresh `Node` forms a single-voter cluster, every later call after a
+    /// stop or kill resumes the instance the first one stamped.
+    pub async fn boot(&mut self) {
+        self.boot_with(bootstrap::bootstrap).await
+    }
+
+    /// Boot as a *joining* replica: same as [`Node::boot`] except that an empty
+    /// data directory mints a fresh learner-join instance instead of forming a
+    /// cluster. The fixture that calls this then adds the node through the
+    /// leader's `add_learner`, standing in for the convergence loop a real
+    /// daemon would run.
+    pub async fn boot_joining(&mut self) {
+        self.boot_with(bootstrap::bootstrap_joining).await
+    }
+
+    async fn boot_with<F, Fut>(&mut self, entry: F)
+    where
+        F: FnOnce(config::ResolvedConfig, Arc<TlsStore>) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<BootedCoordinator>>,
+    {
         assert!(self.booted.is_none(), "node {} already booted", self.id);
-        let resolved = config::load(&self.config_path, overrides)
+        let resolved = config::load(&self.config_path)
             .unwrap_or_else(|e| panic!("load config for node {}: {e:#}", self.id));
-        let booted = bootstrap::bootstrap(resolved, self.tls_store())
+        let booted = entry(resolved, self.tls_store())
             .await
             .unwrap_or_else(|e| panic!("bootstrap node {}: {e:#}", self.id));
         // Cache the minted/stamped raft identity: it survives kill/stop so
@@ -261,8 +352,8 @@ log_level = "warn"
     /// Boot expecting failure; returns the error for assertion (identity
     /// matrix). The success value is discarded so callers can `expect_err`
     /// without `BootedCoordinator: Debug`.
-    pub async fn try_boot(&self, overrides: CliOverrides) -> anyhow::Result<()> {
-        let resolved = config::load(&self.config_path, overrides)?;
+    pub async fn try_boot(&self) -> anyhow::Result<()> {
+        let resolved = config::load(&self.config_path)?;
         bootstrap::bootstrap(resolved, self.tls_store())
             .await
             .map(|_| ())
@@ -492,14 +583,7 @@ log_level = "warn"
         );
         std::fs::write(&config_path, toml).expect("write config");
 
-        let resolved = config::load(
-            &config_path,
-            CliOverrides {
-                bootstrap: true,
-                join: false,
-            },
-        )
-        .expect("load coordinator config");
+        let resolved = config::load(&config_path).expect("load coordinator config");
 
         // One shared hot-reload store for the raft/admin server and the agent
         // gateway (both reuse the node's identity, ADR 0011 / ADR 0037 §4).
@@ -649,6 +733,13 @@ pub struct Daemon {
 struct RunningDaemon {
     shutdown: watch::Sender<bool>,
     join: JoinHandle<anyhow::Result<()>>,
+    /// The daemon's own runtime. `run_with` and everything it spawns —
+    /// consensus core, listeners, the convergence loop — live here rather
+    /// than on the test's runtime, so that [`Daemon::kill`] can drop the lot
+    /// the way process death would: aborting one outer task would orphan the
+    /// inner ones, and an orphaned consensus core holds the storage `LOCK`
+    /// and the listen ports forever, wedging any restart.
+    runtime: tokio::runtime::Runtime,
 }
 
 impl Daemon {
@@ -751,18 +842,97 @@ log_level = "warn"
         std::fs::write(&self.config_path, updated).expect("write config");
     }
 
+    /// Switch this daemon to the `file` discovery backend (ADR 0037 §2),
+    /// enumerating `dir`.
+    ///
+    /// The backend a real fleet uses when it has no service discovery worth
+    /// the name: each daemon drops a run-scoped registration file naming its
+    /// raft address, and every other daemon reads the directory. It is also
+    /// the only backend under which N daemons can be given a *shape-identical*
+    /// config — no per-node seed list — which is what [`Fleet`] needs.
+    pub fn set_file_discovery(&self, dir: &std::path::Path) {
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        let updated = toml
+            .replace("backend = \"static\"", "backend = \"file\"")
+            .replace(
+                "[discovery.static]\naddrs = []",
+                &format!("[discovery.file]\ndir = \"{}\"", dir.display()),
+            );
+        assert_ne!(toml, updated, "no [discovery.static] block to rewrite");
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
+    /// Set `[discovery] cluster_size`, the expected voter count (ADR 0037 §2).
+    /// The fixture default is 1; anything that means to grow past a single
+    /// voter must raise it, or the leader's §7 ceiling refuses the promotion.
+    pub fn set_cluster_size(&self, size: usize) {
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        assert!(
+            toml.contains("cluster_size = 1"),
+            "no cluster_size line to rewrite"
+        );
+        let updated = toml.replace("cluster_size = 1", &format!("cluster_size = {size}"));
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
+    /// Give this daemon an `[enrollment]` block (ADR 0037 §4/§5): the cluster's
+    /// client-listener base URL and the token an operator minted. This is the
+    /// entire fleet-wide artifact — the thing every node in a fleet ships with,
+    /// identical — so a test that writes it is describing a real deployment.
+    ///
+    /// `insecure = true` because the fixture's client listener is plain HTTP.
+    pub fn set_enrollment(&self, endpoint: &str, token: &str) {
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        std::fs::write(
+            &self.config_path,
+            format!(
+                "{toml}\n[enrollment]\nendpoint = \"{endpoint}\"\ntoken = \"{token}\"\n\
+                 insecure = true\n"
+            ),
+        )
+        .expect("write config");
+    }
+
     /// Start (or restart) the daemon. Returns once `run_with` has been spawned;
     /// callers poll a surface to learn when it is serving.
-    pub fn start(&mut self, overrides: CliOverrides) {
+    ///
+    /// A boot failure is printed as it happens rather than only surfacing at
+    /// [`Daemon::stop`]. Without it a daemon that refuses to start is
+    /// indistinguishable from one that is merely slow — the caller is polling
+    /// a surface that will never come up, and the error that explains why sits
+    /// unread in a `JoinHandle` until the test has already failed on a
+    /// timeout. (The fail-stop tests still read the value from `stop`.)
+    pub fn start(&mut self) {
         assert!(self.running.is_none(), "daemon already running");
-        let resolved = config::load(&self.config_path, overrides).expect("load daemon config");
+        let resolved = config::load(&self.config_path).expect("load daemon config");
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let join = tokio::spawn(bootstrap::run_with(
-            resolved,
-            coppice_api::http::MetricsEndpoint::detached_for_tests(),
-            Some(shutdown_rx),
-        ));
-        self.running = Some(RunningDaemon { shutdown, join });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build the daemon's runtime");
+        let join = runtime.spawn(async move {
+            let out = bootstrap::run_with(
+                resolved,
+                coppice_api::http::MetricsEndpoint::detached_for_tests(),
+                Some(shutdown_rx),
+            )
+            .await;
+            if let Err(e) = &out {
+                eprintln!("daemon exited with an error: {e:#}");
+            }
+            out
+        });
+        self.running = Some(RunningDaemon {
+            shutdown,
+            join,
+            runtime,
+        });
+    }
+
+    /// Whether this daemon has been started and not yet stopped.
+    pub fn is_running(&self) -> bool {
+        self.running.is_some()
     }
 
     /// Stop the daemon and return what `run_with` returned — `Err` for the
@@ -770,11 +940,69 @@ log_level = "warn"
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         let running = self.running.take().expect("daemon is not running");
         let _ = running.shutdown.send(true);
-        running.join.await.expect("daemon task joined")
+        let out = running.join.await.expect("daemon task joined");
+        // Wind the daemon's runtime down without blocking the test's: the
+        // graceful path has already drained everything that matters.
+        running.runtime.shutdown_background();
+        out
+    }
+
+    /// Kill the daemon abruptly: no shutdown signal — the daemon's whole
+    /// runtime is torn down, so every task it spawned (listeners, consensus
+    /// core, the convergence loop) is dropped at whatever await it is parked
+    /// on, exactly as process death would drop them. This is the
+    /// crash-injection primitive: disk is left exactly as it was at the
+    /// moment of death, and a subsequent [`Daemon::start`] must converge from
+    /// it with no cleanup (ADR 0037 §6: `Restart=always` is the whole
+    /// recovery story). Resource release (the storage `LOCK`, the ports) is
+    /// asynchronous; a restart is preceded by [`Daemon::await_released`].
+    pub async fn kill(&mut self) {
+        let running = self.running.take().expect("daemon is not running");
+        running.runtime.shutdown_background();
+        let _ = running.join.await;
     }
 
     pub fn data_dir(&self) -> PathBuf {
         self.dir.path().join("data")
+    }
+
+    /// Wait until a killed daemon's resources are actually released.
+    ///
+    /// A real crash releases fds atomically with process death, but
+    /// [`Daemon::kill`] is in-process: aborting the `run_with` task leaves the
+    /// inner tasks it spawned (consensus core, listeners) to die as their
+    /// channels and `Arc`s drop, which takes a few scheduler ticks. Until
+    /// then the storage `LOCK` and the listen ports are still held, and an
+    /// immediate [`Daemon::start`] fail-stops on `EAGAIN`. Call this between
+    /// a kill and a restart; it changes nothing on disk.
+    pub async fn await_released(&self) {
+        use coppice_consensus::fs::Fs as _;
+        // Sequential rather than combined, so a timeout names the resource
+        // that is actually wedged.
+        poll(
+            Duration::from_secs(10),
+            "killed daemon releases its storage LOCK",
+            || async {
+                // Acquiring and dropping the advisory lock is the probe: it
+                // succeeds exactly when the orphaned storage core is gone.
+                coppice_consensus::fs::RealFs::new(self.data_dir())
+                    .lock(std::path::Path::new("LOCK"))
+                    .is_ok()
+            },
+        )
+        .await;
+        for (port, name) in [
+            (self.client_port, "client"),
+            (self.raft_port, "raft"),
+            (self.agent_port, "agent"),
+        ] {
+            poll(
+                Duration::from_secs(10),
+                &format!("killed daemon releases its {name} port"),
+                || async { TcpListener::bind(("127.0.0.1", port)).is_ok() },
+            )
+            .await;
+        }
     }
 
     pub fn admin_socket(&self) -> PathBuf {
@@ -793,6 +1021,17 @@ log_level = "warn"
     /// `localhost:PORT` for the agent session listener — what an agent dials.
     pub fn agent_target(&self) -> String {
         format!("localhost:{}", self.agent_port)
+    }
+
+    /// Write TLS material into this daemon's `[tls]` paths before it starts —
+    /// the state a certless daemon reaches by enrolling, laid down directly.
+    /// For tests whose subject is not enrollment: the daemon's first
+    /// convergence round finds a usable leaf and goes straight to probing.
+    pub fn install_tls_material(&self, ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) {
+        let root = self.dir.path();
+        std::fs::write(root.join("ca.crt"), ca_pem).expect("write ca");
+        std::fs::write(root.join("node.crt"), cert_pem).expect("write cert");
+        std::fs::write(root.join("node.key"), key_pem).expect("write key");
     }
 
     /// The `[tls]` paths this daemon serves from: a certless daemon's
@@ -860,11 +1099,18 @@ log_level = "warn"
     }
 
     /// Poll `/readyz` until it answers, returning `(status, body)`.
+    ///
+    /// The budget is generous because "the listener is not up yet" is a real
+    /// wait, not a failure: a replica restarting into a cluster that lost
+    /// quorum while it was down must first see an election complete, which
+    /// takes seconds, not milliseconds. Only a daemon that never serves at all
+    /// should fail here.
     pub async fn readyz(&self) -> (u16, serde_json::Value) {
         let client = reqwest::Client::new();
         let url = self.api("/readyz");
         let mut last = None;
-        for _ in 0..200 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
             match client.get(&url).send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -878,6 +1124,44 @@ log_level = "warn"
             }
         }
         panic!("/readyz never answered: {last:?}");
+    }
+
+    /// Set `[raft] health_stability_interval` (ADR 0037 §9), the window the
+    /// leader's full-redundancy condition must hold before `?require=healthy`
+    /// answers 200. The production default is 10s; a test that waits on the
+    /// gate shrinks it. Call before [`Daemon::start`].
+    pub fn set_health_stability(&self, interval: &str) {
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        let updated = toml.replace(
+            "[raft]\n",
+            &format!("[raft]\nhealth_stability_interval = \"{interval}\"\n"),
+        );
+        assert_ne!(toml, updated, "no [raft] section to rewrite");
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
+    /// Wait until `/readyz` reports any of `phases`, returning the body.
+    ///
+    /// The tight-poll counterpart of [`Daemon::await_phase`], for tests that
+    /// must *catch* a transient convergence phase (`joining`, `learner`)
+    /// rather than merely arrive at a terminal one: the poll interval is small
+    /// against the convergence loop's 300ms tick, so a phase that exists at
+    /// all is observed.
+    pub async fn await_phase_in(&self, phases: &[&str]) -> serde_json::Value {
+        // Generous: a parked daemon under full-suite load can spend most of
+        // its park backoff (up to 15s a round) before its first join tick.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (_, body) = self.readyz().await;
+            if phases.iter().any(|p| body["phase"] == *p) {
+                return body;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon never reached a phase in {phases:?}; last body: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Wait until `/readyz` reports `phase`, returning the body.
@@ -1076,4 +1360,157 @@ impl coppice_api::ControlPlane for NoopPlane {
 
 fn unattached() -> coppice_api::ApiError {
     coppice_api::ApiError::Unavailable("no control plane attached to this listener".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// A fleet of shape-identical daemons (ADR 0037 §1)
+// ---------------------------------------------------------------------------
+
+/// The enrollment secret every fleet config carries, seeded into the forming
+/// cluster by [`Fleet::seeding_policy`] (ADR 0037 §5).
+///
+/// Operator-chosen rather than cluster-minted, because that is what makes the
+/// configs identical *before* the cluster exists: the value is already in the
+/// launch template when node 1 forms. A cluster-minted token could only be
+/// distributed after formation, which would put a per-node step back into the
+/// flow this chunk exists to delete.
+pub const FLEET_TOKEN: &str = "cpk_fleet-launch-template-secret";
+
+/// N coordinator daemons whose configs differ only in the ports a single test
+/// process forces them to differ in — the ADR 0037 §1 launch-template shape.
+///
+/// Every member gets the `file` discovery backend over one shared registration
+/// directory, the same `cluster_size`, the same `[enrollment]` block naming the
+/// same endpoint and the same pre-baked token, and no seed list, no node id, no
+/// intent flag and no peer addresses. That is the whole point: if a test has to
+/// tell any member anything about any other member, the property under test has
+/// already been lost.
+///
+/// The intended shape is [`Fleet::start_all`] → [`Fleet::init`] on any one
+/// member → [`Fleet::await_voters`]. Nothing in between.
+pub struct Fleet {
+    /// Holds the shared discovery registration directory. Dropped last.
+    _dir: TempDir,
+    pub cluster_id: ClusterId,
+    pub members: Vec<Daemon>,
+}
+
+impl Fleet {
+    /// Lay down `size` shape-identical daemon configs without starting any.
+    ///
+    /// Every member is **certless** (ADR 0037 §4's minimal deployment): the
+    /// forming node mints its own material, and every other member enrolls for
+    /// its leaf through the convergence loop. Nothing is provisioned by hand,
+    /// which is the same reason the enrollment endpoint can be baked in before
+    /// the cluster exists — it is an address, not a credential.
+    pub fn new(size: usize, ca: &Ca) -> Fleet {
+        assert!(size > 0, "a fleet needs at least one member");
+        let dir = tempfile::tempdir().expect("create fleet tempdir");
+        let registry = dir.path().join("discovery");
+        std::fs::create_dir_all(&registry).expect("create the registration directory");
+
+        let cluster_id = ClusterId::new();
+        let members: Vec<Daemon> = (0..size)
+            .map(|_| Daemon::new_certless(cluster_id, ca))
+            .collect();
+
+        // One well-known enrollment endpoint for the whole fleet, standing in
+        // for the load-balanced name a real deployment bakes into its template.
+        // A real name fronts every member and answers from whichever ones are
+        // formed; a test process has no load balancer, so it names **member 0**
+        // — which is why member 0 is the member a fleet test `init`s (see
+        // [`Fleet::init`]). Member 0 pointing at itself is harmless: its own
+        // loop finds it already holds the leaf formation minted.
+        let endpoint = members[0].api("");
+        for member in &members {
+            member.set_file_discovery(&registry);
+            member.set_cluster_size(size);
+            member.set_enrollment(&endpoint, FLEET_TOKEN);
+        }
+
+        Fleet {
+            _dir: dir,
+            cluster_id,
+            members,
+        }
+    }
+
+    /// The `init --policy` document that seeds [`FLEET_TOKEN`], so the token
+    /// every config already carries becomes live the moment the cluster forms.
+    pub fn seeding_policy() -> String {
+        format!(
+            "[[enroll_token]]\nsecret = \"{FLEET_TOKEN}\"\nrole = \"coordinator\"\n\
+             label = \"coordinators\"\n"
+        )
+    }
+
+    /// Start every member. They all park: none of them can form, and none of
+    /// them has a cluster to find yet.
+    pub fn start_all(&mut self) {
+        for member in &mut self.members {
+            member.start();
+        }
+    }
+
+    /// Run `init` on member 0 — the single operator act in the whole lifecycle
+    /// (ADR 0037 §3) — seeding the fleet's enrollment token with it.
+    ///
+    /// Member 0 and not an arbitrary member only because it is the address
+    /// [`Fleet::new`] baked in as the enrollment endpoint, standing in for a
+    /// load-balanced name. Which member forms is not otherwise significant, and
+    /// nothing downstream of `init` treats it specially.
+    pub async fn init(&mut self) -> coppice_coordinator::localadmin::OperatorPem {
+        let index = 0;
+        let member = &mut self.members[index];
+        member.await_phase("waiting").await;
+        let reply = member
+            .admin(coppice_coordinator::localadmin::AdminCall::Init {
+                policy: Some(Fleet::seeding_policy()),
+                operator_csr: None,
+                operator_cn: Some("day0".to_string()),
+            })
+            .await;
+        match reply {
+            coppice_coordinator::localadmin::AdminReply::Formed { operator, .. } => operator,
+            other => panic!("expected member {index} to form the cluster, got {other:?}"),
+        }
+    }
+
+    /// Wait until every member reports `voter` and agrees the voter set has
+    /// `expected` members.
+    ///
+    /// Asserted from *every* member rather than the leader alone: a joiner that
+    /// believes itself a voter while the leader disagrees is exactly the
+    /// half-converged state this loop must not leave behind.
+    /// Both conditions are polled together, because reaching `voter` is not
+    /// reaching convergence: the member that formed the cluster is a voter one
+    /// instant after `init`, in a voter set of one, and asserting there would
+    /// pass before the fleet had done anything at all.
+    pub async fn await_voters(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for (i, member) in self.members.iter().enumerate() {
+            loop {
+                let (_, body) = member.readyz().await;
+                let voters = body["voters"].as_array().map(|v| v.len()).unwrap_or(0);
+                if body["phase"] == "voter" && voters == expected {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "member {i} never reached a {expected}-voter set: {body}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    /// Stop every member, ignoring the order — nothing here asserts on a
+    /// clean shutdown, which the lifecycle tests cover directly.
+    pub async fn stop_all(&mut self) {
+        for member in &mut self.members {
+            if member.is_running() {
+                let _ = member.stop().await;
+            }
+        }
+    }
 }

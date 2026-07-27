@@ -24,6 +24,11 @@ pub mod cli;
 // pre-formation and post-formation — and the integration suite drive it.
 pub mod clientedge;
 pub mod config;
+// The self-converging membership loop (ADR 0037 §1/§6): the parked half that
+// enrolls, discovers, probes, and joins, and the post-start half that carries
+// a started replica from learner to voter. Private: it is driven entirely
+// from `bootstrap`, and nothing outside this crate has a reason to hold one.
+mod convergence;
 // Coordinator discovery backends (ADR 0037 §2): the trait, the
 // static/dns/file/ec2-asg backends, and the file-registration helper. Public
 // because the trait and the run-scoped `FileRegistration` appear in

@@ -16,7 +16,6 @@
 
 mod common;
 
-use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::localadmin::{AdminCall, AdminReply};
 use coppice_core::id::{ClusterId, NodeId};
 use coppice_proto::pb::core::v1 as pbcore;
@@ -39,10 +38,7 @@ async fn no_enrollment_path_ever_logs_the_token_secret() {
 
     let ca = Ca::new();
     let mut daemon = Daemon::new_certless(ClusterId::new(), &ca);
-    daemon.start(CliOverrides {
-        bootstrap: false,
-        join: false,
-    });
+    daemon.start();
     daemon.await_phase("waiting").await;
     let reply = daemon
         .admin(AdminCall::Init {
@@ -96,6 +92,7 @@ async fn no_enrollment_path_ever_logs_the_token_secret() {
             csr_pem: String::from_utf8(csr.clone()).unwrap(),
             node_id: Some(NodeId::new().into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect("enroll");
@@ -110,6 +107,7 @@ async fn no_enrollment_path_ever_logs_the_token_secret() {
         token: None,
         node_id: Some(NodeId::new()),
         machine_id: None,
+        sans: Vec::new(),
     })
     .unwrap();
     let response = http
@@ -138,6 +136,7 @@ async fn no_enrollment_path_ever_logs_the_token_secret() {
             csr_pem: String::from_utf8(csr).unwrap(),
             node_id: Some(NodeId::new().into()),
             machine_id: None,
+            sans: Vec::new(),
         })
         .await
         .expect_err("a revoked token is refused");

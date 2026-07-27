@@ -551,6 +551,11 @@ pub enum RejectionReason {
         machine: MachineId,
         raft_node_id: u64,
     },
+    #[error(
+        "raft node {raft_node_id} carries no machine-identity binding; rebind repoints an \
+         existing binding, it never creates one (ADR 0037 §6)"
+    )]
+    UnknownMachineBinding { raft_node_id: u64 },
     #[error("enrollment token {0} already exists")]
     DuplicateEnrollToken(EnrollTokenId),
     #[error("enrollment token {0} not found")]

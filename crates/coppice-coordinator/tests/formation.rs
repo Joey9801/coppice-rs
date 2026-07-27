@@ -20,22 +20,11 @@ use std::time::Duration;
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::storage::{self, StorageOptions};
 use coppice_consensus::{NodeOptions, StartIntent};
-use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::id::ClusterId;
 use coppice_core::time::Timestamp;
 
 use common::{Ca, Daemon};
-
-const PARKED: CliOverrides = CliOverrides {
-    bootstrap: false,
-    join: false,
-};
-
-const BOOTSTRAPPED: CliOverrides = CliOverrides {
-    bootstrap: true,
-    join: false,
-};
 
 /// A bootstrap policy that seeds one quota entity — the cheapest thing whose
 /// arrival in replicated state is observable through the client API, so
@@ -77,7 +66,7 @@ fn marks(daemon: &Daemon) -> storage::FormationMarks {
 async fn a_fresh_daemon_parks_and_serves_only_readyz_and_the_admin_socket() {
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
 
     // Phase `waiting`, and 503: parked is alive-but-not-ready (ADR 0037 §9).
     let (status, body) = daemon.readyz().await;
@@ -105,7 +94,7 @@ async fn a_fresh_daemon_parks_and_serves_only_readyz_and_the_admin_socket() {
     assert_eq!(response.status().as_u16(), 404);
 
     // Discoverable, and explicitly not joinable.
-    let leaf = ca.leaf();
+    let leaf = ca.operator_leaf();
     let probe = daemon
         .probe(&ca.pem, &leaf.cert_pem, &leaf.key_pem)
         .await
@@ -121,7 +110,7 @@ async fn a_fresh_daemon_parks_and_serves_only_readyz_and_the_admin_socket() {
 async fn init_forms_a_single_voter_cluster_opens_the_api_and_stamps_the_marker() {
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
 
     let entity = coppice_core::id::QuotaEntityId::new();
@@ -196,7 +185,7 @@ async fn init_forms_a_single_voter_cluster_opens_the_api_and_stamps_the_marker()
 async fn re_running_init_reports_already_initialized() {
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
 
     let first = daemon.admin(plain_init()).await;
@@ -217,7 +206,7 @@ async fn re_running_init_reports_already_initialized() {
 async fn issue_operator_cert_signs_a_new_credential_post_formation() {
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
     let formed = daemon.admin(plain_init()).await;
     let AdminReply::Formed { operator, .. } = formed else {
@@ -311,7 +300,7 @@ async fn wiping_the_data_directory_and_re_running_init_recovers() {
     )
     .expect("stamp a formation intent");
 
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("formation-failed").await;
     let _ = daemon.stop().await;
 
@@ -323,7 +312,7 @@ async fn wiping_the_data_directory_and_re_running_init_recovers() {
     // The documented recovery, in full: wipe one data directory, restart
     // (which parks), re-run `init`.
     daemon.wipe_data_dir();
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
     let reply = daemon.admin(plain_init()).await;
     assert!(matches!(reply, AdminReply::Formed { .. }), "{reply:?}");
@@ -353,7 +342,7 @@ async fn two_formations_of_the_same_cluster_id_mint_distinct_histories() {
     // (ADR 0037 §3). Deriving it from config would make every wiped-and-
     // re-formed cluster indistinguishable from its own corpse.
     let mut first = Daemon::new(cluster_id, &ca);
-    first.start(PARKED);
+    first.start();
     first.await_phase("waiting").await;
     assert!(matches!(
         first.admin(plain_init()).await,
@@ -363,7 +352,7 @@ async fn two_formations_of_the_same_cluster_id_mint_distinct_histories() {
     first.stop().await.expect("first daemon stops");
 
     let mut second = Daemon::new(cluster_id, &ca);
-    second.start(PARKED);
+    second.start();
     second.await_phase("waiting").await;
     assert!(matches!(
         second.admin(plain_init()).await,
@@ -393,7 +382,7 @@ async fn two_formations_of_the_same_cluster_id_mint_distinct_histories() {
 async fn a_formed_daemon_resumes_under_the_history_it_minted() {
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
     assert!(matches!(
         daemon.admin(plain_init()).await,
@@ -404,7 +393,7 @@ async fn a_formed_daemon_resumes_under_the_history_it_minted() {
 
     // Restart with no flags: the manifest stamp, not config, names the
     // history the resumed replica serves (ADR 0037 §1/§3).
-    daemon.start(PARKED);
+    daemon.start();
     let after = daemon.await_phase("voter").await;
     assert_eq!(after["history_id"], before["history_id"]);
     assert_eq!(after["node_id"], before["node_id"]);
@@ -416,7 +405,7 @@ async fn a_formed_daemon_resumes_under_the_history_it_minted() {
 async fn a_certless_daemon_parks_forms_and_resumes() {
     let ca = Ca::new();
     let mut daemon = Daemon::new_certless(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
 
     // The ADR 0037 §4 minimal deployment: nothing provisioned. The daemon
     // still parks and says so — `/readyz` and the admin socket need no TLS.
@@ -426,7 +415,7 @@ async fn a_certless_daemon_parks_forms_and_resumes() {
 
     // The mTLS probe surface cannot be served without material; a peer that
     // dials this daemon fails and skips it, per the ADR's probe posture.
-    let leaf = ca.leaf();
+    let leaf = ca.operator_leaf();
     assert!(
         daemon
             .probe(&ca.pem, &leaf.cert_pem, &leaf.key_pem)
@@ -457,52 +446,43 @@ async fn a_certless_daemon_parks_forms_and_resumes() {
 
     // And it persists: a restart resumes from the material formation wrote.
     daemon.stop().await.expect("formed daemon stops");
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("voter").await;
     daemon.stop().await.expect("resumed daemon stops");
 }
 
 #[tokio::test]
-async fn a_certless_init_with_candidates_it_cannot_probe_is_refused() {
+async fn a_certless_init_with_candidates_it_cannot_probe_still_forms() {
     let ca = Ca::new();
     let mut daemon = Daemon::new_certless(ClusterId::new(), &ca);
     // Discovery names a peer, and this daemon has no credentials to ask it
-    // anything. "Cannot probe" must not be read as "no cluster exists" — the
-    // §3 step-1 guard fails closed rather than being silently skipped in the
-    // one deployment (minimal, certless) it most protects.
+    // anything. That is not evidence of a cluster: under ADR 0037 §1 the
+    // convergence loop enrolls before it probes, so a daemon still holding no
+    // material has not reached any cluster either — and refusing here would
+    // wedge the one case that most needs to work, the genuinely first
+    // formation of a certless minimal deployment whose discovery already
+    // lists its future peers.
     daemon.set_static_discovery(&["localhost:1".to_string()]);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
 
     let reply = daemon.admin(plain_init()).await;
-    let AdminReply::Error { message } = reply else {
-        panic!("expected the guard to refuse, got {reply:?}");
-    };
-    assert!(message.contains("double-init guard cannot"), "{message}");
-    assert!(message.contains("empty discovery seed set"), "{message}");
+    assert!(matches!(reply, AdminReply::Formed { .. }), "{reply:?}");
+    daemon.await_phase("voter").await;
 
-    // The refusal is total: nothing durable happened, the daemon is still
-    // parked, and a corrected `init` (fixed discovery or provisioned certs)
-    // remains possible.
-    assert!(
-        storage::read_formation_marks(&RealFs::new(daemon.data_dir()))
-            .expect("read marks")
-            .is_none(),
-        "the guard must refuse before the first durable act"
-    );
-    assert_eq!(daemon.readyz().await.1["phase"], "waiting");
+    // Formation ran in full, including the durable markers step 7 writes.
+    let marks = marks(&daemon);
+    assert!(marks.complete_at_us.is_some());
+    assert!(!marks.failed());
 
-    daemon
-        .stop()
-        .await
-        .expect("still-parked daemon stops cleanly");
+    daemon.stop().await.expect("formed daemon stops cleanly");
 }
 
 #[tokio::test]
 async fn a_certless_daemon_that_discovers_itself_still_forms() {
     let ca = Ca::new();
     let mut daemon = Daemon::new_certless(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
     // Several backends (`file` foremost) list this very process among the
     // candidates. A daemon is never the existing cluster its own formation
@@ -510,7 +490,7 @@ async fn a_certless_daemon_that_discovers_itself_still_forms() {
     // the guard decides anything — including the certless fail-closed check.
     daemon.set_static_discovery(&[daemon.raft_target()]);
     daemon.stop().await.expect("parked daemon stops");
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
 
     let reply = daemon.admin(plain_init()).await;
@@ -518,6 +498,128 @@ async fn a_certless_daemon_that_discovers_itself_still_forms() {
     daemon.await_phase("voter").await;
 
     daemon.stop().await.expect("formed daemon stops cleanly");
+}
+
+/// The ADR 0037 §3 step-1 double-init guard: a parked daemon whose discovery
+/// names an already-initialized cluster with its `cluster_id` refuses `init`
+/// outright, before anything durable happens.
+///
+/// The guard's probe plane is mTLS, so the parked daemon must hold material
+/// chaining to the cluster CA to see the cluster at all — which under ADR
+/// 0037 §1 also means its convergence loop will eventually *join* that
+/// cluster on its own. The guard exists for the window in which an operator's
+/// mistaken second `init` lands first. That window is staged here, honestly
+/// timing-based: the cluster is kept stopped while the parked loop's backoff
+/// grows (rounds at roughly 0 / 0.6 / 1.7 / 3.9 / 8.3 / 16-19s, jitter only
+/// ever pushing them later, so after a 16s park the next round is ~14s+
+/// away), then the cluster is brought back and `init` is delivered inside
+/// the gap.
+///
+/// The race is staged, not eliminated — under full-suite load the loop's
+/// round can still land first, in which case the daemon has legitimately
+/// begun JOINING the existing cluster and `init` answers
+/// `AlreadyInitialized` instead (ADR 0037 §1 working as designed, and the
+/// answer automation treats as success). Both outcomes are accepted and
+/// each is verified all the way down; the one forbidden end-state — a
+/// second formation, which would mint a fresh history — is asserted against
+/// in every branch.
+#[tokio::test]
+async fn init_is_refused_when_discovery_names_an_already_initialized_cluster() {
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+
+    // The existing cluster, formed the only way one can be — which roots it
+    // under its own minted CA, not the fixture's.
+    let mut existing = Daemon::new_certless(cluster_id, &ca);
+    existing.start();
+    existing.await_phase("waiting").await;
+    assert!(matches!(
+        existing.admin(plain_init()).await,
+        AdminReply::Formed { .. }
+    ));
+    existing.await_phase("voter").await;
+    let (cluster_ca, cluster_cert, cluster_key) = existing.tls_material();
+    existing.stop().await.expect("existing cluster stops");
+
+    // The second daemon carries the cluster's own material (as an enrolled
+    // fleet member would), so its guard can actually probe: a leaf under any
+    // other CA fails the handshake, and an unanswerable candidate is skipped,
+    // not refused.
+    let mut newcomer = Daemon::new(cluster_id, &ca);
+    let root = newcomer
+        .data_dir()
+        .parent()
+        .expect("data dir has a parent")
+        .to_path_buf();
+    std::fs::write(root.join("ca.crt"), &cluster_ca).expect("write cluster ca");
+    std::fs::write(root.join("node.crt"), &cluster_cert).expect("write cluster cert");
+    std::fs::write(root.join("node.key"), &cluster_key).expect("write cluster key");
+    newcomer.set_static_discovery(&[existing.raft_target()]);
+    newcomer.start();
+    newcomer.await_phase("waiting").await;
+
+    // Staging, not synchronization: there is no observable surface for the
+    // parked loop's backoff, so the window is bought with elapsed time (see
+    // the doc comment for the round arithmetic).
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    existing.start();
+    let existing_history = existing.await_phase("voter").await["history_id"].clone();
+    assert!(existing_history.is_string());
+
+    match newcomer.admin(plain_init()).await {
+        // The staged window held: the guard's own probe round saw the
+        // initialized cluster and refused before anything durable happened.
+        AdminReply::Error { message } => {
+            assert!(
+                message.contains("already reports an initialized cluster"),
+                "{message}"
+            );
+            // What may follow the refusal is bounded: the daemon either
+            // remains parked with nothing stamped, or its convergence loop's
+            // next round joins the EXISTING cluster — which is ADR 0037 §1
+            // working, not a leak in the guard. Asserting on the history
+            // covers both legitimate outcomes without racing the loop.
+            let body = newcomer.readyz().await.1;
+            if body["phase"] == "waiting" {
+                assert!(
+                    storage::read_formation_marks(&RealFs::new(newcomer.data_dir()))
+                        .expect("read marks")
+                        .is_none(),
+                    "a refused, still-parked daemon must have stamped nothing"
+                );
+            } else {
+                assert_eq!(
+                    body["history_id"], existing_history,
+                    "anything the daemon becomes after the refusal must belong to \
+                     the existing cluster's history, never a second formation: {body}"
+                );
+            }
+        }
+        // The loop's round landed inside the staged window (suite load can
+        // stretch it): the daemon already began joining the existing cluster,
+        // so there was nothing left for `init` to guard — the same
+        // AlreadyInitialized automation treats as success. Verify it really
+        // is a join of the EXISTING history and not a formation.
+        AdminReply::AlreadyInitialized { status } => {
+            assert_eq!(
+                serde_json::to_value(&status.history_id).expect("history encodes"),
+                existing_history,
+                "AlreadyInitialized after the staged window must mean the loop \
+                 joined the existing cluster, never that a second formation ran"
+            );
+        }
+        other => panic!(
+            "init against an initialized cluster must be refused by the probe \
+             guard or answer AlreadyInitialized from a legitimate join, got \
+             {other:?}"
+        ),
+    }
+
+    newcomer.stop().await.expect("newcomer stops cleanly");
+    existing
+        .stop()
+        .await
+        .expect("existing cluster stops cleanly");
 }
 
 /// Hex of raw bytes, mirroring the daemon's identity rendering.
@@ -530,54 +632,10 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-#[tokio::test]
-async fn the_probe_guard_refuses_init_when_a_candidate_is_already_initialized() {
-    let ca = Ca::new();
-    let cluster_id = ClusterId::new();
-
-    // An existing cluster. Formed through the legacy `--bootstrap` flag so it
-    // keeps the shared test CA and the second daemon can still reach it —
-    // enrolling a second coordinator against a cluster-minted CA is chunk 04.
-    let mut existing = Daemon::new(cluster_id, &ca);
-    existing.start(BOOTSTRAPPED);
-    existing.await_phase("voter").await;
-
-    // A second daemon that would form the same cluster a second time.
-    let mut newcomer = Daemon::new(cluster_id, &ca);
-    newcomer.set_static_discovery(&[existing.raft_target()]);
-    newcomer.start(PARKED);
-    newcomer.await_phase("waiting").await;
-
-    let reply = newcomer.admin(plain_init()).await;
-    let AdminReply::Error { message } = reply else {
-        panic!("expected the probe guard to refuse, got {reply:?}");
-    };
-    assert!(
-        message.contains("already reports an initialized cluster"),
-        "{message}"
-    );
-
-    // The refusal is total: nothing was stamped, so the daemon is still parked
-    // and a corrected `init` is still possible.
-    assert!(
-        storage::read_formation_marks(&RealFs::new(newcomer.data_dir()))
-            .expect("read marks")
-            .is_none(),
-        "the guard must refuse before the first durable act"
-    );
-    assert_eq!(newcomer.readyz().await.1["phase"], "waiting");
-
-    newcomer.stop().await.expect("newcomer stops cleanly");
-    existing
-        .stop()
-        .await
-        .expect("existing cluster stops cleanly");
-}
-
 /// A daemon whose directory records an incomplete formation must fail-stop
 /// with its external surface closed on every side, and must say why.
 async fn assert_failed_and_closed(daemon: &mut Daemon, ca: &Ca) {
-    daemon.start(PARKED);
+    daemon.start();
 
     let body = daemon.await_phase("formation-failed").await;
     let (status, _) = daemon.readyz().await;
@@ -594,7 +652,7 @@ async fn assert_failed_and_closed(daemon: &mut Daemon, ca: &Ca) {
 
     // `ProbeCluster` does not report `initialized`, so a parked peer that
     // discovers this node cannot mistake it for the cluster...
-    let leaf = ca.leaf();
+    let leaf = ca.operator_leaf();
     let probe = daemon
         .probe(&ca.pem, &leaf.cert_pem, &leaf.key_pem)
         .await
@@ -651,6 +709,9 @@ async fn initialize_raft_history(daemon: &Daemon, _ca: &Ca) {
             snapshot_keep_log_entries: 0,
             event_tap_capacity: 64,
             tls,
+            // No voter ceiling: this replica is opened only to bring the raft
+            // history into existence, and never promotes anything.
+            cluster_size: 0,
         },
         StartIntent::Restart,
     )
@@ -675,7 +736,7 @@ async fn a_stalled_client_cannot_wedge_the_parked_to_formed_handover() {
 
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
 
     // A connection that begins a request and never finishes it — a stalled
@@ -708,7 +769,7 @@ async fn a_stalled_client_cannot_wedge_the_parked_to_formed_handover() {
 async fn a_concurrent_init_is_always_answered() {
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
 
     // Two callers race — automation that timed out and retried, say. Formation
@@ -752,7 +813,7 @@ async fn a_concurrent_init_is_always_answered() {
 async fn a_policy_that_parses_but_cannot_be_ordered_costs_no_data_directory() {
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
 
     // Valid TOML, valid ids, and an unsatisfiable quota hierarchy: two
@@ -814,7 +875,7 @@ async fn the_admin_socket_is_owner_only() {
 
         let ca = Ca::new();
         let mut daemon = Daemon::new(ClusterId::new(), &ca);
-        daemon.start(PARKED);
+        daemon.start();
         daemon.await_phase("waiting").await;
 
         // Local access IS the authority for formation, so neither the socket
@@ -849,31 +910,25 @@ fn plain_init() -> AdminCall {
 // Readiness under partition (ADR 0037 §9)
 // ---------------------------------------------------------------------------
 
-/// Build a two-voter cluster from `Node`s (the legacy-flag path — chunk 03
-/// has no network join) and return it with the leader first.
+/// Build a two-voter cluster from `Node`s and return it with the leader first.
+///
+/// Membership is driven directly against the leader's consensus seam rather
+/// than through the convergence loop: what these tests are about is what
+/// `/readyz` says once a two-voter cluster exists, so the cheapest way to have
+/// one is the right one. Convergence's own path is covered in `convergence.rs`.
 async fn two_voter_cluster(ca: &common::Ca) -> (common::Node, common::Node) {
     use coppice_consensus::Consensus;
 
     let cluster_id = ClusterId::new();
     let mut leader = common::Node::new(1, cluster_id, ca);
-    leader
-        .boot(CliOverrides {
-            bootstrap: true,
-            join: false,
-        })
-        .await;
+    leader.boot().await;
     common::poll(Duration::from_secs(10), "node 1 becomes leader", || async {
         leader.is_leader()
     })
     .await;
 
     let mut follower = common::Node::new(2, cluster_id, ca);
-    follower
-        .boot(CliOverrides {
-            bootstrap: false,
-            join: true,
-        })
-        .await;
+    follower.boot_joining().await;
 
     leader
         .consensus()

@@ -420,6 +420,7 @@ impl EnrollClient {
         token: &Secret,
         csr_pem: &[u8],
         claim: Claim,
+        sans: &[String],
     ) -> Result<EnrollResponse, EnrollClientError> {
         let (node_id, machine_id) = match claim {
             Claim::Node(node) => (Some(node), None),
@@ -430,6 +431,7 @@ impl EnrollClient {
             token: None,
             node_id,
             machine_id,
+            sans: sans.to_vec(),
         };
 
         let response = self
@@ -516,12 +518,13 @@ pub async fn ensure_enrolled(
     paths: &TlsPaths,
     config: &EnrollmentConfig,
     claim: Claim,
+    sans: &[String],
 ) -> Result<Outcome, EnrollClientError> {
     let client = EnrollClient::new(&config.endpoint, config.insecure)?;
     let token = config.token_source().ok_or(EnrollClientError::EmptyToken {
         path: PathBuf::new(),
     })?;
-    ensure_enrolled_with(paths, &client, &token, claim).await
+    ensure_enrolled_with(paths, &client, &token, claim, sans).await
 }
 
 /// [`ensure_enrolled`] against an already-built client. Separated so the tests
@@ -532,6 +535,7 @@ pub async fn ensure_enrolled_with(
     client: &EnrollClient,
     token: &TokenSource,
     claim: Claim,
+    sans: &[String],
 ) -> Result<Outcome, EnrollClientError> {
     if has_usable_leaf(paths) {
         tracing::debug!(
@@ -549,7 +553,7 @@ pub async fn ensure_enrolled_with(
         claim = ?claim,
         "enrolling for a cluster-signed leaf (ADR 0037 §4)"
     );
-    let issued = client.enroll(&secret, &csr_pem, claim).await?;
+    let issued = client.enroll(&secret, &csr_pem, claim, sans).await?;
 
     pki::install_leaf_material(
         paths,

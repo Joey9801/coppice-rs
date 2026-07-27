@@ -25,14 +25,19 @@
 //! restartable one-time operation.
 
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use coppice_api::http::{ReadyzPhase, ReadyzReport, ReadyzVoter};
+use coppice_api::http::{HealthVerdict, ReadyzPhase, ReadyzReport, ReadyzVoter};
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::storage::{self, StorageOptions};
-use coppice_consensus::{Consensus, NodeHandle, StartIntent, StartedNode, StateViews};
+use coppice_consensus::{
+    Consensus, NodeHandle, ReplicationHealth, StartIntent, StartedNode, StateViews,
+    PROMOTION_LAG_MAX,
+};
 use coppice_core::id::{ClusterId, MachineId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{BindMachineIdentity, RecordCaCertificate};
@@ -54,8 +59,9 @@ pub(crate) const DEFAULT_OPERATOR_CN: &str = "day0-operator";
 /// What this daemon is currently able to serve (ADR 0037 §1).
 enum Phase {
     /// No manifest, no cluster: the admin socket and `/readyz` are up and
-    /// nothing else is. Left only by a local `init` (and, from chunk 05, by
-    /// an initialized cluster appearing in discovery).
+    /// nothing else is. Left two ways, and only two (ADR 0037 §1): a local
+    /// `init` forms a cluster here, or the convergence loop finds an
+    /// initialized one in discovery and joins it.
     Waiting,
     /// This directory records a formation intent with no completion marker.
     /// Fail-stop; the intent's timestamp is the diagnostic.
@@ -86,12 +92,46 @@ struct Formed {
 pub(crate) struct PhaseState {
     cluster_id: ClusterId,
     cluster_size: usize,
-    /// How stale a leader's quorum acknowledgment may be before this replica
-    /// stops reporting itself ready (ADR 0037 §9). Derived from the election
-    /// timeout: past it, a partitioned follower would have started an
-    /// election of its own.
-    contact_staleness: std::time::Duration,
+    /// The staleness bound for cluster contact (ADR 0037 §9), used twice: how
+    /// stale a leader's quorum acknowledgment may be before this replica
+    /// stops reporting itself ready, and how long a voter may go without
+    /// answering the leader's RPCs before the health sampler stops counting
+    /// it live. Derived from the election timeout — twice the minimum, i.e.
+    /// openraft's election-timeout maximum — because past it a partitioned
+    /// node would have started an election of its own.
+    contact_staleness: Duration,
+    /// How long full redundancy must hold continuously before
+    /// `?require=healthy` says yes (`[raft] health_stability_interval`).
+    health_stability: Duration,
     phase: RwLock<Phase>,
+    /// The last admission refusal the convergence loop received (ADR 0037 §7):
+    /// a duplicated machine identity, or an address conflict. Surfaced in
+    /// `/readyz` because §9 makes status — not logs — the place an operator
+    /// finds out that this node will never be admitted.
+    last_admission_refusal: RwLock<Option<String>>,
+    /// The sampler-maintained redundancy verdict and its stability window.
+    /// Written only by the background sampler ([`sample_health`]
+    /// (PhaseState::sample_health)); `/readyz` and `ClusterStatus` are pure
+    /// readers — see [`health`](PhaseState::health) for why that split is
+    /// load-bearing.
+    health_window: Mutex<HealthWindow>,
+    /// Whether the health sampler has been spawned; set once by
+    /// [`publish_formed`](PhaseState::publish_formed).
+    sampler_started: AtomicBool,
+}
+
+/// The state behind [`PhaseState::health`], owned by the sampler.
+struct HealthWindow {
+    /// The verdict as of the last sample.
+    verdict: HealthVerdict,
+    /// When the redundancy condition last *became* true, or `None` while it
+    /// does not hold (or this node is not the leader).
+    since: Option<Instant>,
+    /// The leadership term the window was accumulated under: a re-elected
+    /// leader must not inherit a stability interval nobody watched
+    /// (ADR 0037 §9), and terms are what tell one leadership stint from the
+    /// next.
+    term: Option<u64>,
 }
 
 impl PhaseState {
@@ -99,7 +139,8 @@ impl PhaseState {
     pub(crate) fn unformed(
         cluster_id: ClusterId,
         cluster_size: usize,
-        contact_staleness: std::time::Duration,
+        contact_staleness: Duration,
+        health_stability: Duration,
         marks: storage::FormationMarks,
     ) -> Arc<PhaseState> {
         let phase = match marks.intent_at_us {
@@ -110,14 +151,27 @@ impl PhaseState {
             cluster_id,
             cluster_size,
             contact_staleness,
+            health_stability,
             phase: RwLock::new(phase),
+            last_admission_refusal: RwLock::new(None),
+            health_window: Mutex::new(HealthWindow {
+                verdict: HealthVerdict::Unknown,
+                since: None,
+                term: None,
+            }),
+            sampler_started: AtomicBool::new(false),
         })
     }
 
     /// Publish a formed replica. Every surface that was refusing starts
-    /// answering from the next read.
-    pub(crate) fn publish_formed(&self, handle: NodeHandle, views: StateViews) {
+    /// answering from the next read, and the health sampler starts watching
+    /// (a formed replica is the first thing that *has* replication to watch).
+    ///
+    /// Takes `&Arc<Self>` because the sampler holds a `Weak` back to this
+    /// state — it must die with the daemon that published it, not pin it.
+    pub(crate) fn publish_formed(self: &Arc<Self>, handle: NodeHandle, views: StateViews) {
         *self.phase.write().expect("phase lock") = Phase::Formed(Formed { handle, views });
+        self.spawn_health_sampler();
     }
 
     /// Publish the fail-stop. Reached when a live `init` attempt dies after
@@ -146,22 +200,50 @@ impl PhaseState {
         self.cluster_id
     }
 
+    /// The expected voter count (`[discovery] cluster_size`, ADR 0037 §2).
+    pub(crate) fn cluster_size(&self) -> usize {
+        self.cluster_size
+    }
+
+    /// Record the last admission refusal this daemon received while converging
+    /// (ADR 0037 §7/§9).
+    ///
+    /// Only refusals that will not resolve by waiting belong here — a
+    /// duplicated machine identity, a same-id-different-address conflict.
+    /// A `NotLeader` redirect or a still-catching-up learner is convergence
+    /// working, not convergence stuck, and putting either here would train
+    /// operators to ignore the field.
+    pub(crate) fn record_admission_refusal(&self, message: String) {
+        *self
+            .last_admission_refusal
+            .write()
+            .expect("admission refusal lock") = Some(message);
+    }
+
     /// The current `/readyz` body (ADR 0037 §9).
     pub(crate) fn readyz(&self) -> ReadyzReport {
         let cluster = self.cluster_id.to_string();
+        let refusal = self
+            .last_admission_refusal
+            .read()
+            .expect("admission refusal lock")
+            .clone();
         let formed = match &*self.phase.read().expect("phase lock") {
             Phase::Waiting => {
-                return ReadyzReport::unformed(
+                let mut report = ReadyzReport::unformed(
                     cluster,
                     ReadyzPhase::Waiting,
                     self.cluster_size,
                     Some(
-                        "no cluster formed on this node and none found: run \
+                        "no cluster formed on this node and none found: the convergence loop \
+                         keeps discovering, enrolling, and probing; run \
                          `coppice coordinator init` on one daemon to form the cluster \
-                         (ADR 0037 §3)"
+                         (ADR 0037 §1/§3)"
                             .to_string(),
                     ),
-                )
+                );
+                report.last_admission_refusal = refusal;
+                return report;
             }
             Phase::Failed { intent_at_us } => {
                 return ReadyzReport::unformed(
@@ -176,6 +258,7 @@ impl PhaseState {
 
         let summary = formed.handle.cluster_summary();
         let applied_index = formed.views.latest().applied_index();
+        let in_membership = summary.members.iter().any(|m| m.id == summary.local_id);
         let is_voter = summary
             .members
             .iter()
@@ -224,12 +307,17 @@ impl PhaseState {
             history_id: Some(hex(&formed.handle.history_id())),
             node_id: Some(summary.local_id),
             instance_uuid: Some(hex(&formed.handle.instance_uuid())),
-            // `joining` belongs to the convergence loop (chunk 05); a formed
-            // replica here is a voter, or a learner if membership says so.
+            // The three convergence phases of a started replica (ADR 0037 §9),
+            // read straight off membership: a replica the leader has not
+            // admitted yet is `joining` — it is running, stamped, and driving
+            // `AddLearner`, which is exactly what distinguishes it from a
+            // parked daemon in `waiting`.
             phase: if is_voter {
                 ReadyzPhase::Voter
-            } else {
+            } else if in_membership {
                 ReadyzPhase::Learner
+            } else {
+                ReadyzPhase::Joining
             },
             leader: summary.leader,
             is_leader,
@@ -237,10 +325,126 @@ impl PhaseState {
             committed_index: summary.known_committed,
             replication_lag: summary.known_committed.saturating_sub(applied_index),
             leader_contact_stale,
+            // Cardinality against the configured expectation, and nothing
+            // more (ADR 0037 §9): `formed` says the cluster reached its
+            // desired *shape*, never that the voters in it are reachable.
+            // That question is `health`'s, and only the leader can answer it.
+            formed: voters.len() >= self.cluster_size(),
             voters,
             cluster_size: self.cluster_size,
             reason,
+            live_voters: is_leader
+                .then(|| live_voters(&formed.handle.replication_health(), self.contact_staleness)),
+            last_admission_refusal: refusal,
+            reason_code: None,
         }
+    }
+
+    /// The cluster-redundancy verdict behind `?require=healthy` (ADR 0037 §9).
+    ///
+    /// A **pure read** of the verdict the background sampler maintains — no
+    /// request-driven state. That split is load-bearing: were the stability
+    /// window advanced only when someone asked, a voter could die and recover
+    /// entirely between two HTTP requests and the second request would report
+    /// a "sustained" interval nobody observed. The sampler runs at a fraction
+    /// of the contact-staleness bound, so a lapse shorter than the shortest
+    /// flap worth gating on is still seen, and any observed lapse resets the
+    /// window (see [`sample_health`](PhaseState::sample_health)).
+    ///
+    /// Answered authoritatively **only by the leader**, because replication
+    /// facts exist only there. A follower samples [`HealthVerdict::Unknown`]
+    /// rather than caching what the leader last said: the ADR rejected
+    /// follower caching outright — unknown health is not health, and a
+    /// staleness bound plus a cache is a new failure mode bought for
+    /// load-balancer convenience.
+    pub(crate) fn health(&self) -> HealthVerdict {
+        self.health_window
+            .lock()
+            .expect("health window lock")
+            .verdict
+    }
+
+    /// Start the background health sampler, once per [`PhaseState`].
+    ///
+    /// Cadence is a quarter of the contact-staleness bound (≈ half the
+    /// election-timeout minimum): comfortably finer than the shortest lapse
+    /// the gate is meant to catch, and a trivial cost — each tick is a
+    /// metrics-watch borrow and a map lookup.
+    ///
+    /// The task holds a `Weak` so it exits when the daemon drops its phase
+    /// state, rather than pinning a dead replica's handle forever.
+    fn spawn_health_sampler(self: &Arc<Self>) {
+        if self.sampler_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let period = (self.contact_staleness / 4).max(Duration::from_millis(25));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(state) = weak.upgrade() else { return };
+                state.sample_health();
+            }
+        });
+    }
+
+    /// One sampler tick: observe redundancy now, update the verdict, and
+    /// maintain the stability window (ADR 0037 §9).
+    ///
+    /// On the leader the condition is `live_voters >= cluster_size`, where
+    /// "live" is the two-part test of [`live_voters`]: the voter has answered
+    /// this leader's RPCs within the contact-staleness bound (real transport
+    /// observation — an idle log moves no indexes, so positions alone cannot
+    /// see a death), **and** its matched index is within
+    /// [`PROMOTION_LAG_MAX`] of the leader's last log index — the same
+    /// frontier and threshold promotion uses, so "caught up enough to be a
+    /// voter" and "counts toward redundancy" cannot drift apart. The
+    /// condition must have held continuously for `health_stability` under one
+    /// leadership term; any observed lapse — shortfall, lost leadership, a
+    /// term change — resets the clock.
+    fn sample_health(&self) {
+        let formed = match &*self.phase.read().expect("phase lock") {
+            Phase::Formed(formed) => formed.clone(),
+            // An unformed daemon has no replication view at all, which is the
+            // same epistemic position a follower is in.
+            _ => return self.sample_unknown(),
+        };
+        let health = formed.handle.replication_health();
+        if health.leader != Some(health.local_id) {
+            return self.sample_unknown();
+        }
+
+        let live = live_voters(&health, self.contact_staleness);
+        let mut window = self.health_window.lock().expect("health window lock");
+        if window.term != Some(health.term) {
+            // A new leadership stint — including this same node re-elected —
+            // starts a fresh window: nobody watched redundancy in between.
+            window.since = None;
+            window.term = Some(health.term);
+        }
+        if live < self.cluster_size {
+            window.since = None;
+            window.verdict = HealthVerdict::Degraded { live_voters: live };
+            return;
+        }
+        let started = *window.since.get_or_insert_with(Instant::now);
+        window.verdict = if started.elapsed() >= self.health_stability {
+            HealthVerdict::Sustained { live_voters: live }
+        } else {
+            HealthVerdict::Degraded { live_voters: live }
+        };
+    }
+
+    /// Record a sample taken from a vantage point that cannot observe
+    /// redundancy at all (not formed, or not the leader), clearing the
+    /// stability window on the way.
+    fn sample_unknown(&self) {
+        let mut window = self.health_window.lock().expect("health window lock");
+        window.verdict = HealthVerdict::Unknown;
+        window.since = None;
+        window.term = None;
     }
 
     /// The current `ProbeCluster` answer (ADR 0037 §3).
@@ -279,6 +483,40 @@ impl PhaseState {
     }
 }
 
+/// How many voters the leader currently observes **live** (ADR 0037 §9):
+/// answered this node's RPCs within `contact_staleness`, and matched to
+/// within [`PROMOTION_LAG_MAX`] of the leader's last log index — the same
+/// frontier the promotion lag gate measures against, deliberately not
+/// `last_applied` (a leader with an apply backlog must not flatter its
+/// followers' lag).
+///
+/// The contact half is what makes this work on an idle cluster: a dead
+/// voter's matched index never falls behind a log that is not moving, but its
+/// last successful response goes stale within about one heartbeat interval.
+///
+/// Only meaningful on a leader — nothing else sends replication RPCs or
+/// carries replication metrics, so every follower would report exactly one
+/// live voter (itself) and call a healthy cluster degraded. Callers gate on
+/// leadership first.
+///
+/// The leader counts itself: it is by definition current with its own log and
+/// in contact with itself, and neither the replication map nor the contact
+/// map carries a self-entry.
+fn live_voters(health: &ReplicationHealth, contact_staleness: Duration) -> usize {
+    let floor = health.last_log_index.saturating_sub(PROMOTION_LAG_MAX);
+    health
+        .voters
+        .iter()
+        .filter(|v| {
+            v.id == health.local_id
+                || (v
+                    .last_contact
+                    .is_some_and(|since| since <= contact_staleness)
+                    && v.matched.is_some_and(|matched| matched >= floor))
+        })
+        .count()
+}
+
 /// A daemon's answer to `ProbeCluster`, in domain terms.
 pub(crate) struct ProbeAnswer {
     pub(crate) cluster_id: String,
@@ -311,8 +549,9 @@ pub(crate) fn failed_diagnostic(intent_at_us: i64) -> String {
 /// What a data directory's manifest says about how this daemon must start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StartupState {
-    /// No manifest: a new instance. With no `--bootstrap`/`--join` it parks
-    /// and waits for `init`.
+    /// No manifest: a new instance (ADR 0037 §1). It parks and converges —
+    /// enrolling, discovering, and probing until an initialized cluster
+    /// answers or a local `init` arrives. It never forms one on its own.
     Empty,
     /// A manifest with no dangling formation intent: resume the instance,
     /// under the raft history the stamp records.
@@ -356,15 +595,21 @@ pub(crate) fn inspect(data_dir: &Path) -> Result<(StartupState, storage::Formati
 /// The history a resumed directory serves, cross-checked against config
 /// exactly as far as the stamp allows (ADR 0016 / ADR 0037 §3).
 ///
-/// A **legacy** directory (no formation markers — stamped by the
-/// `--bootstrap`/`--join` flags) recorded the config `cluster_id`'s bytes as
-/// its history, so config-vs-stamp is a real wrong-volume check and a
-/// mismatch fail-stops here with the ADR 0016 message. A **formed** directory
-/// carries a minted history that config cannot know; the stamp is the
-/// authority, and the cross-cluster protection lives where the ADR puts it —
-/// peers compare stamped history ids on every RPC, and the convergence loop
-/// (chunk 05) fail-stops a resumed replica whose history disagrees with the
-/// cluster its discovery finds.
+/// A **legacy** directory (no formation markers — stamped by the removed
+/// `--bootstrap`/`--join` flags, or by `bootstrap`'s single-voter test path)
+/// recorded the config `cluster_id`'s bytes as its history, so config-vs-stamp
+/// is a real wrong-volume check and a mismatch fail-stops here with the ADR
+/// 0016 message.
+///
+/// A directory carrying the `formation_complete` marker does not get that
+/// check, because its history is the *cluster's* and config cannot know it:
+/// either this daemon formed the cluster (`init` minted the history) or the
+/// convergence loop joined one (the probe reported it, and stamped the marker
+/// for exactly this reason). The cross-cluster protection lives where the ADR
+/// puts it instead — peers compare stamped history ids on every RPC, so a
+/// resumed replica whose stamp disagrees with the cluster its discovery finds
+/// is refused by that cluster's own `check_cluster`, not admitted into a
+/// foreign history.
 pub(crate) fn resumed_history(
     cfg: &Config,
     stamped: [u8; 16],
@@ -785,17 +1030,17 @@ pub(crate) fn load_cluster_ca<C: Consensus>(
 /// backends (`file` foremost) list this very process, and a daemon can never
 /// be the existing cluster its own formation must not duplicate.
 ///
-/// **The guard fails closed when it cannot run.** The probe plane is mTLS,
-/// and the ADR's flow gives every prober credentials before it probes: a
-/// certless daemon enrolls first (§1) and only then probes, so by the time a
-/// mistaken `init` could reach a daemon in a fleet with a live cluster, that
-/// daemon holds a leaf and the guard sees the cluster. Until enrollment
-/// exists, a certless daemon whose discovery names candidates has no way to
-/// ask them anything — and "cannot probe" must not be read as "no cluster
-/// exists", because that silently disables a mandated formation step in
-/// exactly the deployment (minimal, certless) it most protects. So it
-/// refuses, naming both ways out; forming with an empty seed set remains the
-/// legitimate certless path.
+/// **A certless daemon is no longer a special case.** The probe plane is
+/// mTLS, and ADR 0037 §1's flow gives every prober credentials before it
+/// probes: a parked daemon's convergence loop enrolls at the first tick that
+/// finds it without a usable leaf, so by the time a mistaken `init` could
+/// reach a daemon in a fleet with a live cluster, that daemon holds a leaf and
+/// this guard sees the cluster. What remains is the honest residue — a daemon
+/// with candidates but still no material has not managed to enroll, which
+/// means it has not reached any cluster either, so an unprobeable round is
+/// reported and formation proceeds. Refusing here instead would wedge the one
+/// legitimate case this must not block: the genuinely first formation in a
+/// certless minimal deployment whose discovery already lists its future peers.
 async fn refuse_if_cluster_exists(cfg: &Config, advertise_addr: &str) -> Result<()> {
     let mut candidates = crate::discovery::build(&cfg.discovery)
         .context("building the discovery backend for the pre-formation probe")?
@@ -811,16 +1056,15 @@ async fn refuse_if_cluster_exists(cfg: &Config, advertise_addr: &str) -> Result<
         .iter()
         .all(|p| p.exists());
     if !have_creds {
-        bail!(
-            "refusing to form: discovery found {} candidate(s) ({}) but this daemon holds \
-             no TLS material, so the pre-formation double-init guard cannot ask them \
-             whether a cluster already exists (ADR 0037 §3 step 1). If this is genuinely \
-             the first formation, run `init` with an empty discovery seed set (or \
-             provision [tls] material and re-run); once enrollment lands, a parked daemon \
-             acquires a leaf before formation and this guard runs as designed.",
+        tracing::warn!(
+            candidates = candidates.len(),
+            "formation: this daemon holds no TLS material yet, so the double-init guard \
+             cannot probe the {} discovered candidate(s) ({}). A daemon that has not \
+             enrolled has not reached a cluster either; proceeding (ADR 0037 §3 step 1).",
             candidates.len(),
             candidates.join(", "),
         );
+        return Ok(());
     }
 
     let probes = crate::probe::probe_all(cfg, &candidates).await?;
@@ -841,7 +1085,13 @@ async fn refuse_if_cluster_exists(cfg: &Config, advertise_addr: &str) -> Result<
 
 /// The SANs this node's own coordinator leaf carries: the address peers dial
 /// it on. `advertise_host` is resolved by `config::load` before any reader.
-fn leaf_sans(cfg: &Config) -> Vec<String> {
+///
+/// Shared with [`crate::convergence`], whose enroll step asks the cluster for
+/// exactly the same SANs formation would have minted locally — the two ways a
+/// coordinator can come by its first leaf must produce a leaf that serves the
+/// same addresses, or a self-enrolled node would fail the leader's dial-back
+/// verification (ADR 0037 §6) that a formed one passes.
+pub(crate) fn leaf_sans(cfg: &Config) -> Vec<String> {
     let mut sans = Vec::new();
     if let Some(host) = cfg.listen.advertise_host.as_deref() {
         sans.push(host.to_string());
@@ -884,6 +1134,7 @@ mod tests {
             ClusterId::new(),
             3,
             std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
             marks,
         )
     }
@@ -1030,7 +1281,7 @@ log_level = "warn"
         )
         .expect("write config");
 
-        crate::config::load(&config_path, crate::config::CliOverrides::default())
+        crate::config::load(&config_path)
             .expect("load config")
             .into_config()
     }

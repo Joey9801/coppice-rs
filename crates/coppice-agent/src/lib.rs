@@ -63,10 +63,21 @@ async fn ensure_enrolled(config: &config::Config) -> Result<()> {
         return Ok(());
     };
     let paths = tls_paths(&config.tls);
+    // An agent's leaf always carries its node id as a SAN — the cluster adds
+    // that itself from the claimed identity, because ADR 0034's id-pinned dial
+    // depends on it. What the cluster cannot know is the *host* this agent
+    // serves `NodeService` on, so an agent that hosts one declares it; an agent
+    // with no `[listen]` table serves nothing and declares nothing.
+    let sans: Vec<String> = config
+        .listen
+        .as_ref()
+        .map(|listen| vec![listen.advertise_host.clone()])
+        .unwrap_or_default();
     let outcome = coppice_enroll::ensure_enrolled(
         &paths,
         enrollment,
         coppice_enroll::Claim::Node(config.node_id),
+        &sans,
     )
     .await
     .context("enrolling for a cluster-signed agent leaf (config [enrollment])")?;

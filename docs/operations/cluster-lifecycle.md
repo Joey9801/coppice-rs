@@ -233,26 +233,39 @@ curl -s https://coord-1:7070/readyz          # 200 iff caught-up voter
 curl -s "https://coord-1:7070/readyz?require=healthy"   # 200 iff formed AND redundant
 ```
 
-The same document is available on the local admin socket, which matters
-when the client listener is not being served at all — a parked daemon, or
-one in `formation-failed`:
+The same document is available on the local admin socket via
+`admin local-status`, which matters when the client listener is not
+being served at all — a parked daemon, or one in `formation-failed`:
 
 ```
-coppice coordinator admin --config coordinator.toml status
+coppice coordinator admin --config coordinator.toml local-status
 ```
 
-The JSON body carries `phase` (`waiting` | `formation-failed` |
-`joining` | `learner` | `voter`), node/cluster/instance ids, applied
-index and lag, `voters`, `cluster_size`, `formed`, and any admission
-refusal the daemon last received. Note that `?require=healthy` is answered authoritatively only
+The JSON body (`local-status --json`) carries `phase` (`waiting` |
+`formation-failed` | `joining` | `learner` | `voter`),
+node/cluster/instance ids, applied index and lag, `voters`,
+`cluster_size`, `formed`, and any admission refusal the daemon last
+received. Note that `?require=healthy` is answered authoritatively only
 by the leader; a follower returns 503 `health_unknown` with a leader
 hint — unknown health is not health, so point automation at the leader
-or use `admin status`. Cluster-wide:
+or use `admin status --json`, the cluster-wide scripting surface, which
+resolves the leader itself:
 
 ```
-coppice coordinator admin --config coordinator.toml --target coord-1:7071 \
-    status --json
+coppice coordinator admin --config coordinator.toml status --json
 ```
+
+`admin status` always emits the cluster-wide document with one stable
+JSON schema, with or without `--target` (without one, the target is the
+first candidate from the config's `[discovery]` backend, as for every
+other network verb). If the replica that answers is a follower, the CLI
+re-dials the leader the answer names — once, at the address the
+follower's own membership view carries — and renders the leader's
+document. The JSON carries membership with roles and machine-identity
+bindings, per-follower replication lag (leader only), leadership, and
+`health` — the same leader-only redundancy verdict `?require=healthy`
+gates on, with `null` values only when no leader could be reached
+(health is never fabricated).
 
 ## Break-glass: the manual verbs
 

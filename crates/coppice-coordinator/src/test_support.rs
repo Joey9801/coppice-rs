@@ -233,6 +233,17 @@ impl Consensus for FakeConsensus {
         Ok(())
     }
 
+    /// A no-op like the other membership verbs: no test in this crate drives
+    /// the operator-only break-glass repoint (ADR 0037 §6), and a fake that
+    /// held membership state would be a second implementation of it.
+    async fn set_node_address(
+        &self,
+        _node: CoordinatorId,
+        _addr: String,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
     async fn trigger_snapshot(&self) -> Result<(), ConsensusError> {
         Ok(())
     }

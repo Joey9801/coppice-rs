@@ -25,7 +25,7 @@ use coppice_net::transport::Server;
 use crate::adapter::{OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY};
 use crate::events::{EventTap, EventTapReceiver};
 use crate::fs::{Fs, RealFs};
-use crate::net::{GrpcNetworkFactory, RaftTransportHandler};
+use crate::net::{GrpcNetworkFactory, PeerContact, RaftTransportHandler};
 use crate::storage::{self, StorageOptions};
 use crate::view::{StateViews, ViewPublisher, ViewPublisherConfig};
 use crate::{apply_loop, status, ConsensusError, ConsensusStatus, CoordinatorId};
@@ -73,6 +73,12 @@ pub struct NodeOptions {
     /// ADR 0037 §4): outbound peer channels re-read the current material on
     /// every (re)dial, so a rotation reaches the raft mesh without a restart.
     pub tls: Arc<coppice_tls::TlsStore>,
+    /// The expected voter-set size (ADR 0037 §7), node-local coordinator
+    /// config. [`Consensus::promote_voter`](crate::Consensus::promote_voter)
+    /// refuses a promotion that would push the voter count past this unless
+    /// it is paired with a same-change removal that keeps the count level.
+    /// `0` disables the ceiling (no configured expectation).
+    pub cluster_size: usize,
 }
 
 /// A running consensus replica, assembled and ready to serve.
@@ -101,6 +107,10 @@ pub struct NodeHandle {
     instance_uuid: [u8; 16],
     history_id: [u8; 16],
     status: watch::Receiver<ConsensusStatus>,
+    /// Per-peer last-successful-RPC-response instants, recorded by this
+    /// node's own transport (ADR 0037 §9): the observation behind
+    /// [`replication_health`](NodeHandle::replication_health)'s `last_contact`.
+    contact: PeerContact,
 }
 
 impl NodeHandle {
@@ -128,7 +138,7 @@ impl NodeHandle {
     /// Create the single-voter cluster this node is the sole member of
     /// (ADR 0037 §3 step 4).
     ///
-    /// Separated from [`start`]'s `--bootstrap` arm so the `init` path can
+    /// Separated from [`start`]'s [`StartIntent::Bootstrap`] arm so the `init` path can
     /// stamp its formation intent, mint the cluster CA, and open the store
     /// *before* the history exists — and so a crash on either side of this
     /// call is a distinguishable, testable point. Idempotent in the only way
@@ -207,6 +217,78 @@ impl NodeHandle {
             millis_since_quorum_ack: m.millis_since_quorum_ack,
         }
     }
+
+    /// The per-voter facts behind the `?require=healthy` liveness test
+    /// (ADR 0037 §9), read at the moment of the call.
+    ///
+    /// Meaningful only on a leader, and the fields say why: `matched` comes
+    /// from openraft's leader-side replication metrics, and `last_contact`
+    /// from this node's own transport, which only sends replication RPCs
+    /// while leading. Callers gate on `leader == Some(local_id)` first.
+    ///
+    /// `last_log_index` is deliberately the frontier — the same one the
+    /// promotion lag gate measures against (see `PROMOTION_LAG_MAX` in
+    /// `adapter.rs`) — not `last_applied`: a leader with an apply backlog must
+    /// not make its followers look closer than promotion would call them.
+    pub fn replication_health(&self) -> ReplicationHealth {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        let voters = m
+            .membership_config
+            .voter_ids()
+            .map(|id| VoterHealth {
+                id,
+                matched: m
+                    .replication
+                    .as_ref()
+                    .and_then(|repl| repl.get(&id).copied())
+                    .map(|logid| logid.map(|l| l.index).unwrap_or(0)),
+                last_contact: self.contact.elapsed(id),
+            })
+            .collect();
+        ReplicationHealth {
+            local_id: self.node_id,
+            leader: m.current_leader,
+            term: m.current_term,
+            last_log_index: m.last_log_index.unwrap_or(0),
+            voters,
+        }
+    }
+}
+
+/// A leader's point-in-time view of each voter's replication liveness
+/// (ADR 0037 §9), from [`NodeHandle::replication_health`].
+#[derive(Debug, Clone)]
+pub struct ReplicationHealth {
+    /// This node's Raft identity.
+    pub local_id: CoordinatorId,
+    /// The current leader, when known.
+    pub leader: Option<CoordinatorId>,
+    /// The current term — a health window accumulated under one leadership
+    /// must not survive into the next (ADR 0037 §9).
+    pub term: u64,
+    /// The leader's last log index: the canonical lag frontier, shared with
+    /// the promotion gate.
+    pub last_log_index: u64,
+    /// One entry per current voter (the local node included).
+    pub voters: Vec<VoterHealth>,
+}
+
+/// One voter in a [`ReplicationHealth`].
+#[derive(Debug, Clone)]
+pub struct VoterHealth {
+    /// The voter's Raft identity.
+    pub id: CoordinatorId,
+    /// The log index the leader has confirmed replicated to this voter;
+    /// `None` when no replication stream tracks it (non-leaders, and a voter
+    /// the leader has not begun replicating to).
+    pub matched: Option<u64>,
+    /// Time since this voter last answered one of this node's RPCs; `None`
+    /// when it never has in this process's life. Real transport observation,
+    /// never inferred from log positions — on an idle log a dead voter's
+    /// `matched` stays current forever, but its contact goes stale within a
+    /// heartbeat interval.
+    pub last_contact: Option<Duration>,
 }
 
 /// A snapshot of cluster state for the admin surface (ADR 0016).
@@ -285,6 +367,7 @@ pub async fn start(
         snapshot_keep_log_entries,
         event_tap_capacity,
         tls,
+        cluster_size,
     } = options;
 
     // Step 1: the directory must exist (the caller owns creating it).
@@ -302,27 +385,42 @@ pub async fn start(
         (StartIntent::Restart, false) => {
             return Err(NodeStartError::RefusedStart(format!(
                 "data directory {} has no manifest: refusing to start on an unexpectedly empty \
-                 directory — a failed mount is indistinguishable from a fresh disk; pass \
-                 --bootstrap (first node of a new cluster) or --join (fresh replacement instance) \
-                 if this is deliberate (ADR 0016)",
+                 directory — a failed mount is indistinguishable from a fresh disk. A daemon \
+                 that means to form or join a cluster does so on an EMPTY directory, and \
+                 derives that intent itself (ADR 0016, ADR 0037 §1)",
                 data_dir.display()
             )));
         }
         (StartIntent::Bootstrap | StartIntent::Join, true) => {
             return Err(NodeStartError::RefusedStart(format!(
-                "--bootstrap/--join was passed but {} is already initialized (manifest present); \
-                 intent flags are only legal on an empty directory (ADR 0016)",
+                "{} is already initialized (manifest present), so it can only be resumed; \
+                 forming or joining a cluster on it would discard the instance it already \
+                 carries (ADR 0016)",
                 data_dir.display()
             )));
         }
-        (StartIntent::Bootstrap | StartIntent::Join, false) => {
+        (intent @ (StartIntent::Bootstrap | StartIntent::Join), false) => {
             // Mints this replica's allocate-once Raft identity and a fresh
             // instance UUID, both stamped into the manifest (ADR 0016 / 0025).
-            let minted = storage::init(&fs, &StorageOptions::new(history_id))?;
+            //
+            // A joiner's directory is additionally stamped as formed: its
+            // history came from the cluster it probed rather than from its own
+            // config, and the marker is what tells a later start not to apply
+            // the config-vs-stamp wrong-volume check to it (ADR 0037 §3/§6).
+            let options = StorageOptions::new(history_id);
+            let minted = if intent == StartIntent::Join {
+                storage::init_joined(
+                    &fs,
+                    &options,
+                    coppice_core::time::Timestamp::now().as_micros(),
+                )?
+            } else {
+                storage::init(&fs, &options)?
+            };
             tracing::debug!(
                 node_id = minted,
-                "minted coordinator raft identity (stamped in the data directory; \
-                 pass it to `admin add-learner` when joining, ADR 0025)"
+                ?intent,
+                "minted coordinator raft identity (stamped in the data directory, ADR 0025)"
             );
         }
     }
@@ -382,6 +480,10 @@ pub async fn start(
     // shared hot-reload store and rebuilds per-peer channels when the material's
     // generation advances (ADR 0037 §4).
     let factory = GrpcNetworkFactory::new(history_id, tls, rpc_timeout);
+    // Taken before the factory moves into openraft: the transport records
+    // per-peer contact instants into this shared handle, and the admin handle
+    // reads them for the `?require=healthy` liveness test (ADR 0037 §9).
+    let contact = factory.contact();
     let raft = Raft::new(node_id, Arc::new(config), factory, log_store, sm_store)
         .await
         .map_err(|e| NodeStartError::Raft(format!("raft node construction failed: {e}")))?;
@@ -396,7 +498,7 @@ pub async fn start(
         )]);
         raft.initialize(members).await.map_err(|e| match e {
             RaftError::APIError(InitializeError::NotAllowed(_)) => NodeStartError::RefusedStart(
-                format!("--bootstrap refused: this cluster is already initialized (ADR 0016): {e}"),
+                format!("refusing to form: this cluster is already initialized (ADR 0016): {e}"),
             ),
             other => NodeStartError::Raft(format!("raft initialize failed: {other}")),
         })?;
@@ -404,7 +506,8 @@ pub async fn start(
 
     // Step 10 + 11: status watch, seam, transport, handle.
     let status = status::spawn(raft.metrics(), committed_rx);
-    let consensus = OpenraftConsensus::new(raft.clone(), status.clone(), views.clone());
+    let consensus =
+        OpenraftConsensus::new(raft.clone(), status.clone(), views.clone(), cluster_size);
     let transport = Server::new(RaftTransportHandler::new(raft.clone(), history_id));
     let handle = NodeHandle {
         raft,
@@ -412,6 +515,7 @@ pub async fn start(
         instance_uuid,
         history_id,
         status,
+        contact,
     };
 
     Ok(StartedNode {

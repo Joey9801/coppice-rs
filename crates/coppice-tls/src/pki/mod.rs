@@ -62,7 +62,7 @@ pub use machine::{
     MACHINE_IDENTITY_FILE,
 };
 pub use token::{generate_secret, hash_secret, verify_secret, TokenError, TOKEN_PREFIX};
-pub use verify::{verify_leaf, VerifyError};
+pub use verify::{leaf_sans, verify_leaf, VerifyError};
 
 // ---------------------------------------------------------------------------
 // Lifetimes and profile markers — the single place these values are defined.

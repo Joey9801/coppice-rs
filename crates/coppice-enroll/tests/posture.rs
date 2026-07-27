@@ -58,7 +58,7 @@ async fn a_verified_https_endpoint_enrolls_and_installs_the_leaf() {
     let endpoint = stub.endpoint("https", "localhost");
 
     let client = EnrollClient::with_extra_root_ca(&endpoint, false, &ca.pem).expect("build client");
-    let outcome = ensure_enrolled_with(&paths, &client, &inline_token(), Claim::Node(node))
+    let outcome = ensure_enrolled_with(&paths, &client, &inline_token(), Claim::Node(node), &[])
         .await
         .expect("enrolls against a verified endpoint");
     assert_eq!(outcome, Outcome::Enrolled);
@@ -114,13 +114,13 @@ async fn a_second_call_finds_the_leaf_and_never_touches_the_network() {
     let endpoint = stub.endpoint("https", "localhost");
     let client = EnrollClient::with_extra_root_ca(&endpoint, false, &ca.pem).expect("build client");
 
-    let first = ensure_enrolled_with(&paths, &client, &inline_token(), Claim::Node(node))
+    let first = ensure_enrolled_with(&paths, &client, &inline_token(), Claim::Node(node), &[])
         .await
         .expect("first enrollment");
     assert_eq!(first, Outcome::Enrolled);
     let installed = std::fs::read(&paths.cert).expect("read the leaf");
 
-    let second = ensure_enrolled_with(&paths, &client, &inline_token(), Claim::Node(node))
+    let second = ensure_enrolled_with(&paths, &client, &inline_token(), Claim::Node(node), &[])
         .await
         .expect("second call");
     assert_eq!(
@@ -149,7 +149,7 @@ async fn assert_refused_without_sending_the_token(
     paths: &TlsPaths,
     node: NodeId,
 ) {
-    let error = ensure_enrolled_with(paths, client, &inline_token(), Claim::Node(node))
+    let error = ensure_enrolled_with(paths, client, &inline_token(), Claim::Node(node), &[])
         .await
         .expect_err("an unverifiable endpoint is refused");
 
@@ -248,7 +248,7 @@ async fn plain_http_with_the_opt_in_enrolls() {
     let config = config(endpoint.clone(), true);
     config.validate().expect("the opt-in makes it valid");
 
-    let outcome = coppice_enroll::ensure_enrolled(&paths, &config, Claim::Node(node))
+    let outcome = coppice_enroll::ensure_enrolled(&paths, &config, Claim::Node(node), &[])
         .await
         .expect("enrolls over cleartext when the operator asked for it");
     assert_eq!(outcome, Outcome::Enrolled);

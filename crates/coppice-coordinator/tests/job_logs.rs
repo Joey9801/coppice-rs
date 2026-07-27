@@ -37,7 +37,6 @@ use coppice_agent::telemetry::{
 };
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::{Consensus, ConsensusError, StateViews};
-use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::{CoordinatorControlPlane, NodeClient};
 use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
@@ -616,18 +615,8 @@ async fn follower_serves_job_logs_directly() {
 
     let mut follower_a = Node::new(2, cluster_id, &ca);
     let mut follower_b = Node::new(3, cluster_id, &ca);
-    follower_a
-        .boot(CliOverrides {
-            bootstrap: false,
-            join: true,
-        })
-        .await;
-    follower_b
-        .boot(CliOverrides {
-            bootstrap: false,
-            join: true,
-        })
-        .await;
+    follower_a.boot_joining().await;
+    follower_b.boot_joining().await;
     add_voter(&leader, &follower_a, DEADLINE).await;
     add_voter(&leader, &follower_b, DEADLINE).await;
 

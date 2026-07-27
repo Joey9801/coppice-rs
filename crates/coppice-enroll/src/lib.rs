@@ -44,6 +44,11 @@ pub struct EnrollRequest {
     /// for itself (ADR 0037 §7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<MachineId>,
+    /// The hostnames/IPs this machine serves on, requested as SANs on the
+    /// issued leaf. Metadata, never identity (ADR 0037 §4). Omitted entirely
+    /// by an enrollee that serves nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sans: Vec<String>,
 }
 
 impl std::fmt::Debug for EnrollRequest {
@@ -53,6 +58,7 @@ impl std::fmt::Debug for EnrollRequest {
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("node_id", &self.node_id)
             .field("machine_id", &self.machine_id)
+            .field("sans", &self.sans)
             .finish()
     }
 }
@@ -79,6 +85,7 @@ mod tests {
             token: Some("cpk_super_secret".to_string()),
             node_id: None,
             machine_id: None,
+            sans: Vec::new(),
         };
         let rendered = format!("{request:?}");
         assert!(!rendered.contains("cpk_"), "{rendered}");
@@ -92,6 +99,7 @@ mod tests {
             token: None,
             node_id: Some(NodeId::new()),
             machine_id: None,
+            sans: Vec::new(),
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("token"), "{json}");

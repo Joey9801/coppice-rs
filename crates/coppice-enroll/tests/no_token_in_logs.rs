@@ -52,6 +52,7 @@ fn neither_a_successful_nor_a_failed_enrollment_logs_the_token() {
                 &good,
                 &TokenSource::Path(token_file.clone()),
                 Claim::Node(node),
+                &[],
             )
             .await
             .expect("enrolls");
@@ -71,6 +72,7 @@ fn neither_a_successful_nor_a_failed_enrollment_logs_the_token() {
                 &bad,
                 &TokenSource::Path(token_file),
                 Claim::Node(node),
+                &[],
             )
             .await
             .expect_err("an untrusted endpoint is refused");

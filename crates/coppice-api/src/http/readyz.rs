@@ -10,27 +10,26 @@
 //! That separation is not incidental. A **parked** daemon (ADR 0037 §1) has
 //! no consensus replica at all, so it has no control plane to answer from —
 //! yet it must still say what it is waiting for. The endpoint therefore
-//! closes over a plain callback the daemon owns, and the same route serves
-//! the closed pre-formation surface ([`super::routes::closed_router`]) and
-//! the full one.
+//! closes over two plain callbacks the daemon owns — the report and the
+//! [`HealthVerdict`] — and the same route serves the closed pre-formation
+//! surface ([`super::routes::closed_router`]) and the full one.
 //!
 //! # Scope
 //!
-//! This is the ADR 0037 chunk-03 subset: the phases a daemon can be in
-//! before self-join exists — [`waiting`](ReadyzPhase::Waiting),
-//! [`formation-failed`](ReadyzPhase::FormationFailed), and a formed replica
-//! ([`voter`](ReadyzPhase::Voter) / [`learner`](ReadyzPhase::Learner)).
-//! `joining`, `?require=healthy`, the `formed` cardinality field, and
-//! admission-refusal surfacing arrive with the convergence loop; the shape
-//! here is the one they slot into.
+//! The full ADR 0037 §9 surface: every [`ReadyzPhase`] a daemon can be in
+//! (parked through voter), the plain node gate (`GET /readyz`), the
+//! cluster-redundancy gate (`GET /readyz?require=healthy`, answered only by
+//! the leader), the `formed` cardinality field (body-only, never a gate),
+//! and last-admission-refusal surfacing (ADR 0037 §7).
 
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 /// Where a daemon is in the ADR 0037 §1 lifecycle.
 ///
@@ -116,6 +115,21 @@ pub struct ReadyzReport {
     /// operator's whole picture when no other surface is served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Membership cardinality has reached `cluster_size` (ADR 0037 §9) — the
+    /// desired *shape*, saying nothing about health. Reported, never a gate.
+    pub formed: bool,
+    /// Voters the leader currently observes within the promotion-lag
+    /// threshold. Only the leader can know this; absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_voters: Option<usize>,
+    /// The last admission refusal this daemon received while converging — a
+    /// duplicated-machine-identity refusal (ADR 0037 §7) surfaces here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_admission_refusal: Option<String>,
+    /// A stable machine-readable code for why a gate failed, when one applies
+    /// (currently only `health_unknown`); `reason` carries the human text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
 }
 
 impl ReadyzReport {
@@ -142,6 +156,10 @@ impl ReadyzReport {
             voters: Vec::new(),
             cluster_size,
             reason,
+            formed: false,
+            live_voters: None,
+            last_admission_refusal: None,
+            reason_code: None,
         }
     }
 
@@ -159,8 +177,8 @@ impl ReadyzReport {
     /// `promotion_lag_max` is the same threshold membership uses to decide a
     /// learner has caught up, passed in so this crate does not depend on
     /// consensus. The *cluster-redundancy* gate (`?require=healthy`) is a
-    /// separate question answered only by the leader; it lands with the
-    /// convergence loop.
+    /// separate question, answered by [`HealthVerdict`] and only by the
+    /// leader.
     pub fn is_ready(&self, promotion_lag_max: u64) -> bool {
         self.phase == ReadyzPhase::Voter
             && self.replication_lag <= promotion_lag_max
@@ -168,7 +186,27 @@ impl ReadyzReport {
     }
 }
 
-/// The daemon-owned source of [`ReadyzReport`]s.
+/// The cluster-redundancy answer behind `?require=healthy` (ADR 0037 §9).
+/// Only the leader has replication metrics, so only the leader can answer;
+/// a follower says so plainly rather than caching a stale snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthVerdict {
+    /// Not the leader: this replica cannot answer. The leader hint travels
+    /// in `ReadyzReport::leader`.
+    Unknown,
+    /// Leader: at least `cluster_size` voters within the promotion-lag
+    /// threshold, sustained for the stability interval.
+    Sustained { live_voters: usize },
+    /// Leader: redundancy is not (yet) sustained.
+    Degraded { live_voters: usize },
+}
+
+/// Machine-readable code for [`ReadyzEndpoint::handle`]'s `health_unknown`
+/// refusal (ADR 0037 §9): `?require=healthy` on a replica that cannot
+/// answer authoritatively.
+const REASON_CODE_HEALTH_UNKNOWN: &str = "health_unknown";
+
+/// The daemon-owned source of [`ReadyzReport`]s and [`HealthVerdict`]s.
 ///
 /// Mirrors [`MetricsEndpoint`](super::MetricsEndpoint): the router captures
 /// it directly rather than reaching it through router state, because the
@@ -177,54 +215,117 @@ impl ReadyzReport {
 #[derive(Clone)]
 pub struct ReadyzEndpoint {
     report: Arc<dyn Fn() -> ReadyzReport + Send + Sync>,
+    health: Arc<dyn Fn() -> HealthVerdict + Send + Sync>,
     promotion_lag_max: u64,
 }
 
 impl ReadyzEndpoint {
-    /// Build the endpoint over the daemon's own view of its phase.
+    /// Build the endpoint over the daemon's own view of its phase and, on
+    /// the leader, its replication health.
     ///
-    /// The callback is invoked per request and must not block: it reads a
-    /// watch/atomic the daemon publishes, never consensus.
+    /// Both callbacks are invoked per request and must not block: they read
+    /// a watch/atomic the daemon publishes, never consensus directly.
     pub fn new(
         promotion_lag_max: u64,
         report: impl Fn() -> ReadyzReport + Send + Sync + 'static,
+        health: impl Fn() -> HealthVerdict + Send + Sync + 'static,
     ) -> ReadyzEndpoint {
         ReadyzEndpoint {
             report: Arc::new(report),
+            health: Arc::new(health),
             promotion_lag_max,
         }
     }
 
     /// An endpoint for tests and embedders with no formation state: always
-    /// reports [`ReadyzPhase::Waiting`], so `/readyz` answers 503 rather than
-    /// panicking or 404ing.
+    /// reports [`ReadyzPhase::Waiting`] and [`HealthVerdict::Unknown`], so
+    /// `/readyz` answers 503 rather than panicking or 404ing.
     pub fn detached_for_tests() -> ReadyzEndpoint {
-        ReadyzEndpoint::new(0, || {
-            ReadyzReport::unformed(
-                "unknown".to_string(),
-                ReadyzPhase::Waiting,
-                0,
-                Some("detached test endpoint: no daemon state attached".to_string()),
-            )
-        })
+        ReadyzEndpoint::new(
+            0,
+            || {
+                ReadyzReport::unformed(
+                    "unknown".to_string(),
+                    ReadyzPhase::Waiting,
+                    0,
+                    Some("detached test endpoint: no daemon state attached".to_string()),
+                )
+            },
+            || HealthVerdict::Unknown,
+        )
     }
 
-    /// The current report.
+    /// The current report, unmodified by any `require` gate.
     pub fn report(&self) -> ReadyzReport {
         (self.report)()
     }
 
-    /// Handle one `GET /readyz`: 200 iff this replica is node-ready, 503 with
-    /// the same body otherwise (ADR 0037 §9 — the body is always the full
-    /// state, the status is only the gate).
-    pub async fn handle(&self) -> impl IntoResponse {
-        let report = self.report();
-        let status = if report.is_ready(self.promotion_lag_max) {
-            StatusCode::OK
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
+    /// Handle one `GET /readyz`; `require` is the raw query value.
+    ///
+    /// - Absent or empty → the plain node gate: 200 iff
+    ///   [`ReadyzReport::is_ready`], 503 otherwise. Body is the full report
+    ///   either way.
+    /// - `healthy` → additionally requires [`HealthVerdict::Sustained`] from
+    ///   the leader. `Unknown` is 503 with `reason_code: "health_unknown"`;
+    ///   `Degraded` is 503; `Sustained` still needs the node gate to answer
+    ///   200.
+    /// - Anything else → 400 with a JSON error body. There is deliberately
+    ///   no `?require=formed`: `formed` is a body field, reported for
+    ///   automation to read, never a gate (ADR 0037 §9).
+    pub async fn handle(&self, require: Option<String>) -> Response {
+        let require = require.as_deref().unwrap_or("");
+        if !require.is_empty() && require != "healthy" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "unknown require value {require:?}; expected: healthy (ADR 0037 §9)"
+                    )
+                })),
+            )
+                .into_response();
+        }
+
+        let mut report = self.report();
+        let node_ready = report.is_ready(self.promotion_lag_max);
+
+        if require.is_empty() {
+            let status = if node_ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            return (status, Json(report)).into_response();
+        }
+
+        // `require=healthy`: the cluster-redundancy gate (ADR 0037 §9),
+        // answered authoritatively only by the leader.
+        let status = match (self.health)() {
+            HealthVerdict::Unknown => {
+                report.reason_code = Some(REASON_CODE_HEALTH_UNKNOWN.to_string());
+                report.reason = Some(
+                    "this replica cannot answer the cluster-redundancy gate: only the leader \
+                     has replication metrics; retry against the leader hinted in `leader`, or \
+                     use `admin status --json`"
+                        .to_string(),
+                );
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            HealthVerdict::Degraded { live_voters } => {
+                report.live_voters = Some(live_voters);
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            HealthVerdict::Sustained { live_voters } => {
+                report.live_voters = Some(live_voters);
+                if node_ready {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
         };
-        (status, Json(report))
+
+        (status, Json(report)).into_response()
     }
 }
 
@@ -251,6 +352,10 @@ mod tests {
             }],
             cluster_size: 1,
             reason: None,
+            formed: true,
+            live_voters: None,
+            last_admission_refusal: None,
+            reason_code: None,
         }
     }
 
@@ -298,6 +403,13 @@ mod tests {
         assert!(json.get("node_id").is_none());
         assert!(json.get("history_id").is_none());
         assert!(json.get("instance_uuid").is_none());
+        // `formed` is a plain bool, always present, never omitted.
+        assert_eq!(json["formed"], false);
+        // The leader-only / refusal / gate-diagnostic fields are omitted
+        // when unknown, not zero/null-filled.
+        assert!(json.get("live_voters").is_none());
+        assert!(json.get("last_admission_refusal").is_none());
+        assert!(json.get("reason_code").is_none());
     }
 
     #[test]
@@ -305,5 +417,98 @@ mod tests {
         let failed = ReadyzReport::unformed("p".into(), ReadyzPhase::FormationFailed, 1, None);
         let json = serde_json::to_value(&failed).expect("serialize");
         assert_eq!(json["phase"], "formation-failed");
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn endpoint(report: ReadyzReport, health: HealthVerdict) -> ReadyzEndpoint {
+        ReadyzEndpoint::new(256, move || report.clone(), move || health)
+    }
+
+    #[tokio::test]
+    async fn plain_gate_is_unchanged_by_the_require_extension() {
+        let ready = endpoint(voter_report(0), HealthVerdict::Unknown);
+        let response = ready.handle(None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut lagging = voter_report(0);
+        lagging.replication_lag = 999;
+        let not_ready = endpoint(lagging, HealthVerdict::Unknown);
+        let response = not_ready.handle(Some(String::new())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn require_healthy_on_a_non_leader_is_health_unknown() {
+        let ep = endpoint(voter_report(0), HealthVerdict::Unknown);
+        let response = ep.handle(Some("healthy".to_string())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(response).await;
+        assert_eq!(body["reason_code"], "health_unknown");
+        assert!(body["reason"].as_str().unwrap().contains("leader"));
+    }
+
+    #[tokio::test]
+    async fn require_healthy_degraded_is_503_with_live_voters() {
+        let ep = endpoint(voter_report(0), HealthVerdict::Degraded { live_voters: 1 });
+        let response = ep.handle(Some("healthy".to_string())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(response).await;
+        assert_eq!(body["live_voters"], 1);
+    }
+
+    #[tokio::test]
+    async fn require_healthy_sustained_and_node_ready_is_200() {
+        let ep = endpoint(voter_report(0), HealthVerdict::Sustained { live_voters: 3 });
+        let response = ep.handle(Some("healthy".to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["live_voters"], 3);
+    }
+
+    #[tokio::test]
+    async fn require_healthy_sustained_but_node_not_ready_is_503() {
+        let mut lagging = voter_report(0);
+        lagging.replication_lag = 999;
+        let ep = endpoint(lagging, HealthVerdict::Sustained { live_voters: 3 });
+        let response = ep.handle(Some("healthy".to_string())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(response).await;
+        // Still populated even though the overall gate failed.
+        assert_eq!(body["live_voters"], 3);
+    }
+
+    #[tokio::test]
+    async fn unknown_require_value_is_400() {
+        let ep = endpoint(voter_report(0), HealthVerdict::Unknown);
+        let response = ep.handle(Some("formed".to_string())).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("expected: healthy"));
+    }
+
+    #[tokio::test]
+    async fn last_admission_refusal_is_omitted_when_absent_and_present_when_set() {
+        let ep = endpoint(voter_report(0), HealthVerdict::Unknown);
+        let body = body_json(ep.handle(None).await).await;
+        assert!(body.get("last_admission_refusal").is_none());
+
+        let mut refused = voter_report(0);
+        refused.last_admission_refusal =
+            Some("duplicated machine identity for node 7 (ADR 0037 §7)".to_string());
+        let ep = endpoint(refused, HealthVerdict::Unknown);
+        let body = body_json(ep.handle(None).await).await;
+        assert_eq!(
+            body["last_admission_refusal"],
+            "duplicated machine identity for node 7 (ADR 0037 §7)"
+        );
     }
 }

@@ -134,10 +134,13 @@ Intended command surface, following the initial scope
 
 Two binaries expose a CLI, and they are not the same thing:
 
-- **`coppice-coordinator`** is the coordinator *daemon*. Its CLI is a
-  deliberately tiny startup shell — `--config`, `--bootstrap` / `--join` — that
-  loads a per-node TOML file and runs the server process
-  ([ADR 0020](../../docs/decisions/0020-node-config-vs-replicated-policy.md)).
+- **`coppice-coordinator`** is the coordinator *daemon*. Its CLI is a startup
+  shell of exactly one flag — `--config` — that loads a per-node TOML file and
+  runs the server process. Startup intent is derived from the data directory,
+  not declared, so the same command line covers first node, joining node, and
+  restart alike
+  ([ADR 0020](../../docs/decisions/0020-node-config-vs-replicated-policy.md),
+  [ADR 0037](../../docs/decisions/0037-coordinator-discovery-and-self-converging-membership.md) §1).
 - **`coppice`** (this crate) is a *client*. It runs anywhere, holds no server
   state, and talks to a running cluster over the public API to submit and query
   work and to administer replicated policy.

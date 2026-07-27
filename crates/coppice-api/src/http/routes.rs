@@ -100,12 +100,14 @@ fn operational_routes<S: Clone + Send + Sync + 'static>(
             }),
         )
         // Readiness (ADR 0037 §9): served in every daemon state, including
-        // parked and formation-failed.
+        // parked and formation-failed. `?require=healthy` is the only gate
+        // query the endpoint recognizes; anything else is a 400 from
+        // `ReadyzEndpoint::handle` itself.
         .route(
             "/readyz",
-            get(move || {
+            get(move |Query(ReadyzQuery { require }): Query<ReadyzQuery>| {
                 let readyz = readyz.clone();
-                async move { readyz.handle().await }
+                async move { readyz.handle(require).await }
             }),
         )
 }
@@ -204,6 +206,16 @@ where
     T::Err: std::fmt::Display,
 {
     move |IdPath(_), ReadQuery(_)| ready(HttpError::unimplemented(endpoint))
+}
+
+/// `GET /readyz` query parameters (ADR 0037 §9): the raw `require` value,
+/// validated by [`ReadyzEndpoint::handle`] itself rather than here — the
+/// endpoint owns the "healthy is the only recognized value" contract so it
+/// stays true regardless of which router mounts it.
+#[derive(Debug, Default, Deserialize)]
+struct ReadyzQuery {
+    #[serde(default)]
+    require: Option<String>,
 }
 
 /// Default page size when `?limit=` is absent.

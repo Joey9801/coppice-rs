@@ -103,6 +103,12 @@ pub struct EnrollCall {
     pub node_id: Option<NodeId>,
     /// The machine identity a coordinator-role enrollee minted for itself.
     pub machine_id: Option<MachineId>,
+    /// The hostnames/IPs the enrollee will serve on, carried into the issued
+    /// leaf as SANs. Metadata, never identity (ADR 0037 §4) — the subject is
+    /// dictated from `node_id`/`machine_id`, and a declared address is made
+    /// trustworthy by the leader's dial-back verification at admission (§6),
+    /// not by having been declared here.
+    pub sans: Vec<String>,
 }
 
 impl fmt::Debug for EnrollCall {
@@ -112,6 +118,7 @@ impl fmt::Debug for EnrollCall {
             .field("csr_pem_len", &self.csr_pem.len())
             .field("node_id", &self.node_id)
             .field("machine_id", &self.machine_id)
+            .field("sans", &self.sans)
             .finish()
     }
 }
@@ -221,6 +228,7 @@ impl EnrollEndpoint {
             csr_pem: body.csr_pem,
             node_id: body.node_id,
             machine_id: body.machine_id,
+            sans: body.sans,
         };
 
         match (self.issue)(call).await {
@@ -359,6 +367,7 @@ mod tests {
             csr_pem: "-----BEGIN CERTIFICATE REQUEST-----".to_string(),
             node_id: None,
             machine_id: None,
+            sans: Vec::new(),
         };
         let rendered = format!("{call:?}");
         assert!(!rendered.contains("cpk_"), "{rendered}");

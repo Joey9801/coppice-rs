@@ -17,7 +17,7 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -57,6 +57,43 @@ pub const SNAPSHOT_CHUNK: ByteSize = ByteSize::from_mib(1);
 /// The path name fail-stop wire-decode errors are attributed to.
 const WIRE: &str = "raft-rpc";
 
+/// When each peer last *answered* a Raft RPC from this node — recorded at the
+/// transport, per successful response (ADR 0037 §9).
+///
+/// This is the leader-side "have I actually heard from this voter" fact behind
+/// the `?require=healthy` liveness test. It cannot be inferred from log
+/// positions: openraft's metrics expose only matched indexes, and on an idle
+/// log a dead follower's matched index stays current forever. A replication
+/// response is real observation — a leader heartbeats every follower at
+/// `heartbeat_interval` even when the log is idle, so on a leader this map
+/// stays fresh for a live peer and goes stale within about one interval of a
+/// dead one. On a non-leader nothing sends replication RPCs, so the map simply
+/// freezes; callers gate on leadership before reading it.
+#[derive(Clone, Default)]
+pub struct PeerContact {
+    peers: Arc<Mutex<HashMap<CoordinatorId, Instant>>>,
+}
+
+impl PeerContact {
+    /// Record a successful RPC response from `target`, now.
+    fn record(&self, target: CoordinatorId) {
+        self.peers
+            .lock()
+            .expect("peer contact map poisoned")
+            .insert(target, Instant::now());
+    }
+
+    /// Time since `target` last answered an RPC from this process; `None`
+    /// when it never has.
+    pub fn elapsed(&self, target: CoordinatorId) -> Option<Duration> {
+        self.peers
+            .lock()
+            .expect("peer contact map poisoned")
+            .get(&target)
+            .map(Instant::elapsed)
+    }
+}
+
 /// Creates one [`GrpcRaftNetwork`] per target, sharing a per-peer channel map.
 ///
 /// Cheap to hold: it keeps the shared TLS store and rebuilds a
@@ -90,6 +127,8 @@ struct Shared {
     ///
     /// [`generation`]: coppice_tls::TlsStore::generation
     channels: Mutex<PeerChannels>,
+    /// Per-peer last-successful-response instants (ADR 0037 §9).
+    contact: PeerContact,
 }
 
 /// Per-peer cache value: the dialed address, the TLS material generation it was
@@ -106,8 +145,16 @@ impl GrpcNetworkFactory {
                 tls,
                 rpc_timeout,
                 channels: Mutex::new(HashMap::new()),
+                contact: PeerContact::default(),
             }),
         }
+    }
+
+    /// The per-peer contact facts this factory's networks record. Taken once
+    /// at assembly (before the factory moves into openraft) and read wherever
+    /// the `?require=healthy` liveness test runs (ADR 0037 §9).
+    pub fn contact(&self) -> PeerContact {
+        self.shared.contact.clone()
     }
 }
 
@@ -296,6 +343,11 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
             .append_entries(req)
             .await
             .map_err(|status| status_to_rpc(self.target, status))?;
+        // The peer answered a replication RPC (heartbeats ride this same
+        // path), which is exactly what "the leader has heard from this voter"
+        // means for the liveness test (ADR 0037 §9). A rejection body still
+        // counts: the peer is alive and reachable either way.
+        self.shared.contact.record(self.target);
         convert::append_response_from_pb(resp.into_inner())
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }
@@ -405,6 +457,10 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
             }
             result = &mut call => {
                 let resp = result.map_err(|status| status_to_streaming(self.target, status))?;
+                // A completed snapshot install is contact too (ADR 0037 §9):
+                // a follower resyncing by snapshot answers no append RPCs for
+                // the whole transfer, and must not read as dead meanwhile.
+                self.shared.contact.record(self.target);
                 let vote_pb = resp.into_inner().vote.ok_or_else(|| {
                     StreamingError::Network(NetworkError::new(&io::Error::new(
                         io::ErrorKind::InvalidData,

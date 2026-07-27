@@ -50,10 +50,11 @@ directory's manifest stamp,
 [ADR 0025](../../docs/decisions/0025-self-minted-coordinator-identity.md).) Anything two
 replicas must agree on — quotas, decay policy, retention, authorization mappings
 — is **replicated cluster policy** held in the state machine, never in this file.
-Unknown keys fail-stop naming the offending key, durations are humane strings
-(bare integers rejected), and precedence is `CLI > file > built-in defaults`. The
-CLI surface ([`cli`](src/cli.rs)) is correspondingly tiny: `--config` plus the
-startup-intent flags `--bootstrap` / `--join`. See
+Unknown keys fail-stop naming the offending key and durations are humane strings
+(bare integers rejected). The CLI surface ([`cli`](src/cli.rs)) is exactly
+`--config`: startup intent is *derived* from the data directory, never declared
+([ADR 0037](../../docs/decisions/0037-coordinator-discovery-and-self-converging-membership.md) §1),
+so there is no override layer and every knob resolves file-over-default. See
 [configuration](../../docs/operations/configuration.md).
 
 The Prometheus `/metrics` endpoint is now served on the client API listener at
@@ -63,12 +64,18 @@ remaining one read but not yet consumed (marked as such in the source).
 
 ## Bootstrap, membership, and rebuild
 
-Startup intent follows the
-[ADR 0016](../../docs/decisions/0016-coordinator-rebuild-learner-join.md) matrix:
-`--bootstrap` (first coordinator of a new cluster), `--join` (a fresh replacement
-replica), or neither (restart), cross-checked against the data directory's
-stamped identity inside `coppice-consensus::start`. All coordinator↔coordinator
-traffic is mutual TLS ([ADR 0011]) with no insecure fallback.
+Startup intent is **derived**, not declared (ADR 0037 §1): a manifest resumes
+the replica stamped on this disk; a manifest with a formation intent and no
+`formation_complete` marker fail-stops; an absent manifest means a new instance,
+which **parks** and runs [`convergence`](src/convergence.rs) — enroll if there is
+no usable leaf, discover, probe, and join the initialized cluster that answers.
+It never bootstraps itself; first-ever formation is the one deliberate act,
+`coppice coordinator init` over the local admin socket. Every started replica
+then runs the post-start half of the same loop (`AddLearner` → catch up →
+`PromoteVoter`), which no-ops for a caught-up voter. The ADR 0016 cross-check
+against the data directory's stamped identity still runs inside
+`coppice-consensus::start`. All coordinator↔coordinator traffic is mutual TLS
+([ADR 0011]) with no insecure fallback.
 
 [`admin`](src/admin.rs) is the membership surface, both halves in one module: the
 server implements the `RaftAdminService` RPCs (add-learner, promote-voter,

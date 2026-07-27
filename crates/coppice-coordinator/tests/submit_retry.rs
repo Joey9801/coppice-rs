@@ -16,7 +16,6 @@ use coppice_api::http::dto;
 use coppice_api::{ApiError, ControlPlane};
 use coppice_consensus::Consensus;
 use coppice_coordinator::admin;
-use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::CoordinatorControlPlane;
 use coppice_core::id::{ClusterId, JobId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
@@ -65,26 +64,16 @@ fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequ
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retried_submission_across_leader_change_creates_one_job() {
     let ca = Ca::new();
-    let admin_leaf = ca.leaf();
+    let admin_leaf = ca.operator_leaf();
     let cluster_id = ClusterId::new();
     let history_id = *cluster_id.0.as_bytes();
 
     // -- Form a three-voter cluster (bootstrap + learner-join + promote). ---
     let mut nodes: Vec<Node> = (1..=3).map(|id| Node::new(id, cluster_id, &ca)).collect();
-    nodes[0]
-        .boot(CliOverrides {
-            bootstrap: true,
-            join: false,
-        })
-        .await;
+    nodes[0].boot().await;
     wait_for_leader(&nodes, &[0], DEADLINE).await;
     for i in [1usize, 2] {
-        nodes[i]
-            .boot(CliOverrides {
-                bootstrap: false,
-                join: true,
-            })
-            .await;
+        nodes[i].boot_joining().await;
     }
     {
         let target = nodes[0].advertise.clone();

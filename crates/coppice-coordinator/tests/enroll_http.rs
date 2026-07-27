@@ -12,7 +12,6 @@ mod common;
 
 use std::time::Duration;
 
-use coppice_coordinator::config::CliOverrides;
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::id::{ClusterId, MachineId, NodeId};
 use coppice_proto::pb::core::v1 as pbcore;
@@ -21,16 +20,11 @@ use coppice_tls::pki;
 
 use common::{Ca, Daemon};
 
-const PARKED: CliOverrides = CliOverrides {
-    bootstrap: false,
-    join: false,
-};
-
 /// A formed, certless single-node cluster and the operator credential `init`
 /// printed.
 async fn formed(ca: &Ca) -> (Daemon, OperatorPem) {
     let mut daemon = Daemon::new_certless(ClusterId::new(), ca);
-    daemon.start(PARKED);
+    daemon.start();
     daemon.await_phase("waiting").await;
     let reply = daemon
         .admin(AdminCall::Init {
@@ -137,6 +131,7 @@ fn enroll_body(csr_pem: &[u8], node: Option<NodeId>, machine: Option<MachineId>)
         token: None,
         node_id: node,
         machine_id: machine,
+        sans: Vec::new(),
     })
     .expect("serialize the enrollment request")
 }
@@ -235,6 +230,7 @@ async fn the_body_token_works_and_a_query_parameter_never_does() {
         token: Some(minted.secret.clone()),
         node_id: Some(NodeId::new()),
         machine_id: None,
+        sans: Vec::new(),
     })
     .unwrap();
     let response = http()
@@ -402,6 +398,7 @@ async fn a_follower_proxies_to_the_leader_and_never_redirects() {
             csr_pem: String::from_utf8(machine_csr).unwrap(),
             node_id: None,
             machine_id: Some(machine.into()),
+            sans: Vec::new(),
         })
         .await
         .expect("enroll the follower's own identity")
@@ -506,7 +503,7 @@ async fn an_agent_enrolls_over_http_registers_and_renews_with_production_code_on
 
     let node = NodeId::new();
     let outcome =
-        coppice_enroll::ensure_enrolled(&paths, &config, coppice_enroll::Claim::Node(node))
+        coppice_enroll::ensure_enrolled(&paths, &config, coppice_enroll::Claim::Node(node), &[])
             .await
             .expect("enroll over the public route");
     assert_eq!(outcome, coppice_enroll::Outcome::Enrolled);
@@ -517,9 +514,10 @@ async fn an_agent_enrolls_over_http_registers_and_renews_with_production_code_on
     assert_eq!(verified.profile, pki::Profile::Agent(node));
 
     // Idempotent: a restart with a usable leaf makes no network call.
-    let again = coppice_enroll::ensure_enrolled(&paths, &config, coppice_enroll::Claim::Node(node))
-        .await
-        .expect("second startup");
+    let again =
+        coppice_enroll::ensure_enrolled(&paths, &config, coppice_enroll::Claim::Node(node), &[])
+            .await
+            .expect("second startup");
     assert_eq!(again, coppice_enroll::Outcome::AlreadyEnrolled);
 
     // The enrolled material is a working gateway credential (registration's
@@ -571,7 +569,7 @@ async fn an_agent_enrolls_over_http_registers_and_renews_with_production_code_on
     };
     std::fs::write(&paths.cert, expired).expect("simulate a leaf that expired while down");
     let after_expiry =
-        coppice_enroll::ensure_enrolled(&paths, &config, coppice_enroll::Claim::Node(node))
+        coppice_enroll::ensure_enrolled(&paths, &config, coppice_enroll::Claim::Node(node), &[])
             .await
             .expect("restart after expiry re-enrolls");
     assert_eq!(
