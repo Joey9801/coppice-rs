@@ -18,11 +18,13 @@
 //! which rejects bare integers by construction — deliberately, so an
 //! unlabelled `1500` cannot silently mean milliseconds, seconds, or a bug.
 //!
-//! Precedence is `CLI > file > built-in defaults`. The CLI surface is
-//! deliberately tiny — `--config` plus the ADR 0016 startup-intent flags,
-//! [`CliOverrides::bootstrap`] and [`CliOverrides::join`] — so every other
-//! knob resolves file-over-default via `serde` defaults, and [`load`] is the
-//! single place the two layers merge.
+//! The CLI surface is now exactly `--config` (ADR 0037 §1): startup intent is
+//! *derived* from what the data directory says, not declared, so there is no
+//! override layer left to merge and every knob resolves file-over-default via
+//! `serde` defaults. [`load`] is the single place a config file becomes a
+//! [`ResolvedConfig`], and the only values it computes rather than reads are
+//! the ones a fleet must be able to leave blank in a byte-identical artifact
+//! (chiefly `advertise_host`, ADR 0037 §2).
 
 use std::fs;
 use std::net::SocketAddr;
@@ -39,7 +41,6 @@ pub(crate) use discovery::{BackendKind, DiscoveryConfig};
 // same type the agent parses, so the two daemons cannot disagree about what
 // `insecure` means, and its `Secret` token field redacts itself from every
 // `Debug` rendering (the whole config is logged at startup).
-#[allow(unused_imports)] // consumed by the convergence loop (chunk 05)
 pub(crate) use coppice_enroll::EnrollmentConfig;
 
 mod client_tls {
@@ -154,9 +155,8 @@ mod discovery {
         /// Expected voter count. Node-local config (ADR 0037 §2): consulted by
         /// convergence, the leader's removal rule (§7), and the
         /// formation-complete signal (§9) before replicated state is
-        /// reachable. Parsed now; its consumers land with convergence.
+        /// reachable.
         #[serde(default = "default_cluster_size")]
-        #[allow(dead_code)]
         pub(crate) cluster_size: usize,
 
         /// `[discovery.static]` — present iff `backend = "static"`.
@@ -389,10 +389,10 @@ pub(crate) struct Config {
 
     /// How this installation enrolls for its own machine leaf when it has none
     /// (ADR 0037 §4). Optional: a formed voter, or one whose material is
-    /// supplied by an external PKI, never enrolls. Parsed and validated here;
-    /// the convergence loop that acts on it lands in the next chunk.
+    /// supplied by an external PKI, never enrolls. Validated here, consumed by
+    /// the convergence loop's enroll step ([`crate::convergence`]), which
+    /// retries it every tick until a usable leaf exists.
     #[serde(default)]
-    #[allow(dead_code)]
     pub(crate) enrollment: Option<EnrollmentConfig>,
 
     /// SSO connection parameters, if this deployment uses SSO. `None` when
@@ -624,6 +624,21 @@ pub(crate) struct RaftConfig {
     /// log replay and resyncs via install-snapshot instead (ADR 0016).
     #[serde(default = "default_snapshot_keep_log_entries")]
     pub(crate) snapshot_keep_log_entries: u64,
+
+    /// How long the leader must *continuously* observe a full, caught-up voter
+    /// set before `GET /readyz?require=healthy` answers 200 (ADR 0037 §9).
+    ///
+    /// The gate is cluster redundancy, and redundancy that flickers is not
+    /// redundancy: a voter that replicates for one poll and drops out for the
+    /// next would otherwise let bringup automation proceed into a cluster that
+    /// cannot survive losing a node. The interval is how long "sustained"
+    /// means; any lapse restarts it. Tests and `coppice dev` shorten it, which
+    /// is the only reason it is configurable at all.
+    #[serde(
+        default = "default_health_stability_interval",
+        with = "humantime_serde"
+    )]
+    pub(crate) health_stability_interval: Duration,
 }
 
 impl Default for RaftConfig {
@@ -634,6 +649,7 @@ impl Default for RaftConfig {
             rpc_timeout: default_rpc_timeout(),
             snapshot_log_entries: default_snapshot_log_entries(),
             snapshot_keep_log_entries: default_snapshot_keep_log_entries(),
+            health_stability_interval: default_health_stability_interval(),
         }
     }
 }
@@ -735,6 +751,12 @@ fn default_snapshot_keep_log_entries() -> u64 {
     1000
 }
 
+/// ADR 0037 §9's stated default: long enough that a flapping follower cannot
+/// slip through between two polls, short enough not to stall a bringup.
+fn default_health_stability_interval() -> Duration {
+    Duration::from_secs(10)
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -743,26 +765,17 @@ fn default_log_format() -> String {
     "text".to_string()
 }
 
-/// The entire CLI override surface (ADR 0020: the flag set stays
-/// deliberately tiny). These are the ADR 0016 startup-intent flags; they
-/// never appear in the config file, so the CLI layer is their sole
-/// authority.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CliOverrides {
-    /// `--bootstrap`: this is the first coordinator of a brand-new cluster.
-    pub bootstrap: bool,
-    /// `--join`: this is a fresh replica joining an existing cluster.
-    pub join: bool,
-}
-
-/// The fully-resolved configuration for this process: the parsed file plus
-/// the CLI startup-intent flags layered on top (ADR 0020 precedence,
-/// `CLI > file > built-in defaults`).
+/// The fully-resolved configuration for this process.
+///
+/// A thin wrapper rather than a bare [`Config`] because "resolved" is a real
+/// state: `load` has validated both TLS postures, checked the discovery
+/// backend, and pinned `advertise_host` to a concrete value, so every reader
+/// downstream may treat those as settled. It carries no startup intent —
+/// under ADR 0037 §1 intent is derived from the data directory, and there is
+/// no flag left for a config layer to override.
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub(crate) config: Config,
-    pub(crate) bootstrap: bool,
-    pub(crate) join: bool,
 }
 
 impl Config {
@@ -789,7 +802,8 @@ impl Config {
 }
 
 impl ResolvedConfig {
-    /// The parsed configuration, dropping the startup-intent flags.
+    /// The parsed configuration itself, for callers that only want the file's
+    /// contents (the in-crate formation tests, which never boot a daemon).
     #[cfg(test)]
     pub(crate) fn into_config(self) -> Config {
         self.config
@@ -804,24 +818,23 @@ impl ResolvedConfig {
     pub(crate) fn log_effective(&self) {
         tracing::info!(
             cluster_id = %self.config.cluster_id,
-            bootstrap = self.bootstrap,
-            join = self.join,
             config = ?self.config,
             "effective coordinator configuration"
         );
     }
 }
 
-/// Load the node configuration file and merge it with CLI overrides.
+/// Load and validate the node configuration file.
 ///
-/// Precedence is `CLI > file > built-in defaults` (ADR 0020): `cli` is
-/// authoritative for the startup-intent flags, which never appear in the
-/// file; every other value resolves file-over-default via `serde` field
-/// defaults. `--bootstrap` and `--join` are mutually exclusive.
-pub fn load(path: &Path, cli: CliOverrides) -> Result<ResolvedConfig> {
-    if cli.bootstrap && cli.join {
-        bail!("--bootstrap and --join are mutually exclusive; pass at most one");
-    }
+/// One argument, because there is nothing left to layer on top of it: ADR 0037
+/// §1 removed `--bootstrap`/`--join`, so every value resolves file-over-default
+/// via `serde` field defaults. What this does beyond parsing is reject, at
+/// startup, three things that would otherwise fail much later and much less
+/// clearly — a discovery section that names a backend without its table, a
+/// public listener whose TLS posture was never stated, and an `[enrollment]`
+/// endpoint a token must never be sent to — and resolve `advertise_host` once
+/// so no reader downstream has to.
+pub fn load(path: &Path) -> Result<ResolvedConfig> {
     let mut config = read_config(path)?;
     config
         .discovery
@@ -841,11 +854,7 @@ pub fn load(path: &Path, cli: CliOverrides) -> Result<ResolvedConfig> {
     }
     let resolved_host = resolve_advertise_host(config.listen.advertise_host.as_deref())?;
     config.listen.advertise_host = Some(resolved_host);
-    Ok(ResolvedConfig {
-        config,
-        bootstrap: cli.bootstrap,
-        join: cli.join,
-    })
+    Ok(ResolvedConfig { config })
 }
 
 /// Read and parse the config file, wrapping any I/O or deserialization
@@ -1107,20 +1116,24 @@ addrs = []
         );
     }
 
+    /// The health-stability interval is a `[raft]` duration like the others:
+    /// humantime or nothing, defaulting to the ADR's 10s.
     #[test]
-    fn bootstrap_and_join_together_fail() {
+    fn health_stability_interval_defaults_and_parses() {
         let (_guard, path) = write_config(MINIMAL_EXAMPLE);
-        let err = load(
-            &path,
-            CliOverrides {
-                bootstrap: true,
-                join: true,
-            },
-        )
-        .expect_err("bootstrap and join together should be rejected");
-        let message = format!("{err:#}");
-        assert!(message.contains("--bootstrap"));
-        assert!(message.contains("--join"));
+        let config = read_config(&path).expect("config should parse");
+        assert_eq!(
+            config.raft.health_stability_interval,
+            Duration::from_secs(10)
+        );
+
+        let contents = format!("{MINIMAL_EXAMPLE}\n[raft]\nhealth_stability_interval = \"2s\"\n");
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("config should parse");
+        assert_eq!(
+            config.raft.health_stability_interval,
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
@@ -1269,7 +1282,7 @@ addrs = []
         // A minimal config with an explicit advertise_host: load() must resolve
         // it in place and pass discovery validation.
         let (_guard, path) = write_config(MINIMAL_EXAMPLE);
-        let resolved = load(&path, CliOverrides::default()).expect("load succeeds");
+        let resolved = load(&path).expect("load succeeds");
         assert_eq!(
             resolved.config.listen.advertise_host.as_deref(),
             Some("coord-1.example.com")
@@ -1280,8 +1293,7 @@ addrs = []
     fn load_rejects_invalid_discovery_section() {
         let contents = format!("{BASE_WITHOUT_DISCOVERY}\n[discovery]\nbackend = \"dns\"\n");
         let (_guard, path) = write_config(&contents);
-        let err = load(&path, CliOverrides::default())
-            .expect_err("load must surface discovery validation errors");
+        let err = load(&path).expect_err("load must surface discovery validation errors");
         assert!(format!("{err:#}").contains("[discovery.dns]"), "{err:#}");
     }
 
@@ -1433,7 +1445,7 @@ addrs = []
         ];
         for (label, contents) in cases {
             let (_guard, path) = write_config(&contents);
-            let err = match load(&path, CliOverrides::default()) {
+            let err = match load(&path) {
                 Err(e) => format!("{e:#}"),
                 Ok(_) => panic!("{label}: an unstated posture must fail startup"),
             };
@@ -1452,21 +1464,20 @@ addrs = []
              token_path = \"/etc/coppice/enroll-token\"\n"
         );
         let (_guard, path) = write_config(&https);
-        load(&path, CliOverrides::default()).expect("an https endpoint needs no opt-in");
+        load(&path).expect("an https endpoint needs no opt-in");
 
         let http = format!(
             "{base}\n[enrollment]\nendpoint = \"http://coord.example.com:7070\"\n\
              token_path = \"/etc/coppice/enroll-token\"\n"
         );
         let (_guard, path) = write_config(&http);
-        let err = load(&path, CliOverrides::default())
-            .expect_err("plain http without the opt-in fails at startup");
+        let err = load(&path).expect_err("plain http without the opt-in fails at startup");
         let message = format!("{err:#}");
         assert!(message.contains("insecure = true"), "{message}");
 
         let opted_in = format!("{http}insecure = true\n");
         let (_guard, path) = write_config(&opted_in);
-        load(&path, CliOverrides::default()).expect("the opt-in accepts plain http");
+        load(&path).expect("the opt-in accepts plain http");
     }
 
     #[test]
@@ -1476,12 +1487,12 @@ addrs = []
              token = \"cpk_x\"\ntoken_path = \"/t\"\n"
         );
         let (_guard, path) = write_config(&both);
-        let err = load(&path, CliOverrides::default()).expect_err("both token forms is an error");
+        let err = load(&path).expect_err("both token forms is an error");
         assert!(format!("{err:#}").contains("exactly one"), "{err:#}");
 
         let neither = format!("{MINIMAL_EXAMPLE}\n[enrollment]\nendpoint = \"https://c:7070\"\n");
         let (_guard, path) = write_config(&neither);
-        let err = load(&path, CliOverrides::default()).expect_err("no token is an error");
+        let err = load(&path).expect_err("no token is an error");
         assert!(format!("{err:#}").contains("token_path"), "{err:#}");
     }
 
@@ -1495,7 +1506,7 @@ addrs = []
              token = \"cpk_inline_startup_secret\"\ninsecure = false\n"
         );
         let (_guard, path) = write_config(&inline);
-        let resolved = load(&path, CliOverrides::default()).expect("load");
+        let resolved = load(&path).expect("load");
 
         let ((), rendered) = coppice_testkit::tracing_capture::capture(|| resolved.log_effective());
         assert!(
@@ -1515,7 +1526,7 @@ addrs = []
         // A formed voter, or one whose material comes from an external PKI,
         // never enrolls.
         let (_guard, path) = write_config(MINIMAL_EXAMPLE);
-        let resolved = load(&path, CliOverrides::default()).expect("load");
+        let resolved = load(&path).expect("load");
         assert!(resolved.config.enrollment.is_none());
     }
 }

@@ -12,9 +12,10 @@ use coppice_core::time::Duration;
 use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
     ConfigureQuotaEntity, ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt,
-    EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement, ReconcileNode, RecordAttemptExited,
-    RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity,
-    RegisterNode, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement, RebindMachineAddress,
+    ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
+    RecordCaCertificate, RecordEnrolledIdentity, RegisterNode, RevokeEnrollToken, RevokeIdentity,
+    SetNodeSchedulable, SubmitJob, UpdatePolicy,
 };
 use coppice_state::{CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity};
 
@@ -52,6 +53,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::RevokeIdentity(c) => Body::RevokeIdentity(c.into()),
         Command::ConfirmKeyPossession(c) => Body::ConfirmKeyPossession(c.into()),
         Command::RecordEnrolledIdentity(c) => Body::RecordEnrolledIdentity(c.into()),
+        Command::RebindMachineAddress(c) => Body::RebindMachineAddress(c.into()),
     };
     pb::Command {
         version: cluster_version,
@@ -89,6 +91,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::RevokeIdentity(c) => Command::RevokeIdentity(c.try_into()?),
         Body::ConfirmKeyPossession(c) => Command::ConfirmKeyPossession(c.try_into()?),
         Body::RecordEnrolledIdentity(c) => Command::RecordEnrolledIdentity(c.try_into()?),
+        Body::RebindMachineAddress(c) => Command::RebindMachineAddress(c.try_into()?),
     };
     Ok((command_version, body))
 }
@@ -718,6 +721,28 @@ impl TryFrom<pb::ConfirmKeyPossession> for ConfirmKeyPossession {
         Ok(ConfirmKeyPossession {
             raft_node_id: c.raft_node_id,
             confirmed_at: timestamp(c.confirmed_at_us, "ConfirmKeyPossession.confirmed_at_us")?,
+        })
+    }
+}
+
+impl From<&RebindMachineAddress> for pb::RebindMachineAddress {
+    fn from(c: &RebindMachineAddress) -> Self {
+        pb::RebindMachineAddress {
+            raft_node_id: c.raft_node_id,
+            address: c.address.clone(),
+            rebound_at_us: c.rebound_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RebindMachineAddress> for RebindMachineAddress {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RebindMachineAddress) -> Result<Self, ConvertError> {
+        Ok(RebindMachineAddress {
+            raft_node_id: c.raft_node_id,
+            address: c.address,
+            rebound_at: timestamp(c.rebound_at_us, "RebindMachineAddress.rebound_at_us")?,
         })
     }
 }

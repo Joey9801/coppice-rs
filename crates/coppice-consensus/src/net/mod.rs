@@ -24,5 +24,5 @@ mod client;
 mod convert;
 mod server;
 
-pub use client::GrpcNetworkFactory;
+pub use client::{GrpcNetworkFactory, PeerContact};
 pub use server::RaftTransportHandler;

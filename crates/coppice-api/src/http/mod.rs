@@ -34,7 +34,7 @@ pub use error::{ErrorCode, HttpError};
 pub use extract::{IdPath, ReadIndexes, ReadQuery};
 pub use metrics::MetricsEndpoint;
 pub use read::{Consistency, ReadParams};
-pub use readyz::{ReadyzEndpoint, ReadyzPhase, ReadyzReport, ReadyzVoter};
+pub use readyz::{HealthVerdict, ReadyzEndpoint, ReadyzPhase, ReadyzReport, ReadyzVoter};
 pub use routes::{closed_router, router};
 pub use ui::ui_available;
 

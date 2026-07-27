@@ -1,24 +1,29 @@
 //! The coordinator boot sequence and process lifecycle.
 //!
-//! [`run`] is the default (run-a-replica) entry point the CLI dispatches to.
-//! It loads config, initializes tracing, binds every listener, and then
-//! branches on what the data directory says (ADR 0037 §1):
+//! [`run`] is the only entry point the CLI dispatches to, and it takes no
+//! startup intent — under ADR 0037 §1 there is one command for every
+//! situation and intent is *derived*. It loads config, initializes tracing,
+//! binds every listener, and then branches on what the data directory says:
 //!
 //! - **a manifest with a dangling formation intent** → serve the closed
 //!   surface and nothing else, in phase `formation-failed`;
-//! - **a manifest** (or an explicit `--bootstrap`/`--join`) → start consensus
-//!   and run the full task runtime, as it always has;
-//! - **an empty directory with no intent flags** → **park**: serve the admin
-//!   socket, `/readyz`, and `ProbeCluster`, and wait for a local
-//!   `coppice coordinator init` to form the cluster — then run the same full
-//!   runtime, on the same listeners.
+//! - **a manifest** → resume the instance on this disk under the history its
+//!   stamp records, then run the full task runtime, as it always has;
+//! - **no manifest** → this is a new instance, so **park**: serve the admin
+//!   socket, `/readyz`, and `ProbeCluster` while the convergence loop enrolls,
+//!   discovers, and probes. Park is left exactly two ways — an initialized
+//!   cluster answers and this daemon joins it, or a local
+//!   `coppice coordinator init` forms one here. It never bootstraps itself.
 //!
 //! The last branch is why the listeners are bound in [`run`] and handed to
 //! whichever surface is serving: a parked daemon must be reachable on its
 //! real ports (including a `:0` port a test asked for) *before* it has a
-//! cluster, and must keep them across the transition. [`bootstrap`] remains
-//! the flag-driven assembly half that the integration harness drives
-//! directly.
+//! cluster, and must keep them across the transition.
+//!
+//! Every started replica — resumed, joined, or freshly formed — then runs the
+//! post-start convergence loop ([`crate::convergence`]), which no-ops for a
+//! caught-up voter and otherwise carries this identity to a voter seat.
+//! [`bootstrap`] is the test/dev entry that skips park and formation entirely.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -109,14 +114,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // Config load happens before tracing init: a config error rides out as an
     // `anyhow` error and `main` prints it to stderr even though no subscriber
     // is installed yet.
-    let resolved = config::load(
-        &args.config,
-        config::CliOverrides {
-            bootstrap: args.bootstrap,
-            join: args.join,
-        },
-    )
-    .with_context(|| format!("loading coordinator config {}", args.config.display()))?;
+    let resolved = config::load(&args.config)
+        .with_context(|| format!("loading coordinator config {}", args.config.display()))?;
 
     init_tracing(&resolved.config.observability)?;
     resolved.log_effective();
@@ -223,6 +222,7 @@ pub async fn run_with(
         resolved.config.cluster_id,
         resolved.config.discovery.cluster_size,
         contact_staleness(&resolved.config),
+        resolved.config.raft.health_stability_interval,
         marks,
     );
     let readyz = readyz_endpoint(Arc::clone(&phase));
@@ -237,8 +237,11 @@ pub async fn run_with(
     let admin_socket_join =
         tokio::spawn(admin_socket.serve(Arc::clone(&local_admin), shutdown_rx.clone()));
 
-    let admin_service: AdminService<OpenraftConsensus> =
-        AdminService::unformed(Arc::clone(&phase), resolved.config.data_dir.clone());
+    let admin_service: AdminService<OpenraftConsensus> = AdminService::unformed(
+        Arc::clone(&phase),
+        resolved.config.data_dir.clone(),
+        tls.clone(),
+    );
 
     let (started, tls_store) = match startup {
         // Fail-stop (ADR 0037 §3): serve the closed surface so the operator
@@ -267,11 +270,10 @@ pub async fn run_with(
             );
         }
 
-        // A resumable instance, or an operator-declared intent flag: the
-        // ADR 0016 matrix inside `start` still governs (the flags are removed
-        // in a later chunk; until then they remain a working alternative to
-        // `init`). These states serve consensus, so TLS material is required
-        // exactly as it always was.
+        // A resumable instance: the ADR 0016 matrix inside `start` governs,
+        // and identity comes from the stamp. This state serves consensus, so
+        // TLS material is required exactly as it always was — a formed daemon
+        // whose certificates went missing must fail loudly, not park.
         StartupState::Resume { history_id } => {
             let store = tls
                 .take()
@@ -287,32 +289,9 @@ pub async fn run_with(
             .await?;
             (started, store)
         }
-        StartupState::Empty if resolved.bootstrap || resolved.join => {
-            let store = tls
-                .take()
-                .ok_or_else(|| missing_tls_error(&resolved.config))?;
-            let intent = if resolved.bootstrap {
-                StartIntent::Bootstrap
-            } else {
-                StartIntent::Join
-            };
-            // The legacy flags predate minted histories: they stamp the
-            // config-derived value, preserving the ADR 0016 config-vs-stamp
-            // cross-check for directories they create.
-            let history = *resolved.config.cluster_id.0.as_bytes();
-            let started = start_with_intent(
-                &resolved.config,
-                &prepared,
-                history,
-                Arc::clone(&store),
-                intent,
-            )
-            .await?;
-            (started, store)
-        }
-
-        // Park (ADR 0037 §1): a new instance with no declared intent. It
-        // never bootstraps itself; it waits for a local `init`.
+        // Park (ADR 0037 §1): a new instance. It never bootstraps itself; it
+        // converges toward whatever cluster exists, and waits for a local
+        // `init` if none does.
         StartupState::Empty => {
             match park(
                 &resolved,
@@ -328,9 +307,12 @@ pub async fn run_with(
             )
             .await?
             {
-                ParkOutcome::Formed(started, store) => {
-                    // The daemon may have started certless; the store now
-                    // exists either way, so the reload task starts here.
+                // Formed here, or joined a cluster the convergence loop found.
+                // Both leave park with a running replica and a store; the
+                // daemon may have started certless (formation minted the
+                // material, or enrollment fetched it), so the reload task
+                // starts here for either path.
+                ParkOutcome::Started(started, store) => {
                     if _tls_reload.is_none() {
                         _tls_reload = Some(spawn_tls_reload(&store, daemon_owned));
                     }
@@ -365,6 +347,12 @@ pub async fn run_with(
         tls: Arc::clone(&tls_store),
     };
 
+    // Captured before `assemble` consumes `prepared`: the convergence loop
+    // asks to be admitted at exactly the address this process publishes
+    // everywhere else, resolved `:0` port included.
+    let advertise_addr = prepared.advertise_addr.clone();
+    let convergence_tls = Arc::clone(&tls_store);
+
     let BootedCoordinator {
         cluster_id,
         consensus,
@@ -387,9 +375,25 @@ pub async fn run_with(
 
     local_admin.attach(Arc::clone(&consensus));
 
+    // The post-start convergence loop (ADR 0037 §6), for every replica this
+    // process could have produced: a resumed voter (where it no-ops), a
+    // replica the park loop just joined as an unadmitted new instance, and a
+    // freshly formed first voter (which is already a voter, so it also
+    // no-ops). One loop, no special cases — and the reason a scale-out needs
+    // no operator at all.
+    let convergence = crate::convergence::spawn(crate::convergence::Convergence {
+        handle: handle.clone(),
+        advertise_addr,
+        cluster_id: cluster_id.to_string(),
+        discovery: crate::discovery::build(&resolved.config.discovery)
+            .context("building the discovery backend for the convergence loop")?,
+        tls: convergence_tls,
+        phase: Arc::clone(&phase),
+    });
+
     // The task runtime owns steps 1–4 of the shutdown order and returns once
     // the shared shutdown watch has fully drained it.
-    serve_runtime(
+    serve_runtime_with_serving_sans(
         Arc::clone(&consensus),
         views,
         event_tap,
@@ -401,10 +405,19 @@ pub async fn run_with(
         resolved.config.data_dir.clone(),
         metrics,
         readyz,
+        // The config-declared serving names: renewal re-declares these on
+        // every re-issued leaf, which is what lets an operator move this
+        // daemon's advertised host by editing the config and restarting
+        // (ADR 0037 §6 set-address choreography — see `tasks::renewal`).
+        Some(crate::formation::leaf_sans(&resolved.config)),
         Some(shutdown_rx),
     )
     .await?;
 
+    // The convergence loop holds only client dials and drives idempotent
+    // verbs, so aborting it at any await is indistinguishable from a tick
+    // that never happened (ADR 0037 §6).
+    convergence.abort();
     let _ = admin_socket_join.await;
 
     // Shutdown tail (coordinator-runtime.md steps 5–6), in dependency order.
@@ -468,6 +481,46 @@ pub async fn serve_runtime(
     readyz: ReadyzEndpoint,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
+    serve_runtime_with_serving_sans(
+        consensus,
+        views,
+        event_tap,
+        node_handle,
+        agent_listener,
+        client_listener,
+        cluster_id,
+        node_log_client,
+        data_dir,
+        metrics,
+        readyz,
+        None,
+        shutdown,
+    )
+    .await
+}
+
+/// [`serve_runtime`] plus the daemon's configured serving names
+/// (`formation::leaf_sans`), which the renewal task re-declares on every
+/// re-issued leaf instead of copying the old leaf's SANs (ADR 0037 §4/§6 —
+/// what lets an address move renew its way to a verifiable leaf). The daemon
+/// path (`run_with`) always passes `Some`; [`serve_runtime`] is the
+/// config-less embedder seam and falls back to copying.
+#[allow(clippy::too_many_arguments)] // thin wiring seam over `runtime::run`
+pub async fn serve_runtime_with_serving_sans(
+    consensus: Arc<OpenraftConsensus>,
+    views: StateViews,
+    event_tap: EventTapReceiver,
+    node_handle: NodeHandle,
+    agent_listener: AgentListener,
+    client_listener: ClientListener,
+    cluster_id: ClusterId,
+    node_log_client: Arc<NodeClient>,
+    data_dir: std::path::PathBuf,
+    metrics: coppice_api::http::MetricsEndpoint,
+    readyz: ReadyzEndpoint,
+    serving_sans: Option<Vec<String>>,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Result<()> {
     crate::runtime::run(
         SharedConsensus(consensus),
         views,
@@ -480,6 +533,7 @@ pub async fn serve_runtime(
         data_dir,
         metrics,
         readyz,
+        serving_sans,
         shutdown,
     )
     .await
@@ -489,8 +543,19 @@ pub async fn serve_runtime(
 ///
 /// The threshold is consensus's own promotion threshold, so "ready" means
 /// exactly what "caught up enough to be a voter" means everywhere else.
+///
+/// Two callbacks because §9 asks two questions of the same daemon: the report
+/// is *node* readiness, which every replica can answer about itself, and the
+/// verdict is *cluster redundancy*, which only the leader can answer at all.
+/// Both read the same [`PhaseState`], so a scrape of one can never disagree
+/// with a scrape of the other about what this replica is.
 pub(crate) fn readyz_endpoint(phase: Arc<PhaseState>) -> ReadyzEndpoint {
-    ReadyzEndpoint::new(PROMOTION_LAG_MAX, move || phase.readyz())
+    let health = Arc::clone(&phase);
+    ReadyzEndpoint::new(
+        PROMOTION_LAG_MAX,
+        move || phase.readyz(),
+        move || health.health(),
+    )
 }
 
 /// The bound public client-API listener (`listen.client_addr`, ADR 0031),
@@ -677,10 +742,13 @@ fn spawn_tls_reload(store: &Arc<TlsStore>, daemon_owned: bool) -> tokio::task::J
     )
 }
 
-/// How stale a leader's quorum acknowledgment may be before this replica
-/// stops reporting itself ready (ADR 0037 §9): twice the election-timeout
-/// minimum — openraft's election-timeout maximum — past which a healthy
-/// follower would have called an election of its own.
+/// The contact-staleness bound (ADR 0037 §9), used for both directions of
+/// "have we actually heard from each other": how stale a leader's quorum
+/// acknowledgment may be before this replica stops reporting itself ready,
+/// and how long a voter may go without answering the leader's RPCs before
+/// the health sampler stops counting it live. Twice the election-timeout
+/// minimum — openraft's election-timeout maximum — past which a healthy,
+/// connected node would have called an election of its own.
 fn contact_staleness(cfg: &config::Config) -> std::time::Duration {
     cfg.raft.election_timeout.saturating_mul(2)
 }
@@ -764,6 +832,10 @@ pub(crate) fn node_options(
         snapshot_keep_log_entries: cfg.raft.snapshot_keep_log_entries,
         event_tap_capacity: limits::EVENT_TAP_CAPACITY,
         tls: tls_store,
+        // The expected voter count (ADR 0037 §2/§7): the ceiling the leader
+        // applies to promotions. Node-local config, because convergence
+        // consults it before replicated state is reachable.
+        cluster_size: cfg.discovery.cluster_size,
     }
 }
 
@@ -808,7 +880,11 @@ fn assemble(
 
     let consensus = Arc::new(consensus);
     phase.publish_formed(handle.clone(), views.clone());
-    admin_service.attach(Arc::clone(&consensus), handle.clone());
+    admin_service.attach(
+        Arc::clone(&consensus),
+        handle.clone(),
+        Arc::clone(&tls_store),
+    );
 
     // The replica-local log-fetch client (ADR 0034): dials agents' NodeService
     // listeners with this node's leaf as the client identity and the cluster CA
@@ -858,36 +934,72 @@ fn assemble(
     })
 }
 
-/// Assemble and start a coordinator replica under the ADR 0016 intent flags
-/// (does not run the task runtime, and does not park).
+/// The **test and `coppice dev` entry**: resume this data directory, or form a
+/// single-voter cluster on it if it is empty.
 ///
-/// The flag-driven path: `--bootstrap`/`--join`/plain restart, with no admin
-/// socket and no formation. [`run`] uses the same pieces but interposes the
-/// ADR 0037 §1 branch; the integration harness drives this directly, which is
-/// what keeps the flags exercised while they remain.
+/// Deliberately not the production path. It skips park, skips formation's
+/// seven steps, and runs no convergence loop — an embedder that wants those
+/// calls [`run`] or [`run_with`], which is what a real daemon does. What this
+/// is for is the caller that already knows there is exactly one replica and
+/// wants it serving now: `coppice dev`, and the integration harness's
+/// single-node fixtures.
+///
+/// The derived behavior mirrors the two states that matter to such a caller,
+/// with no flag to get wrong: a directory with a manifest resumes under the
+/// history its stamp records (a formed one carries the history `init` minted,
+/// which config cannot know); a fresh directory becomes a single-voter cluster
+/// stamped with the config-derived history, preserving the ADR 0016
+/// config-vs-stamp cross-check for the directories it creates.
 pub async fn bootstrap(
     resolved: config::ResolvedConfig,
     tls_store: Arc<TlsStore>,
 ) -> Result<BootedCoordinator> {
-    let prepared = prepare(&resolved.config).await?;
-    let intent = if resolved.bootstrap {
-        StartIntent::Bootstrap
-    } else if resolved.join {
-        StartIntent::Join
-    } else {
-        StartIntent::Restart
-    };
+    start_directly(resolved, tls_store, StartIntent::Bootstrap).await
+}
 
-    // Fresh directories on this path stamp the config-derived history (the
-    // pre-formation behavior these flags preserve); a resumed directory is
-    // served under whatever its stamp records — a formed one carries the
-    // history `init` minted, which config cannot know.
+/// The **test entry for the joining half** of a multi-replica fixture: resume
+/// this data directory, or start a fresh learner-join instance on it if it is
+/// empty.
+///
+/// Identical to [`bootstrap`] but for what an *empty* directory means. A
+/// production replica reaches [`StartIntent::Join`] through the convergence
+/// loop ([`crate::convergence`]), which discovers a cluster, probes it, and
+/// stamps the history the probe reported. A test that is building the cluster
+/// by hand — one node bootstrapped in-process, the rest added through
+/// `add_learner` on its consensus seam — has no discovery to do and already
+/// knows the history, so it says so here rather than standing up the loop.
+///
+/// Nothing outside the integration suite should call this: a real daemon that
+/// wants to join converges into it.
+pub async fn bootstrap_joining(
+    resolved: config::ResolvedConfig,
+    tls_store: Arc<TlsStore>,
+) -> Result<BootedCoordinator> {
+    start_directly(resolved, tls_store, StartIntent::Join).await
+}
+
+/// The shared body of [`bootstrap`] and [`bootstrap_joining`]: derive the
+/// intent from the directory, start, and assemble. `empty_intent` is what an
+/// empty directory means to this caller — the only thing the two differ on.
+async fn start_directly(
+    resolved: config::ResolvedConfig,
+    tls_store: Arc<TlsStore>,
+    empty_intent: StartIntent,
+) -> Result<BootedCoordinator> {
+    let prepared = prepare(&resolved.config).await?;
     let (startup, marks) = formation::inspect(&resolved.config.data_dir)?;
-    let history_id = match startup {
-        StartupState::Resume { history_id } => {
-            formation::resumed_history(&resolved.config, history_id, marks)?
+    let (intent, history_id) = match startup {
+        StartupState::Resume { history_id } => (
+            StartIntent::Restart,
+            formation::resumed_history(&resolved.config, history_id, marks)?,
+        ),
+        StartupState::Empty => (empty_intent, *resolved.config.cluster_id.0.as_bytes()),
+        StartupState::FormationFailed { intent_at_us } => {
+            bail!(
+                "refusing to serve: {}",
+                formation::failed_diagnostic(intent_at_us)
+            )
         }
-        _ => *resolved.config.cluster_id.0.as_bytes(),
     };
 
     let options = node_options(
@@ -904,10 +1016,14 @@ pub async fn bootstrap(
         resolved.config.cluster_id,
         resolved.config.discovery.cluster_size,
         contact_staleness(&resolved.config),
+        resolved.config.raft.health_stability_interval,
         marks,
     );
-    let admin_service =
-        AdminService::unformed(Arc::clone(&phase), resolved.config.data_dir.clone());
+    let admin_service = AdminService::unformed(
+        Arc::clone(&phase),
+        resolved.config.data_dir.clone(),
+        Some(Arc::clone(&tls_store)),
+    );
 
     assemble(
         &resolved.config,
@@ -1077,14 +1193,19 @@ fn dup_listener(listener: &TcpListener) -> Result<TcpListener> {
 
 /// How a stint in the parked state ended.
 ///
-/// The `Formed` arm is much larger than the other two, which is the right
+/// The `Started` arm is much larger than the other two, which is the right
 /// shape here: this value is constructed once per process, moved once, and
 /// boxing the started replica would buy nothing but an allocation.
 #[allow(clippy::large_enum_variant)]
 enum ParkOutcome {
-    /// A local `init` formed the cluster; the daemon serves it over the
-    /// carried store (freshly created when the daemon started certless).
-    Formed(StartedNode, Arc<TlsStore>),
+    /// A cluster now exists for this daemon to serve, by either of park's two
+    /// exits (ADR 0037 §1): a local `init` formed one here, or the convergence
+    /// loop found one in discovery and joined it. Deliberately one variant —
+    /// nothing downstream of park behaves differently between the two, and a
+    /// split would invite it to. The store is carried because it may have been
+    /// created *during* park, by formation minting material or enrollment
+    /// fetching it on a daemon that started certless.
+    Started(StartedNode, Arc<TlsStore>),
     /// The daemon was asked to stop while still parked.
     Shutdown,
     /// A formation attempt died after stamping its intent. The directory is
@@ -1093,12 +1214,21 @@ enum ParkOutcome {
     Failed { intent_at_us: i64 },
 }
 
-/// Park until a local `init` forms the cluster, or the daemon is asked to stop
-/// (ADR 0037 §1).
+/// Park until this daemon has a cluster, or is asked to stop (ADR 0037 §1).
 ///
-/// A parked daemon **never** bootstraps itself: this loop has exactly
-/// one way out that produces a cluster, and it is an operator (or their
-/// automation) calling `init` on the local socket.
+/// Two exits produce a cluster and they race in the `select!` below, because
+/// a fleet's whole bringup is that race: **converge**, where this daemon
+/// enrolls, discovers, probes, and joins an initialized cluster that already
+/// exists; and **`init`**, where an operator (or their automation) forms one
+/// here over the local socket. Whichever lands first wins, and the loser is
+/// simply dropped — the convergence future holds nothing but client dials
+/// until the instant it produces a replica, and `init`'s own probe guard
+/// refuses if a cluster appeared meanwhile.
+///
+/// A parked daemon **never** bootstraps itself. That is the invariant this
+/// function exists to hold: neither exit is reachable from discovery churn, a
+/// partition, or a fleet that lost its volumes — all of those keep cycling
+/// here, visibly, in phase `waiting`.
 ///
 /// A formation attempt that fails leaves one of two states, distinguished by
 /// re-reading the directory rather than by guessing: nothing durable happened
@@ -1130,20 +1260,41 @@ async fn park(
 
     tracing::info!(
         socket = %resolved.config.admin_socket_path().display(),
-        "parked: no cluster on this node and none declared. Run \
-         `coppice coordinator init` on one daemon to form the cluster (ADR 0037 §3)."
+        "parked: this data directory holds no cluster. Converging — enrolling, discovering, \
+         and probing for one. If this is a brand-new cluster, run \
+         `coppice coordinator init` on one daemon to form it (ADR 0037 §1/§3)."
     );
     // Parked is a healthy, running daemon — `READY=1`, phase `waiting`, HTTP
     // 503 (ADR 0037 §9). Unit ordering keys off this, not off readiness.
     crate::systemd::notify_ready();
 
+    // The converging half of park. Held across the whole stint rather than
+    // rebuilt per iteration so its backoff survives a failed `init` attempt:
+    // a daemon whose operator typo'd a policy file should not restart its
+    // discovery cadence from scratch.
+    let mut converge =
+        crate::convergence::PreStart::new(&resolved.config, &prepared.advertise_addr, tls.clone());
+
     let outcome = loop {
         let call = tokio::select! {
+            // Biased toward the local socket: an operator who ran `init` on
+            // this host is waiting on a reply, and if a cluster genuinely
+            // appeared in the same instant, `init`'s probe guard says so
+            // rather than forming a second one.
+            biased;
             call = form_rx.recv() => match call {
                 Some(call) => call,
                 // Nothing else holds the sender while parked.
                 None => break ParkOutcome::Shutdown,
             },
+            (started, store) = converge.run() => {
+                phase.publish_formed(started.handle.clone(), started.views.clone());
+                tracing::info!(
+                    node_id = started.handle.node_id(),
+                    "leaving park: joined the cluster discovery found (ADR 0037 §1)"
+                );
+                break ParkOutcome::Started(started, store);
+            }
             _ = shutdown_rx.wait_for(|s| *s) => break ParkOutcome::Shutdown,
         };
 
@@ -1171,7 +1322,7 @@ async fn park(
                 // act is often to poll `/readyz` or `ProbeCluster`.
                 phase.publish_formed(started.handle.clone(), started.views.clone());
                 let _ = call.reply.send(Ok(done));
-                break ParkOutcome::Formed(started, tls_store);
+                break ParkOutcome::Started(started, tls_store);
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "formation failed");
@@ -1331,6 +1482,14 @@ impl Consensus for SharedConsensus {
         node: CoordinatorId,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
         self.0.remove_node(node)
+    }
+
+    fn set_node_address(
+        &self,
+        node: CoordinatorId,
+        addr: String,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
+        self.0.set_node_address(node, addr)
     }
 
     fn trigger_snapshot(&self) -> impl Future<Output = Result<(), ConsensusError>> + Send {

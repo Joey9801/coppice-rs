@@ -133,6 +133,44 @@ fn classify(subject: &crate::LeafSubject) -> Result<Profile, VerifyError> {
     }
 }
 
+/// The dNSName and iPAddress SANs a leaf carries, in certificate order.
+///
+/// The addresses a leaf may **serve** under, as distinct from the subject that
+/// says who it is (ADR 0037 §4: hostnames are metadata, never identity). What
+/// needs this is renewal: a re-issue must re-declare the same serving
+/// addresses, or a renewed replica would silently stop terminating TLS for the
+/// name its peers dial it by. Returns an empty vector for a leaf with no SAN
+/// extension, which is a legitimate shape (an operator credential serves
+/// nothing).
+pub fn leaf_sans(leaf: &[u8]) -> Result<Vec<String>, VerifyError> {
+    let der = coerce_to_der(leaf)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref())
+        .map_err(|e| VerifyError::Decode(format!("parsing certificate DER: {e}")))?;
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return Ok(Vec::new());
+    };
+    Ok(san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::DNSName(dns) => Some((*dns).to_string()),
+            x509_parser::extensions::GeneralName::IPAddress(bytes) => match bytes.len() {
+                4 => {
+                    let octets: [u8; 4] = (*bytes).try_into().ok()?;
+                    Some(std::net::Ipv4Addr::from(octets).to_string())
+                }
+                16 => {
+                    let octets: [u8; 16] = (*bytes).try_into().ok()?;
+                    Some(std::net::Ipv6Addr::from(octets).to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect())
+}
+
 /// Decode a leaf that may be PEM or raw DER into an owned [`CertificateDer`].
 fn coerce_to_der(input: &[u8]) -> Result<CertificateDer<'static>, VerifyError> {
     if looks_like_pem(input) {

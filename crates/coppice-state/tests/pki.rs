@@ -10,8 +10,8 @@ use common::*;
 use coppice_core::id::{EnrollTokenId, MachineId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{
-    BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RecordCaCertificate,
-    RecordEnrolledIdentity, RevokeEnrollToken, RevokeIdentity,
+    BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RebindMachineAddress,
+    RecordCaCertificate, RecordEnrolledIdentity, RevokeEnrollToken, RevokeIdentity,
 };
 use coppice_state::{
     CaCertBundle, Command, EnrollRole, RejectionReason, RevokedIdentity, StateMachine,
@@ -207,6 +207,66 @@ fn bind_rejects_machine_moving_to_a_different_node() {
     );
     // Unchanged: the original binding stands.
     assert_eq!(sm.machine_binding(&mid(1)).unwrap().raft_node_id, 1);
+}
+
+// ---- RebindMachineAddress ----
+
+fn rebind(raft_node_id: u64, address: &str, at_us_offset: i64) -> Command {
+    Command::RebindMachineAddress(RebindMachineAddress {
+        raft_node_id,
+        address: address.into(),
+        rebound_at: ts(TS_US + at_us_offset),
+    })
+}
+
+#[test]
+fn rebind_repoints_an_existing_binding_and_replays_as_a_noop() {
+    let mut sm = StateMachine::default();
+    apply_ok(&mut sm, bind(mid(1), 1, "10.0.0.1:7000"));
+
+    // The operator set-address path: the binding follows the membership
+    // change to the new address (ADR 0037 §6), and `bound_at` stays the
+    // original admission instant — the fact it dates is the binding.
+    apply_ok(&mut sm, rebind(1, "10.0.0.9:7000", 5_000_000));
+    let binding = sm.machine_binding(&mid(1)).unwrap().clone();
+    assert_eq!(binding.address, "10.0.0.9:7000");
+    assert_eq!(binding.raft_node_id, 1);
+    assert_eq!(binding.bound_at, base_ts(), "bound_at must not move");
+
+    // Exact replay: accepted no-op, state unchanged.
+    apply_ok(&mut sm, rebind(1, "10.0.0.9:7000", 9_000_000));
+    assert_eq!(sm.machine_binding(&mid(1)).unwrap(), &binding);
+
+    // And after the rebind, re-admission at the NEW address is the accepted
+    // replay — this is the whole reason the command exists: the moved
+    // daemon's convergence loop re-offers its (machine, seat) pair at the
+    // new address on every restart, and must not be refused forever.
+    apply_ok(
+        &mut sm,
+        Command::BindMachineIdentity(BindMachineIdentity {
+            machine: mid(1),
+            raft_node_id: 1,
+            address: "10.0.0.9:7000".into(),
+            bound_at: ts(TS_US + 12_000_000),
+        }),
+    );
+    assert_eq!(
+        sm.machine_binding(&mid(1)).unwrap().address,
+        "10.0.0.9:7000"
+    );
+}
+
+#[test]
+fn rebind_refuses_a_seat_with_no_binding() {
+    // Repoints only, never creates: a seat with no binding has nothing an
+    // endpoint was ever verified against.
+    let mut sm = StateMachine::default();
+    let err = sm.apply(&rebind(1, "10.0.0.9:7000", 0)).unwrap_err();
+    assert_eq!(
+        err,
+        RejectionReason::UnknownMachineBinding { raft_node_id: 1 }
+    );
+    assert!(sm.machine_binding(&mid(1)).is_none());
 }
 
 #[test]

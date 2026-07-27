@@ -42,8 +42,8 @@ pub use adapter::{
 pub use error::{ConsensusError, ProposeError};
 pub use events::{EventBatch, EventTap, EventTapReceiver, TapItem};
 pub use node::{
-    start, ClusterSummary, MemberSummary, NodeHandle, NodeOptions, NodeStartError, StartIntent,
-    StartedNode,
+    start, ClusterSummary, MemberSummary, NodeHandle, NodeOptions, NodeStartError,
+    ReplicationHealth, StartIntent, StartedNode, VoterHealth,
 };
 pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
 
@@ -175,6 +175,15 @@ pub trait Consensus: Send + Sync + 'static {
     fn remove_node(
         &self,
         node: CoordinatorId,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// Repoint an existing member's dial address (ADR 0037 §6, operator-only
+    /// break-glass). There is no self-service address repair: the admin
+    /// service dial-back-verifies the new address before calling this.
+    fn set_node_address(
+        &self,
+        node: CoordinatorId,
+        addr: String,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
     /// Ask consensus to build a snapshot now (housekeeping trigger; sealed

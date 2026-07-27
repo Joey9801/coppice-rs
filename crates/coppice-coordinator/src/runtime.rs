@@ -114,6 +114,10 @@ pub async fn run<C>(
     data_dir: std::path::PathBuf,
     metrics: coppice_api::http::MetricsEndpoint,
     readyz: coppice_api::http::ReadyzEndpoint,
+    // The serving names this daemon's config declares (`formation::leaf_sans`);
+    // renewal re-issues leaves against these rather than copying the old
+    // leaf's SANs (ADR 0037 §4/§6). `None` falls back to copying.
+    serving_sans: Option<Vec<String>>,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -235,6 +239,7 @@ where
         data_dir,
         Arc::clone(&consensus),
         node_handle,
+        serving_sans,
         shutdown_rx.clone(),
     ));
 

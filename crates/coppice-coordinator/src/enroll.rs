@@ -89,6 +89,17 @@ pub(crate) struct EnrollRequest<'a> {
     pub node_id: Option<NodeId>,
     /// The machine id a coordinator-role enrollee minted for itself (§7).
     pub machine_id: Option<MachineId>,
+    /// The hostnames/IPs the enrollee will serve on, requested as SANs.
+    ///
+    /// Metadata, never identity (ADR 0037 §4): the subject is dictated below
+    /// from the claimed id, and the leaf's SANs decide only which addresses
+    /// this machine can *serve* under. Accepting them from the enrollee is
+    /// what makes a coordinator's own leaf usable for its raft listener at
+    /// all — the cluster cannot know a node's advertised address before that
+    /// node tells it. What makes a declared address trustworthy is the
+    /// leader's dial-back verification at admission (§6), which happens
+    /// against the running listener, not against this list.
+    pub sans: &'a [String],
 }
 
 impl std::fmt::Debug for EnrollRequest<'_> {
@@ -98,6 +109,7 @@ impl std::fmt::Debug for EnrollRequest<'_> {
             .field("csr_pem_len", &self.csr_pem.len())
             .field("node_id", &self.node_id)
             .field("machine_id", &self.machine_id)
+            .field("sans", &self.sans)
             .finish()
     }
 }
@@ -229,7 +241,7 @@ pub(crate) async fn handle_enroll<C: Consensus>(
             {
                 return Err(EnrollError::Unauthorized);
             }
-            let cert_pem = pki::issue_agent(&signer, request.csr_pem, &node, &[])
+            let cert_pem = pki::issue_agent(&signer, request.csr_pem, &node, request.sans)
                 .map_err(|e| EnrollError::BadRequest(format!("signing the agent CSR: {e}")))?;
             tracing::info!(node = %node, "enroll: issued an agent leaf");
             Ok(Enrolled { cert_pem, ca_pem })
@@ -244,7 +256,7 @@ pub(crate) async fn handle_enroll<C: Consensus>(
             {
                 return Err(EnrollError::Unauthorized);
             }
-            let cert_pem = pki::issue_coordinator(&signer, request.csr_pem, &machine, &[])
+            let cert_pem = pki::issue_coordinator(&signer, request.csr_pem, &machine, request.sans)
                 .map_err(|e| {
                     EnrollError::BadRequest(format!("signing the coordinator CSR: {e}"))
                 })?;
@@ -286,6 +298,7 @@ pub(crate) async fn renew_coordinator<C: Consensus>(
     ctx: &EnrollContext<'_, C>,
     machine: MachineId,
     csr_pem: &[u8],
+    sans: &[String],
 ) -> Result<Enrolled, EnrollError> {
     if !ctx.formed {
         return Err(EnrollError::NotFormed);
@@ -300,7 +313,7 @@ pub(crate) async fn renew_coordinator<C: Consensus>(
     }
     drop(view);
     let (signer, ca_pem) = load_ca(ctx.data_dir, ctx.consensus)?;
-    let cert_pem = pki::issue_coordinator(&signer, csr_pem, &machine, &[])
+    let cert_pem = pki::issue_coordinator(&signer, csr_pem, &machine, sans)
         .map_err(|e| EnrollError::BadRequest(format!("signing the coordinator CSR: {e}")))?;
     tracing::info!(machine = %machine, "renew: re-issued a coordinator leaf");
     Ok(Enrolled { cert_pem, ca_pem })
@@ -428,6 +441,7 @@ impl<C: Consensus> EnrollService<C> {
                     csr_pem: call.csr_pem.as_bytes(),
                     node_id: call.node_id,
                     machine_id: call.machine_id,
+                    sans: &call.sans,
                 },
             )
             .await
@@ -495,6 +509,7 @@ pub(crate) async fn forward_to_leader(
                 csr_pem: call.csr_pem.clone(),
                 node_id: call.node_id.map(Into::into),
                 machine_id: call.machine_id.map(Into::into),
+                sans: call.sans.clone(),
             })
             .await
             .map_err(|status| match status.code() {
@@ -788,6 +803,7 @@ mod tests {
             csr_pem: b"-----BEGIN CERTIFICATE REQUEST-----",
             node_id: None,
             machine_id: None,
+            sans: &[],
         };
         let rendered = format!("{request:?}");
         assert!(!rendered.contains("cpk_"), "{rendered}");

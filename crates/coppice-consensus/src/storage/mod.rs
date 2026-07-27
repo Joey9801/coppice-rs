@@ -129,6 +129,36 @@ pub fn init_forming<F: Fs>(
     )
 }
 
+/// Initialize an empty data directory for a replica **joining** an already-formed
+/// cluster (ADR 0037 §6), recording both formation markers at once.
+///
+/// A joiner's history id came from the cluster it probed, not from its own
+/// config, so the ADR 0016 config-vs-stamp wrong-volume check cannot apply to
+/// this directory on any later start — and the `formation_complete` marker is
+/// exactly the signal that says so ([`crate::storage::FormationMarks`],
+/// consulted by the coordinator's `resumed_history`).
+///
+/// Both markers land in the *same* manifest write rather than intent-now,
+/// complete-later, because there is no window here worth reporting: formation
+/// happened on another node, and a joiner that dies mid-start has nothing
+/// half-done to diagnose — it simply has an initialized directory that will
+/// resume. Stamping only the intent would instead leave it fail-stopped in
+/// `formation-failed`, which would be a lie about what went wrong.
+pub fn init_joined<F: Fs>(
+    fs: &F,
+    options: &StorageOptions,
+    at_us: i64,
+) -> io::Result<CoordinatorId> {
+    init_with_formation(
+        fs,
+        options,
+        FormationMarks {
+            intent_at_us: Some(at_us),
+            complete_at_us: Some(at_us),
+        },
+    )
+}
+
 fn init_with_formation<F: Fs>(
     fs: &F,
     options: &StorageOptions,

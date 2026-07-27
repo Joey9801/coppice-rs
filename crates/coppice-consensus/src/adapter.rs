@@ -18,7 +18,7 @@
 //! by the coordinator runtime (`docs/architecture/coordinator-runtime.md`),
 //! which then assembles this adapter with [`OpenraftConsensus::new`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tokio::sync::{oneshot, watch, Semaphore};
@@ -125,6 +125,9 @@ pub struct OpenraftConsensus {
     status: watch::Receiver<ConsensusStatus>,
     views: StateViews,
     proposal_permits: Arc<Semaphore>,
+    /// The expected voter-set size (ADR 0037 §7); `0` disables the ceiling.
+    /// See [`crate::node::NodeOptions::cluster_size`].
+    cluster_size: usize,
 }
 
 impl OpenraftConsensus {
@@ -144,13 +147,29 @@ impl OpenraftConsensus {
         raft: Raft<TypeConfig>,
         status: watch::Receiver<ConsensusStatus>,
         views: StateViews,
+        cluster_size: usize,
     ) -> Self {
         OpenraftConsensus {
             raft,
             status,
             views,
             proposal_permits: Arc::new(Semaphore::new(MAX_INFLIGHT_PROPOSALS)),
+            cluster_size,
         }
+    }
+
+    /// The dial address membership currently records for `node`, or `None`
+    /// when it is not a member at all. The one read the ADR 0037 §6
+    /// idempotency short-circuits are expressed in terms of.
+    fn member_address(&self, node: CoordinatorId) -> Option<String> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        let addr = m
+            .membership_config
+            .nodes()
+            .find(|(id, _)| **id == node)
+            .map(|(_, n)| n.addr.clone());
+        addr
     }
 }
 
@@ -192,6 +211,23 @@ impl Consensus for OpenraftConsensus {
     }
 
     async fn add_learner(&self, node: CoordinatorId, addr: String) -> Result<(), ConsensusError> {
+        // The ADR 0037 §6 idempotency contract, checked BEFORE any other gate:
+        // the convergence loop re-runs this verb on every tick and on every
+        // restart, so "already admitted at this address" must be a plain
+        // success rather than an openraft error the caller has to interpret.
+        // The same id at a *different* address is the one refusal — no silent
+        // repointing.
+        if let Some(current) = self.member_address(node) {
+            if current == addr {
+                return Ok(());
+            }
+            return Err(ConsensusError::AddressConflict {
+                node,
+                current,
+                requested: addr,
+            });
+        }
+
         // Non-blocking: return once replication to the learner is set up. The
         // learner catches up via snapshot install plus log replay with no
         // quorum impact; the CLI polls health before promotion (ADR 0016).
@@ -207,6 +243,55 @@ impl Consensus for OpenraftConsensus {
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
     ) -> Result<(), ConsensusError> {
+        // ADR 0037 §6 idempotency, before the lag gate and deliberately so: a
+        // voter has no learner replication entry to measure, so reaching the
+        // gate below would bounce a settled voter with `LearnerNotCaughtUp`
+        // forever. "Already the shape you asked for" is success.
+        {
+            let metrics = self.raft.metrics();
+            let m = metrics.borrow();
+            let voters: BTreeSet<CoordinatorId> = m.membership_config.voter_ids().collect();
+            let known = m.membership_config.nodes().any(|(id, _)| *id == promote);
+            let removal_settled = remove.map_or(true, |departed| {
+                !m.membership_config.nodes().any(|(id, _)| *id == departed)
+            });
+            if voters.contains(&promote) && removal_settled {
+                return Ok(());
+            }
+            // Promoting something membership has never heard of is terminal,
+            // not "behind": nothing is replicating to it to catch up.
+            if !known {
+                return Err(ConsensusError::UnknownNode { node: promote });
+            }
+
+            // ADR 0037 §7 voter-count ceiling: refuse a promotion that would
+            // push the voter set past `cluster_size`, unless a paired
+            // same-change removal keeps the post-change count level (the
+            // hands-off evidence-gated-removal path folds a departing voter
+            // into this same joint change, so it must never be blocked
+            // here). `cluster_size == 0` means no configured expectation —
+            // the ceiling is not enforced.
+            //
+            // chunk 06 seam: the confirmed-key-receipt precondition (§4) and
+            // the evidence-gated removal that picks `remove` when no caller
+            // named a pair (§7 "the hands-off path") both hook in here —
+            // this check only enforces the count, not who is admissible.
+            if self.cluster_size > 0 {
+                let mut post_change = voters.clone();
+                post_change.insert(promote);
+                if let Some(departed) = remove {
+                    post_change.remove(&departed);
+                }
+                if post_change.len() > self.cluster_size {
+                    return Err(ConsensusError::VoterSetFull {
+                        node: promote,
+                        voters: voters.len(),
+                        cluster_size: self.cluster_size,
+                    });
+                }
+            }
+        }
+
         // ADR 0016 catch-up gate: refuse to raise a learner into the quorum
         // until its replication lag is within the threshold. The check is
         // best-effort — it needs leader replication metrics; if this node is
@@ -263,10 +348,39 @@ impl Consensus for OpenraftConsensus {
     }
 
     async fn remove_node(&self, node: CoordinatorId) -> Result<(), ConsensusError> {
+        // ADR 0037 §6: a node that is already absent is the state the caller
+        // asked for, so a retried removal succeeds instead of erroring.
+        if self.member_address(node).is_none() {
+            return Ok(());
+        }
         // Removes the node entirely. openraft requires it be a non-voter first;
         // a departed voter is dropped through `promote_voter`'s removal path.
         self.raft
             .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node])), false)
+            .await
+            .map(|_| ())
+            .map_err(map_client_write_error)
+    }
+
+    async fn set_node_address(
+        &self,
+        node: CoordinatorId,
+        addr: String,
+    ) -> Result<(), ConsensusError> {
+        // The operator-only break-glass of ADR 0037 §6. `SetNodes` is the one
+        // openraft change that can split-brain when misused, which is exactly
+        // why no machine credential can reach this path and why the admin
+        // service dial-back-verifies the *new* address before calling it.
+        match self.member_address(node) {
+            Some(current) if current == addr => return Ok(()),
+            Some(_) => {}
+            None => return Err(ConsensusError::UnknownNode { node }),
+        }
+        self.raft
+            .change_membership(
+                ChangeMembers::SetNodes(BTreeMap::from([(node, BasicNode { addr })])),
+                false,
+            )
             .await
             .map(|_| ())
             .map_err(map_client_write_error)
@@ -327,5 +441,297 @@ fn map_fatal(fatal: Fatal<CoordinatorId>) -> ConsensusError {
         Fatal::Stopped => ConsensusError::Shutdown,
         Fatal::Panicked => ConsensusError::Fatal("raft core panicked".to_string()),
         Fatal::StorageError(inner) => ConsensusError::Fatal(inner.to_string()),
+    }
+}
+
+/// The ADR 0037 §6 idempotency short-circuits and the §7 voter-count
+/// ceiling, exercised against a real single-voter openraft cluster over the
+/// segment storage engine. No real network is needed: every case here is
+/// decided from local membership metrics before any RPC would be sent, so
+/// the network factory below only has to exist, never actually connect.
+#[cfg(test)]
+mod idempotency_tests {
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::io;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use openraft::error::{
+        Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
+    };
+    use openraft::network::RPCOption;
+    use openraft::raft::{
+        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    };
+    use openraft::{BasicNode, Config, Raft, RaftNetwork, RaftNetworkFactory, Snapshot, Vote};
+
+    use crate::fs::RealFs;
+    use crate::storage::{self, StorageOptions};
+    use crate::view::{ViewPublisher, ViewPublisherConfig};
+    use crate::{status, Consensus, ConsensusError, CoordinatorId};
+
+    use super::{OpenraftConsensus, TypeConfig};
+
+    /// A network that never reaches a peer: `new_client` builds a lazy
+    /// handle per openraft's contract (no dial on construction), and every
+    /// RPC method fails `Unreachable`.
+    #[derive(Clone)]
+    struct NoopNetworkFactory;
+
+    struct NoopNetwork;
+
+    impl RaftNetworkFactory<TypeConfig> for NoopNetworkFactory {
+        type Network = NoopNetwork;
+
+        async fn new_client(&mut self, _target: CoordinatorId, _node: &BasicNode) -> NoopNetwork {
+            NoopNetwork
+        }
+    }
+
+    impl RaftNetwork<TypeConfig> for NoopNetwork {
+        async fn append_entries(
+            &mut self,
+            _rpc: AppendEntriesRequest<TypeConfig>,
+            _option: RPCOption,
+        ) -> Result<
+            AppendEntriesResponse<CoordinatorId>,
+            RPCError<CoordinatorId, BasicNode, RaftError<CoordinatorId>>,
+        > {
+            Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                "idempotency_tests: no real network",
+            ))))
+        }
+
+        async fn vote(
+            &mut self,
+            _rpc: VoteRequest<CoordinatorId>,
+            _option: RPCOption,
+        ) -> Result<
+            VoteResponse<CoordinatorId>,
+            RPCError<CoordinatorId, BasicNode, RaftError<CoordinatorId>>,
+        > {
+            Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                "idempotency_tests: no real network",
+            ))))
+        }
+
+        async fn full_snapshot(
+            &mut self,
+            _vote: Vote<CoordinatorId>,
+            _snapshot: Snapshot<TypeConfig>,
+            _cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
+            _option: RPCOption,
+        ) -> Result<SnapshotResponse<CoordinatorId>, StreamingError<TypeConfig, Fatal<CoordinatorId>>>
+        {
+            Err(StreamingError::Unreachable(Unreachable::new(
+                &io::Error::other("idempotency_tests: no real network"),
+            )))
+        }
+    }
+
+    /// Bring up a real single-voter cluster over the segment storage engine
+    /// with the no-op network above — enough to exercise membership
+    /// short-circuits, which are decided from local metrics.
+    async fn single_voter(
+        cluster_size: usize,
+    ) -> (tempfile::TempDir, OpenraftConsensus, CoordinatorId) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history_id = *b"idempotency-test";
+        let options = StorageOptions::new(history_id);
+        let fs = RealFs::new(dir.path());
+        storage::init(&fs, &options).expect("init data dir");
+        let recovered = storage::open(RealFs::new(dir.path()), options).expect("open");
+        let node_id = recovered.node_id;
+        let state = recovered.state.clone();
+        let last_applied_index = recovered.last_applied.map(|id| id.index).unwrap_or(0);
+        let (log, sm) = recovered.into_stores_with_local_apply_task();
+        let committed_rx = log.committed_watch();
+
+        let (_publisher, views) =
+            ViewPublisher::new(state, last_applied_index, ViewPublisherConfig::default());
+
+        let config = Config {
+            cluster_name: "idempotency-test".to_string(),
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid config");
+
+        let raft = Raft::new(node_id, Arc::new(config), NoopNetworkFactory, log, sm)
+            .await
+            .expect("raft construction");
+
+        raft.initialize(BTreeMap::from([(
+            node_id,
+            BasicNode {
+                addr: "127.0.0.1:0".to_string(),
+            },
+        )]))
+        .await
+        .expect("initialize single-voter cluster");
+
+        // A single-voter cluster becomes leader with no RPC round-trip; poll
+        // metrics rather than sleeping a fixed guess.
+        loop {
+            if raft.metrics().borrow().current_leader == Some(node_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let status = status::spawn(raft.metrics(), committed_rx);
+        let consensus = OpenraftConsensus::new(raft, status, views, cluster_size);
+        (dir, consensus, node_id)
+    }
+
+    #[tokio::test]
+    async fn add_learner_same_address_is_noop() {
+        let (_dir, consensus, node_id) = single_voter(0).await;
+        // The bootstrap voter is already a member at this address (ADR 0037
+        // §6): a retried `AddLearner` must be a plain success, not an error
+        // the caller has to interpret.
+        let result = consensus
+            .add_learner(node_id, "127.0.0.1:0".to_string())
+            .await;
+        assert!(
+            result.is_ok(),
+            "same-address add_learner must be a no-op success: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_learner_different_address_is_address_conflict() {
+        let (_dir, consensus, node_id) = single_voter(0).await;
+        let result = consensus
+            .add_learner(node_id, "127.0.0.1:9999".to_string())
+            .await;
+        match result {
+            Err(ConsensusError::AddressConflict { node, .. }) => {
+                assert_eq!(node, node_id);
+            }
+            other => panic!("expected AddressConflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_voter_already_voter_is_noop() {
+        let (_dir, consensus, node_id) = single_voter(0).await;
+        // Checked before the replication-lag gate (ADR 0037 §6): a voter has
+        // no learner replication entry to measure, so this must not bounce
+        // with `LearnerNotCaughtUp`.
+        let result = consensus.promote_voter(node_id, None).await;
+        assert!(
+            result.is_ok(),
+            "already-voter promotion must be a no-op success: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_voter_unknown_node_is_refused() {
+        let (_dir, consensus, _node_id) = single_voter(0).await;
+        let result = consensus.promote_voter(999, None).await;
+        match result {
+            Err(ConsensusError::UnknownNode { node }) => assert_eq!(node, 999),
+            other => panic!("expected UnknownNode, got {other:?}"),
+        }
+        // "Promote a node that was never admitted" is a caller error no
+        // amount of waiting fixes.
+        assert!(!ConsensusError::UnknownNode { node: 999 }.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn remove_node_absent_is_noop() {
+        let (_dir, consensus, _node_id) = single_voter(0).await;
+        let result = consensus.remove_node(999).await;
+        assert!(
+            result.is_ok(),
+            "removing an absent node must be a no-op success: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_node_address_unknown_node_is_refused() {
+        let (_dir, consensus, _node_id) = single_voter(0).await;
+        let result = consensus
+            .set_node_address(999, "127.0.0.1:1".to_string())
+            .await;
+        assert!(matches!(
+            result,
+            Err(ConsensusError::UnknownNode { node: 999 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_node_address_same_address_is_noop() {
+        let (_dir, consensus, node_id) = single_voter(0).await;
+        let result = consensus
+            .set_node_address(node_id, "127.0.0.1:0".to_string())
+            .await;
+        assert!(
+            result.is_ok(),
+            "same-address set_node_address must be a no-op: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_voter_voter_set_full_is_retryable() {
+        // cluster_size 1: the bootstrap voter already fills the one seat.
+        let (_dir, consensus, node_id) = single_voter(1).await;
+        let learner_id = node_id + 1000;
+        consensus
+            .add_learner(learner_id, "127.0.0.1:1".to_string())
+            .await
+            .expect("add_learner registers a fresh learner (no RPC needed to return)");
+
+        let result = consensus.promote_voter(learner_id, None).await;
+        match &result {
+            Err(ConsensusError::VoterSetFull {
+                node,
+                voters,
+                cluster_size,
+            }) => {
+                assert_eq!(*node, learner_id);
+                assert_eq!(*voters, 1);
+                assert_eq!(*cluster_size, 1);
+            }
+            other => panic!("expected VoterSetFull, got {other:?}"),
+        }
+        assert!(
+            result.unwrap_err().is_retryable(),
+            "VoterSetFull must be retryable: the learner polls until a seat opens (ADR 0037 §7)"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_voter_paired_with_remove_is_not_blocked_by_ceiling() {
+        // The same seat count (cluster_size 1, one existing voter) but this
+        // time the promotion is paired with removing the existing voter in
+        // the same joint change: the post-change count stays at 1, so the
+        // ceiling must never refuse it with `VoterSetFull` (ADR 0037 §7 —
+        // "an explicit paired promote/remove is not blocked").
+        let (_dir, consensus, node_id) = single_voter(1).await;
+        let learner_id = node_id + 1000;
+        consensus
+            .add_learner(learner_id, "127.0.0.1:1".to_string())
+            .await
+            .expect("add_learner");
+
+        // With the local lag gate satisfied too (a fresh learner's zero
+        // matched-index reads as zero lag, see the harness's replication
+        // metrics), the call proceeds past both local gates into a real
+        // openraft joint-consensus commit — which this no-op-network
+        // harness can never complete, since the incoming voter can never
+        // actually acknowledge the entry. Bound it with a short timeout:
+        // the only thing under test is that neither local gate short-circuits
+        // with `VoterSetFull`, not that the commit finishes.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            consensus.promote_voter(learner_id, Some(node_id)),
+        )
+        .await;
+        if let Ok(Err(ConsensusError::VoterSetFull { .. })) = outcome {
+            panic!("paired promote/remove must not be blocked by the voter-count ceiling");
+        }
     }
 }

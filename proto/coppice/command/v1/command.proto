@@ -73,6 +73,7 @@ message Command {
     RevokeIdentity revoke_identity = 94;
     ConfirmKeyPossession confirm_key_possession = 95;
     RecordEnrolledIdentity record_enrolled_identity = 96;
+    RebindMachineAddress rebind_machine_address = 97;
   }
 }
 
@@ -317,4 +318,17 @@ message ConfirmKeyPossession {
 message RecordEnrolledIdentity {
   coppice.core.v1.MachineId machine = 1;
   int64 recorded_at_us = 2;
+}
+
+// Repoint the bound address of an EXISTING machine-identity binding
+// (ADR 0037 §6). The replicated half of the operator-only `set-address`
+// break-glass: proposed only by the leader inside SetNodeAddress, after
+// dial-back verification of the new endpoint and after the membership change
+// commits — never reachable from any machine self-service path (re-admission
+// never repoints; BindMachineIdentity rejects an address change). Apply
+// refuses a raft node id with no binding; an exact replay is a no-op.
+message RebindMachineAddress {
+  uint64 raft_node_id = 1;
+  string address = 2;
+  int64 rebound_at_us = 3;
 }

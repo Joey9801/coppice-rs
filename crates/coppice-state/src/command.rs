@@ -56,6 +56,7 @@ pub enum Command {
     RevokeIdentity(RevokeIdentity),
     ConfirmKeyPossession(ConfirmKeyPossession),
     RecordEnrolledIdentity(RecordEnrolledIdentity),
+    RebindMachineAddress(RebindMachineAddress),
 }
 
 impl Command {
@@ -91,6 +92,7 @@ impl Command {
             Command::RevokeIdentity(c) => c.revoked_at,
             Command::ConfirmKeyPossession(c) => c.confirmed_at,
             Command::RecordEnrolledIdentity(c) => c.recorded_at,
+            Command::RebindMachineAddress(c) => c.rebound_at,
         }
     }
 }
@@ -408,6 +410,30 @@ pub struct RecordEnrolledIdentity {
     pub recorded_at: Timestamp,
 }
 
+/// Repoint the bound address of an *existing* machine-identity binding
+/// (ADR 0037 §6).
+///
+/// The replicated half of the operator-only `set-address` break-glass. It is
+/// deliberately keyed on the raft seat, not the machine identity: the
+/// operator names a seat, and the binding invariant guarantees at most one
+/// identity holds it. Apply refuses a seat with no binding — this verb
+/// repoints, it never creates — and an exact replay is an accepted no-op
+/// (`bound_at` keeps the original admission instant, because the fact it
+/// dates is the binding, not its latest address).
+///
+/// This command must never be reachable from a machine self-service path:
+/// re-admission never repoints a seat (`BindMachineIdentity` rejects an
+/// address change), and only the leader proposes this, after dial-back
+/// verification of the new endpoint (ADR 0037 §6/§7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebindMachineAddress {
+    /// The u64 openraft node id whose binding to repoint (distinct from a
+    /// compute [`NodeId`]).
+    pub raft_node_id: u64,
+    pub address: String,
+    pub rebound_at: Timestamp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +534,12 @@ mod tests {
             recorded_at: ts(33),
         });
         assert_eq!(enrolled.stamped_at(), ts(33));
+
+        let rebind = Command::RebindMachineAddress(RebindMachineAddress {
+            raft_node_id: 7,
+            address: "10.0.0.2:9000".into(),
+            rebound_at: ts(35),
+        });
+        assert_eq!(rebind.stamped_at(), ts(35));
     }
 }

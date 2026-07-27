@@ -131,6 +131,12 @@ snapshot_log_entries = 50_000
 # Post-snapshot log entries kept before purge (ADR 0017); a fresh learner
 # beyond this window resyncs via streaming snapshot install (ADR 0016).
 snapshot_keep_log_entries = 1_000
+# How long the leader must CONTINUOUSLY observe a full, caught-up voter set
+# before `GET /readyz?require=healthy` returns 200 (ADR 0037 §9). Any lapse
+# restarts the interval, which is what stops a flapping follower from
+# satisfying a redundancy gate between two polls. Shorten it for tests and
+# dev; the default suits bringup automation.
+health_stability_interval = "10s"
 
 [tls]
 # MACHINE PLANE ONLY: the leaf served on the raft and agent-gateway

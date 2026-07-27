@@ -99,23 +99,31 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The nested run path takes `--config` and nothing else: ADR 0037 §1
+    /// removed `--bootstrap`/`--join`, so one command line covers scale-out
+    /// join, instance replacement, and plain restart alike.
     #[test]
-    fn coordinator_subcommand_parses_run_flags() {
-        let cli = Cli::parse_from([
-            "coppice",
-            "coordinator",
-            "--config",
-            "/etc/c.toml",
-            "--join",
-        ]);
+    fn coordinator_subcommand_parses_the_run_path() {
+        let cli = Cli::parse_from(["coppice", "coordinator", "--config", "/etc/c.toml"]);
         match cli.command {
             Command::Coordinator(c) => {
                 let run = c.run_args();
                 assert_eq!(run.config, PathBuf::from("/etc/c.toml"));
-                assert!(run.join);
-                assert!(!run.bootstrap);
             }
             other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    /// And a stale unit file carrying the removed flags fails loudly at parse
+    /// rather than silently starting a daemon whose intent it cannot honor.
+    #[test]
+    fn the_removed_intent_flags_are_rejected() {
+        for flag in ["--bootstrap", "--join"] {
+            assert!(
+                Cli::try_parse_from(["coppice", "coordinator", "--config", "/etc/c.toml", flag])
+                    .is_err(),
+                "{flag} must no longer parse (ADR 0037 §1)"
+            );
         }
     }
 

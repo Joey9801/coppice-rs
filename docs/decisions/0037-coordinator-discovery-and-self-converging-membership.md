@@ -450,6 +450,21 @@ A minimal deployment provisions no certificates at all.
   leaf, run the convergence loop) as a routine instance refresh years
   later. There is exactly one privileged ceremony in the system's
   lifetime, and it is §3.
+- **The enrollee declares the addresses it serves; the cluster dictates
+  who it is.** The enrollment request carries a `sans` list alongside
+  the CSR, and the issued leaf gets those as SANs. It has to: a
+  coordinator's leaf is a *serving* certificate for its raft listener,
+  and the cluster cannot know what hostname a machine it has never met
+  answers to. Declaring them is not trusting them — the subject still
+  comes from the cluster (`CN` from the claimed identity, `OU` from the
+  token's role, both ignoring anything in the CSR), and what makes a
+  declared address load-bearing is the leader's dial-back verification
+  at admission (§6), which tests the running listener rather than the
+  list. An agent that hosts no listener declares nothing; its node-id
+  SAN is added cluster-side from the identity it claimed, because
+  ADR 0034's id-pinned dial depends on it. Renewal re-declares the SANs
+  the leaf in hand already carries, so a re-issue preserves what a
+  replica serves as well as who it is.
 - **Enrollment transport is the client listener's posture — explicitly
   secure or explicitly insecure, never implicit.**
   - With TLS on the listener (the production posture: an
@@ -855,8 +870,14 @@ Log scraping is removed from every workflow:
     "wait for the new node to finish synchronizing before replacing the
     next" is exactly "wait for 200".
   - `GET /readyz?require=healthy` → 200 additionally requires the leader
-    to observe at least `cluster_size` voters within the promotion-lag
-    threshold, sustained for a stability interval (default 10s). This is
+    to observe at least `cluster_size` voters **live**: in current
+    replication contact (each has answered the leader's RPCs within the
+    contact-staleness bound — log positions alone cannot see a death on
+    an idle log) and within the promotion-lag threshold of the leader's
+    log frontier (the same frontier the promotion gate measures),
+    sustained continuously for a stability interval (default 10s),
+    maintained by a leader-side sampler rather than per-request so a
+    flap between two requests still resets the window. This is
     the *cluster-redundancy* gate for bringup automation and anything
     that assumes the cluster can lose a node. It is answered
     authoritatively **only by the leader** (openraft replication metrics

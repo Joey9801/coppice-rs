@@ -17,6 +17,35 @@
 //! who has revoked this machine's identity (ADR 0037 §5) expects renewal to
 //! fail and the leaf to age out. So a failure retries with backoff and gets
 //! louder as expiry approaches — it never falls back to anything.
+//!
+//! # Serving SANs follow the config, not the previous leaf
+//!
+//! The re-issued leaf declares the daemon's **configured** serving names
+//! ([`crate::formation::leaf_sans`] over `[listen]`) rather than copying
+//! whatever the expiring leaf happened to carry. The config is the declared
+//! truth about where this daemon serves — it is exactly what initial
+//! enrollment declared — so a leaf that no longer matches it is stale, and a
+//! renewal that merely copied the old SANs could never repair it. The subject
+//! stays cluster-dictated on both signing paths; only the address metadata
+//! follows the config.
+//!
+//! That rule is also what makes an **address move** (a real host change, not
+//! just a port) operable with no dedicated verb. `admin set-address` (ADR 0037
+//! §6) commits only after the leader dial-back-verifies the NEW address, and
+//! that dial validates the member's *serving* certificate against the new
+//! name — so the leaf must cover the new name before the repoint can ever be
+//! accepted. The break-glass choreography is therefore:
+//!
+//! 1. the operator updates the daemon's config (and DNS) to the new
+//!    advertise host, and restarts it;
+//! 2. this task notices the installed leaf does not cover the configured
+//!    serving names and renews **immediately** rather than waiting out the
+//!    expiry timer — the re-issued leaf carries the new SANs and hot-reloads
+//!    into every listener;
+//! 3. the operator runs `admin set-address`; the leader's dial-back now
+//!    verifies at the new name and both replicated facts (membership address
+//!    and machine binding) move together;
+//! 4. the member's own convergence replay at the new address no-ops.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,11 +78,18 @@ const ALARM_REMAINING: Duration = Duration::from_secs(24 * 60 * 60);
 const UNKNOWN_EXPIRY_POLL: Duration = Duration::from_secs(60 * 60);
 
 /// Run the renewal loop until `shutdown`.
+///
+/// `serving_sans` is the daemon's configured serving-name set
+/// ([`crate::formation::leaf_sans`] over its `[listen]` config), the set every
+/// re-issued leaf declares. `None` (embedders with no config in hand) falls
+/// back to copying the current leaf's SANs, which also disables the
+/// SAN-mismatch fast path below.
 pub async fn run<C: Consensus>(
     store: Arc<TlsStore>,
     data_dir: PathBuf,
     consensus: Arc<C>,
     node: NodeHandle,
+    serving_sans: Option<Vec<String>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let paths = store.paths().clone();
@@ -62,6 +98,20 @@ pub async fn run<C: Consensus>(
     loop {
         let not_after = store.current().not_after_unix();
         let delay = match not_after {
+            // The address-move fast path (see the module doc): a leaf that
+            // does not cover the configured serving names cannot pass the
+            // leader's set-address dial-back, so waiting out the expiry
+            // timer would leave the operator wedged for most of a leaf
+            // lifetime. Renew now — but only when no failure backoff is
+            // pending, so a refused renewal (revocation, no leader yet)
+            // still paces itself instead of hammering.
+            Some(_) if backoff.is_none() && sans_stale(&store, serving_sans.as_deref()) => {
+                tracing::info!(
+                    "renewal: the installed leaf does not cover this daemon's configured \
+                     serving names; renewing immediately (ADR 0037 §4/§6 address move)"
+                );
+                Duration::ZERO
+            }
             Some(not_after) => backoff
                 .unwrap_or_else(|| renewal_delay(now_unix(), not_after, jitter_fraction(&paths))),
             None => {
@@ -83,7 +133,16 @@ pub async fn run<C: Consensus>(
             continue;
         }
 
-        match renew_once(&store, &paths, &data_dir, consensus.as_ref(), &node).await {
+        match renew_once(
+            &store,
+            &paths,
+            &data_dir,
+            consensus.as_ref(),
+            &node,
+            serving_sans.as_deref(),
+        )
+        .await
+        {
             Ok(()) => {
                 backoff = None;
                 tracing::info!(
@@ -132,14 +191,27 @@ pub async fn renew_once<C: Consensus>(
     data_dir: &std::path::Path,
     consensus: &C,
     node: &NodeHandle,
+    serving_sans: Option<&[String]>,
 ) -> anyhow::Result<()> {
     let (key_pem, csr_pem) = pki::generate_key_and_csr()?;
+    // Re-declare the daemon's CONFIGURED serving names — the same set initial
+    // enrollment declared (`formation::leaf_sans`), so the leaf tracks where
+    // this daemon actually serves rather than fossilizing whatever the
+    // previous leaf carried. That is what lets an address move renew its way
+    // to a verifiable leaf (module doc). Without a config in hand, fall back
+    // to copying the current leaf: a renewal that dropped the serving names
+    // would leave this replica unable to terminate TLS for the name its peers
+    // dial it by (ADR 0037 §4).
+    let sans = match serving_sans {
+        Some(sans) => sans.to_vec(),
+        None => pki::leaf_sans(store.current().cert_pem())?,
+    };
 
     let summary = node.cluster_summary();
     let (cert_pem, ca_pem) = if summary.leader == Some(summary.local_id) {
-        sign_locally(data_dir, consensus, &csr_pem).await?
+        sign_locally(data_dir, consensus, &csr_pem, &sans).await?
     } else {
-        forward_to_leader(store, node, &summary, &csr_pem).await?
+        forward_to_leader(store, node, &summary, &csr_pem, &sans).await?
     };
 
     pki::install_leaf_material(paths, &ca_pem, &cert_pem, &key_pem)?;
@@ -162,6 +234,7 @@ async fn sign_locally<C: Consensus>(
     data_dir: &std::path::Path,
     consensus: &C,
     csr_pem: &[u8],
+    sans: &[String],
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let machine = pki::load_machine_identity(data_dir)?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -174,7 +247,7 @@ async fn sign_locally<C: Consensus>(
         data_dir,
         formed: true,
     };
-    let issued = crate::enroll::renew_coordinator(&ctx, machine, csr_pem)
+    let issued = crate::enroll::renew_coordinator(&ctx, machine, csr_pem, sans)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok((issued.cert_pem, issued.ca_pem))
@@ -187,6 +260,7 @@ async fn forward_to_leader(
     node: &NodeHandle,
     summary: &coppice_consensus::ClusterSummary,
     csr_pem: &[u8],
+    sans: &[String],
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     use coppice_proto::pb::raft::v1 as pb;
 
@@ -214,6 +288,7 @@ async fn forward_to_leader(
         .renew_coordinator(pb::RenewCoordinatorRequest {
             history_id: node.history_id().to_vec(),
             csr_pem: String::from_utf8(csr_pem.to_vec())?,
+            sans: sans.to_vec(),
         })
         .await
         .map_err(|status| {
@@ -225,6 +300,29 @@ async fn forward_to_leader(
         })?
         .into_inner();
     Ok((renewed.cert_pem.into_bytes(), renewed.ca_pem.into_bytes()))
+}
+
+/// Whether the installed leaf fails to cover the configured serving names.
+///
+/// `true` exactly when a config is in hand AND the current leaf parses AND at
+/// least one configured name is missing from it. Extra names on the leaf are
+/// not staleness — the config is a floor, not an exact set, so a cluster that
+/// chooses to issue broader material never triggers a renew loop. An
+/// unparseable leaf is not staleness either: the expiry-driven arm of the
+/// loop already owns that case.
+fn sans_stale(store: &TlsStore, serving_sans: Option<&[String]>) -> bool {
+    let Some(configured) = serving_sans else {
+        return false;
+    };
+    match pki::leaf_sans(store.current().cert_pem()) {
+        Ok(current) => stale_against(&current, configured),
+        Err(_) => false,
+    }
+}
+
+/// The pure half of [`sans_stale`]: does `current` miss any of `configured`?
+fn stale_against(current: &[String], configured: &[String]) -> bool {
+    configured.iter().any(|c| !current.contains(c))
 }
 
 /// How long to wait before renewing a leaf that expires at `not_after_unix`.
@@ -326,6 +424,24 @@ mod tests {
             let jitter = jitter_fraction(&paths);
             assert!((-JITTER..=JITTER).contains(&jitter), "{jitter}");
         }
+    }
+
+    #[test]
+    fn staleness_is_a_configured_name_the_leaf_misses_never_an_extra_it_carries() {
+        let owned =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| s.to_string()).collect() };
+
+        // The steady state: the leaf covers exactly what the config declares.
+        let config = owned(&["localhost", "127.0.0.1", "::1"]);
+        assert!(!stale_against(&config, &config));
+
+        // An address move: the config now declares a name the leaf misses.
+        let moved = owned(&["node2.example", "localhost", "127.0.0.1", "::1"]);
+        assert!(stale_against(&config, &moved));
+
+        // A leaf broader than the config is NOT stale — the config is a
+        // floor, so this must never renew-loop.
+        assert!(!stale_against(&moved, &config));
     }
 
     #[test]

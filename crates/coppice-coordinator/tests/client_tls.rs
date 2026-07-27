@@ -21,7 +21,6 @@ use axum::routing::get;
 use axum::Router;
 use coppice_api::http::PeerCertificates;
 use coppice_coordinator::clientedge::{self, ClusterCa};
-use coppice_coordinator::config::CliOverrides;
 use coppice_core::id::ClusterId;
 use coppice_tls::{ClientTlsPaths, ClientTlsStore};
 
@@ -159,10 +158,7 @@ async fn a_daemon_configured_with_a_certificate_serves_readyz_over_https() {
     let ca = Ca::new();
     let mut daemon = Daemon::new(ClusterId::new(), &ca);
     let (ca_pem, base) = daemon.set_client_tls(&ca);
-    daemon.start(CliOverrides {
-        bootstrap: false,
-        join: false,
-    });
+    daemon.start();
 
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem).expect("root"))

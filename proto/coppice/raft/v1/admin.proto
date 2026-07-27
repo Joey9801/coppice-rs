@@ -45,6 +45,17 @@ message RemoveNodeRequest {
 
 message RemoveNodeResponse {}
 
+// Repoint a member's dial address (ADR 0037 §6). Operator-credential
+// break-glass only; the leader dial-back-verifies the new address before
+// committing. There is no self-service address repair.
+message SetNodeAddressRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  uint64 node_id = 8;
+  string address = 9;
+}
+
+message SetNodeAddressResponse {}
+
 // Poll a coordinator for its view of cluster state.
 message ClusterStatusRequest {
   bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
@@ -60,6 +71,31 @@ message ClusterStatusResponse {
   uint64 known_committed_index = 5;
   Membership membership = 6;
   repeated ReplicationProgress replication = 7; // leader only; empty elsewhere.
+  repeated MachineBinding bindings = 8; // as surfaced by `admin status --json`.
+  // The cluster-redundancy verdict (ADR 0037 §9) — the same leader-only
+  // stability-window answer `?require=healthy` gives. Absent when this
+  // responder cannot answer authoritatively (a follower, or an unformed
+  // daemon): unknown health is not health, and it is never faked or cached.
+  ClusterHealth health = 9;
+}
+
+// The leader's cluster-redundancy verdict (ADR 0037 §9): whether at least
+// `cluster_size` voters have replicated within the promotion-lag threshold,
+// sustained for the configured stability interval.
+message ClusterHealth {
+  bool healthy = 1;
+  // Voters the leader currently observes within the lag threshold
+  // (including itself).
+  uint64 live_voters = 2;
+}
+
+// One replicated machine-identity <-> seat binding (ADR 0037 §7), as
+// surfaced by `admin status --json`.
+message MachineBinding {
+  string machine_id = 1;
+  uint64 node_id = 2;
+  string address = 3;
+  int64 bound_at_us = 4;
 }
 
 // One follower's replication progress as the leader tracks it.
@@ -119,6 +155,10 @@ service RaftAdminService {
   rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
   rpc PromoteVoter(PromoteVoterRequest) returns (PromoteVoterResponse);
   rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
+  // Repoint a member's dial address (ADR 0037 §6). Operator-credential
+  // break-glass only; the leader dial-back-verifies the new address before
+  // committing. There is no self-service address repair.
+  rpc SetNodeAddress(SetNodeAddressRequest) returns (SetNodeAddressResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
   // Answered in every daemon state, including parked and formation-failed
   // (ADR 0037 §3) — the one verb that is not gated on a formed cluster.
@@ -212,6 +252,13 @@ message ForwardEnrollRequest {
   // which is required.
   optional coppice.core.v1.NodeId node_id = 10;
   optional coppice.core.v1.MachineId machine_id = 11;
+  // The hostnames/IPs the enrollee will SERVE on, carried into the issued
+  // leaf as SANs. Metadata, never identity (ADR 0037 §4): the subject is
+  // dictated by the cluster from node_id/machine_id, and what makes a
+  // declared address trustworthy is the leader's dial-back verification at
+  // admission (§6), not this field. An enrollee that serves nothing — an
+  // agent behind an outbound-only session — sends none.
+  repeated string sans = 12;
 }
 
 message ForwardEnrollResponse {
@@ -225,6 +272,9 @@ message ForwardEnrollResponse {
 message RenewCoordinatorRequest {
   bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   string csr_pem = 8;
+  // As ForwardEnrollRequest.sans: the addresses this coordinator serves on,
+  // re-declared each renewal so a re-addressed node's next leaf follows it.
+  repeated string sans = 9;
 }
 
 message RenewCoordinatorResponse {

@@ -201,6 +201,18 @@ EOF
 systemctl start coppice-agent   # ExecStart=coppice agent --config …
 ```
 
+The coordinator unit is the same shape and the same single `ExecStart`
+line — `coppice coordinator --config /etc/coppice/coordinator.toml`, with
+no startup-intent flag in any situation (ADR 0037 §1). Two unit
+directives carry the rest of the operational story:
+`RequiresMountsFor=/var/lib/coppice`, because the empty-directory
+fail-stop is gone and a failed mount must fail unit ordering rather than
+present a coordinator with a blank disk; and `Restart=always`, which is
+the *entire* recovery story — the convergence loop re-enters from the top
+on every restart and the membership verbs are idempotent by contract
+(ADR 0037 §6), so a process killed at any step converges after respawn
+with no cleanup.
+
 No ids, no certs, no capacity numbers, no coordinator-side
 pre-registration, no secrets manager, no CA distribution — the token is
 the only secret, and the endpoint is verified like any HTTPS service.
