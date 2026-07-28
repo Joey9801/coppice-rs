@@ -14,8 +14,8 @@ use coppice_state::command::{
     ConfigureQuotaEntity, ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt,
     EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement, RebindMachineAddress,
     ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RecordCaCertificate, RecordEnrolledIdentity, RegisterNode, RevokeEnrollToken, RevokeIdentity,
-    SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    RecordCaCertificate, RecordEnrolledIdentity, RegisterNode, RetireMachineBinding,
+    RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
 };
 use coppice_state::{CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity};
 
@@ -54,6 +54,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::ConfirmKeyPossession(c) => Body::ConfirmKeyPossession(c.into()),
         Command::RecordEnrolledIdentity(c) => Body::RecordEnrolledIdentity(c.into()),
         Command::RebindMachineAddress(c) => Body::RebindMachineAddress(c.into()),
+        Command::RetireMachineBinding(c) => Body::RetireMachineBinding(c.into()),
     };
     pb::Command {
         version: cluster_version,
@@ -92,6 +93,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::ConfirmKeyPossession(c) => Command::ConfirmKeyPossession(c.try_into()?),
         Body::RecordEnrolledIdentity(c) => Command::RecordEnrolledIdentity(c.try_into()?),
         Body::RebindMachineAddress(c) => Command::RebindMachineAddress(c.try_into()?),
+        Body::RetireMachineBinding(c) => Command::RetireMachineBinding(c.try_into()?),
     };
     Ok((command_version, body))
 }
@@ -743,6 +745,26 @@ impl TryFrom<pb::RebindMachineAddress> for RebindMachineAddress {
             raft_node_id: c.raft_node_id,
             address: c.address,
             rebound_at: timestamp(c.rebound_at_us, "RebindMachineAddress.rebound_at_us")?,
+        })
+    }
+}
+
+impl From<&RetireMachineBinding> for pb::RetireMachineBinding {
+    fn from(c: &RetireMachineBinding) -> Self {
+        pb::RetireMachineBinding {
+            machine: Some(c.machine.into()),
+            retired_at_us: c.retired_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RetireMachineBinding> for RetireMachineBinding {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RetireMachineBinding) -> Result<Self, ConvertError> {
+        Ok(RetireMachineBinding {
+            machine: req(c.machine, "RetireMachineBinding.machine")?.try_into()?,
+            retired_at: timestamp(c.retired_at_us, "RetireMachineBinding.retired_at_us")?,
         })
     }
 }

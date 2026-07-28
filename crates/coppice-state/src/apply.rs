@@ -23,7 +23,8 @@ use crate::command::{
     ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, MintEnrollToken,
     Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
     RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RegisterNode,
-    RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob,
+    UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -65,6 +66,7 @@ impl StateMachine {
             Command::ConfirmKeyPossession(c) => self.confirm_key_possession(c),
             Command::RecordEnrolledIdentity(c) => self.record_enrolled_identity(c),
             Command::RebindMachineAddress(c) => self.rebind_machine_address(c),
+            Command::RetireMachineBinding(c) => self.retire_machine_binding(c),
         };
         self.version += 1;
         result
@@ -959,6 +961,15 @@ impl StateMachine {
     }
 
     fn bind_machine_identity(&mut self, c: &BindMachineIdentity) -> ApplyResult {
+        // Retirement is checked before anything else, including the
+        // exact-replay no-op below: a retired identity is never re-admitted,
+        // ever (ADR 0037 §7 one-seat-ever) — a replayed admission for a
+        // now-retired machine must still be refused, not silently accepted.
+        if let Some(binding) = self.machine_bindings.get(&c.machine) {
+            if binding.retired_at.is_some() {
+                return Err(RejectionReason::MachineIdentityRetired { machine: c.machine });
+            }
+        }
         // One machine identity ↔ at most one raft node id, ever (ADR 0037 §7).
         // Reject in both directions: this raft node id already carrying a
         // different machine, or this machine already carrying a different node.
@@ -998,6 +1009,7 @@ impl StateMachine {
                         raft_node_id: c.raft_node_id,
                         address: c.address.clone(),
                         bound_at: c.bound_at,
+                        retired_at: None,
                     },
                 );
             }
@@ -1066,10 +1078,31 @@ impl StateMachine {
             .machine_bindings
             .get_mut(&machine)
             .expect("machine_for_raft_node answered from machine_bindings");
+        // A retired seat is never repointed either (ADR 0037 §7
+        // one-seat-ever) — checked before the mutation below.
+        if binding.retired_at.is_some() {
+            return Err(RejectionReason::MachineIdentityRetired { machine });
+        }
         // Setting the same address again is the exact-replay no-op the
         // command contract promises; `bound_at` stays the original admission
         // instant either way, because the fact it dates is the binding.
         binding.address = c.address.clone();
+        Ok(Applied::default())
+    }
+
+    fn retire_machine_binding(&mut self, c: &RetireMachineBinding) -> ApplyResult {
+        // Mark, never delete (ADR 0037 §7): the binding invariant extends
+        // past retirement — a retired identity is never re-admitted, so the
+        // record must survive to keep refusing it.
+        let Some(binding) = self.machine_bindings.get_mut(&c.machine) else {
+            return Err(RejectionReason::UnknownMachineIdentity(c.machine));
+        };
+        // Already-retired is an accepted no-op (idempotent, mirroring
+        // `RevokeEnrollToken`): the learner-GC task retries this proposal
+        // every tick until the seat removal that follows it also lands.
+        if binding.retired_at.is_none() {
+            binding.retired_at = Some(c.retired_at);
+        }
         Ok(Applied::default())
     }
 

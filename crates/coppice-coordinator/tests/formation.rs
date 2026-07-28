@@ -712,6 +712,8 @@ async fn initialize_raft_history(daemon: &Daemon, _ca: &Ca) {
             // No voter ceiling: this replica is opened only to bring the raft
             // history into existence, and never promotes anything.
             cluster_size: 0,
+            removal_grace: Duration::from_secs(120),
+            learner_expiry: Duration::from_secs(3600),
         },
         StartIntent::Restart,
     )

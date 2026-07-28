@@ -783,6 +783,8 @@ data_dir = "{data_dir}"
 [discovery]
 backend = "static"
 cluster_size = 1
+removal_grace = "120s"
+learner_expiry = "1h"
 
 [discovery.static]
 addrs = []
@@ -872,6 +874,36 @@ log_level = "warn"
             "no cluster_size line to rewrite"
         );
         let updated = toml.replace("cluster_size = 1", &format!("cluster_size = {size}"));
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
+    /// Set `[discovery] removal_grace`, the evidence-gated-removal window
+    /// (ADR 0037 §7). The fixture default is `120s`.
+    pub fn set_removal_grace(&self, value: &str) {
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        assert!(
+            toml.contains("removal_grace = \"120s\""),
+            "no removal_grace line to rewrite"
+        );
+        let updated = toml.replace(
+            "removal_grace = \"120s\"",
+            &format!("removal_grace = \"{value}\""),
+        );
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
+    /// Set `[discovery] learner_expiry`, the learner-GC window (ADR 0037 §7).
+    /// The fixture default is `1h`.
+    pub fn set_learner_expiry(&self, value: &str) {
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        assert!(
+            toml.contains("learner_expiry = \"1h\""),
+            "no learner_expiry line to rewrite"
+        );
+        let updated = toml.replace(
+            "learner_expiry = \"1h\"",
+            &format!("learner_expiry = \"{value}\""),
+        );
         std::fs::write(&self.config_path, updated).expect("write config");
     }
 

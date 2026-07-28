@@ -23,6 +23,7 @@ use openraft::{BasicNode, Config, Raft, SnapshotPolicy};
 use coppice_net::transport::Server;
 
 use crate::adapter::{OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY};
+use crate::contact::ContactTracker;
 use crate::events::{EventTap, EventTapReceiver};
 use crate::fs::{Fs, RealFs};
 use crate::net::{GrpcNetworkFactory, PeerContact, RaftTransportHandler};
@@ -79,6 +80,18 @@ pub struct NodeOptions {
     /// it is paired with a same-change removal that keeps the count level.
     /// `0` disables the ceiling (no configured expectation).
     pub cluster_size: usize,
+    /// How long a voter may go without acknowledging leader contact before
+    /// the evidence-gated removal path (ADR 0037 §7) may fold it out of the
+    /// voter set. Node-local coordinator config
+    /// (`[discovery].removal_grace`), read from the leader's own
+    /// [`ContactTracker`] evidence — never from log-position progress, which
+    /// stalls identically for a dead peer and an idle-but-live one.
+    pub removal_grace: Duration,
+    /// How long a learner may go without acknowledging leader contact before
+    /// the periodic learner-GC task (ADR 0037 §7) retires its bound machine
+    /// identity and removes its seat. Node-local coordinator config
+    /// (`[discovery].learner_expiry`).
+    pub learner_expiry: Duration,
 }
 
 /// A running consensus replica, assembled and ready to serve.
@@ -368,6 +381,8 @@ pub async fn start(
         event_tap_capacity,
         tls,
         cluster_size,
+        removal_grace,
+        learner_expiry,
     } = options;
 
     // Step 1: the directory must exist (the caller owns creating it).
@@ -479,7 +494,12 @@ pub async fn start(
     // Step 8: the network factory and the openraft node. The factory holds the
     // shared hot-reload store and rebuilds per-peer channels when the material's
     // generation advances (ADR 0037 §4).
-    let factory = GrpcNetworkFactory::new(history_id, tls, rpc_timeout);
+    //
+    // The evidence tracker is the shared seam between the network factory
+    // (which notes every AppendEntries attempt/ack) and the evidence-gated
+    // membership decisions in the consensus adapter (ADR 0037 §7).
+    let evidence = Arc::new(ContactTracker::default());
+    let factory = GrpcNetworkFactory::new(history_id, tls, rpc_timeout, evidence.clone());
     // Taken before the factory moves into openraft: the transport records
     // per-peer contact instants into this shared handle, and the admin handle
     // reads them for the `?require=healthy` liveness test (ADR 0037 §9).
@@ -506,8 +526,15 @@ pub async fn start(
 
     // Step 10 + 11: status watch, seam, transport, handle.
     let status = status::spawn(raft.metrics(), committed_rx);
-    let consensus =
-        OpenraftConsensus::new(raft.clone(), status.clone(), views.clone(), cluster_size);
+    let consensus = OpenraftConsensus::new(
+        raft.clone(),
+        status.clone(),
+        views.clone(),
+        cluster_size,
+        removal_grace,
+        learner_expiry,
+        evidence,
+    );
     let transport = Server::new(RaftTransportHandler::new(raft.clone(), history_id));
     let handle = NodeHandle {
         raft,

@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{oneshot, watch, Semaphore};
 
@@ -30,6 +31,7 @@ use openraft::{BasicNode, ChangeMembers, Raft};
 
 use coppice_state::{Command, StateMachine};
 
+use crate::contact::ContactTracker;
 use crate::error::ConsensusError;
 use crate::view::StateViews;
 use crate::{Applied, Consensus, ConsensusStatus, CoordinatorId};
@@ -128,6 +130,23 @@ pub struct OpenraftConsensus {
     /// The expected voter-set size (ADR 0037 §7); `0` disables the ceiling.
     /// See [`crate::node::NodeOptions::cluster_size`].
     cluster_size: usize,
+    /// How long a voter may go unanswered before the evidence-gated removal
+    /// path may fold it out of the voter set (ADR 0037 §7). See
+    /// [`crate::node::NodeOptions::removal_grace`].
+    #[allow(dead_code)] // consumed by the evidence-gated removal path (chunk 06 continuation)
+    removal_grace: Duration,
+    /// How long a learner may go unanswered before the periodic learner-GC
+    /// task retires it (ADR 0037 §7). See
+    /// [`crate::node::NodeOptions::learner_expiry`].
+    #[allow(dead_code)] // consumed by the learner-GC task (chunk 06 continuation)
+    learner_expiry: Duration,
+    /// Per-peer contact evidence, written by the Raft network client on every
+    /// AppendEntries round-trip (heartbeats included). The evidence source for
+    /// evidence-gated voter removal and stale-learner GC (ADR 0037 §7): a
+    /// live-but-idle peer keeps acknowledging heartbeats, so — unlike
+    /// matched-index progress — it never goes stale on an idle cluster.
+    #[allow(dead_code)] // read by the evidence-gated removal path (chunk 06 continuation)
+    contact: Arc<ContactTracker>,
 }
 
 impl OpenraftConsensus {
@@ -143,11 +162,15 @@ impl OpenraftConsensus {
     ///
     /// [`RaftLogStorage`]: openraft::storage::RaftLogStorage
     /// [`RaftStateMachine`]: openraft::storage::RaftStateMachine
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raft: Raft<TypeConfig>,
         status: watch::Receiver<ConsensusStatus>,
         views: StateViews,
         cluster_size: usize,
+        removal_grace: Duration,
+        learner_expiry: Duration,
+        contact: Arc<ContactTracker>,
     ) -> Self {
         OpenraftConsensus {
             raft,
@@ -155,6 +178,9 @@ impl OpenraftConsensus {
             views,
             proposal_permits: Arc::new(Semaphore::new(MAX_INFLIGHT_PROPOSALS)),
             cluster_size,
+            removal_grace,
+            learner_expiry,
+            contact,
         }
     }
 
@@ -466,6 +492,7 @@ mod idempotency_tests {
     };
     use openraft::{BasicNode, Config, Raft, RaftNetwork, RaftNetworkFactory, Snapshot, Vote};
 
+    use crate::contact::ContactTracker;
     use crate::fs::RealFs;
     use crate::storage::{self, StorageOptions};
     use crate::view::{ViewPublisher, ViewPublisherConfig};
@@ -581,7 +608,15 @@ mod idempotency_tests {
         }
 
         let status = status::spawn(raft.metrics(), committed_rx);
-        let consensus = OpenraftConsensus::new(raft, status, views, cluster_size);
+        let consensus = OpenraftConsensus::new(
+            raft,
+            status,
+            views,
+            cluster_size,
+            Duration::from_secs(120),
+            Duration::from_secs(3600),
+            Arc::new(ContactTracker::default()),
+        );
         (dir, consensus, node_id)
     }
 

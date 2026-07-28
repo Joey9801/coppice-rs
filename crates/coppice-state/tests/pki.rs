@@ -11,7 +11,8 @@ use coppice_core::id::{EnrollTokenId, MachineId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{
     BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RebindMachineAddress,
-    RecordCaCertificate, RecordEnrolledIdentity, RevokeEnrollToken, RevokeIdentity,
+    RecordCaCertificate, RecordEnrolledIdentity, RetireMachineBinding, RevokeEnrollToken,
+    RevokeIdentity,
 };
 use coppice_state::{
     CaCertBundle, Command, EnrollRole, RejectionReason, RevokedIdentity, StateMachine,
@@ -285,6 +286,75 @@ fn bind_rejects_node_taken_by_a_different_machine() {
     assert_eq!(sm.machine_for_raft_node(1), Some(&mid(1)));
 }
 
+// ---- RetireMachineBinding ----
+
+fn retire(machine: MachineId, at_us_offset: i64) -> Command {
+    Command::RetireMachineBinding(RetireMachineBinding {
+        machine,
+        retired_at: ts(TS_US + at_us_offset),
+    })
+}
+
+#[test]
+fn retire_marks_the_binding_and_repeat_is_idempotent() {
+    let mut sm = StateMachine::default();
+    apply_ok(&mut sm, bind(mid(1), 1, "10.0.0.1:7000"));
+    assert!(sm.machine_binding(&mid(1)).unwrap().retired_at.is_none());
+
+    apply_ok(&mut sm, retire(mid(1), 5_000_000));
+    let retired_at = sm.machine_binding(&mid(1)).unwrap().retired_at;
+    assert_eq!(retired_at, Some(ts(TS_US + 5_000_000)));
+
+    // Already-retired: accepted no-op, the original retirement instant
+    // stands (learner GC retries this proposal every tick).
+    apply_ok(&mut sm, retire(mid(1), 9_000_000));
+    assert_eq!(sm.machine_binding(&mid(1)).unwrap().retired_at, retired_at);
+}
+
+#[test]
+fn retire_rejects_an_unknown_machine() {
+    let mut sm = StateMachine::default();
+    let err = sm.apply(&retire(mid(1), 0)).unwrap_err();
+    assert_eq!(err, RejectionReason::UnknownMachineIdentity(mid(1)));
+    assert!(sm.machine_binding(&mid(1)).is_none());
+}
+
+#[test]
+fn bind_after_retire_is_refused_even_as_an_exact_replay() {
+    let mut sm = StateMachine::default();
+    apply_ok(&mut sm, bind(mid(1), 1, "10.0.0.1:7000"));
+    apply_ok(&mut sm, retire(mid(1), 5_000_000));
+
+    // A retired identity is never re-admitted, ever (ADR 0037 §7
+    // one-seat-ever) — even the exact same (machine, node, address) that
+    // would otherwise be the accepted-replay no-op.
+    let err = sm.apply(&bind(mid(1), 1, "10.0.0.1:7000")).unwrap_err();
+    assert_eq!(
+        err,
+        RejectionReason::MachineIdentityRetired { machine: mid(1) }
+    );
+}
+
+#[test]
+fn rebind_after_retire_is_refused() {
+    let mut sm = StateMachine::default();
+    apply_ok(&mut sm, bind(mid(1), 1, "10.0.0.1:7000"));
+    apply_ok(&mut sm, retire(mid(1), 5_000_000));
+
+    let err = sm
+        .apply(&rebind(1, "10.0.0.9:7000", 9_000_000))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        RejectionReason::MachineIdentityRetired { machine: mid(1) }
+    );
+    assert_eq!(
+        sm.machine_binding(&mid(1)).unwrap().address,
+        "10.0.0.1:7000",
+        "state untouched by the refusal"
+    );
+}
+
 // ---- MintEnrollToken / RevokeEnrollToken ----
 
 #[test]
@@ -477,4 +547,5 @@ fn pki_commands_emit_no_events() {
     )
     .events
     .is_empty());
+    assert!(apply_ok(&mut sm, retire(mid(1), 0)).events.is_empty());
 }

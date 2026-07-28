@@ -565,6 +565,16 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | Apply effects | Insert `enrolled_identities[machine] = recorded_at` if absent. First write wins — unlike `ConfirmKeyPossession`, the fact recorded is *that* the identity enrolled, so the useful instant is its first admission; a re-enrollment or a replay is an accepted no-op that keeps the earlier stamp. Enrollment alone claims no raft seat — that is `BindMachineIdentity`. |
 | Rejections | — |
 
+#### `RetireMachineBinding`
+
+| | |
+| --- | --- |
+| Proposer | The leader's learner-GC task (chunk 06), proposed for a learner's bound machine identity before that learner's raft seat is removed (ADR 0037 §7) |
+| Payload | `machine: MachineId`, `retired_at_us` |
+| Validation | The machine carries an existing binding (ADR 0037 §7) — this verb marks an existing binding, it never creates one |
+| Apply effects | Set `machine_bindings[machine].retired_at = retired_at`. A mark, never a delete: the binding invariant extends past retirement, so `BindMachineIdentity` and `RebindMachineAddress` both refuse a retired binding forever (one-seat-ever). An already-retired binding is an accepted no-op. |
+| Rejections | `UnknownMachineIdentity` |
+
 ---
 
 ## RejectionReason taxonomy
@@ -592,6 +602,10 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | `AuthorizationLockout` | Bindings replacement would leave no unscoped admin |
 | `ClusterVersionNotMonotonic` | Bump not strictly increasing |
 | `MachineIdentityConflict` | Machine↔raft-node binding would break the one-machine-one-seat invariant (ADR 0037 §7) |
+| `MachineAddressConflict` | Same (machine, raft node) pair re-admitted at a different address (ADR 0037 §7) |
+| `UnknownMachineBinding` | `RebindMachineAddress` named a raft node id with no binding to repoint (ADR 0037 §6) |
+| `UnknownMachineIdentity` | `RetireMachineBinding` named a machine with no binding to mark (ADR 0037 §7) |
+| `MachineIdentityRetired` | Admission or rebind targets a binding learner GC already retired — never re-admitted, ever (ADR 0037 §7 one-seat-ever) |
 | `DuplicateEnrollToken` | Enrollment token id already exists |
 | `UnknownEnrollToken` | Revocation of a token not in state |
 | `InvalidCommand` | Shape violation (e.g. outcome `Revoked` outside `CommitPlacements`, empty CA bundle, empty token hash) |

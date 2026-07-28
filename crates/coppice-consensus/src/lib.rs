@@ -26,6 +26,7 @@ use coppice_state::Command;
 
 mod adapter;
 mod apply_loop;
+mod contact;
 mod error;
 mod events;
 pub mod fs;
@@ -39,6 +40,7 @@ pub use adapter::{
     ApplyRequest, ApplyResult, OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY,
     MAX_INFLIGHT_PROPOSALS, PROMOTION_LAG_MAX,
 };
+pub use contact::ContactTracker;
 pub use error::{ConsensusError, ProposeError};
 pub use events::{EventBatch, EventTap, EventTapReceiver, TapItem};
 pub use node::{
