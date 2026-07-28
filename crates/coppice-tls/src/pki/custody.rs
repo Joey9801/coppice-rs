@@ -96,6 +96,24 @@ pub fn install_leaf_material(
     Ok(())
 }
 
+/// Whether `key_pem` is the private half of `ca_cert_pem` — the same SPKI
+/// comparison [`load_ca_key`] makes, on material that is not on disk yet.
+///
+/// The key-transfer recipient of ADR 0037 §4 checks this **before** writing:
+/// the key it was handed must match the CA certificate the cluster already
+/// replicates, or the transfer is a misdirected (or hostile) push and the
+/// candidate must refuse rather than overwrite its own custody file.
+pub fn key_matches_ca(ca_cert_pem: &[u8], key_pem: &[u8]) -> Result<(), CustodyError> {
+    let ca_spki = ca_public_key_der(ca_cert_pem).map_err(CustodyError::BadCaCert)?;
+    let key_spki = key_public_key_der(key_pem).map_err(CustodyError::BadKey)?;
+    if ca_spki != key_spki {
+        return Err(CustodyError::KeyMismatch {
+            path: PathBuf::from(CA_KEY_FILE),
+        });
+    }
+    Ok(())
+}
+
 /// Load `<dir>/ca.key`, enforcing the custody invariants (ADR 0037 §4):
 ///
 /// - the file must exist ([`CustodyError::NotFound`] otherwise);

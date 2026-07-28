@@ -673,15 +673,14 @@ impl Convergence {
             Err(status) => return classify(&status),
         }
 
-        // Step 5: promotion. `remove` is always `None` here — a machine
-        // credential may never remove anyone (ADR 0037 §7). Where a removal is
-        // warranted the leader folds it in itself, under its own replication
-        // evidence.
+        // Step 5: promotion. The request names no removal — it has no field
+        // for one — because a machine credential may never remove anyone
+        // (ADR 0037 §7). Where a removal is warranted the leader folds it in
+        // itself, under its own replication evidence.
         match client
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: history_id.to_vec(),
                 promote_node_id: node_id,
-                remove_node_id: None,
             })
             .await
         {
@@ -732,7 +731,13 @@ fn cross_history_refusal(leader_addr: &str, cluster_history: &[u8], stamped: &[u
 ///   promotion means our own `AddLearner` was refused or reverted, not that
 ///   we are slow; `history-conflict` is the ADR 0016 wrong-volume case, which
 ///   no retry changes.)
-/// - [`admin::VOTER_SET_FULL`] — stay a caught-up learner and keep polling.
+/// - [`admin::VOTER_SET_FULL`], [`admin::NO_REMOVABLE_PEER`],
+///   [`admin::QUORUM_AT_RISK`] — the seat is not available yet; stay a
+///   caught-up learner and keep polling on the settled interval.
+/// - [`admin::NO_KEY_HOLDER`], [`admin::KEY_UNAVAILABLE`],
+///   [`admin::IDENTITY_RETIRED`] — terminal for the tick: CA-key custody
+///   needs operator repair (ADR 0037 §4), or this identity was retired with
+///   its seat and is never re-admitted (§7).
 /// - [`admin::LEARNER_BEHIND`] — still catching up, poll at the fast cadence.
 /// - [`admin::ENDPOINT_UNVERIFIED`] — surfaced *and* retried fast: transient
 ///   during fleet boot, permanent when `advertise_addr` is wrong, and only
@@ -745,7 +750,18 @@ fn cross_history_refusal(leader_addr: &str, cluster_history: &[u8], stamped: &[u
 fn classify(status: &tonic::Status) -> JoinStep {
     let message = status.message();
 
-    if admin::has_marker(message, admin::VOTER_SET_FULL) {
+    // `no-removable-peer` and `quorum-at-risk` are the same situation from
+    // the learner's side as a full voter set: the seat is not available *yet*,
+    // nothing about the learner is wrong, and re-offering on the settled
+    // interval is the expected behaviour (ADR 0037 §7).
+    if [
+        admin::VOTER_SET_FULL,
+        admin::NO_REMOVABLE_PEER,
+        admin::QUORUM_AT_RISK,
+    ]
+    .iter()
+    .any(|marker| admin::has_marker(message, marker))
+    {
         return JoinStep::VoterSetFull;
     }
     if [
@@ -754,6 +770,12 @@ fn classify(status: &tonic::Status) -> JoinStep {
         admin::ADDRESS_CONFLICT,
         admin::UNKNOWN_NODE,
         admin::HISTORY_CONFLICT,
+        // Custody repair conditions and the one-seat-ever refusal: all
+        // operator problems, none of them things polling resolves
+        // (ADR 0037 §4/§7).
+        admin::NO_KEY_HOLDER,
+        admin::KEY_UNAVAILABLE,
+        admin::IDENTITY_RETIRED,
     ]
     .iter()
     .any(|marker| admin::has_marker(message, marker))
@@ -836,6 +858,53 @@ mod tests {
                 }
                 _ => panic!("a machine-binding conflict must be terminal for the tick"),
             }
+        }
+    }
+
+    #[test]
+    fn a_full_set_with_no_dead_peer_also_keeps_the_learner_polling() {
+        // ADR 0037 §7: "no removable peer" is the launch-before-terminate
+        // steady state — the learner is fine, the seat simply is not free,
+        // and it re-offers on the settled interval exactly as for a full
+        // voter set. Same for a momentary loss of live-majority evidence.
+        for status in [
+            admin::consensus_error_to_status(ConsensusError::NoRemovablePeer {
+                node: 7,
+                voters: 3,
+                cluster_size: 3,
+            }),
+            admin::consensus_error_to_status(ConsensusError::QuorumAtRisk {
+                live: 1,
+                continuing: 3,
+            }),
+        ] {
+            assert!(
+                matches!(classify(&status), JoinStep::VoterSetFull),
+                "must keep polling: {}",
+                status.message()
+            );
+        }
+    }
+
+    #[test]
+    fn custody_repair_and_retirement_are_terminal_for_the_tick() {
+        // ADR 0037 §4/§7: a cluster that cannot keep a confirmed key holder,
+        // a leader that cannot read its own key, and an identity retired with
+        // its seat are all operator problems — polling resolves none of them.
+        let key_unavailable = tonic::Status::failed_precondition(format!(
+            "{}: this leader cannot read its own CA key (ADR 0037 §4)",
+            admin::KEY_UNAVAILABLE
+        ));
+        for status in [
+            admin::consensus_error_to_status(ConsensusError::NoKeyHolder),
+            key_unavailable,
+            admin::identity_retired_status(MachineId::new()),
+        ] {
+            assert!(
+                matches!(classify(&status), JoinStep::Refused(_)),
+                "must be terminal for the tick: {}",
+                status.message()
+            );
         }
     }
 

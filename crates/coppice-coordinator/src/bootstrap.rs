@@ -1471,12 +1471,35 @@ impl Consensus for SharedConsensus {
         self.0.add_learner(node, addr)
     }
 
-    fn promote_voter(
+    fn plan_promotion(
+        &self,
+        promote: CoordinatorId,
+    ) -> Result<coppice_consensus::PromotionPlan, ConsensusError> {
+        self.0.plan_promotion(promote)
+    }
+
+    fn commit_promotion(
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
-        self.0.promote_voter(promote, remove)
+        self.0.commit_promotion(promote, remove)
+    }
+
+    fn replace_voter(
+        &self,
+        old: CoordinatorId,
+        new: CoordinatorId,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
+        self.0.replace_voter(old, new)
+    }
+
+    fn learner_expiry(&self) -> std::time::Duration {
+        self.0.learner_expiry()
+    }
+
+    fn expired_learners(&self) -> Vec<CoordinatorId> {
+        self.0.expired_learners()
     }
 
     fn remove_node(

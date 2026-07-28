@@ -37,8 +37,8 @@ pub mod storage;
 mod view;
 
 pub use adapter::{
-    ApplyRequest, ApplyResult, OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY,
-    MAX_INFLIGHT_PROPOSALS, PROMOTION_LAG_MAX,
+    ApplyRequest, ApplyResult, OpenraftConsensus, PromotionPlan, TypeConfig,
+    APPLY_CHANNEL_CAPACITY, LIVE_CONTACT_STALENESS, MAX_INFLIGHT_PROPOSALS, PROMOTION_LAG_MAX,
 };
 pub use contact::ContactTracker;
 pub use error::{ConsensusError, ProposeError};
@@ -165,19 +165,74 @@ pub trait Consensus: Send + Sync + 'static {
         addr: String,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
-    /// Promote a caught-up learner to voter, optionally removing a departed
-    /// voter in the same joint-consensus change (ADR 0016 step 3).
-    fn promote_voter(
+    /// Decide whether a learner may be promoted, and what the joint change
+    /// would have to fold in — **without changing anything** (ADR 0016 step 3,
+    /// ADR 0037 §4/§7).
+    ///
+    /// Planning is separate from committing because the confirmed-key-receipt
+    /// precondition of §4 sits between them: the admin service plans, then
+    /// transfers the CA key to the candidate and records the replicated
+    /// possession fact, then calls [`commit_promotion`](Consensus::commit_promotion).
+    /// Ordering the key *before* membership is what makes the custody
+    /// postcondition trivially true even when the last other key holder
+    /// vanishes mid-change.
+    ///
+    /// Synchronous on purpose: every input is local — membership metrics, the
+    /// leader's own contact evidence, and applied state.
+    fn plan_promotion(&self, promote: CoordinatorId) -> Result<PromotionPlan, ConsensusError>;
+
+    /// Commit the promotion a [`plan_promotion`](Consensus::plan_promotion)
+    /// decided, with `remove` as the evidence-dead voter to fold into the same
+    /// joint change (ADR 0037 §7).
+    ///
+    /// The gates and postconditions are re-checked here rather than trusted
+    /// from the plan: a key transfer is a network round-trip and a replicated
+    /// write, and membership may have moved during it.
+    fn commit_promotion(
         &self,
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
-    /// Remove a node from membership.
+    /// Replace one voter with another in a single joint change (ADR 0037 §7).
+    ///
+    /// The operator-authenticated launch-before-terminate path: `old` may be
+    /// perfectly alive — that is the point — and `new` must be a caught-up
+    /// learner that has already confirmed durable key receipt (§4), which the
+    /// caller arranges before calling. Idempotent per §6: `new` already a
+    /// voter with `old` gone is a no-op success.
+    fn replace_voter(
+        &self,
+        old: CoordinatorId,
+        new: CoordinatorId,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// Remove a node from membership — a learner outright, a voter subject to
+    /// the §4 key-custody postcondition (ADR 0037 §7's explicit `admin remove`
+    /// shrink path).
     fn remove_node(
         &self,
         node: CoordinatorId,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
+    /// How long a learner may go without acknowledging leader contact before
+    /// the leader's GC task retires it (ADR 0037 §7, `[discovery]
+    /// learner_expiry`). The GC task reads it here rather than re-deriving it
+    /// from config, so the seam and the task can never disagree.
+    fn learner_expiry(&self) -> std::time::Duration;
+
+    /// The membership learners this leader has failed to reach continuously
+    /// for longer than [`learner_expiry`](Consensus::learner_expiry)
+    /// (ADR 0037 §7).
+    ///
+    /// The criterion is *failed acknowledgement while attempting*, never lack
+    /// of log advancement: an idle cluster's caught-up learner — say the
+    /// `new_node_id` of a pending `ReplaceVoter` — sees no new entries for
+    /// hours and must never expire, and it does not, because it keeps
+    /// answering heartbeats. Voters are never returned: there is no
+    /// background voter reaper (§7). Empty off the leader, where there is no
+    /// contact evidence to testify with.
+    fn expired_learners(&self) -> Vec<CoordinatorId>;
 
     /// Repoint an existing member's dial address (ADR 0037 §6, operator-only
     /// break-glass). There is no self-service address repair: the admin

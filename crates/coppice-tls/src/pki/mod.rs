@@ -52,7 +52,9 @@ pub mod verify;
 
 pub use ca::{mint_root_ca, CaError, CaMaterial, CaSigner};
 pub use csr::{generate_key_and_csr, CsrError};
-pub use custody::{install_leaf_material, load_ca_key, write_ca_key, CustodyError, CA_KEY_FILE};
+pub use custody::{
+    install_leaf_material, key_matches_ca, load_ca_key, write_ca_key, CustodyError, CA_KEY_FILE,
+};
 pub use issue::{
     issue_agent, issue_coordinator, issue_operator, mint_agent_local, mint_coordinator_local,
     mint_operator_local, IssueError,

@@ -161,22 +161,43 @@ pub enum AdminVerb {
         addr: String,
     },
 
-    /// Promote a caught-up learner to voter, optionally dropping a departed
-    /// voter in the same joint change (ADR 0016 step 3).
+    /// Promote a caught-up learner to voter (ADR 0016 step 3, ADR 0037 §7).
     ///
     /// A learner still behind the promotion threshold yields a retryable
     /// "behind" response; this verb polls until it catches up or `--wait`
     /// elapses, which is what makes `coordinator replace` operable end to end.
+    ///
+    /// There is deliberately no `--remove`: a caller never names a pair. If
+    /// the voter set is full the leader may fold out one voter it has itself
+    /// observed unreachable past `removal_grace` (the hands-off,
+    /// terminate-before-launch path), and a caller-named pair is the
+    /// operator-only `replace-voter` below.
     Promote {
         /// The learner to promote.
         #[arg(long)]
         node_id: u64,
-        /// A departed voter to remove in the same joint change.
-        #[arg(long)]
-        remove: Option<u64>,
         /// How long to keep retrying while the learner is still catching up.
         #[arg(long, default_value = "60s", value_parser = parse_duration)]
         wait: Duration,
+    },
+
+    /// Replace one voter with another in a single joint change (ADR 0037 §7).
+    ///
+    /// The launch-before-terminate verb: the replacement installation enrolls,
+    /// joins, and catches up as a learner on its own, and this names the pair
+    /// the cluster cannot infer — a replacement carries a *new* machine
+    /// identity by construction, so nothing links it to its predecessor.
+    /// `--old` may be perfectly alive; a live predecessor never qualifies for
+    /// the evidence-gated path, which is exactly why this verb exists.
+    /// Operator credential only, and idempotent, so rollout automation may
+    /// retry it.
+    ReplaceVoter {
+        /// The voter being replaced. Must currently be a voter.
+        #[arg(long)]
+        old: u64,
+        /// The caught-up learner taking over the seat.
+        #[arg(long)]
+        new: u64,
     },
 
     /// Remove a node from membership entirely. Operator credential only
@@ -438,7 +459,10 @@ mod tests {
     }
 
     #[test]
-    fn admin_promote_parses_remove_and_wait() {
+    fn admin_promote_parses_node_id_and_wait() {
+        // No `--remove`: a caller never names a pair (ADR 0037 §7). The
+        // removal a promotion may fold in is the leader's own
+        // evidence-gated one, and a caller-named pair is `replace-voter`.
         let cli = parse(&[
             "coppice-coordinator",
             "admin",
@@ -449,8 +473,6 @@ mod tests {
             "promote",
             "--node-id",
             "4",
-            "--remove",
-            "2",
             "--wait",
             "90s",
         ]);
@@ -459,14 +481,34 @@ mod tests {
         };
         assert_eq!(a.target.as_deref(), Some("coord-1:7071"));
         match a.verb {
-            AdminVerb::Promote {
-                node_id,
-                remove,
-                wait,
-            } => {
+            AdminVerb::Promote { node_id, wait } => {
                 assert_eq!(node_id, 4);
-                assert_eq!(remove, Some(2));
                 assert_eq!(wait, Duration::from_secs(90));
+            }
+            other => panic!("wrong verb: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_replace_voter_parses_the_pair() {
+        let cli = parse(&[
+            "coppice-coordinator",
+            "admin",
+            "--config",
+            "/etc/c.toml",
+            "replace-voter",
+            "--old",
+            "2",
+            "--new",
+            "5",
+        ]);
+        let Some(Command::Admin(a)) = cli.command else {
+            panic!("expected admin subcommand");
+        };
+        match a.verb {
+            AdminVerb::ReplaceVoter { old, new } => {
+                assert_eq!(old, 2);
+                assert_eq!(new, 5);
             }
             other => panic!("wrong verb: {other:?}"),
         }
@@ -487,10 +529,7 @@ mod tests {
             panic!("expected admin subcommand");
         };
         match a.verb {
-            AdminVerb::Promote { remove, wait, .. } => {
-                assert_eq!(remove, None);
-                assert_eq!(wait, Duration::from_secs(60));
-            }
+            AdminVerb::Promote { wait, .. } => assert_eq!(wait, Duration::from_secs(60)),
             other => panic!("wrong verb: {other:?}"),
         }
     }

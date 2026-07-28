@@ -941,7 +941,11 @@ async fn two_voter_cluster(ca: &common::Ca) -> (common::Node, common::Node) {
     loop {
         match leader
             .consensus()
-            .promote_voter(follower.raft_id(), None)
+            // Straight at the seam, bypassing the admin service: these
+            // fleets are formed, so the founding voter already holds a
+            // confirmed CA key and the §4 custody postcondition is satisfied
+            // without a transfer.
+            .commit_promotion(follower.raft_id(), None)
             .await
         {
             Ok(()) => break,

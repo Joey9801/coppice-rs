@@ -12,6 +12,9 @@ pub mod dispatch;
 pub mod event_fanout;
 pub mod housekeeping;
 pub mod ingestion;
+// Stale-learner garbage collection (ADR 0037 §7): leader-only, evidence is
+// failed replication contact past `learner_expiry` — never log position.
+pub mod learner_gc;
 pub mod node_client;
 // This replica's own leaf renewal (ADR 0037 §4): re-issue at ~2/3 lifetime,
 // locally while leader and over the admin channel otherwise.

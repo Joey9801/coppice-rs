@@ -40,7 +40,7 @@ use coppice_consensus::{
 };
 use coppice_core::id::{ClusterId, MachineId};
 use coppice_core::time::Timestamp;
-use coppice_state::command::{BindMachineIdentity, RecordCaCertificate};
+use coppice_state::command::{BindMachineIdentity, ConfirmKeyPossession, RecordCaCertificate};
 use coppice_state::{CaCertBundle, Command};
 use coppice_tls::pki;
 use coppice_tls::{TlsPaths, TlsStore};
@@ -904,10 +904,21 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
                 address: advertise_addr.to_string(),
                 bound_at: recorded_at,
             }),
+            // The forming voter wrote the CA key to its own data directory at
+            // mint (step 3's local half), so it is the day-0 confirmed holder
+            // (ADR 0037 §4). Recording that here is what makes the custody
+            // postcondition satisfiable at all: without a first confirmation
+            // every later promotion and removal would be refused with
+            // `no-key-holder`, because no continuing voter would ever hold a
+            // confirmed key.
+            Command::ConfirmKeyPossession(ConfirmKeyPossession {
+                raft_node_id: node_id,
+                confirmed_at: recorded_at,
+            }),
         ],
     )
     .await
-    .context("recording the cluster CA and this node's machine identity")?;
+    .context("recording the cluster CA, this node's machine identity, and its key custody")?;
 
     // --- Step 5: the day-0 operator certificate. -------------------------
     let operator = issue_operator_credential(signer, &ca.cert_pem, req)?;

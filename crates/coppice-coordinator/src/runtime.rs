@@ -22,8 +22,8 @@ use crate::tasks::api_server::{self, CoordinatorControlPlane};
 use crate::tasks::housekeeping::StubHistoryStore;
 use crate::tasks::node_client::NodeClient;
 use crate::tasks::{
-    agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, renewal,
-    scheduler_driver,
+    agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, learner_gc,
+    renewal, scheduler_driver,
 };
 
 /// How often the detached upkeep task drains the recorder's histogram buckets.
@@ -272,6 +272,17 @@ where
         shutdown_rx.clone(),
     ));
 
+    // Bounds membership records under instance churn (ADR 0037 §7): retires
+    // the machine binding of a learner the leader has failed to reach for
+    // longer than `learner_expiry`, then releases its seat. Voters are never
+    // touched — there is no background voter reaper.
+    let learner_gc_join = tokio::spawn(learner_gc::run(
+        Arc::clone(&consensus),
+        views.clone(),
+        status.clone(),
+        shutdown_rx.clone(),
+    ));
+
     let housekeeping_join = tokio::spawn(housekeeping::run(
         Arc::clone(&consensus),
         views.clone(),
@@ -348,6 +359,7 @@ where
     let _ = dispatch_join.await;
     let _ = scheduler_join.await;
     let _ = housekeeping_join.await;
+    let _ = learner_gc_join.await;
     tracing::debug!("runtime: leader-only loops down");
 
     // Derived stats subscribes to the fanout, so it drains before it.
