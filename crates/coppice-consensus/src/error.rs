@@ -74,6 +74,52 @@ pub enum ConsensusError {
         cluster_size: usize,
     },
 
+    /// A promotion would exceed `cluster_size` and no voter qualifies as
+    /// evidence-dead — or removing the one that does would still leave the
+    /// set too large (ADR 0037 §7 "the hands-off path"). Retryable exactly
+    /// like [`VoterSetFull`](ConsensusError::VoterSetFull): the learner stays
+    /// a caught-up learner and keeps polling, and the evidence may mature
+    /// (or an operator may drive `ReplaceVoter`) at any tick.
+    ///
+    /// A *live* predecessor never qualifies, which is why a
+    /// launch-before-terminate rollout has to name its pair explicitly.
+    #[error(
+        "no voter qualifies as evidence-dead for the {voters}/{cluster_size} voter set, so \
+         promoting node {node} would overshoot; it remains a learner"
+    )]
+    NoRemovablePeer {
+        node: CoordinatorId,
+        voters: usize,
+        cluster_size: usize,
+    },
+
+    /// The membership change would leave the continuing voter set with no
+    /// confirmed CA-key holder (ADR 0037 §4). Terminal for the verb: it is a
+    /// repair condition (a lost confirmation, a corrupt key file), not
+    /// something a retry resolves.
+    #[error(
+        "refusing the change: no continuing voter holds a confirmed CA key (ADR 0037 §4) — \
+         the change would leave the cluster unable to sign"
+    )]
+    NoKeyHolder,
+
+    /// The membership change would leave a voter set the leader cannot see a
+    /// live majority of (ADR 0037 §7's second postcondition). Retryable:
+    /// contact may recover, and the caller (an operator driving
+    /// `ReplaceVoter`, or a polling learner) re-offers.
+    #[error(
+        "refusing the change: only {live} of the {continuing} continuing voters have answered \
+         this leader recently, which is not a live majority (ADR 0037 §7)"
+    )]
+    QuorumAtRisk { live: usize, continuing: usize },
+
+    /// `ReplaceVoter` named an `old_node_id` that is not a voter (ADR 0037
+    /// §7). Terminal: the verb replaces a voter, and naming a learner (or a
+    /// stranger) is a caller error no waiting fixes. The idempotent
+    /// already-replaced case is a success, not this.
+    #[error("node {node} is not a voter, so it cannot be replaced (ADR 0037 §7)")]
+    OldNotVoter { node: CoordinatorId },
+
     /// This handle's consensus node is shutting down; the operation will not
     /// complete and retrying against this handle will not help.
     #[error("consensus is shutting down")]
@@ -96,8 +142,12 @@ impl ConsensusError {
     /// [`Shutdown`](ConsensusError::Shutdown) and [`Fatal`](ConsensusError::Fatal)
     /// are terminal for this handle, and
     /// [`UnknownNode`](ConsensusError::UnknownNode) /
-    /// [`AddressConflict`](ConsensusError::AddressConflict) are terminal-not-fatal
-    /// caller errors no amount of waiting fixes.
+    /// [`AddressConflict`](ConsensusError::AddressConflict) /
+    /// [`NoKeyHolder`](ConsensusError::NoKeyHolder) /
+    /// [`OldNotVoter`](ConsensusError::OldNotVoter) are terminal-not-fatal
+    /// caller or repair conditions no amount of waiting fixes.
+    /// [`NoRemovablePeer`](ConsensusError::NoRemovablePeer) joins the
+    /// retryable set for the same reason `VoterSetFull` does (ADR 0037 §7).
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -106,6 +156,8 @@ impl ConsensusError {
                 | ConsensusError::MembershipInProgress
                 | ConsensusError::LearnerNotCaughtUp { .. }
                 | ConsensusError::VoterSetFull { .. }
+                | ConsensusError::NoRemovablePeer { .. }
+                | ConsensusError::QuorumAtRisk { .. }
         )
     }
 }

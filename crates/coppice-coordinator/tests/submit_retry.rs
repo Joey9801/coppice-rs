@@ -93,7 +93,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
         }
         // promote_voter polls the catch-up gate itself.
         for i in [1usize, 2] {
-            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), None, DEADLINE)
+            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), DEADLINE)
                 .await
                 .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
         }

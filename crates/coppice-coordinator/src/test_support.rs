@@ -221,12 +221,41 @@ impl Consensus for FakeConsensus {
         Ok(())
     }
 
-    async fn promote_voter(
+    /// Always "ready, nothing to fold out": this fake holds no membership,
+    /// so there is no ceiling to hit and no contact evidence to consult.
+    fn plan_promotion(
+        &self,
+        _promote: CoordinatorId,
+    ) -> Result<coppice_consensus::PromotionPlan, ConsensusError> {
+        Ok(coppice_consensus::PromotionPlan::Ready {
+            evidence_removal: None,
+        })
+    }
+
+    async fn commit_promotion(
         &self,
         _promote: CoordinatorId,
         _remove: Option<CoordinatorId>,
     ) -> Result<(), ConsensusError> {
         Ok(())
+    }
+
+    async fn replace_voter(
+        &self,
+        _old: CoordinatorId,
+        _new: CoordinatorId,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn learner_expiry(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(3600)
+    }
+
+    /// Never anything to reap: contact evidence lives in the real seam, and a
+    /// fake that invented some would be testing itself.
+    fn expired_learners(&self) -> Vec<CoordinatorId> {
+        Vec::new()
     }
 
     async fn remove_node(&self, _node: CoordinatorId) -> Result<(), ConsensusError> {

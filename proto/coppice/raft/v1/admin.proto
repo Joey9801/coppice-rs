@@ -27,15 +27,57 @@ message AddLearnerRequest {
 
 message AddLearnerResponse {}
 
-// Promote a caught-up learner to voter, optionally dropping a departed
-// voter in the same joint change (ADR 0016 step 3).
+// Promote a caught-up learner to voter (ADR 0016 step 3, ADR 0037 §7).
+//
+// The caller never names a removal. A promotion that would exceed
+// `cluster_size` folds in the removal of at most one *evidence-dead* voter,
+// chosen by the leader from its own replication observation (ADR 0037 §7
+// "the hands-off path"); a caller-named pair is the operator-only
+// ReplaceVoter below. Field 9 carried the old caller-named `remove_node_id`
+// and is reserved: §7 admits no other shrink path.
 message PromoteVoterRequest {
   bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   uint64 promote_node_id = 8;
-  optional uint64 remove_node_id = 9; // absent = pure addition, no removal.
+  reserved 9;
+  reserved "remove_node_id";
 }
 
 message PromoteVoterResponse {}
+
+// Replace one voter with another in a single joint change (ADR 0037 §7).
+//
+// The operator-authenticated verb for launch-before-terminate replacement:
+// `new_node_id` is a caught-up learner that has confirmed durable receipt of
+// the CA key (§4), `old_node_id` is the voter it takes over from — alive or
+// not. Promotion and removal commit atomically, so the voter count never
+// overshoots and quorum among survivors holds throughout. Idempotent per §6:
+// `new` already a voter and `old` gone entirely is a no-op success.
+message ReplaceVoterRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  uint64 old_node_id = 8;
+  uint64 new_node_id = 9;
+}
+
+message ReplaceVoterResponse {}
+
+// Push the CA private key from the leader to a promotion candidate
+// (ADR 0037 §4), on the mutually-authenticated admin channel and nowhere
+// else: the key never enters replicated state, a snapshot, or a log.
+//
+// The candidate verifies the key against the CA certificate it already
+// replicates, persists it owner-only and durably, and acknowledges; the
+// leader then records the *fact* of possession as a replicated
+// ConfirmKeyPossession. Idempotent: a candidate that already holds a valid
+// matching key acknowledges without rewriting.
+message TransferCaKeyRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  // PEM of the cluster CA private key. Root-equivalent material: never
+  // logged, never echoed, never persisted anywhere but the recipient's own
+  // owner-only key file.
+  bytes ca_key_pem = 8;
+}
+
+message TransferCaKeyResponse {}
 
 // Remove a node from membership entirely.
 message RemoveNodeRequest {
@@ -77,6 +119,18 @@ message ClusterStatusResponse {
   // responder cannot answer authoritatively (a follower, or an unformed
   // daemon): unknown health is not health, and it is never faked or cached.
   ClusterHealth health = 9;
+  // Every node that has ever confirmed durable receipt of the CA key
+  // (ADR 0037 §4) — voters, keyed-but-never-promoted candidates, and
+  // departed seats alike. The §4 abandoned-candidate case is visible here
+  // and nowhere else: every disk that received the key is root-equivalent.
+  repeated KeyHolder key_holders = 10;
+}
+
+// One node's confirmed CA-key possession (ADR 0037 §4). The fact only —
+// possession is replicated, the key never is.
+message KeyHolder {
+  uint64 node_id = 1;
+  int64 confirmed_at_us = 2;
 }
 
 // The leader's cluster-redundancy verdict (ADR 0037 §9): whether at least
@@ -154,7 +208,14 @@ message ProbeClusterResponse {
 service RaftAdminService {
   rpc AddLearner(AddLearnerRequest) returns (AddLearnerResponse);
   rpc PromoteVoter(PromoteVoterRequest) returns (PromoteVoterResponse);
+  // Replace one voter with another atomically (ADR 0037 §7). Operator-only:
+  // a machine credential can never remove, replace, repoint, or initialize.
+  rpc ReplaceVoter(ReplaceVoterRequest) returns (ReplaceVoterResponse);
   rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
+  // Leader → promotion candidate CA-key push (ADR 0037 §4), the one carrier
+  // of the key between disks. Served by every coordinator; the candidate
+  // side is what persists the key.
+  rpc TransferCaKey(TransferCaKeyRequest) returns (TransferCaKeyResponse);
   // Repoint a member's dial address (ADR 0037 §6). Operator-credential
   // break-glass only; the leader dial-back-verifies the new address before
   // committing. There is no self-service address repair.

@@ -670,7 +670,7 @@ async fn three_node_cluster_lifecycle() {
                 .expect("dial leader admin surface");
         // No removal: pure promotions. The helper polls the catch-up gate.
         for i in [1usize, 2] {
-            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), None, DEADLINE)
+            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), DEADLINE)
                 .await
                 .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
         }
@@ -831,16 +831,14 @@ async fn three_node_cluster_lifecycle() {
         )
         .await
         .expect("dial leader admin surface");
-        // Promote node 4 and drop the dead node in one joint change (ADR 0016 step 3).
-        admin::promote_voter(
-            &mut client,
-            history_id,
-            node4.raft_id(),
-            Some(dead_id),
-            DEADLINE,
-        )
-        .await
-        .expect("promote node 4, remove dead node");
+        // Promote node 4 and drop the dead node in ONE joint change
+        // (ADR 0037 §7): a caller-named pair is `ReplaceVoter`, the
+        // operator-authenticated verb — `PromoteVoter` never names a removal
+        // any more, and the leader's own evidence-gated fold-in is the other
+        // path to the same shape.
+        admin::replace_voter(&mut client, history_id, dead_id, node4.raft_id())
+            .await
+            .expect("replace the dead voter with node 4");
     }
 
     poll(

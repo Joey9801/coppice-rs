@@ -296,7 +296,6 @@ async fn an_agent_certificate_holds_none_of_the_membership_surface() {
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: hid.clone(),
                 promote_node_id: formed.seat,
-                remove_node_id: None,
             })
             .await,
         "PromoteVoter from an agent",
@@ -313,6 +312,35 @@ async fn an_agent_certificate_holds_none_of_the_membership_surface() {
         "RemoveNode from an agent",
     );
     assert_denied(&status, "RemoveNode");
+
+    // ADR 0037 §7 names `ReplaceVoter` in the same breath as `RemoveNode`:
+    // it removes a voter, so it is operator-only and an agent is nowhere
+    // near it.
+    let status = refusal(
+        client
+            .replace_voter(pb::ReplaceVoterRequest {
+                history_id: hid.clone(),
+                old_node_id: formed.seat,
+                new_node_id: formed.seat + 1,
+            })
+            .await,
+        "ReplaceVoter from an agent",
+    );
+    assert_denied(&status, "ReplaceVoter");
+
+    // The CA-key transfer is coordinator-to-coordinator (ADR 0037 §4); an
+    // agent leaf reaching it would be a path from one compute node's
+    // credential to root-equivalence.
+    let status = refusal(
+        client
+            .transfer_ca_key(pb::TransferCaKeyRequest {
+                history_id: hid.clone(),
+                ca_key_pem: b"not a key".to_vec(),
+            })
+            .await,
+        "TransferCaKey from an agent",
+    );
+    assert_denied(&status, "TransferCaKey");
 
     let status = refusal(
         client
@@ -391,7 +419,6 @@ async fn a_machine_certificate_gets_exactly_the_self_scope_grant() {
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: hid.clone(),
                 promote_node_id: formed.seat,
-                remove_node_id: None,
             })
             .await,
         "PromoteVoter from an unbound machine",
@@ -428,7 +455,6 @@ async fn a_machine_certificate_gets_exactly_the_self_scope_grant() {
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: hid.clone(),
                 promote_node_id: formed.seat + 1,
-                remove_node_id: None,
             })
             .await,
         "PromoteVoter for a seat that is not the caller's binding",
@@ -451,6 +477,21 @@ async fn a_machine_certificate_gets_exactly_the_self_scope_grant() {
         "RemoveNode from a machine",
     );
     assert_denied(&status, "RemoveNode");
+
+    // ReplaceVoter joins them: "it can never remove, replace, repoint, or
+    // initialize" (§7) — even for its own bound seat, and even when the
+    // caller is the very machine that formed the cluster.
+    let status = refusal(
+        bound_client
+            .replace_voter(pb::ReplaceVoterRequest {
+                history_id: hid.clone(),
+                old_node_id: formed.seat,
+                new_node_id: formed.seat + 1,
+            })
+            .await,
+        "ReplaceVoter from a machine",
+    );
+    assert_denied(&status, "ReplaceVoter");
 
     let status = refusal(
         bound_client
@@ -527,6 +568,26 @@ async fn an_operator_certificate_reaches_every_membership_verb() {
         status.message()
     );
 
+    // ReplaceVoter naming a seat that is not in membership: refused by the
+    // membership gate, not by the matrix — the operator is the *only*
+    // profile that reaches this verb at all (ADR 0037 §7).
+    let status = refusal(
+        client
+            .replace_voter(pb::ReplaceVoterRequest {
+                history_id: hid.clone(),
+                old_node_id: formed.seat,
+                new_node_id: 424_242,
+            })
+            .await,
+        "operator ReplaceVoter for an unknown new node",
+    );
+    assert_marker(&status, UNKNOWN_NODE, "operator ReplaceVoter");
+    assert!(
+        !has_marker(status.message(), NOT_AUTHORIZED),
+        "the operator must not be authz-refused: {:?}",
+        status.message()
+    );
+
     // PromoteVoter of an unknown seat: refused by the membership gate, not
     // authz.
     let status = refusal(
@@ -534,7 +595,6 @@ async fn an_operator_certificate_reaches_every_membership_verb() {
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: hid,
                 promote_node_id: 424_242,
-                remove_node_id: None,
             })
             .await,
         "operator PromoteVoter for an unknown node",
@@ -661,7 +721,6 @@ async fn promoting_an_already_voter_is_a_noop_before_the_lag_gate() {
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: formed.history_id.clone(),
                 promote_node_id: formed.seat,
-                remove_node_id: None,
             })
             .await
         {
@@ -700,7 +759,6 @@ async fn promoting_an_unknown_node_is_refused_as_unknown() {
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: formed.history_id.clone(),
                 promote_node_id: 424_242,
-                remove_node_id: None,
             })
             .await,
         "PromoteVoter for an unknown node",
@@ -1205,7 +1263,6 @@ async fn an_operator_admission_dial_back_verifies_binds_and_replays_as_a_noop() 
         &mut client,
         cluster.history_id,
         joiner.raft_id(),
-        None,
         Duration::from_secs(60),
     )
     .await

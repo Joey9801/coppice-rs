@@ -29,14 +29,17 @@ use tonic::{Code, Request, Response, Status};
 
 use coppice_api::http::HealthVerdict;
 
-use coppice_consensus::{ClusterSummary, Consensus, ConsensusError, CoordinatorId, NodeHandle};
+use coppice_consensus::{
+    ClusterSummary, Consensus, ConsensusError, CoordinatorId, NodeHandle, PromotionPlan,
+};
 use coppice_core::id::{EnrollTokenId, MachineId, NodeId};
 use coppice_core::time::{Duration as CoreDuration, Timestamp};
 use coppice_net::admin::{Client, RaftAdminService};
 use coppice_proto::convert::{enroll_role_from_pb, enroll_role_to_pb};
 use coppice_proto::pb::raft::v1 as pb;
 use coppice_state::command::{
-    BindMachineIdentity, MintEnrollToken, RebindMachineAddress, RevokeEnrollToken, RevokeIdentity,
+    BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RebindMachineAddress,
+    RevokeEnrollToken, RevokeIdentity,
 };
 use coppice_state::{Command, RejectionReason, RevokedIdentity};
 use coppice_tls::pki;
@@ -48,6 +51,20 @@ use crate::enroll::{self, EnrollContext, EnrollError, EnrollRequest};
 
 /// How often the promotion wrapper retries while a learner is still catching up.
 const PROMOTE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a CA-key recipient waits for the cluster's CA certificate to
+/// become visible in its own applied state before refusing the transfer
+/// (ADR 0037 §4).
+///
+/// A candidate is keyed the moment it clears the replication-lag gate, and
+/// apply plus view publication trail commit by a small margin — so "I have
+/// not applied the CA yet" is a race with the promotion, not a fact about the
+/// cluster. Waiting it out here keeps a one-tick race out of the convergence
+/// loop's surfaced refusals (§9).
+const CA_VISIBILITY_WAIT: Duration = Duration::from_secs(5);
+
+/// Poll cadence for [`CA_VISIBILITY_WAIT`].
+const CA_VISIBILITY_POLL: Duration = Duration::from_millis(25);
 
 // ---------------------------------------------------------------------------
 // Machine-readable status markers
@@ -98,6 +115,37 @@ pub const HISTORY_CONFLICT: &str = "history-conflict";
 /// step 3). Retryable in principle — the endpoint may not be serving yet —
 /// so the convergence loop re-enters from the top rather than giving up.
 pub const ENDPOINT_UNVERIFIED: &str = "endpoint-unverified";
+
+/// `PromoteVoter` would exceed `cluster_size` and no voter qualifies as
+/// evidence-dead (ADR 0037 §7 "the hands-off path"). **Retryable by polling**,
+/// exactly like [`VOTER_SET_FULL`]: a live predecessor never qualifies, so
+/// this is the steady state of a launch-before-terminate rollout until an
+/// operator drives `ReplaceVoter` — or of a terminate-before-launch one until
+/// `removal_grace` elapses.
+pub const NO_REMOVABLE_PEER: &str = "no-removable-peer";
+
+/// A membership change was refused because it would leave the continuing
+/// voter set with no confirmed CA-key holder (ADR 0037 §4). Terminal: a lost
+/// confirmation or a corrupt key file is a repair condition, not a wait.
+pub const NO_KEY_HOLDER: &str = "no-key-holder";
+
+/// The leader could not load its own CA key to transfer it (missing, wrong
+/// permissions, or not matching the replicated CA certificate — ADR 0037 §4).
+/// Terminal: the promotion cannot proceed until an operator repairs custody
+/// on the leader's disk.
+pub const KEY_UNAVAILABLE: &str = "key-unavailable";
+
+/// The machine identity behind this request has been retired (ADR 0037 §7
+/// one-seat-ever): the learner-GC task marked its binding dead before
+/// releasing the seat, and a re-arriving installation with that identity is
+/// refused forever. Terminal — a replacement installation starts with fresh
+/// state and mints a fresh identity.
+pub const IDENTITY_RETIRED: &str = "identity-retired";
+
+/// A membership change was refused because the leader cannot see a live
+/// majority of the voter set it would leave behind (ADR 0037 §7's second
+/// postcondition). Retryable: contact may recover.
+pub const QUORUM_AT_RISK: &str = "quorum-at-risk";
 
 /// `PromoteVoter` refused because the learner is still catching up
 /// (`LearnerNotCaughtUp`). Retryable by polling: the human tail keeps the
@@ -544,10 +592,21 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
     /// step 5).
     ///
     /// A coordinator machine may promote exactly one node id — the one its
-    /// machine identity is bound to — and may never drive the `remove_node_id`
-    /// half, which folds a removal into the same joint change and is therefore
-    /// an operator operation (ADR 0037 §7: a machine credential "can never
-    /// remove, replace, repoint, or initialize").
+    /// machine identity is bound to. It names no removal: the request carries
+    /// no such field any more (§7 admits exactly three shrink paths, and a
+    /// caller-named pair is the operator-only `ReplaceVoter`). What the
+    /// *leader* may fold into this promotion's joint change is the removal of
+    /// at most one evidence-dead voter, chosen from its own replication
+    /// observation — the hands-off path of §7, which needs no caller at all.
+    ///
+    /// The order is **plan → key → commit** and it is the ADR §4 ordering
+    /// made concrete: the gates decide the promotion is admissible, the
+    /// candidate then receives the CA key and confirms durable receipt as a
+    /// replicated fact, and only then does the joint change commit. Committing
+    /// membership first and keying afterwards was considered and rejected: a
+    /// replacement could end as sole voter without the signing key. A crash in
+    /// the window leaves a keyed learner, which the next tick's re-entry
+    /// converges without transferring anything twice.
     async fn promote_voter(
         &self,
         request: Request<pb::PromoteVoterRequest>,
@@ -558,14 +617,6 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         Self::check_cluster(&req.history_id, &handle)?;
 
         if let Caller::Machine(machine) = &caller {
-            if req.remove_node_id.is_some() {
-                return Err(Status::permission_denied(format!(
-                    "{NOT_AUTHORIZED}: {} may promote its own seat but may not remove a voter \
-                     in the same joint change — removal is an operator operation \
-                     (ADR 0037 §7)",
-                    caller.describe()
-                )));
-            }
             let bound = consensus
                 .views()
                 .latest()
@@ -593,23 +644,170 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
             }
         }
 
-        // chunk 06 seam: the ADR §4 confirmed-key-receipt precondition (the
-        // incoming voter must have durably acknowledged the CA key *before*
-        // the joint change) and the ADR §7 evidence-gated removal (fold in the
-        // removal of at most one voter whose replication has been failing for
-        // longer than `removal_grace`) hook in here, between the self-scope
-        // check and the consensus call. Until they land, a full voter set
-        // surfaces as `VOTER_SET_FULL` and the learner keeps polling.
+        let plan = consensus
+            .plan_promotion(req.promote_node_id)
+            .map_err(consensus_error_to_status)?;
+        let evidence_removal = match plan {
+            // Already a voter: the §6 idempotency no-op. No key transfer —
+            // a voter was keyed before it was ever promoted.
+            PromotionPlan::AlreadyVoter => return Ok(Response::new(pb::PromoteVoterResponse {})),
+            PromotionPlan::Ready { evidence_removal } => evidence_removal,
+        };
+
+        self.ensure_key_transferred(&consensus, &handle, req.promote_node_id)
+            .await?;
+
         consensus
-            .promote_voter(req.promote_node_id, req.remove_node_id)
+            .commit_promotion(req.promote_node_id, evidence_removal)
             .await
             .map_err(consensus_error_to_status)?;
+        if let Some(departed) = evidence_removal {
+            tracing::info!(
+                promoted = req.promote_node_id,
+                removed = departed,
+                "admin: promoted a learner and folded out an evidence-dead voter (ADR 0037 §7)"
+            );
+        }
         Ok(Response::new(pb::PromoteVoterResponse {}))
+    }
+
+    /// Replace one voter with another in a single joint change (ADR 0037 §7).
+    ///
+    /// Operator-only, and deliberately so: this is the verb a
+    /// launch-before-terminate rollout drives, and it removes a voter — which
+    /// §7 puts entirely out of a machine credential's reach ("it can never
+    /// remove, replace, repoint, or initialize").
+    ///
+    /// Identifying the pair is the caller's job: replacement is an explicit
+    /// operation, never an inference from a shared machine identity (a
+    /// replacement installation carries a *new* identity by construction, and
+    /// inferring the pair would deadlock precisely the rollout this exists
+    /// for). `old_node_id` may be perfectly alive — that is the point.
+    ///
+    /// Same ordering as promotion: gates → key transfer + confirmed receipt →
+    /// the joint change. Because the incoming voter confirmed possession
+    /// first, the continuing voter set holds the signing key even when the
+    /// departing voter was the last other holder — the single-voter
+    /// replacement case, where `old` vanishes the instant the change commits.
+    async fn replace_voter(
+        &self,
+        request: Request<pb::ReplaceVoterRequest>,
+    ) -> Result<Response<pb::ReplaceVoterResponse>, Status> {
+        self.require_operator(&request, "ReplaceVoter")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        // The §6 idempotency short-circuit lives in the seam, which owns the
+        // membership view; a settled replacement returns success from there
+        // without transferring anything. Everything else needs the key first,
+        // so the transfer runs before the change — and is itself idempotent,
+        // skipping instantly when the candidate already confirmed receipt.
+        let settled = {
+            let summary = handle.cluster_summary();
+            let new_is_voter = summary
+                .members
+                .iter()
+                .any(|m| m.id == req.new_node_id && m.voter);
+            let old_gone = !summary.members.iter().any(|m| m.id == req.old_node_id);
+            new_is_voter && old_gone
+        };
+        if !settled {
+            self.ensure_key_transferred(&consensus, &handle, req.new_node_id)
+                .await?;
+        }
+
+        consensus
+            .replace_voter(req.old_node_id, req.new_node_id)
+            .await
+            .map_err(consensus_error_to_status)?;
+        tracing::info!(
+            old = req.old_node_id,
+            new = req.new_node_id,
+            "admin: replaced a voter (ADR 0037 §7)"
+        );
+        Ok(Response::new(pb::ReplaceVoterResponse {}))
+    }
+
+    /// Receive the cluster CA private key from the leader and persist it
+    /// (ADR 0037 §4) — the candidate half of the key-transfer protocol.
+    ///
+    /// This is the *only* path by which the key reaches a disk other than the
+    /// forming voter's, and it is why every disk that has ever run this
+    /// handler is accounted root-equivalent. The channel is the mutually
+    /// authenticated admin listener, so the caller is already a coordinator
+    /// machine (the leader dials with its own machine leaf) or an operator.
+    ///
+    /// The received key is checked against the CA certificate **this node
+    /// already replicates** before anything is written: a push that does not
+    /// match the cluster's own root is misdirected or hostile, and must never
+    /// overwrite custody. The write is owner-only and durable, and the whole
+    /// handler is idempotent — a node that already holds a valid matching key
+    /// acknowledges without rewriting, which is what makes a crash between
+    /// receipt and the joint change converge on re-entry.
+    ///
+    /// Nothing here logs, echoes, or otherwise reproduces the key material.
+    async fn transfer_ca_key(
+        &self,
+        request: Request<pb::TransferCaKeyRequest>,
+    ) -> Result<Response<pb::TransferCaKeyResponse>, Status> {
+        let caller = self.require_operator_or_machine(&request, "TransferCaKey")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        // The CA certificate this node has *applied*. A candidate keyed the
+        // instant it passed the lag gate may still be applying the log its
+        // raft layer already holds (apply and view publication trail commit),
+        // so this waits briefly rather than refusing a transfer that is simply
+        // early — the leader only ever sends one for a cluster whose CA is
+        // committed, and a candidate caught up enough to be promoted is at
+        // most an apply cycle behind it.
+        let ca_pem = self.replicated_ca(&consensus).await.ok_or_else(|| {
+            Status::failed_precondition(
+                "this cluster has no replicated CA certificate to check a transferred key \
+                 against (ADR 0037 §4)",
+            )
+        })?;
+
+        // Idempotent: a valid matching key already on disk is the state the
+        // caller is asking for. Checked before the match below so a retried
+        // transfer costs one stat and one parse, not a rewrite.
+        if pki::load_ca_key(&self.inner.data_dir, &ca_pem).is_ok() {
+            return Ok(Response::new(pb::TransferCaKeyResponse {}));
+        }
+
+        pki::key_matches_ca(&ca_pem, &req.ca_key_pem).map_err(|e| {
+            tracing::warn!(
+                caller = %caller.describe(),
+                error = %e,
+                "admin: refused a CA key transfer that does not match the replicated CA \
+                 certificate"
+            );
+            Status::invalid_argument(
+                "the transferred key does not match this cluster's CA certificate (ADR 0037 §4)",
+            )
+        })?;
+
+        pki::write_ca_key(&self.inner.data_dir, &req.ca_key_pem)
+            .map_err(|e| Status::internal(format!("persisting the transferred CA key: {e}")))?;
+        tracing::info!(
+            node_id = handle.node_id(),
+            "admin: accepted custody of the cluster CA key (ADR 0037 §4)"
+        );
+        Ok(Response::new(pb::TransferCaKeyResponse {}))
     }
 
     /// Remove a node from membership. Operator-only (ADR 0037 §7): removal is
     /// the one membership change no machine credential may ever reach, because
     /// it is the one that can shrink a quorum.
+    ///
+    /// Removing a *voter* is one of §7's three shrink paths, and the seam
+    /// enforces §4's postcondition on it: a removal that would leave the
+    /// continuing voters with no confirmed key holder is refused
+    /// ([`NO_KEY_HOLDER`]) even for an operator, because no authority can
+    /// waive the cluster's ability to sign. Removing a learner touches no
+    /// quorum and carries no such condition.
     async fn remove_node(
         &self,
         request: Request<pb::RemoveNodeRequest>,
@@ -771,6 +969,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         Self::check_cluster(&req.history_id, &handle)?;
         let mut resp = cluster_summary_to_pb(handle.cluster_summary());
         resp.bindings = machine_bindings_to_pb(&consensus);
+        resp.key_holders = key_holders_to_pb(&consensus);
         resp.health = match self.inner.phase.health() {
             HealthVerdict::Unknown => None,
             HealthVerdict::Sustained { live_voters } => Some(pb::ClusterHealth {
@@ -1215,6 +1414,146 @@ impl<C: Consensus> AdminService<C> {
         Ok(())
     }
 
+    /// The applied CA certificate, waiting up to [`CA_VISIBILITY_WAIT`] for it
+    /// to appear.
+    ///
+    /// `None` means this node genuinely has no cluster-owned CA — either the
+    /// trust root was provisioned externally (ADR 0022's pre-0037 model) or
+    /// this replica is far enough behind that it cannot answer for the
+    /// cluster's custody at all.
+    async fn replicated_ca(&self, consensus: &Arc<C>) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + CA_VISIBILITY_WAIT;
+        loop {
+            if let Some(pem) = consensus
+                .views()
+                .latest()
+                .state()
+                .ca
+                .as_ref()
+                .map(|ca| ca.bundle.pem().as_bytes().to_vec())
+            {
+                return Some(pem);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(CA_VISIBILITY_POLL).await;
+        }
+    }
+
+    /// Put the CA key on `candidate`'s disk and record the replicated fact
+    /// that it is there — the precondition every voter-raising change waits
+    /// on (ADR 0037 §4).
+    ///
+    /// Three steps, each idempotent, in this order:
+    ///
+    /// 1. **Skip if already confirmed.** The possession fact is replicated, so
+    ///    a re-entered promotion (a retried verb, a restarted convergence
+    ///    loop, a leader that changed mid-flight) transfers nothing twice.
+    /// 2. **Load the leader's own key.** A missing, group-readable, or
+    ///    mismatched key file is not something to work around: the verb is
+    ///    refused with [`KEY_UNAVAILABLE`] for operator repair. The leader is
+    ///    always a voter and therefore always ought to hold the key.
+    /// 3. **Push, then confirm.** Dial the candidate's membership address with
+    ///    this daemon's own material — the same client the dial-back
+    ///    verification uses — and propose `ConfirmKeyPossession` only after
+    ///    the candidate acknowledges a durable write. Confirming before the
+    ///    ack would replicate a possession fact no disk backs.
+    ///
+    /// The key exists in this frame and in that one request. It never enters a
+    /// command, the log, a snapshot, or a log line.
+    async fn ensure_key_transferred(
+        &self,
+        consensus: &Arc<C>,
+        handle: &NodeHandle,
+        candidate: CoordinatorId,
+    ) -> Result<(), Status> {
+        if consensus
+            .views()
+            .latest()
+            .state()
+            .has_key_confirmation(candidate)
+        {
+            return Ok(());
+        }
+
+        // No replicated CA certificate means this cluster does not own its
+        // trust root: the material was provisioned externally (ADR 0022's
+        // pre-0037 model), there is no cluster-held private key, and there is
+        // nothing to transfer. The custody postcondition is skipped on the
+        // same condition, in the seam.
+        let Some(ca_pem) = consensus
+            .views()
+            .latest()
+            .state()
+            .ca
+            .as_ref()
+            .map(|ca| ca.bundle.pem().as_bytes().to_vec())
+        else {
+            return Ok(());
+        };
+        let key_pem = pki::load_ca_key(&self.inner.data_dir, &ca_pem).map_err(|e| {
+            Status::failed_precondition(format!(
+                "{KEY_UNAVAILABLE}: this leader cannot read its own CA key, so it cannot key \
+                 node {candidate} for promotion: {e}. Repair custody on this node's data \
+                 directory (ADR 0037 §4)"
+            ))
+        })?;
+
+        let addr = handle
+            .cluster_summary()
+            .members
+            .iter()
+            .find(|m| m.id == candidate)
+            .map(|m| m.addr.clone())
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "{UNKNOWN_NODE}: node {candidate} is not in membership, so there is no \
+                     address to transfer the CA key to (ADR 0037 §6)"
+                ))
+            })?;
+
+        let tls = self.tls()?;
+        let mut client = admin_channel_from_store(&addr, &tls).await.map_err(|e| {
+            endpoint_unverified_status(format_args!("dialing {addr} to transfer the CA key: {e:#}"))
+        })?;
+        client
+            .transfer_ca_key(pb::TransferCaKeyRequest {
+                history_id: handle.history_id().to_vec(),
+                ca_key_pem: key_pem,
+            })
+            .await
+            .map_err(|s| {
+                endpoint_unverified_status(format_args!(
+                    "transferring the CA key to {addr}: {}",
+                    s.message()
+                ))
+            })?;
+
+        let applied = consensus
+            .propose(Command::ConfirmKeyPossession(ConfirmKeyPossession {
+                raft_node_id: candidate,
+                confirmed_at: Timestamp::now(),
+            }))
+            .await
+            .map_err(consensus_error_to_status)?;
+        applied.outcome.map_err(|reason| {
+            Status::failed_precondition(format!(
+                "node {candidate} confirmed durable receipt of the CA key, but recording the \
+                 possession fact was rejected: {reason}"
+            ))
+        })?;
+        // Read-your-writes: the custody postcondition the joint change is
+        // about to check reads the *published* view, and it must see the
+        // confirmation this call just made.
+        await_visible(&**consensus, applied.log_index).await?;
+        tracing::info!(
+            node_id = candidate,
+            "admin: node confirmed durable CA-key receipt (ADR 0037 §4)"
+        );
+        Ok(())
+    }
+
     /// Commit the machine-identity ↔ seat binding for an admission
     /// (ADR 0037 §7).
     ///
@@ -1255,6 +1594,14 @@ impl<C: Consensus> AdminService<C> {
             }
             Err(RejectionReason::MachineAddressConflict { .. }) => {
                 Err(machine_address_conflict_status(machine, raft_node_id))
+            }
+            // The learner-GC task retired this identity before releasing its
+            // seat (ADR 0037 §7): one seat ever, and a retired identity is
+            // never re-admitted — not even by an operator, because the
+            // re-arriving installation is by construction a *different*
+            // installation that should have minted a fresh identity.
+            Err(RejectionReason::MachineIdentityRetired { .. }) => {
+                Err(identity_retired_status(machine))
             }
             Err(other) => Err(Status::failed_precondition(format!(
                 "machine-identity binding rejected: {other}"
@@ -1325,6 +1672,17 @@ pub(crate) fn machine_address_conflict_status(
     ))
 }
 
+/// The identity was retired by the stale-learner GC (ADR 0037 §7): its seat
+/// is gone and its record survives precisely to keep refusing it.
+pub(crate) fn identity_retired_status(machine: MachineId) -> Status {
+    Status::failed_precondition(format!(
+        "{IDENTITY_RETIRED}: machine {machine} was retired when its seat was garbage-collected \
+         after a prolonged loss of contact, and a retired identity is never re-admitted — one \
+         identity, one seat, ever. A returning installation starts with fresh state and mints a \
+         fresh identity (ADR 0037 §7)"
+    ))
+}
+
 /// The replicated machine-identity bindings (ADR 0037 §7) in wire form,
 /// ascending by machine id so the listing is stable across calls and replicas.
 fn machine_bindings_to_pb<C: Consensus>(consensus: &Arc<C>) -> Vec<pb::MachineBinding> {
@@ -1339,6 +1697,29 @@ fn machine_bindings_to_pb<C: Consensus>(consensus: &Arc<C>) -> Vec<pb::MachineBi
             node_id: binding.raft_node_id,
             address: binding.address.clone(),
             bound_at_us: binding.bound_at.as_micros(),
+        })
+        .collect()
+}
+
+/// The confirmed CA-key holders (ADR 0037 §4) in wire form, ascending by node
+/// id.
+///
+/// **Every** entry is reported, not just current voters: the §4 threat model
+/// says every disk that has ever received the key is root-equivalent, so a
+/// keyed-but-never-promoted candidate (a leader crash in the promotion
+/// window abandons one) and a departed voter's seat must both stay visible.
+/// Filtering this to the live voter set would hide exactly the cases custody
+/// accounting exists to surface.
+fn key_holders_to_pb<C: Consensus>(consensus: &Arc<C>) -> Vec<pb::KeyHolder> {
+    consensus
+        .views()
+        .latest()
+        .state()
+        .key_confirmations
+        .iter()
+        .map(|(node_id, confirmed_at)| pb::KeyHolder {
+            node_id: *node_id,
+            confirmed_at_us: confirmed_at.as_micros(),
         })
         .collect()
 }
@@ -1431,6 +1812,44 @@ pub(crate) fn consensus_error_to_status(err: ConsensusError) -> Status {
              {cluster_size} voters. Remaining a caught-up learner and re-offering is the \
              expected behaviour (ADR 0037 §7)"
         )),
+        // The hands-off path found no corpse to fold out (ADR 0037 §7).
+        // Retryable for the same reason `VoterSetFull` is — the learner stays
+        // a caught-up learner — and marked distinctly because the *reason* to
+        // keep polling differs, and status output says which.
+        ConsensusError::NoRemovablePeer {
+            node,
+            voters,
+            cluster_size,
+        } => Status::failed_precondition(format!(
+            "{NO_REMOVABLE_PEER}: cannot promote node {node}; the cluster already has {voters} of \
+             {cluster_size} voters and none of them has been unreachable for longer than the \
+             removal grace. A live predecessor never qualifies — a launch-before-terminate \
+             replacement is driven with `admin replace-voter` (ADR 0037 §7)"
+        )),
+        // ADR 0037 §4: no change may leave the continuing voters unable to
+        // sign. Terminal — an operator repairs custody, nothing waits it out.
+        ConsensusError::NoKeyHolder => Status::failed_precondition(format!(
+            "{NO_KEY_HOLDER}: refusing the change; no continuing voter holds a confirmed CA key. \
+             Repair custody (a lost confirmation, or a key file that no longer matches the \
+             cluster CA) before retrying (ADR 0037 §4)"
+        )),
+        ConsensusError::QuorumAtRisk { live, continuing } => Status::failed_precondition(format!(
+            // Deliberately avoids the word "behind" (as every terminal or
+            // seat-unavailable refusal does): `is_learner_behind` keys the
+            // promotion poll loop on that substring, and a false positive
+            // there polls a hopeless request until the deadline.
+            "{QUORUM_AT_RISK}: refusing the change; this leader has recent contact with only \
+             {live} of the {continuing} continuing voters, which is not a live majority \
+             (ADR 0037 §7)"
+        )),
+        // Shares the terminal `unknown-node` marker (and its NOT_FOUND code):
+        // from the caller's side "that seat is not a voter" and "that seat is
+        // not in membership" are the same class of mistake — a wrong node id,
+        // which no retry corrects.
+        ConsensusError::OldNotVoter { node } => Status::not_found(format!(
+            "{UNKNOWN_NODE}: node {node} is not a voter, so it cannot be replaced; \
+             `replace-voter` swaps a voter for a caught-up learner (ADR 0037 §7)"
+        )),
         ConsensusError::MembershipInProgress => Status::aborted(
             "a membership change is already in progress; only one may be outstanding (ADR 0016)",
         ),
@@ -1491,6 +1910,10 @@ pub fn cluster_summary_to_pb(summary: ClusterSummary) -> pb::ClusterStatusRespon
         }),
         replication,
         bindings: Vec::new(),
+        // Filled by the handler from replicated state, like `bindings`:
+        // custody is a replicated fact the state machine owns (ADR 0037 §4),
+        // not something a raft membership summary carries.
+        key_holders: Vec::new(),
         // Filled by the handler from `PhaseState`, like `bindings`: the
         // redundancy verdict is the daemon's (leader-only) observation, not
         // something a raw membership summary carries.
@@ -1714,7 +2137,6 @@ pub async fn promote_voter(
     client: &mut Client<Channel>,
     history_id: [u8; 16],
     promote: CoordinatorId,
-    remove: Option<CoordinatorId>,
     wait: Duration,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + wait;
@@ -1723,7 +2145,6 @@ pub async fn promote_voter(
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: history_id.to_vec(),
                 promote_node_id: promote,
-                remove_node_id: remove,
             })
             .await;
 
@@ -1742,6 +2163,29 @@ pub async fn promote_voter(
             Err(status) => return Err(status_to_anyhow(status)),
         }
     }
+}
+
+/// Replace one voter with another in a single joint change (ADR 0037 §7).
+///
+/// Operator-credential only. The leader keys `new_node_id` and commits the
+/// promotion and the removal atomically; `old_node_id` may be alive, which is
+/// the whole point of the verb. Idempotent per §6, so a rollout automation may
+/// retry it freely.
+pub async fn replace_voter(
+    client: &mut Client<Channel>,
+    history_id: [u8; 16],
+    old_node_id: CoordinatorId,
+    new_node_id: CoordinatorId,
+) -> Result<()> {
+    client
+        .replace_voter(pb::ReplaceVoterRequest {
+            history_id: history_id.to_vec(),
+            old_node_id,
+            new_node_id,
+        })
+        .await
+        .map_err(status_to_anyhow)?;
+    Ok(())
 }
 
 /// Whether a promotion failure is the retryable "learner still catching up"
@@ -1871,16 +2315,13 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
             add_learner(&mut client, history_id, node_id, addr.clone()).await?;
             println!("added node {node_id} as a learner ({addr})");
         }
-        AdminVerb::Promote {
-            node_id,
-            remove,
-            wait,
-        } => {
-            promote_voter(&mut client, history_id, node_id, remove, wait).await?;
-            match remove {
-                Some(r) => println!("promoted node {node_id} to voter, removed node {r}"),
-                None => println!("promoted node {node_id} to voter"),
-            }
+        AdminVerb::Promote { node_id, wait } => {
+            promote_voter(&mut client, history_id, node_id, wait).await?;
+            println!("promoted node {node_id} to voter");
+        }
+        AdminVerb::ReplaceVoter { old, new } => {
+            replace_voter(&mut client, history_id, old, new).await?;
+            println!("replaced voter {old} with node {new}");
         }
         AdminVerb::Remove { node_id } => {
             remove_node(&mut client, history_id, node_id).await?;
@@ -1946,6 +2387,29 @@ fn render_status(s: &pb::ClusterStatusResponse) -> String {
                 "  node {:<6} {:<8} {}",
                 member.node_id, role, member.address
             );
+        }
+    }
+
+    // Custody accounting (ADR 0037 §4): every node that ever confirmed
+    // receipt of the CA key, including keyed candidates that never became
+    // voters and seats that have since departed — each is root-equivalent
+    // for as long as its disk exists, so each is listed.
+    if !s.key_holders.is_empty() {
+        let members: std::collections::BTreeSet<u64> = s
+            .membership
+            .as_ref()
+            .map(|m| m.members.iter().map(|m| m.node_id).collect())
+            .unwrap_or_default();
+        let _ = writeln!(out, "key holders (ADR 0037 §4):");
+        for holder in &s.key_holders {
+            let role = if voters.contains(&holder.node_id) {
+                "voter"
+            } else if members.contains(&holder.node_id) {
+                "learner"
+            } else {
+                "departed"
+            };
+            let _ = writeln!(out, "  node {:<6} {}", holder.node_id, role);
         }
     }
 
@@ -2047,6 +2511,33 @@ fn render_status_json(s: &pb::ClusterStatusResponse) -> String {
         "live_voters": s.health.as_ref().map(|h| h.live_voters),
     });
 
+    // Custody accounting (ADR 0037 §4). `role` joins against membership so a
+    // holder that is no longer a member reads "departed" rather than
+    // vanishing: the §4 abandoned-candidate and removed-voter cases are
+    // exactly what this list exists to make visible.
+    let member_ids: std::collections::BTreeSet<u64> = s
+        .membership
+        .as_ref()
+        .map(|m| m.members.iter().map(|m| m.node_id).collect())
+        .unwrap_or_default();
+    let key_holders: Vec<serde_json::Value> = s
+        .key_holders
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "node_id": h.node_id,
+                "confirmed_at_us": h.confirmed_at_us,
+                "role": if voters.contains(&h.node_id) {
+                    "voter"
+                } else if member_ids.contains(&h.node_id) {
+                    "learner"
+                } else {
+                    "departed"
+                },
+            })
+        })
+        .collect();
+
     let value = serde_json::json!({
         "node_id": s.local_node_id,
         "leader": s.leader_node_id,
@@ -2057,6 +2548,7 @@ fn render_status_json(s: &pb::ClusterStatusResponse) -> String {
         "members": members,
         "replication": replication,
         "bindings": bindings,
+        "key_holders": key_holders,
         "health": health,
     });
     serde_json::to_string_pretty(&value).expect("a json! value always serializes")
@@ -2191,6 +2683,52 @@ mod tests {
         assert!(full.message().starts_with(VOTER_SET_FULL));
     }
 
+    /// The ADR 0037 §4/§7 refusals this chunk adds carry their own stable
+    /// markers, and each is distinct: the convergence loop keeps polling on
+    /// `no-removable-peer` and stops on `no-key-holder`, so a shared marker
+    /// would be a behaviour change, not a wording one.
+    #[test]
+    fn the_custody_and_evidence_refusals_carry_their_markers() {
+        let no_peer = consensus_error_to_status(ConsensusError::NoRemovablePeer {
+            node: 9,
+            voters: 3,
+            cluster_size: 3,
+        });
+        assert_eq!(no_peer.code(), Code::FailedPrecondition);
+        assert!(has_marker(no_peer.message(), NO_REMOVABLE_PEER));
+
+        let no_key = consensus_error_to_status(ConsensusError::NoKeyHolder);
+        assert_eq!(no_key.code(), Code::FailedPrecondition);
+        assert!(has_marker(no_key.message(), NO_KEY_HOLDER));
+
+        let quorum = consensus_error_to_status(ConsensusError::QuorumAtRisk {
+            live: 1,
+            continuing: 3,
+        });
+        assert!(has_marker(quorum.message(), QUORUM_AT_RISK));
+
+        // A seat that is not a voter shares the terminal `unknown-node`
+        // marker: from the caller's side it is the same wrong-node-id
+        // mistake, and no retry corrects either.
+        let not_voter = consensus_error_to_status(ConsensusError::OldNotVoter { node: 9 });
+        assert_eq!(not_voter.code(), Code::NotFound);
+        assert!(has_marker(not_voter.message(), UNKNOWN_NODE));
+
+        let retired = identity_retired_status(MachineId::new());
+        assert_eq!(retired.code(), Code::FailedPrecondition);
+        assert!(has_marker(retired.message(), IDENTITY_RETIRED));
+
+        // None of them may read as a catch-up wait, or the CLI's promotion
+        // poll loop would spin on a hopeless request until its deadline.
+        for status in [no_peer, no_key, quorum, not_voter, retired] {
+            assert!(
+                !is_learner_behind(&status),
+                "must not read as a catch-up wait: {}",
+                status.message()
+            );
+        }
+    }
+
     /// None of the terminal-or-voter-full refusals may look like a learner
     /// still catching up: `is_learner_behind` keys on the substring "behind",
     /// and a false positive there polls a hopeless request until the deadline.
@@ -2251,6 +2789,19 @@ mod tests {
                 address: "c1:7071".into(),
                 bound_at_us: 1_700_000_000_000_000,
             }],
+            // Two holders, one of them node 4 — a keyed candidate that is not
+            // even a member any more (ADR 0037 §4's abandoned-candidate /
+            // departed-voter case), which custody accounting must still show.
+            key_holders: vec![
+                pb::KeyHolder {
+                    node_id: 1,
+                    confirmed_at_us: 1_700_000_000_000_000,
+                },
+                pb::KeyHolder {
+                    node_id: 4,
+                    confirmed_at_us: 1_700_000_001_000_000,
+                },
+            ],
             health: Some(pb::ClusterHealth {
                 healthy: true,
                 live_voters: 2,
@@ -2304,6 +2855,17 @@ mod tests {
         // `?require=healthy` gates on.
         assert_eq!(v["health"]["healthy"], true);
         assert_eq!(v["health"]["live_voters"], 2);
+
+        // Custody accounting (ADR 0037 §4): every confirmed holder, with a
+        // membership-joined role — including "departed", which is how the
+        // abandoned-candidate case becomes visible at all.
+        let holders = v["key_holders"].as_array().expect("key_holders array");
+        assert_eq!(holders.len(), 2);
+        assert_eq!(holders[0]["node_id"], 1);
+        assert_eq!(holders[0]["role"], "voter");
+        assert_eq!(holders[0]["confirmed_at_us"], 1_700_000_000_000_000i64);
+        assert_eq!(holders[1]["node_id"], 4);
+        assert_eq!(holders[1]["role"], "departed");
 
         // Explicitly rejected by ADR 0037 §7 — replacement is never inferred.
         assert!(v.get("superseded").is_none());

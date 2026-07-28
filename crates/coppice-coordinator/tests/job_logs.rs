@@ -305,7 +305,11 @@ async fn add_voter(leader: &RunningCoordinator, follower: &Node, deadline: Durat
     loop {
         match leader
             .consensus()
-            .promote_voter(follower.raft_id(), None)
+            // Straight at the seam, bypassing the admin service: these
+            // fleets are formed, so the founding voter already holds a
+            // confirmed CA key and the §4 custody postcondition is satisfied
+            // without a transfer.
+            .commit_promotion(follower.raft_id(), None)
             .await
         {
             Ok(()) => return,
