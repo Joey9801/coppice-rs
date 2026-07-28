@@ -57,6 +57,7 @@ pub enum Command {
     ConfirmKeyPossession(ConfirmKeyPossession),
     RecordEnrolledIdentity(RecordEnrolledIdentity),
     RebindMachineAddress(RebindMachineAddress),
+    RetireMachineBinding(RetireMachineBinding),
 }
 
 impl Command {
@@ -93,6 +94,7 @@ impl Command {
             Command::ConfirmKeyPossession(c) => c.confirmed_at,
             Command::RecordEnrolledIdentity(c) => c.recorded_at,
             Command::RebindMachineAddress(c) => c.rebound_at,
+            Command::RetireMachineBinding(c) => c.retired_at,
         }
     }
 }
@@ -434,6 +436,21 @@ pub struct RebindMachineAddress {
     pub rebound_at: Timestamp,
 }
 
+/// Mark a machine-identity binding retired (ADR 0037 §7 stale-learner GC).
+///
+/// Proposed by the leader's learner-GC task before it removes the learner's
+/// raft seat — order matters, so a re-arriving installation is refused, not
+/// re-admitted, even if the seat removal has not yet landed. A mark, never a
+/// delete: the binding invariant extends past retirement, so the record must
+/// survive to keep refusing a retired identity forever (one-seat-ever). An
+/// already-retired binding is an accepted no-op; an unknown machine is
+/// refused (this verb marks an existing binding, it never creates one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireMachineBinding {
+    pub machine: MachineId,
+    pub retired_at: Timestamp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +558,11 @@ mod tests {
             rebound_at: ts(35),
         });
         assert_eq!(rebind.stamped_at(), ts(35));
+
+        let retire = Command::RetireMachineBinding(RetireMachineBinding {
+            machine: MachineId::new(),
+            retired_at: ts(37),
+        });
+        assert_eq!(retire.stamped_at(), ts(37));
     }
 }

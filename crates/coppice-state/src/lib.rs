@@ -291,6 +291,12 @@ pub struct MachineBinding {
     /// When the identity was first bound; preserved verbatim across a same-pair
     /// re-admission.
     pub bound_at: Timestamp,
+    /// When learner GC marked this binding dead (ADR 0037 §7 stale-learner
+    /// GC). `None` while live. A retired identity is never re-admitted — this
+    /// is a mark, never a delete, and the binding invariant (one machine
+    /// identity ↔ at most one raft node id, ever) extends past retirement:
+    /// the seat that was retired stays retired, one seat ever.
+    pub retired_at: Option<Timestamp>,
 }
 
 /// The role an enrollment token grants (ADR 0037 §5) — never both.
@@ -556,6 +562,16 @@ pub enum RejectionReason {
          existing binding, it never creates one (ADR 0037 §6)"
     )]
     UnknownMachineBinding { raft_node_id: u64 },
+    #[error(
+        "machine {0} carries no machine-identity binding; retire marks an existing binding, it \
+         never creates one (ADR 0037 §7 learner GC)"
+    )]
+    UnknownMachineIdentity(MachineId),
+    #[error(
+        "machine {machine} was retired by learner GC and is never re-admitted (ADR 0037 §7 \
+         one-seat-ever)"
+    )]
+    MachineIdentityRetired { machine: MachineId },
     #[error("enrollment token {0} already exists")]
     DuplicateEnrollToken(EnrollTokenId),
     #[error("enrollment token {0} not found")]

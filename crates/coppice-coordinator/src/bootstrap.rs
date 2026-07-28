@@ -836,6 +836,8 @@ pub(crate) fn node_options(
         // applies to promotions. Node-local config, because convergence
         // consults it before replicated state is reachable.
         cluster_size: cfg.discovery.cluster_size,
+        removal_grace: cfg.discovery.removal_grace,
+        learner_expiry: cfg.discovery.learner_expiry,
     }
 }
 

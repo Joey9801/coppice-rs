@@ -211,6 +211,7 @@ impl From<(&MachineId, &MachineBinding)> for pb::MachineBindingRecord {
             raft_node_id: b.raft_node_id,
             address: b.address.clone(),
             bound_at_us: b.bound_at.as_micros(),
+            retired_at_us: b.retired_at.map(|t| t.as_micros()),
         }
     }
 }
@@ -225,6 +226,10 @@ impl TryFrom<pb::MachineBindingRecord> for (MachineId, MachineBinding) {
                 raft_node_id: r.raft_node_id,
                 address: r.address,
                 bound_at: timestamp(r.bound_at_us, "MachineBindingRecord.bound_at_us")?,
+                retired_at: r
+                    .retired_at_us
+                    .map(|us| timestamp(us, "MachineBindingRecord.retired_at_us"))
+                    .transpose()?,
             },
         ))
     }

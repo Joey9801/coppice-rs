@@ -224,7 +224,7 @@ fn pki_facts_survive_snapshot_roundtrip() {
     use coppice_core::id::{EnrollTokenId, MachineId};
     use coppice_state::command::{
         BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RecordCaCertificate,
-        RecordEnrolledIdentity, RevokeEnrollToken, RevokeIdentity,
+        RecordEnrolledIdentity, RetireMachineBinding, RevokeEnrollToken, RevokeIdentity,
     };
     use coppice_state::{EnrollRole, RevokedIdentity};
 
@@ -300,6 +300,12 @@ fn pki_facts_survive_snapshot_roundtrip() {
             machine: mid(2),
             recorded_at: base_ts(),
         }),
+        // Retirement (ADR 0037 §7 learner GC): a mark, not a delete, so the
+        // binding round-trips WITH its retired_at set.
+        Command::RetireMachineBinding(RetireMachineBinding {
+            machine: mid(2),
+            retired_at: ts(TS_US + 2_000_000),
+        }),
     ];
     for cmd in &cmds {
         sm.apply(cmd).expect("PKI command accepted");
@@ -312,6 +318,11 @@ fn pki_facts_survive_snapshot_roundtrip() {
     assert_eq!(sm.revoked_identities.len(), 2);
     assert_eq!(sm.key_confirmations.len(), 2);
     assert_eq!(sm.enrolled_identities.len(), 2);
+    assert!(sm.machine_binding(&mid(1)).unwrap().retired_at.is_none());
+    assert_eq!(
+        sm.machine_binding(&mid(2)).unwrap().retired_at,
+        Some(ts(TS_US + 2_000_000))
+    );
 
     let restored = snapshot_roundtrip(&sm);
     assert_eq!(restored, sm, "PKI facts must round-trip losslessly");

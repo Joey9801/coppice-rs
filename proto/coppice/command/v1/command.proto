@@ -74,6 +74,7 @@ message Command {
     ConfirmKeyPossession confirm_key_possession = 95;
     RecordEnrolledIdentity record_enrolled_identity = 96;
     RebindMachineAddress rebind_machine_address = 97;
+    RetireMachineBinding retire_machine_binding = 98;
   }
 }
 
@@ -331,4 +332,16 @@ message RebindMachineAddress {
   uint64 raft_node_id = 1;
   string address = 2;
   int64 rebound_at_us = 3;
+}
+
+// Mark a machine-identity binding retired (ADR 0037 §7 stale-learner GC).
+// Proposed by the leader's learner-GC task before it removes the learner's
+// raft seat — order matters, so a re-arriving installation is refused, not
+// re-admitted, even if the seat removal has not yet landed. A mark, never a
+// delete: an already-retired binding is an accepted no-op; an unknown
+// machine is refused (this verb marks an existing binding, it never creates
+// one).
+message RetireMachineBinding {
+  coppice.core.v1.MachineId machine = 1;
+  int64 retired_at_us = 2;
 }

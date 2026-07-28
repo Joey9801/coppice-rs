@@ -40,6 +40,7 @@ use coppice_net::transport::Client;
 use coppice_proto::pb::raft::v1 as pb;
 
 use crate::adapter::TypeConfig;
+use crate::contact::ContactTracker;
 use crate::storage::raftpb;
 use crate::CoordinatorId;
 
@@ -129,6 +130,11 @@ struct Shared {
     channels: Mutex<PeerChannels>,
     /// Per-peer last-successful-response instants (ADR 0037 §9).
     contact: PeerContact,
+    /// Per-peer attempt/ack contact evidence (ADR 0037 §7): the input to the
+    /// evidence-gated voter-removal and stale-learner-GC decisions, distinct
+    /// from `contact` above (which only ever records the raw last-answered
+    /// instant for the `/readyz` liveness test and never an attempt).
+    evidence: Arc<ContactTracker>,
 }
 
 /// Per-peer cache value: the dialed address, the TLS material generation it was
@@ -137,8 +143,15 @@ type PeerChannels = HashMap<CoordinatorId, (String, u64, Channel)>;
 
 impl GrpcNetworkFactory {
     /// Build the factory from the shared hot-reload TLS store (ADR 0011/0037),
-    /// the per-RPC timeout, and the cluster identity stamped into every request.
-    pub fn new(history_id: [u8; 16], tls: Arc<TlsStore>, rpc_timeout: Duration) -> Self {
+    /// the per-RPC timeout, the cluster identity stamped into every request,
+    /// and the shared per-peer [`ContactTracker`] the evidence-gated
+    /// membership decisions read (ADR 0037 §7).
+    pub fn new(
+        history_id: [u8; 16],
+        tls: Arc<TlsStore>,
+        rpc_timeout: Duration,
+        evidence: Arc<ContactTracker>,
+    ) -> Self {
         GrpcNetworkFactory {
             shared: Arc::new(Shared {
                 history_id,
@@ -146,6 +159,7 @@ impl GrpcNetworkFactory {
                 rpc_timeout,
                 channels: Mutex::new(HashMap::new()),
                 contact: PeerContact::default(),
+                evidence,
             }),
         }
     }
@@ -336,6 +350,13 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         AppendEntriesResponse<CoordinatorId>,
         RPCError<CoordinatorId, BasicNode, RaftError<CoordinatorId>>,
     > {
+        // Contact evidence (ADR 0037 §7): every send attempt is noted before
+        // the dial, and any reply — including heartbeat acks and log-conflict
+        // rejections — proves the peer reachable. This is the evidence source
+        // the evidence-gated voter-removal and stale-learner-GC decisions
+        // read; matched-index progress deliberately is not, because it
+        // freezes on an idle cluster.
+        self.shared.evidence.note_attempt(self.target);
         let channel = self.dial()?;
         let mut client = Client::new(channel);
         let req = convert::append_entries_to_pb(&rpc, self.shared.history_id);
@@ -348,6 +369,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         // means for the liveness test (ADR 0037 §9). A rejection body still
         // counts: the peer is alive and reachable either way.
         self.shared.contact.record(self.target);
+        self.shared.evidence.note_ack(self.target);
         convert::append_response_from_pb(resp.into_inner())
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }

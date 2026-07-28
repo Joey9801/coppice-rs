@@ -214,6 +214,15 @@ fn every_command() -> Vec<Command> {
             machine: MachineId(Uuid::from_u128(0x26)),
             recorded_at: ts(),
         }),
+        Command::RebindMachineAddress(RebindMachineAddress {
+            raft_node_id: 3,
+            address: "10.0.0.9:7000".into(),
+            rebound_at: ts(),
+        }),
+        Command::RetireMachineBinding(RetireMachineBinding {
+            machine: MachineId(Uuid::from_u128(0x11)),
+            retired_at: ts(),
+        }),
     ]
 }
 

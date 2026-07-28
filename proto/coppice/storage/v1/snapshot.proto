@@ -195,6 +195,9 @@ message MachineBindingRecord {
   uint64 raft_node_id = 2;
   string address = 3;
   int64 bound_at_us = 4;
+  // Set when learner GC marked this binding dead (ADR 0037 §7 stale-learner
+  // GC); absent while live. A retired identity is never re-admitted.
+  optional int64 retired_at_us = 5;
 }
 
 // A replicated enrollment-token record (ADR 0037 §5). Keyed by `token`.

@@ -159,6 +159,22 @@ mod discovery {
         #[serde(default = "default_cluster_size")]
         pub(crate) cluster_size: usize,
 
+        /// How long a voter may go without acknowledging leader contact
+        /// before the leader's evidence-gated removal path (ADR 0037 §7) may
+        /// fold it out of the voter set — the leader's own
+        /// heartbeat-acknowledgement evidence, never log-position progress
+        /// (which stalls identically for a dead peer and an idle-but-live
+        /// one). Node-local coordinator config, like `cluster_size` above.
+        #[serde(default = "default_removal_grace", with = "humantime_serde")]
+        pub(crate) removal_grace: Duration,
+
+        /// How long a learner may go without acknowledging leader contact
+        /// before the periodic learner-GC task (ADR 0037 §7) retires its
+        /// bound machine identity and removes its seat. Node-local
+        /// coordinator config, like `cluster_size` above.
+        #[serde(default = "default_learner_expiry", with = "humantime_serde")]
+        pub(crate) learner_expiry: Duration,
+
         /// `[discovery.static]` — present iff `backend = "static"`.
         #[serde(default, rename = "static")]
         pub(crate) static_backend: Option<StaticBackend>,
@@ -328,6 +344,14 @@ mod discovery {
 
     fn default_cluster_size() -> usize {
         3
+    }
+
+    fn default_removal_grace() -> Duration {
+        Duration::from_secs(120)
+    }
+
+    fn default_learner_expiry() -> Duration {
+        Duration::from_secs(3600)
     }
 
     fn default_ec2_asg_timeout() -> Duration {
@@ -891,6 +915,8 @@ data_dir = "/var/lib/coppice"
 [discovery]
 backend = "static"
 cluster_size = 3
+removal_grace = "90s"
+learner_expiry = "30m"
 
 [discovery.static]
 addrs = ["coord-1.batch.example.com:7071", "coord-2.batch.example.com:7071"]
@@ -983,6 +1009,11 @@ addrs = []
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/coppice"));
         assert_eq!(config.discovery.backend, BackendKind::Static);
         assert_eq!(config.discovery.cluster_size, 3);
+        assert_eq!(config.discovery.removal_grace, Duration::from_secs(90));
+        assert_eq!(
+            config.discovery.learner_expiry,
+            Duration::from_secs(30 * 60)
+        );
         assert_eq!(
             config.discovery.static_addrs(),
             [
@@ -1041,6 +1072,8 @@ addrs = []
         assert_eq!(config.discovery.backend, BackendKind::Static);
         assert!(config.discovery.static_addrs().is_empty());
         assert_eq!(config.discovery.cluster_size, 3);
+        assert_eq!(config.discovery.removal_grace, Duration::from_secs(120));
+        assert_eq!(config.discovery.learner_expiry, Duration::from_secs(3600));
         config.discovery.validate().expect("empty static is valid");
 
         assert_eq!(config.listen.client_addr, default_client_addr());
