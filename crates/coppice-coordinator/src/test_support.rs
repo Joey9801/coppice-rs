@@ -240,6 +240,16 @@ impl Consensus for FakeConsensus {
         Ok(())
     }
 
+    /// Mirrors [`plan_promotion`](Self::plan_promotion): no membership, so
+    /// every replacement plans clean.
+    fn plan_replacement(
+        &self,
+        _old: CoordinatorId,
+        _new: CoordinatorId,
+    ) -> Result<coppice_consensus::ReplacementPlan, ConsensusError> {
+        Ok(coppice_consensus::ReplacementPlan::Ready)
+    }
+
     async fn replace_voter(
         &self,
         _old: CoordinatorId,
@@ -256,6 +266,16 @@ impl Consensus for FakeConsensus {
     /// fake that invented some would be testing itself.
     fn expired_learners(&self) -> Vec<CoordinatorId> {
         Vec::new()
+    }
+
+    /// Nothing is ever eligible, for the same reason as
+    /// [`expired_learners`](Self::expired_learners).
+    async fn reap_expired_learner(
+        &self,
+        _node: CoordinatorId,
+        _retire: Option<Command>,
+    ) -> Result<bool, ConsensusError> {
+        Ok(false)
     }
 
     async fn remove_node(&self, _node: CoordinatorId) -> Result<(), ConsensusError> {

@@ -322,10 +322,13 @@ pub enum EnrollClientError {
     )]
     Redirected { status: u16 },
 
-    /// The endpoint refused the enrollment. The body is deliberately not
-    /// interpreted — it is one uniform refusal for every credential failure.
-    #[error("the enrollment endpoint refused the request: HTTP {status}")]
-    Refused { status: u16 },
+    /// The endpoint refused the enrollment. A credential refusal (401) stays
+    /// deliberately opaque — one uniform refusal for every credential
+    /// failure — but an *operational* refusal (429, 503, 5xx) carries the
+    /// server's stated reason: discarding it would force exactly the log
+    /// archaeology ADR 0037 §9 removes.
+    #[error("the enrollment endpoint refused the request: HTTP {status}{detail}")]
+    Refused { status: u16, detail: String },
 
     /// A 200 whose body was not an [`EnrollResponse`].
     #[error("the enrollment endpoint returned an unreadable body: {0}")]
@@ -453,8 +456,25 @@ impl EnrollClient {
             });
         }
         if !status.is_success() {
+            // See `Refused`: the 401 body is the uniform refusal and stays
+            // unread; any other refusal's body is the server's reason,
+            // surfaced (bounded) so a stuck convergence loop names its
+            // blocker in status output instead of requiring server logs.
+            let detail = if status.as_u16() == 401 {
+                String::new()
+            } else {
+                match response.text().await {
+                    Ok(body) if !body.is_empty() => {
+                        let mut body = body;
+                        body.truncate(512);
+                        format!(": {body}")
+                    }
+                    _ => String::new(),
+                }
+            };
             return Err(EnrollClientError::Refused {
                 status: status.as_u16(),
+                detail,
             });
         }
         response

@@ -141,6 +141,14 @@ impl Ca {
         self.leaf_with_cn(&node.to_string())
     }
 
+    /// This CA's own private key, PEM-encoded — the material `pki::write_ca_key`
+    /// persists to a data directory that is meant to *own* this root (ADR 0037
+    /// §4). Only a test that stages cluster custody by hand (rather than
+    /// forming a cluster the normal way, which mints its own CA) needs this.
+    pub fn key_pem(&self) -> Vec<u8> {
+        self.key.serialize_pem().into_bytes()
+    }
+
     fn leaf_with_subject(&self, cn: &str, ou: Option<&str>, extra_sans: &[String]) -> Leaf {
         let key = KeyPair::generate().expect("generate leaf key pair");
         let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];

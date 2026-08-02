@@ -120,7 +120,9 @@ async fn history_id_of(client: &mut AdminClient) -> [u8; 16] {
 }
 
 /// Mint the coordinator enrollment token a fleet's config artifact carries
-/// (ADR 0037 §5), using an operator client already dialed.
+/// (ADR 0037 §5), using an operator client already dialed. Only safe where
+/// leadership cannot move — the single-voter tests; a multi-voter fleet uses
+/// [`fleet_coordinator_token`].
 async fn coordinator_token(client: &mut AdminClient, history_id: [u8; 16]) -> String {
     client
         .mint_enroll_token(pb::MintEnrollTokenRequest {
@@ -133,6 +135,39 @@ async fn coordinator_token(client: &mut AdminClient, history_id: [u8; 16]) -> St
         .expect("mint a coordinator enrollment token")
         .into_inner()
         .secret
+}
+
+/// [`coordinator_token`] for a multi-voter fleet: leadership can move between
+/// resolving the leader and the mint (observed in CI), so a refused attempt
+/// re-resolves the current leader and retries — the label-keyed duplicate a
+/// retry could mint is harmless.
+async fn fleet_coordinator_token(
+    fleet: &Fleet,
+    operator: &OperatorPem,
+    history_id: [u8; 16],
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut client = operator_client(find_leader(fleet).await, operator).await;
+        match client
+            .mint_enroll_token(pb::MintEnrollTokenRequest {
+                history_id: history_id.to_vec(),
+                role: pbcore::EnrollRole::Coordinator as i32,
+                label: "coordinators".to_string(),
+                ttl_seconds: None,
+            })
+            .await
+        {
+            Ok(resp) => return resp.into_inner().secret,
+            Err(status) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "minting the fleet's coordinator token kept failing: {status}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 /// A fifth wheel: a certless daemon configured exactly as a fleet's identical
@@ -259,6 +294,18 @@ async fn replace_voter_until_success(
 /// achieve, racing a learner whose replication stream has had no chance to
 /// even begin, against a snapshot payload now too large to install in that
 /// window.
+///
+/// This is also the review-mandated "never keyed on refusal" claim (ADR 0037
+/// §4: "A `new` that is refused here is never keyed and never appears in the
+/// custody accounting"). The rest of this file's cases run against a whole
+/// [`Daemon`]/[`Fleet`], which forms its own cluster CA; this one runs at the
+/// bare [`Node`]/[`Command`] level with no cluster CA at all, so custody would
+/// otherwise be vacuously absent from the claim. Custody is staged by hand
+/// before the learner ever joins — a minted CA recorded in replicated state,
+/// its key written to the founder's own data directory, and the founder's own
+/// key-possession fact confirmed — exactly what a formed voter holds, so the
+/// refusal below is checked against a cluster that actually has something to
+/// strand.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replace_voter_refuses_a_new_that_is_still_catching_up() {
     init_tracing();
@@ -276,6 +323,44 @@ async fn replace_voter_refuses_a_new_that_is_still_catching_up() {
         || async { founder.is_leader() },
     )
     .await;
+
+    // Stage cluster custody by hand (ADR 0037 §4), before the learner joins:
+    // the fixture's own CA (the one this founder's mTLS material already
+    // chains to — recording a DIFFERENT minted CA here would make the
+    // admin surface's own authorization plane start classifying every
+    // caller, including this test's admin client, against a trust root
+    // nothing in the fixture was signed under), its key on the founder's
+    // disk, and the founder's own possession confirmed — exactly what
+    // `check_change_postconditions`'s key-custody clause reads.
+    coppice_tls::pki::write_ca_key(&founder.data_dir(), &ca.key_pem())
+        .expect("write the CA key to the founder's data dir");
+    let ca_recorded = founder
+        .consensus()
+        .propose(Command::RecordCaCertificate(
+            coppice_state::command::RecordCaCertificate {
+                bundle: coppice_state::CaCertBundle::parse(
+                    std::str::from_utf8(&ca.pem).expect("CA cert PEM is UTF-8"),
+                )
+                .expect("the fixture CA parses"),
+                recorded_at: Timestamp::now(),
+            },
+        ))
+        .await
+        .expect("record the CA");
+    ca_recorded.outcome.expect("recording the CA is accepted");
+    let confirmed = founder
+        .consensus()
+        .propose(Command::ConfirmKeyPossession(
+            coppice_state::command::ConfirmKeyPossession {
+                raft_node_id: founder.raft_id(),
+                confirmed_at: Timestamp::now(),
+            },
+        ))
+        .await
+        .expect("confirm the founder's key possession");
+    confirmed
+        .outcome
+        .expect("confirming founder key possession is accepted");
 
     // Tens of thousands of real `MintEnrollToken` commands, proposed directly
     // (no admin RPC, no argon2): each lands a persistent `EnrollToken` record,
@@ -343,6 +428,28 @@ async fn replace_voter_refuses_a_new_that_is_still_catching_up() {
         status.message()
     );
 
+    // Never keyed on refusal (ADR 0037 §4): the gate above ran before any key
+    // transfer, so the refused learner's disk must hold no CA key at all.
+    let learner_key_path = learner.data_dir().join(coppice_tls::pki::CA_KEY_FILE);
+    assert!(
+        !learner_key_path.exists(),
+        "a refused ReplaceVoter must never have written a CA key to the learner's disk: {}",
+        learner_key_path.display()
+    );
+
+    // ...and never appears in the custody accounting: `key_holders` names the
+    // founder alone.
+    let status_after = admin::cluster_status(&mut client, history_id)
+        .await
+        .expect("read cluster status after the refusal");
+    let holder_ids: std::collections::BTreeSet<u64> =
+        status_after.key_holders.iter().map(|h| h.node_id).collect();
+    assert_eq!(
+        holder_ids,
+        std::collections::BTreeSet::from([founder.raft_id()]),
+        "a refused new must never appear in key_holders: {status_after:?}"
+    );
+
     learner.graceful_stop().await;
     founder.graceful_stop().await;
 }
@@ -372,7 +479,7 @@ async fn replace_voter_with_a_live_old_succeeds_and_is_idempotent() {
     let leader = find_leader(&fleet).await;
     let mut leader_client = operator_client(leader, &operator).await;
     let history_id = history_id_of(&mut leader_client).await;
-    let token = coordinator_token(&mut leader_client, history_id).await;
+    let token = fleet_coordinator_token(&fleet, &operator, history_id).await;
 
     let mut fourth = newcomer(fleet.cluster_id, &ca, leader, &token, 3);
     fourth.start();
@@ -468,7 +575,7 @@ async fn a_replacement_raced_by_the_predecessors_crash_converges_hands_off() {
     let leader = find_leader(&fleet).await;
     let mut leader_client = operator_client(leader, &operator).await;
     let history_id = history_id_of(&mut leader_client).await;
-    let token = coordinator_token(&mut leader_client, history_id).await;
+    let token = fleet_coordinator_token(&fleet, &operator, history_id).await;
 
     let mut fifth = newcomer(fleet.cluster_id, &ca, leader, &token, 3);
     fifth.set_removal_grace("2s");

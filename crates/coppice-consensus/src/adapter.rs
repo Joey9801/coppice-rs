@@ -161,6 +161,24 @@ pub enum PromotionPlan {
     },
 }
 
+/// What [`Consensus::plan_replacement`] decided, before any key transfer or
+/// membership change happens (ADR 0037 §4/§7).
+///
+/// The same split, for the same reason, as [`PromotionPlan`]: `ReplaceVoter`'s
+/// key transfer grants root-equivalent custody (§4), so every gate — `old` a
+/// sitting voter, `new` a caught-up learner, the postconditions — must pass
+/// **before** the key leaves the leader's disk. A `new` that is refused here
+/// is never keyed and never appears in the custody accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementPlan {
+    /// `new` is already a voter and `old` is gone from membership entirely:
+    /// the ADR 0037 §6 idempotent no-op. No key transfer, no change.
+    Settled,
+    /// Every gate passed; the replacement may proceed once `new` confirms
+    /// durable key receipt.
+    Ready,
+}
+
 /// The openraft-backed [`Consensus`] implementation.
 pub struct OpenraftConsensus {
     raft: Raft<TypeConfig>,
@@ -184,6 +202,14 @@ pub struct OpenraftConsensus {
     /// live-but-idle peer keeps acknowledging heartbeats, so — unlike
     /// matched-index progress — it never goes stale on an idle cluster.
     contact: Arc<ContactTracker>,
+    /// Serializes every check-then-act membership mutation on this leader —
+    /// promotion commits, replacements, removals, address repoints, and the
+    /// learner-GC reap. openraft serializes the `change_membership` calls
+    /// themselves, but not the *decisions* in front of them: without this
+    /// lock, learner GC could re-verify "still a learner" while a promotion
+    /// is mid-commit and then remove a brand-new voter — precisely the
+    /// background voter reaper ADR 0037 §7 forbids.
+    membership_change: tokio::sync::Mutex<()>,
 }
 
 impl OpenraftConsensus {
@@ -218,6 +244,7 @@ impl OpenraftConsensus {
             removal_grace,
             learner_expiry,
             contact,
+            membership_change: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -320,15 +347,20 @@ impl OpenraftConsensus {
     ///
     /// `continuing` is the voter set the change would leave behind, and
     /// `incoming` (when there is one) is the node being raised into it —
-    /// which counts as live because it has just passed the replication-lag
-    /// gate, evidence at least as fresh as any contact record.
+    /// used only to attribute a refusal, never as evidence: passing the
+    /// replication-lag gate does **not** prove life on an idle log (a dead
+    /// learner's matched index sits at zero lag forever), so the incoming
+    /// node earns its liveness the same way every other voter does — a
+    /// fresh acknowledgement.
     ///
     /// 1. **Size.** At most `cluster_size` voters, when one is configured.
     /// 2. **Live majority from the leader's vantage.** A strict majority of
-    ///    `continuing` must have answered this leader within
-    ///    [`LIVE_CONTACT_STALENESS`] (the leader itself always counts). This
-    ///    is what stops an evidence-gated removal, or an operator's
-    ///    `ReplaceVoter`, from committing a set that cannot elect.
+    ///    `continuing` must have **acknowledged** this leader within
+    ///    [`LIVE_CONTACT_STALENESS`] — attempts and matched indexes are not
+    ///    evidence of life; only the leader itself is credited without an
+    ///    ack (it cannot dial itself). This is what stops an evidence-gated
+    ///    removal, or an operator's `ReplaceVoter`, from committing a set
+    ///    that cannot elect.
     /// 3. **Key custody.** At least one continuing voter must hold a
     ///    confirmed CA key (§4): no change may leave the cluster unable to
     ///    sign. Read from replicated state, so it sees the confirmation the
@@ -350,9 +382,7 @@ impl OpenraftConsensus {
         let live = continuing
             .iter()
             .filter(|voter| {
-                **voter == local
-                    || Some(**voter) == incoming
-                    || self.contact.is_live(**voter, LIVE_CONTACT_STALENESS)
+                **voter == local || self.contact.is_live(**voter, LIVE_CONTACT_STALENESS)
             })
             .count();
         if live * 2 <= continuing.len() {
@@ -377,6 +407,63 @@ impl OpenraftConsensus {
             return Err(ConsensusError::NoKeyHolder);
         }
         Ok(())
+    }
+
+    /// Whether `voter` qualifies as evidence-dead **right now**: failing
+    /// contact for longer than `removal_grace` (ADR 0037 §7). Consulted both
+    /// when a removal is planned and again at commit — a predecessor that
+    /// recovers during the key transfer stops qualifying, and a live
+    /// predecessor never qualifies.
+    fn still_evidence_dead(&self, voter: CoordinatorId) -> bool {
+        self.contact
+            .failed_contact_for(voter, std::time::Instant::now())
+            .is_some_and(|failing| failing > self.removal_grace)
+    }
+
+    /// The `ReplaceVoter` gate sequence (ADR 0037 §6/§7), shared verbatim by
+    /// [`Consensus::plan_replacement`] — run *before* the key transfer, so a
+    /// refused `new` is never keyed — and [`Consensus::replace_voter`],
+    /// which re-runs it under the membership lock at commit because the
+    /// transfer is a network round-trip and a replicated write.
+    fn replacement_gates(
+        &self,
+        old: CoordinatorId,
+        new: CoordinatorId,
+    ) -> Result<ReplacementPlan, ConsensusError> {
+        let voters = self.voter_ids();
+
+        // The §6 idempotency short-circuit, first: "already the shape you
+        // asked for" — `new` a voter and `old` gone from membership entirely
+        // — is a plain success. (`old == new` can never satisfy it: one id
+        // cannot be both a voter and absent.)
+        if voters.contains(&new) && !self.is_member(old) {
+            return Ok(ReplacementPlan::Settled);
+        }
+        // The verb replaces a *voter*: naming a learner or a stranger as
+        // `old` is a caller error no waiting fixes. This also answers
+        // `old == new` naming a learner.
+        if !voters.contains(&old) {
+            return Err(ConsensusError::OldNotVoter { node: old });
+        }
+        // The verb promotes a *learner*: outside the settled no-op above, a
+        // sitting voter is never a valid `new` — accepting one would quietly
+        // turn the call into a bare removal of `old`, a shrink path §7 does
+        // not grant this verb. This also answers `old == new` naming a
+        // voter.
+        if voters.contains(&new) {
+            return Err(ConsensusError::NewAlreadyVoter { node: new });
+        }
+        if !self.is_member(new) {
+            return Err(ConsensusError::UnknownNode { node: new });
+        }
+        // The same catch-up gate promotion uses (ADR 0016).
+        self.check_promotion_lag(new)?;
+
+        let mut continuing = voters;
+        continuing.insert(new);
+        continuing.remove(&old);
+        self.check_change_postconditions(&continuing, Some(new))?;
+        Ok(ReplacementPlan::Ready)
     }
 }
 
@@ -522,6 +609,11 @@ impl Consensus for OpenraftConsensus {
         promote: CoordinatorId,
         remove: Option<CoordinatorId>,
     ) -> Result<(), ConsensusError> {
+        // Serialize with every other membership mutation (see
+        // `membership_change`): the checks below and the change they guard
+        // must be one indivisible decision.
+        let _guard = self.membership_change.lock().await;
+
         // Re-run the cheap gates: `plan_promotion` ran before the key
         // transfer, which is a network round-trip and a replicated write, so
         // membership may have moved underneath it.
@@ -535,6 +627,22 @@ impl Consensus for OpenraftConsensus {
         }
         if !voters.contains(&promote) {
             self.check_promotion_lag(promote)?;
+        }
+
+        // Re-validate the evidence itself, not just membership (ADR 0037 §7:
+        // "a *live* predecessor never qualifies"): the voter the plan chose
+        // may have recovered during the key transfer, and removing it anyway
+        // would evict a live peer on stale evidence. Refusing here sends the
+        // learner back around the loop, which re-plans against fresh
+        // evidence on its next tick.
+        if let Some(departed) = remove {
+            if !voters.contains(&departed) || !self.still_evidence_dead(departed) {
+                return Err(ConsensusError::NoRemovablePeer {
+                    node: promote,
+                    voters: voters.len(),
+                    cluster_size: self.cluster_size,
+                });
+            }
         }
 
         let mut continuing = voters.clone();
@@ -563,39 +671,31 @@ impl Consensus for OpenraftConsensus {
             .map_err(map_client_write_error)
     }
 
+    fn plan_replacement(
+        &self,
+        old: CoordinatorId,
+        new: CoordinatorId,
+    ) -> Result<ReplacementPlan, ConsensusError> {
+        self.replacement_gates(old, new)
+    }
+
     async fn replace_voter(
         &self,
         old: CoordinatorId,
         new: CoordinatorId,
     ) -> Result<(), ConsensusError> {
-        let voters = self.voter_ids();
-
-        // ADR 0037 §6 idempotency, first: the operator (or the rollout
-        // automation) retries this verb, and "already the shape you asked
-        // for" — `new` a voter and `old` gone from membership entirely — is a
-        // plain success. Anything short of that falls through to the gates,
-        // which name the specific unmet precondition.
-        if voters.contains(&new) && !self.is_member(old) {
+        // Serialize with every other membership mutation (see
+        // `membership_change`), and re-run the full gate sequence: the plan
+        // the caller acted on predates the key transfer, so nothing from it
+        // is trusted here.
+        let _guard = self.membership_change.lock().await;
+        if self.replacement_gates(old, new)? == ReplacementPlan::Settled {
             return Ok(());
         }
-        if !self.is_member(new) {
-            return Err(ConsensusError::UnknownNode { node: new });
-        }
-        if !voters.contains(&old) {
-            return Err(ConsensusError::OldNotVoter { node: old });
-        }
-        // The same catch-up gate promotion uses; skipped when `new` is
-        // already a voter (a half-done replacement whose removal has not
-        // landed), because a voter has no learner replication entry to
-        // measure.
-        if !voters.contains(&new) {
-            self.check_promotion_lag(new)?;
-        }
 
-        let mut continuing = voters.clone();
+        let mut continuing = self.voter_ids();
         continuing.insert(new);
         continuing.remove(&old);
-        self.check_change_postconditions(&continuing, Some(new))?;
 
         // ONE joint change, per §7: promote and remove commit atomically, so
         // the voter count never overshoots and — because `new` confirmed
@@ -610,6 +710,10 @@ impl Consensus for OpenraftConsensus {
     }
 
     async fn remove_node(&self, node: CoordinatorId) -> Result<(), ConsensusError> {
+        // Serialize with every other membership mutation (see
+        // `membership_change`).
+        let _guard = self.membership_change.lock().await;
+
         // ADR 0037 §6: a node that is already absent is the state the caller
         // asked for, so a retried removal succeeds instead of erroring.
         if self.member_address(node).is_none() {
@@ -683,11 +787,78 @@ impl Consensus for OpenraftConsensus {
             .collect()
     }
 
+    async fn reap_expired_learner(
+        &self,
+        node: CoordinatorId,
+        retire: Option<Command>,
+    ) -> Result<bool, ConsensusError> {
+        // Serialize with every membership mutation, and hold the lock across
+        // the WHOLE sequence — eligibility re-check, retirement proposal, and
+        // removal. [`Consensus::expired_learners`] chose this candidate an
+        // await or two ago; if it has been promoted since (or is mid-commit
+        // behind this lock), reaping it anyway would remove a voter — the
+        // background voter reaper ADR 0037 §7 forbids — and retiring its
+        // identity would orphan a live seat. Every check therefore re-runs
+        // here, at the destructive point, under the same lock promotion
+        // commits hold.
+        let _guard = self.membership_change.lock().await;
+
+        if self.member_address(node).is_none() {
+            // Already gone (a crash between a prior reap's retirement and
+            // removal re-arrives here: the retirement stands, and the
+            // removal completes on this tick).
+        } else {
+            if self.voter_ids().contains(&node) {
+                return Ok(false);
+            }
+            let expired = self
+                .contact
+                .failed_contact_for(node, std::time::Instant::now())
+                .is_some_and(|failing| failing > self.learner_expiry);
+            if !expired {
+                return Ok(false);
+            }
+        }
+
+        // Retirement lands BEFORE the seat vanishes (ADR 0037 §7 one-seat-
+        // ever): a re-arriving installation with this identity must find the
+        // binding already marked, never a window where the seat is gone but
+        // the identity is re-admittable. The command is committed — ordered
+        // ahead of the membership change in the same log — before the
+        // removal is proposed, and a *rejected* retirement aborts the reap:
+        // the seat is never released with its identity still re-admittable.
+        if let Some(command) = retire {
+            let applied = <Self as Consensus>::propose(self, command).await?;
+            if let Err(reason) = applied.outcome {
+                tracing::warn!(
+                    node,
+                    %reason,
+                    "learner-gc reap: retiring the machine binding was rejected; leaving the \
+                     seat in place"
+                );
+                return Ok(false);
+            }
+        }
+
+        if self.member_address(node).is_some() {
+            self.raft
+                .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node])), false)
+                .await
+                .map(|_| ())
+                .map_err(map_client_write_error)?;
+        }
+        Ok(true)
+    }
+
     async fn set_node_address(
         &self,
         node: CoordinatorId,
         addr: String,
     ) -> Result<(), ConsensusError> {
+        // Serialize with every other membership mutation (see
+        // `membership_change`).
+        let _guard = self.membership_change.lock().await;
+
         // The operator-only break-glass of ADR 0037 §6. `SetNodes` is the one
         // openraft change that can split-brain when misused, which is exactly
         // why no machine credential can reach this path and why the admin
@@ -1133,11 +1304,44 @@ mod idempotency_tests {
             .add_learner(learner_id, "127.0.0.1:1".to_string())
             .await
             .expect("add_learner");
+        // Life is proven only by an acknowledgement (ADR 0037 §7): the
+        // incoming learner earns its place in the live-majority count the
+        // same way any voter does, so the fixture stages one fresh ack.
+        h.contact.note_attempt(learner_id);
+        h.contact.note_ack(learner_id);
 
         match consensus.plan_promotion(learner_id) {
             Ok(PromotionPlan::Ready { evidence_removal }) => assert_eq!(evidence_removal, None),
             other => panic!("expected a removal-free promotion plan, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_never_acknowledging_candidate_cannot_be_promoted() {
+        // The inverse of the fixture above, and the review finding it
+        // encodes: a dead learner sits at zero lag forever on an idle log, so
+        // passing the lag gate is NOT evidence of life. With no ack ever
+        // recorded — an attempt alone is this node talking, not the peer
+        // answering — the continuing set {leader, candidate} has one live
+        // member of two, no strict majority, and the plan is refused before
+        // any key could be transferred.
+        let h = single_voter(3).await;
+        let consensus = &h.consensus;
+        let node_id = h.node_id;
+        h.record_ca();
+        h.confirm_key(node_id);
+        let learner_id = node_id + 1000;
+        consensus
+            .add_learner(learner_id, "127.0.0.1:1".to_string())
+            .await
+            .expect("add_learner");
+        h.contact.note_attempt(learner_id);
+
+        let result = consensus.plan_promotion(learner_id);
+        assert!(
+            matches!(result, Err(ConsensusError::QuorumAtRisk { live: 1, .. })),
+            "an attempted-but-never-acknowledging candidate must not count as live: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1156,6 +1360,10 @@ mod idempotency_tests {
             .add_learner(learner_id, "127.0.0.1:1".to_string())
             .await
             .expect("add_learner");
+        // A live candidate (fresh ack staged), so the refusal below is
+        // attributable to custody alone.
+        h.contact.note_attempt(learner_id);
+        h.contact.note_ack(learner_id);
 
         let result = consensus.plan_promotion(learner_id);
         assert!(
@@ -1221,6 +1429,10 @@ mod idempotency_tests {
             .expect("add_learner");
         h.record_ca();
         h.confirm_key(learner_id);
+        // The continuing set is {new} alone: a strict majority of one needs
+        // the incoming learner itself live, proven by a fresh ack.
+        h.contact.note_attempt(learner_id);
+        h.contact.note_ack(learner_id);
 
         let outcome = tokio::time::timeout(
             Duration::from_millis(200),
@@ -1230,6 +1442,66 @@ mod idempotency_tests {
         if let Ok(Err(e)) = outcome {
             panic!("no local gate may refuse this replacement: {e:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn replace_voter_refuses_a_sitting_voter_as_new() {
+        // ADR 0037 §7: outside the exact idempotent no-op, `new` must be a
+        // caught-up *learner* — a sitting voter as `new` would quietly turn
+        // the call into a bare removal of `old`. `old == new` naming the one
+        // voter is the sharpest form: it is a voter (so `OldNotVoter` does
+        // not fire) and it is not the settled no-op (it is still a member),
+        // so the new-is-a-voter refusal is the one that must answer.
+        let h = single_voter(1).await;
+        let consensus = &h.consensus;
+        let node_id = h.node_id;
+        h.record_ca();
+        h.confirm_key(node_id);
+
+        let result = consensus.replace_voter(node_id, node_id).await;
+        match result {
+            Err(ConsensusError::NewAlreadyVoter { node }) => assert_eq!(node, node_id),
+            other => panic!("expected NewAlreadyVoter, got {other:?}"),
+        }
+        assert!(!ConsensusError::NewAlreadyVoter { node: node_id }.is_retryable());
+
+        // The plan-side gate answers identically, so the refusal lands
+        // before any key transfer could (ADR 0037 §4).
+        let planned = consensus.plan_replacement(node_id, node_id);
+        assert!(
+            matches!(planned, Err(ConsensusError::NewAlreadyVoter { .. })),
+            "plan_replacement must refuse the same pair: {planned:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_refuses_a_removal_whose_evidence_went_stale() {
+        // ADR 0037 §7: "a *live* predecessor never qualifies" — and the
+        // key transfer between planning and committing is exactly the window
+        // a predecessor can recover in. A commit handed a removal target
+        // that is not evidence-dead RIGHT NOW must refuse and send the
+        // caller back around the loop, whatever some earlier plan said. Here
+        // the "plan" is simulated by naming the leader's own (never
+        // evidence-dead) seat as the removal — the strongest form of stale
+        // evidence.
+        let h = single_voter(1).await;
+        let consensus = &h.consensus;
+        let node_id = h.node_id;
+        h.record_ca();
+        h.confirm_key(node_id);
+        let learner_id = node_id + 1000;
+        consensus
+            .add_learner(learner_id, "127.0.0.1:1".to_string())
+            .await
+            .expect("add_learner");
+        h.contact.note_attempt(learner_id);
+        h.contact.note_ack(learner_id);
+
+        let result = consensus.commit_promotion(learner_id, Some(node_id)).await;
+        assert!(
+            matches!(result, Err(ConsensusError::NoRemovablePeer { .. })),
+            "a removal target that is not evidence-dead at commit must be refused: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1294,5 +1566,64 @@ mod idempotency_tests {
         let h = single_voter(3).await;
         h.contact.note_attempt(h.node_id);
         assert!(h.consensus.expired_learners().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reap_never_touches_a_voter() {
+        // The review finding this guards, at the reap call itself rather
+        // than at `expired_learners`' filtering: even handed the sitting
+        // voter's own id directly — as if some caller had raced past the
+        // membership snapshot `expired_learners` took — `reap_expired_learner`
+        // re-checks "still a learner" under the membership lock and refuses,
+        // exactly the background voter reaper ADR 0037 §7 forbids.
+        let h = single_voter(3).await;
+        let voters_before = h.consensus.voter_ids();
+
+        let result = h.consensus.reap_expired_learner(h.node_id, None).await;
+        assert_eq!(
+            result.expect("reap must not error, only decline"),
+            false,
+            "a sitting voter must never be reaped by learner GC"
+        );
+
+        let voters_after = h.consensus.voter_ids();
+        assert_eq!(
+            voters_before, voters_after,
+            "membership must be unchanged after refusing to reap a voter"
+        );
+        assert!(
+            h.consensus.is_member(h.node_id),
+            "the voter must still be a member after the reap declined"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_skips_a_learner_that_is_not_expired() {
+        // The other half of the same race guard: a learner that has been
+        // ANSWERING — an attempt followed by an ack, the same evidence
+        // `expired_learners` itself requires — must not be reaped even if a
+        // caller invokes the reap directly, because it re-runs the
+        // eligibility check at the destructive point rather than trusting
+        // whatever evidence justified an earlier candidacy.
+        let h = single_voter(3).await;
+        let consensus = &h.consensus;
+        let learner_id = h.node_id + 1000;
+        consensus
+            .add_learner(learner_id, "127.0.0.1:1".to_string())
+            .await
+            .expect("add_learner");
+        h.contact.note_attempt(learner_id);
+        h.contact.note_ack(learner_id);
+
+        let result = consensus.reap_expired_learner(learner_id, None).await;
+        assert_eq!(
+            result.expect("reap must not error, only decline"),
+            false,
+            "a learner that is currently answering must not be reaped"
+        );
+        assert!(
+            consensus.is_member(learner_id),
+            "the learner must still be in membership after the reap declined"
+        );
     }
 }

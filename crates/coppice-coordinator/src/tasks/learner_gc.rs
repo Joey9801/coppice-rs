@@ -18,7 +18,12 @@
 //!   [`Consensus::expired_learners`].
 //! - **Voters are never touched.** There is no background *voter* reaper
 //!   (§7): voter membership shrinks only inside `ReplaceVoter`, an
-//!   evidence-gated promotion, or an explicit `admin remove`.
+//!   evidence-gated promotion, or an explicit `admin remove`. Because a
+//!   candidate's own convergence loop runs concurrently with this task, the
+//!   whole destructive step is delegated to
+//!   [`Consensus::reap_expired_learner`], which re-verifies
+//!   still-a-learner-and-still-expired under the same lock promotion commits
+//!   hold — a candidate that races to voter is skipped, retirement and all.
 //! - **Retire the binding, then release the seat.** Retirement is a mark, not
 //!   a delete: the one-identity↔one-seat invariant extends past the seat's
 //!   life, so a re-arriving installation carrying the retired identity is
@@ -85,62 +90,47 @@ pub async fn run<C: Consensus>(
 }
 
 /// One sweep: retire and release every learner past `learner_expiry`.
+///
+/// [`Consensus::expired_learners`] is only a candidate list; the destructive
+/// half runs entirely inside [`Consensus::reap_expired_learner`], which
+/// re-checks — under the same lock every membership mutation holds — that the
+/// candidate is *still* an expired non-voter at the moment it acts. A
+/// candidate that raced to voter in the awaits between listing and reaping is
+/// skipped with nothing proposed: its retirement never lands, its seat is
+/// never touched, and this task can never become the background voter reaper
+/// §7 forbids.
 async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews) {
     for learner in consensus.expired_learners() {
-        // The binding first (see the module doc): a retired identity is
-        // refused re-admission even if the seat removal below never lands.
         let machine = views
             .latest()
             .state()
             .machine_for_raft_node(learner)
             .copied();
-        if let Some(machine) = machine {
-            match consensus
-                .propose(Command::RetireMachineBinding(RetireMachineBinding {
-                    machine,
-                    retired_at: Timestamp::now(),
-                }))
-                .await
-            {
-                // An already-retired binding applies as a no-op, so a repeated
-                // pass (the removal below failed last time) is free.
-                Ok(applied) => {
-                    if let Err(reason) = applied.outcome {
-                        tracing::warn!(
-                            node_id = learner,
-                            %machine,
-                            %reason,
-                            "learner-gc: retiring the machine binding was rejected; leaving the \
-                             seat in place"
-                        );
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    // Lost leadership, a timeout, a shutdown: the next tick
-                    // (or the next leader) retries. Never remove the seat
-                    // without the binding retired first.
-                    tracing::debug!(
-                        node_id = learner,
-                        error = %e,
-                        "learner-gc: could not retire the machine binding; retrying next tick"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        match consensus.remove_node(learner).await {
-            Ok(()) => tracing::info!(
+        // The reap commits the retirement strictly before releasing the seat
+        // (see the module doc); an already-retired binding applies as a
+        // no-op, so a repeated pass (the removal failed last time) is free.
+        let retire = machine.map(|machine| {
+            Command::RetireMachineBinding(RetireMachineBinding {
+                machine,
+                retired_at: Timestamp::now(),
+            })
+        });
+        match consensus.reap_expired_learner(learner, retire).await {
+            Ok(true) => tracing::info!(
                 node_id = learner,
                 machine = ?machine.map(|m| m.to_string()),
-                "learner-gc: removed a learner with no successful replication contact for \
-                 longer than learner_expiry (ADR 0037 §7)"
+                "learner-gc: retired and removed a learner with no successful replication \
+                 contact for longer than learner_expiry (ADR 0037 §7)"
+            ),
+            Ok(false) => tracing::debug!(
+                node_id = learner,
+                "learner-gc: candidate was no longer an expired learner at the destructive \
+                 point (promoted, recovered, or its retirement was refused); skipped"
             ),
             Err(e) => tracing::debug!(
                 node_id = learner,
                 error = %e,
-                "learner-gc: could not remove the expired learner; retrying next tick"
+                "learner-gc: could not reap the expired learner; retrying next tick"
             ),
         }
     }

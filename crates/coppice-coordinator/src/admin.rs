@@ -32,6 +32,7 @@ use coppice_api::http::HealthVerdict;
 
 use coppice_consensus::{
     ClusterSummary, Consensus, ConsensusError, CoordinatorId, NodeHandle, PromotionPlan,
+    ReplacementPlan,
 };
 use coppice_core::id::{EnrollTokenId, MachineId, NodeId};
 use coppice_core::time::{Duration as CoreDuration, Timestamp};
@@ -147,6 +148,12 @@ pub const IDENTITY_RETIRED: &str = "identity-retired";
 /// majority of the voter set it would leave behind (ADR 0037 §7's second
 /// postcondition). Retryable: contact may recover.
 pub const QUORUM_AT_RISK: &str = "quorum-at-risk";
+
+/// `ReplaceVoter` named a `new_node_id` that is already a voter, outside the
+/// exact idempotent no-op (`new` a voter AND `old` absent) (ADR 0037 §6/§7).
+/// Terminal: the verb promotes a caught-up learner, and accepting a sitting
+/// voter would quietly turn the call into a bare removal of `old`.
+pub const NEW_ALREADY_VOTER: &str = "new-already-voter";
 
 /// `PromoteVoter` refused because the learner is still catching up
 /// (`LearnerNotCaughtUp`). Retryable by polling: the human tail keeps the
@@ -755,25 +762,29 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         let (consensus, handle) = self.formed()?;
         Self::check_cluster(&req.history_id, &handle)?;
 
-        // The §6 idempotency short-circuit lives in the seam, which owns the
-        // membership view; a settled replacement returns success from there
-        // without transferring anything. Everything else needs the key first,
-        // so the transfer runs before the change — and is itself idempotent,
-        // skipping instantly when the candidate already confirmed receipt.
-        let settled = {
-            let summary = handle.cluster_summary();
-            let new_is_voter = summary
-                .members
-                .iter()
-                .any(|m| m.id == req.new_node_id && m.voter);
-            let old_gone = !summary.members.iter().any(|m| m.id == req.old_node_id);
-            new_is_voter && old_gone
-        };
-        if !settled {
-            self.ensure_key_transferred(&consensus, &handle, req.new_node_id)
-                .await?;
+        // Plan first, key second, commit third — the same §4 ordering as
+        // promotion, and for the same reason: the key transfer grants
+        // root-equivalent custody, so every gate (old a sitting voter, new a
+        // caught-up learner, the postconditions) must pass BEFORE the key
+        // leaves this leader's disk. A lagging `new`, or a mistyped `old`,
+        // is refused here with nothing transferred and nothing confirmed —
+        // it never appears in the custody accounting.
+        match consensus
+            .plan_replacement(req.old_node_id, req.new_node_id)
+            .map_err(consensus_error_to_status)?
+        {
+            // The §6 idempotent no-op: already the shape the caller asked
+            // for, nothing to key.
+            ReplacementPlan::Settled => return Ok(Response::new(pb::ReplaceVoterResponse {})),
+            ReplacementPlan::Ready => {}
         }
 
+        self.ensure_key_transferred(&consensus, &handle, req.new_node_id)
+            .await?;
+
+        // The seam re-runs the full gate sequence under its membership lock:
+        // the plan above predates the transfer, and nothing from it is
+        // trusted at commit.
         consensus
             .replace_voter(req.old_node_id, req.new_node_id)
             .await
@@ -792,8 +803,11 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
     /// This is the *only* path by which the key reaches a disk other than the
     /// forming voter's, and it is why every disk that has ever run this
     /// handler is accounted root-equivalent. The channel is the mutually
-    /// authenticated admin listener, so the caller is already a coordinator
-    /// machine (the leader dials with its own machine leaf) or an operator.
+    /// authenticated admin listener, and the accepted caller is exactly one
+    /// party: the machine identity bound to the raft seat this recipient
+    /// currently observes as leader — the one party whose transfer is
+    /// followed by the replicated possession fact, so no accepted transfer
+    /// can leave a holder the custody accounting cannot see.
     ///
     /// The received key is checked against the CA certificate **this node
     /// already replicates** before anything is written: a push that does not
@@ -812,6 +826,49 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         let req = request.into_inner();
         let (consensus, handle) = self.formed()?;
         Self::check_cluster(&req.history_id, &handle)?;
+
+        // The transfer protocol is leader → candidate, and nothing else
+        // (ADR 0037 §4): the leader is the one party whose transfer is
+        // followed by the replicated possession fact, so a key accepted from
+        // anyone else would put custody on this disk *without an entry in
+        // the accounting* — a root-equivalent holder `key_holders` cannot
+        // see. The caller must therefore be a machine whose bound raft seat
+        // is the leader this recipient currently observes; operator
+        // certificates are refused outright (an operator with a legitimate
+        // need for key placement has the leader drive it via promotion or
+        // replacement).
+        let Caller::Machine(machine) = &caller else {
+            return Err(Status::permission_denied(format!(
+                "{NOT_AUTHORIZED}: {} may not push the cluster CA key; the transfer protocol \
+                 is leader-to-candidate only (ADR 0037 §4)",
+                caller.describe()
+            )));
+        };
+        let bound = consensus
+            .views()
+            .latest()
+            .state()
+            .machine_bindings
+            .get(machine)
+            .map(|b| b.raft_node_id);
+        let leader = handle.cluster_summary().leader;
+        match (bound, leader) {
+            (Some(node), Some(leader)) if node == leader => {}
+            (_, None) => {
+                return Err(Status::failed_precondition(
+                    "this replica does not currently know a leader, so it cannot verify the \
+                     key transfer came from one — retry (ADR 0037 §4)",
+                ));
+            }
+            (bound, Some(leader)) => {
+                return Err(Status::permission_denied(format!(
+                    "{NOT_AUTHORIZED}: {} is bound to {} but the leader this replica observes \
+                     is node {leader}; only the leader transfers the CA key (ADR 0037 §4)",
+                    caller.describe(),
+                    bound.map_or_else(|| "no seat".to_string(), |n| format!("node {n}")),
+                )));
+            }
+        }
 
         // The CA certificate this node has *applied*. A candidate keyed the
         // instant it passed the lag gate may still be applying the log its
@@ -1906,6 +1963,16 @@ pub(crate) fn consensus_error_to_status(err: ConsensusError) -> Status {
         ConsensusError::OldNotVoter { node } => Status::not_found(format!(
             "{UNKNOWN_NODE}: node {node} is not a voter, so it cannot be replaced; \
              `replace-voter` swaps a voter for a caught-up learner (ADR 0037 §7)"
+        )),
+        // The mirror-image caller error: outside the exact idempotent no-op,
+        // a sitting voter is never a valid `new_node_id` — accepting one
+        // would quietly turn ReplaceVoter into a bare removal of `old`, a
+        // shrink path §7 does not grant the verb. Same terminal class and
+        // marker treatment as `OldNotVoter`: a wrong node id.
+        ConsensusError::NewAlreadyVoter { node } => Status::failed_precondition(format!(
+            "{NEW_ALREADY_VOTER}: node {node} is already a voter, so it cannot be the incoming \
+             half of a replacement; `replace-voter` swaps a voter for a caught-up learner \
+             (ADR 0037 §7)"
         )),
         ConsensusError::MembershipInProgress => Status::aborted(
             "a membership change is already in progress; only one may be outstanding (ADR 0016)",

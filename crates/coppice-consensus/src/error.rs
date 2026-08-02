@@ -120,6 +120,18 @@ pub enum ConsensusError {
     #[error("node {node} is not a voter, so it cannot be replaced (ADR 0037 §7)")]
     OldNotVoter { node: CoordinatorId },
 
+    /// `ReplaceVoter` named a `new_node_id` that is already a voter, outside
+    /// the exact idempotent state (`new` a voter AND `old` gone) that is a
+    /// no-op success (ADR 0037 §6/§7). Terminal: the verb promotes a
+    /// caught-up *learner*; accepting a sitting voter as `new` would quietly
+    /// turn the call into a bare removal of `old` — a shrink path §7 does
+    /// not grant this verb.
+    #[error(
+        "node {node} is already a voter, so it cannot be the incoming half of a replacement \
+         (ADR 0037 §7); a replacement's new_node_id names a caught-up learner"
+    )]
+    NewAlreadyVoter { node: CoordinatorId },
+
     /// This handle's consensus node is shutting down; the operation will not
     /// complete and retrying against this handle will not help.
     #[error("consensus is shutting down")]
@@ -144,8 +156,10 @@ impl ConsensusError {
     /// [`UnknownNode`](ConsensusError::UnknownNode) /
     /// [`AddressConflict`](ConsensusError::AddressConflict) /
     /// [`NoKeyHolder`](ConsensusError::NoKeyHolder) /
-    /// [`OldNotVoter`](ConsensusError::OldNotVoter) are terminal-not-fatal
-    /// caller or repair conditions no amount of waiting fixes.
+    /// [`OldNotVoter`](ConsensusError::OldNotVoter) /
+    /// [`NewAlreadyVoter`](ConsensusError::NewAlreadyVoter) are
+    /// terminal-not-fatal caller or repair conditions no amount of waiting
+    /// fixes.
     /// [`NoRemovablePeer`](ConsensusError::NoRemovablePeer) joins the
     /// retryable set for the same reason `VoterSetFull` does (ADR 0037 §7).
     pub fn is_retryable(&self) -> bool {
