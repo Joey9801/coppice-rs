@@ -1486,6 +1486,14 @@ impl Consensus for SharedConsensus {
         self.0.commit_promotion(promote, remove)
     }
 
+    fn plan_replacement(
+        &self,
+        old: CoordinatorId,
+        new: CoordinatorId,
+    ) -> Result<coppice_consensus::ReplacementPlan, ConsensusError> {
+        self.0.plan_replacement(old, new)
+    }
+
     fn replace_voter(
         &self,
         old: CoordinatorId,
@@ -1500,6 +1508,14 @@ impl Consensus for SharedConsensus {
 
     fn expired_learners(&self) -> Vec<CoordinatorId> {
         self.0.expired_learners()
+    }
+
+    fn reap_expired_learner(
+        &self,
+        node: CoordinatorId,
+        retire: Option<Command>,
+    ) -> impl Future<Output = Result<bool, ConsensusError>> + Send {
+        self.0.reap_expired_learner(node, retire)
     }
 
     fn remove_node(

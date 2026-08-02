@@ -120,23 +120,27 @@ impl ContactTracker {
 
     /// Whether `peer` has proven reachable within `staleness_bound` — the
     /// "live majority from the leader's vantage" postcondition (ADR 0037 §7).
-    /// An unattempted peer is not live: unlike [`Self::failed_contact_for`]'s
-    /// reachable-until-proven default for removal, a liveness check that
-    /// counted "never tried" as live could inflate the leader's own quorum
-    /// view.
+    ///
+    /// Life is proven **only by a successful acknowledgement**: an attempt is
+    /// this node talking, not the peer answering, and a fresh epoch's
+    /// `epoch_start` is merely when we started asking. Counting either would
+    /// let a dead-but-recently-attempted peer inflate the leader's quorum
+    /// view for a window — exactly the inflation the postcondition exists to
+    /// prevent. The asymmetry with [`Self::failed_contact_for`] is
+    /// deliberate: *removal* evidence errs toward "reachable until proven
+    /// otherwise" (measuring failure from `epoch_start`), while *liveness*
+    /// errs toward "dead until it answers".
     pub fn is_live(&self, peer: CoordinatorId, staleness_bound: Duration) -> bool {
         self.is_live_at(peer, staleness_bound, Instant::now())
     }
 
     fn is_live_at(&self, peer: CoordinatorId, staleness_bound: Duration, now: Instant) -> bool {
         let peers = self.peers.lock().expect("contact tracker poisoned");
-        match peers.get(&peer) {
-            Some(state) => {
-                let last_seen = state.last_ack.unwrap_or(state.epoch_start);
-                now.saturating_duration_since(last_seen) < staleness_bound
-            }
-            None => false,
-        }
+        peers.get(&peer).is_some_and(|state| {
+            state
+                .last_ack
+                .is_some_and(|ack| now.saturating_duration_since(ack) < staleness_bound)
+        })
     }
 
     fn note_attempt_at(&self, peer: CoordinatorId, now: Instant) {

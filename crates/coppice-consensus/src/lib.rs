@@ -37,7 +37,7 @@ pub mod storage;
 mod view;
 
 pub use adapter::{
-    ApplyRequest, ApplyResult, OpenraftConsensus, PromotionPlan, TypeConfig,
+    ApplyRequest, ApplyResult, OpenraftConsensus, PromotionPlan, ReplacementPlan, TypeConfig,
     APPLY_CHANNEL_CAPACITY, LIVE_CONTACT_STALENESS, MAX_INFLIGHT_PROPOSALS, PROMOTION_LAG_MAX,
 };
 pub use contact::ContactTracker;
@@ -194,13 +194,31 @@ pub trait Consensus: Send + Sync + 'static {
         remove: Option<CoordinatorId>,
     ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
 
+    /// Decide whether a replacement may proceed — **without changing
+    /// anything** (ADR 0037 §6/§7).
+    ///
+    /// The same plan/commit split, for the same §4 reason, as
+    /// [`plan_promotion`](Consensus::plan_promotion): the key transfer that
+    /// sits between planning and [`replace_voter`](Consensus::replace_voter)
+    /// grants root-equivalent custody, so every gate — `old` a sitting
+    /// voter, `new` a caught-up learner, the postconditions — must pass
+    /// before the key leaves the leader's disk. A `new` refused here is
+    /// never keyed and never enters the custody accounting.
+    fn plan_replacement(
+        &self,
+        old: CoordinatorId,
+        new: CoordinatorId,
+    ) -> Result<ReplacementPlan, ConsensusError>;
+
     /// Replace one voter with another in a single joint change (ADR 0037 §7).
     ///
     /// The operator-authenticated launch-before-terminate path: `old` may be
     /// perfectly alive — that is the point — and `new` must be a caught-up
     /// learner that has already confirmed durable key receipt (§4), which the
-    /// caller arranges before calling. Idempotent per §6: `new` already a
-    /// voter with `old` gone is a no-op success.
+    /// caller arranges — after a [`plan_replacement`](Consensus::plan_replacement)
+    /// pass — before calling. The full gate sequence is re-run here under the
+    /// membership lock rather than trusted from the plan. Idempotent per §6:
+    /// `new` already a voter with `old` gone is a no-op success.
     fn replace_voter(
         &self,
         old: CoordinatorId,
@@ -233,6 +251,26 @@ pub trait Consensus: Send + Sync + 'static {
     /// background voter reaper (§7). Empty off the leader, where there is no
     /// contact evidence to testify with.
     fn expired_learners(&self) -> Vec<CoordinatorId>;
+
+    /// Retire and remove one expired learner — the destructive half of
+    /// learner GC (ADR 0037 §7), as a single serialized decision.
+    ///
+    /// [`expired_learners`](Consensus::expired_learners) is only a candidate
+    /// list: by the time the GC task acts on it, the candidate may have been
+    /// promoted (its convergence loop runs concurrently), and removing it
+    /// then would be the background voter reaper §7 forbids. This method
+    /// therefore re-checks — under the same lock every membership mutation
+    /// holds — that `node` is *still* a non-voter member *still* past
+    /// `learner_expiry` at the destructive point; anything else returns
+    /// `Ok(false)` with nothing proposed, and in particular `retire` (the
+    /// caller-built `RetireMachineBinding` for the learner's identity) never
+    /// lands for a target that raced to voter. On success the retirement is
+    /// committed strictly before the seat is removed (§7 one-seat-ever).
+    fn reap_expired_learner(
+        &self,
+        node: CoordinatorId,
+        retire: Option<Command>,
+    ) -> impl Future<Output = Result<bool, ConsensusError>> + Send;
 
     /// Repoint an existing member's dial address (ADR 0037 §6, operator-only
     /// break-glass). There is no self-service address repair: the admin

@@ -358,6 +358,83 @@ async fn an_agent_certificate_holds_none_of_the_membership_surface() {
     daemon.stop().await.expect("daemon stops cleanly");
 }
 
+/// The CA-key transfer protocol is leader-to-candidate only (ADR 0037 §4):
+/// neither an operator credential — however broad its other grants — nor a
+/// machine credential whose bound seat is not the leader the recipient
+/// currently observes may push a key. Both refusals are permission-denied
+/// with the `not-authorized` marker, but — unlike the matrix's `deny` path —
+/// neither message names the verb (the handler's own bespoke phrasing), so
+/// this asserts marker and code directly rather than via `assert_denied`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfer_ca_key_is_refused_for_an_operator_and_a_caller_not_bound_to_the_leader() {
+    init_tracing();
+    let ca = Ca::new();
+    let formed = formed_single_voter(&ca).await;
+    let hid = formed.history_id.clone();
+
+    // (a) An operator certificate: the transfer protocol is
+    // coordinator-to-coordinator only, so an operator with a legitimate need
+    // to key a candidate must drive it via promotion or replacement instead
+    // (ADR 0037 §4) — not by pushing a key itself.
+    let mut operator = operator_client(&formed.daemon, &formed.operator).await;
+    let status = refusal(
+        operator
+            .transfer_ca_key(pb::TransferCaKeyRequest {
+                history_id: hid.clone(),
+                ca_key_pem: b"not a key".to_vec(),
+            })
+            .await,
+        "TransferCaKey from an operator",
+    );
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "TransferCaKey from an operator: expected permission_denied, got ({:?}) {:?}",
+        status.code(),
+        status.message()
+    );
+    assert_marker(&status, NOT_AUTHORIZED, "TransferCaKey from an operator");
+
+    // (b) A machine certificate whose bound raft seat is not the leader this
+    // recipient observes. The fixture is a single-voter cluster, so the one
+    // seat that exists is bound to the leader itself — there is no *other*
+    // seat to bind a caller to and still land in this arm. A machine
+    // identity the cluster has never bound to any seat exercises the same
+    // check the leader-binding gate runs (`bound != Some(leader)`): its
+    // bound node is `None`, which is not `Some(formed.seat)`, the leader
+    // this single-voter recipient observes.
+    let signer = cluster_signer(&formed.daemon);
+    let (ca_pem, _, _) = formed.daemon.tls_material();
+    let stranger = pki::mint_machine_identity();
+    let (cert, key) =
+        pki::mint_coordinator_local(&signer, &stranger, &[]).expect("mint a machine leaf");
+    let mut stranger_client = dial(&formed.daemon, &ca_pem, &cert, &key).await;
+    let status = refusal(
+        stranger_client
+            .transfer_ca_key(pb::TransferCaKeyRequest {
+                history_id: hid,
+                ca_key_pem: b"not a key".to_vec(),
+            })
+            .await,
+        "TransferCaKey from a machine not bound to the leader",
+    );
+    assert_eq!(
+        status.code(),
+        Code::PermissionDenied,
+        "TransferCaKey from an unbound machine: expected permission_denied, got ({:?}) {:?}",
+        status.code(),
+        status.message()
+    );
+    assert_marker(
+        &status,
+        NOT_AUTHORIZED,
+        "TransferCaKey from a machine not bound to the leader",
+    );
+
+    let mut daemon = formed.daemon;
+    daemon.stop().await.expect("daemon stops cleanly");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_machine_certificate_gets_exactly_the_self_scope_grant() {
     init_tracing();

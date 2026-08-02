@@ -93,6 +93,40 @@ async fn leader_admin_client(fleet: &Fleet, operator: &OperatorPem, hid: [u8; 16
     }
 }
 
+/// Ask the current leader to promote `learner_id` and return its refusal.
+///
+/// Leadership can move between [`leader_admin_client`]'s resolution and the
+/// call itself (observed in CI), in which case the answer is the server's
+/// stale-leader redirect rather than a verdict; that one transient is
+/// re-resolved and retried, and every other outcome — success included —
+/// is returned to the caller's assertions untouched.
+async fn promote_refusal(
+    fleet: &Fleet,
+    operator: &OperatorPem,
+    hid: [u8; 16],
+    learner_id: u64,
+) -> tonic::Status {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut leader = leader_admin_client(fleet, operator, hid).await;
+        let status = leader
+            .promote_voter(pb::PromoteVoterRequest {
+                history_id: hid.to_vec(),
+                promote_node_id: learner_id,
+            })
+            .await
+            .expect_err("promotion must be refused: the voter set is full and live");
+        if !status.message().contains("not the leader") {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never reached the actual leader: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// The voter node ids a `/readyz` body reports.
 fn voter_ids(body: &serde_json::Value) -> BTreeSet<u64> {
     body["voters"]
@@ -239,14 +273,7 @@ async fn a_live_predecessor_never_qualifies_as_evidence_dead() {
     let hid = history_id_of(&fleet.members[0]).await;
     let learner_id = node_id(&learner_body);
     for _ in 0..2 {
-        let mut leader = leader_admin_client(&fleet, &operator, hid).await;
-        let status = leader
-            .promote_voter(pb::PromoteVoterRequest {
-                history_id: hid.to_vec(),
-                promote_node_id: learner_id,
-            })
-            .await
-            .expect_err("promotion must be refused: three live voters, no dead candidate");
+        let status = promote_refusal(&fleet, &operator, hid, learner_id).await;
         assert!(
             has_marker(status.message(), NO_REMOVABLE_PEER),
             "expected the {NO_REMOVABLE_PEER:?} marker, got {:?}",
@@ -281,14 +308,7 @@ async fn an_overfull_voter_set_with_no_dead_candidate_refuses_promotion_machine_
     // voters alive, the marker asserted directly against the leader.
     tokio::time::sleep(Duration::from_secs(6)).await;
     {
-        let mut leader = leader_admin_client(&fleet, &operator, hid).await;
-        let status = leader
-            .promote_voter(pb::PromoteVoterRequest {
-                history_id: hid.to_vec(),
-                promote_node_id: learner_id,
-            })
-            .await
-            .expect_err("promotion must be refused while the voter set is full and live");
+        let status = promote_refusal(&fleet, &operator, hid, learner_id).await;
         assert_eq!(
             status.code(),
             tonic::Code::FailedPrecondition,
