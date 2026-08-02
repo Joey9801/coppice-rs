@@ -32,7 +32,7 @@ mod stats;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use bollard::models::{ContainerStateStatusEnum, ContainerUpdateBody};
+use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, ContainerUpdateBody};
 use bollard::query_parameters::ListContainersOptionsBuilder;
 use bollard::Docker;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
@@ -763,6 +763,15 @@ pub(crate) async fn update_fractional_containers(
                 tracing::debug!(%allocation, "fractional container vanished during cpuset update");
                 continue;
             }
+            // The same race with the container still present: the daemon
+            // refuses cpuset updates to a stopped container (a 500, so the
+            // status alone can't identify it). Re-inspect rather than match
+            // the message: exited-and-present is as benign as vanished — the
+            // exit reaches the session through normal reconciliation.
+            if container_is_inactive(docker, &container_name(allocation)).await {
+                tracing::debug!(%allocation, "fractional container exited during cpuset update");
+                continue;
+            }
             errors.push(format!("updating fractional container {allocation}: {err}"));
         }
     }
@@ -770,6 +779,44 @@ pub(crate) async fn update_fractional_containers(
         return Err(errors.join("; "));
     }
     Ok(())
+}
+
+/// Whether `target` is missing or in a state that no longer runs on any CPU.
+async fn container_is_inactive(docker: &Docker, target: &str) -> bool {
+    inactive_verdict(
+        docker
+            .inspect_container(
+                target,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await,
+    )
+}
+
+/// The pure verdict behind [`container_is_inactive`]: gone (404) or present in
+/// a non-active state. Inspect errors other than 404 answer `false` — without
+/// evidence the container is truly done, the caller must keep treating its
+/// update failure as real.
+fn inactive_verdict(inspect: Result<ContainerInspectResponse, bollard::errors::Error>) -> bool {
+    match inspect {
+        Ok(inspect) => !inspect
+            .state
+            .as_ref()
+            .and_then(|state| state.status)
+            .is_some_and(is_active_status),
+        Err(err) => api::status_code(&err) == Some(404),
+    }
+}
+
+/// The states in which a container occupies its cpuset: running, or one of the
+/// held/transitional states adoption also treats as running (§3).
+fn is_active_status(status: ContainerStateStatusEnum) -> bool {
+    matches!(
+        status,
+        ContainerStateStatusEnum::RUNNING
+            | ContainerStateStatusEnum::PAUSED
+            | ContainerStateStatusEnum::RESTARTING
+    )
 }
 
 async fn recover_cpu_allocations(
@@ -817,14 +864,7 @@ async fn recover_cpu_allocations(
             .state
             .as_ref()
             .and_then(|state| state.status)
-            .is_some_and(|status| {
-                matches!(
-                    status,
-                    ContainerStateStatusEnum::RUNNING
-                        | ContainerStateStatusEnum::PAUSED
-                        | ContainerStateStatusEnum::RESTARTING
-                )
-            });
+            .is_some_and(is_active_status);
         if !running {
             continue;
         }
@@ -1155,6 +1195,60 @@ mod tests {
         labels.insert(LABEL_JOB.to_string(), "nope".to_string());
         assert!(parse_container_ids(Some(&labels)).is_none());
         assert!(parse_container_ids(None).is_none());
+    }
+
+    // ---- fractional cpuset-update tolerance (§6.3) --------------------------
+
+    fn inspect_with_status(status: ContainerStateStatusEnum) -> ContainerInspectResponse {
+        ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                status: Some(status),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn server_error(status_code: u16) -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message: "test".to_string(),
+        }
+    }
+
+    /// The exact CI-observed race: the container exited between the daemon
+    /// listing/inspecting it as running and the cpuset update landing, so the
+    /// update was refused ("cannot update a stopped container") with the
+    /// container still present. Exited-but-present must be as benign as gone.
+    #[test]
+    fn exited_or_vanished_containers_are_inactive() {
+        use ContainerStateStatusEnum as S;
+        for status in [S::EXITED, S::DEAD, S::CREATED, S::REMOVING, S::EMPTY] {
+            assert!(
+                inactive_verdict(Ok(inspect_with_status(status))),
+                "{status}"
+            );
+        }
+        // No state at all: nothing left to occupy a cpuset.
+        assert!(inactive_verdict(Ok(ContainerInspectResponse::default())));
+        assert!(inactive_verdict(Err(server_error(404))));
+    }
+
+    /// An active container, or an inspect that answers nothing, must keep the
+    /// original update failure fatal.
+    #[test]
+    fn active_or_unknown_containers_keep_the_update_error() {
+        use ContainerStateStatusEnum as S;
+        for status in [S::RUNNING, S::PAUSED, S::RESTARTING] {
+            assert!(
+                !inactive_verdict(Ok(inspect_with_status(status))),
+                "{status}"
+            );
+        }
+        assert!(!inactive_verdict(Err(server_error(500))));
+        assert!(!inactive_verdict(Err(
+            bollard::errors::Error::RequestTimeoutError
+        )));
     }
 
     // ---- CollectorSlot state machine (docker-executor.md §8.1/§8.2) ---------
