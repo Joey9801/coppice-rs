@@ -126,12 +126,59 @@ async fn get_entries<F: Fs, RB: RangeBounds<u64> + Debug>(
         .collect()
 }
 
+// The `Err` variant size again; see `get_entries`.
+#[allow(clippy::result_large_err)]
+async fn limited_get<F: Fs>(
+    core: &Arc<Mutex<StorageCore<F>>>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<CoordinatorId>> {
+    // A range that dips below the purge floor asks for entries purged out
+    // from under the reader — a replication task racing a post-snapshot purge
+    // (observed: a killed voter's replication session reading just as the
+    // floor advanced). This override answers EMPTY instead of
+    // `try_get_log_entries`'s suffix: `limited_get_log_entries` feeds
+    // AppendEntries directly, where entries must follow `prev_log_id`
+    // contiguously — a suffix starting past the requested start would ride
+    // after the wrong `prev`. The empty answer is the tolerated soft signal:
+    // openraft ≥ 0.9.25 treats it as a heartbeat, logs the contract warning,
+    // and re-plans, switching that follower to snapshot replication once it
+    // sees the purged frontier. (`try_get_log_entries` keeps the suffix
+    // behavior — openraft's storage compliance suite mandates it there, and
+    // its callers bound their ranges by `last_purged` themselves.) Floor
+    // check and read happen under one core lock so the floor cannot advance
+    // between them.
+    blocking(core, move |core| {
+        let (purged, _) = core.log_state();
+        if purged.is_some_and(|p| start <= p.index) {
+            return Ok(Vec::new());
+        }
+        core.read_payloads(start, end)
+    })
+    .await
+    .map_err(|e| read_err(&e))?
+    .iter()
+    .map(|(index, bytes)| {
+        raftpb::entry_from_bytes(std::path::Path::new("log"), *index, bytes)
+            .map_err(|e| read_err(&e))
+    })
+    .collect()
+}
+
 impl<F: Fs> RaftLogReader<TypeConfig> for SegmentLogStorage<F> {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<CoordinatorId>> {
         get_entries(&self.core, range).await
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<CoordinatorId>> {
+        limited_get(&self.core, start, end).await
     }
 }
 
@@ -141,6 +188,14 @@ impl<F: Fs> RaftLogReader<TypeConfig> for SegmentLogReader<F> {
         range: RB,
     ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<CoordinatorId>> {
         get_entries(&self.core, range).await
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<CoordinatorId>> {
+        limited_get(&self.core, start, end).await
     }
 }
 
@@ -282,5 +337,104 @@ impl<F: Fs> RaftLogStorage<TypeConfig> for SegmentLogStorage<F> {
         blocking(&self.core, move |core| core.purge(upto))
             .await
             .map_err(|e| storage_err(&e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openraft::testing::log_id;
+    use openraft::{CommittedLeaderId, EntryPayload};
+
+    use super::*;
+    use crate::fs::RealFs;
+    use crate::storage::StorageOptions;
+
+    /// Build a core holding blank entries `1..=count` at term 1.
+    fn core_with_entries(
+        dir: &tempfile::TempDir,
+        count: u64,
+    ) -> (Arc<Mutex<StorageCore<RealFs>>>, CoordinatorId) {
+        let options = StorageOptions::new(*b"purged-read-test");
+        let node_id: CoordinatorId = 1;
+        StorageCore::init(
+            &RealFs::new(dir.path()),
+            &options,
+            node_id,
+            [7u8; 16],
+            crate::storage::FormationMarks::default(),
+        )
+        .expect("init data dir");
+        let core = StorageCore::open(RealFs::new(dir.path()), options).expect("open fresh core");
+        let core = Arc::new(Mutex::new(core));
+        {
+            let mut locked = core.lock().expect("storage engine poisoned");
+            let entries: Vec<EncodedEntry> = (1..=count)
+                .map(|index| {
+                    let entry = openraft::Entry::<TypeConfig> {
+                        log_id: LogId::new(CommittedLeaderId::new(1, node_id), index),
+                        payload: EntryPayload::Blank,
+                    };
+                    EncodedEntry {
+                        id: crate::storage::FrameLogId {
+                            index,
+                            term: 1,
+                            node_id,
+                        },
+                        payload: raftpb::entry_to_bytes(&entry),
+                    }
+                })
+                .collect();
+            locked.append_batch(&entries).expect("append entries");
+        }
+        (core, node_id)
+    }
+
+    /// The two read contracts around the purge floor, side by side:
+    ///
+    /// - `try_get_log_entries` returns the surviving SUFFIX for a range that
+    ///   dips below the floor — openraft's storage compliance suite mandates
+    ///   it, and its callers bound their own ranges by `last_purged`.
+    /// - `limited_get_log_entries` — the replication read that feeds
+    ///   AppendEntries directly, where a suffix would ride after the wrong
+    ///   `prev_log_id` — answers EMPTY instead, the soft signal openraft
+    ///   ≥ 0.9.25 handles as a heartbeat before re-planning (the panic this
+    ///   guards against was observed live: a killed voter's replication
+    ///   session racing a post-snapshot purge).
+    #[tokio::test]
+    async fn reads_below_the_purge_floor_suffix_for_try_get_empty_for_limited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (core, node_id) = core_with_entries(&dir, 10);
+
+        // Control, pre-purge: both paths serve the full range.
+        let all = get_entries(&core, 1..11).await.expect("read all");
+        assert_eq!(all.len(), 10);
+        let all = limited_get(&core, 1, 11).await.expect("limited read all");
+        assert_eq!(all.len(), 10);
+
+        core.lock()
+            .expect("storage engine poisoned")
+            .purge(raftpb::log_id_to_pb(&log_id::<CoordinatorId>(
+                1, node_id, 5,
+            )))
+            .expect("purge upto 5");
+
+        // try_get: the compliance-mandated suffix (entries 6..8 of 3..8).
+        let suffix = get_entries(&core, 3..8).await.expect("try_get read");
+        assert_eq!(suffix.first().map(|e| e.log_id.index), Some(6));
+        assert_eq!(suffix.len(), 2);
+
+        // limited_get: empty, never that suffix.
+        let raced = limited_get(&core, 3, 8).await.expect("limited read");
+        assert!(
+            raced.is_empty(),
+            "a limited read below the purge floor must be empty, got {} entries starting at {:?}",
+            raced.len(),
+            raced.first().map(|e| e.log_id.index)
+        );
+
+        // Entirely above the floor: both paths serve.
+        let live = limited_get(&core, 6, 9).await.expect("live limited read");
+        assert_eq!(live.len(), 3);
+        assert_eq!(live.first().map(|e| e.log_id.index), Some(6));
     }
 }
