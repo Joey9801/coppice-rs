@@ -351,11 +351,16 @@ enum JoinStep {
     Promoted,
     /// Admitted (or already) a learner, still catching up — keep polling.
     Learner,
-    /// The voter set is full (ADR 0037 §7). Deliberately *not* terminal: this
-    /// replica stays a caught-up learner and keeps polling, because it is
-    /// then either the `new_node_id` of a pending `ReplaceVoter` or waiting on
-    /// the evidence-gated removal of a dead predecessor.
-    VoterSetFull,
+    /// The voter set is full, or the leader could not fold in a removal
+    /// (`no-removable-peer`, `quorum-at-risk`) (ADR 0037 §7). Deliberately
+    /// *not* terminal: this replica stays a caught-up learner and keeps
+    /// polling, because it is then either the `new_node_id` of a pending
+    /// `ReplaceVoter` or waiting on the evidence-gated removal of a dead
+    /// predecessor. The server's machine-readable reason is carried so §7's
+    /// "visible in status output" holds — an operator reading `/readyz` can
+    /// tell a routine full set from a promotion the leader refused because
+    /// no dead peer qualified.
+    VoterSetFull(String),
     /// A retryable failure — not the leader, an election in flight, an
     /// unreachable dial. Re-probe and try again.
     Retry,
@@ -424,15 +429,27 @@ impl Convergence {
                     node_id = summary.local_id,
                     "convergence: promoted to voter; this replica has converged (ADR 0037 §6)"
                 );
+                // A converged voter has nothing pending; leaving a stale
+                // refusal or hold in `/readyz` would read as a live problem.
+                self.phase.clear_admission_refusal();
+                self.phase.clear_promotion_hold();
                 SETTLED_INTERVAL
             }
             JoinStep::Learner => PROBE_INTERVAL,
-            JoinStep::VoterSetFull => {
+            JoinStep::VoterSetFull(message) => {
                 tracing::debug!(
                     node_id = summary.local_id,
-                    "convergence: voter set is full; remaining a caught-up learner and \
-                     continuing to poll (ADR 0037 §7)"
+                    hold = %message,
+                    "convergence: no voter seat is available; remaining a caught-up learner \
+                     and continuing to poll (ADR 0037 §7)"
                 );
+                // §7: "promotion is refused with a machine-readable reason —
+                // the learner keeps polling and the situation is visible in
+                // status output". The reason lands in `/readyz
+                // promotion_hold` — deliberately NOT `last_admission_refusal`,
+                // which stays reserved for operator-actionable refusals —
+                // without changing the polling cadence.
+                self.phase.record_promotion_hold(message);
                 SETTLED_INTERVAL
             }
             JoinStep::Retry => PROBE_INTERVAL,
@@ -762,7 +779,7 @@ fn classify(status: &tonic::Status) -> JoinStep {
     .iter()
     .any(|marker| admin::has_marker(message, marker))
     {
-        return JoinStep::VoterSetFull;
+        return JoinStep::VoterSetFull(message.to_string());
     }
     if [
         admin::MACHINE_IDENTITY_CONFLICT,
@@ -827,7 +844,7 @@ mod tests {
             voters: 3,
             cluster_size: 3,
         });
-        assert!(matches!(classify(&status), JoinStep::VoterSetFull));
+        assert!(matches!(classify(&status), JoinStep::VoterSetFull(_)));
     }
 
     #[test]
@@ -879,7 +896,7 @@ mod tests {
             }),
         ] {
             assert!(
-                matches!(classify(&status), JoinStep::VoterSetFull),
+                matches!(classify(&status), JoinStep::VoterSetFull(_)),
                 "must keep polling: {}",
                 status.message()
             );

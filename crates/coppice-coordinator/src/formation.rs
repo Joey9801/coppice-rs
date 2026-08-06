@@ -109,6 +109,11 @@ pub(crate) struct PhaseState {
     /// `/readyz` because §9 makes status — not logs — the place an operator
     /// finds out that this node will never be admitted.
     last_admission_refusal: RwLock<Option<String>>,
+    /// Why promotion is currently held while this replica waits as a
+    /// caught-up learner (ADR 0037 §7): full voter set, no evidence-dead
+    /// peer, quorum at risk. A *hold*, not a refusal — see the field of the
+    /// same name on `ReadyzReport` for why the two are kept apart.
+    promotion_hold: RwLock<Option<String>>,
     /// The sampler-maintained redundancy verdict and its stability window.
     /// Written only by the background sampler ([`sample_health`]
     /// (PhaseState::sample_health)); `/readyz` and `ClusterStatus` are pure
@@ -154,6 +159,7 @@ impl PhaseState {
             health_stability,
             phase: RwLock::new(phase),
             last_admission_refusal: RwLock::new(None),
+            promotion_hold: RwLock::new(None),
             health_window: Mutex::new(HealthWindow {
                 verdict: HealthVerdict::Unknown,
                 since: None,
@@ -218,6 +224,30 @@ impl PhaseState {
             .last_admission_refusal
             .write()
             .expect("admission refusal lock") = Some(message);
+    }
+
+    /// Drop the recorded refusal once this replica converges to voter: a
+    /// settled seat has no admission pending, and a stale refusal in
+    /// `/readyz` would read as a live problem (ADR 0037 §9).
+    pub(crate) fn clear_admission_refusal(&self) {
+        *self
+            .last_admission_refusal
+            .write()
+            .expect("admission refusal lock") = None;
+    }
+
+    /// Record why the leader is holding this replica's promotion (ADR 0037
+    /// §7: "the learner keeps polling and the situation is visible in status
+    /// output"). A hold is a wait, not a failure — it lives in its own
+    /// `/readyz` field so `last_admission_refusal` keeps meaning
+    /// operator-actionable.
+    pub(crate) fn record_promotion_hold(&self, message: String) {
+        *self.promotion_hold.write().expect("promotion hold lock") = Some(message);
+    }
+
+    /// Drop the recorded hold once this replica converges to voter.
+    pub(crate) fn clear_promotion_hold(&self) {
+        *self.promotion_hold.write().expect("promotion hold lock") = None;
     }
 
     /// The current `/readyz` body (ADR 0037 §9).
@@ -336,6 +366,11 @@ impl PhaseState {
             live_voters: is_leader
                 .then(|| live_voters(&formed.handle.replication_health(), self.contact_staleness)),
             last_admission_refusal: refusal,
+            promotion_hold: self
+                .promotion_hold
+                .read()
+                .expect("promotion hold lock")
+                .clone(),
             reason_code: None,
         }
     }
