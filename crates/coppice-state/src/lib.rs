@@ -99,6 +99,16 @@ pub struct StateMachine {
     /// CA key (ADR 0037 §4). The replicated *fact* of possession; the key
     /// itself is never replicated. Bounded (~cluster size).
     pub key_confirmations: BTreeMap<u64, Timestamp>,
+    /// Raft node id → when the leader committed its intent to transfer the CA
+    /// key to that node (ADR 0037 §4).
+    ///
+    /// An entry with no matching [`key_confirmations`](Self::key_confirmations)
+    /// entry is an UNRESOLVED intent: the transfer may or may not have reached
+    /// that disk before a crash, so custody accounting must treat it as a
+    /// possible key holder until a later confirmation resolves it (the §4
+    /// conservative stance: a disk that MAY hold the key is accounted as if it
+    /// does). Bounded (~cluster size).
+    pub key_transfer_intents: BTreeMap<u64, Timestamp>,
     /// Coordinator machine identity → the instant it first enrolled and
     /// received a leaf (ADR 0037 §4). Records enrollment only; binding to a
     /// raft seat is [`machine_bindings`](Self::machine_bindings). Bounded
@@ -146,6 +156,13 @@ impl StateMachine {
     /// §4).
     pub fn has_key_confirmation(&self, raft_node_id: u64) -> bool {
         self.key_confirmations.contains_key(&raft_node_id)
+    }
+
+    /// Whether the leader has committed an intent to transfer the CA key to
+    /// this node that has not yet been resolved by a confirmation (ADR 0037
+    /// §4).
+    pub fn has_key_transfer_intent(&self, raft_node_id: u64) -> bool {
+        self.key_transfer_intents.contains_key(&raft_node_id)
     }
 
     /// Whether a coordinator machine identity has enrolled (ADR 0037 §4).

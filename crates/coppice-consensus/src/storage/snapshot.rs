@@ -36,9 +36,9 @@ use prost::Message;
 use coppice_core::bytes::ByteSize;
 use coppice_proto::convert::{
     allocation_records, attempt_records, cluster_record, enroll_token_records,
-    enrolled_identity_records, job_records, key_confirmation_records, machine_binding_records,
-    node_records, quota_entity_records, record_counts, revoked_identity_records, RecordCounts,
-    StateRecords,
+    enrolled_identity_records, job_records, key_confirmation_records, key_transfer_intent_records,
+    machine_binding_records, node_records, quota_entity_records, record_counts,
+    revoked_identity_records, RecordCounts, StateRecords,
 };
 use coppice_proto::pb::storage::v1 as pb;
 use coppice_state::StateMachine;
@@ -343,6 +343,7 @@ enum SectionRecords<'a> {
     EnrollTokens(&'a [pb::EnrollTokenRecord]),
     RevokedIdentities(&'a [pb::RevokedIdentityRecord]),
     KeyConfirmations(&'a [pb::KeyConfirmationRecord]),
+    KeyTransferIntents(&'a [pb::KeyTransferIntentRecord]),
     EnrolledIdentities(&'a [pb::EnrolledIdentityRecord]),
     Cluster(&'a pb::ClusterStateRecord),
 }
@@ -441,6 +442,13 @@ fn section_jobs(records: &StateRecords, shards: usize) -> Vec<SectionJob<'_>> {
         &mut jobs,
     );
     shard(
+        pb::SectionKind::KeyTransferIntent,
+        &records.key_transfer_intents,
+        shards,
+        SectionRecords::KeyTransferIntents,
+        &mut jobs,
+    );
+    shard(
         pb::SectionKind::EnrolledIdentity,
         &records.enrolled_identities,
         shards,
@@ -479,6 +487,7 @@ fn encode_job(job: &SectionJob) -> RawSection {
         SectionRecords::EnrollTokens(records) => encode(records, &mut bytes),
         SectionRecords::RevokedIdentities(records) => encode(records, &mut bytes),
         SectionRecords::KeyConfirmations(records) => encode(records, &mut bytes),
+        SectionRecords::KeyTransferIntents(records) => encode(records, &mut bytes),
         SectionRecords::EnrolledIdentities(records) => encode(records, &mut bytes),
         SectionRecords::Cluster(record) => encode(std::slice::from_ref(record), &mut bytes),
     };
@@ -782,6 +791,12 @@ fn state_section_jobs(counts: &RecordCounts, shards: usize) -> Vec<StateSectionJ
         &mut jobs,
     );
     shard(
+        pb::SectionKind::KeyTransferIntent,
+        counts.key_transfer_intents,
+        shards,
+        &mut jobs,
+    );
+    shard(
         pb::SectionKind::EnrolledIdentity,
         counts.enrolled_identities,
         shards,
@@ -832,6 +847,9 @@ fn encode_state_job(state: &StateMachine, job: &StateSectionJob) -> RawSection {
         }
         pb::SectionKind::KeyConfirmation => {
             encode(key_confirmation_records(state, start, count), &mut bytes)
+        }
+        pb::SectionKind::KeyTransferIntent => {
+            encode(key_transfer_intent_records(state, start, count), &mut bytes)
         }
         pb::SectionKind::EnrolledIdentity => {
             encode(enrolled_identity_records(state, start, count), &mut bytes)
@@ -1056,6 +1074,9 @@ fn decode_entry(path: &Path, entry: &pb::SectionEntry, section: &[u8]) -> io::Re
         pb::SectionKind::KeyConfirmation => {
             Decoded::KeyConfirmations(decode_section(path, entry, section)?)
         }
+        pb::SectionKind::KeyTransferIntent => {
+            Decoded::KeyTransferIntents(decode_section(path, entry, section)?)
+        }
         pb::SectionKind::EnrolledIdentity => {
             Decoded::EnrolledIdentities(decode_section(path, entry, section)?)
         }
@@ -1078,6 +1099,7 @@ fn merge_decoded(path: &Path, records: &mut StateRecords, part: Decoded) -> io::
         Decoded::EnrollTokens(mut v) => records.enroll_tokens.append(&mut v),
         Decoded::RevokedIdentities(mut v) => records.revoked_identities.append(&mut v),
         Decoded::KeyConfirmations(mut v) => records.key_confirmations.append(&mut v),
+        Decoded::KeyTransferIntents(mut v) => records.key_transfer_intents.append(&mut v),
         Decoded::EnrolledIdentities(mut v) => records.enrolled_identities.append(&mut v),
         Decoded::Cluster(v) => {
             if records.cluster.is_some() || v.len() != 1 {
@@ -1116,6 +1138,7 @@ enum Decoded {
     EnrollTokens(Vec<pb::EnrollTokenRecord>),
     RevokedIdentities(Vec<pb::RevokedIdentityRecord>),
     KeyConfirmations(Vec<pb::KeyConfirmationRecord>),
+    KeyTransferIntents(Vec<pb::KeyTransferIntentRecord>),
     EnrolledIdentities(Vec<pb::EnrolledIdentityRecord>),
     Cluster(Vec<pb::ClusterStateRecord>),
 }

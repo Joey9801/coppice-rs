@@ -75,6 +75,7 @@ message Command {
     RecordEnrolledIdentity record_enrolled_identity = 96;
     RebindMachineAddress rebind_machine_address = 97;
     RetireMachineBinding retire_machine_binding = 98;
+    RecordKeyTransferIntent record_key_transfer_intent = 99;
   }
 }
 
@@ -344,4 +345,19 @@ message RebindMachineAddress {
 message RetireMachineBinding {
   coppice.core.v1.MachineId machine = 1;
   int64 retired_at_us = 2;
+}
+
+// Record the replicated FACT that the leader committed an intent to
+// transfer the CA key to a node, before the key ever leaves the leader's
+// disk (ADR 0037 §4). Closes the crash window between a candidate's durable
+// key receipt (its ConfirmKeyPossession ack) and the leader's confirmation
+// proposal: with the intent committed first, custody accounting can treat
+// the node as a possible key holder even if the leader crashes mid-transfer.
+// First write wins: an existing intent keeps its original timestamp — the
+// earliest moment the key could have left the leader's disk — and a repeat
+// proposal is an accepted no-op. Never a rejection. ConfirmKeyPossession
+// resolves (removes) the matching entry when the transfer completes.
+message RecordKeyTransferIntent {
+  uint64 raft_node_id = 1;
+  int64 intended_at_us = 2;
 }

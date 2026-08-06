@@ -309,6 +309,29 @@ impl TryFrom<pb::KeyConfirmationRecord> for (u64, Timestamp) {
     }
 }
 
+// Key transfer intents are keyed by the raft node id, so the record carries
+// the key and converts as a (raft_node_id, intended_at) pair.
+
+impl From<(&u64, &Timestamp)> for pb::KeyTransferIntentRecord {
+    fn from((raft_node_id, intended_at): (&u64, &Timestamp)) -> Self {
+        pb::KeyTransferIntentRecord {
+            raft_node_id: *raft_node_id,
+            intended_at_us: intended_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::KeyTransferIntentRecord> for (u64, Timestamp) {
+    type Error = ConvertError;
+
+    fn try_from(r: pb::KeyTransferIntentRecord) -> Result<Self, ConvertError> {
+        Ok((
+            r.raft_node_id,
+            timestamp(r.intended_at_us, "KeyTransferIntentRecord.intended_at_us")?,
+        ))
+    }
+}
+
 // Enrolled identities are keyed by the machine id, so the record carries the
 // key and converts as a (machine, recorded_at) pair.
 
@@ -348,6 +371,7 @@ pub struct StateRecords {
     pub revoked_identities: Vec<pb::RevokedIdentityRecord>,
     pub key_confirmations: Vec<pb::KeyConfirmationRecord>,
     pub enrolled_identities: Vec<pb::EnrolledIdentityRecord>,
+    pub key_transfer_intents: Vec<pb::KeyTransferIntentRecord>,
     pub cluster: Option<pb::ClusterStateRecord>,
 }
 
@@ -368,6 +392,7 @@ pub struct RecordCounts {
     pub revoked_identities: usize,
     pub key_confirmations: usize,
     pub enrolled_identities: usize,
+    pub key_transfer_intents: usize,
 }
 
 /// Count each entity kind without touching a record.
@@ -383,6 +408,7 @@ pub fn record_counts(state: &StateMachine) -> RecordCounts {
         revoked_identities: state.revoked_identities.len(),
         key_confirmations: state.key_confirmations.len(),
         enrolled_identities: state.enrolled_identities.len(),
+        key_transfer_intents: state.key_transfer_intents.len(),
     }
 }
 
@@ -537,6 +563,21 @@ pub fn enrolled_identity_records(
         .map(Into::into)
 }
 
+/// Key-transfer-intent records for the window `[start, start + count)`,
+/// `(&raft_node_id, &intended_at)` pairs.
+pub fn key_transfer_intent_records(
+    state: &StateMachine,
+    start: usize,
+    count: usize,
+) -> impl Iterator<Item = pb::KeyTransferIntentRecord> + '_ {
+    state
+        .key_transfer_intents
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(Into::into)
+}
+
 /// The single `ClusterStateRecord` — the state's scalar tail (policy,
 /// versions, allocation sequence, and the singleton CA bundle). Not sharded:
 /// exactly one per snapshot.
@@ -568,6 +609,8 @@ pub fn state_to_records(state: &StateMachine) -> StateRecords {
         revoked_identities: revoked_identity_records(state, 0, counts.revoked_identities).collect(),
         key_confirmations: key_confirmation_records(state, 0, counts.key_confirmations).collect(),
         enrolled_identities: enrolled_identity_records(state, 0, counts.enrolled_identities)
+            .collect(),
+        key_transfer_intents: key_transfer_intent_records(state, 0, counts.key_transfer_intents)
             .collect(),
         cluster: Some(cluster_record(state)),
     }
@@ -664,6 +707,19 @@ pub fn state_from_records(records: StateRecords) -> Result<StateMachine, Convert
         {
             return Err(ConvertError::DuplicateEntry(
                 "StateRecords.enrolled_identities",
+            ));
+        }
+    }
+
+    for r in records.key_transfer_intents {
+        let (raft_node_id, intended_at) = r.try_into()?;
+        if state
+            .key_transfer_intents
+            .insert(raft_node_id, intended_at)
+            .is_some()
+        {
+            return Err(ConvertError::DuplicateEntry(
+                "StateRecords.key_transfer_intents",
             ));
         }
     }

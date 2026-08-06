@@ -41,7 +41,7 @@ use coppice_proto::convert::{enroll_role_from_pb, enroll_role_to_pb};
 use coppice_proto::pb::raft::v1 as pb;
 use coppice_state::command::{
     BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RebindMachineAddress,
-    RevokeEnrollToken, RevokeIdentity,
+    RecordKeyTransferIntent, RevokeEnrollToken, RevokeIdentity,
 };
 use coppice_state::{Command, RejectionReason, RevokedIdentity};
 use coppice_tls::pki;
@@ -216,6 +216,37 @@ fn maybe_fire_promote_after_key_transfer_failpoint() -> Result<(), Status> {
     }
     Err(Status::internal(
         "promotion aborted at the promote-after-key-transfer failpoint (test-only)",
+    ))
+}
+
+/// The failpoint name for the OTHER crash window of the transfer protocol:
+/// abort between the candidate's durable transfer acknowledgement and the
+/// `ConfirmKeyPossession` proposal — the window in which a leader crash
+/// leaves a keyed disk whose possession fact never replicated. The
+/// transfer-intent fact (committed before the key leaves this disk) is what
+/// keeps that disk visible in custody accounting; this failpoint exists to
+/// prove it.
+pub const TRANSFER_BEFORE_CONFIRM: &str = "transfer-before-confirm";
+
+/// Fire-once latch for [`TRANSFER_BEFORE_CONFIRM`]; same process-global
+/// contract and caveats as [`PROMOTE_AFTER_KEY_TRANSFER_FIRED`].
+static TRANSFER_BEFORE_CONFIRM_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// Consult and, at most once per process, fire the
+/// [`TRANSFER_BEFORE_CONFIRM`] failpoint. A no-op in every real deployment
+/// and in any test process that never sets [`TEST_FAILPOINT_ENV`].
+fn maybe_fire_transfer_before_confirm_failpoint() -> Result<(), Status> {
+    if std::env::var(TEST_FAILPOINT_ENV).ok().as_deref() != Some(TRANSFER_BEFORE_CONFIRM) {
+        return Ok(());
+    }
+    if TRANSFER_BEFORE_CONFIRM_FIRED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(());
+    }
+    Err(Status::internal(
+        "key transfer aborted at the transfer-before-confirm failpoint (test-only)",
     ))
 }
 
@@ -1084,6 +1115,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         let mut resp = cluster_summary_to_pb(handle.cluster_summary());
         resp.bindings = machine_bindings_to_pb(&consensus);
         resp.key_holders = key_holders_to_pb(&consensus);
+        resp.pending_key_transfers = pending_key_transfers_to_pb(&consensus);
         resp.health = match self.inner.phase.health() {
             HealthVerdict::Unknown => None,
             HealthVerdict::Sustained { live_voters } => Some(pb::ClusterHealth {
@@ -1627,6 +1659,43 @@ impl<C: Consensus> AdminService<C> {
                 ))
             })?;
 
+        // The transfer INTENT is committed before the key ever leaves this
+        // disk (ADR 0037 §4): from this entry on, whatever crashes — the
+        // transfer itself, this leader between the candidate's durable ack
+        // and the confirmation below — the candidate stays visible to
+        // custody accounting as a possible key holder, resolved only by a
+        // completed confirmation. Without it, a crash inside that window
+        // minted a root-equivalent disk `key_holders` could not see, and in
+        // the abandoned-`ReplaceVoter` case (full live voter set, operator
+        // never retries) it stayed invisible forever. First-write-wins in
+        // apply, so a re-entered transfer keeps the earliest moment the key
+        // could have left a leader.
+        if !consensus
+            .views()
+            .latest()
+            .state()
+            .has_key_transfer_intent(candidate)
+        {
+            let applied = consensus
+                .propose(Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+                    raft_node_id: candidate,
+                    intended_at: Timestamp::now(),
+                }))
+                .await
+                .map_err(consensus_error_to_status)?;
+            applied.outcome.map_err(|reason| {
+                Status::internal(format!(
+                    "recording the key-transfer intent for node {candidate} was rejected: \
+                     {reason}"
+                ))
+            })?;
+            // Read-your-writes: the ordering claim is that custody accounting
+            // can report the candidate as a possible holder *before* key
+            // bytes leave this disk — so the published view must show the
+            // intent before the transfer below dials out.
+            await_visible(&**consensus, applied.log_index).await?;
+        }
+
         let tls = self.tls()?;
         let mut client = admin_channel_from_store(&addr, &tls).await.map_err(|e| {
             endpoint_unverified_status(format_args!("dialing {addr} to transfer the CA key: {e:#}"))
@@ -1643,6 +1712,11 @@ impl<C: Consensus> AdminService<C> {
                     s.message()
                 ))
             })?;
+
+        // Test-only (ADR 0037 §4): stages the crash window between the
+        // candidate's durable acknowledgement and the replicated
+        // confirmation — the window the intent above exists for.
+        maybe_fire_transfer_before_confirm_failpoint()?;
 
         let applied = consensus
             .propose(Command::ConfirmKeyPossession(ConfirmKeyPossession {
@@ -1834,6 +1908,25 @@ fn key_holders_to_pb<C: Consensus>(consensus: &Arc<C>) -> Vec<pb::KeyHolder> {
         .map(|(node_id, confirmed_at)| pb::KeyHolder {
             node_id: *node_id,
             confirmed_at_us: confirmed_at.as_micros(),
+        })
+        .collect()
+}
+
+/// Unresolved key-transfer intents (ADR 0037 §4): nodes the leader committed
+/// to keying whose confirmation never landed — a crash window's residue, kept
+/// visible because such a disk MAY hold the key and is accounted as if it
+/// does. Resolved intents are removed by the confirmation's apply, so this is
+/// exactly the map's contents.
+fn pending_key_transfers_to_pb<C: Consensus>(consensus: &Arc<C>) -> Vec<pb::PendingKeyTransfer> {
+    consensus
+        .views()
+        .latest()
+        .state()
+        .key_transfer_intents
+        .iter()
+        .map(|(node_id, intended_at)| pb::PendingKeyTransfer {
+            node_id: *node_id,
+            intended_at_us: intended_at.as_micros(),
         })
         .collect()
 }
@@ -2038,6 +2131,7 @@ pub fn cluster_summary_to_pb(summary: ClusterSummary) -> pb::ClusterStatusRespon
         // custody is a replicated fact the state machine owns (ADR 0037 §4),
         // not something a raft membership summary carries.
         key_holders: Vec::new(),
+        pending_key_transfers: Vec::new(),
         // Filled by the handler from `PhaseState`, like `bindings`: the
         // redundancy verdict is the daemon's (leader-only) observation, not
         // something a raw membership summary carries.
@@ -2546,6 +2640,20 @@ fn render_status(s: &pb::ClusterStatusResponse) -> String {
         }
     }
 
+    // Unresolved transfer intents (ADR 0037 §4): the key MAY have reached
+    // these disks (a crash between the durable receipt and the confirmation
+    // lands here), so they are accounted as possible holders until a retried
+    // transfer confirms.
+    if !s.pending_key_transfers.is_empty() {
+        let _ = writeln!(
+            out,
+            "pending key transfers (unresolved intents, ADR 0037 §4):"
+        );
+        for pending in &s.pending_key_transfers {
+            let _ = writeln!(out, "  node {:<6} possibly keyed", pending.node_id);
+        }
+    }
+
     if !s.replication.is_empty() {
         let _ = writeln!(out, "replication (leader view):");
         for r in &s.replication {
@@ -2682,6 +2790,16 @@ fn render_status_json(s: &pb::ClusterStatusResponse) -> String {
         "replication": replication,
         "bindings": bindings,
         "key_holders": key_holders,
+        "pending_key_transfers": s
+            .pending_key_transfers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "node_id": p.node_id,
+                    "intended_at_us": p.intended_at_us,
+                })
+            })
+            .collect::<Vec<_>>(),
         "health": health,
     });
     serde_json::to_string_pretty(&value).expect("a json! value always serializes")
@@ -2935,6 +3053,10 @@ mod tests {
                     confirmed_at_us: 1_700_000_001_000_000,
                 },
             ],
+            pending_key_transfers: vec![pb::PendingKeyTransfer {
+                node_id: 9,
+                intended_at_us: 1_700_000_002_000_000,
+            }],
             health: Some(pb::ClusterHealth {
                 healthy: true,
                 live_voters: 2,

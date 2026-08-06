@@ -34,9 +34,9 @@ mod snapshot;
 pub use command::{command_from_pb, command_to_pb, enroll_role_from_pb, enroll_role_to_pb};
 pub use snapshot::{
     allocation_records, attempt_records, cluster_record, enroll_token_records,
-    enrolled_identity_records, job_records, key_confirmation_records, machine_binding_records,
-    node_records, quota_entity_records, record_counts, revoked_identity_records,
-    state_from_records, state_to_records, RecordCounts, StateRecords,
+    enrolled_identity_records, job_records, key_confirmation_records, key_transfer_intent_records,
+    machine_binding_records, node_records, quota_entity_records, record_counts,
+    revoked_identity_records, state_from_records, state_to_records, RecordCounts, StateRecords,
 };
 
 /// Why a wire value could not become a domain value.
