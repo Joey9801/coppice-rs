@@ -364,11 +364,18 @@ impl OpenraftConsensus {
     /// 3. **Key custody.** At least one continuing voter must hold a
     ///    confirmed CA key (§4): no change may leave the cluster unable to
     ///    sign. Read from replicated state, so it sees the confirmation the
-    ///    key transfer just recorded.
+    ///    key transfer just recorded. `pending_key` names a node whose
+    ///    confirmation the *plan* phase may assume: the key transfer sits
+    ///    between planning and committing, so at plan time the incoming node
+    ///    is a prospective holder — clearest in single-voter replacement,
+    ///    where the continuing set is `{new}` alone and a strict plan-time
+    ///    check could never pass. Commit passes `None` and enforces the real
+    ///    replicated fact, so a failed or skipped transfer still refuses.
     fn check_change_postconditions(
         &self,
         continuing: &BTreeSet<CoordinatorId>,
         incoming: Option<CoordinatorId>,
+        pending_key: Option<CoordinatorId>,
     ) -> Result<(), ConsensusError> {
         if self.cluster_size > 0 && continuing.len() > self.cluster_size {
             return Err(ConsensusError::VoterSetFull {
@@ -403,6 +410,7 @@ impl OpenraftConsensus {
             && !continuing
                 .iter()
                 .any(|voter| state.has_key_confirmation(*voter))
+            && !pending_key.is_some_and(|node| continuing.contains(&node))
         {
             return Err(ConsensusError::NoKeyHolder);
         }
@@ -424,11 +432,14 @@ impl OpenraftConsensus {
     /// [`Consensus::plan_replacement`] — run *before* the key transfer, so a
     /// refused `new` is never keyed — and [`Consensus::replace_voter`],
     /// which re-runs it under the membership lock at commit because the
-    /// transfer is a network round-trip and a replicated write.
+    /// transfer is a network round-trip and a replicated write. `planning`
+    /// selects the custody stance: a plan may assume `new`'s confirmation
+    /// (the transfer it gates is what records it); the commit may not.
     fn replacement_gates(
         &self,
         old: CoordinatorId,
         new: CoordinatorId,
+        planning: bool,
     ) -> Result<ReplacementPlan, ConsensusError> {
         let voters = self.voter_ids();
 
@@ -462,7 +473,7 @@ impl OpenraftConsensus {
         let mut continuing = voters;
         continuing.insert(new);
         continuing.remove(&old);
-        self.check_change_postconditions(&continuing, Some(new))?;
+        self.check_change_postconditions(&continuing, Some(new), planning.then_some(new))?;
         Ok(ReplacementPlan::Ready)
     }
 }
@@ -585,7 +596,9 @@ impl Consensus for OpenraftConsensus {
         if let Some(dead) = evidence_removal {
             continuing.remove(&dead);
         }
-        match self.check_change_postconditions(&continuing, Some(promote)) {
+        // A plan may assume the candidate's own confirmation: the transfer
+        // this plan gates is what records it (commit checks the real fact).
+        match self.check_change_postconditions(&continuing, Some(promote), Some(promote)) {
             Ok(()) => {}
             // A removal that would break the live majority is a removal that
             // does not qualify, which is exactly "no removable peer" — the
@@ -650,7 +663,7 @@ impl Consensus for OpenraftConsensus {
         if let Some(departed) = remove {
             continuing.remove(&departed);
         }
-        self.check_change_postconditions(&continuing, Some(promote))?;
+        self.check_change_postconditions(&continuing, Some(promote), None)?;
 
         let changes = match remove {
             // Pure promotion: raise one learner to voter, leaving the rest of
@@ -676,7 +689,7 @@ impl Consensus for OpenraftConsensus {
         old: CoordinatorId,
         new: CoordinatorId,
     ) -> Result<ReplacementPlan, ConsensusError> {
-        self.replacement_gates(old, new)
+        self.replacement_gates(old, new, true)
     }
 
     async fn replace_voter(
@@ -689,7 +702,7 @@ impl Consensus for OpenraftConsensus {
         // the caller acted on predates the key transfer, so nothing from it
         // is trusted here.
         let _guard = self.membership_change.lock().await;
-        if self.replacement_gates(old, new)? == ReplacementPlan::Settled {
+        if self.replacement_gates(old, new, false)? == ReplacementPlan::Settled {
             return Ok(());
         }
 
@@ -1350,7 +1363,11 @@ mod idempotency_tests {
         // owns a CA, so *someone* in the continuing voter set must hold a
         // confirmed key. With no confirmation recorded anywhere, promoting a
         // learner is refused for operator repair — terminally, not something
-        // polling fixes.
+        // polling fixes. The refusal is asserted at COMMIT, deliberately:
+        // the plan phase may assume the candidate's own pending confirmation
+        // (the key transfer sits between plan and commit and is what records
+        // it), so commit is where a transfer that failed to confirm — or a
+        // lost confirmation — must stop the change.
         let h = single_voter(3).await;
         h.record_ca();
         let consensus = &h.consensus;
@@ -1365,10 +1382,10 @@ mod idempotency_tests {
         h.contact.note_attempt(learner_id);
         h.contact.note_ack(learner_id);
 
-        let result = consensus.plan_promotion(learner_id);
+        let result = consensus.commit_promotion(learner_id, None).await;
         assert!(
             matches!(result, Err(ConsensusError::NoKeyHolder)),
-            "expected NoKeyHolder, got {result:?}"
+            "expected NoKeyHolder at commit, got {result:?}"
         );
         assert!(!ConsensusError::NoKeyHolder.is_retryable());
     }
@@ -1580,9 +1597,8 @@ mod idempotency_tests {
         let voters_before = h.consensus.voter_ids();
 
         let result = h.consensus.reap_expired_learner(h.node_id, None).await;
-        assert_eq!(
-            result.expect("reap must not error, only decline"),
-            false,
+        assert!(
+            !result.expect("reap must not error, only decline"),
             "a sitting voter must never be reaped by learner GC"
         );
 
@@ -1616,9 +1632,8 @@ mod idempotency_tests {
         h.contact.note_ack(learner_id);
 
         let result = consensus.reap_expired_learner(learner_id, None).await;
-        assert_eq!(
-            result.expect("reap must not error, only decline"),
-            false,
+        assert!(
+            !result.expect("reap must not error, only decline"),
             "a learner that is currently answering must not be reaped"
         );
         assert!(

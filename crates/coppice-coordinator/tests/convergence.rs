@@ -397,12 +397,12 @@ async fn two_racing_newcomers_both_converge_to_distinct_voter_seats() {
 
 /// Widen a follower's election timeout, so that after its leader dies it goes
 /// on believing in — and hinting at — the dead leader for a *known* window
-/// instead of the default 300ms one.
+/// instead of the fixture default (1s).
 fn stretch_election_timeout(daemon: &Daemon, timeout: &str) {
     let path = daemon.config_path();
     let toml = std::fs::read_to_string(&path).expect("read config");
     let updated = toml.replace(
-        "election_timeout = \"300ms\"",
+        "election_timeout = \"1s\"",
         &format!("election_timeout = \"{timeout}\""),
     );
     assert_ne!(toml, updated, "no election_timeout line to rewrite");
@@ -418,7 +418,7 @@ fn stretch_election_timeout(daemon: &Daemon, timeout: &str) {
 /// answer claims leadership, and never returns an endpoint it has not just
 /// heard from.
 ///
-/// Staging: a 3-voter cluster whose two followers carry a stretched (2s)
+/// Staging: a 3-voter cluster whose two followers carry a stretched (4s)
 /// election timeout; a fourth daemon enrolls while the leader is alive and is
 /// killed still parked; then the leader is killed and the joiner is restarted
 /// with the two surviving followers as its ONLY discovery candidates. For the
@@ -428,7 +428,7 @@ fn stretch_election_timeout(daemon: &Daemon, timeout: &str) {
 ///
 /// Residual nondeterminism, documented rather than hidden: this harness has
 /// no network partition primitive, so the survivors' stale hint lasts only
-/// until they elect (~2s here), not indefinitely — meaning the *old* code
+/// until they elect (~4s here), not indefinitely — meaning the *old* code
 /// eventually converged too, once the hint changed, and under it this test
 /// would have shown up as a stall inside the window rather than a guaranteed
 /// timeout. What the test pins deterministically is the invariant the finding
@@ -452,7 +452,7 @@ async fn a_stale_hint_naming_a_dead_leader_does_not_wedge_a_joiner() {
     let mut second = newcomer(cluster_id, &ca, &first, &token, 4);
     let mut third = newcomer(cluster_id, &ca, &first, &token, 4);
     for follower in [&second, &third] {
-        stretch_election_timeout(follower, "2s");
+        stretch_election_timeout(follower, "4s");
     }
     second.start();
     third.start();

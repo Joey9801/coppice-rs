@@ -577,22 +577,39 @@ async fn init_is_refused_when_discovery_names_an_already_initialized_cluster() {
             // What may follow the refusal is bounded: the daemon either
             // remains parked with nothing stamped, or its convergence loop's
             // next round joins the EXISTING cluster — which is ADR 0037 §1
-            // working, not a leak in the guard. Asserting on the history
-            // covers both legitimate outcomes without racing the loop.
-            let body = newcomer.readyz().await.1;
-            if body["phase"] == "waiting" {
+            // working, not a leak in the guard. The manifest stamp is the one
+            // authoritative observation (reading `/readyz` first and the
+            // stamp second raced the loop: a join can legally stamp between
+            // the two reads — seen under CI load):
+            // - no stamp → the guard held and nothing durable happened;
+            // - a stamp WITHOUT formation intent → the loop began a §6 join,
+            //   which must resolve to the existing cluster's history;
+            // - a stamp WITH formation intent → a second formation ran: the
+            //   exact leak this test exists to rule out.
+            let marks = storage::read_formation_marks(&RealFs::new(newcomer.data_dir()))
+                .expect("read marks");
+            if let Some(marks) = marks {
                 assert!(
-                    storage::read_formation_marks(&RealFs::new(newcomer.data_dir()))
-                        .expect("read marks")
-                        .is_none(),
-                    "a refused, still-parked daemon must have stamped nothing"
+                    marks.intent_at_us.is_none(),
+                    "a refused init must never stamp formation intent; a second \
+                     formation began: {marks:?}"
                 );
-            } else {
-                assert_eq!(
-                    body["history_id"], existing_history,
-                    "anything the daemon becomes after the refusal must belong to \
-                     the existing cluster's history, never a second formation: {body}"
-                );
+                // The stamp is a join identity: the daemon is on its way into
+                // the existing cluster. Its history becomes visible once the
+                // probe round's stamp is served; poll rather than racing it.
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    let body = newcomer.readyz().await.1;
+                    if body["history_id"] == existing_history {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a join-stamped daemon must belong to the existing cluster's \
+                         history, never a second formation: {body}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
         // The loop's round landed inside the staged window (suite load can

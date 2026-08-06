@@ -171,14 +171,29 @@ async fn fleet_coordinator_token(
 }
 
 /// A fifth wheel: a certless daemon configured exactly as a fleet's identical
-/// artifact would configure it, pointed at `leader` for both discovery and
-/// enrollment.
-fn newcomer(cluster_id: ClusterId, ca: &Ca, leader: &Daemon, token: &str, size: usize) -> Daemon {
+/// artifact would configure it — `seeds` names every member's raft address
+/// (as a production shape config's discovery would), so one slow or
+/// re-electing member never wedges the newcomer's probe rounds; enrollment
+/// targets `enroll` (one URL, as in production — a follower forwards to the
+/// leader).
+fn newcomer(
+    cluster_id: ClusterId,
+    ca: &Ca,
+    seeds: &[String],
+    enroll: &Daemon,
+    token: &str,
+    size: usize,
+) -> Daemon {
     let daemon = Daemon::new_certless(cluster_id, ca);
     daemon.set_cluster_size(size);
-    daemon.set_static_discovery(&[leader.raft_target()]);
-    daemon.set_enrollment(&leader.api(""), token);
+    daemon.set_static_discovery(seeds);
+    daemon.set_enrollment(&enroll.api(""), token);
     daemon
+}
+
+/// Every fleet member's raft address, for [`newcomer`]'s discovery seeds.
+fn fleet_seeds(fleet: &Fleet) -> Vec<String> {
+    fleet.members.iter().map(|m| m.raft_target()).collect()
 }
 
 /// This daemon's currently reported voter set, as node ids (from `/readyz`,
@@ -481,7 +496,14 @@ async fn replace_voter_with_a_live_old_succeeds_and_is_idempotent() {
     let history_id = history_id_of(&mut leader_client).await;
     let token = fleet_coordinator_token(&fleet, &operator, history_id).await;
 
-    let mut fourth = newcomer(fleet.cluster_id, &ca, leader, &token, 3);
+    let mut fourth = newcomer(
+        fleet.cluster_id,
+        &ca,
+        &fleet_seeds(&fleet),
+        leader,
+        &token,
+        3,
+    );
     fourth.start();
     // `_in` rather than the plain form: a generous (60s) budget, since this
     // process runs several multi-voter fleets — this file's other cases —
@@ -577,7 +599,14 @@ async fn a_replacement_raced_by_the_predecessors_crash_converges_hands_off() {
     let history_id = history_id_of(&mut leader_client).await;
     let token = fleet_coordinator_token(&fleet, &operator, history_id).await;
 
-    let mut fifth = newcomer(fleet.cluster_id, &ca, leader, &token, 3);
+    let mut fifth = newcomer(
+        fleet.cluster_id,
+        &ca,
+        &fleet_seeds(&fleet),
+        leader,
+        &token,
+        3,
+    );
     fifth.set_removal_grace("2s");
     fifth.start();
     // `_in` rather than the plain form: a generous (60s) budget, since this
@@ -674,7 +703,14 @@ async fn single_voter_replacement_leaves_a_new_voter_that_provably_holds_the_key
     // cluster_size stays at the fixture default of 1: the continuing voter
     // set after the replacement is `{new}`, a single seat, which is exactly
     // what the ceiling allows.
-    let mut learner = newcomer(founder.cluster_id, &ca, &founder, &token, 1);
+    let mut learner = newcomer(
+        founder.cluster_id,
+        &ca,
+        &[founder.raft_target()],
+        &founder,
+        &token,
+        1,
+    );
     learner.start();
     // `_in` rather than the plain form: a generous (60s) budget, since this
     // process runs several multi-voter fleets — this file's other cases —

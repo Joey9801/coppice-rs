@@ -313,7 +313,13 @@ async fn add_voter(leader: &RunningCoordinator, follower: &Node, deadline: Durat
             .await
         {
             Ok(()) => return,
-            Err(ConsensusError::LearnerNotCaughtUp { .. }) if start.elapsed() < deadline => {
+            // Catch-up and first-heartbeat-ack are both normal transients: a
+            // freshly admitted learner is not "live" until it has answered a
+            // heartbeat (ADR 0037 §7 — liveness is proven only by an ack),
+            // which can trail the admission by a heartbeat interval.
+            Err(
+                ConsensusError::LearnerNotCaughtUp { .. } | ConsensusError::QuorumAtRisk { .. },
+            ) if start.elapsed() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(e) => panic!("promote node {} failed: {e:?}", follower.id),

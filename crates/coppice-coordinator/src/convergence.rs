@@ -129,6 +129,19 @@ impl<'a> PreStart<'a> {
             match self.round().await {
                 Ok(Some(joined)) => return joined,
                 Ok(None) => {}
+                // Escalate once the backoff has maxed out: the first failed
+                // rounds of a fleet boot are routine (peers still binding),
+                // but a daemon that has been failing for the whole backoff
+                // ramp is *stuck*, and its reason must be visible at the
+                // default log level — a parked daemon has no other surface
+                // that says why (ADR 0037 §9's spirit).
+                Err(e) if self.backoff >= PARK_INTERVAL_MAX => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "convergence: rounds keep failing at maximum backoff; still parked, \
+                         will retry"
+                    );
+                }
                 Err(e) => {
                     tracing::info!(
                         error = %format!("{e:#}"),
@@ -235,11 +248,23 @@ impl<'a> PreStart<'a> {
             return;
         }
         if let Err(e) = self.enroll(enrollment, &paths).await {
-            tracing::info!(
-                endpoint = %enrollment.endpoint,
-                error = %format!("{e:#}"),
-                "convergence: enrollment did not succeed; will retry"
-            );
+            // Same escalation rule as the round loop: a first refusal is
+            // routine fleet-boot noise, but enrollment still failing once the
+            // backoff has maxed out is the thing an operator (or a CI log)
+            // needs to see without turning the log level up.
+            if self.backoff >= PARK_INTERVAL_MAX {
+                tracing::warn!(
+                    endpoint = %enrollment.endpoint,
+                    error = %format!("{e:#}"),
+                    "convergence: enrollment keeps failing at maximum backoff; will retry"
+                );
+            } else {
+                tracing::info!(
+                    endpoint = %enrollment.endpoint,
+                    error = %format!("{e:#}"),
+                    "convergence: enrollment did not succeed; will retry"
+                );
+            }
         }
     }
 

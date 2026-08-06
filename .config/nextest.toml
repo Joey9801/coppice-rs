@@ -1,5 +1,12 @@
 [test-groups]
 heavy-integration = { max-threads = 2 }
+# Multi-daemon fleet suites (ADR 0037): each test boots 3-5 in-process
+# coordinator daemons with 300ms election timeouts, and nextest runs every
+# test in its own process — so any in-binary serialization is invisible here.
+# Concurrent fleets starve each other's runtimes on small (CI) hosts into
+# election churn: joiners then loop on 503s until their deadlines lapse.
+# One fleet at a time is the point, not a throughput tweak.
+fleet-serial = { max-threads = 1 }
 
 # Ordinary local runs exclude the heavy integration binaries.
 [profile.default]
@@ -21,8 +28,7 @@ not (
 # applies to the default, ci, and heavy profiles.
 [[profile.default.overrides]]
 filter = '''
-binary(cluster)
-| binary(agent_protocol)
+binary(agent_protocol)
 | binary(submit_retry)
 | binary(job_logs)
 | binary(job_metrics)
@@ -30,6 +36,19 @@ binary(cluster)
 | test(openraft_storage_compliance)
 '''
 test-group = 'heavy-integration'
+
+[[profile.default.overrides]]
+filter = '''
+binary(cluster)
+| binary(formation)
+| binary(convergence)
+| binary(admin_membership)
+| binary(replace_voter)
+| binary(key_custody)
+| binary(evidence_removal)
+| binary(address_move)
+'''
+test-group = 'fleet-serial'
 
 # CI runs the complete test suite.
 [profile.ci]

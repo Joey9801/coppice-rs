@@ -2274,10 +2274,19 @@ pub async fn promote_voter(
 
         match result {
             Ok(_) => return Ok(()),
-            Err(status) if is_learner_behind(&status) => {
+            // Two transients ride the same wait: catch-up (the learner is
+            // still replaying log) and `quorum-at-risk` (the leader has not
+            // yet heard a heartbeat acknowledgement from the incoming node —
+            // liveness is proven only by an ack (ADR 0037 §7), and a freshly
+            // admitted learner's first ack can trail the admission by a
+            // heartbeat interval). Both resolve on their own within moments;
+            // every other refusal is final for this call.
+            Err(status)
+                if is_learner_behind(&status) || has_marker(status.message(), QUORUM_AT_RISK) =>
+            {
                 if tokio::time::Instant::now() + PROMOTE_POLL_INTERVAL >= deadline {
                     bail!(
-                        "learner {promote} did not catch up within {}: {}",
+                        "learner {promote} was not promotable within {}: {}",
                         humantime_serde::re::humantime::format_duration(wait),
                         status.message()
                     );
