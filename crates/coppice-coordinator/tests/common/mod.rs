@@ -1424,6 +1424,10 @@ pub struct Fleet {
     /// Holds the shared discovery registration directory. Dropped last.
     _dir: TempDir,
     pub cluster_id: ClusterId,
+    /// The `[discovery] cluster_size` every member was given at construction
+    /// (ADR 0037 §2/§7): fixed at the fleet's target voter count regardless of
+    /// how many learners [`Fleet::add_member`] appends afterward.
+    cluster_size: usize,
     pub members: Vec<Daemon>,
 }
 
@@ -1463,8 +1467,41 @@ impl Fleet {
         Fleet {
             _dir: dir,
             cluster_id,
+            cluster_size: size,
             members,
         }
+    }
+
+    /// The shared `file`-discovery registration directory every member
+    /// enumerates, for a test that hand-assembles one more same-shape member
+    /// outside the initial batch (see [`Fleet::add_member`]).
+    pub fn registry_dir(&self) -> PathBuf {
+        self._dir.path().join("discovery")
+    }
+
+    /// The `[discovery] cluster_size` this fleet was built with.
+    pub fn cluster_size(&self) -> usize {
+        self.cluster_size
+    }
+
+    /// Lay down (without starting) one more shape-identical, certless member
+    /// and append it to [`Fleet::members`] — a fresh installation joining a
+    /// fleet that already exists (ADR 0037 §7: the hands-off replacement path
+    /// is terminate-then-launch, and the evidence-gated-removal tests need a
+    /// literal new installation, not a member `Fleet::new` already knew
+    /// about). Returns the new member's index.
+    ///
+    /// The enrollment endpoint is re-derived from member 0 exactly as
+    /// [`Fleet::new`] derives it, so the new member's config is identical in
+    /// shape to every other member's, just later in time.
+    pub fn add_member(&mut self, ca: &Ca) -> usize {
+        let member = Daemon::new_certless(self.cluster_id, ca);
+        member.set_file_discovery(&self.registry_dir());
+        member.set_cluster_size(self.cluster_size);
+        let endpoint = self.members[0].api("");
+        member.set_enrollment(&endpoint, FLEET_TOKEN);
+        self.members.push(member);
+        self.members.len() - 1
     }
 
     /// The `init --policy` document that seeds [`FLEET_TOKEN`], so the token

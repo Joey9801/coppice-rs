@@ -144,7 +144,14 @@ replicated; the private key never enters replicated state — it normally
 resides on voter disks and may also reside on a promotion candidate past
 the key-transfer gate, and every disk that has ever received it is
 root-equivalent (compromise response: re-rooting; the runbook is a
-required pre-production deliverable). Enrollment is public ingress by
+required pre-production deliverable). Custody accounting is not left to
+inference: `admin status`'s `key_holders` lists every node the leader has
+a confirmed receipt from, by design including a candidate abandoned mid-
+promotion (a leader crash in the key-transfer window) and a voter that has
+since been removed — both are disks that received the key and remain
+root-equivalent, so filtering the list down to current voters would hide
+exactly the custody an operator most needs to see before re-rooting.
+Enrollment is public ingress by
 design: a certless machine cannot verify cluster-PKI TLS yet, so
 `POST /api/v1/enroll` rides the client listener's externally-signed
 certificate and clients perform ordinary system-root verification —

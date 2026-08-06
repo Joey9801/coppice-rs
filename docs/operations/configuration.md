@@ -100,6 +100,13 @@ data_dir = "/var/lib/coppice"
 # write an explicit `[discovery.static]` with `addrs = []`.
 backend = "dns"
 cluster_size = 3            # intended voter count (removal + `formed` gates)
+removal_grace = "120s"       # evidence-gated voter removal (ADR 0037 §7); shorten
+                              # only if your network's flap tolerance is tighter
+                              # than the default — too short folds out a merely
+                              # slow voter, not a dead one
+learner_expiry = "1h"         # stale-learner GC (ADR 0037 §7); shorten for fast
+                              # instance churn so abandoned learner seats and
+                              # their machine-identity bindings don't linger
 [discovery.dns]
 name = "coord.batch.example.com"
 port = 7071

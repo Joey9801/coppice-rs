@@ -493,6 +493,23 @@ async fn a_machine_certificate_gets_exactly_the_self_scope_grant() {
     );
     assert_denied(&status, "ReplaceVoter");
 
+    // The sharper form: the bound machine names *itself* as the seat that
+    // would be added (`new_node_id`), asking the cluster to replace some
+    // other voter with the caller's own binding. Self-interest is not a
+    // grant — ReplaceVoter is operator-only regardless of which side of the
+    // swap the caller's own seat appears on.
+    let status = refusal(
+        bound_client
+            .replace_voter(pb::ReplaceVoterRequest {
+                history_id: hid.clone(),
+                old_node_id: formed.seat + 1,
+                new_node_id: formed.seat,
+            })
+            .await,
+        "ReplaceVoter naming the caller's own seat as the replacement",
+    );
+    assert_denied(&status, "ReplaceVoter");
+
     let status = refusal(
         bound_client
             .set_node_address(pb::SetNodeAddressRequest {

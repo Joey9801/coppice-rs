@@ -623,6 +623,16 @@ async fn a_newcomer_at_a_full_voter_set_stays_a_learner() {
     // Not a refusal, either: this is a wait, and `/readyz` must not report it
     // as an operator-actionable failure.
     assert!(body["last_admission_refusal"].is_null(), "{body}");
+    // But the wait is not silent: §7 requires the leader's machine-readable
+    // reason be visible in status output, and it has its own field so the
+    // distinction between "waiting" and "refused" survives.
+    let hold = body["promotion_hold"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a held promotion must surface its reason: {body}"));
+    assert!(
+        hold.starts_with("no-removable-peer") || hold.starts_with("voter-set-full"),
+        "the hold must carry the leader's marker: {hold}"
+    );
 
     newcomer.stop().await.expect("newcomer stops cleanly");
     leader.stop().await.expect("leader stops cleanly");

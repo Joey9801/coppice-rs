@@ -20,6 +20,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -160,6 +161,55 @@ pub fn has_marker(message: &str, marker: &str) -> bool {
     message
         .strip_prefix(marker)
         .is_some_and(|rest| rest.starts_with(':'))
+}
+
+// ---------------------------------------------------------------------------
+// Test-only crash injection (ADR 0037 §4)
+// ---------------------------------------------------------------------------
+
+/// The env var an integration test sets to arm [`promote_voter`]'s one
+/// failpoint. Never read except when this exact var is present, so a real
+/// daemon's environment is never in a position to trip it.
+const TEST_FAILPOINT_ENV: &str = "COPPICE_TEST_FAILPOINT";
+
+/// The failpoint name: abort `PromoteVoter` between `ensure_key_transferred`
+/// and `commit_promotion` — the ADR §4 crash window whose custody statement
+/// this exists to stage deterministically ("a crash between key receipt and
+/// the joint change leaves a caught-up learner holding the key for the
+/// promotion it was already gated into").
+pub const PROMOTE_AFTER_KEY_TRANSFER: &str = "promote-after-key-transfer";
+
+/// Fire-once latch for [`PROMOTE_AFTER_KEY_TRANSFER`]. Process-global and
+/// deliberately so: this is production code reachable only through the gRPC
+/// surface, so there is no per-call test parameter to thread a `Failpoint`
+/// enum through the way `formation::Failpoint` does — and the integration
+/// harness runs every daemon of one test process in a single address space,
+/// so this flag (like the env var that arms it) is shared by all of them.
+/// Set the env var immediately before the one `PromoteVoter` call under test
+/// and keep that test alone in its file, or a second test's promotion in the
+/// same process could observe the latch already fired (or, worse, fire the
+/// abort itself).
+static PROMOTE_AFTER_KEY_TRANSFER_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// Consult and, at most once per process, fire the [`PROMOTE_AFTER_KEY_TRANSFER`]
+/// failpoint. A no-op in every real deployment and in any test process that
+/// never sets [`TEST_FAILPOINT_ENV`].
+fn maybe_fire_promote_after_key_transfer_failpoint() -> Result<(), Status> {
+    if std::env::var(TEST_FAILPOINT_ENV).ok().as_deref() != Some(PROMOTE_AFTER_KEY_TRANSFER) {
+        return Ok(());
+    }
+    if PROMOTE_AFTER_KEY_TRANSFER_FIRED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        // Already fired once this process: the fire-once contract, so the
+        // re-entrant promotion that converges the crash window is not aborted
+        // a second time.
+        return Ok(());
+    }
+    Err(Status::internal(
+        "promotion aborted at the promote-after-key-transfer failpoint (test-only)",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +706,13 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
 
         self.ensure_key_transferred(&consensus, &handle, req.promote_node_id)
             .await?;
+
+        // Test-only (ADR 0037 §4): stages the crash window between confirmed
+        // key receipt and the joint change. See
+        // `maybe_fire_promote_after_key_transfer_failpoint`'s doc comment for
+        // why this is a process-global env-var latch rather than a threaded
+        // parameter.
+        maybe_fire_promote_after_key_transfer_failpoint()?;
 
         consensus
             .commit_promotion(req.promote_node_id, evidence_removal)

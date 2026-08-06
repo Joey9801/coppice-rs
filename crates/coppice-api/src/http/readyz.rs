@@ -126,6 +126,16 @@ pub struct ReadyzReport {
     /// duplicated-machine-identity refusal (ADR 0037 §7) surfaces here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_admission_refusal: Option<String>,
+    /// Why promotion is currently held while this replica waits as a
+    /// caught-up learner (ADR 0037 §7): the leader's machine-readable reason
+    /// — a full voter set, no evidence-dead peer to fold out
+    /// (`no-removable-peer`), or a removal that would risk quorum
+    /// (`quorum-at-risk`). Deliberately a separate field from
+    /// `last_admission_refusal`: a hold is convergence *waiting*, not
+    /// convergence refused, but §7 requires the situation be visible in
+    /// status output all the same. Cleared when the replica converges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_hold: Option<String>,
     /// A stable machine-readable code for why a gate failed, when one applies
     /// (currently only `health_unknown`); `reason` carries the human text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +169,7 @@ impl ReadyzReport {
             formed: false,
             live_voters: None,
             last_admission_refusal: None,
+            promotion_hold: None,
             reason_code: None,
         }
     }
@@ -355,6 +366,7 @@ mod tests {
             formed: true,
             live_voters: None,
             last_admission_refusal: None,
+            promotion_hold: None,
             reason_code: None,
         }
     }
