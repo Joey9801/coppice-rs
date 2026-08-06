@@ -11,8 +11,8 @@ use coppice_core::id::{EnrollTokenId, MachineId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{
     BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RebindMachineAddress,
-    RecordCaCertificate, RecordEnrolledIdentity, RetireMachineBinding, RevokeEnrollToken,
-    RevokeIdentity,
+    RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent, RetireMachineBinding,
+    RevokeEnrollToken, RevokeIdentity,
 };
 use coppice_state::{
     CaCertBundle, Command, EnrollRole, RejectionReason, RevokedIdentity, StateMachine,
@@ -486,6 +486,114 @@ fn confirm_key_possession_inserts_and_reconfirmation_overwrites() {
     );
 }
 
+// ---- RecordKeyTransferIntent ----
+
+#[test]
+fn record_key_transfer_intent_inserts_and_repeat_keeps_the_first_stamp() {
+    let mut sm = StateMachine::default();
+    assert!(!sm.has_key_transfer_intent(3));
+    apply_ok(
+        &mut sm,
+        Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 3,
+            intended_at: base_ts(),
+        }),
+    );
+    assert!(sm.has_key_transfer_intent(3));
+    assert_eq!(sm.key_transfer_intents[&3], base_ts());
+
+    // First write wins, unlike ConfirmKeyPossession: the fact recorded is
+    // the earliest moment the key could have left the leader's disk.
+    let before = sm.version;
+    let later = ts(TS_US + 9_000_000);
+    apply_ok(
+        &mut sm,
+        Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 3,
+            intended_at: later,
+        }),
+    );
+    assert_eq!(
+        sm.key_transfer_intents[&3],
+        base_ts(),
+        "repeat intent keeps the first stamp"
+    );
+    assert_eq!(sm.version, before + 1);
+}
+
+#[test]
+fn confirm_key_possession_resolves_a_matching_transfer_intent() {
+    let mut sm = StateMachine::default();
+    apply_ok(
+        &mut sm,
+        Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 5,
+            intended_at: base_ts(),
+        }),
+    );
+    assert!(sm.has_key_transfer_intent(5));
+
+    apply_ok(
+        &mut sm,
+        Command::ConfirmKeyPossession(ConfirmKeyPossession {
+            raft_node_id: 5,
+            confirmed_at: ts(TS_US + 1_000_000),
+        }),
+    );
+    assert!(
+        !sm.has_key_transfer_intent(5),
+        "confirmation resolves (removes) the intent"
+    );
+    assert!(sm.has_key_confirmation(5));
+}
+
+#[test]
+fn transfer_intent_after_confirmation_is_a_noop_and_the_maps_stay_disjoint() {
+    let mut sm = StateMachine::default();
+    apply_ok(
+        &mut sm,
+        Command::ConfirmKeyPossession(ConfirmKeyPossession {
+            raft_node_id: 7,
+            confirmed_at: base_ts(),
+        }),
+    );
+    assert!(sm.has_key_confirmation(7));
+
+    // A concurrent promotion that read an older view can commit its intent
+    // after the confirmation. Confirmation dominates: the late intent is an
+    // accepted no-op, never a stranded entry retries would leave behind
+    // (they short-circuit on the confirmation and would never resolve it).
+    let before = sm.version;
+    apply_ok(
+        &mut sm,
+        Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 7,
+            intended_at: ts(TS_US + 1_000_000),
+        }),
+    );
+    assert!(
+        !sm.has_key_transfer_intent(7),
+        "a confirmed holder never re-enters the intent map"
+    );
+    assert!(sm.has_key_confirmation(7));
+    assert_eq!(sm.version, before + 1);
+}
+
+#[test]
+fn confirm_key_possession_without_a_prior_intent_still_succeeds() {
+    let mut sm = StateMachine::default();
+    assert!(!sm.has_key_transfer_intent(6));
+    apply_ok(
+        &mut sm,
+        Command::ConfirmKeyPossession(ConfirmKeyPossession {
+            raft_node_id: 6,
+            confirmed_at: base_ts(),
+        }),
+    );
+    assert!(sm.has_key_confirmation(6));
+    assert!(!sm.has_key_transfer_intent(6));
+}
+
 // ---- RecordEnrolledIdentity ----
 
 #[test]
@@ -548,4 +656,13 @@ fn pki_commands_emit_no_events() {
     .events
     .is_empty());
     assert!(apply_ok(&mut sm, retire(mid(1), 0)).events.is_empty());
+    assert!(apply_ok(
+        &mut sm,
+        Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 9,
+            intended_at: base_ts(),
+        })
+    )
+    .events
+    .is_empty());
 }

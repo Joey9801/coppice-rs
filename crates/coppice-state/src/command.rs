@@ -58,6 +58,7 @@ pub enum Command {
     RecordEnrolledIdentity(RecordEnrolledIdentity),
     RebindMachineAddress(RebindMachineAddress),
     RetireMachineBinding(RetireMachineBinding),
+    RecordKeyTransferIntent(RecordKeyTransferIntent),
 }
 
 impl Command {
@@ -95,6 +96,7 @@ impl Command {
             Command::RecordEnrolledIdentity(c) => c.recorded_at,
             Command::RebindMachineAddress(c) => c.rebound_at,
             Command::RetireMachineBinding(c) => c.retired_at,
+            Command::RecordKeyTransferIntent(c) => c.intended_at,
         }
     }
 }
@@ -451,6 +453,31 @@ pub struct RetireMachineBinding {
     pub retired_at: Timestamp,
 }
 
+/// Record the replicated fact that the leader committed an intent to
+/// transfer the CA key to a node, before the key ever leaves the leader's
+/// disk (ADR 0037 §4).
+///
+/// Closes the crash window between a candidate's durable receipt of the key
+/// (its `ConfirmKeyPossession` ack) and the leader's confirmation proposal:
+/// with the intent committed first, a leader crash mid-transfer still leaves
+/// a replicated record that the disk may hold a root-equivalent key, so
+/// custody accounting can treat it conservatively as a possible key holder.
+///
+/// First write wins: an existing intent keeps its original timestamp — the
+/// earliest moment the key could have left a leader's disk — and a repeat
+/// proposal (e.g. a retried transfer) is an accepted no-op. Never a
+/// rejection: unlike [`RebindMachineAddress`] or [`RetireMachineBinding`],
+/// this verb does not need an existing binding to make sense of, since the
+/// intent is about the CA key, not a machine identity.
+///
+/// [`ConfirmKeyPossession`] resolves (removes) the matching entry when the
+/// transfer completes successfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordKeyTransferIntent {
+    pub raft_node_id: u64,
+    pub intended_at: Timestamp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +591,11 @@ mod tests {
             retired_at: ts(37),
         });
         assert_eq!(retire.stamped_at(), ts(37));
+
+        let intent = Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 7,
+            intended_at: ts(39),
+        });
+        assert_eq!(intent.stamped_at(), ts(39));
     }
 }

@@ -22,6 +22,11 @@
 //!    (`an_evidence_promotion_that_cannot_proceed_never_keys_the_candidate`):
 //!    a learner arriving at an already-full voter set is never keyed at all,
 //!    for as long as it keeps polling.
+//! 5. The transfer protocol's other crash window
+//!    (`an_abandoned_transfer_keeps_the_keyed_disk_visible_in_custody_accounting`):
+//!    a leader lost between the candidate's durable ack and the replicated
+//!    confirmation leaves a keyed disk — which the pre-committed transfer
+//!    intent keeps visible in custody accounting until a retry resolves it.
 //!
 //! ## The failpoint is process-global — read this before touching test 1
 //!
@@ -40,7 +45,8 @@
 //! is a plain in-process async mutex: every test in this file takes [`SERIAL`] for
 //! its whole body, so at most one of the four ever runs at a time — cheap
 //! insurance given there is exactly one test file that ever sets the var,
-//! and it does so only for its own duration.
+//! and it does so only for its own duration. (Test 5 arms the second
+//! failpoint, `TRANSFER_BEFORE_CONFIRM`, under the same rules.)
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -48,7 +54,10 @@ use std::time::{Duration, Instant};
 use rcgen::KeyPair;
 use tonic::Status;
 
-use coppice_coordinator::admin::{self, has_marker, NO_KEY_HOLDER, PROMOTE_AFTER_KEY_TRANSFER};
+use coppice_coordinator::admin::{
+    self, has_marker, NO_KEY_HOLDER, NO_REMOVABLE_PEER, PROMOTE_AFTER_KEY_TRANSFER,
+    TRANSFER_BEFORE_CONFIRM, VOTER_SET_FULL,
+};
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::id::ClusterId;
 use coppice_proto::pb::core::v1 as pbcore;
@@ -683,4 +692,156 @@ async fn an_evidence_promotion_that_cannot_proceed_never_keys_the_candidate() {
 
     learner.stop().await.expect("learner stops cleanly");
     fleet.stop_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// 5. The crash window between the durable transfer ack and the confirmation
+// ---------------------------------------------------------------------------
+
+/// The transfer protocol's OTHER crash window (ADR 0037 §4), staged
+/// deterministically: the candidate durably persists the CA key and
+/// acknowledges `TransferCaKey`; the leader "crashes" (the failpoint aborts
+/// the verb) before `ConfirmKeyPossession` is proposed. The disk now holds
+/// the key with no confirmation — and in the launch-before-terminate
+/// abandonment this test stages, nothing ever retries: the live voter set is
+/// full, so the learner's own promotion attempts are refused *before* the
+/// transfer path, and the operator's failed `ReplaceVoter` is simply never
+/// re-issued.
+///
+/// What makes the disk visible anyway is the transfer INTENT, committed
+/// before the key ever left the leader: it stays in the custody accounting
+/// (`pending_key_transfers`, conservatively "possibly keyed") until a
+/// completed transfer's confirmation resolves it. The test closes by
+/// retrying the replacement (the failpoint is fire-once) and proving the
+/// intent resolves into an ordinary confirmed holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_transfer_keeps_the_keyed_disk_visible_in_custody_accounting() {
+    let _serial = SERIAL.lock().await;
+    init_tracing();
+    let ca = Ca::new();
+
+    let mut founder = Daemon::new_certless(ClusterId::new(), &ca);
+    let operator = form(&mut founder).await;
+    let mut op = dial_operator(&founder, &operator).await;
+    let hid = probe_history_id(&mut op).await;
+    let token = coordinator_token(&mut op, hid).await;
+    let founder_id = founder.readyz().await.1["node_id"]
+        .as_u64()
+        .expect("the founder has a node id");
+
+    // A caught-up learner at a full (1/1) live voter set: the §7 hands-off
+    // path can never fire (the predecessor is alive), so only `ReplaceVoter`
+    // can key it.
+    let mut learner = newcomer(founder.cluster_id, &ca, &founder, &token, 1);
+    learner.start();
+    learner.await_phase("learner").await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let learner_id = loop {
+        let (_, body) = learner.readyz().await;
+        if body["replication_lag"].as_u64() == Some(0) && body["leader_contact_stale"] == false {
+            break body["node_id"].as_u64().expect("the learner has a node id");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the learner never settled: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // Arm the crash window and drive the replacement into it. A transient
+    // catch-up refusal retries (the gate can flicker right after the lag
+    // settles); the failpoint abort is the outcome under test.
+    std::env::set_var("COPPICE_TEST_FAILPOINT", TRANSFER_BEFORE_CONFIRM);
+    let _guard = FailpointGuard;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = op
+            .replace_voter(pb::ReplaceVoterRequest {
+                history_id: hid.to_vec(),
+                old_node_id: founder_id,
+                new_node_id: learner_id,
+            })
+            .await
+            .expect_err("the staged crash must abort the replacement, not complete it");
+        if status.message().contains(TRANSFER_BEFORE_CONFIRM) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replacement never reached the staged window: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // The key reached the disk (the ack preceded the abort)...
+    assert!(
+        learner
+            .data_dir()
+            .join(coppice_tls::pki::CA_KEY_FILE)
+            .exists(),
+        "the candidate acknowledged a durable transfer, so its ca.key must exist"
+    );
+    // ...and the §4 accounting sees it: an unresolved intent, not a
+    // confirmed holder.
+    let status = admin::cluster_status(&mut op, hid)
+        .await
+        .expect("cluster status");
+    assert!(
+        status
+            .pending_key_transfers
+            .iter()
+            .any(|p| p.node_id == learner_id),
+        "the keyed-but-unconfirmed disk must be visible as an unresolved intent: {status:?}"
+    );
+    assert!(
+        !status.key_holders.iter().any(|h| h.node_id == learner_id),
+        "no confirmation landed, so the learner must not be a confirmed holder: {status:?}"
+    );
+
+    // Abandonment persists: the full live voter set keeps refusing the
+    // learner's own promotion (visibly — the hold reaches `/readyz`), and
+    // several settled-interval ticks later the unresolved intent is still
+    // the only custody record. Nothing quietly resolves or drops it.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    let (_, body) = learner.readyz().await;
+    assert_eq!(body["phase"], "learner", "{body}");
+    let hold = body["promotion_hold"].as_str().unwrap_or_default();
+    assert!(
+        has_marker(hold, NO_REMOVABLE_PEER) || has_marker(hold, VOTER_SET_FULL),
+        "the abandoned learner keeps polling against a full live set: {body}"
+    );
+    let status = admin::cluster_status(&mut op, hid)
+        .await
+        .expect("cluster status");
+    assert!(
+        status
+            .pending_key_transfers
+            .iter()
+            .any(|p| p.node_id == learner_id),
+        "the unresolved intent must survive abandonment indefinitely: {status:?}"
+    );
+    assert!(!status.key_holders.iter().any(|h| h.node_id == learner_id));
+
+    // The ordinary retry resolves it (the failpoint latch is spent): the
+    // transfer re-acks idempotently, the confirmation lands, the joint
+    // change commits — and the intent collapses into a confirmed holder.
+    admin::replace_voter(&mut op, hid, founder_id, learner_id)
+        .await
+        .expect("the retried replacement completes");
+    learner.await_phase("voter").await;
+    let mut op = dial_operator(&learner, &operator).await;
+    let status = admin::cluster_status(&mut op, hid)
+        .await
+        .expect("cluster status from the new sole voter");
+    assert!(
+        status.key_holders.iter().any(|h| h.node_id == learner_id),
+        "the resolved transfer must appear as a confirmed holder: {status:?}"
+    );
+    assert!(
+        status.pending_key_transfers.is_empty(),
+        "a confirmation must resolve the intent: {status:?}"
+    );
+
+    learner.stop().await.expect("learner stops cleanly");
+    founder.stop().await.expect("founder stops cleanly");
 }

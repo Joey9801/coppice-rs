@@ -150,7 +150,13 @@ a confirmed receipt from, by design including a candidate abandoned mid-
 promotion (a leader crash in the key-transfer window) and a voter that has
 since been removed — both are disks that received the key and remain
 root-equivalent, so filtering the list down to current voters would hide
-exactly the custody an operator most needs to see before re-rooting.
+exactly the custody an operator most needs to see before re-rooting. The
+transfer protocol itself is crash-accounted: the leader commits a transfer
+intent before the key ever leaves its disk, so a leader lost between the
+candidate's durable receipt and the replicated confirmation still leaves the
+disk visible — `admin status` lists such unresolved intents as
+`pending_key_transfers` ("possibly keyed"), resolved only when a retried
+transfer confirms.
 Enrollment is public ingress by
 design: a certless machine cannot verify cluster-PKI TLS yet, so
 `POST /api/v1/enroll` rides the client listener's externally-signed

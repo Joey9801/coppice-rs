@@ -124,6 +124,13 @@ message ClusterStatusResponse {
   // departed seats alike. The §4 abandoned-candidate case is visible here
   // and nowhere else: every disk that received the key is root-equivalent.
   repeated KeyHolder key_holders = 10;
+  // Unresolved key-transfer intents (ADR 0037 §4): the leader committed its
+  // intent to transfer the CA key to these nodes, and no confirmation has
+  // resolved it — a crash between the candidate's durable receipt and the
+  // replicated confirmation lands here. Conservative by design: such a disk
+  // MAY hold the key, so custody accounting treats it as if it does until a
+  // retried transfer confirms.
+  repeated PendingKeyTransfer pending_key_transfers = 11;
 }
 
 // One node's confirmed CA-key possession (ADR 0037 §4). The fact only —
@@ -131,6 +138,13 @@ message ClusterStatusResponse {
 message KeyHolder {
   uint64 node_id = 1;
   int64 confirmed_at_us = 2;
+}
+
+// One node's unresolved key-transfer intent (ADR 0037 §4): committed before
+// the key ever leaves the leader's disk, resolved by the confirmation.
+message PendingKeyTransfer {
+  uint64 node_id = 1;
+  int64 intended_at_us = 2;
 }
 
 // The leader's cluster-redundancy verdict (ADR 0037 §9): whether at least

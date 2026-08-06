@@ -223,6 +223,10 @@ fn every_command() -> Vec<Command> {
             machine: MachineId(Uuid::from_u128(0x11)),
             retired_at: ts(),
         }),
+        Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 5,
+            intended_at: ts(),
+        }),
     ]
 }
 

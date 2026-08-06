@@ -575,6 +575,16 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | Apply effects | Set `machine_bindings[machine].retired_at = retired_at`. A mark, never a delete: the binding invariant extends past retirement, so `BindMachineIdentity` and `RebindMachineAddress` both refuse a retired binding forever (one-seat-ever). An already-retired binding is an accepted no-op. |
 | Rejections | `UnknownMachineIdentity` |
 
+#### `RecordKeyTransferIntent`
+
+| | |
+| --- | --- |
+| Proposer | Key transfer (chunk 06): the leader commits its intent to transfer the CA key to a node *before the key ever leaves the leader's disk* (ADR 0037 §4) |
+| Payload | `raft_node_id: u64`, `intended_at_us` |
+| Validation | None — never a rejection (ADR 0037 §4) |
+| Apply effects | Insert `key_transfer_intents[raft_node_id] = intended_at` if absent. First write wins — unlike `ConfirmKeyPossession`, the fact recorded is the earliest moment the key could have left the leader's disk, so a repeat proposal (e.g. a retried transfer) is an accepted no-op that keeps the earlier stamp. Closes the crash window between a candidate's durable key receipt and the leader's `ConfirmKeyPossession` proposal: with the intent committed first, a leader crash mid-transfer still leaves a replicated record that the disk may hold a root-equivalent key. An entry with no matching `key_confirmations` entry is UNRESOLVED — custody accounting must treat that disk as a possible key holder (the §4 conservative stance). `ConfirmKeyPossession` removes the matching entry when the transfer resolves. |
+| Rejections | — |
+
 ---
 
 ## RejectionReason taxonomy

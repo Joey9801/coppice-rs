@@ -22,9 +22,9 @@ use crate::command::{
     AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
     ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, MintEnrollToken,
     Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
-    RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RegisterNode,
-    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob,
-    UpdatePolicy,
+    RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
+    RegisterNode, RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable,
+    SubmitJob, UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -67,6 +67,7 @@ impl StateMachine {
             Command::RecordEnrolledIdentity(c) => self.record_enrolled_identity(c),
             Command::RebindMachineAddress(c) => self.rebind_machine_address(c),
             Command::RetireMachineBinding(c) => self.retire_machine_binding(c),
+            Command::RecordKeyTransferIntent(c) => self.record_key_transfer_intent(c),
         };
         self.version += 1;
         result
@@ -1062,6 +1063,29 @@ impl StateMachine {
         // Re-confirmation overwrites the timestamp (ADR 0037 §4).
         self.key_confirmations
             .insert(c.raft_node_id, c.confirmed_at);
+        // A confirmation resolves any outstanding transfer intent: the map
+        // holds only unresolved intents (ADR 0037 §4).
+        self.key_transfer_intents.remove(&c.raft_node_id);
+        Ok(Applied::default())
+    }
+
+    fn record_key_transfer_intent(&mut self, c: &RecordKeyTransferIntent) -> ApplyResult {
+        // Confirmation dominates (ADR 0037 §4): a confirmed holder is the
+        // *resolved* form of an intent, so an intent arriving after the
+        // confirmation — a concurrent promotion that proposed against an
+        // older published view — is an accepted no-op. Inserting it would
+        // strand the node in both maps: retries short-circuit on the
+        // confirmation and nothing ever resolves the stale intent.
+        if self.key_confirmations.contains_key(&c.raft_node_id) {
+            return Ok(Applied::default());
+        }
+        // First write wins (ADR 0037 §4): an existing intent keeps the
+        // earliest instant the key could have left the leader's disk, and a
+        // repeat proposal (e.g. a retried transfer) is an accepted no-op.
+        // Never a rejection.
+        self.key_transfer_intents
+            .entry(c.raft_node_id)
+            .or_insert(c.intended_at);
         Ok(Applied::default())
     }
 

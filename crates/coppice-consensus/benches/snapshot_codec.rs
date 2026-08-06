@@ -52,6 +52,7 @@ struct SectionBuffers {
     revoked_identities: Vec<u8>,
     key_confirmations: Vec<u8>,
     enrolled_identities: Vec<u8>,
+    key_transfer_intents: Vec<u8>,
     cluster: Vec<u8>,
 }
 
@@ -80,6 +81,10 @@ fn encode_all(records: &StateRecords, bufs: &mut SectionBuffers) -> u64 {
     encode_section(&records.revoked_identities, &mut bufs.revoked_identities);
     encode_section(&records.key_confirmations, &mut bufs.key_confirmations);
     encode_section(&records.enrolled_identities, &mut bufs.enrolled_identities);
+    encode_section(
+        &records.key_transfer_intents,
+        &mut bufs.key_transfer_intents,
+    );
     bufs.cluster.clear();
     if let Some(cluster) = &records.cluster {
         cluster
@@ -96,6 +101,7 @@ fn encode_all(records: &StateRecords, bufs: &mut SectionBuffers) -> u64 {
         + bufs.revoked_identities.len()
         + bufs.key_confirmations.len()
         + bufs.enrolled_identities.len()
+        + bufs.key_transfer_intents.len()
         + bufs.cluster.len()) as u64
 }
 
@@ -123,6 +129,7 @@ fn decode_all(bufs: &SectionBuffers) -> StateRecords {
         revoked_identities: decode_section(&bufs.revoked_identities),
         key_confirmations: decode_section(&bufs.key_confirmations),
         enrolled_identities: decode_section(&bufs.enrolled_identities),
+        key_transfer_intents: decode_section(&bufs.key_transfer_intents),
         cluster: if bufs.cluster.is_empty() {
             None
         } else {

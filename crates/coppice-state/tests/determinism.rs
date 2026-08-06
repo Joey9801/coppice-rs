@@ -208,6 +208,7 @@ fn snapshot_roundtrip(state: &StateMachine) -> StateMachine {
         revoked_identities: recode(records.revoked_identities),
         key_confirmations: recode(records.key_confirmations),
         enrolled_identities: recode(records.enrolled_identities),
+        key_transfer_intents: recode(records.key_transfer_intents),
         cluster: records.cluster.map(|c| {
             let mut recoded = recode(vec![c]);
             recoded.pop().expect("one cluster record")
@@ -224,7 +225,8 @@ fn pki_facts_survive_snapshot_roundtrip() {
     use coppice_core::id::{EnrollTokenId, MachineId};
     use coppice_state::command::{
         BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RecordCaCertificate,
-        RecordEnrolledIdentity, RetireMachineBinding, RevokeEnrollToken, RevokeIdentity,
+        RecordEnrolledIdentity, RecordKeyTransferIntent, RetireMachineBinding, RevokeEnrollToken,
+        RevokeIdentity,
     };
     use coppice_state::{EnrollRole, RevokedIdentity};
 
@@ -284,6 +286,17 @@ fn pki_facts_survive_snapshot_roundtrip() {
             identity: RevokedIdentity::Node(nid(9)),
             revoked_at: base_ts(),
         }),
+        // An intent for node 1 that its ConfirmKeyPossession below resolves
+        // (removes), and a separate UNRESOLVED intent for node 3 (no
+        // matching confirmation) that must survive the round trip.
+        Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 1,
+            intended_at: base_ts(),
+        }),
+        Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
+            raft_node_id: 3,
+            intended_at: base_ts(),
+        }),
         Command::ConfirmKeyPossession(ConfirmKeyPossession {
             raft_node_id: 1,
             confirmed_at: base_ts(),
@@ -318,6 +331,13 @@ fn pki_facts_survive_snapshot_roundtrip() {
     assert_eq!(sm.revoked_identities.len(), 2);
     assert_eq!(sm.key_confirmations.len(), 2);
     assert_eq!(sm.enrolled_identities.len(), 2);
+    assert_eq!(
+        sm.key_transfer_intents.len(),
+        1,
+        "node 1's intent is resolved by its confirmation; node 3's stays UNRESOLVED"
+    );
+    assert!(sm.has_key_transfer_intent(3));
+    assert!(!sm.has_key_transfer_intent(1));
     assert!(sm.machine_binding(&mid(1)).unwrap().retired_at.is_none());
     assert_eq!(
         sm.machine_binding(&mid(2)).unwrap().retired_at,

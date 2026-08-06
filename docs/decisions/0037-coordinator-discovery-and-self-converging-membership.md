@@ -398,6 +398,26 @@ A minimal deployment provisions no certificates at all.
   between key receipt and the joint change leaves a caught-up learner
   holding the key for the promotion it was already gated into —
   accepted, and covered by the custody statement below.
+- **The transfer is bracketed by a replicated intent.** Before the key
+  bytes leave the leader's disk, the leader commits a *key-transfer
+  intent* for the candidate — first write wins, so the recorded
+  timestamp is the earliest instant the key could have left a leader —
+  and only then dials the transfer. The possession confirmation
+  *resolves* the intent: the two facts are one protocol's pending and
+  settled states, a node is never legitimately in both, and because a
+  confirmed holder is the resolved form of an intent, an intent
+  committed after the confirmation (a concurrent proposal read against
+  an older published view) is an accepted no-op rather than a stranded
+  entry nothing would ever clear. An *unresolved* intent means exactly
+  "may hold the key": once the transfer is dialed its outcome can be
+  unknowable from the leader's side — the candidate may have persisted
+  the key and crashed before acknowledging — so an unsuccessful or
+  ambiguous transfer deliberately leaves the intent behind, visible in
+  the custody accounting of §9's status surface as a possible holder
+  until some later confirmation resolves it. The false positive is the
+  point: over-counting root-equivalent disks costs an operator a
+  glance, under-counting is the invisible-key-holder failure the
+  intent exists to prevent.
 - **What key custody honestly means.** Removal cannot make a disk
   forget: a disk, a snapshot of one, or a compromised instance retains
   signing authority indefinitely, and identity revocation plus seat
@@ -407,7 +427,12 @@ A minimal deployment provisions no certificates at all.
   promotion candidate keyed ahead of a joint change, *including one
   whose promotion never committed* (a leader crash in that window
   abandons the candidate as a learner, but abandons it holding the key,
-  exactly as a removed voter does). Equally root-equivalent is any
+  exactly as a removed voter does). The transfer intent above is what
+  keeps that last class *visible*: it was committed before the key left
+  the leader, so an abandoned candidate appears in custody accounting
+  as a possible holder even though its confirmation never arrived —
+  without it, a crash in the transfer window would leave a
+  root-equivalent disk no accounting surface ever mentioned. Equally root-equivalent is any
   credential path that can reach the key transfer — in particular a
   coordinator enrollment token (§5), which through a legitimate vacancy
   or an evidence-gated removal window can place a learner that is
@@ -956,6 +981,11 @@ Log scraping is removed from every workflow:
   continuing voters — so a replacement can never end as a keyless sole
   voter, and no credential short of a staged promotion can mint
   certificates.
+  Every transfer is bracketed by a replicated intent committed before
+  the key leaves the leader and resolved by the possession
+  confirmation, so a transfer whose outcome the leader cannot know
+  still leaves a conservative "may hold the key" fact in custody
+  accounting rather than an invisible root-equivalent disk.
   The custody corollary is stated, not hidden: removal cannot make a
   disk forget, so every disk that has ever received the key — current
   and former voters, and promotion candidates whose joint change never
@@ -1014,7 +1044,14 @@ Log scraping is removed from every workflow:
   `formation_complete` marker present, and `init` against a marker-less
   formation reporting `formation-failed`; a promotion candidate keyed
   and then abandoned by a leader crash (never a voter, flagged in the
-  key-custody accounting as a holder); enrollment with a revoked,
+  key-custody accounting as a holder — its pre-transfer intent, never
+  resolved by a confirmation, is what flags it); a transfer interrupted
+  after the intent committed but with the outcome unknowable (the
+  unresolved intent stays visible as a possible holder until a retried
+  transfer's confirmation resolves it); an intent committed after
+  possession is already confirmed — a concurrent proposal against an
+  older view (accepted no-op; the intent and confirmation maps stay
+  disjoint); enrollment with a revoked,
   expired, or
   wrong-role token; enrollment configured against an unverified
   endpoint without the insecure flag (startup failure); enrollment

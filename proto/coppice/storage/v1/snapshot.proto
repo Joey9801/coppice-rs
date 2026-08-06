@@ -85,6 +85,10 @@ enum SectionKind {
   SECTION_KIND_REVOKED_IDENTITY = 9;
   SECTION_KIND_KEY_CONFIRMATION = 10;
   SECTION_KIND_ENROLLED_IDENTITY = 11;
+  // Unresolved key-transfer intents (ADR 0037 §4). An UNRESOLVED intent must
+  // survive snapshots and restarts — it is the record that keeps a
+  // possibly-keyed disk visible across exactly the crashes it exists for.
+  SECTION_KIND_KEY_TRANSFER_INTENT = 12;
 }
 
 enum Compression {
@@ -231,4 +235,15 @@ message KeyConfirmationRecord {
 message EnrolledIdentityRecord {
   coppice.core.v1.MachineId machine = 1;
   int64 recorded_at_us = 2;
+}
+
+// The replicated fact that the leader committed an intent to transfer the CA
+// key to a node, before the key left the leader's disk (ADR 0037 §4). Keyed
+// by `raft_node_id`. An entry with no matching `KeyConfirmationRecord` is an
+// UNRESOLVED intent — custody accounting must treat that disk as a possible
+// key holder. `ConfirmKeyPossession` removes the matching entry when the
+// transfer resolves, so only unresolved intents are ever present.
+message KeyTransferIntentRecord {
+  uint64 raft_node_id = 1;
+  int64 intended_at_us = 2;
 }
