@@ -271,8 +271,13 @@ raft_addr = "127.0.0.1:{port}"
 advertise_host = "localhost"
 
 [raft]
-election_timeout = "300ms"
-heartbeat_interval = "100ms"
+# Generous for oversubscribed CI runners: 300ms elections flap for minutes on a
+# 2-core host under load (observed: every enrollment forward bouncing between
+# two voters each naming the other leader), and nothing in these suites needs
+# fast failover — kills are real process deaths detected by contact evidence,
+# not election timing.
+election_timeout = "1s"
+heartbeat_interval = "250ms"
 rpc_timeout = "2s"
 snapshot_log_entries = 32
 snapshot_keep_log_entries = 0
@@ -565,8 +570,13 @@ raft_addr = "127.0.0.1:{raft_port}"
 advertise_host = "localhost"
 
 [raft]
-election_timeout = "300ms"
-heartbeat_interval = "100ms"
+# Generous for oversubscribed CI runners: 300ms elections flap for minutes on a
+# 2-core host under load (observed: every enrollment forward bouncing between
+# two voters each naming the other leader), and nothing in these suites needs
+# fast failover — kills are real process deaths detected by contact evidence,
+# not election timing.
+election_timeout = "1s"
+heartbeat_interval = "250ms"
 rpc_timeout = "2s"
 snapshot_log_entries = 32
 snapshot_keep_log_entries = 0
@@ -804,8 +814,13 @@ agent_addr = "127.0.0.1:{agent_port}"
 advertise_host = "localhost"
 
 [raft]
-election_timeout = "300ms"
-heartbeat_interval = "100ms"
+# Generous for oversubscribed CI runners: 300ms elections flap for minutes on a
+# 2-core host under load (observed: every enrollment forward bouncing between
+# two voters each naming the other leader), and nothing in these suites needs
+# fast failover — kills are real process deaths detected by contact evidence,
+# not election timing.
+election_timeout = "1s"
+heartbeat_interval = "250ms"
 rpc_timeout = "2s"
 snapshot_log_entries = 32
 snapshot_keep_log_entries = 0
@@ -1189,8 +1204,11 @@ log_level = "warn"
     /// all is observed.
     pub async fn await_phase_in(&self, phases: &[&str]) -> serde_json::Value {
         // Generous: a parked daemon under full-suite load can spend most of
-        // its park backoff (up to 15s a round) before its first join tick.
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // its park backoff (up to 15s a round) before its first join tick —
+        // and on an oversubscribed host (CI, or concurrent builds) a starved
+        // fleet can churn elections for a while first, during which every
+        // enrollment answers 503 and each failed round costs a full backoff.
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let (_, body) = self.readyz().await;
             if phases.iter().any(|p| body["phase"] == *p) {

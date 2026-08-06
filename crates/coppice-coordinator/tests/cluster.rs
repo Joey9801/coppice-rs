@@ -305,7 +305,8 @@ async fn formed_stays_true_but_require_healthy_degrades_once_a_voter_dies() {
     assert_eq!(body["voters"].as_array().expect("voters").len(), 3);
 
     // The idle-cluster requirement itself: the dead voter stops answering the
-    // leader's heartbeats, its contact goes stale (600ms), the sampler
+    // leader's heartbeats, its contact goes stale (2s: twice the fixture's 1s
+    // election timeout), the sampler
     // observes the shortfall on its next tick — 503 well inside this budget,
     // with the log never moving.
     poll(
@@ -378,12 +379,13 @@ async fn a_flap_between_health_requests_still_resets_the_stability_window() {
 
     // The flap: kill a non-leader voter and bring it straight back, touching
     // no health endpoint in between. The sleep only guarantees the outage
-    // outlives the contact-staleness bound (600ms) plus a couple of sampler
-    // ticks, so the lapse is observable *by the sampler* — nothing else is
-    // watching, which is the point.
+    // outlives the contact-staleness bound (2× the fixture's 1s election
+    // timeout = 2s) plus a couple of sampler ticks (staleness/4 = 500ms), so
+    // the lapse is observable *by the sampler* — nothing else is watching,
+    // which is the point.
     let victim = (leader_idx + 1) % 3;
     fleet.members[victim].kill().await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(3500)).await;
     fleet.members[victim].await_released().await;
     fleet.members[victim].start();
 
