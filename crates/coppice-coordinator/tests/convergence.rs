@@ -612,7 +612,10 @@ async fn a_newcomer_at_a_full_voter_set_stays_a_learner() {
     // It is admitted and catches up — the leader's membership grows — but the
     // ceiling holds, so it never reaches `voter`.
     newcomer.await_phase("learner").await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Four settled-interval ticks of the newcomer's own convergence loop
+    // (250ms under the fixture's `[pacing]`), and twenty probe rounds: it has
+    // asked to be promoted repeatedly and been held every time.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let body = newcomer.readyz().await.1;
     assert_eq!(body["phase"], "learner", "the ceiling must hold: {body}");
     assert_eq!(

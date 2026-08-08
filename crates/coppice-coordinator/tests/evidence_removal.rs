@@ -247,10 +247,12 @@ async fn a_live_predecessor_never_qualifies_as_evidence_dead() {
     fleet.members[learner].start();
     fleet.members[learner].await_phase("learner").await;
 
-    // Comfortably longer than several `removal_grace` windows: nothing here
-    // is a race against the leader's own evidence clock, because no voter
-    // ever stops answering.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Two and a half `removal_grace` windows (2s each): long enough that a
+    // leader willing to condemn a live voter would have done it by now, and
+    // nothing here is a race against the leader's own evidence clock, because
+    // no voter ever stops answering — every one of them acks a heartbeat
+    // every 250ms, eight times per window.
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     for member in [&fleet.members[0], &fleet.members[2]] {
         let (_, body) = member.readyz().await;
@@ -279,7 +281,7 @@ async fn a_live_predecessor_never_qualifies_as_evidence_dead() {
             "expected the {NO_REMOVABLE_PEER:?} marker, got {:?}",
             status.message()
         );
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     fleet.stop_all().await;
@@ -304,9 +306,9 @@ async fn an_overfull_voter_set_with_no_dead_candidate_refuses_promotion_machine_
     let hid = history_id_of(&fleet.members[0]).await;
     let learner_id = node_id(&fleet.members[learner].readyz().await.1);
 
-    // The refusal window: several `removal_grace` periods with all three
-    // voters alive, the marker asserted directly against the leader.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // The refusal window: two `removal_grace` periods (2s each) with all
+    // three voters alive, the marker asserted directly against the leader.
+    tokio::time::sleep(Duration::from_secs(4)).await;
     {
         let status = promote_refusal(&fleet, &operator, hid, learner_id).await;
         assert_eq!(
@@ -366,10 +368,10 @@ async fn an_overfull_voter_set_with_no_dead_candidate_refuses_promotion_machine_
 async fn a_learner_without_replication_contact_expires_and_its_identity_is_retired() {
     init_tracing();
     let ca = Ca::new();
-    let (mut fleet, operator) = formed_trio(&ca, |m| m.set_learner_expiry("4s")).await;
+    let (mut fleet, operator) = formed_trio(&ca, |m| m.set_learner_expiry("2s")).await;
 
     let learner = fleet.add_member(&ca);
-    fleet.members[learner].set_learner_expiry("4s");
+    fleet.members[learner].set_learner_expiry("2s");
     fleet.members[learner].start();
     fleet.members[learner].await_phase("learner").await;
     let learner_id = node_id(&fleet.members[learner].readyz().await.1);
@@ -379,8 +381,8 @@ async fn a_learner_without_replication_contact_expires_and_its_identity_is_retir
     fleet.members[learner].kill().await;
 
     let hid = history_id_of(&fleet.members[0]).await;
-    // Tick period is min(learner_expiry/4, 60s) = 1s here; a generous deadline
-    // covers the expiry window plus several sweeps.
+    // Tick period is (learner_expiry/4).clamp(100ms, 60s) = 500ms here; a
+    // generous deadline covers the expiry window plus several sweeps.
     poll(
         Duration::from_secs(30),
         "learner-gc removes the expired, contactless learner",
@@ -429,8 +431,10 @@ async fn a_learner_without_replication_contact_expires_and_its_identity_is_retir
     // receives the log entry that removed it) — `phase: learner` here is that
     // stale belief, not a re-admission. The authoritative check is the
     // leader's: the retired identity never re-enters membership no matter how
-    // long its convergence loop keeps retrying.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // long its convergence loop keeps retrying — a second is twenty of that
+    // loop's probe rounds (50ms under the fixture's `[pacing]`), so it has
+    // asked and been refused many times over.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let mut client = operator_client(&fleet.members[0], &operator).await;
     let status = admin::cluster_status(&mut client, hid)
         .await
@@ -452,17 +456,19 @@ async fn a_learner_without_replication_contact_expires_and_its_identity_is_retir
 async fn an_idle_caught_up_learner_survives_on_heartbeats_alone() {
     init_tracing();
     let ca = Ca::new();
-    let (mut fleet, operator) = formed_trio(&ca, |m| m.set_learner_expiry("4s")).await;
+    let (mut fleet, operator) = formed_trio(&ca, |m| m.set_learner_expiry("2s")).await;
 
     let learner = fleet.add_member(&ca);
-    fleet.members[learner].set_learner_expiry("4s");
+    fleet.members[learner].set_learner_expiry("2s");
     fleet.members[learner].start();
     fleet.members[learner].await_phase("learner").await;
     let learner_id = node_id(&fleet.members[learner].readyz().await.1);
 
-    // Several expiry periods, fully idle: no job submission, no membership
-    // verb, nothing but the raft heartbeat traffic every member already runs.
-    tokio::time::sleep(Duration::from_secs(12)).await;
+    // Two and a half `learner_expiry` periods (2s each) and ten GC sweeps
+    // (expiry/4 = 500ms), fully idle: no job submission, no membership verb,
+    // nothing but the raft heartbeat traffic every member already runs — of
+    // which the learner acks eight per expiry window.
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let body = fleet.members[learner].readyz().await.1;
     assert_eq!(

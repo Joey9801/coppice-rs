@@ -114,9 +114,12 @@ async fn a_parked_fleet_converges_when_a_cluster_finally_appears() {
     }
 
     // Long enough to cross several convergence rounds and let the parked
-    // backoff grow: the daemons must still be parked, not wedged, and not
-    // have talked each other into forming anything.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // backoff grow to its ceiling: under the fixture's `[pacing]` the parked
+    // interval starts at 50ms and doubles to its 250ms maximum within the
+    // first ~400ms, so a second covers the whole ramp plus several rounds at
+    // the ceiling. The daemons must still be parked, not wedged, and not have
+    // talked each other into forming anything.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     for (i, member) in fleet.members.iter().enumerate() {
         let body = member.readyz().await.1;
         assert_eq!(
@@ -269,7 +272,8 @@ async fn formed_stays_true_but_require_healthy_degrades_once_a_voter_dies() {
     let mut fleet = Fleet::new(3, &ca);
     // Shrink the sustain window (default 10s) so the healthy 200 arrives
     // inside a test-sized wait; degradation itself needs only the staleness
-    // bound (2× the 300ms election timeout) plus a sampler tick either way.
+    // bound (2× the fixture's 1s election timeout = 2s) plus a sampler tick
+    // (staleness/4 = 500ms) either way.
     for member in &fleet.members {
         member.set_health_stability("1s");
     }
@@ -352,11 +356,14 @@ async fn a_flap_between_health_requests_still_resets_the_stability_window() {
     init_tracing();
     let ca = Ca::new();
     let mut fleet = Fleet::new(3, &ca);
-    // Long enough that "recovered but not yet re-sustained" is a wide, safely
-    // assertable state; short enough to keep the test bounded.
-    const STABILITY: Duration = Duration::from_secs(5);
+    // Six sampler ticks (the sampler runs at contact_staleness/4 = 500ms):
+    // wide enough that "recovered but not yet re-sustained" is a safely
+    // assertable state — the 503-with-full-replication observation below has
+    // the whole window to land in, polling at 100ms — and short enough that
+    // the test pays this interval only twice.
+    const STABILITY: Duration = Duration::from_secs(3);
     for member in &fleet.members {
-        member.set_health_stability("5s");
+        member.set_health_stability("3s");
     }
     fleet.start_all();
     fleet.init().await;
