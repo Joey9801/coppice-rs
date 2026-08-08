@@ -1358,6 +1358,7 @@ async fn an_operator_admission_dial_back_verifies_binds_and_replays_as_a_noop() 
         cluster.history_id,
         joiner.raft_id(),
         Duration::from_secs(60),
+        Duration::from_millis(50),
     )
     .await
     .expect("promote the admitted joiner");

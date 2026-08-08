@@ -51,9 +51,6 @@ use crate::cli::{AdminArgs, AdminVerb};
 use crate::config;
 use crate::enroll::{self, EnrollContext, EnrollError, EnrollRequest};
 
-/// How often the promotion wrapper retries while a learner is still catching up.
-const PROMOTE_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
 /// How long a CA-key recipient waits for the cluster's CA certificate to
 /// become visible in its own applied state before refusing the transfer
 /// (ADR 0037 §4).
@@ -2355,14 +2352,19 @@ pub async fn cluster_status_resolving_leader(
 /// (ADR 0016 step 3).
 ///
 /// A learner still behind the promotion threshold yields a retryable
-/// `FAILED_PRECONDITION`/"behind" response; this retries every 500ms up to the
+/// `FAILED_PRECONDITION`/"behind" response; this retries every `poll` up to the
 /// `wait` deadline before giving up, which is what makes `coordinator replace`
 /// operable end to end. Any other failure returns immediately.
+///
+/// `poll` is the caller's `[pacing] promote_poll_interval` (the CLI reads it
+/// from the node config it was pointed at); `wait` is the caller's own
+/// deadline, which is a flag rather than configuration.
 pub async fn promote_voter(
     client: &mut Client<Channel>,
     history_id: [u8; 16],
     promote: CoordinatorId,
     wait: Duration,
+    poll: Duration,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
@@ -2385,14 +2387,14 @@ pub async fn promote_voter(
             Err(status)
                 if is_learner_behind(&status) || has_marker(status.message(), QUORUM_AT_RISK) =>
             {
-                if tokio::time::Instant::now() + PROMOTE_POLL_INTERVAL >= deadline {
+                if tokio::time::Instant::now() + poll >= deadline {
                     bail!(
                         "learner {promote} was not promotable within {}: {}",
                         humantime_serde::re::humantime::format_duration(wait),
                         status.message()
                     );
                 }
-                tokio::time::sleep(PROMOTE_POLL_INTERVAL).await;
+                tokio::time::sleep(poll).await;
             }
             Err(status) => return Err(status_to_anyhow(status)),
         }
@@ -2550,7 +2552,14 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
             println!("added node {node_id} as a learner ({addr})");
         }
         AdminVerb::Promote { node_id, wait } => {
-            promote_voter(&mut client, history_id, node_id, wait).await?;
+            promote_voter(
+                &mut client,
+                history_id,
+                node_id,
+                wait,
+                cfg.pacing.promote_poll_interval,
+            )
+            .await?;
             println!("promoted node {node_id} to voter");
         }
         AdminVerb::ReplaceVoter { old, new } => {

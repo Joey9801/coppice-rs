@@ -389,6 +389,7 @@ pub async fn run_with(
             .context("building the discovery backend for the convergence loop")?,
         tls: convergence_tls,
         phase: Arc::clone(&phase),
+        pacing: resolved.config.pacing.clone(),
     });
 
     // The task runtime owns steps 1–4 of the shutdown order and returns once

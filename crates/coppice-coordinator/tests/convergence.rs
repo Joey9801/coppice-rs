@@ -274,8 +274,8 @@ async fn a_newcomer_killed_after_enrolling_but_before_joining_resumes_the_same_i
 /// starts under `Join` (stamped, driving `AddLearner`, not yet admitted);
 /// `learner` means the leader admitted it (between admission and promotion).
 /// Which one the kill lands in is timing-dependent — admission needs at least
-/// one 300ms loop tick plus the leader's dial-back, so the 10ms poll almost
-/// always catches `joining` first — and the observed phase is carried into
+/// one loop tick (50ms under the fixture's `[pacing]`) plus the leader's
+/// dial-back, so the 10ms poll usually catches `joining` first — and the observed phase is carried into
 /// the assertion messages rather than assumed. `voter` is in the accepted set
 /// only so a loaded test host cannot flake the staging: on a busy machine the
 /// whole join can outrun the observer's HTTP polls, and a kill that lands

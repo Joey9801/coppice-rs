@@ -399,6 +399,12 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) raft: RaftConfig,
 
+    /// Convergence-loop pacing. Optional: the defaults suit ordinary
+    /// deployments; the integration-test fixture shortens them so a fleet
+    /// forms in milliseconds instead of production seconds.
+    #[serde(default)]
+    pub(crate) pacing: PacingConfig,
+
     /// mTLS material for intra-cluster traffic (ADR 0011, day one). Required:
     /// there is no insecure fallback.
     pub(crate) tls: TlsConfig,
@@ -678,6 +684,76 @@ impl Default for RaftConfig {
     }
 }
 
+/// Convergence-loop pacing (ADR 0037 §6).
+///
+/// Every value here is a *sleep between rounds*, never a timeout or a
+/// deadline: the loop is tick-driven, nothing wakes it early, so these are
+/// exactly the knobs that decide how long a join, a catch-up, or a promotion
+/// takes to be noticed. Like `[raft]` they affect only liveness — a shorter
+/// interval costs dials, a longer one costs latency, and neither can change
+/// what the cluster agrees on — so they are node-local and safe to vary per
+/// replica (ADR 0020). The defaults suit ordinary deployments; the
+/// integration-test fixture shrinks them, which is the only reason they are
+/// configurable at all — a fleet that forms in one process tree has no reason
+/// to pay a production deployment's pacing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PacingConfig {
+    /// Base re-probe cadence while actively converging. Short: the cost of a
+    /// tick is one dial to a peer that is expecting it, and convergence
+    /// latency is a deployment's rolling-upgrade latency.
+    #[serde(default = "default_probe_interval", with = "humantime_serde")]
+    pub(crate) probe_interval: Duration,
+
+    /// Slow cadence once converged to a voter, or once parked on an
+    /// unavailable voter seat: nothing to do but keep observing, so a later
+    /// membership change (a removal, a demotion) is still noticed.
+    #[serde(default = "default_settled_interval", with = "humantime_serde")]
+    pub(crate) settled_interval: Duration,
+
+    /// How long to back off after a refusal that will not resolve by waiting —
+    /// a duplicated machine identity, an address conflict (ADR 0037 §7).
+    /// Hammering a leader that has already said "never" buys nothing; the
+    /// operator sees the refusal in `/readyz` and fixes it, and the retry is
+    /// only here at all because "never" can become "yes" once they do.
+    #[serde(default = "default_refusal_backoff", with = "humantime_serde")]
+    pub(crate) refusal_backoff: Duration,
+
+    /// The shortest a parked daemon waits between pre-start convergence
+    /// rounds: a fleet booting together should find each other in the first
+    /// second or two.
+    #[serde(default = "default_park_interval_min", with = "humantime_serde")]
+    pub(crate) park_interval_min: Duration,
+
+    /// The longest a parked daemon waits between rounds — a fleet parked for a
+    /// week must not spin. The backoff doubles each failed round, so this also
+    /// bounds the ramp, and reaching it is what escalates a parked daemon's
+    /// failure reason to `warn` (a daemon still failing at maximum backoff is
+    /// stuck, not booting).
+    #[serde(default = "default_park_interval_max", with = "humantime_serde")]
+    pub(crate) park_interval_max: Duration,
+
+    /// How often the admin-side promotion wrapper retries while a learner is
+    /// still catching up or the leader has not yet heard its first heartbeat
+    /// acknowledgement. Bounded by the caller's own `wait` deadline, which is
+    /// not configuration.
+    #[serde(default = "default_promote_poll_interval", with = "humantime_serde")]
+    pub(crate) promote_poll_interval: Duration,
+}
+
+impl Default for PacingConfig {
+    fn default() -> Self {
+        PacingConfig {
+            probe_interval: default_probe_interval(),
+            settled_interval: default_settled_interval(),
+            refusal_backoff: default_refusal_backoff(),
+            park_interval_min: default_park_interval_min(),
+            park_interval_max: default_park_interval_max(),
+            promote_poll_interval: default_promote_poll_interval(),
+        }
+    }
+}
+
 /// mTLS material for intra-cluster traffic (ADR 0011).
 ///
 /// Secrets by path reference only: the config file itself never holds key
@@ -779,6 +855,30 @@ fn default_snapshot_keep_log_entries() -> u64 {
 /// slip through between two polls, short enough not to stall a bringup.
 fn default_health_stability_interval() -> Duration {
     Duration::from_secs(10)
+}
+
+fn default_probe_interval() -> Duration {
+    Duration::from_millis(300)
+}
+
+fn default_settled_interval() -> Duration {
+    Duration::from_secs(3)
+}
+
+fn default_refusal_backoff() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_park_interval_min() -> Duration {
+    Duration::from_millis(500)
+}
+
+fn default_park_interval_max() -> Duration {
+    Duration::from_secs(15)
+}
+
+fn default_promote_poll_interval() -> Duration {
+    Duration::from_millis(500)
 }
 
 fn default_log_level() -> String {
@@ -1167,6 +1267,49 @@ addrs = []
             config.raft.health_stability_interval,
             Duration::from_secs(2)
         );
+    }
+
+    /// `[pacing]` is entirely optional and every field defaults to the value
+    /// the convergence loop used when these were hardcoded constants — a
+    /// config written before the section existed must keep production pacing.
+    #[test]
+    fn pacing_defaults_and_parses() {
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let config = read_config(&path).expect("an absent [pacing] section is valid");
+        assert_eq!(config.pacing.probe_interval, Duration::from_millis(300));
+        assert_eq!(config.pacing.settled_interval, Duration::from_secs(3));
+        assert_eq!(config.pacing.refusal_backoff, Duration::from_secs(30));
+        assert_eq!(config.pacing.park_interval_min, Duration::from_millis(500));
+        assert_eq!(config.pacing.park_interval_max, Duration::from_secs(15));
+        assert_eq!(
+            config.pacing.promote_poll_interval,
+            Duration::from_millis(500)
+        );
+
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[pacing]\nprobe_interval = \"50ms\"\n\
+             settled_interval = \"250ms\"\nrefusal_backoff = \"1s\"\n\
+             park_interval_min = \"50ms\"\npark_interval_max = \"250ms\"\n\
+             promote_poll_interval = \"50ms\"\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("an explicit [pacing] section parses");
+        assert_eq!(config.pacing.probe_interval, Duration::from_millis(50));
+        assert_eq!(config.pacing.settled_interval, Duration::from_millis(250));
+        assert_eq!(config.pacing.refusal_backoff, Duration::from_secs(1));
+        assert_eq!(config.pacing.park_interval_min, Duration::from_millis(50));
+        assert_eq!(config.pacing.park_interval_max, Duration::from_millis(250));
+        assert_eq!(
+            config.pacing.promote_poll_interval,
+            Duration::from_millis(50)
+        );
+
+        // A partial section keeps the defaults for everything it omits.
+        let contents = format!("{MINIMAL_EXAMPLE}\n[pacing]\nsettled_interval = \"1s\"\n");
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("a partial [pacing] section parses");
+        assert_eq!(config.pacing.settled_interval, Duration::from_secs(1));
+        assert_eq!(config.pacing.probe_interval, Duration::from_millis(300));
     }
 
     #[test]
