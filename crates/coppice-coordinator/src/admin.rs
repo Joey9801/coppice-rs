@@ -1213,10 +1213,17 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         };
 
         // Generated, hashed, and immediately handed back: the clear secret
-        // exists only in this frame and the response.
-        let secret = pki::generate_secret();
-        let hash = pki::hash_secret(&secret)
-            .map_err(|e| Status::internal(format!("hashing the token secret: {e}")))?;
+        // exists only in this task and the response. Argon2id hashing is
+        // deliberate CPU work (tens of milliseconds), so it runs off the
+        // async workers rather than stalling them.
+        let (secret, hash) = tokio::task::spawn_blocking(|| {
+            let secret = pki::generate_secret();
+            let hash = pki::hash_secret(&secret);
+            (secret, hash)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("token hashing task: {e}")))?;
+        let hash = hash.map_err(|e| Status::internal(format!("hashing the token secret: {e}")))?;
         let token = EnrollTokenId::new();
 
         let applied = consensus
