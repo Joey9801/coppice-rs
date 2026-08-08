@@ -39,11 +39,51 @@ pub fn generate_secret() -> String {
     format!("{TOKEN_PREFIX}{body}")
 }
 
-/// Hash `secret` with argon2id and a fresh random salt, returning the PHC
-/// string (`$argon2id$v=19$m=…$<salt>$<hash>`) stored in replicated policy.
+/// Argon2id cost parameters for hashing enrollment-token secrets.
+///
+/// The defaults are the `argon2` crate's own recommended parameters — the
+/// exact costs [`hash_secret`] has always used. Lowering them weakens every
+/// hash minted under them; the one legitimate reason is a test or dev fleet
+/// that mints throwaway tokens by the dozen and must not pay hundreds of
+/// milliseconds of deliberate KDF work per mint. Verification reads its
+/// parameters from the stored PHC string, so tokens minted cheap verify
+/// cheap with no second knob — and a fleet with mixed-cost hashes verifies
+/// each against the cost it was minted with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenKdf {
+    /// Memory cost in KiB.
+    pub m_cost_kib: u32,
+    /// Iteration count.
+    pub t_cost: u32,
+    /// Parallelism lanes.
+    pub p_cost: u32,
+}
+
+impl Default for TokenKdf {
+    fn default() -> Self {
+        let params = argon2::Params::default();
+        TokenKdf {
+            m_cost_kib: params.m_cost(),
+            t_cost: params.t_cost(),
+            p_cost: params.p_cost(),
+        }
+    }
+}
+
+/// Hash `secret` with argon2id at [`TokenKdf::default`] cost and a fresh
+/// random salt, returning the PHC string (`$argon2id$v=19$m=…$<salt>$<hash>`)
+/// stored in replicated policy.
 pub fn hash_secret(secret: &str) -> Result<String, TokenError> {
+    hash_secret_with(secret, TokenKdf::default())
+}
+
+/// As [`hash_secret`], at an explicit cost.
+pub fn hash_secret_with(secret: &str, kdf: TokenKdf) -> Result<String, TokenError> {
+    let params = argon2::Params::new(kdf.m_cost_kib, kdf.t_cost, kdf.p_cost, None)
+        .map_err(|e| TokenError::Hash(e.to_string()))?;
+    let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
+    let hash = argon
         .hash_password(secret.as_bytes(), &salt)
         .map_err(|e| TokenError::Hash(e.to_string()))?;
     Ok(hash.to_string())
