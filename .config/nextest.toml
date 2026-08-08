@@ -8,7 +8,8 @@ heavy-integration = { max-threads = 2 }
 # One fleet at a time is the point, not a throughput tweak.
 fleet-serial = { max-threads = 1 }
 
-# Ordinary local runs exclude the heavy integration binaries.
+# Ordinary local runs exclude the heavy integration binaries and the
+# multi-daemon fleet suites; `--profile heavy` opts back in.
 [profile.default]
 default-filter = '''
 not (
@@ -19,6 +20,13 @@ not (
     | binary(job_metrics)
     | binary(docker_executor)
     | test(openraft_storage_compliance)
+    | binary(formation)
+    | binary(convergence)
+    | binary(admin_membership)
+    | binary(replace_voter)
+    | binary(key_custody)
+    | binary(evidence_removal)
+    | binary(address_move)
 )
 '''
 
@@ -50,8 +58,49 @@ binary(cluster)
 '''
 test-group = 'fleet-serial'
 
-# CI runs the complete test suite.
+# CI runs the complete suite, but the fleet-serial suites are carved out into
+# the ci-fleet-* shard profiles below: fleet-serial runs one test at a time
+# (see the group comment above), so its wall time is the *sum* of every fleet
+# test — ~6.5 minutes if a single job runs them all. Each shard instead runs
+# its suites on its own CI host (still one fleet at a time per host), and the
+# shards are balanced by measured suite duration. A binary excluded here must
+# appear in exactly one ci-fleet-* profile or CI silently skips it —
+# scripts/check-fleet-shards.sh enforces that partition on every CI run.
 [profile.ci]
+default-filter = '''
+not (
+    binary(cluster)
+    | binary(formation)
+    | binary(convergence)
+    | binary(admin_membership)
+    | binary(replace_voter)
+    | binary(key_custody)
+    | binary(evidence_removal)
+    | binary(address_move)
+)
+'''
+fail-fast = false
+
+[profile.ci-fleet-1]
+default-filter = 'binary(cluster) | binary(convergence)'
+fail-fast = false
+
+[profile.ci-fleet-2]
+default-filter = 'binary(evidence_removal) | binary(replace_voter)'
+fail-fast = false
+
+[profile.ci-fleet-3]
+default-filter = '''
+binary(key_custody)
+| binary(formation)
+| binary(admin_membership)
+| binary(address_move)
+'''
+fail-fast = false
+
+# The whole suite in one run — what CI's {ci, ci-fleet-*} jobs add up to.
+# The profile to reach for when reproducing CI behavior in a single run.
+[profile.ci-full]
 default-filter = 'all()'
 fail-fast = false
 
@@ -65,4 +114,11 @@ binary(cluster)
 | binary(job_metrics)
 | binary(docker_executor)
 | test(openraft_storage_compliance)
+| binary(formation)
+| binary(convergence)
+| binary(admin_membership)
+| binary(replace_voter)
+| binary(key_custody)
+| binary(evidence_removal)
+| binary(address_move)
 '''
