@@ -178,11 +178,70 @@ impl Ca {
     }
 }
 
-/// Grab a currently-free localhost TCP port by binding `:0` and dropping the
-/// listener. Racy in principle, fine in practice for a short-lived test.
+/// Grab a localhost TCP port that will still be free when a daemon binds it.
+///
+/// Binding `:0` and dropping the listener is not good enough: the kernel is
+/// free to hand the released port to any other process on the host — another
+/// test process's own `:0` bind, or the source port of an outbound connection
+/// — in the window before the daemon binds it, and CI has observed exactly
+/// that ("binding agent gateway listener: Address already in use"). Reallocating
+/// on failure is no fix either, because a daemon's ports are cross-baked into
+/// peer configs (static discovery, the fleet enrollment endpoint) and, once
+/// formed, into replicated raft membership.
+///
+/// So the race is removed at allocation instead, with two defenses:
+/// 1. ports come from a range *below* both the Linux (32768+) and macOS
+///    (49152+) ephemeral defaults, where the kernel never lands `:0` binds or
+///    outbound source ports — only an explicit bind can collide;
+/// 2. each port is claimed via an exclusive advisory lock on a per-port file
+///    in a host-shared directory, held for the life of this test process, so
+///    concurrent test processes never pick the same port. The lock dies with
+///    the process; crashed runs leak nothing.
+///
+/// A bind probe then filters ports an unrelated service already owns.
 pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
+    use nix::fcntl::{Flock, FlockArg};
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::sync::Mutex;
+
+    const RANGE_START: u32 = 20_000;
+    const RANGE_LEN: u32 = 10_000;
+    /// The claims this process holds, kept locked until process exit.
+    static CLAIMED: Mutex<Vec<Flock<std::fs::File>>> = Mutex::new(Vec::new());
+
+    let dir = std::env::temp_dir().join("coppice-test-ports");
+    std::fs::create_dir_all(&dir).expect("create the port-claim directory");
+
+    // A random starting point, so concurrent processes probe disjoint runs of
+    // the range instead of all contending on the same first candidates.
+    let mut seed = std::collections::hash_map::RandomState::new().build_hasher();
+    seed.write_u32(std::process::id());
+    let start = seed.finish() as u32 % RANGE_LEN;
+
+    for i in 0..RANGE_LEN {
+        let port = (RANGE_START + (start + i) % RANGE_LEN) as u16;
+        // Unwritable claim file (another user's leftover in a shared /tmp):
+        // not ours to take, move on.
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{port}.lock")))
+        else {
+            continue;
+        };
+        // Held by another live test process (or an earlier claim of our own).
+        let Ok(lock) = Flock::lock(file, FlockArg::LockExclusiveNonblock) else {
+            continue;
+        };
+        // Owned by an unrelated service; dropping `lock` releases the claim.
+        if TcpListener::bind(("127.0.0.1", port)).is_err() {
+            continue;
+        }
+        CLAIMED.lock().unwrap().push(lock);
+        return port;
+    }
+    panic!("no free port in {RANGE_START}..{}", RANGE_START + RANGE_LEN);
 }
 
 /// One coordinator replica's on-disk world (config + data dir + certs in a
