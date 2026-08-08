@@ -764,7 +764,11 @@ pub(crate) async fn form(ctx: FormationContext, req: FormRequest) -> Result<Form
         .context("parsing the bootstrap policy")?;
     if let Some(policy) = &policy {
         policy
-            .commands(&coppice_state::StateMachine::default(), Timestamp::now())
+            .commands(
+                &coppice_state::StateMachine::default(),
+                Timestamp::now(),
+                cfg.token_kdf.kdf(),
+            )
             .context("validating the bootstrap policy")?;
     }
 
@@ -869,6 +873,7 @@ pub(crate) async fn form(ctx: FormationContext, req: FormRequest) -> Result<Form
         machine,
         node_id,
         policy,
+        token_kdf: cfg.token_kdf.kdf(),
     })
     .await;
     match rest {
@@ -900,6 +905,8 @@ struct FinishInputs<'a> {
     machine: MachineId,
     node_id: u64,
     policy: Option<FormationPolicy>,
+    /// The cost `[[enroll_token]]` secrets are hashed at (`[token_kdf]`).
+    token_kdf: coppice_tls::pki::TokenKdf,
 }
 
 async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential> {
@@ -913,6 +920,7 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
         machine,
         node_id,
         policy,
+        token_kdf,
     } = inputs;
     if failpoint == Some(Failpoint::AfterRaftInitialize) {
         bail!("formation aborted at the AfterRaftInitialize failpoint (test-only)");
@@ -967,7 +975,7 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
     if let Some(policy) = policy {
         let commands = {
             let view = started.views.latest();
-            policy.commands(view.state(), Timestamp::now())?
+            policy.commands(view.state(), Timestamp::now(), token_kdf)?
         };
         let count = commands.len();
         let policy_index = crate::policy::propose_all(&started.consensus, commands)

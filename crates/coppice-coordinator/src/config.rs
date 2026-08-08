@@ -405,6 +405,11 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) pacing: PacingConfig,
 
+    /// Argon2id cost for hashing enrollment-token secrets. Optional; the
+    /// defaults are the `argon2` crate's recommended production parameters.
+    #[serde(default)]
+    pub(crate) token_kdf: TokenKdfConfig,
+
     /// mTLS material for intra-cluster traffic (ADR 0011, day one). Required:
     /// there is no insecure fallback.
     pub(crate) tls: TlsConfig,
@@ -741,6 +746,54 @@ pub(crate) struct PacingConfig {
     pub(crate) promote_poll_interval: Duration,
 }
 
+/// `[token_kdf]`: argon2id cost for hashing enrollment-token secrets
+/// (ADR 0037 §5).
+///
+/// Hashing happens on the node that seeds or mints a token; only the PHC
+/// string — which records the cost it was hashed at — is replicated, and
+/// verification reads its parameters from that string. So this is node-local
+/// (ADR 0020) and mixed-cost fleets verify correctly.
+///
+/// **Lowering these weakens every hash minted under them.** The defaults are
+/// the `argon2` crate's recommended production parameters; the one legitimate
+/// reason to shrink them is a test or dev fleet minting throwaway tokens by
+/// the dozen, where the default's deliberate ~hundreds-of-milliseconds of
+/// work per hash is pure drag.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TokenKdfConfig {
+    /// Memory cost in KiB.
+    #[serde(default = "default_kdf_m_cost_kib")]
+    pub(crate) m_cost_kib: u32,
+    /// Iteration count.
+    #[serde(default = "default_kdf_t_cost")]
+    pub(crate) t_cost: u32,
+    /// Parallelism lanes.
+    #[serde(default = "default_kdf_p_cost")]
+    pub(crate) p_cost: u32,
+}
+
+impl TokenKdfConfig {
+    /// The cost as the `coppice-tls` hashing layer takes it.
+    pub(crate) fn kdf(&self) -> coppice_tls::pki::TokenKdf {
+        coppice_tls::pki::TokenKdf {
+            m_cost_kib: self.m_cost_kib,
+            t_cost: self.t_cost,
+            p_cost: self.p_cost,
+        }
+    }
+}
+
+impl Default for TokenKdfConfig {
+    fn default() -> Self {
+        TokenKdfConfig {
+            m_cost_kib: default_kdf_m_cost_kib(),
+            t_cost: default_kdf_t_cost(),
+            p_cost: default_kdf_p_cost(),
+        }
+    }
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         PacingConfig {
@@ -879,6 +932,21 @@ fn default_park_interval_max() -> Duration {
 
 fn default_promote_poll_interval() -> Duration {
     Duration::from_millis(500)
+}
+
+// The `argon2` crate's `Params::default()` values, restated as literals so a
+// dependency bump that silently changes them fails the config unit test
+// instead of silently re-costing every fleet's token hashes.
+fn default_kdf_m_cost_kib() -> u32 {
+    19456
+}
+
+fn default_kdf_t_cost() -> u32 {
+    2
+}
+
+fn default_kdf_p_cost() -> u32 {
+    1
 }
 
 fn default_log_level() -> String {
@@ -1267,6 +1335,32 @@ addrs = []
             config.raft.health_stability_interval,
             Duration::from_secs(2)
         );
+    }
+
+    /// `[token_kdf]` is entirely optional; its defaults must equal the
+    /// `argon2` crate's own — the cost `hash_secret` used before the section
+    /// existed — so an old config keeps minting identically-priced hashes,
+    /// and a dependency bump that changes the crate's defaults is caught here
+    /// rather than silently re-costing production fleets.
+    #[test]
+    fn token_kdf_defaults_and_parses() {
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let config = read_config(&path).expect("an absent [token_kdf] section is valid");
+        assert_eq!(
+            config.token_kdf.kdf(),
+            coppice_tls::pki::TokenKdf::default()
+        );
+        assert_eq!(config.token_kdf.m_cost_kib, 19456);
+        assert_eq!(config.token_kdf.t_cost, 2);
+        assert_eq!(config.token_kdf.p_cost, 1);
+
+        let contents =
+            format!("{MINIMAL_EXAMPLE}\n[token_kdf]\nm_cost_kib = 8\nt_cost = 1\np_cost = 1\n");
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("an explicit [token_kdf] section parses");
+        assert_eq!(config.token_kdf.m_cost_kib, 8);
+        assert_eq!(config.token_kdf.t_cost, 1);
+        assert_eq!(config.token_kdf.p_cost, 1);
     }
 
     /// `[pacing]` is entirely optional and every field defaults to the value

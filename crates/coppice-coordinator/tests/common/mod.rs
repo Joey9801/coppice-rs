@@ -290,6 +290,13 @@ park_interval_min = "50ms"
 park_interval_max = "250ms"
 promote_poll_interval = "50ms"
 
+# Minimal argon2 cost: these fleets mint throwaway tokens, and the production
+# default costs ~300ms of KDF per hash in a debug build.
+[token_kdf]
+m_cost_kib = 8
+t_cost = 1
+p_cost = 1
+
 [tls]
 cert_path = "{cert}"
 key_path = "{key}"
@@ -597,6 +604,13 @@ park_interval_min = "50ms"
 park_interval_max = "250ms"
 promote_poll_interval = "50ms"
 
+# Minimal argon2 cost: these fleets mint throwaway tokens, and the production
+# default costs ~300ms of KDF per hash in a debug build.
+[token_kdf]
+m_cost_kib = 8
+t_cost = 1
+p_cost = 1
+
 [tls]
 cert_path = "{cert}"
 key_path = "{key}"
@@ -848,6 +862,13 @@ refusal_backoff = "1s"
 park_interval_min = "50ms"
 park_interval_max = "250ms"
 promote_poll_interval = "50ms"
+
+# Minimal argon2 cost: these fleets mint throwaway tokens, and the production
+# default costs ~300ms of KDF per hash in a debug build.
+[token_kdf]
+m_cost_kib = 8
+t_cost = 1
+p_cost = 1
 
 [tls]
 cert_path = "{cert}"

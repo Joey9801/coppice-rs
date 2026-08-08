@@ -63,7 +63,10 @@ pub use machine::{
     load_machine_identity, mint_machine_identity, persist_machine_identity, MachineIdentityError,
     MACHINE_IDENTITY_FILE,
 };
-pub use token::{generate_secret, hash_secret, verify_secret, TokenError, TOKEN_PREFIX};
+pub use token::{
+    generate_secret, hash_secret, hash_secret_with, verify_secret, TokenError, TokenKdf,
+    TOKEN_PREFIX,
+};
 pub use verify::{leaf_sans, verify_leaf, VerifyError};
 
 // ---------------------------------------------------------------------------

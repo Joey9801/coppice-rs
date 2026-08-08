@@ -231,7 +231,16 @@ impl FormationPolicy {
     /// through seeding. A parent that is neither in the document nor already in
     /// `state`, or a parent cycle within the document, is an error here — at
     /// the seeding edge — rather than a mid-apply rejection.
-    pub fn commands(&self, state: &StateMachine, now: Timestamp) -> Result<Vec<Command>> {
+    ///
+    /// `kdf` is the cost the seeding node hashes `[[enroll_token]]` secrets
+    /// at (`[token_kdf]` in its config); only the resulting PHC strings are
+    /// replicated, so the choice is node-local.
+    pub fn commands(
+        &self,
+        state: &StateMachine,
+        now: Timestamp,
+        kdf: pki::TokenKdf,
+    ) -> Result<Vec<Command>> {
         let mut commands = Vec::new();
 
         // Priority table: seed only while the replicated table is still empty.
@@ -276,7 +285,7 @@ impl FormationPolicy {
             if live_labels.contains(spec.label.as_str()) {
                 continue;
             }
-            let hash = pki::hash_secret(&spec.secret).with_context(|| {
+            let hash = pki::hash_secret_with(&spec.secret, kdf).with_context(|| {
                 format!("hashing the enrollment token secret for {:?}", spec.label)
             })?;
             let expires_at = spec.ttl.map(|ttl| {
@@ -410,6 +419,14 @@ pub async fn propose_all<C: coppice_consensus::Consensus>(
 mod tests {
     use super::*;
 
+    /// Minimal argon2 cost: these tests assert seeding logic, not KDF
+    /// strength, and the default cost is ~300ms per hash in a debug build.
+    const CHEAP_KDF: pki::TokenKdf = pki::TokenKdf {
+        m_cost_kib: 8,
+        t_cost: 1,
+        p_cost: 1,
+    };
+
     const SAMPLE: &str = r#"
 [[priority_multiplier]]
 index = -1
@@ -474,7 +491,7 @@ quota = 1000000000000
         let policy = FormationPolicy::parse_toml(b"").expect("empty parses");
         let state = StateMachine::default();
         assert!(policy
-            .commands(&state, Timestamp::now())
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect("valid policy")
             .is_empty());
     }
@@ -484,7 +501,7 @@ quota = 1000000000000
         let policy = FormationPolicy::parse_toml(SAMPLE.as_bytes()).unwrap();
         let state = StateMachine::default();
         let commands = policy
-            .commands(&state, Timestamp::now())
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect("valid policy");
         // One UpdatePolicy (table) + one ConfigureQuotaEntity.
         assert_eq!(commands.len(), 2);
@@ -513,7 +530,7 @@ quota = 1000000000000
             },
         );
         assert!(policy
-            .commands(&state, now)
+            .commands(&state, now, CHEAP_KDF)
             .expect("valid policy")
             .is_empty());
     }
@@ -532,7 +549,7 @@ quota = 1000000000000
             .priority_multipliers
             .insert(0, PriorityMultiplier(9 << 32));
         assert!(policy
-            .commands(&state, Timestamp::now())
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect("valid policy")
             .is_empty());
     }
@@ -568,7 +585,7 @@ ttl = "15m"
         let policy = FormationPolicy::parse_toml(TOKEN_DOC.as_bytes()).expect("parses");
         let now = Timestamp::now();
         let commands = policy
-            .commands(&StateMachine::default(), now)
+            .commands(&StateMachine::default(), now, CHEAP_KDF)
             .expect("valid policy");
         let tokens = minted(&commands);
         assert_eq!(tokens.len(), 2);
@@ -597,7 +614,7 @@ ttl = "15m"
         let now = Timestamp::now();
         let mut state = StateMachine::default();
         // Apply once, then fold the results into state as the apply loop would.
-        for command in policy.commands(&state, now).unwrap() {
+        for command in policy.commands(&state, now, CHEAP_KDF).unwrap() {
             if let Command::MintEnrollToken(m) = command {
                 state.enroll_tokens.insert(
                     m.token,
@@ -613,7 +630,7 @@ ttl = "15m"
             }
         }
         assert!(
-            minted(&policy.commands(&state, now).unwrap()).is_empty(),
+            minted(&policy.commands(&state, now, CHEAP_KDF).unwrap()).is_empty(),
             "a re-apply must mint nothing — labels are the idempotency key"
         );
     }
@@ -636,7 +653,7 @@ ttl = "15m"
                 revoked: true,
             },
         );
-        let commands = policy.commands(&state, now).unwrap();
+        let commands = policy.commands(&state, now, CHEAP_KDF).unwrap();
         let labels: Vec<&str> = minted(&commands).iter().map(|m| m.label.as_str()).collect();
         assert!(labels.contains(&"fleet-agents"), "{labels:?}");
     }
@@ -704,7 +721,7 @@ ttl = "15m"
         let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
         let state = StateMachine::default();
         let commands = policy
-            .commands(&state, Timestamp::now())
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect("valid hierarchy");
         assert_eq!(
             configured_ids(&commands),
@@ -736,7 +753,9 @@ ttl = "15m"
                 updated_at: now,
             },
         );
-        let commands = policy.commands(&state, now).expect("parent found in state");
+        let commands = policy
+            .commands(&state, now, CHEAP_KDF)
+            .expect("parent found in state");
         assert_eq!(configured_ids(&commands), vec![CHILD.parse().unwrap()]);
     }
 
@@ -746,7 +765,7 @@ ttl = "15m"
         let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
         let state = StateMachine::default();
         let err = policy
-            .commands(&state, Timestamp::now())
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect_err("dangling parent must be rejected");
         let message = format!("{err:#}");
         assert!(message.contains(CHILD), "{message}");
@@ -767,7 +786,7 @@ ttl = "15m"
         let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
         let state = StateMachine::default();
         let err = policy
-            .commands(&state, Timestamp::now())
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect_err("parent cycle must be rejected");
         assert!(format!("{err:#}").contains("cycle"), "{err:#}");
     }
@@ -778,7 +797,7 @@ ttl = "15m"
         let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
         let state = StateMachine::default();
         let err = policy
-            .commands(&state, Timestamp::now())
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect_err("self-parent must be rejected");
         assert!(format!("{err:#}").contains("cycle"), "{err:#}");
     }

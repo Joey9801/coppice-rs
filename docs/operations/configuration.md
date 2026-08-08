@@ -161,6 +161,19 @@ park_interval_max = "15s"   # round up to this ceiling, which is also where a
 promote_poll_interval = "500ms"  # admin-side promote retry while a learner
                                  # is still catching up
 
+[token_kdf]
+# Argon2id cost for hashing enrollment-token secrets (ADR 0037 §5). Hashing
+# happens on the node that seeds or mints a token; only the PHC string —
+# which records the cost it was hashed at — is replicated, and verification
+# reads its parameters from that string, so this is node-local and safe to
+# vary per replica. LOWERING THESE WEAKENS EVERY HASH MINTED UNDER THEM: the
+# defaults are the argon2 crate's recommended production parameters, and the
+# only legitimate reason to shrink them is a test or dev fleet minting
+# throwaway tokens.
+m_cost_kib = 19456  # memory cost in KiB
+t_cost = 2          # iteration count
+p_cost = 1          # parallelism lanes
+
 [tls]
 # MACHINE PLANE ONLY: the leaf served on the raft and agent-gateway
 # listeners, and this node's client identity toward peers. The trust

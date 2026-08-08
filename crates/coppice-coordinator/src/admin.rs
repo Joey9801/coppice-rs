@@ -297,6 +297,9 @@ struct AdminInner<C: Consensus> {
     /// no replicated CA, no caller can be classified and every verb is
     /// refused, which is the fail-closed direction.
     tls: RwLock<Option<Arc<TlsStore>>>,
+    /// The argon2id cost minted token secrets are hashed at (`[token_kdf]`,
+    /// ADR 0037 §5). Node-local: only the PHC string is replicated.
+    token_kdf: pki::TokenKdf,
 }
 
 /// The consensus-backed half of [`AdminService`], present only once formed.
@@ -318,6 +321,7 @@ impl<C: Consensus> AdminService<C> {
         phase: Arc<crate::formation::PhaseState>,
         data_dir: PathBuf,
         tls: Option<Arc<TlsStore>>,
+        token_kdf: pki::TokenKdf,
     ) -> Self {
         AdminService {
             inner: Arc::new(AdminInner {
@@ -325,6 +329,7 @@ impl<C: Consensus> AdminService<C> {
                 phase,
                 data_dir,
                 tls: RwLock::new(tls),
+                token_kdf,
             }),
         }
     }
@@ -1211,11 +1216,13 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
 
         // Generated, hashed, and immediately handed back: the clear secret
         // exists only in this task and the response. Argon2id hashing is
-        // deliberate CPU work (tens of milliseconds), so it runs off the
-        // async workers rather than stalling them.
-        let (secret, hash) = tokio::task::spawn_blocking(|| {
+        // deliberate CPU work (tens of milliseconds at the `[token_kdf]`
+        // production default), so it runs off the async workers rather than
+        // stalling them.
+        let kdf = self.inner.token_kdf;
+        let (secret, hash) = tokio::task::spawn_blocking(move || {
             let secret = pki::generate_secret();
-            let hash = pki::hash_secret(&secret);
+            let hash = pki::hash_secret_with(&secret, kdf);
             (secret, hash)
         })
         .await

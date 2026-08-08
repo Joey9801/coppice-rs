@@ -241,6 +241,7 @@ pub async fn run_with(
         Arc::clone(&phase),
         resolved.config.data_dir.clone(),
         tls.clone(),
+        resolved.config.token_kdf.kdf(),
     );
 
     let (started, tls_store) = match startup {
@@ -1026,6 +1027,7 @@ async fn start_directly(
         Arc::clone(&phase),
         resolved.config.data_dir.clone(),
         Some(Arc::clone(&tls_store)),
+        resolved.config.token_kdf.kdf(),
     );
 
     assemble(
