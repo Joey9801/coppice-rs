@@ -210,8 +210,18 @@ pub(crate) async fn handle_enroll<C: Consensus>(
     // enrollment within the view cadence, and short leaf lifetimes bound
     // what that buys.
     let view = ctx.consensus.views().latest();
-    let (_, role) =
-        verify_enroll_token(view.state(), request.token, now).ok_or(EnrollError::Unauthorized)?;
+    // The argon2 scan is deliberate CPU work (see `verify_enroll_token`), so
+    // it runs off the async workers: concurrent enrollment attempts must not
+    // stall the executor. The view is an `Arc` clone, and the owned copy of
+    // the token dies with the closure — nothing here logs or returns it.
+    let verified = {
+        let view = view.clone();
+        let token = request.token.to_owned();
+        tokio::task::spawn_blocking(move || verify_enroll_token(view.state(), &token, now))
+            .await
+            .map_err(|e| EnrollError::Internal(format!("token verification task: {e}")))?
+    };
+    let (_, role) = verified.ok_or(EnrollError::Unauthorized)?;
 
     // Refuse an empty CSR before doing any work with the CA key; a malformed
     // one is caught by `issue_*` below, which verifies proof-of-possession.
