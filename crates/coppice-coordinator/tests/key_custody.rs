@@ -660,9 +660,10 @@ async fn an_evidence_promotion_that_cannot_proceed_never_keys_the_candidate() {
         .as_u64()
         .expect("a caught-up learner reports its node id");
 
-    // Sustained, not momentary: poll across several probe intervals so a
-    // one-tick fluke cannot pass for the invariant.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Sustained, not momentary: fifteen observation rounds spanning three of
+    // the learner's own 1s refusal-backoff retries (and twelve settled-interval
+    // ticks), so a one-tick fluke cannot pass for the invariant.
+    let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         let body = learner.readyz().await.1;
         assert_eq!(
@@ -801,9 +802,11 @@ async fn an_abandoned_transfer_keeps_the_keyed_disk_visible_in_custody_accountin
 
     // Abandonment persists: the full live voter set keeps refusing the
     // learner's own promotion (visibly — the hold reaches `/readyz`), and
-    // several settled-interval ticks later the unresolved intent is still
-    // the only custody record. Nothing quietly resolves or drops it.
-    tokio::time::sleep(Duration::from_secs(7)).await;
+    // several settled-interval ticks later (250ms each under the fixture's
+    // `[pacing]`, so eight of them, plus two of the learner's 1s
+    // refusal-backoff retries) the unresolved intent is still the only
+    // custody record. Nothing quietly resolves or drops it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let (_, body) = learner.readyz().await;
     assert_eq!(body["phase"], "learner", "{body}");
     let hold = body["promotion_hold"].as_str().unwrap_or_default();
