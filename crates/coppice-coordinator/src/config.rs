@@ -782,6 +782,17 @@ impl TokenKdfConfig {
             p_cost: self.p_cost,
         }
     }
+
+    /// Reject a cost argon2 itself would refuse (`t_cost = 0`, `p_cost = 0`,
+    /// memory under `8 × p_cost` KiB). Checked at load because the first
+    /// *use* can be arbitrarily far away: a daemon with no seeded tokens
+    /// starts cleanly and would otherwise surface a bad `[token_kdf]` only
+    /// as internal errors on every later mint request.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.kdf()
+            .validate()
+            .map_err(|e| anyhow::anyhow!("[token_kdf] {e}"))
+    }
 }
 
 impl Default for TokenKdfConfig {
@@ -791,6 +802,41 @@ impl Default for TokenKdfConfig {
             t_cost: default_kdf_t_cost(),
             p_cost: default_kdf_p_cost(),
         }
+    }
+}
+
+impl PacingConfig {
+    /// Every `[pacing]` value is a sleep between rounds of some retry loop —
+    /// zero turns that loop into a busy spin (the convergence tick, the
+    /// pre-start park loop, the promote poll), so zero is a config error,
+    /// not a speed setting. The park ramp's floor must not exceed its
+    /// ceiling: the backoff doubles from `min` and clamps to `max`, and an
+    /// inverted pair would "clamp" every wait up to the ceiling immediately.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("probe_interval", self.probe_interval),
+            ("settled_interval", self.settled_interval),
+            ("refusal_backoff", self.refusal_backoff),
+            ("park_interval_min", self.park_interval_min),
+            ("park_interval_max", self.park_interval_max),
+            ("promote_poll_interval", self.promote_poll_interval),
+        ] {
+            if value.is_zero() {
+                anyhow::bail!(
+                    "[pacing] {name} must be non-zero — a zero interval turns its \
+                     retry loop into a busy spin"
+                );
+            }
+        }
+        if self.park_interval_min > self.park_interval_max {
+            anyhow::bail!(
+                "[pacing] park_interval_min ({}) exceeds park_interval_max ({}) — \
+                 the park backoff doubles from the min and clamps to the max",
+                humantime_serde::re::humantime::format_duration(self.park_interval_min),
+                humantime_serde::re::humantime::format_duration(self.park_interval_max),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1044,6 +1090,18 @@ pub fn load(path: &Path) -> Result<ResolvedConfig> {
             .validate()
             .with_context(|| format!("reading coordinator config {}", path.display()))?;
     }
+    // Both fail at load rather than at first use: a zero pacing interval
+    // would busy-spin a background loop from the moment the daemon starts,
+    // and an argon2-rejected `[token_kdf]` would otherwise surface only when
+    // the first token is minted.
+    config
+        .pacing
+        .validate()
+        .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    config
+        .token_kdf
+        .validate()
+        .with_context(|| format!("reading coordinator config {}", path.display()))?;
     let resolved_host = resolve_advertise_host(config.listen.advertise_host.as_deref())?;
     config.listen.advertise_host = Some(resolved_host);
     Ok(ResolvedConfig { config })
@@ -1565,6 +1623,46 @@ addrs = []
         let (_guard, path) = write_config(&contents);
         let err = load(&path).expect_err("load must surface discovery validation errors");
         assert!(format!("{err:#}").contains("[discovery.dns]"), "{err:#}");
+    }
+
+    /// Every `[pacing]` value is a between-rounds sleep, so zero means a
+    /// busy-spinning background loop — a startup error, not a speed setting.
+    /// An inverted park ramp (min > max) is equally malformed.
+    #[test]
+    fn load_rejects_zero_and_inverted_pacing() {
+        let contents = format!("{MINIMAL_EXAMPLE}\n[pacing]\nprobe_interval = \"0s\"\n");
+        let (_guard, path) = write_config(&contents);
+        let err = load(&path).expect_err("a zero pacing interval must fail at load");
+        assert!(format!("{err:#}").contains("probe_interval"), "{err:#}");
+
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[pacing]\npark_interval_min = \"5s\"\n\
+             park_interval_max = \"1s\"\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let err = load(&path).expect_err("an inverted park ramp must fail at load");
+        assert!(format!("{err:#}").contains("park_interval_min"), "{err:#}");
+    }
+
+    /// A `[token_kdf]` argon2 rejects must fail at load: the first mint can
+    /// be arbitrarily far from startup, and until then the daemon looks
+    /// healthy.
+    #[test]
+    fn load_rejects_argon2_refused_token_kdf() {
+        for bad in [
+            "t_cost = 0",
+            "p_cost = 0",
+            // Below argon2's floor of 8 KiB per lane.
+            "m_cost_kib = 7",
+        ] {
+            let contents = format!("{MINIMAL_EXAMPLE}\n[token_kdf]\n{bad}\n");
+            let (_guard, path) = write_config(&contents);
+            let err = match load(&path) {
+                Err(err) => err,
+                Ok(_) => panic!("[token_kdf] {bad} must fail at load"),
+            };
+            assert!(format!("{err:#}").contains("[token_kdf]"), "{err:#}");
+        }
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub enum TokenError {
     /// well-formed secret; surfaced rather than panicked on).
     #[error("hashing enrollment token secret: {0}")]
     Hash(String),
+    /// A [`TokenKdf`] cost argon2 refuses (zero iterations, zero lanes,
+    /// memory below `8 × p_cost` KiB, …).
+    #[error("invalid argon2 cost parameters: {0}")]
+    InvalidParams(String),
 }
 
 /// The recognizable prefix on every enrollment-token secret (`cpk_` = Coppice
@@ -59,6 +63,22 @@ pub struct TokenKdf {
     pub p_cost: u32,
 }
 
+impl TokenKdf {
+    /// Check this cost is one argon2 will accept (it rejects zero iterations,
+    /// zero lanes, and memory below `8 × p_cost` KiB), so a configured cost
+    /// can fail at daemon startup instead of at the first mint — a daemon
+    /// with no seeded tokens would otherwise start cleanly and only surface
+    /// the bad config as internal errors on every later mint request.
+    pub fn validate(&self) -> Result<(), TokenError> {
+        self.params().map(|_| ())
+    }
+
+    fn params(&self) -> Result<argon2::Params, TokenError> {
+        argon2::Params::new(self.m_cost_kib, self.t_cost, self.p_cost, None)
+            .map_err(|e| TokenError::InvalidParams(e.to_string()))
+    }
+}
+
 impl Default for TokenKdf {
     fn default() -> Self {
         let params = argon2::Params::default();
@@ -79,9 +99,11 @@ pub fn hash_secret(secret: &str) -> Result<String, TokenError> {
 
 /// As [`hash_secret`], at an explicit cost.
 pub fn hash_secret_with(secret: &str, kdf: TokenKdf) -> Result<String, TokenError> {
-    let params = argon2::Params::new(kdf.m_cost_kib, kdf.t_cost, kdf.p_cost, None)
-        .map_err(|e| TokenError::Hash(e.to_string()))?;
-    let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let argon = Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        kdf.params()?,
+    );
     let salt = SaltString::generate(&mut OsRng);
     let hash = argon
         .hash_password(secret.as_bytes(), &salt)
