@@ -191,8 +191,11 @@ impl Ca {
 ///
 /// So the race is removed at allocation instead, with two defenses:
 /// 1. ports come from a range *below* both the Linux (32768+) and macOS
-///    (49152+) ephemeral defaults, where the kernel never lands `:0` binds or
-///    outbound source ports — only an explicit bind can collide;
+///    (49152+) ephemeral defaults, so with the default ranges the kernel
+///    never lands `:0` binds or outbound source ports there — only an
+///    explicit bind can collide (a host whose ephemeral range was widened,
+///    e.g. via `ip_local_port_range`, loses this defense but keeps the
+///    others);
 /// 2. each port is claimed via an exclusive advisory lock on a per-port file
 ///    in a host-shared directory, held for the life of this test process, so
 ///    concurrent test processes never pick the same port. The lock dies with
