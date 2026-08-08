@@ -26,6 +26,9 @@ use coppice_state::{Command, PolicyConfig};
 use common::{poll, Ca, Node};
 
 const DEADLINE: Duration = Duration::from_secs(20);
+/// Promotion retry cadence for the admin wrapper — the in-test twin of the
+/// fixture's `[pacing] promote_poll_interval`, which the daemons run with.
+const POLL: Duration = Duration::from_millis(50);
 
 async fn wait_for_leader(nodes: &[Node], candidates: &[usize], deadline: Duration) -> usize {
     let start = Instant::now();
@@ -93,7 +96,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
         }
         // promote_voter polls the catch-up gate itself.
         for i in [1usize, 2] {
-            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), DEADLINE)
+            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), DEADLINE, POLL)
                 .await
                 .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
         }

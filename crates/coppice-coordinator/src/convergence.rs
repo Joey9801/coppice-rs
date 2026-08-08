@@ -54,29 +54,16 @@ use coppice_tls::pki::machine;
 use coppice_tls::{TlsPaths, TlsStore};
 
 use crate::admin::{self, admin_channel_from_store};
-use crate::config::Config;
+use crate::config::{Config, PacingConfig};
 use crate::discovery::Discovery;
 use crate::formation::PhaseState;
 
-/// Base re-probe cadence while actively converging. Short: the cost of a tick
-/// is one dial to a peer that is expecting it, and convergence latency is a
-/// deployment's rolling-upgrade latency.
-const PROBE_INTERVAL: Duration = Duration::from_millis(300);
-/// Slow cadence once converged to a voter: nothing to do but keep observing,
-/// so a later membership change (a removal, a demotion) is still noticed.
-const SETTLED_INTERVAL: Duration = Duration::from_secs(3);
-/// How long to back off after a refusal that will not resolve by waiting —
-/// a duplicated machine identity, an address conflict (ADR 0037 §7). Hammering
-/// a leader that has already said "never" buys nothing; the operator sees the
-/// refusal in `/readyz` and fixes it, and the retry is only here at all
-/// because "never" can become "yes" once they do.
-const REFUSAL_BACKOFF: Duration = Duration::from_secs(30);
-
-/// The shortest and longest a parked daemon waits between convergence rounds.
-/// A fleet booting together should find each other in the first second or two;
-/// a fleet parked for a week must not spin.
-const PARK_INTERVAL_MIN: Duration = Duration::from_millis(500);
-const PARK_INTERVAL_MAX: Duration = Duration::from_secs(15);
+// Every interval this loop sleeps for is `[pacing]` node configuration
+// ([`crate::config::PacingConfig`]), whose defaults are the values these were
+// as constants. They are pure liveness knobs — a shorter interval costs dials,
+// a longer one costs convergence latency — and the reason they are
+// configurable is that a test fleet has no reason to pay production pacing to
+// form.
 
 // ---------------------------------------------------------------------------
 // (a) Pre-start convergence, inside park
@@ -109,7 +96,7 @@ impl<'a> PreStart<'a> {
             config,
             advertise_addr,
             tls,
-            backoff: PARK_INTERVAL_MIN,
+            backoff: config.pacing.park_interval_min,
         }
     }
 
@@ -135,7 +122,7 @@ impl<'a> PreStart<'a> {
                 // ramp is *stuck*, and its reason must be visible at the
                 // default log level — a parked daemon has no other surface
                 // that says why (ADR 0037 §9's spirit).
-                Err(e) if self.backoff >= PARK_INTERVAL_MAX => {
+                Err(e) if self.backoff >= self.config.pacing.park_interval_max => {
                     tracing::warn!(
                         error = %format!("{e:#}"),
                         "convergence: rounds keep failing at maximum backoff; still parked, \
@@ -150,7 +137,7 @@ impl<'a> PreStart<'a> {
                 }
             }
             tokio::time::sleep(jittered(self.backoff)).await;
-            self.backoff = (self.backoff * 2).min(PARK_INTERVAL_MAX);
+            self.backoff = (self.backoff * 2).min(self.config.pacing.park_interval_max);
         }
     }
 
@@ -252,7 +239,7 @@ impl<'a> PreStart<'a> {
             // routine fleet-boot noise, but enrollment still failing once the
             // backoff has maxed out is the thing an operator (or a CI log)
             // needs to see without turning the log level up.
-            if self.backoff >= PARK_INTERVAL_MAX {
+            if self.backoff >= self.config.pacing.park_interval_max {
                 tracing::warn!(
                     endpoint = %enrollment.endpoint,
                     error = %format!("{e:#}"),
@@ -348,6 +335,9 @@ pub(crate) struct Convergence {
     pub(crate) tls: Arc<TlsStore>,
     /// Where terminal admission refusals are published for `/readyz` (§9).
     pub(crate) phase: Arc<PhaseState>,
+    /// How fast this loop ticks: the `[pacing]` section of node config,
+    /// carried by value because the loop outlives the borrow of `Config`.
+    pub(crate) pacing: PacingConfig,
 }
 
 /// Spawn the post-start convergence loop over a started replica.
@@ -414,7 +404,7 @@ impl Convergence {
         // for the overwhelmingly common case (a restart of a healthy replica),
         // which is why the check is first and cheap.
         if me.is_some_and(|m| m.voter) {
-            return SETTLED_INTERVAL;
+            return self.pacing.settled_interval;
         }
 
         let targets = self.dial_targets(&summary).await;
@@ -423,7 +413,7 @@ impl Convergence {
                 targets = targets.len(),
                 "convergence: no leader found this tick; retrying"
             );
-            return PROBE_INTERVAL;
+            return self.pacing.probe_interval;
         };
 
         // Compare histories BEFORE asking to be admitted (ADR 0016 / ADR 0037
@@ -445,7 +435,7 @@ impl Convergence {
                  joining can never succeed (ADR 0016 / ADR 0037 §3)"
             );
             self.phase.record_admission_refusal(message);
-            return REFUSAL_BACKOFF;
+            return self.pacing.refusal_backoff;
         }
 
         match self.attempt_join(&summary, &leader_addr).await {
@@ -458,9 +448,9 @@ impl Convergence {
                 // refusal or hold in `/readyz` would read as a live problem.
                 self.phase.clear_admission_refusal();
                 self.phase.clear_promotion_hold();
-                SETTLED_INTERVAL
+                self.pacing.settled_interval
             }
-            JoinStep::Learner => PROBE_INTERVAL,
+            JoinStep::Learner => self.pacing.probe_interval,
             JoinStep::VoterSetFull(message) => {
                 tracing::debug!(
                     node_id = summary.local_id,
@@ -475,9 +465,9 @@ impl Convergence {
                 // which stays reserved for operator-actionable refusals —
                 // without changing the polling cadence.
                 self.phase.record_promotion_hold(message);
-                SETTLED_INTERVAL
+                self.pacing.settled_interval
             }
-            JoinStep::Retry => PROBE_INTERVAL,
+            JoinStep::Retry => self.pacing.probe_interval,
             JoinStep::EndpointUnverified(message) => {
                 tracing::info!(
                     node_id = summary.local_id,
@@ -486,7 +476,7 @@ impl Convergence {
                      endpoint; surfacing it and retrying at the probe cadence (ADR 0037 §6)"
                 );
                 self.phase.record_admission_refusal(message);
-                PROBE_INTERVAL
+                self.pacing.probe_interval
             }
             JoinStep::Refused(message) => {
                 tracing::error!(
@@ -496,7 +486,7 @@ impl Convergence {
                      /readyz last_admission_refusal (ADR 0037 §7)"
                 );
                 self.phase.record_admission_refusal(message);
-                REFUSAL_BACKOFF
+                self.pacing.refusal_backoff
             }
         }
     }
@@ -1051,7 +1041,12 @@ mod tests {
 
     #[test]
     fn jitter_stays_within_a_quarter_of_the_base() {
-        for base in [PROBE_INTERVAL, SETTLED_INTERVAL, REFUSAL_BACKOFF] {
+        let pacing = PacingConfig::default();
+        for base in [
+            pacing.probe_interval,
+            pacing.settled_interval,
+            pacing.refusal_backoff,
+        ] {
             let jittered = jittered(base);
             assert!(jittered >= base);
             assert!(jittered < base + base / 4 + Duration::from_millis(1));

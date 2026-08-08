@@ -219,7 +219,8 @@ async fn a_mid_join_newcomer_converges_via_the_new_leader_after_the_old_one_stop
 
     // Start the newcomer and catch it mid-join: `joining` (driving admission)
     // or `learner` (admitted, catching up). The 10ms poll against the loop's
-    // 300ms tick usually observes one of the two, but under full-suite load
+    // tick (50ms under the fixture's `[pacing]`) usually observes one of the
+    // two, but under full-suite load
     // the whole join can outrun the observer, so `voter` is accepted too and
     // the phase actually caught travels into the final assertion message —
     // the invariant under test (a leader change never strands the newcomer,
@@ -507,6 +508,9 @@ async fn require_healthy_on_a_follower_is_health_unknown_with_a_leader_hint() {
 /// enough that a genuine hang fails the test rather than the 2-minute harness
 /// timeout.
 const DEADLINE: Duration = Duration::from_secs(20);
+/// Promotion retry cadence for the admin wrapper — the in-test twin of the
+/// fixture's `[pacing] promote_poll_interval`, which the daemons run with.
+const POLL: Duration = Duration::from_millis(50);
 
 fn uuid_bytes(u: ClusterId) -> [u8; 16] {
     *u.0.as_bytes()
@@ -672,7 +676,7 @@ async fn three_node_cluster_lifecycle() {
                 .expect("dial leader admin surface");
         // No removal: pure promotions. The helper polls the catch-up gate.
         for i in [1usize, 2] {
-            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), DEADLINE)
+            admin::promote_voter(&mut client, history_id, nodes[i].raft_id(), DEADLINE, POLL)
                 .await
                 .unwrap_or_else(|e| panic!("promote {} failed: {e:#}", nodes[i].id));
         }

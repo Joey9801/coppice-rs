@@ -282,6 +282,14 @@ rpc_timeout = "2s"
 snapshot_log_entries = 32
 snapshot_keep_log_entries = 0
 
+[pacing]
+probe_interval = "50ms"
+settled_interval = "250ms"
+refusal_backoff = "1s"
+park_interval_min = "50ms"
+park_interval_max = "250ms"
+promote_poll_interval = "50ms"
+
 [tls]
 cert_path = "{cert}"
 key_path = "{key}"
@@ -581,6 +589,14 @@ rpc_timeout = "2s"
 snapshot_log_entries = 32
 snapshot_keep_log_entries = 0
 
+[pacing]
+probe_interval = "50ms"
+settled_interval = "250ms"
+refusal_backoff = "1s"
+park_interval_min = "50ms"
+park_interval_max = "250ms"
+promote_poll_interval = "50ms"
+
 [tls]
 cert_path = "{cert}"
 key_path = "{key}"
@@ -824,6 +840,14 @@ heartbeat_interval = "250ms"
 rpc_timeout = "2s"
 snapshot_log_entries = 32
 snapshot_keep_log_entries = 0
+
+[pacing]
+probe_interval = "50ms"
+settled_interval = "250ms"
+refusal_backoff = "1s"
+park_interval_min = "50ms"
+park_interval_max = "250ms"
+promote_poll_interval = "50ms"
 
 [tls]
 cert_path = "{cert}"
@@ -1200,14 +1224,15 @@ log_level = "warn"
     /// The tight-poll counterpart of [`Daemon::await_phase`], for tests that
     /// must *catch* a transient convergence phase (`joining`, `learner`)
     /// rather than merely arrive at a terminal one: the poll interval is small
-    /// against the convergence loop's 300ms tick, so a phase that exists at
-    /// all is observed.
+    /// against the convergence loop's tick (50ms under the fixture's
+    /// `[pacing]`), so a phase that exists at all is observed.
     pub async fn await_phase_in(&self, phases: &[&str]) -> serde_json::Value {
         // Generous: a parked daemon under full-suite load can spend most of
-        // its park backoff (up to 15s a round) before its first join tick —
-        // and on an oversubscribed host (CI, or concurrent builds) a starved
-        // fleet can churn elections for a while first, during which every
-        // enrollment answers 503 and each failed round costs a full backoff.
+        // its park backoff (up to 250ms a round under the fixture's
+        // `[pacing]`) before its first join tick — and on an oversubscribed
+        // host (CI, or concurrent builds) a starved fleet can churn elections
+        // for a while first, during which every enrollment answers 503 and
+        // each failed round costs a full backoff.
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let (_, body) = self.readyz().await;

@@ -510,10 +510,11 @@ async fn a_certless_daemon_that_discovers_itself_still_forms() {
 /// cluster on its own. The guard exists for the window in which an operator's
 /// mistaken second `init` lands first. That window is staged here, honestly
 /// timing-based: the cluster is kept stopped while the parked loop's backoff
-/// grows (rounds at roughly 0 / 0.6 / 1.7 / 3.9 / 8.3 / 16-19s, jitter only
-/// ever pushing them later, so after a 16s park the next round is ~14s+
-/// away), then the cluster is brought back and `init` is delivered inside
-/// the gap.
+/// grows to its configured ceiling — under the fixture's `[pacing]` the ramp
+/// is 50ms doubling to a 250ms cap, so a 2s park covers the whole ramp and
+/// several capped rounds, leaving up to one capped interval (250ms, plus
+/// jitter, which only ever pushes a round later) before the next one — then
+/// the cluster is brought back and `init` is delivered inside that gap.
 ///
 /// The race is staged, not eliminated — under full-suite load the loop's
 /// round can still land first, in which case the daemon has legitimately
@@ -559,9 +560,11 @@ async fn init_is_refused_when_discovery_names_an_already_initialized_cluster() {
     newcomer.await_phase("waiting").await;
 
     // Staging, not synchronization: there is no observable surface for the
-    // parked loop's backoff, so the window is bought with elapsed time (see
-    // the doc comment for the round arithmetic).
-    tokio::time::sleep(Duration::from_secs(16)).await;
+    // parked loop's backoff, so the window is bought with elapsed time — long
+    // enough for the fixture's 50ms→250ms ramp to reach and sit at its cap,
+    // which is what makes the gap after it a full capped interval rather than
+    // a fraction of a growing one (see the doc comment for the arithmetic).
+    tokio::time::sleep(Duration::from_secs(2)).await;
     existing.start();
     let existing_history = existing.await_phase("voter").await["history_id"].clone();
     assert!(existing_history.is_string());

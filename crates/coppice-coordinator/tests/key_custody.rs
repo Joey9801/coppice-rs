@@ -236,7 +236,8 @@ impl Drop for FailpointGuard {
 /// confirmation) and `commit_promotion`, so the abort always lands after the
 /// fact of possession is already recorded. The loop treats the abort as an
 /// unmarked (hence retryable) refusal and tries again on its next tick —
-/// `PROBE_INTERVAL` (300ms) later — and that retry is the one this test lets
+/// one `[pacing] probe_interval` (50ms under the fixture) later — and that
+/// retry is the one this test lets
 /// through, because the failpoint fires at most once per process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_between_key_receipt_and_the_joint_change_converges_without_a_second_transfer() {

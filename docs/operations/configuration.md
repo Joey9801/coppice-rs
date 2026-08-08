@@ -145,6 +145,22 @@ snapshot_keep_log_entries = 1_000
 # dev; the default suits bringup automation.
 health_stability_interval = "10s"
 
+[pacing]
+# Convergence-loop pacing (ADR 0037 §6) — how often the self-join loop ticks.
+# Liveness only, like [raft]: shorter costs dials, longer costs convergence
+# latency, and neither changes what the cluster agrees on. The defaults are
+# right for ordinary deployments; shorten them for tests and dev, where a
+# fleet forming in milliseconds is the point.
+probe_interval  = "300ms"   # re-probe cadence while actively converging
+settled_interval = "3s"     # idle poll once a voter, or once parked on a
+                            # full voter set
+refusal_backoff  = "30s"    # after a refusal waiting cannot fix (§7)
+park_interval_min = "500ms" # first pre-start park retry; doubles each failed
+park_interval_max = "15s"   # round up to this ceiling, which is also where a
+                            # still-failing parked daemon escalates to warn
+promote_poll_interval = "500ms"  # admin-side promote retry while a learner
+                                 # is still catching up
+
 [tls]
 # MACHINE PLANE ONLY: the leaf served on the raft and agent-gateway
 # listeners, and this node's client identity toward peers. The trust
