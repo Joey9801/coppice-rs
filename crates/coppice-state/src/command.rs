@@ -59,6 +59,8 @@ pub enum Command {
     RebindMachineAddress(RebindMachineAddress),
     RetireMachineBinding(RetireMachineBinding),
     RecordKeyTransferIntent(RecordKeyTransferIntent),
+    RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent),
+    ConfirmStagedKeyPossession(ConfirmStagedKeyPossession),
 }
 
 impl Command {
@@ -97,6 +99,8 @@ impl Command {
             Command::RebindMachineAddress(c) => c.rebound_at,
             Command::RetireMachineBinding(c) => c.retired_at,
             Command::RecordKeyTransferIntent(c) => c.intended_at,
+            Command::RecordStagedKeyTransferIntent(c) => c.intended_at,
+            Command::ConfirmStagedKeyPossession(c) => c.confirmed_at,
         }
     }
 }
@@ -335,6 +339,13 @@ pub struct BumpClusterVersion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordCaCertificate {
     pub bundle: CaCertBundle,
+    /// When `Some`, this bundle STAGES the root with that serial: it must be a
+    /// certificate of `bundle` at a position other than 0 (a staged root is
+    /// never the active signing root — that is the whole invariant). `None`
+    /// means the bundle carries no pending root: a single-root steady state, a
+    /// completed rotation, or the ACTIVATION commit that promotes a previously
+    /// staged root to position 0.
+    pub staged_root_serial: Option<String>,
     pub recorded_at: Timestamp,
 }
 
@@ -478,6 +489,49 @@ pub struct RecordKeyTransferIntent {
     pub intended_at: Timestamp,
 }
 
+/// Record the replicated fact that the leader committed an intent to
+/// transfer the *staged (pending)* root's key to a node, before the key ever
+/// leaves the leader's disk (ADR 0037 §4) — the staged-phase counterpart of
+/// [`RecordKeyTransferIntent`].
+///
+/// Closes the same crash window as [`RecordKeyTransferIntent`], scoped to the
+/// staged root instead of the active one.
+///
+/// First write wins: an existing intent keeps its original timestamp, and a
+/// repeat proposal is an accepted no-op. Rejected — unlike
+/// [`RecordKeyTransferIntent`] — when there is no staged root in scope, or
+/// the staged root's serial differs from `root_serial`: an intent for any
+/// other serial is stale (a re-run of `begin` on a new leader may have
+/// replaced the pending root) and must not be miscounted against the wrong
+/// root.
+///
+/// [`ConfirmStagedKeyPossession`] resolves (removes) the matching entry when
+/// the transfer completes successfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordStagedKeyTransferIntent {
+    pub raft_node_id: u64,
+    /// The staged root this intent is scoped to; an intent for any other
+    /// serial is stale (a re-run of `begin` on a new leader may have replaced
+    /// the pending root) and is rejected rather than miscounted.
+    pub root_serial: String,
+    pub intended_at: Timestamp,
+}
+
+/// Record the replicated fact that a node confirmed durable receipt of the
+/// *staged (pending)* root's key (ADR 0037 §4) — the staged-phase counterpart
+/// of [`ConfirmKeyPossession`].
+///
+/// The key itself is never replicated; re-confirmation overwrites the
+/// timestamp. Rejected when there is no staged root in scope, or the staged
+/// root's serial differs from `root_serial` (same staleness guard as
+/// [`RecordStagedKeyTransferIntent`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmStagedKeyPossession {
+    pub raft_node_id: u64,
+    pub root_serial: String,
+    pub confirmed_at: Timestamp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +587,7 @@ mod tests {
         };
         let ca = Command::RecordCaCertificate(RecordCaCertificate {
             bundle: CaCertBundle::parse(ca_pem).unwrap(),
+            staged_root_serial: None,
             recorded_at: ts(21),
         });
         assert_eq!(ca.stamped_at(), ts(21));
@@ -597,5 +652,19 @@ mod tests {
             intended_at: ts(39),
         });
         assert_eq!(intent.stamped_at(), ts(39));
+
+        let staged_intent = Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 7,
+            root_serial: "ab12".into(),
+            intended_at: ts(41),
+        });
+        assert_eq!(staged_intent.stamped_at(), ts(41));
+
+        let staged_confirm = Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 7,
+            root_serial: "ab12".into(),
+            confirmed_at: ts(43),
+        });
+        assert_eq!(staged_confirm.stamped_at(), ts(43));
     }
 }

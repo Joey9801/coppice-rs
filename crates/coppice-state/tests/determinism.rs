@@ -224,14 +224,29 @@ fn snapshot_roundtrip(state: &StateMachine) -> StateMachine {
 fn pki_facts_survive_snapshot_roundtrip() {
     use coppice_core::id::{EnrollTokenId, MachineId};
     use coppice_state::command::{
-        BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RecordCaCertificate,
-        RecordEnrolledIdentity, RecordKeyTransferIntent, RetireMachineBinding, RevokeEnrollToken,
-        RevokeIdentity,
+        BindMachineIdentity, ConfirmKeyPossession, ConfirmStagedKeyPossession, MintEnrollToken,
+        RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
+        RecordStagedKeyTransferIntent, RetireMachineBinding, RevokeEnrollToken, RevokeIdentity,
     };
     use coppice_state::{EnrollRole, RevokedIdentity};
 
     let mid = |n: u128| MachineId(uuid::Uuid::from_u128(n));
     let tok = |n: u128| EnrollTokenId(uuid::Uuid::from_u128(n));
+
+    // A two-certificate bundle (the still-active old root at position 0, a
+    // pending new root at position 1) plus the new root's serial, so the
+    // staged phase can be exercised (ADR 0037 §4).
+    let staged_bundle = {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let mint_ca = || {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.self_signed(&key).unwrap().pem()
+        };
+        coppice_state::CaCertBundle::parse(format!("{}{}", mint_ca(), mint_ca())).unwrap()
+    };
+    let staged_serial = staged_bundle.serials()[1].clone();
 
     let mut sm = StateMachine::default();
     let cmds = vec![
@@ -244,7 +259,26 @@ fn pki_facts_survive_snapshot_roundtrip() {
                 params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
                 coppice_state::CaCertBundle::parse(params.self_signed(&key).unwrap().pem()).unwrap()
             },
+            staged_root_serial: None,
             recorded_at: base_ts(),
+        }),
+        // Stage a re-root: the recorded bundle now carries a pending root at
+        // position 1, and one voter's transfer intent plus another voter's
+        // confirmation of that staged root's key.
+        Command::RecordCaCertificate(RecordCaCertificate {
+            bundle: staged_bundle,
+            staged_root_serial: Some(staged_serial.clone()),
+            recorded_at: ts(TS_US + 1_500_000),
+        }),
+        Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 3,
+            root_serial: staged_serial.clone(),
+            intended_at: base_ts(),
+        }),
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 1,
+            root_serial: staged_serial.clone(),
+            confirmed_at: base_ts(),
         }),
         Command::BindMachineIdentity(BindMachineIdentity {
             machine: mid(1),
@@ -344,8 +378,18 @@ fn pki_facts_survive_snapshot_roundtrip() {
         Some(ts(TS_US + 2_000_000))
     );
 
+    // The staged root itself has teeth: a holder, an unresolved intent.
+    let staged = sm.staged_root.as_ref().expect("staged root recorded");
+    assert_eq!(staged.serial, staged_serial);
+    assert!(sm.has_staged_key_confirmation(1));
+    assert!(sm.has_staged_key_transfer_intent(3));
+
     let restored = snapshot_roundtrip(&sm);
     assert_eq!(restored, sm, "PKI facts must round-trip losslessly");
+    assert!(
+        restored.staged_root.is_some(),
+        "the staged root itself must survive the round trip"
+    );
 }
 
 /// Merge chains preserving intra-chain order; the pick sequence chooses

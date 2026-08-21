@@ -10,9 +10,9 @@ use common::*;
 use coppice_core::id::{EnrollTokenId, MachineId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{
-    BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RebindMachineAddress,
-    RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent, RetireMachineBinding,
-    RevokeEnrollToken, RevokeIdentity,
+    BindMachineIdentity, ConfirmKeyPossession, ConfirmStagedKeyPossession, MintEnrollToken,
+    RebindMachineAddress, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
+    RecordStagedKeyTransferIntent, RetireMachineBinding, RevokeEnrollToken, RevokeIdentity,
 };
 use coppice_state::{
     CaCertBundle, Command, EnrollRole, RejectionReason, RevokedIdentity, StateMachine,
@@ -47,8 +47,31 @@ fn cert_bundle(cn: &str) -> CaCertBundle {
 fn record_ca(bundle: &CaCertBundle) -> Command {
     Command::RecordCaCertificate(RecordCaCertificate {
         bundle: bundle.clone(),
+        staged_root_serial: None,
         recorded_at: base_ts(),
     })
+}
+
+fn record_ca_at(
+    bundle: &CaCertBundle,
+    staged_root_serial: Option<String>,
+    at: Timestamp,
+) -> Command {
+    Command::RecordCaCertificate(RecordCaCertificate {
+        bundle: bundle.clone(),
+        staged_root_serial,
+        recorded_at: at,
+    })
+}
+
+/// A two-certificate bundle: an "old" root at position 0 and a "new" root at
+/// position 1, plus the new root's lowercase-hex serial — the shape a staged
+/// re-root records (ADR 0037 §4).
+fn staged_bundle(old_cn: &str, new_cn: &str) -> (CaCertBundle, String) {
+    let bundle =
+        CaCertBundle::parse(format!("{}{}", ca_cert_pem(old_cn), ca_cert_pem(new_cn))).unwrap();
+    let serial = bundle.serials()[1].clone();
+    (bundle, serial)
 }
 
 fn bind(machine: MachineId, raft_node_id: u64, address: &str) -> Command {
@@ -665,4 +688,426 @@ fn pki_commands_emit_no_events() {
     )
     .events
     .is_empty());
+}
+
+// ---- Staged re-root custody (ADR 0037 §4) ----
+
+#[test]
+fn staging_sets_staged_root_with_empty_holders() {
+    let mut sm = StateMachine::default();
+    let (bundle, serial) = staged_bundle("old", "new");
+    apply_ok(
+        &mut sm,
+        record_ca_at(&bundle, Some(serial.clone()), base_ts()),
+    );
+
+    let staged = sm.staged_root.as_ref().expect("staged root recorded");
+    assert_eq!(staged.serial, serial);
+    assert_eq!(staged.staged_at, base_ts());
+    assert!(staged.holders.is_empty());
+    assert!(staged.intents.is_empty());
+    // The recorded bundle itself still lands in `ca`.
+    assert_eq!(sm.ca.as_ref().unwrap().bundle, bundle);
+}
+
+#[test]
+fn repeated_identical_stage_commit_preserves_accumulated_holders() {
+    let mut sm = StateMachine::default();
+    let (bundle, serial) = staged_bundle("old", "new");
+    apply_ok(
+        &mut sm,
+        record_ca_at(&bundle, Some(serial.clone()), base_ts()),
+    );
+    apply_ok(
+        &mut sm,
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 1,
+            root_serial: serial.clone(),
+            confirmed_at: base_ts(),
+        }),
+    );
+    assert!(sm.has_staged_key_confirmation(1));
+
+    // A repeated/replayed stage commit for the SAME pending root must not
+    // discard the accumulated ack.
+    let later = ts(TS_US + 1_000_000);
+    apply_ok(&mut sm, record_ca_at(&bundle, Some(serial.clone()), later));
+    assert!(sm.has_staged_key_confirmation(1));
+    assert_eq!(sm.staged_root.as_ref().unwrap().staged_at, later);
+}
+
+#[test]
+fn stage_commit_naming_the_active_position_is_rejected() {
+    let mut sm = StateMachine::default();
+    let (bundle, _new_serial) = staged_bundle("old", "new");
+    let active_serial = bundle.serials()[0].clone();
+
+    let err = sm
+        .apply(&record_ca_at(
+            &bundle,
+            Some(active_serial.clone()),
+            base_ts(),
+        ))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        coppice_state::RejectionReason::UnknownStagedRoot {
+            serial: active_serial,
+        }
+    );
+    assert!(sm.ca.is_none(), "a rejected command has no effects");
+    assert!(sm.staged_root.is_none());
+}
+
+#[test]
+fn stage_commit_naming_a_serial_absent_from_the_bundle_is_rejected() {
+    let mut sm = StateMachine::default();
+    let (bundle, _serial) = staged_bundle("old", "new");
+    let err = sm
+        .apply(&record_ca_at(&bundle, Some("deadbeef".into()), base_ts()))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        coppice_state::RejectionReason::UnknownStagedRoot {
+            serial: "deadbeef".into(),
+        }
+    );
+}
+
+#[test]
+fn confirm_staged_key_possession_inserts_holder_and_clears_intent() {
+    let mut sm = StateMachine::default();
+    let (bundle, serial) = staged_bundle("old", "new");
+    apply_ok(
+        &mut sm,
+        record_ca_at(&bundle, Some(serial.clone()), base_ts()),
+    );
+    apply_ok(
+        &mut sm,
+        Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 2,
+            root_serial: serial.clone(),
+            intended_at: base_ts(),
+        }),
+    );
+    assert!(sm.has_staged_key_transfer_intent(2));
+
+    apply_ok(
+        &mut sm,
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 2,
+            root_serial: serial.clone(),
+            confirmed_at: ts(TS_US + 1_000_000),
+        }),
+    );
+    assert!(sm.has_staged_key_confirmation(2));
+    assert!(
+        !sm.has_staged_key_transfer_intent(2),
+        "confirmation resolves the matching intent"
+    );
+}
+
+#[test]
+fn confirm_staged_key_possession_for_a_stale_serial_is_rejected() {
+    let mut sm = StateMachine::default();
+    let (bundle, serial) = staged_bundle("old", "new");
+    apply_ok(&mut sm, record_ca_at(&bundle, Some(serial), base_ts()));
+
+    let err = sm
+        .apply(&Command::ConfirmStagedKeyPossession(
+            ConfirmStagedKeyPossession {
+                raft_node_id: 2,
+                root_serial: "stale".into(),
+                confirmed_at: base_ts(),
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        coppice_state::RejectionReason::StagedRootMismatch { .. }
+    ));
+}
+
+#[test]
+fn confirm_staged_key_possession_with_nothing_staged_is_rejected() {
+    let mut sm = StateMachine::default();
+    let err = sm
+        .apply(&Command::ConfirmStagedKeyPossession(
+            ConfirmStagedKeyPossession {
+                raft_node_id: 2,
+                root_serial: "anything".into(),
+                confirmed_at: base_ts(),
+            },
+        ))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        coppice_state::RejectionReason::StagedRootMismatch {
+            expected: None,
+            got: "anything".into(),
+        }
+    );
+}
+
+#[test]
+fn record_staged_key_transfer_intent_is_first_write_wins_and_a_noop_once_confirmed() {
+    let mut sm = StateMachine::default();
+    let (bundle, serial) = staged_bundle("old", "new");
+    apply_ok(
+        &mut sm,
+        record_ca_at(&bundle, Some(serial.clone()), base_ts()),
+    );
+
+    apply_ok(
+        &mut sm,
+        Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 4,
+            root_serial: serial.clone(),
+            intended_at: base_ts(),
+        }),
+    );
+    let later = ts(TS_US + 9_000_000);
+    apply_ok(
+        &mut sm,
+        Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 4,
+            root_serial: serial.clone(),
+            intended_at: later,
+        }),
+    );
+    assert_eq!(
+        sm.staged_root.as_ref().unwrap().intents[&4],
+        base_ts(),
+        "repeat intent keeps the first stamp"
+    );
+
+    // Confirmation dominates: an intent for an already-confirmed node is a
+    // no-op that never re-enters the intent map.
+    apply_ok(
+        &mut sm,
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 4,
+            root_serial: serial.clone(),
+            confirmed_at: later,
+        }),
+    );
+    apply_ok(
+        &mut sm,
+        Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 4,
+            root_serial: serial,
+            intended_at: ts(TS_US + 20_000_000),
+        }),
+    );
+    assert!(!sm.has_staged_key_transfer_intent(4));
+    assert!(sm.has_staged_key_confirmation(4));
+}
+
+#[test]
+fn record_staged_key_transfer_intent_rejects_scope_mismatches() {
+    let mut sm = StateMachine::default();
+    let err = sm
+        .apply(&Command::RecordStagedKeyTransferIntent(
+            RecordStagedKeyTransferIntent {
+                raft_node_id: 4,
+                root_serial: "anything".into(),
+                intended_at: base_ts(),
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        coppice_state::RejectionReason::StagedRootMismatch { .. }
+    ));
+
+    let (bundle, serial) = staged_bundle("old", "new");
+    apply_ok(&mut sm, record_ca_at(&bundle, Some(serial), base_ts()));
+    let err = sm
+        .apply(&Command::RecordStagedKeyTransferIntent(
+            RecordStagedKeyTransferIntent {
+                raft_node_id: 4,
+                root_serial: "stale".into(),
+                intended_at: base_ts(),
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        coppice_state::RejectionReason::StagedRootMismatch { .. }
+    ));
+}
+
+#[test]
+fn replacing_the_pending_root_clears_holders_and_intents() {
+    let mut sm = StateMachine::default();
+    let (bundle_a, serial_a) = staged_bundle("old", "candidateA");
+    apply_ok(
+        &mut sm,
+        record_ca_at(&bundle_a, Some(serial_a.clone()), base_ts()),
+    );
+    apply_ok(
+        &mut sm,
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 1,
+            root_serial: serial_a.clone(),
+            confirmed_at: base_ts(),
+        }),
+    );
+    apply_ok(
+        &mut sm,
+        Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 2,
+            root_serial: serial_a,
+            intended_at: base_ts(),
+        }),
+    );
+    assert!(sm.has_staged_key_confirmation(1));
+    assert!(sm.has_staged_key_transfer_intent(2));
+
+    // A DIFFERENT pending root replaces the first: the previous pending
+    // root's key is worthless (it just left the bundle), so the new one
+    // starts with no acks at all.
+    let (bundle_b, serial_b) = staged_bundle("old", "candidateB");
+    let later = ts(TS_US + 5_000_000);
+    apply_ok(
+        &mut sm,
+        record_ca_at(&bundle_b, Some(serial_b.clone()), later),
+    );
+
+    let staged = sm.staged_root.as_ref().unwrap();
+    assert_eq!(staged.serial, serial_b);
+    assert!(staged.holders.is_empty());
+    assert!(staged.intents.is_empty());
+    assert!(!sm.has_staged_key_confirmation(1));
+    assert!(!sm.has_staged_key_transfer_intent(2));
+}
+
+#[test]
+fn activation_commit_merges_holders_and_intents_and_clears_staged_root() {
+    let mut sm = StateMachine::default();
+    let (staged_pem, serial) = staged_bundle("old", "new");
+    apply_ok(
+        &mut sm,
+        record_ca_at(&staged_pem, Some(serial.clone()), base_ts()),
+    );
+    apply_ok(
+        &mut sm,
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 1,
+            root_serial: serial.clone(),
+            confirmed_at: base_ts(),
+        }),
+    );
+    apply_ok(
+        &mut sm,
+        Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 2,
+            root_serial: serial.clone(),
+            intended_at: base_ts(),
+        }),
+    );
+    // A confirmation that predates the pre-existing active-key confirmation:
+    // the merge must keep the later timestamp, matching
+    // `confirm_key_possession`'s re-confirmation semantics.
+    apply_ok(
+        &mut sm,
+        Command::ConfirmKeyPossession(ConfirmKeyPossession {
+            raft_node_id: 3,
+            confirmed_at: base_ts(),
+        }),
+    );
+
+    // Activation: a bundle with the previously-staged root now at position 0.
+    let new_only = CaCertBundle::parse(ca_cert_pem_matching(&staged_pem, &serial)).unwrap();
+    let activate_at = ts(TS_US + 9_000_000);
+    apply_ok(&mut sm, record_ca_at(&new_only, None, activate_at));
+
+    assert!(sm.staged_root.is_none(), "activation clears staged_root");
+    assert!(sm.has_key_confirmation(1), "staged holder graduates");
+    assert_eq!(sm.key_confirmations[&1], base_ts());
+    assert!(
+        sm.has_key_transfer_intent(2),
+        "staged intent graduates when no confirmation exists"
+    );
+    assert!(sm.has_key_confirmation(3), "prior active confirmation kept");
+}
+
+/// Extracts the certificate at bundle position `serial` from `bundle` as a
+/// standalone one-certificate bundle PEM string — used to build the
+/// activation commit's bundle (the staged root alone, now at position 0).
+fn ca_cert_pem_matching(bundle: &CaCertBundle, serial: &str) -> String {
+    // The bundle's serials() are in bundle order; recover the matching PEM
+    // block by re-scanning the same way `serials()` does.
+    let idx = bundle
+        .serials()
+        .iter()
+        .position(|s| s == serial)
+        .expect("serial present in bundle");
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+    let mut in_block = false;
+    for line in bundle.pem().lines() {
+        if line.starts_with("-----BEGIN ") {
+            in_block = true;
+            current.clear();
+        }
+        if in_block {
+            current.push_str(line);
+            current.push('\n');
+        }
+        if line.starts_with("-----END ") {
+            in_block = false;
+            blocks.push(current.clone());
+        }
+    }
+    blocks[idx].clone()
+}
+
+#[test]
+fn staged_key_coverage_gap_reports_missing_voters_sorted() {
+    let mut sm = StateMachine::default();
+    let voters = [3u64, 1, 2];
+
+    // Outside the staged phase, every voter is a gap.
+    let mut gap = sm.staged_key_coverage_gap(&voters);
+    gap.sort_unstable();
+    assert_eq!(gap, vec![1, 2, 3]);
+
+    let (bundle, serial) = staged_bundle("old", "new");
+    apply_ok(
+        &mut sm,
+        record_ca_at(&bundle, Some(serial.clone()), base_ts()),
+    );
+    assert_eq!(sm.staged_key_coverage_gap(&voters), vec![1, 2, 3]);
+
+    apply_ok(
+        &mut sm,
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 2,
+            root_serial: serial.clone(),
+            confirmed_at: base_ts(),
+        }),
+    );
+    assert_eq!(sm.staged_key_coverage_gap(&voters), vec![1, 3]);
+
+    apply_ok(
+        &mut sm,
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 1,
+            root_serial: serial.clone(),
+            confirmed_at: base_ts(),
+        }),
+    );
+    apply_ok(
+        &mut sm,
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 3,
+            root_serial: serial,
+            confirmed_at: base_ts(),
+        }),
+    );
+    assert!(
+        sm.staged_key_coverage_gap(&voters).is_empty(),
+        "total coverage is an empty gap"
+    );
 }

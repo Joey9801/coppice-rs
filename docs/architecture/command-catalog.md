@@ -500,10 +500,10 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | | |
 | --- | --- |
 | Proposer | Formation (chunk 03) at cluster birth; re-root runbook (ADR 0037 §4) thereafter |
-| Payload | `bundle: CaCertBundle` (a validated PEM bundle of **public** certificate material — a chain is allowed for re-root; on the wire, `cert_pem: string`), `recorded_at_us` |
-| Validation | Enforced *before proposal*, at the wire→domain conversion boundary: the `CaCertBundle` newtype base64-decodes and DER-parses every PEM block as a real X.509 certificate and requires the CA basic constraint, so a private key — alone, appended to a certificate, or relabeled as one — and non-CA leaves can never enter the Raft log (ADR 0037 §4; apply-time validation would be too late). |
-| Apply effects | Set or replace `ca`. Replacement **is** re-rooting: the new bundle wholly supersedes the old (ADR 0037 §4 re-root runbook). |
-| Rejections | none at apply (an invalid bundle cannot exist as a domain command; the conversion boundary rejects it as a decode error) |
+| Payload | `bundle: CaCertBundle` (a validated PEM bundle of **public** certificate material — a chain is allowed for re-root; on the wire, `cert_pem: string`), `staged_root_serial: optional string`, `recorded_at_us` |
+| Validation | Bundle validity is enforced *before proposal*, at the wire→domain conversion boundary: the `CaCertBundle` newtype base64-decodes and DER-parses every PEM block as a real X.509 certificate and requires the CA basic constraint, so a private key — alone, appended to a certificate, or relabeled as one — and non-CA leaves can never enter the Raft log (ADR 0037 §4; apply-time validation would be too late). `staged_root_serial`, when present, must name a certificate of this bundle at a position **other than 0** — a staged root is never the active signing root, which is the whole rotation invariant. |
+| Apply effects | Set or replace `ca`. Replacement **is** re-rooting: the new bundle wholly supersedes the old (ADR 0037 §4 re-root runbook). This command is also the **sole** writer of `staged_root`, which is therefore a property of the recorded bundle and never independently mutable. `Some(serial)` stages that root: `staged_root` is set, carrying over accumulated `holders`/`intents` when the serial is unchanged (an idempotent restage) and starting empty when it is not (a **replacement** pending root — the superseded one leaves the bundle in the same commit, so its key is no longer the private half of any anchor). `None` clears it, and when the cleared staged serial is the *new* bundle's position 0 the clearing is an **activation**: `holders` merge into `key_confirmations` and `intents` into `key_transfer_intents`, because those disks now hold the active root's key and custody accounting must say so. |
+| Rejections | `UnknownStagedRoot` |
 
 #### `BindMachineIdentity`
 
@@ -585,6 +585,26 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | Apply effects | Insert `key_transfer_intents[raft_node_id] = intended_at` if absent. First write wins — unlike `ConfirmKeyPossession`, the fact recorded is the earliest moment the key could have left the leader's disk, so a repeat proposal (e.g. a retried transfer) is an accepted no-op that keeps the earlier stamp. Closes the crash window between a candidate's durable key receipt and the leader's `ConfirmKeyPossession` proposal: with the intent committed first, a leader crash mid-transfer still leaves a replicated record that the disk may hold a root-equivalent key. An entry with no matching `key_confirmations` entry is UNRESOLVED — custody accounting must treat that disk as a possible key holder (the §4 conservative stance). `ConfirmKeyPossession` removes the matching entry when the transfer resolves. |
 | Rejections | — |
 
+#### `RecordStagedKeyTransferIntent`
+
+| | |
+| --- | --- |
+| Proposer | Re-root staging (`rotate.rs`): the leader commits its intent to transfer the **staged** root's key to a voter, before the key leaves its disk (ADR 0037 §4) |
+| Payload | `raft_node_id: u64`, `root_serial: string`, `intended_at_us` |
+| Validation | A rotation must be staged and `root_serial` must equal `staged_root.serial`. Scoping is the point: a resume on a new leader may have replaced the pending root, and an intent for a superseded one must be refused rather than miscounted against the activation gate. |
+| Apply effects | Insert `staged_root.intents[raft_node_id] = intended_at` if absent. First write wins, and a node already in `holders` is an accepted no-op (confirmation dominates) — the same shape as `RecordKeyTransferIntent`, for the same reason: an unresolved intent keeps a possibly-keyed disk visible to custody accounting across exactly the crashes it exists for. A staged root is a trust anchor from the moment it is staged, so that disk's authority is not hypothetical. |
+| Rejections | `StagedRootMismatch` |
+
+#### `ConfirmStagedKeyPossession`
+
+| | |
+| --- | --- |
+| Proposer | Re-root staging (`rotate.rs`), and `admin.rs`'s promotion key-transfer gate: the leader records a voter's acknowledged, durable receipt of the **staged** root's key (ADR 0037 §4) |
+| Payload | `raft_node_id: u64`, `root_serial: string`, `confirmed_at_us` |
+| Validation | As `RecordStagedKeyTransferIntent`: staged, and the serial must match. |
+| Apply effects | Insert / overwrite `staged_root.holders[raft_node_id] = confirmed_at` and resolve any matching intent. This map **is** the rotation's activation gate: `begin` promotes the staged root to bundle position 0 only when every current voter appears here, which is what makes a crash between the activation commit and any daemon's local key swap self-healing — every voter already holds the key that just became active. |
+| Rejections | `StagedRootMismatch` |
+
 ---
 
 ## RejectionReason taxonomy
@@ -618,6 +638,8 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | `MachineIdentityRetired` | Admission or rebind targets a binding learner GC already retired — never re-admitted, ever (ADR 0037 §7 one-seat-ever) |
 | `DuplicateEnrollToken` | Enrollment token id already exists |
 | `UnknownEnrollToken` | Revocation of a token not in state |
+| `UnknownStagedRoot` | A `RecordCaCertificate` named a staged root serial that no certificate of its bundle carries at a non-zero position (ADR 0037 §4 — a staged root is never the active signing root) |
+| `StagedRootMismatch` | A staged-custody command named a root this cluster does not currently stage — a stale ack from before a resumed rotation replaced the pending root |
 | `InvalidCommand` | Shape violation (e.g. outcome `Revoked` outside `CommitPlacements`, empty CA bundle, empty token hash) |
 | `InvalidBatch[(index, reason)]` | All-or-nothing batch rejection with per-item diagnostics |
 

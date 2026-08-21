@@ -130,6 +130,21 @@ pub async fn run<C: Consensus>(
     let mut backoff: Option<Duration> = None;
 
     loop {
+        // The local half of a re-root activation, on every pass — which means
+        // at startup and within one re-evaluate interval forever after.
+        //
+        // Activation is one replicated commit plus one local file swap
+        // (`rotate.rs` phase 3), and a leader that dies between them must not
+        // be needed for the cluster to recover. It is not: activation is gated
+        // on *every* current voter holding the staged key, so each daemon can
+        // finish its own half unilaterally, and this is where it does. Doing it
+        // only inside `rotate-ca begin` would make recovery depend on an
+        // operator noticing — and on the very host that crashed coming back.
+        //
+        // A no-op in every ordinary pass: one view read, and a stat only when
+        // this daemon's live key is not already the active root's.
+        promote_staged_locally(&data_dir, consensus.as_ref());
+
         let not_after = store.current().not_after_unix();
         let delay = match not_after {
             // The address-move fast path (see the module doc): a leaf that
@@ -143,6 +158,28 @@ pub async fn run<C: Consensus>(
                 tracing::info!(
                     "renewal: the installed leaf does not cover this daemon's configured \
                      serving names; renewing immediately (ADR 0037 §4/§6 address move)"
+                );
+                Duration::ZERO
+            }
+            // The re-root fast path, the same shape and for the same reason:
+            // `rotate-ca begin` has recorded a new root (ADR 0037 §4) and this
+            // daemon has not caught up to it. Renewing re-signs this leaf
+            // under the incoming root, which is what turns a replicated
+            // decision into an on-the-wire one. Waiting out the expiry timer
+            // would stretch the dual-trust window to a full leaf lifetime, and
+            // the operator cannot run `rotate-ca complete` until the window
+            // closes — so the rotation would take a month for want of a
+            // wakeup.
+            //
+            // The condition is about the **leaf**, not the anchors, because
+            // the anchors move on their own (below, and via `begin`'s push):
+            // a daemon that has adopted the recorded bundle but is still
+            // serving a leaf signed by the outgoing root is exactly the state
+            // this fast path exists to leave.
+            Some(_) if backoff.is_none() && rotation_pending(&store, consensus.as_ref()) => {
+                tracing::info!(
+                    "renewal: this daemon is not yet on the root the cluster records; renewing \
+                     immediately to re-sign under it (ADR 0037 §4 re-root)"
                 );
                 Duration::ZERO
             }
@@ -183,9 +220,13 @@ pub async fn run<C: Consensus>(
             if *shutdown.borrow() {
                 break;
             }
-            // Re-check the condition the sleep was computed under: if this
-            // daemon's serving names moved while we were waiting, stop waiting.
-            if backoff.is_none() && sans_stale(&store, serving_sans.as_deref()) {
+            // Re-check the conditions the sleep was computed under: if the
+            // cluster re-rooted (or this daemon's serving names moved) while
+            // we were waiting, stop waiting.
+            if backoff.is_none()
+                && (sans_stale(&store, serving_sans.as_deref())
+                    || rotation_pending(&store, consensus.as_ref()))
+            {
                 break;
             }
         }
@@ -195,6 +236,33 @@ pub async fn run<C: Consensus>(
 
         if not_after.is_none() {
             continue;
+        }
+
+        // Adopt the recorded trust anchors *before* attempting the renewal
+        // they were noticed by.
+        //
+        // A follower renews by dialing the leader, and it verifies the leader
+        // against its own on-disk bundle — so once the leader is signing (and
+        // serving) under a root this node has not adopted, the dial cannot
+        // succeed, and the dial is the only thing that would have installed
+        // the bundle. That circularity is a wedge, not a delay: it does not
+        // resolve with retries. Anchors are replicated state and need no
+        // signature, no dial and no leader to adopt, so this node repairs its
+        // own trust first and then renews through a connection that can work.
+        //
+        // `begin` also pushes the bundle to every key-holding voter
+        // synchronously (`rotate.rs` "trust before signature"), so on those
+        // this is normally a no-op. It is the path for everyone else: a
+        // learner, a voter that was unreachable during `begin`, a replica that
+        // was down for the whole rotation.
+        if let Some(recorded) = stale_recorded_ca(&store, consensus.as_ref()) {
+            if let Err(e) = crate::rotate::adopt_anchors(&store, recorded.as_bytes()).await {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "renewal: could not adopt the trust anchors the cluster records; \
+                     renewal will be attempted against the anchors already installed"
+                );
+            }
         }
 
         match renew_once(
@@ -208,11 +276,26 @@ pub async fn run<C: Consensus>(
         .await
         {
             Ok(()) => {
-                backoff = None;
-                tracing::info!(
-                    not_after_unix = ?store.current().not_after_unix(),
-                    "renewal: installed a re-issued coordinator leaf"
-                );
+                // Normally clears the backoff. The exception is a renewal that
+                // succeeded and yet left this daemon behind the recorded root
+                // — a leader that signed under a bundle this node has since
+                // moved past, say. The fast path would fire again immediately
+                // on the next pass, so pacing it as a failure is what keeps
+                // "renew, still behind, renew" from becoming a tight loop; the
+                // condition is still re-checked every retry.
+                if rotation_pending(&store, consensus.as_ref()) {
+                    backoff = Some(next_backoff(backoff, pacing));
+                    tracing::warn!(
+                        "renewal: re-issued this coordinator's leaf, but it is still not on the \
+                         root the cluster records; retrying with backoff"
+                    );
+                } else {
+                    backoff = None;
+                    tracing::info!(
+                        not_after_unix = ?store.current().not_after_unix(),
+                        "renewal: installed a re-issued coordinator leaf"
+                    );
+                }
             }
             Err(e) => {
                 let remaining = not_after
@@ -382,6 +465,125 @@ fn sans_stale(store: &TlsStore, serving_sans: Option<&[String]>) -> bool {
         Ok(current) => stale_against(&current, configured),
         Err(_) => false,
     }
+}
+
+/// Whether this daemon has not yet caught up to the root the cluster records
+/// — the re-root fast path's condition (ADR 0037 §4).
+///
+/// Two ways to be behind, and the fast path answers both with one renewal:
+///
+/// - the installed **anchors** are not the recorded bundle (this replica has
+///   not seen the rotation at all), or
+/// - the installed **leaf** does not chain to the recorded bundle's *active*
+///   root (position 0). This is the half that survives anchor adoption:
+///   anchors move on their own — `begin` pushes them to the voters and the
+///   loop adopts them locally — and a daemon that trusts the incoming root
+///   while still presenting a leaf under the outgoing one is precisely the
+///   state `rotate-ca complete` would strand.
+///
+/// `false` when the cluster records no CA: an externally-provisioned cluster
+/// (the pre-ADR-0037 model) has no replicated bundle to be behind, and must
+/// never be dragged into a renew loop by one. `false` too when either side is
+/// unparseable — renewal has no repair to offer for material it cannot read,
+/// and the expiry arm already owns that case.
+fn rotation_pending<C: Consensus>(store: &TlsStore, consensus: &C) -> bool {
+    let Some(recorded) = recorded_ca(consensus) else {
+        return false;
+    };
+    if anchors_differ(store, &recorded) {
+        return true;
+    }
+    match crate::rotate::nth_cert_pem(recorded.as_bytes(), 0) {
+        Ok(active) => pki::verify_leaf(active.as_bytes(), store.current().cert_pem()).is_err(),
+        Err(_) => false,
+    }
+}
+
+/// Promote a staged CA key to this host's live signing path when the recorded
+/// bundle says the staged root has been activated (ADR 0037 §4).
+///
+/// Failure is logged, never fatal: this is a self-heal, and a daemon that
+/// cannot complete it is still a working replica serving a valid leaf — it
+/// simply cannot sign if it becomes leader, which is exactly what the warning
+/// says. The next pass tries again.
+fn promote_staged_locally<C: Consensus>(data_dir: &std::path::Path, consensus: &C) {
+    let view = consensus.views().latest();
+    let state = view.state();
+    let Some(ca) = state.ca.as_ref() else {
+        return;
+    };
+    match crate::rotate::promote_staged_if_activated(
+        data_dir,
+        ca.bundle.pem().as_bytes(),
+        state.staged_root.as_ref(),
+    ) {
+        Ok(Some(backup)) => tracing::info!(
+            backup = %backup.display(),
+            "renewal: this host's staged CA key is the cluster's active root; promoted it to \
+             the live signing path (ADR 0037 §4 re-root)"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "renewal: could not promote this host's staged CA key after a re-root activation; \
+             this replica cannot sign until it succeeds"
+        ),
+    }
+}
+
+/// The CA bundle the cluster records, if it records one.
+fn recorded_ca<C: Consensus>(consensus: &C) -> Option<String> {
+    consensus
+        .views()
+        .latest()
+        .state()
+        .ca
+        .as_ref()
+        .map(|ca| ca.bundle.pem().to_string())
+}
+
+/// Whether the installed anchor set differs from `recorded`.
+///
+/// Compared as an unordered **set of certificates**, not as bytes: what
+/// matters is which roots this replica trusts, and a bundle that differs only
+/// in ordering or whitespace is the same trust decision. Order does carry
+/// meaning for *signing* (position 0 is the active root), but a replica's
+/// on-disk bundle is a trust anchor set and nothing else.
+///
+/// `false` when either side does not parse.
+fn anchors_differ(store: &TlsStore, recorded: &str) -> bool {
+    match (
+        anchor_set(store.current().ca_pem()),
+        anchor_set(recorded.as_bytes()),
+    ) {
+        (Some(installed), Some(replicated)) => installed != replicated,
+        _ => false,
+    }
+}
+
+/// The recorded bundle, when it is not the one installed here — the re-root
+/// signal *and* the bytes that answer it, so the condition and the repair
+/// cannot drift apart.
+fn stale_recorded_ca<C: Consensus>(store: &TlsStore, consensus: &C) -> Option<String> {
+    // Equal, or unparseable either side: not a staleness claim. Renewal has no
+    // repair to offer for material it cannot read, and the expiry arm already
+    // owns that case.
+    recorded_ca(consensus).filter(|recorded| anchors_differ(store, recorded))
+}
+
+/// The sorted DER set of a PEM bundle, or `None` if it does not parse.
+fn anchor_set(pem: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut ders: Vec<Vec<u8>> = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?
+        .into_iter()
+        .map(|d| d.to_vec())
+        .collect();
+    if ders.is_empty() {
+        return None;
+    }
+    ders.sort();
+    Some(ders)
 }
 
 /// The pure half of [`sans_stale`]: does `current` miss any of `configured`?

@@ -73,6 +73,16 @@ pub mod policy;
 /// (ADR 0037 §5), over the same admin channel `coordinator admin` uses.
 pub mod node;
 mod probe;
+// Cluster CA re-rooting (ADR 0037 §4): the `rotate-ca` verbs on the local
+// admin socket, and the runbook they implement (docs/operations/re-rooting.md).
+//
+// `pub` because its types are already part of this crate's public surface —
+// `localadmin::AdminReply` carries `BeginReport`, `CompleteReport` and
+// `RotationStatus` by value — so a caller could destructure them but not name
+// them. It also makes the rotation failpoint names and `COVERAGE_INCOMPLETE`
+// importable by the integration suites instead of copied as string literals,
+// which is what keeps a rename from silently disarming a crash-window test.
+pub mod rotate;
 mod runtime;
 // Minimal systemd `Type=notify` client (ADR 0037 §9): READY=1 when listeners
 // serve, STOPPING=1 at shutdown. Silent no-op off systemd.

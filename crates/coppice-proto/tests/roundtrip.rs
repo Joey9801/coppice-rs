@@ -168,8 +168,32 @@ fn every_command() -> Vec<Command> {
                 params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
                 coppice_state::CaCertBundle::parse(params.self_signed(&key).unwrap().pem()).unwrap()
             },
+            staged_root_serial: None,
             recorded_at: ts(),
         }),
+        // A staged re-root: the recorded bundle carries the still-active old
+        // root at position 0 and the pending new root at position 1
+        // (ADR 0037 §4).
+        {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let old_key = KeyPair::generate().unwrap();
+            let mut old_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            old_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let old_pem = old_params.self_signed(&old_key).unwrap().pem();
+
+            let new_key = KeyPair::generate().unwrap();
+            let mut new_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            new_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let new_pem = new_params.self_signed(&new_key).unwrap().pem();
+
+            let bundle = coppice_state::CaCertBundle::parse(format!("{old_pem}{new_pem}")).unwrap();
+            let staged_serial = bundle.serials()[1].clone();
+            Command::RecordCaCertificate(RecordCaCertificate {
+                bundle,
+                staged_root_serial: Some(staged_serial),
+                recorded_at: ts(),
+            })
+        },
         Command::BindMachineIdentity(BindMachineIdentity {
             machine: MachineId(Uuid::from_u128(0x11)),
             raft_node_id: 3,
@@ -226,6 +250,16 @@ fn every_command() -> Vec<Command> {
         Command::RecordKeyTransferIntent(RecordKeyTransferIntent {
             raft_node_id: 5,
             intended_at: ts(),
+        }),
+        Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {
+            raft_node_id: 5,
+            root_serial: "ab12cd34".into(),
+            intended_at: ts(),
+        }),
+        Command::ConfirmStagedKeyPossession(ConfirmStagedKeyPossession {
+            raft_node_id: 3,
+            root_serial: "ab12cd34".into(),
+            confirmed_at: ts(),
         }),
     ]
 }
@@ -377,6 +411,7 @@ fn ca_bundle_carrying_key_material_is_rejected_at_the_boundary() {
             body: Some(pb::command::v1::command::Body::RecordCaCertificate(
                 pb::command::v1::RecordCaCertificate {
                     cert_pem: cert_pem.clone(),
+                    staged_root_serial: None,
                     recorded_at_us: ts().as_micros(),
                 },
             )),

@@ -88,6 +88,11 @@ pub struct StateMachine {
     /// *private key* never lives in replicated state — no field of
     /// [`CaCertificate`] could hold it.
     pub ca: Option<CaCertificate>,
+    /// The staged (pending) root of an in-flight re-root, or `None` outside the
+    /// staged phase (ADR 0037 §4). Set/replaced/cleared only by
+    /// `RecordCaCertificate` — it is a property of the recorded bundle, never
+    /// independently mutable.
+    pub staged_root: Option<StagedRoot>,
     /// Coordinator machine identity → raft seat bindings (ADR 0037 §7).
     /// Bounded (~cluster size), so a plain `BTreeMap`, not `imbl::OrdMap`.
     pub machine_bindings: BTreeMap<MachineId, MachineBinding>,
@@ -168,6 +173,39 @@ impl StateMachine {
     /// Whether a coordinator machine identity has enrolled (ADR 0037 §4).
     pub fn is_identity_enrolled(&self, machine: &MachineId) -> bool {
         self.enrolled_identities.contains_key(machine)
+    }
+
+    /// Whether a node has confirmed durable receipt of the staged (pending)
+    /// root's private key (ADR 0037 §4).
+    pub fn has_staged_key_confirmation(&self, raft_node_id: u64) -> bool {
+        self.staged_root
+            .as_ref()
+            .is_some_and(|s| s.holders.contains_key(&raft_node_id))
+    }
+
+    /// Whether the leader has committed an intent to transfer the staged
+    /// root's key to this node that has not yet been resolved by a
+    /// confirmation (ADR 0037 §4).
+    pub fn has_staged_key_transfer_intent(&self, raft_node_id: u64) -> bool {
+        self.staged_root
+            .as_ref()
+            .is_some_and(|s| s.intents.contains_key(&raft_node_id))
+    }
+
+    /// Voters with no replicated staged-key confirmation, sorted ascending —
+    /// the activation gate's refusal list. An empty result means total
+    /// coverage. Outside the staged phase (`staged_root` is `None`), every
+    /// voter is a gap.
+    pub fn staged_key_coverage_gap(&self, voters: &[u64]) -> Vec<u64> {
+        let holders = self.staged_root.as_ref().map(|s| &s.holders);
+        let mut gap: Vec<u64> = voters
+            .iter()
+            .copied()
+            .filter(|id| !holders.is_some_and(|h| h.contains_key(id)))
+            .collect();
+        gap.sort_unstable();
+        gap.dedup();
+        gap
     }
 }
 
@@ -276,6 +314,45 @@ impl CaCertBundle {
     pub fn pem(&self) -> &str {
         &self.pem
     }
+
+    /// The lowercase-hex serial of every certificate in the bundle, in bundle
+    /// order. The bundle was validated at construction, so this cannot fail;
+    /// a block that somehow does not re-parse yields no entry.
+    pub fn serials(&self) -> Vec<String> {
+        use base64::Engine as _;
+        use std::fmt::Write as _;
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let mut out = Vec::new();
+        let mut body: Option<String> = None;
+        for raw in self.pem.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.strip_prefix("-----BEGIN ").is_some() {
+                body = Some(String::new());
+            } else if line.strip_prefix("-----END ").is_some() {
+                let Some(base64_body) = body.take() else {
+                    continue;
+                };
+                let Ok(der) = base64::engine::general_purpose::STANDARD.decode(base64_body) else {
+                    continue;
+                };
+                let Ok(([], cert)) = X509Certificate::from_der(&der) else {
+                    continue;
+                };
+                let mut serial = String::with_capacity(cert.raw_serial().len() * 2);
+                for b in cert.raw_serial() {
+                    let _ = write!(serial, "{b:02x}");
+                }
+                out.push(serial);
+            } else if let Some(b) = body.as_mut() {
+                b.push_str(line);
+            }
+        }
+        out
+    }
 }
 
 /// The cluster CA certificate bundle — **public** material only (ADR 0037 §4).
@@ -290,6 +367,38 @@ pub struct CaCertificate {
     /// Validated public certificate material (never a private key).
     pub bundle: CaCertBundle,
     pub recorded_at: Timestamp,
+}
+
+/// The pending root of a staged re-root, and the disks that durably hold its
+/// private key (ADR 0037 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedRoot {
+    /// Lowercase-hex serial of the pending root certificate in the recorded
+    /// bundle — the same string `openssl x509 -noout -serial` prints, and the
+    /// same one `rotate-ca status` shows.
+    pub serial: String,
+    /// When the bundle that staged this root was recorded.
+    pub staged_at: Timestamp,
+    /// raft node id -> when that node confirmed a durable write of the staged
+    /// key. These disks are root-equivalent from the instant the staged root
+    /// is activated, and the pending root is already a trust anchor while
+    /// staged, so they are root-equivalent NOW.
+    pub holders: BTreeMap<u64, Timestamp>,
+    /// raft node id -> unresolved staged-transfer intents (the key may have
+    /// reached that disk). Same conservative accounting as
+    /// `key_transfer_intents`.
+    pub intents: BTreeMap<u64, Timestamp>,
+}
+
+impl Default for StagedRoot {
+    fn default() -> Self {
+        StagedRoot {
+            serial: String::new(),
+            staged_at: Timestamp::UNIX_EPOCH,
+            holders: BTreeMap::new(),
+            intents: BTreeMap::new(),
+        }
+    }
 }
 
 /// One coordinator installation's binding to a raft seat (ADR 0037 §7).
@@ -597,6 +706,19 @@ pub enum RejectionReason {
     InvalidCommand(String),
     #[error("batch rejected; per-item diagnostics attached")]
     InvalidBatch(Vec<Rejection>),
+    #[error(
+        "no certificate at a non-active position of the recorded bundle carries serial {serial}; \
+         a staged root is never the active signing root (ADR 0037 §4)"
+    )]
+    UnknownStagedRoot { serial: String },
+    #[error(
+        "staged-root scope mismatch: this cluster stages {expected:?} but the command names \
+         {got} (ADR 0037 §4)"
+    )]
+    StagedRootMismatch {
+        expected: Option<String>,
+        got: String,
+    },
 }
 
 /// One item's rejection within an otherwise-processed batch: the failing

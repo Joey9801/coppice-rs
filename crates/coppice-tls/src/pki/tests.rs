@@ -468,3 +468,96 @@ fn machine_and_node_id_prefixes_are_what_the_classifier_expects() {
     assert_eq!(MachineId::PREFIX, "machine");
     assert_eq!(NodeId::PREFIX, "node");
 }
+
+// ---------------------------------------------------------------------------
+// Staged CA-key custody (ADR 0037 §4 re-root staging)
+// ---------------------------------------------------------------------------
+
+/// The staged pair is written owner-only and loads back against the pending
+/// root it belongs to — the "durably held" half of the rotation invariant.
+#[cfg(unix)]
+#[test]
+fn staged_custody_writes_an_owner_only_pair_that_loads_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pending = mint_root_ca().unwrap();
+
+    stage_ca_material(dir.path(), &pending.cert_pem, &pending.key_pem).unwrap();
+
+    for name in [CA_STAGED_KEY_FILE, CA_STAGED_CERT_FILE] {
+        let mode = std::fs::metadata(dir.path().join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{name} must be 0600, got {mode:04o}");
+    }
+    let loaded = load_staged_ca_key(dir.path(), &pending.cert_pem).unwrap();
+    assert_eq!(loaded, pending.key_pem);
+    assert_eq!(
+        load_staged_ca_cert(dir.path()).unwrap().as_deref(),
+        Some(pending.cert_pem.as_slice())
+    );
+}
+
+/// The question a resuming leader actually asks: "is the staged key on my disk
+/// the private half of the root this cluster *currently* stages?" A superseded
+/// pending root must answer `KeyMismatch`, not succeed — that mismatch is what
+/// makes `begin` mint a replacement instead of distributing a key no recorded
+/// bundle mentions.
+#[test]
+fn staged_custody_refuses_a_key_belonging_to_a_superseded_pending_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let superseded = mint_root_ca().unwrap();
+    let current = mint_root_ca().unwrap();
+
+    stage_ca_material(dir.path(), &superseded.cert_pem, &superseded.key_pem).unwrap();
+
+    let err = load_staged_ca_key(dir.path(), &current.cert_pem).unwrap_err();
+    assert!(
+        matches!(err, CustodyError::KeyMismatch { .. }),
+        "got {err:?}"
+    );
+}
+
+/// Nothing staged is a distinct signal from a broken stage, and discarding is
+/// idempotent — both matter to a resume path that runs on every restart.
+#[test]
+fn staged_custody_absence_and_discard_are_both_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let pending = mint_root_ca().unwrap();
+
+    let err = load_staged_ca_key(dir.path(), &pending.cert_pem).unwrap_err();
+    assert!(matches!(err, CustodyError::NotFound { .. }), "got {err:?}");
+    assert!(load_staged_ca_cert(dir.path()).unwrap().is_none());
+    discard_staged_ca_material(dir.path()).expect("discarding nothing is not an error");
+
+    stage_ca_material(dir.path(), &pending.cert_pem, &pending.key_pem).unwrap();
+    discard_staged_ca_material(dir.path()).unwrap();
+    discard_staged_ca_material(dir.path()).expect("discard is idempotent");
+    assert!(!dir.path().join(CA_STAGED_KEY_FILE).exists());
+    assert!(!dir.path().join(CA_STAGED_CERT_FILE).exists());
+}
+
+/// Staging leaves the live key strictly alone: during the staged phase the
+/// outgoing root is still the active signing root, and a rotation that
+/// disturbed `ca.key` before total coverage would be the very key-loss window
+/// the phase exists to close.
+#[test]
+fn staging_does_not_disturb_the_live_signing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = mint_root_ca().unwrap();
+    let pending = mint_root_ca().unwrap();
+
+    write_ca_key(dir.path(), &live.key_pem).unwrap();
+    stage_ca_material(dir.path(), &pending.cert_pem, &pending.key_pem).unwrap();
+
+    assert_eq!(
+        load_ca_key(dir.path(), &live.cert_pem).unwrap(),
+        live.key_pem
+    );
+    assert_eq!(
+        load_staged_ca_key(dir.path(), &pending.cert_pem).unwrap(),
+        pending.key_pem
+    );
+}

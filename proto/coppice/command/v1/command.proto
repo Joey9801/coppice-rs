@@ -76,6 +76,11 @@ message Command {
     RebindMachineAddress rebind_machine_address = 97;
     RetireMachineBinding retire_machine_binding = 98;
     RecordKeyTransferIntent record_key_transfer_intent = 99;
+
+    // 90–99 filled; staged-root custody (ADR 0037 §4) continues in the
+    // 100+ unallocated range.
+    RecordStagedKeyTransferIntent record_staged_key_transfer_intent = 100;
+    ConfirmStagedKeyPossession confirm_staged_key_possession = 101;
   }
 }
 
@@ -263,6 +268,13 @@ message BumpClusterVersion {
 message RecordCaCertificate {
   string cert_pem = 1;
   int64 recorded_at_us = 2;
+  // When set, this bundle STAGES the root with this serial (ADR 0037 §4): it
+  // must be a certificate of `cert_pem` at a position other than 0 — a
+  // staged root is never the active signing root. Unset means the bundle
+  // carries no pending root: a single-root steady state, a completed
+  // rotation, or the ACTIVATION commit that promotes a previously staged
+  // root to position 0.
+  optional string staged_root_serial = 3;
 }
 
 // Bind a coordinator machine identity to a raft seat (ADR 0037 §7). One
@@ -360,4 +372,30 @@ message RetireMachineBinding {
 message RecordKeyTransferIntent {
   uint64 raft_node_id = 1;
   int64 intended_at_us = 2;
+}
+
+// Record the replicated FACT that the leader committed an intent to
+// transfer the STAGED (pending) root's key to a node, before the key ever
+// leaves the leader's disk (ADR 0037 §4) — the staged-phase counterpart of
+// RecordKeyTransferIntent. `root_serial` scopes the intent to a specific
+// staged root: an intent for any other serial is stale (a re-run of `begin`
+// on a new leader may have replaced the pending root) and is rejected rather
+// than miscounted. First write wins on `intended_at_us`; a repeat proposal
+// is an accepted no-op. ConfirmStagedKeyPossession resolves (removes) the
+// matching entry when the transfer completes.
+message RecordStagedKeyTransferIntent {
+  uint64 raft_node_id = 1;
+  string root_serial = 2;
+  int64 intended_at_us = 3;
+}
+
+// Record the replicated FACT that a node confirmed durable receipt of the
+// STAGED (pending) root's key (ADR 0037 §4) — the staged-phase counterpart of
+// ConfirmKeyPossession. The key itself is never replicated; re-confirmation
+// overwrites the timestamp. `root_serial` scopes the confirmation the same
+// way as RecordStagedKeyTransferIntent.
+message ConfirmStagedKeyPossession {
+  uint64 raft_node_id = 1;
+  string root_serial = 2;
+  int64 confirmed_at_us = 3;
 }

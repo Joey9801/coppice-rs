@@ -190,6 +190,11 @@ message ClusterStateRecord {
   // policy above — PUBLIC material only; the private key is never here.
   // Absent on a pre-0037 snapshot and on a cluster that has not been formed.
   optional coppice.core.v1.CaCertificate ca = 5;
+  // The pending root of an in-flight re-root and the disks that durably hold
+  // its private key (ADR 0037 §4). Absent outside the staged phase. Bounded
+  // by cluster size, so it rides this singleton record rather than a section
+  // of its own.
+  optional StagedRootRecord staged_root = 6;
 }
 
 // One coordinator installation's binding to a raft seat (ADR 0037 §7). Keyed
@@ -246,4 +251,14 @@ message EnrolledIdentityRecord {
 message KeyTransferIntentRecord {
   uint64 raft_node_id = 1;
   int64 intended_at_us = 2;
+}
+
+// The pending root of a staged re-root and the disks that durably hold its
+// private key (ADR 0037 §4). Bounded by cluster size, so it rides the
+// singleton cluster record rather than a section of its own.
+message StagedRootRecord {
+  string serial = 1;
+  int64 staged_at_us = 2;
+  repeated KeyConfirmationRecord holders = 3;
+  repeated KeyTransferIntentRecord intents = 4;
 }

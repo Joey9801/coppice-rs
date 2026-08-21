@@ -285,6 +285,59 @@ pub enum AdminVerb {
         #[arg(long)]
         out_dir: Option<PathBuf>,
     },
+
+    /// Re-root this cluster: replace the CA every machine credential chains
+    /// to (ADR 0037 §4). See `docs/operations/re-rooting.md`.
+    ///
+    /// The compromise response for anything root-equivalent — any disk that
+    /// has ever held the CA key, or a coordinator enrollment token. Like
+    /// `init` and `issue-operator-cert`, and for the same reason, this rides
+    /// the daemon's Unix socket rather than the network: re-rooting is
+    /// root-equivalent authority, and authorizing it with a certificate
+    /// issued by the CA being replaced would make every operator credential a
+    /// re-rooting credential. `--target` does not apply, and it must be run
+    /// on the **leader's** host — the new key is written to the disk it runs
+    /// on, and that disk has to be the one that signs.
+    RotateCa {
+        #[command(subcommand)]
+        verb: RotateCaVerb,
+    },
+}
+
+/// The three moves of a re-root (ADR 0037 §4).
+#[derive(Debug, Subcommand)]
+pub enum RotateCaVerb {
+    /// Open the dual-trust window: mint a new root, record it ahead of the
+    /// outgoing one, sign under it from now on, and key the other voters.
+    ///
+    /// Nothing is refused at this point — both roots verify — so this is the
+    /// safe half. Re-running it against a rotation already in progress mints
+    /// nothing and only re-attempts key distribution, which is the recovery
+    /// for a voter that was unreachable the first time.
+    Begin,
+
+    /// Report the recorded roots, this replica's turnover, and the custody
+    /// accounting (ADR 0037 §4/§9). Read-only, and answerable on any replica
+    /// — two of its three questions are about the replica it runs on.
+    Status {
+        /// Emit JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Close the dual-trust window: drop the outgoing root.
+    ///
+    /// The one irreversible step, and the only one that can strand a node.
+    /// Refused until one full leaf lifetime has passed since `begin` — the
+    /// point after which no leaf the outgoing root signed can still be
+    /// unexpired — unless `--force` says the operator has verified turnover
+    /// themselves.
+    Complete {
+        /// Complete before the leaf-lifetime bound has elapsed. Run it after
+        /// verifying turnover, not instead of verifying it.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------

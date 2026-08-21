@@ -1274,6 +1274,7 @@ dependencies = [
  "nix",
  "rcgen",
  "reqwest",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",
