@@ -39,6 +39,14 @@ pub mod discovery;
 /// `ForwardEnroll` admin RPC and the public `POST /api/v1/enroll` route.
 mod enroll;
 
+// Per-daemon crash injection for the join pipeline (ADR 0037 §6), armed by the
+// `[test_failpoints]` config section — which cannot load in a release build.
+//
+// `pub` for the same reason `rotate` is: the integration suites import the
+// failpoint names and the halt-marker path from here rather than copying
+// string literals, so a rename cannot silently disarm a crash-window test.
+pub mod failpoints;
+
 // The follower's proxy of `/enroll` to the leader, as a standalone endpoint
 // (ADR 0037 §4). Public so the same production hop can be driven directly.
 pub use enroll::proxying_enroll_endpoint;

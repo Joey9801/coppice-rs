@@ -1065,6 +1065,69 @@ log_level = "warn"
         .expect("write config");
     }
 
+    /// Arm this daemon's join-pipeline failpoints (ADR 0037 §6), scoped to it
+    /// alone: the `[test_failpoints]` section goes into *its* config file, so
+    /// a fleet sharing this test process is untouched.
+    ///
+    /// Appended last and rewritten wholesale, so arming, re-arming and
+    /// [`Daemon::clear_failpoints`] are all one operation on the tail of the
+    /// file. Every other `set_*` here rewrites a line or appends its own
+    /// section, so nothing else is disturbed — but call this *after* them.
+    pub fn arm_failpoints(&self, names: &[&str]) {
+        let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+        let toml = self.config_without_failpoints();
+        std::fs::write(
+            &self.config_path,
+            format!(
+                "{toml}\n[test_failpoints]\nhalt_at = [{}]\n",
+                quoted.join(", ")
+            ),
+        )
+        .expect("write config");
+    }
+
+    /// Disarm every failpoint: the config a restarted daemon gets, so a
+    /// resume is a resume and not a second halt.
+    pub fn clear_failpoints(&self) {
+        std::fs::write(&self.config_path, self.config_without_failpoints()).expect("write config");
+    }
+
+    /// Where a daemon halted at `name` records that it got there — the
+    /// harness's side of [`coppice_coordinator::failpoints::halt_marker`].
+    pub fn halt_marker(&self, name: &str) -> PathBuf {
+        coppice_coordinator::failpoints::halt_marker(&self.data_dir(), name)
+    }
+
+    /// Wait until this daemon has halted at `name`.
+    ///
+    /// The marker file is durable, so unlike a phase poll this cannot lose a
+    /// race: the daemon is still serving (only its convergence loop is parked,
+    /// permanently), so a caller that sees the marker can read `/readyz` for
+    /// the state at the halt and then kill the process where it stands.
+    pub async fn await_halted_at(&self, name: &str) {
+        let marker = self.halt_marker(name);
+        poll(
+            Duration::from_secs(30),
+            &format!("the daemon halts at the {name} failpoint"),
+            || {
+                let marker = marker.clone();
+                async move { marker.exists() }
+            },
+        )
+        .await;
+    }
+
+    /// This daemon's config with any `[test_failpoints]` section removed.
+    /// The section is always the file's tail (see [`Daemon::arm_failpoints`]),
+    /// so truncating at its header is exact.
+    fn config_without_failpoints(&self) -> String {
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        match toml.find("[test_failpoints]") {
+            Some(at) => toml[..at].trim_end().to_string(),
+            None => toml,
+        }
+    }
+
     /// Start (or restart) the daemon. Returns once `run_with` has been spawned;
     /// callers poll a surface to learn when it is serving.
     ///

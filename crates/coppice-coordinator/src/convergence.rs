@@ -338,6 +338,12 @@ pub(crate) struct Convergence {
     /// How fast this loop ticks: the `[pacing]` section of node config,
     /// carried by value because the loop outlives the borrow of `Config`.
     pub(crate) pacing: PacingConfig,
+    /// Where this daemon's join pipeline stops dead, if its config armed a
+    /// failpoint (ADR 0037 §6). Disarmed in every real deployment, and
+    /// unarmable in a release build — see [`crate::failpoints`]. Carried on
+    /// the loop rather than read from a global so that arming one daemon of a
+    /// single-process test fleet cannot arm its leader.
+    pub(crate) failpoints: crate::failpoints::Failpoints,
 }
 
 /// Spawn the post-start convergence loop over a started replica.
@@ -659,14 +665,28 @@ impl Convergence {
         // Step 3: admission. The leader binds the machine identity from the
         // mTLS session this call arrives under and dial-back-verifies the
         // advertised address before admitting (ADR 0037 §6/§7).
-        if let Err(status) = client
+        //
+        // The two failpoints around this call bracket the admission RPC from
+        // both sides — stamped-but-never-asked, and asked-but-never-answered.
+        // Both are no-ops unless this daemon's own config armed them.
+        self.failpoints
+            .halt_if_armed(crate::failpoints::JOIN_BEFORE_ADD_LEARNER)
+            .await;
+        let admitted = client
             .add_learner(pb::AddLearnerRequest {
                 history_id: history_id.to_vec(),
                 node_id,
                 address: self.advertise_addr.clone(),
             })
-            .await
-        {
+            .await;
+        // Deliberately between the `await` and the inspection below: an armed
+        // daemon halts holding an answer it never looks at, which is exactly
+        // the state a crash on the wire produces — the leader may have
+        // committed the admission, and this replica has no idea.
+        self.failpoints
+            .halt_if_armed(crate::failpoints::JOIN_ADD_LEARNER_ISSUED)
+            .await;
+        if let Err(status) = admitted {
             // Debug rather than warn: a redirect to the real leader and an
             // election in flight both land here, and both are ordinary. The
             // refusals an operator must see are published to `/readyz` by the
@@ -709,13 +729,19 @@ impl Convergence {
         // for one — because a machine credential may never remove anyone
         // (ADR 0037 §7). Where a removal is warranted the leader folds it in
         // itself, under its own replication evidence.
-        match client
+        let promoted = client
             .promote_voter(pb::PromoteVoterRequest {
                 history_id: history_id.to_vec(),
                 promote_node_id: node_id,
             })
-            .await
-        {
+            .await;
+        // The in-flight promotion instant, for the same reason and in the same
+        // place as the admission one above: the seat may already be this
+        // replica's while this replica still believes it is a learner.
+        self.failpoints
+            .halt_if_armed(crate::failpoints::JOIN_PROMOTE_VOTER_ISSUED)
+            .await;
+        match promoted {
             Ok(_) => JoinStep::Promoted,
             Err(status) => classify(&status),
         }

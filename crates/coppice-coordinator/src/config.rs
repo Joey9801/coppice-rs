@@ -410,6 +410,14 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) token_kdf: TokenKdfConfig,
 
+    /// Join-pipeline crash injection (ADR 0037 §6), for the integration
+    /// suites. `None` in every real deployment — and unloadable in a release
+    /// build at all, see [`TestFailpointConfig`]. An `Option` rather than a
+    /// defaulted table because the *presence* of the section is what the
+    /// build-mode check rejects, empty or not.
+    #[serde(default)]
+    pub(crate) test_failpoints: Option<TestFailpointConfig>,
+
     /// mTLS material for intra-cluster traffic (ADR 0011, day one). Required:
     /// there is no insecure fallback.
     pub(crate) tls: TlsConfig,
@@ -836,6 +844,54 @@ impl Default for TokenKdfConfig {
     }
 }
 
+/// `[test_failpoints]`: where this daemon's join pipeline stops dead
+/// (ADR 0037 §6). See [`crate::failpoints`] for what a failpoint is and why it
+/// is carried per daemon instead of in an environment variable.
+///
+/// **Not production-legal, and not merely discouraged.** `[pacing]` and
+/// `[token_kdf]` are knobs a test fleet sets to extreme values; this is a
+/// switch whose only setting is "stop working". So unlike those two — which
+/// are validated at load and then honoured — this section is *refused* at load
+/// unless the binary was built with `debug_assertions`, which is what stops a
+/// production config from smuggling one in.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TestFailpointConfig {
+    /// The failpoint names this daemon halts at, from
+    /// [`crate::failpoints::ALL`].
+    #[serde(default)]
+    pub(crate) halt_at: Vec<String>,
+}
+
+impl TestFailpointConfig {
+    /// Refuse the section outright in a release build, and refuse a name no
+    /// failpoint answers to in any build.
+    ///
+    /// The second check matters as much as the first: a `halt_at` entry that
+    /// matches nothing arms nothing, and a test staged on a renamed failpoint
+    /// would then pass while exercising the very code path it meant to
+    /// interrupt.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if !cfg!(debug_assertions) {
+            bail!(
+                "[test_failpoints] is a debug-build-only section — it makes a daemon stop \
+                 converging on purpose, so there is no deployment it belongs in, and this \
+                 binary was built without debug assertions. Remove the section."
+            );
+        }
+        for name in &self.halt_at {
+            if !crate::failpoints::ALL.contains(&name.as_str()) {
+                bail!(
+                    "[test_failpoints] halt_at names an unknown failpoint {name:?}; the \
+                     failpoints this build has are: {}",
+                    crate::failpoints::ALL.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PacingConfig {
     /// The renewal knobs as the leaf-renewal task takes them
     /// ([`crate::tasks::renewal::RenewalPacing`]), mirroring
@@ -1104,6 +1160,16 @@ impl Config {
         }
     }
 
+    /// This daemon's armed join-pipeline failpoints (ADR 0037 §6), scoped to
+    /// it alone. Disarmed for every config without the section — which, in a
+    /// release build, is every config that loads at all.
+    pub(crate) fn failpoints(&self) -> crate::failpoints::Failpoints {
+        match &self.test_failpoints {
+            Some(section) => crate::failpoints::Failpoints::new(&section.halt_at, &self.data_dir),
+            None => crate::failpoints::Failpoints::default(),
+        }
+    }
+
     pub(crate) fn admin_socket_path(&self) -> PathBuf {
         self.listen
             .admin_socket
@@ -1175,6 +1241,14 @@ pub fn load(path: &Path) -> Result<ResolvedConfig> {
         .token_kdf
         .validate()
         .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    // Here rather than at first use for a different reason than those two: the
+    // check this runs is "was this binary built to allow the section at all",
+    // and the honest moment to answer it is before the daemon binds anything.
+    if let Some(failpoints) = &config.test_failpoints {
+        failpoints
+            .validate()
+            .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    }
     let resolved_host = resolve_advertise_host(config.listen.advertise_host.as_deref())?;
     config.listen.advertise_host = Some(resolved_host);
     Ok(ResolvedConfig { config })
@@ -1492,6 +1566,100 @@ addrs = []
         assert_eq!(config.token_kdf.m_cost_kib, 8);
         assert_eq!(config.token_kdf.t_cost, 1);
         assert_eq!(config.token_kdf.p_cost, 1);
+    }
+
+    /// A config carrying `[test_failpoints]` is a **debug-build-only** config.
+    ///
+    /// The assertion is written against `cfg!(debug_assertions)` rather than
+    /// pinned to one build mode because both halves are load-bearing and both
+    /// must be checked in the mode they apply to: under `cargo test` the
+    /// section has to load (the integration suites depend on it), and under
+    /// `cargo test --release` it has to be refused by name (a production
+    /// coordinator handed this config must fail-stop, not converge on purpose
+    /// into a permanent halt).
+    #[test]
+    fn test_failpoints_load_only_in_a_debug_build() {
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[test_failpoints]\nhalt_at = [\"{}\"]\n",
+            crate::failpoints::JOIN_ADD_LEARNER_ISSUED
+        );
+        let (_guard, path) = write_config(&contents);
+        let loaded = load(&path);
+        assert_eq!(
+            loaded.is_ok(),
+            cfg!(debug_assertions),
+            "[test_failpoints] must load in a debug build and only there: {}",
+            loaded
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default()
+        );
+        match loaded {
+            Ok(resolved) => {
+                let section = resolved
+                    .config
+                    .test_failpoints
+                    .as_ref()
+                    .expect("the section parsed");
+                assert_eq!(
+                    section.halt_at,
+                    [crate::failpoints::JOIN_ADD_LEARNER_ISSUED.to_string()]
+                );
+            }
+            Err(e) => {
+                let rendered = format!("{e:#}");
+                assert!(
+                    rendered.contains("[test_failpoints]") && rendered.contains("debug-build-only"),
+                    "the refusal must name the section and why: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// An empty `[test_failpoints]` section is still a `[test_failpoints]`
+    /// section: presence is what the build-mode check rejects, because a
+    /// production config has no business carrying the table at all.
+    #[test]
+    fn an_empty_test_failpoints_section_is_still_the_section() {
+        let contents = format!("{MINIMAL_EXAMPLE}\n[test_failpoints]\n");
+        let (_guard, path) = write_config(&contents);
+        assert_eq!(load(&path).is_ok(), cfg!(debug_assertions));
+    }
+
+    /// A `halt_at` entry no failpoint answers to is a config error in **every**
+    /// build. An unknown name arms nothing, so accepting it would let a
+    /// renamed failpoint turn a crash-window test into a test of the
+    /// uninterrupted happy path — passing, and covering nothing.
+    #[test]
+    fn an_unknown_failpoint_name_is_refused() {
+        let contents =
+            format!("{MINIMAL_EXAMPLE}\n[test_failpoints]\nhalt_at = [\"join-after-lunch\"]\n");
+        let (_guard, path) = write_config(&contents);
+        let err = load(&path).expect_err("an unknown failpoint name must fail at load");
+        let rendered = format!("{err:#}");
+        if cfg!(debug_assertions) {
+            assert!(
+                rendered.contains("join-after-lunch")
+                    && rendered.contains(crate::failpoints::JOIN_BEFORE_ADD_LEARNER),
+                "the refusal must name the bad entry and the real ones: {rendered}"
+            );
+        }
+    }
+
+    /// The overwhelmingly common case, asserted so it cannot regress into an
+    /// accidentally-required section: no `[test_failpoints]`, nothing armed.
+    #[test]
+    fn a_config_without_the_section_arms_nothing() {
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let config = read_config(&path).expect("the minimal example parses");
+        assert!(config.test_failpoints.is_none());
+        for name in crate::failpoints::ALL {
+            assert!(
+                !config.failpoints().is_armed_for_tests(name),
+                "{name} must be disarmed without the section"
+            );
+        }
     }
 
     /// `[pacing]` is entirely optional and every field defaults to the value
