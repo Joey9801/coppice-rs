@@ -48,20 +48,43 @@ pub enum VerifyError {
 ///
 /// `leaf` may be PEM or raw DER. Verification is a full webpki chain check
 /// (signature over the leaf by the CA key, and the leaf's validity window)
-/// against the CA as the sole trust anchor with no intermediates — v1 issues
-/// directly under the root. Classification then reads the subject:
+/// with no intermediates — v1 issues directly under a root. Classification
+/// then reads the subject:
 ///
 /// - `OU=coppice-operators` ⇒ [`Profile::Operator`] (`CN` = the operator name);
 /// - `OU=coppice-coordinator` + `CN` parsing as a [`MachineId`] ⇒
 ///   [`Profile::Coordinator`];
 /// - no `OU` + `CN` parsing as a [`NodeId`] ⇒ [`Profile::Agent`];
 /// - anything else ⇒ [`VerifyError::Unclassifiable`].
+///
+/// # Every certificate in the bundle is a trust anchor
+///
+/// `ca_pem` is the cluster's *trust-anchor set*, not one certificate, and a
+/// leaf verifying under **any** member of it verifies. That is what makes the
+/// dual-trust window of a re-root (ADR 0037 §4) work: `rotate-ca begin`
+/// records a two-root bundle, and for the length of the rotation both the
+/// incoming root's leaves and the outgoing root's still-unexpired leaves must
+/// authenticate on the same listener. Anchoring on only the first entry would
+/// have made the recorded chain decorative — every peer that had not yet
+/// renewed would have been refused at the instant the new bundle committed,
+/// which is a flag day, not a rotation.
+///
+/// Bundle **order** still carries meaning, just not here: position 0 is the
+/// *active signing* root (what [`super::load_ca_key`] and
+/// [`CaSigner::load`](super::CaSigner::load) pair a key against, and therefore
+/// what new leaves are issued under). Verification is order-independent;
+/// issuance is not.
 pub fn verify_leaf(ca_pem: &[u8], leaf: &[u8]) -> Result<VerifiedLeaf, VerifyError> {
     let leaf_der = coerce_to_der(leaf)?;
-    let ca_der = first_cert_der(ca_pem)?;
+    let ca_ders = all_cert_ders(ca_pem)?;
 
-    let anchor = webpki::anchor_from_trusted_cert(&ca_der)
-        .map_err(|e| VerifyError::UntrustedChain(format!("trust anchor: {e}")))?;
+    let anchors = ca_ders
+        .iter()
+        .map(|der| {
+            webpki::anchor_from_trusted_cert(der)
+                .map_err(|e| VerifyError::UntrustedChain(format!("trust anchor: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let ee = EndEntityCert::try_from(&leaf_der)
         .map_err(|e| VerifyError::Decode(format!("leaf certificate: {e}")))?;
 
@@ -75,7 +98,7 @@ pub fn verify_leaf(ca_pem: &[u8], leaf: &[u8]) -> Result<VerifiedLeaf, VerifyErr
     // authorization use — the peer is authenticating).
     ee.verify_for_usage(
         webpki::ALL_VERIFICATION_ALGS,
-        &[anchor],
+        &anchors,
         &[],
         now,
         KeyUsage::client_auth(),
@@ -187,6 +210,21 @@ fn first_cert_der(pem: &[u8]) -> Result<CertificateDer<'static>, VerifyError> {
         .ok_or_else(|| VerifyError::Decode("no certificate in PEM".to_string()))?
         .map(|der| der.into_owned())
         .map_err(|e| VerifyError::Decode(format!("parsing certificate PEM: {e}")))
+}
+
+/// Every certificate in a PEM bundle, as owned DER, in bundle order.
+///
+/// The whole trust-anchor set, because a re-root's dual-trust window records
+/// two roots and both must authenticate (see [`verify_leaf`]).
+fn all_cert_ders(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, VerifyError> {
+    let ders = rustls_pemfile::certs(&mut Cursor::new(pem))
+        .map(|der| der.map(|d| d.into_owned()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VerifyError::Decode(format!("parsing certificate PEM: {e}")))?;
+    if ders.is_empty() {
+        return Err(VerifyError::Decode("no certificate in PEM".to_string()));
+    }
+    Ok(ders)
 }
 
 /// A cheap sniff: PEM is ASCII beginning (after any leading whitespace) with the
