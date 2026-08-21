@@ -87,20 +87,20 @@ the operational workflow is described in
   refresh with a launch lifecycle hook polling it implements the loop;
   no further coordinator code needed).
 
-Implementation of all of the above is tracked as issue #47 and is landing
-in pieces. Already in the tree: the discovery backends and hot-reload TLS
-store; the cluster-owned PKI primitives and the replicated identity
-facts; and the **formation half of C1** — the local admin socket,
-`coppice coordinator init` with its `formation_complete` marker and
-fail-stop, the parked daemon, `ProbeCluster`, and the `/readyz` phases
-that exist before self-join (`waiting`, `formation-failed`, `voter`).
-Still outstanding: enrollment (`POST /api/v1/enroll` and the token
-lifecycle), the convergence loop that turns a parked daemon into a
-learner and then a voter, the evidence-gated removal and `ReplaceVoter`
-of C4, and the `?require=healthy` gate. Until those land the pre-0037
-manual sequence continues to work via the retained admin verbs and the
-`--bootstrap`/`--join` flags, which are removed with the convergence
-loop.
+Implementation is tracked as issue #47 and has landed in chunks: the
+substrate and hot-reload TLS store, the cluster-owned PKI primitives and
+replicated identity facts, formation (chunk 01, PR #70), PKI core
+(chunk 02, PR #71), the local admin socket and `coppice coordinator init`
+(chunk 03, PR #72), enrollment — `POST /api/v1/enroll` and the token
+lifecycle (chunk 04, PR #73), the convergence loop that turns a parked
+daemon into a learner and then a voter, plus `/readyz` and its
+`?require=healthy` gate (chunk 05, PR #74), and evidence-gated removal
+plus `ReplaceVoter` and CA-key custody (chunk 06, PR #76). The pre-0037
+manual sequence and the `--bootstrap`/`--join` flags are gone; every
+coordinator runs the one flagless `coppice coordinator --config …`
+command described above. What remains is chunk 07 — completing the test
+matrix and writing the re-root runbook (this PR) — which closes out
+issue #47.
 
 ## Part 2 — Agent lifecycle (autoscaling to zero-touch)
 
@@ -109,7 +109,7 @@ loop.
 | # | Gap | Today |
 | --- | --- | --- |
 | A1 | Node identity + config are hand-authored | `node_id` written into `agent.toml` by a human, must match the cert CN |
-| A2 | Cert issuance is out-of-band | ADR 0011's enrollment-token → CSR → per-node-cert flow is documented, not built; `configuration.md` lists an `enrollment token path` field no code reads |
+| A2 | ~~Cert issuance is out-of-band~~ — landed | ADR 0011's enrollment-token → CSR → per-node-cert flow is built (`POST /api/v1/enroll`, `[enrollment]` in `configuration.md`, agent-side renewal), resolving OD-15a; see the plan below for the shape as shipped |
 | A3 | Capacity is static config | the advertised vector is typed in by hand; nothing detects cores/memory/disk |
 | A4 | No graceful scale-in | `SetNodeSchedulable` exists in the state machine but **nothing calls it** (no API, no CLI); there is no compute-node removal/GC command at all; scale-in today = instance dies → 90 s liveness timeout → `DeclareNodeLost` → running attempts killed as `NodeLost` |
 | A5 | The Docker executor is a stub | every `start` fails; the agent cannot run real workloads (tracked as the top critical-path item) |
@@ -122,8 +122,8 @@ dir (`coppice dev` already does exactly this); `node_id` leaves
 `agent.toml`. The CN↔NodeId binding then inverts: identity exists first,
 the cert is issued *for* it — which is the enrollment flow's shape anyway.
 
-**A2 — enrollment (the keystone).** Implement ADR 0011's flow, whose
-signer ADR 0037 has now decided (resolving OD-15a):
+**A2 — enrollment (the keystone), landed.** ADR 0011's flow, whose
+signer ADR 0037 decided (resolving OD-15a), is built as follows:
 
 1. The launch template carries a **role-scoped enrollment token**
    (agent role; reusable and long-lived is the supported default — no
