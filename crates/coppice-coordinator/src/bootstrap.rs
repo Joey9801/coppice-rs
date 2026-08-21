@@ -392,6 +392,10 @@ pub async fn run_with(
         tls: convergence_tls,
         phase: Arc::clone(&phase),
         pacing: resolved.config.pacing.clone(),
+        // Scoped to this daemon's config, so one process hosting a whole test
+        // fleet can arm the joiner without arming its leader (ADR 0037 §6).
+        // Always disarmed in a release build: the section cannot load there.
+        failpoints: resolved.config.failpoints(),
     });
 
     // The task runtime owns steps 1–4 of the shutdown order and returns once
