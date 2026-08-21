@@ -220,6 +220,31 @@ cross-cluster mixup, or a volume from before a re-formation); an *empty*
 directory is treated as a new instance and converges as above — which is
 why the mount guard belongs in the unit file, not in operator memory.
 
+A volume from before a re-formation is the one case the daemon cannot
+judge at startup: its stamp, its membership and its log are internally
+consistent, and nothing looks wrong until it hears from the cluster. The
+refusal therefore arrives a moment later. A resumed voter that has lost
+contact with the peers it remembers asks whether a formed cluster still
+answers to its `cluster_id`; if one does and reports a *different*
+`history_id`, the daemon publishes phase `history-superseded` on
+`/readyz` and exits nonzero rather than serving state the fleet has moved
+past. A voter still in contact with its own history never asks, and
+empty or unreachable discovery is never itself an answer — only a
+positive observation of a formed cluster on another history stops a
+daemon.
+
+**Known bound — a sole-voter cluster is not covered.** The trigger is
+*lost contact with remembered peers*; a single voter is its own quorum,
+remembers no peers, and so never registers the loss that starts the
+check. An old volume from a one-voter cluster that was wiped and
+re-formed under the same `cluster_id` will therefore resume and serve
+its stale history in isolation (the per-RPC `history_id` check still
+keeps it from joining, forking, or being absorbed) rather than
+fail-stopping. Polling the public edge forever on every single-node
+deployment to close this was judged the worse trade. If you re-form a
+one-voter cluster, retire or wipe the old volume yourself — or choose a
+new `cluster_id`, which makes the old volume's refusal unconditional.
+
 ## Join and replace
 
 Adding capacity and replacing an instance start the same way: a new
@@ -283,7 +308,8 @@ coppice coordinator admin --config coordinator.toml local-status
 ```
 
 The JSON body (`local-status --json`) carries `phase` (`waiting` |
-`formation-failed` | `joining` | `learner` | `voter`),
+`formation-failed` | `history-superseded` | `joining` | `learner` |
+`voter`),
 node/cluster/instance ids, applied index and lag, `voters`,
 `cluster_size`, `formed`, and any admission refusal the daemon last
 received. Note that `?require=healthy` is answered authoritatively only
@@ -340,6 +366,7 @@ current leader named in the error.
 | --- | --- | --- |
 | phase `waiting`, indefinitely | no initialized cluster found: genuinely new fleet awaiting `init`, discovery misconfiguration, failing enrollment (bad token, unreachable endpoint), or a fleet whose volumes are all gone | form the cluster deliberately, fix `[discovery]`/`[enrollment]`, or begin restore — parking is deliberate, never auto-resolved |
 | phase `formation-failed` | a formation crashed before its `formation_complete` marker (either side of `raft.initialize`) | wipe that one data directory, restart the daemon, re-run `init` — no peer can have joined |
+| phase `history-superseded`, then a nonzero exit | this daemon resumed a volume whose raft history predates a deliberate re-init of a cluster wearing the same `cluster_id`: a formed cluster answering to that `cluster_id` reports a *different* `history_id`, and a history id is minted once per formation | decide restore-versus-wipe, and do exactly one. Restoring the fleet from a backup of the **stamped** history keeps this volume's state; wiping this data directory enrolls the node into the **new** history as a fresh installation and abandons that state. Doing neither leaves the unit restart-looping on the same refusal, which is the intended alarm — never "fix" it by editing the stamp or downgrading the daemon |
 | "identity stamp mismatch" at startup | volume belongs to another cluster or another instance | attach the right volume; never edit the stamp |
 | "cross-cluster contact refused" (from a peer) | a coordinator from a different cluster dialed this one | fix the peer's config/addressing |
 | startup error: enrollment endpoint unverifiable | `[enrollment]` names a token against a plain-HTTP endpoint without `insecure = true` | give the endpoint an externally-verified certificate, or opt into insecure for dev/test; never fall back silently |

@@ -1790,3 +1790,53 @@ impl Fleet {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Volume loss (ADR 0037 §1/§3)
+// ---------------------------------------------------------------------------
+
+/// A second `impl` block rather than an edit to the one above, so this file
+/// stays append-only while several suites are being written against it.
+impl Daemon {
+    /// Destroy this installation the way losing its disk would: the data
+    /// directory (manifest, raft log, machine identity, CA key) **and** the
+    /// `[tls]` material go together.
+    ///
+    /// Distinct from [`Daemon::wipe_data_dir`], which models the ADR 0037 §3
+    /// recovery from a failed formation — a deliberate operator act on a node
+    /// whose certificates are still valid. This one models the volume being
+    /// gone: what comes back is a fresh installation with no identity, no
+    /// certificate and no history, which is the only state from which a daemon
+    /// re-enrolls (`enroll_if_needed` returns early whenever a usable leaf is
+    /// on disk, so a half-wipe would quietly keep the old identity's leaf).
+    ///
+    /// The config, the ports and the enrollment block survive, because in a
+    /// real fleet those come from the launch template and not from the volume.
+    pub fn wipe_installation(&self) {
+        self.wipe_data_dir();
+        for file in ["node.crt", "node.key", "ca.crt"] {
+            let path = self.dir.path().join(file);
+            if path.exists() {
+                std::fs::remove_file(&path).expect("wipe tls material");
+            }
+        }
+    }
+
+    /// Wait for a daemon to exit **on its own**, and return what `run_with`
+    /// returned.
+    ///
+    /// The counterpart of [`Daemon::stop`] for the fail-stop paths: nothing is
+    /// signalled, because the point of the assertion is that the daemon
+    /// decided to stop by itself (ADR 0037 §3). A daemon that is still serving
+    /// when the budget runs out fails the test here rather than at whatever
+    /// the caller was going to assert next, and names that it never exited.
+    pub async fn await_exit(&mut self, budget: Duration) -> anyhow::Result<()> {
+        let running = self.running.take().expect("daemon is not running");
+        let out = tokio::time::timeout(budget, running.join)
+            .await
+            .expect("the daemon was still running when its exit budget ran out")
+            .expect("daemon task joined");
+        running.runtime.shutdown_background();
+        out
+    }
+}

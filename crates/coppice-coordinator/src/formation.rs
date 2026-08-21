@@ -114,6 +114,15 @@ pub(crate) struct PhaseState {
     /// peer, quorum at risk. A *hold*, not a refusal — see the field of the
     /// same name on `ReadyzReport` for why the two are kept apart.
     promotion_hold: RwLock<Option<String>>,
+    /// Set once, and never cleared, when this replica establishes that its
+    /// stamped raft history has been superseded by a same-`cluster_id` re-init
+    /// (ADR 0037 §3). It overrides the phase every surface reports, because a
+    /// superseded replica is *structurally* not part of the cluster its
+    /// `cluster_id` names — however healthy its own consensus state looks from
+    /// the inside. The daemon fail-stops immediately afterwards; this exists so
+    /// the last `/readyz` an operator (or a load balancer) reads before the
+    /// process exits says why.
+    superseded: RwLock<Option<String>>,
     /// The sampler-maintained redundancy verdict and its stability window.
     /// Written only by the background sampler ([`sample_health`]
     /// (PhaseState::sample_health)); `/readyz` and `ClusterStatus` are pure
@@ -160,6 +169,7 @@ impl PhaseState {
             phase: RwLock::new(phase),
             last_admission_refusal: RwLock::new(None),
             promotion_hold: RwLock::new(None),
+            superseded: RwLock::new(None),
             health_window: Mutex::new(HealthWindow {
                 verdict: HealthVerdict::Unknown,
                 since: None,
@@ -250,9 +260,24 @@ impl PhaseState {
         *self.promotion_hold.write().expect("promotion hold lock") = None;
     }
 
+    /// Publish the history-superseded fail-stop (ADR 0037 §3): this volume's
+    /// raft history predates a re-init of a cluster wearing the same
+    /// `cluster_id`, so nothing this replica holds can ever rejoin it.
+    ///
+    /// Terminal by construction — there is no clearing counterpart, and the
+    /// daemon exits nonzero right after — but deliberately *not* a transition
+    /// to [`Phase::Failed`]: that phase means "a formation attempt died
+    /// mid-flight", and conflating the two would send an operator to the wrong
+    /// half of the runbook. The replica stays `Formed` internally, so the
+    /// report still carries the history id and node id the message is about.
+    pub(crate) fn publish_superseded(&self, reason: String) {
+        *self.superseded.write().expect("superseded lock") = Some(reason);
+    }
+
     /// The current `/readyz` body (ADR 0037 §9).
     pub(crate) fn readyz(&self) -> ReadyzReport {
         let cluster = self.cluster_id.to_string();
+        let superseded = self.superseded.read().expect("superseded lock").clone();
         let refusal = self
             .last_admission_refusal
             .read()
@@ -332,7 +357,7 @@ impl PhaseState {
         } else {
             (!is_voter).then(|| "this replica is not a voter".to_string())
         };
-        ReadyzReport {
+        let mut report = ReadyzReport {
             cluster_id: cluster,
             history_id: Some(hex(&formed.handle.history_id())),
             node_id: Some(summary.local_id),
@@ -372,7 +397,17 @@ impl PhaseState {
                 .expect("promotion hold lock")
                 .clone(),
             reason_code: None,
+        };
+        // The supersession override is applied last and wins outright: this
+        // replica's membership, lag and leadership are all *internally*
+        // consistent — they are simply consistent with a history the cluster
+        // has moved past — so every field below `phase` stays as computed and
+        // only the verdict changes (ADR 0037 §3).
+        if let Some(reason) = superseded {
+            report.phase = ReadyzPhase::HistorySuperseded;
+            report.reason = Some(reason);
         }
+        report
     }
 
     /// The cluster-redundancy verdict behind `?require=healthy` (ADR 0037 §9).

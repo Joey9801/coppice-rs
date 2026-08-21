@@ -209,7 +209,7 @@ pub async fn run_with(
     // skips its own signal handler; the handler is installed here instead,
     // because a parked daemon must answer a SIGTERM and never reaches the
     // runtime.)
-    let shutdown_rx = match shutdown {
+    let external_shutdown = match shutdown {
         Some(rx) => rx,
         None => {
             let (tx, rx) = watch::channel(false);
@@ -217,6 +217,20 @@ pub async fn run_with(
             rx
         }
     };
+    // Everything below drains from an *internal* watch that the external one
+    // feeds, so this daemon has a second way to stop itself: the convergence
+    // loop's history-superseded fail-stop (ADR 0037 §3) flips it, and the tail
+    // of this function turns that into a nonzero exit. One watch either way, so
+    // the documented shutdown order is identical whichever trigger fired.
+    let (internal_shutdown, shutdown_rx) = watch::channel(false);
+    let failstop = crate::convergence::FailStop::new(internal_shutdown.clone());
+    tokio::spawn({
+        let mut external = external_shutdown;
+        async move {
+            let _ = external.wait_for(|stop| *stop).await;
+            let _ = internal_shutdown.send(true);
+        }
+    });
 
     let (startup, marks) = formation::inspect(&resolved.config.data_dir)?;
     let phase = PhaseState::unformed(
@@ -392,10 +406,18 @@ pub async fn run_with(
         tls: convergence_tls,
         phase: Arc::clone(&phase),
         pacing: resolved.config.pacing.clone(),
+        // The supersession channel that survives a re-init's new trust root
+        // (ADR 0037 §3/§4); absent when this deployment configures no
+        // enrollment endpoint.
+        public_edge: crate::convergence::PublicEdge::from_config(
+            resolved.config.enrollment.as_ref(),
+        ),
+        failstop: failstop.clone(),
         // Scoped to this daemon's config, so one process hosting a whole test
         // fleet can arm the joiner without arming its leader (ADR 0037 §6).
         // Always disarmed in a release build: the section cannot load there.
         failpoints: resolved.config.failpoints(),
+        supersession: std::sync::Mutex::new(None),
     });
 
     // The task runtime owns steps 1–4 of the shutdown order and returns once
@@ -459,6 +481,16 @@ pub async fn run_with(
         "shutdown: consensus down; releasing remaining handles (storage flushes on drop)"
     );
     drop(consensus);
+
+    // A fail-stop drains exactly like a signal and then exits **nonzero**
+    // (ADR 0037 §3): the difference between "the operator stopped this daemon"
+    // and "this daemon refused to keep running" has to survive into the exit
+    // status, because under `Restart=always` that status is the only thing
+    // standing between a superseded volume and an endless quiet restart.
+    if let Some(reason) = failstop.reason() {
+        bail!("refusing to serve: {reason}");
+    }
+
     tracing::info!("shutdown complete");
     Ok(())
 }

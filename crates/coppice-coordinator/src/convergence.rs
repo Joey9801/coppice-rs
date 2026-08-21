@@ -41,12 +41,14 @@
 //! and a leader change mid-join costs one tick because the next tick
 //! re-derives its targets from the by-then-updated local view.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use coppice_api::http::ReadyzReport;
 use coppice_consensus::{ClusterSummary, NodeHandle, StartIntent, StartedNode, PROMOTION_LAG_MAX};
 use coppice_enroll::{Claim, EnrollmentConfig};
 use coppice_proto::pb::raft::v1 as pb;
@@ -338,12 +340,167 @@ pub(crate) struct Convergence {
     /// How fast this loop ticks: the `[pacing]` section of node config,
     /// carried by value because the loop outlives the borrow of `Config`.
     pub(crate) pacing: PacingConfig,
+    /// The cluster's **public** client edge, as this daemon's `[enrollment]`
+    /// table names it — the second supersession channel (see
+    /// [`Convergence::watch_for_supersession`]). `None` when no `[enrollment]`
+    /// table is configured, which simply leaves that channel silent.
+    pub(crate) public_edge: Option<PublicEdge>,
+    /// How this loop stops the whole daemon when it establishes that this
+    /// volume's history has been superseded (ADR 0037 §3).
+    pub(crate) failstop: FailStop,
     /// Where this daemon's join pipeline stops dead, if its config armed a
     /// failpoint (ADR 0037 §6). Disarmed in every real deployment, and
     /// unarmable in a release build — see [`crate::failpoints`]. Carried on
     /// the loop rather than read from a global so that arming one daemon of a
     /// single-process test fleet cannot arm its leader.
     pub(crate) failpoints: crate::failpoints::Failpoints,
+    /// Consecutive public-edge supersession observations, and the superseding
+    /// history they all named. Interior mutability because the loop's tick
+    /// takes `&self`; a plain `Mutex` because it is written once per tick and
+    /// never held across an await.
+    pub(crate) supersession: Mutex<Option<(String, u32)>>,
+}
+
+/// How many **consecutive** rounds a public-edge supersession observation must
+/// repeat — naming the same superseding history each time — before this daemon
+/// fail-stops. See [`Convergence::watch_for_supersession`] for why the machine
+/// plane needs no such corroboration and this channel does.
+const SUPERSESSION_ROUNDS: u32 = 3;
+
+/// How long the terminal `/readyz` stays readable after the fail-stop verdict
+/// is published and before the daemon starts draining. Not pacing-derived: it
+/// is a bound on how long a *reader* has, and it is deliberately the same on a
+/// test fleet as in production so nothing depends on the tempo.
+const SUPERSESSION_READYZ_GRACE: Duration = Duration::from_secs(1);
+
+/// The marker every history-superseded refusal message begins with, matching
+/// the `/readyz` phase name ([`ReadyzPhase::HistorySuperseded`]) so a log line
+/// and a status document are greppable by the same string.
+pub(crate) const HISTORY_SUPERSEDED: &str = "history-superseded";
+
+/// The daemon-wide stop this loop pulls on a superseded history.
+///
+/// Fail-stop, not park: a process that keeps running would keep answering raft
+/// and client traffic out of a history the cluster has abandoned. The reason is
+/// stashed alongside the trigger so `bootstrap::run_with` can exit **nonzero**
+/// with it after the ordinary shutdown order has drained — a clean stop with an
+/// alarming exit status, which under `Restart=always` becomes a restart loop
+/// that re-reaches the same refusal. That loop is the intended posture: ADR
+/// 0037's parked-fleet consequence is that a fleet which cannot legitimately
+/// join anything must alarm rather than quietly serve something wrong.
+#[derive(Clone)]
+pub(crate) struct FailStop {
+    reason: Arc<OnceLock<String>>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl FailStop {
+    pub(crate) fn new(shutdown: watch::Sender<bool>) -> FailStop {
+        FailStop {
+            reason: Arc::new(OnceLock::new()),
+            shutdown,
+        }
+    }
+
+    /// Record why the daemon is stopping and start the drain. Idempotent: the
+    /// first reason wins, and a second trigger cannot overwrite it.
+    fn trigger(&self, reason: String) {
+        let _ = self.reason.set(reason);
+        let _ = self.shutdown.send(true);
+    }
+
+    /// The recorded reason, if this daemon is stopping because of a fail-stop
+    /// rather than a signal.
+    pub(crate) fn reason(&self) -> Option<String> {
+        self.reason.get().cloned()
+    }
+}
+
+/// A client for the cluster's public client-listener edge — the surface
+/// `[enrollment]` already names, dialed under exactly the posture enrollment
+/// declares (`https` verified against system roots, or plain `http` only with
+/// the explicit `insecure` flag, ADR 0037 §4).
+///
+/// `GET /readyz` there answers with the responder's `cluster_id` and
+/// `history_id`, which is all supersession detection needs.
+pub(crate) struct PublicEdge {
+    /// The `[enrollment] endpoint` base URL, trailing slash trimmed.
+    endpoint: String,
+    insecure: bool,
+    /// Built on first use, not at startup: a healthy fleet never dials this,
+    /// and assembling a root store costs real time in a debug build.
+    http: OnceLock<reqwest::Client>,
+}
+
+impl PublicEdge {
+    /// Build the edge client for a daemon whose config declares one.
+    ///
+    /// Returns `None` for an `[enrollment]` table whose posture
+    /// [`validate_endpoint`](coppice_enroll::client::validate_endpoint)
+    /// rejects. That is unreachable through config load (which validates the
+    /// same table), and if it ever were reachable the right answer is a silent
+    /// channel rather than a daemon that refuses to start over a diagnostic.
+    pub(crate) fn from_config(cfg: Option<&EnrollmentConfig>) -> Option<PublicEdge> {
+        let cfg = cfg?;
+        if let Err(e) = coppice_enroll::client::validate_endpoint(&cfg.endpoint, cfg.insecure) {
+            tracing::warn!(
+                endpoint = %cfg.endpoint,
+                error = %e,
+                "convergence: the [enrollment] endpoint cannot be dialed for supersession \
+                 detection; that channel stays silent"
+            );
+            return None;
+        }
+        Some(PublicEdge {
+            endpoint: cfg.endpoint.trim_end_matches('/').to_string(),
+            insecure: cfg.insecure,
+            http: OnceLock::new(),
+        })
+    }
+
+    /// One bounded `GET /readyz`. `None` for anything that did not produce a
+    /// well-formed report — unreachable, timed out, a proxy error page, a
+    /// version that does not serve the route. A silent channel never
+    /// fail-stops anything.
+    async fn readyz(&self) -> Option<ReadyzReport> {
+        let http = match self.http.get() {
+            Some(http) => http,
+            None => {
+                let built = reqwest::Client::builder()
+                    // The same two transport rules the enrollment client sets,
+                    // for the same reasons: a redirect is a different host's
+                    // answer, and an unbounded dial is a hung tick.
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(crate::probe::PROBE_TIMEOUT)
+                    .use_rustls_tls()
+                    .tls_built_in_root_certs(!self.insecure)
+                    .build();
+                match built {
+                    Ok(http) => {
+                        let _ = self.http.set(http);
+                        self.http.get()?
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "convergence: could not build the public-edge client"
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+        let response = http
+            .get(format!("{}/readyz", self.endpoint))
+            .send()
+            .await
+            .ok()?;
+        // `/readyz` answers 503 in every phase but a ready voter, and a
+        // superseding cluster's leader is exactly as likely to be 200 as a
+        // follower is to be 503 — so the status is deliberately not consulted,
+        // only the body.
+        response.json::<ReadyzReport>().await.ok()
+    }
 }
 
 /// Spawn the post-start convergence loop over a started replica.
@@ -406,10 +563,18 @@ impl Convergence {
         let summary = self.handle.cluster_summary();
         let me = summary.members.iter().find(|m| m.id == summary.local_id);
 
-        // Already a voter: converged. Everything below this line is a no-op
-        // for the overwhelmingly common case (a restart of a healthy replica),
-        // which is why the check is first and cheap.
+        // Already a voter: converged as far as *membership* goes, so all the
+        // admission machinery below this line is a no-op for the
+        // overwhelmingly common case (a restart of a healthy replica).
+        //
+        // One question survives that short-circuit, and only for a voter that
+        // has lost contact with its cluster: is this replica's whole history
+        // still the cluster's? A resuming voter cannot answer it from local
+        // state — its membership, its stamp and its log are all perfectly
+        // self-consistent — which is precisely how an old volume ends up
+        // serving a history the fleet re-initialized past (ADR 0037 §3).
         if me.is_some_and(|m| m.voter) {
+            self.watch_for_supersession(&summary).await;
             return self.pacing.settled_interval;
         }
 
@@ -495,6 +660,205 @@ impl Convergence {
                 self.pacing.refusal_backoff
             }
         }
+    }
+
+    /// Decide whether this voter's raft history has been **superseded** by a
+    /// re-init of a cluster wearing the same `cluster_id`, and fail-stop the
+    /// daemon if so (ADR 0037 §3 Consequences).
+    ///
+    /// # The state being detected
+    ///
+    /// `history_id` is minted exactly once per formation, so *one* situation
+    /// produces "a formed cluster answering to my `cluster_id` with a history
+    /// that is not mine": somebody re-inited. This volume then holds state from
+    /// before that act. Two raft histories never merge, so there is nothing to
+    /// converge toward and nothing worth serving — the ADR's answer is a
+    /// fail-stop, and the operator's is restore-or-wipe.
+    ///
+    /// # Three guards against fail-stopping a healthy voter
+    ///
+    /// A false positive here takes down a working replica, so the trigger is
+    /// *exclusively* a positive observation of a formed, same-`cluster_id`,
+    /// different-`history_id` cluster. Everything else — empty discovery, an
+    /// unreachable peer, a malformed answer, no `[enrollment]` table — leaves
+    /// the daemon exactly as it was.
+    ///
+    /// 1. **In-contact voters never look.** A voter that still has its
+    ///    cluster (a follower that knows a leader, a leader with a fresh
+    ///    quorum acknowledgment) is healthy by definition and returns before
+    ///    dialing anything. That also keeps discovery off the hot path of a
+    ///    healthy fleet entirely: this costs nothing until a voter is already
+    ///    alone.
+    /// 2. **Our own history wins outright.** If any peer answers carrying the
+    ///    history this replica is stamped for, the counter resets and the
+    ///    round ends — a partition is not a supersession, and the two look
+    ///    identical from the inside until somebody answers.
+    /// 3. **Corroboration where the channel is weaker.** See below.
+    ///
+    /// Guard 1 has a known boundary: a **sole voter** is its own quorum and can
+    /// never register lost contact, so a single-voter cluster's old volume is
+    /// not detected here. That is deliberate rather than overlooked — the
+    /// alternative is polling the public edge forever on every single-node
+    /// deployment — and it is the narrow case: a one-voter cluster whose volume
+    /// survives a re-init has no peers to disagree with it in the first place.
+    ///
+    /// # Two channels, because a re-init breaks the strong one
+    ///
+    /// **(1) The machine plane** — `ProbeCluster` over mTLS. The strongest
+    /// signal available: the responder proved possession of a leaf signed by
+    /// *this replica's own* trust root and vice versa, so an answer here is
+    /// structural and one observation is conclusive.
+    ///
+    /// It is also, for the case that matters most, silent. Formation mints a
+    /// brand-new root CA (`formation::form`, ADR 0037 §3/§4), so a fleet
+    /// re-inited after losing its volumes is not merely on a new history — it
+    /// is on a new trust root, and the handshake fails before either side says
+    /// anything. That is not a signal: a refused handshake and a dead peer are
+    /// the same observation.
+    ///
+    /// **(2) The public client edge** — `GET /readyz` at the `[enrollment]`
+    /// endpoint. Deliberately the one plane designed to work *across* a trust
+    /// discontinuity, which is exactly why enrollment lives there (§4): it is
+    /// verified against system roots, not the cluster's own CA, so it still
+    /// answers after a re-root or a re-init. Its answer is unauthenticated
+    /// with respect to *this* cluster, so it is corroborated instead: the same
+    /// superseding history must be observed on [`SUPERSESSION_ROUNDS`]
+    /// consecutive rounds, and any round that observes something else — our
+    /// own history, a different superseding history, nothing at all — resets
+    /// the count to zero.
+    async fn watch_for_supersession(&self, summary: &ClusterSummary) {
+        // Already fail-stopped and draining; do not re-log the same verdict
+        // every tick until the task is aborted.
+        if self.failstop.reason().is_some() {
+            return;
+        }
+        // Guard 1: a voter still in contact with its cluster has its answer.
+        if !self.phase.readyz().leader_contact_stale {
+            self.forget_supersession();
+            return;
+        }
+
+        let stamped = crate::formation::hex(&self.handle.history_id());
+
+        // Channel 1: every peer this replica knows of, plus whatever discovery
+        // names. Discovery is additive here and never load-bearing — a voter
+        // out of contact is exactly the case where its replicated membership
+        // may name only addresses that no longer exist.
+        let mut targets = self.dial_targets(summary).await;
+        for candidate in self.discovery.candidates().await {
+            if candidate != self.advertise_addr && !targets.contains(&candidate) {
+                targets.push(candidate);
+            }
+        }
+        for target in &targets {
+            let Some(answer) = self.probe(target).await else {
+                continue;
+            };
+            let observed = crate::formation::hex(&answer.history_id);
+            // Guard 2.
+            if observed == stamped {
+                self.forget_supersession();
+                return;
+            }
+            self.fail_stop(supersession_refusal(
+                target,
+                "the mutually authenticated machine plane",
+                &observed,
+                &stamped,
+            ))
+            .await;
+            return;
+        }
+
+        // Channel 2.
+        let Some(edge) = &self.public_edge else {
+            self.forget_supersession();
+            return;
+        };
+        let Some(report) = edge.readyz().await else {
+            self.forget_supersession();
+            return;
+        };
+        // A responder that names another `cluster_id`, or that has no history
+        // to report (parked, or fail-stopped itself), says nothing about ours.
+        let observed = match report.history_id {
+            Some(history) if report.cluster_id == self.cluster_id => history,
+            _ => {
+                self.forget_supersession();
+                return;
+            }
+        };
+        // Guard 2, on this channel: the endpoint is usually a load-balanced
+        // name in front of *our own* cluster, and that is what it answers with
+        // whenever the cluster is fine.
+        if observed == stamped {
+            self.forget_supersession();
+            return;
+        }
+        // Guard 3.
+        let seen = self.note_supersession(&observed);
+        if seen < SUPERSESSION_ROUNDS {
+            tracing::warn!(
+                endpoint = %edge.endpoint,
+                observed_history = %observed,
+                stamped_history = %stamped,
+                round = seen,
+                of = SUPERSESSION_ROUNDS,
+                "convergence: the cluster's public endpoint reports a different raft history \
+                 than this replica is stamped for; corroborating before fail-stopping \
+                 (ADR 0037 §3)"
+            );
+            return;
+        }
+        self.fail_stop(supersession_refusal(
+            &edge.endpoint,
+            "the cluster's public client edge, on three consecutive rounds",
+            &observed,
+            &stamped,
+        ))
+        .await;
+    }
+
+    /// Count one more consecutive observation of `observed`, returning the run
+    /// length. A different history restarts the run rather than extending it:
+    /// three answers naming three histories corroborate nothing.
+    fn note_supersession(&self, observed: &str) -> u32 {
+        let mut seen = self.supersession.lock().expect("supersession lock");
+        let count = match seen.take() {
+            Some((history, count)) if history == observed => count + 1,
+            _ => 1,
+        };
+        *seen = Some((observed.to_string(), count));
+        count
+    }
+
+    fn forget_supersession(&self) {
+        *self.supersession.lock().expect("supersession lock") = None;
+    }
+
+    /// Publish the verdict and stop the daemon (ADR 0037 §3/§9).
+    ///
+    /// All three surfaces the ADR names, in the order an operator meets them:
+    /// an ERROR log line naming both histories and what produced them, a
+    /// terminal `/readyz` phase carrying the same text, and a nonzero exit
+    /// through the ordinary shutdown drain — which stops client and raft
+    /// traffic on the way out.
+    async fn fail_stop(&self, message: String) {
+        tracing::error!(
+            refusal = %message,
+            "convergence: this replica's raft history has been superseded by a re-init of a \
+             cluster with the same cluster_id; there is no path back into it, so this daemon \
+             is fail-stopping rather than serving state the fleet has abandoned (ADR 0037 §3)"
+        );
+        self.phase.publish_superseded(message.clone());
+        // Publish, *then* stop — with a window in between wide enough that the
+        // terminal state can actually be read. ADR 0037 §9 makes status the
+        // surface an operator (and a load balancer, and a scrape) learns this
+        // from, and a phase that exists for a millisecond before the listener
+        // goes away is a phase nobody ever sees. Bounded and short: this is a
+        // grace period for readers, not a retry.
+        tokio::time::sleep(SUPERSESSION_READYZ_GRACE).await;
+        self.failstop.trigger(message);
     }
 
     /// The ordered addresses to look for a leader at this tick.
@@ -770,6 +1134,27 @@ fn cross_history_refusal(leader_addr: &str, cluster_history: &[u8], stamped: &[u
         admin::HISTORY_CONFLICT,
         crate::formation::hex(cluster_history),
         crate::formation::hex(stamped),
+    )
+}
+
+/// The history-superseded fail-stop message: what was observed, on which
+/// channel, and what an operator does about it.
+///
+/// Both histories are named in full, because the first thing anyone reading
+/// this will want is to check the surviving one against a backup. The two
+/// remedies are spelled out rather than implied: this is the one refusal in the
+/// lifecycle where *doing nothing* silently costs the fleet its data, since the
+/// cluster it belongs to no longer exists to be rejoined.
+fn supersession_refusal(observed_at: &str, channel: &str, observed: &str, stamped: &str) -> String {
+    format!(
+        "{HISTORY_SUPERSEDED}: {observed_at} reports a formed cluster with this \
+         daemon's cluster_id but raft history {observed}, while this data directory is \
+         stamped for history {stamped} — observed over {channel}. A history id is minted \
+         once per formation, so this means the cluster was deliberately re-initialized and \
+         the state on this volume predates it; the two histories can never merge (ADR 0016 / \
+         ADR 0037 §3). Either restore the fleet from a backup of history {stamped}, or wipe \
+         this data directory so this daemon enrolls into history {observed} as a new \
+         installation — but not both, and not neither."
     )
 }
 
