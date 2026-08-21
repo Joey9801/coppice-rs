@@ -31,8 +31,8 @@ struct CertKey {
     key: Vec<u8>,
 }
 
-/// A throwaway CA plus a server and client leaf, mirroring `coppice dev`'s
-/// `mint_pki`: both leaves carry the dual `ServerAuth`+`ClientAuth` EKU (a node
+/// A throwaway CA plus a server and client leaf, mirroring what the cluster CA
+/// issues an enrolled node: both leaves carry the dual `ServerAuth`+`ClientAuth` EKU (a node
 /// leaf must be usable in both TLS roles, ADR 0034), and the server leaf gets a
 /// dNSName SAN of the node id typed string so the client can pin it.
 struct Pki {

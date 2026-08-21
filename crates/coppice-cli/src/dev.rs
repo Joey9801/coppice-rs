@@ -1,26 +1,35 @@
 //! `coppice dev`: a self-contained single-node cluster for development and
 //! integration testing.
 //!
-//! One process runs a bootstrap-intent coordinator (consensus, scheduler,
-//! agent gateway — the full task runtime) plus an in-process agent session
-//! dialing it over localhost. mTLS stays structurally intact — the wire
-//! paths are the production ones — but the CA and both leaves are minted
-//! fresh in memory on every run and trusted only by this process, so there
-//! is no key material to provision and **no authentication in any
-//! meaningful sense: anything that can reach the ports is effectively
-//! admin**. Never expose a dev instance beyond localhost.
+//! One process runs a coordinator daemon (consensus, scheduler, agent gateway
+//! — the full task runtime) plus an in-process agent session dialing it over
+//! localhost. Nothing about the security machinery is simulated: the
+//! coordinator starts **certless** on the production park/converge path
+//! ([`bootstrap::run_with`]), `dev` performs the single operator act the
+//! lifecycle has — one local `init` over the daemon's Unix admin socket, the
+//! same call `coppice coordinator init` makes — and formation mints the real
+//! cluster CA and the coordinator's first leaf. The agent then **enrolls**
+//! against the client listener with a token the `init` policy seeded, exactly
+//! as a fleet machine does (ADR 0037 §3/§4/§5).
+//!
+//! What is dev-only is the *posture*, and it is declared rather than implied:
+//! the client listener serves plain HTTP (`[client_tls] insecure = true`), so
+//! the enrollment token crosses it in the clear and anything that can reach
+//! the ports is effectively admin. Never expose a dev instance beyond
+//! localhost.
 //!
 //! The data directory defaults to a temp dir deleted on exit; pass
-//! `--data-dir` to keep state across runs (the coordinator restarts from its
-//! manifest stamp and the agent keeps its journal and node identity).
+//! `--data-dir` to keep state across runs. A second run against the same
+//! directory **resumes**: the coordinator restarts from its manifest stamp,
+//! `init` answers `AlreadyInitialized` (a success, ADR 0037 §3), the agent
+//! finds its leaf already installed and makes no enrollment call at all, and
+//! the ports, cluster id, and node id are the ones the directory remembers.
 
-use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use coppice_agent::config::{
     CapacityConfig, Config as AgentConfig, ExecutorConfig, ListenConfig, TlsConfig as AgentTls,
 };
@@ -28,20 +37,14 @@ use coppice_agent::executor::{DockerExecutor, Executor, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{self, Session};
 use coppice_agent::telemetry::FilesystemSink;
+use coppice_api::http::ReadyzPhase;
 use coppice_consensus::fs::RealFs;
-use coppice_consensus::{Consensus, ConsensusError};
-use coppice_coordinator::bootstrap::{self, AgentListener, BootedCoordinator, ClientListener};
+use coppice_coordinator::bootstrap;
 use coppice_coordinator::config as coord_config;
+use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{ClusterId, NodeId, QuotaEntityId};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
-use coppice_core::time::Timestamp;
-use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
-use coppice_state::Command;
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose,
-};
+use coppice_enroll::{EnrollmentConfig, Secret};
 
 #[derive(Debug, clap::Args)]
 pub struct DevArgs {
@@ -50,27 +53,32 @@ pub struct DevArgs {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Client API port (0 picks a free one; logged at startup).
+    /// Client API port (0 reuses this data dir's remembered port, or picks a
+    /// free one; logged at startup).
     #[arg(long, default_value_t = 0)]
     client_port: u16,
 
-    /// Agent-gateway port (0 picks a free one; logged at startup).
+    /// Agent-gateway port (0 reuses this data dir's remembered port, or picks
+    /// a free one; logged at startup).
     #[arg(long, default_value_t = 0)]
     agent_port: u16,
 
-    /// Raft/admin port (0 picks a free one; logged at startup).
+    /// Raft/admin port (0 reuses this data dir's remembered port, or picks a
+    /// free one; logged at startup).
     #[arg(long, default_value_t = 0)]
     raft_port: u16,
 
-    /// Agent NodeService port for job-log retrieval (0 picks a free one;
-    /// logged at startup). The in-process coordinator dials this over mTLS to
-    /// serve `GET /api/v1/jobs/{job}/logs` (ADR 0034).
+    /// Agent NodeService port for job-log retrieval (0 reuses this data dir's
+    /// remembered port, or picks a free one; logged at startup). The
+    /// in-process coordinator dials this over mTLS to serve
+    /// `GET /api/v1/jobs/{job}/logs` (ADR 0034).
     #[arg(long, default_value_t = 0)]
     node_service_port: u16,
 
-    /// Agent Prometheus `/metrics` port (0 picks a free one; logged at
-    /// startup). Dev serves the agent scrape endpoint here (issue #46); the
-    /// coordinator's `/metrics` rides the client API port instead.
+    /// Agent Prometheus `/metrics` port (0 reuses this data dir's remembered
+    /// port, or picks a free one; logged at startup). Dev serves the agent
+    /// scrape endpoint here (issue #46); the coordinator's `/metrics` rides
+    /// the client API port instead.
     #[arg(long, default_value_t = 0)]
     metrics_port: u16,
 
@@ -96,72 +104,25 @@ impl std::fmt::Display for DevExecutor {
     }
 }
 
-/// A minted leaf credential: the certificate and its private key, as PEM bytes.
-#[derive(Debug, Clone)]
-struct CertKey {
-    /// The X.509 leaf certificate, PEM-encoded.
-    cert: Vec<u8>,
-    /// The corresponding private key, PEM-encoded.
-    key: Vec<u8>,
-}
+/// The well-known quota entity dev jobs charge to. Fixed rather than minted
+/// so submit examples keep working verbatim across dev clusters.
+const DEV_QUOTA_ENTITY: &str = "quota-00000000-0000-0000-0000-000000000001";
 
-/// A throwaway in-memory CA and the two leaves a dev run needs. Minted fresh
-/// every run: TLS material is deliberately not part of the persistent state.
-struct DevPki {
-    ca_pem: Vec<u8>,
-    coordinator: CertKey,
-    agent: CertKey,
-}
+/// The agent-role enrollment token `init` seeds and the in-process agent
+/// presents (ADR 0037 §5).
+///
+/// A fixed literal rather than a generated secret, and that is not a
+/// shortcut being papered over: the dev cluster's client listener is plain
+/// HTTP, so the token crosses it in the clear regardless, and the banner says
+/// so. What matters here is that the *mechanism* is the production one — a
+/// role-scoped token seeded by the formation policy, a CSR, a cluster-signed
+/// leaf — not that the secret is unguessable on a loopback interface no
+/// remote party can reach.
+const DEV_ENROLL_TOKEN: &str = "cpk_coppice-dev-local-agent-token";
 
-fn mint_pki(agent_node: NodeId) -> Result<DevPki> {
-    let ca_key = KeyPair::generate().context("generate dev CA key")?;
-    let mut params = CertificateParams::new(Vec::<String>::new()).context("dev CA params")?;
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "coppice-dev-ca");
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    let ca_cert = params.self_signed(&ca_key).context("self-sign dev CA")?;
-
-    let leaf = |cn: &str, extra_sans: &[String]| -> Result<CertKey> {
-        let key = KeyPair::generate().context("generate dev leaf key")?;
-        let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-        sans.extend(extra_sans.iter().cloned());
-        let mut params = CertificateParams::new(sans).context("dev leaf params")?;
-        params.distinguished_name.push(DnType::CommonName, cn);
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyEncipherment,
-        ];
-        let cert = params
-            .signed_by(&key, &ca_cert, &ca_key)
-            .context("sign dev leaf")?;
-        Ok(CertKey {
-            cert: cert.pem().into_bytes(),
-            key: key.serialize_pem().into_bytes(),
-        })
-    };
-
-    let agent_cn = agent_node.to_string();
-    Ok(DevPki {
-        ca_pem: ca_cert.pem().into_bytes(),
-        coordinator: leaf("coppice-dev-coordinator", &[])?,
-        // The gateway binds the client leaf's CN to the claimed NodeId
-        // (ADR 0011), so the agent leaf carries the typed id string. The same
-        // leaf doubles as the NodeService server certificate; coordinators pin
-        // the typed node id as the TLS server-name, so it also carries that id
-        // as a dNSName SAN (ADR 0034).
-        agent: leaf(&agent_cn, std::slice::from_ref(&agent_cn))?,
-    })
-}
+/// The label carrying that token's idempotency (ADR 0037 §5): a re-`init`
+/// mints nothing while a live token holds it.
+const DEV_ENROLL_LABEL: &str = "dev-agent";
 
 /// Read a persisted typed id from `path`, or mint one and persist it.
 fn load_or_mint<T>(path: &Path, mint: impl FnOnce() -> T) -> Result<T>
@@ -184,12 +145,33 @@ where
     }
 }
 
-fn resolve_port(requested: u16) -> Result<u16> {
+/// Resolve one listen port and remember it under the data directory.
+///
+/// An explicit `--*-port` always wins. Otherwise a persistent data dir reuses
+/// the port it used last, which is what makes a restart a *resume*: the raft
+/// manifest records this replica's advertised address, and the printed URLs
+/// stay valid across runs. A fresh (or temp) directory picks a free ephemeral
+/// port and writes it down.
+fn resolve_port(root: &Path, name: &str, requested: u16) -> Result<u16> {
+    let path = root.join(format!("port-{name}"));
+    let remember = |port: u16| -> Result<u16> {
+        std::fs::write(&path, format!("{port}\n"))
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(port)
+    };
+
     if requested != 0 {
-        return Ok(requested);
+        return remember(requested);
+    }
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(port) = raw.trim().parse::<u16>() {
+            if port != 0 {
+                return Ok(port);
+            }
+        }
     }
     let listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
-    Ok(listener.local_addr().context("local addr")?.port())
+    remember(listener.local_addr().context("local addr")?.port())
 }
 
 /// Sample every metric tree the dev cluster's single global recorder holds
@@ -212,7 +194,18 @@ pub async fn run(args: DevArgs) -> Result<()> {
         Some(dir) => {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating data dir {}", dir.display()))?;
-            (dir.clone(), None)
+            // Absolute, but **not** canonicalized: the config records this
+            // path, the admin socket lives under it, and a Unix socket path
+            // has ~100 bytes to spend. Resolving a short symlink an operator
+            // deliberately pointed at a deep directory would spend them all.
+            let dir = if dir.is_absolute() {
+                dir.clone()
+            } else {
+                std::env::current_dir()
+                    .context("resolving the working directory")?
+                    .join(dir)
+            };
+            (dir, None)
         }
         None => {
             let dir = tempfile::tempdir().context("creating temp data dir")?;
@@ -221,30 +214,17 @@ pub async fn run(args: DevArgs) -> Result<()> {
     };
 
     // Persistent identities: the cluster id must keep matching the manifest
-    // stamp across restarts, and the agent node id must keep matching its
-    // journal history. Both live as typed-string files under the root.
+    // stamp across restarts, and the agent node id must keep matching both its
+    // journal history and the CN of the leaf it enrolled for. Both live as
+    // typed-string files under the root.
     let cluster_id: ClusterId = load_or_mint(&root.join("cluster-id"), ClusterId::new)?;
     let agent_node: NodeId = load_or_mint(&root.join("agent-node-id"), NodeId::new)?;
 
-    let pki = mint_pki(agent_node)?;
-    let pki_dir = root.join("pki");
-    std::fs::create_dir_all(&pki_dir).context("creating pki dir")?;
-    let coord_cert = pki_dir.join("coordinator.crt");
-    let coord_key = pki_dir.join("coordinator.key");
-    let agent_cert = pki_dir.join("agent.crt");
-    let agent_key = pki_dir.join("agent.key");
-    let ca_path = pki_dir.join("ca.crt");
-    std::fs::write(&coord_cert, &pki.coordinator.cert)?;
-    std::fs::write(&coord_key, &pki.coordinator.key)?;
-    std::fs::write(&agent_cert, &pki.agent.cert)?;
-    std::fs::write(&agent_key, &pki.agent.key)?;
-    std::fs::write(&ca_path, &pki.ca_pem)?;
-
-    let raft_port = resolve_port(args.raft_port)?;
-    let agent_port = resolve_port(args.agent_port)?;
-    let client_port = resolve_port(args.client_port)?;
-    let node_service_port = resolve_port(args.node_service_port)?;
-    let metrics_port = resolve_port(args.metrics_port)?;
+    let raft_port = resolve_port(&root, "raft", args.raft_port)?;
+    let agent_port = resolve_port(&root, "agent", args.agent_port)?;
+    let client_port = resolve_port(&root, "client", args.client_port)?;
+    let node_service_port = resolve_port(&root, "node-service", args.node_service_port)?;
+    let metrics_port = resolve_port(&root, "metrics", args.metrics_port)?;
 
     // Install the one process-wide Prometheus recorder this dev cluster shares
     // (issue #46). `coppice dev` runs a coordinator AND an agent in one process,
@@ -255,133 +235,85 @@ pub async fn run(args: DevArgs) -> Result<()> {
     let metrics_handle = coppice_coordinator::install_metrics_recorder()?;
     coppice_agent::describe_metrics();
 
-    // -- Coordinator: the production config + bootstrap path. --------------
+    // -- Coordinator: certless, on the production park/converge path. ------
+    //
+    // Nothing is provisioned: the `[tls]` trio names paths that do not exist
+    // yet, and formation writes into them (ADR 0037 §4's minimal deployment).
     let coord_data = root.join("coordinator");
+    let coord_pki = root.join("coordinator-pki");
+    std::fs::create_dir_all(&coord_pki).context("creating the coordinator PKI dir")?;
     let config_path = root.join("coordinator.toml");
-    let toml = format!(
-        r#"# Generated by `coppice dev` on every run; edits are overwritten.
-cluster_id = "{cluster_id}"
-data_dir = "{data_dir}"
-
-# Single-node dev cluster: nothing to discover, but the section (and its
-# matching backend table) is required — an explicit empty seed list is the
-# `peers = []` successor (ADR 0037).
-[discovery]
-backend = "static"
-
-[discovery.static]
-addrs = []
-
-[listen]
-raft_addr = "127.0.0.1:{raft_port}"
-advertise_host = "localhost"
-
-[raft]
-# Snappy dev timings: single node, localhost, no real elections to lose.
-election_timeout = "300ms"
-heartbeat_interval = "100ms"
-rpc_timeout = "2s"
-
-[tls]
-cert_path = "{cert}"
-key_path = "{key}"
-ca_path = "{ca}"
-
-[client_tls]
-# Plain HTTP on the client listener (ADR 0037 §4: the posture is always
-# explicit, never implied).
-insecure = true
-"#,
-        data_dir = coord_data.display(),
-        cert = coord_cert.display(),
-        key = coord_key.display(),
-        ca = ca_path.display(),
-    );
-    std::fs::write(&config_path, toml).context("writing dev coordinator config")?;
+    std::fs::write(
+        &config_path,
+        coordinator_toml(&CoordinatorLayout {
+            cluster_id,
+            data_dir: &coord_data,
+            pki_dir: &coord_pki,
+            raft_port,
+            agent_port,
+            client_port,
+        }),
+    )
+    .context("writing dev coordinator config")?;
 
     let resolved = coord_config::load(&config_path).context("loading dev coordinator config")?;
 
-    // The coordinator's hot-reload TLS store (ADR 0037 §4), shared by the
-    // raft/admin server, the agent gateway listener, and the node-fetch
-    // client. Dev skips the SIGHUP/mtime reload task — the material is minted
-    // per run and never rotated under a live dev cluster.
-    let coord_tls = coppice_tls::TlsStore::load(coppice_tls::TlsPaths {
-        cert: coord_cert.clone(),
-        key: coord_key.clone(),
-        ca: ca_path.clone(),
-    })
-    .context("loading dev coordinator TLS material")?;
+    // The daemon lifecycle itself — park or resume, form on `init`, serve,
+    // drain — over a shutdown watch this command owns. `run_with` binds every
+    // listener, so there is no dev-specific transport wiring left.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let metrics = coppice_api::http::MetricsEndpoint::new(metrics_handle.clone(), dev_gather);
+    let mut coordinator = tokio::spawn(bootstrap::run_with(resolved, metrics, Some(shutdown_rx)));
 
-    let booted = bootstrap::bootstrap(resolved, Arc::clone(&coord_tls))
-        .await
-        .context("bootstrapping the dev coordinator")?;
-    // `dev` never parks: `bootstrap` resumes this directory or forms a single
-    // voter on it, so the readiness endpoint reports a formed voter from the
-    // first scrape (ADR 0037 §1 — the production park/converge path is
-    // `bootstrap::run`, which `dev` deliberately does not take).
-    let readyz = booted.readyz_endpoint();
-    let BootedCoordinator {
-        // The same id `dev` minted (or loaded) above and wrote into the config
-        // bootstrap just read back.
-        cluster_id: _,
-        consensus,
-        views,
-        event_tap,
-        handle,
-        node_log_client,
-        raft_server_shutdown,
-        raft_server,
-        ..
-    } = booted;
+    // The single operator act in the whole lifecycle (ADR 0037 §3). The socket
+    // is the documented default, `<data_dir>/admin.sock`, because the config
+    // above leaves `[listen] admin_socket` unset.
+    let admin_socket = coord_data.join("admin.sock");
+    let formed = match init_cluster(&admin_socket, &coord_data, &mut coordinator).await {
+        Ok(formed) => formed,
+        Err(e) => {
+            // A daemon that died on the way up (a taken port, unreadable
+            // material) explains itself far better than the socket timeout
+            // does; prefer its error when it has one.
+            let _ = shutdown_tx.send(true);
+            return Err(daemon_error(&mut coordinator).await.unwrap_or(e));
+        }
+    };
+    if let Some(operator) = &formed.operator {
+        write_operator_material(&root, operator)?;
+    }
 
-    let agent_addr = format!("127.0.0.1:{agent_port}")
-        .parse()
-        .expect("agent socket addr");
-    let listener = AgentListener::bind(agent_addr, Arc::clone(&coord_tls))
-        .context("binding the dev agent listener")?;
+    // Formation is complete, but the client listener only starts serving once
+    // the task runtime is up — and the agent's first act is to enroll against
+    // it. Wait for it before starting the agent, so enrollment does not race
+    // the route it posts to.
+    let api = format!("http://127.0.0.1:{client_port}");
+    wait_for_client_api(&api, &mut coordinator).await?;
 
-    let client_addr = format!("127.0.0.1:{client_port}")
-        .parse()
-        .expect("client socket addr");
-    let client_listener = ClientListener::bind(client_addr)
-        .await
-        .context("binding the dev client API listener")?;
-
-    let (runtime_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
-    let runtime_join = tokio::spawn(bootstrap::serve_runtime(
-        Arc::clone(&consensus),
-        views.clone(),
-        event_tap,
-        handle.clone(),
-        listener,
-        client_listener,
-        cluster_id,
-        node_log_client,
-        coord_data.clone(),
-        // The coordinator's `/metrics` on the client listener renders over the
-        // shared recorder; `dev_gather` samples BOTH daemons' trees (issue #46).
-        coppice_api::http::MetricsEndpoint::new(metrics_handle.clone(), dev_gather),
-        readyz,
-        Some(shutdown_rx),
-    ));
-
-    // Replicated state a dev cluster needs before it can accept a job: a
-    // priority-multiplier table (empty on a fresh cluster by design) and a
-    // quota entity to charge jobs to.
-    let quota_entity = seed_dev_state(consensus.as_ref(), &views).await?;
-
-    // -- Agent: in-process, dialing the gateway over localhost. ------------
+    // -- Agent: in-process, enrolling, dialing the gateway over localhost. --
+    let agent_pki = root.join("agent-pki");
+    std::fs::create_dir_all(&agent_pki).context("creating the agent PKI dir")?;
     let agent_config = AgentConfig {
         node_id: agent_node,
         data_dir: root.join("agent"),
         coordinators: vec![format!("localhost:{agent_port}")],
+        // Certless, exactly like the coordinator: these three paths are where
+        // enrollment installs what it is handed.
         tls: AgentTls {
-            cert_path: agent_cert,
-            key_path: agent_key,
-            ca_path,
+            cert_path: agent_pki.join("agent.crt"),
+            key_path: agent_pki.join("agent.key"),
+            ca_path: agent_pki.join("ca.crt"),
         },
-        // `coppice dev` mints its own PKI, so there is nothing to enroll for.
-        enrollment: None,
+        // The real thing (ADR 0037 §4): a token and an address. `insecure`
+        // because the dev client listener is `[client_tls] insecure = true`,
+        // and the posture must be declared on both ends or the endpoint is
+        // refused at config validation.
+        enrollment: Some(EnrollmentConfig {
+            endpoint: api.clone(),
+            token: Some(Secret::new(DEV_ENROLL_TOKEN)),
+            token_path: None,
+            insecure: true,
+        }),
         // Generous static capacity: dev jobs should never be capacity-bound.
         capacity: CapacityConfig {
             cpu_millis: 16_000,
@@ -405,8 +337,9 @@ insecure = true
         telemetry: Default::default(),
         // The agent-hosted NodeService (ADR 0034): bind 127.0.0.1:<port> and
         // advertise 127.0.0.1, so the in-process coordinator can dial it for job
-        // logs. The node-id-SAN agent leaf (minted above) lets the id-pinned
-        // TLS dial validate. Bound and served below via `serve_node_service`.
+        // logs. The enrolled leaf carries the node id as a SAN — the cluster
+        // adds that itself from the claimed identity — plus this advertised
+        // host, which the cluster cannot know and the agent therefore declares.
         listen: Some(ListenConfig {
             addr: format!("127.0.0.1:{node_service_port}")
                 .parse()
@@ -424,6 +357,14 @@ insecure = true
                 .expect("agent metrics socket addr"),
         ),
     };
+
+    // Obtain the machine-plane leaf before anything tries to load it — the
+    // same call, in the same place, that `coppice_agent::run_daemon` makes.
+    // A no-op on every run after the first: a usable leaf on disk means no
+    // network call and the token is never even read.
+    coppice_agent::ensure_enrolled(&agent_config)
+        .await
+        .context("enrolling the dev agent")?;
 
     // Bind and serve the agent's `/metrics` endpoint before the executor match
     // moves `agent_config` into the session task (issue #46). Both dev scrape
@@ -529,7 +470,7 @@ insecure = true
     // landed in applied state (epoch >= 1, ADR 0009). Treat that as the dev
     // command's readiness boundary rather than printing "up" while the loop
     // is still closing.
-    let agent_epoch = wait_for_agent(&views, agent_node).await?;
+    let agent_epoch = wait_for_agent(&api, agent_node).await?;
     tracing::debug!(node = %agent_node, epoch = agent_epoch, "dev agent registered");
 
     eprintln!(
@@ -538,7 +479,7 @@ insecure = true
             root: &root,
             persistent: args.data_dir.is_some(),
             cluster_id,
-            coordinator_raft_id: handle.node_id(),
+            coordinator_raft_id: formed.raft_node_id,
             agent_node,
             agent_epoch,
             raft_port,
@@ -547,7 +488,7 @@ insecure = true
             node_service_port,
             metrics_port,
             ui_available: coppice_api::http::ui_available(),
-            quota_entity,
+            quota_entity: DEV_QUOTA_ENTITY.parse().expect("dev quota entity id"),
             executor: args.executor,
         })
     );
@@ -557,19 +498,331 @@ insecure = true
         .context("waiting for Ctrl-C")?;
     tracing::info!("shutting down the dev cluster");
 
-    // Ordered teardown mirroring the daemon shutdown tail: agent session,
-    // task runtime, raft/admin transport, consensus.
+    // Ordered teardown: stop the agent session first (its journal is crash-safe
+    // by design, ADR 0009), then let the daemon drain itself through the shared
+    // shutdown watch — `run_with` owns the whole coordinator-side order.
     agent_join.abort();
     let _ = agent_join.await;
-    let _ = runtime_shutdown.send(true);
-    let _ = runtime_join.await;
-    let _ = raft_server_shutdown.send(());
-    let _ = raft_server.await;
-    let _ = handle.shutdown().await;
-    drop(consensus);
+    let _ = shutdown_tx.send(true);
+    match coordinator.await {
+        Ok(result) => result.context("the dev coordinator exited with an error")?,
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => return Err(e).context("the dev coordinator task panicked"),
+    }
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Coordinator config
+// ---------------------------------------------------------------------------
+
+struct CoordinatorLayout<'a> {
+    cluster_id: ClusterId,
+    data_dir: &'a Path,
+    pki_dir: &'a Path,
+    raft_port: u16,
+    agent_port: u16,
+    client_port: u16,
+}
+
+/// The dev coordinator's config file: a production config with a single-voter
+/// target, snappy raft timings, and a declared plain-HTTP client posture.
+///
+/// Regenerated on every run (ports and paths are derived), so edits do not
+/// survive — the file exists to be read by `config::load`, not to be tuned.
+fn coordinator_toml(layout: &CoordinatorLayout<'_>) -> String {
+    format!(
+        r#"# Generated by `coppice dev` on every run; edits are overwritten.
+cluster_id = "{cluster_id}"
+data_dir = "{data_dir}"
+
+# Single-node dev cluster: nothing to discover, but the section (and its
+# matching backend table) is required — an explicit empty seed list is the
+# `peers = []` successor (ADR 0037). `cluster_size = 1` is what makes one
+# voter the *converged* state rather than a third of one.
+[discovery]
+backend = "static"
+cluster_size = 1
+
+[discovery.static]
+addrs = []
+
+[listen]
+client_addr = "127.0.0.1:{client_port}"
+raft_addr = "127.0.0.1:{raft_port}"
+agent_addr = "127.0.0.1:{agent_port}"
+advertise_host = "localhost"
+# `admin_socket` is deliberately unset: the default is <data_dir>/admin.sock,
+# which is the path `dev` drives `init` over.
+
+[raft]
+# Snappy dev timings: single node, localhost, no real elections to lose.
+election_timeout = "300ms"
+heartbeat_interval = "100ms"
+rpc_timeout = "2s"
+
+# Certless (ADR 0037 §4's minimal deployment): none of these three files
+# exists at startup. Formation mints the cluster CA and this daemon's first
+# leaf and writes them here.
+[tls]
+cert_path = "{cert}"
+key_path = "{key}"
+ca_path = "{ca}"
+
+[client_tls]
+# Plain HTTP on the client listener (ADR 0037 §4: the posture is always
+# explicit, never implied). The agent's enrollment token crosses this listener
+# in the clear, which is why its `[enrollment] insecure` says so too.
+insecure = true
+"#,
+        cluster_id = layout.cluster_id,
+        data_dir = layout.data_dir.display(),
+        client_port = layout.client_port,
+        raft_port = layout.raft_port,
+        agent_port = layout.agent_port,
+        cert = layout.pki_dir.join("coordinator.crt").display(),
+        key = layout.pki_dir.join("coordinator.key").display(),
+        ca = layout.pki_dir.join("ca.crt").display(),
+    )
+}
+
+/// The bootstrap policy `init` applies (ADR 0037 §3), seeding exactly the
+/// replicated state a dev cluster needs before it can do anything.
+///
+/// A new cluster's policy has an **empty** priority-multiplier table, so every
+/// `SubmitJob` fails synchronous validation until one commits, and there is no
+/// quota entity to charge a job to. In production that is deliberate: policy
+/// is replicated state an operator configures explicitly, and the node config
+/// file never seeds it (ADR 0020). Dev has no operator, so it hands `init` the
+/// same document an operator would: multipliers for priorities `-2..=2`
+/// (doubling per step — monotone in priority, as ADR 0021's ranking expects),
+/// the well-known "dev" quota entity, and the agent-role enrollment token the
+/// in-process agent presents.
+///
+/// Every entry is idempotent by construction on the server side, so a re-run
+/// against an existing cluster changes nothing — which is what lets `dev`
+/// treat `AlreadyInitialized` as success.
+fn dev_policy_toml() -> String {
+    let mut out = String::new();
+    for priority in -2i32..=2 {
+        out.push_str(&format!(
+            "[[priority_multiplier]]\nindex = {priority}\nmultiplier = {multiplier}\n\n",
+            multiplier = 2f64.powi(priority),
+        ));
+    }
+    // ~1e6 CU: deep enough that dev jobs never starve on quota, far enough
+    // from u64::MAX to stay clear of saturation.
+    out.push_str(&format!(
+        "[[quota_entity]]\nid = \"{DEV_QUOTA_ENTITY}\"\nname = \"dev\"\nquota = 1000000000000\n\n"
+    ));
+    out.push_str(&format!(
+        "[[enroll_token]]\nsecret = \"{DEV_ENROLL_TOKEN}\"\nrole = \"agent\"\n\
+         label = \"{DEV_ENROLL_LABEL}\"\n"
+    ));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Formation
+// ---------------------------------------------------------------------------
+
+/// What `dev` learned from its one `init` call.
+struct FormedCluster {
+    /// This replica's allocate-once raft identity (ADR 0025).
+    raft_node_id: u64,
+    /// The day-0 operator credential, on the run that actually formed. A
+    /// resumed cluster answers `AlreadyInitialized` and issues nothing.
+    operator: Option<OperatorPem>,
+}
+
+/// Wait for the daemon to be ready for `init`, then run it (ADR 0037 §3).
+///
+/// The wait is not cosmetic. The admin socket serves in *every* phase, but the
+/// `init` verb is only answerable in two of them: a parked daemon, whose park
+/// loop is the consumer of the formation channel, and a formed one, which
+/// short-circuits to `AlreadyInitialized`. Between the two — a daemon resuming
+/// an existing directory, which still reports `waiting` until it publishes
+/// itself formed — nothing is consuming formation requests, so a call landing
+/// there would block forever. The manifest is the thing that distinguishes
+/// them: its presence is what makes the daemon take the resume branch, so
+/// `waiting` is only an invitation to `init` while there is no manifest.
+async fn init_cluster(
+    socket: &Path,
+    coord_data: &Path,
+    coordinator: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<FormedCluster> {
+    let manifest = coord_data.join("manifest");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    loop {
+        if coordinator.is_finished() {
+            bail!("the dev coordinator exited before it could be initialized");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("the dev coordinator did not become ready for `init` within 60 seconds");
+        }
+        match coppice_coordinator::localadmin::call(socket, AdminCall::Status).await {
+            Ok(AdminReply::Status { status }) => match status.phase {
+                // Formed already: `init` is answerable and will say so.
+                ReadyzPhase::Joining | ReadyzPhase::Learner | ReadyzPhase::Voter => break,
+                // Parked *and* nothing on disk to resume: the park loop is
+                // waiting on exactly this call.
+                ReadyzPhase::Waiting if !manifest.exists() => break,
+                // Resuming; the phase will settle. Or a fail-stop, which has no
+                // resume path and must be reported rather than retried.
+                ReadyzPhase::Waiting => {}
+                ReadyzPhase::FormationFailed => {
+                    bail!(
+                        "the dev coordinator's data directory records a formation that never \
+                         completed; there is no resume path — remove {} and start again \
+                         (ADR 0037 §3)",
+                        coord_data.display()
+                    );
+                }
+                ReadyzPhase::HistorySuperseded => {
+                    bail!(
+                        "the dev coordinator's data directory holds a raft history that a \
+                         later re-init superseded; there is no resume path — remove {} and \
+                         start again (ADR 0037 §3)",
+                        coord_data.display()
+                    );
+                }
+            },
+            Ok(other) => bail!("unexpected reply to the dev coordinator's status: {other:?}"),
+            // Not bound yet: the socket appears early in startup, but not
+            // instantly.
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let reply = coppice_coordinator::localadmin::call(
+        socket,
+        AdminCall::Init {
+            policy: Some(dev_policy_toml()),
+            operator_csr: None,
+            operator_cn: Some("dev".to_string()),
+        },
+    )
+    .await
+    .context("running `init` on the dev coordinator")?;
+
+    match reply {
+        AdminReply::Formed {
+            node_id, operator, ..
+        } => {
+            tracing::info!(raft_node = node_id, "dev cluster formed");
+            Ok(FormedCluster {
+                raft_node_id: node_id,
+                operator: Some(operator),
+            })
+        }
+        // A distinct outcome, not an error (ADR 0037 §3): this is what a second
+        // `coppice dev` against the same data dir gets, and it means resume.
+        AdminReply::AlreadyInitialized { status } => {
+            tracing::info!("dev cluster already initialized; resuming");
+            Ok(FormedCluster {
+                raft_node_id: status.node_id.unwrap_or_default(),
+                operator: None,
+            })
+        }
+        AdminReply::FormationFailed { reason, .. } => bail!("{reason}"),
+        AdminReply::Error { message } => bail!("{message}"),
+        other => bail!("unexpected reply to init: {other:?}"),
+    }
+}
+
+/// Write the day-0 operator credential beside the cluster (ADR 0037 §3 step 5).
+///
+/// Nothing in a dev cluster needs it — the client listener is plain HTTP with
+/// no authentication — but it is what formation produced, and discarding it
+/// would mean the one path that mints an operator identity is the one path dev
+/// does not exercise end to end.
+fn write_operator_material(root: &Path, operator: &OperatorPem) -> Result<()> {
+    let dir = root.join("operator");
+    std::fs::create_dir_all(&dir).context("creating the dev operator dir")?;
+    std::fs::write(dir.join("operator.crt"), &operator.cert_pem)?;
+    if let Some(key) = &operator.key_pem {
+        std::fs::write(dir.join("operator.key"), key)?;
+    }
+    std::fs::write(dir.join("ca.crt"), &operator.ca_pem)?;
+    tracing::info!(dir = %dir.display(), "wrote the dev cluster's day-0 operator credential");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Readiness polling over the client API
+// ---------------------------------------------------------------------------
+
+/// Wait until the client listener answers, i.e. the task runtime is serving.
+///
+/// Formation returns as soon as the replica is started; the API edge (and with
+/// it `POST /api/v1/enroll`) comes up a moment later, as part of the runtime.
+async fn wait_for_client_api(
+    api: &str,
+    coordinator: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{api}/api/v1/nodes");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if coordinator.is_finished() {
+            return Err(daemon_error(coordinator)
+                .await
+                .unwrap_or_else(|| anyhow::anyhow!("the dev coordinator exited during startup")));
+        }
+        if client.get(&url).send().await.is_ok() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("the dev coordinator's client API did not come up within 60 seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait for the in-process agent's registration to land in applied state,
+/// returning its epoch (ADR 0009).
+async fn wait_for_agent(api: &str, agent_node: NodeId) -> Result<u64> {
+    let client = reqwest::Client::new();
+    let url = format!("{api}/api/v1/nodes/{agent_node}");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(response) = client.get(&url).send().await {
+                if response.status().is_success() {
+                    if let Ok(node) = response
+                        .json::<coppice_api::http::dto::GetNodeResponse>()
+                        .await
+                    {
+                        return node.summary.epoch;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("dev agent did not register within 30 seconds")
+}
+
+/// The coordinator task's own error, when it has already finished.
+async fn daemon_error(
+    coordinator: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Option<anyhow::Error> {
+    if !coordinator.is_finished() {
+        return None;
+    }
+    match coordinator.await {
+        Ok(Err(e)) => Some(e.context("the dev coordinator failed to start")),
+        Ok(Ok(())) => Some(anyhow::anyhow!("the dev coordinator stopped unexpectedly")),
+        Err(e) => Some(anyhow::Error::new(e).context("the dev coordinator task panicked")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent wiring
+// ---------------------------------------------------------------------------
 
 /// Open the agent journal under the config's data dir (acquiring its `LOCK`)
 /// and build the session over `executor`.
@@ -636,114 +889,9 @@ async fn run_agent<E: Executor + Clone>(session: Session<RealFs, E>, config: Age
     }
 }
 
-/// The well-known quota entity dev jobs charge to. Fixed rather than minted
-/// so submit examples keep working verbatim across dev clusters.
-const DEV_QUOTA_ENTITY: &str = "quota-00000000-0000-0000-0000-000000000001";
-
-/// Dev priorities `-2..=2` mapped to cost multipliers 0.25×..4× (doubling
-/// per step — monotone in priority, as ADR 0021's ranking expects).
-fn dev_priority_table() -> BTreeMap<i32, PriorityMultiplier> {
-    (-2i32..=2)
-        .map(|p| (p, PriorityMultiplier(1u64 << (32 + p))))
-        .collect()
-}
-
-/// Seed the replicated state a fresh dev cluster needs to accept a job.
-///
-/// A new cluster's policy has an **empty** priority-multiplier table, so
-/// every `SubmitJob` fails synchronous validation until an `UpdatePolicy`
-/// commits. In production that is deliberate: policy is replicated state an
-/// operator configures explicitly through the admin tooling, and the node
-/// config file never seeds it (ADR 0020). Dev has no operator, so propose
-/// the same commands the tooling will use: multipliers for priorities
-/// `-2..=2` and the well-known "dev" quota entity. Each seed is skipped
-/// when already present, so policy or quota edits made against a persistent
-/// `--data-dir` survive restarts.
-async fn seed_dev_state<C: Consensus>(
-    consensus: &C,
-    views: &coppice_consensus::StateViews,
-) -> Result<QuotaEntityId> {
-    let entity: QuotaEntityId = DEV_QUOTA_ENTITY.parse().expect("dev quota entity id");
-    let view = views.latest();
-    let state = view.state();
-
-    if state.policy.priority_multipliers.is_empty() {
-        // UpdatePolicy is a full replacement: change only the table, keep
-        // the booted defaults for everything else.
-        let mut policy = state.policy.clone();
-        policy.priority_multipliers = dev_priority_table();
-        propose_seed(
-            consensus,
-            Command::UpdatePolicy(UpdatePolicy {
-                policy,
-                updated_at: Timestamp::now(),
-            }),
-            "seeding the dev priority-multiplier table",
-        )
-        .await?;
-    }
-
-    if !state.quota_entities.contains_key(&entity) {
-        propose_seed(
-            consensus,
-            Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
-                entity,
-                parent: None,
-                name: "dev".to_string(),
-                // ~1e6 CU: deep enough that dev jobs never starve on quota,
-                // far enough from u64::MAX to stay clear of saturation.
-                quota: CostUnits(1_000_000_000_000),
-                updated_at: Timestamp::now(),
-            }),
-            "seeding the dev quota entity",
-        )
-        .await?;
-    }
-
-    Ok(entity)
-}
-
-/// Propose one seed command, riding out the single node's initial election
-/// (`NotLeader`/`Timeout` right after bootstrap) for up to 10 seconds.
-async fn propose_seed<C: Consensus>(consensus: &C, command: Command, what: &str) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match consensus.propose(command.clone()).await {
-            Ok(applied) => {
-                applied
-                    .outcome
-                    .with_context(|| format!("{what}: rejected at apply"))?;
-                return Ok(());
-            }
-            Err(e @ (ConsensusError::NotLeader { .. } | ConsensusError::Timeout)) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(e).context(what.to_string());
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => return Err(e).context(what.to_string()),
-        }
-    }
-}
-
-async fn wait_for_agent(views: &coppice_consensus::StateViews, agent_node: NodeId) -> Result<u64> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(epoch) = views
-                .latest()
-                .state()
-                .nodes
-                .get(&agent_node)
-                .map(|node| node.epoch)
-            {
-                return epoch;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .context("dev agent did not register within 10 seconds")
-}
+// ---------------------------------------------------------------------------
+// The ready banner
+// ---------------------------------------------------------------------------
 
 struct ReadySummary<'a> {
     root: &'a Path,
@@ -782,7 +930,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
          \x20 Data            {data_dir} ({data_lifetime})\n\
          \x20 Executor        {executor}\n\
          \x20 Cluster         {cluster_id} (Raft node {coordinator_raft_id})\n\
-         \x20 Agent           {agent_node} (registered, epoch {agent_epoch})\n\
+         \x20 Agent           {agent_node} (enrolled, epoch {agent_epoch})\n\
          \x20 Quota entity    {quota_entity} (\"dev\", seeded; priorities -2..=2)\n\
          \n\
          \x20 Local development only: authentication is effectively disabled.\n\
@@ -844,10 +992,87 @@ mod tests {
         assert!(summary.contains("Metrics (agent) http://127.0.0.1:7074/metrics"));
         assert!(summary.contains("/tmp/coppice-dev (temporary; deleted on exit)"));
         assert!(summary.contains(
-            "Agent           node-00000000-0000-0000-0000-000000000002 (registered, epoch 1)"
+            "Agent           node-00000000-0000-0000-0000-000000000002 (enrolled, epoch 1)"
         ));
         assert!(summary.contains(&format!(
             "Quota entity    {DEV_QUOTA_ENTITY} (\"dev\", seeded; priorities -2..=2)"
         )));
+    }
+
+    /// The generated coordinator config must survive the daemon's own loader —
+    /// it is written by `dev` and read back by `config::load`, so a drifted
+    /// key or a missing required table is a startup failure, not a test one.
+    #[test]
+    fn the_generated_coordinator_config_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("coordinator.toml");
+        std::fs::write(
+            &path,
+            coordinator_toml(&CoordinatorLayout {
+                cluster_id: "cluster-00000000-0000-0000-0000-000000000001"
+                    .parse()
+                    .expect("cluster id"),
+                data_dir: &dir.path().join("coordinator"),
+                pki_dir: &dir.path().join("pki"),
+                raft_port: 7071,
+                agent_port: 7072,
+                client_port: 7070,
+            }),
+        )
+        .expect("write config");
+        // Certless by construction: none of the `[tls]` files exists, and the
+        // loader must accept that (formation mints them, ADR 0037 §4).
+        coord_config::load(&path).expect("the dev coordinator config loads");
+    }
+
+    /// The seeding policy `dev` hands `init` must parse under the daemon's own
+    /// schema, and must carry all three things a dev cluster needs.
+    #[test]
+    fn the_seeding_policy_parses_and_seeds_everything_dev_needs() {
+        let toml = dev_policy_toml();
+        let policy = coppice_coordinator::policy::FormationPolicy::parse_toml(toml.as_bytes())
+            .expect("the dev policy parses");
+
+        assert_eq!(policy.priority_multipliers.len(), 5);
+        let zero = policy
+            .priority_multipliers
+            .iter()
+            .find(|pm| pm.index == 0)
+            .expect("priority 0");
+        assert_eq!(zero.multiplier, 1.0);
+
+        assert_eq!(policy.quota_entities.len(), 1);
+        assert_eq!(
+            policy.quota_entities[0].id.to_string(),
+            DEV_QUOTA_ENTITY,
+            "submit examples name this entity verbatim"
+        );
+
+        assert_eq!(policy.enroll_tokens.len(), 1);
+        assert_eq!(policy.enroll_tokens[0].label, DEV_ENROLL_LABEL);
+        assert_eq!(policy.enroll_tokens[0].secret, DEV_ENROLL_TOKEN);
+    }
+
+    /// An explicit port is honored and remembered; a zero port is minted once
+    /// and then reused, which is what keeps a restarted dev cluster's URLs
+    /// (and its advertised raft address) stable.
+    #[test]
+    fn ports_are_remembered_across_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_port(dir.path(), "raft", 7071).expect("explicit port"),
+            7071
+        );
+        assert_eq!(
+            resolve_port(dir.path(), "raft", 0).expect("remembered port"),
+            7071
+        );
+
+        let minted = resolve_port(dir.path(), "client", 0).expect("minted port");
+        assert_ne!(minted, 0);
+        assert_eq!(
+            resolve_port(dir.path(), "client", 0).expect("remembered port"),
+            minted
+        );
     }
 }

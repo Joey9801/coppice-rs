@@ -58,7 +58,12 @@ fn tls_paths(tls: &config::TlsConfig) -> TlsPaths {
 /// leaf already installed this makes no network call at all and never reads the
 /// token — restarts are free, and a compromised endpoint sees nothing from an
 /// already-enrolled fleet.
-async fn ensure_enrolled(config: &config::Config) -> Result<()> {
+///
+/// Public because `coppice dev` assembles its in-process agent from the parts
+/// rather than through [`run_daemon`], and must make this same call in this
+/// same place — an agent that skipped it would be back to being handed
+/// material out of band.
+pub async fn ensure_enrolled(config: &config::Config) -> Result<()> {
     let Some(enrollment) = &config.enrollment else {
         return Ok(());
     };

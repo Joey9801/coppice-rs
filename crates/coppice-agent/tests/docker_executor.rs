@@ -3168,7 +3168,8 @@ async fn poll_mode_disk_reading_reaches_metric_samples() {
 
 /// A throwaway CA plus a NodeService server leaf (its dNSName SAN is the typed
 /// node id, so an id-pinned dial validates) and a coordinator client leaf, both
-/// dual-EKU — mirrors `coppice dev`'s `mint_pki` and `tests/node_service.rs`.
+/// dual-EKU — the same shape `pki::issue_agent` gives an enrolled node leaf,
+/// and the same fixture `tests/node_service.rs` builds.
 struct ServicePki {
     ca_pem: Vec<u8>,
     server_cert: Vec<u8>,
