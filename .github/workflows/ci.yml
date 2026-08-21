@@ -77,12 +77,12 @@ jobs:
       - run: cargo nextest run --workspace --all-features --locked --profile ci
 
   fleet:
-    name: fleet integration tests (shard ${{ matrix.shard }} of 3)
+    name: fleet integration tests (shard ${{ matrix.shard }} of 4)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install --no-self-update
@@ -96,9 +96,10 @@ jobs:
       # .config/nextest.toml's ci-fleet-* profiles.
       - run: cargo nextest run --workspace --all-features --locked --profile ci-fleet-${{ matrix.shard }}
       # Every binary profile.ci excludes must land in exactly one ci-fleet-*
-      # shard — a new fleet suite missing from a shard profile would
-      # otherwise silently vanish from CI. A pure config check, so one
-      # shard's worth is enough.
+      # shard, and every ci-fleet-* profile must be named in this job's
+      # matrix — a suite missing from a shard profile, or a shard profile
+      # missing from the matrix, would otherwise silently vanish from CI.
+      # A pure config check, so one shard's worth is enough.
       - if: matrix.shard == 1
         name: check the shard profiles partition the fleet suites
         run: scripts/check-fleet-shards.sh

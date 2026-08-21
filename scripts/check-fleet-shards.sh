@@ -7,6 +7,10 @@
 # renamed out from under both, just runs in the ordinary test job via
 # profile.ci's `not(...)`.)
 #
+# Also verifies the ci.yml fleet matrix names every ci-fleet-* profile: a
+# shard profile with no CI job running it is the same silent drop one level
+# up, and nextest cannot see the workflow file.
+#
 # A pure config check on .config/nextest.toml — deliberately no cargo: the
 # coppice-api build script is always-dirty while web/dist is absent, so any
 # extra cargo invocation in CI rebuilds three heavy crates for nothing.
@@ -49,7 +53,23 @@ if extra := sharded - excluded:
     ok = False
     print(f"in a ci-fleet-* shard but not excluded by profile.ci: {sorted(extra)}")
 
+with open(".github/workflows/ci.yml") as f:
+    workflow = f.read()
+
+matrix = re.search(r"^\s*shard:\s*\[([0-9,\s]+)\]", workflow, re.M)
+if not matrix:
+    sys.exit("no `shard: [...]` matrix found in .github/workflows/ci.yml")
+matrix_shards = {f"ci-fleet-{n.strip()}" for n in matrix.group(1).split(",")}
+
+if unrun := set(shards) - matrix_shards:
+    ok = False
+    print(f"ci-fleet-* profiles with no ci.yml matrix entry: {sorted(unrun)}")
+if phantom := matrix_shards - set(shards):
+    ok = False
+    print(f"ci.yml matrix entries with no ci-fleet-* profile: {sorted(phantom)}")
+
 if not ok:
     sys.exit(1)
 print(f"profile.ci exclusions == shard union: {sorted(sharded)}")
+print(f"ci.yml matrix covers every shard profile: {sorted(matrix_shards)}")
 EOF
