@@ -11,12 +11,12 @@ use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::Duration;
 use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
-    ConfigureQuotaEntity, ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt,
-    EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement, RebindMachineAddress,
-    ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent, RegisterNode,
-    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob,
-    UpdatePolicy,
+    ConfigureQuotaEntity, ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost,
+    DispatchAttempt, EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement,
+    RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
+    RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
+    RecordStagedKeyTransferIntent, RegisterNode, RetireMachineBinding, RevokeEnrollToken,
+    RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
 };
 use coppice_state::{CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity};
 
@@ -57,6 +57,8 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::RebindMachineAddress(c) => Body::RebindMachineAddress(c.into()),
         Command::RetireMachineBinding(c) => Body::RetireMachineBinding(c.into()),
         Command::RecordKeyTransferIntent(c) => Body::RecordKeyTransferIntent(c.into()),
+        Command::RecordStagedKeyTransferIntent(c) => Body::RecordStagedKeyTransferIntent(c.into()),
+        Command::ConfirmStagedKeyPossession(c) => Body::ConfirmStagedKeyPossession(c.into()),
     };
     pb::Command {
         version: cluster_version,
@@ -97,6 +99,10 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::RebindMachineAddress(c) => Command::RebindMachineAddress(c.try_into()?),
         Body::RetireMachineBinding(c) => Command::RetireMachineBinding(c.try_into()?),
         Body::RecordKeyTransferIntent(c) => Command::RecordKeyTransferIntent(c.try_into()?),
+        Body::RecordStagedKeyTransferIntent(c) => {
+            Command::RecordStagedKeyTransferIntent(c.try_into()?)
+        }
+        Body::ConfirmStagedKeyPossession(c) => Command::ConfirmStagedKeyPossession(c.try_into()?),
     };
     Ok((command_version, body))
 }
@@ -594,6 +600,7 @@ impl From<&RecordCaCertificate> for pb::RecordCaCertificate {
     fn from(c: &RecordCaCertificate) -> Self {
         pb::RecordCaCertificate {
             cert_pem: c.bundle.pem().to_string(),
+            staged_root_serial: c.staged_root_serial.clone(),
             recorded_at_us: c.recorded_at.as_micros(),
         }
     }
@@ -610,6 +617,8 @@ impl TryFrom<pb::RecordCaCertificate> for RecordCaCertificate {
                 field: "RecordCaCertificate.cert_pem",
                 reason: "not a sequence of X.509 CA certificate PEM blocks",
             })?,
+            // An empty/absent staged_root_serial decodes as `None`.
+            staged_root_serial: c.staged_root_serial.filter(|s| !s.is_empty()),
             recorded_at: timestamp(c.recorded_at_us, "RecordCaCertificate.recorded_at_us")?,
         })
     }
@@ -788,6 +797,56 @@ impl TryFrom<pb::RecordKeyTransferIntent> for RecordKeyTransferIntent {
         Ok(RecordKeyTransferIntent {
             raft_node_id: c.raft_node_id,
             intended_at: timestamp(c.intended_at_us, "RecordKeyTransferIntent.intended_at_us")?,
+        })
+    }
+}
+
+impl From<&RecordStagedKeyTransferIntent> for pb::RecordStagedKeyTransferIntent {
+    fn from(c: &RecordStagedKeyTransferIntent) -> Self {
+        pb::RecordStagedKeyTransferIntent {
+            raft_node_id: c.raft_node_id,
+            root_serial: c.root_serial.clone(),
+            intended_at_us: c.intended_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RecordStagedKeyTransferIntent> for RecordStagedKeyTransferIntent {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RecordStagedKeyTransferIntent) -> Result<Self, ConvertError> {
+        Ok(RecordStagedKeyTransferIntent {
+            raft_node_id: c.raft_node_id,
+            root_serial: c.root_serial,
+            intended_at: timestamp(
+                c.intended_at_us,
+                "RecordStagedKeyTransferIntent.intended_at_us",
+            )?,
+        })
+    }
+}
+
+impl From<&ConfirmStagedKeyPossession> for pb::ConfirmStagedKeyPossession {
+    fn from(c: &ConfirmStagedKeyPossession) -> Self {
+        pb::ConfirmStagedKeyPossession {
+            raft_node_id: c.raft_node_id,
+            root_serial: c.root_serial.clone(),
+            confirmed_at_us: c.confirmed_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::ConfirmStagedKeyPossession> for ConfirmStagedKeyPossession {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::ConfirmStagedKeyPossession) -> Result<Self, ConvertError> {
+        Ok(ConfirmStagedKeyPossession {
+            raft_node_id: c.raft_node_id,
+            root_serial: c.root_serial,
+            confirmed_at: timestamp(
+                c.confirmed_at_us,
+                "ConfirmStagedKeyPossession.confirmed_at_us",
+            )?,
         })
     }
 }

@@ -368,6 +368,10 @@ pub async fn run_with(
     // everywhere else, resolved `:0` port included.
     let advertise_addr = prepared.advertise_addr.clone();
     let convergence_tls = Arc::clone(&tls_store);
+    // The local admin socket's share: `rotate-ca begin` keys the other voters
+    // over the machine plane, which means dialing them with this daemon's own
+    // serving material (ADR 0037 §4).
+    let local_admin_tls = Arc::clone(&tls_store);
 
     let BootedCoordinator {
         cluster_id,
@@ -389,7 +393,7 @@ pub async fn run_with(
         prepared,
     )?;
 
-    local_admin.attach(Arc::clone(&consensus));
+    local_admin.attach(Arc::clone(&consensus), handle.clone(), local_admin_tls);
 
     // The post-start convergence loop (ADR 0037 §6), for every replica this
     // process could have produced: a resumed voter (where it no-ops), a

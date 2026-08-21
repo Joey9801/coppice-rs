@@ -972,8 +972,11 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
     let mut last_index = crate::policy::propose_all(
         &started.consensus,
         vec![
+            // Formation records a single root and nothing pending: there is
+            // no rotation to stage on a cluster that does not exist yet.
             Command::RecordCaCertificate(RecordCaCertificate {
                 bundle,
+                staged_root_serial: None,
                 recorded_at,
             }),
             Command::BindMachineIdentity(BindMachineIdentity {

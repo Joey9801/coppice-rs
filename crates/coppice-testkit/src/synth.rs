@@ -366,6 +366,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         // ADR 0037 PKI/identity facts are not part of the job-scaled synthetic
         // state; the dedicated PKI tests populate them directly.
         ca: None,
+        staged_root: None,
         machine_bindings: Default::default(),
         enroll_tokens: Default::default(),
         revoked_identities: Default::default(),

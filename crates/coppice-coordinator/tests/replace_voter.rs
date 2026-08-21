@@ -357,6 +357,7 @@ async fn replace_voter_refuses_a_new_that_is_still_catching_up() {
                     std::str::from_utf8(&ca.pem).expect("CA cert PEM is UTF-8"),
                 )
                 .expect("the fixture CA parses"),
+                staged_root_serial: None,
                 recorded_at: Timestamp::now(),
             },
         ))

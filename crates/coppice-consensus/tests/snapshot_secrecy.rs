@@ -68,6 +68,7 @@ fn ca_private_key_never_appears_in_a_snapshot() {
         .apply(&Command::RecordCaCertificate(RecordCaCertificate {
             bundle: coppice_state::CaCertBundle::parse(cert_pem.clone())
                 .expect("a real CA cert PEM is a valid bundle"),
+            staged_root_serial: None,
             recorded_at: coppice_core::time::Timestamp::from_micros(1_760_000_000_000_000)
                 .expect("in range"),
         }))

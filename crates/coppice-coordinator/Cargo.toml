@@ -77,7 +77,8 @@ aws-config.workspace = true
 aws-sdk-ec2.workspace = true
 aws-sdk-autoscaling.workspace = true
 # Parses the agent's mTLS client-leaf certificate to enforce CN == NodeId at
-# session accept (ADR 0011); see `tasks::agent_gateway`.
+# session accept (ADR 0011); see `tasks::agent_gateway`. Also splits the
+# replicated CA bundle into its roots for `rotate-ca` (ADR 0037 §4).
 # The convergence loop's public-edge supersession probe (ADR 0037 §3): a
 # `GET /readyz` against the `[enrollment]` endpoint, under the same
 # system-roots posture the enrollment client uses. It is the only plane that
@@ -85,6 +86,9 @@ aws-sdk-autoscaling.workspace = true
 # what makes it the channel that can see a superseded history at all.
 reqwest.workspace = true
 x509-parser.workspace = true
+# Splits the replicated CA bundle into per-certificate DER for the re-root
+# verb's inspection surface (`rotate`), using the same parser the TLS stores do.
+rustls-pemfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

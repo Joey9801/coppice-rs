@@ -13,13 +13,15 @@
 //! allocations rather than snapshotted, so there is no second copy to
 //! disagree with the allocation records.
 
+use std::collections::BTreeMap;
+
 use coppice_core::allocation::AllocationState;
 use coppice_core::id::{EnrollTokenId, MachineId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::Timestamp;
 use coppice_state::{
     AllocationRecord, AttemptRecord, CaCertBundle, CaCertificate, EnrollToken, JobRecord,
-    MachineBinding, NodeRecord, QuotaEntity, RevokedIdentity, StateMachine,
+    MachineBinding, NodeRecord, QuotaEntity, RevokedIdentity, StagedRoot, StateMachine,
 };
 
 use super::command::{enroll_role_from_pb, enroll_role_to_pb};
@@ -332,6 +334,47 @@ impl TryFrom<pb::KeyTransferIntentRecord> for (u64, Timestamp) {
     }
 }
 
+// The staged root rides the singleton cluster record, not a sharded section
+// — bounded by cluster size (ADR 0037 §4).
+
+impl From<&StagedRoot> for pb::StagedRootRecord {
+    fn from(s: &StagedRoot) -> Self {
+        pb::StagedRootRecord {
+            serial: s.serial.clone(),
+            staged_at_us: s.staged_at.as_micros(),
+            holders: s.holders.iter().map(Into::into).collect(),
+            intents: s.intents.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<pb::StagedRootRecord> for StagedRoot {
+    type Error = ConvertError;
+
+    fn try_from(r: pb::StagedRootRecord) -> Result<Self, ConvertError> {
+        let mut holders = BTreeMap::new();
+        for h in r.holders {
+            let (raft_node_id, confirmed_at): (u64, Timestamp) = h.try_into()?;
+            if holders.insert(raft_node_id, confirmed_at).is_some() {
+                return Err(ConvertError::DuplicateEntry("StagedRootRecord.holders"));
+            }
+        }
+        let mut intents = BTreeMap::new();
+        for i in r.intents {
+            let (raft_node_id, intended_at): (u64, Timestamp) = i.try_into()?;
+            if intents.insert(raft_node_id, intended_at).is_some() {
+                return Err(ConvertError::DuplicateEntry("StagedRootRecord.intents"));
+            }
+        }
+        Ok(StagedRoot {
+            serial: r.serial,
+            staged_at: timestamp(r.staged_at_us, "StagedRootRecord.staged_at_us")?,
+            holders,
+            intents,
+        })
+    }
+}
+
 // Enrolled identities are keyed by the machine id, so the record carries the
 // key and converts as a (machine, recorded_at) pair.
 
@@ -588,6 +631,7 @@ pub fn cluster_record(state: &StateMachine) -> pb::ClusterStateRecord {
         version: state.version,
         next_allocation_seq: state.next_allocation_seq,
         ca: state.ca.as_ref().map(Into::into),
+        staged_root: state.staged_root.as_ref().map(Into::into),
     }
 }
 
@@ -730,6 +774,7 @@ pub fn state_from_records(records: StateRecords) -> Result<StateMachine, Convert
     state.version = cluster.version;
     state.next_allocation_seq = cluster.next_allocation_seq;
     state.ca = cluster.ca.map(TryInto::try_into).transpose()?;
+    state.staged_root = cluster.staged_root.map(TryInto::try_into).transpose()?;
 
     Ok(state)
 }

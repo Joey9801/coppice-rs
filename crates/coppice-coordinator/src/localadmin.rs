@@ -42,9 +42,11 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use coppice_api::http::ReadyzReport;
-use coppice_consensus::OpenraftConsensus;
+use coppice_consensus::{NodeHandle, OpenraftConsensus};
+use coppice_tls::TlsStore;
 
 use crate::formation::{self, FormRequest, OperatorCredential, PhaseState};
+use crate::rotate;
 
 /// Cap on one request line. Generous for a policy TOML and a CSR, far below
 /// anything that could exhaust the daemon: the surface is local, but "local"
@@ -83,6 +85,17 @@ pub enum AdminCall {
     /// This daemon's readiness document — byte-for-byte what `GET /readyz`
     /// serves, available without the client listener.
     Status,
+    /// Open a re-root's dual-trust window (ADR 0037 §4). Leader-only, and on
+    /// this plane for the same reason `init` is: re-rooting is
+    /// root-equivalent authority.
+    RotateCaBegin,
+    /// The re-root's read-only surface; answerable on any replica.
+    RotateCaStatus,
+    /// Close a re-root's dual-trust window by dropping the outgoing root.
+    RotateCaComplete {
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 /// The answer to an [`AdminCall`].
@@ -111,6 +124,12 @@ pub enum AdminReply {
     Issued { operator: OperatorPem },
     /// The `status` verb's answer.
     Status { status: ReadyzReport },
+    /// A re-root's dual-trust window is open (ADR 0037 §4).
+    RotationBegun { report: rotate::BeginReport },
+    /// The `rotate-ca status` verb's answer.
+    RotationStatus { status: rotate::RotationStatus },
+    /// The outgoing root is no longer a trust anchor.
+    RotationCompleted { report: rotate::CompleteReport },
     /// Anything that went wrong, in the operator's terms.
     Error { message: String },
 }
@@ -165,8 +184,22 @@ pub(crate) struct LocalAdmin {
     data_dir: PathBuf,
     form_tx: mpsc::Sender<FormationCall>,
     /// Attached once the cluster is formed, so `issue-operator-cert` can read
-    /// the CA certificate out of replicated state.
-    consensus: RwLock<Option<Arc<OpenraftConsensus>>>,
+    /// the CA certificate out of replicated state and the `rotate-ca` verbs
+    /// can propose against it.
+    formed: RwLock<Option<FormedSeam>>,
+}
+
+/// What the formed daemon lends this socket.
+///
+/// `issue-operator-cert` needed only consensus. Re-rooting needs two more
+/// things, both of which exist only once the replica is assembled: the raft
+/// [`NodeHandle`], to know whether this node leads and where its peers are,
+/// and the serving [`TlsStore`], because keying the other voters means dialing
+/// them on the machine plane with this daemon's own leaf.
+struct FormedSeam {
+    consensus: Arc<OpenraftConsensus>,
+    handle: NodeHandle,
+    tls: Arc<TlsStore>,
 }
 
 impl LocalAdmin {
@@ -179,13 +212,61 @@ impl LocalAdmin {
             phase,
             data_dir,
             form_tx,
-            consensus: RwLock::new(None),
+            formed: RwLock::new(None),
         })
     }
 
-    /// Attach the consensus seam once formed.
-    pub(crate) fn attach(&self, consensus: Arc<OpenraftConsensus>) {
-        *self.consensus.write().expect("localadmin seam lock") = Some(consensus);
+    /// Attach the formed seam once the replica is assembled.
+    pub(crate) fn attach(
+        &self,
+        consensus: Arc<OpenraftConsensus>,
+        handle: NodeHandle,
+        tls: Arc<TlsStore>,
+    ) {
+        *self.formed.write().expect("localadmin seam lock") = Some(FormedSeam {
+            consensus,
+            handle,
+            tls,
+        });
+    }
+
+    /// Clone the formed seam out, or report the pre-formation refusal every
+    /// verb here shares: there is no cluster to act on yet.
+    ///
+    /// Cloned rather than borrowed because the rotation verbs await across
+    /// their use of it, and a `std::sync::RwLock` guard must not be held over
+    /// an await point.
+    fn formed_seam(
+        &self,
+        verb: &str,
+    ) -> Result<(Arc<OpenraftConsensus>, NodeHandle, Arc<TlsStore>)> {
+        let guard = self.formed.read().expect("localadmin seam lock");
+        let seam = guard.as_ref().ok_or_else(|| {
+            anyhow!(
+                "this coordinator has not formed a cluster, so `{verb}` has nothing to act on \
+                 (ADR 0037 §3). Run `coppice coordinator init` first."
+            )
+        })?;
+        Ok((
+            Arc::clone(&seam.consensus),
+            seam.handle.clone(),
+            Arc::clone(&seam.tls),
+        ))
+    }
+
+    /// The rotation context this daemon lends the `rotate-ca` verbs.
+    fn rotation<'a>(
+        &'a self,
+        consensus: &'a OpenraftConsensus,
+        handle: &'a NodeHandle,
+        tls: &'a TlsStore,
+    ) -> rotate::RotationContext<'a, OpenraftConsensus> {
+        rotate::RotationContext {
+            consensus,
+            handle,
+            tls,
+            data_dir: &self.data_dir,
+        }
     }
 
     async fn dispatch(&self, call: AdminCall) -> AdminReply {
@@ -220,7 +301,40 @@ impl LocalAdmin {
             AdminCall::Status => AdminReply::Status {
                 status: self.phase.readyz(),
             },
+            AdminCall::RotateCaBegin => match self.rotate_ca_begin().await {
+                Ok(report) => AdminReply::RotationBegun { report },
+                Err(e) => AdminReply::Error {
+                    message: format!("{e:#}"),
+                },
+            },
+            AdminCall::RotateCaStatus => match self.rotate_ca_status() {
+                Ok(status) => AdminReply::RotationStatus { status },
+                Err(e) => AdminReply::Error {
+                    message: format!("{e:#}"),
+                },
+            },
+            AdminCall::RotateCaComplete { force } => match self.rotate_ca_complete(force).await {
+                Ok(report) => AdminReply::RotationCompleted { report },
+                Err(e) => AdminReply::Error {
+                    message: format!("{e:#}"),
+                },
+            },
         }
+    }
+
+    async fn rotate_ca_begin(&self) -> Result<rotate::BeginReport> {
+        let (consensus, handle, tls) = self.formed_seam("rotate-ca begin")?;
+        rotate::begin(&self.rotation(&consensus, &handle, &tls)).await
+    }
+
+    fn rotate_ca_status(&self) -> Result<rotate::RotationStatus> {
+        let (consensus, handle, tls) = self.formed_seam("rotate-ca status")?;
+        rotate::status(&self.rotation(&consensus, &handle, &tls))
+    }
+
+    async fn rotate_ca_complete(&self, force: bool) -> Result<rotate::CompleteReport> {
+        let (consensus, handle, tls) = self.formed_seam("rotate-ca complete")?;
+        rotate::complete(&self.rotation(&consensus, &handle, &tls), force).await
     }
 
     async fn init(&self, request: FormRequest) -> AdminReply {
@@ -284,17 +398,7 @@ impl LocalAdmin {
     }
 
     fn issue_operator_cert(&self, request: FormRequest) -> Result<OperatorCredential> {
-        let consensus = self
-            .consensus
-            .read()
-            .expect("localadmin seam lock")
-            .clone()
-            .ok_or_else(|| {
-                anyhow!(
-                    "this coordinator has not formed a cluster: there is no cluster CA to \
-                     sign with (ADR 0037 §3). Run `coppice coordinator init` first."
-                )
-            })?;
+        let (consensus, _, _) = self.formed_seam("issue-operator-cert")?;
         let (signer, ca_pem) = formation::load_cluster_ca(&self.data_dir, consensus.as_ref())?;
         formation::issue_operator_credential(&signer, &ca_pem, &request)
     }
@@ -617,6 +721,266 @@ pub(crate) async fn run_issue_operator_cert(
         AdminReply::Error { message } => bail!("{message}"),
         other => bail!("unexpected reply to issue-operator-cert: {other:?}"),
     }
+}
+
+/// `coppice coordinator admin rotate-ca <verb>` (ADR 0037 §4).
+///
+/// On the local socket, like `init` and `issue-operator-cert`: re-rooting is
+/// root-equivalent authority, and the runbook is
+/// `docs/operations/re-rooting.md`.
+pub(crate) async fn run_rotate_ca(config: &Path, verb: &crate::cli::RotateCaVerb) -> Result<()> {
+    use crate::cli::RotateCaVerb;
+    let socket = socket_path(config)?;
+
+    match verb {
+        RotateCaVerb::Begin => match call(&socket, AdminCall::RotateCaBegin).await? {
+            AdminReply::RotationBegun { report } => {
+                // Two independent facts, reported as two lines: what this call
+                // did about *staging*, and whether it went on to *activate*.
+                // Folding them into one sentence reads as a falsehood whenever
+                // a single call does both — the staging line would say the
+                // outgoing root still signs, moments after activation moved it.
+                match (report.replaced_pending_root, report.resumed) {
+                    (true, _) => println!(
+                        "re-root resumed: the recorded pending root's key was not on this \
+                         host's disk, so a REPLACEMENT pending root was minted and staged \
+                         here. The superseded one left the bundle in the same commit, so it \
+                         is no longer a trust anchor and any copy of its key is inert."
+                    ),
+                    (false, true) => println!(
+                        "re-root resumed: the recorded rotation was picked up as it stood; \
+                         nothing was re-minted."
+                    ),
+                    (false, false) => println!(
+                        "re-root staged: the incoming root is recorded as PENDING, and both \
+                         roots are now trust anchors."
+                    ),
+                }
+                if report.activated {
+                    println!(
+                        "re-root ACTIVATED: every current voter durably holds the incoming \
+                         key, so it is now the active signing root.\n"
+                    );
+                } else {
+                    println!(
+                        "the OUTGOING root still signs. Activation waits until every current \
+                         voter durably holds the incoming key.\n"
+                    );
+                }
+                if let Some(backup) = &report.key_backup {
+                    println!("outgoing CA key preserved at {backup}");
+                    println!(
+                        "  that file is root-equivalent for as long as the outgoing root is \
+                         trusted; treat it as such."
+                    );
+                    println!();
+                }
+                if report.distribution.is_empty() {
+                    println!("no other voter to key (single-voter cluster)\n");
+                } else {
+                    println!("staged-key distribution to the other current voters:");
+                    for peer in &report.distribution {
+                        match (&peer.error, peer.already_held) {
+                            (None, true) => println!(
+                                "  node {:<6} {}  already held (nothing pushed)",
+                                peer.node_id, peer.addr
+                            ),
+                            (None, false) => {
+                                println!("  node {:<6} {}  installed", peer.node_id, peer.addr)
+                            }
+                            (Some(e), _) => {
+                                println!("  node {:<6} {}  FAILED: {e}", peer.node_id, peer.addr)
+                            }
+                        }
+                    }
+                    println!();
+                }
+                print!("{}", render_rotation(&report.status));
+                println!();
+
+                // The refusal is a first-class outcome, not an error in the
+                // rotation: staging succeeded, dual trust is in place, and the
+                // outgoing root still signs — indefinitely and harmlessly. What
+                // it is not is *done*, so this exits non-zero, with the marker
+                // an operator can match on.
+                if let Some(marker) = &report.refusal {
+                    bail!(
+                        "{marker}: the incoming root was NOT activated, because these current \
+                         voters do not hold its key: {:?}.\n\n\
+                         A root never becomes the active signing root until every current \
+                         voter durably holds its private key — otherwise a failover could \
+                         land the cluster on a voter that cannot sign. The rotation is parked \
+                         in the staged phase, which is a working state: both roots are trust \
+                         anchors and the outgoing root still signs, indefinitely if need be.\n\n\
+                         Fix membership first — repair those hosts, or `admin replace-voter` / \
+                         `admin remove-node` them — then re-run `rotate-ca begin`. It re-checks \
+                         coverage against the CURRENT voter set and mints nothing it does not \
+                         have to.",
+                        report.missing_voters
+                    );
+                }
+                println!(
+                    "next: wait for every coordinator and agent to renew onto the new root \
+                     (watch `rotate-ca status` on each), then run `rotate-ca complete`."
+                );
+                Ok(())
+            }
+            AdminReply::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply to rotate-ca begin: {other:?}"),
+        },
+
+        RotateCaVerb::Status { json } => match call(&socket, AdminCall::RotateCaStatus).await? {
+            AdminReply::RotationStatus { status } => {
+                if *json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&status)
+                            .context("encoding the rotation status")?
+                    );
+                } else {
+                    print!("{}", render_rotation(&status));
+                }
+                Ok(())
+            }
+            AdminReply::Error { message } => bail!("{message}"),
+            other => bail!("unexpected reply to rotate-ca status: {other:?}"),
+        },
+
+        RotateCaVerb::Complete { force } => {
+            match call(&socket, AdminCall::RotateCaComplete { force: *force }).await? {
+                AdminReply::RotationCompleted { report } => {
+                    println!("re-root complete: the outgoing root is no longer trusted\n");
+                    for root in &report.retired {
+                        println!(
+                            "retired  serial {}  ski {}",
+                            root.serial,
+                            root.subject_key_id.as_deref().unwrap_or("-")
+                        );
+                    }
+                    println!();
+                    print!("{}", render_rotation(&report.status));
+                    Ok(())
+                }
+                AdminReply::Error { message } => bail!("{message}"),
+                other => bail!("unexpected reply to rotate-ca complete: {other:?}"),
+            }
+        }
+    }
+}
+
+/// The human table for `rotate-ca status`.
+fn render_rotation(s: &rotate::RotationStatus) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "rotation      {}",
+        match s.phase {
+            rotate::RotationPhase::None => "none (single root)",
+            rotate::RotationPhase::Staged =>
+                "STAGED — incoming root pending; the OUTGOING root still signs",
+            rotate::RotationPhase::Distributing =>
+                "DISTRIBUTING — staged key going to the voters; the OUTGOING root still signs",
+            rotate::RotationPhase::ActivePendingSwap =>
+                "ACTIVE, PENDING LOCAL SWAP — the incoming root signs, but not on this host yet",
+            rotate::RotationPhase::CompleteEligible =>
+                "ACTIVE (dual trust) — ready for `rotate-ca complete` once its clock allows",
+        }
+    );
+    let _ = writeln!(out, "recorded at   {} (unix us)", s.recorded_at_us);
+    for root in &s.roots {
+        let _ = writeln!(
+            out,
+            "  root {}      {}  cn={}  serial={}  ski={}",
+            root.position,
+            if root.active {
+                "ACTIVE (signs)"
+            } else if root.pending {
+                "PENDING      "
+            } else {
+                "trusted only "
+            },
+            root.common_name.as_deref().unwrap_or("-"),
+            root.serial,
+            root.subject_key_id.as_deref().unwrap_or("-"),
+        );
+    }
+    // The activation gate, per voter. This is the whole operator surface for
+    // "why has my rotation not activated": a rotation parks in the staged
+    // phase until every current voter holds the staged key, and these lines
+    // name the ones that do not.
+    if s.staged_root_serial.is_some() {
+        for voter in &s.voters {
+            let state = if s.staged_key_holders.contains(voter) {
+                "holds the staged key"
+            } else if s.staged_key_transfers.contains(voter) {
+                "MAY hold it (unresolved transfer intent) — not counted by the gate"
+            } else {
+                "DOES NOT hold the staged key"
+            };
+            let _ = writeln!(out, "  voter {voter:<21} {state}");
+        }
+        if s.missing_voters.is_empty() {
+            let _ = writeln!(
+                out,
+                "activation    every current voter holds the staged key; the next \
+                 `rotate-ca begin` activates it"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "activation    BLOCKED on {:?} — `rotate-ca begin` will refuse to activate \
+                 until every current voter holds the staged key. Repair or replace those \
+                 voters, then re-run it.",
+                s.missing_voters
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "this replica  anchor {} · leaf {} · signing key {}",
+        if s.installed_matches_replicated {
+            "current"
+        } else {
+            "STALE (does not trust the recorded bundle)"
+        },
+        if s.leaf_under_active_root {
+            "renewed onto the active root"
+        } else {
+            "STALE (still under the outgoing root)"
+        },
+        if s.local_key_signs_active_root {
+            "signs the active root"
+        } else {
+            "does NOT sign the active root"
+        },
+    );
+    let _ = writeln!(out, "node          {} (leader {:?})", s.local_id, s.leader);
+    if let Some(earliest) = s.earliest_complete_us {
+        let _ = writeln!(
+            out,
+            "complete at   {earliest} (unix us) — one leaf lifetime ({}s) after begin; \
+             --force overrides",
+            s.leaf_lifetime_secs
+        );
+    }
+    let _ = writeln!(
+        out,
+        "key holders   {:?}   pending transfers {:?}",
+        s.key_holders, s.pending_key_transfers
+    );
+    // Staged holders are listed separately and are every bit as
+    // root-equivalent: the pending root is a trust anchor from the moment it
+    // is staged, so a leaf minted with the staged key already verifies
+    // fleet-wide. They merge into `key holders` at activation.
+    if s.staged_root_serial.is_some() {
+        let _ = writeln!(
+            out,
+            "staged key    holders {:?}   pending transfers {:?}",
+            s.staged_key_holders, s.staged_key_transfers
+        );
+    }
+    out
 }
 
 /// `coppice coordinator admin local-status`: this daemon's own readiness

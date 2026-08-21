@@ -53,7 +53,9 @@ pub mod verify;
 pub use ca::{mint_root_ca, CaError, CaMaterial, CaSigner};
 pub use csr::{generate_key_and_csr, CsrError};
 pub use custody::{
-    install_leaf_material, key_matches_ca, load_ca_key, write_ca_key, CustodyError, CA_KEY_FILE,
+    discard_staged_ca_material, install_ca_bundle, install_leaf_material, key_matches_ca,
+    load_ca_key, load_staged_ca_cert, load_staged_ca_key, stage_ca_material, write_ca_key,
+    CustodyError, CA_KEY_FILE, CA_STAGED_CERT_FILE, CA_STAGED_KEY_FILE,
 };
 pub use issue::{
     issue_agent, issue_coordinator, issue_operator, mint_agent_local, mint_coordinator_local,

@@ -40,8 +40,9 @@ use coppice_net::admin::{Client, RaftAdminService};
 use coppice_proto::convert::{enroll_role_from_pb, enroll_role_to_pb};
 use coppice_proto::pb::raft::v1 as pb;
 use coppice_state::command::{
-    BindMachineIdentity, ConfirmKeyPossession, MintEnrollToken, RebindMachineAddress,
-    RecordKeyTransferIntent, RevokeEnrollToken, RevokeIdentity,
+    BindMachineIdentity, ConfirmKeyPossession, ConfirmStagedKeyPossession, MintEnrollToken,
+    RebindMachineAddress, RecordKeyTransferIntent, RecordStagedKeyTransferIntent,
+    RevokeEnrollToken, RevokeIdentity,
 };
 use coppice_state::{Command, RejectionReason, RevokedIdentity};
 use coppice_tls::pki;
@@ -199,21 +200,32 @@ static PROMOTE_AFTER_KEY_TRANSFER_FIRED: AtomicBool = AtomicBool::new(false);
 /// failpoint. A no-op in every real deployment and in any test process that
 /// never sets [`TEST_FAILPOINT_ENV`].
 fn maybe_fire_promote_after_key_transfer_failpoint() -> Result<(), Status> {
-    if std::env::var(TEST_FAILPOINT_ENV).ok().as_deref() != Some(PROMOTE_AFTER_KEY_TRANSFER) {
-        return Ok(());
-    }
-    if PROMOTE_AFTER_KEY_TRANSFER_FIRED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        // Already fired once this process: the fire-once contract, so the
-        // re-entrant promotion that converges the crash window is not aborted
-        // a second time.
+    if !failpoint_fires(
+        PROMOTE_AFTER_KEY_TRANSFER,
+        &PROMOTE_AFTER_KEY_TRANSFER_FIRED,
+    ) {
         return Ok(());
     }
     Err(Status::internal(
         "promotion aborted at the promote-after-key-transfer failpoint (test-only)",
     ))
+}
+
+/// Whether the failpoint `name` is armed by [`TEST_FAILPOINT_ENV`] **and** its
+/// fire-once latch is still unspent — the shared body of every failpoint in the
+/// tree, so `rotate.rs`'s crash windows obey exactly the same contract as this
+/// module's two.
+///
+/// Fire-once is the contract, not an optimization: the tests that arm these
+/// re-enter the very code path they aborted (that is the recovery under test),
+/// and a latch that fired twice would abort the recovery as well.
+pub(crate) fn failpoint_fires(name: &str, latch: &AtomicBool) -> bool {
+    if std::env::var(TEST_FAILPOINT_ENV).ok().as_deref() != Some(name) {
+        return false;
+    }
+    latch
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
 }
 
 /// The failpoint name for the OTHER crash window of the transfer protocol:
@@ -233,19 +245,27 @@ static TRANSFER_BEFORE_CONFIRM_FIRED: AtomicBool = AtomicBool::new(false);
 /// [`TRANSFER_BEFORE_CONFIRM`] failpoint. A no-op in every real deployment
 /// and in any test process that never sets [`TEST_FAILPOINT_ENV`].
 fn maybe_fire_transfer_before_confirm_failpoint() -> Result<(), Status> {
-    if std::env::var(TEST_FAILPOINT_ENV).ok().as_deref() != Some(TRANSFER_BEFORE_CONFIRM) {
-        return Ok(());
-    }
-    if TRANSFER_BEFORE_CONFIRM_FIRED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if !failpoint_fires(TRANSFER_BEFORE_CONFIRM, &TRANSFER_BEFORE_CONFIRM_FIRED) {
         return Ok(());
     }
     Err(Status::internal(
         "key transfer aborted at the transfer-before-confirm failpoint (test-only)",
     ))
 }
+
+/// The failpoint a **recipient** arms to simulate a disk that cannot persist a
+/// pushed staged CA key: `TransferCaKey` refuses after every check has passed,
+/// exactly where the durable write would be.
+///
+/// It exists because "the voter could not write the key" must be
+/// indistinguishable, at the gate, from "the voter was unreachable": both are
+/// the absence of a replicated confirmation, and both must park the rotation in
+/// the staged phase rather than let it activate.
+pub const STAGED_KEY_WRITE_FAILS: &str = "staged-key-write-fails";
+
+/// Fire-once latch for [`STAGED_KEY_WRITE_FAILS`]; same process-global
+/// contract and caveats as [`PROMOTE_AFTER_KEY_TRANSFER_FIRED`].
+static STAGED_KEY_WRITE_FAILS_FIRED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Server side
@@ -850,6 +870,13 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
     /// acknowledges without rewriting, which is what makes a crash between
     /// receipt and the joint change converge on re-entry.
     ///
+    /// It also **adopts the replicated CA bundle as this node's own trust
+    /// anchors** before acknowledging. A re-root uses this RPC to key the
+    /// other voters, and the acknowledgement is what tells the leader it is
+    /// safe to start signing under the incoming root — so the acknowledgement
+    /// has to mean "I trust it", not merely "I could sign it". See the
+    /// "trust before signature" section of [`crate::rotate`].
+    ///
     /// Nothing here logs, echoes, or otherwise reproduces the key material.
     async fn transfer_ca_key(
         &self,
@@ -917,32 +944,123 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
             )
         })?;
 
+        // Adopt the replicated bundle as this node's own trust anchors before
+        // acknowledging anything — including on the idempotent path below, so
+        // a re-run of `rotate-ca begin` repairs a node that took the key but
+        // not the anchors.
+        //
+        // This is the recipient half of the re-root ordering (ADR 0037 §4,
+        // `rotate.rs` "trust before signature"): the leader keys the other
+        // voters *before* it switches its own signing key, and this
+        // acknowledgement is what tells it a voter can verify a leaf under the
+        // incoming root. Without it the leader would re-sign its serving leaf
+        // under a root its followers do not trust, and a follower that cannot
+        // verify the leader cannot dial it to renew — the anchors would be
+        // reachable only through a connection their absence forbids.
+        //
+        // Adopting anchors takes no key and no signature: the bundle is
+        // replicated state this node has already applied and validated, which
+        // is why it is safe to do here, on a request whose *key* half may yet
+        // be refused below.
+        let tls = self.tls()?;
+        crate::rotate::adopt_anchors(&tls, &ca_pem)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "adopting the cluster's recorded trust anchors: {e:#}"
+                ))
+            })?;
+
+        // Route the pushed key by **which recorded root it is the private half
+        // of** (ADR 0037 §4, `rotate.rs` phase model). A cluster mid-rotation
+        // records two roots with different jobs: position 0 is the active
+        // signing root, and a staged rotation's pending root is a trust anchor
+        // whose key must reach every voter *before* it may become active. One
+        // RPC serves both, because the key itself says which one it is — which
+        // is why staging needed no new verb, no new authorization rule, and no
+        // second custody path on this side.
+        //
+        // Position 0 first, so a live-key transfer on a cluster that happens to
+        // be mid-rotation is never mistaken for a staged one.
+        let active_pem = crate::rotate::nth_cert_pem(&ca_pem, 0)
+            .map_err(|e| Status::internal(format!("reading the recorded active root: {e:#}")))?;
+
         // Idempotent: a valid matching key already on disk is the state the
         // caller is asking for. Checked before the match below so a retried
         // transfer costs one stat and one parse, not a rewrite.
-        if pki::load_ca_key(&self.inner.data_dir, &ca_pem).is_ok() {
+        if pki::load_ca_key(&self.inner.data_dir, active_pem.as_bytes()).is_ok()
+            && pki::key_matches_ca(active_pem.as_bytes(), &req.ca_key_pem).is_ok()
+        {
             return Ok(Response::new(pb::TransferCaKeyResponse {}));
         }
 
-        pki::key_matches_ca(&ca_pem, &req.ca_key_pem).map_err(|e| {
-            tracing::warn!(
-                caller = %caller.describe(),
-                error = %e,
-                "admin: refused a CA key transfer that does not match the replicated CA \
-                 certificate"
+        if pki::key_matches_ca(active_pem.as_bytes(), &req.ca_key_pem).is_ok() {
+            pki::write_ca_key(&self.inner.data_dir, &req.ca_key_pem).map_err(|e| {
+                Status::internal(format!(
+                    "{}: persisting the transferred CA key: {e}",
+                    crate::rotate::KEY_PERSIST_FAILED
+                ))
+            })?;
+            tracing::info!(
+                node_id = handle.node_id(),
+                "admin: accepted custody of the cluster CA key (ADR 0037 §4)"
             );
-            Status::invalid_argument(
-                "the transferred key does not match this cluster's CA certificate (ADR 0037 §4)",
-            )
-        })?;
+            return Ok(Response::new(pb::TransferCaKeyResponse {}));
+        }
 
-        pki::write_ca_key(&self.inner.data_dir, &req.ca_key_pem)
-            .map_err(|e| Status::internal(format!("persisting the transferred CA key: {e}")))?;
-        tracing::info!(
-            node_id = handle.node_id(),
-            "admin: accepted custody of the cluster CA key (ADR 0037 §4)"
+        // Not the active root's key. The one other key this cluster can
+        // legitimately be pushing is the **staged** root's, and only while a
+        // staging is recorded.
+        let staged = consensus.views().latest().state().staged_root.clone();
+        if let Some(staged) = staged {
+            let pending_pem = crate::rotate::pending_cert_pem_for(&ca_pem, &staged.serial)
+                .map_err(|e| {
+                    Status::internal(format!("reading the recorded pending root: {e:#}"))
+                })?;
+            if pki::key_matches_ca(pending_pem.as_bytes(), &req.ca_key_pem).is_ok() {
+                if pki::load_staged_ca_key(&self.inner.data_dir, pending_pem.as_bytes()).is_ok() {
+                    return Ok(Response::new(pb::TransferCaKeyResponse {}));
+                }
+                // Test-only (ADR 0037 §4): a voter whose disk refuses the
+                // staged write. The leader must read this as "no
+                // confirmation", identically to an unreachable peer.
+                if failpoint_fires(STAGED_KEY_WRITE_FAILS, &STAGED_KEY_WRITE_FAILS_FIRED) {
+                    return Err(Status::internal(format!(
+                        "{}: staged CA key write aborted at the staged-key-write-fails \
+                         failpoint (test-only)",
+                        crate::rotate::KEY_PERSIST_FAILED
+                    )));
+                }
+                pki::stage_ca_material(
+                    &self.inner.data_dir,
+                    pending_pem.as_bytes(),
+                    &req.ca_key_pem,
+                )
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "{}: persisting the transferred staged CA key: {e}",
+                        crate::rotate::KEY_PERSIST_FAILED
+                    ))
+                })?;
+                tracing::info!(
+                    node_id = handle.node_id(),
+                    serial = %staged.serial,
+                    "admin: accepted custody of the cluster's STAGED CA key; it is not the \
+                     signing key until the cluster activates it (ADR 0037 §4)"
+                );
+                return Ok(Response::new(pb::TransferCaKeyResponse {}));
+            }
+        }
+
+        tracing::warn!(
+            caller = %caller.describe(),
+            "admin: refused a CA key transfer that matches neither the active nor the staged \
+             recorded root"
         );
-        Ok(Response::new(pb::TransferCaKeyResponse {}))
+        Err(Status::invalid_argument(
+            "the transferred key is the private half of neither this cluster's active root nor \
+             its staged one (ADR 0037 §4)",
+        ))
     }
 
     /// Remove a node from membership. Operator-only (ADR 0037 §7): removal is
@@ -1625,6 +1743,25 @@ impl<C: Consensus> AdminService<C> {
         handle: &NodeHandle,
         candidate: CoordinatorId,
     ) -> Result<(), Status> {
+        self.ensure_live_key_transferred(consensus, handle, candidate)
+            .await?;
+        // And, when a re-root is staged, the pending root's key too. Both, or
+        // the promotion does not commit: a voter raised holding only one of
+        // the cluster's two live keys is a hole in whichever invariant depends
+        // on the other.
+        self.ensure_staged_key_transferred(consensus, handle, candidate)
+            .await
+    }
+
+    /// The live half of [`Self::ensure_key_transferred`] — the CA key of the
+    /// bundle's active root, which is the one the candidate must hold to sign
+    /// if it becomes leader.
+    async fn ensure_live_key_transferred(
+        &self,
+        consensus: &Arc<C>,
+        handle: &NodeHandle,
+        candidate: CoordinatorId,
+    ) -> Result<(), Status> {
         if consensus
             .views()
             .latest()
@@ -1749,6 +1886,142 @@ impl<C: Consensus> AdminService<C> {
         tracing::info!(
             node_id = candidate,
             "admin: node confirmed durable CA-key receipt (ADR 0037 §4)"
+        );
+        Ok(())
+    }
+
+    /// Key a promotion candidate with the **staged** root as well, when a
+    /// re-root is staged (ADR 0037 §4, `rotate.rs` phase model).
+    ///
+    /// This is the membership half of the rotation invariant. Activation is
+    /// gated on *every current voter* holding the staged key, so a promotion
+    /// that raised a new voter without keying it would silently reopen the gap
+    /// the gate exists to close — and worse, could do so between a `begin`
+    /// that measured coverage and the activation commit that acts on it. The
+    /// same key-before-membership ordering the live key already gets therefore
+    /// covers the staged one: the candidate holds both before the joint change
+    /// commits, so the coverage invariant survives membership changes rather
+    /// than merely coexisting with them.
+    ///
+    /// Refusing promotions outright while a rotation is staged was the smaller
+    /// alternative and was rejected: `replace-voter` is precisely the remedy
+    /// the runbook prescribes for a rotation parked on a dead voter, so a
+    /// promotion ban would make the documented escape from a stuck rotation
+    /// impossible.
+    ///
+    /// No-op when nothing is staged, and idempotent when the candidate already
+    /// confirmed — the same three-step shape as the live transfer above.
+    async fn ensure_staged_key_transferred(
+        &self,
+        consensus: &Arc<C>,
+        handle: &NodeHandle,
+        candidate: CoordinatorId,
+    ) -> Result<(), Status> {
+        let (staged, ca_pem) = {
+            let view = consensus.views().latest();
+            let state = view.state();
+            match (&state.staged_root, &state.ca) {
+                (Some(staged), Some(ca)) => {
+                    if state.has_staged_key_confirmation(candidate) {
+                        return Ok(());
+                    }
+                    (staged.clone(), ca.bundle.pem().as_bytes().to_vec())
+                }
+                _ => return Ok(()),
+            }
+        };
+
+        let pending_pem = crate::rotate::pending_cert_pem_for(&ca_pem, &staged.serial)
+            .map_err(|e| Status::internal(format!("reading the recorded pending root: {e:#}")))?;
+        let staged_key = pki::load_staged_ca_key(&self.inner.data_dir, pending_pem.as_bytes())
+            .map_err(|e| {
+                Status::failed_precondition(format!(
+                    "{KEY_UNAVAILABLE}: a re-root is staged but this leader does not hold the \
+                     staged CA key ({e}), so it cannot key node {candidate} for it. Promoting \
+                     an unkeyed voter would reopen the coverage gap the activation gate exists \
+                     to close. Re-run `rotate-ca begin` on this leader first — it re-stages a \
+                     replacement pending root — then retry the promotion (ADR 0037 §4)"
+                ))
+            })?;
+
+        if !consensus
+            .views()
+            .latest()
+            .state()
+            .has_staged_key_transfer_intent(candidate)
+        {
+            let applied = consensus
+                .propose(Command::RecordStagedKeyTransferIntent(
+                    RecordStagedKeyTransferIntent {
+                        raft_node_id: candidate,
+                        root_serial: staged.serial.clone(),
+                        intended_at: Timestamp::now(),
+                    },
+                ))
+                .await
+                .map_err(consensus_error_to_status)?;
+            applied.outcome.map_err(|reason| {
+                Status::internal(format!(
+                    "recording the staged-key transfer intent for node {candidate} was \
+                     rejected: {reason}"
+                ))
+            })?;
+            await_visible(&**consensus, applied.log_index).await?;
+        }
+
+        let addr = handle
+            .cluster_summary()
+            .members
+            .iter()
+            .find(|m| m.id == candidate)
+            .map(|m| m.addr.clone())
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "{UNKNOWN_NODE}: node {candidate} is not in membership, so there is no \
+                     address to transfer the staged CA key to (ADR 0037 §6)"
+                ))
+            })?;
+
+        let tls = self.tls()?;
+        let mut client = admin_channel_from_store(&addr, &tls).await.map_err(|e| {
+            endpoint_unverified_status(format_args!(
+                "dialing {addr} to transfer the staged CA key: {e:#}"
+            ))
+        })?;
+        client
+            .transfer_ca_key(pb::TransferCaKeyRequest {
+                history_id: handle.history_id().to_vec(),
+                ca_key_pem: staged_key,
+            })
+            .await
+            .map_err(|s| {
+                endpoint_unverified_status(format_args!(
+                    "transferring the staged CA key to {addr}: {}",
+                    s.message()
+                ))
+            })?;
+
+        let applied = consensus
+            .propose(Command::ConfirmStagedKeyPossession(
+                ConfirmStagedKeyPossession {
+                    raft_node_id: candidate,
+                    root_serial: staged.serial.clone(),
+                    confirmed_at: Timestamp::now(),
+                },
+            ))
+            .await
+            .map_err(consensus_error_to_status)?;
+        applied.outcome.map_err(|reason| {
+            Status::failed_precondition(format!(
+                "node {candidate} confirmed durable receipt of the staged CA key, but recording \
+                 the possession fact was rejected: {reason}"
+            ))
+        })?;
+        await_visible(&**consensus, applied.log_index).await?;
+        tracing::info!(
+            node_id = candidate,
+            serial = %staged.serial,
+            "admin: node confirmed durable STAGED CA-key receipt (ADR 0037 §4)"
         );
         Ok(())
     }
@@ -2483,6 +2756,15 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
         return crate::localadmin::run_status(&args.config, *json).await;
     }
 
+    // `rotate-ca` rides it too, and for the strongest version of
+    // `issue-operator-cert`'s reason (ADR 0037 §4): re-rooting replaces the CA
+    // that would authorize the network path, so authorizing it there would
+    // make every operator certificate a re-rooting credential. It also has to
+    // execute on the host whose disk will hold the new key.
+    if let AdminVerb::RotateCa { verb } = &args.verb {
+        return crate::localadmin::run_rotate_ca(&args.config, verb).await;
+    }
+
     let resolved = config::load(&args.config)
         .with_context(|| format!("reading config {}", args.config.display()))?;
     let cfg = &resolved.config;
@@ -2591,7 +2873,9 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
             }
         }
         // Dispatched above, before any network client was built.
-        AdminVerb::IssueOperatorCert { .. } | AdminVerb::LocalStatus { .. } => {
+        AdminVerb::IssueOperatorCert { .. }
+        | AdminVerb::LocalStatus { .. }
+        | AdminVerb::RotateCa { .. } => {
             unreachable!("handled on the local socket")
         }
     }

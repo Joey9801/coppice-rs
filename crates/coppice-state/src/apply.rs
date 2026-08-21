@@ -20,16 +20,17 @@ use coppice_core::time::{Duration, Timestamp};
 
 use crate::command::{
     AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
-    ConfirmKeyPossession, DeclareNodeLost, DispatchAttempt, EvictTerminalJobs, MintEnrollToken,
-    Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
-    RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
-    RegisterNode, RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable,
-    SubmitJob, UpdatePolicy,
+    ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost, DispatchAttempt,
+    EvictTerminalJobs, MintEnrollToken, Placement, RebindMachineAddress, ReconcileNode,
+    RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate,
+    RecordEnrolledIdentity, RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode,
+    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob,
+    UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
-    JobRecord, MachineBinding, NodeRecord, QuotaEntity, Rejection, RejectionReason, StateMachine,
-    QUOTA_TREE_DEPTH_CAP,
+    JobRecord, MachineBinding, NodeRecord, QuotaEntity, Rejection, RejectionReason, StagedRoot,
+    StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
 
 type ApplyResult = Result<Applied, RejectionReason>;
@@ -68,6 +69,8 @@ impl StateMachine {
             Command::RebindMachineAddress(c) => self.rebind_machine_address(c),
             Command::RetireMachineBinding(c) => self.retire_machine_binding(c),
             Command::RecordKeyTransferIntent(c) => self.record_key_transfer_intent(c),
+            Command::RecordStagedKeyTransferIntent(c) => self.record_staged_key_transfer_intent(c),
+            Command::ConfirmStagedKeyPossession(c) => self.confirm_staged_key_possession(c),
         };
         self.version += 1;
         result
@@ -954,6 +957,75 @@ impl StateMachine {
         // apply-time validation would be too late, the payload would already
         // be in the Raft log. Replacement is re-rooting (ADR 0037 §4 re-root
         // runbook): the new bundle wholly supersedes the old.
+        let serials = c.bundle.serials();
+
+        match &c.staged_root_serial {
+            Some(serial) => {
+                // The named serial must sit at a position other than 0: a
+                // staged root is never the active signing root — that is the
+                // whole ADR 0037 §4 invariant.
+                if !serials.iter().skip(1).any(|s| s == serial) {
+                    return Err(RejectionReason::UnknownStagedRoot {
+                        serial: serial.clone(),
+                    });
+                }
+                // A repeated/replayed stage commit for the SAME pending root
+                // carries forward accumulated acks; a stage commit that
+                // REPLACES the pending root starts with none — the previous
+                // pending root has just left the bundle and its key is
+                // worthless.
+                let (holders, intents) = match &self.staged_root {
+                    Some(existing) if &existing.serial == serial => {
+                        (existing.holders.clone(), existing.intents.clone())
+                    }
+                    _ => (BTreeMap::new(), BTreeMap::new()),
+                };
+                self.staged_root = Some(StagedRoot {
+                    serial: serial.clone(),
+                    staged_at: c.recorded_at,
+                    holders,
+                    intents,
+                });
+            }
+            None => {
+                // If a staged root was recorded and it just landed at
+                // position 0, this is the ACTIVATION commit: the staged
+                // root's key custody now describes the active CA key, so its
+                // acks graduate into the active-key maps. Any other `None`
+                // case (single-root steady state, `complete`, or an
+                // abandoned staging) simply drops whatever was staged.
+                if let Some(staged) = self.staged_root.take() {
+                    if serials.first() == Some(&staged.serial) {
+                        for (raft_node_id, confirmed_at) in staged.holders {
+                            // Re-confirmation overwrites, matching
+                            // `confirm_key_possession`: a later timestamp
+                            // wins.
+                            match self.key_confirmations.get(&raft_node_id) {
+                                Some(existing) if *existing >= confirmed_at => {}
+                                _ => {
+                                    self.key_confirmations.insert(raft_node_id, confirmed_at);
+                                }
+                            }
+                            // A confirmation resolves any outstanding
+                            // transfer intent for that node.
+                            self.key_transfer_intents.remove(&raft_node_id);
+                        }
+                        for (raft_node_id, intended_at) in staged.intents {
+                            // Confirmation dominates: never insert an intent
+                            // for a node that already carries a confirmation.
+                            if self.key_confirmations.contains_key(&raft_node_id) {
+                                continue;
+                            }
+                            // First write wins.
+                            self.key_transfer_intents
+                                .entry(raft_node_id)
+                                .or_insert(intended_at);
+                        }
+                    }
+                }
+            }
+        }
+
         self.ca = Some(CaCertificate {
             bundle: c.bundle.clone(),
             recorded_at: c.recorded_at,
@@ -1084,6 +1156,55 @@ impl StateMachine {
         // repeat proposal (e.g. a retried transfer) is an accepted no-op.
         // Never a rejection.
         self.key_transfer_intents
+            .entry(c.raft_node_id)
+            .or_insert(c.intended_at);
+        Ok(Applied::default())
+    }
+
+    /// Reject scope mismatches shared by the two staged-key commands: no root
+    /// currently staged, or the command names a serial other than the one
+    /// staged (a stale command from a superseded `begin`, ADR 0037 §4).
+    fn staged_root_in_scope<'a>(
+        staged: &'a Option<StagedRoot>,
+        root_serial: &str,
+    ) -> Result<&'a StagedRoot, RejectionReason> {
+        match staged {
+            Some(staged) if staged.serial == root_serial => Ok(staged),
+            Some(staged) => Err(RejectionReason::StagedRootMismatch {
+                expected: Some(staged.serial.clone()),
+                got: root_serial.to_string(),
+            }),
+            None => Err(RejectionReason::StagedRootMismatch {
+                expected: None,
+                got: root_serial.to_string(),
+            }),
+        }
+    }
+
+    fn confirm_staged_key_possession(&mut self, c: &ConfirmStagedKeyPossession) -> ApplyResult {
+        Self::staged_root_in_scope(&self.staged_root, &c.root_serial)?;
+        let staged = self.staged_root.as_mut().expect("checked above");
+        // Re-confirmation overwrites the timestamp (ADR 0037 §4).
+        staged.holders.insert(c.raft_node_id, c.confirmed_at);
+        // A confirmation resolves any outstanding staged transfer intent.
+        staged.intents.remove(&c.raft_node_id);
+        Ok(Applied::default())
+    }
+
+    fn record_staged_key_transfer_intent(
+        &mut self,
+        c: &RecordStagedKeyTransferIntent,
+    ) -> ApplyResult {
+        Self::staged_root_in_scope(&self.staged_root, &c.root_serial)?;
+        let staged = self.staged_root.as_mut().expect("checked above");
+        // Confirmation dominates (ADR 0037 §4): see
+        // `record_key_transfer_intent` for the rationale.
+        if staged.holders.contains_key(&c.raft_node_id) {
+            return Ok(Applied::default());
+        }
+        // First write wins.
+        staged
+            .intents
             .entry(c.raft_node_id)
             .or_insert(c.intended_at);
         Ok(Applied::default())
