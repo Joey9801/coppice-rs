@@ -143,8 +143,8 @@ The trust root is decided
 replicated; the private key never enters replicated state — it normally
 resides on voter disks and may also reside on a promotion candidate past
 the key-transfer gate, and every disk that has ever received it is
-root-equivalent (compromise response: re-rooting; the runbook is a
-required pre-production deliverable). Custody accounting is not left to
+root-equivalent (compromise response: re-rooting — the runbook is
+[re-rooting.md](re-rooting.md)). Custody accounting is not left to
 inference: `admin status`'s `key_holders` lists every node the leader has
 a confirmed receipt from, by design including a candidate abandoned mid-
 promotion (a leader crash in the key-transfer window) and a voter that has
@@ -223,7 +223,9 @@ The operational consequence of renewal-refusal-as-revocation is a
 revoked machine keeps working until its current leaf expires, which is why
 leaf lifetimes are short. If a compromise requires an immediate cutoff,
 revoking the identity is not sufficient on its own — re-rooting is the
-only mechanism that invalidates an issued leaf before its expiry.
+only mechanism that invalidates an issued leaf before its expiry
+([re-rooting.md](re-rooting.md), which also gives the test for which tier
+an incident belongs to).
 
 ## Secrets
 
