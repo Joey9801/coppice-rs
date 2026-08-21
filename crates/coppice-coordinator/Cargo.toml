@@ -78,6 +78,12 @@ aws-sdk-ec2.workspace = true
 aws-sdk-autoscaling.workspace = true
 # Parses the agent's mTLS client-leaf certificate to enforce CN == NodeId at
 # session accept (ADR 0011); see `tasks::agent_gateway`.
+# The convergence loop's public-edge supersession probe (ADR 0037 §3): a
+# `GET /readyz` against the `[enrollment]` endpoint, under the same
+# system-roots posture the enrollment client uses. It is the only plane that
+# still answers across the trust-root discontinuity a re-init creates, which is
+# what makes it the channel that can see a superseded history at all.
+reqwest.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
@@ -97,11 +103,10 @@ coppice-agent.workspace = true
 # `tower::ServiceExt::oneshot` drives the real axum router in-process there and
 # is already a normal dependency above.
 bytes.workspace = true
-# Drives the real client listener over the loopback for the ADR 0037 §9
-# `/readyz` gate and the closed-until-formed API surface (`tests/formation.rs`),
-# where an in-process `oneshot` against the router would not exercise the
-# listener handover a parked daemon performs.
-reqwest.workspace = true
+# (`reqwest` is a normal dependency above; the suites also drive the real client
+# listener over the loopback for the ADR 0037 §9 `/readyz` gate and the
+# closed-until-formed API surface, where an in-process `oneshot` against the
+# router would not exercise the listener handover a parked daemon performs.)
 # In-memory tracing capture for the ADR 0037 §4 assertion that an enrollment
 # token secret never reaches a log line (`tests/enrollment_logging.rs`).
 coppice-testkit.workspace = true

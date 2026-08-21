@@ -253,7 +253,13 @@ Two cluster identifiers appear here, and they are deliberately distinct:
   exactly what lets volumes from the old history fail-stop (ADR 0016's
   cross-check) instead of merging into the new one. Daemons resuming a
   manifest, and peers contacting each other, compare stamped history
-  ids. (Earlier ADRs and the storage manifest call this value the
+  ids. A resumed *voter* additionally asks, once it has lost contact with
+  the peers it remembers, whether a formed cluster still answers to its
+  `cluster_id` on another history, and fail-stops on a positive answer
+  — with one stated bound: a sole voter remembers no peers and never
+  registers that loss, so a one-voter cluster's old volume is isolated
+  by the per-RPC check but not stopped (implementation note, chunk 07;
+  see `docs/operations/cluster-lifecycle.md`). (Earlier ADRs and the storage manifest call this value the
   *cluster UUID*; this ADR renames the design surface deliberately —
   `cluster_id` next to `cluster_uuid` was a confusion waiting to
   happen, and the new name says what the value distinguishes.)

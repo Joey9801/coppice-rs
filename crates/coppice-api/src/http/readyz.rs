@@ -46,6 +46,15 @@ pub enum ReadyzPhase {
     /// A fail-stop with no resume path: wipe the data directory, restart,
     /// re-run `init` (ADR 0037 §3).
     FormationFailed,
+    /// This replica's stamped raft history has been **superseded**: a cluster
+    /// wearing the same `cluster_id` is serving a *different* `history_id`,
+    /// which only a deliberate re-init can produce (ADR 0037 §3 — the history
+    /// is minted once per formation). The state on this volume predates that
+    /// re-init and can never merge into it, so the daemon fail-stops rather
+    /// than serving it. There is no resume path: restore the fleet from a
+    /// backup of the old history, or wipe this data directory so the daemon
+    /// enrolls into the new one.
+    HistorySuperseded,
     /// Admitted and catching up; reported once the convergence loop lands.
     Joining,
     /// A member of the cluster, but not a voter.
@@ -392,6 +401,7 @@ mod tests {
         for phase in [
             ReadyzPhase::Waiting,
             ReadyzPhase::FormationFailed,
+            ReadyzPhase::HistorySuperseded,
             ReadyzPhase::Joining,
             ReadyzPhase::Learner,
         ] {
@@ -429,6 +439,11 @@ mod tests {
         let failed = ReadyzReport::unformed("p".into(), ReadyzPhase::FormationFailed, 1, None);
         let json = serde_json::to_value(&failed).expect("serialize");
         assert_eq!(json["phase"], "formation-failed");
+
+        let superseded =
+            ReadyzReport::unformed("p".into(), ReadyzPhase::HistorySuperseded, 1, None);
+        let json = serde_json::to_value(&superseded).expect("serialize");
+        assert_eq!(json["phase"], "history-superseded");
     }
 
     async fn body_json(response: Response) -> serde_json::Value {
