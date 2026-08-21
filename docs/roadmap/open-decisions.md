@@ -36,7 +36,7 @@ re-deriving it from the whole design.
 | [OD-12](#od-12-abort-semantics-partial-scheduling-and-job-groups) | Abort semantics, partial scheduling & job groups | High | Resolved — [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md), [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) |
 | [OD-13](#od-13-base-score-and-the-exact-job-costing-formula) | Base score and the exact job-costing formula | High | Resolved — [ADR 0021](../decisions/0021-effective-score-ranking.md) |
 | [OD-14](#od-14-coordinator-discovery-and-control-plane-pki) | Coordinator discovery & control-plane PKI | Medium | Resolved — [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md) |
-| [OD-15](#od-15-agent-enrollment-signer-and-decommission-protocol) | Agent enrollment signer & decommission protocol | High — gates zero-touch autoscaling | Open — plan in [deployment-story.md](deployment-story.md) |
+| [OD-15](#od-15-agent-enrollment-signer-and-decommission-protocol) | Agent enrollment signer & decommission protocol | High — gates zero-touch autoscaling | Half resolved — OD-15(a) via [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md); (b) drain/decommission open, plan in [deployment-story.md](deployment-story.md) |
 | [OD-16](#od-16-user-authentication-and-principal-model) | User authentication & principal model | High | Resolved — [ADR 0022](../decisions/0022-oidc-identity-and-authentication.md) |
 | [OD-17](#od-17-authorization-model-and-enforcement) | Authorization model & enforcement | High | Resolved — [ADR 0023](../decisions/0023-scoped-role-bindings.md) |
 
@@ -401,6 +401,12 @@ identity); replacing a live voter is the explicit operator verb
 replication evidence inside the newcomer's promotion. In-process cert
 reload (mtime watch + SIGHUP) lands as planned.
 
+Implementation has landed (issue #47, PRs #70–#76): the substrate, PKI
+core, formation, enrollment, convergence loop, and custody/replacement
+chunks are all in the tree. What remains is chunk 07 — completing the
+test matrix and writing the re-root runbook — tracked alongside OD-15(b)
+in [deployment-story.md](deployment-story.md).
+
 **Question.** (a) Which discovery backends feed the coordinator seed list —
 static config (today), DNS, Consul — and is any of them load-bearing beyond
 first-dial? (b) Where do coordinator↔coordinator certificates come from in a
@@ -440,7 +446,9 @@ every recipient root-equivalent; the leader signs). Agents share the coordinator
 enrollment endpoint (system-root-verified TLS), role-scoped revocable
 tokens, and renewal-as-revocation-lever over their mTLS sessions;
 Vault-style external issuance remains a substitution behind the same
-`[tls]` paths. **Half (b) — drain and
+`[tls]` paths. Enrollment has landed in the tree (PR #73, part of issue
+#47's chunk series), with the remaining OD-14/15(a) work limited to the
+chunk 07 test matrix and re-root runbook. **Half (b) — drain and
 decommission — remains open.**
 
 **Question.** (a) Who signs agent leaves in the ADR 0011 enrollment flow —

@@ -46,7 +46,48 @@ directory:
 The systemd unit should set `Restart=always` (the join loop is idempotent
 and resumes from any interruption) and `RequiresMountsFor=` the data
 volume (an unmounted volume must fail unit ordering, not present an empty
-directory).
+directory). A worked unit, including the `RuntimeDirectory` convention for
+the admin socket directory
+(see [configuration.md](configuration.md)):
+
+```ini
+[Unit]
+Description=Coppice coordinator
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/coppice
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/coppice coordinator --config /etc/coppice/coordinator.toml
+RuntimeDirectory=coppice
+RuntimeDirectoryMode=0700
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`Type=notify` matches the daemon's own readiness signal: it sends
+`READY=1` once its listeners (client, raft, agent, and the readyz
+surface) are actually serving, not merely after process start — so
+`systemctl start`/dependency ordering waits for something meaningful.
+
+### Readiness gate for rolling replacement
+
+The same `GET /readyz?require=healthy` used above is the hook a rolling
+replacement or ASG instance refresh polls before moving to the next
+instance. A launch lifecycle hook (or any pre-terminate hook) shaped like:
+
+```sh
+until curl -fsS "https://${NODE_ADDR}:7070/readyz?require=healthy" >/dev/null; do
+  sleep 5
+done
+# 200 here means the cluster is formed and redundant; safe to continue the rollout
+```
+
+is sufficient — no coordinator-side integration beyond the endpoint
+itself is required.
 
 ## Identities and certificates, once
 
