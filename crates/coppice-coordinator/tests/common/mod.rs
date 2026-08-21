@@ -924,6 +924,16 @@ refusal_backoff = "1s"
 park_interval_min = "50ms"
 park_interval_max = "250ms"
 promote_poll_interval = "50ms"
+# Leaf renewal (ADR 0037 §4) — only `Daemon` runs the renewal task, since only
+# it goes through `bootstrap::run_with`. Production re-evaluates its conditions
+# every 15s, which is the floor on how long a re-rooted fleet takes to notice
+# and carry itself onto the new root, and a failed attempt (routine while a
+# fleet is still electing) then waits out a 30s-and-doubling backoff. Nothing
+# here tests that tempo — the suites test that renewal happens at all — so pace
+# it to this fleet's own timescale.
+renewal_reevaluate_interval = "200ms"
+renewal_retry_min = "300ms"
+renewal_retry_max = "2s"
 
 # Minimal argon2 cost: these fleets mint throwaway tokens, and the production
 # default costs ~300ms of KDF per hash in a debug build.

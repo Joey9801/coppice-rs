@@ -146,11 +146,11 @@ snapshot_keep_log_entries = 1_000
 health_stability_interval = "10s"
 
 [pacing]
-# Convergence-loop pacing (ADR 0037 §6) — how often the self-join loop ticks.
-# Liveness only, like [raft]: shorter costs dials, longer costs convergence
-# latency, and neither changes what the cluster agrees on. The defaults are
-# right for ordinary deployments; shorten them for tests and dev, where a
-# fleet forming in milliseconds is the point.
+# Background-loop pacing: the convergence loop (ADR 0037 §6) and the leaf
+# renewal loop (ADR 0037 §4). Liveness only, like [raft]: shorter costs dials,
+# longer costs convergence and re-root latency, and neither changes what the
+# cluster agrees on. The defaults are right for ordinary deployments; shorten
+# them for tests and dev, where a fleet forming in milliseconds is the point.
 probe_interval  = "300ms"   # re-probe cadence while actively converging
 settled_interval = "3s"     # idle poll once a voter, or once parked on a
                             # full voter set
@@ -160,6 +160,26 @@ park_interval_max = "15s"   # round up to this ceiling, which is also where a
                             # still-failing parked daemon escalates to warn
 promote_poll_interval = "500ms"  # admin-side promote retry while a learner
                                  # is still catching up
+# Leaf renewal (ADR 0037 §4). The renewal task's fast paths — a leaf that no
+# longer covers this daemon's configured serving names, an on-disk trust anchor
+# that is not the bundle the cluster replicates, a staged CA key the cluster has
+# since activated — are CONDITIONS, not events: nothing wakes the task when the
+# replicated CA changes under it. So the re-evaluate interval is how long after
+# a re-root ACTIVATES that a replica notices, and therefore how long an operator
+# waits before the dual-trust window can be closed. (Activation, not
+# `rotate-ca begin`: a rotation stages first and only activates once every voter
+# holds the incoming key, so a `begin` that parks on a missing voter moves no
+# leaf at all.) It is also how long a daemon takes to promote its own staged key
+# after an activation it did not run — the self-heal for a leader lost between
+# the activation commit and its local key swap. Re-evaluating costs one view
+# read and one certificate parse.
+renewal_reevaluate_interval = "15s"
+renewal_retry_min = "30s"   # wait after the first failed renewal; doubles each
+renewal_retry_max = "15m"   # failure up to this ceiling. A revoked identity
+                            # (§5) retries until its leaf expires and must not
+                            # spin; the ceiling must still sit well inside a
+                            # leaf lifetime so a fleet that regains a leader
+                            # renews with no operator action.
 
 [token_kdf]
 # Argon2id cost for hashing enrollment-token secrets (ADR 0037 §5). Hashing

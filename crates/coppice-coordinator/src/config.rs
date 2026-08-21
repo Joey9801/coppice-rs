@@ -689,12 +689,13 @@ impl Default for RaftConfig {
     }
 }
 
-/// Convergence-loop pacing (ADR 0037 §6).
+/// Background-loop pacing: the convergence loop (ADR 0037 §6) and the leaf
+/// renewal loop (ADR 0037 §4).
 ///
 /// Every value here is a *sleep between rounds*, never a timeout or a
-/// deadline: the loop is tick-driven, nothing wakes it early, so these are
-/// exactly the knobs that decide how long a join, a catch-up, or a promotion
-/// takes to be noticed. Like `[raft]` they affect only liveness — a shorter
+/// deadline: the loops are tick-driven, nothing wakes them early, so these are
+/// exactly the knobs that decide how long a join, a catch-up, a promotion, or
+/// a re-root takes to be noticed. Like `[raft]` they affect only liveness — a shorter
 /// interval costs dials, a longer one costs latency, and neither can change
 /// what the cluster agrees on — so they are node-local and safe to vary per
 /// replica (ADR 0020). The defaults suit ordinary deployments; the
@@ -744,6 +745,36 @@ pub(crate) struct PacingConfig {
     /// not configuration.
     #[serde(default = "default_promote_poll_interval", with = "humantime_serde")]
     pub(crate) promote_poll_interval: Duration,
+
+    /// The longest the leaf-renewal loop sleeps in one go before re-examining
+    /// its conditions (ADR 0037 §4). Its two immediate-renewal fast paths —
+    /// a leaf that no longer covers the configured serving names, an on-disk
+    /// trust anchor that is not the bundle the cluster replicates — are
+    /// *conditions*, not events: nothing wakes that task when the replicated
+    /// CA changes under it. So this is the latency between `rotate-ca begin`
+    /// and a replica noticing it, and thus the width of the dual-trust window
+    /// an operator has to sit through. Re-examining costs one view read and
+    /// one certificate parse, which is why it can be tight.
+    #[serde(
+        default = "default_renewal_reevaluate_interval",
+        with = "humantime_serde"
+    )]
+    pub(crate) renewal_reevaluate_interval: Duration,
+
+    /// How long the renewal loop waits after its *first* failed attempt; the
+    /// backoff doubles from here. A renewal fails for reasons that do not
+    /// resolve in milliseconds — no leader yet, a revoked identity (ADR 0037
+    /// §5) — so retrying hard buys nothing against a leaf with weeks of life
+    /// left.
+    #[serde(default = "default_renewal_retry_min", with = "humantime_serde")]
+    pub(crate) renewal_retry_min: Duration,
+
+    /// The ceiling that doubling backoff clamps to. A replica whose identity
+    /// was revoked retries until its leaf expires and must not spin doing it;
+    /// the ceiling still has to be well inside a leaf lifetime so a fleet
+    /// that recovers a leader renews without operator action.
+    #[serde(default = "default_renewal_retry_max", with = "humantime_serde")]
+    pub(crate) renewal_retry_max: Duration,
 }
 
 /// `[token_kdf]`: argon2id cost for hashing enrollment-token secrets
@@ -806,12 +837,25 @@ impl Default for TokenKdfConfig {
 }
 
 impl PacingConfig {
+    /// The renewal knobs as the leaf-renewal task takes them
+    /// ([`crate::tasks::renewal::RenewalPacing`]), mirroring
+    /// [`TokenKdfConfig::kdf`]: the task names its own inputs, and
+    /// `PacingConfig` stays crate-private behind that public seam.
+    pub(crate) fn renewal(&self) -> crate::tasks::renewal::RenewalPacing {
+        crate::tasks::renewal::RenewalPacing {
+            reevaluate_interval: self.renewal_reevaluate_interval,
+            retry_min: self.renewal_retry_min,
+            retry_max: self.renewal_retry_max,
+        }
+    }
+
     /// Every `[pacing]` value is a sleep between rounds of some retry loop —
     /// zero turns that loop into a busy spin (the convergence tick, the
-    /// pre-start park loop, the promote poll), so zero is a config error,
-    /// not a speed setting. The park ramp's floor must not exceed its
-    /// ceiling: the backoff doubles from `min` and clamps to `max`, and an
-    /// inverted pair would "clamp" every wait up to the ceiling immediately.
+    /// pre-start park loop, the promote poll, the renewal re-evaluate slice),
+    /// so zero is a config error, not a speed setting. Both ramps' floors
+    /// must not exceed their ceilings: the backoff doubles from `min` and
+    /// clamps to `max`, and an inverted pair would "clamp" every wait up to
+    /// the ceiling immediately.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         for (name, value) in [
             ("probe_interval", self.probe_interval),
@@ -820,6 +864,12 @@ impl PacingConfig {
             ("park_interval_min", self.park_interval_min),
             ("park_interval_max", self.park_interval_max),
             ("promote_poll_interval", self.promote_poll_interval),
+            (
+                "renewal_reevaluate_interval",
+                self.renewal_reevaluate_interval,
+            ),
+            ("renewal_retry_min", self.renewal_retry_min),
+            ("renewal_retry_max", self.renewal_retry_max),
         ] {
             if value.is_zero() {
                 anyhow::bail!(
@@ -836,6 +886,14 @@ impl PacingConfig {
                 humantime_serde::re::humantime::format_duration(self.park_interval_max),
             );
         }
+        if self.renewal_retry_min > self.renewal_retry_max {
+            anyhow::bail!(
+                "[pacing] renewal_retry_min ({}) exceeds renewal_retry_max ({}) — \
+                 the renewal backoff doubles from the min and clamps to the max",
+                humantime_serde::re::humantime::format_duration(self.renewal_retry_min),
+                humantime_serde::re::humantime::format_duration(self.renewal_retry_max),
+            );
+        }
         Ok(())
     }
 }
@@ -849,6 +907,9 @@ impl Default for PacingConfig {
             park_interval_min: default_park_interval_min(),
             park_interval_max: default_park_interval_max(),
             promote_poll_interval: default_promote_poll_interval(),
+            renewal_reevaluate_interval: default_renewal_reevaluate_interval(),
+            renewal_retry_min: default_renewal_retry_min(),
+            renewal_retry_max: default_renewal_retry_max(),
         }
     }
 }
@@ -978,6 +1039,18 @@ fn default_park_interval_max() -> Duration {
 
 fn default_promote_poll_interval() -> Duration {
     Duration::from_millis(500)
+}
+
+fn default_renewal_reevaluate_interval() -> Duration {
+    Duration::from_secs(15)
+}
+
+fn default_renewal_retry_min() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_renewal_retry_max() -> Duration {
+    Duration::from_secs(15 * 60)
 }
 
 // The `argon2` crate's `Params::default()` values, restated as literals so a
@@ -1437,12 +1510,23 @@ addrs = []
             config.pacing.promote_poll_interval,
             Duration::from_millis(500)
         );
+        assert_eq!(
+            config.pacing.renewal_reevaluate_interval,
+            Duration::from_secs(15)
+        );
+        assert_eq!(config.pacing.renewal_retry_min, Duration::from_secs(30));
+        assert_eq!(
+            config.pacing.renewal_retry_max,
+            Duration::from_secs(15 * 60)
+        );
 
         let contents = format!(
             "{MINIMAL_EXAMPLE}\n[pacing]\nprobe_interval = \"50ms\"\n\
              settled_interval = \"250ms\"\nrefusal_backoff = \"1s\"\n\
              park_interval_min = \"50ms\"\npark_interval_max = \"250ms\"\n\
-             promote_poll_interval = \"50ms\"\n"
+             promote_poll_interval = \"50ms\"\n\
+             renewal_reevaluate_interval = \"200ms\"\n\
+             renewal_retry_min = \"300ms\"\nrenewal_retry_max = \"2s\"\n"
         );
         let (_guard, path) = write_config(&contents);
         let config = read_config(&path).expect("an explicit [pacing] section parses");
@@ -1455,6 +1539,12 @@ addrs = []
             config.pacing.promote_poll_interval,
             Duration::from_millis(50)
         );
+        assert_eq!(
+            config.pacing.renewal_reevaluate_interval,
+            Duration::from_millis(200)
+        );
+        assert_eq!(config.pacing.renewal_retry_min, Duration::from_millis(300));
+        assert_eq!(config.pacing.renewal_retry_max, Duration::from_secs(2));
 
         // A partial section keeps the defaults for everything it omits.
         let contents = format!("{MINIMAL_EXAMPLE}\n[pacing]\nsettled_interval = \"1s\"\n");
@@ -1627,13 +1717,21 @@ addrs = []
 
     /// Every `[pacing]` value is a between-rounds sleep, so zero means a
     /// busy-spinning background loop — a startup error, not a speed setting.
-    /// An inverted park ramp (min > max) is equally malformed.
+    /// An inverted ramp (min > max) is equally malformed — for the park
+    /// backoff and for the renewal backoff alike.
     #[test]
     fn load_rejects_zero_and_inverted_pacing() {
-        let contents = format!("{MINIMAL_EXAMPLE}\n[pacing]\nprobe_interval = \"0s\"\n");
-        let (_guard, path) = write_config(&contents);
-        let err = load(&path).expect_err("a zero pacing interval must fail at load");
-        assert!(format!("{err:#}").contains("probe_interval"), "{err:#}");
+        for zeroed in [
+            "probe_interval",
+            "renewal_reevaluate_interval",
+            "renewal_retry_min",
+            "renewal_retry_max",
+        ] {
+            let contents = format!("{MINIMAL_EXAMPLE}\n[pacing]\n{zeroed} = \"0s\"\n");
+            let (_guard, path) = write_config(&contents);
+            let err = load(&path).expect_err("a zero pacing interval must fail at load");
+            assert!(format!("{err:#}").contains(zeroed), "{err:#}");
+        }
 
         let contents = format!(
             "{MINIMAL_EXAMPLE}\n[pacing]\npark_interval_min = \"5s\"\n\
@@ -1642,6 +1740,14 @@ addrs = []
         let (_guard, path) = write_config(&contents);
         let err = load(&path).expect_err("an inverted park ramp must fail at load");
         assert!(format!("{err:#}").contains("park_interval_min"), "{err:#}");
+
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[pacing]\nrenewal_retry_min = \"5m\"\n\
+             renewal_retry_max = \"1m\"\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let err = load(&path).expect_err("an inverted renewal ramp must fail at load");
+        assert!(format!("{err:#}").contains("renewal_retry_min"), "{err:#}");
     }
 
     /// A `[token_kdf]` argon2 rejects must fail at load: the first mint can

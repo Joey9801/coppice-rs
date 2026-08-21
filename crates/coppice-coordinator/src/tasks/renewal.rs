@@ -64,9 +64,37 @@ const RENEW_AT: f64 = 2.0 / 3.0;
 /// enrolled together would otherwise renew together.
 const JITTER: f64 = 0.1;
 
-/// Backoff bounds for a failed renewal.
-const RETRY_MIN: Duration = Duration::from_secs(30);
-const RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+/// The pacing this loop runs at: the `[pacing]` renewal knobs of node config
+/// ([`crate::config::PacingConfig`]), whose defaults are the values these were
+/// before they were configurable. Like `[raft]` and the convergence pacing,
+/// they affect only liveness — how *promptly* a re-root or an address move is
+/// noticed and how hard a refused renewal retries — never what gets signed or
+/// by whom. Shrinking them is how the integration fleets exercise a rotation
+/// in seconds instead of sitting out a production re-evaluate window.
+///
+/// A struct rather than three arguments so a caller cannot silently transpose
+/// the two backoff bounds, and so this stays nameable from `runtime.rs` while
+/// `PacingConfig` itself remains crate-private.
+#[derive(Debug, Clone, Copy)]
+pub struct RenewalPacing {
+    /// The longest this task sleeps in one go before re-examining its
+    /// conditions — see the loop below for why that bound has to exist.
+    pub reevaluate_interval: Duration,
+    /// The wait after the first failed renewal; the backoff doubles from here.
+    pub retry_min: Duration,
+    /// The ceiling that doubling backoff clamps to.
+    pub retry_max: Duration,
+}
+
+impl Default for RenewalPacing {
+    fn default() -> Self {
+        RenewalPacing {
+            reevaluate_interval: Duration::from_secs(15),
+            retry_min: Duration::from_secs(30),
+            retry_max: Duration::from_secs(15 * 60),
+        }
+    }
+}
 
 /// Below this much remaining lifetime a renewal failure is an `error`, not a
 /// `warning`: the leaf is close enough to expiry that an operator must act.
@@ -84,12 +112,18 @@ const UNKNOWN_EXPIRY_POLL: Duration = Duration::from_secs(60 * 60);
 /// re-issued leaf declares. `None` (embedders with no config in hand) falls
 /// back to copying the current leaf's SANs, which also disables the
 /// SAN-mismatch fast path below.
+///
+/// `pacing` is the `[pacing]` renewal configuration ([`RenewalPacing`]); the
+/// renewal *point* (`RENEW_AT` of the leaf's lifetime), the alarm threshold,
+/// and the unknown-expiry poll are not configurable — they are properties of
+/// the design, not of a deployment's tempo.
 pub async fn run<C: Consensus>(
     store: Arc<TlsStore>,
     data_dir: PathBuf,
     consensus: Arc<C>,
     node: NodeHandle,
     serving_sans: Option<Vec<String>>,
+    pacing: RenewalPacing,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let paths = store.paths().clone();
@@ -124,9 +158,39 @@ pub async fn run<C: Consensus>(
             }
         };
 
-        tokio::select! {
-            _ = shutdown.wait_for(|s| *s) => break,
-            _ = tokio::time::sleep(delay) => {}
+        // Sleep in bounded slices rather than one 20-day `sleep`. The two
+        // fast paths above are *conditions*, not events — nothing wakes this
+        // task when the replicated CA changes under it (`StateViews` has no
+        // change subscription) — so a single long sleep would mean a re-root
+        // recorded a minute after this task last looked went unnoticed until
+        // the leaf was two thirds spent, a month during which the operator
+        // cannot close the dual-trust window. Re-evaluating costs one view
+        // read and one certificate parse, which is why the slice
+        // (`[pacing] renewal_reevaluate_interval`) can be tight.
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let slice = remaining.min(pacing.reevaluate_interval);
+            tokio::select! {
+                // Resolving means the flag flipped; the check below turns
+                // that into the break, so both loop levels exit together.
+                _ = shutdown.wait_for(|s| *s) => {}
+                _ = tokio::time::sleep(slice) => {}
+            }
+            if *shutdown.borrow() {
+                break;
+            }
+            // Re-check the condition the sleep was computed under: if this
+            // daemon's serving names moved while we were waiting, stop waiting.
+            if backoff.is_none() && sans_stale(&store, serving_sans.as_deref()) {
+                break;
+            }
+        }
+        if *shutdown.borrow() {
+            break;
         }
 
         if not_after.is_none() {
@@ -169,7 +233,7 @@ pub async fn run<C: Consensus>(
                         "renewal: could not re-issue this coordinator's leaf; retrying"
                     );
                 }
-                backoff = Some(next_backoff(backoff));
+                backoff = Some(next_backoff(backoff, pacing));
             }
         }
     }
@@ -357,10 +421,10 @@ fn jitter_fraction(paths: &TlsPaths) -> f64 {
     unit * JITTER
 }
 
-fn next_backoff(previous: Option<Duration>) -> Duration {
+fn next_backoff(previous: Option<Duration>, pacing: RenewalPacing) -> Duration {
     match previous {
-        None => RETRY_MIN,
-        Some(previous) => (previous * 2).min(RETRY_MAX),
+        None => pacing.retry_min,
+        Some(previous) => (previous * 2).min(pacing.retry_max),
     }
 }
 
@@ -446,11 +510,12 @@ mod tests {
 
     #[test]
     fn backoff_doubles_up_to_the_cap() {
-        let mut delay = next_backoff(None);
-        assert_eq!(delay, RETRY_MIN);
+        let pacing = RenewalPacing::default();
+        let mut delay = next_backoff(None, pacing);
+        assert_eq!(delay, pacing.retry_min);
         for _ in 0..10 {
-            delay = next_backoff(Some(delay));
+            delay = next_backoff(Some(delay), pacing);
         }
-        assert_eq!(delay, RETRY_MAX);
+        assert_eq!(delay, pacing.retry_max);
     }
 }

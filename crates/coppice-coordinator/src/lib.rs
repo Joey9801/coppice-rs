@@ -74,6 +74,10 @@ mod tasks;
 // exposed so integration tests can drive it without waiting out the timer.
 #[doc(hidden)]
 pub use tasks::renewal::renew_once as coordinator_renew_once;
+// Named in `bootstrap::serve_runtime_with_serving_sans`'s signature, so it has
+// to be reachable by embedders driving that seam; `[pacing]` itself stays
+// crate-private (`config::PacingConfig::renewal` builds this).
+pub use tasks::renewal::RenewalPacing;
 
 #[cfg(test)]
 mod test_support;

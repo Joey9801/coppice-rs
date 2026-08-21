@@ -53,6 +53,7 @@ use crate::discovery::FileRegistration;
 use crate::formation::{self, Formation, PhaseState, StartupState};
 use crate::localadmin::{AdminSocket, FormationCall, FormationDone, LocalAdmin};
 use crate::tasks::node_client::NodeClient;
+use crate::tasks::renewal::RenewalPacing;
 use crate::{config, limits};
 
 /// A fully-assembled, running coordinator replica.
@@ -412,6 +413,10 @@ pub async fn run_with(
         // daemon's advertised host by editing the config and restarting
         // (ADR 0037 §6 set-address choreography — see `tasks::renewal`).
         Some(crate::formation::leaf_sans(&resolved.config)),
+        // The `[pacing]` renewal knobs, alongside the convergence pacing the
+        // loop above got: same section, same node-local liveness-only
+        // character (ADR 0020).
+        resolved.config.pacing.renewal(),
         Some(shutdown_rx),
     )
     .await?;
@@ -496,6 +501,8 @@ pub async fn serve_runtime(
         metrics,
         readyz,
         None,
+        // No config in hand on this seam, so production renewal pacing.
+        RenewalPacing::default(),
         shutdown,
     )
     .await
@@ -507,6 +514,10 @@ pub async fn serve_runtime(
 /// what lets an address move renew its way to a verifiable leaf). The daemon
 /// path (`run_with`) always passes `Some`; [`serve_runtime`] is the
 /// config-less embedder seam and falls back to copying.
+///
+/// `renewal_pacing` is that same task's `[pacing]` configuration, for the same
+/// reason: the daemon path passes what the config says, the config-less seam
+/// passes the production defaults.
 #[allow(clippy::too_many_arguments)] // thin wiring seam over `runtime::run`
 pub async fn serve_runtime_with_serving_sans(
     consensus: Arc<OpenraftConsensus>,
@@ -521,6 +532,7 @@ pub async fn serve_runtime_with_serving_sans(
     metrics: coppice_api::http::MetricsEndpoint,
     readyz: ReadyzEndpoint,
     serving_sans: Option<Vec<String>>,
+    renewal_pacing: RenewalPacing,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -536,6 +548,7 @@ pub async fn serve_runtime_with_serving_sans(
         metrics,
         readyz,
         serving_sans,
+        renewal_pacing,
         shutdown,
     )
     .await

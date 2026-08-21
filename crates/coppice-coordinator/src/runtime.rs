@@ -118,6 +118,9 @@ pub async fn run<C>(
     // renewal re-issues leaves against these rather than copying the old
     // leaf's SANs (ADR 0037 §4/§6). `None` falls back to copying.
     serving_sans: Option<Vec<String>>,
+    // How often that task re-examines its conditions, and how hard a failed
+    // renewal retries: the `[pacing]` renewal knobs (ADR 0037 §4).
+    renewal_pacing: renewal::RenewalPacing,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -240,6 +243,7 @@ where
         Arc::clone(&consensus),
         node_handle,
         serving_sans,
+        renewal_pacing,
         shutdown_rx.clone(),
     ));
 
