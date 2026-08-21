@@ -24,7 +24,7 @@ use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::id::ClusterId;
 use coppice_core::time::Timestamp;
 
-use common::{Ca, Daemon};
+use common::{Ca, Daemon, Fleet};
 
 /// A bootstrap policy that seeds one quota entity — the cheapest thing whose
 /// arrival in replicated state is observable through the client API, so
@@ -104,6 +104,120 @@ async fn a_fresh_daemon_parks_and_serves_only_readyz_and_the_admin_socket() {
     assert_eq!(probe.cluster_id, daemon.cluster_id.to_string());
 
     daemon.stop().await.expect("parked daemon stops cleanly");
+}
+
+/// The `waiting` half of the ADR 0037 §3 closure claim, asserted on the verbs
+/// rather than inferred from the probe answer.
+///
+/// The test above establishes that a parked daemon is *discoverable* and does
+/// not report `initialized`. This one establishes the stronger property the
+/// ADR states — "enrollment and membership refused, until the marker exists" —
+/// for the **never-attempted** `waiting` daemon specifically. That distinction
+/// matters because the verb-refusal assertions have so far lived only in
+/// `assert_failed_and_closed`, i.e. in `formation-failed`: a daemon that tried
+/// to form and crashed. A daemon that never tried is a different state with the
+/// same requirement, and nothing was checking it.
+///
+/// The refusal is then shown to be the *marker's* doing and not a permanently
+/// dead surface, by forming this very daemon and re-issuing both calls: the
+/// membership verb stops answering "has not formed a cluster", and `/enroll`
+/// stops 404ing. A closure that never opened would pass the first half of this
+/// test and mean nothing.
+#[tokio::test]
+async fn a_never_attempted_waiting_daemon_refuses_enrollment_and_membership_until_the_marker() {
+    let ca = Ca::new();
+    let mut daemon = Daemon::new(ClusterId::new(), &ca);
+    daemon.start();
+    daemon.await_phase("waiting").await;
+
+    // Nothing was ever attempted here: no formation intent, no failure. This
+    // is `waiting`, not `formation-failed`, and the manifest says so.
+    assert!(
+        storage::read_formation_marks(&RealFs::new(daemon.data_dir()))
+            .expect("read formation marks")
+            .is_none(),
+        "a never-attempted daemon has no manifest at all"
+    );
+
+    // (1) Membership: refused outright, so a peer cannot join this daemon even
+    // by being told to.
+    let leaf = ca.operator_leaf();
+    let err = daemon
+        .try_add_learner(&ca.pem, &leaf.cert_pem, &leaf.key_pem)
+        .await
+        .expect_err("membership verbs must be refused before the marker exists");
+    assert!(
+        err.to_string().contains("has not formed a cluster"),
+        "{err:#}"
+    );
+
+    // (2) Enrollment: the whole `/api/v1` tree is unmounted before formation,
+    // so `/enroll` is not merely unauthenticated — it does not exist. Asserted
+    // with a *well-formed* enrollment request (the shape `coppice-enroll`
+    // sends), so a 404 cannot be confused with a rejected body.
+    let client = reqwest::Client::new();
+    let enroll = daemon.api("/api/v1/enroll");
+    let response = client
+        .post(&enroll)
+        .json(&serde_json::json!({
+            "token": "cpk_whatever",
+            "role": "coordinator",
+            "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----\n",
+        }))
+        .send()
+        .await
+        .expect("the client listener is up even while parked");
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "enrollment must not be served before the formation_complete marker exists"
+    );
+
+    // And the surface a parked daemon *does* serve is unaffected: readiness
+    // still answers, which is how an operator sees the state at all (§9).
+    assert_eq!(daemon.readyz().await.1["phase"], "waiting");
+
+    // ---- the marker arrives -------------------------------------------------
+    let reply = daemon.admin(plain_init()).await;
+    let AdminReply::Formed { operator, .. } = reply else {
+        panic!("expected the cluster to form, got {reply:?}");
+    };
+    daemon.await_phase("voter").await;
+    assert!(marks(&daemon).complete_at_us.is_some());
+
+    // The membership verb is served now. It still fails — node 42 at
+    // `localhost:1` is not a daemon anyone can dial back — but it fails as a
+    // *membership* refusal, never again as "this coordinator has not formed a
+    // cluster", which is the only distinction this assertion is about.
+    let (op_ca, op_cert, op_key) = operator_identity(&operator);
+    let err = daemon
+        .try_add_learner(&op_ca, &op_cert, &op_key)
+        .await
+        .expect_err("node 42 at localhost:1 cannot be admitted");
+    assert!(
+        !err.to_string().contains("has not formed a cluster"),
+        "post-formation the verb must be served, not refused as unformed: {err:#}"
+    );
+
+    // And `/enroll` is mounted: the same request now reaches the endpoint's own
+    // guards (an unknown token) instead of falling through to the UI fallback.
+    let response = client
+        .post(&enroll)
+        .json(&serde_json::json!({
+            "token": "cpk_whatever",
+            "role": "coordinator",
+            "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----\n",
+        }))
+        .send()
+        .await
+        .expect("the client listener is up");
+    assert_ne!(
+        response.status().as_u16(),
+        404,
+        "formation must open the enrollment route, or the refusal above proved nothing"
+    );
+
+    daemon.stop().await.expect("formed daemon stops cleanly");
 }
 
 #[tokio::test]
@@ -932,67 +1046,59 @@ fn plain_init() -> AdminCall {
 // Readiness under partition (ADR 0037 §9)
 // ---------------------------------------------------------------------------
 
-/// Build a two-voter cluster from `Node`s and return it with the leader first.
+/// Build a two-voter cluster the ADR 0037 §1 way — two shape-identical
+/// certless daemons, one `init`, and the second member enrolling, joining and
+/// promoting itself — and return it with the index of the member currently
+/// reporting leadership and the index of the other.
 ///
-/// Membership is driven directly against the leader's consensus seam rather
-/// than through the convergence loop: what these tests are about is what
-/// `/readyz` says once a two-voter cluster exists, so the cheapest way to have
-/// one is the right one. Convergence's own path is covered in `convergence.rs`.
-async fn two_voter_cluster(ca: &common::Ca) -> (common::Node, common::Node) {
-    use coppice_consensus::Consensus;
+/// Which member leads is *observed*, never assumed: `Fleet::init` forms on
+/// member 0, but leadership can move the moment the second voter arrives, and
+/// these tests kill a specific role.
+async fn two_voter_fleet(ca: &Ca) -> (Fleet, usize, usize) {
+    let mut fleet = Fleet::new(2, ca);
+    fleet.start_all();
+    fleet.init().await;
+    fleet.await_voters(2).await;
 
-    let cluster_id = ClusterId::new();
-    let mut leader = common::Node::new(1, cluster_id, ca);
-    leader.boot().await;
-    common::poll(Duration::from_secs(10), "node 1 becomes leader", || async {
-        leader.is_leader()
-    })
-    .await;
-
-    let mut follower = common::Node::new(2, cluster_id, ca);
-    follower.boot_joining().await;
-
-    leader
-        .consensus()
-        .add_learner(follower.raft_id(), follower.advertise.clone())
-        .await
-        .expect("add learner");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        match leader
-            .consensus()
-            // Straight at the seam, bypassing the admin service: these
-            // fleets are formed, so the founding voter already holds a
-            // confirmed CA key and the §4 custody postcondition is satisfied
-            // without a transfer.
-            .commit_promotion(follower.raft_id(), None)
-            .await
-        {
-            Ok(()) => break,
-            Err(e) if e.is_retryable() && std::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+    let leader = loop {
+        let mut found = None;
+        for (i, member) in fleet.members.iter().enumerate() {
+            if member.readyz().await.1["is_leader"] == true {
+                found = Some(i);
+                break;
             }
-            Err(e) => panic!("promote failed: {e:#}"),
         }
-    }
-    (leader, follower)
+        if let Some(i) = found {
+            break i;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "neither member of a converged two-voter fleet reported leadership"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    (fleet, leader, 1 - leader)
 }
 
-#[tokio::test]
-async fn a_voter_that_loses_its_leader_stops_reporting_ready() {
-    use coppice_consensus::PROMOTION_LAG_MAX;
+/// This member's `/readyz`, as the gate's HTTP status plus the report body —
+/// the same pair an orchestrator's probe sees. The status *is* the readiness
+/// verdict (`ReadyzReport::is_ready` against the promotion threshold, ADR 0037
+/// §9), so a test asserts on it rather than re-deriving the predicate.
+async fn ready_gate(member: &Daemon) -> (u16, serde_json::Value) {
+    member.readyz().await
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voter_that_loses_its_leader_stops_reporting_ready() {
     let ca = Ca::new();
-    let (mut leader, follower) = two_voter_cluster(&ca).await;
+    let (mut fleet, leader, follower) = two_voter_fleet(&ca).await;
 
     // In contact: the follower is a ready voter.
     common::poll(
-        Duration::from_secs(10),
+        Duration::from_secs(20),
         "follower reports ready while in contact",
-        || async {
-            let report = follower.readyz();
-            report.is_ready(PROMOTION_LAG_MAX)
-        },
+        || async { ready_gate(&fleet.members[follower]).await.0 == 200 },
     )
     .await;
 
@@ -1002,33 +1108,34 @@ async fn a_voter_that_loses_its_leader_stops_reporting_ready() {
     // it becomes a candidate in a term with no leader, and readiness must
     // follow (ADR 0037 §9: within the promotion threshold of the *leader*,
     // and there is none).
-    leader.kill().await;
+    fleet.members[leader].kill().await;
     common::poll(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         "partitioned follower stops reporting ready",
-        || async {
-            let report = follower.readyz();
-            !report.is_ready(PROMOTION_LAG_MAX)
-        },
+        || async { ready_gate(&fleet.members[follower]).await.0 == 503 },
     )
     .await;
-    let report = follower.readyz();
-    assert_eq!(report.replication_lag, 0, "the lag alone cannot see this");
+    let (status, body) = ready_gate(&fleet.members[follower]).await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body["replication_lag"], 0,
+        "the lag alone cannot see this: {body}"
+    );
+
+    fleet.stop_all().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_leader_that_loses_quorum_stops_reporting_ready() {
-    use coppice_consensus::PROMOTION_LAG_MAX;
-
     let ca = Ca::new();
-    let (leader, mut follower) = two_voter_cluster(&ca).await;
+    let (mut fleet, leader, follower) = two_voter_fleet(&ca).await;
 
     common::poll(
-        Duration::from_secs(10),
+        Duration::from_secs(20),
         "leader reports ready while quorum holds",
         || async {
-            let report = leader.readyz();
-            report.is_leader && report.is_ready(PROMOTION_LAG_MAX)
+            let (status, body) = ready_gate(&fleet.members[leader]).await;
+            status == 200 && body["is_leader"] == true
         },
     )
     .await;
@@ -1036,15 +1143,19 @@ async fn a_leader_that_loses_quorum_stops_reporting_ready() {
     // Kill the follower: the leader keeps its role (openraft has no automatic
     // stepdown) but its quorum acknowledgment goes stale, and a leader whose
     // cluster cannot hear it must not gate an instance refresh as "ready".
-    follower.kill().await;
+    fleet.members[follower].kill().await;
     common::poll(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         "quorumless leader stops reporting ready",
-        || async {
-            let report = leader.readyz();
-            !report.is_ready(PROMOTION_LAG_MAX)
-        },
+        || async { ready_gate(&fleet.members[leader]).await.0 == 503 },
     )
     .await;
-    assert!(leader.readyz().leader_contact_stale);
+    let (status, body) = ready_gate(&fleet.members[leader]).await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body["leader_contact_stale"], true,
+        "a quorumless leader must report stale contact: {body}"
+    );
+
+    fleet.stop_all().await;
 }

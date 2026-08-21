@@ -241,271 +241,201 @@ async fn formed_single_voter(ca: &Ca) -> Formed {
 // 1. The §7 refusal matrix
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_agent_certificate_holds_none_of_the_membership_surface() {
-    init_tracing();
-    let ca = Ca::new();
-    let formed = formed_single_voter(&ca).await;
+/// A membership verb: the columns of the §7 matrix.
+#[derive(Clone, Copy, Debug)]
+enum Verb {
+    ProbeCluster,
+    ClusterStatus,
+    AddLearner,
+    PromoteVoter,
+    RemoveNode,
+    ReplaceVoter,
+    TransferCaKey,
+    SetNodeAddress,
+}
 
-    // A perfectly valid agent leaf under the cluster's own CA: the refusals
-    // below are the matrix saying no, not a chain failure saying "who?".
-    let signer = cluster_signer(&formed.daemon);
-    let (cert, key) =
-        pki::mint_agent_local(&signer, &NodeId::new(), &[]).expect("mint an agent leaf");
-    let (ca_pem, _, _) = formed.daemon.tls_material();
-    let mut client = dial(&formed.daemon, &ca_pem, &cert, &key).await;
+impl Verb {
+    /// The name a matrix denial's message must contain (see
+    /// [`assert_denied`]) — also just a readable label for panics.
+    fn name(self) -> &'static str {
+        match self {
+            Verb::ProbeCluster => "ProbeCluster",
+            Verb::ClusterStatus => "ClusterStatus",
+            Verb::AddLearner => "AddLearner",
+            Verb::PromoteVoter => "PromoteVoter",
+            Verb::RemoveNode => "RemoveNode",
+            Verb::ReplaceVoter => "ReplaceVoter",
+            Verb::TransferCaKey => "TransferCaKey",
+            Verb::SetNodeAddress => "SetNodeAddress",
+        }
+    }
+}
 
-    let hid = formed.history_id.clone();
+/// Per-cell request arguments. A verb reads only the fields it needs; the
+/// rest are harmless defaults.
+#[derive(Default)]
+struct Params {
+    node_id: u64,
+    address: String,
+    old_node_id: u64,
+    new_node_id: u64,
+    ca_key_pem: Vec<u8>,
+}
 
-    // Every membership verb, including the read-only ones: an agent probing
-    // membership must learn nothing, not even what exists (§7).
-    let status = refusal(
-        client
+/// Which certificate class a cell is aimed at — each maps to exactly one
+/// already-dialed client, so the fixture and every mint happen once.
+#[derive(Clone, Copy, Debug)]
+enum Class {
+    Agent,
+    UnboundMachine,
+    BoundMachine,
+    Operator,
+    Unclassifiable,
+}
+
+/// The outcome a cell expects — the whole vocabulary the superseded
+/// functions' assertions used.
+enum Expect {
+    /// PERMISSION_DENIED + NOT_AUTHORIZED, and the message names the verb —
+    /// the ordinary matrix "no" (see [`assert_denied`]).
+    Denied,
+    /// PERMISSION_DENIED + NOT_AUTHORIZED, but the message need not name the
+    /// verb — a self-scope or leader-binding refusal with its own bespoke
+    /// phrasing (see [`assert_out_of_scope`]).
+    OutOfScope,
+    /// UNAUTHENTICATED, and specifically NOT the NOT_AUTHORIZED marker — an
+    /// unclassifiable caller, not a known profile denied a verb.
+    Unauthenticated,
+    /// Refused, but by a gate *past* authorization (ENDPOINT_UNVERIFIED /
+    /// UNKNOWN_NODE / ADDRESS_CONFLICT / ...) — the operator-reachability
+    /// claim, so this additionally asserts the refusal carries no
+    /// NOT_AUTHORIZED marker.
+    Marker(&'static str),
+    /// The call must succeed outright.
+    Ok,
+}
+
+/// Issue `verb` against `client` with `params`, discarding the response body
+/// — every table cell cares only about success/failure and the failure's
+/// markers.
+async fn call_verb(
+    client: &mut AdminClient,
+    verb: Verb,
+    hid: Vec<u8>,
+    params: &Params,
+) -> Result<tonic::Response<()>, Status> {
+    match verb {
+        Verb::ProbeCluster => client
             .probe_cluster(pb::ProbeClusterRequest {
                 cluster_id: String::new(),
             })
-            .await,
-        "ProbeCluster from an agent",
-    );
-    assert_denied(&status, "ProbeCluster");
-
-    let status = refusal(
-        client
-            .cluster_status(pb::ClusterStatusRequest {
-                history_id: hid.clone(),
-            })
-            .await,
-        "ClusterStatus from an agent",
-    );
-    assert_denied(&status, "ClusterStatus");
-
-    let status = refusal(
-        client
+            .await
+            .map(|resp| resp.map(|_| ())),
+        Verb::ClusterStatus => client
+            .cluster_status(pb::ClusterStatusRequest { history_id: hid })
+            .await
+            .map(|resp| resp.map(|_| ())),
+        Verb::AddLearner => client
             .add_learner(pb::AddLearnerRequest {
-                history_id: hid.clone(),
-                node_id: formed.seat,
-                address: formed.seat_addr.clone(),
+                history_id: hid,
+                node_id: params.node_id,
+                address: params.address.clone(),
             })
-            .await,
-        "AddLearner from an agent",
-    );
-    assert_denied(&status, "AddLearner");
-
-    let status = refusal(
-        client
+            .await
+            .map(|resp| resp.map(|_| ())),
+        Verb::PromoteVoter => client
             .promote_voter(pb::PromoteVoterRequest {
-                history_id: hid.clone(),
-                promote_node_id: formed.seat,
+                history_id: hid,
+                promote_node_id: params.node_id,
             })
-            .await,
-        "PromoteVoter from an agent",
-    );
-    assert_denied(&status, "PromoteVoter");
-
-    let status = refusal(
-        client
+            .await
+            .map(|resp| resp.map(|_| ())),
+        Verb::RemoveNode => client
             .remove_node(pb::RemoveNodeRequest {
-                history_id: hid.clone(),
-                node_id: formed.seat,
+                history_id: hid,
+                node_id: params.node_id,
             })
-            .await,
-        "RemoveNode from an agent",
-    );
-    assert_denied(&status, "RemoveNode");
-
-    // ADR 0037 §7 names `ReplaceVoter` in the same breath as `RemoveNode`:
-    // it removes a voter, so it is operator-only and an agent is nowhere
-    // near it.
-    let status = refusal(
-        client
+            .await
+            .map(|resp| resp.map(|_| ())),
+        Verb::ReplaceVoter => client
             .replace_voter(pb::ReplaceVoterRequest {
-                history_id: hid.clone(),
-                old_node_id: formed.seat,
-                new_node_id: formed.seat + 1,
+                history_id: hid,
+                old_node_id: params.old_node_id,
+                new_node_id: params.new_node_id,
             })
-            .await,
-        "ReplaceVoter from an agent",
-    );
-    assert_denied(&status, "ReplaceVoter");
-
-    // The CA-key transfer is coordinator-to-coordinator (ADR 0037 §4); an
-    // agent leaf reaching it would be a path from one compute node's
-    // credential to root-equivalence.
-    let status = refusal(
-        client
+            .await
+            .map(|resp| resp.map(|_| ())),
+        Verb::TransferCaKey => client
             .transfer_ca_key(pb::TransferCaKeyRequest {
-                history_id: hid.clone(),
-                ca_key_pem: b"not a key".to_vec(),
+                history_id: hid,
+                ca_key_pem: params.ca_key_pem.clone(),
             })
-            .await,
-        "TransferCaKey from an agent",
-    );
-    assert_denied(&status, "TransferCaKey");
-
-    let status = refusal(
-        client
+            .await
+            .map(|resp| resp.map(|_| ())),
+        Verb::SetNodeAddress => client
             .set_node_address(pb::SetNodeAddressRequest {
                 history_id: hid,
-                node_id: formed.seat,
-                address: formed.seat_addr.clone(),
+                node_id: params.node_id,
+                address: params.address.clone(),
             })
-            .await,
-        "SetNodeAddress from an agent",
-    );
-    assert_denied(&status, "SetNodeAddress");
-
-    let mut daemon = formed.daemon;
-    daemon.stop().await.expect("daemon stops cleanly");
+            .await
+            .map(|resp| resp.map(|_| ())),
+    }
 }
 
-/// The CA-key transfer protocol is leader-to-candidate only (ADR 0037 §4):
-/// neither an operator credential — however broad its other grants — nor a
-/// machine credential whose bound seat is not the leader the recipient
-/// currently observes may push a key. Both refusals are permission-denied
-/// with the `not-authorized` marker, but — unlike the matrix's `deny` path —
-/// neither message names the verb (the handler's own bespoke phrasing), so
-/// this asserts marker and code directly rather than via `assert_denied`.
+/// One row of the §7 matrix.
+struct Cell {
+    what: &'static str,
+    class: Class,
+    verb: Verb,
+    params: Params,
+    expect: Expect,
+}
+
+/// The §7 refusal matrix, table-driven: every (certificate class, verb) cell
+/// the ADR draws a line for, aimed exactly as the granular tests it replaces
+/// aimed them (same request arguments reach the same later gates), so the
+/// assertions are unchanged — only their layout is.
+///
+/// One cluster fixture and one client per certificate class (agent, a
+/// coordinator machine the cluster never bound, the forming voter's own
+/// bound machine identity, operator, and an unclassifiable leaf), then the
+/// loop drives every verb the ADR names against whichever class's client the
+/// cell selects. The only cells that expect success are read-only or a true
+/// no-op (an absent-seat RemoveNode, a machine's own ClusterStatus), so this
+/// order is safe without a fixture per cell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn transfer_ca_key_is_refused_for_an_operator_and_a_caller_not_bound_to_the_leader() {
+async fn the_refusal_matrix_covers_every_certificate_class_and_verb() {
     init_tracing();
     let ca = Ca::new();
     let formed = formed_single_voter(&ca).await;
     let hid = formed.history_id.clone();
-
-    // (a) An operator certificate: the transfer protocol is
-    // coordinator-to-coordinator only, so an operator with a legitimate need
-    // to key a candidate must drive it via promotion or replacement instead
-    // (ADR 0037 §4) — not by pushing a key itself.
-    let mut operator = operator_client(&formed.daemon, &formed.operator).await;
-    let status = refusal(
-        operator
-            .transfer_ca_key(pb::TransferCaKeyRequest {
-                history_id: hid.clone(),
-                ca_key_pem: b"not a key".to_vec(),
-            })
-            .await,
-        "TransferCaKey from an operator",
-    );
-    assert_eq!(
-        status.code(),
-        Code::PermissionDenied,
-        "TransferCaKey from an operator: expected permission_denied, got ({:?}) {:?}",
-        status.code(),
-        status.message()
-    );
-    assert_marker(&status, NOT_AUTHORIZED, "TransferCaKey from an operator");
-
-    // (b) A machine certificate whose bound raft seat is not the leader this
-    // recipient observes. The fixture is a single-voter cluster, so the one
-    // seat that exists is bound to the leader itself — there is no *other*
-    // seat to bind a caller to and still land in this arm. A machine
-    // identity the cluster has never bound to any seat exercises the same
-    // check the leader-binding gate runs (`bound != Some(leader)`): its
-    // bound node is `None`, which is not `Some(formed.seat)`, the leader
-    // this single-voter recipient observes.
-    let signer = cluster_signer(&formed.daemon);
     let (ca_pem, _, _) = formed.daemon.tls_material();
-    let stranger = pki::mint_machine_identity();
-    let (cert, key) =
-        pki::mint_coordinator_local(&signer, &stranger, &[]).expect("mint a machine leaf");
-    let mut stranger_client = dial(&formed.daemon, &ca_pem, &cert, &key).await;
-    let status = refusal(
-        stranger_client
-            .transfer_ca_key(pb::TransferCaKeyRequest {
-                history_id: hid,
-                ca_key_pem: b"not a key".to_vec(),
-            })
-            .await,
-        "TransferCaKey from a machine not bound to the leader",
-    );
-    assert_eq!(
-        status.code(),
-        Code::PermissionDenied,
-        "TransferCaKey from an unbound machine: expected permission_denied, got ({:?}) {:?}",
-        status.code(),
-        status.message()
-    );
-    assert_marker(
-        &status,
-        NOT_AUTHORIZED,
-        "TransferCaKey from a machine not bound to the leader",
-    );
-
-    let mut daemon = formed.daemon;
-    daemon.stop().await.expect("daemon stops cleanly");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_machine_certificate_gets_exactly_the_self_scope_grant() {
-    init_tracing();
-    let ca = Ca::new();
-    let formed = formed_single_voter(&ca).await;
     let signer = cluster_signer(&formed.daemon);
-    let (ca_pem, _, _) = formed.daemon.tls_material();
-    let hid = formed.history_id.clone();
 
-    // A coordinator machine leaf whose identity the cluster has NEVER bound —
-    // a second installation's credential arriving at someone else's seat.
+    // Agent: a perfectly valid agent leaf under the cluster's own CA, so the
+    // refusals below are the matrix saying no, not a chain failure saying
+    // "who?".
+    let (agent_cert, agent_key) =
+        pki::mint_agent_local(&signer, &NodeId::new(), &[]).expect("mint an agent leaf");
+    let mut agent_client = dial(&formed.daemon, &ca_pem, &agent_cert, &agent_key).await;
+
+    // Unbound machine: a coordinator machine leaf whose identity the cluster
+    // has NEVER bound — a second installation's credential arriving at
+    // someone else's seat. For TransferCaKey this is also exactly the caller
+    // the leader-binding gate's `bound != Some(leader)` check is built for:
+    // the single-voter fixture leaves no *other* seat to bind a caller to
+    // and still land in that arm, but an identity bound to no seat at all
+    // exercises the same `bound != Some(leader)` comparison (`None !=
+    // Some(formed.seat)`).
     let stranger = pki::mint_machine_identity();
-    let (cert, key) =
+    let (stranger_cert, stranger_key) =
         pki::mint_coordinator_local(&signer, &stranger, &[]).expect("mint a machine leaf");
-    let mut client = dial(&formed.daemon, &ca_pem, &cert, &key).await;
+    let mut unbound_client = dial(&formed.daemon, &ca_pem, &stranger_cert, &stranger_key).await;
 
-    // The read half of the grant: probe and status are how the convergence
-    // loop finds the cluster and watches its own catch-up (§6 steps 3-4).
-    let probe = client
-        .probe_cluster(pb::ProbeClusterRequest {
-            cluster_id: String::new(),
-        })
-        .await
-        .expect("a machine cert may probe")
-        .into_inner();
-    assert_eq!(probe.history_id, hid);
-    client
-        .cluster_status(pb::ClusterStatusRequest {
-            history_id: hid.clone(),
-        })
-        .await
-        .expect("a machine cert may read cluster status");
-
-    // AddLearner for a seat bound to a DIFFERENT identity. The service's
-    // order is verify -> bind -> admit, so the stranger is stopped at
-    // dial-back verification: the endpoint at that address serves the bound
-    // machine's identity, not the caller's — which is precisely why a stolen
-    // client credential alone cannot occupy someone else's seat (§7).
-    let status = refusal(
-        client
-            .add_learner(pb::AddLearnerRequest {
-                history_id: hid.clone(),
-                node_id: formed.seat,
-                address: formed.seat_addr.clone(),
-            })
-            .await,
-        "AddLearner for another identity's seat",
-    );
-    assert_marker(
-        &status,
-        ENDPOINT_UNVERIFIED,
-        "AddLearner for another identity's seat",
-    );
-
-    // PromoteVoter for a seat this identity is not bound to: an unbound
-    // machine has no seat at all, so the self-scope check refuses outright.
-    let status = refusal(
-        client
-            .promote_voter(pb::PromoteVoterRequest {
-                history_id: hid.clone(),
-                promote_node_id: formed.seat,
-            })
-            .await,
-        "PromoteVoter from an unbound machine",
-    );
-    assert_out_of_scope(&status, "PromoteVoter from an unbound machine");
-
-    // The same self-scope refusal from a *bound* machine naming the wrong
-    // seat: mint the forming voter's own machine leaf and promote a seat that
-    // is not its binding. This is the sharper half of the claim — even the
-    // right credential may drive only its own seat.
+    // Bound machine: the forming voter's own machine identity, minted under
+    // the cluster CA — the sharper case, where even the right credential may
+    // drive only its own seat.
     let bound_machine: MachineId = {
         let status_resp = operator_client(&formed.daemon, &formed.operator)
             .await
@@ -527,218 +457,385 @@ async fn a_machine_certificate_gets_exactly_the_self_scope_grant() {
     let (bound_cert, bound_key) =
         pki::mint_coordinator_local(&signer, &bound_machine, &[]).expect("mint the bound leaf");
     let mut bound_client = dial(&formed.daemon, &ca_pem, &bound_cert, &bound_key).await;
-    let status = refusal(
-        bound_client
-            .promote_voter(pb::PromoteVoterRequest {
-                history_id: hid.clone(),
-                promote_node_id: formed.seat + 1,
-            })
-            .await,
-        "PromoteVoter for a seat that is not the caller's binding",
-    );
-    assert_out_of_scope(
-        &status,
-        "PromoteVoter for a seat that is not the caller's binding",
-    );
 
-    // RemoveNode and SetNodeAddress: never granted to a machine credential,
-    // regardless of binding — they are the verbs that can shrink or
-    // split-brain a quorum (§7).
-    let status = refusal(
-        bound_client
-            .remove_node(pb::RemoveNodeRequest {
-                history_id: hid.clone(),
-                node_id: formed.seat,
-            })
-            .await,
-        "RemoveNode from a machine",
-    );
-    assert_denied(&status, "RemoveNode");
+    // Operator: the credential `init` minted.
+    let mut op_client = operator_client(&formed.daemon, &formed.operator).await;
 
-    // ReplaceVoter joins them: "it can never remove, replace, repoint, or
-    // initialize" (§7) — even for its own bound seat, and even when the
-    // caller is the very machine that formed the cluster.
-    let status = refusal(
-        bound_client
-            .replace_voter(pb::ReplaceVoterRequest {
-                history_id: hid.clone(),
-                old_node_id: formed.seat,
-                new_node_id: formed.seat + 1,
-            })
-            .await,
-        "ReplaceVoter from a machine",
-    );
-    assert_denied(&status, "ReplaceVoter");
+    // Unclassifiable leaf: chains to the cluster CA, but its subject matches
+    // no profile.
+    let (unclass_cert, unclass_key) = unclassifiable_leaf(&formed.daemon);
+    let mut unclass_client = dial(&formed.daemon, &ca_pem, &unclass_cert, &unclass_key).await;
 
-    // The sharper form: the bound machine names *itself* as the seat that
-    // would be added (`new_node_id`), asking the cluster to replace some
-    // other voter with the caller's own binding. Self-interest is not a
-    // grant — ReplaceVoter is operator-only regardless of which side of the
-    // swap the caller's own seat appears on.
-    let status = refusal(
-        bound_client
-            .replace_voter(pb::ReplaceVoterRequest {
-                history_id: hid.clone(),
-                old_node_id: formed.seat + 1,
-                new_node_id: formed.seat,
-            })
-            .await,
-        "ReplaceVoter naming the caller's own seat as the replacement",
-    );
-    assert_denied(&status, "ReplaceVoter");
-
-    let status = refusal(
-        bound_client
-            .set_node_address(pb::SetNodeAddressRequest {
-                history_id: hid,
-                node_id: formed.seat,
-                address: formed.seat_addr.clone(),
-            })
-            .await,
-        "SetNodeAddress from a machine",
-    );
-    assert_denied(&status, "SetNodeAddress");
-
-    let mut daemon = formed.daemon;
-    daemon.stop().await.expect("daemon stops cleanly");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_operator_certificate_reaches_every_membership_verb() {
-    init_tracing();
-    let ca = Ca::new();
-    let formed = formed_single_voter(&ca).await;
-    let mut client = operator_client(&formed.daemon, &formed.operator).await;
-    let hid = formed.history_id.clone();
-
-    // The claim is *reachability*: none of these may bounce off the §7
-    // matrix. Each is aimed past the authz layer at a later gate (or at a
-    // no-op success), and the assertion is that whatever comes back is not
-    // an authorization denial.
-
-    // RemoveNode of an absent seat: reaches the verb and no-ops (§6).
-    client
-        .remove_node(pb::RemoveNodeRequest {
-            history_id: hid.clone(),
-            node_id: 424_242,
+    // Bespoke, does not fit the table: the unbound machine's ProbeCluster
+    // answer must name the same history the fixture stamped — reachability
+    // plus content, not just pass/fail. This also proves the read half of
+    // the grant that the ClusterStatus cell below proves for status (§6
+    // steps 3-4).
+    let probe = unbound_client
+        .probe_cluster(pb::ProbeClusterRequest {
+            cluster_id: String::new(),
         })
         .await
-        .expect("an operator's RemoveNode of an absent node is a no-op success");
+        .expect("a machine cert may probe")
+        .into_inner();
+    assert_eq!(probe.history_id, hid);
 
-    // SetNodeAddress of an unknown seat: refused by a later gate, not authz.
-    let status = refusal(
-        client
-            .set_node_address(pb::SetNodeAddressRequest {
-                history_id: hid.clone(),
+    let cells = vec![
+        // --- Agent: holds none of the membership surface. Every verb,
+        // including the read-only ones — an agent probing membership must
+        // learn nothing, not even what exists.
+        Cell {
+            what: "ProbeCluster from an agent",
+            class: Class::Agent,
+            verb: Verb::ProbeCluster,
+            params: Params::default(),
+            expect: Expect::Denied,
+        },
+        Cell {
+            what: "ClusterStatus from an agent",
+            class: Class::Agent,
+            verb: Verb::ClusterStatus,
+            params: Params::default(),
+            expect: Expect::Denied,
+        },
+        Cell {
+            what: "AddLearner from an agent",
+            class: Class::Agent,
+            verb: Verb::AddLearner,
+            params: Params {
+                node_id: formed.seat,
+                address: formed.seat_addr.clone(),
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        Cell {
+            what: "PromoteVoter from an agent",
+            class: Class::Agent,
+            verb: Verb::PromoteVoter,
+            params: Params {
+                node_id: formed.seat,
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        Cell {
+            what: "RemoveNode from an agent",
+            class: Class::Agent,
+            verb: Verb::RemoveNode,
+            params: Params {
+                node_id: formed.seat,
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        // ReplaceVoter joins RemoveNode: it removes a voter, so it is
+        // operator-only and an agent is nowhere near it (§7).
+        Cell {
+            what: "ReplaceVoter from an agent",
+            class: Class::Agent,
+            verb: Verb::ReplaceVoter,
+            params: Params {
+                old_node_id: formed.seat,
+                new_node_id: formed.seat + 1,
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        // The CA-key transfer is coordinator-to-coordinator (§4); an agent
+        // leaf reaching it would be a path from one compute node's
+        // credential to root-equivalence.
+        Cell {
+            what: "TransferCaKey from an agent",
+            class: Class::Agent,
+            verb: Verb::TransferCaKey,
+            params: Params {
+                ca_key_pem: b"not a key".to_vec(),
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        Cell {
+            what: "SetNodeAddress from an agent",
+            class: Class::Agent,
+            verb: Verb::SetNodeAddress,
+            params: Params {
+                node_id: formed.seat,
+                address: formed.seat_addr.clone(),
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        // --- Unbound machine: the read half of the grant, refused
+        // everywhere else.
+        Cell {
+            what: "ClusterStatus from an unbound machine",
+            class: Class::UnboundMachine,
+            verb: Verb::ClusterStatus,
+            params: Params::default(),
+            expect: Expect::Ok,
+        },
+        // AddLearner for a seat bound to a DIFFERENT identity. The service's
+        // order is verify -> bind -> admit, so the stranger is stopped at
+        // dial-back verification: the endpoint at that address serves the
+        // bound machine's identity, not the caller's — which is precisely
+        // why a stolen client credential alone cannot occupy someone else's
+        // seat (§7).
+        Cell {
+            what: "AddLearner for another identity's seat",
+            class: Class::UnboundMachine,
+            verb: Verb::AddLearner,
+            params: Params {
+                node_id: formed.seat,
+                address: formed.seat_addr.clone(),
+                ..Default::default()
+            },
+            expect: Expect::Marker(ENDPOINT_UNVERIFIED),
+        },
+        // An unbound machine has no seat at all, so the self-scope check
+        // refuses outright.
+        Cell {
+            what: "PromoteVoter from an unbound machine",
+            class: Class::UnboundMachine,
+            verb: Verb::PromoteVoter,
+            params: Params {
+                node_id: formed.seat,
+                ..Default::default()
+            },
+            expect: Expect::OutOfScope,
+        },
+        // (a) The transfer protocol is leader-to-candidate only (§4): a
+        // machine whose bound seat is not the leader this recipient
+        // observes is refused with the handler's own bespoke phrasing, not
+        // the matrix's verb-naming denial.
+        Cell {
+            what: "TransferCaKey from a machine not bound to the leader",
+            class: Class::UnboundMachine,
+            verb: Verb::TransferCaKey,
+            params: Params {
+                ca_key_pem: b"not a key".to_vec(),
+                ..Default::default()
+            },
+            expect: Expect::OutOfScope,
+        },
+        // --- Bound machine: exactly the self-scope grant, and never the
+        // membership-shrinking verbs, regardless of binding.
+        // The same self-scope refusal as the unbound machine's PromoteVoter
+        // cell above, but from a *bound* machine naming a seat that is not
+        // its own binding — the sharper half: even the right credential may
+        // drive only its own seat.
+        Cell {
+            what: "PromoteVoter for a seat that is not the caller's binding",
+            class: Class::BoundMachine,
+            verb: Verb::PromoteVoter,
+            params: Params {
+                node_id: formed.seat + 1,
+                ..Default::default()
+            },
+            expect: Expect::OutOfScope,
+        },
+        Cell {
+            what: "RemoveNode from a machine",
+            class: Class::BoundMachine,
+            verb: Verb::RemoveNode,
+            params: Params {
+                node_id: formed.seat,
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        // "it can never remove, replace, repoint, or initialize" (§7) — even
+        // for its own bound seat, and even when the caller is the very
+        // machine that formed the cluster.
+        Cell {
+            what: "ReplaceVoter from a machine",
+            class: Class::BoundMachine,
+            verb: Verb::ReplaceVoter,
+            params: Params {
+                old_node_id: formed.seat,
+                new_node_id: formed.seat + 1,
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        // The sharper form: the bound machine names *itself* as the seat
+        // that would be added (`new_node_id`), asking the cluster to
+        // replace some other voter with the caller's own binding.
+        // Self-interest is not a grant — ReplaceVoter is operator-only
+        // regardless of which side of the swap the caller's own seat
+        // appears on.
+        Cell {
+            what: "ReplaceVoter naming the caller's own seat as the replacement",
+            class: Class::BoundMachine,
+            verb: Verb::ReplaceVoter,
+            params: Params {
+                old_node_id: formed.seat + 1,
+                new_node_id: formed.seat,
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        Cell {
+            what: "SetNodeAddress from a machine",
+            class: Class::BoundMachine,
+            verb: Verb::SetNodeAddress,
+            params: Params {
+                node_id: formed.seat,
+                address: formed.seat_addr.clone(),
+                ..Default::default()
+            },
+            expect: Expect::Denied,
+        },
+        // --- Operator: reachability. None of these may bounce off the §7
+        // matrix — each is aimed past the authz layer at a later gate (or a
+        // no-op success).
+        // RemoveNode of an absent seat: reaches the verb and no-ops (§6).
+        Cell {
+            what: "operator RemoveNode of an absent seat",
+            class: Class::Operator,
+            verb: Verb::RemoveNode,
+            params: Params {
+                node_id: 424_242,
+                ..Default::default()
+            },
+            expect: Expect::Ok,
+        },
+        // SetNodeAddress of an unknown seat: refused by a later gate, not
+        // authz.
+        Cell {
+            what: "operator SetNodeAddress for an unknown node",
+            class: Class::Operator,
+            verb: Verb::SetNodeAddress,
+            params: Params {
                 node_id: 424_242,
                 address: "localhost:1".to_string(),
-            })
-            .await,
-        "operator SetNodeAddress for an unknown node",
-    );
-    assert_marker(&status, UNKNOWN_NODE, "operator SetNodeAddress");
-    assert!(
-        !has_marker(status.message(), NOT_AUTHORIZED),
-        "the operator must not be authz-refused: {:?}",
-        status.message()
-    );
-
-    // AddLearner naming the existing seat at a different address: refused by
-    // the no-silent-repointing gate, not authz.
-    let status = refusal(
-        client
-            .add_learner(pb::AddLearnerRequest {
-                history_id: hid.clone(),
+                ..Default::default()
+            },
+            expect: Expect::Marker(UNKNOWN_NODE),
+        },
+        // AddLearner naming the existing seat at a different address:
+        // refused by the no-silent-repointing gate, not authz.
+        Cell {
+            what: "operator AddLearner at a conflicting address",
+            class: Class::Operator,
+            verb: Verb::AddLearner,
+            params: Params {
                 node_id: formed.seat,
                 address: "localhost:1".to_string(),
-            })
-            .await,
-        "operator AddLearner at a conflicting address",
-    );
-    assert_marker(&status, ADDRESS_CONFLICT, "operator AddLearner");
-    assert!(
-        !has_marker(status.message(), NOT_AUTHORIZED),
-        "the operator must not be authz-refused: {:?}",
-        status.message()
-    );
-
-    // ReplaceVoter naming a seat that is not in membership: refused by the
-    // membership gate, not by the matrix — the operator is the *only*
-    // profile that reaches this verb at all (ADR 0037 §7).
-    let status = refusal(
-        client
-            .replace_voter(pb::ReplaceVoterRequest {
-                history_id: hid.clone(),
+                ..Default::default()
+            },
+            expect: Expect::Marker(ADDRESS_CONFLICT),
+        },
+        // ReplaceVoter naming a seat that is not in membership: refused by
+        // the membership gate, not by the matrix — the operator is the
+        // *only* profile that reaches this verb at all (§7).
+        Cell {
+            what: "operator ReplaceVoter for an unknown new node",
+            class: Class::Operator,
+            verb: Verb::ReplaceVoter,
+            params: Params {
                 old_node_id: formed.seat,
                 new_node_id: 424_242,
-            })
-            .await,
-        "operator ReplaceVoter for an unknown new node",
-    );
-    assert_marker(&status, UNKNOWN_NODE, "operator ReplaceVoter");
-    assert!(
-        !has_marker(status.message(), NOT_AUTHORIZED),
-        "the operator must not be authz-refused: {:?}",
-        status.message()
-    );
+                ..Default::default()
+            },
+            expect: Expect::Marker(UNKNOWN_NODE),
+        },
+        // PromoteVoter of an unknown seat: refused by the membership gate,
+        // not authz.
+        Cell {
+            what: "operator PromoteVoter for an unknown node",
+            class: Class::Operator,
+            verb: Verb::PromoteVoter,
+            params: Params {
+                node_id: 424_242,
+                ..Default::default()
+            },
+            expect: Expect::Marker(UNKNOWN_NODE),
+        },
+        // (b) The transfer protocol is coordinator-to-coordinator only (§4):
+        // an operator with a legitimate need to key a candidate must drive
+        // it via promotion or replacement instead — not by pushing a key
+        // itself. Refused with the handler's own bespoke phrasing, like the
+        // unbound machine's cell above.
+        Cell {
+            what: "TransferCaKey from an operator",
+            class: Class::Operator,
+            verb: Verb::TransferCaKey,
+            params: Params {
+                ca_key_pem: b"not a key".to_vec(),
+                ..Default::default()
+            },
+            expect: Expect::OutOfScope,
+        },
+        // --- Unclassifiable leaf: chains to the cluster CA — the TLS
+        // acceptor lets the session in — but its subject matches no
+        // profile. That is an *unknown caller*, which must read as
+        // UNAUTHENTICATED, not as a known profile being denied a verb: the
+        // matrix's PERMISSION_DENIED would leak that classification
+        // succeeded.
+        Cell {
+            what: "ProbeCluster with an unclassifiable leaf",
+            class: Class::Unclassifiable,
+            verb: Verb::ProbeCluster,
+            params: Params::default(),
+            expect: Expect::Unauthenticated,
+        },
+    ];
 
-    // PromoteVoter of an unknown seat: refused by the membership gate, not
-    // authz.
-    let status = refusal(
-        client
-            .promote_voter(pb::PromoteVoterRequest {
-                history_id: hid,
-                promote_node_id: 424_242,
-            })
-            .await,
-        "operator PromoteVoter for an unknown node",
-    );
-    assert_marker(&status, UNKNOWN_NODE, "operator PromoteVoter");
-    assert!(
-        !has_marker(status.message(), NOT_AUTHORIZED),
-        "the operator must not be authz-refused: {:?}",
-        status.message()
-    );
-
-    let mut daemon = formed.daemon;
-    daemon.stop().await.expect("daemon stops cleanly");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unclassifiable_leaf_is_rejected_as_unauthenticated() {
-    init_tracing();
-    let ca = Ca::new();
-    let formed = formed_single_voter(&ca).await;
-
-    // The leaf chains to the cluster CA — the TLS acceptor lets the session
-    // in — but its subject matches no profile. That is an *unknown caller*,
-    // which must read as UNAUTHENTICATED, not as a known profile being denied
-    // a verb: the matrix's PERMISSION_DENIED would leak that classification
-    // succeeded.
-    let (cert, key) = unclassifiable_leaf(&formed.daemon);
-    let (ca_pem, _, _) = formed.daemon.tls_material();
-    let mut client = dial(&formed.daemon, &ca_pem, &cert, &key).await;
-
-    let status = refusal(
-        client
-            .probe_cluster(pb::ProbeClusterRequest {
-                cluster_id: String::new(),
-            })
-            .await,
-        "ProbeCluster with an unclassifiable leaf",
-    );
-    assert_eq!(
-        status.code(),
-        Code::Unauthenticated,
-        "an unclassifiable caller is unauthenticated, got ({:?}) {:?}",
-        status.code(),
-        status.message()
-    );
-    assert!(
-        !has_marker(status.message(), NOT_AUTHORIZED),
-        "not a matrix denial: {:?}",
-        status.message()
-    );
+    for Cell {
+        what,
+        class,
+        verb,
+        params,
+        expect,
+    } in cells
+    {
+        let client = match class {
+            Class::Agent => &mut agent_client,
+            Class::UnboundMachine => &mut unbound_client,
+            Class::BoundMachine => &mut bound_client,
+            Class::Operator => &mut op_client,
+            Class::Unclassifiable => &mut unclass_client,
+        };
+        let result = call_verb(client, verb, hid.clone(), &params).await;
+        match expect {
+            Expect::Ok => {
+                result.unwrap_or_else(|status| panic!("{what} must succeed: {status:?}"));
+            }
+            Expect::Denied => {
+                let status = refusal(result, what);
+                assert_denied(&status, verb.name());
+            }
+            Expect::OutOfScope => {
+                let status = refusal(result, what);
+                assert_out_of_scope(&status, what);
+            }
+            Expect::Unauthenticated => {
+                let status = refusal(result, what);
+                assert_eq!(
+                    status.code(),
+                    Code::Unauthenticated,
+                    "{what}: an unclassifiable caller is unauthenticated, got ({:?}) {:?}",
+                    status.code(),
+                    status.message()
+                );
+                assert!(
+                    !has_marker(status.message(), NOT_AUTHORIZED),
+                    "{what}: not a matrix denial: {:?}",
+                    status.message()
+                );
+            }
+            Expect::Marker(marker) => {
+                let status = refusal(result, what);
+                assert_marker(&status, marker, what);
+                assert!(
+                    !has_marker(status.message(), NOT_AUTHORIZED),
+                    "{what}: the caller must not be authz-refused: {:?}",
+                    status.message()
+                );
+            }
+        }
+    }
 
     let mut daemon = formed.daemon;
     daemon.stop().await.expect("daemon stops cleanly");
@@ -1445,79 +1542,108 @@ async fn an_operator_admission_of_an_unclassifiable_endpoint_creates_no_seat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_status_against_a_follower_resolves_and_renders_the_leader() {
     init_tracing();
-    let cluster = NodeCluster::start().await;
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
 
-    // A joined learner: a real follower whose membership view names the
-    // leader's dialable address.
-    let mut joiner = Node::new(2, cluster.leader.cluster_id, &cluster.ca);
-    joiner.boot_joining().await;
-    let mut leader_client = cluster.operator(&cluster.leader.advertise).await;
-    leader_client
-        .add_learner(pb::AddLearnerRequest {
-            history_id: cluster.history_id.to_vec(),
-            node_id: joiner.raft_id(),
-            address: joiner.advertise.clone(),
+    // A two-voter cluster stood up the self-converging way (ADR 0037 §1): the
+    // second member enrolls, joins and promotes itself, so the replica this
+    // test queries is a real converged follower whose membership view already
+    // names the leader's dialable address — nothing is admitted by hand.
+    let mut first_member = Daemon::new_certless(cluster_id, &ca);
+    first_member.set_cluster_size(2);
+    let operator = form(&mut first_member).await;
+    let token = coordinator_token(&first_member, &operator).await;
+
+    let mut second_member = Daemon::new_certless(cluster_id, &ca);
+    second_member.set_cluster_size(2);
+    second_member.set_static_discovery(&[first_member.raft_target()]);
+    second_member.set_enrollment(&first_member.api(""), &token);
+    second_member.start();
+    second_member.await_phase("voter").await;
+
+    // Which of the two leads is observed, not assumed: leadership can move the
+    // moment the second voter arrives, and this test needs a genuine follower.
+    let (leader, follower) = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let first_leads = first_member.readyz().await.1["is_leader"] == true;
+            let second_leads = second_member.readyz().await.1["is_leader"] == true;
+            if first_leads {
+                break (&first_member, &second_member);
+            }
+            if second_leads {
+                break (&second_member, &first_member);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "neither member of a converged two-voter cluster reported leadership"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let leader_seat = node_id_of(leader).await;
+    let follower_seat = node_id_of(follower).await;
+    assert_ne!(leader_seat, follower_seat);
+
+    let mut leader_client = operator_client(leader, &operator).await;
+    let hid_bytes = leader_client
+        .probe_cluster(pb::ProbeClusterRequest {
+            cluster_id: String::new(),
         })
         .await
-        .expect("admit the joiner");
-
-    // Wait until the learner has applied the membership that names both
-    // seats — retargeting resolves the leader's address from the follower's
-    // own answer, so the follower must know it first.
-    {
-        let joiner_ref = &joiner;
-        let leader_id = cluster.leader.raft_id();
-        poll(
-            Duration::from_secs(20),
-            "the learner's membership view names the leader",
-            || async {
-                joiner_ref
-                    .summary()
-                    .members
-                    .iter()
-                    .any(|m| m.id == leader_id)
-            },
-        )
-        .await;
-    }
+        .expect("probe")
+        .into_inner()
+        .history_id;
+    let history_id: [u8; 16] = hid_bytes
+        .try_into()
+        .unwrap_or_else(|v: Vec<u8>| panic!("history id must be 16 bytes, got {}", v.len()));
 
     // Straight ClusterStatus at the follower: its own local view — no health
     // verdict (only the leader can answer one), leader named elsewhere.
-    let mut follower_client = cluster.operator(&joiner.advertise).await;
-    let first = admin::cluster_status(&mut follower_client, cluster.history_id)
+    let mut follower_client = operator_client(follower, &operator).await;
+    let first = admin::cluster_status(&mut follower_client, history_id)
         .await
         .expect("the follower answers cluster status");
-    assert_eq!(first.local_node_id, joiner.raft_id());
+    assert_eq!(first.local_node_id, follower_seat);
     assert!(
         first.health.is_none(),
         "a follower must not fabricate a health verdict"
     );
-    assert_eq!(first.leader_node_id, Some(cluster.leader.raft_id()));
+    assert_eq!(first.leader_node_id, Some(leader_seat));
 
     // The resolving form re-dials the leader once and renders its answer.
-    let leaf = cluster.ca.operator_leaf();
-    let mut follower_client = cluster.operator(&joiner.advertise).await;
+    let mut follower_client = operator_client(follower, &operator).await;
     let resolved = admin::cluster_status_resolving_leader(
         &mut follower_client,
-        cluster.history_id,
-        &cluster.ca.pem,
-        &leaf.cert_pem,
-        &leaf.key_pem,
+        history_id,
+        operator.ca_pem.as_bytes(),
+        operator.cert_pem.as_bytes(),
+        operator
+            .key_pem
+            .as_ref()
+            .expect("no CSR was supplied, so the cluster minted the keypair")
+            .as_bytes(),
     )
     .await
     .expect("status resolves the leader");
     assert_eq!(
-        resolved.local_node_id,
-        cluster.leader.raft_id(),
+        resolved.local_node_id, leader_seat,
         "the rendered document is the leader's answer"
     );
-    assert_eq!(resolved.leader_node_id, Some(cluster.leader.raft_id()));
+    assert_eq!(resolved.leader_node_id, Some(leader_seat));
     assert!(
         !resolved.replication.is_empty(),
         "the leader's answer carries per-follower replication progress"
     );
 
-    joiner.graceful_stop().await;
-    let mut leader = cluster.leader;
-    leader.graceful_stop().await;
+    let _ = second_member.stop().await;
+    let _ = first_member.stop().await;
+}
+
+/// This daemon's own allocated raft seat, from `/readyz`.
+async fn node_id_of(daemon: &Daemon) -> u64 {
+    let (_, body) = daemon.readyz().await;
+    body["node_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a formed member reports its node id: {body}"))
 }

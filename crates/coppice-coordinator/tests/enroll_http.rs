@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::id::{ClusterId, MachineId, NodeId};
@@ -81,6 +81,27 @@ async fn mint(
             role: role as i32,
             label: label.to_string(),
             ttl_seconds: None,
+        })
+        .await
+        .expect("mint")
+        .into_inner()
+}
+
+/// Like [`mint`], but with a real TTL — the `expired` row below needs one that
+/// actually elapses.
+async fn mint_with_ttl(
+    client: &mut coppice_net::admin::Client<tonic::transport::Channel>,
+    history_id: &[u8],
+    role: pbcore::EnrollRole,
+    label: &str,
+    ttl_seconds: u64,
+) -> pb::MintEnrollTokenResponse {
+    client
+        .mint_enroll_token(pb::MintEnrollTokenRequest {
+            history_id: history_id.to_vec(),
+            role: role as i32,
+            label: label.to_string(),
+            ttl_seconds: Some(ttl_seconds),
         })
         .await
         .expect("mint")
@@ -271,6 +292,22 @@ async fn every_authentication_failure_is_one_indistinguishable_response() {
     let (mut daemon, operator) = formed(&ca).await;
     let (mut admin, history_id) = admin_client(&daemon, &operator).await;
 
+    // Mint the soon-to-expire token FIRST, before the rest of setup below, and
+    // sleep only for whatever time remains once everything else is done —
+    // there is no clock knob for token *expiry* ([pacing] only paces the
+    // convergence loop, not the TTL check), so the TTL must genuinely elapse.
+    // A ~1s real sleep is test-sized and this ordering keeps it off the
+    // critical path of every other assertion in this test.
+    let mint_started = std::time::Instant::now();
+    let expiring = mint_with_ttl(
+        &mut admin,
+        &history_id,
+        pbcore::EnrollRole::Agent,
+        "expiring",
+        1,
+    )
+    .await;
+
     let agent_token = mint(&mut admin, &history_id, pbcore::EnrollRole::Agent, "agents").await;
     let doomed = mint(
         &mut admin,
@@ -290,6 +327,11 @@ async fn every_authentication_failure_is_one_indistinguishable_response() {
     let (_key, csr_pem) = pki::generate_key_and_csr().unwrap();
     let url = daemon.api(coppice_enroll::ENROLL_PATH);
 
+    let remaining = std::time::Duration::from_millis(1_200).saturating_sub(mint_started.elapsed());
+    if !remaining.is_zero() {
+        tokio::time::sleep(remaining).await;
+    }
+
     let mut answers = Vec::new();
     for (label, token, body) in [
         (
@@ -300,6 +342,11 @@ async fn every_authentication_failure_is_one_indistinguishable_response() {
         (
             "revoked",
             Some(doomed.secret.clone()),
+            enroll_body(&csr_pem, Some(NodeId::new()), None),
+        ),
+        (
+            "expired",
+            Some(expiring.secret.clone()),
             enroll_body(&csr_pem, Some(NodeId::new()), None),
         ),
         (
@@ -582,5 +629,518 @@ async fn an_agent_enrolls_over_http_registers_and_renews_with_production_code_on
         .expect("the re-enrolled leaf chains to the cluster CA");
     assert_eq!(verified.profile, pki::Profile::Agent(node));
 
+    daemon.stop().await.expect("daemon stops cleanly");
+}
+
+/// Wait until `{base}/readyz` (an HTTPS surface) reports `phase`, the way
+/// [`Daemon::await_phase`] does for a plain-HTTP one — needed once
+/// [`Daemon::set_client_tls`] is in effect, since that helper always dials
+/// plain HTTP.
+async fn await_https_phase(client: &reqwest::Client, base: &str, phase: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) = client.get(format!("{base}/readyz")).send().await {
+            if let Ok(body) = response.json::<serde_json::Value>().await {
+                if body["phase"] == phase {
+                    return;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never reached phase {phase} over HTTPS"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Dial the agent session listener over mTLS with the supplied identity.
+/// Copied file-locally from the sibling `enrollment.rs`, whose version this
+/// test cannot reach from a different integration-test binary.
+async fn agent_client(
+    daemon: &Daemon,
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> coppice_net::session::Client<tonic::transport::Channel> {
+    use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+
+    let target = daemon.agent_target();
+    let host = target.rsplit_once(':').map(|(h, _)| h).unwrap_or(&target);
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca_pem))
+        .identity(Identity::from_pem(cert_pem, key_pem))
+        .domain_name(host.to_string());
+    let channel = Channel::from_shared(format!("https://{target}"))
+        .expect("agent target")
+        .tls_config(tls)
+        .expect("agent client TLS")
+        .connect()
+        .await
+        .expect("dial the agent gateway");
+    coppice_net::session::Client::new(channel)
+}
+
+/// A renewal-shaped request — one presented by a machine that already holds a
+/// cluster-issued leaf — is refused on the public, certless `/enroll`, while
+/// the SAME identity renews successfully over the machine-plane mTLS services
+/// (ADR 0037 §4: "renewal over the machine-plane mTLS services (agent
+/// session, coordinator admin) and refused on /enroll").
+///
+/// Post-formation the client listener requests client certificates and
+/// verifies them against the CLUSTER CA
+/// ([`clientedge::ClusterCa::from_views`](coppice_coordinator::clientedge::ClusterCa::from_views)),
+/// so a cluster-issued leaf can be presented as a client identity there —
+/// this is what makes the refusal below meaningful: it is not that the
+/// listener cannot see the certificate, it is that `/enroll` refuses to look
+/// past it.
+#[tokio::test]
+async fn a_client_certificate_is_refused_on_enroll_and_renews_on_the_machine_planes() {
+    let ca = Ca::new();
+    let mut daemon = Daemon::new_certless(ClusterId::new(), &ca);
+    // `ca` here signs only the listener's OWN serving certificate — what the
+    // client below must trust as the *server* root. That is a different
+    // concern from the cluster-issued leaf enrolled below and presented as
+    // the *client* identity, which the listener verifies against the
+    // cluster's own CA instead.
+    let (server_root_pem, https_base) = daemon.set_client_tls(&ca);
+    daemon.start();
+    // `Daemon::await_phase` polls `/readyz` over plain HTTP, which this
+    // daemon no longer serves once `set_client_tls` is in effect — poll the
+    // same surface over HTTPS instead.
+    let root_only = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(&server_root_pem).expect("root"))
+        .build()
+        .expect("build the https polling client");
+    await_https_phase(&root_only, &https_base, "waiting").await;
+    let reply = daemon
+        .admin(AdminCall::Init {
+            policy: None,
+            operator_csr: None,
+            operator_cn: None,
+        })
+        .await;
+    let AdminReply::Formed { operator, .. } = reply else {
+        panic!("expected the cluster to form, got {reply:?}");
+    };
+    await_https_phase(&root_only, &https_base, "voter").await;
+
+    let (mut admin, history_id) = admin_client(&daemon, &operator).await;
+
+    // Enroll a coordinator identity and an agent identity through
+    // `ForwardEnroll` over the admin plane, exactly as `enrollment.rs` does —
+    // these are the "already holds a cluster-issued leaf" machines.
+    let coordinator_token = mint(
+        &mut admin,
+        &history_id,
+        pbcore::EnrollRole::Coordinator,
+        "coordinators",
+    )
+    .await;
+    let (machine_key, machine_csr) = pki::generate_key_and_csr().unwrap();
+    let machine = MachineId::new();
+    let coordinator_leaf = admin
+        .forward_enroll(pb::ForwardEnrollRequest {
+            history_id: history_id.clone(),
+            token: coordinator_token.secret,
+            csr_pem: String::from_utf8(machine_csr).unwrap(),
+            node_id: None,
+            machine_id: Some(machine.into()),
+            sans: Vec::new(),
+        })
+        .await
+        .expect("enroll the coordinator identity")
+        .into_inner();
+
+    let agent_token = mint(&mut admin, &history_id, pbcore::EnrollRole::Agent, "agents").await;
+    let (agent_key, agent_csr) = pki::generate_key_and_csr().unwrap();
+    let node = NodeId::new();
+    let agent_leaf = admin
+        .forward_enroll(pb::ForwardEnrollRequest {
+            history_id: history_id.clone(),
+            token: agent_token.secret,
+            csr_pem: String::from_utf8(agent_csr).unwrap(),
+            node_id: Some(node.into()),
+            machine_id: None,
+            sans: Vec::new(),
+        })
+        .await
+        .expect("enroll the agent identity")
+        .into_inner();
+
+    // A fresh live token: the renewal-shaped request still carries a real
+    // credential in the body, so the refusal below is demonstrably about the
+    // presented certificate, not about a missing/invalid token.
+    let renewal_shaped_token = mint(
+        &mut admin,
+        &history_id,
+        pbcore::EnrollRole::Agent,
+        "renewal-shaped",
+    )
+    .await;
+    let (_key, fresh_csr) = pki::generate_key_and_csr().unwrap();
+
+    let root = reqwest::Certificate::from_pem(&server_root_pem).expect("server root");
+    let with_cert = reqwest::Client::builder()
+        .add_root_certificate(root.clone())
+        .identity({
+            // reqwest's rustls identity takes one PEM blob: key then chain
+            // (see crates/coppice-coordinator/tests/client_tls.rs).
+            let mut pem = agent_key.clone();
+            pem.extend_from_slice(agent_leaf.cert_pem.as_bytes());
+            reqwest::Identity::from_pem(&pem).expect("client identity")
+        })
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build the client-cert https client");
+
+    let response = with_cert
+        .post(format!("{https_base}{}", coppice_enroll::ENROLL_PATH))
+        .bearer_auth(&renewal_shaped_token.secret)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(enroll_body(&fresh_csr, Some(NodeId::new()), None))
+        .send()
+        .await
+        .expect("POST /enroll presenting a cluster-issued leaf");
+    let (status, body) = checked(response).await;
+    assert_eq!(status, 401, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        body.as_slice(),
+        coppice_api::http::REFUSED_BODY.as_bytes(),
+        "/enroll refuses ANY certificate-bearing request before it looks at the credential \
+         (ADR 0037 §4)"
+    );
+
+    // The same request WITHOUT the client certificate, same live token:
+    // succeeds — proving the refusal above is about the presented
+    // certificate, not about the request being malformed.
+    let certless = reqwest::Client::builder()
+        .add_root_certificate(root)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build the certless https client");
+    let response = certless
+        .post(format!("{https_base}{}", coppice_enroll::ENROLL_PATH))
+        .bearer_auth(&renewal_shaped_token.secret)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(enroll_body(&fresh_csr, Some(NodeId::new()), None))
+        .send()
+        .await
+        .expect("POST /enroll without a client certificate");
+    assert_eq!(checked(response).await.0, 200);
+
+    // Renewal DOES work for the same identities, on the machine planes ADR
+    // 0037 §4 names: the coordinator admin plane…
+    let mut coord_admin = coppice_coordinator::admin::admin_channel(
+        &daemon.raft_target(),
+        coordinator_leaf.ca_pem.as_bytes(),
+        coordinator_leaf.cert_pem.as_bytes(),
+        &machine_key,
+    )
+    .await
+    .expect("dial the admin surface with the coordinator leaf");
+    let (_key, renew_csr) = pki::generate_key_and_csr().unwrap();
+    let renewed_coordinator = coord_admin
+        .renew_coordinator(pb::RenewCoordinatorRequest {
+            history_id: history_id.clone(),
+            csr_pem: String::from_utf8(renew_csr).unwrap(),
+            sans: Vec::new(),
+        })
+        .await
+        .expect("renew the coordinator identity over the admin plane")
+        .into_inner();
+    let verified = pki::verify_leaf(
+        renewed_coordinator.ca_pem.as_bytes(),
+        renewed_coordinator.cert_pem.as_bytes(),
+    )
+    .expect("the renewed coordinator leaf chains to the cluster CA");
+    assert_eq!(
+        verified.profile,
+        pki::Profile::Coordinator(machine),
+        "renewal preserves the subject exactly (ADR 0037 §4)"
+    );
+
+    // …and the agent session plane.
+    let mut agent_session = agent_client(
+        &daemon,
+        agent_leaf.ca_pem.as_bytes(),
+        agent_leaf.cert_pem.as_bytes(),
+        &agent_key,
+    )
+    .await;
+    let (_key, renew_csr) = pki::generate_key_and_csr().unwrap();
+    let renewed_agent = agent_session
+        .renew(coppice_proto::pb::agent::v1::RenewRequest {
+            csr_pem: String::from_utf8(renew_csr).unwrap(),
+        })
+        .await
+        .expect("renew the agent identity over the session plane")
+        .into_inner();
+    let verified = pki::verify_leaf(
+        renewed_agent.ca_pem.as_bytes(),
+        renewed_agent.cert_pem.as_bytes(),
+    )
+    .expect("the renewed agent leaf chains to the cluster CA");
+    assert_eq!(
+        verified.profile,
+        pki::Profile::Agent(node),
+        "renewal preserves the subject exactly (ADR 0037 §4)"
+    );
+
+    daemon.stop().await.expect("daemon stops cleanly");
+}
+
+/// Proxy one `EnrollCall` to the real leader over the mTLS admin channel,
+/// mapping the RPC outcome onto the same refusal shape
+/// [`coppice_coordinator::enroll::forward_to_leader`] (the production proxy
+/// path) uses. That function is `pub(crate)` and unreachable from this
+/// integration-test binary, so this is a file-local copy of just the mapping.
+async fn forward_via_admin(
+    mut admin: coppice_net::admin::Client<tonic::transport::Channel>,
+    history_id: Vec<u8>,
+    call: coppice_api::http::EnrollCall,
+) -> Result<coppice_enroll::EnrollResponse, coppice_api::http::EnrollRefusal> {
+    let reply = admin
+        .forward_enroll(pb::ForwardEnrollRequest {
+            history_id,
+            token: call.token,
+            csr_pem: call.csr_pem,
+            node_id: call.node_id.map(Into::into),
+            machine_id: call.machine_id.map(Into::into),
+            sans: call.sans,
+        })
+        .await
+        .map_err(|status| match status.code() {
+            tonic::Code::Unauthenticated => coppice_api::http::EnrollRefusal::Unauthorized,
+            tonic::Code::InvalidArgument => {
+                coppice_api::http::EnrollRefusal::BadRequest(status.message().to_string())
+            }
+            _ => coppice_api::http::EnrollRefusal::Unavailable(status.message().to_string()),
+        })?
+        .into_inner();
+    Ok(coppice_enroll::EnrollResponse {
+        cert_pem: reply.cert_pem,
+        ca_pem: reply.ca_pem,
+    })
+}
+
+/// Coordinator-level analogue of the `coppice-api` route unit tests (oversize
+/// ~line 2370, concurrency cap ~line 2398, rate limiter ~line 2447 in
+/// `crates/coppice-api/src/http/routes.rs`), whose observable is an
+/// issuer-invocation counter on the [`EnrollEndpoint`] callback. Here that
+/// callback is wired to a REAL leader over the real mTLS admin channel — the
+/// same seam [`EnrollService::endpoint()`](coppice_coordinator) fills in
+/// production — so a request that IS admitted does real signing work, and a
+/// request that is shed provably never reaches it.
+///
+/// The rate limiter is 10/s with a burst of 20 (`crates/coppice-api/src/http/enroll.rs`);
+/// a 40-request concurrent burst deterministically exceeds that burst.
+// Real concurrency (not cooperative interleaving on one thread) matters here:
+// the whole point is that 40 requests land on the limiter at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_is_shed_before_the_issuer_is_ever_invoked() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let ca = Ca::new();
+    let (mut daemon, operator) = formed(&ca).await;
+    let (mut admin, history_id) = admin_client(&daemon, &operator).await;
+    let agent_token = mint(&mut admin, &history_id, pbcore::EnrollRole::Agent, "agents").await;
+
+    let issuer_calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = {
+        let admin_for_endpoint = admin.clone();
+        let history_id = history_id.clone();
+        let issuer_calls = Arc::clone(&issuer_calls);
+        coppice_api::http::EnrollEndpoint::new(move |call| {
+            let admin = admin_for_endpoint.clone();
+            let history_id = history_id.clone();
+            let issuer_calls = Arc::clone(&issuer_calls);
+            async move {
+                // Every request the limits admit reaches here — the same seam
+                // `EnrollService::endpoint()` fills in production, and the one
+                // the `routes.rs` unit tests count invocations on.
+                issuer_calls.fetch_add(1, Ordering::SeqCst);
+                forward_via_admin(admin, history_id, call).await
+            }
+        })
+    };
+
+    // A second client listener over the real router, exactly as
+    // `a_follower_proxies_to_the_leader_and_never_redirects` sets one up, but
+    // with our counting endpoint instead of the production proxy.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the flood target's client listener");
+    let addr = listener.local_addr().expect("local addr");
+    let router = coppice_api::http::router(
+        Arc::new(common::NoopPlane),
+        coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        coppice_api::http::ReadyzEndpoint::detached_for_tests(),
+        endpoint,
+    );
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(async move {
+        coppice_coordinator::clientedge::serve(listener, router, None, stop_rx).await;
+    });
+
+    let url = format!("http://{addr}{}", coppice_enroll::ENROLL_PATH);
+
+    // Status, body, and (for the valid enrollments) the node id claimed — the
+    // three things the tally below needs back from each in-flight request.
+    type Answer = tokio::task::JoinHandle<(u16, Vec<u8>, Option<NodeId>)>;
+    let mut handles: Vec<Answer> = Vec::new();
+
+    // Oversized bodies: shed at the 413 byte cap, before the token is even
+    // read from the body.
+    for i in 0..16u32 {
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            let huge = format!(
+                r#"{{"csr_pem":"{}"}}"#,
+                "A".repeat(coppice_api::http::MAX_ENROLL_BODY + 1)
+            );
+            let response = http()
+                .post(&url)
+                .bearer_auth(format!("cpk_oversize-{i}"))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(huge)
+                .send()
+                .await
+                .expect("POST /enroll (oversize)");
+            let (status, body) = checked(response).await;
+            (status, body, None)
+        }));
+    }
+
+    // Ordinary flooding requests: normal-sized bodies, unminted tokens. If
+    // admitted (not shed by rate/concurrency), these reach the issuer and are
+    // refused there (401) — the token is never a real one, but the CSR is
+    // never even looked at, because the enrollment core checks the token
+    // first.
+    for i in 0..16u32 {
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            let body = enroll_body(b"not-a-real-csr", Some(NodeId::new()), None);
+            let response = http()
+                .post(&url)
+                .bearer_auth(format!("cpk_flood-{i}"))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("POST /enroll (flood)");
+            let (status, body) = checked(response).await;
+            (status, body, None)
+        }));
+    }
+
+    // A handful of genuinely valid enrollments, with distinct node ids.
+    for _ in 0..8u32 {
+        let url = url.clone();
+        let token = agent_token.secret.clone();
+        let (_key, csr_pem) = pki::generate_key_and_csr().unwrap();
+        let node = NodeId::new();
+        handles.push(tokio::spawn(async move {
+            let body = enroll_body(&csr_pem, Some(node), None);
+            let response = http()
+                .post(&url)
+                .bearer_auth(token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("POST /enroll (valid)");
+            let (status, body) = checked(response).await;
+            (status, body, Some(node))
+        }));
+    }
+
+    let mut non_shed = 0usize;
+    let mut saw_413 = false;
+    let mut saw_429_or_503 = false;
+    let mut valid_success: Option<(Vec<u8>, NodeId)> = None;
+
+    for handle in handles {
+        let (status, body, node) = handle.await.expect("request task joined");
+        match status {
+            413 => {
+                saw_413 = true;
+            }
+            429 | 503 => {
+                saw_429_or_503 = true;
+            }
+            _ => {
+                non_shed += 1;
+                if status == 200 {
+                    if let Some(node) = node {
+                        valid_success = Some((body, node));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        saw_413,
+        "an oversized body among the burst must be shed at 413"
+    );
+    assert!(
+        saw_429_or_503,
+        "40 concurrent requests against a burst of 20 must shed some at 429/503"
+    );
+    assert_eq!(
+        issuer_calls.load(Ordering::SeqCst),
+        non_shed,
+        "nothing shed by the limits ever reaches the issuer"
+    );
+
+    // A valid enrollment must succeed despite the flood — but on a starved
+    // host the limiter may legitimately shed every valid request that raced
+    // the burst itself. What the ADR promises is that shedding is a
+    // liveness delay, not a lockout: once the burst subsides, a valid
+    // enrollment is admitted. So take an in-burst success if one landed,
+    // and otherwise retry a fresh one until the limiter recovers.
+    let (body, node) = match valid_success {
+        Some(hit) => hit,
+        None => {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let (_key, csr_pem) = pki::generate_key_and_csr().unwrap();
+                let node = NodeId::new();
+                let response = http()
+                    .post(&url)
+                    .bearer_auth(agent_token.secret.clone())
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(enroll_body(&csr_pem, Some(node), None))
+                    .send()
+                    .await
+                    .expect("POST /enroll (post-burst)");
+                let (status, body) = checked(response).await;
+                match status {
+                    200 => break (body, node),
+                    429 | 503 if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    other => panic!(
+                        "a valid enrollment after the burst must eventually be \
+                         admitted, got {other} with the deadline {}",
+                        if Instant::now() < deadline {
+                            "open"
+                        } else {
+                            "elapsed"
+                        }
+                    ),
+                }
+            }
+        }
+    };
+    let issued: coppice_enroll::EnrollResponse = serde_json::from_slice(&body).unwrap();
+    let verified = pki::verify_leaf(issued.ca_pem.as_bytes(), issued.cert_pem.as_bytes())
+        .expect("the issued leaf chains to the cluster CA");
+    assert_eq!(verified.profile, pki::Profile::Agent(node));
+
+    let _ = stop.send(true);
+    let _ = serving.await;
     daemon.stop().await.expect("daemon stops cleanly");
 }

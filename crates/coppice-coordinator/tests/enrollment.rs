@@ -14,9 +14,14 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::id::ClusterId;
 use coppice_core::id::{MachineId, NodeId};
+use coppice_proto::pb::agent::v1 as pbagent;
 use coppice_proto::pb::core::v1 as pbcore;
 use coppice_proto::pb::raft::v1 as pb;
 use coppice_tls::pki;
@@ -162,6 +167,114 @@ async fn a_ttl_is_recorded_as_an_expiry() {
         .expect("mint")
         .into_inner();
     assert!(minted.expires_at_us.is_some());
+
+    daemon.stop().await.expect("daemon stops cleanly");
+}
+
+/// A TTL that has actually **elapsed** refuses enrollment, and refuses it
+/// indistinguishably (ADR 0037 §4/§5: revoked, unknown, expired, and
+/// wrong-role are one answer).
+///
+/// The sibling test above only proves the expiry is *recorded*; the state
+/// machine's own filter is unit-tested in `coppice-state`. Neither says what a
+/// machine presenting an aged-out token gets from the live enrollment core,
+/// which is the failure mode the ADR names — so this drives the whole path,
+/// with the deadline crossed for real.
+///
+/// The wait is a real sleep on purpose. Token expiry is wall-clock
+/// (`Timestamp::now()` at the leader, `crates/coppice-state/src/lib.rs`
+/// `usable_enroll_tokens`), and no test knob moves it: `[pacing]` paces the
+/// convergence loop's retry sleeps and nothing else, `[token_kdf]` only cheapens
+/// hashing. A one-second TTL is therefore the smallest honest way to reach an
+/// expired token, and the sleep is trimmed by however long the setup already
+/// took.
+#[tokio::test]
+async fn an_elapsed_ttl_refuses_enrollment_indistinguishably() {
+    let ca = Ca::new();
+    let (mut daemon, operator) = formed(&ca).await;
+    let (mut client, history_id) = admin_client(&daemon, &operator).await;
+
+    let minted_at = Instant::now();
+    let minted = client
+        .mint_enroll_token(pb::MintEnrollTokenRequest {
+            history_id: history_id.clone(),
+            role: pbcore::EnrollRole::Agent as i32,
+            label: "one-second".to_string(),
+            ttl_seconds: Some(1),
+        })
+        .await
+        .expect("mint")
+        .into_inner();
+    assert!(
+        minted.expires_at_us.is_some(),
+        "a TTL is recorded as an expiry"
+    );
+
+    // Live while the TTL still holds: the refusal below is the deadline
+    // passing, not a token that never worked.
+    let (_key, csr) = pki::generate_key_and_csr().expect("generate a CSR");
+    client
+        .forward_enroll(pb::ForwardEnrollRequest {
+            history_id: history_id.clone(),
+            token: minted.secret.clone(),
+            csr_pem: String::from_utf8(csr.clone()).unwrap(),
+            node_id: Some(NodeId::new().into()),
+            machine_id: None,
+            sans: Vec::new(),
+        })
+        .await
+        .expect("a token enrolls while its TTL still holds");
+
+    // Past the deadline, with margin for the leader's own clock read.
+    let elapsed = minted_at.elapsed();
+    tokio::time::sleep(Duration::from_millis(1_300).saturating_sub(elapsed)).await;
+
+    let expired = client
+        .forward_enroll(pb::ForwardEnrollRequest {
+            history_id: history_id.clone(),
+            token: minted.secret.clone(),
+            csr_pem: String::from_utf8(csr.clone()).unwrap(),
+            node_id: Some(NodeId::new().into()),
+            machine_id: None,
+            sans: Vec::new(),
+        })
+        .await
+        .expect_err("an expired token is refused (ADR 0037 §5)");
+    let unknown = client
+        .forward_enroll(pb::ForwardEnrollRequest {
+            history_id: history_id.clone(),
+            token: "cpk_never-minted".to_string(),
+            csr_pem: String::from_utf8(csr).unwrap(),
+            node_id: Some(NodeId::new().into()),
+            machine_id: None,
+            sans: Vec::new(),
+        })
+        .await
+        .expect_err("an unknown token is refused");
+    assert_eq!(expired.code(), tonic::Code::Unauthenticated);
+    assert_eq!(expired.code(), unknown.code());
+    assert_eq!(
+        expired.message(),
+        unknown.message(),
+        "expired and unknown must be one indistinguishable failure (ADR 0037 §4)"
+    );
+
+    // The token is expired, not revoked: the inventory still carries it
+    // unrevoked, so an operator reading `enroll-token list` sees why it
+    // stopped working rather than a row that claims someone revoked it.
+    let listed = client
+        .list_enroll_tokens(pb::ListEnrollTokensRequest {
+            history_id: history_id.clone(),
+        })
+        .await
+        .expect("list")
+        .into_inner();
+    let row = listed
+        .tokens
+        .iter()
+        .find(|t| t.label == "one-second")
+        .expect("the expired token is still in the inventory");
+    assert!(!row.revoked, "an expired token is not a revoked one");
 
     daemon.stop().await.expect("daemon stops cleanly");
 }
@@ -936,6 +1049,346 @@ async fn a_revoked_identity_cannot_re_enroll_under_either_role() {
         })
         .await
         .expect("an unrevoked subject still enrolls");
+
+    daemon.stop().await.expect("daemon stops cleanly");
+}
+
+// ---------------------------------------------------------------------------
+// Renewal under load
+// ---------------------------------------------------------------------------
+
+/// How many agent identities renew at once. Modest on purpose — the claim is
+/// that renewals genuinely *overlap*, which a barrier guarantees at any width,
+/// not that the cluster survives a stampede of arbitrary size.
+const RENEWERS: usize = 8;
+
+/// One enrolled agent identity: everything needed to dial the session plane
+/// with it.
+struct EnrolledAgent {
+    node: NodeId,
+    key_pem: Vec<u8>,
+    ca_pem: Vec<u8>,
+    cert_pem: Vec<u8>,
+}
+
+/// Redeem `token` for a fresh agent leaf under the cluster CA.
+async fn enroll_agent(
+    client: &mut coppice_net::admin::Client<tonic::transport::Channel>,
+    history_id: &[u8],
+    token: &str,
+) -> EnrolledAgent {
+    let (key_pem, csr) = pki::generate_key_and_csr().expect("generate a CSR");
+    let node = NodeId::new();
+    let issued = client
+        .forward_enroll(pb::ForwardEnrollRequest {
+            history_id: history_id.to_vec(),
+            token: token.to_string(),
+            csr_pem: String::from_utf8(csr).unwrap(),
+            node_id: Some(node.into()),
+            machine_id: None,
+            sans: Vec::new(),
+        })
+        .await
+        .expect("enroll an agent identity")
+        .into_inner();
+    EnrolledAgent {
+        node,
+        key_pem,
+        ca_pem: issued.ca_pem.into_bytes(),
+        cert_pem: issued.cert_pem.into_bytes(),
+    }
+}
+
+/// The registration report an agent opens a session with (ADR 0009 step 2),
+/// hand-rolled: this test wants session-plane *traffic*, not an agent runner.
+fn register_report(node: NodeId) -> pbagent::AgentReport {
+    pbagent::AgentReport {
+        node: Some(node.into()),
+        node_epoch: 0,
+        body: Some(pbagent::agent_report::Body::Register(pbagent::Register {
+            capacity: Some(pbcore::Resources {
+                quantities: Vec::new(),
+            }),
+            labels: Vec::new(),
+            service_addr: None,
+        })),
+    }
+}
+
+/// Cert renewal **under load** (ADR 0037 §4/§5, and the Consequences clause
+/// "cert renewal under load, including renewal refusal for a revoked
+/// identity").
+///
+/// The single-shot renewal tests above each prove one seam with nothing else
+/// happening. The failure modes that only appear under concurrency are
+/// different ones: a renewal that takes the CA key under a lock every other
+/// plane needs, a signing path that serializes behind the session manager, a
+/// revocation read that is skipped when the leader is busy. So this fires
+/// every renewal the deployment has — [`RENEWERS`] agents on the session plane
+/// and the coordinator's own machine identity on the admin plane — from behind
+/// a barrier, so they are genuinely in flight together, while both machine
+/// planes carry ordinary traffic throughout.
+///
+/// Four claims, all of them about the storm and not about any one renewal:
+/// every renewal succeeds; every renewed leaf keeps its subject exactly; the
+/// planes never hiccup (every session opened and every admin read issued
+/// *during* the storm succeeds); and a revoked identity renewing in the middle
+/// of it is still refused — being one of a crowd is not a way past §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_renewals_ride_out_live_plane_traffic_and_a_revoked_identity_is_refused() {
+    let ca = Ca::new();
+    let (mut daemon, operator) = formed(&ca).await;
+    let (mut admin, history_id) = admin_client(&daemon, &operator).await;
+    let minted = mint(&mut admin, &history_id, pbcore::EnrollRole::Agent, "fleet").await;
+
+    // --- Enroll every identity up front, and dial every client, so the
+    // --- barrier releases into renewals and nothing else.
+    let mut renewers = Vec::new();
+    for _ in 0..RENEWERS {
+        let agent = enroll_agent(&mut admin, &history_id, &minted.secret).await;
+        let client = agent_client(&daemon, &agent.ca_pem, &agent.cert_pem, &agent.key_pem).await;
+        renewers.push((agent, client));
+    }
+
+    // Two more agents whose whole job is to keep the session plane busy.
+    let mut traffic_agents = Vec::new();
+    for _ in 0..2 {
+        let agent = enroll_agent(&mut admin, &history_id, &minted.secret).await;
+        let client = agent_client(&daemon, &agent.ca_pem, &agent.cert_pem, &agent.key_pem).await;
+        traffic_agents.push((agent.node, client));
+    }
+
+    // One more, enrolled and then revoked: its renewal rides in the same
+    // storm and must still be refused.
+    let doomed = enroll_agent(&mut admin, &history_id, &minted.secret).await;
+    let mut doomed_client =
+        agent_client(&daemon, &doomed.ca_pem, &doomed.cert_pem, &doomed.key_pem).await;
+    admin
+        .revoke_identity(pb::RevokeIdentityRequest {
+            history_id: history_id.clone(),
+            identity: Some(pbcore::RevokedIdentity {
+                identity: Some(pbcore::revoked_identity::Identity::Node(doomed.node.into())),
+            }),
+        })
+        .await
+        .expect("revoke the doomed node's identity");
+
+    // The coordinator's own renewal, over the admin plane: the same storm has
+    // to carry the machine half of §4, not just the agent half.
+    let (cluster_ca, machine_cert, machine_key) = daemon.tls_material();
+    let machine = match pki::verify_leaf(&cluster_ca, &machine_cert)
+        .expect("the daemon's own leaf verifies")
+        .profile
+    {
+        pki::Profile::Coordinator(m) => m,
+        other => panic!("expected a coordinator leaf, got {other:?}"),
+    };
+    let mut machine_client = coppice_coordinator::admin::admin_channel(
+        &daemon.raft_target(),
+        &cluster_ca,
+        &machine_cert,
+        &machine_key,
+    )
+    .await
+    .expect("dial the admin surface with the machine leaf");
+
+    // --- Background traffic on both machine planes, running before the storm
+    // --- starts and still running when it ends.
+    let stop = Arc::new(AtomicBool::new(false));
+    let admin_ok = Arc::new(AtomicUsize::new(0));
+    let admin_err = Arc::new(AtomicUsize::new(0));
+    let session_ok = Arc::new(AtomicUsize::new(0));
+    let session_err = Arc::new(AtomicUsize::new(0));
+
+    let admin_traffic = {
+        let (ca_pem, cert_pem, key_pem) = operator_identity(&operator);
+        let target = daemon.raft_target();
+        let hid = history_id.clone();
+        let (stop, ok, err) = (
+            Arc::clone(&stop),
+            Arc::clone(&admin_ok),
+            Arc::clone(&admin_err),
+        );
+        tokio::spawn(async move {
+            let mut client =
+                coppice_coordinator::admin::admin_channel(&target, &ca_pem, &cert_pem, &key_pem)
+                    .await
+                    .expect("dial the admin surface for background traffic");
+            while !stop.load(Ordering::Relaxed) {
+                match client
+                    .cluster_status(pb::ClusterStatusRequest {
+                        history_id: hid.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => ok.fetch_add(1, Ordering::Relaxed),
+                    Err(_) => err.fetch_add(1, Ordering::Relaxed),
+                };
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    let mut session_traffic = Vec::new();
+    for (node, client) in traffic_agents {
+        let (stop, ok, err) = (
+            Arc::clone(&stop),
+            Arc::clone(&session_ok),
+            Arc::clone(&session_err),
+        );
+        session_traffic.push(tokio::spawn(async move {
+            let mut client = client;
+            while !stop.load(Ordering::Relaxed) {
+                // Open a session, register, let the request half end. Each
+                // round is a real mTLS handshake, a real gateway accept, and a
+                // real replicated `RegisterNode` — the session plane doing its
+                // ordinary work while the leaf under it is being reissued for
+                // everyone else.
+                let reports = tokio_stream::iter(std::iter::once(register_report(node)));
+                match client.session(reports).await {
+                    Ok(_) => ok.fetch_add(1, Ordering::Relaxed),
+                    Err(_) => err.fetch_add(1, Ordering::Relaxed),
+                };
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }));
+    }
+
+    // Let the traffic get going before the storm, so "during" means during.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let admin_before = admin_ok.load(Ordering::Relaxed);
+    let session_before = session_ok.load(Ordering::Relaxed);
+
+    // --- The storm: every renewal waits on the barrier, so they are in flight
+    // --- together rather than in a queue that happens to be fast.
+    let barrier = Arc::new(tokio::sync::Barrier::new(RENEWERS + 2));
+
+    let mut renewals = Vec::new();
+    for (agent, client) in renewers {
+        let barrier = Arc::clone(&barrier);
+        renewals.push(tokio::spawn(async move {
+            let mut client = client;
+            let (_key, csr) = pki::generate_key_and_csr().expect("generate a CSR");
+            barrier.wait().await;
+            let renewed = client
+                .renew(pbagent::RenewRequest {
+                    csr_pem: String::from_utf8(csr).unwrap(),
+                })
+                .await;
+            (agent, renewed)
+        }));
+    }
+
+    let coordinator_renewal = {
+        let barrier = Arc::clone(&barrier);
+        let hid = history_id.clone();
+        tokio::spawn(async move {
+            let (_key, csr) = pki::generate_key_and_csr().expect("generate a CSR");
+            barrier.wait().await;
+            machine_client
+                .renew_coordinator(pb::RenewCoordinatorRequest {
+                    history_id: hid,
+                    csr_pem: String::from_utf8(csr).unwrap(),
+                    sans: Vec::new(),
+                })
+                .await
+        })
+    };
+
+    let revoked_renewal = {
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            let (_key, csr) = pki::generate_key_and_csr().expect("generate a CSR");
+            barrier.wait().await;
+            doomed_client
+                .renew(pbagent::RenewRequest {
+                    csr_pem: String::from_utf8(csr).unwrap(),
+                })
+                .await
+        })
+    };
+
+    // --- Every agent renewal succeeded, and kept its subject.
+    let mut renewed_certs = Vec::new();
+    for handle in renewals {
+        let (agent, renewed) = handle.await.expect("renewal task joined");
+        let renewed = renewed
+            .unwrap_or_else(|e| panic!("node {} failed to renew under load: {e:?}", agent.node))
+            .into_inner();
+        let verified = pki::verify_leaf(renewed.ca_pem.as_bytes(), renewed.cert_pem.as_bytes())
+            .expect("a leaf renewed under load chains to the cluster CA");
+        assert_eq!(
+            verified.profile,
+            pki::Profile::Agent(agent.node),
+            "renewal under load preserves the subject exactly (ADR 0037 §4)"
+        );
+        assert_ne!(
+            renewed.cert_pem.as_bytes(),
+            agent.cert_pem.as_slice(),
+            "a renewal is a new certificate"
+        );
+        renewed_certs.push(renewed.cert_pem);
+    }
+    renewed_certs.sort();
+    renewed_certs.dedup();
+    assert_eq!(
+        renewed_certs.len(),
+        RENEWERS,
+        "concurrent renewals must not hand two callers the same leaf"
+    );
+
+    // --- …and so did the coordinator's own, on the other plane.
+    let renewed = coordinator_renewal
+        .await
+        .expect("coordinator renewal task joined")
+        .expect("the coordinator renews its own leaf under load")
+        .into_inner();
+    let verified = pki::verify_leaf(renewed.ca_pem.as_bytes(), renewed.cert_pem.as_bytes())
+        .expect("the renewed machine leaf verifies");
+    assert_eq!(
+        verified.profile,
+        pki::Profile::Coordinator(machine),
+        "the machine plane's renewal preserves its subject too"
+    );
+
+    // --- The revoked identity was refused in the middle of all that.
+    let status = revoked_renewal
+        .await
+        .expect("revoked renewal task joined")
+        .expect_err("a revoked identity is refused renewal, however busy the leader is");
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "refusal is v1's revocation mechanism (ADR 0037 §5)"
+    );
+
+    // --- No plane hiccuped: both kept answering throughout the storm, and
+    // --- never once failed.
+    let admin_during = admin_ok.load(Ordering::Relaxed) - admin_before;
+    let session_during = session_ok.load(Ordering::Relaxed) - session_before;
+    stop.store(true, Ordering::Relaxed);
+    admin_traffic.await.expect("admin traffic task joined");
+    for handle in session_traffic {
+        handle.await.expect("session traffic task joined");
+    }
+    assert_eq!(
+        admin_err.load(Ordering::Relaxed),
+        0,
+        "the admin plane refused a read while renewals were in flight"
+    );
+    assert_eq!(
+        session_err.load(Ordering::Relaxed),
+        0,
+        "the session plane refused a session while renewals were in flight"
+    );
+    assert!(
+        admin_during > 0,
+        "no admin-plane traffic overlapped the storm, so nothing was proven"
+    );
+    assert!(
+        session_during > 0,
+        "no session-plane traffic overlapped the storm, so nothing was proven"
+    );
 
     daemon.stop().await.expect("daemon stops cleanly");
 }
