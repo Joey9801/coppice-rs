@@ -6,8 +6,8 @@
 //! idempotently if formation is re-run. The schema is deliberately
 //! minimal: it seeds exactly the replicated state a fresh cluster needs before
 //! it can accept a job — the priority-multiplier table and one or more quota
-//! entities — mirroring what `coppice dev`'s `seed_dev_state` seeds so the two
-//! never drift. Everything else in [`coppice_state::PolicyConfig`] (cost
+//! entities — and `coppice dev` seeds its state through this same schema via
+//! its local `init`, so the two never drift. Everything else in [`coppice_state::PolicyConfig`] (cost
 //! weights, decay, surcharges) keeps its booted defaults and is left to the
 //! ordinary admin tooling; this is not a general policy-editing surface.
 //!
