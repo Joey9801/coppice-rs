@@ -489,12 +489,6 @@ log_level = "warn"
         self.status_rx().borrow().role.is_leader()
     }
 
-    /// This replica's `/readyz` document (ADR 0037 §9), straight from the
-    /// booted coordinator's phase — no HTTP involved.
-    pub fn readyz(&self) -> coppice_api::http::ReadyzReport {
-        self.booted().readyz()
-    }
-
     pub fn summary(&self) -> ClusterSummary {
         self.booted().handle.cluster_summary()
     }
