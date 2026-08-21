@@ -27,6 +27,9 @@ not (
     | binary(key_custody)
     | binary(evidence_removal)
     | binary(address_move)
+    | binary(rotate_ca)
+    | binary(rotate_ca_durability)
+    | binary(refleet)
 )
 '''
 
@@ -55,6 +58,9 @@ binary(cluster)
 | binary(key_custody)
 | binary(evidence_removal)
 | binary(address_move)
+| binary(rotate_ca)
+| binary(rotate_ca_durability)
+| binary(refleet)
 '''
 test-group = 'fleet-serial'
 
@@ -66,6 +72,53 @@ test-group = 'fleet-serial'
 # shards are balanced by measured suite duration. A binary excluded here must
 # appear in exactly one ci-fleet-* profile or CI silently skips it —
 # scripts/check-fleet-shards.sh enforces that partition on every CI run.
+#
+# Balance as of the rotate_ca/refleet placement. Those two are fleet-shaped
+# (3 in-process daemons each) but were in none of these lists, so they ran in
+# the ordinary non-fleet job concurrently with the whole workspace and starved
+# into election churn — the exact failure the fleet-serial comment predicts.
+# Sizing them: local wall time does not divide by one constant, because the dev
+# host adds ~10s of per-test overhead that CI does not (shard 2's 10 long tests
+# measure 248s locally against a 256s CI wall — 1:1 — while shard 3's 37 short
+# ones measure 634s against 235s). Netting that overhead out, rotate_ca's four
+# tests (89s local) are worth ~45s of CI and refleet's one (39s local) ~28s. So
+# the larger goes to the lightest shard and the smaller to the next:
+#
+#   shard 1  cluster, convergence                              4m27s (unchanged)
+#   shard 2  evidence_removal, replace_voter, + refleet        4m16s -> ~4m44s
+#   shard 3  key_custody, formation, admin_membership,
+#            address_move, + rotate_ca                         3m55s -> ~4m40s
+#
+# rotate_ca_durability (5 tests, 3-4 in-process daemons each) is the heaviest
+# addition since, and it does not fit without visibly unbalancing a shard. Two
+# clean serial `--test-threads=1` local runs measured 203.78s and 168.45s; the
+# spread is real, not noise in the measurement — the suite kills leaders and
+# waits on elections and on the 30s per-peer push deadline, so its wall moves
+# run to run more than the other fleet suites do. (Per-test `--exact` runs sum
+# to 329s, but that figure is contended garbage: they were measured against a
+# concurrently building second worktree. The in-process serial runs are the
+# numbers to trust.) Netting out this file's ~10s-per-test dev-host overhead,
+# 5 tests are worth roughly 118-154s of CI; take the conservative ~2m34s.
+#
+# Placement: the shards run in parallel on separate hosts, so the fleet job's
+# wall is their max. Folding ~2m34s into any of the three existing shards puts
+# the max at 7m01s-7m18s — a real regression — so the suite gets its own
+# FOURTH shard instead, keeping the critical path at shard 2's ~4m44s:
+#
+#   shard 1  cluster, convergence                              ~4m27s
+#   shard 2  evidence_removal, replace_voter, refleet          ~4m44s
+#   shard 3  key_custody, formation, admin_membership,
+#            address_move, rotate_ca                           ~4m40s
+#   shard 4  rotate_ca_durability                              ~2m34s
+#
+# A shard profile is only as real as the CI job that runs it:
+# .github/workflows/ci.yml's `matrix: shard:` list must name every ci-fleet-N,
+# or that shard's suites are silently skipped. check-fleet-shards.sh now
+# cross-checks the workflow's matrix against the profiles here, so adding a
+# shard in only one of the two places fails CI instead of dropping tests.
+#
+# Re-measure rather than extrapolate when a suite is added: these are estimates
+# off one host, and the shard walls in CI's own job summaries are the truth.
 [profile.ci]
 default-filter = '''
 not (
@@ -77,6 +130,9 @@ not (
     | binary(key_custody)
     | binary(evidence_removal)
     | binary(address_move)
+    | binary(rotate_ca)
+    | binary(rotate_ca_durability)
+    | binary(refleet)
 )
 '''
 fail-fast = false
@@ -86,7 +142,11 @@ default-filter = 'binary(cluster) | binary(convergence)'
 fail-fast = false
 
 [profile.ci-fleet-2]
-default-filter = 'binary(evidence_removal) | binary(replace_voter)'
+default-filter = '''
+binary(evidence_removal)
+| binary(replace_voter)
+| binary(refleet)
+'''
 fail-fast = false
 
 [profile.ci-fleet-3]
@@ -95,7 +155,12 @@ binary(key_custody)
 | binary(formation)
 | binary(admin_membership)
 | binary(address_move)
+| binary(rotate_ca)
 '''
+fail-fast = false
+
+[profile.ci-fleet-4]
+default-filter = 'binary(rotate_ca_durability)'
 fail-fast = false
 
 # The whole suite in one run — what CI's {ci, ci-fleet-*} jobs add up to.
@@ -121,4 +186,7 @@ binary(cluster)
 | binary(key_custody)
 | binary(evidence_removal)
 | binary(address_move)
+| binary(rotate_ca)
+| binary(rotate_ca_durability)
+| binary(refleet)
 '''
