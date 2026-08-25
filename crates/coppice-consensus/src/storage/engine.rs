@@ -1270,6 +1270,12 @@ impl<F: Fs> StorageCore<F> {
         // The commit point: one atomic manifest swap.
         write_manifest(&self.fs, &self.manifest)?;
 
+        // Adoption is a fact as of this line, so the metrics say so here and
+        // not at the end: everything below — dropping the segments this
+        // snapshot covers, deleting the snapshot it supersedes — is cleanup
+        // that can fail without making the flip any less committed.
+        super::sm::record_snapshot_adopted(meta.last_applied.as_ref().map_or(0, |id| id.index));
+
         for start in &dropped {
             self.segments.remove(start);
             if self.active.as_ref().is_some_and(|a| a.start == *start) {

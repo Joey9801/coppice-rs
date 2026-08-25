@@ -338,11 +338,17 @@ snapshot-capture stall histograms, and state-size gauges, all behind the
 `describe_metrics()`/`gather_metrics()` module pattern. Snapshot health rides
 the same pattern: `coordinator_snapshot_build_seconds` (duration),
 `coordinator_snapshot_last_index` (the log index the newest adopted snapshot
-covers — read against `coordinator_view_applied_index` for how far the log
-has run past it), `coordinator_snapshot_age_seconds` (sampled, and absent
-until this process adopts a snapshot rather than falsely zero after a
-restart), and `coordinator_snapshot_failures_total{phase}` for builds and
-installs that failed without touching durable storage. These are served on the
+covers — seeded at startup from the snapshot recovery finds on disk, and read
+against `coordinator_view_applied_index` for how far the log has run past it),
+`coordinator_snapshot_age_seconds` (sampled, and absent until this process
+adopts a snapshot rather than falsely zero after a restart — no durable stamp
+carries a snapshot's wall clock), and
+`coordinator_snapshot_failures_total{phase}` for builds and installs that
+returned an error. Both gauges are written by the engine at the manifest flip,
+the one moment adoption becomes a fact, so a snapshot that commits and then
+fails its cleanup still reports a fresh age and index; the failure counter
+rising *with* a climbing age is what distinguishes a replica that cannot
+snapshot at all. These are served on the
 `/metrics` endpoint mounted on the client API listener (issue #46): the recorder
 is installed at bootstrap before consensus starts, so metrics accrue from the
 first apply, and a periodic upkeep task drains the histogram buckets on a timer
