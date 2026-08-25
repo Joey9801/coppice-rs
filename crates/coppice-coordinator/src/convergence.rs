@@ -574,6 +574,14 @@ impl Convergence {
         // self-consistent — which is precisely how an old volume ends up
         // serving a history the fleet re-initialized past (ADR 0037 §3).
         if me.is_some_and(|m| m.voter) {
+            // Including the notices: this replica holds a seat, so whatever
+            // the pre-promotion churn left in `/readyz` is stale by
+            // definition. The `Promoted` arm below clears them too, but only
+            // for the promotion *this* loop drove — a replica that restarts
+            // already promoted, or one a new leader promoted out from under
+            // an in-flight attempt, converges through here and never through
+            // that arm (ADR 0037 §6/§9).
+            self.phase.clear_convergence_notices();
             self.watch_for_supersession(&summary).await;
             return self.pacing.settled_interval;
         }
@@ -617,8 +625,7 @@ impl Convergence {
                 );
                 // A converged voter has nothing pending; leaving a stale
                 // refusal or hold in `/readyz` would read as a live problem.
-                self.phase.clear_admission_refusal();
-                self.phase.clear_promotion_hold();
+                self.phase.clear_convergence_notices();
                 self.pacing.settled_interval
             }
             JoinStep::Learner => self.pacing.probe_interval,

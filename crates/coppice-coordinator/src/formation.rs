@@ -260,6 +260,31 @@ impl PhaseState {
         *self.promotion_hold.write().expect("promotion hold lock") = None;
     }
 
+    /// Drop both convergence notices, because this replica now observes
+    /// itself as a voter and a voter has nothing pending.
+    ///
+    /// Called from every path the convergence loop can reach a settled seat
+    /// by — the promotion this loop drove, and equally the promotion it did
+    /// *not*: a restart that comes back already promoted, or a promotion a
+    /// new leader completed, both of which reach voterhood without this
+    /// process ever seeing a `PromoteVoter` succeed. Either notice left
+    /// behind by the pre-promotion churn (a refusal from a leader that has
+    /// since moved, a hold on a seat since granted) would then sit in
+    /// `/readyz` forever, and §9 makes that field the operator's signal that
+    /// this node will *not* converge — the one meaning it must not carry on a
+    /// node that already has.
+    ///
+    /// Safe against masking a live problem because nothing records either
+    /// notice from a voter: both writers sit past the loop's voter
+    /// short-circuit, so any message being dropped here necessarily predates
+    /// the seat. The terminal conditions that *must* outlive convergence —
+    /// the superseded fail-stop (§3) — are deliberately not kept in these
+    /// fields, and have no clearing counterpart at all.
+    pub(crate) fn clear_convergence_notices(&self) {
+        self.clear_admission_refusal();
+        self.clear_promotion_hold();
+    }
+
     /// Publish the history-superseded fail-stop (ADR 0037 §3): this volume's
     /// raft history predates a re-init of a cluster wearing the same
     /// `cluster_id`, so nothing this replica holds can ever rejoin it.
