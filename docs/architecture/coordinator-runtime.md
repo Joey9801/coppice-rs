@@ -78,9 +78,9 @@ followers, which is what lets followers serve reads and event streams.
 | Ingestion / normalizer | `coppice-coordinator` | yes | the ObservedSet diff, dedupe state | agent inbound reports |
 | Dispatch loop | `coppice-coordinator` | yes | in-flight dispatch bookkeeping | the event stream |
 | Scheduler driver | `coppice-coordinator` | yes | the current scheduling pass | its own loop + view updates |
-| Housekeeping | `coppice-coordinator` | yes | the eviction/snapshot cadence | a 60 s tick |
+| Housekeeping | `coppice-coordinator` | yes | the eviction cadence and the leader health monitor | a 60 s tick |
 | Leaf renewal | `coppice-coordinator` | no | this replica's own `[tls]` material ([ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md) §4) | a timer at ~2/3 of the served leaf's remaining lifetime |
-| Snapshot builder | `coppice-consensus` | no | snapshot serialization/IO | snapshot requests |
+| Snapshot builder | `coppice-consensus` | no | snapshot serialization/IO | openraft's `SnapshotPolicy`, or an explicit `trigger_snapshot` |
 
 1. **openraft core + replication + election.** A black box. Its internal
    channels are its own business. It calls our storage layer (the segment
@@ -194,10 +194,16 @@ followers, which is what lets followers serve reads and event streams.
    only after that write is durable proposes `EvictTerminalJobs`. This is the
    [ADR 0012](../decisions/0012-data-retention.md) ordering: history-write
    durability is sequenced *before* the evict proposal, never concurrent with
-   it. The same task triggers snapshots via `Consensus::trigger_snapshot`
-   when applied-entries-since-snapshot crosses a threshold ([ADR 0002](../decisions/0002-openraft-with-custom-segment-storage.md)
+   it. Snapshot cadence is **not** housekeeping's job: openraft drives it
+   from `SnapshotPolicy::LogsSinceLast(snapshot_log_entries)`, and purges
+   behind it down to `max_in_snapshot_log_to_keep = snapshot_keep_log_entries`
+   ([ADR 0002](../decisions/0002-openraft-with-custom-segment-storage.md)
    / [ADR 0017](../decisions/0017-log-manifest-truncation-and-purge.md):
-   sealed segments are deletable only once a snapshot covers them). Duplicate
+   sealed segments are deletable only once a snapshot covers them). Both
+   values come from `[raft]` in the node config and are passed through at
+   node assembly (`coppice-consensus::node`); coalescing and retry live in
+   openraft, and `Consensus::trigger_snapshot` remains for operators and
+   tests that need a snapshot *now*. Duplicate
    history writes across a leader change are harmless (idempotent by job id);
    duplicate evict proposals are absorbed by apply (missing ids are skipped).
    The same tick is the **leader health monitor** of
@@ -329,7 +335,14 @@ a bound on watch-channel churn, no longer as protection against clone cost.
 Publishing is **instrumented**, as originally promised: a
 `coordinator_view_clone_seconds` histogram, apply-batch and
 snapshot-capture stall histograms, and state-size gauges, all behind the
-`describe_metrics()`/`gather_metrics()` module pattern. These are served on the
+`describe_metrics()`/`gather_metrics()` module pattern. Snapshot health rides
+the same pattern: `coordinator_snapshot_build_seconds` (duration),
+`coordinator_snapshot_last_index` (the log index the newest adopted snapshot
+covers — read against `coordinator_view_applied_index` for how far the log
+has run past it), `coordinator_snapshot_age_seconds` (sampled, and absent
+until this process adopts a snapshot rather than falsely zero after a
+restart), and `coordinator_snapshot_failures_total{phase}` for builds and
+installs that failed without touching durable storage. These are served on the
 `/metrics` endpoint mounted on the client API listener (issue #46): the recorder
 is installed at bootstrap before consensus starts, so metrics accrue from the
 first apply, and a periodic upkeep task drains the histogram buckets on a timer

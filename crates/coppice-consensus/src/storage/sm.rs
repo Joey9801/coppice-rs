@@ -70,6 +70,33 @@ use super::snapshot;
 /// Off-apply-task snapshot build cost: encode + write + validate + adopt of
 /// one container, on the blocking pool.
 const SNAPSHOT_BUILD_SECONDS: &str = "coordinator_snapshot_build_seconds";
+/// The `last_applied` log index covered by the newest snapshot this replica
+/// has adopted — the coordinate the purge floor follows (ADR 0017). Read
+/// against `coordinator_view_applied_index` to see how far the log has run
+/// past the last snapshot.
+const SNAPSHOT_LAST_INDEX: &str = "coordinator_snapshot_last_index";
+/// How long ago this replica last adopted a snapshot. Sampled, not pushed:
+/// age advances with the clock, not with events.
+const SNAPSHOT_AGE_SECONDS: &str = "coordinator_snapshot_age_seconds";
+/// Snapshot adoptions that failed, by [`PHASE_BUILD`]/[`PHASE_INSTALL`].
+///
+/// A failure here is survivable by construction — nothing durable changes
+/// until a container validates and the manifest pointer flips (ADR 0017) —
+/// so this counter rising without `coordinator_snapshot_age_seconds`
+/// flattening is the signal worth alerting on.
+const SNAPSHOT_FAILURES_TOTAL: &str = "coordinator_snapshot_failures_total";
+
+/// `phase` label values for [`SNAPSHOT_FAILURES_TOTAL`].
+const PHASE_BUILD: &str = "build";
+const PHASE_INSTALL: &str = "install";
+
+/// When this process last adopted a snapshot, behind [`SNAPSHOT_AGE_SECONDS`].
+///
+/// Process-local on purpose: no durable stamp carries a snapshot's wall
+/// clock, so after a restart the gauge is simply **absent** until this
+/// replica adopts one. Absent beats a fabricated zero — an age alert must not
+/// read "just snapshotted" merely because the coordinator bounced.
+static LAST_SNAPSHOT_AT: StdMutex<Option<Instant>> = StdMutex::new(None);
 
 pub(crate) fn describe_metrics() {
     metrics::describe_histogram!(
@@ -77,10 +104,43 @@ pub(crate) fn describe_metrics() {
         metrics::Unit::Seconds,
         "Time to encode, write, validate, and adopt one snapshot container (off the apply task)."
     );
+    metrics::describe_gauge!(
+        SNAPSHOT_LAST_INDEX,
+        metrics::Unit::Count,
+        "Raft log index covered by the newest snapshot this replica has adopted."
+    );
+    metrics::describe_gauge!(
+        SNAPSHOT_AGE_SECONDS,
+        metrics::Unit::Seconds,
+        "Seconds since this replica last adopted a snapshot (absent until it adopts one)."
+    );
+    metrics::describe_counter!(
+        SNAPSHOT_FAILURES_TOTAL,
+        metrics::Unit::Count,
+        "Snapshot adoptions that failed, by phase (build, install)."
+    );
 }
 
 pub(crate) fn gather_metrics() {
-    // The build histogram is pushed as builds run; nothing needs sampling.
+    // Build duration and last-index are pushed as snapshots are adopted; age
+    // is a function of the clock alone, so it is sampled here.
+    if let Some(at) = *LAST_SNAPSHOT_AT.lock().unwrap_or_else(|e| e.into_inner()) {
+        metrics::gauge!(SNAPSHOT_AGE_SECONDS).set(at.elapsed().as_secs_f64());
+    }
+}
+
+/// Note one adopted snapshot — built here or installed from the leader.
+///
+/// Called only once the manifest pointer has flipped, so the gauges describe
+/// what is durably on this disk, never what was merely attempted.
+fn record_snapshot_adopted(last_index: u64) {
+    *LAST_SNAPSHOT_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    metrics::gauge!(SNAPSHOT_LAST_INDEX).set(last_index as f64);
+}
+
+/// Note one failed snapshot adoption.
+fn record_snapshot_failure(phase: &'static str) {
+    metrics::counter!(SNAPSHOT_FAILURES_TOTAL, "phase" => phase).increment(1);
 }
 
 /// The openraft `SnapshotData` binding: a file-backed handle to one ADR 0018
@@ -205,6 +265,72 @@ impl<F: Fs> StateMachineStore<F> {
             shards,
             history_id,
         }
+    }
+
+    async fn install_snapshot_inner(
+        &mut self,
+        meta: &SnapshotMeta<CoordinatorId, BasicNode>,
+        snapshot: Box<SnapshotFile>,
+    ) -> Result<(), StorageError<CoordinatorId>> {
+        // Decode first, streaming from the file: every section CRC is
+        // validated and every record must convert before anything durable
+        // changes (ADR 0016 — a snapshot that cannot rebuild state is never
+        // adopted). Only per-section buffers are ever in memory (ADR 0018).
+        let expect_id = meta.snapshot_id.clone();
+        let (snapshot, state) = tokio::task::spawn_blocking(
+            move || -> io::Result<(Box<SnapshotFile>, StateMachine)> {
+                let path = std::path::Path::new("install-snapshot");
+                let (embedded, records) = snapshot::decode_state_file(path, snapshot.as_file())?;
+                if embedded.snapshot_id != expect_id {
+                    return Err(io::Error::other(format!(
+                        "snapshot stream claims id {expect_id:?} but carries {:?}",
+                        embedded.snapshot_id
+                    )));
+                }
+                let state = state_from_records(records).map_err(|e| {
+                    io::Error::other(format!("snapshot records do not rebuild: {e}"))
+                })?;
+                Ok((snapshot, state))
+            },
+        )
+        .await
+        .map_err(|e| sm_write_err(&io::Error::other(format!("storage task panicked: {e}"))))?
+        .map_err(|e| sm_write_err(&e))?;
+
+        let mut applied = self.applied.lock().await;
+
+        // Durable adoption: stream the container into this store (copy,
+        // fsync, rename), flip the manifest pointer, and advance the purge
+        // floor past everything the snapshot covers, in one manifest swap
+        // (ADR 0016 learner rebuild; ADR 0017 ordering).
+        let core = Arc::clone(&self.core);
+        tokio::task::spawn_blocking(move || {
+            let mut core = core.lock().expect("storage engine poisoned");
+            core.install_snapshot_from(snapshot.as_file(), true)?;
+            // If this snapshot arrived over the wire, `snapshot` is the
+            // receive spool — adopted now, so drop the spool file.
+            core.remove_snapshot_spool()
+        })
+        .await
+        .map_err(|e| sm_write_err(&io::Error::other(format!("storage task panicked: {e}"))))?
+        .map_err(|e| sm_write_err(&e))?;
+
+        // State adoption, through the single-writer protocol.
+        let applied_index = meta.last_log_id.map(|id| id.index).unwrap_or(0);
+        let (reply, rx) = oneshot::channel();
+        self.apply_tx
+            .send(ApplyRequest::Install {
+                state: Box::new(state),
+                applied_index,
+                reply,
+            })
+            .await
+            .map_err(|_| channel_closed())?;
+        rx.await.map_err(|_| channel_closed())?;
+
+        applied.last_applied = meta.last_log_id;
+        applied.membership = meta.last_membership.clone();
+        Ok(())
     }
 }
 
@@ -335,70 +461,26 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
         Ok(Box::new(SnapshotFile::new(file)))
     }
 
+    /// The metrics skin over [`StateMachineStore::install_snapshot_inner`].
+    ///
+    /// A rejected container (bad CRC, wrong snapshot id, records that will
+    /// not rebuild) is discarded before anything durable changes, so this
+    /// only ever counts the failure.
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<CoordinatorId, BasicNode>,
         snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<CoordinatorId>> {
-        // Decode first, streaming from the file: every section CRC is
-        // validated and every record must convert before anything durable
-        // changes (ADR 0016 — a snapshot that cannot rebuild state is never
-        // adopted). Only per-section buffers are ever in memory (ADR 0018).
-        let expect_id = meta.snapshot_id.clone();
-        let (snapshot, state) = tokio::task::spawn_blocking(
-            move || -> io::Result<(Box<SnapshotFile>, StateMachine)> {
-                let path = std::path::Path::new("install-snapshot");
-                let (embedded, records) = snapshot::decode_state_file(path, snapshot.as_file())?;
-                if embedded.snapshot_id != expect_id {
-                    return Err(io::Error::other(format!(
-                        "snapshot stream claims id {expect_id:?} but carries {:?}",
-                        embedded.snapshot_id
-                    )));
-                }
-                let state = state_from_records(records).map_err(|e| {
-                    io::Error::other(format!("snapshot records do not rebuild: {e}"))
-                })?;
-                Ok((snapshot, state))
-            },
-        )
-        .await
-        .map_err(|e| sm_write_err(&io::Error::other(format!("storage task panicked: {e}"))))?
-        .map_err(|e| sm_write_err(&e))?;
-
-        let mut applied = self.applied.lock().await;
-
-        // Durable adoption: stream the container into this store (copy,
-        // fsync, rename), flip the manifest pointer, and advance the purge
-        // floor past everything the snapshot covers, in one manifest swap
-        // (ADR 0016 learner rebuild; ADR 0017 ordering).
-        let core = Arc::clone(&self.core);
-        tokio::task::spawn_blocking(move || {
-            let mut core = core.lock().expect("storage engine poisoned");
-            core.install_snapshot_from(snapshot.as_file(), true)?;
-            // If this snapshot arrived over the wire, `snapshot` is the
-            // receive spool — adopted now, so drop the spool file.
-            core.remove_snapshot_spool()
-        })
-        .await
-        .map_err(|e| sm_write_err(&io::Error::other(format!("storage task panicked: {e}"))))?
-        .map_err(|e| sm_write_err(&e))?;
-
-        // State adoption, through the single-writer protocol.
-        let applied_index = meta.last_log_id.map(|id| id.index).unwrap_or(0);
-        let (reply, rx) = oneshot::channel();
-        self.apply_tx
-            .send(ApplyRequest::Install {
-                state: Box::new(state),
-                applied_index,
-                reply,
-            })
-            .await
-            .map_err(|_| channel_closed())?;
-        rx.await.map_err(|_| channel_closed())?;
-
-        applied.last_applied = meta.last_log_id;
-        applied.membership = meta.last_membership.clone();
-        Ok(())
+        match self.install_snapshot_inner(meta, snapshot).await {
+            Ok(()) => {
+                record_snapshot_adopted(meta.last_log_id.as_ref().map_or(0, |id| id.index));
+                Ok(())
+            }
+            Err(e) => {
+                record_snapshot_failure(PHASE_INSTALL);
+                Err(e)
+            }
+        }
     }
 
     async fn get_current_snapshot(
@@ -425,7 +507,31 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
 }
 
 impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
+    /// The metrics skin over [`SegmentSnapshotBuilder::build_snapshot_inner`].
+    ///
+    /// Success is recorded from the returned meta, i.e. after the manifest
+    /// pointer has flipped; a failure leaves storage untouched (ADR 0017) and
+    /// openraft retries on its own cadence, so it is counted, not escalated.
     async fn build_snapshot(
+        &mut self,
+    ) -> Result<Snapshot<TypeConfig>, StorageError<CoordinatorId>> {
+        match self.build_snapshot_inner().await {
+            Ok(snapshot) => {
+                record_snapshot_adopted(
+                    snapshot.meta.last_log_id.as_ref().map_or(0, |id| id.index),
+                );
+                Ok(snapshot)
+            }
+            Err(e) => {
+                record_snapshot_failure(PHASE_BUILD);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl<F: Fs> SegmentSnapshotBuilder<F> {
+    async fn build_snapshot_inner(
         &mut self,
     ) -> Result<Snapshot<TypeConfig>, StorageError<CoordinatorId>> {
         // Capture a coherent (state, log id, membership) triple under the
@@ -559,5 +665,97 @@ pub async fn run_apply_task(mut state: StateMachine, mut rx: mpsc::Receiver<Appl
                 let _ = reply.send(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+    /// One metric's value by name, or `None` if it was never touched.
+    fn value(snapshotter: &Snapshotter, name: &str) -> Option<DebugValue> {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _unit, _desc, value)| (key.key().name() == name).then_some(value))
+    }
+
+    /// Adoption pushes the index; age is only ever *sampled*, so a gather is
+    /// what materializes it — and it stays absent until something is adopted,
+    /// because a zero would read as "just snapshotted" on a replica that has
+    /// never snapshotted at all.
+    #[test]
+    fn adoption_pushes_the_index_and_gather_samples_the_age() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            // The static is process-wide, so this test cannot assert the
+            // never-adopted case against it; it asserts the ordering instead:
+            // no gather, no age, even after an adoption.
+            record_snapshot_adopted(4_211);
+            assert_eq!(
+                value(&snapshotter, SNAPSHOT_LAST_INDEX),
+                Some(DebugValue::Gauge(4_211.0.into())),
+                "the last-index gauge is pushed at adoption"
+            );
+            assert!(
+                value(&snapshotter, SNAPSHOT_AGE_SECONDS).is_none(),
+                "age is sampled, never pushed: nothing should exist before a gather"
+            );
+
+            gather_metrics();
+            let DebugValue::Gauge(age) = value(&snapshotter, SNAPSHOT_AGE_SECONDS)
+                .expect("age is emitted once a snapshot has been adopted and gathered")
+            else {
+                panic!("snapshot age must be a gauge");
+            };
+            assert!(
+                age.into_inner() < 60.0,
+                "age measures from the adoption we just recorded, got {age:?}"
+            );
+        });
+    }
+
+    /// Failures are counted per phase, so a build that keeps failing is
+    /// distinguishable from a peer that keeps sending containers this replica
+    /// rejects.
+    #[test]
+    fn failures_are_counted_per_phase() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            record_snapshot_failure(PHASE_BUILD);
+            record_snapshot_failure(PHASE_INSTALL);
+            record_snapshot_failure(PHASE_INSTALL);
+        });
+
+        let mut by_phase: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == SNAPSHOT_FAILURES_TOTAL)
+            .map(|(key, _, _, value)| {
+                let phase = key
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "phase")
+                    .expect("every failure carries a phase label")
+                    .value()
+                    .to_string();
+                let DebugValue::Counter(n) = value else {
+                    panic!("snapshot failures must be a counter");
+                };
+                (phase, n)
+            })
+            .collect();
+        by_phase.sort();
+        assert_eq!(
+            by_phase,
+            vec![("build".to_string(), 1), ("install".to_string(), 2)]
+        );
     }
 }
