@@ -78,12 +78,17 @@ const SNAPSHOT_LAST_INDEX: &str = "coordinator_snapshot_last_index";
 /// How long ago this replica last adopted a snapshot. Sampled, not pushed:
 /// age advances with the clock, not with events.
 const SNAPSHOT_AGE_SECONDS: &str = "coordinator_snapshot_age_seconds";
-/// Snapshot adoptions that failed, by [`PHASE_BUILD`]/[`PHASE_INSTALL`].
+/// Snapshot operations that returned an error, by
+/// [`PHASE_BUILD`]/[`PHASE_INSTALL`].
 ///
-/// A failure here is survivable by construction — nothing durable changes
-/// until a container validates and the manifest pointer flips (ADR 0017) —
-/// so this counter rising without `coordinator_snapshot_age_seconds`
-/// flattening is the signal worth alerting on.
+/// Failed *operation*, not necessarily failed adoption: the commit point is
+/// the manifest flip inside `StorageCore::adopt_snapshot`, and the cleanup
+/// after it (dropping purged segments, deleting the superseded snapshot) is
+/// fallible too. Both are counted here, and the two cases are told apart by
+/// what the gauges do — an error before the flip leaves
+/// `coordinator_snapshot_age_seconds` climbing, while an error after it
+/// arrives with a fresh age and an advanced index, because the snapshot
+/// really is durable. Rising failures *with* a climbing age is the alert.
 const SNAPSHOT_FAILURES_TOTAL: &str = "coordinator_snapshot_failures_total";
 
 /// `phase` label values for [`SNAPSHOT_FAILURES_TOTAL`].
@@ -121,6 +126,19 @@ pub(crate) fn describe_metrics() {
     );
 }
 
+/// Publish the index of the snapshot recovery found on disk.
+///
+/// Deliberately only the index, never the timestamp: the index is a durable
+/// fact the manifest carries, while *when* that snapshot was taken is not
+/// recorded anywhere, so age stays absent until this process adopts one
+/// itself (see [`LAST_SNAPSHOT_AT`]). Without this, a healthy replica that
+/// simply has not snapshotted since it restarted would publish no index at
+/// all, and the documented reading against `coordinator_view_applied_index`
+/// would have nothing to compare.
+fn seed_snapshot_index(last_index: u64) {
+    metrics::gauge!(SNAPSHOT_LAST_INDEX).set(last_index as f64);
+}
+
 pub(crate) fn gather_metrics() {
     // Build duration and last-index are pushed as snapshots are adopted; age
     // is a function of the clock alone, so it is sampled here.
@@ -131,14 +149,17 @@ pub(crate) fn gather_metrics() {
 
 /// Note one adopted snapshot — built here or installed from the leader.
 ///
-/// Called only once the manifest pointer has flipped, so the gauges describe
-/// what is durably on this disk, never what was merely attempted.
-fn record_snapshot_adopted(last_index: u64) {
+/// Called from the engine the instant the manifest flip commits, which is
+/// the only moment that means "this snapshot is now the one on disk". Doing
+/// it there rather than on the outer method's `Ok` is what keeps the gauges
+/// honest when adoption succeeds and the cleanup behind it fails: the
+/// snapshot is durable, so age and index must say so.
+pub(super) fn record_snapshot_adopted(last_index: u64) {
     *LAST_SNAPSHOT_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     metrics::gauge!(SNAPSHOT_LAST_INDEX).set(last_index as f64);
 }
 
-/// Note one failed snapshot adoption.
+/// Note one snapshot operation that returned an error.
 fn record_snapshot_failure(phase: &'static str) {
     metrics::counter!(SNAPSHOT_FAILURES_TOTAL, "phase" => phase).increment(1);
 }
@@ -255,6 +276,14 @@ impl<F: Fs> StateMachineStore<F> {
         shards: u32,
         history_id: [u8; 16],
     ) -> Self {
+        // `last_applied` here is the *snapshot's* log id, read back from the
+        // manifest by `storage::open` — not a post-replay applied index — so
+        // it is exactly what the last-index gauge means. `None` is a store
+        // with no snapshot yet: no index to publish, and the gauge stays
+        // absent rather than claiming index 0.
+        if let Some(id) = last_applied.as_ref() {
+            seed_snapshot_index(id.index);
+        }
         StateMachineStore {
             core,
             apply_tx,
@@ -463,24 +492,22 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
 
     /// The metrics skin over [`StateMachineStore::install_snapshot_inner`].
     ///
-    /// A rejected container (bad CRC, wrong snapshot id, records that will
-    /// not rebuild) is discarded before anything durable changes, so this
-    /// only ever counts the failure.
+    /// Only the failure counter lives here, for the same reason as
+    /// [`RaftSnapshotBuilder::build_snapshot`]: an install commits at the
+    /// manifest flip and then still has work that can fail — dropping the
+    /// receive spool, handing the rebuilt state to the apply task — after
+    /// the container is already the durable one. The engine records adoption
+    /// at the flip; this counts the error either way.
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<CoordinatorId, BasicNode>,
         snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<CoordinatorId>> {
-        match self.install_snapshot_inner(meta, snapshot).await {
-            Ok(()) => {
-                record_snapshot_adopted(meta.last_log_id.as_ref().map_or(0, |id| id.index));
-                Ok(())
-            }
-            Err(e) => {
+        self.install_snapshot_inner(meta, snapshot)
+            .await
+            .inspect_err(|_| {
                 record_snapshot_failure(PHASE_INSTALL);
-                Err(e)
-            }
-        }
+            })
     }
 
     async fn get_current_snapshot(
@@ -509,24 +536,18 @@ impl<F: Fs> RaftStateMachine<TypeConfig> for StateMachineStore<F> {
 impl<F: Fs> RaftSnapshotBuilder<TypeConfig> for SegmentSnapshotBuilder<F> {
     /// The metrics skin over [`SegmentSnapshotBuilder::build_snapshot_inner`].
     ///
-    /// Success is recorded from the returned meta, i.e. after the manifest
-    /// pointer has flipped; a failure leaves storage untouched (ADR 0017) and
-    /// openraft retries on its own cadence, so it is counted, not escalated.
+    /// Only the failure counter lives here. Adoption is recorded by the
+    /// engine at the manifest flip, because a build can commit and *then*
+    /// fail — reopening the freshly adopted container, or the cleanup inside
+    /// `adopt_snapshot` — and that snapshot is durable whatever this method
+    /// returns. openraft retries on its own cadence, so an error is counted,
+    /// not escalated.
     async fn build_snapshot(
         &mut self,
     ) -> Result<Snapshot<TypeConfig>, StorageError<CoordinatorId>> {
-        match self.build_snapshot_inner().await {
-            Ok(snapshot) => {
-                record_snapshot_adopted(
-                    snapshot.meta.last_log_id.as_ref().map_or(0, |id| id.index),
-                );
-                Ok(snapshot)
-            }
-            Err(e) => {
-                record_snapshot_failure(PHASE_BUILD);
-                Err(e)
-            }
-        }
+        self.build_snapshot_inner().await.inspect_err(|_| {
+            record_snapshot_failure(PHASE_BUILD);
+        })
     }
 }
 
@@ -715,6 +736,28 @@ mod metrics_tests {
             assert!(
                 age.into_inner() < 60.0,
                 "age measures from the adoption we just recorded, got {age:?}"
+            );
+        });
+    }
+
+    /// Recovery seeds the index without claiming a fresh snapshot: the
+    /// manifest knows which index the snapshot on disk covers, but nothing
+    /// records when it was taken.
+    #[test]
+    fn recovery_seeds_the_index_but_never_the_age() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            seed_snapshot_index(9_042);
+            assert_eq!(
+                value(&snapshotter, SNAPSHOT_LAST_INDEX),
+                Some(DebugValue::Gauge(9_042.0.into())),
+                "a replica that restarts onto an existing snapshot publishes its index"
+            );
+            assert!(
+                value(&snapshotter, SNAPSHOT_AGE_SECONDS).is_none(),
+                "seeding must not fabricate an age for a snapshot of unknown vintage"
             );
         });
     }
