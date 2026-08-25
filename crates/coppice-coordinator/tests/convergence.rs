@@ -454,10 +454,23 @@ async fn interrupted_join_at(point: KillPoint) {
             "{point:?} (killed at {phase_at_kill}): the restart must resume the stamped node id"
         );
     }
-    assert!(
-        body["last_admission_refusal"].is_null(),
-        "{point:?}: a converged replica reports no refusal: {body}"
-    );
+    // Converged means converged: whatever refusal or hold the interrupted
+    // attempt left behind — a key transfer aimed at a leader that has since
+    // moved, a seat that was full when this replica last asked — is cleared
+    // once the loop observes the seat, so an operator reading `/readyz`
+    // afterwards sees no outstanding problem (ADR 0037 §9). Polled, not read
+    // once: `phase` flips the instant membership shows the seat, while the
+    // notices are cleared by the loop's next pass — a window one tick wide
+    // that a single sample can land inside under CI load.
+    poll(
+        Duration::from_secs(10),
+        "the converged replica clears its refusal and hold on the next loop pass",
+        || async {
+            let body = joiner.readyz().await.1;
+            body["last_admission_refusal"].is_null() && body["promotion_hold"].is_null()
+        },
+    )
+    .await;
 
     // One seat ever existed, and it is the joiner's: asserted from the
     // leader's side of membership, which is the side that decides.
