@@ -3,10 +3,16 @@
 //! Scans the view for terminal jobs past retention and writes them to the
 //! SQL job-history store first — an external network call, therefore
 //! outside apply, with retries — and only after that write is durable
-//! proposes `EvictTerminalJobs` (ADR 0012 ordering). The same task triggers
-//! snapshots via `Consensus::trigger_snapshot` once applied-entries-since-
-//! snapshot crosses a threshold (ADR 0002 / ADR 0017). See
+//! proposes `EvictTerminalJobs` (ADR 0012 ordering). See
 //! `docs/architecture/coordinator-runtime.md`, "Housekeeping".
+//!
+//! Snapshot cadence is **not** this task's job. openraft drives it from
+//! `SnapshotPolicy::LogsSinceLast(snapshot_log_entries)` with
+//! `max_in_snapshot_log_to_keep = snapshot_keep_log_entries`, both configured
+//! in `[raft]` and passed through at node assembly
+//! (`coppice-consensus::node`) — coalescing, retry, and the post-snapshot
+//! purge (ADR 0017) all live there. `Consensus::trigger_snapshot` remains for
+//! operators and tests that need a snapshot *now*.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -192,7 +198,6 @@ async fn run_pass<C: Consensus, H: HistoryStore>(
     let due = due_for_eviction(&view, now);
 
     if due.is_empty() {
-        maybe_trigger_snapshot(consensus).await;
         return;
     }
 
@@ -220,8 +225,6 @@ async fn run_pass<C: Consensus, H: HistoryStore>(
             tracing::error!(error = %e, "housekeeping: fatal propose error");
         }
     }
-
-    maybe_trigger_snapshot(consensus).await;
 }
 
 /// The terminal jobs whose full post-terminal retention interval has
@@ -261,24 +264,6 @@ fn due_for_eviction(view: &StateView, now: Timestamp) -> Vec<TerminalJobRecord> 
         );
     }
     due
-}
-
-async fn maybe_trigger_snapshot<C: Consensus>(consensus: &Arc<C>) {
-    if snapshot_due() {
-        if let Err(e) = consensus.trigger_snapshot().await {
-            tracing::warn!(error = %e, "housekeeping: trigger_snapshot failed");
-        }
-    }
-}
-
-/// Whether applied-entries-since-snapshot has crossed the ADR 0017 threshold.
-///
-/// Not yet wired to real metrics, so this never fires.
-fn snapshot_due() -> bool {
-    // TODO(ADR 0017): trigger once applied-entries-since-snapshot crosses
-    // the configured threshold; sealed segments become deletable only once a
-    // snapshot covers them.
-    false
 }
 
 #[cfg(test)]
