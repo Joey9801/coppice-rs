@@ -7,20 +7,18 @@
 //! replicas must agree on is cluster policy and never appears in this file
 //! (ADR 0020's litmus test).
 //!
-//! Two things an operator used to type here are no longer typed at all:
+//! Two things are deliberately *not* typed here:
 //!
 //! * **Identity.** The node id is self-minted and persisted at
 //!   `<data_dir>/node-identity` (deployment-story A1, [`crate::identity`]), so
-//!   a fleet's machines run byte-identical files. A `node_id` key is a
-//!   *tombstone* here: it parses and then fail-stops with the migration.
+//!   a fleet's machines run byte-identical files.
 //! * **Capacity.** `[capacity]` is detected from the host at startup
-//!   (deployment-story A3, [`crate::capacity`]); the section survives only as a
+//!   (deployment-story A3, [`crate::capacity`]); the section is only a
 //!   per-dimension override, and an absent section is the ordinary shape.
 //!
 //! Coordinator endpoints come from the same `[discovery]` section the
 //! coordinator parses (ADR 0037 §2, `coppice-discovery`), so an address change
-//! reaches the agent by the same mechanism and with the same spelling. The old
-//! top-level `coordinators` list is a tombstone too.
+//! reaches the agent by the same mechanism and with the same spelling.
 //!
 //! The conventions mirror the coordinator's config module exactly:
 //! `deny_unknown_fields` so a typo'd knob fail-stops naming the offending key;
@@ -35,7 +33,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::NodeId;
 use coppice_core::resource::Resources;
 use serde::Deserialize;
 
@@ -45,26 +42,9 @@ use crate::telemetry::{FilesystemSinkConfig, SinkConfig, SinkKind};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// **Tombstone** (deployment-story A1). The node id is no longer typed
-    /// into this file: the agent mints its own and persists it at
-    /// `<data_dir>/node-identity` ([`crate::identity`]), which is what lets a
-    /// fleet ship one byte-identical `agent.toml`. The field is kept only so a
-    /// config still carrying `node_id` fails with the migration instead of
-    /// `deny_unknown_fields`' bare "unknown field". Always `None` in a valid
-    /// config; [`Config::validate`] rejects `Some`.
-    #[serde(default)]
-    pub node_id: Option<NodeId>,
-
     /// Root of this node's on-disk state: the durable journal (`journal`), its
     /// `LOCK`, and the persisted `node-identity` live directly under here.
     pub data_dir: PathBuf,
-
-    /// **Tombstone** (ADR 0037 §2). The literal endpoint list moved into
-    /// `[discovery.static] addrs`; see [`Config::discovery`]. Kept only so an
-    /// old config fails with the migration rather than a bare unknown-field
-    /// error. Always `None` in a valid config.
-    #[serde(default)]
-    pub coordinators: Option<Vec<String>>,
 
     /// Where coordinator endpoints come from (ADR 0037 §2): the same
     /// `[discovery]` section the coordinator parses, minus its coordinator-only
@@ -627,33 +607,6 @@ impl Config {
     /// the humane-duration codec handle shape and typos; this handles meaning.
     /// Errors name the offending key so the operator can fix it directly.
     fn validate(&self) -> Result<()> {
-        // The two tombstones first: an operator whose file still carries either
-        // key gets the migration, not a downstream complaint about something
-        // else (deployment-story A1, ADR 0037 §2).
-        if let Some(node_id) = self.node_id {
-            anyhow::bail!(
-                "`node_id` is no longer configured: an agent mints its own identity and \
-                 persists it at {path} (deployment-story A1), so a fleet ships one \
-                 byte-identical agent.toml. Delete the `node_id` line. If this node has \
-                 run before, first write its existing id into that file (one line, \
-                 `{node_id}`) so journal fencing and the certificate CN keep matching.",
-                path = self
-                    .data_dir
-                    .join(crate::identity::NODE_IDENTITY_FILE)
-                    .display(),
-            );
-        }
-        if let Some(coordinators) = &self.coordinators {
-            anyhow::bail!(
-                "`coordinators` is no longer configured: coordinator endpoints come from the \
-                 [discovery] section (ADR 0037 §2), consulted on every reconnect rather than \
-                 read once at startup. Replace the line with:\n\
-                 \n\
-                 [discovery]\nbackend = \"static\"\n\n[discovery.static]\naddrs = {coordinators:?}\n\
-                 \n\
-                 …or select the `dns`, `file`, or `ec2-asg` backend instead."
-            );
-        }
         self.discovery
             .validate()
             .map_err(|e| anyhow::anyhow!("[discovery]: {e}"))?;
@@ -1284,28 +1237,13 @@ ca_path   = "/etc/coppice/pki/ca.crt"
     }
 
     #[test]
-    fn a_node_id_key_is_rejected_with_the_migration() {
+    fn a_node_id_key_is_an_unknown_field() {
+        // Identity is self-minted (A1); `deny_unknown_fields` rejects the key
+        // like any other typo.
         let bad = minimal_with("node_id = \"node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10\"");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a configured node_id must fail (A1)");
-        let message = format!("{err:#}");
-        // The remedy is the whole point of the tombstone: name the file to
-        // seed, and the id to seed it with.
-        assert!(message.contains("node-identity"), "{message}");
-        assert!(
-            message.contains("node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn a_coordinators_key_is_rejected_with_the_migration() {
-        let bad = minimal_with("coordinators = [\"coord-1.example.com:7072\"]");
-        let (_guard, path) = write_config(&bad);
-        let err = load(&path).expect_err("a configured coordinators list must fail (§2)");
-        let message = format!("{err:#}");
-        assert!(message.contains("[discovery.static]"), "{message}");
-        assert!(message.contains("coord-1.example.com:7072"), "{message}");
+        assert!(format!("{err:#}").contains("node_id"), "{err:#}");
     }
 
     #[test]

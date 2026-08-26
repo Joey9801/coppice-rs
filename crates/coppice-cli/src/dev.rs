@@ -147,33 +147,6 @@ where
     }
 }
 
-/// Move a pre-A1 dev root's agent id into the agent's data directory.
-///
-/// Before deployment-story A1 the agent node id lived at `<root>/agent-node-id`
-/// as a dev-only sibling of `cluster-id`; it now lives where production puts
-/// it, at `<data_dir>/node-identity`. A persistent dev root from before the
-/// move holds a journal fenced by the old id and a leaf whose CN names it, so
-/// minting fresh would strand both — carry the id across instead. The legacy
-/// file is left behind: harmless, and a downgrade keeps working.
-fn migrate_legacy_agent_node_id(root: &Path, agent_data: &Path) -> Result<()> {
-    let legacy = root.join("agent-node-id");
-    let current = agent_data.join(coppice_agent::identity::NODE_IDENTITY_FILE);
-    if !legacy.exists() || current.exists() {
-        return Ok(());
-    }
-    let id: NodeId = load_or_mint(&legacy, || unreachable!("legacy file exists"))?;
-    std::fs::create_dir_all(agent_data)
-        .with_context(|| format!("creating {}", agent_data.display()))?;
-    std::fs::write(&current, format!("{id}\n"))
-        .with_context(|| format!("writing {}", current.display()))?;
-    tracing::info!(
-        from = %legacy.display(),
-        to = %current.display(),
-        "migrated the dev agent's node id to its production location (A1)"
-    );
-    Ok(())
-}
-
 /// Resolve one listen port and remember it under the data directory.
 ///
 /// An explicit `--*-port` always wins. Otherwise a persistent data dir reuses
@@ -252,7 +225,6 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // cluster id above. Dev exercises the production path, including the refusal
     // to mint over a data dir that already holds a journal.
     let agent_data = root.join("agent");
-    migrate_legacy_agent_node_id(&root, &agent_data)?;
     let agent_node: NodeId = coppice_agent::identity::load_or_mint_node_identity(&agent_data)?;
 
     let raft_port = resolve_port(&root, "raft", args.raft_port)?;
@@ -329,10 +301,6 @@ pub async fn run(args: DevArgs) -> Result<()> {
     let agent_pki = root.join("agent-pki");
     std::fs::create_dir_all(&agent_pki).context("creating the agent PKI dir")?;
     let agent_config = AgentConfig {
-        // The two tombstones are never set: the identity above was minted into
-        // `data_dir`, and endpoints come from `[discovery]`.
-        node_id: None,
-        coordinators: None,
         data_dir: agent_data,
         // The dev coordinator is this same process on localhost, so the static
         // backend names it directly (ADR 0037 §2).
