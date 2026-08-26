@@ -41,9 +41,11 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use coppice_api::http::dto;
-use coppice_api::http::COPPICE_LEADER;
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::{AttemptId, JobId, QuotaEntityId};
+use coppice_core::id::{AttemptId, JobId, NodeId, QuotaEntityId};
+use coppice_core::time::Timestamp;
+
+use crate::client::{ctx, print_json, render_table, ApiClient, Query};
 
 // ---------------------------------------------------------------------------
 // Spec file
@@ -207,6 +209,22 @@ pub struct JobArgs {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum JobCommand {
+    /// List jobs, newest first, filtered by the flags below.
+    List {
+        #[command(flatten)]
+        filter: JobFilterArgs,
+        /// Page size (server range 1..=1000; the server's default when
+        /// absent). A short page with a next cursor means "continue", never
+        /// "done".
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Continue from a prior page's `next cursor`.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Print the server's JSON response instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Submit a job from a TOML spec file.
     Submit {
         /// Path to the job spec (`.toml`).
@@ -264,6 +282,200 @@ pub enum JobCommand {
     },
 }
 
+/// The ergonomic flags that build `job list`'s JSON filter AST.
+///
+/// Every flag here is one **leaf** of [`dto::JobFilter`]; the flags given are
+/// ANDed together into an `all` node (a lone leaf is sent bare). The full AST —
+/// `any`, `not`, nested combinators — is deliberately not expressible from the
+/// command line: it is a JSON tree, and a flag grammar for it would be worse
+/// than the JSON. Only leaves the server actually implements appear: the
+/// contract reserves `label` and `submitted_by` without backing them, so no
+/// flag pretends to offer them.
+#[derive(Debug, Default, clap::Args)]
+pub struct JobFilterArgs {
+    /// Match jobs in these display phases (repeatable).
+    #[arg(long = "phase", value_enum)]
+    pub phases: Vec<PhaseArg>,
+    /// Match jobs charged to this quota entity (`quota-<uuid>`).
+    #[arg(long)]
+    pub entity: Option<QuotaEntityId>,
+    /// How broadly `--entity` matches; the server defaults to `subtree`.
+    #[arg(long, value_enum, requires = "entity")]
+    pub entity_scope: Option<ScopeArg>,
+    /// Match jobs whose current attempt runs on this node (`node-<uuid>`).
+    #[arg(long)]
+    pub node: Option<NodeId>,
+    /// Match jobs whose image contains this substring.
+    #[arg(long, conflicts_with = "image_equals")]
+    pub image: Option<String>,
+    /// Match jobs whose image is exactly this reference.
+    #[arg(long)]
+    pub image_equals: Option<String>,
+    /// Case-insensitive substring over the job id or the image.
+    #[arg(long)]
+    pub search: Option<String>,
+    /// Match jobs submitted at or after this instant (RFC 3339, e.g.
+    /// `2026-07-16T09:30:00Z`).
+    #[arg(long, value_parser = parse_timestamp)]
+    pub submitted_after: Option<Timestamp>,
+    /// Match jobs submitted strictly before this instant (RFC 3339).
+    #[arg(long, value_parser = parse_timestamp)]
+    pub submitted_before: Option<Timestamp>,
+    /// Bound the request on one resource dimension; needs `--requests-min`
+    /// and/or `--requests-max`.
+    #[arg(long, value_enum)]
+    pub requests: Option<ResourceArg>,
+    /// Inclusive lower bound for `--requests`.
+    #[arg(long, requires = "requests")]
+    pub requests_min: Option<u64>,
+    /// Inclusive upper bound for `--requests`.
+    #[arg(long, requires = "requests")]
+    pub requests_max: Option<u64>,
+}
+
+/// Parse an RFC 3339 instant with the *contract's* parser — the same
+/// `Deserialize` the server uses — so a value this CLI accepts is exactly a
+/// value the filter AST can carry.
+fn parse_timestamp(raw: &str) -> Result<Timestamp, String> {
+    serde_json::from_value::<Timestamp>(serde_json::Value::String(raw.to_string()))
+        .map_err(|e| e.to_string())
+}
+
+/// A `--phase` value; the wire spelling is [`dto::JobPhase`]'s snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PhaseArg {
+    Submitted,
+    Accepted,
+    Queued,
+    Preparing,
+    Running,
+    Finalizing,
+    Succeeded,
+    Failed,
+    Aborted,
+}
+
+impl PhaseArg {
+    /// The wire value, matching `dto::JobPhase`'s serde spelling.
+    fn wire(self) -> &'static str {
+        match self {
+            PhaseArg::Submitted => "submitted",
+            PhaseArg::Accepted => "accepted",
+            PhaseArg::Queued => "queued",
+            PhaseArg::Preparing => "preparing",
+            PhaseArg::Running => "running",
+            PhaseArg::Finalizing => "finalizing",
+            PhaseArg::Succeeded => "succeeded",
+            PhaseArg::Failed => "failed",
+            PhaseArg::Aborted => "aborted",
+        }
+    }
+}
+
+/// An `--entity-scope` value ([`dto::EntityScope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ScopeArg {
+    Exact,
+    Subtree,
+}
+
+/// A `--requests` dimension ([`dto::RequestsResource`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ResourceArg {
+    CpuMillis,
+    MemoryBytes,
+    DiskBytes,
+}
+
+impl ResourceArg {
+    fn wire(self) -> &'static str {
+        match self {
+            ResourceArg::CpuMillis => "cpu_millis",
+            ResourceArg::MemoryBytes => "memory_bytes",
+            ResourceArg::DiskBytes => "disk_bytes",
+        }
+    }
+}
+
+/// Build the `?filter=` AST from the flags: one leaf per flag given, ANDed
+/// under `all` when there is more than one, sent bare when there is exactly
+/// one, and omitted entirely when there are none (which matches every job).
+///
+/// The tree is built as JSON rather than as a [`dto::JobFilter`] because that
+/// type is deserialize-only — it exists to *parse* what a client sends. The
+/// tests close the loop by deserializing what this builds back into it.
+fn build_filter(args: &JobFilterArgs) -> Result<Option<serde_json::Value>> {
+    use serde_json::json;
+
+    let mut leaves: Vec<serde_json::Value> = Vec::new();
+    if !args.phases.is_empty() {
+        let phases: Vec<&str> = args.phases.iter().map(|p| p.wire()).collect();
+        leaves.push(json!({ "phase": { "in": phases } }));
+    }
+    if let Some(entity) = args.entity {
+        let mut leaf = json!({ "id": entity.to_string() });
+        if let Some(scope) = args.entity_scope {
+            leaf["scope"] = json!(match scope {
+                ScopeArg::Exact => "exact",
+                ScopeArg::Subtree => "subtree",
+            });
+        }
+        leaves.push(json!({ "entity": leaf }));
+    }
+    if let Some(node) = args.node {
+        leaves.push(json!({ "node": node.to_string() }));
+    }
+    if let Some(image) = &args.image {
+        leaves.push(json!({ "image": { "contains": image } }));
+    }
+    if let Some(image) = &args.image_equals {
+        leaves.push(json!({ "image": { "equals": image } }));
+    }
+    if let Some(search) = &args.search {
+        leaves.push(json!({ "search": search }));
+    }
+    if args.submitted_after.is_some() || args.submitted_before.is_some() {
+        if let (Some(after), Some(before)) = (args.submitted_after, args.submitted_before) {
+            if after > before {
+                bail!("--submitted-after must not be later than --submitted-before");
+            }
+        }
+        let mut leaf = serde_json::Map::new();
+        if let Some(after) = args.submitted_after {
+            leaf.insert("after".to_string(), json!(after));
+        }
+        if let Some(before) = args.submitted_before {
+            leaf.insert("before".to_string(), json!(before));
+        }
+        leaves.push(json!({ "submitted": leaf }));
+    }
+    if let Some(resource) = args.requests {
+        if args.requests_min.is_none() && args.requests_max.is_none() {
+            bail!("--requests needs at least one of --requests-min / --requests-max");
+        }
+        if let (Some(min), Some(max)) = (args.requests_min, args.requests_max) {
+            if min > max {
+                bail!("--requests-min must not exceed --requests-max");
+            }
+        }
+        let mut leaf = serde_json::Map::new();
+        leaf.insert("resource".to_string(), json!(resource.wire()));
+        if let Some(min) = args.requests_min {
+            leaf.insert("min".to_string(), json!(min));
+        }
+        if let Some(max) = args.requests_max {
+            leaf.insert("max".to_string(), json!(max));
+        }
+        leaves.push(json!({ "requests": leaf }));
+    }
+
+    Ok(match leaves.len() {
+        0 => None,
+        1 => leaves.pop(),
+        _ => Some(json!({ "all": leaves })),
+    })
+}
+
 /// One of an attempt's two output streams (the `--stream` value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum StreamArg {
@@ -292,11 +504,16 @@ const FOLLOW_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Run the selected `coppice job` verb.
 pub async fn run(args: JobArgs) -> Result<()> {
-    let base = normalize_base(&args.api);
-    let client = reqwest::Client::new();
+    let client = ApiClient::new(&args.api)?;
     match args.command {
-        JobCommand::Submit { spec, job } => submit(&client, &base, &spec, job).await,
-        JobCommand::Status { job } => status(&client, &base, job).await,
+        JobCommand::List {
+            filter,
+            limit,
+            cursor,
+            json,
+        } => list(&client, &filter, limit, cursor.as_deref(), json).await,
+        JobCommand::Submit { spec, job } => submit(&client, &spec, job).await,
+        JobCommand::Status { job } => status(&client, job).await,
         JobCommand::Logs {
             job,
             stream,
@@ -307,9 +524,9 @@ pub async fn run(args: JobArgs) -> Result<()> {
             let order = resolve_order(order, follow)?;
             let stream = stream.map(dto::LogStreamName::from);
             if follow {
-                run_follow(&client, &base, job, stream, attempt, FOLLOW_POLL_INTERVAL).await
+                run_follow(&client, job, stream, attempt, FOLLOW_POLL_INTERVAL).await
             } else {
-                run_logs(&client, &base, job, stream, attempt, order).await
+                run_logs(&client, job, stream, attempt, order).await
             }
         }
         JobCommand::Usage {
@@ -318,22 +535,10 @@ pub async fn run(args: JobArgs) -> Result<()> {
             order,
         } => {
             let order = usage_order(order);
-            run_usage(&client, &base, job, attempt, order).await
+            run_usage(&client, job, attempt, order).await
         }
-        JobCommand::Abort { job, reason } => abort(&client, &base, job, reason).await,
+        JobCommand::Abort { job, reason } => abort(&client, job, reason).await,
     }
-}
-
-/// Reduce an `--api` value to a bare base URL. Trims a trailing slash, then a
-/// trailing `/api/v1` (the form the dev banner prints and users paste), then
-/// any slash that exposes — so every accepted form maps to the same base.
-fn normalize_base(raw: &str) -> String {
-    let trimmed = raw.trim_end_matches('/');
-    trimmed
-        .strip_suffix("/api/v1")
-        .unwrap_or(trimmed)
-        .trim_end_matches('/')
-        .to_string()
 }
 
 /// Resolve the effective log order. `--follow` streams chronologically, so it
@@ -367,26 +572,108 @@ fn usage_order(order: Option<OrderArg>) -> dto::LogOrder {
 // Verbs
 // ---------------------------------------------------------------------------
 
-async fn submit(
-    client: &reqwest::Client,
-    base: &str,
-    spec_path: &Path,
-    job: Option<JobId>,
+/// `coppice job list`: one page of the job list, newest first.
+///
+/// Deliberately **one page** rather than a paging walk: the list is unbounded
+/// and a filtered scan is budgeted server-side, so a walk would turn a typo'd
+/// filter into an open-ended scan of the whole cluster. The page's continuation
+/// token is printed instead, to be passed back as `--cursor`.
+async fn list(
+    client: &ApiClient,
+    filter: &JobFilterArgs,
+    limit: Option<u64>,
+    cursor: Option<&str>,
+    json: bool,
 ) -> Result<()> {
+    let mut query: Query = Vec::new();
+    if let Some(filter) = build_filter(filter)? {
+        query.push(("filter", filter.to_string()));
+    }
+    if let Some(limit) = limit {
+        query.push(("limit", limit.to_string()));
+    }
+    if let Some(cursor) = cursor {
+        query.push(("cursor", cursor.to_string()));
+    }
+    let body: serde_json::Value = client
+        .get_json("/jobs", &query, ctx("listing jobs", "reading the job list"))
+        .await?;
+    if json {
+        print_json(&body);
+        return Ok(());
+    }
+    let page: dto::ListJobsResponse =
+        serde_json::from_value(body).context("reading the job list")?;
+    print!("{}", render_job_list(&page));
+    Ok(())
+}
+
+/// Render a job-list page as a table plus, when the scan did not reach the end,
+/// the continuation token to pass back as `--cursor`. A non-null cursor is
+/// printed even for a short (or empty) page: it means "more may exist", and
+/// silently omitting it would present a budget-cut page as a complete answer.
+fn render_job_list(page: &dto::ListJobsResponse) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    if page.jobs.is_empty() {
+        out.push_str("(no jobs)\n");
+    } else {
+        let rows: Vec<Vec<String>> = page
+            .jobs
+            .iter()
+            .map(|job| {
+                let state = match job.attempt_state {
+                    Some(attempt) => format!(
+                        "{} ({})",
+                        job_state_label(job.state),
+                        attempt_state_label(attempt)
+                    ),
+                    None => job_state_label(job.state).to_string(),
+                };
+                vec![
+                    job.id.to_string(),
+                    state,
+                    job.image.clone(),
+                    job.quota_entity.to_string(),
+                    job.node
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    job.submitted_at.to_string(),
+                    job.cost_ucu.to_string(),
+                ]
+            })
+            .collect();
+        out.push_str(&render_table(
+            &[
+                "id",
+                "state",
+                "image",
+                "entity",
+                "node",
+                "submitted",
+                "cost (uCU)",
+            ],
+            &rows,
+        ));
+    }
+    if let Some(cursor) = &page.next_cursor {
+        let _ = writeln!(out, "\nmore may exist; continue with --cursor {cursor}");
+    }
+    out
+}
+
+async fn submit(client: &ApiClient, spec_path: &Path, job: Option<JobId>) -> Result<()> {
     let spec = JobSpec::load(spec_path)?;
     let job = job.unwrap_or_else(JobId::new);
     let request = spec.request(job);
-    let response = client
-        .post(format!("{base}/api/v1/jobs"))
-        .json(&request)
-        .send()
-        .await
-        .context("submitting job")?;
-    if !response.status().is_success() {
-        return Err(api_error(response).await);
-    }
-    let submitted: dto::SubmitJobResponse =
-        response.json().await.context("reading submit response")?;
+    let submitted: dto::SubmitJobResponse = client
+        .post_json(
+            "/jobs",
+            &request,
+            ctx("submitting job", "reading submit response"),
+        )
+        .await?;
     println!(
         "submitted {} (log index {})",
         submitted.job, submitted.log_index
@@ -394,13 +681,13 @@ async fn submit(
     Ok(())
 }
 
-async fn status(client: &reqwest::Client, base: &str, job: JobId) -> Result<()> {
-    let detail = get_job(client, base, job).await?;
+async fn status(client: &ApiClient, job: JobId) -> Result<()> {
+    let detail = get_job(client, job).await?;
     // The event timeline (ADR 0032) is enrichment, not core status: a
     // coordinator too old to serve the route answers 501, and `get_job` already
     // proved the job exists, so a timeline failure degrades to a stderr warning
     // rather than failing `job status`.
-    let timeline = fetch_timeline(client, base, job).await;
+    let timeline = fetch_timeline(client, job).await;
     let (out, warning) = compose_status(&detail, timeline);
     if let Some(warning) = warning {
         eprintln!("warning: {warning}");
@@ -427,38 +714,25 @@ fn compose_status(
     }
 }
 
-async fn abort(
-    client: &reqwest::Client,
-    base: &str,
-    job: JobId,
-    reason: Option<String>,
-) -> Result<()> {
+async fn abort(client: &ApiClient, job: JobId, reason: Option<String>) -> Result<()> {
     // The path segment is authoritative for the job id; the body omits it.
     let request = dto::AbortJobRequest { job: None, reason };
-    let response = client
-        .post(format!("{base}/api/v1/jobs/{job}/abort"))
-        .json(&request)
-        .send()
-        .await
-        .context("requesting abort")?;
-    if !response.status().is_success() {
-        return Err(api_error(response).await);
-    }
+    client
+        .post_ignoring_body(&format!("/jobs/{job}/abort"), &request, "requesting abort")
+        .await?;
     println!("abort requested for {job}");
     Ok(())
 }
 
 /// GET a job's detail, mapping a non-2xx response to a rich error.
-async fn get_job(client: &reqwest::Client, base: &str, job: JobId) -> Result<dto::JobDetail> {
-    let response = client
-        .get(format!("{base}/api/v1/jobs/{job}"))
-        .send()
+async fn get_job(client: &ApiClient, job: JobId) -> Result<dto::JobDetail> {
+    client
+        .get_json(
+            &format!("/jobs/{job}"),
+            &Vec::new(),
+            ctx("fetching job status", "reading job detail"),
+        )
         .await
-        .context("fetching job status")?;
-    if !response.status().is_success() {
-        return Err(api_error(response).await);
-    }
-    response.json().await.context("reading job detail")
 }
 
 /// Walk a job's event timeline (ADR 0032), paging through `next_cursor` until
@@ -466,29 +740,21 @@ async fn get_job(client: &reqwest::Client, base: &str, job: JobId) -> Result<dto
 /// is sent — the server's default page size governs — and `cursor` is passed
 /// only when continuing from a prior page. A non-2xx response (including the
 /// 501 an older coordinator gives) maps to a rich error.
-async fn fetch_timeline(
-    client: &reqwest::Client,
-    base: &str,
-    job: JobId,
-) -> Result<Vec<dto::TimelineEvent>> {
+async fn fetch_timeline(client: &ApiClient, job: JobId) -> Result<Vec<dto::TimelineEvent>> {
     let mut events: Vec<dto::TimelineEvent> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let mut query: Vec<(&str, String)> = Vec::new();
+        let mut query: Query = Vec::new();
         if let Some(cursor) = &cursor {
             query.push(("cursor", cursor.clone()));
         }
-        let response = client
-            .get(format!("{base}/api/v1/jobs/{job}/timeline"))
-            .query(&query)
-            .send()
-            .await
-            .context("fetching job timeline")?;
-        if !response.status().is_success() {
-            return Err(api_error(response).await);
-        }
-        let page: dto::GetJobTimelineResponse =
-            response.json().await.context("reading job timeline")?;
+        let page: dto::GetJobTimelineResponse = client
+            .get_json(
+                &format!("/jobs/{job}/timeline"),
+                &query,
+                ctx("fetching job timeline", "reading job timeline"),
+            )
+            .await?;
         events.extend(page.events);
         match page.next_cursor {
             Some(next) => cursor = Some(next),
@@ -505,8 +771,7 @@ async fn fetch_timeline(
 /// The non-follow log walk: page through `next_cursor` until it is null, then
 /// report any source that was not fully available.
 async fn run_logs(
-    client: &reqwest::Client,
-    base: &str,
+    client: &ApiClient,
     job: JobId,
     stream: Option<dto::LogStreamName>,
     attempt: Option<AttemptId>,
@@ -516,21 +781,12 @@ async fn run_logs(
     // page can cover a single attempt even when the job has several (the server
     // ends a page wherever the budget lands), so the walk itself is a late
     // signal. The extra GET also surfaces NOT_FOUND before the first page.
-    let mut multi = initial_multi(&get_job(client, base, job).await?, attempt);
+    let mut multi = initial_multi(&get_job(client, job).await?, attempt);
     let mut sources: Vec<dto::LogSourceRecord> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page = fetch_logs_page(
-            client,
-            base,
-            job,
-            stream,
-            attempt,
-            order,
-            cursor.as_deref(),
-            None,
-        )
-        .await?;
+        let page =
+            fetch_logs_page(client, job, stream, attempt, order, cursor.as_deref(), None).await?;
         merge_sources(&mut sources, page.sources);
         multi = latch_multi(multi, &sources);
         for entry in &page.entries {
@@ -584,8 +840,7 @@ struct FollowState {
 /// The `--follow` loop: drain to the live head, and once caught up either exit
 /// (job terminal, after one final drain for stragglers) or sleep and re-poll.
 async fn run_follow(
-    client: &reqwest::Client,
-    base: &str,
+    client: &ApiClient,
     job: JobId,
     stream: Option<dto::LogStreamName>,
     attempt: Option<AttemptId>,
@@ -594,16 +849,16 @@ async fn run_follow(
     let mut state = FollowState {
         // Same up-front multiplicity decision as the non-follow walk (a page is
         // a late signal); `latch_multi` covers retries that appear mid-follow.
-        multi: initial_multi(&get_job(client, base, job).await?, attempt),
+        multi: initial_multi(&get_job(client, job).await?, attempt),
         ..FollowState::default()
     };
     loop {
-        drain_to_head(client, base, job, stream, attempt, &mut state).await?;
-        let detail = get_job(client, base, job).await?;
+        drain_to_head(client, job, stream, attempt, &mut state).await?;
+        let detail = get_job(client, job).await?;
         if is_terminal(detail.state) {
             // A last drain catches anything written between our final page and
             // the job reaching a terminal state.
-            drain_to_head(client, base, job, stream, attempt, &mut state).await?;
+            drain_to_head(client, job, stream, attempt, &mut state).await?;
             break;
         }
         tokio::time::sleep(interval).await;
@@ -615,8 +870,7 @@ async fn run_follow(
 /// Fetch and print pages until the walk reaches the live head (`next_cursor`
 /// null), resuming by cursor when one is held and by `from`/skip otherwise.
 async fn drain_to_head(
-    client: &reqwest::Client,
-    base: &str,
+    client: &ApiClient,
     job: JobId,
     stream: Option<dto::LogStreamName>,
     attempt: Option<AttemptId>,
@@ -631,7 +885,6 @@ async fn drain_to_head(
         };
         let page = fetch_logs_page(
             client,
-            base,
             job,
             stream,
             attempt,
@@ -671,8 +924,7 @@ async fn drain_to_head(
 /// One logs GET, mapping a non-2xx response to a rich error.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_logs_page(
-    client: &reqwest::Client,
-    base: &str,
+    client: &ApiClient,
     job: JobId,
     stream: Option<dto::LogStreamName>,
     attempt: Option<AttemptId>,
@@ -680,7 +932,7 @@ async fn fetch_logs_page(
     cursor: Option<&str>,
     from: Option<&str>,
 ) -> Result<dto::GetJobLogsResponse> {
-    let mut query: Vec<(&str, String)> = vec![("order", order.as_str().to_string())];
+    let mut query: Query = vec![("order", order.as_str().to_string())];
     if let Some(stream) = stream {
         query.push(("stream", stream_query(stream).to_string()));
     }
@@ -693,16 +945,13 @@ async fn fetch_logs_page(
     if let Some(from) = from {
         query.push(("from", from.to_string()));
     }
-    let response = client
-        .get(format!("{base}/api/v1/jobs/{job}/logs"))
-        .query(&query)
-        .send()
+    client
+        .get_json(
+            &format!("/jobs/{job}/logs"),
+            &query,
+            ctx("fetching job logs", "reading job logs"),
+        )
         .await
-        .context("fetching job logs")?;
-    if !response.status().is_success() {
-        return Err(api_error(response).await);
-    }
-    response.json().await.context("reading job logs")
 }
 
 /// The `stream=` query spelling.
@@ -796,8 +1045,7 @@ fn availability_label(availability: dto::LogAvailability) -> Option<&'static str
 /// bounded, so buffering the whole series lets rate derivation see each
 /// sample's chronological neighbour across page boundaries.
 async fn run_usage(
-    client: &reqwest::Client,
-    base: &str,
+    client: &ApiClient,
     job: JobId,
     attempt: Option<AttemptId>,
     order: dto::LogOrder,
@@ -806,7 +1054,7 @@ async fn run_usage(
     let mut sources: Vec<dto::UsageSourceRecord> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page = fetch_usage_page(client, base, job, attempt, order, cursor.as_deref()).await?;
+        let page = fetch_usage_page(client, job, attempt, order, cursor.as_deref()).await?;
         merge_usage_sources(&mut sources, page.sources);
         samples.extend(page.samples);
         match page.next_cursor {
@@ -822,30 +1070,26 @@ async fn run_usage(
 /// One usage GET, mapping a non-2xx response to a rich error. `limit` is left
 /// to the server default; `cursor` is passed only when continuing a walk.
 async fn fetch_usage_page(
-    client: &reqwest::Client,
-    base: &str,
+    client: &ApiClient,
     job: JobId,
     attempt: Option<AttemptId>,
     order: dto::LogOrder,
     cursor: Option<&str>,
 ) -> Result<dto::GetJobUsageResponse> {
-    let mut query: Vec<(&str, String)> = vec![("order", order.as_str().to_string())];
+    let mut query: Query = vec![("order", order.as_str().to_string())];
     if let Some(attempt) = attempt {
         query.push(("attempt", attempt.to_string()));
     }
     if let Some(cursor) = cursor {
         query.push(("cursor", cursor.to_string()));
     }
-    let response = client
-        .get(format!("{base}/api/v1/jobs/{job}/usage"))
-        .query(&query)
-        .send()
+    client
+        .get_json(
+            &format!("/jobs/{job}/usage"),
+            &query,
+            ctx("fetching job usage", "reading job usage"),
+        )
         .await
-        .context("fetching job usage")?;
-    if !response.status().is_success() {
-        return Err(api_error(response).await);
-    }
-    response.json().await.context("reading job usage")
 }
 
 /// Merge a page's source records into the running set — the usage twin of
@@ -1261,45 +1505,6 @@ fn timeline_description(body: &dto::TimelineEventBody) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
-/// The wire error body (ADR 0031). The API's own `ErrorBody` is private and
-/// serialize-only, so the client mirrors just the two fields it reads.
-#[derive(Debug, Deserialize)]
-struct ApiErrorBody {
-    code: String,
-    message: String,
-}
-
-/// Turn a non-2xx response into an `anyhow` error, reading the `{code,
-/// message}` body (falling back to raw text) and, on a 421/NOT_LEADER with a
-/// `Coppice-Leader` hint, appending where to retry.
-async fn api_error(response: reqwest::Response) -> anyhow::Error {
-    let status = response.status();
-    let leader = response
-        .headers()
-        .get(COPPICE_LEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let body = response.text().await.unwrap_or_default();
-
-    let mut message = match serde_json::from_str::<ApiErrorBody>(&body) {
-        Ok(parsed) => format!("api error ({}): {}", parsed.code, parsed.message),
-        Err(_) if !body.trim().is_empty() => {
-            format!("api error (HTTP {}): {}", status.as_u16(), body.trim())
-        }
-        Err(_) => format!("api error (HTTP {})", status.as_u16()),
-    };
-    if status == reqwest::StatusCode::MISDIRECTED_REQUEST {
-        if let Some(leader) = leader {
-            message.push_str(&format!("; retry against the leader at {leader}"));
-        }
-    }
-    anyhow::anyhow!(message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,11 +1512,12 @@ mod tests {
     use std::io::Write as _;
     use std::sync::{Arc, Mutex};
 
-    use axum::extract::{Path as AxumPath, Query, State};
-    use axum::http::{HeaderMap, StatusCode as AxumStatus};
+    use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
+    use axum::http::StatusCode as AxumStatus;
     use axum::routing::{get, post};
     use axum::{Json, Router};
-    use coppice_core::time::Timestamp;
+
+    use crate::testsupport::{error_body, leader_hint, spawn};
 
     // -- Spec parsing -------------------------------------------------------
 
@@ -1457,47 +1663,319 @@ retry_user_errors = true
         assert!(retry.retry_user_errors);
     }
 
-    // -- API base normalization --------------------------------------------
-
-    #[test]
-    fn api_base_normalizes_to_one_form() {
-        let want = "http://h:7070";
-        for raw in [
-            "http://h:7070",
-            "http://h:7070/",
-            "http://h:7070/api/v1",
-            "http://h:7070/api/v1/",
-        ] {
-            assert_eq!(normalize_base(raw), want, "{raw}");
-        }
-    }
-
     // -- HTTP round-trips ---------------------------------------------------
 
-    /// Spawn `router` on an ephemeral loopback port and return its base URL.
-    async fn spawn(router: Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        format!("http://{addr}")
-    }
-
-    fn client() -> reqwest::Client {
-        reqwest::Client::new()
-    }
-
-    /// Build the wire error body (no shared Rust type exists for it — the API's
-    /// own `ErrorBody` is private).
-    fn error_body(code: &str, message: &str) -> serde_json::Value {
-        serde_json::json!({ "code": code, "message": message })
+    /// A client bound to a spawned fake server's base URL.
+    fn client(base: &str) -> ApiClient {
+        ApiClient::new(base).expect("client builds")
     }
 
     fn write_spec(contents: &str) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(contents.as_bytes()).unwrap();
         file
+    }
+
+    // -- job list -----------------------------------------------------------
+
+    /// The AST this CLI builds is JSON, because `dto::JobFilter` is
+    /// deserialize-only. That makes the contract check a *round trip*: what
+    /// `build_filter` emits must deserialize into the very type the server
+    /// parses it with, and equal the tree we meant.
+    fn round_trip(args: &JobFilterArgs) -> Option<dto::JobFilter> {
+        let built = build_filter(args).expect("filter builds");
+        built.map(|value| {
+            let parsed: dto::JobFilter = serde_json::from_value(value)
+                .expect("the built filter deserializes as the server's own JobFilter");
+            parsed.validate().expect("the built filter validates");
+            parsed
+        })
+    }
+
+    #[test]
+    fn no_filter_flags_send_no_filter() {
+        assert!(round_trip(&JobFilterArgs::default()).is_none());
+    }
+
+    #[test]
+    fn a_lone_leaf_is_sent_bare() {
+        let filter = round_trip(&JobFilterArgs {
+            phases: vec![PhaseArg::Queued, PhaseArg::Running],
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Phase(dto::PhaseFilter {
+                r#in: vec![dto::JobPhase::Queued, dto::JobPhase::Running],
+            })
+        );
+    }
+
+    #[test]
+    fn several_leaves_are_anded_under_all() {
+        let entity: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let node: NodeId = "node-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let filter = round_trip(&JobFilterArgs {
+            entity: Some(entity),
+            entity_scope: Some(ScopeArg::Exact),
+            node: Some(node),
+            image: Some("busybox".to_string()),
+            search: Some("hello".to_string()),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        let dto::JobFilter::All(leaves) = filter else {
+            panic!("expected an `all` combinator");
+        };
+        assert_eq!(
+            leaves,
+            [
+                dto::JobFilter::Entity(dto::EntityFilter {
+                    id: entity,
+                    scope: dto::EntityScope::Exact,
+                }),
+                dto::JobFilter::Node(node),
+                dto::JobFilter::Image(dto::ImageFilter::Contains("busybox".to_string())),
+                dto::JobFilter::Search("hello".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn image_equals_builds_the_other_operator() {
+        let filter = round_trip(&JobFilterArgs {
+            image_equals: Some("busybox:1.36".to_string()),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Image(dto::ImageFilter::Equals("busybox:1.36".to_string()))
+        );
+    }
+
+    #[test]
+    fn submitted_bounds_serialize_as_rfc3339() {
+        let after = parse_timestamp("2026-07-16T09:30:00Z").expect("parses");
+        let filter = round_trip(&JobFilterArgs {
+            submitted_after: Some(after),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Submitted(dto::SubmittedFilter {
+                after: Some(after),
+                before: None,
+            })
+        );
+    }
+
+    #[test]
+    fn requests_bounds_round_trip() {
+        let filter = round_trip(&JobFilterArgs {
+            requests: Some(ResourceArg::MemoryBytes),
+            requests_min: Some(1024),
+            requests_max: Some(4096),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Requests(dto::RequestsFilter {
+                resource: dto::RequestsResource::MemoryBytes,
+                min: Some(1024),
+                max: Some(4096),
+            })
+        );
+    }
+
+    /// The server refuses an unbounded `requests` leaf and inverted bounds;
+    /// catching them client-side turns a round-trip INVALID_ARGUMENT into an
+    /// immediate message naming the flags the operator actually typed.
+    #[test]
+    fn impossible_bounds_are_refused_before_the_request() {
+        let unbounded = build_filter(&JobFilterArgs {
+            requests: Some(ResourceArg::CpuMillis),
+            ..JobFilterArgs::default()
+        })
+        .expect_err("an unbounded requests leaf is refused");
+        assert!(format!("{unbounded:#}").contains("--requests-min"));
+
+        let inverted = build_filter(&JobFilterArgs {
+            requests: Some(ResourceArg::CpuMillis),
+            requests_min: Some(10),
+            requests_max: Some(1),
+            ..JobFilterArgs::default()
+        })
+        .expect_err("inverted bounds are refused");
+        assert!(format!("{inverted:#}").contains("must not exceed"));
+
+        let before = parse_timestamp("2026-07-16T09:30:00Z").unwrap();
+        let after = parse_timestamp("2026-07-17T09:30:00Z").unwrap();
+        let backwards = build_filter(&JobFilterArgs {
+            submitted_after: Some(after),
+            submitted_before: Some(before),
+            ..JobFilterArgs::default()
+        })
+        .expect_err("an inverted submitted window is refused");
+        assert!(format!("{backwards:#}").contains("--submitted-after"));
+    }
+
+    fn sample_job_summary(id: JobId) -> dto::JobSummary {
+        dto::JobSummary {
+            id,
+            state: dto::JobStateKind::Queued,
+            attempt: None,
+            image: "busybox:1.36".to_string(),
+            quota_entity: "quota-00000000-0000-0000-0000-000000000001"
+                .parse()
+                .unwrap(),
+            quota_entity_name: "default".to_string(),
+            priority: 0,
+            submitted_at: Timestamp::from_micros(1_000_000).unwrap(),
+            terminal_at: None,
+            node: None,
+            attempt_state: None,
+            funding_fraction: None,
+            cost_ucu: 1234,
+            outcome: None,
+        }
+    }
+
+    /// The request the CLI actually sends is the contract under test: the
+    /// filter AST built from flags, the page size, and the cursor must arrive
+    /// as the query parameters `ListJobsParams` expects.
+    #[tokio::test]
+    async fn list_sends_the_filter_ast_limit_and_cursor() {
+        type Seen = Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let job = JobId::new();
+        let body = serde_json::to_value(dto::ListJobsResponse {
+            jobs: vec![sample_job_summary(job)],
+            next_cursor: Some("v1:job-00000000-0000-0000-0000-000000000009".to_string()),
+        })
+        .unwrap();
+        let router =
+            Router::new()
+                .route(
+                    "/api/v1/jobs",
+                    get(
+                        |State((seen, body)): State<(Seen, serde_json::Value)>,
+                         AxumQuery(params): AxumQuery<
+                            std::collections::HashMap<String, String>,
+                        >| async move {
+                            seen.lock().unwrap().push(params);
+                            Json(body)
+                        },
+                    ),
+                )
+                .with_state((seen.clone(), body));
+        let base = spawn(router).await;
+
+        let filter = JobFilterArgs {
+            phases: vec![PhaseArg::Queued],
+            ..JobFilterArgs::default()
+        };
+        list(&client(&base), &filter, Some(25), Some("v1:job-x"), false)
+            .await
+            .expect("list succeeds");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["limit"], "25");
+        assert_eq!(seen[0]["cursor"], "v1:job-x");
+        // The server parses `filter` as JSON and then as its own AST — assert
+        // the CLI sent something that survives exactly that.
+        let parsed: dto::JobFilter = serde_json::from_str(&seen[0]["filter"]).expect("valid AST");
+        assert_eq!(
+            parsed,
+            dto::JobFilter::Phase(dto::PhaseFilter {
+                r#in: vec![dto::JobPhase::Queued],
+            })
+        );
+    }
+
+    /// No filter flags means no `filter` parameter at all — an empty AST is
+    /// not the same request as an absent one.
+    #[tokio::test]
+    async fn list_omits_the_filter_when_no_flags_are_given() {
+        type Seen = Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let body = serde_json::to_value(dto::ListJobsResponse {
+            jobs: Vec::new(),
+            next_cursor: None,
+        })
+        .unwrap();
+        let router =
+            Router::new()
+                .route(
+                    "/api/v1/jobs",
+                    get(
+                        |State((seen, body)): State<(Seen, serde_json::Value)>,
+                         AxumQuery(params): AxumQuery<
+                            std::collections::HashMap<String, String>,
+                        >| async move {
+                            seen.lock().unwrap().push(params);
+                            Json(body)
+                        },
+                    ),
+                )
+                .with_state((seen.clone(), body));
+        let base = spawn(router).await;
+
+        list(&client(&base), &JobFilterArgs::default(), None, None, false)
+            .await
+            .expect("list succeeds");
+        assert!(seen.lock().unwrap()[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_surfaces_an_invalid_argument_body() {
+        let router = Router::new().route(
+            "/api/v1/jobs",
+            get(|| async {
+                (
+                    AxumStatus::BAD_REQUEST,
+                    Json(error_body("INVALID_ARGUMENT", "invalid filter: bad leaf")),
+                )
+            }),
+        );
+        let base = spawn(router).await;
+        let err = list(&client(&base), &JobFilterArgs::default(), None, None, false)
+            .await
+            .expect_err("list fails");
+        let message = format!("{err:#}");
+        assert!(message.contains("INVALID_ARGUMENT"), "{message}");
+        assert!(message.contains("bad leaf"), "{message}");
+    }
+
+    #[test]
+    fn list_render_shows_the_rows_and_the_continuation() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let rendered = render_job_list(&dto::ListJobsResponse {
+            jobs: vec![sample_job_summary(job)],
+            next_cursor: Some("v1:job-00000000-0000-0000-0000-000000000009".to_string()),
+        });
+        assert!(rendered.contains(&job.to_string()), "{rendered}");
+        assert!(rendered.contains("busybox:1.36"), "{rendered}");
+        assert!(rendered.contains("1234"), "{rendered}");
+        assert!(rendered.contains("--cursor v1:job-000"), "{rendered}");
+    }
+
+    /// An empty page with a cursor is "more may exist", not "done" — the
+    /// render must not swallow the continuation token.
+    #[test]
+    fn list_render_keeps_the_cursor_on_an_empty_page() {
+        let rendered = render_job_list(&dto::ListJobsResponse {
+            jobs: Vec::new(),
+            next_cursor: Some("v1:job-00000000-0000-0000-0000-000000000009".to_string()),
+        });
+        assert!(rendered.contains("(no jobs)"), "{rendered}");
+        assert!(rendered.contains("more may exist"), "{rendered}");
     }
 
     #[tokio::test]
@@ -1523,7 +2001,7 @@ retry_user_errors = true
 
         let spec = write_spec(FULL_SPEC);
         let job = JobId::new();
-        submit(&client(), &base, spec.path(), Some(job))
+        submit(&client(&base), spec.path(), Some(job))
             .await
             .expect("submit succeeds");
 
@@ -1553,7 +2031,7 @@ retry_user_errors = true
         let base = spawn(router).await;
         let spec = write_spec(MINIMAL_SPEC);
 
-        let err = submit(&client(), &base, spec.path(), None)
+        let err = submit(&client(&base), spec.path(), None)
             .await
             .expect_err("submit fails");
         let message = format!("{err:#}");
@@ -1579,7 +2057,7 @@ retry_user_errors = true
         let base = spawn(router).await;
 
         let job = JobId::new();
-        abort(&client(), &base, job, Some("cleanup".to_string()))
+        abort(&client(&base), job, Some("cleanup".to_string()))
             .await
             .expect("abort succeeds");
 
@@ -1595,18 +2073,16 @@ retry_user_errors = true
         let router = Router::new().route(
             "/api/v1/jobs/:job/abort",
             post(|| async {
-                let mut headers = HeaderMap::new();
-                headers.insert(COPPICE_LEADER, "10.0.0.3:7070".parse().unwrap());
                 (
                     AxumStatus::MISDIRECTED_REQUEST,
-                    headers,
+                    leader_hint("10.0.0.3:7070"),
                     Json(error_body("NOT_LEADER", "not the leader")),
                 )
             }),
         );
         let base = spawn(router).await;
 
-        let err = abort(&client(), &base, JobId::new(), None)
+        let err = abort(&client(&base), JobId::new(), None)
             .await
             .expect_err("not-leader fails");
         let message = format!("{err:#}");
@@ -1741,51 +2217,54 @@ retry_user_errors = true
         type SeenCursors = Arc<Mutex<Vec<Option<String>>>>;
         let seen: SeenCursors = Arc::new(Mutex::new(Vec::new()));
         let pages = Arc::new((page_one, page_two, seen.clone()));
-        let router = Router::new()
-            .route(
-                "/api/v1/jobs/:job/logs",
-                get(
-                    #[allow(clippy::type_complexity)]
-                    |State(pages): State<
-                        Arc<(dto::GetJobLogsResponse, dto::GetJobLogsResponse, SeenCursors)>,
-                    >,
-                     Query(params): Query<std::collections::HashMap<String, String>>| async move {
-                        let cursor = params.get("cursor").cloned();
-                        pages.2.lock().unwrap().push(cursor.clone());
-                        let page = if cursor.as_deref() == Some("page2") {
-                            &pages.1
-                        } else {
-                            &pages.0
-                        };
-                        Json(serde_json::to_value(page).unwrap())
-                    },
-                ),
-            )
-            // The walk fetches the job detail first (attempt multiplicity
-            // decides prefixing up front).
-            .route(
-                "/api/v1/jobs/:job",
-                get(|AxumPath(job): AxumPath<String>| async move {
-                    let id: JobId = job.parse().unwrap();
-                    Json(
-                        serde_json::to_value(sample_job_detail(id, dto::JobStateKind::Succeeded))
+        let router =
+            Router::new()
+                .route(
+                    "/api/v1/jobs/:job/logs",
+                    get(
+                        #[allow(clippy::type_complexity)]
+                        |State(pages): State<
+                            Arc<(
+                                dto::GetJobLogsResponse,
+                                dto::GetJobLogsResponse,
+                                SeenCursors,
+                            )>,
+                        >,
+                         AxumQuery(params): AxumQuery<
+                            std::collections::HashMap<String, String>,
+                        >| async move {
+                            let cursor = params.get("cursor").cloned();
+                            pages.2.lock().unwrap().push(cursor.clone());
+                            let page = if cursor.as_deref() == Some("page2") {
+                                &pages.1
+                            } else {
+                                &pages.0
+                            };
+                            Json(serde_json::to_value(page).unwrap())
+                        },
+                    ),
+                )
+                // The walk fetches the job detail first (attempt multiplicity
+                // decides prefixing up front).
+                .route(
+                    "/api/v1/jobs/:job",
+                    get(|AxumPath(job): AxumPath<String>| async move {
+                        let id: JobId = job.parse().unwrap();
+                        Json(
+                            serde_json::to_value(sample_job_detail(
+                                id,
+                                dto::JobStateKind::Succeeded,
+                            ))
                             .unwrap(),
-                    )
-                }),
-            )
-            .with_state(pages);
+                        )
+                    }),
+                )
+                .with_state(pages);
         let base = spawn(router).await;
 
-        run_logs(
-            &client(),
-            &base,
-            JobId::new(),
-            None,
-            None,
-            dto::LogOrder::Asc,
-        )
-        .await
-        .expect("logs walk completes");
+        run_logs(&client(&base), JobId::new(), None, None, dto::LogOrder::Asc)
+            .await
+            .expect("logs walk completes");
 
         // The walk made exactly two requests: the first with no cursor, the
         // second resuming with the cursor page one returned.
@@ -1832,7 +2311,7 @@ retry_user_errors = true
         // the loop should not actually sleep.
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_follow(&client(), &base, job, None, None, Duration::from_millis(5)),
+            run_follow(&client(&base), job, None, None, Duration::from_millis(5)),
         )
         .await
         .expect("follow terminates promptly")
@@ -1965,34 +2444,37 @@ retry_user_errors = true
         type SeenCursors = Arc<Mutex<Vec<Option<String>>>>;
         let seen: SeenCursors = Arc::new(Mutex::new(Vec::new()));
         let pages = Arc::new((page_one, page_two, seen.clone()));
-        let router = Router::new()
-            .route(
-                "/api/v1/jobs/:job/timeline",
-                get(
-                    #[allow(clippy::type_complexity)]
-                    |State(pages): State<
-                        Arc<(
-                            dto::GetJobTimelineResponse,
-                            dto::GetJobTimelineResponse,
-                            SeenCursors,
-                        )>,
-                    >,
-                     Query(params): Query<std::collections::HashMap<String, String>>| async move {
-                        let cursor = params.get("cursor").cloned();
-                        pages.2.lock().unwrap().push(cursor.clone());
-                        let page = if cursor.as_deref() == Some("v1:9:0") {
-                            &pages.1
-                        } else {
-                            &pages.0
-                        };
-                        Json(serde_json::to_value(page).unwrap())
-                    },
-                ),
-            )
-            .with_state(pages);
+        let router =
+            Router::new()
+                .route(
+                    "/api/v1/jobs/:job/timeline",
+                    get(
+                        #[allow(clippy::type_complexity)]
+                        |State(pages): State<
+                            Arc<(
+                                dto::GetJobTimelineResponse,
+                                dto::GetJobTimelineResponse,
+                                SeenCursors,
+                            )>,
+                        >,
+                         AxumQuery(params): AxumQuery<
+                            std::collections::HashMap<String, String>,
+                        >| async move {
+                            let cursor = params.get("cursor").cloned();
+                            pages.2.lock().unwrap().push(cursor.clone());
+                            let page = if cursor.as_deref() == Some("v1:9:0") {
+                                &pages.1
+                            } else {
+                                &pages.0
+                            };
+                            Json(serde_json::to_value(page).unwrap())
+                        },
+                    ),
+                )
+                .with_state(pages);
         let base = spawn(router).await;
 
-        let events = fetch_timeline(&client(), &base, job)
+        let events = fetch_timeline(&client(&base), job)
             .await
             .expect("timeline walk completes");
 
@@ -2190,36 +2672,38 @@ retry_user_errors = true
         type Seen = Arc<Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>>;
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let pages = Arc::new((page_one, page_two, seen.clone()));
-        let router = Router::new()
-            .route(
-                "/api/v1/jobs/:job/usage",
-                get(
-                    #[allow(clippy::type_complexity)]
-                    |State(pages): State<
-                        Arc<(dto::GetJobUsageResponse, dto::GetJobUsageResponse, Seen)>,
-                    >,
-                     Query(params): Query<std::collections::HashMap<String, String>>| async move {
-                        let cursor = params.get("cursor").cloned();
-                        pages.2.lock().unwrap().push((
-                            cursor.clone(),
-                            params.get("order").cloned(),
-                            params.get("attempt").cloned(),
-                        ));
-                        let page = if cursor.as_deref() == Some("v1:desc:page2") {
-                            &pages.1
-                        } else {
-                            &pages.0
-                        };
-                        Json(serde_json::to_value(page).unwrap())
-                    },
-                ),
-            )
-            .with_state(pages);
+        let router =
+            Router::new()
+                .route(
+                    "/api/v1/jobs/:job/usage",
+                    get(
+                        #[allow(clippy::type_complexity)]
+                        |State(pages): State<
+                            Arc<(dto::GetJobUsageResponse, dto::GetJobUsageResponse, Seen)>,
+                        >,
+                         AxumQuery(params): AxumQuery<
+                            std::collections::HashMap<String, String>,
+                        >| async move {
+                            let cursor = params.get("cursor").cloned();
+                            pages.2.lock().unwrap().push((
+                                cursor.clone(),
+                                params.get("order").cloned(),
+                                params.get("attempt").cloned(),
+                            ));
+                            let page = if cursor.as_deref() == Some("v1:desc:page2") {
+                                &pages.1
+                            } else {
+                                &pages.0
+                            };
+                            Json(serde_json::to_value(page).unwrap())
+                        },
+                    ),
+                )
+                .with_state(pages);
         let base = spawn(router).await;
 
         run_usage(
-            &client(),
-            &base,
+            &client(&base),
             JobId::new(),
             Some(attempt),
             dto::LogOrder::Desc,
@@ -2252,7 +2736,7 @@ retry_user_errors = true
         );
         let base = spawn(router).await;
 
-        let err = run_usage(&client(), &base, JobId::new(), None, dto::LogOrder::Asc)
+        let err = run_usage(&client(&base), JobId::new(), None, dto::LogOrder::Asc)
             .await
             .expect_err("usage fails");
         let message = format!("{err:#}");
@@ -2276,7 +2760,7 @@ retry_user_errors = true
         let base = spawn(router).await;
 
         // fetch_timeline surfaces the error code from the wire body.
-        let err = fetch_timeline(&client(), &base, job)
+        let err = fetch_timeline(&client(&base), job)
             .await
             .expect_err("501 errors");
         assert!(format!("{err:#}").contains("UNIMPLEMENTED"), "{err:#}");

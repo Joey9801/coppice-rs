@@ -1314,7 +1314,7 @@ pub struct ConfigureQuotaEntityResponse {
 /// Read locally off the consensus metrics and a replica-local state snapshot,
 /// so every figure is "as this replica sees it" — a follower answers from its
 /// own applied position, not the leader's.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetCoordinatorStatusResponse {
     /// The cluster this replica belongs to (node config, ADR 0020).
     pub cluster_id: ClusterId,
@@ -1346,7 +1346,7 @@ pub struct GetCoordinatorStatusResponse {
 
 /// The serving replica's last snapshot, as far as it is knowable from
 /// openraft metrics. Only the covered log index is real today.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CoordinatorSnapshot {
     /// Snapshot size on disk. Always `null`: `SnapshotMeta` carries no size,
     /// and computing one would mean stat-ing snapshot files on a read path.
@@ -1361,7 +1361,7 @@ pub struct CoordinatorSnapshot {
 }
 
 /// Object counts in the replicated state machine (`StateMachine` map lengths).
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CoordinatorStateCounts {
     pub jobs: u64,
     pub attempts: u64,
@@ -1373,7 +1373,7 @@ pub struct CoordinatorStateCounts {
 /// A coordinator's role in the raft cluster, derived from the leader id and
 /// its voter flag (ADR 0031): leader if it is the current leader, learner if
 /// it is a non-voter, follower otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinatorRole {
     Leader,
@@ -1382,7 +1382,7 @@ pub enum CoordinatorRole {
 }
 
 /// One cluster member in a [`GetCoordinatorStatusResponse`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinatorMember {
     /// The member's raft id.
     pub id: u64,

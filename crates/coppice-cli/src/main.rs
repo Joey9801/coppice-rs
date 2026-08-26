@@ -5,9 +5,12 @@
 //!   hidden `admin` membership verbs);
 //! - `coppice agent --config …` — run a node agent;
 //! - `coppice dev …` — a self-contained single-node dev cluster;
-//! - `coppice node …` — enrollment-token and identity administration
+//! - `coppice node …` — compute-node reads over the client API, plus
+//!   enrollment-token and identity administration over the admin channel
 //!   (ADR 0037 §5);
-//! - `coppice job …` — client commands against a cluster's API.
+//! - `coppice job …` — job commands against a cluster's API;
+//! - `coppice cluster …` — whole-cluster reads against a cluster's API;
+//! - `coppice quota …` — quota-entity reads and the configure upsert.
 //!
 //! Shipping one binary keeps deployment to a single artifact: the same build
 //! runs as any component, so images and packaging never skew across roles.
@@ -16,8 +19,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod client;
+mod cluster;
 mod dev;
 mod job;
+mod node;
+mod quota;
+#[cfg(test)]
+mod testsupport;
 
 #[derive(Debug, Parser)]
 #[command(name = "coppice", version, about = "Coppice batch scheduler")]
@@ -40,12 +49,19 @@ enum Command {
     /// For local development and integration tests only.
     Dev(dev::DevArgs),
 
-    /// Enrollment-token and identity administration over a coordinator's
-    /// admin channel (ADR 0037 §5).
-    Node(coppice_coordinator::cli::NodeArgs),
+    /// Compute-node reads over a cluster's API, plus enrollment-token and
+    /// identity administration over a coordinator's admin channel
+    /// (ADR 0037 §5).
+    Node(node::NodeArgs),
 
     /// Job operations against a cluster's API.
     Job(job::JobArgs),
+
+    /// Whole-cluster status against a cluster's API.
+    Cluster(cluster::ClusterArgs),
+
+    /// Quota-entity operations against a cluster's API.
+    Quota(quota::QuotaArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -86,11 +102,19 @@ async fn main() -> Result<()> {
         }
         Command::Node(args) => {
             init_tracing();
-            coppice_coordinator::node::run_cli(args).await
+            node::run(args).await
         }
         Command::Job(args) => {
             init_tracing();
             job::run(args).await
+        }
+        Command::Cluster(args) => {
+            init_tracing();
+            cluster::run(args).await
+        }
+        Command::Quota(args) => {
+            init_tracing();
+            quota::run(args).await
         }
     }
 }
@@ -155,6 +179,9 @@ mod tests {
         }
     }
 
+    /// The admin verbs keep the exact command line they had before `list` and
+    /// `show` joined the group: the connection flags still sit on
+    /// `coppice node`, ahead of the verb, so no unit file or runbook changes.
     #[test]
     fn node_enroll_token_mint_parses() {
         use coppice_coordinator::cli::{EnrollTokenVerb, NodeVerb, RoleArg};
@@ -180,11 +207,11 @@ mod tests {
         ]);
         match cli.command {
             Command::Node(args) => {
-                assert_eq!(args.target, "coord-1:7071");
-                assert_eq!(args.ca, PathBuf::from("ca.crt"));
-                let NodeVerb::EnrollToken {
+                assert_eq!(args.target.as_deref(), Some("coord-1:7071"));
+                assert_eq!(args.ca, Some(PathBuf::from("ca.crt")));
+                let node::NodeVerb::Admin(NodeVerb::EnrollToken {
                     verb: EnrollTokenVerb::Mint { role, ttl, label },
-                } = args.verb
+                }) = args.verb
                 else {
                     panic!("expected enroll-token mint");
                 };
@@ -217,7 +244,7 @@ mod tests {
             cli.command,
             Command::Node(args) if matches!(
                 args.verb,
-                NodeVerb::EnrollToken { verb: EnrollTokenVerb::List }
+                node::NodeVerb::Admin(NodeVerb::EnrollToken { verb: EnrollTokenVerb::List })
             )
         ));
 
@@ -225,9 +252,9 @@ mod tests {
         let cli = Cli::parse_from(base.iter().copied().chain(["revoke", "--id", id]));
         match cli.command {
             Command::Node(args) => {
-                let NodeVerb::EnrollToken {
+                let node::NodeVerb::Admin(NodeVerb::EnrollToken {
                     verb: EnrollTokenVerb::Revoke { id: parsed },
-                } = args.verb
+                }) = args.verb
                 else {
                     panic!("expected enroll-token revoke");
                 };
@@ -272,8 +299,10 @@ mod tests {
         );
         match cli.command {
             Command::Node(args) => {
-                let coppice_coordinator::cli::NodeVerb::RevokeIdentity { machine, node } =
-                    args.verb
+                let node::NodeVerb::Admin(coppice_coordinator::cli::NodeVerb::RevokeIdentity {
+                    machine,
+                    node,
+                }) = args.verb
                 else {
                     panic!("expected revoke-identity");
                 };
@@ -353,6 +382,218 @@ mod tests {
             }
             other => panic!("expected job usage, got {other:?}"),
         }
+    }
+
+    // -- The new client verbs ------------------------------------------------
+
+    #[test]
+    fn job_list_parses_every_filter_flag() {
+        let cli = Cli::parse_from([
+            "coppice",
+            "job",
+            "list",
+            "--phase",
+            "queued",
+            "--phase",
+            "running",
+            "--entity",
+            "quota-00000000-0000-0000-0000-000000000001",
+            "--entity-scope",
+            "exact",
+            "--node",
+            "node-00000000-0000-0000-0000-000000000002",
+            "--image",
+            "busybox",
+            "--search",
+            "hello",
+            "--submitted-after",
+            "2026-07-16T09:30:00Z",
+            "--requests",
+            "cpu-millis",
+            "--requests-min",
+            "500",
+            "--limit",
+            "25",
+            "--cursor",
+            "v1:job-00000000-0000-0000-0000-000000000003",
+            "--json",
+        ]);
+        match cli.command {
+            Command::Job(job::JobArgs {
+                command:
+                    job::JobCommand::List {
+                        filter,
+                        limit,
+                        cursor,
+                        json,
+                    },
+                ..
+            }) => {
+                assert_eq!(
+                    filter.phases,
+                    [job::PhaseArg::Queued, job::PhaseArg::Running]
+                );
+                assert_eq!(filter.entity_scope, Some(job::ScopeArg::Exact));
+                assert_eq!(filter.image.as_deref(), Some("busybox"));
+                assert_eq!(filter.search.as_deref(), Some("hello"));
+                assert!(filter.submitted_after.is_some());
+                assert_eq!(filter.requests, Some(job::ResourceArg::CpuMillis));
+                assert_eq!(filter.requests_min, Some(500));
+                assert_eq!(limit, Some(25));
+                assert_eq!(
+                    cursor.as_deref(),
+                    Some("v1:job-00000000-0000-0000-0000-000000000003")
+                );
+                assert!(json);
+            }
+            other => panic!("expected job list, got {other:?}"),
+        }
+    }
+
+    /// The two image predicates are alternatives, not a pair: the AST has one
+    /// `image` leaf with exactly one operator.
+    #[test]
+    fn job_list_refuses_two_image_predicates() {
+        assert!(Cli::try_parse_from([
+            "coppice",
+            "job",
+            "list",
+            "--image",
+            "a",
+            "--image-equals",
+            "b",
+        ])
+        .is_err());
+    }
+
+    /// `--entity-scope` says how `--entity` matches; alone it means nothing.
+    #[test]
+    fn job_list_scope_requires_an_entity() {
+        assert!(
+            Cli::try_parse_from(["coppice", "job", "list", "--entity-scope", "exact"]).is_err()
+        );
+    }
+
+    #[test]
+    fn job_list_rejects_a_non_rfc3339_instant() {
+        assert!(
+            Cli::try_parse_from(["coppice", "job", "list", "--submitted-after", "yesterday"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cluster_status_parses_with_json() {
+        let cli = Cli::parse_from([
+            "coppice",
+            "cluster",
+            "--api",
+            "http://h:1",
+            "status",
+            "--json",
+        ]);
+        match cli.command {
+            Command::Cluster(cluster::ClusterArgs {
+                command: cluster::ClusterCommand::Status { json },
+                ..
+            }) => assert!(json),
+            other => panic!("expected cluster status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_list_and_show_parse() {
+        let cli = Cli::parse_from(["coppice", "node", "list"]);
+        assert!(matches!(
+            cli.command,
+            Command::Node(node::NodeArgs {
+                verb: node::NodeVerb::List { json: false },
+                ..
+            })
+        ));
+
+        let id = "node-00000000-0000-0000-0000-000000000001";
+        let cli = Cli::parse_from(["coppice", "node", "show", id, "--json"]);
+        match cli.command {
+            Command::Node(args) => {
+                let node::NodeVerb::Show { node, json } = args.verb else {
+                    panic!("expected node show");
+                };
+                assert_eq!(node.to_string(), id);
+                assert!(json);
+            }
+            other => panic!("expected node show, got {other:?}"),
+        }
+
+        // A malformed id is refused at parse, not at the server.
+        assert!(Cli::try_parse_from(["coppice", "node", "show", "not-a-node"]).is_err());
+    }
+
+    /// The HTTP node verbs need no admin credentials — that is the whole point
+    /// of making the connection flags optional on the group.
+    #[test]
+    fn node_list_needs_no_admin_credentials() {
+        assert!(Cli::try_parse_from(["coppice", "node", "list"]).is_ok());
+    }
+
+    #[test]
+    fn quota_verbs_parse() {
+        let entity = "quota-00000000-0000-0000-0000-000000000001";
+
+        let cli = Cli::parse_from(["coppice", "quota", "list"]);
+        assert!(matches!(
+            cli.command,
+            Command::Quota(quota::QuotaArgs {
+                command: quota::QuotaCommand::List { json: false },
+                ..
+            })
+        ));
+
+        let cli = Cli::parse_from(["coppice", "quota", "show", entity]);
+        match cli.command {
+            Command::Quota(args) => {
+                let quota::QuotaCommand::Show { entity: parsed, .. } = args.command else {
+                    panic!("expected quota show");
+                };
+                assert_eq!(parsed.to_string(), entity);
+            }
+            other => panic!("expected quota show, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from([
+            "coppice",
+            "quota",
+            "configure",
+            "--entity",
+            entity,
+            "--name",
+            "team-a",
+            "--quota-ucu",
+            "1000",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Quota(quota::QuotaArgs {
+                command: quota::QuotaCommand::Configure { .. },
+                ..
+            })
+        ));
+    }
+
+    /// The two `quota configure` input modes are alternatives: a file and
+    /// flags describing different entities would have no defined winner.
+    #[test]
+    fn quota_configure_refuses_a_file_and_flags_together() {
+        assert!(Cli::try_parse_from([
+            "coppice",
+            "quota",
+            "configure",
+            "--file",
+            "e.toml",
+            "--name",
+            "team-a",
+        ])
+        .is_err());
     }
 
     #[test]
