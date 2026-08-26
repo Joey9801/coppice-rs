@@ -155,15 +155,26 @@ pub struct FakeConsensus {
 }
 
 impl FakeConsensus {
-    /// Build a fake reporting `Leader { term: 1 }`.
+    /// Build a fake whose published role agrees with what `propose` will say.
+    ///
+    /// The two are not independent on a real replica, and code that reads
+    /// leadership from the status watch *before* proposing — the ADR 0038
+    /// write gate does — would be tested against an impossible replica if
+    /// they disagreed here. So a fake that refuses proposals with `NotLeader`
+    /// reports itself a follower of the same leader; anything else reports
+    /// `Leader { term: 1 }`.
     ///
     /// Also returns the [`ViewPublisher`] half the test uses to seed/advance published state.
     pub fn new(outcome: ProposeOutcome) -> (Self, ViewPublisher) {
         let (publisher, views) =
             ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
+        let role = match &outcome {
+            ProposeOutcome::NotLeader(leader) => Role::Follower { leader: *leader },
+            ProposeOutcome::Accepted | ProposeOutcome::Rejected(_) => Role::Leader { term: 1 },
+        };
         let (status_tx, status_rx) = watch::channel(ConsensusStatus {
             id: 1,
-            role: Role::Leader { term: 1 },
+            role,
             last_applied: 0,
             known_committed: 0,
         });

@@ -69,6 +69,22 @@ raft log under the leader's name. Forwarding a request, not a decision,
 keeps "the leader proposes what the leader itself would have proposed"
 true regardless of which replica the client happened to reach.
 
+The follower's own share of that path stops at the state-independent
+checks — a missing command, an empty entrypoint override, an
+out-of-range `max_runtime_seconds` — whose verdict is identical on every
+replica, so refusing them locally costs a hop and misleads nobody.
+Anything that reads applied state is deferred to the leader outright: a
+follower behind a policy update that added a priority class would find
+no multiplier for it and refuse, as `INVALID_ARGUMENT`, a submission the
+leader would accept. A lagging replica must never veto a write on the
+strength of a view it knows is behind, so the write path consults the
+leadership status watch before the multiplier lookup and forwards
+instead. Both stale readings are safe: a follower that still believes it
+leads falls through to the propose, which reports `NotLeader` and
+forwards one step later; the leader that briefly believes it follows
+spends one self-directed hop, which the single-hop rule below already
+covers.
+
 ### Single hop, always
 
 The receiving coordinator never re-forwards. If it turns out not to be
@@ -86,7 +102,11 @@ A dial failure, a proxy timeout (10s, matching the enroll proxy's
 resolve to the retriable `UNAVAILABLE` (503) — the same answer a local
 propose timeout already produces, and honest about the outcome being
 genuinely *unknown*: the write may have committed on the leader before
-the connection broke. What makes that safe to retry is already built:
+the connection broke. The 10s bounds the dial as well as the call,
+because a leader address that blackholes packets would otherwise hold
+the client for the kernel's connect budget rather than this one; a dial
+that fails or times out says so in its own words, since nothing left
+this replica and the write is therefore known not to have committed. What makes that safe to retry is already built:
 ADR 0026 gives `SubmitJob` and `ConfigureQuotaEntity` client-minted ids,
 so a retry of the identical request lands on the same job or entity as
 an accepted no-op rather than a duplicate, and `AbortJob` is naturally
