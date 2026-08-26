@@ -219,10 +219,18 @@ pub enum ApiError {
     /// This replica is not the leader. `leader_hint`, when present, is the
     /// leader's advertised **client-API address** (dialable by the caller
     /// for a retry) — never an internal identifier like the raft
-    /// CoordinatorId. Today no producer can supply it (raft membership
-    /// records only the peer-plane address), so it is `None` until client
-    /// addresses are advertised through membership or writes are forwarded
-    /// internally (ADR 0031).
+    /// CoordinatorId. No producer can supply it: raft membership records
+    /// only the peer-plane address, and ADR 0038 chose internal forwarding
+    /// over advertising client addresses through membership, so it stays
+    /// `None` by design.
+    ///
+    /// Since ADR 0038 this is the *fallback*, not the ordinary answer to a
+    /// write on a follower: a follower forwards the write to the leader and
+    /// answers with the leader's own outcome. This reaches a client only
+    /// when no leader is known at all (an election is in progress), when the
+    /// known leader has no address to forward to, or when the coordinator
+    /// forwarded to turns out not to lead either — all of which mean "ask
+    /// again", which is exactly what an empty hint says.
     #[error("not the leader{}", .leader_hint.as_deref().map(|h| format!(" (leader is {h})")).unwrap_or_default())]
     NotLeader { leader_hint: Option<String> },
 
@@ -237,6 +245,15 @@ pub enum ApiError {
     /// (see `docs/architecture/command-catalog.md` for rejection semantics), not a server fault.
     #[error("rejected: {0}")]
     Rejected(#[source] coppice_state::RejectionReason),
+
+    /// A [`Rejected`](Self::Rejected) relayed from the leader across the
+    /// internal forwarding hop (ADR 0038), carrying the leader's *rendered*
+    /// reason rather than the reason itself: `RejectionReason` has no proto
+    /// encoding to reconstruct from, and the rendered text is all a client
+    /// ever sees of it. Same error code, same status, same body — the
+    /// distinction exists only in this enum.
+    #[error("rejected: {0}")]
+    ForwardedRejection(String),
 
     /// The write did not resolve to a replicated decision: a timeout,
     /// overload, or the seam shutting down. The caller may retry.

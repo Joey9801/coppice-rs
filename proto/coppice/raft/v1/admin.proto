@@ -14,7 +14,9 @@ syntax = "proto3";
 package coppice.raft.v1;
 
 import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/job.proto";
 import "coppice/core/v1/pki.proto";
+import "coppice/core/v1/resource.proto";
 import "coppice/raft/v1/raft.proto";
 
 // Add a coordinator to membership as a non-voting learner so it can catch
@@ -252,6 +254,20 @@ service RaftAdminService {
   // Re-issue the caller's own coordinator leaf, authenticated by the current
   // leaf it presented (ADR 0037 §4 renewal).
   rpc RenewCoordinator(RenewCoordinatorRequest) returns (RenewCoordinatorResponse);
+
+  // A follower's internal forwarding of the three client writes to the
+  // leader (ADR 0038), generalizing ForwardEnroll above. Each carries the
+  // request at the *control-plane* level, never a pre-encoded log command:
+  // the leader re-runs the whole write path — shape validation, the
+  // replicated multiplier lookup against its own view, its own timestamp,
+  // and the propose — exactly as it would for a direct client.
+  //
+  // Single hop by construction: a receiver that is not the leader answers
+  // with the NotLeader outcome rather than forwarding again.
+  rpc ForwardSubmitJob(ForwardSubmitJobRequest) returns (ForwardSubmitJobResponse);
+  rpc ForwardAbortJob(ForwardAbortJobRequest) returns (ForwardAbortJobResponse);
+  rpc ForwardConfigureQuotaEntity(ForwardConfigureQuotaEntityRequest)
+      returns (ForwardConfigureQuotaEntityResponse);
 }
 
 // ---- Enrollment tokens and identity revocation (ADR 0037 §5) -------------
@@ -355,4 +371,109 @@ message RenewCoordinatorRequest {
 message RenewCoordinatorResponse {
   string cert_pem = 1;
   string ca_pem = 2;
+}
+
+// ---- Forwarded client writes (ADR 0038) ---------------------------------
+
+// The outcome of one forwarded client write.
+//
+// Reported in the response body rather than as a gRPC status because the
+// originating follower has to tell four things apart that no status code
+// distinguishes reliably: committed-and-applied, committed-and-refused (a
+// 409 the client must see), "you asked the wrong replica" (the follower's
+// own 421), and a request that never resolved at all. Only the last is a
+// gRPC error here; the first three are answers.
+//
+// A rich enum is a oneof with a message per arm, empty ones included, per
+// the house style.
+message ForwardWriteOutcome {
+  // Committed and applied. `log_index` is the apply index, which the
+  // follower hands back to the client for read-your-writes (ADR 0007).
+  message Applied {
+    uint64 log_index = 1;
+  }
+  // Committed, and apply refused it deterministically — a normal race
+  // outcome, not a fault. `reason` is the leader's *rendered*
+  // RejectionReason: the type has no proto encoding, and the client only
+  // ever sees the rendered text anyway (ADR 0038).
+  message Rejected {
+    string reason = 1;
+  }
+  // The receiver is not the leader (the forwarder's view was stale, or
+  // leadership moved under it). It never forwards again — the originating
+  // follower answers the client with its ordinary not-leader refusal.
+  message NotLeader {}
+  // Refused by synchronous validation before anything was proposed; the
+  // client must fix the request, and retrying it as-is cannot help.
+  message Invalid {
+    string message = 1;
+  }
+
+  oneof outcome {
+    Applied applied = 1;
+    Rejected rejected = 2;
+    NotLeader not_leader = 3;
+    Invalid invalid = 4;
+  }
+}
+
+// A follower's forwarding of `POST /api/v1/jobs`. Mirrors the JSON write
+// body field for field, deliberately: what crosses the hop is the client's
+// request, not a decision derived from it.
+message ForwardSubmitJobRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  // Client-minted job identity (ADR 0024), and the submission's idempotency
+  // identity (ADR 0026): it is what makes retrying an unknown forwarding
+  // outcome safe.
+  coppice.core.v1.JobId job = 8;
+  string image = 9;
+  // Required non-empty, enforced by the leader (Job.command's rule).
+  repeated string command = 10;
+  // Absent runs the image's own entrypoint; present must be non-empty.
+  coppice.core.v1.Entrypoint entrypoint = 11;
+  coppice.core.v1.Resources requests = 12;
+  // Raw, as the client sent it: the leader resolves it through *its own*
+  // view of the replicated multiplier table (ADR 0019), and a priority with
+  // no configured multiplier is invalid there, not here.
+  sint32 priority = 13;
+  // Whole seconds, as the JSON body spells it, not the domain's µs: the
+  // range check belongs to the leader's validation, so the value it checks
+  // must be the one the client wrote.
+  optional int64 max_runtime_seconds = 14;
+  coppice.core.v1.QuotaEntityId quota_entity = 15;
+  // Absent = the platform default policy.
+  coppice.core.v1.RetryPolicy retry = 16;
+}
+
+message ForwardSubmitJobResponse {
+  ForwardWriteOutcome outcome = 1;
+}
+
+// A follower's forwarding of `POST /api/v1/jobs/{job}/abort`. The job id is
+// the one the HTTP layer already resolved from the path.
+message ForwardAbortJobRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  coppice.core.v1.JobId job = 8;
+  optional string reason = 9;
+}
+
+message ForwardAbortJobResponse {
+  ForwardWriteOutcome outcome = 1;
+}
+
+// A follower's forwarding of `POST /api/v1/quota-entities`.
+message ForwardConfigureQuotaEntityRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  // Client-minted (ADR 0024/0026), and the upsert target: an existing id
+  // updates, a fresh one creates.
+  coppice.core.v1.QuotaEntityId entity = 8;
+  // Absent roots the entity. A missing or cycle-forming parent is rejected
+  // at apply, and comes back as the Rejected outcome above.
+  optional coppice.core.v1.QuotaEntityId parent = 9;
+  string name = 10;
+  uint64 quota_ucu = 11; // soft quota as a stock in µCU (ADR 0019).
+}
+
+message ForwardConfigureQuotaEntityResponse {
+  ForwardWriteOutcome outcome = 1;
 }
