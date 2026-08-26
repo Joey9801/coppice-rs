@@ -1702,7 +1702,26 @@ async fn concurrent_starts_pull_once() {
 /// container pins its image, so the hint is ignored; once the container is
 /// stopped and reaped (unpinning it), the same hint is honored. A dedicated tag
 /// (`busybox:uclibc`) keeps the eviction from disturbing the shared `busybox`
-/// image other tests use.
+/// image other tests use: no other test in the workspace names it, and its
+/// image id differs from `busybox:1.37.0`'s, so the by-id `remove_image` below
+/// cannot trip the multiply-tagged `409`.
+///
+/// Both phases re-fire the hint on every poll instead of firing once and then
+/// waiting out a deadline. `EvictImageHint` is fire-and-forget by contract
+/// (§7: `evict_hint` spawns a task, and a pinned, unknown, or daemon-`409`
+/// digest is dropped with nothing scheduled to retry), so one hint that lands
+/// on a transient skip costs the whole deadline — while the *coordinator*
+/// re-hints every heartbeat, so a hint stream is what production actually
+/// sends. Repeating strengthens both assertions rather than weakening them:
+/// the pinned phase must now survive a stream of hints (what its comment
+/// always claimed, though the code fired once), and the unpinned phase still
+/// fails if hints are never honored.
+///
+/// The waits carry diagnostics because the failure they guard is contention on
+/// a shared daemon (other docker tests pulling and starting concurrently),
+/// which does not reproduce on demand: each timeout reports the container
+/// count for the allocation and whether the cache still tracks the digest, so
+/// one CI failure is enough to tell a slow daemon apart from an unhonored hint.
 #[tokio::test]
 async fn evict_hint_respects_pins() {
     let Some(docker) = harness::docker().await else {
@@ -1715,13 +1734,19 @@ async fn evict_hint_respects_pins() {
 
     let r: anyhow::Result<()> = async {
         exec.start(sp).await?;
-        harness::wait_observed_running(&exec, alloc, 30).await?;
+        if let Err(err) = harness::wait_observed_running(&exec, alloc, 30).await {
+            let present = docker.inspect_image(IMAGE).await.is_ok();
+            let containers = harness::count_containers_by_alloc(&docker, alloc)
+                .await
+                .map_or_else(|err| format!("<{err}>"), |n| n.to_string());
+            anyhow::bail!("{err} (image {IMAGE} present: {present}, containers: {containers})");
+        }
         let digest = harness::image_digest_label(&docker, alloc).await?;
 
         // Pinned by the running container → the hint is ignored: the image must
         // survive a full second of repeated hints.
-        exec.evict_image(digest.clone());
         for _ in 0..5 {
+            exec.evict_image(digest.clone());
             tokio::time::sleep(StdDuration::from_millis(200)).await;
             ensure!(
                 docker.inspect_image(IMAGE).await.is_ok(),
@@ -1729,20 +1754,32 @@ async fn evict_hint_respects_pins() {
             );
         }
 
-        // Stop + reap → the pin drains → the hint is now honored.
+        // Stop + reap → the pin drains → the hint is now honored. `reap`
+        // releases the pin synchronously before it returns, so every hint from
+        // here on sees an unpinned digest.
         exec.stop(alloc, CoreDuration::from_millis(1)).await?;
         exec.reap(alloc).await?;
-        exec.evict_image(digest);
 
         let deadline = tokio::time::Instant::now() + StdDuration::from_secs(15);
         loop {
+            exec.evict_image(digest.clone());
             if docker.inspect_image(IMAGE).await.is_err() {
                 break; // gone — the unpinned hint was honored
             }
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "an unpinned evict hint was not honored within 15s"
-            );
+            if tokio::time::Instant::now() >= deadline {
+                let containers = harness::count_containers_by_alloc(&docker, alloc)
+                    .await
+                    .map_or_else(|err| format!("<{err}>"), |n| n.to_string());
+                let tracked = exec
+                    .cache_inventory()
+                    .images
+                    .iter()
+                    .any(|image| image.digest == digest);
+                anyhow::bail!(
+                    "an unpinned evict hint was not honored within 15s \
+                     (containers for {alloc}: {containers}, digest still tracked: {tracked})"
+                );
+            }
             tokio::time::sleep(StdDuration::from_millis(200)).await;
         }
         Ok(())
