@@ -509,13 +509,21 @@ pub(crate) async fn stop(
     // 2. Issue the stop with grace ceiled to whole seconds. Mark the kill in
     //    flight first so a die event that beats our own claim knows the 137 it
     //    is about to see is ours, and skips the OOM settle (§4).
-    lock_state(&inner.state).killing.insert(allocation);
+    //
+    //    The marker clears itself unless the stop actually took effect. A stop
+    //    that failed killed nothing, so leaving it set would make some later,
+    //    unrelated exit for this allocation skip its OOM settle — reinstating
+    //    the very Natural(137) misclassification this path exists to prevent.
+    //    Only a successful stop keeps it, deliberately: its own die event may
+    //    still be in flight, and `reap` clears it (§5).
+    let mut kill_marker = KillMarker::arm(inner, allocation);
     let options = StopContainerOptionsBuilder::new()
         .t(grace_to_secs_ceil(grace))
         .build();
     let stopped = inner.docker.stop_container(&name, Some(options)).await;
     match stopped {
         Ok(()) => {
+            kill_marker.keep();
             // Post-inspect for the terminal evidence. Deliberately *not*
             // settled via settle_oom_flag: a 137 here is expected from our own
             // grace-expiry SIGKILL, so the settle would burn its full budget on
@@ -550,6 +558,45 @@ pub(crate) async fn stop(
     }
     // Never remove here: an exited container is evidence until the session
     // journals its exit and calls reap (§5).
+}
+
+/// The kill-in-flight marker (§4), cleared on drop unless [`keep`](Self::keep)
+/// is called.
+///
+/// Default-clear is the safe polarity: a marker wrongly cleared costs one
+/// unnecessary settle, while a marker wrongly *kept* silences the settle for a
+/// later exit and can misreport a real OOM as a plain exit.
+struct KillMarker<'a> {
+    inner: &'a Inner,
+    allocation: AllocationId,
+    keep: bool,
+}
+
+impl<'a> KillMarker<'a> {
+    fn arm(inner: &'a Inner, allocation: AllocationId) -> Self {
+        lock_state(&inner.state).killing.insert(allocation);
+        Self {
+            inner,
+            allocation,
+            keep: false,
+        }
+    }
+
+    /// Leave the marker set past this scope — the stop took effect, so its die
+    /// event is ours whenever it lands. `reap` is what finally clears it.
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for KillMarker<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            lock_state(&self.inner.state)
+                .killing
+                .remove(&self.allocation);
+        }
+    }
 }
 
 /// Whole seconds to wait before SIGKILL, rounding a sub-second grace *up* so a

@@ -109,12 +109,20 @@ shape is present: SIGKILL exit code, explicit memory limit, flag unset.
 The settle has **two** channels, raced against one deadline:
 
 1. *The witness* (`oom.rs`) — the daemon's own container `oom` event,
-   recorded by the events task, which now subscribes to `oom` alongside
+   recorded by the events pump, which now subscribes to `oom` alongside
    `die`. This is the primary channel and it is a push, not a poll: both
    events come from the same daemon handler, and the `oom` reaches a live
    tail **before** the `die` (~80 ms on Docker 29.5/cgroup v2), so a
    die-driven settle normally finds the answer already waiting and returns
    without sleeping.
+
+   This is why the events task is split in two (§11). A settle waits for a
+   witness only the stream can produce, so a settle running on the task that
+   *reads* the stream could never observe the event it waits for: an `oom`
+   arriving after its `die`, or one published while a resync snapshot is in
+   flight, would sit unread until the settle had already given up. The pump
+   records witnesses inline and blocks on nothing; the settle task owns
+   every await that can take time.
 2. *The re-inspect ladder* — the original short backoff (~1.6 s), kept as
    the backstop for what a witness cannot cover: an `oom` that fell into an
    events-stream gap, or an executor with no events task at all.
@@ -139,15 +147,22 @@ coordinator + journal) that wants its own ADR; recording the distinction at
 the evidence layer makes that a one-line mapping change if it is taken.
 Every `Killed` is metered (`agent_oom_unconfirmed_total`) and warned.
 
-The window is 5 s, bounded by the fact that the die-driven settle runs
-inline in the single events task. Two things keep that from being a stall:
-a verdict is memoised per allocation, so however many evidence paths
-inspect the same corpse only the first waits; and a stop marks its kill in
-flight, so the die event for our own grace-expiry SIGKILL skips the settle
-entirely. The stop post-inspect and the disk enforcer's kill path skip it
-for the same reason — a 137 there is expected from their own SIGKILL, and
-waiting out the budget on every hard kill would be pure latency for no
-evidence.
+The window is 5 s, bounded by the fact that the settle task drains its
+queue serially. Two things keep that from being a stall: a verdict is
+memoised per allocation, so however many evidence paths inspect the same
+corpse only the first waits; and a stop marks its kill in flight, so the
+die event for our own grace-expiry SIGKILL skips the settle. The stop
+post-inspect and the disk enforcer's kill path skip it for the same reason
+— a 137 there is expected from their own SIGKILL, and waiting out the
+budget on every hard kill would be pure latency for no evidence.
+
+Skipping the settle is not the same as assuming the kill was ours: a
+container can genuinely OOM inside the stop's grace window, so the kill
+marker's fast path still consults the witness (a map lookup, no wait) and
+reports `OomKilled` when one is recorded. The kernel's kill outranks ours.
+The marker itself clears on drop unless the stop actually took effect — a
+stop that failed killed nothing, and a marker left behind by one would
+silence the settle for some later, unrelated exit.
 
 **Executor-initiated kills**: the disk enforcer's poll strategy (§6.2) is
 the one place the *executor itself* decides to kill, analogous to the
@@ -924,7 +939,8 @@ all resilient to Docker daemon restarts via reconnect-and-resync):
 
 | Task | Role |
 | --- | --- |
-| events | `docker events` stream → inspect → `ExitEvent` queue (feeds `next_exit`); primes the lazy stream before each resync snapshot and sweeps a periodic resync (60 s) so a subscription-establishment gap can never strand an exit |
+| events pump | owns the `docker events` stream and never blocks: records `oom` witnesses inline (§4) and hands `die` events and resync requests to the settle task; primes the lazy stream before each resync snapshot and sweeps a periodic resync (60 s) so a subscription-establishment gap can never strand an exit |
+| events settle | drains that queue: inspect → OOM settle → `ExitEvent` (feeds `next_exit`), plus the resync sweeps. Everything that can block lives here, so the pump keeps tailing while a settle waits |
 | disk enforcer | poll strategy only: usage sweep + kill decisions |
 | cache janitor | TTL/pressure eviction, inventory refresh |
 | pressure monitor | statfs sampling → watch channel |
