@@ -1717,6 +1717,16 @@ async fn concurrent_starts_pull_once() {
 /// always claimed, though the code fired once), and the unpinned phase still
 /// fails if hints are never honored.
 ///
+/// Between the phases the test waits for `cache_hints_inflight()` to reach
+/// zero. Re-firing alone does not order the two phases: a pinned-phase hint is
+/// only *fired* by the time its sleep elapses, and one still queued on the
+/// digest's image lock could resolve after the pin drains and evict the image
+/// itself — leaving the unpinned phase to pass on a leftover, proving neither
+/// that the pinned hints were ignored nor that a post-unpin hint was honored.
+/// Draining them first makes the pinned assertion final rather than
+/// not-yet-violated, and makes the unpinned phase's eviction attributable to
+/// its own hints.
+///
 /// The waits carry diagnostics because the failure they guard is contention on
 /// a shared daemon (other docker tests pulling and starting concurrently),
 /// which does not reproduce on demand: each timeout reports the container
@@ -1754,9 +1764,34 @@ async fn evict_hint_respects_pins() {
             );
         }
 
+        // Quiesce before unpinning. `evict_image` is fire-and-forget, so the
+        // sleeps above bound when each hint was *fired*, not when it finished:
+        // a pinned-phase task still queued on the digest's image lock would
+        // otherwise resolve after the pin drains and evict the image itself,
+        // and the unpinned phase below would pass on that leftover without
+        // ever proving a post-unpin hint was honored.
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(15);
+        while exec.cache_hints_inflight() > 0 {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "pinned-phase evict hints did not resolve within 15s ({} still in flight)",
+                exec.cache_hints_inflight()
+            );
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+        // Every pinned-phase hint is now resolved, so this is the honest form
+        // of the pinned assertion: not "no hint has evicted it *yet*" but "no
+        // hint fired while pinned ever will".
+        ensure!(
+            docker.inspect_image(IMAGE).await.is_ok(),
+            "a pinned image must survive every hint fired while it was pinned"
+        );
+
         // Stop + reap → the pin drains → the hint is now honored. `reap`
         // releases the pin synchronously before it returns, so every hint from
-        // here on sees an unpinned digest.
+        // here on sees an unpinned digest — and with the pinned-phase hints
+        // drained above, the only hints that can act from here are this
+        // phase's own.
         exec.stop(alloc, CoreDuration::from_millis(1)).await?;
         exec.reap(alloc).await?;
 

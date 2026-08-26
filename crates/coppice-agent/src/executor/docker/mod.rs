@@ -962,6 +962,18 @@ impl DockerExecutor {
         self.inner.cache.pulls_started()
     }
 
+    /// The number of hint-driven evictions fired but not yet finished
+    /// (docker-executor.md §7). An integration-test seam: `evict_image` is
+    /// fire-and-forget by contract, so a test that changes an image's pin state
+    /// must first wait for this to reach zero — otherwise a hint fired against
+    /// the *old* pin state could still be queued on the digest's image lock and
+    /// act after the change, and an assertion about the new state would be
+    /// proving nothing about the hint it thinks it is testing.
+    #[doc(hidden)]
+    pub fn cache_hints_inflight(&self) -> u64 {
+        self.inner.cache.hints_inflight()
+    }
+
     /// The number of per-container telemetry collector slots currently held —
     /// [`Reserved`](CollectorSlot::Reserved) or [`Active`](CollectorSlot::Active)
     /// (docker-executor.md §8.1/§8.2). An integration-test seam: it lets the
