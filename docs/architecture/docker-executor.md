@@ -38,6 +38,7 @@ crates/coppice-agent/src/
     state.rs                   Docker state ↔ ContainerState mapping (§3)
     classify.rs                exit-evidence extraction (§4)
     events.rs                  docker events stream → ExitEvent queue
+    oom.rs                     oom-event witness + settle verdict (§4)
     limits.rs                  Resources → HostConfig translation (§6)
     cpuset.rs                  whole-core exclusive-affinity allocator (§6.3)
     disk.rs                    DiskEnforcer: quota / poll strategies (§6.2)
@@ -102,15 +103,51 @@ event fires — some daemons set it from an async OOM-event handler that can
 lag the exit, so an inspect issued at event time can read exit 137 under a
 memory limit with the flag still unset. Every natural-exit evidence path
 (die event, resync, stop's pre-inspect, `observe`) therefore routes its
-inspect through a bounded settle (`settle_oom_flag`): when the racy shape
-is present — SIGKILL exit code, explicit memory limit, flag unset — it
-re-inspects on a short backoff (~1.6 s total) until the flag commits or the
-budget runs out. The flag remains the **sole** OOM gate: an exhausted
-budget still classifies `Natural` (an external SIGKILL is indistinguishable
-by code alone), so this changes timing, never the classification contract.
-The stop post-inspect and the disk enforcer's kill path skip the settle —
-a 137 there is expected from their own SIGKILL, and waiting out the budget
-on every hard kill would be pure latency for no evidence.
+inspect through a bounded settle (`settle_oom_flag`) whenever the racy
+shape is present: SIGKILL exit code, explicit memory limit, flag unset.
+
+The settle has **two** channels, raced against one deadline:
+
+1. *The witness* (`oom.rs`) — the daemon's own container `oom` event,
+   recorded by the events task, which now subscribes to `oom` alongside
+   `die`. This is the primary channel and it is a push, not a poll: both
+   events come from the same daemon handler, and the `oom` reaches a live
+   tail **before** the `die` (~80 ms on Docker 29.5/cgroup v2), so a
+   die-driven settle normally finds the answer already waiting and returns
+   without sleeping.
+2. *The re-inspect ladder* — the original short backoff (~1.6 s), kept as
+   the backstop for what a witness cannot cover: an `oom` that fell into an
+   events-stream gap, or an executor with no events task at all.
+
+The flag is therefore no longer the sole OOM gate; the daemon's `oom` event
+is accepted as equivalent evidence, because it *is* the same signal. Both
+are consulted only under the racy shape, which keeps their semantics
+identical: Docker sets `OOMKilled`, and emits `oom`, when the cgroup
+OOM-kills any process in the container — including one it survived — so
+neither is proof of death on its own.
+
+**A settle that closes with neither channel answering reports
+`ExitCause::Killed`, not `Natural`.** This is the third arm of the
+taxonomy and it exists because both alternatives are false statements: the
+container was SIGKILLed, so it did not "exit on its own", and an external
+SIGKILL of a memory-limited container is indistinguishable from an OOM
+whose notification the daemon lost, so `OomKilled` would be a fabricated
+limit breach. `classify_exit` maps `Killed` to `Exited{code}` today — the
+replicated outcome taxonomy has no "killed, cause unknown" variant, and
+adding one is a contract change (core enum + proto + descriptor gate +
+coordinator + journal) that wants its own ADR; recording the distinction at
+the evidence layer makes that a one-line mapping change if it is taken.
+Every `Killed` is metered (`agent_oom_unconfirmed_total`) and warned.
+
+The window is 5 s, bounded by the fact that the die-driven settle runs
+inline in the single events task. Two things keep that from being a stall:
+a verdict is memoised per allocation, so however many evidence paths
+inspect the same corpse only the first waits; and a stop marks its kill in
+flight, so the die event for our own grace-expiry SIGKILL skips the settle
+entirely. The stop post-inspect and the disk enforcer's kill path skip it
+for the same reason — a 137 there is expected from their own SIGKILL, and
+waiting out the budget on every hard kill would be pure latency for no
+evidence.
 
 **Executor-initiated kills**: the disk enforcer's poll strategy (§6.2) is
 the one place the *executor itself* decides to kill, analogous to the
@@ -125,7 +162,7 @@ pub struct ExitInfo {
     pub finished_at: Timestamp, // Docker's FinishedAt; lets the session
                                 // janitor age exited containers (§5)
 }
-pub enum ExitCause { Natural, OomKilled, DiskKilled }
+pub enum ExitCause { Natural, OomKilled, DiskKilled, Killed }
 ```
 
 `classify_exit` maps `DiskKilled` into the **limit-breach outcome

@@ -1092,6 +1092,72 @@ async fn oom_classification() {
     r.unwrap();
 }
 
+/// An external SIGKILL of a *memory-limited* container is reported as
+/// [`ExitCause::Killed`] — never `Natural` (§4).
+///
+/// This is the other side of `oom_classification`, and the regression guard for
+/// the bug it flushed out: exit 137 under a memory limit is the exact shape a
+/// lagging (or lost) `OOMKilled` commit leaves behind, so the settle window has
+/// to close on *something*. Reporting `Natural` would tell an operator the
+/// container "exited on its own" with a code it never chose — which is the one
+/// answer the cause field exists to rule out. Reporting `OomKilled` would be a
+/// fabrication: this container is killed from outside with plenty of headroom
+/// under its limit, and looks identical to a real OOM whose daemon-side
+/// notification went missing.
+///
+/// The kill is issued straight at the daemon, deliberately bypassing
+/// `exec.stop()`, so this runs the natural-exit evidence path (die event →
+/// settle → `next_exit`) rather than the stop path.
+#[tokio::test]
+async fn external_sigkill_under_a_memory_limit_is_killed_not_natural() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    let (exec, _tx) = harness::executor(docker.clone()).await;
+    let limits = Resources {
+        cpu_millis: 0,
+        memory: ByteSize::from_mib(64),
+        disk: ByteSize::ZERO,
+    };
+    let sp = harness::spec(harness::BUSYBOX, &["sleep", "300"], limits);
+    let alloc = sp.allocation;
+
+    let r: anyhow::Result<()> = async {
+        exec.start(sp).await?;
+        harness::wait_observed_running(&exec, alloc, 30).await?;
+
+        // SIGKILL from outside: no OOM flag will ever commit, and no `oom`
+        // event will ever be published, so the settle must run to its deadline.
+        docker
+            .kill_container(
+                &format!("coppice-{alloc}"),
+                Some(
+                    bollard::query_parameters::KillContainerOptionsBuilder::new()
+                        .signal("SIGKILL")
+                        .build(),
+                ),
+            )
+            .await?;
+
+        let info = harness::wait_exit(&exec, alloc, 60).await?;
+        ensure!(
+            info.code == 137,
+            "expected an exit code of 137, got {}",
+            info.code
+        );
+        ensure!(
+            info.cause == ExitCause::Killed,
+            "expected Killed (cause unconfirmed), got {:?}",
+            info.cause
+        );
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[alloc]).await;
+    r.unwrap();
+}
+
 // ---- 4. stop grace, TERM-trapping container -----------------------------
 
 /// Stopping a running container that traps SIGTERM and exits 0 during the grace

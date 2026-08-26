@@ -46,11 +46,13 @@ pub(crate) fn parse_docker_time(s: &str) -> Option<Timestamp> {
 /// - `code`: `ExitCode` narrowed `i64 → i32`, saturating.
 /// - `cause`: [`ExitCause::OomKilled`] iff `OOMKilled == Some(true)`, else
 ///   [`ExitCause::Natural`]. [`ExitCause::DiskKilled`] is produced only by the
-///   S4 disk enforcer — never synthesised from inspect here. The daemon can
-///   commit `OOMKilled` *after* the `die` event fires (issue #34); callers on
-///   the natural-exit paths give it a bounded window to land via
-///   [`super::settle_oom_flag`] before extracting evidence — the flag stays
-///   the sole gate, this function never guesses from the code alone.
+///   S4 disk enforcer — never synthesised from inspect here. This function
+///   never guesses from the exit code alone: the flag is the only thing it
+///   reads. The daemon can commit `OOMKilled` *after* the `die` event fires
+///   (issue #34), so callers on the natural-exit paths settle that race first
+///   ([`super::settle_oom_flag`]) and re-stamp the result with
+///   [`apply_oom_verdict`] — which is also the only way `Natural` can become
+///   [`ExitCause::Killed`].
 /// - `finished_at`: `parse_docker_time(FinishedAt)`; an unusable value yields
 ///   `None` (no evidence).
 /// - `runtime`: `FinishedAt − StartedAt`, clamped to ≥ 0; an unset `StartedAt`
@@ -83,6 +85,39 @@ pub(crate) fn exit_info(state: &bollard::models::ContainerState) -> Option<ExitI
     })
 }
 
+/// Re-stamp exit evidence with what a bounded OOM settle concluded
+/// (docker-executor.md §4).
+///
+/// [`exit_info`] is pure and flag-only: it reads `OOMKilled` and nothing else,
+/// which is right for the paths that never settle (the stop post-inspect, the
+/// disk enforcer, the §3 state table). The natural-exit paths *do* settle, and
+/// their verdict can know two things the flag alone cannot — that the daemon's
+/// own `oom` event confirmed the kill, and that the window closed without any
+/// confirmation at all. This applies that verdict:
+///
+/// - [`Confirmed`](super::oom::OomVerdict::Confirmed) ⇒ `OomKilled`, even when
+///   the inspect's flag is still uncommitted (the witness is the same daemon
+///   signal, delivered earlier).
+/// - [`Unconfirmed`](super::oom::OomVerdict::Unconfirmed) ⇒
+///   [`ExitCause::Killed`] — never `Natural`. The container did not exit on its
+///   own; we simply cannot name who killed it.
+/// - [`NotInQuestion`](super::oom::OomVerdict::NotInQuestion) ⇒ untouched.
+///
+/// The verdict only ever moves a `Natural` reading: a `DiskKilled` cause is
+/// synthesised by the enforcer and never routed through a settle, and an
+/// already-`OomKilled` inspect is not the racy shape.
+pub(crate) fn apply_oom_verdict(mut info: ExitInfo, verdict: super::oom::OomVerdict) -> ExitInfo {
+    if info.cause != ExitCause::Natural {
+        return info;
+    }
+    info.cause = match verdict {
+        super::oom::OomVerdict::NotInQuestion => return info,
+        super::oom::OomVerdict::Confirmed => ExitCause::OomKilled,
+        super::oom::OomVerdict::Unconfirmed => ExitCause::Killed,
+    };
+    info
+}
+
 /// The exit code of a SIGKILL-terminated PID 1 (128 + 9) — what the kernel's
 /// OOM killer leaves behind.
 const SIGKILL_EXIT_CODE: i64 = 137;
@@ -94,8 +129,9 @@ const SIGKILL_EXIT_CODE: i64 = 137;
 /// immediately after the event can transiently miss it. `true` means "worth
 /// re-inspecting before trusting `Natural`", **not** "this was an OOM" — an
 /// external SIGKILL of a memory-limited container looks identical, which is
-/// why callers re-inspect (bounded, [`super::settle_oom_flag`]) rather than
-/// reclassify on this signal alone.
+/// why callers settle the question (bounded, [`super::settle_oom_flag`]) rather
+/// than reclassify on this signal alone — and why a settle that closes without
+/// an answer reports [`ExitCause::Killed`] rather than picking a side.
 pub(crate) fn oom_flag_may_lag(inspect: &bollard::models::ContainerInspectResponse) -> bool {
     let Some(state) = inspect.state.as_ref() else {
         return false;
@@ -311,6 +347,57 @@ mod tests {
             ..state()
         };
         assert_eq!(exit_info(&s).expect("usable").code, i32::MAX);
+    }
+
+    // ---- apply_oom_verdict (§4) --------------------------------------------
+
+    fn natural_137() -> ExitInfo {
+        let s = bollard::models::ContainerState {
+            exit_code: Some(137),
+            oom_killed: Some(false),
+            started_at: Some("2026-07-17T10:00:00Z".into()),
+            finished_at: Some("2026-07-17T10:00:01Z".into()),
+            ..state()
+        };
+        exit_info(&s).expect("usable evidence")
+    }
+
+    #[test]
+    fn verdict_confirmed_promotes_a_natural_137_to_oom() {
+        let info = apply_oom_verdict(natural_137(), super::super::oom::OomVerdict::Confirmed);
+        assert_eq!(info.cause, ExitCause::OomKilled);
+        assert_eq!(info.code, 137);
+    }
+
+    /// The regression this whole path exists for: an unconfirmed SIGKILL must
+    /// not be reported as having exited on its own.
+    #[test]
+    fn verdict_unconfirmed_is_killed_never_natural() {
+        let info = apply_oom_verdict(natural_137(), super::super::oom::OomVerdict::Unconfirmed);
+        assert_eq!(info.cause, ExitCause::Killed);
+        assert_eq!(info.code, 137);
+    }
+
+    #[test]
+    fn verdict_not_in_question_leaves_evidence_alone() {
+        let info = apply_oom_verdict(natural_137(), super::super::oom::OomVerdict::NotInQuestion);
+        assert_eq!(info.cause, ExitCause::Natural);
+    }
+
+    #[test]
+    fn a_non_natural_cause_is_never_rewritten() {
+        let mut disk = natural_137();
+        disk.cause = ExitCause::DiskKilled;
+        for verdict in [
+            super::super::oom::OomVerdict::Confirmed,
+            super::super::oom::OomVerdict::Unconfirmed,
+            super::super::oom::OomVerdict::NotInQuestion,
+        ] {
+            assert_eq!(
+                apply_oom_verdict(disk, verdict).cause,
+                ExitCause::DiskKilled
+            );
+        }
     }
 
     // ---- oom_flag_may_lag (issue #34) --------------------------------------
