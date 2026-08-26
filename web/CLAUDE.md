@@ -9,7 +9,10 @@ eventual serve-from-coordinator story.
 
 All run from `web/`:
 
-- `npm run dev` — dev server (mock data, no coordinator needed)
+- `npm run dev` — dev server; proxies `/api/v1` to a coordinator at
+  `COPPICE_API_ADDR` (default `http://127.0.0.1:7070`). Set
+  `VITE_COPPICE_MOCK=1` to force the mock client instead (no coordinator
+  needed) — see README.md.
 - `npm run typecheck` / `npm run lint` / `npm test` / `npm run build`
 - `npm run format` — Prettier; run it before committing
 
@@ -73,12 +76,12 @@ routes every endpoint below, with unimplemented ones answering
    `crates/coppice-api/src/http/project.rs`, and swap its stub handler
    in `crates/coppice-api/src/http/routes.rs` for a real one backed by
    the coordinator.
-2. Add the method to the real client (create `src/api/real-client.ts`
-   implementing part of `CoppiceApi` with `fetch` against `/api/v1/...`
-   when the first endpoint lands). The real client owns the wire
-   mapping: snake_case keys and enum strings ↔ the camelCase/PascalCase
-   `types.ts` shapes (both directions — write bodies use the same DTO
-   conventions), and error translation.
+2. Add the method to `src/api/real-client.ts` (`createRealClient()`),
+   which implements `CoppiceApi` with `fetch` against `/api/v1/...`. The
+   real client owns the wire mapping: snake_case keys and enum strings ↔
+   the camelCase/PascalCase `types.ts` shapes (both directions — write
+   bodies use the same DTO conventions), `Date` ↔ ISO 8601 strings, and
+   error translation (`{ code, message }` → `ApiError`).
 3. Flip that one method in the delegation table in `src/api/index.ts`
    (`{ ...mock, listJobs: real.listJobs }`).
 4. Do not delete the mock implementation — it backs tests and offline
@@ -101,8 +104,19 @@ the world, not by hardcoding values in components.
   a bounded most-recent-N snapshot; the server owns windowing/coalescing.
   Do not build UI that assumes it sees every cluster event.
 
-- **Logs are invented.** No log storage exists in the backend; `LogChunk`
-  in types.ts is the UI's proposal. When the real log API is designed,
-  reconcile types.ts with it.
+- **Logs are invented, and now partially reconciled.** The real log API
+  landed (ADR 0034, `GetJobLogsResponse`/`LogEntry` in dto.rs) with a
+  richer per-attempt shape (`attempt`, `stream`, per-attempt `sources`
+  availability) than the UI's `LogChunk`/`LogEntry` (`t`, `level`,
+  `target`, `message`). `real-client.ts`'s `getJobLogs` maps losslessly
+  enough to render (`stream` → `level`, `attempt` → `target`) but drops
+  `sources`; a follow-up should widen `LogChunk` to carry the real fields
+  instead of approximating them at the boundary.
+- **Job usage now mirrors the wire contract exactly.** `getJobUsage`
+  returns `GetJobUsageResponse` (cumulative `UsagePoint` counters plus
+  per-attempt `sources`), both from the mock and the real client — there
+  is no more separate "UI's own shape" for this endpoint. A CPU
+  instantaneous rate is derived by differencing consecutive samples at
+  the point of use (`job-usage-section.tsx`), not served pre-computed.
 - **Auth is a stub.** `src/auth/session.tsx` documents the SSO seam
   (ADRs 0022/0023). Everyone is "Demo User" until then.

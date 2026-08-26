@@ -5,19 +5,22 @@ capacity, per-job deep dives (timeline, spec, queue-position explainer,
 accrual funding, cost/usage, logs), per-node deep dives, and a
 coordinator debug page.
 
-**Status: frontend template on mock data.** There is no dependency on a
-running coordinator — every view is served by a deterministic in-browser
-cluster simulation (`src/api/mock/`). Real endpoints replace the mock one
-at a time as the coordinator's HTTP API is built; the seam is the
-`CoppiceApi` interface in `src/api/client.ts` (see CLAUDE.md for the
-exact procedure and the architecture rules).
+**Status: most reads are real.** Most `CoppiceApi` methods now call the
+coordinator's real HTTP API (`src/api/real-client.ts`) against
+`/api/v1/...`; a handful of routes the server hasn't implemented yet
+(`getSession`, node utilization/history/logs, coordinator logs) still fall
+back to a deterministic in-browser cluster simulation (`src/api/mock/`).
+Real endpoints replace their mock counterpart one at a time as the
+coordinator's HTTP API grows; the seam is the `CoppiceApi` interface in
+`src/api/client.ts` and the delegation table in `src/api/index.ts` (see
+CLAUDE.md for the exact procedure and the architecture rules).
 
 ## Running
 
 ```sh
 cd web
 npm install
-npm run dev       # http://localhost:5173, mock data
+npm run dev       # http://localhost:5173, proxies /api/v1 to a coordinator
 npm run build     # typecheck + static bundle in dist/
 npm test          # mock-world invariants + component smoke tests
 npm run lint      # oxlint
@@ -25,6 +28,39 @@ npm run format    # prettier
 ```
 
 Requires Node ≥ 20.
+
+### Dev workflow: pointing at a live coordinator
+
+`npm run dev` proxies `/api/v1/...` (Vite's dev server, `vite.config.ts`)
+to a coordinator's client listener at `http://127.0.0.1:7070` by default —
+run `coppice dev` (or any coordinator) alongside it and the UI drives that
+real cluster. Point at a different replica or host with `COPPICE_API_ADDR`:
+
+```sh
+COPPICE_API_ADDR=http://127.0.0.1:7071 npm run dev
+```
+
+The proxy only exists in the dev server; a production build embeds no
+proxy config (see "How this ships" below).
+
+### Mock vs. real data
+
+Set `VITE_COPPICE_MOCK` (a build-time Vite env var) to force the mock
+client for **every** `CoppiceApi` method, real endpoints included — useful
+for working on the UI with no coordinator running at all, or for the
+existing offline component/story workflows:
+
+```sh
+VITE_COPPICE_MOCK=1 npm run dev
+```
+
+or in a `.env.local` file (`VITE_COPPICE_MOCK=1`, gitignored). The flag is
+read as a single direct `import.meta.env.VITE_COPPICE_MOCK` expression in
+`src/api/index.ts`, which Vite resolves at build time — a build with the
+flag set statically eliminates `real-client.ts` (and its `fetch` calls)
+from the bundle, since nothing reachable calls it. The mock world itself
+stays bundled either way: a few routes (see above) have no real
+implementation yet and always fall back to it.
 
 ## Stack
 
