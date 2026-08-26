@@ -276,6 +276,13 @@ struct CacheInner {
     /// Monotone count of pulls actually performed, for the `cache_pulls_started`
     /// integration-test seam (§7). Incremented inside the pull path.
     pulls_started: AtomicU64,
+    /// Hint-eviction tasks fired but not yet finished, for the
+    /// `cache_hints_inflight` integration-test seam (§7). Incremented *before*
+    /// [`ImageCache::evict_hint`] spawns and decremented by a drop guard in the
+    /// task, so a hint that has been fired but not yet polled still counts.
+    /// Production reads it never — it exists so a test can wait for its own
+    /// hints to be resolved before changing the pin state underneath them.
+    hints_inflight: AtomicU64,
     /// Serializes [`ImageCache::persist`]'s snapshot→write→rename sequence.
     /// Concurrent persists (a pull racing a release racing a sweep) share one
     /// `.json.tmp` path; unserialized, an older snapshot could overwrite a newer
@@ -325,6 +332,7 @@ impl ImageCache {
             image_locks: Mutex::new(HashMap::new()),
             pull_semaphore: Semaphore::new(permits),
             pulls_started: AtomicU64::new(0),
+            hints_inflight: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
         };
         let cache = ImageCache {
@@ -947,11 +955,25 @@ impl ImageCache {
     /// pin recheck itself, under the digest's image lock. Fire and forget.
     pub(crate) fn evict_hint(&self, digest: String) {
         let cache = self.clone();
+        // Counted before the spawn, and released by a drop guard inside the
+        // task: between the two, `hints_inflight` covers a hint that has been
+        // fired but not yet polled, which is precisely the window the
+        // `cache_hints_inflight` seam exists to let a test close.
+        cache.inner.hints_inflight.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
+            let _inflight = HintInflight(cache.inner.clone());
             if !cache.evict(&digest, REASON_HINT).await {
                 tracing::debug!(%digest, "evict hint: nothing to evict (pinned, unknown, or in use)");
             }
         });
+    }
+
+    /// The `cache_hints_inflight` integration-test seam (§7): hint-eviction
+    /// tasks fired but not yet finished. Zero means every hint fired so far has
+    /// resolved — been honored, or skipped as pinned/unknown/in-use — and none
+    /// can still act on a pin state observed later.
+    pub(crate) fn hints_inflight(&self) -> u64 {
+        self.inner.hints_inflight.load(Ordering::SeqCst)
     }
 
     /// The `cache_pulls_started` integration-test seam (§7): a monotone count of
@@ -998,6 +1020,17 @@ impl ImageCache {
         if let Err(err) = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, path)) {
             tracing::info!(path = %path.display(), error = %err, "persisting image-cache state failed (lossy-OK)");
         }
+    }
+}
+
+/// Decrements [`CacheInner::hints_inflight`] however its hint task ends —
+/// normal return, panic, or abort when the executor drops — so a leaked count
+/// can never wedge a test waiting on quiescence.
+struct HintInflight(Arc<CacheInner>);
+
+impl Drop for HintInflight {
+    fn drop(&mut self) {
+        self.0.hints_inflight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
