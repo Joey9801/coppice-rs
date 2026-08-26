@@ -57,8 +57,8 @@ use coppice_tls::{TlsPaths, TlsStore};
 
 use crate::admin::{self, admin_channel_from_store};
 use crate::config::{Config, PacingConfig};
-use crate::discovery::Discovery;
 use crate::formation::PhaseState;
+use coppice_discovery::Discovery;
 
 // Every interval this loop sleeps for is `[pacing]` node configuration
 // ([`crate::config::PacingConfig`]), whose defaults are the values these were
@@ -147,7 +147,7 @@ impl<'a> PreStart<'a> {
     async fn round(&mut self) -> Result<Option<(StartedNode, Arc<TlsStore>)>> {
         self.enroll_if_needed().await;
 
-        let mut candidates = crate::discovery::build(&self.config.discovery)
+        let mut candidates = coppice_discovery::build(&self.config.discovery.seed_config())
             .context("building the discovery backend")?
             .candidates()
             .await;

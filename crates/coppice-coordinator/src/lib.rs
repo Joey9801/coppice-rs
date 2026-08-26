@@ -34,11 +34,6 @@ pub mod config;
 // a started replica from learner to voter. Private: it is driven entirely
 // from `bootstrap`, and nothing outside this crate has a reason to hold one.
 mod convergence;
-// Coordinator discovery backends (ADR 0037 §2): the trait, the
-// static/dns/file/ec2-asg backends, and the file-registration helper. Public
-// because the trait and the run-scoped `FileRegistration` appear in
-// `bootstrap` signatures.
-pub mod discovery;
 
 /// The leader-side enrollment and renewal core (ADR 0037 §4/§5), shared by the
 /// `ForwardEnroll` admin RPC and the public `POST /api/v1/enroll` route.

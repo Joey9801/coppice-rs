@@ -2903,7 +2903,7 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
     let target = match &args.target {
         Some(t) => t.clone(),
         None => {
-            let discovery = crate::discovery::build(&cfg.discovery)
+            let discovery = coppice_discovery::build(&cfg.discovery.seed_config())
                 .context("building the discovery backend for the default --target")?;
             discovery
                 .candidates()

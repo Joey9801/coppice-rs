@@ -1145,6 +1145,7 @@ dependencies = [
  "chrono",
  "coppice-consensus",
  "coppice-core",
+ "coppice-discovery",
  "coppice-enroll",
  "coppice-net",
  "coppice-proto",
@@ -1204,6 +1205,7 @@ dependencies = [
  "coppice-consensus",
  "coppice-coordinator",
  "coppice-core",
+ "coppice-discovery",
  "coppice-enroll",
  "humantime-serde",
  "reqwest",
@@ -1248,9 +1250,6 @@ name = "coppice-coordinator"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "aws-config",
- "aws-sdk-autoscaling",
- "aws-sdk-ec2",
  "axum",
  "bytes",
  "clap",
@@ -1258,6 +1257,7 @@ dependencies = [
  "coppice-api",
  "coppice-consensus",
  "coppice-core",
+ "coppice-discovery",
  "coppice-enroll",
  "coppice-net",
  "coppice-proto",
@@ -1266,7 +1266,6 @@ dependencies = [
  "coppice-testkit",
  "coppice-tls",
  "gethostname",
- "hickory-resolver",
  "humantime-serde",
  "hyper 1.10.1",
  "hyper-util",
@@ -1302,6 +1301,24 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "coppice-discovery"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-sdk-autoscaling",
+ "aws-sdk-ec2",
+ "hickory-resolver",
+ "humantime-serde",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
  "uuid",
 ]
 

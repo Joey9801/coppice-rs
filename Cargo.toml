@@ -9,6 +9,7 @@ members = [
     "crates/coppice-state",
     "crates/coppice-consensus",
     "crates/coppice-scheduler",
+    "crates/coppice-discovery",
     "crates/coppice-api",
     "crates/coppice-coordinator",
     "crates/coppice-agent",
@@ -35,6 +36,7 @@ coppice-agent = { path = "crates/coppice-agent" }
 coppice-state = { path = "crates/coppice-state" }
 coppice-consensus = { path = "crates/coppice-consensus" }
 coppice-scheduler = { path = "crates/coppice-scheduler" }
+coppice-discovery = { path = "crates/coppice-discovery" }
 coppice-api = { path = "crates/coppice-api" }
 coppice-coordinator = { path = "crates/coppice-coordinator" }
 # Test and bench infrastructure only — always a dev-dependency, never shipped.
@@ -217,7 +219,7 @@ nix = { version = "0.30", features = ["fs", "user"] }
 # duration strings ("1500ms") parsed at load.
 toml = "0.8"
 humantime-serde = "1"
-# Coordinator discovery (ADR 0037 §2): the `dns` backend resolves one name per
+# Seed discovery (ADR 0037 §2): the `dns` backend resolves one name per
 # consultation. `system-config` reads `/etc/resolv.conf`; `tokio-runtime` runs
 # the async resolver on the workspace runtime. Default features are off to keep
 # the tree minimal — no DNSSEC, no bundled root hints.

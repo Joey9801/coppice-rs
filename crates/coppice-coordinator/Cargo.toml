@@ -16,6 +16,11 @@ coppice-state.workspace = true
 coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
 coppice-api.workspace = true
+# Seed discovery (ADR 0037 §2): the `Discovery` trait, the four backends, the
+# `[discovery]` table shapes, and the `file`-backend registration handle — the
+# same crate the agent consults, so the two daemons cannot disagree about a
+# backend's spelling or its advisory failure semantics.
+coppice-discovery.workspace = true
 # The `/enroll` wire contract (ADR 0037 §4): the response this coordinator
 # hands back is the DTO both halves share.
 coppice-enroll.workspace = true
@@ -65,17 +70,8 @@ uuid.workspace = true
 # `geteuid` against the directory's stat — because socket access IS the
 # authority on that surface.
 nix.workspace = true
-# Coordinator discovery (ADR 0037 §2): the `dns` backend resolves candidate
-# raft addresses (A/AAAA + SRV) once per consultation.
-hickory-resolver.workspace = true
 # The `advertise_host` fallback chain reads the OS hostname when unset (ADR 0037).
 gethostname.workspace = true
-# The `ec2-asg` discovery backend (ADR 0037 §2): IMDSv2 for this instance's
-# id/region, Auto Scaling for group membership, EC2 for private IPs. Confined to
-# `discovery::ec2_asg` behind the internal `AsgApi` seam.
-aws-config.workspace = true
-aws-sdk-ec2.workspace = true
-aws-sdk-autoscaling.workspace = true
 # Parses the agent's mTLS client-leaf certificate to enforce CN == NodeId at
 # session accept (ADR 0011); see `tasks::agent_gateway`. Also splits the
 # replicated CA bundle into its roots for `rotate-ca` (ADR 0037 §4).

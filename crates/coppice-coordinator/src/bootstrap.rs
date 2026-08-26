@@ -49,12 +49,12 @@ use coppice_api::http::{MetricsEndpoint, ReadyzEndpoint};
 
 use crate::admin::AdminService;
 use crate::cli::RunArgs;
-use crate::discovery::FileRegistration;
 use crate::formation::{self, Formation, PhaseState, StartupState};
 use crate::localadmin::{AdminSocket, FormationCall, FormationDone, LocalAdmin};
 use crate::tasks::node_client::NodeClient;
 use crate::tasks::renewal::RenewalPacing;
 use crate::{config, limits};
+use coppice_discovery::FileRegistration;
 
 /// A fully-assembled, running coordinator replica.
 ///
@@ -405,7 +405,7 @@ pub async fn run_with(
         handle: handle.clone(),
         advertise_addr,
         cluster_id: cluster_id.to_string(),
-        discovery: crate::discovery::build(&resolved.config.discovery)
+        discovery: coppice_discovery::build(&resolved.config.discovery.seed_config())
             .context("building the discovery backend for the convergence loop")?,
         tls: convergence_tls,
         phase: Arc::clone(&phase),
