@@ -1730,12 +1730,23 @@ impl Fleet {
     /// load-balanced name. Which member forms is not otherwise significant, and
     /// nothing downstream of `init` treats it specially.
     pub async fn init(&mut self) -> coppice_coordinator::localadmin::OperatorPem {
+        self.init_with_policy(Fleet::seeding_policy()).await
+    }
+
+    /// As [`Fleet::init`], but with a caller-supplied bootstrap-policy
+    /// document instead of [`Fleet::seeding_policy`]'s bare token — e.g. a
+    /// test that also needs a priority-multiplier table seeded before it can
+    /// submit a job.
+    pub async fn init_with_policy(
+        &mut self,
+        policy: String,
+    ) -> coppice_coordinator::localadmin::OperatorPem {
         let index = 0;
         let member = &mut self.members[index];
         member.await_phase("waiting").await;
         let reply = member
             .admin(coppice_coordinator::localadmin::AdminCall::Init {
-                policy: Some(Fleet::seeding_policy()),
+                policy: Some(policy),
                 operator_csr: None,
                 operator_cn: Some("day0".to_string()),
             })

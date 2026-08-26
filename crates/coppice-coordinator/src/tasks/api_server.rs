@@ -7,10 +7,20 @@
 //! every replica, including followers: a follower still accepts requests and
 //! maps `ConsensusError::NotLeader` to a redirect, per the trait's contract.
 //!
+//! A follower does not stop there, though: since ADR 0038 it **forwards**
+//! the write to the leader over the coordinator mTLS admin channel rather
+//! than redirecting, so any replica's address serves the whole API. The
+//! redirect survives only as the fallback for the cases forwarding cannot
+//! cover — no leader known, no address for the one that is. The write logic
+//! itself lives in the `*_here` functions below, which the leader re-runs
+//! verbatim for a forwarded request (`crate::admin`).
+//!
 //! The HTTP transport is `coppice_api::http` (axum, ADR 0031): [`run`]
 //! serves that router over the bound `listen.client_addr` listener, with
 //! this file owning only the `ControlPlane` implementation behind it.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::watch;
@@ -25,7 +35,9 @@ use coppice_api::{
     MetricsFetchOutcome, MetricsFetchRequest, QueueWindow, ReadOptions, ReadView,
     RecentClusterEvents, StampedEvent,
 };
-use coppice_consensus::{Applied, Consensus, ConsensusError, NodeHandle, StateViews};
+use coppice_consensus::{
+    Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, StateViews,
+};
 use coppice_core::id::{ClusterId, JobId, NodeId};
 
 use crate::tasks::node_client::NodeClient;
@@ -36,6 +48,233 @@ use coppice_state::command::{AbortJob, ConfigureQuotaEntity, SubmitJob};
 use coppice_state::Command;
 
 use crate::tasks::event_fanout::{EventFilter, FanoutHandle};
+
+/// A boxed future, the shape a dyn-compatible async seam has to take.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Where a follower sends a client write it cannot serve itself (ADR 0038).
+///
+/// The trait exists so the decision to forward is testable without a
+/// network: production plugs in
+/// [`crate::clientwrite::AdminForwarder`], which resolves the leader's raft
+/// address from membership and calls the `Forward*` admin RPCs; unit tests
+/// plug in whatever outcome they want to see mapped.
+///
+/// Every method takes the raft [`CoordinatorId`] the failed propose named,
+/// not an address: which address that id dials is the forwarder's business,
+/// and it is the one thing a plane without a [`NodeHandle`] could not
+/// answer.
+pub trait LeaderWrites: Send + Sync + 'static {
+    fn submit_job<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        req: &'a SubmitJobRequest,
+    ) -> BoxFuture<'a, Result<SubmitJobResponse, ApiError>>;
+
+    fn abort_job<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        job: JobId,
+        reason: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), ApiError>>;
+
+    fn configure_quota_entity<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        req: &'a ConfigureQuotaEntityRequest,
+    ) -> BoxFuture<'a, Result<ConfigureQuotaEntityResponse, ApiError>>;
+}
+
+/// How a write attempted on *this* replica ended.
+///
+/// [`ApiError`] cannot express the one distinction the forwarding decision
+/// turns on — a `NotLeader` refusal carries a *dialable* hint or nothing,
+/// never the raft id — so the local write path reports that case separately
+/// and lets its two callers decide: the control plane forwards, and the
+/// leader-side handler of a forwarded write reports "not me" back rather
+/// than chaining a second hop (ADR 0038).
+pub(crate) enum LocalWriteError {
+    /// A final answer for the client: validation refused it, or apply did.
+    Api(ApiError),
+    /// This replica is not the leader; `leader` is the raft id when it knows
+    /// one.
+    NotLeader { leader: Option<CoordinatorId> },
+}
+
+impl From<ConsensusError> for LocalWriteError {
+    fn from(e: ConsensusError) -> Self {
+        match e {
+            ConsensusError::NotLeader { leader } => LocalWriteError::NotLeader { leader },
+            other => LocalWriteError::Api(ApiError::Unavailable(other.to_string())),
+        }
+    }
+}
+
+/// Validate and propose one submission on this replica (ADR 0031's write
+/// class), with no forwarding of any kind.
+///
+/// The whole write path for a submission lives here, so the leader running a
+/// *forwarded* request runs exactly what it would have run for a direct one:
+/// the shape checks, the multiplier lookup against **this** replica's view,
+/// this replica's `submitted_at` stamp, and the propose. That is why
+/// forwarding carries the request and never a pre-built [`Command`]
+/// (ADR 0038).
+pub(crate) async fn submit_job_here<C: Consensus>(
+    consensus: &C,
+    views: &StateViews,
+    req: &SubmitJobRequest,
+) -> Result<SubmitJobResponse, LocalWriteError> {
+    // The client-minted job id is the submission's idempotency identity
+    // (ADR 0026): a retry re-sends the same id, and apply resolves a
+    // repeat of an already-committed submission as an accepted no-op, so
+    // the retrying caller still lands in the `Ok` arm below with the
+    // original id.
+    //
+    // The DTO already carries typed ids and required fields; what's
+    // left to validate here are the rules serde can't express — the
+    // same ones the conversion boundary enforces on core.v1.Job: a
+    // command is required non-empty, and an entrypoint override, when
+    // present, is non-empty.
+    let invalid = |m: String| LocalWriteError::Api(ApiError::Invalid(m));
+    let job = req.job;
+    if req.command.is_empty() {
+        return Err(invalid("missing command".into()));
+    }
+    let entrypoint = match &req.entrypoint {
+        None => None,
+        Some(argv) if argv.is_empty() => {
+            return Err(invalid(
+                "entrypoint override must have at least one token".into(),
+            ));
+        }
+        Some(argv) => Some(argv.clone()),
+    };
+    let max_runtime = match req.max_runtime_seconds {
+        None => None,
+        Some(seconds) if seconds <= 0 => {
+            return Err(invalid("max_runtime_seconds must be positive".into()));
+        }
+        Some(seconds) => match Duration::checked_from_secs(seconds) {
+            Some(duration) => Some(duration),
+            // Saturating here would accept the request and then run the
+            // job to a wildly shorter limit than the one asked for.
+            None => {
+                return Err(invalid(format!(
+                    "max_runtime_seconds {seconds} is out of range (at most {})",
+                    Duration::MAX.as_secs()
+                )));
+            }
+        },
+    };
+
+    // Multiplier resolution reads the replicated table off the latest
+    // view (ADR 0019: apply never sees the raw `priority: i32` in
+    // arithmetic) — this is the "synchronous validation" that needs
+    // `views` rather than being purely shape-level.
+    let view = views.latest();
+    let multiplier = *view
+        .state()
+        .policy
+        .priority_multipliers
+        .get(&req.priority)
+        .ok_or_else(|| {
+            invalid(format!(
+                "no multiplier configured for priority {}",
+                req.priority
+            ))
+        })?;
+
+    let command = Command::SubmitJob(SubmitJob {
+        job: Job {
+            id: job,
+            image: req.image.clone(),
+            command: req.command.clone(),
+            entrypoint,
+            requests: req.requests.into(),
+            priority: req.priority,
+            max_runtime,
+            quota_entity: req.quota_entity,
+            retry: req.retry.map(Into::into).unwrap_or_default(),
+            abort_requested: None,
+        },
+        multiplier,
+        submitted_at: Timestamp::now(),
+    });
+
+    match consensus.propose(command).await {
+        // `log_index` lets the caller pair this write with a strong read
+        // (ADR 0007 read-your-writes). On an idempotent repeat it is the
+        // repeat's own apply index — ≥ the original commit, so still a
+        // valid cursor for the job.
+        Ok(Applied {
+            outcome: Ok(_),
+            log_index,
+        }) => Ok(SubmitJobResponse { job, log_index }),
+        Ok(Applied {
+            outcome: Err(rejection),
+            ..
+        }) => Err(LocalWriteError::Api(ApiError::Rejected(rejection))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Propose one abort on this replica, with no forwarding. The twin of
+/// [`submit_job_here`]; `job` is the id the HTTP layer resolved from the path.
+pub(crate) async fn abort_job_here<C: Consensus>(
+    consensus: &C,
+    job: JobId,
+    reason: Option<String>,
+) -> Result<(), LocalWriteError> {
+    let command = Command::AbortJob(AbortJob {
+        job,
+        reason,
+        requested_at: Timestamp::now(),
+    });
+
+    match consensus.propose(command).await {
+        Ok(Applied { outcome: Ok(_), .. }) => Ok(()),
+        Ok(Applied {
+            outcome: Err(rejection),
+            ..
+        }) => Err(LocalWriteError::Api(ApiError::Rejected(rejection))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Propose one quota-entity upsert on this replica, with no forwarding.
+///
+/// The client-minted entity id is the upsert's idempotency identity
+/// (ADR 0026), echoed back on success. Direct copy of [`abort_job_here`]'s
+/// propose-and-map shape; the id and quota ride the command as-is, with
+/// `updated_at` stamped by this proposer (apply never reads a clock). Cycle /
+/// unknown-parent refusals come back through the rejection arm as a normal
+/// 409. No authz — matching the existing submit_job/abort_job precedent
+/// (ADR 0023 is a separate subsystem).
+pub(crate) async fn configure_quota_entity_here<C: Consensus>(
+    consensus: &C,
+    req: &ConfigureQuotaEntityRequest,
+) -> Result<ConfigureQuotaEntityResponse, LocalWriteError> {
+    let entity = req.entity;
+    let command = Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+        entity,
+        parent: req.parent,
+        name: req.name.clone(),
+        quota: CostUnits(req.quota_ucu),
+        updated_at: Timestamp::now(),
+    });
+
+    match consensus.propose(command).await {
+        Ok(Applied {
+            outcome: Ok(_),
+            log_index,
+        }) => Ok(ConfigureQuotaEntityResponse { entity, log_index }),
+        Ok(Applied {
+            outcome: Err(rejection),
+            ..
+        }) => Err(LocalWriteError::Api(ApiError::Rejected(rejection))),
+        Err(e) => Err(e.into()),
+    }
+}
 
 /// Implements [`ControlPlane`] by proposing through the consensus seam.
 #[allow(dead_code)] // fields are read by submit_job/abort_job, exercised in tests below.
@@ -70,6 +309,14 @@ pub struct CoordinatorControlPlane<C> {
     ///
     /// [`with_log_client`]: Self::with_log_client
     node_log_client: Option<Arc<NodeClient>>,
+    /// Where a write that landed on this replica while it is a follower gets
+    /// sent (ADR 0038). `None` until [`with_forwarder`] attaches one — and a
+    /// plane without one falls back to exactly the pre-0038 behaviour, the
+    /// bare 421 with an empty hint, which is also what a plane *with* one
+    /// answers when no leader is known.
+    ///
+    /// [`with_forwarder`]: Self::with_forwarder
+    forwarder: Option<Arc<dyn LeaderWrites>>,
 }
 
 impl<C> CoordinatorControlPlane<C> {
@@ -85,6 +332,7 @@ impl<C> CoordinatorControlPlane<C> {
             fanout: None,
             node_handle: None,
             node_log_client: None,
+            forwarder: None,
         }
     }
 
@@ -116,6 +364,31 @@ impl<C> CoordinatorControlPlane<C> {
         self.node_log_client = Some(client);
         self
     }
+
+    /// Attach the leader-forwarding seam backing follower writes (ADR 0038).
+    /// The runtime builds one over this replica's machine-plane identity; a
+    /// plane without one refuses follower writes with the ADR 0031 redirect
+    /// instead.
+    pub fn with_forwarder(mut self, forwarder: Arc<dyn LeaderWrites>) -> Self {
+        self.forwarder = Some(forwarder);
+        self
+    }
+
+    /// The forwarder and the leader to send to, when both are known.
+    ///
+    /// `None` on either half missing is the ADR 0038 fallback: an election in
+    /// progress leaves no id to forward to, and a plane with no seam attached
+    /// cannot forward at all. Both answer the client the same way — the
+    /// hintless 421 — because both are "ask again", not "ask over there".
+    fn forward_to(
+        &self,
+        leader: Option<CoordinatorId>,
+    ) -> Option<(&Arc<dyn LeaderWrites>, CoordinatorId)> {
+        match (&self.forwarder, leader) {
+            (Some(forwarder), Some(leader)) => Some((forwarder, leader)),
+            _ => None,
+        }
+    }
 }
 
 impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
@@ -124,98 +397,17 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
     }
 
     async fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
-        // The client-minted job id is the submission's idempotency identity
-        // (ADR 0026): a retry re-sends the same id, and apply resolves a
-        // repeat of an already-committed submission as an accepted no-op, so
-        // the retrying caller still lands in the `Ok` arm below with the
-        // original id.
-        //
-        // The DTO already carries typed ids and required fields; what's
-        // left to validate here are the rules serde can't express — the
-        // same ones the conversion boundary enforces on core.v1.Job: a
-        // command is required non-empty, and an entrypoint override, when
-        // present, is non-empty.
-        let job = req.job;
-        if req.command.is_empty() {
-            return Err(ApiError::Invalid("missing command".into()));
-        }
-        let entrypoint = match req.entrypoint {
-            None => None,
-            Some(argv) if argv.is_empty() => {
-                return Err(ApiError::Invalid(
-                    "entrypoint override must have at least one token".into(),
-                ));
-            }
-            Some(argv) => Some(argv),
-        };
-        let max_runtime = match req.max_runtime_seconds {
-            None => None,
-            Some(seconds) if seconds <= 0 => {
-                return Err(ApiError::Invalid(
-                    "max_runtime_seconds must be positive".into(),
-                ));
-            }
-            Some(seconds) => match Duration::checked_from_secs(seconds) {
-                Some(duration) => Some(duration),
-                // Saturating here would accept the request and then run the
-                // job to a wildly shorter limit than the one asked for.
-                None => {
-                    return Err(ApiError::Invalid(format!(
-                        "max_runtime_seconds {seconds} is out of range (at most {})",
-                        Duration::MAX.as_secs()
-                    )));
-                }
+        match submit_job_here(&*self.consensus, &self.views, &req).await {
+            Ok(response) => Ok(response),
+            Err(LocalWriteError::Api(e)) => Err(e),
+            // A follower forwards rather than redirecting (ADR 0038): the
+            // request crosses one internal mTLS hop and the leader re-runs
+            // the whole write path on it. A forwarding failure is reported
+            // as itself — never as a success this replica cannot vouch for.
+            Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
+                Some((forwarder, leader)) => forwarder.submit_job(leader, &req).await,
+                None => Err(no_leader_here(leader)),
             },
-        };
-
-        // Multiplier resolution reads the replicated table off the latest
-        // view (ADR 0019: apply never sees the raw `priority: i32` in
-        // arithmetic) — this is the "synchronous validation" that needs
-        // `self.views` rather than being purely shape-level.
-        let view = self.views.latest();
-        let multiplier = *view
-            .state()
-            .policy
-            .priority_multipliers
-            .get(&req.priority)
-            .ok_or_else(|| {
-                ApiError::Invalid(format!(
-                    "no multiplier configured for priority {}",
-                    req.priority
-                ))
-            })?;
-
-        let command = Command::SubmitJob(SubmitJob {
-            job: Job {
-                id: job,
-                image: req.image,
-                command: req.command,
-                entrypoint,
-                requests: req.requests.into(),
-                priority: req.priority,
-                max_runtime,
-                quota_entity: req.quota_entity,
-                retry: req.retry.map(Into::into).unwrap_or_default(),
-                abort_requested: None,
-            },
-            multiplier,
-            submitted_at: Timestamp::now(),
-        });
-
-        match self.consensus.propose(command).await {
-            // `log_index` lets the caller pair this write with a strong read
-            // (ADR 0007 read-your-writes). On an idempotent repeat it is the
-            // repeat's own apply index — ≥ the original commit, so still a
-            // valid cursor for the job.
-            Ok(Applied {
-                outcome: Ok(_),
-                log_index,
-            }) => Ok(SubmitJobResponse { job, log_index }),
-            Ok(Applied {
-                outcome: Err(rejection),
-                ..
-            }) => Err(ApiError::Rejected(rejection)),
-            Err(e) => Err(map_consensus_error(e)),
         }
     }
 
@@ -226,19 +418,17 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             .job
             .ok_or_else(|| ApiError::Invalid("missing job".into()))?;
 
-        let command = Command::AbortJob(AbortJob {
-            job,
-            reason: req.reason,
-            requested_at: Timestamp::now(),
-        });
-
-        match self.consensus.propose(command).await {
-            Ok(Applied { outcome: Ok(_), .. }) => Ok(()),
-            Ok(Applied {
-                outcome: Err(rejection),
-                ..
-            }) => Err(ApiError::Rejected(rejection)),
-            Err(e) => Err(map_consensus_error(e)),
+        match abort_job_here(&*self.consensus, job, req.reason.clone()).await {
+            Ok(()) => Ok(()),
+            Err(LocalWriteError::Api(e)) => Err(e),
+            Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
+                Some((forwarder, leader)) => {
+                    forwarder
+                        .abort_job(leader, job, req.reason.as_deref())
+                        .await
+                }
+                None => Err(no_leader_here(leader)),
+            },
         }
     }
 
@@ -246,32 +436,13 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         &self,
         req: ConfigureQuotaEntityRequest,
     ) -> Result<ConfigureQuotaEntityResponse, ApiError> {
-        // The client-minted entity id is the upsert's idempotency identity
-        // (ADR 0026), echoed back on success. Direct copy of abort_job's
-        // propose-and-map shape; the id and quota ride the command as-is,
-        // with `updated_at` stamped by this proposer (apply never reads a
-        // clock). Cycle / unknown-parent refusals come back through the
-        // rejection arm as a normal 409. No authz — matching the existing
-        // submit_job/abort_job precedent (ADR 0023 is a separate subsystem).
-        let entity = req.entity;
-        let command = Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
-            entity,
-            parent: req.parent,
-            name: req.name,
-            quota: CostUnits(req.quota_ucu),
-            updated_at: Timestamp::now(),
-        });
-
-        match self.consensus.propose(command).await {
-            Ok(Applied {
-                outcome: Ok(_),
-                log_index,
-            }) => Ok(ConfigureQuotaEntityResponse { entity, log_index }),
-            Ok(Applied {
-                outcome: Err(rejection),
-                ..
-            }) => Err(ApiError::Rejected(rejection)),
-            Err(e) => Err(map_consensus_error(e)),
+        match configure_quota_entity_here(&*self.consensus, &req).await {
+            Ok(response) => Ok(response),
+            Err(LocalWriteError::Api(e)) => Err(e),
+            Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
+                Some((forwarder, leader)) => forwarder.configure_quota_entity(leader, &req).await,
+                None => Err(no_leader_here(leader)),
+            },
         }
     }
 
@@ -475,19 +646,25 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
 /// caller's side.
 fn map_consensus_error(e: ConsensusError) -> ApiError {
     match e {
-        ConsensusError::NotLeader { leader } => {
-            // `leader` is the raft CoordinatorId — useful in logs, useless
-            // to a client, which needs a dialable client-API address. That
-            // mapping does not exist yet (raft membership records only the
-            // peer-plane address; ADR 0031 leaves advertising client
-            // addresses through membership — or internal forwarding — as
-            // the follow-up), so the hint stays empty rather than lying
-            // with a bare integer the caller cannot retry against.
-            tracing::debug!(leader = ?leader, "write refused: not the leader");
-            ApiError::NotLeader { leader_hint: None }
-        }
+        ConsensusError::NotLeader { leader } => no_leader_here(leader),
         other => ApiError::Unavailable(other.to_string()),
     }
+}
+
+/// The ADR 0031 redirect, now the ADR 0038 *fallback*: what a replica answers
+/// when it cannot serve a write and cannot forward it either.
+///
+/// The hint stays empty. `leader` is the raft CoordinatorId — useful in logs,
+/// useless to a client, which needs a dialable client-API address, and raft
+/// membership records only the peer-plane one. Rendering the bare integer
+/// would hand the caller a retry target it cannot dial. ADR 0038 chose not to
+/// advertise client addresses through membership precisely because forwarding
+/// makes this path rare: reaching it means no leader is known at all, or this
+/// replica has no forwarding seam, and in both cases the honest advice is
+/// "ask again", not "ask over there".
+fn no_leader_here(leader: Option<CoordinatorId>) -> ApiError {
+    tracing::debug!(leader = ?leader, "write refused: not the leader, and not forwarded");
+    ApiError::NotLeader { leader_hint: None }
 }
 
 /// Serve the public client API (ADR 0031) on the bound listener.
@@ -549,6 +726,111 @@ mod tests {
         CoordinatorControlPlane::new(Arc::new(consensus), views, ClusterId::new())
     }
 
+    /// What a [`FakeForwarder`] pretends the leader said.
+    ///
+    /// One answer per outcome the real transport can produce, so the mapping
+    /// from "what the leader decided" to "what the client sees" is testable
+    /// without a socket. `Timeout` stands for every lost hop: the request may
+    /// have committed, and this replica cannot tell.
+    #[derive(Clone)]
+    enum ForwardAnswer {
+        Applied(u64),
+        Rejected(String),
+        NotLeader,
+        Timeout,
+    }
+
+    /// A [`LeaderWrites`] seam that answers from a script and records what
+    /// crossed it.
+    struct FakeForwarder {
+        answer: std::sync::Mutex<ForwardAnswer>,
+        seen: std::sync::Mutex<Vec<(CoordinatorId, Option<JobId>)>>,
+    }
+
+    impl FakeForwarder {
+        fn answering(answer: ForwardAnswer) -> Arc<FakeForwarder> {
+            Arc::new(FakeForwarder {
+                answer: std::sync::Mutex::new(answer),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn answer(&self, answer: ForwardAnswer) {
+            *self.answer.lock().unwrap() = answer;
+        }
+
+        fn record(&self, leader: CoordinatorId, job: Option<JobId>) -> Result<u64, ApiError> {
+            self.seen.lock().unwrap().push((leader, job));
+            match self.answer.lock().unwrap().clone() {
+                ForwardAnswer::Applied(index) => Ok(index),
+                ForwardAnswer::Rejected(reason) => Err(ApiError::ForwardedRejection(reason)),
+                ForwardAnswer::NotLeader => Err(ApiError::NotLeader { leader_hint: None }),
+                ForwardAnswer::Timeout => Err(ApiError::Unavailable(
+                    "the leader did not answer in time; the outcome is unknown".to_string(),
+                )),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        fn leaders(&self) -> Vec<CoordinatorId> {
+            self.seen.lock().unwrap().iter().map(|(l, _)| *l).collect()
+        }
+
+        fn jobs(&self) -> Vec<JobId> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, job)| *job)
+                .collect()
+        }
+    }
+
+    impl LeaderWrites for FakeForwarder {
+        fn submit_job<'a>(
+            &'a self,
+            leader: CoordinatorId,
+            req: &'a SubmitJobRequest,
+        ) -> BoxFuture<'a, Result<SubmitJobResponse, ApiError>> {
+            Box::pin(async move {
+                let log_index = self.record(leader, Some(req.job))?;
+                Ok(SubmitJobResponse {
+                    job: req.job,
+                    log_index,
+                })
+            })
+        }
+
+        fn abort_job<'a>(
+            &'a self,
+            leader: CoordinatorId,
+            job: JobId,
+            _reason: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<(), ApiError>> {
+            Box::pin(async move {
+                self.record(leader, Some(job))?;
+                Ok(())
+            })
+        }
+
+        fn configure_quota_entity<'a>(
+            &'a self,
+            leader: CoordinatorId,
+            req: &'a ConfigureQuotaEntityRequest,
+        ) -> BoxFuture<'a, Result<ConfigureQuotaEntityResponse, ApiError>> {
+            Box::pin(async move {
+                let log_index = self.record(leader, None)?;
+                Ok(ConfigureQuotaEntityResponse {
+                    entity: req.entity,
+                    log_index,
+                })
+            })
+        }
+    }
+
     fn submit_request(job: JobId) -> SubmitJobRequest {
         SubmitJobRequest {
             image: "busybox".to_string(),
@@ -606,16 +888,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn not_leader_submit_maps_to_not_leader_without_a_fake_hint() {
+    async fn not_leader_submit_without_a_forwarder_still_redirects_without_a_fake_hint() {
+        // The ADR 0038 fallback, and the pre-0038 behaviour unchanged: with
+        // no forwarding seam attached there is nowhere to send the write, so
+        // the client gets the redirect. The raft CoordinatorId is not a
+        // dialable client address, so it must not leak into the hint (which
+        // the HTTP layer would render as a retry target).
         let cp = control_plane(ProposeOutcome::NotLeader(Some(7)));
         let result = cp.submit_job(submit_request(JobId::new())).await;
-        // The raft CoordinatorId is not a dialable client address, so it
-        // must not leak into the hint (which the HTTP layer would render
-        // as a retry target).
         assert!(matches!(
             result,
             Err(ApiError::NotLeader { leader_hint: None })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_write_with_no_leader_to_forward_to_is_not_forwarded() {
+        // An election in progress: the propose names no leader, so even a
+        // plane with a seam attached has no target. Forwarding must not be
+        // attempted (the fake would answer, and answering here would mean
+        // guessing at a leader).
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(99));
+        let cp = control_plane(ProposeOutcome::NotLeader(None))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+        let result = cp.submit_job(submit_request(JobId::new())).await;
+        assert!(matches!(
+            result,
+            Err(ApiError::NotLeader { leader_hint: None })
+        ));
+        assert_eq!(forwarder.calls(), 0, "nothing to forward to");
+    }
+
+    #[tokio::test]
+    async fn a_follower_forwards_the_submission_and_serves_the_leaders_answer() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let job = JobId::new();
+        let response = cp.submit_job(submit_request(job)).await.expect("forwarded");
+        // The leader's apply index, not one this replica made up, and the
+        // client's own job id back.
+        assert_eq!(response.log_index, 42);
+        assert_eq!(response.job, job);
+        // Forwarded to the leader the failed propose named — the one thing
+        // `ConsensusError::NotLeader`'s id is now load-bearing for.
+        assert_eq!(forwarder.leaders(), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn a_leader_that_has_moved_on_ends_the_hop_at_the_redirect() {
+        // Single hop (ADR 0038): the coordinator this write was forwarded to
+        // is no longer the leader, and says so. The follower surfaces its
+        // ordinary redirect rather than chasing a second hop.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::NotLeader);
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+        let result = cp.submit_job(submit_request(JobId::new())).await;
+        assert!(matches!(
+            result,
+            Err(ApiError::NotLeader { leader_hint: None })
+        ));
+        assert_eq!(forwarder.calls(), 1, "exactly one hop");
+    }
+
+    #[tokio::test]
+    async fn a_forwarding_timeout_is_reported_as_retriable_and_never_as_success() {
+        // The outcome is genuinely unknown — the write may have committed —
+        // so the one thing that must not happen is an `Ok`. `Unavailable` is
+        // the "did not resolve to a replicated decision" answer, which is
+        // exactly what a local propose timeout already produces.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Timeout);
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+        let result = cp.submit_job(submit_request(JobId::new())).await;
+        match result {
+            Err(ApiError::Unavailable(message)) => {
+                assert!(message.contains("unknown"), "{message}");
+            }
+            other => panic!("a lost forwarding hop must be retriable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retrying_after_an_unknown_forwarding_outcome_lands_on_the_same_job() {
+        // The idempotency contract that makes the retriable error above safe
+        // to act on (ADR 0026): the client re-sends the *identical* request,
+        // including its own job id, and the leader's apply resolves the
+        // repeat as an accepted no-op. Nothing on the forwarding path mints
+        // an id or rewrites the request, so the retry cannot become a second
+        // job — which is what this asserts by watching what crossed the hop.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Timeout);
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let job = JobId::new();
+        let request = submit_request(job);
+        let first = cp.submit_job(request.clone()).await;
+        assert!(matches!(first, Err(ApiError::Unavailable(_))));
+
+        // The retry: same request, same id. The leader has it now.
+        forwarder.answer(ForwardAnswer::Applied(7));
+        let second = cp.submit_job(request).await.expect("the retry resolves");
+        assert_eq!(second.job, job);
+        assert_eq!(
+            forwarder.jobs(),
+            vec![job, job],
+            "both hops carried the client's id, unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_from_the_leader_stays_a_rejection() {
+        // Apply refused it on the leader; the client must still see the 409,
+        // not a redirect and not a server fault.
+        let forwarder =
+            FakeForwarder::answering(ForwardAnswer::Rejected("job already exists".to_string()));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+        let result = cp.submit_job(submit_request(JobId::new())).await;
+        match result {
+            Err(ApiError::ForwardedRejection(reason)) => assert_eq!(reason, "job already exists"),
+            other => panic!("expected a relayed rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follower_forwards_aborts_and_quota_upserts_too() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(11));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let job = JobId::new();
+        cp.abort_job(AbortJobRequest {
+            job: Some(job),
+            reason: Some("done with it".to_string()),
+        })
+        .await
+        .expect("forwarded abort");
+
+        let entity = coppice_core::id::QuotaEntityId::new();
+        let response = cp
+            .configure_quota_entity(configure_request(entity))
+            .await
+            .expect("forwarded upsert");
+        assert_eq!(response.entity, entity);
+        assert_eq!(response.log_index, 11);
+        assert_eq!(forwarder.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn validation_is_refused_locally_and_never_forwarded() {
+        // A follower is not a proxy: a request that cannot be valid anywhere
+        // is refused here, before a hop is spent on it.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(1));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+        let mut req = submit_request(JobId::new());
+        req.command.clear();
+        assert!(matches!(
+            cp.submit_job(req).await,
+            Err(ApiError::Invalid(_))
+        ));
+        assert_eq!(forwarder.calls(), 0);
     }
 
     #[tokio::test]
@@ -681,7 +1116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn not_leader_configure_maps_to_not_leader_without_a_fake_hint() {
+    async fn not_leader_configure_without_a_forwarder_still_redirects_without_a_fake_hint() {
         let cp = control_plane(ProposeOutcome::NotLeader(Some(7)));
         let result = cp
             .configure_quota_entity(configure_request(coppice_core::id::QuotaEntityId::new()))

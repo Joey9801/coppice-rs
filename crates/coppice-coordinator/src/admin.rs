@@ -51,6 +51,7 @@ use coppice_tls::TlsStore;
 use crate::cli::{AdminArgs, AdminVerb};
 use crate::config;
 use crate::enroll::{self, EnrollContext, EnrollError, EnrollRequest};
+use crate::tasks::api_server;
 
 /// How long a CA-key recipient waits for the cluster's CA certificate to
 /// become visible in its own applied state before refusing the transfer
@@ -1578,6 +1579,131 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
             ca_pem: pem_string(issued.ca_pem)?,
         }))
     }
+
+    /// The leader-side half of a follower's forwarded submission (ADR 0038).
+    ///
+    /// It runs [`api_server::submit_job_here`] — the *same* function the
+    /// direct client path runs, not a parallel implementation of it — so a
+    /// forwarded request is validated against this replica's view, stamped by
+    /// this replica's clock, and proposed exactly as a direct one would be.
+    /// Nothing about it is trusted because a coordinator sent it.
+    ///
+    /// Reachable by a coordinator machine or an operator (ADR 0037 §7), the
+    /// same posture as `ForwardEnroll`: forwarding is coordinator-to-
+    /// coordinator by construction, and no client can reach this surface.
+    async fn forward_submit_job(
+        &self,
+        request: Request<pb::ForwardSubmitJobRequest>,
+    ) -> Result<Response<pb::ForwardSubmitJobResponse>, Status> {
+        self.require_operator_or_machine(&request, "ForwardSubmitJob")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        let dto = crate::clientwrite::submit_from_pb(req)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let views = consensus.views();
+        let outcome = api_server::submit_job_here(consensus.as_ref(), &views, &dto).await;
+        Ok(Response::new(pb::ForwardSubmitJobResponse {
+            outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
+        }))
+    }
+
+    /// The leader-side half of a forwarded abort (ADR 0038). As
+    /// [`forward_submit_job`](Self::forward_submit_job), through the same
+    /// propose the direct path uses.
+    async fn forward_abort_job(
+        &self,
+        request: Request<pb::ForwardAbortJobRequest>,
+    ) -> Result<Response<pb::ForwardAbortJobResponse>, Status> {
+        self.require_operator_or_machine(&request, "ForwardAbortJob")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        let job: coppice_core::id::JobId = req
+            .job
+            .ok_or_else(|| Status::invalid_argument("missing ForwardAbortJobRequest.job"))?
+            .try_into()
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let outcome = api_server::abort_job_here(consensus.as_ref(), job, req.reason).await;
+        Ok(Response::new(pb::ForwardAbortJobResponse {
+            // An abort's applied index has no client-visible use (the DTO
+            // response is empty), but the outcome message is shared and
+            // carrying it costs nothing.
+            outcome: Some(forwarded_outcome(outcome.map(|()| 0))?),
+        }))
+    }
+
+    /// The leader-side half of a forwarded quota-entity upsert (ADR 0038).
+    async fn forward_configure_quota_entity(
+        &self,
+        request: Request<pb::ForwardConfigureQuotaEntityRequest>,
+    ) -> Result<Response<pb::ForwardConfigureQuotaEntityResponse>, Status> {
+        self.require_operator_or_machine(&request, "ForwardConfigureQuotaEntity")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        let dto = crate::clientwrite::configure_from_pb(req)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let outcome = api_server::configure_quota_entity_here(consensus.as_ref(), &dto).await;
+        Ok(Response::new(pb::ForwardConfigureQuotaEntityResponse {
+            outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
+        }))
+    }
+}
+
+/// Report one forwarded write's result to the follower that sent it
+/// (ADR 0038).
+///
+/// Everything the leader *decided* — applied, refused by validation, refused
+/// by apply, or "I am not the leader either" — is an outcome in the response
+/// body, because the follower has to render four different client answers
+/// from them and gRPC status codes do not carry that distinction reliably.
+/// Only a write that reached no decision at all is a status: it is the one
+/// case where the follower must tell its client the outcome is unknown.
+///
+/// The not-leader arm is where single-hop forwarding is enforced: a leader
+/// that has moved on says so and stops. It never forwards again — a chain of
+/// coordinators each convinced the next one leads is exactly the loop this
+/// design refuses to have.
+fn forwarded_outcome(
+    result: Result<u64, api_server::LocalWriteError>,
+) -> Result<pb::ForwardWriteOutcome, Status> {
+    use api_server::LocalWriteError;
+    use coppice_api::ApiError;
+    use pb::forward_write_outcome::Outcome;
+
+    let outcome = match result {
+        Ok(log_index) => Outcome::Applied(pb::forward_write_outcome::Applied { log_index }),
+        Err(LocalWriteError::NotLeader { .. }) => {
+            Outcome::NotLeader(pb::forward_write_outcome::NotLeader {})
+        }
+        Err(LocalWriteError::Api(ApiError::Invalid(message))) => {
+            Outcome::Invalid(pb::forward_write_outcome::Invalid { message })
+        }
+        Err(LocalWriteError::Api(ApiError::Rejected(reason))) => {
+            Outcome::Rejected(pb::forward_write_outcome::Rejected {
+                reason: reason.to_string(),
+            })
+        }
+        // A relayed rejection cannot arise here — this replica proposed
+        // locally — but it is a rejection all the same, and flattening it
+        // would be a lie about which arm the client should see.
+        Err(LocalWriteError::Api(ApiError::ForwardedRejection(reason))) => {
+            Outcome::Rejected(pb::forward_write_outcome::Rejected { reason })
+        }
+        Err(LocalWriteError::Api(ApiError::NotLeader { .. })) => {
+            Outcome::NotLeader(pb::forward_write_outcome::NotLeader {})
+        }
+        Err(LocalWriteError::Api(ApiError::Unavailable(message))) => {
+            return Err(Status::unavailable(message))
+        }
+    };
+    Ok(pb::ForwardWriteOutcome {
+        outcome: Some(outcome),
+    })
 }
 
 impl<C: Consensus> AdminService<C> {
@@ -3128,6 +3254,62 @@ mod tests {
     fn not_leader_unknown_maps_to_failed_precondition() {
         let status = consensus_error_to_status(ConsensusError::NotLeader { leader: None });
         assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn a_forwarded_write_reports_every_decision_in_the_body() {
+        use api_server::LocalWriteError;
+        use coppice_api::ApiError;
+        use coppice_core::id::JobId;
+        use pb::forward_write_outcome::Outcome;
+
+        let outcome = |result| {
+            forwarded_outcome(result)
+                .expect("a decision is never a status")
+                .outcome
+                .expect("an outcome is always set")
+        };
+
+        assert!(matches!(
+            outcome(Ok(31)),
+            Outcome::Applied(a) if a.log_index == 31
+        ));
+        // Apply refused it: the follower has to render a 409, so the reason
+        // travels as the rendered text (there is no proto RejectionReason).
+        let job = JobId::new();
+        assert!(matches!(
+            outcome(Err(LocalWriteError::Api(ApiError::Rejected(
+                RejectionReason::JobTerminal(job)
+            )))),
+            Outcome::Rejected(r) if r.reason.contains(&job.to_string())
+        ));
+        assert!(matches!(
+            outcome(Err(LocalWriteError::Api(ApiError::Invalid(
+                "no multiplier configured for priority 3".into()
+            )))),
+            Outcome::Invalid(i) if i.message.contains("multiplier")
+        ));
+        // Single hop: this replica is not the leader either, and it says so
+        // rather than forwarding again.
+        assert!(matches!(
+            outcome(Err(LocalWriteError::NotLeader { leader: Some(9) })),
+            Outcome::NotLeader(_)
+        ));
+    }
+
+    #[test]
+    fn a_forwarded_write_that_reached_no_decision_is_a_status_not_an_outcome() {
+        // The one case the follower must turn into "the outcome is unknown":
+        // reporting it as an outcome would claim a decision that was never
+        // made.
+        use api_server::LocalWriteError;
+        use coppice_api::ApiError;
+
+        let status = forwarded_outcome(Err(LocalWriteError::Api(ApiError::Unavailable(
+            "propose timed out".into(),
+        ))))
+        .expect_err("no decision, so no outcome");
+        assert_eq!(status.code(), Code::Unavailable);
     }
 
     #[test]

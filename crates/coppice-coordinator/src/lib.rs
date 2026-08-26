@@ -23,6 +23,11 @@ pub mod cli;
 // certificate to handlers. Public because both serving surfaces —
 // pre-formation and post-formation — and the integration suite drive it.
 pub mod clientedge;
+// The transport half of follower write forwarding (ADR 0038): the mTLS hop a
+// follower sends a client write over, and the DTO ⇄ pb conversion at its
+// boundary. Private: the runtime attaches one to the control plane, and the
+// decision to forward belongs to the write path, not here.
+mod clientwrite;
 pub mod config;
 // The self-converging membership loop (ADR 0037 §1/§6): the parked half that
 // enrolls, discovers, probes, and joins, and the post-start half that carries

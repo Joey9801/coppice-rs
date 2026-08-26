@@ -210,7 +210,15 @@ where
         CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
             .with_derived(queue_window, fanout.clone())
             .with_node_handle(node_handle.clone())
-            .with_log_client(node_log_client),
+            .with_log_client(node_log_client)
+            // Writes that land here while this replica follows go to the
+            // leader over the admin channel instead of coming back as a
+            // redirect (ADR 0038) — the same hop, and the same machine
+            // identity, the `/enroll` proxy below uses.
+            .with_forwarder(crate::clientwrite::AdminForwarder::new(
+                node_handle.clone(),
+                Arc::clone(&machine_tls),
+            )),
     );
     // `POST /api/v1/enroll` (ADR 0037 §4). Captured by the router directly,
     // not reached through the `ControlPlane`: issuing a certificate needs the

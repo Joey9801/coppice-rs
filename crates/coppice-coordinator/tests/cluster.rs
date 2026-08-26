@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use coppice_consensus::{Consensus, OpenraftConsensus};
 use coppice_coordinator::admin;
-use coppice_core::id::{ClusterId, MachineId};
+use coppice_core::id::{ClusterId, JobId, MachineId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::BumpClusterVersion;
 use coppice_state::Command;
@@ -509,6 +509,207 @@ async fn require_healthy_on_a_follower_is_health_unknown_with_a_leader_hint() {
     );
 
     fleet.stop_all().await;
+}
+
+/// The ADR 0038 acceptance criterion, end to end: a client that only ever
+/// talks to a FOLLOWER can submit a job, observe it, and abort it, exactly as
+/// it could talk to the leader.
+///
+/// Before ADR 0038 a follower answered every client write with HTTP 421 and
+/// left the client to re-dial the leader itself; now the follower forwards
+/// the write over the coordinator-to-coordinator mTLS admin channel and
+/// answers as if it had committed the write locally. This test never once
+/// asks which member is the leader for the *purpose* of talking to it — it
+/// asks only so it can assert every request below is aimed at a member that
+/// is NOT the leader, which is the whole point.
+///
+/// Three things ride on one flow, deliberately, because they are the three
+/// halves of "a follower is a fully capable client-facing replica" and none
+/// of them is interesting alone:
+/// - the follower's own two write routes (quota-entity create, job submit)
+///   both forward and both return 200, not 421;
+/// - the client-minted job id's idempotency (ADR 0026) survives the
+///   forwarding hop: a byte-identical resubmission to the follower is still
+///   accepted as the same no-op job, not rejected or duplicated;
+/// - the observe/abort loop is read-your-writes correct on a follower
+///   specifically: `?consistency=strong` is a leader-only barrier and must
+///   NOT be used here, so every read below rides the follower's own bounded
+///   read with `?min_index=` from the write's `log_index` (ADR 0007).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_pointed_at_a_follower_submits_observes_and_aborts() {
+    init_tracing();
+    let ca = Ca::new();
+    let mut fleet = Fleet::new(3, &ca);
+    fleet.start_all();
+
+    // The seeding policy every fleet test uses (a bare enrollment token)
+    // leaves the replicated priority-multiplier table empty, and a job with
+    // no configured multiplier for its priority is INVALID_ARGUMENT — so this
+    // test's `init` also seeds a 1.0x multiplier for priority 0.
+    let policy = format!(
+        "{}\n[[priority_multiplier]]\nindex = 0\nmultiplier = 1.0\n",
+        Fleet::seeding_policy()
+    );
+    fleet.init_with_policy(policy).await;
+    fleet.await_voters(3).await;
+
+    let leader_idx = fleet_leader_index(&fleet, 3).await;
+    let follower_idx = (leader_idx + 1) % 3;
+    assert_ne!(follower_idx, leader_idx);
+    let follower = &fleet.members[follower_idx];
+    assert!(
+        follower.readyz().await.1["is_leader"] == false,
+        "the member every request below targets must actually be a follower"
+    );
+
+    let client = reqwest::Client::new();
+
+    // (a) Create the quota entity the job will charge against, over the
+    // follower. Pre-ADR-0038 this was a 421 REDIRECT; now the follower
+    // forwards it to the leader and answers 200 as if it had applied it
+    // itself.
+    let entity = QuotaEntityId::new();
+    let create_body = serde_json::json!({
+        "entity": entity.to_string(),
+        "parent": null,
+        "name": "adr-0038-acceptance",
+        "quota_ucu": 1_000_000_000_000u64,
+    });
+    let resp = client
+        .post(follower.api("/api/v1/quota-entities"))
+        .json(&create_body)
+        .send()
+        .await
+        .expect("quota-entity create request reaches the follower");
+    let (status, body) = split_response(resp).await;
+    assert_eq!(
+        status, 200,
+        "a follower must forward a quota-entity create to the leader and \
+         answer 200, not 421: {body}"
+    );
+    assert_eq!(body["entity"], entity.to_string(), "{body}");
+    assert!(body["log_index"].as_u64().is_some(), "{body}");
+
+    // (b) Submit a job over the SAME follower, with a fresh client-minted id.
+    let job = JobId::new();
+    let submit_body = serde_json::json!({
+        "job": job.to_string(),
+        "image": "busybox",
+        "command": ["true"],
+        "requests": { "cpu_millis": 100, "memory_bytes": 1_048_576u64, "disk_bytes": 0 },
+        "priority": 0,
+        "quota_entity": entity.to_string(),
+    });
+    let resp = client
+        .post(follower.api("/api/v1/jobs"))
+        .json(&submit_body)
+        .send()
+        .await
+        .expect("job submit request reaches the follower");
+    let (status, body) = split_response(resp).await;
+    assert_eq!(
+        status, 200,
+        "a follower must forward a job submission to the leader and answer \
+         200, not 421: {body}"
+    );
+    assert_eq!(body["job"], job.to_string(), "{body}");
+    let submit_log_index = body["log_index"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("submit response carries no log_index: {body}"));
+
+    // (c) Re-send the byte-identical submission to the follower. The
+    // client-minted id makes a repeat an accepted no-op (ADR 0026); that
+    // contract must survive the forwarding hop, not just a direct-to-leader
+    // write.
+    let resp = client
+        .post(follower.api("/api/v1/jobs"))
+        .json(&submit_body)
+        .send()
+        .await
+        .expect("repeated job submit request reaches the follower");
+    let (status, body) = split_response(resp).await;
+    assert_eq!(
+        status, 200,
+        "a repeated submission forwarded through a follower must still be \
+         an accepted no-op: {body}"
+    );
+    assert_eq!(
+        body["job"],
+        job.to_string(),
+        "a repeat with the same client-minted id must resolve to the SAME \
+         job, not a second one: {body}"
+    );
+
+    // (d) Observe the job by reading it back FROM THE FOLLOWER. This must NOT
+    // use `?consistency=strong` — that calls a leader-only read barrier and
+    // fails on a follower. Instead it uses the follower's default (bounded)
+    // consistency with `?min_index=` set to the submission's own log index,
+    // which waits for the follower's own applied state to catch up
+    // (ADR 0007 read-your-writes) without ever asking the leader anything.
+    let resp = client
+        .get(follower.api(&format!("/api/v1/jobs/{job}?min_index={submit_log_index}")))
+        .send()
+        .await
+        .expect("job read request reaches the follower");
+    let (status, body) = split_response(resp).await;
+    assert_eq!(
+        status, 200,
+        "the follower must be able to read its own job back: {body}"
+    );
+    assert_eq!(body["id"], job.to_string(), "{body}");
+    assert_eq!(
+        body["state"], "queued",
+        "with no agents in this fleet the job has nowhere to run and must \
+         still be sitting queued, not terminal: {body}"
+    );
+
+    // (e) Abort the job, again over the follower.
+    let resp = client
+        .post(follower.api(&format!("/api/v1/jobs/{job}/abort")))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("abort request reaches the follower");
+    let (status, body) = split_response(resp).await;
+    assert!(
+        (200..300).contains(&status),
+        "a follower must forward an abort to the leader and answer \
+         success, not 421: {body}"
+    );
+
+    // (f) Observe the abort, again from the follower. `AbortJobResponse`
+    // carries no `log_index` to pin a `?min_index=`, so this polls the
+    // follower's own bounded read instead — it will catch up once ordinary
+    // raft replication carries the committed `AbortJob` back to it.
+    poll(
+        Duration::from_secs(20),
+        "the follower's own read shows the job aborted",
+        || {
+            let client = &client;
+            let url = follower.api(&format!("/api/v1/jobs/{job}"));
+            async move {
+                let Ok(resp) = client.get(&url).send().await else {
+                    return false;
+                };
+                let (status, body) = split_response(resp).await;
+                status == 200 && body["state"] == "aborted"
+            }
+        },
+    )
+    .await;
+
+    fleet.stop_all().await;
+}
+
+/// One HTTP response, split into its status code and JSON body — every
+/// subsequent assertion in a fleet HTTP test wants both, and a bare
+/// `assert_eq!(status, 200)` alone leaves a failure with no explanation of
+/// what the server actually said.
+async fn split_response(resp: reqwest::Response) -> (u16, serde_json::Value) {
+    let status = resp.status().as_u16();
+    let text = resp.text().await.expect("response body text");
+    let body = serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
+    (status, body)
 }
 
 /// Generous per-wait deadline. Well above the 300ms election timeout, small

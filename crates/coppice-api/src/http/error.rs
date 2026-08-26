@@ -113,6 +113,10 @@ impl From<ApiError> for HttpError {
         match e {
             ApiError::Invalid(m) => HttpError::new(ErrorCode::InvalidArgument, m),
             ApiError::Rejected(r) => HttpError::new(ErrorCode::Rejected, r.to_string()),
+            // Byte-identical to the arm above: a rejection is a rejection
+            // whether apply refused it on this replica or on the leader this
+            // one forwarded to (ADR 0038).
+            ApiError::ForwardedRejection(m) => HttpError::new(ErrorCode::Rejected, m),
             ApiError::NotLeader { leader_hint } => HttpError {
                 code: ErrorCode::NotLeader,
                 message: "not the leader".to_string(),
