@@ -122,7 +122,8 @@ pub(crate) fn describe_metrics() {
     metrics::describe_counter!(
         SNAPSHOT_FAILURES_TOTAL,
         metrics::Unit::Count,
-        "Snapshot adoptions that failed, by phase (build, install)."
+        "Snapshot operations that returned an error, by phase (build, install); \
+         an error after the manifest flip still leaves the snapshot durable."
     );
 }
 
