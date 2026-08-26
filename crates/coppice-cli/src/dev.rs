@@ -31,7 +31,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use coppice_agent::config::{
-    CapacityConfig, Config as AgentConfig, ExecutorConfig, ListenConfig, TlsConfig as AgentTls,
+    CapacityConfig, Config as AgentConfig, EffectiveCapacity, ExecutorConfig, ListenConfig,
+    TlsConfig as AgentTls,
 };
 use coppice_agent::executor::{DockerExecutor, Executor, FakeExecutor};
 use coppice_agent::journal::Journal;
@@ -44,6 +45,7 @@ use coppice_coordinator::config as coord_config;
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{ClusterId, NodeId, QuotaEntityId};
+use coppice_discovery::SeedConfig;
 use coppice_enroll::{EnrollmentConfig, Secret};
 
 #[derive(Debug, clap::Args)]
@@ -145,6 +147,33 @@ where
     }
 }
 
+/// Move a pre-A1 dev root's agent id into the agent's data directory.
+///
+/// Before deployment-story A1 the agent node id lived at `<root>/agent-node-id`
+/// as a dev-only sibling of `cluster-id`; it now lives where production puts
+/// it, at `<data_dir>/node-identity`. A persistent dev root from before the
+/// move holds a journal fenced by the old id and a leaf whose CN names it, so
+/// minting fresh would strand both — carry the id across instead. The legacy
+/// file is left behind: harmless, and a downgrade keeps working.
+fn migrate_legacy_agent_node_id(root: &Path, agent_data: &Path) -> Result<()> {
+    let legacy = root.join("agent-node-id");
+    let current = agent_data.join(coppice_agent::identity::NODE_IDENTITY_FILE);
+    if !legacy.exists() || current.exists() {
+        return Ok(());
+    }
+    let id: NodeId = load_or_mint(&legacy, || unreachable!("legacy file exists"))?;
+    std::fs::create_dir_all(agent_data)
+        .with_context(|| format!("creating {}", agent_data.display()))?;
+    std::fs::write(&current, format!("{id}\n"))
+        .with_context(|| format!("writing {}", current.display()))?;
+    tracing::info!(
+        from = %legacy.display(),
+        to = %current.display(),
+        "migrated the dev agent's node id to its production location (A1)"
+    );
+    Ok(())
+}
+
 /// Resolve one listen port and remember it under the data directory.
 ///
 /// An explicit `--*-port` always wins. Otherwise a persistent data dir reuses
@@ -218,7 +247,13 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // journal history and the CN of the leaf it enrolled for. Both live as
     // typed-string files under the root.
     let cluster_id: ClusterId = load_or_mint(&root.join("cluster-id"), ClusterId::new)?;
-    let agent_node: NodeId = load_or_mint(&root.join("agent-node-id"), NodeId::new)?;
+    // The agent's identity is minted by the agent's own code, in the agent's own
+    // data directory (deployment-story A1) — not by a dev-only sibling of the
+    // cluster id above. Dev exercises the production path, including the refusal
+    // to mint over a data dir that already holds a journal.
+    let agent_data = root.join("agent");
+    migrate_legacy_agent_node_id(&root, &agent_data)?;
+    let agent_node: NodeId = coppice_agent::identity::load_or_mint_node_identity(&agent_data)?;
 
     let raft_port = resolve_port(&root, "raft", args.raft_port)?;
     let agent_port = resolve_port(&root, "agent", args.agent_port)?;
@@ -294,9 +329,14 @@ pub async fn run(args: DevArgs) -> Result<()> {
     let agent_pki = root.join("agent-pki");
     std::fs::create_dir_all(&agent_pki).context("creating the agent PKI dir")?;
     let agent_config = AgentConfig {
-        node_id: agent_node,
-        data_dir: root.join("agent"),
-        coordinators: vec![format!("localhost:{agent_port}")],
+        // The two tombstones are never set: the identity above was minted into
+        // `data_dir`, and endpoints come from `[discovery]`.
+        node_id: None,
+        coordinators: None,
+        data_dir: agent_data,
+        // The dev coordinator is this same process on localhost, so the static
+        // backend names it directly (ADR 0037 §2).
+        discovery: SeedConfig::static_seeds(vec![format!("localhost:{agent_port}")]),
         // Certless, exactly like the coordinator: these three paths are where
         // enrollment installs what it is handed.
         tls: AgentTls {
@@ -314,11 +354,13 @@ pub async fn run(args: DevArgs) -> Result<()> {
             token_path: None,
             insecure: true,
         }),
-        // Generous static capacity: dev jobs should never be capacity-bound.
+        // Generous capacity, overridden on every dimension: a dev cluster must
+        // not become capacity-bound because the laptop running it is small, nor
+        // fail to start because a dimension could not be detected (A3).
         capacity: CapacityConfig {
-            cpu_millis: 16_000,
-            memory: ByteSize::from_gib(16),
-            disk: ByteSize::from_tib(1),
+            cpu_millis: Some(16_000),
+            memory: Some(ByteSize::from_gib(16)),
+            disk: Some(ByteSize::from_tib(1)),
         },
         reservation: Default::default(),
         heartbeat_interval: Duration::from_secs(2),
@@ -362,9 +404,18 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // same call, in the same place, that `coppice_agent::run_daemon` makes.
     // A no-op on every run after the first: a usable leaf on disk means no
     // network call and the token is never even read.
-    coppice_agent::ensure_enrolled(&agent_config)
+    coppice_agent::ensure_enrolled(&agent_config, agent_node)
         .await
         .context("enrolling the dev agent")?;
+
+    // Settle the agent's capacity exactly as `run_daemon` does (A3). Every
+    // dimension is overridden above, so this never depends on the host — but it
+    // runs through the same `effective_capacity` path, reservation check
+    // included, rather than around it.
+    let detected = coppice_agent::capacity::detect(&agent_config.data_dir);
+    let effective = agent_config
+        .effective_capacity(&detected)
+        .context("settling the dev agent's capacity")?;
 
     // Bind and serve the agent's `/metrics` endpoint before the executor match
     // moves `agent_config` into the session task (issue #46). Both dev scrape
@@ -385,7 +436,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // dropped early (§8.4).
     let (agent_join, _telemetry_guard) = match args.executor {
         DevExecutor::Fake => {
-            let session = build_session(&agent_config, FakeExecutor::new())?;
+            let session = build_session(&agent_config, agent_node, effective, FakeExecutor::new())?;
             // The fake executor captures no container output, so the NodeService
             // serves no stores: every fetch honestly answers UnknownAttempt.
             serve_node_service(&agent_config, None, None)?;
@@ -442,15 +493,15 @@ pub async fn run(args: DevArgs) -> Result<()> {
                 docker,
                 &agent_config.executor,
                 &docker_host,
-                agent_config.capacity.cpu_millis,
+                effective.capacity.cpu_millis,
                 agent_config.reservation.cpu_millis,
-                agent_config.node(),
+                agent_node,
                 pressure_rx,
                 cache_options,
                 telemetry_wiring,
             )
             .await?;
-            let session = build_session(&agent_config, executor)?;
+            let session = build_session(&agent_config, agent_node, effective, executor)?;
             // Serve the NodeService over the first LOG- and METRICS-consuming
             // telemetry stores (ADR 0034/0036), so the in-process coordinator
             // can dial for job logs and usage.
@@ -828,6 +879,8 @@ async fn daemon_error(
 /// and build the session over `executor`.
 fn build_session<E: Executor + Clone>(
     config: &AgentConfig,
+    node: NodeId,
+    effective: EffectiveCapacity,
     executor: E,
 ) -> Result<Session<RealFs, E>> {
     std::fs::create_dir_all(&config.data_dir)
@@ -835,8 +888,8 @@ fn build_session<E: Executor + Clone>(
     let fs = RealFs::new(config.data_dir.clone());
     let (journal, state) = Journal::open(fs).context("recovering the dev agent journal")?;
     Ok(Session::new(
-        config.node(),
-        config.advertised_resources(),
+        node,
+        effective.advertised,
         Vec::new(),
         journal,
         state,

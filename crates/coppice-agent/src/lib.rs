@@ -9,8 +9,10 @@
 //! restart the recovered journal is reconciled against the runtime to build
 //! the full `ObservedSet` reported before any new work is accepted.
 
+pub mod capacity;
 pub mod config;
 pub mod executor;
+pub mod identity;
 pub mod journal;
 pub mod metrics_server;
 pub mod node_service;
@@ -53,17 +55,27 @@ fn tls_paths(tls: &config::TlsConfig) -> TlsPaths {
 ///
 /// Runs before [`load_tls_store`], which is what makes an agent's minimal
 /// deployment a token and an address: boot with neither certificate nor key,
-/// enroll for a leaf whose CN is this node's configured id (ADR 0011), and
-/// register exactly as an out-of-band-provisioned agent does. With a usable
-/// leaf already installed this makes no network call at all and never reads the
-/// token — restarts are free, and a compromised endpoint sees nothing from an
-/// already-enrolled fleet.
+/// enroll for a leaf whose CN is `node` (ADR 0011), and register exactly as an
+/// out-of-band-provisioned agent does. With a usable leaf already installed
+/// this makes no network call at all and never reads the token — restarts are
+/// free, and a compromised endpoint sees nothing from an already-enrolled
+/// fleet.
+///
+/// `node` is a parameter rather than a config field because the CN↔NodeId
+/// binding now runs the other way (deployment-story A1): the identity is minted
+/// and persisted at `<data_dir>/node-identity` *before* this call
+/// ([`identity::load_or_mint_node_identity`]), and the leaf is issued **for**
+/// it — where a pre-A1 agent read an operator-typed id out of `agent.toml` and
+/// hoped the certificate it was handed agreed.
 ///
 /// Public because `coppice dev` assembles its in-process agent from the parts
 /// rather than through [`run_daemon`], and must make this same call in this
 /// same place — an agent that skipped it would be back to being handed
 /// material out of band.
-pub async fn ensure_enrolled(config: &config::Config) -> Result<()> {
+pub async fn ensure_enrolled(
+    config: &config::Config,
+    node: coppice_core::id::NodeId,
+) -> Result<()> {
     let Some(enrollment) = &config.enrollment else {
         return Ok(());
     };
@@ -81,7 +93,7 @@ pub async fn ensure_enrolled(config: &config::Config) -> Result<()> {
     let outcome = coppice_enroll::ensure_enrolled(
         &paths,
         enrollment,
-        coppice_enroll::Claim::Node(config.node_id),
+        coppice_enroll::Claim::Node(node),
         &sans,
     )
     .await
@@ -174,11 +186,21 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // accrue (and upkeep drains histograms) from the start regardless.
     let metrics_handle = install_metrics_recorder()?;
 
+    // The data directory comes first now: the node identity lives in it, and
+    // everything downstream — enrollment's claim, the journal's fencing
+    // watermark, the session's registration — is issued *for* that identity
+    // (deployment-story A1). Minted on a fresh installation, read back on every
+    // later boot, and a hard error on a directory that holds a journal but no
+    // identity file.
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
+    let node = identity::load_or_mint_node_identity(&config.data_dir)?;
+
     // Obtain the machine-plane leaf before anything tries to load it (ADR 0037
-    // §4/§8). A no-op when `[enrollment]` is absent, and a no-op when a usable
-    // leaf is already installed — so this is safe on every restart, not just
-    // the first boot.
-    ensure_enrolled(&config).await?;
+    // §4/§8), for the identity just settled. A no-op when `[enrollment]` is
+    // absent, and a no-op when a usable leaf is already installed — so this is
+    // safe on every restart, not just the first boot.
+    ensure_enrolled(&config, node).await?;
 
     // Load the shared hot-reload TLS store up front (fail-fast on missing or
     // unparseable material, ADR 0011) and drive reloads from an mtime poll plus
@@ -194,10 +216,22 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     );
 
     // The journal lives directly under the data directory; anchor RealFs there.
-    std::fs::create_dir_all(&config.data_dir)
-        .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
     let fs = RealFs::new(config.data_dir.clone());
     let (journal, state) = journal::Journal::open(fs).context("recovering the agent journal")?;
+
+    // Settle what this host offers (deployment-story A3): read the machine,
+    // then let `[capacity]` override per dimension. Startup fails here — before
+    // any container work — when a dimension has neither a reading nor an
+    // override, or when the reservation leaves nothing to schedule.
+    let detected = capacity::detect(&config.data_dir);
+    let effective = config.effective_capacity(&detected)?;
+    tracing::info!(
+        node = %node,
+        capacity = ?effective.capacity,
+        advertised = ?effective.advertised,
+        detected = ?detected,
+        "agent identity and capacity settled (deployment-story A1/A3)"
+    );
 
     let labels: Vec<pbcore::Label> = config
         .labels
@@ -264,9 +298,9 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         docker,
         &config.executor,
         &docker_host,
-        config.capacity.cpu_millis,
+        effective.capacity.cpu_millis,
         config.reservation.cpu_millis,
-        config.node(),
+        node,
         pressure_rx,
         cache_options,
         telemetry_wiring,
@@ -308,8 +342,8 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     }
 
     let session = session::Session::new(
-        config.node(),
-        config.advertised_resources(),
+        node,
+        effective.advertised,
         labels,
         journal,
         state,

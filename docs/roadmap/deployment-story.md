@@ -108,19 +108,23 @@ issue #47.
 
 | # | Gap | Today |
 | --- | --- | --- |
-| A1 | Node identity + config are hand-authored | `node_id` written into `agent.toml` by a human, must match the cert CN |
+| A1 | ~~Node identity + config are hand-authored~~ — landed | the agent mints `NodeId::new()` on first boot and persists it at `<data_dir>/node-identity`; `node_id` is gone from `agent.toml` (a tombstone key rejects it with the migration), so a fleet ships one byte-identical file |
 | A2 | ~~Cert issuance is out-of-band~~ — landed | ADR 0011's enrollment-token → CSR → per-node-cert flow is built (`POST /api/v1/enroll`, `[enrollment]` in `configuration.md`, agent-side renewal), resolving OD-15a; see the plan below for the shape as shipped |
-| A3 | Capacity is static config | the advertised vector is typed in by hand; nothing detects cores/memory/disk |
+| A3 | ~~Capacity is static config~~ — landed | cpu/memory/disk are detected at startup (`available_parallelism` ∩ cgroup `cpu.max`, `MemTotal` ∩ `memory.max`, `statvfs` on `data_dir`); `[capacity]` survives only as a per-dimension override |
 | A4 | No graceful scale-in | `SetNodeSchedulable` exists in the state machine but **nothing calls it** (no API, no CLI); there is no compute-node removal/GC command at all; scale-in today = instance dies → 90 s liveness timeout → `DeclareNodeLost` → running attempts killed as `NodeLost` |
 | A5 | The Docker executor is a stub | every `start` fails; the agent cannot run real workloads (tracked as the top critical-path item) |
 
 ### Plan, in shipping order
 
-**A1 — self-minted agent identity (mirrors ADR 0025).** On first boot with
-no journal, the agent mints `NodeId::new()` and persists it in its data
-dir (`coppice dev` already does exactly this); `node_id` leaves
-`agent.toml`. The CN↔NodeId binding then inverts: identity exists first,
-the cert is issued *for* it — which is the enrollment flow's shape anyway.
+**A1 — self-minted agent identity (mirrors ADR 0025), landed.** On first
+boot with no journal, the agent mints `NodeId::new()` and persists it at
+`<data_dir>/node-identity`; `node_id` left `agent.toml` (the key is a
+tombstone that fail-stops with the migration, which for a pre-A1 node is
+"seed the identity file once with your existing id"). A data dir holding
+a journal but no identity file is a hard error, never a re-mint — fencing
+history and the leaf's CN both hang off the id. The CN↔NodeId binding
+inverted as planned: identity exists first, enrollment issues the cert
+*for* it, and `coppice dev` now goes through this same production path.
 
 **A2 — enrollment (the keystone), landed.** ADR 0011's flow, whose
 signer ADR 0037 decided (resolving OD-15a), is built as follows:
@@ -157,10 +161,18 @@ caveat that token revocation stops future enrollments but does not
 recall already-issued leaves. Vault-style external issuance remains a
 substitution behind the same `[tls]` paths, not a dependency.
 
-**A3 — capacity autodetect.** Detect cpu/memory/disk at startup
-(`available_parallelism`, cgroup/sysinfo limits, statvfs on the workdir)
-with `[capacity]` becoming an optional override. Advertised capacity is
-already re-sent on every heartbeat, so nothing downstream changes.
+**A3 — capacity autodetect, landed.** cpu/memory/disk are detected at
+startup (`available_parallelism` ∩ the cgroup v2 `cpu.max` quota,
+`MemTotal` ∩ `memory.max`, `statvfs` on `data_dir`), and `[capacity]`
+became an optional per-dimension override: a set field wins over its
+reading, a dimension with neither reading nor override fails startup, and
+the reservation is checked against the *settled* vector. Advertised
+capacity is re-sent on every heartbeat as before, so nothing downstream
+changed. The agent also gained the coordinator's `[discovery]` section
+(Part 1 C2, same spelling) in place of the old `coordinators` list —
+consulted on every reconnect, so a DNS/ASG change reaches a running agent
+without a restart — and an empty static seed list is now a config-load
+error rather than a runtime panic.
 
 **A4 — graceful drain and decommission.** Three pieces:
 
@@ -187,13 +199,18 @@ critical-path item ahead of everything here except possibly A1 (trivial).
 
 ### The resulting launch script
 
-With A1–A3 shipped, the entire ASG user-data is:
+With A1–A3 shipped (all three now landed, issue #48), the entire ASG
+user-data is:
 
 ```sh
 curl -o /usr/local/bin/coppice …   # or baked into the AMI
 cat > /etc/coppice/agent.toml <<EOF
 data_dir = "/var/lib/coppice-agent"
-coordinators = ["coord.batch.example.com:7072"]   # DNS, per Part 1 C2
+[discovery]                                       # ADR 0037 §2, per Part 1 C2
+backend = "dns"
+[discovery.dns]
+name = "coord.batch.example.com"                  # re-resolved on every reconnect
+port = 7072
 [enrollment]
 token_path = "/etc/coppice/enroll-token"          # baked into user-data
 endpoint = "https://coord.batch.example.com:7070" # system-root verified
@@ -221,9 +238,8 @@ the only secret, and the endpoint is verified like any HTTPS service.
 
 The MVP critical path landed 2026-07-20 (Docker executor → API server →
 CLI), so nothing here competes with it any more. Remaining sequencing:
-the Part 1 implementation (issue #47) is fully specified by ADR 0037 and
-can proceed now; on the agent side, A1 (hours, removes ceremony) can land
-any time, and A2 is now fully specified too (ADR 0037 decided the
-signer, resolving OD-15a). Only A4 still waits on the OD-15
+the Part 1 implementation (issue #47) landed in full, and the agent side
+followed: A1, A2, and A3 are all built (issue #48), so the zero-touch ASG
+launch script above is real. Only A4 still waits on the OD-15
 decommission/scale-in decision — ADRs 0022/0023 are written, so
 authorization is no longer the blocker there.

@@ -42,7 +42,10 @@ use coppice_core::time::Duration;
 use coppice_proto::pb::agent::v1 as pb;
 use prost::Message;
 
-const JOURNAL: &str = "journal";
+/// The journal file itself, relative to the data directory. `pub(crate)` so
+/// [`crate::identity`] can probe for prior agent state without restating the
+/// name (deployment-story A1).
+pub(crate) const JOURNAL: &str = "journal";
 const JOURNAL_TMP: &str = "journal.tmp";
 const LOCK: &str = "LOCK";
 

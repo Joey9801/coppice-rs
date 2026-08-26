@@ -15,19 +15,18 @@ const TOKEN: &str = "cpk_agent_startup_secret";
 fn config_with(enrollment: &str) -> String {
     format!(
         r#"
-node_id = "node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice-agent"
-coordinators = ["coord-1.example.com:7072"]
+
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = ["coord-1.example.com:7072"]
 
 [tls]
 cert_path = "/etc/coppice/pki/node.crt"
 key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"
-
-[capacity]
-cpu_millis = 32000
-memory = "128GiB"
-disk = "1TiB"
 
 {enrollment}
 "#

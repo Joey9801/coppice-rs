@@ -1,10 +1,26 @@
 //! Node agent configuration file (`agent.toml`, ADR 0020 conventions).
 //!
-//! The agent reads exactly one TOML file at startup: its `node_id`, the data
-//! directory the durable journal lives in, the coordinator endpoints to dial,
-//! mTLS material (by path only), advertised capacity, and a handful of timing
-//! knobs. Everything here is node-local; anything two replicas must agree on
-//! is cluster policy and never appears in this file (ADR 0020's litmus test).
+//! The agent reads exactly one TOML file at startup: the data directory the
+//! durable journal lives in, the `[discovery]` section that seeds coordinator
+//! endpoints, mTLS material (by path only), optional capacity overrides, and a
+//! handful of timing knobs. Everything here is node-local; anything two
+//! replicas must agree on is cluster policy and never appears in this file
+//! (ADR 0020's litmus test).
+//!
+//! Two things an operator used to type here are no longer typed at all:
+//!
+//! * **Identity.** The node id is self-minted and persisted at
+//!   `<data_dir>/node-identity` (deployment-story A1, [`crate::identity`]), so
+//!   a fleet's machines run byte-identical files. A `node_id` key is a
+//!   *tombstone* here: it parses and then fail-stops with the migration.
+//! * **Capacity.** `[capacity]` is detected from the host at startup
+//!   (deployment-story A3, [`crate::capacity`]); the section survives only as a
+//!   per-dimension override, and an absent section is the ordinary shape.
+//!
+//! Coordinator endpoints come from the same `[discovery]` section the
+//! coordinator parses (ADR 0037 §2, `coppice-discovery`), so an address change
+//! reaches the agent by the same mechanism and with the same spelling. The old
+//! top-level `coordinators` list is a tombstone too.
 //!
 //! The conventions mirror the coordinator's config module exactly:
 //! `deny_unknown_fields` so a typo'd knob fail-stops naming the offending key;
@@ -29,21 +45,37 @@ use crate::telemetry::{FilesystemSinkConfig, SinkConfig, SinkKind};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// This node's identity (ADR 0009). The agent's mTLS client certificate
-    /// carries this id's typed string form (`node-<uuid>`) as its subject CN;
-    /// the coordinator authenticates that the CN matches the `node` in every
-    /// report. Parsed from the same typed string form (ADR 0024).
-    pub node_id: NodeId,
+    /// **Tombstone** (deployment-story A1). The node id is no longer typed
+    /// into this file: the agent mints its own and persists it at
+    /// `<data_dir>/node-identity` ([`crate::identity`]), which is what lets a
+    /// fleet ship one byte-identical `agent.toml`. The field is kept only so a
+    /// config still carrying `node_id` fails with the migration instead of
+    /// `deny_unknown_fields`' bare "unknown field". Always `None` in a valid
+    /// config; [`Config::validate`] rejects `Some`.
+    #[serde(default)]
+    pub node_id: Option<NodeId>,
 
-    /// Root of this node's on-disk state: the durable journal (`journal`) and
-    /// its `LOCK` live directly under here.
+    /// Root of this node's on-disk state: the durable journal (`journal`), its
+    /// `LOCK`, and the persisted `node-identity` live directly under here.
     pub data_dir: PathBuf,
 
-    /// Coordinator endpoints to dial (`"host:port"`), tried in order and
-    /// rotated on connection failure or a not-leader refusal. Sessions
-    /// terminate on the leader only; a follower refuses with a leader hint
-    /// (agent-coordinator.md).
-    pub coordinators: Vec<String>,
+    /// **Tombstone** (ADR 0037 §2). The literal endpoint list moved into
+    /// `[discovery.static] addrs`; see [`Config::discovery`]. Kept only so an
+    /// old config fails with the migration rather than a bare unknown-field
+    /// error. Always `None` in a valid config.
+    #[serde(default)]
+    pub coordinators: Option<Vec<String>>,
+
+    /// Where coordinator endpoints come from (ADR 0037 §2): the same
+    /// `[discovery]` section the coordinator parses, minus its coordinator-only
+    /// knobs. Required — an agent that cannot name a coordinator cannot
+    /// register at all, so a `static` backend with an empty `addrs` is rejected
+    /// at load rather than dialing nothing forever (issue #48).
+    ///
+    /// The list is consulted **per reconnect**, not once at startup, so a DNS
+    /// record or ASG membership change reaches a running agent without a
+    /// restart ([`crate::session::run`]).
+    pub discovery: coppice_discovery::SeedConfig,
 
     /// mTLS material for the session transport (ADR 0011). Required: there is
     /// no insecure fallback.
@@ -62,8 +94,13 @@ pub struct Config {
     #[serde(default)]
     pub enrollment: Option<coppice_enroll::EnrollmentConfig>,
 
-    /// Full physical capacity. The system reservation is deducted before this
-    /// vector is advertised upstream.
+    /// Per-dimension **overrides** over what the host reports
+    /// (deployment-story A3). Optional whole, and optional per field: capacity
+    /// is detected at startup ([`crate::capacity::detect`]) and a dimension set
+    /// here wins over its reading. The system reservation is deducted from the
+    /// settled vector before it is advertised
+    /// ([`Config::effective_capacity`]).
+    #[serde(default)]
     pub capacity: CapacityConfig,
 
     /// Capacity withheld for the agent, daemon, kernel, and transient system
@@ -425,16 +462,40 @@ pub struct TlsConfig {
     pub ca_path: PathBuf,
 }
 
-/// Advertised capacity vector (v1: configured, not detected).
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// Capacity overrides (deployment-story A3: detected at startup, configured
+/// only to override).
+///
+/// Every field is optional and defaults to "take the host's reading". A set
+/// field wins over detection for *that dimension only*, which is what makes an
+/// override useful on a host where one reading is wrong or unavailable without
+/// forcing the operator to hand-type the other two.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapacityConfig {
-    /// Milli-CPU units (1000 = one core).
-    pub cpu_millis: u64,
-    /// Total RAM the node offers, before the system reservation.
-    pub memory: ByteSize,
+    /// Milli-CPU units (1000 = one core). Overrides the detected host
+    /// parallelism (∩ cgroup quota).
+    pub cpu_millis: Option<u64>,
+    /// Total RAM the node offers, before the system reservation. Overrides the
+    /// detected total memory.
+    pub memory: Option<ByteSize>,
     /// Total scratch disk the node offers, before the system reservation.
-    pub disk: ByteSize,
+    /// Overrides the detected size of the filesystem holding `data_dir`.
+    pub disk: Option<ByteSize>,
+}
+
+/// The settled capacity vector for this host: what the node *has*, and what it
+/// advertises after the system reservation (§6.4).
+///
+/// Both halves are returned because both have live call sites — the executor's
+/// CPU accounting works from full capacity, registration advertises the
+/// remainder — and deriving one from the other at each site would put the same
+/// subtraction in two places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveCapacity {
+    /// Full physical capacity after detection and overrides.
+    pub capacity: Resources,
+    /// `capacity` minus [`ReservationConfig`] — the vector registered upstream.
+    pub advertised: Resources,
 }
 
 /// Fixed resources withheld from scheduling (§6.4).
@@ -460,25 +521,96 @@ impl Default for ReservationConfig {
 }
 
 impl Config {
-    /// Full capacity minus the fixed system reservation (§6.4).
-    pub fn advertised_resources(&self) -> Resources {
-        Resources {
-            cpu_millis: self.capacity.cpu_millis - self.reservation.cpu_millis,
-            memory: self.capacity.memory - self.reservation.memory,
-            disk: self.capacity.disk - self.reservation.disk,
+    /// Settle this host's capacity: detection, then overrides, then the
+    /// reservation (deployment-story A3, §6.4).
+    ///
+    /// Per dimension, [`crate::capacity::resolve`] applies the
+    /// override-beats-detection rule and errors only where there is neither a
+    /// reading nor an override — the one path on which a missing reading fails
+    /// startup. The reservation is then checked against the *settled* capacity
+    /// (it cannot be checked at load: config alone no longer knows what the
+    /// host has). A CPU override above the host's reading is oversubscription
+    /// and only warns here; the affinity path refuses it outright (see below).
+    ///
+    /// Takes `detected` rather than detecting itself so this stays a pure
+    /// function of (config, host reading) — the same reason
+    /// [`crate::capacity::detect`] is separate from [`crate::capacity::resolve`].
+    pub fn effective_capacity(
+        &self,
+        detected: &crate::capacity::DetectedCapacity,
+    ) -> Result<EffectiveCapacity> {
+        let cpu_millis =
+            crate::capacity::resolve(&detected.cpu_millis, self.capacity.cpu_millis)
+                .context("settling capacity.cpu_millis; set it in [capacity] to override")?;
+        let memory =
+            crate::capacity::resolve(&detected.memory, self.capacity.memory.map(ByteSize::as_u64))
+                .context("settling capacity.memory; set it in [capacity] to override")?;
+        let disk =
+            crate::capacity::resolve(&detected.disk, self.capacity.disk.map(ByteSize::as_u64))
+                .context("settling capacity.disk; set it in [capacity] to override")?;
+        let capacity = Resources {
+            cpu_millis,
+            memory: ByteSize::from_bytes(memory),
+            disk: ByteSize::from_bytes(disk),
+        };
+
+        // The reservation must leave something to schedule on every dimension.
+        // CPU and the two sizes are checked separately because they are not the
+        // same type — the sizes report themselves in IEC units, so the error
+        // names the same quantity the operator wrote in the file.
+        if self.reservation.cpu_millis >= capacity.cpu_millis {
+            anyhow::bail!(
+                "reservation.cpu_millis ({}) must be less than the node's cpu capacity ({}); \
+                 lower the reservation or set capacity.cpu_millis to override detection",
+                self.reservation.cpu_millis,
+                capacity.cpu_millis
+            );
         }
-    }
+        for (key, reservation, settled) in [
+            ("memory", self.reservation.memory, capacity.memory),
+            ("disk", self.reservation.disk, capacity.disk),
+        ] {
+            if reservation >= settled {
+                anyhow::bail!(
+                    "reservation.{key} ({reservation}) must be less than the node's {key} \
+                     capacity ({settled}); lower the reservation or set capacity.{key} to \
+                     override detection"
+                );
+            }
+        }
 
-    /// Validate the configured full CPU capacity against discovered physical
-    /// cores. Kept separate from file parsing so unit tests and non-Linux
-    /// config tooling need not depend on the machine running them.
-    pub fn validate_physical_cores(&self, physical_cores: usize) -> Result<()> {
-        validate_cpu_capacity(self.capacity.cpu_millis, physical_cores).map_err(anyhow::Error::msg)
-    }
+        // `validate_cpu_capacity`'s rule against the detected host, which can
+        // only trip when an override claims more CPU than the machine reports.
+        //
+        // A warning, not a failure, and deliberately so: an override above the
+        // reading is how an operator *oversubscribes* on purpose, and the
+        // reading is logical parallelism (∩ cgroup quota), not a core count —
+        // so this cannot tell a considered oversubscription from a typo. Where
+        // the rule is load-bearing it still fails hard: whole-core affinity
+        // hands out real SMT sibling groups, and its call site in
+        // `executor::docker` runs the same check against the daemon's actual
+        // topology and refuses to start (docker-executor.md §6.3).
+        if let Ok(detected_cpu_millis) = detected.cpu_millis {
+            let detected_cores = usize::try_from(detected_cpu_millis / 1000).unwrap_or(usize::MAX);
+            if let Err(message) = validate_cpu_capacity(capacity.cpu_millis, detected_cores) {
+                tracing::warn!(
+                    detected_cpu_millis,
+                    configured_cpu_millis = capacity.cpu_millis,
+                    "{message}; the node is oversubscribed. With \
+                     executor.whole_core_affinity enabled this is refused outright at executor \
+                     startup (§6.3)"
+                );
+            }
+        }
 
-    /// The strongly-typed node identity.
-    pub fn node(&self) -> NodeId {
-        self.node_id
+        Ok(EffectiveCapacity {
+            capacity,
+            advertised: Resources {
+                cpu_millis: capacity.cpu_millis - self.reservation.cpu_millis,
+                memory: capacity.memory - self.reservation.memory,
+                disk: capacity.disk - self.reservation.disk,
+            },
+        })
     }
 
     /// The advertised `NodeService` address (ADR 0034), or `None` when no
@@ -495,6 +627,49 @@ impl Config {
     /// the humane-duration codec handle shape and typos; this handles meaning.
     /// Errors name the offending key so the operator can fix it directly.
     fn validate(&self) -> Result<()> {
+        // The two tombstones first: an operator whose file still carries either
+        // key gets the migration, not a downstream complaint about something
+        // else (deployment-story A1, ADR 0037 §2).
+        if let Some(node_id) = self.node_id {
+            anyhow::bail!(
+                "`node_id` is no longer configured: an agent mints its own identity and \
+                 persists it at {path} (deployment-story A1), so a fleet ships one \
+                 byte-identical agent.toml. Delete the `node_id` line. If this node has \
+                 run before, first write its existing id into that file (one line, \
+                 `{node_id}`) so journal fencing and the certificate CN keep matching.",
+                path = self
+                    .data_dir
+                    .join(crate::identity::NODE_IDENTITY_FILE)
+                    .display(),
+            );
+        }
+        if let Some(coordinators) = &self.coordinators {
+            anyhow::bail!(
+                "`coordinators` is no longer configured: coordinator endpoints come from the \
+                 [discovery] section (ADR 0037 §2), consulted on every reconnect rather than \
+                 read once at startup. Replace the line with:\n\
+                 \n\
+                 [discovery]\nbackend = \"static\"\n\n[discovery.static]\naddrs = {coordinators:?}\n\
+                 \n\
+                 …or select the `dns`, `file`, or `ec2-asg` backend instead."
+            );
+        }
+        self.discovery
+            .validate()
+            .map_err(|e| anyhow::anyhow!("[discovery]: {e}"))?;
+        // An agent with no seeds has nothing to dial and would spin on an empty
+        // candidate list forever, so — unlike the coordinator, which may
+        // legitimately start with no peers and be joined — an empty static list
+        // is a config error at load (issue #48, ADR 0037 §2).
+        if self.discovery.backend == coppice_discovery::BackendKind::Static
+            && self.discovery.static_addrs().is_empty()
+        {
+            anyhow::bail!(
+                "[discovery.static] addrs is empty: an agent with no coordinator seeds can \
+                 never register. List at least one coordinator endpoint (\"host:port\"), or \
+                 select a backend that discovers them (issue #48, ADR 0037 §2)"
+            );
+        }
         if self.executor.default_uid == 0 {
             anyhow::bail!("executor.default_uid must not be 0: workloads never run as root (§6)");
         }
@@ -507,27 +682,9 @@ impl Config {
         if self.executor.disk_poll_interval.is_zero() {
             anyhow::bail!("executor.disk_poll_interval must be greater than zero");
         }
-        // The reservation must leave something to schedule on every dimension.
-        // CPU and the two sizes are checked separately because they are no
-        // longer the same type — the sizes report themselves in IEC units, so
-        // the error names the same quantity the operator wrote in the file.
-        if self.reservation.cpu_millis >= self.capacity.cpu_millis {
-            anyhow::bail!(
-                "reservation.cpu_millis ({}) must be less than capacity.cpu_millis ({})",
-                self.reservation.cpu_millis,
-                self.capacity.cpu_millis
-            );
-        }
-        for (key, reservation, capacity) in [
-            ("memory", self.reservation.memory, self.capacity.memory),
-            ("disk", self.reservation.disk, self.capacity.disk),
-        ] {
-            if reservation >= capacity {
-                anyhow::bail!(
-                    "reservation.{key} ({reservation}) must be less than capacity.{key} ({capacity})"
-                );
-            }
-        }
+        // The reservation-vs-capacity check is *not* here: capacity is settled
+        // against the host at startup, so the comparison has no meaning until
+        // detection has run. It lives in `effective_capacity`.
         if self.image_cache.ttl.is_zero() {
             anyhow::bail!("image_cache.ttl must be greater than zero (§7)");
         }
@@ -581,13 +738,13 @@ impl Config {
             );
         }
         tracing::info!(
-            node_id = %self.node_id,
             data_dir = %self.data_dir.display(),
-            coordinators = ?self.coordinators,
+            discovery_backend = self.discovery.backend.as_str(),
+            discovery = ?self.discovery,
             heartbeat_interval = ?self.heartbeat_interval,
             reconnect_backoff_min = ?self.reconnect_backoff_min,
             reconnect_backoff_max = ?self.reconnect_backoff_max,
-            capacity = ?self.capacity,
+            capacity_overrides = ?self.capacity,
             reservation = ?self.reservation,
             labels = ?self.labels,
             executor = ?self.executor,
@@ -751,15 +908,39 @@ mod tests {
         (file, path)
     }
 
+    /// A host reading with every dimension present, so a test exercising
+    /// overrides is not at the mercy of the machine running it.
+    fn detected(
+        cpu_millis: u64,
+        memory: ByteSize,
+        disk: ByteSize,
+    ) -> crate::capacity::DetectedCapacity {
+        crate::capacity::DetectedCapacity {
+            cpu_millis: Ok(cpu_millis),
+            memory: Ok(memory.as_u64()),
+            disk: Ok(disk.as_u64()),
+        }
+    }
+
+    /// A generous host: 64 cores, 256 GiB, 4 TiB — bigger than every override
+    /// in the fixtures below, so detection never limits them.
+    fn big_host() -> crate::capacity::DetectedCapacity {
+        detected(64_000, ByteSize::from_gib(256), ByteSize::from_tib(4))
+    }
+
     const FULL_EXAMPLE: &str = r#"
-node_id = "node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
 data_dir = "/var/lib/coppice-agent"
-coordinators = ["coord-1.example.com:7072", "coord-2.example.com:7072"]
 metrics_addr = "127.0.0.1:9464"
 
 heartbeat_interval = "5s"
 reconnect_backoff_min = "250ms"
 reconnect_backoff_max = "30s"
+
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = ["coord-1.example.com:7072", "coord-2.example.com:7072"]
 
 [tls]
 cert_path = "/etc/coppice/pki/node.crt"
@@ -822,41 +1003,55 @@ addr = "0.0.0.0:7085"
 advertise_host = "node-3.batch.example.com"
 "#;
 
-    const MINIMAL_EXAMPLE: &str = r#"
-node_id = "node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
+    /// The top-level scalars of a minimal config. Kept apart from the tables
+    /// below so [`minimal_with`] can splice a fragment between them: TOML puts
+    /// every bare key after a table header *inside* that table, so a test
+    /// appending `heartbeat_interval = …` to a whole document would silently be
+    /// testing a key of `[tls]`.
+    const MINIMAL_TOP: &str = r#"
 data_dir = "/var/lib/coppice-agent"
-coordinators = ["coord-1.example.com:7072"]
+"#;
+
+    /// The required tables of a minimal config: a `[discovery]` section with
+    /// one seed, and the mTLS trio. No `[capacity]` — it is detected
+    /// (deployment-story A3), and an absent section is the ordinary shape.
+    const MINIMAL_TABLES: &str = r#"
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = ["coord-1.example.com:7072"]
 
 [tls]
 cert_path = "/etc/coppice/pki/node.crt"
 key_path  = "/etc/coppice/pki/node.key"
 ca_path   = "/etc/coppice/pki/ca.crt"
-
-[capacity]
-cpu_millis   = 8000
-memory     = "16GiB"
-disk       = "100GiB"
 "#;
+
+    /// A minimal config with `extra` (bare keys, tables, or both) spliced in
+    /// between the scalars and the required tables.
+    fn minimal_with(extra: &str) -> String {
+        format!("{MINIMAL_TOP}\n{extra}\n{MINIMAL_TABLES}")
+    }
 
     #[test]
     fn full_example_parses() {
         let (_guard, path) = write_config(FULL_EXAMPLE);
         let config = load(&path).expect("full example should parse");
 
-        assert_eq!(
-            config.node_id,
-            "node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10".parse().unwrap()
-        );
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/coppice-agent"));
-        assert_eq!(config.coordinators.len(), 2);
+        assert_eq!(config.discovery.static_addrs().len(), 2);
         assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.reconnect_backoff_min, Duration::from_millis(250));
         assert_eq!(config.reconnect_backoff_max, Duration::from_secs(30));
-        assert_eq!(config.advertised_resources().cpu_millis, 30000);
-        assert_eq!(
-            config.advertised_resources().memory,
-            ByteSize::from_gib(124)
-        );
+        // Every dimension is overridden here, so the settled vector is the
+        // file's and the host's reading does not enter into it.
+        let effective = config
+            .effective_capacity(&big_host())
+            .expect("overrides settle every dimension");
+        assert_eq!(effective.capacity.cpu_millis, 32000);
+        assert_eq!(effective.advertised.cpu_millis, 30000);
+        assert_eq!(effective.advertised.memory, ByteSize::from_gib(124));
         assert_eq!(
             config.labels.get("zone").map(String::as_str),
             Some("us-east-1a")
@@ -923,7 +1118,7 @@ disk       = "100GiB"
 
     #[test]
     fn absent_listen_table_advertises_nothing() {
-        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let (_guard, path) = write_config(&minimal_with(""));
         let config = load(&path).expect("minimal example should parse");
         assert!(
             config.listen.is_none(),
@@ -936,7 +1131,7 @@ disk       = "100GiB"
 
     #[test]
     fn listen_addr_defaults_when_only_advertise_host_given() {
-        let toml = format!("{MINIMAL_EXAMPLE}\n[listen]\nadvertise_host = \"agent.internal\"\n");
+        let toml = minimal_with("[listen]\nadvertise_host = \"agent.internal\"\n");
         let (_guard, path) = write_config(&toml);
         let config = load(&path).expect("advertise_host alone should parse");
         let listen = config.listen.as_ref().expect("listen table present");
@@ -952,7 +1147,7 @@ disk       = "100GiB"
     fn listen_table_without_advertise_host_is_rejected() {
         // `advertise_host` has no default (0.0.0.0 binds are never dialable), so
         // an operator enabling the listener must supply it — serde fail-stops.
-        let toml = format!("{MINIMAL_EXAMPLE}\n[listen]\naddr = \"0.0.0.0:7073\"\n");
+        let toml = minimal_with("[listen]\naddr = \"0.0.0.0:7073\"\n");
         let (_guard, path) = write_config(&toml);
         assert!(
             load(&path).is_err(),
@@ -962,7 +1157,7 @@ disk       = "100GiB"
 
     #[test]
     fn empty_advertise_host_is_a_config_error() {
-        let toml = format!("{MINIMAL_EXAMPLE}\n[listen]\nadvertise_host = \"\"\n");
+        let toml = minimal_with("[listen]\nadvertise_host = \"\"\n");
         let (_guard, path) = write_config(&toml);
         let err = load(&path).expect_err("an empty advertise_host should be rejected");
         assert!(format!("{err:#}").contains("listen.advertise_host"));
@@ -970,9 +1165,7 @@ disk       = "100GiB"
 
     #[test]
     fn unknown_key_in_listen_table_is_rejected() {
-        let toml = format!(
-            "{MINIMAL_EXAMPLE}\n[listen]\nadvertise_host = \"a\"\naddrr = \"0.0.0.0:7073\"\n"
-        );
+        let toml = minimal_with("[listen]\nadvertise_host = \"a\"\naddrr = \"0.0.0.0:7073\"\n");
         let (_guard, path) = write_config(&toml);
         let err = load(&path).expect_err("typo'd listen key should fail");
         assert!(format!("{err:#}").contains("addrr"));
@@ -980,7 +1173,7 @@ disk       = "100GiB"
 
     #[test]
     fn minimal_example_applies_defaults() {
-        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let (_guard, path) = write_config(&minimal_with(""));
         let config = load(&path).expect("minimal example should parse");
 
         assert_eq!(config.heartbeat_interval, default_heartbeat_interval());
@@ -1008,7 +1201,19 @@ disk       = "100GiB"
         assert_eq!(config.reservation.cpu_millis, 1000);
         assert_eq!(config.reservation.memory, ByteSize::from_gib(2));
         assert_eq!(config.reservation.disk, ByteSize::from_gib(20));
-        assert_eq!(config.advertised_resources().cpu_millis, 7000);
+        // No `[capacity]` at all: every dimension comes from detection, and
+        // only the reservation is subtracted.
+        let effective = config
+            .effective_capacity(&detected(
+                8000,
+                ByteSize::from_gib(16),
+                ByteSize::from_gib(100),
+            ))
+            .expect("detection settles every dimension");
+        assert_eq!(effective.capacity.cpu_millis, 8000);
+        assert_eq!(effective.advertised.cpu_millis, 7000);
+        assert_eq!(effective.advertised.memory, ByteSize::from_gib(14));
+        assert_eq!(effective.advertised.disk, ByteSize::from_gib(80));
         assert_eq!(config.pressure.high_pct, 85);
         assert_eq!(config.pressure.critical_pct, 95);
         assert_eq!(config.image_cache.ttl, default_image_cache_ttl());
@@ -1060,7 +1265,7 @@ disk       = "100GiB"
 
     #[test]
     fn unknown_key_fails_naming_the_key() {
-        let bad = format!("{MINIMAL_EXAMPLE}\nheatbeat_interval = \"10s\"\n");
+        let bad = minimal_with("heatbeat_interval = \"10s\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("typo'd key should fail");
         let message = format!("{err:#}");
@@ -1072,32 +1277,185 @@ disk       = "100GiB"
 
     #[test]
     fn raw_integer_duration_is_rejected() {
-        let bad = format!("{MINIMAL_EXAMPLE}\nheartbeat_interval = 10\n");
+        let bad = minimal_with("heartbeat_interval = 10\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("unlabelled duration should fail");
         assert!(!format!("{err:#}").is_empty());
     }
 
     #[test]
-    fn reservation_must_be_strictly_less_than_capacity() {
-        let bad = MINIMAL_EXAMPLE.replace("cpu_millis   = 8000", "cpu_millis   = 1000");
+    fn a_node_id_key_is_rejected_with_the_migration() {
+        let bad = minimal_with("node_id = \"node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10\"");
         let (_guard, path) = write_config(&bad);
-        let err = load(&path).expect_err("reservation equal to capacity must fail");
-        assert!(format!("{err:#}").contains("reservation.cpu_millis"));
+        let err = load(&path).expect_err("a configured node_id must fail (A1)");
+        let message = format!("{err:#}");
+        // The remedy is the whole point of the tombstone: name the file to
+        // seed, and the id to seed it with.
+        assert!(message.contains("node-identity"), "{message}");
+        assert!(
+            message.contains("node-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"),
+            "{message}"
+        );
     }
 
     #[test]
-    fn full_capacity_must_fit_physical_cores() {
-        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
-        let config = load(&path).unwrap();
-        config.validate_physical_cores(8).unwrap();
-        let err = config.validate_physical_cores(7).unwrap_err();
-        assert!(format!("{err:#}").contains("capacity.cpu_millis"));
+    fn a_coordinators_key_is_rejected_with_the_migration() {
+        let bad = minimal_with("coordinators = [\"coord-1.example.com:7072\"]");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a configured coordinators list must fail (§2)");
+        let message = format!("{err:#}");
+        assert!(message.contains("[discovery.static]"), "{message}");
+        assert!(message.contains("coord-1.example.com:7072"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_static_seed_list_is_a_config_error() {
+        // Valid for a coordinator (it may be joined), never for an agent: with
+        // no seeds there is nothing to dial, ever (issue #48).
+        let bad = MINIMAL_TABLES.replace("addrs = [\"coord-1.example.com:7072\"]", "addrs = []");
+        let (_guard, path) = write_config(&format!("{MINIMAL_TOP}\n{bad}"));
+        let err = load(&path).expect_err("an agent with no seeds must fail at load");
+        let message = format!("{err:#}");
+        assert!(message.contains("addrs"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_discovery_section_is_rejected() {
+        let bad =
+            format!("{MINIMAL_TOP}\n[tls]\ncert_path = \"a\"\nkey_path = \"b\"\nca_path = \"c\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("[discovery] is required");
+        assert!(format!("{err:#}").contains("discovery"));
+    }
+
+    #[test]
+    fn the_dns_backend_is_accepted() {
+        // Nothing about the agent's use of discovery is static-only: a name
+        // resolved per reconnect is the point (ADR 0037 §2).
+        let toml = format!(
+            "{MINIMAL_TOP}\n[discovery]\nbackend = \"dns\"\n\n[discovery.dns]\n\
+             name = \"coordinators.example.com\"\nport = 7072\n\n\
+             [tls]\ncert_path = \"a\"\nkey_path = \"b\"\nca_path = \"c\"\n"
+        );
+        let (_guard, path) = write_config(&toml);
+        let config = load(&path).expect("a dns backend is valid for an agent");
+        assert_eq!(
+            config.discovery.backend,
+            coppice_discovery::BackendKind::Dns
+        );
+        // The empty-seed rule is a static-backend rule only; a dns section that
+        // resolves nothing today may resolve something on the next reconnect.
+        assert!(config.discovery.static_addrs().is_empty());
+    }
+
+    #[test]
+    fn an_absent_capacity_section_takes_the_host() {
+        let (_guard, path) = write_config(&minimal_with(""));
+        let config = load(&path).expect("no [capacity] is the ordinary shape (A3)");
+        assert_eq!(config.capacity.cpu_millis, None);
+        let effective = config
+            .effective_capacity(&detected(
+                4000,
+                ByteSize::from_gib(8),
+                ByteSize::from_gib(50),
+            ))
+            .expect("detection alone settles capacity");
+        assert_eq!(effective.capacity.cpu_millis, 4000);
+        assert_eq!(effective.capacity.memory, ByteSize::from_gib(8));
+        assert_eq!(effective.capacity.disk, ByteSize::from_gib(50));
+    }
+
+    #[test]
+    fn a_partial_override_beats_detection_on_that_dimension_only() {
+        let toml = minimal_with("[capacity]\nmemory = \"64GiB\"\n");
+        let (_guard, path) = write_config(&toml);
+        let config = load(&path).expect("a one-key [capacity] is valid");
+        let effective = config
+            .effective_capacity(&detected(
+                4000,
+                ByteSize::from_gib(8),
+                ByteSize::from_gib(50),
+            ))
+            .expect("settles");
+        assert_eq!(
+            effective.capacity.memory,
+            ByteSize::from_gib(64),
+            "override"
+        );
+        assert_eq!(effective.capacity.cpu_millis, 4000, "detected");
+        assert_eq!(effective.capacity.disk, ByteSize::from_gib(50), "detected");
+    }
+
+    #[test]
+    fn an_override_for_an_undetectable_dimension_keeps_startup_alive() {
+        let toml = minimal_with("[capacity]\ndisk = \"200GiB\"\n");
+        let (_guard, path) = write_config(&toml);
+        let config = load(&path).expect("parse");
+        let mut host = detected(4000, ByteSize::from_gib(8), ByteSize::from_gib(50));
+        host.disk = Err(crate::capacity::DetectError {
+            dimension: "capacity.disk",
+            reason: "statvfs failed".to_string(),
+        });
+        let effective = config.effective_capacity(&host).expect("the override wins");
+        assert_eq!(effective.capacity.disk, ByteSize::from_gib(200));
+
+        // …and without the override, the same host fails startup naming the
+        // dimension the operator would set.
+        let (_guard, path) = write_config(&minimal_with(""));
+        let bare = load(&path).expect("parse");
+        let err = bare
+            .effective_capacity(&host)
+            .expect_err("no reading and no override is fatal");
+        assert!(format!("{err:#}").contains("capacity.disk"), "{err:#}");
+    }
+
+    #[test]
+    fn reservation_must_be_strictly_less_than_the_settled_capacity() {
+        // The check moved to `effective_capacity`: config alone no longer knows
+        // what the host has.
+        let toml = minimal_with("[capacity]\ncpu_millis = 1000\n");
+        let (_guard, path) = write_config(&toml);
+        let config = load(&path).expect("a config is not rejected on this at load");
+        let err = config
+            .effective_capacity(&big_host())
+            .expect_err("reservation equal to capacity must fail");
+        assert!(
+            format!("{err:#}").contains("reservation.cpu_millis"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_cpu_override_beyond_the_host_is_oversubscription_not_an_error() {
+        // The rule `validate_cpu_capacity` states is enforced where it is
+        // load-bearing — whole-core affinity, against the daemon's real
+        // topology (§6.3). Here it can only mean the operator asked for more
+        // CPU than the host reports, which is a deliberate posture, so the
+        // settled vector is the one written and the mismatch is a warning.
+        let toml = minimal_with("[capacity]\ncpu_millis = 32000\n");
+        let (_guard, path) = write_config(&toml);
+        let config = load(&path).expect("parse");
+        let effective = config
+            .effective_capacity(&detected(
+                8000,
+                ByteSize::from_gib(8),
+                ByteSize::from_gib(50),
+            ))
+            .expect("oversubscription settles");
+        assert_eq!(effective.capacity.cpu_millis, 32_000);
+    }
+
+    #[test]
+    fn unknown_key_in_capacity_table_is_rejected() {
+        let bad = minimal_with("[capacity]\ncpu_milis = 8000\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("typo'd capacity key should fail");
+        assert!(format!("{err:#}").contains("cpu_milis"));
     }
 
     #[test]
     fn unknown_key_in_executor_table_is_rejected() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\nreap_janitor_afterr = \"1h\"\n");
+        let bad = minimal_with("[executor]\nreap_janitor_afterr = \"1h\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("typo'd executor key should fail");
         let message = format!("{err:#}");
@@ -1117,7 +1475,7 @@ disk       = "100GiB"
 
     #[test]
     fn root_default_uid_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\ndefault_uid = 0\n");
+        let bad = minimal_with("[executor]\ndefault_uid = 0\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("UID 0 should be rejected");
         let message = format!("{err:#}");
@@ -1129,7 +1487,7 @@ disk       = "100GiB"
 
     #[test]
     fn non_positive_pids_limit_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\npids_limit = 0\n");
+        let bad = minimal_with("[executor]\npids_limit = 0\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("pids_limit 0 should be rejected");
         let message = format!("{err:#}");
@@ -1141,7 +1499,7 @@ disk       = "100GiB"
 
     #[test]
     fn pressure_high_at_least_critical_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[pressure]\nhigh_pct = 95\ncritical_pct = 95\n");
+        let bad = minimal_with("[pressure]\nhigh_pct = 95\ncritical_pct = 95\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("high_pct == critical_pct should be rejected");
         let message = format!("{err:#}");
@@ -1153,7 +1511,7 @@ disk       = "100GiB"
 
     #[test]
     fn pressure_zero_high_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[pressure]\nhigh_pct = 0\ncritical_pct = 95\n");
+        let bad = minimal_with("[pressure]\nhigh_pct = 0\ncritical_pct = 95\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("high_pct 0 should be rejected");
         assert!(format!("{err:#}").contains("high_pct"));
@@ -1161,7 +1519,7 @@ disk       = "100GiB"
 
     #[test]
     fn pressure_critical_over_100_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[pressure]\nhigh_pct = 85\ncritical_pct = 101\n");
+        let bad = minimal_with("[pressure]\nhigh_pct = 85\ncritical_pct = 101\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("critical_pct > 100 should be rejected");
         assert!(format!("{err:#}").contains("critical_pct"));
@@ -1169,7 +1527,7 @@ disk       = "100GiB"
 
     #[test]
     fn unknown_key_in_pressure_table_is_rejected() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[pressure]\nhigh_pctt = 85\n");
+        let bad = minimal_with("[pressure]\nhigh_pctt = 85\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("typo'd pressure key should fail");
         let message = format!("{err:#}");
@@ -1186,7 +1544,7 @@ disk       = "100GiB"
             ("quota", DiskEnforcement::Quota),
             ("poll", DiskEnforcement::Poll),
         ] {
-            let toml = format!("{MINIMAL_EXAMPLE}\n[executor]\ndisk_enforcement = \"{raw}\"\n");
+            let toml = minimal_with(&format!("[executor]\ndisk_enforcement = \"{raw}\"\n"));
             let (_guard, path) = write_config(&toml);
             let config = load(&path).unwrap_or_else(|e| panic!("{raw:?} should parse: {e:#}"));
             assert_eq!(config.executor.disk_enforcement, expected);
@@ -1195,14 +1553,14 @@ disk       = "100GiB"
 
     #[test]
     fn unknown_disk_enforcement_variant_is_rejected() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\ndisk_enforcement = \"native\"\n");
+        let bad = minimal_with("[executor]\ndisk_enforcement = \"native\"\n");
         let (_guard, path) = write_config(&bad);
         assert!(load(&path).is_err(), "an unknown strategy name must fail");
     }
 
     #[test]
     fn zero_disk_poll_interval_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\ndisk_poll_interval = \"0s\"\n");
+        let bad = minimal_with("[executor]\ndisk_poll_interval = \"0s\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero poll interval should be rejected");
         let message = format!("{err:#}");
@@ -1214,7 +1572,7 @@ disk       = "100GiB"
 
     #[test]
     fn zero_image_cache_ttl_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[image_cache]\nttl = \"0s\"\n");
+        let bad = minimal_with("[image_cache]\nttl = \"0s\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero cache TTL should be rejected");
         let message = format!("{err:#}");
@@ -1226,7 +1584,7 @@ disk       = "100GiB"
 
     #[test]
     fn zero_max_concurrent_pulls_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[image_cache]\nmax_concurrent_pulls = 0\n");
+        let bad = minimal_with("[image_cache]\nmax_concurrent_pulls = 0\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero concurrent-pull limit should be rejected");
         let message = format!("{err:#}");
@@ -1238,7 +1596,7 @@ disk       = "100GiB"
 
     #[test]
     fn unknown_key_in_image_cache_table_is_rejected() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[image_cache]\nttll = \"30m\"\n");
+        let bad = minimal_with("[image_cache]\nttll = \"30m\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("typo'd image_cache key should fail");
         assert!(format!("{err:#}").contains("ttll"));
@@ -1246,7 +1604,7 @@ disk       = "100GiB"
 
     #[test]
     fn unknown_key_in_executor_table_still_rejected_with_new_fields() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[executor]\ndocker_hostt = \"x\"\n");
+        let bad = minimal_with("[executor]\ndocker_hostt = \"x\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("typo'd executor key should fail");
         assert!(format!("{err:#}").contains("docker_hostt"));
@@ -1254,7 +1612,7 @@ disk       = "100GiB"
 
     #[test]
     fn unknown_key_in_telemetry_table_is_rejected() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nmetrics_intervall = \"10s\"\n");
+        let bad = minimal_with("[telemetry]\nmetrics_intervall = \"10s\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("typo'd telemetry key should fail");
         let message = format!("{err:#}");
@@ -1266,7 +1624,7 @@ disk       = "100GiB"
 
     #[test]
     fn raw_integer_telemetry_duration_is_rejected() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nmetrics_interval = 10\n");
+        let bad = minimal_with("[telemetry]\nmetrics_interval = 10\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a bare integer duration should fail");
         assert!(!format!("{err:#}").is_empty());
@@ -1274,7 +1632,7 @@ disk       = "100GiB"
 
     #[test]
     fn zero_metrics_interval_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nmetrics_interval = \"0s\"\n");
+        let bad = minimal_with("[telemetry]\nmetrics_interval = \"0s\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero metrics interval should be rejected");
         assert!(format!("{err:#}").contains("telemetry.metrics_interval"));
@@ -1282,7 +1640,7 @@ disk       = "100GiB"
 
     #[test]
     fn zero_drain_force_after_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\ndrain_force_after = \"0s\"\n");
+        let bad = minimal_with("[telemetry]\ndrain_force_after = \"0s\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero drain backstop should be rejected");
         assert!(format!("{err:#}").contains("telemetry.drain_force_after"));
@@ -1290,7 +1648,7 @@ disk       = "100GiB"
 
     #[test]
     fn zero_segment_max_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nsegment_max = \"0B\"\n");
+        let bad = minimal_with("[telemetry]\nsegment_max = \"0B\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero segment bound should be rejected");
         assert!(format!("{err:#}").contains("telemetry.segment_max"));
@@ -1298,7 +1656,7 @@ disk       = "100GiB"
 
     #[test]
     fn zero_segment_max_age_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nsegment_max_age = \"0s\"\n");
+        let bad = minimal_with("[telemetry]\nsegment_max_age = \"0s\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero segment age should be rejected");
         assert!(format!("{err:#}").contains("telemetry.segment_max_age"));
@@ -1306,7 +1664,7 @@ disk       = "100GiB"
 
     #[test]
     fn zero_live_retention_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nlive_retention = \"0s\"\n");
+        let bad = minimal_with("[telemetry]\nlive_retention = \"0s\"\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero live retention should be rejected");
         assert!(format!("{err:#}").contains("telemetry.live_retention"));
@@ -1314,7 +1672,7 @@ disk       = "100GiB"
 
     #[test]
     fn zero_queue_depth_is_a_config_error() {
-        let bad = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nqueue_depth = 0\n");
+        let bad = minimal_with("[telemetry]\nqueue_depth = 0\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a zero queue depth should be rejected");
         assert!(format!("{err:#}").contains("telemetry.queue_depth"));
@@ -1324,7 +1682,7 @@ disk       = "100GiB"
     fn empty_sinks_array_is_accepted() {
         // An operator may deliberately disable job telemetry by configuring no
         // sinks: an explicit empty array is valid.
-        let toml = format!("{MINIMAL_EXAMPLE}\n[telemetry]\nsinks = []\n");
+        let toml = minimal_with("[telemetry]\nsinks = []\n");
         let (_guard, path) = write_config(&toml);
         let config = load(&path).expect("an empty sinks array should be accepted");
         assert!(config.telemetry.sinks.is_empty());
@@ -1334,8 +1692,7 @@ disk       = "100GiB"
     fn invalid_sink_entry_is_rejected_through_config_validate() {
         // An empty `kinds` list is shape-valid but meaning-invalid; the delegation
         // to `SinkConfig::validate` must surface it through `Config::validate`.
-        let bad =
-            format!("{MINIMAL_EXAMPLE}\n[[telemetry.sinks]]\ntype = \"filesystem\"\nkinds = []\n");
+        let bad = minimal_with("[[telemetry.sinks]]\ntype = \"filesystem\"\nkinds = []\n");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("a sink with empty kinds should be rejected");
         assert!(format!("{err:#}").contains("kinds"));
