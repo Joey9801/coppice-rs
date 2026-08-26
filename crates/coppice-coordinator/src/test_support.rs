@@ -137,6 +137,23 @@ pub enum ProposeOutcome {
     NotLeader(Option<CoordinatorId>),
 }
 
+/// The canned outcome [`FakeConsensus::read_index`] returns.
+///
+/// Separate from [`ProposeOutcome`] and from the published status because the
+/// ADR 0038 write path exists to survive them *disagreeing*: the barrier is
+/// what tells a replica whose status watch still says "leader" that it is
+/// not. A fake that derived all three from one knob could not express the
+/// race the barrier was added for.
+pub enum ReadIndexOutcome {
+    /// A barrier at this index — the default, at index 0.
+    At(u64),
+    /// The barrier refused: this replica does not lead after all.
+    NotLeader(Option<CoordinatorId>),
+    /// The barrier could not be established (a stand-in for every non-leader
+    /// failure: timeout, shutdown, …).
+    Timeout,
+}
+
 /// A [`Consensus`] fake: `propose` returns a canned outcome instead of running real Raft.
 ///
 /// `status`/`views` are backed by a real [`ViewPublisher`]/[`StateViews`] pair
@@ -151,7 +168,7 @@ pub struct FakeConsensus {
     status_rx: watch::Receiver<ConsensusStatus>,
     views: StateViews,
     next_log_index: Mutex<u64>,
-    read_index: Mutex<u64>,
+    read_index: Mutex<ReadIndexOutcome>,
 }
 
 impl FakeConsensus {
@@ -184,7 +201,7 @@ impl FakeConsensus {
             status_rx,
             views,
             next_log_index: Mutex::new(1),
-            read_index: Mutex::new(0),
+            read_index: Mutex::new(ReadIndexOutcome::At(0)),
         };
         (consensus, publisher)
     }
@@ -194,7 +211,16 @@ impl FakeConsensus {
     /// Lets a test hold the linearizable read barrier *ahead* of what the
     /// publisher has published, to exercise strong-read gating.
     pub fn set_read_index(&self, index: u64) {
-        *self.read_index.lock().unwrap() = index;
+        self.set_read_index_outcome(ReadIndexOutcome::At(index));
+    }
+
+    /// Make the barrier answer something other than an index.
+    ///
+    /// The interesting case is [`ReadIndexOutcome::NotLeader`] while the
+    /// status watch still reports `Leader`: the replica that *was* the leader
+    /// when the watch was last published and is not one now.
+    pub fn set_read_index_outcome(&self, outcome: ReadIndexOutcome) {
+        *self.read_index.lock().unwrap() = outcome;
     }
 }
 
@@ -217,7 +243,13 @@ impl Consensus for FakeConsensus {
     }
 
     async fn read_index(&self) -> Result<u64, ConsensusError> {
-        Ok(*self.read_index.lock().unwrap())
+        match &*self.read_index.lock().unwrap() {
+            ReadIndexOutcome::At(index) => Ok(*index),
+            ReadIndexOutcome::NotLeader(leader) => {
+                Err(ConsensusError::NotLeader { leader: *leader })
+            }
+            ReadIndexOutcome::Timeout => Err(ConsensusError::Timeout),
+        }
     }
 
     fn status(&self) -> watch::Receiver<ConsensusStatus> {

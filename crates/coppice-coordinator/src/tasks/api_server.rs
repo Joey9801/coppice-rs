@@ -36,13 +36,13 @@ use coppice_api::{
     RecentClusterEvents, StampedEvent,
 };
 use coppice_consensus::{
-    Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, Role, StateViews,
+    Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, Role, StateView, StateViews,
 };
 use coppice_core::id::{ClusterId, JobId, NodeId};
 
 use crate::tasks::node_client::NodeClient;
 use coppice_core::job::Job;
-use coppice_core::quota::CostUnits;
+use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{AbortJob, ConfigureQuotaEntity, SubmitJob};
 use coppice_state::Command;
@@ -110,6 +110,30 @@ impl From<ConsensusError> for LocalWriteError {
     }
 }
 
+/// How long [`submit_job_here`] waits for this replica's published view to
+/// reach the [`Consensus::read_index`] barrier before giving up on judging a
+/// submission whose priority class it cannot find.
+///
+/// [`StateViews::at_least`] has no bound of its own — it waits until the
+/// apply loop publishes or goes away — and this wait sits inside a client's
+/// request. A replica that leads but cannot apply is a real (if rare) state,
+/// and the honest answer for it is the retriable "cannot judge this right
+/// now", not a held-open connection and not a verdict.
+const BARRIER_CATCHUP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The replicated priority-multiplier for `priority` in one published view.
+///
+/// Factored out because the ADR 0038 write path looks it up twice — once
+/// optimistically on the latest view, once on a view known to have caught up
+/// to a read barrier — and the two must be the same lookup.
+fn multiplier_for(view: &StateView, priority: i32) -> Option<PriorityMultiplier> {
+    view.state()
+        .policy
+        .priority_multipliers
+        .get(&priority)
+        .copied()
+}
+
 /// Validate and propose one submission on this replica (ADR 0031's write
 /// class), with no forwarding of any kind.
 ///
@@ -123,7 +147,11 @@ impl From<ConsensusError> for LocalWriteError {
 /// The half of that which reads replicated state runs only on the leader: a
 /// replica that is not the leader stops at the shape checks and reports
 /// [`LocalWriteError::NotLeader`], so its own lagging view can never refuse a
-/// submission the leader would have accepted.
+/// submission the leader would have accepted. The status watch screens for
+/// that cheaply, but it is a cached fact and cannot be trusted when it says
+/// "leader"; the terminal `Invalid` verdict is therefore only rendered behind
+/// a [`Consensus::read_index`] barrier, which is leader-only and so turns a
+/// stale "leader" into the forward it should have been.
 pub(crate) async fn submit_job_here<C: Consensus>(
     consensus: &C,
     views: &StateViews,
@@ -185,11 +213,12 @@ pub(crate) async fn submit_job_here<C: Consensus>(
     // would accept. So leadership is consulted first, and a replica that is
     // not the leader hands the whole request over instead of judging it.
     //
-    // Both stale answers are safe. Stale "leader" on a follower: the lookup
-    // runs, the propose below returns `NotLeader` anyway, and forwarding
-    // happens one step later. Stale "follower" on the actual leader: the
-    // request takes one self-directed hop, which the single-hop rule already
-    // handles.
+    // The watch is the *cheap* half of that gate, and it is trustworthy in
+    // exactly one direction. "Follower"/"Unknown" is conclusive enough to act
+    // on: this replica is not going to be able to propose, so there is no
+    // point doing the work. "Leader" is not conclusive at all — a watch
+    // publishes a fact that was true when it was sampled, and leadership may
+    // already have moved. That is why the barrier below exists.
     //
     // Only this write path needs the gate. `abort_job_here` and
     // `configure_quota_entity_here` validate nothing against the view — they
@@ -208,18 +237,51 @@ pub(crate) async fn submit_job_here<C: Consensus>(
     // view (ADR 0019: apply never sees the raw `priority: i32` in
     // arithmetic) — this is the "synchronous validation" that needs
     // `views` rather than being purely shape-level.
-    let view = views.latest();
-    let multiplier = *view
-        .state()
-        .policy
-        .priority_multipliers
-        .get(&req.priority)
-        .ok_or_else(|| {
-            invalid(format!(
-                "no multiplier configured for priority {}",
-                req.priority
-            ))
-        })?;
+    let multiplier = match multiplier_for(&views.latest(), req.priority) {
+        // The happy path is unchanged and stays free of extra round trips: a
+        // multiplier that resolves is a multiplier every replica agrees on
+        // (classes are added, not silently redefined), and the propose below
+        // is itself the leadership check — a replica that has lost leadership
+        // fails there with `NotLeader` and the caller forwards.
+        Some(multiplier) => multiplier,
+        // A *missing* multiplier is the one verdict that cannot be taken from
+        // a possibly-stale view, because `Invalid` is terminal: it tells the
+        // client to change a request the leader would have accepted, and no
+        // retry recovers from it. So before refusing, establish leadership
+        // authoritatively — `read_index` is the linearizable read barrier and
+        // is leader-only, so a replica whose watch was stale learns it here
+        // and forwards instead of vetoing.
+        None => {
+            // `NotLeader` becomes the forwarding path (the barrier just told
+            // us this replica is not authoritative); everything else is a
+            // "cannot serve this right now", never a verdict on the request.
+            let barrier = consensus.read_index().await?;
+            // Leadership is confirmed, but the barrier is a *future* index on
+            // a replica that has yet to apply it. Reading before the view
+            // catches up would re-run the same stale lookup that motivated
+            // the barrier, so wait for it — bounded, because `at_least` waits
+            // as long as it takes and a wedged apply loop must not pin a
+            // client's connection open indefinitely.
+            let view = tokio::time::timeout(BARRIER_CATCHUP, views.at_least(barrier))
+                .await
+                .map_err(|_elapsed| {
+                    LocalWriteError::Api(ApiError::Unavailable(format!(
+                        "this replica did not catch up to the read barrier at index {barrier} \
+                         within {}s, so it cannot judge the request; retry it",
+                        BARRIER_CATCHUP.as_secs()
+                    )))
+                })??;
+            // Now authoritative: at the linearized point `barrier`, this
+            // replica led and the table held no such class. That is a
+            // genuinely malformed request, and gets the 400 it deserves.
+            multiplier_for(&view, req.priority).ok_or_else(|| {
+                invalid(format!(
+                    "no multiplier configured for priority {}",
+                    req.priority
+                ))
+            })?
+        }
+    };
 
     let command = Command::SubmitJob(SubmitJob {
         job: Job {
@@ -740,27 +802,53 @@ pub async fn run<C: Consensus>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{FakeConsensus, ProposeOutcome};
+    use crate::test_support::{FakeConsensus, ProposeOutcome, ReadIndexOutcome};
     use coppice_api::http::dto;
     use coppice_core::id::JobId;
 
-    fn control_plane(outcome: ProposeOutcome) -> CoordinatorControlPlane<FakeConsensus> {
+    /// A state machine whose policy configures multipliers for exactly the
+    /// listed priorities.
+    fn state_with_priorities(priorities: &[i32]) -> coppice_state::StateMachine {
+        let mut policy = coppice_state::PolicyConfig::default();
+        for priority in priorities {
+            policy
+                .priority_multipliers
+                .insert(*priority, coppice_core::quota::PriorityMultiplier::ONE);
+        }
+        coppice_state::StateMachine {
+            policy,
+            ..coppice_state::StateMachine::default()
+        }
+    }
+
+    /// The plane plus the publisher half, for tests that advance published
+    /// state under a running request.
+    ///
+    /// Handing the publisher back matters beyond seeding: dropping it closes
+    /// the view watch, and `StateViews::at_least` reports `Shutdown` on a
+    /// closed watch rather than waiting. A test that means to exercise the
+    /// catch-up wait has to keep it alive.
+    fn control_plane_and_publisher(
+        outcome: ProposeOutcome,
+    ) -> (
+        CoordinatorControlPlane<FakeConsensus>,
+        Arc<FakeConsensus>,
+        coppice_consensus::ViewPublisher,
+    ) {
         let (consensus, mut publisher) = FakeConsensus::new(outcome);
 
         // Seed a multiplier for priority 0 so submit_job's synchronous
         // validation passes and the test actually reaches `propose`.
-        let mut policy = coppice_state::PolicyConfig::default();
-        policy
-            .priority_multipliers
-            .insert(0, coppice_core::quota::PriorityMultiplier::ONE);
-        let state = coppice_state::StateMachine {
-            policy,
-            ..coppice_state::StateMachine::default()
-        };
-        publisher.publish_now(&state, 1);
+        publisher.publish_now(&state_with_priorities(&[0]), 1);
 
         let views = consensus.views();
-        CoordinatorControlPlane::new(Arc::new(consensus), views, ClusterId::new())
+        let consensus = Arc::new(consensus);
+        let plane = CoordinatorControlPlane::new(Arc::clone(&consensus), views, ClusterId::new());
+        (plane, consensus, publisher)
+    }
+
+    fn control_plane(outcome: ProposeOutcome) -> CoordinatorControlPlane<FakeConsensus> {
+        control_plane_and_publisher(outcome).0
     }
 
     /// What a [`FakeForwarder`] pretends the leader said.
@@ -1124,13 +1212,104 @@ mod tests {
         // The converse, and the reason the check is deferred rather than
         // dropped: on the replica that *is* authoritative, an unknown
         // priority is a genuinely malformed request and still gets the 400.
+        //
+        // Authoritative here means all three agree: the status watch says
+        // leader, the read barrier resolves (so leadership is confirmed, not
+        // merely cached), and the published view has reached that barrier and
+        // still has no such class.
         let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
-        let cp = control_plane(ProposeOutcome::Accepted)
-            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index(1); // the index the publisher seeded
+        let cp = cp.with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
 
         let result = cp.submit_job(submit_at_an_unconfigured_priority()).await;
         assert!(matches!(result, Err(ApiError::Invalid(_))), "{result:?}");
         assert_eq!(forwarder.calls(), 0, "the leader forwards nothing");
+    }
+
+    #[tokio::test]
+    async fn a_stale_leader_status_never_turns_a_missing_multiplier_into_invalid() {
+        // The TOCTOU the read barrier exists for. The status watch is a
+        // *cached* fact: it still says `Leader` here, but leadership has
+        // already moved to 7. Trusting it would render the one verdict that
+        // cannot be walked back — INVALID_ARGUMENT, "change your request" —
+        // from a view that is now a follower's, vetoing a submission the real
+        // leader would accept. `read_index` is leader-only, so it reveals the
+        // move and the write forwards, exactly as if the watch had been
+        // current all along.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index_outcome(ReadIndexOutcome::NotLeader(Some(7)));
+        let cp = cp.with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let response = cp
+            .submit_job(submit_at_an_unconfigured_priority())
+            .await
+            .expect("forwarded, not refused");
+        assert_eq!(response.log_index, 42);
+        assert_eq!(forwarder.leaders(), vec![7], "forwarded to the real leader");
+    }
+
+    #[tokio::test]
+    async fn the_barrier_waits_for_the_class_that_was_committed_but_not_yet_applied() {
+        // Leadership is genuine, but this replica's published view is behind
+        // the barrier — and the policy update that added priority 5 is in
+        // exactly that gap. Judging on `latest()` would refuse a class the
+        // linearized state already has; waiting for the barrier index finds
+        // it and the submission proposes normally.
+        let (cp, consensus, mut publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index(5);
+
+        let (result, ()) = tokio::join!(cp.submit_job(submit_at_an_unconfigured_priority()), {
+            // `join!` polls the submission first, so by the time this runs it
+            // is parked in `at_least(5)`. This is the apply catching up under
+            // it — no sleeping, no spawning, nothing to flake.
+            let publisher = &mut publisher;
+            async move { publisher.publish_now(&state_with_priorities(&[0, 5]), 5) }
+        });
+
+        let response = result.expect("accepted once the view caught up");
+        assert!(response.log_index > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_that_cannot_reach_the_barrier_is_unavailable_not_a_verdict() {
+        // The bound on the catch-up wait. This replica leads and the barrier
+        // resolves, but its apply loop never publishes that far, so it never
+        // becomes authoritative about the class. The honest answer is the
+        // retriable "cannot judge this", never `Invalid` and never a
+        // connection held open for as long as the wedge lasts. The publisher
+        // is kept alive on purpose: dropping it would end the wait early with
+        // `Shutdown` and test nothing.
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index(99);
+
+        let started = tokio::time::Instant::now();
+        match cp.submit_job(submit_at_an_unconfigured_priority()).await {
+            Err(ApiError::Unavailable(message)) => {
+                assert!(message.contains("barrier"), "{message}");
+                assert!(started.elapsed() >= BARRIER_CATCHUP);
+            }
+            other => panic!("a stalled replica must not render a verdict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_barrier_that_fails_for_any_other_reason_is_retriable() {
+        // Not `NotLeader`, so there is nothing to forward to — but equally
+        // not a statement about the request. `Unavailable` says "ask again",
+        // which is the only thing this replica knows.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index_outcome(ReadIndexOutcome::Timeout);
+        let cp = cp.with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let result = cp.submit_job(submit_at_an_unconfigured_priority()).await;
+        assert!(
+            matches!(result, Err(ApiError::Unavailable(_))),
+            "{result:?}"
+        );
+        assert_eq!(forwarder.calls(), 0);
     }
 
     #[tokio::test]
