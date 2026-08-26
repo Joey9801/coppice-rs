@@ -192,8 +192,22 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // (deployment-story A1). Minted on a fresh installation, read back on every
     // later boot, and a hard error on a directory that holds a journal but no
     // identity file.
+    //
+    // The directory's singleton `LOCK` is taken *before* any of that: an
+    // accidental overlapping start (a service manager plus a manual
+    // invocation) must lose here, not after both processes have minted
+    // different identities and enrolled a certificate for the wrong one. The
+    // guard's ownership moves into the journal below and lives as long as it
+    // does.
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
+    let fs = RealFs::new(config.data_dir.clone());
+    let dir_lock = journal::lock_data_dir(&fs).with_context(|| {
+        format!(
+            "locking data dir {} (is another agent already running here?)",
+            config.data_dir.display()
+        )
+    })?;
     let node = identity::load_or_mint_node_identity(&config.data_dir)?;
 
     // Obtain the machine-plane leaf before anything tries to load it (ADR 0037
@@ -215,9 +229,10 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         },
     );
 
-    // The journal lives directly under the data directory; anchor RealFs there.
-    let fs = RealFs::new(config.data_dir.clone());
-    let (journal, state) = journal::Journal::open(fs).context("recovering the agent journal")?;
+    // The journal lives directly under the data directory; it inherits the
+    // lock taken at the top of startup.
+    let (journal, state) =
+        journal::Journal::open_locked(fs, dir_lock).context("recovering the agent journal")?;
 
     // Settle what this host offers (deployment-story A3): read the machine,
     // then let `[capacity]` override per dimension. Startup fails here — before

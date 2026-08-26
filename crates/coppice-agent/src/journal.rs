@@ -180,14 +180,36 @@ pub struct Journal<F: Fs> {
     _lock: F::Lock,
 }
 
+/// Acquire the data directory's singleton `LOCK` (second-opener refusal,
+/// ADR 0017) ahead of journal recovery.
+///
+/// Split out of [`Journal::open`] so the daemon can take sole ownership of the
+/// directory *before* first-boot work that must not race a second process:
+/// identity minting writes `node-identity` and enrollment then issues a
+/// certificate *for* the minted id ([`crate::identity`], deployment-story A1),
+/// so an accidental overlapping start — a service manager plus a manual
+/// invocation — must be cut down to one process before either begins, not
+/// when the journal finally opens. The returned guard is handed back to
+/// [`Journal::open_locked`]; dropping it releases the lock.
+pub fn lock_data_dir<F: Fs>(fs: &F) -> io::Result<F::Lock> {
+    fs.lock(Path::new(LOCK))
+}
+
 impl<F: Fs> Journal<F> {
     /// Open (recovering) the journal at the data directory `fs` is anchored
     /// at. Takes the `LOCK`, scans and truncates any torn tail by rewriting
     /// the compacted live set atomically, and reopens for append. Returns the
     /// journal handle and the recovered [`JournalState`].
     pub fn open(fs: F) -> io::Result<(Journal<F>, JournalState)> {
-        let lock = fs.lock(Path::new(LOCK))?;
+        let lock = lock_data_dir(&fs)?;
+        Self::open_locked(fs, lock)
+    }
 
+    /// [`Journal::open`] for a caller that already holds the directory lock
+    /// from [`lock_data_dir`] — the daemon, which locks before minting its
+    /// identity. The lock's ownership moves into the journal and lives as
+    /// long as it does.
+    pub fn open_locked(fs: F, lock: F::Lock) -> io::Result<(Journal<F>, JournalState)> {
         let mut state = JournalState::default();
         if fs.exists(Path::new(JOURNAL))? {
             let reader = fs.open_read(Path::new(JOURNAL))?;
