@@ -1159,7 +1159,7 @@ pub(crate) fn load_cluster_ca<C: Consensus>(
 /// legitimate case this must not block: the genuinely first formation in a
 /// certless minimal deployment whose discovery already lists its future peers.
 async fn refuse_if_cluster_exists(cfg: &Config, advertise_addr: &str) -> Result<()> {
-    let mut candidates = crate::discovery::build(&cfg.discovery)
+    let mut candidates = coppice_discovery::build(&cfg.discovery.seed_config())
         .context("building the discovery backend for the pre-formation probe")?
         .candidates()
         .await;

@@ -1,11 +1,12 @@
-//! Coordinator discovery (ADR 0037 §2): pluggable, seed-only, non-blocking.
+//! Seed discovery (ADR 0037 §2): pluggable, seed-only, non-blocking.
 //!
 //! A [`Discovery`] backend answers exactly one question — *the current set of
-//! coordinator candidates*, as dialable raft addresses. That answer is
-//! **advisory**: it seeds who a converging process probes and who a leader
-//! reconciles membership against, but it is never authoritative and never on
-//! the raft hot path. Raft membership remains the sole authority on who is in
-//! the cluster and at what address (ADR 0016, restated by ADR 0037).
+//! coordinator candidates*, as dialable addresses. That answer is
+//! **advisory**: it seeds who a converging process probes, who a leader
+//! reconciles membership against, and which endpoint an enrolling machine
+//! tries first, but it is never authoritative and never on the raft hot path.
+//! Raft membership remains the sole authority on who is in the cluster and at
+//! what address (ADR 0016, restated by ADR 0037).
 //!
 //! Because discovery only seeds dialing, a backend that is stale, partial, or
 //! down may *delay* convergence but must never *wedge* it: every backend
@@ -14,38 +15,46 @@
 //! requires every discovered candidate to respond, so a stale entry costs only
 //! a skipped dial.
 //!
-//! Backends at this stage: [`static_backend`] (a literal list), [`dns`] (one
-//! name resolved per consultation), [`file`] (a directory of run-scoped
-//! registration files), and [`ec2_asg`] (Auto Scaling group membership — the
-//! one platform-specific backend). Every backend has a candidate-listing role
-//! only: discovery output is never membership evidence (ADR 0037 §7).
+//! Backends at this stage: `static` (a literal list), `dns` (one name resolved
+//! per consultation), `file` (a directory of run-scoped registration files),
+//! and `ec2_asg` (Auto Scaling group membership — the one platform-specific
+//! backend). Every backend has a candidate-listing role only: discovery output
+//! is never membership evidence (ADR 0037 §7).
+//!
+//! The crate is shared rather than coordinator-local because both daemons need
+//! the same answer under the same failure semantics: the coordinator to
+//! converge and reconcile, the agent to find a coordinator at all. [`config`]
+//! carries the TOML shape that goes with it, so their spelling cannot drift.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::config::{BackendKind, DiscoveryConfig};
+pub mod config;
 
 mod dns;
 mod ec2_asg;
 mod file;
 mod static_backend;
 
+pub use config::{BackendKind, DnsBackend, Ec2AsgBackend, FileBackend, SeedConfig, StaticBackend};
+pub use file::FileRegistration;
+
 pub(crate) use dns::DnsDiscovery;
 pub(crate) use ec2_asg::Ec2AsgDiscovery;
 pub(crate) use file::FileDiscovery;
-pub use file::FileRegistration;
 pub(crate) use static_backend::StaticDiscovery;
 
-/// A source of coordinator candidates: dialable raft addresses (`"host:port"`)
-/// to probe when converging or reconciling membership (ADR 0037 §2).
+/// A source of coordinator candidates: dialable addresses (`"host:port"`)
+/// to probe when converging, reconciling membership, or enrolling
+/// (ADR 0037 §2).
 ///
 /// The contract is advisory and non-blocking: [`candidates`](Discovery::candidates)
 /// returns whatever it can and must not error out to the caller. A backend that
 /// cannot reach its source logs a warning and returns an empty or partial list.
 #[tonic::async_trait]
 pub trait Discovery: Send + Sync {
-    /// The current candidate raft addresses. May be empty (nothing found, or
+    /// The current candidate addresses. May be empty (nothing found, or
     /// the source is unreachable) or partial; never an error.
     async fn candidates(&self) -> Vec<String>;
 }
@@ -55,7 +64,7 @@ pub trait Discovery: Send + Sync {
 /// The `ec2-asg` variant is a thin adapter over the same [`Discovery`] trait
 /// (ADR 0037 §2); its real AWS client is built lazily on the first consultation,
 /// so `build` never touches IMDS or the network and cannot hang startup.
-pub(crate) fn build(config: &DiscoveryConfig) -> Result<Arc<dyn Discovery>> {
+pub fn build(config: &SeedConfig) -> Result<Arc<dyn Discovery>> {
     match config.backend {
         BackendKind::Static => Ok(Arc::new(StaticDiscovery::new(
             config.static_addrs().to_vec(),

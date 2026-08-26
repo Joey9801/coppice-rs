@@ -1,0 +1,45 @@
+[package]
+name = "coppice-discovery"
+description = "Seed discovery (ADR 0037 §2): the advisory candidate-address backends shared by the coordinator and the agent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Seed discovery answers "whom might I dial first?", never "who are the
+# voters?". The trait, the four backends, and the `[discovery]`-shaped config
+# types live here rather than in `coppice-coordinator` because both daemons
+# need the same answer: the coordinator to converge and reconcile membership
+# (ADR 0037 §2), the agent to find a coordinator to enroll against. Sharing the
+# crate is what keeps their TOML spelling and their failure semantics identical.
+
+[dependencies]
+anyhow.workspace = true
+# The `Discovery` trait is object-safe-with-async via tonic's re-export of
+# `async_trait` — the same one every other async trait in the workspace uses.
+tonic.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# The backend tables and `SeedConfig` deserialize straight out of the host
+# daemon's TOML file (ADR 0020), durations as humane strings.
+serde.workspace = true
+humantime-serde.workspace = true
+# The `dns` backend resolves one name per consultation (A/AAAA + SRV).
+hickory-resolver.workspace = true
+# Run-scoped registration filenames for the `file` backend.
+uuid.workspace = true
+# The `ec2-asg` backend: IMDSv2 for this instance's id/region, Auto Scaling for
+# group membership, EC2 for private IPs. Confined to `ec2_asg` behind the
+# internal `AsgApi` seam.
+aws-config.workspace = true
+aws-sdk-ec2.workspace = true
+aws-sdk-autoscaling.workspace = true
+
+[dev-dependencies]
+# The `file` backend's tests drive a real registration directory.
+tempfile.workspace = true
+
+[lints]
+workspace = true
