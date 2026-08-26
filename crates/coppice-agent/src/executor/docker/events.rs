@@ -75,6 +75,39 @@ pub(crate) fn spawn(
     tokio::spawn(run(docker, state, witness, cpuset, exit_tx))
 }
 
+/// One unit of work for the settle task, produced by the pump.
+enum Work {
+    /// A `die` event to turn into an [`ExitEvent`].
+    Die(Box<bollard::models::EventMessage>),
+    /// Re-snapshot the daemon: on every (re)subscribe, and per sweep.
+    Resync,
+}
+
+/// Abort a task when this guard drops. The pump is a child of the settle task,
+/// and [`super::Inner`]'s drop aborts only the handle it holds — without this
+/// the pump would outlive the executor that owns it.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The settle half: drains [`Work`] and does everything that can block —
+/// inspects, OOM settles, resync sweeps.
+///
+/// It is deliberately *not* the half that reads the event stream. Settling an
+/// OOM means waiting for a witness that only [`pump`] can record, so a settle
+/// running on the pump's own task could never observe the event it waits for:
+/// an `oom` arriving after its `die`, or one buffered during a resync, would
+/// sit unread in the stream until the settle had already given up and reported
+/// the exit as cause-unconfirmed. Splitting the two is what makes the witness
+/// wait mean anything — the pump keeps recording while a settle is parked.
+///
+/// Work is drained serially, so a settle still delays *other* exits; that is
+/// bounded by the give-up memo and the kill-in-flight marker (§4), and exits
+/// queue in the channel rather than being lost.
 async fn run(
     docker: Docker,
     state: Arc<Mutex<ExecutorState>>,
@@ -82,6 +115,37 @@ async fn run(
     cpuset: Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: mpsc::UnboundedSender<ExitEvent>,
 ) {
+    let (work_tx, mut work_rx) = mpsc::unbounded_channel();
+    // Held for its drop effect: aborting this task also stops the pump.
+    let _pump = AbortOnDrop(tokio::spawn(pump(
+        docker.clone(),
+        Arc::clone(&witness),
+        work_tx,
+    )));
+
+    // Ends when the pump drops its sender — i.e. only when the pump itself
+    // stops, which it does not do short of being aborted.
+    while let Some(work) = work_rx.recv().await {
+        match work {
+            Work::Die(event) => {
+                handle_die(&docker, &state, &witness, &cpuset, &exit_tx, &event).await
+            }
+            Work::Resync => {
+                if let Err(err) = resync(&docker, &state, &witness, &cpuset, &exit_tx).await {
+                    tracing::warn!(error = %err, "events resync failed; relying on later observe/resync");
+                }
+            }
+        }
+    }
+}
+
+/// The ingestion half: owns the events stream and never awaits anything slow.
+///
+/// `oom` events are recorded inline (a map insert and a notify — microseconds);
+/// `die` events and resync requests are handed to [`run`]. Because nothing here
+/// blocks, the tail stays live for as long as the subscription does, which is
+/// the property the OOM witness depends on.
+async fn pump(docker: Docker, witness: Arc<oom::OomWitness>, work_tx: mpsc::UnboundedSender<Work>) {
     loop {
         // 1. Subscribe (live tail; no `since` — gaps are covered by the resync).
         let mut filters = HashMap::new();
@@ -106,7 +170,9 @@ async fn run(
         match tokio::time::timeout(SUBSCRIBE_PRIME, stream.next()).await {
             Err(_elapsed) => {} // no event during the prime — the normal case
             Ok(Some(Ok(event))) => {
-                handle_event(&docker, &state, &witness, &cpuset, &exit_tx, &event).await
+                if dispatch(&witness, &work_tx, event).is_err() {
+                    return;
+                }
             }
             Ok(Some(Err(err))) => {
                 tracing::warn!(error = %err, "docker events stream error; reconnecting");
@@ -120,16 +186,18 @@ async fn run(
             }
         }
 
-        // 3. Resync immediately after the subscription is up, so exits that
-        //    predate the stream (or fell into a gap) are surfaced through
-        //    `next_exit` and reach the session's journaling path.
-        if let Err(err) = resync(&docker, &state, &witness, &cpuset, &exit_tx).await {
-            tracing::warn!(error = %err, "events resync failed; relying on later observe/resync");
+        // 3. Ask for a resync now the subscription is up, so exits that predate
+        //    the stream (or fell into a gap) are surfaced through `next_exit`
+        //    and reach the session's journaling path. The settle task runs it
+        //    while this loop keeps draining the tail — so an `oom` published
+        //    during the snapshot is recorded, not stranded behind it.
+        if work_tx.send(Work::Resync).is_err() {
+            return;
         }
 
-        // 4. Per die event, with the periodic sweep as backstop (see
+        // 4. Per event, with the periodic sweep as backstop (see
         //    RESYNC_INTERVAL). The interval starts one full period out — step 3
-        //    just resynced.
+        //    just asked for a resync.
         let mut sweep = tokio::time::interval_at(
             tokio::time::Instant::now() + RESYNC_INTERVAL,
             RESYNC_INTERVAL,
@@ -138,7 +206,9 @@ async fn run(
             tokio::select! {
                 item = stream.next() => match item {
                     Some(Ok(event)) => {
-                        handle_event(&docker, &state, &witness, &cpuset, &exit_tx, &event).await
+                        if dispatch(&witness, &work_tx, event).is_err() {
+                            return;
+                        }
                     }
                     Some(Err(err)) => {
                         tracing::warn!(error = %err, "docker events stream error; reconnecting");
@@ -150,8 +220,8 @@ async fn run(
                     }
                 },
                 _ = sweep.tick() => {
-                    if let Err(err) = resync(&docker, &state, &witness, &cpuset, &exit_tx).await {
-                        tracing::warn!(error = %err, "periodic events resync failed; retrying next sweep");
+                    if work_tx.send(Work::Resync).is_err() {
+                        return;
                     }
                 }
             }
@@ -159,6 +229,26 @@ async fn run(
 
         // 5. Backoff, then reconnect at step 1.
         tokio::time::sleep(RECONNECT_BACKOFF).await;
+    }
+}
+
+/// Route one container event off the stream: `oom` is recorded here and now,
+/// `die` is queued for the settle task. `Err` means that task is gone and the
+/// pump should stop.
+fn dispatch(
+    witness: &oom::OomWitness,
+    work_tx: &mpsc::UnboundedSender<Work>,
+    event: bollard::models::EventMessage,
+) -> Result<(), ()> {
+    match event.action.as_deref() {
+        Some("oom") => {
+            handle_oom(witness, &event);
+            Ok(())
+        }
+        Some("die") => work_tx.send(Work::Die(Box::new(event))).map_err(|_| ()),
+        // The subscription filters to these two; anything else is the daemon
+        // widening a filter under us, and is not ours to interpret.
+        _ => Ok(()),
     }
 }
 
@@ -257,27 +347,6 @@ async fn resync(
     Ok(())
 }
 
-/// Route one container event: `oom` records a witness, `die` becomes an exit.
-///
-/// Both carry the allocation in the actor attributes (the subscription filters
-/// on the label, so a foreign container never reaches here).
-async fn handle_event(
-    docker: &Docker,
-    state: &Mutex<ExecutorState>,
-    witness: &oom::OomWitness,
-    cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
-    exit_tx: &mpsc::UnboundedSender<ExitEvent>,
-    event: &bollard::models::EventMessage,
-) {
-    match event.action.as_deref() {
-        Some("oom") => handle_oom(witness, event),
-        Some("die") => handle_die(docker, state, witness, cpuset, exit_tx, event).await,
-        // The subscription filters to these two; anything else is the daemon
-        // widening a filter under us, and is not ours to interpret.
-        _ => {}
-    }
-}
-
 /// Record the daemon's `oom` event for later settles (§4).
 ///
 /// Deliberately does nothing else: an `oom` is not proof the *container* died
@@ -358,13 +427,24 @@ async fn handle_die(
     let info = match actor.id.as_deref() {
         Some(id) => match docker.inspect_container(id, INSPECT_OPTS).await {
             Ok(inspect) => {
-                // A stop of ours is in flight: the 137 about to be read is our
-                // own grace-expiry SIGKILL, so skip the settle exactly as the
-                // stop's post-inspect does (§4). The caller assigns abort vs
-                // max-runtime attribution; spending the window here would be
-                // pure latency in the events task.
+                // A stop of ours is in flight: the 137 about to be read is
+                // most likely our own grace-expiry SIGKILL, so skip the settle
+                // exactly as the stop's post-inspect does (§4) rather than
+                // spend the window proving what we already know.
+                //
+                // "Skip the settle" is not "assume it was us", though. A
+                // container can genuinely OOM inside the grace window, and the
+                // oom-before-die ordering means that evidence is normally
+                // already recorded — so consult the witness first. That is a
+                // map lookup, not a wait, and the kernel's kill outranks ours
+                // (§4's carve-out on the stopped path).
                 let (inspect, verdict) = if our_kill {
-                    (inspect, oom::OomVerdict::NotInQuestion)
+                    let verdict = if witness.witnessed(allocation) {
+                        oom::OomVerdict::Confirmed
+                    } else {
+                        oom::OomVerdict::NotInQuestion
+                    };
+                    (inspect, verdict)
                 } else {
                     super::settle_oom_flag(docker, witness, allocation, id, inspect).await
                 };
