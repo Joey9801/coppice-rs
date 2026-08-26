@@ -79,11 +79,28 @@ no multiplier for it and refuse, as `INVALID_ARGUMENT`, a submission the
 leader would accept. A lagging replica must never veto a write on the
 strength of a view it knows is behind, so the write path consults the
 leadership status watch before the multiplier lookup and forwards
-instead. Both stale readings are safe: a follower that still believes it
-leads falls through to the propose, which reports `NotLeader` and
-forwards one step later; the leader that briefly believes it follows
-spends one self-directed hop, which the single-hop rule below already
-covers.
+instead.
+
+The status watch is a cache, though, and it is only conclusive in one
+direction. "Follower" or "no leader" is safe to act on immediately — the
+replica is not going to be able to propose, so the work is pointless
+either way. "Leader" is not: the watch reports leadership as of the last
+publication, and leadership may already have moved. That gap does not
+matter when the multiplier *is* found — the propose that follows is
+itself the leadership check, and reports `NotLeader` for the caller to
+forward on — but it matters absolutely when the multiplier is missing,
+because `INVALID_ARGUMENT` is terminal: it tells the client to change a
+request no retry will fix. So a missing multiplier is never declared
+invalid on the strength of the watch. The write path first establishes a
+`Consensus::read_index` barrier, which is leader-only, so a replica whose
+cached leadership has gone stale learns it there and forwards; then it
+waits for its own published view to reach that barrier index
+(`StateViews::at_least`, bounded — a replica that leads but cannot apply
+answers the retriable `UNAVAILABLE`, never a verdict), and re-runs the
+lookup on *that* view. Only a class still absent at a linearized point on
+the confirmed leader is `INVALID_ARGUMENT`. The remaining stale reading —
+the leader that briefly believes it follows — spends one self-directed
+hop, which the single-hop rule below already covers.
 
 ### Single hop, always
 
@@ -102,11 +119,18 @@ A dial failure, a proxy timeout (10s, matching the enroll proxy's
 resolve to the retriable `UNAVAILABLE` (503) — the same answer a local
 propose timeout already produces, and honest about the outcome being
 genuinely *unknown*: the write may have committed on the leader before
-the connection broke. The 10s bounds the dial as well as the call,
-because a leader address that blackholes packets would otherwise hold
-the client for the kernel's connect budget rather than this one; a dial
-that fails or times out says so in its own words, since nothing left
-this replica and the write is therefore known not to have committed. What makes that safe to retry is already built:
+the connection broke. The 10s is a *total* budget, dial included: a
+single deadline is stamped when the forwarded write begins and both the
+dial and the RPC run against it, so a slow dial spends the call's time
+rather than adding to it. Bounding the dial at all is what a leader
+address that blackholes packets demands — it would otherwise hold the
+client for the kernel's connect budget rather than this one — and
+bounding the two stages against one deadline is what keeps the
+advertised 10s from becoming 20 in the worst case. A dial that fails or
+times out says so in its own words, since nothing left this replica and
+the write is therefore known not to have committed; once the request is
+on the wire the message changes to outcome-unknown, and the shared
+budget does not blur that line. What makes that safe to retry is already built:
 ADR 0026 gives `SubmitJob` and `ConfigureQuotaEntity` client-minted ids,
 so a retry of the identical request lands on the same job or entity as
 an accepted no-op rather than a duplicate, and `AbortJob` is naturally
@@ -171,9 +195,15 @@ are exactly what a direct write would have returned.
   redirect-following logic to write successfully — the acceptance
   criterion of GitHub issue #41.
 - A write that lands on a follower now costs one extra internal hop
-  before it reaches the leader, bounded by the 10s proxy timeout; the
+  before it reaches the leader, bounded by the 10s proxy timeout in
+  total — dial and call share the one deadline; the
   read path, which already load-balances across replicas (ADR 0007,
   ADR 0034), is untouched.
+- Submissions whose priority class resolves are unaffected; only the
+  ones about to be refused pay for a `read_index` round trip and a view
+  catch-up wait. That is the right place to spend it — the refusal is the
+  answer a client cannot retry its way out of — and it means the common
+  path adds nothing to the write.
 - The leader still concentrates all write fan-in, exactly as it already
   did through raft — forwarding changes where a write enters the
   cluster, not where it is decided.

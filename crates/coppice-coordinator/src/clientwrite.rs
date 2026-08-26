@@ -34,7 +34,8 @@ use tonic::transport::Channel;
 
 use crate::tasks::api_server::{BoxFuture, LeaderWrites};
 
-/// How long a follower waits for the leader to answer a forwarded write.
+/// How long a follower waits for the leader to answer a forwarded write —
+/// **in total**, dial included.
 ///
 /// The same 10s the `/enroll` proxy allows (`crate::enroll::PROXY_TIMEOUT`),
 /// and for the same reason: generous next to a commit-and-apply round trip,
@@ -46,7 +47,21 @@ use crate::tasks::api_server::{BoxFuture, LeaderWrites};
 /// microseconds — leaves a TCP connect hanging for the OS's own retry budget,
 /// which is minutes on every platform this runs on. Budgeting only the RPC
 /// would have made the 10s a promise this path could not keep.
+///
+/// One budget, not one per stage: each forwarded write stamps a single
+/// [`forward_deadline`] up front and both stages run against it, so a slow
+/// dial spends the call's time rather than adding to it. Two independent 10s
+/// timeouts would have advertised 10s and delivered up to 20.
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The single instant every stage of one forwarded write must finish by.
+///
+/// Stamped once per [`LeaderWrites`] call and threaded through the dial and
+/// the RPC, which is what makes the budget additive across stages rather than
+/// per stage.
+fn forward_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + FORWARD_TIMEOUT
+}
 
 /// Forwards client writes to the leader over the mTLS admin channel.
 pub(crate) struct AdminForwarder {
@@ -70,7 +85,11 @@ impl AdminForwarder {
     /// fallback case, not a failure: nothing can be forwarded, so the client
     /// gets the hintless redirect and retries. A leader that *has* an address
     /// but will not answer is a genuine unavailability.
-    async fn dial(&self, leader: CoordinatorId) -> Result<(Client<Channel>, [u8; 16]), ApiError> {
+    async fn dial(
+        &self,
+        leader: CoordinatorId,
+        deadline: tokio::time::Instant,
+    ) -> Result<(Client<Channel>, [u8; 16]), ApiError> {
         let summary = self.node.cluster_summary();
         let Some(addr) = summary
             .members
@@ -86,8 +105,11 @@ impl AdminForwarder {
             return Err(ApiError::NotLeader { leader_hint: None });
         };
 
-        let client =
-            under_dial_timeout(crate::admin::admin_channel_from_store(&addr, &self.tls)).await?;
+        let client = under_dial_timeout(
+            deadline,
+            crate::admin::admin_channel_from_store(&addr, &self.tls),
+        )
+        .await?;
         Ok((client, self.node.history_id()))
     }
 }
@@ -107,7 +129,8 @@ fn not_sent(detail: String) -> ApiError {
     ))
 }
 
-/// Dial under the same budget the call gets.
+/// Dial under the write's shared deadline — the *first* claim on it, not a
+/// budget of its own.
 ///
 /// Split out from [`AdminForwarder::dial`] so the budget is testable against a
 /// future that never resolves. The failure it exists for — an address that
@@ -115,20 +138,21 @@ fn not_sent(detail: String) -> ApiError {
 /// manufacture from a real socket: a listener it binds accepts, and one it
 /// does not bind refuses.
 async fn under_dial_timeout<T>(
+    deadline: tokio::time::Instant,
     dial: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> Result<T, ApiError> {
-    match tokio::time::timeout(FORWARD_TIMEOUT, dial).await {
+    match tokio::time::timeout_at(deadline, dial).await {
         Ok(Ok(client)) => Ok(client),
         Ok(Err(e)) => Err(not_sent(format!("{e:#}"))),
         Err(_elapsed) => Err(not_sent(format!(
-            "the connection did not establish within {}s",
+            "the connection did not establish within the {}s forwarding budget",
             FORWARD_TIMEOUT.as_secs()
         ))),
     }
 }
 
-/// Run one forwarding call under the timeout, collapsing both failure shapes
-/// onto the retriable answer.
+/// Run one forwarding call under whatever the dial left of the write's shared
+/// deadline, collapsing both failure shapes onto the retriable answer.
 ///
 /// A timeout here means the outcome is genuinely **unknown**: the leader may
 /// have committed the write and lost the answer on the way back. That is
@@ -138,20 +162,20 @@ async fn under_dial_timeout<T>(
 /// accepted no-op rather than a second job or a second entity. What must
 /// never happen is reporting success for a write this replica cannot vouch
 /// for.
-async fn under_timeout<F, T>(call: F) -> Result<T, ApiError>
+async fn under_timeout<F, T>(deadline: tokio::time::Instant, call: F) -> Result<T, ApiError>
 where
     F: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 {
-    match tokio::time::timeout(FORWARD_TIMEOUT, call).await {
+    match tokio::time::timeout_at(deadline, call).await {
         Ok(Ok(response)) => Ok(response.into_inner()),
         Ok(Err(status)) => Err(ApiError::Unavailable(format!(
             "the leader did not complete the forwarded write: {}",
             status.message()
         ))),
         Err(_elapsed) => Err(ApiError::Unavailable(
-            "the leader did not answer the forwarded write within 10s; the outcome is unknown \
-             and the request may still commit — retry it unchanged (its id makes the retry a \
-             no-op if it did)"
+            "the leader did not answer the forwarded write within the 10s forwarding budget \
+             (dial included); the outcome is unknown and the request may still commit — retry \
+             it unchanged (its id makes the retry a no-op if it did)"
                 .to_string(),
         )),
     }
@@ -189,9 +213,10 @@ impl LeaderWrites for AdminForwarder {
         req: &'a SubmitJobRequest,
     ) -> BoxFuture<'a, Result<SubmitJobResponse, ApiError>> {
         Box::pin(async move {
-            let (mut client, history_id) = self.dial(leader).await?;
+            let deadline = forward_deadline();
+            let (mut client, history_id) = self.dial(leader, deadline).await?;
             let wire = submit_to_pb(history_id, req);
-            let response = under_timeout(client.forward_submit_job(wire)).await?;
+            let response = under_timeout(deadline, client.forward_submit_job(wire)).await?;
             let log_index = applied_index(response.outcome)?;
             Ok(SubmitJobResponse {
                 job: req.job,
@@ -207,13 +232,14 @@ impl LeaderWrites for AdminForwarder {
         reason: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), ApiError>> {
         Box::pin(async move {
-            let (mut client, history_id) = self.dial(leader).await?;
+            let deadline = forward_deadline();
+            let (mut client, history_id) = self.dial(leader, deadline).await?;
             let wire = pb::ForwardAbortJobRequest {
                 history_id: history_id.to_vec(),
                 job: Some(job.into()),
                 reason: reason.map(str::to_string),
             };
-            let response = under_timeout(client.forward_abort_job(wire)).await?;
+            let response = under_timeout(deadline, client.forward_abort_job(wire)).await?;
             applied_index(response.outcome)?;
             Ok(())
         })
@@ -225,7 +251,8 @@ impl LeaderWrites for AdminForwarder {
         req: &'a ConfigureQuotaEntityRequest,
     ) -> BoxFuture<'a, Result<ConfigureQuotaEntityResponse, ApiError>> {
         Box::pin(async move {
-            let (mut client, history_id) = self.dial(leader).await?;
+            let deadline = forward_deadline();
+            let (mut client, history_id) = self.dial(leader, deadline).await?;
             let wire = pb::ForwardConfigureQuotaEntityRequest {
                 history_id: history_id.to_vec(),
                 entity: Some(req.entity.into()),
@@ -233,7 +260,8 @@ impl LeaderWrites for AdminForwarder {
                 name: req.name.clone(),
                 quota_ucu: req.quota_ucu,
             };
-            let response = under_timeout(client.forward_configure_quota_entity(wire)).await?;
+            let response =
+                under_timeout(deadline, client.forward_configure_quota_entity(wire)).await?;
             let log_index = applied_index(response.outcome)?;
             Ok(ConfigureQuotaEntityResponse {
                 entity: req.entity,
@@ -495,7 +523,9 @@ mod tests {
         // flakes.
         let started = tokio::time::Instant::now();
         let never = std::future::pending::<anyhow::Result<()>>();
-        let error = under_dial_timeout(never).await.expect_err("bounded");
+        let error = under_dial_timeout(forward_deadline(), never)
+            .await
+            .expect_err("bounded");
         assert!(started.elapsed() >= FORWARD_TIMEOUT);
         match error {
             ApiError::Unavailable(message) => {
@@ -515,7 +545,10 @@ mod tests {
         // "never left this replica".
         let refused =
             std::future::ready::<anyhow::Result<()>>(Err(anyhow::anyhow!("connection refused")));
-        match under_dial_timeout(refused).await.expect_err("dial failed") {
+        match under_dial_timeout(forward_deadline(), refused)
+            .await
+            .expect_err("dial failed")
+        {
             ApiError::Unavailable(message) => {
                 assert!(message.contains("connection refused"), "{message}");
                 assert!(message.contains("nothing was sent"), "{message}");
@@ -530,12 +563,67 @@ mod tests {
         // request is on the wire, silence is not evidence that it did not
         // commit, so this message must never claim it was not sent.
         let never = std::future::pending::<Result<tonic::Response<()>, tonic::Status>>();
-        match under_timeout(never).await.expect_err("bounded") {
+        match under_timeout(forward_deadline(), never)
+            .await
+            .expect_err("bounded")
+        {
             ApiError::Unavailable(message) => {
                 assert!(message.contains("unknown"), "{message}");
                 assert!(!message.contains("nothing was sent"), "{message}");
             }
             other => panic!("a lost call must be retriable, got {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_dial_spends_the_calls_budget_rather_than_adding_to_it() {
+        // The advertised budget is 10s *total*. A fresh timeout per stage
+        // would let a 9s dial be followed by a further 10s of silence — 19s
+        // against a promise of 10 — so the deadline is stamped once and both
+        // stages run against it. The dial here eats almost all of it, leaving
+        // the call about a second.
+        let deadline = forward_deadline();
+        let started = tokio::time::Instant::now();
+
+        let slow_dial = async {
+            tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+            anyhow::Ok(())
+        };
+        under_dial_timeout(deadline, slow_dial)
+            .await
+            .expect("the dial finished inside the budget");
+
+        let never = std::future::pending::<Result<tonic::Response<()>, tonic::Status>>();
+        let error = under_timeout(deadline, never).await.expect_err("bounded");
+
+        // The whole operation ends at the one deadline, not at 9s + 10s.
+        assert_eq!(started.elapsed(), FORWARD_TIMEOUT);
+        match error {
+            // Still the *sent* message: the dial succeeded, the request went
+            // out, and a shared budget must not blur that distinction.
+            ApiError::Unavailable(message) => {
+                assert!(message.contains("unknown"), "{message}");
+                assert!(!message.contains("nothing was sent"), "{message}");
+            }
+            other => panic!("a lost call must be retriable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_that_burns_the_whole_budget_leaves_the_call_none_of_it() {
+        // The boundary of the same rule: with the deadline already spent, the
+        // call does not get a fresh one — it fails immediately, and says so
+        // in the *outcome-unknown* words, because by then the request is on
+        // the wire.
+        let deadline = forward_deadline();
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(FORWARD_TIMEOUT).await;
+
+        let never = std::future::pending::<Result<tonic::Response<()>, tonic::Status>>();
+        assert!(matches!(
+            under_timeout(deadline, never).await,
+            Err(ApiError::Unavailable(_))
+        ));
+        assert_eq!(started.elapsed(), FORWARD_TIMEOUT, "not a second more");
     }
 }
