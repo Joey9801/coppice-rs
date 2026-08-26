@@ -4,10 +4,10 @@ import type {
   ConfigureQuotaEntityInput,
   CoordinatorId,
   CoordinatorStatus,
+  GetJobUsageResponse,
   JobDetail,
   JobId,
   JobList,
-  JobUsage,
   ListJobsRequest,
   LogChunk,
   NodeDetail,
@@ -63,7 +63,7 @@ export interface CoppiceApi {
   getJob(id: JobId): Promise<JobDetail>
   getJobTimeline(id: JobId): Promise<TimelineEvent[]>
   /** Usage samples for one attempt; null/omitted = current (else latest). */
-  getJobUsage(id: JobId, attempt?: AttemptId | null): Promise<JobUsage>
+  getJobUsage(id: JobId, attempt?: AttemptId | null): Promise<GetJobUsageResponse>
   getJobLogs(id: JobId, cursor: string | null): Promise<LogChunk>
 
   // Nodes
@@ -88,16 +88,37 @@ export interface CoppiceApi {
   configureQuotaEntity(input: ConfigureQuotaEntityInput): Promise<QuotaEntityNode>
 }
 
-/** Error shape all clients throw; mirrors `coppice_api::ApiError` loosely. */
+/**
+ * Error shape all clients throw; mirrors the server's closed `code`
+ * vocabulary (`crates/coppice-api/src/http/error.rs::ErrorCode`) one for
+ * one. The mock only ever throws `NotFound`/`InvalidArgument`; the real
+ * client can throw any of these, translated from the wire `{ code, message }`
+ * body.
+ */
 export type ApiErrorCode =
-  'NotFound' | 'InvalidArgument' | 'PermissionDenied' | 'Unavailable' | 'Internal'
+  | 'InvalidArgument'
+  | 'Unauthenticated'
+  | 'PermissionDenied'
+  | 'NotFound'
+  | 'Rejected'
+  | 'NotLeader'
+  | 'Unavailable'
+  | 'Unimplemented'
+  | 'Internal'
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode
+  /**
+   * The `Coppice-Leader` header value on a `NotLeader` response, when the
+   * server knew the current leader's dial address; `undefined` otherwise
+   * and for every other error code.
+   */
+  readonly leaderHint?: string
 
-  constructor(code: ApiErrorCode, message: string) {
+  constructor(code: ApiErrorCode, message: string, leaderHint?: string) {
     super(message)
     this.name = 'ApiError'
     this.code = code
+    this.leaderHint = leaderHint
   }
 }

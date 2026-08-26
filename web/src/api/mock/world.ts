@@ -29,6 +29,7 @@ import type {
   CoordinatorMember,
   CoordinatorStatus,
   CostReport,
+  GetJobUsageResponse,
   JobDetail,
   JobFilter,
   JobList,
@@ -36,7 +37,6 @@ import type {
   JobState,
   JobStateKind,
   JobSummary,
-  JobUsage,
   ListJobsRequest,
   LogChunk,
   LogEntry,
@@ -59,8 +59,10 @@ import type {
   Resources,
   TimelineEvent,
   TimelineEventBody,
+  UsageAvailability,
+  UsagePoint,
+  UsageSourceRecord,
   UtilizationSample,
-  UsageSample,
 } from '../types'
 import { derivePhase, isTerminalJobState, jobAttemptId, JOB_PHASES } from '../types'
 import {
@@ -319,6 +321,20 @@ interface MAlloc {
   seq: number
 }
 
+/**
+ * One instantaneous internal usage reading (the simulation's own format —
+ * NOT the wire `UsagePoint` shape, which is cumulative counters).
+ * `buildJobUsage` converts a ring of these into `UsagePoint`s at the API
+ * boundary, integrating `cpuMillis` over time into a cumulative CPU-time
+ * total the same way a real cgroup counter would report it.
+ */
+interface MockUsageSample {
+  t: Date
+  cpuMillis: number
+  memoryBytes: number
+  diskBytes: number
+}
+
 interface MAttempt {
   id: string
   job: string
@@ -331,7 +347,7 @@ interface MAttempt {
   rateUcuPerSecond: number
   chargedUcu: number
   /** Usage samples recorded while this attempt ran (bounded ring). */
-  usage: UsageSample[]
+  usage: MockUsageSample[]
 }
 
 interface JobSpecInternal {
@@ -1166,7 +1182,7 @@ export class MockWorld {
   private seedUsage(attempt: MAttempt, requested: Resources, startUs: number, endUs: number): void {
     const span = Math.max(0, endUs - startUs)
     const step = Math.max(SECOND_US, Math.floor(span / USAGE_RING))
-    const samples: UsageSample[] = []
+    const samples: MockUsageSample[] = []
     const seedRng = new Rng(hashSeed(attempt.id))
     for (let t = startUs; t <= endUs && samples.length < USAGE_RING; t += step) {
       samples.push(this.usageSample(t, requested, seedRng))
@@ -1174,7 +1190,7 @@ export class MockWorld {
     attempt.usage = samples
   }
 
-  private usageSample(tUs: number, requested: Resources, rng: Rng): UsageSample {
+  private usageSample(tUs: number, requested: Resources, rng: Rng): MockUsageSample {
     // Usage wobbles under requested; memory occasionally near the ceiling.
     const cpuFrac = rng.range(0.35, 0.95)
     const memFrac = rng.bool(0.15) ? rng.range(0.9, 0.99) : rng.range(0.4, 0.85)
@@ -2321,21 +2337,48 @@ export class MockWorld {
     return merged.sort((a, b) => a.index - b.index || a.ordinal - b.ordinal).map((e) => ({ ...e }))
   }
 
-  /** Usage for one attempt; null = the current (else latest) attempt. */
-  buildJobUsage(id: string, attemptId: string | null = null): JobUsage {
+  /**
+   * Usage for one attempt; null = the current (else latest) attempt. Returns
+   * the real wire shape (`GetJobUsageResponse`), converting the internal
+   * instantaneous ring into cumulative `UsagePoint`s the same way the real
+   * server's cgroup-backed counters would report them, so mock and real
+   * callers see one contract (see the "Job usage metrics" note in types.ts).
+   */
+  buildJobUsage(id: string, attemptId: string | null = null): GetJobUsageResponse {
     const job = this.jobOrThrow(id)
     const chosen =
       attemptId ?? jobAttemptId(job.state) ?? job.attempts[job.attempts.length - 1] ?? null
     if (chosen === null) {
-      return { attempt: null, requested: { ...job.spec.requests }, samples: [] }
+      // No attempt to walk — mirrors the server's zero-attempt-job response.
+      return { samples: [], sources: [], nextCursor: null }
     }
     const attempt = this.attempts.get(chosen)
     if (!attempt || attempt.job !== id) throw new NotFound(`attempt ${chosen} of job ${id}`)
-    return {
-      attempt: attempt.id,
-      requested: { ...job.spec.requests },
-      samples: attempt.usage.map((s) => ({ ...s })),
+
+    if (attempt.usage.length === 0) {
+      const availability: UsageAvailability =
+        attempt.startedAtUs === null ? 'not_started' : 'available'
+      const source: UsageSourceRecord = {
+        attempt: attempt.id,
+        node: attempt.node,
+        availability,
+        truncated: false,
+        earliestAvailableAt: null,
+        reason: availability === 'not_started' ? 'attempt never reached Running' : null,
+      }
+      return { samples: [], sources: [source], nextCursor: null }
     }
+
+    const samples = usagePointsFromRing(attempt.id, attempt.usage)
+    const source: UsageSourceRecord = {
+      attempt: attempt.id,
+      node: attempt.node,
+      availability: 'available',
+      truncated: false,
+      earliestAvailableAt: attempt.usage[0]!.t,
+      reason: null,
+    }
+    return { samples, sources: [source], nextCursor: null }
   }
 
   // ---- quota entities ------------------------------------------------------
@@ -2838,6 +2881,51 @@ class MockInvalid extends Error {
 
 export function isMockInvalid(e: unknown): boolean {
   return typeof e === 'object' && e !== null && 'invalid' in e
+}
+
+/**
+ * Convert one attempt's ring of instantaneous internal samples into the wire
+ * `UsagePoint` cumulative-counter shape. CPU is integrated (millicores ×
+ * elapsed seconds → cumulative microseconds, exactly what a real cgroup
+ * `cpu.stat` counter accumulates); memory and disk are already
+ * point-in-time quantities on the wire (`memory_used_bytes`,
+ * `disk_writable_bytes`), so they pass through directly, with
+ * `disk_image_bytes` fixed at 0 (the mock has no separate image-layer
+ * notion). Network/block-IO counters are not simulated — reported as a
+ * monotonically increasing but otherwise made-up total, deterministic per
+ * attempt so a chart consuming them at least never goes backwards.
+ */
+function usagePointsFromRing(attempt: string, ring: MockUsageSample[]): UsagePoint[] {
+  const points: UsagePoint[] = []
+  let cpuUsageTotalUs = 0
+  let prevTUs: number | null = null
+  let ioTotal = 0
+  for (const s of ring) {
+    const tUs = s.t.getTime() * 1000
+    if (prevTUs !== null) {
+      const dtSeconds = Math.max(0, (tUs - prevTUs) / 1_000_000)
+      // millicores * seconds = milli-core-seconds; /1000 => core-seconds;
+      // *1e6 => microseconds of CPU time. Net multiplier: 1e6/1000 = 1000.
+      cpuUsageTotalUs += Math.round(s.cpuMillis * dtSeconds * 1000)
+    }
+    prevTUs = tUs
+    ioTotal += 4096
+    points.push({
+      attempt,
+      at: s.t,
+      cpuUsageTotalUs,
+      cpuThrottledTotalUs: 0,
+      memoryUsedBytes: s.memoryBytes,
+      memoryPeakBytes: s.memoryBytes,
+      diskWritableBytes: s.diskBytes,
+      diskImageBytes: 0,
+      netRxBytesTotal: ioTotal,
+      netTxBytesTotal: ioTotal,
+      blkioReadBytesTotal: ioTotal,
+      blkioWriteBytesTotal: ioTotal,
+    })
+  }
+  return points
 }
 
 const LOG_PAGE = 40

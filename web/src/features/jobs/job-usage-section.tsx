@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import {
   Area,
   AreaChart,
@@ -16,7 +16,7 @@ import {
   jobCurrentAttempt,
   type AttemptId,
   type JobDetail,
-  type UsageSample,
+  type UsagePoint,
 } from '@/api/types'
 import { useJobUsage } from '@/api/queries'
 import { formatBytes, formatCpu, formatTimeOfDay, shortId } from '@/lib/format'
@@ -40,6 +40,13 @@ export function JobUsageSection({ job }: { job: JobDetail }) {
   // A stale pick (e.g. the world moved on) falls back to the current attempt.
   const attemptId = picked !== null && attempts.some((a) => a.id === picked) ? picked : fallback
   const usage = useJobUsage(job.id, attemptId)
+  // The wire response carries cumulative counters (a client differences
+  // consecutive samples to derive rates); this derives the chartable
+  // instantaneous series once per fetch. `requested` for the reference
+  // lines comes from the job's own spec — the usage response no longer
+  // echoes it (see the "Job usage metrics" note in api/types.ts).
+  const series = useMemo(() => deriveUsageSeries(usage.data?.samples ?? []), [usage.data])
+  const requested = job.spec.requests
 
   return (
     <Card>
@@ -67,33 +74,33 @@ export function JobUsageSection({ job }: { job: JobDetail }) {
       <CardContent className="p-4">
         {usage.isLoading ? (
           <Skeleton className="h-48" />
-        ) : !usage.data || usage.data.samples.length === 0 ? (
+        ) : series.length === 0 ? (
           <EmptyState icon={Gauge} title="No usage yet" description={placeholderText(job)} />
         ) : (
           <div className="grid gap-4 lg:grid-cols-3">
             <UsageChart
               title="CPU"
-              samples={usage.data.samples}
+              samples={series}
               dataKey="cpuMillis"
-              requested={usage.data.requested.cpuMillis}
+              requested={requested.cpuMillis}
               format={formatCpu}
               makeTicks={cpuTicks}
               color="var(--chart-1)"
             />
             <UsageChart
               title="Memory"
-              samples={usage.data.samples}
+              samples={series}
               dataKey="memoryBytes"
-              requested={usage.data.requested.memoryBytes}
+              requested={requested.memoryBytes}
               format={formatBytes}
               makeTicks={byteTicks}
               color="var(--chart-2)"
             />
             <UsageChart
               title="Disk"
-              samples={usage.data.samples}
+              samples={series}
               dataKey="diskBytes"
-              requested={usage.data.requested.diskBytes}
+              requested={requested.diskBytes}
               format={formatBytes}
               makeTicks={byteTicks}
               color="var(--chart-3)"
@@ -123,6 +130,42 @@ function placeholderText(job: JobDetail): string {
   }
 }
 
+/** One instantaneous chart point, derived from the wire's cumulative samples. */
+interface UsageChartPoint {
+  t: Date
+  cpuMillis: number
+  memoryBytes: number
+  diskBytes: number
+}
+
+/**
+ * Turn the wire's cumulative `UsagePoint`s into instantaneous chart points:
+ * CPU is a rate (derived by differencing consecutive `cpuUsageTotalUs`
+ * against the elapsed wall time), while memory and disk are already
+ * point-in-time quantities on the wire, so they pass through directly. The
+ * first sample has no predecessor to difference against, so it is dropped —
+ * every returned point has a well-defined instantaneous CPU rate.
+ */
+function deriveUsageSeries(samples: UsagePoint[]): UsageChartPoint[] {
+  const points: UsageChartPoint[] = []
+  for (let i = 1; i < samples.length; i += 1) {
+    const prev = samples[i - 1]!
+    const cur = samples[i]!
+    const dtSeconds = (cur.at.getTime() - prev.at.getTime()) / 1000
+    const cpuDeltaUs = cur.cpuUsageTotalUs - prev.cpuUsageTotalUs
+    // (µs of CPU time / 1e6) = core-seconds consumed over dtSeconds;
+    // /dtSeconds = cores; *1000 = millicores.
+    const cpuMillis = dtSeconds > 0 ? Math.max(0, (cpuDeltaUs / 1_000_000 / dtSeconds) * 1000) : 0
+    points.push({
+      t: cur.at,
+      cpuMillis,
+      memoryBytes: cur.memoryUsedBytes,
+      diskBytes: cur.diskWritableBytes + cur.diskImageBytes,
+    })
+  }
+  return points
+}
+
 function UsageChart({
   title,
   samples,
@@ -133,7 +176,7 @@ function UsageChart({
   color,
 }: {
   title: string
-  samples: UsageSample[]
+  samples: UsageChartPoint[]
   dataKey: 'cpuMillis' | 'memoryBytes' | 'diskBytes'
   requested: number
   format: (n: number) => string

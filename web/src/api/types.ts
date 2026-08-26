@@ -517,34 +517,17 @@ export interface RecentEventsWindow {
 // Usage / utilization series
 // ---------------------------------------------------------------------------
 
-export interface UsageSample {
-  t: Date
-  cpuMillis: number
-  memoryBytes: number
-  diskBytes: number
-}
-
-export interface JobUsage {
-  /**
-   * The attempt these samples belong to (usage is measured per attempt);
-   * null when the job has no attempts yet. When the request named no
-   * attempt, the server picks the current (else latest) one.
-   */
-  attempt: AttemptId | null
-  /** What the job asked for — chart ceilings. */
-  requested: Resources
-  samples: UsageSample[]
-}
-
 // ---------------------------------------------------------------------------
 // Job usage metrics — the real GET /api/v1/jobs/{job}/usage contract
 // ---------------------------------------------------------------------------
 // Mirrors the Rust DTOs in crates/coppice-api/src/http/dto.rs
 // (GetJobUsageResponse / UsagePoint / UsageSourceRecord / UsageAvailability),
-// the metrics twin of the job-logs pipeline. Supersedes the invented
-// `JobUsage`/`UsageSample` proposal above (kept for the mock world and its
-// tests) exactly as the real log DTOs superseded this file's invented
-// `LogChunk`. Cursor-paged over the job's attempts with a per-attempt
+// the metrics twin of the job-logs pipeline. This is now the ONLY job-usage
+// shape — it superseded an earlier invented `JobUsage`/`UsageSample`
+// proposal (instantaneous per-dimension samples plus a `requested` echo);
+// both the mock world and the real client return this wire-shaped contract,
+// and callers get the job's `requested` resources from `JobDetail.spec`
+// instead. Cursor-paged over the job's attempts with a per-attempt
 // availability accounting; `order` defaults to `asc` (chart order).
 //
 // Counters are cumulative — a client differences consecutive samples to derive
