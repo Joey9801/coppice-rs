@@ -2,6 +2,15 @@
 //! register, then pump commands down and reports up, reconnecting with
 //! exponential backoff and rotating endpoints on failure (ADR 0009/0011).
 //!
+//! Endpoints come from the configured discovery backend (ADR 0037 §2), which is
+//! built once — a bad `[discovery]` section is the unrecoverable configuration
+//! error below — and then **consulted on every reconnect**. That re-consultation
+//! is the point: a coordinator fleet that changes address (a DNS record edited,
+//! an ASG scaled, a registration file dropped) reaches a running agent without a
+//! restart, and a source that is momentarily unreachable degrades to an empty
+//! list — backoff and retry — rather than pinning the agent to a stale address
+//! it read at startup.
+//!
 //! All decisions live in [`Session`]; this file only moves bytes and owns the
 //! timers (heartbeat cadence, max-runtime watchdogs). It is not unit-tested —
 //! there is no live server in the unit suite — but every branch it can take
@@ -96,10 +105,31 @@ where
         while inflight.join_next().await.is_some() {}
     });
 
+    // Built once: an unusable `[discovery]` section is a configuration error,
+    // not something to retry against (ADR 0037 §2). Consulting it, by contrast,
+    // never fails — a backend that cannot reach its source answers with an empty
+    // list and a warning of its own.
+    let discovery = coppice_discovery::build(&config.discovery)?;
+
     let mut backoff = config.reconnect_backoff_min;
     let mut endpoint_idx = 0usize;
     loop {
-        let endpoint = &config.coordinators[endpoint_idx % config.coordinators.len()];
+        let candidates = discovery.candidates().await;
+        if candidates.is_empty() {
+            // Nothing to dial this round: the source is unreachable or lists
+            // nobody. Back off exactly as a failed session does — the next
+            // consultation may well answer. Checked here rather than indexed
+            // blindly, so an empty list can never be a modulo-by-zero panic.
+            tracing::warn!(
+                backend = config.discovery.backend.as_str(),
+                ?backoff,
+                "discovery returned no coordinator candidates; retrying after backoff"
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(config.reconnect_backoff_max);
+            continue;
+        }
+        let endpoint = candidates[endpoint_idx % candidates.len()].as_str();
         endpoint_idx += 1;
 
         match serve_once(&mut session, endpoint, &tls, config, &mut exit_rx, &reap_tx).await {

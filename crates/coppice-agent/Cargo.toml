@@ -21,6 +21,10 @@ coppice-tls.workspace = true
 # The `[enrollment]` table and the client that redeems its token for a leaf
 # (ADR 0037 §4/§8): an agent's minimal deployment is a token and an address.
 coppice-enroll.workspace = true
+# Seed discovery (ADR 0037 §2): the `[discovery]` section's shape and its
+# backends, shared with the coordinator so one spelling answers "whom do I
+# dial?" on both sides. Consulted per reconnect, never authoritative.
+coppice-discovery.workspace = true
 anyhow.workspace = true
 # Serves the agent's optional Prometheus `/metrics` scrape endpoint (issue #46);
 # a single-route axum router in `metrics_server`, the same 0.7 stack the rest of

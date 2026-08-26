@@ -45,6 +45,7 @@ use coppice_core::job::{Job, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
+use coppice_discovery::SeedConfig;
 use coppice_state::command::{ConfigureQuotaEntity, SubmitJob};
 use coppice_state::Command;
 
@@ -93,10 +94,27 @@ fn agent_config(
     std::fs::write(&key_path, &leaf.key_pem).expect("write agent key");
     std::fs::write(&ca_path, &ca.pem).expect("write agent ca");
 
+    // An agent settles its identity from `<data_dir>/node-identity`
+    // (deployment-story A1). The harness seeds that file with the id the leaf
+    // above was minted for, which is exactly the documented shape of a node
+    // whose identity predates the file — and keeps the CN↔NodeId binding the
+    // gateway checks intact.
+    std::fs::create_dir_all(&data_dir).expect("create agent data dir");
+    std::fs::write(
+        data_dir.join(coppice_agent::identity::NODE_IDENTITY_FILE),
+        format!("{node_id}\n"),
+    )
+    .expect("seed the agent node identity");
+
     Config {
-        node_id,
+        // Identity is minted and persisted by the agent itself
+        // (deployment-story A1); the harness passes it to `Session::new`
+        // directly, and the tombstone stays unset.
+        node_id: None,
         data_dir,
-        coordinators: vec![endpoint.to_string()],
+        coordinators: None,
+        // One coordinator, this harness's gateway (ADR 0037 §2).
+        discovery: SeedConfig::static_seeds(vec![endpoint.to_string()]),
         tls: TlsConfig {
             cert_path,
             key_path,
@@ -104,10 +122,12 @@ fn agent_config(
         },
         // The harness provisions the leaf directly; no enrollment.
         enrollment: None,
+        // Generous overrides on every dimension (deployment-story A3), so the
+        // harness never depends on what the machine running the test reports.
         capacity: CapacityConfig {
-            cpu_millis: 16_000,
-            memory: ByteSize::from_gib(16),
-            disk: ByteSize::from_tib(1),
+            cpu_millis: Some(16_000),
+            memory: Some(ByteSize::from_gib(16)),
+            disk: Some(ByteSize::from_tib(1)),
         },
         reservation: Default::default(),
         heartbeat_interval: Duration::from_millis(300),
@@ -134,8 +154,8 @@ fn spawn_agent(
     let fs = RealFs::new(config.data_dir.clone());
     let (journal, state) = Journal::open(fs).expect("open agent journal");
     let session = Session::new(
-        config.node(),
-        config.advertised_resources(),
+        node_identity(&config),
+        advertised(&config),
         Vec::new(),
         journal,
         state,
@@ -776,4 +796,21 @@ async fn follower_serves_job_logs_directly() {
     leader.shutdown().await;
     drop(agent_dir);
     drop(tel_dir);
+}
+
+/// The node id the agent settles on: read back from `<data_dir>/node-identity`
+/// exactly as the daemon does (deployment-story A1).
+fn node_identity(config: &Config) -> NodeId {
+    coppice_agent::identity::load_or_mint_node_identity(&config.data_dir)
+        .expect("the harness seeded the agent node identity")
+}
+
+/// The resource vector the agent advertises: detection, the config's overrides
+/// (all three set by [`agent_config`]), then the system reservation
+/// (deployment-story A3).
+fn advertised(config: &Config) -> coppice_core::resource::Resources {
+    config
+        .effective_capacity(&coppice_agent::capacity::detect(&config.data_dir))
+        .expect("every capacity dimension is overridden by the harness")
+        .advertised
 }

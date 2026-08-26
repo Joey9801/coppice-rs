@@ -257,9 +257,13 @@ it is served on the client API listener at `/metrics` (issue #46), alongside
 `/api/v1`, so there is no coordinator `metrics_addr` knob. (The agent daemon,
 which has no such listener, keeps its own optional `metrics_addr`.)
 
-The agent's file follows the same conventions with its own schema
-(coordinator endpoints, the same `[enrollment]` table, image-cache and
-workdir paths, resource-advertisement overrides).
+The agent's file follows the same conventions with its own schema: the
+same `[discovery]` section (minus the coordinator-only knobs, consulted
+on every reconnect), the same `[enrollment]` table, image-cache and
+workdir paths, and an optional `[capacity]` table of per-dimension
+overrides — capacity is detected from the host at startup, and the node
+identity is self-minted and persisted at `<data_dir>/node-identity`
+rather than configured (deployment-story A1/A3, issue #48).
 
 ## Replicated policy
 
