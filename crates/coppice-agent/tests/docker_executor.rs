@@ -1108,9 +1108,9 @@ async fn oom_classification() {
                          (cause Killed); retrying with a fresh container"
                     );
                 }
-                cause => bail!(
-                    "expected OomKilled, got {cause:?} on attempt {attempt}/{OOM_ATTEMPTS}"
-                ),
+                cause => {
+                    bail!("expected OomKilled, got {cause:?} on attempt {attempt}/{OOM_ATTEMPTS}")
+                }
             }
         }
         unreachable!("loop returns or bails on the final attempt");
