@@ -20,10 +20,14 @@
 //! # What "detected" means per dimension
 //!
 //! * **CPU** — [`std::thread::available_parallelism`] × 1000, intersected on
-//!   Linux with this process's cgroup v2 `cpu.max` quota. A container pinned to
-//!   half a core must not advertise the host's core count.
-//! * **Memory** — `/proc/meminfo`'s `MemTotal` on Linux, intersected with
-//!   cgroup v2 `memory.max`; `hw.memsize` on macOS.
+//!   Linux with the effective cgroup v2 `cpu.max` quota — the minimum across
+//!   the process's cgroup chain, since v2 limits are hierarchical and the
+//!   common containerized layout carries the real ceiling in a parent slice
+//!   while the leaf says `max`. A container pinned to half a core must not
+//!   advertise the host's core count.
+//! * **Memory** — `/proc/meminfo`'s `MemTotal` on Linux, intersected with the
+//!   effective cgroup v2 `memory.max` (minimum across the chain, likewise);
+//!   `hw.memsize` on macOS.
 //! * **Disk** — the *total* size of the filesystem holding `data_dir`, via the
 //!   same `statvfs` reading [`crate::pressure`] samples. Total, not available:
 //!   the system reservation (`[reservation]`, §6.4) is what withholds room, and
@@ -236,6 +240,31 @@ fn parse_bytes_max(raw: &str) -> Option<u64> {
     raw.parse().ok()
 }
 
+/// Every cgroup directory from the process's own (leaf) up to the hierarchy
+/// root, as absolute filesystem paths under `/sys/fs/cgroup`.
+///
+/// cgroup v2 limits are **hierarchical**: the effective limit is the minimum
+/// across the chain, and the common containerized layout puts `max` in the
+/// leaf while a parent slice or pod cgroup carries the real ceiling. Reading
+/// only the leaf would fall back to the host total there and over-advertise.
+/// `rel` is the `0::` path from `/proc/self/cgroup` (absolute within the
+/// hierarchy; `/` for the root cgroup).
+/// Compiled on every target though only the Linux paths call it: the pure
+/// parse/fold helpers are unit-tested on any OS, which is the point of
+/// keeping them free of platform code.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_ancestor_paths(rel: &str) -> Vec<String> {
+    let mut current = rel.trim_end_matches('/').to_string();
+    let mut paths = Vec::new();
+    loop {
+        paths.push(format!("/sys/fs/cgroup{current}"));
+        if current.is_empty() {
+            return paths;
+        }
+        current.truncate(current.rfind('/').unwrap_or(0));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io;
@@ -251,30 +280,41 @@ mod linux {
             .map(|path| path.trim().to_string())
     }
 
-    /// Read one file from this process's cgroup directory, if it exists.
-    fn read_cgroup_file(name: &str) -> Option<String> {
+    /// The minimum finite limit named `name` across this process's cgroup
+    /// chain, leaf to hierarchy root, parsed by `parse`.
+    ///
+    /// Limits are hierarchical (see [`super::cgroup_ancestor_paths`]): a level
+    /// whose file is absent (the root cgroup exposes neither `cpu.max` nor
+    /// `memory.max`), unreadable, or unlimited (`max`) simply contributes
+    /// nothing, and `None` overall means no level imposes a limit.
+    fn cgroup_min_limit(name: &str, parse: impl Fn(&str) -> Option<u64>) -> Option<u64> {
         let raw = std::fs::read_to_string("/proc/self/cgroup").ok()?;
         let rel = parse_self_cgroup(&raw)?;
-        // The path is absolute *within* the hierarchy, so it is joined by
-        // concatenation rather than `Path::join` (which would discard the root).
-        let path = format!("/sys/fs/cgroup{}/{}", rel.trim_end_matches('/'), name);
-        match std::fs::read_to_string(&path) {
-            Ok(s) => Some(s),
-            Err(err) => {
-                tracing::debug!(path, error = %err, "no cgroup limit file; using the host value");
-                None
-            }
-        }
+        super::cgroup_ancestor_paths(&rel)
+            .into_iter()
+            .filter_map(|dir| {
+                let path = format!("{dir}/{name}");
+                match std::fs::read_to_string(&path) {
+                    Ok(s) => parse(&s),
+                    Err(err) => {
+                        tracing::debug!(path, error = %err, "no cgroup limit file at this level");
+                        None
+                    }
+                }
+            })
+            .min()
     }
 
-    /// This process's cgroup v2 CPU quota in milli-CPU, if any.
+    /// This process's effective cgroup v2 CPU quota in milli-CPU, if any:
+    /// the minimum across the cgroup chain.
     pub(super) fn cgroup_cpu_millis() -> Option<u64> {
-        super::parse_cpu_max(&read_cgroup_file("cpu.max")?)
+        cgroup_min_limit("cpu.max", super::parse_cpu_max)
     }
 
-    /// This process's cgroup v2 memory ceiling in bytes, if any.
+    /// This process's effective cgroup v2 memory ceiling in bytes, if any:
+    /// the minimum across the cgroup chain.
     pub(super) fn cgroup_memory_max() -> Option<u64> {
-        super::parse_bytes_max(&read_cgroup_file("memory.max")?)
+        cgroup_min_limit("memory.max", super::parse_bytes_max)
     }
 
     /// `MemTotal` from a `/proc/meminfo` body, in bytes. The kernel reports it
@@ -389,6 +429,18 @@ mod tests {
         );
     }
 
+    /// Memory detection is allowed to fail on macOS — a sandboxed test
+    /// environment may refuse the `sysctl` subprocess — and that failure is
+    /// exactly what the per-dimension `DetectResult` models. On Linux the
+    /// `/proc/meminfo` read has no such mode, so a failure there is a bug.
+    fn assert_memory_reading(memory: &DetectResult) {
+        match memory {
+            Ok(m) => assert!(*m > 0, "some memory: {m}"),
+            Err(e) if cfg!(target_os = "linux") => panic!("memory must detect on Linux: {e}"),
+            Err(e) => assert_eq!(e.dimension, "capacity.memory", "{e}"),
+        }
+    }
+
     #[test]
     fn detect_reports_the_host() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -397,8 +449,7 @@ mod tests {
         // reports a fraction of a core, so the whole-core shape is not asserted.
         let cpu = detected.cpu_millis.expect("cpu detected");
         assert!(cpu >= 1, "some cpu: {cpu}");
-        let memory = detected.memory.expect("memory detected");
-        assert!(memory > 0, "some memory: {memory}");
+        assert_memory_reading(&detected.memory);
         let disk = detected.disk.expect("disk detected");
         assert!(disk > 0, "some disk: {disk}");
     }
@@ -409,9 +460,32 @@ mod tests {
         let detected = detect(&dir.path().join("does-not-exist"));
         assert!(detected.disk.is_err(), "statvfs cannot resolve the path");
         assert!(detected.cpu_millis.is_ok());
-        assert!(detected.memory.is_ok());
+        assert_memory_reading(&detected.memory);
         // …and an override for the failed dimension keeps startup alive.
         assert_eq!(resolve(&detected.disk, Some(42)).unwrap(), 42);
+    }
+
+    #[test]
+    fn ancestor_paths_walk_leaf_to_hierarchy_root() {
+        // Limits are hierarchical: the effective value is the minimum across
+        // exactly these directories, leaf first (P1: a leaf holding `max`
+        // under a limited parent slice must not fall back to the host total).
+        assert_eq!(
+            cgroup_ancestor_paths("/kubepods.slice/pod-1.slice/cri-abc.scope"),
+            vec![
+                "/sys/fs/cgroup/kubepods.slice/pod-1.slice/cri-abc.scope",
+                "/sys/fs/cgroup/kubepods.slice/pod-1.slice",
+                "/sys/fs/cgroup/kubepods.slice",
+                "/sys/fs/cgroup",
+            ]
+        );
+        // The root cgroup: just the hierarchy root.
+        assert_eq!(cgroup_ancestor_paths("/"), vec!["/sys/fs/cgroup"]);
+        // A trailing slash does not produce a duplicate level.
+        assert_eq!(
+            cgroup_ancestor_paths("/a/"),
+            vec!["/sys/fs/cgroup/a", "/sys/fs/cgroup"]
+        );
     }
 
     #[cfg(target_os = "linux")]

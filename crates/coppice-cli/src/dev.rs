@@ -225,6 +225,19 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // cluster id above. Dev exercises the production path, including the refusal
     // to mint over a data dir that already holds a journal.
     let agent_data = root.join("agent");
+    // Take the agent data dir's singleton `LOCK` before minting the identity —
+    // the same ordering as `run_daemon`, so an overlapping `coppice dev` on a
+    // persistent root loses here rather than racing the mint and enrollment.
+    // The guard moves into the journal in `build_session`.
+    std::fs::create_dir_all(&agent_data)
+        .with_context(|| format!("creating agent data dir {}", agent_data.display()))?;
+    let agent_dir_lock = coppice_agent::journal::lock_data_dir(&RealFs::new(agent_data.clone()))
+        .with_context(|| {
+            format!(
+                "locking agent data dir {} (is another coppice dev already running here?)",
+                agent_data.display()
+            )
+        })?;
     let agent_node: NodeId = coppice_agent::identity::load_or_mint_node_identity(&agent_data)?;
 
     let raft_port = resolve_port(&root, "raft", args.raft_port)?;
@@ -404,7 +417,13 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // dropped early (§8.4).
     let (agent_join, _telemetry_guard) = match args.executor {
         DevExecutor::Fake => {
-            let session = build_session(&agent_config, agent_node, effective, FakeExecutor::new())?;
+            let session = build_session(
+                &agent_config,
+                agent_node,
+                agent_dir_lock,
+                effective,
+                FakeExecutor::new(),
+            )?;
             // The fake executor captures no container output, so the NodeService
             // serves no stores: every fetch honestly answers UnknownAttempt.
             serve_node_service(&agent_config, None, None)?;
@@ -469,7 +488,13 @@ pub async fn run(args: DevArgs) -> Result<()> {
                 telemetry_wiring,
             )
             .await?;
-            let session = build_session(&agent_config, agent_node, effective, executor)?;
+            let session = build_session(
+                &agent_config,
+                agent_node,
+                agent_dir_lock,
+                effective,
+                executor,
+            )?;
             // Serve the NodeService over the first LOG- and METRICS-consuming
             // telemetry stores (ADR 0034/0036), so the in-process coordinator
             // can dial for job logs and usage.
@@ -843,18 +868,20 @@ async fn daemon_error(
 // Agent wiring
 // ---------------------------------------------------------------------------
 
-/// Open the agent journal under the config's data dir (acquiring its `LOCK`)
-/// and build the session over `executor`.
+/// Open the agent journal under the config's data dir and build the session
+/// over `executor`. `dir_lock` is the data-dir `LOCK` taken before the
+/// identity was minted (the same ordering as `run_daemon`); its ownership
+/// moves into the journal here.
 fn build_session<E: Executor + Clone>(
     config: &AgentConfig,
     node: NodeId,
+    dir_lock: <RealFs as coppice_consensus::fs::Fs>::Lock,
     effective: EffectiveCapacity,
     executor: E,
 ) -> Result<Session<RealFs, E>> {
-    std::fs::create_dir_all(&config.data_dir)
-        .with_context(|| format!("creating agent data dir {}", config.data_dir.display()))?;
     let fs = RealFs::new(config.data_dir.clone());
-    let (journal, state) = Journal::open(fs).context("recovering the dev agent journal")?;
+    let (journal, state) =
+        Journal::open_locked(fs, dir_lock).context("recovering the dev agent journal")?;
     Ok(Session::new(
         node,
         effective.advertised,
