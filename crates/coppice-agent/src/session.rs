@@ -491,7 +491,13 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 // the terminal state must never claim our stop terminated a
                 // container that policy had already killed.
                 let outcome = match exit.cause {
-                    ExitCause::Natural => kill_outcome,
+                    // `Killed` cannot reach this arm today — the stop's
+                    // post-inspect is deliberately not settled (§4), and only a
+                    // settle produces it — but if it ever did, our stop is
+                    // still the best attribution we hold: an unattributable
+                    // SIGKILL landing as our own stop takes effect is exactly
+                    // the TERM-grace window ADR 0013 assigns to the stop.
+                    ExitCause::Natural | ExitCause::Killed => kill_outcome,
                     ExitCause::OomKilled | ExitCause::DiskKilled => classify_exit(&exit),
                 };
                 self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;

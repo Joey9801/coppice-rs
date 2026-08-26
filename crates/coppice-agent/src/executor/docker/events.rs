@@ -1,8 +1,10 @@
 //! The docker-events task (docker-executor.md §11, S2 item 6).
 //!
-//! A single long-lived task live-tails `docker events` for container `die`
-//! events on labeled containers, turns each into an [`ExitEvent`] on the
-//! natural-exit channel that feeds [`crate::executor::Executor::next_exit`], and
+//! A single long-lived task live-tails `docker events` for container `die` and
+//! `oom` events on labeled containers, turns each `die` into an [`ExitEvent`]
+//! on the natural-exit channel that feeds
+//! [`crate::executor::Executor::next_exit`], records each `oom` in the witness
+//! registry that [`super::settle_oom_flag`] consults (§4), and
 //! resyncs against the daemon on every (re)subscribe — after priming the lazy
 //! stream so the tail is up before the snapshot — plus a low-frequency periodic
 //! sweep, so a stream gap can never swallow an exit for long. It is aborted on [`super::Inner`] drop, so it captures only
@@ -35,7 +37,7 @@ use tokio_stream::StreamExt;
 use coppice_core::id::AllocationId;
 use coppice_core::time::Timestamp;
 
-use super::{classify, cpuset, lock_state, ExecutorState, LABEL_ALLOCATION};
+use super::{classify, cpuset, lock_state, oom, ExecutorState, LABEL_ALLOCATION};
 use crate::executor::ExitEvent;
 
 /// Backoff between an events-stream error/end and the reconnect-and-resync
@@ -66,15 +68,17 @@ const INSPECT_OPTS: Option<bollard::query_parameters::InspectContainerOptions> =
 pub(crate) fn spawn(
     docker: Docker,
     state: Arc<Mutex<ExecutorState>>,
+    witness: Arc<oom::OomWitness>,
     cpuset: Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: mpsc::UnboundedSender<ExitEvent>,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(docker, state, cpuset, exit_tx))
+    tokio::spawn(run(docker, state, witness, cpuset, exit_tx))
 }
 
 async fn run(
     docker: Docker,
     state: Arc<Mutex<ExecutorState>>,
+    witness: Arc<oom::OomWitness>,
     cpuset: Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: mpsc::UnboundedSender<ExitEvent>,
 ) {
@@ -82,7 +86,15 @@ async fn run(
         // 1. Subscribe (live tail; no `since` — gaps are covered by the resync).
         let mut filters = HashMap::new();
         filters.insert("type".to_string(), vec!["container".to_string()]);
-        filters.insert("event".to_string(), vec!["die".to_string()]);
+        // `oom` rides the same subscription as `die`, and on a healthy daemon
+        // it arrives *first* (§4): both are published from the daemon's
+        // container-event path, and the OOM notification is handled before the
+        // task-exit one. Tailing it is what turns the OOM settle from polling
+        // for a flag commit into waiting on the daemon's own signal.
+        filters.insert(
+            "event".to_string(),
+            vec!["die".to_string(), "oom".to_string()],
+        );
         filters.insert("label".to_string(), vec![LABEL_ALLOCATION.to_string()]);
         let options = EventsOptionsBuilder::new().filters(&filters).build();
         let mut stream = Box::pin(docker.events(Some(options)));
@@ -93,7 +105,9 @@ async fn run(
         //    event arriving this early is handled, never dropped.
         match tokio::time::timeout(SUBSCRIBE_PRIME, stream.next()).await {
             Err(_elapsed) => {} // no event during the prime — the normal case
-            Ok(Some(Ok(event))) => handle_die(&docker, &state, &cpuset, &exit_tx, &event).await,
+            Ok(Some(Ok(event))) => {
+                handle_event(&docker, &state, &witness, &cpuset, &exit_tx, &event).await
+            }
             Ok(Some(Err(err))) => {
                 tracing::warn!(error = %err, "docker events stream error; reconnecting");
                 tokio::time::sleep(RECONNECT_BACKOFF).await;
@@ -109,7 +123,7 @@ async fn run(
         // 3. Resync immediately after the subscription is up, so exits that
         //    predate the stream (or fell into a gap) are surfaced through
         //    `next_exit` and reach the session's journaling path.
-        if let Err(err) = resync(&docker, &state, &cpuset, &exit_tx).await {
+        if let Err(err) = resync(&docker, &state, &witness, &cpuset, &exit_tx).await {
             tracing::warn!(error = %err, "events resync failed; relying on later observe/resync");
         }
 
@@ -123,7 +137,9 @@ async fn run(
         loop {
             tokio::select! {
                 item = stream.next() => match item {
-                    Some(Ok(event)) => handle_die(&docker, &state, &cpuset, &exit_tx, &event).await,
+                    Some(Ok(event)) => {
+                        handle_event(&docker, &state, &witness, &cpuset, &exit_tx, &event).await
+                    }
                     Some(Err(err)) => {
                         tracing::warn!(error = %err, "docker events stream error; reconnecting");
                         break;
@@ -134,7 +150,7 @@ async fn run(
                     }
                 },
                 _ = sweep.tick() => {
-                    if let Err(err) = resync(&docker, &state, &cpuset, &exit_tx).await {
+                    if let Err(err) = resync(&docker, &state, &witness, &cpuset, &exit_tx).await {
                         tracing::warn!(error = %err, "periodic events resync failed; retrying next sweep");
                     }
                 }
@@ -155,6 +171,7 @@ async fn run(
 async fn resync(
     docker: &Docker,
     state: &Mutex<ExecutorState>,
+    witness: &oom::OomWitness,
     cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: &mpsc::UnboundedSender<ExitEvent>,
 ) -> Result<(), bollard::errors::Error> {
@@ -198,8 +215,13 @@ async fn resync(
         let info = match docker.inspect_container(target, INSPECT_OPTS).await {
             Ok(inspect) => {
                 // Bounded settle for a lagging OOMKilled commit (issue #34).
-                let inspect = super::settle_oom_flag(docker, target, inspect).await;
-                inspect.state.as_ref().and_then(classify::exit_info)
+                let (inspect, verdict) =
+                    super::settle_oom_flag(docker, witness, allocation, target, inspect).await;
+                inspect
+                    .state
+                    .as_ref()
+                    .and_then(classify::exit_info)
+                    .map(|info| classify::apply_oom_verdict(info, verdict))
             }
             Err(_) => None, // vanished or torn — a later resync/stop can surface it
         };
@@ -235,6 +257,50 @@ async fn resync(
     Ok(())
 }
 
+/// Route one container event: `oom` records a witness, `die` becomes an exit.
+///
+/// Both carry the allocation in the actor attributes (the subscription filters
+/// on the label, so a foreign container never reaches here).
+async fn handle_event(
+    docker: &Docker,
+    state: &Mutex<ExecutorState>,
+    witness: &oom::OomWitness,
+    cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
+    exit_tx: &mpsc::UnboundedSender<ExitEvent>,
+    event: &bollard::models::EventMessage,
+) {
+    match event.action.as_deref() {
+        Some("oom") => handle_oom(witness, event),
+        Some("die") => handle_die(docker, state, witness, cpuset, exit_tx, event).await,
+        // The subscription filters to these two; anything else is the daemon
+        // widening a filter under us, and is not ours to interpret.
+        _ => {}
+    }
+}
+
+/// Record the daemon's `oom` event for later settles (§4).
+///
+/// Deliberately does nothing else: an `oom` is not proof the *container* died
+/// (the cgroup OOM killer may take a child the container survives), so it never
+/// enqueues an exit or touches the claim set. It only becomes evidence when a
+/// settle finds the racy shape — SIGKILL exit under a memory limit — and asks.
+fn handle_oom(witness: &oom::OomWitness, event: &bollard::models::EventMessage) {
+    if event.typ != Some(EventMessageTypeEnum::CONTAINER) {
+        return;
+    }
+    let Some(allocation) = event
+        .actor
+        .as_ref()
+        .and_then(|actor| actor.attributes.as_ref())
+        .and_then(|attrs| attrs.get(LABEL_ALLOCATION))
+        .and_then(|raw| raw.parse::<AllocationId>().ok())
+    else {
+        return;
+    };
+    tracing::debug!(%allocation, "daemon reported a cgroup OOM kill in this container");
+    witness.record(allocation, Timestamp::now());
+}
+
 /// Turn one `die` event into an exit: parse the allocation from the actor's
 /// `coppice.allocation` attribute, claim it (skip duplicates, §4), inspect for
 /// evidence, and enqueue — un-claiming on an unusable/failed inspect so a later
@@ -242,6 +308,7 @@ async fn resync(
 async fn handle_die(
     docker: &Docker,
     state: &Mutex<ExecutorState>,
+    witness: &oom::OomWitness,
     cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: &mpsc::UnboundedSender<ExitEvent>,
     event: &bollard::models::EventMessage,
@@ -264,12 +331,14 @@ async fn handle_die(
     };
 
     // Claim first; a re-delivery of an already-claimed exit is suppressed (§4).
+    let our_kill;
     let newly_claimed = {
         let mut st = lock_state(state);
         // The die event is proof of death regardless of who holds the claim (a
         // disk kill claims *before* its SIGKILL, then this event confirms it):
         // fire the follower's fast drain unconditionally (§8.2).
         st.note_container_dead(allocation);
+        our_kill = st.killing.contains(&allocation);
         if st.claimed.contains(&allocation) {
             false
         } else {
@@ -289,8 +358,21 @@ async fn handle_die(
     let info = match actor.id.as_deref() {
         Some(id) => match docker.inspect_container(id, INSPECT_OPTS).await {
             Ok(inspect) => {
-                let inspect = super::settle_oom_flag(docker, id, inspect).await;
-                inspect.state.as_ref().and_then(classify::exit_info)
+                // A stop of ours is in flight: the 137 about to be read is our
+                // own grace-expiry SIGKILL, so skip the settle exactly as the
+                // stop's post-inspect does (§4). The caller assigns abort vs
+                // max-runtime attribution; spending the window here would be
+                // pure latency in the events task.
+                let (inspect, verdict) = if our_kill {
+                    (inspect, oom::OomVerdict::NotInQuestion)
+                } else {
+                    super::settle_oom_flag(docker, witness, allocation, id, inspect).await
+                };
+                inspect
+                    .state
+                    .as_ref()
+                    .and_then(classify::exit_info)
+                    .map(|info| classify::apply_oom_verdict(info, verdict))
             }
             Err(_) => None,
         },

@@ -21,6 +21,7 @@ pub mod disk;
 pub mod events;
 pub mod lifecycle;
 pub mod limits;
+pub mod oom;
 pub mod state;
 
 // The per-container telemetry collectors (docker-executor.md §8.1/§8.2), private
@@ -109,6 +110,16 @@ pub(crate) const AGENT_LOG_RESUME_REPLAYED_CHUNKS_TOTAL: &str =
 /// incremented by `reap` alongside a `tracing::error!`.
 pub(crate) const AGENT_LOG_DRAIN_FORCED_TOTAL: &str = "agent_log_drain_forced_total";
 
+/// Exits reported as [`ExitCause::Killed`](crate::executor::ExitCause::Killed):
+/// PID 1 SIGKILLed under a memory limit with the cgroup OOM kill neither
+/// confirmed nor excluded within the settle window (§4). A **warn-level**
+/// signal — each one is an attempt whose terminal outcome names an exit code
+/// where the honest answer is "killed, cause unknown" — and the production
+/// counterpart of the unreproducible CI flake that motivated the witness: if it
+/// is ever non-zero in a fleet, the settle is losing a race the design assumes
+/// it wins.
+const AGENT_OOM_UNCONFIRMED_TOTAL: &str = "agent_oom_unconfirmed_total";
+
 /// Register this module's metric names (docker-executor.md §8.1). Part of the
 /// crate-level `describe_metrics` fan-out.
 pub(crate) fn describe_metrics() {
@@ -126,6 +137,12 @@ pub(crate) fn describe_metrics() {
         AGENT_LOG_DRAIN_FORCED_TOTAL,
         metrics::Unit::Count,
         "Log follower drains forced past drain_force_after, risking tail loss (§8.2)."
+    );
+    metrics::describe_counter!(
+        AGENT_OOM_UNCONFIRMED_TOTAL,
+        metrics::Unit::Count,
+        "SIGKILL exits under a memory limit whose OOM cause the settle window \
+         could not confirm or exclude (§4)."
     );
     disk::describe_metrics();
     cache::describe_metrics();
@@ -264,6 +281,15 @@ pub(crate) struct ExecutorState {
     /// Exits already surfaced (via `next_exit`, `stop`, or a resync): the §4
     /// best-effort duplicate-suppression set.
     pub(crate) claimed: HashSet<AllocationId>,
+    /// Allocations with a `stop` in flight — held only across the stop request.
+    ///
+    /// A 137 from our own grace-expiry SIGKILL is *expected*, so the die event
+    /// for one must not spend the OOM settle window proving what it already
+    /// knows (§4: the same reason the stop's post-inspect skips the settle).
+    /// Without this the die event routinely wins the race against `stop`'s own
+    /// claim, and every aborted memory-limited container stalls the events task
+    /// for the full window.
+    pub(crate) killing: HashSet<AllocationId>,
     /// Allocations with a running container, for the [`AGENT_RUNNING_JOBS`]
     /// gauge. A snapshot, replaced wholesale by `observe`.
     pub(crate) running: HashSet<AllocationId>,
@@ -445,6 +471,9 @@ pub(crate) struct Inner {
     pub(crate) cpu_start: AsyncMutex<()>,
     /// Shared with the events task; never held across an await.
     pub(crate) state: Arc<Mutex<ExecutorState>>,
+    /// Container `oom` events seen on the live tail (§4). Written by the events
+    /// task, read by every natural-exit settle.
+    pub(crate) oom_witness: Arc<oom::OomWitness>,
     /// Natural exits flow from the events task into here; kept on `Inner` as a
     /// keep-alive so [`Executor::next_exit`]'s `recv()` never observes a closed
     /// channel while the executor lives (the events task holds the sender that
@@ -572,9 +601,11 @@ impl DockerExecutor {
         let disk = disk::DiskEnforcer::detect(&docker, config.disk_enforcement).await?;
 
         // Clones only — never `Arc<Inner>` — so `Inner::drop` can abort it.
+        let oom_witness = Arc::new(oom::OomWitness::default());
         let events_task = events::spawn(
             docker.clone(),
             Arc::clone(&state),
+            Arc::clone(&oom_witness),
             cpuset.clone(),
             exit_tx.clone(),
         );
@@ -622,6 +653,7 @@ impl DockerExecutor {
                 cpuset,
                 cpu_start: AsyncMutex::new(()),
                 state,
+                oom_witness,
                 exit_tx,
                 exit_rx: AsyncMutex::new(exit_rx),
                 disk,
@@ -638,7 +670,9 @@ impl DockerExecutor {
 /// Re-inspect delays for [`settle_oom_flag`]: ~1.6 s total, front-loaded
 /// because a lagging `OOMKilled` commit lands within milliseconds of the `die`
 /// event when it lands at all (issue #34 measurements: on a healthy daemon the
-/// flag is committed *before* the event publishes).
+/// flag is committed *before* the event publishes). The ladder is now only the
+/// *backstop* — the witness (§4) is the primary channel — so it deliberately
+/// stops well short of the deadline instead of filling it with polling.
 const OOM_FLAG_DELAYS: [std::time::Duration; 6] = [
     std::time::Duration::from_millis(25),
     std::time::Duration::from_millis(50),
@@ -649,42 +683,143 @@ const OOM_FLAG_DELAYS: [std::time::Duration; 6] = [
 ];
 
 /// Hard wall-clock ceiling on one [`settle_oom_flag`] call, covering the
-/// re-inspect *requests* as well as the sleeps. Without it the bound above is
-/// illusory: bollard requests carry a 120 s timeout (`api::DOCKER_TIMEOUT`),
-/// so six inspects against an unresponsive daemon could pin the events task,
-/// a stop, or observe for minutes. Slightly above the summed delays (~1.6 s)
-/// to leave normal requests real headroom.
-const OOM_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+/// re-inspect *requests* as well as the sleeps. Without it the bound is
+/// illusory: bollard requests carry a 120 s timeout (`api::DOCKER_TIMEOUT`), so
+/// inspects against an unresponsive daemon could pin the events task, a stop,
+/// or observe for minutes.
+///
+/// Comfortably above the ~1.6 s re-inspect ladder because the remaining budget
+/// is spent *waiting on the witness*, not polling: once the ladder is done the
+/// settle is parked on a `Notify` and costs nothing per second. The only price
+/// of the wider window is exit-report latency, and only for an exit that has
+/// the racy shape and no witness yet — which is why a loaded daemon can no
+/// longer blow through it the way a poll-only 2 s bound did (issue #34
+/// follow-up: a CI run where the settle burned its whole 2 s and reported
+/// `Natural` for a 137).
+///
+/// Not wider than this, though: the die-driven settle runs *inline* in the
+/// single events task, so every second here is a second no other container's
+/// exit is being handled. 5 s is the balance — enough headroom over the ladder
+/// for a daemon that is merely slow, short enough that a burst of
+/// unattributable kills cannot stall exit reporting. The give-up memo
+/// ([`oom::OomWitness::note_unconfirmed`]) keeps it to *one* such wait per
+/// allocation however many evidence paths inspect the same corpse.
+const OOM_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Give the daemon a bounded window to commit a lagging `OOMKilled` flag
-/// before exit evidence is extracted (issue #34).
+/// Whether an inspect's state carries a committed `OOMKilled`.
+fn oom_flag_committed(inspect: &bollard::models::ContainerInspectResponse) -> bool {
+    inspect
+        .state
+        .as_ref()
+        .is_some_and(|state| state.oom_killed == Some(true))
+}
+
+/// Settle whether a SIGKILL exit under a memory limit was a cgroup OOM kill,
+/// and say so explicitly (docker-executor.md §4, issue #34).
 ///
-/// Some daemons set `OOMKilled` from an async OOM-event handler that can lag
-/// the `die` event, so an inspect issued at event time can read exit 137 under
-/// a memory limit with the flag still unset — which `classify::exit_info`
-/// would report as `Natural`, misclassifying a real OOM kill as `Failed`
-/// downstream. When `initial` has that racy shape
-/// ([`classify::oom_flag_may_lag`]) this re-inspects on a short backoff until
-/// the flag commits or the budget runs out, returning the freshest inspect
-/// either way; on any other shape it returns `initial` untouched, cost-free.
+/// The daemon does not guarantee `State.OOMKilled` is committed to inspect
+/// state at the instant the `die` event fires, so an inspect taken at event
+/// time can read exit 137 under a memory limit with the flag still unset. Two
+/// channels answer that question here, raced against one shared deadline:
 ///
-/// The flag remains the sole OOM gate: an exhausted budget still classifies
-/// `Natural` (an external SIGKILL of a memory-limited container is
-/// indistinguishable by code alone, and fabricating `OomKilled` would breach
-/// the documented `exit_info` contract). Callers are the *natural-exit*
-/// evidence paths only — the stop post-inspect and the disk enforcer skip it
-/// because a 137 there is expected from their own SIGKILL, and burning the
-/// budget on every hard kill would be pure latency.
+/// 1. **The witness** ([`oom::OomWitness`]) — the daemon's own container `oom`
+///    event, recorded by the events task. This is the primary channel: the
+///    event is *pushed*, and it reaches a live tail ~80 ms **before** `die`, so
+///    by the time a die-driven settle runs the witness is normally already
+///    positive and this returns without sleeping at all.
+/// 2. **The re-inspect ladder** — the original short backoff, kept as the
+///    backstop for the paths a witness cannot cover: an `oom` event that landed
+///    in an events-stream gap, or a settle running under a unit-test executor
+///    with no events task at all.
+///
+/// The return is an explicit [`oom::OomVerdict`], not a silently-adjusted
+/// inspect. `Unconfirmed` — the window closed with neither channel confirming
+/// — is a *third* answer, and callers must not collapse it into `Natural`: PID
+/// 1 was SIGKILLed under a memory limit, which is not "exited on its own",
+/// while an external SIGKILL of a memory-limited container is indistinguishable
+/// from a lost OOM notification, so claiming `OomKilled` would be a guess. See
+/// [`crate::executor::ExitCause::Killed`].
+///
+/// Callers are the *natural-exit* evidence paths only — the stop post-inspect
+/// and the disk enforcer skip it because a 137 there is expected from their own
+/// SIGKILL, and burning the budget on every hard kill would be pure latency.
 pub(crate) async fn settle_oom_flag(
     docker: &Docker,
+    witness: &oom::OomWitness,
+    allocation: AllocationId,
     target: &str,
     initial: bollard::models::ContainerInspectResponse,
-) -> bollard::models::ContainerInspectResponse {
+) -> (bollard::models::ContainerInspectResponse, oom::OomVerdict) {
     if !classify::oom_flag_may_lag(&initial) {
-        return initial;
+        return (initial, oom::OomVerdict::NotInQuestion);
     }
-    let mut latest = initial;
+    // Both short-circuits, in the order that keeps the memo honest: a witness
+    // recorded since the last settle must win over that settle's verdict.
+    if witness.witnessed(allocation) {
+        return (initial, oom::OomVerdict::Confirmed);
+    }
+    if witness.is_unconfirmed(allocation) {
+        return (initial, oom::OomVerdict::Unconfirmed);
+    }
     let deadline = tokio::time::Instant::now() + OOM_SETTLE_DEADLINE;
+
+    /// Which channel answered, if either.
+    enum Settled {
+        Witness,
+        Flag(Box<bollard::models::ContainerInspectResponse>),
+        Neither,
+    }
+
+    let settled = tokio::select! {
+        // Biased: a witness that is already positive short-circuits before the
+        // ladder's first sleep is even scheduled — the common case.
+        biased;
+        witnessed = witness.witnessed_by(allocation, deadline) => {
+            if witnessed { Settled::Witness } else { Settled::Neither }
+        }
+        inspect = reinspect_until_committed(docker, target, &initial, deadline) => {
+            match inspect {
+                Some(inspect) => Settled::Flag(Box::new(inspect)),
+                None => Settled::Neither,
+            }
+        }
+    };
+
+    match settled {
+        // The daemon's own oom event, seen on the live tail.
+        Settled::Witness => (initial, oom::OomVerdict::Confirmed),
+        // The ladder saw the flag commit.
+        Settled::Flag(inspect) => (*inspect, oom::OomVerdict::Confirmed),
+        // Deadline, with neither channel confirming.
+        Settled::Neither => {
+            witness.note_unconfirmed(allocation, Timestamp::now());
+            metrics::counter!(AGENT_OOM_UNCONFIRMED_TOTAL).increment(1);
+            tracing::warn!(
+                target,
+                %allocation,
+                "exit 137 under a memory limit with no OOMKilled flag and no oom event \
+                 within the settle window; reporting the kill as cause-unconfirmed \
+                 (external SIGKILL, or a daemon that lost the OOM notification)"
+            );
+            (initial, oom::OomVerdict::Unconfirmed)
+        }
+    }
+}
+
+/// Re-inspect `target` on the [`OOM_FLAG_DELAYS`] backoff until the `OOMKilled`
+/// flag is committed, returning that inspect; `None` if the ladder runs out (or
+/// `deadline` arrives) with the flag still unset.
+///
+/// Never resolves before the deadline once the ladder is exhausted: this is one
+/// half of a `select!` whose other half is the witness wait, and returning
+/// early would cut that wait short.
+async fn reinspect_until_committed(
+    docker: &Docker,
+    target: &str,
+    initial: &bollard::models::ContainerInspectResponse,
+    deadline: tokio::time::Instant,
+) -> Option<bollard::models::ContainerInspectResponse> {
+    debug_assert!(!oom_flag_committed(initial));
     for delay in OOM_FLAG_DELAYS {
         tokio::time::sleep(delay).await;
         // The per-request clamp is what makes the settle's bound real: a
@@ -695,12 +830,8 @@ pub(crate) async fn settle_oom_flag(
             None::<bollard::query_parameters::InspectContainerOptions>,
         );
         match tokio::time::timeout_at(deadline, request).await {
-            Ok(Ok(inspect)) => {
-                if !classify::oom_flag_may_lag(&inspect) {
-                    return inspect;
-                }
-                latest = inspect;
-            }
+            Ok(Ok(inspect)) if oom_flag_committed(&inspect) => return Some(inspect),
+            Ok(Ok(_)) => {}
             // A torn read mid-settle: keep the evidence we already hold.
             Ok(Err(err)) => {
                 tracing::debug!(target, error = %err, "re-inspect failed while settling OOMKilled");
@@ -710,16 +841,13 @@ pub(crate) async fn settle_oom_flag(
                     target,
                     "settle deadline hit mid-inspect; keeping prior evidence"
                 );
-                break;
+                return None;
             }
         }
     }
-    tracing::warn!(
-        target,
-        "exit 137 under a memory limit but OOMKilled never committed; \
-         classifying Natural (external SIGKILL, or a daemon that lost the OOM event)"
-    );
-    latest
+    // Ladder exhausted: hand the rest of the budget to the witness wait.
+    tokio::time::sleep_until(deadline).await;
+    None
 }
 
 /// Release an allocation's CPU bookkeeping and push the enlarged shared pool

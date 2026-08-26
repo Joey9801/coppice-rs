@@ -485,8 +485,20 @@ pub(crate) async fn stop(
             // A natural-exit verdict, so settle a lagging OOMKilled commit
             // first (issue #34); a running container has no exit code and
             // passes through untouched.
-            let inspect = super::settle_oom_flag(&inner.docker, &name, inspect).await;
-            if let Some(info) = inspect.state.as_ref().and_then(classify::exit_info) {
+            let (inspect, verdict) = super::settle_oom_flag(
+                &inner.docker,
+                &inner.oom_witness,
+                allocation,
+                &name,
+                inspect,
+            )
+            .await;
+            if let Some(info) = inspect
+                .state
+                .as_ref()
+                .and_then(classify::exit_info)
+                .map(|info| classify::apply_oom_verdict(info, verdict))
+            {
                 claim_exit(inner, allocation).await;
                 return Ok(StopOutcome::AlreadyExited(info));
             }
@@ -494,11 +506,15 @@ pub(crate) async fn stop(
         }
     }
 
-    // 2. Issue the stop with grace ceiled to whole seconds.
+    // 2. Issue the stop with grace ceiled to whole seconds. Mark the kill in
+    //    flight first so a die event that beats our own claim knows the 137 it
+    //    is about to see is ours, and skips the OOM settle (§4).
+    lock_state(&inner.state).killing.insert(allocation);
     let options = StopContainerOptionsBuilder::new()
         .t(grace_to_secs_ceil(grace))
         .build();
-    match inner.docker.stop_container(&name, Some(options)).await {
+    let stopped = inner.docker.stop_container(&name, Some(options)).await;
+    match stopped {
         Ok(()) => {
             // Post-inspect for the terminal evidence. Deliberately *not*
             // settled via settle_oom_flag: a 137 here is expected from our own
@@ -591,13 +607,28 @@ pub(crate) async fn observe(inner: &Inner) -> Result<Vec<ObservedContainer>, Exe
         // Recovery evidence feeds journaling like any natural exit, so give a
         // lagging OOMKilled commit its bounded window too (issue #34); almost
         // always a no-op this long after the exit.
-        let inspect = super::settle_oom_flag(&inner.docker, target, inspect).await;
+        let (inspect, verdict) = super::settle_oom_flag(
+            &inner.docker,
+            &inner.oom_witness,
+            ids.allocation,
+            target,
+            inspect,
+        )
+        .await;
         let Some(cstate) = inspect.state.as_ref() else {
             continue;
         };
 
         match state::map_container(cstate, now) {
             Mapped::Report(runtime_state) => {
+                // The §3 table reads the `OOMKilled` flag alone; re-stamp an
+                // exit with what the settle actually concluded (§4).
+                let runtime_state = match runtime_state {
+                    ContainerState::Exited(info) => {
+                        ContainerState::Exited(classify::apply_oom_verdict(info, verdict))
+                    }
+                    running => running,
+                };
                 if matches!(runtime_state, ContainerState::Running { .. }) {
                     running.insert(ids.allocation);
                     // Queue a collector resume for a running container we are not
@@ -746,6 +777,10 @@ pub(crate) async fn reap(inner: &Inner, allocation: AllocationId) -> Result<(), 
         st.claimed.remove(&allocation);
         st.running.remove(&allocation);
         st.starting.remove(&allocation);
+        // The kill marker is deliberately not cleared when `stop` returns: the
+        // die event it exists for can land after that, and the entry is
+        // meaningless once the container is gone anyway.
+        st.killing.remove(&allocation);
         st.push_running_gauge();
     }
     // Reap is the terminal cleanup: drop the image pin here (evidence retention
@@ -753,6 +788,10 @@ pub(crate) async fn reap(inner: &Inner, allocation: AllocationId) -> Result<(), 
     // `last_used_at` on the image when its last pin drains, starting the TTL
     // clock from the end of the last attempt that used it.
     inner.cache.release(allocation);
+    // Reap is also the last moment any evidence path can ask about this
+    // allocation's OOM witness (§4), so drop it here rather than leaving it to
+    // the registry's TTL.
+    inner.oom_witness.forget(allocation);
     Ok(())
 }
 

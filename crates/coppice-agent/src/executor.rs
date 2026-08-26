@@ -66,6 +66,28 @@ pub enum ExitCause {
     OomKilled,
     /// The disk enforcer killed it for exceeding its writable-layer budget.
     DiskKilled,
+    /// PID 1 died to a SIGKILL that neither we nor the daemon can attribute:
+    /// exit 137 under an explicit memory limit, with the cgroup OOM kill
+    /// neither confirmed nor excluded by the bounded settle
+    /// (docker-executor.md §4).
+    ///
+    /// This is deliberately **not** `Natural`. A container killed by a signal
+    /// did not "exit on its own", and reporting one as if it had is the single
+    /// worst answer available here: an operator debugging a job the kernel
+    /// killed for memory is shown "exited normally", which is precisely the
+    /// diagnosis the cause field exists to give them. It is equally not
+    /// `OomKilled`: an external SIGKILL of a memory-limited container (an
+    /// operator's `docker kill`, a host-level kill) is indistinguishable from
+    /// an OOM whose daemon-side notification was lost, and inventing a limit
+    /// breach would put a `MemoryLimitExceeded` on an attempt that never
+    /// breached anything.
+    ///
+    /// So it says only what is known: killed, cause unconfirmed. It is rare by
+    /// construction — both the `OOMKilled` flag and the daemon's `oom` event
+    /// have to go missing — and metered
+    /// ([`AGENT_OOM_UNCONFIRMED_TOTAL`](crate::executor::docker::AGENT_OOM_UNCONFIRMED_TOTAL))
+    /// so the rate is observable rather than assumed.
+    Killed,
 }
 
 /// An allocation's process having exited, with how it ended. Carried from
@@ -155,7 +177,14 @@ pub fn classify_exit(exit: &ExitInfo) -> AttemptOutcome {
     match exit.cause {
         ExitCause::OomKilled => AttemptOutcome::MemoryLimitExceeded,
         ExitCause::DiskKilled => AttemptOutcome::DiskLimitExceeded,
-        ExitCause::Natural => AttemptOutcome::Exited { code: exit.code },
+        // A kill we could not attribute reports the same *outcome* as a plain
+        // exit — the code (137) is the only fact we have, and the replicated
+        // outcome taxonomy has no "killed, cause unknown" variant to name it.
+        // Adding one is a replicated-contract change (core enum + proto +
+        // descriptor gate + coordinator + journal) and wants its own ADR; the
+        // evidence layer records the distinction now so that decision is a
+        // mapping change here and nothing else.
+        ExitCause::Natural | ExitCause::Killed => AttemptOutcome::Exited { code: exit.code },
     }
 }
 
