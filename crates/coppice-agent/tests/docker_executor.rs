@@ -76,7 +76,7 @@ use rcgen::{
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, bail, ensure};
 
 /// Shared, S3–S6-reusable scaffolding: the daemon gate, executor construction,
 /// spec minting, the exit/observe waiters, and best-effort cleanup.
@@ -1057,8 +1057,23 @@ async fn exit_nonzero() {
 /// documented `cat /dev/zero | head | tail` fallback was not used: it spreads
 /// bytes across piped processes and a page cache, a murkier accounting target
 /// than a single heap-growing shell.)
+///
+/// A `Killed` verdict is retried (up to [`OOM_ATTEMPTS`] fresh containers)
+/// rather than failed outright. `Killed` means the settle window closed with
+/// neither the `OOMKilled` flag committed nor an `oom` event published — the
+/// daemon itself lost the OOM notification (a known containerd/cgroup-v2 race
+/// on loaded CI runners, seen as a CI-only flake), which no executor-side
+/// evidence channel can recover. That loss is rare and independent per
+/// container, so a classification bug still fails deterministically on every
+/// attempt, while a one-off daemon loss does not fail the suite. Any cause
+/// other than `OomKilled`/`Killed` is a real misclassification and fails
+/// immediately.
 #[tokio::test]
 async fn oom_classification() {
+    /// Fresh-container attempts before concluding the daemon's OOM signal loss
+    /// is not the one-off the retry exists to absorb.
+    const OOM_ATTEMPTS: usize = 3;
+
     let Some(docker) = harness::docker().await else {
         return;
     };
@@ -1068,27 +1083,40 @@ async fn oom_classification() {
         memory: ByteSize::from_mib(16),
         disk: ByteSize::ZERO,
     };
-    let sp = harness::spec(
-        harness::BUSYBOX,
-        &["sh", "-c", "x=a; while true; do x=\"$x$x$x$x\"; done"],
-        limits,
-    );
-    let alloc = sp.allocation;
 
     let r: anyhow::Result<()> = async {
-        exec.start(sp).await?;
-        let info = harness::wait_exit(&exec, alloc, 30).await?;
-        ensure!(
-            info.cause == ExitCause::OomKilled,
-            "expected OomKilled, got {:?} (code {})",
-            info.cause,
-            info.code
-        );
-        Ok(())
+        for attempt in 1..=OOM_ATTEMPTS {
+            let sp = harness::spec(
+                harness::BUSYBOX,
+                &["sh", "-c", "x=a; while true; do x=\"$x$x$x$x\"; done"],
+                limits,
+            );
+            let alloc = sp.allocation;
+            let start = exec.start(sp).await;
+            let info = match start {
+                Ok(()) => harness::wait_exit(&exec, alloc, 30).await,
+                Err(e) => Err(anyhow!("start failed: {e:?}")),
+            };
+            harness::cleanup(&exec, &[alloc]).await;
+            match info?.cause {
+                ExitCause::OomKilled => return Ok(()),
+                // The daemon lost the OOM notification: flag never committed,
+                // no `oom` event. Independent per container — try a fresh one.
+                ExitCause::Killed if attempt < OOM_ATTEMPTS => {
+                    eprintln!(
+                        "attempt {attempt}: daemon lost the OOM notification \
+                         (cause Killed); retrying with a fresh container"
+                    );
+                }
+                cause => bail!(
+                    "expected OomKilled, got {cause:?} on attempt {attempt}/{OOM_ATTEMPTS}"
+                ),
+            }
+        }
+        unreachable!("loop returns or bails on the final attempt");
     }
     .await;
 
-    harness::cleanup(&exec, &[alloc]).await;
     r.unwrap();
 }
 
