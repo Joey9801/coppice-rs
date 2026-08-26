@@ -108,7 +108,7 @@ issue #47.
 
 | # | Gap | Today |
 | --- | --- | --- |
-| A1 | ~~Node identity + config are hand-authored~~ — landed | the agent mints `NodeId::new()` on first boot and persists it at `<data_dir>/node-identity`; `node_id` is gone from `agent.toml` (a tombstone key rejects it with the migration), so a fleet ships one byte-identical file |
+| A1 | ~~Node identity + config are hand-authored~~ — landed | the agent mints `NodeId::new()` on first boot and persists it at `<data_dir>/node-identity`; `node_id` is gone from `agent.toml`, so a fleet ships one byte-identical file |
 | A2 | ~~Cert issuance is out-of-band~~ — landed | ADR 0011's enrollment-token → CSR → per-node-cert flow is built (`POST /api/v1/enroll`, `[enrollment]` in `configuration.md`, agent-side renewal), resolving OD-15a; see the plan below for the shape as shipped |
 | A3 | ~~Capacity is static config~~ — landed | cpu/memory/disk are detected at startup (`available_parallelism` ∩ cgroup `cpu.max`, `MemTotal` ∩ `memory.max`, `statvfs` on `data_dir`); `[capacity]` survives only as a per-dimension override |
 | A4 | No graceful scale-in | `SetNodeSchedulable` exists in the state machine but **nothing calls it** (no API, no CLI); there is no compute-node removal/GC command at all; scale-in today = instance dies → 90 s liveness timeout → `DeclareNodeLost` → running attempts killed as `NodeLost` |
@@ -118,11 +118,9 @@ issue #47.
 
 **A1 — self-minted agent identity (mirrors ADR 0025), landed.** On first
 boot with no journal, the agent mints `NodeId::new()` and persists it at
-`<data_dir>/node-identity`; `node_id` left `agent.toml` (the key is a
-tombstone that fail-stops with the migration, which for a pre-A1 node is
-"seed the identity file once with your existing id"). A data dir holding
-a journal but no identity file is a hard error, never a re-mint — fencing
-history and the leaf's CN both hang off the id. The CN↔NodeId binding
+`<data_dir>/node-identity`; `node_id` left `agent.toml`. A data dir
+holding a journal but no identity file is a hard error, never a re-mint —
+fencing history and the leaf's CN both hang off the id. The CN↔NodeId binding
 inverted as planned: identity exists first, enrollment issues the cert
 *for* it, and `coppice dev` now goes through this same production path.
 

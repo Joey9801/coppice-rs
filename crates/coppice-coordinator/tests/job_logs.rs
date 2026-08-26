@@ -107,12 +107,7 @@ fn agent_config(
     .expect("seed the agent node identity");
 
     Config {
-        // Identity is minted and persisted by the agent itself
-        // (deployment-story A1); the harness passes it to `Session::new`
-        // directly, and the tombstone stays unset.
-        node_id: None,
         data_dir,
-        coordinators: None,
         // One coordinator, this harness's gateway (ADR 0037 §2).
         discovery: SeedConfig::static_seeds(vec![endpoint.to_string()]),
         tls: TlsConfig {

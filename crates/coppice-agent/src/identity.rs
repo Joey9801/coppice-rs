@@ -15,11 +15,11 @@
 //!   while its journal, its leaf's CN, and the coordinator's view of it all
 //!   still name the first.
 //! * **A data directory with prior state but no identity file is a hard
-//!   error.** That is the shape of a pre-A1 deployment upgraded in place, whose
-//!   node id used to live in `agent.toml`. Minting there would break journal
-//!   fencing (the recovered `(leader_term, node_epoch)` watermark belongs to
-//!   the old id) and the certificate CN binding, so the agent refuses and tells
-//!   the operator to write the id it already has into the file, once.
+//!   error.** That shape only arises when the identity file has gone missing
+//!   from a directory the agent already ran in. Minting there would break
+//!   journal fencing (the recovered `(leader_term, node_epoch)` watermark
+//!   belongs to the old id) and the certificate CN binding, so the agent
+//!   refuses and tells the operator to restore the id or start fresh.
 //!
 //! "Prior state" is probed as the presence of the agent's journal
 //! ([`crate::journal::JOURNAL`], `<data_dir>/journal`). It is the right probe
@@ -48,7 +48,8 @@ const NODE_IDENTITY_TMP: &str = "node-identity.tmp";
 /// Load the persisted node identity from `<data_dir>/node-identity`.
 ///
 /// `Ok(None)` when the file is absent — the caller decides whether that is a
-/// fresh installation (mint) or an upgraded one (refuse). `Err` when the file
+/// fresh installation (mint) or a missing file beside prior state (refuse).
+/// `Err` when the file
 /// exists but cannot be read or does not parse as a `node-<uuid>`: a directory
 /// this agent must not paper over.
 pub fn load_node_identity(data_dir: &Path) -> Result<Option<NodeId>> {
@@ -78,7 +79,7 @@ pub fn load_node_identity(data_dir: &Path) -> Result<Option<NodeId>> {
 /// * File absent, no prior agent state → mint [`NodeId::new`], write it
 ///   durably (`tmp` + fsync + rename + directory fsync, ADR 0017), return it.
 /// * File absent but a journal is present → error instructing the operator to
-///   seed the file with the node id this installation already goes by.
+///   restore the node id this installation already goes by, or start fresh.
 ///
 /// `data_dir` is created if missing, so an agent pointed at a fresh path mints
 /// without a separate setup step.
@@ -100,11 +101,11 @@ pub fn load_or_mint_node_identity(data_dir: &Path) -> Result<NodeId> {
     })?;
     if has_prior_state {
         bail!(
-            "{data} holds an agent journal but no {file}: this looks like a node \
-             upgraded from a release that kept `node_id` in agent.toml. Minting a \
-             fresh identity here would break journal fencing and the certificate CN \
-             binding, so write the node id this agent already goes by into {path} \
-             (one line, `node-<uuid>`) and restart.",
+            "{data} holds an agent journal but no {file}: the identity file has gone \
+             missing from a directory this agent already ran in. Minting a fresh \
+             identity would break journal fencing and the certificate CN binding, so \
+             restore the node id this agent goes by into {path} (one line, \
+             `node-<uuid>`) and restart — or point the agent at a fresh data_dir.",
             data = data_dir.display(),
             file = NODE_IDENTITY_FILE,
             path = data_dir.join(NODE_IDENTITY_FILE).display(),
@@ -202,11 +203,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join(crate::journal::JOURNAL), b"").expect("write");
 
-        let err = load_or_mint_node_identity(dir.path()).expect_err("upgraded node is fatal");
+        let err =
+            load_or_mint_node_identity(dir.path()).expect_err("a missing identity file is fatal");
         let text = format!("{err:#}");
         assert!(
             text.contains(NODE_IDENTITY_FILE),
-            "the error names the file to write: {text}"
+            "the error names the file to restore: {text}"
         );
         assert!(
             !dir.path().join(NODE_IDENTITY_FILE).exists(),
@@ -216,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_seeded_identity_beside_a_journal_loads() {
-        // The documented remedy for the case above.
+        // The documented remedy for the case above: restore the id, restart.
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join(crate::journal::JOURNAL), b"").expect("write");
         let existing = NodeId::new();
