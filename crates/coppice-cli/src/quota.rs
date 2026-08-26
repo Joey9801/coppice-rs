@@ -193,10 +193,10 @@ fn quota_node_row(node: &dto::QuotaEntityNode) -> Vec<String> {
 }
 
 /// Format a ratio (`over_quota_ratio` or `penalty`) to two decimals, or as
-/// `unbounded` when it is not finite. The wire type is a plain `f64` — the
-/// DTO has no room for a null here, so this branch exists purely to give a
-/// non-finite value (an entity with zero quota and nonzero usage) a readable
-/// word instead of Rust's raw `inf`/`NaN` spelling.
+/// `unbounded` when it is not finite. The infinite case is real and reachable
+/// — an entity with zero quota and nonzero usage is infinitely over — and it
+/// arrives here as a wire `null` that the DTO reads back as `f64::INFINITY`;
+/// this branch gives it a readable word instead of Rust's raw `inf`/`NaN`.
 fn format_ratio(value: f64) -> String {
     if value.is_finite() {
         format!("{value:.2}")
@@ -530,6 +530,38 @@ mod tests {
         }
     }
 
+    /// The wire body for an entity that is infinitely over quota (zero quota,
+    /// nonzero usage): the API renders those non-finite floats as JSON
+    /// `null`, so it is written literally here rather than via a DTO, to pin
+    /// the shape the CLI actually has to decode.
+    fn unbounded_node_json(id: QuotaEntityId) -> serde_json::Value {
+        serde_json::json!({
+            "id": id.to_string(),
+            "name": "starved",
+            "parent": null,
+            "quota_ucu": 0,
+            "usage_ucu": 42,
+            "over_quota_ratio": null,
+            "penalty": null,
+            "created_at": "1970-01-01T00:00:01.000000Z",
+            "updated_at": "1970-01-01T00:00:02.000000Z",
+            "queued_count": 1,
+            "running_count": 0,
+        })
+    }
+
+    fn unbounded_view_json(id: QuotaEntityId) -> serde_json::Value {
+        serde_json::json!({
+            "id": id.to_string(),
+            "name": "starved",
+            "parent": null,
+            "quota_ucu": 0,
+            "usage_ucu": 42,
+            "over_quota_ratio": null,
+            "penalty": null,
+        })
+    }
+
     fn client(base: &str) -> ApiClient {
         ApiClient::new(base).unwrap()
     }
@@ -551,6 +583,70 @@ mod tests {
         );
         let base = spawn(router).await;
         list(&client(&base), false).await.expect("list succeeds");
+    }
+
+    /// A zero-quota entity with nonzero usage is infinitely over quota, and
+    /// the API serves that as JSON `null`. `quota list` must decode it (not
+    /// fail on the null) and render it as `unbounded`.
+    #[tokio::test]
+    async fn list_accepts_null_over_quota_ratio_and_renders_unbounded() {
+        let id = quota_id(12);
+        let body = serde_json::json!({ "entities": [unbounded_node_json(id)] });
+        let router = Router::new().route(
+            "/api/v1/quota-entities",
+            get({
+                let body = body.clone();
+                move || {
+                    let body = body.clone();
+                    async move { Json(body) }
+                }
+            }),
+        );
+        let base = spawn(router).await;
+        list(&client(&base), false)
+            .await
+            .expect("list decodes null over_quota_ratio");
+
+        // The same body, through the same decode the renderer sees.
+        let page: dto::ListQuotaEntitiesResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(page.entities[0].over_quota_ratio, f64::INFINITY);
+        assert_eq!(page.entities[0].penalty, f64::INFINITY);
+        let rendered = render_quota_list(&page.entities);
+        assert!(rendered.contains("unbounded"), "{rendered}");
+        assert!(!rendered.contains("inf"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn show_accepts_null_over_quota_ratio_and_renders_unbounded() {
+        let id = quota_id(13);
+        let body = serde_json::json!({
+            "entity": unbounded_node_json(id),
+            "chain": [unbounded_view_json(id)],
+            "children": [unbounded_node_json(quota_id(14))],
+            "stats": serde_json::to_value(sample_stats()).unwrap(),
+        });
+        let router = Router::new().route(
+            "/api/v1/quota-entities/:entity",
+            get({
+                let body = body.clone();
+                move |AxumPath(_entity): AxumPath<String>| {
+                    let body = body.clone();
+                    async move { Json(body) }
+                }
+            }),
+        );
+        let base = spawn(router).await;
+        show(&client(&base), id, false)
+            .await
+            .expect("show decodes null over_quota_ratio");
+
+        let detail: dto::GetQuotaEntityResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(detail.entity.over_quota_ratio, f64::INFINITY);
+        assert_eq!(detail.chain[0].penalty, f64::INFINITY);
+        let rendered = render_quota_detail(&detail);
+        assert!(rendered.contains("over quota      unbounded"), "{rendered}");
+        assert!(rendered.contains("penalty         unbounded"), "{rendered}");
+        assert!(!rendered.contains("inf"), "{rendered}");
     }
 
     #[test]

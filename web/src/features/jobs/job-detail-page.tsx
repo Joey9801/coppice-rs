@@ -12,7 +12,13 @@ import {
   type QuotaEntityView,
 } from '@/api/types'
 import { useJob, useJobLogs } from '@/api/queries'
-import { formatDuration, formatPercent, formatTimeAgo, formatTimestamp } from '@/lib/format'
+import {
+  formatDuration,
+  formatMultiplier,
+  formatPercent,
+  formatTimeAgo,
+  formatTimestamp,
+} from '@/lib/format'
 import { EmptyState, LogViewer, PageHeader, StatePill, StatTile, TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -271,7 +277,7 @@ function EntityChain({ chain }: { chain: QuotaEntityView[] }): ReactNode {
                 variant="outline"
                 className="border-amber-500/40 text-amber-600 dark:text-amber-400"
               >
-                over quota ×{Number(entity.penalty.toPrecision(3))}
+                over quota {formatMultiplier(entity.penalty)}
               </Badge>
             ) : null}
           </Fragment>

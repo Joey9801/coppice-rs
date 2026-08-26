@@ -11,7 +11,7 @@ import type {
 import { derivePhase, JOB_PHASES } from '@/api/types'
 import { useJobs, useQuotaEntities, useQuotaEntity } from '@/api/queries'
 import { canConfigureEntities, useSession } from '@/auth/session'
-import { formatDuration, formatPercent, formatUcu } from '@/lib/format'
+import { formatDuration, formatMultiplier, formatPercent, formatUcu } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
   EmptyState,
@@ -138,12 +138,18 @@ function EntityDetailBody({
         <StatTile
           label="Quota"
           value={formatUcu(entity.quotaUcu)}
-          hint={`${formatPercent(entity.overQuotaRatio)} used`}
+          hint={
+            Number.isFinite(entity.overQuotaRatio)
+              ? `${formatPercent(entity.overQuotaRatio)} used`
+              : 'unbounded'
+          }
         />
         <StatTile
           label="Penalty"
           value={
-            <span className={cn(over && 'text-destructive')}>×{entity.penalty.toFixed(2)}</span>
+            <span className={cn(over && 'text-destructive')}>
+              {formatMultiplier(entity.penalty)}
+            </span>
           }
           hint="multiplies queue cost"
         />

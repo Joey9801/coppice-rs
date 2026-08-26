@@ -67,8 +67,14 @@ export function formatUcuRatePerHour(rateUcuPerSecond: number): string {
   return `${formatUcu(rateUcuPerSecond * 3600)}/hour`
 }
 
-/** A cost/scheduling multiplier: "×2", "×1.5" (trimmed to a few sig figs). */
+/**
+ * A cost/scheduling multiplier: "×2", "×1.5" (trimmed to a few sig figs), or
+ * "unbounded" for a non-finite multiplier (e.g. a zero-quota entity's
+ * penalty, which the wire serializes as `null` and the real client maps to
+ * `Infinity` — see `real-client.ts`'s `orInfinity`).
+ */
 export function formatMultiplier(multiplier: number): string {
+  if (!Number.isFinite(multiplier)) return 'unbounded'
   return `×${Number(multiplier.toPrecision(3))}`
 }
 
