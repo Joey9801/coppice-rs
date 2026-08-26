@@ -1616,6 +1616,18 @@ export class MockWorld {
     return PRIORITY_MULTIPLIER[priority] ?? 1
   }
 
+  /**
+   * Mirrors the server's `over_quota_ratio` (dto.rs `QuotaEntityNode`):
+   * `usage / quota`, but `Infinity` for a zero-quota entity with nonzero
+   * usage (reachable here via `configureQuotaEntity`, which lets an update
+   * drop `quotaUcu` to 0 while deliberately preserving accumulated usage) —
+   * not the `0` a naive `quota > 0 ? … : 0` guard would give.
+   */
+  private overQuotaRatio(usageUcu: number, quotaUcu: number): number {
+    if (quotaUcu > 0) return usageUcu / quotaUcu
+    return usageUcu > 0 ? Number.POSITIVE_INFINITY : 0
+  }
+
   private penaltyChain(entityId: string): Array<{
     entity: string
     name: string
@@ -1627,7 +1639,7 @@ export class MockWorld {
     const chain = []
     let cur: QEntity | undefined = this.entities.get(entityId)
     while (cur) {
-      const ratio = cur.quotaUcu > 0 ? cur.usageUcu / cur.quotaUcu : 0
+      const ratio = this.overQuotaRatio(cur.usageUcu, cur.quotaUcu)
       chain.push({
         entity: cur.id,
         name: cur.name,
@@ -2165,7 +2177,7 @@ export class MockWorld {
 
   /** Project one entity to the read-only view (usage rounded at the edge). */
   private entityView(ent: QEntity): QuotaEntityView {
-    const ratio = ent.quotaUcu > 0 ? ent.usageUcu / ent.quotaUcu : 0
+    const ratio = this.overQuotaRatio(ent.usageUcu, ent.quotaUcu)
     return {
       id: ent.id,
       name: ent.name,
@@ -2411,7 +2423,7 @@ export class MockWorld {
     queuedCount: number,
     runningCount: number,
   ): QuotaEntityNode {
-    const ratio = ent.quotaUcu > 0 ? ent.usageUcu / ent.quotaUcu : 0
+    const ratio = this.overQuotaRatio(ent.usageUcu, ent.quotaUcu)
     return {
       id: ent.id,
       name: ent.name,

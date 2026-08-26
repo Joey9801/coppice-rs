@@ -1,5 +1,5 @@
 import type { QueuePositionExplainer } from '@/api/types'
-import { formatDuration, formatUcu } from '@/lib/format'
+import { formatDuration, formatMultiplier, formatUcu } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -72,10 +72,10 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
                         link.overQuotaRatio > 1 && 'text-red-600 dark:text-red-400',
                       )}
                     >
-                      ×{sig(link.overQuotaRatio, 3)}
+                      {formatMultiplier(link.overQuotaRatio)}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      ×{sig(link.penalty, 3)}
+                      {formatMultiplier(link.penalty)}
                     </TableCell>
                   </TableRow>
                 ))}

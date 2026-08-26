@@ -174,6 +174,124 @@ describe('getJobUsage', () => {
   })
 })
 
+describe('getQuotaEntity', () => {
+  it('maps a null over_quota_ratio/penalty (infinite on the wire) to Infinity', async () => {
+    const entityWithInfiniteFields = {
+      id: 'quota-00000000-0000-0000-0000-000000000001',
+      name: 'zero-quota-team',
+      parent: null,
+      quota_ucu: 0,
+      usage_ucu: 10,
+      over_quota_ratio: null,
+      penalty: null,
+      created_at: '2026-01-01T00:00:00.000000Z',
+      updated_at: '2026-01-01T00:00:00.000000Z',
+      queued_count: 0,
+      running_count: 1,
+    }
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        entity: entityWithInfiniteFields,
+        chain: [
+          {
+            id: 'quota-00000000-0000-0000-0000-000000000001',
+            name: 'zero-quota-team',
+            parent: null,
+            quota_ucu: 0,
+            usage_ucu: 10,
+            over_quota_ratio: null,
+            penalty: null,
+          },
+        ],
+        children: [],
+        stats: {
+          by_state: {},
+          oldest_queued_age_seconds: null,
+          burn_rate_ucu_per_second: 0,
+          charged_ucu_24h: null,
+          usage_history: [],
+        },
+      }),
+    )
+    const client = createRealClient()
+    const detail = await client.getQuotaEntity('quota-00000000-0000-0000-0000-000000000001')
+
+    expect(detail.entity.overQuotaRatio).toBe(Infinity)
+    expect(detail.entity.penalty).toBe(Infinity)
+    expect(detail.chain[0]!.overQuotaRatio).toBe(Infinity)
+    expect(detail.chain[0]!.penalty).toBe(Infinity)
+  })
+})
+
+describe('getJob queue explainer', () => {
+  it('maps a null penalty_chain entry and penalty_product (infinite on the wire) to Infinity', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: 'job-00000000-0000-0000-0000-000000000001',
+        state: 'queued',
+        spec: {
+          image: 'busybox',
+          command: [],
+          entrypoint: null,
+          requests: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
+          priority: 0,
+          max_runtime_seconds: null,
+          quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
+          retry: { max_retries: 0, retry_user_errors: false },
+        },
+        submitted_at: '2026-01-01T00:00:00.000000Z',
+        state_since: '2026-01-01T00:00:00.000000Z',
+        terminal_at: null,
+        retries_used: 0,
+        abort_requested: null,
+        entity_chain: [],
+        attempts: [],
+        queue: {
+          multiplier: 1,
+          penalty_chain: [
+            {
+              entity: 'quota-00000000-0000-0000-0000-000000000001',
+              name: 'zero-quota-team',
+              usage_ucu: 10,
+              quota_ucu: 0,
+              over_quota_ratio: null,
+              penalty: null,
+            },
+          ],
+          penalty_product: null,
+          age_seconds: 5,
+        },
+        accrual: null,
+        cost: {
+          rate_ucu_per_second: 0,
+          rate_breakdown: { cpu: 0, memory: 0, disk: 0 },
+          priority_multiplier: 1,
+          unbounded_multiplier: 1,
+          effective_rate_ucu_per_second: 0,
+          charge_window_seconds: 0,
+          charge_window_is_default: true,
+          estimated_ucu: 0,
+          charged_ucu: 0,
+          refund_fraction: 0,
+          actual_ucu: null,
+          true_up: null,
+        },
+      }),
+    )
+    const client = createRealClient()
+    const job = await client.getJob('job-00000000-0000-0000-0000-000000000001')
+
+    expect(job.queue).not.toBeNull()
+    expect(job.queue!.penaltyChain[0]!.overQuotaRatio).toBe(Infinity)
+    expect(job.queue!.penaltyChain[0]!.penalty).toBe(Infinity)
+    expect(job.queue!.penaltyProduct).toBe(Infinity)
+    // An infinite penalty product means the job's effective score is the
+    // lowest possible (multiplier / Infinity), not the finite fallback used
+    // for a not-yet-computed (zero) penalty product.
+    expect(job.queue!.score).toBe(0)
+  })
+})
+
 describe('error translation', () => {
   it('maps a wire error code to the matching ApiErrorCode', async () => {
     fetchMock.mockResolvedValueOnce(

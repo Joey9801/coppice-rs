@@ -659,20 +659,33 @@ function mapJobSpec(s: WireJobSpecView): JobSpec {
   }
 }
 
+/**
+ * `over_quota_ratio`/`penalty` are `f64` on the server and serialize as JSON
+ * `null` when infinite (a zero-quota entity with nonzero usage — see the
+ * dto.rs `QuotaEntityNode` doc comment); JSON has no infinity. Modeled as
+ * `number | null` here and mapped to `Number.POSITIVE_INFINITY` below so the
+ * app-side type stays a plain `number` with the honest in-memory value.
+ */
 interface WirePenaltyLink {
   entity: QuotaEntityId
   name: string
   usage_ucu: number
   quota_ucu: number
-  over_quota_ratio: number
-  penalty: number
+  over_quota_ratio: number | null
+  penalty: number | null
 }
 
 interface WireQueuePositionExplainer {
   multiplier: number
   penalty_chain: WirePenaltyLink[]
-  penalty_product: number
+  /** Product of the chain penalties — also `null` when infinite; see above. */
+  penalty_product: number | null
   age_seconds: number
+}
+
+/** `null` (non-finite on the wire) becomes the honest in-memory `Infinity`. */
+function orInfinity(n: number | null): number {
+  return n ?? Number.POSITIVE_INFINITY
 }
 
 /**
@@ -687,17 +700,26 @@ function mapQueuePositionExplainer(q: WireQueuePositionExplainer): QueuePosition
   return {
     rank: 0,
     queueDepth: 0,
-    score: q.penalty_product > 0 ? q.multiplier / q.penalty_product : q.multiplier,
+    // `null` penalty_product means infinite (see `orInfinity`): the job's
+    // effective score is then 0 (multiplier / Infinity), the lowest
+    // priority, not the `q.multiplier` fallback used for the finite
+    // non-positive case (penalty_product not yet computed).
+    score:
+      q.penalty_product === null
+        ? 0
+        : q.penalty_product > 0
+          ? q.multiplier / q.penalty_product
+          : q.multiplier,
     multiplier: q.multiplier,
     penaltyChain: q.penalty_chain.map((p) => ({
       entity: p.entity,
       name: p.name,
       usageUcu: p.usage_ucu,
       quotaUcu: p.quota_ucu,
-      overQuotaRatio: p.over_quota_ratio,
-      penalty: p.penalty,
+      overQuotaRatio: orInfinity(p.over_quota_ratio),
+      penalty: orInfinity(p.penalty),
     })),
-    penaltyProduct: q.penalty_product,
+    penaltyProduct: orInfinity(q.penalty_product),
     ageSeconds: q.age_seconds,
     ageHorizonSeconds: 0,
     wAge: 0,
@@ -739,14 +761,15 @@ function mapCostReport(c: WireCostReport): CostReport {
   }
 }
 
+/** `over_quota_ratio`/`penalty` nullability: see `WirePenaltyLink` above. */
 interface WireQuotaEntityView {
   id: QuotaEntityId
   name: string
   parent: QuotaEntityId | null
   quota_ucu: number
   usage_ucu: number
-  over_quota_ratio: number
-  penalty: number
+  over_quota_ratio: number | null
+  penalty: number | null
 }
 
 function mapQuotaEntityView(v: WireQuotaEntityView): QuotaEntityView {
@@ -756,8 +779,8 @@ function mapQuotaEntityView(v: WireQuotaEntityView): QuotaEntityView {
     parent: v.parent,
     quotaUcu: v.quota_ucu,
     usageUcu: v.usage_ucu,
-    overQuotaRatio: v.over_quota_ratio,
-    penalty: v.penalty,
+    overQuotaRatio: orInfinity(v.over_quota_ratio),
+    penalty: orInfinity(v.penalty),
   }
 }
 
@@ -1003,14 +1026,15 @@ function mapNodeDetail(n: WireGetNodeResponse): NodeDetail {
 // Quota entities
 // ---------------------------------------------------------------------------
 
+/** `over_quota_ratio`/`penalty` nullability: see `WirePenaltyLink` above. */
 interface WireQuotaEntityNode {
   id: QuotaEntityId
   name: string
   parent: QuotaEntityId | null
   quota_ucu: number
   usage_ucu: number
-  over_quota_ratio: number
-  penalty: number
+  over_quota_ratio: number | null
+  penalty: number | null
   created_at: string
   updated_at: string
   queued_count: number
@@ -1032,8 +1056,8 @@ function mapQuotaEntityNode(n: WireQuotaEntityNode): QuotaEntityNode {
     principal: null,
     quotaUcu: n.quota_ucu,
     usageUcu: n.usage_ucu,
-    overQuotaRatio: n.over_quota_ratio,
-    penalty: n.penalty,
+    overQuotaRatio: orInfinity(n.over_quota_ratio),
+    penalty: orInfinity(n.penalty),
     createdAt: toDate(n.created_at),
     updatedAt: toDate(n.updated_at),
     queuedCount: n.queued_count,

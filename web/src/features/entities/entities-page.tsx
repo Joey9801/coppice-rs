@@ -4,7 +4,7 @@ import { ChevronDown, ChevronRight, Network, Plus, Search } from 'lucide-react'
 import type { QuotaEntityNode } from '@/api/types'
 import { useQuotaEntities } from '@/api/queries'
 import { canConfigureEntities, useSession } from '@/auth/session'
-import { formatUcu } from '@/lib/format'
+import { formatMultiplier, formatUcu } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { EmptyState, PageHeader } from '@/components'
 import { Badge } from '@/components/ui/badge'
@@ -253,7 +253,7 @@ function EntityRow({
           over ? 'font-medium text-destructive' : 'text-muted-foreground',
         )}
       >
-        ×{node.penalty.toFixed(2)}
+        {formatMultiplier(node.penalty)}
       </TableCell>
       <TableCell className="text-right tabular-nums">{node.queuedCount}</TableCell>
       <TableCell className="text-right tabular-nums">{node.runningCount}</TableCell>

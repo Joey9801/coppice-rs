@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use coppice_core::attempt;
 use coppice_core::bytes::ByteSize;
@@ -891,6 +891,25 @@ impl JobFilter {
 // Quota entities (GET /api/v1/quota-entities[/{entity}])
 // ---------------------------------------------------------------------------
 
+/// Deserialize a float that may arrive as `null`, mapping `null` to
+/// [`f64::INFINITY`].
+///
+/// This is the exact inverse of the serialization side: JSON has no infinity,
+/// so `serde_json` renders a non-finite float as `null`, and a plain `f64`
+/// field then *fails* to read its own output back. The quota figures below
+/// are legitimately infinite (an entity with zero quota and nonzero usage is
+/// infinitely over — see `coppice_core::quota::over_quota_ratio`), so every
+/// such field opts into this reader; without it a client that decodes these
+/// DTOs (`coppice quota list`/`show`) errors on a valid cluster state.
+///
+/// Serialization is untouched — this only affects reading.
+fn null_as_infinity<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::INFINITY))
+}
+
 /// One node of the quota-entity tree for the list/detail views (mirrors
 /// `QuotaEntityNode` in `types.ts`).
 ///
@@ -911,9 +930,12 @@ pub struct QuotaEntityNode {
     pub usage_ucu: u64,
     /// How far over quota, as a ratio. Serializes as `null` when infinite
     /// (zero quota, nonzero usage) — JSON has no infinity, and serde renders
-    /// non-finite floats as null.
+    /// non-finite floats as null; [`null_as_infinity`] reads that back.
+    #[serde(deserialize_with = "null_as_infinity")]
     pub over_quota_ratio: f64,
-    /// Multiplicative scheduling penalty ≥ 1 derived from the ratio.
+    /// Multiplicative scheduling penalty ≥ 1 derived from the ratio (so also
+    /// infinite, and `null` on the wire, when the ratio is).
+    #[serde(deserialize_with = "null_as_infinity")]
     pub penalty: f64,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -936,8 +958,12 @@ pub struct QuotaEntityView {
     pub quota_ucu: u64,
     /// Decayed usage as of the read's `now` (ADR 0019 integer decay).
     pub usage_ucu: u64,
+    /// `null` on the wire when infinite; see [`null_as_infinity`].
+    #[serde(deserialize_with = "null_as_infinity")]
     pub over_quota_ratio: f64,
-    /// Multiplicative scheduling penalty ≥ 1 derived from the ratio.
+    /// Multiplicative scheduling penalty ≥ 1 derived from the ratio (`null`
+    /// on the wire when infinite).
+    #[serde(deserialize_with = "null_as_infinity")]
     pub penalty: f64,
 }
 
@@ -1038,7 +1064,11 @@ pub struct PenaltyLink {
     pub name: String,
     pub usage_ucu: u64,
     pub quota_ucu: u64,
+    /// `null` on the wire when infinite; see [`null_as_infinity`].
+    #[serde(deserialize_with = "null_as_infinity")]
     pub over_quota_ratio: f64,
+    /// `null` on the wire when infinite; see [`null_as_infinity`].
+    #[serde(deserialize_with = "null_as_infinity")]
     pub penalty: f64,
 }
 
@@ -1058,7 +1088,11 @@ pub struct QueuePositionExplainer {
     pub multiplier: f64,
     /// One entry per ancestor entity, leaf → root.
     pub penalty_chain: Vec<PenaltyLink>,
-    /// Product of the chain penalties, `P(j)`.
+    /// Product of the chain penalties, `P(j)`. Infinite — hence `null` on the
+    /// wire, see [`null_as_infinity`] — whenever any link in the chain is: the
+    /// product is taken over the per-link penalties, and each is ≥ 1, so one
+    /// infinite ancestor carries through (there is no `0 × ∞` NaN case).
+    #[serde(deserialize_with = "null_as_infinity")]
     pub penalty_product: f64,
     pub age_seconds: i64,
 }
@@ -2424,6 +2458,79 @@ mod tests {
         assert_eq!(json["over_quota_ratio"], serde_json::Value::Null);
         assert_eq!(json["penalty"], serde_json::Value::Null);
         assert_eq!(json["parent"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn null_quota_floats_round_trip_back_to_infinity() {
+        // The wire `null` must read back as infinity, or a client decoding
+        // these DTOs (`coppice quota list`/`show`) fails on a perfectly valid
+        // cluster state: a zero-quota entity with nonzero usage.
+        let id: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let node = QuotaEntityNode {
+            id,
+            name: "root".to_string(),
+            parent: None,
+            quota_ucu: 0,
+            usage_ucu: 1,
+            over_quota_ratio: f64::INFINITY,
+            penalty: f64::INFINITY,
+            created_at: ts(1_000_000),
+            updated_at: ts(2_000_000),
+            queued_count: 1,
+            running_count: 0,
+        };
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(json["over_quota_ratio"], serde_json::Value::Null);
+        assert_eq!(json["penalty"], serde_json::Value::Null);
+        let back: QuotaEntityNode = serde_json::from_value(json).unwrap();
+        assert_eq!(back.over_quota_ratio, f64::INFINITY);
+        assert_eq!(back.penalty, f64::INFINITY);
+
+        // A finite value is untouched by the same reader.
+        let finite = QuotaEntityNode {
+            over_quota_ratio: 2.5,
+            penalty: 6.25,
+            ..node
+        };
+        let json = serde_json::to_value(&finite).unwrap();
+        assert_eq!(json["over_quota_ratio"], serde_json::json!(2.5));
+        let back: QuotaEntityNode = serde_json::from_value(json).unwrap();
+        assert_eq!(back.over_quota_ratio, 2.5);
+        assert_eq!(back.penalty, 6.25);
+
+        // The same on the chain view and the penalty-chain link/product.
+        let view: QuotaEntityView = serde_json::from_value(serde_json::json!({
+            "id": id.to_string(),
+            "name": "root",
+            "parent": null,
+            "quota_ucu": 0,
+            "usage_ucu": 1,
+            "over_quota_ratio": null,
+            "penalty": null,
+        }))
+        .unwrap();
+        assert_eq!(view.over_quota_ratio, f64::INFINITY);
+        assert_eq!(view.penalty, f64::INFINITY);
+
+        let queue: QueuePositionExplainer = serde_json::from_value(serde_json::json!({
+            "multiplier": 1.0,
+            "penalty_chain": [{
+                "entity": id.to_string(),
+                "name": "root",
+                "usage_ucu": 1,
+                "quota_ucu": 0,
+                "over_quota_ratio": null,
+                "penalty": null,
+            }],
+            "penalty_product": null,
+            "age_seconds": 12,
+        }))
+        .unwrap();
+        assert_eq!(queue.penalty_chain[0].over_quota_ratio, f64::INFINITY);
+        assert_eq!(queue.penalty_chain[0].penalty, f64::INFINITY);
+        assert_eq!(queue.penalty_product, f64::INFINITY);
     }
 
     #[test]
