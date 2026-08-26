@@ -40,6 +40,12 @@ use crate::tasks::api_server::{BoxFuture, LeaderWrites};
 /// and for the same reason: generous next to a commit-and-apply round trip,
 /// short enough that a wedged leader does not hold a client's connection —
 /// or this replica's ingress slot — indefinitely.
+///
+/// It bounds the *dial* as well as the call. A leader address that blackholes
+/// packets — the interesting failure, since a dead process refuses in
+/// microseconds — leaves a TCP connect hanging for the OS's own retry budget,
+/// which is minutes on every platform this runs on. Budgeting only the RPC
+/// would have made the 10s a promise this path could not keep.
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Forwards client writes to the leader over the mTLS admin channel.
@@ -80,17 +86,44 @@ impl AdminForwarder {
             return Err(ApiError::NotLeader { leader_hint: None });
         };
 
-        let client = crate::admin::admin_channel_from_store(&addr, &self.tls)
-            .await
-            .map_err(|e| {
-                // Nothing was sent, so the outcome is *known*: not applied.
-                // It is still reported as the same retriable unavailability —
-                // the caller's next move is identical either way.
-                ApiError::Unavailable(format!(
-                    "could not reach the leader to forward the write: {e:#}"
-                ))
-            })?;
+        let client =
+            under_dial_timeout(crate::admin::admin_channel_from_store(&addr, &self.tls)).await?;
         Ok((client, self.node.history_id()))
+    }
+}
+
+/// The answer for every way the dial can end badly.
+///
+/// A dial that failed and a dial that never finished are the same fact:
+/// nothing left this replica, so the outcome is *known* — the write did not
+/// commit, and the client may retry it anywhere, including against a replica
+/// that turns out to be the leader. That is the distinction this message
+/// carries and [`under_timeout`]'s does not: once the request is on the wire,
+/// silence means the leader may have committed it.
+fn not_sent(detail: String) -> ApiError {
+    ApiError::Unavailable(format!(
+        "could not reach the leader to forward the write: {detail}; nothing was sent, so the \
+         write did not commit — it is safe to retry against any replica"
+    ))
+}
+
+/// Dial under the same budget the call gets.
+///
+/// Split out from [`AdminForwarder::dial`] so the budget is testable against a
+/// future that never resolves. The failure it exists for — an address that
+/// neither answers nor refuses — is exactly the one a unit test cannot
+/// manufacture from a real socket: a listener it binds accepts, and one it
+/// does not bind refuses.
+async fn under_dial_timeout<T>(
+    dial: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Result<T, ApiError> {
+    match tokio::time::timeout(FORWARD_TIMEOUT, dial).await {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(e)) => Err(not_sent(format!("{e:#}"))),
+        Err(_elapsed) => Err(not_sent(format!(
+            "the connection did not establish within {}s",
+            FORWARD_TIMEOUT.as_secs()
+        ))),
     }
 }
 
@@ -451,5 +484,58 @@ mod tests {
         // No outcome at all is not a decision, and must not be reported as
         // one.
         assert!(matches!(applied_index(None), Err(ApiError::Unavailable(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_that_never_completes_is_bounded_by_the_forward_budget() {
+        // The blackholed leader address: connect neither succeeds nor fails.
+        // Without a budget here the client's request outlives the 10s the
+        // forwarding path advertises, by however long the kernel keeps
+        // retransmitting SYNs. Virtual time, so nothing waits and nothing
+        // flakes.
+        let started = tokio::time::Instant::now();
+        let never = std::future::pending::<anyhow::Result<()>>();
+        let error = under_dial_timeout(never).await.expect_err("bounded");
+        assert!(started.elapsed() >= FORWARD_TIMEOUT);
+        match error {
+            ApiError::Unavailable(message) => {
+                // Known-not-sent, not outcome-unknown: nothing reached the
+                // leader, so the retry advice is unconditional.
+                assert!(message.contains("nothing was sent"), "{message}");
+                assert!(!message.contains("unknown"), "{message}");
+            }
+            other => panic!("a bounded dial must be retriable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dial_that_fails_says_the_write_was_not_sent() {
+        // The other half of the same fact, and the reason both arms share one
+        // message: a refused connection and an abandoned one are equally
+        // "never left this replica".
+        let refused =
+            std::future::ready::<anyhow::Result<()>>(Err(anyhow::anyhow!("connection refused")));
+        match under_dial_timeout(refused).await.expect_err("dial failed") {
+            ApiError::Unavailable(message) => {
+                assert!(message.contains("connection refused"), "{message}");
+                assert!(message.contains("nothing was sent"), "{message}");
+            }
+            other => panic!("a failed dial must be retriable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_call_says_the_outcome_is_unknown_instead() {
+        // The distinction the two budgets exist to keep apart: once the
+        // request is on the wire, silence is not evidence that it did not
+        // commit, so this message must never claim it was not sent.
+        let never = std::future::pending::<Result<tonic::Response<()>, tonic::Status>>();
+        match under_timeout(never).await.expect_err("bounded") {
+            ApiError::Unavailable(message) => {
+                assert!(message.contains("unknown"), "{message}");
+                assert!(!message.contains("nothing was sent"), "{message}");
+            }
+            other => panic!("a lost call must be retriable, got {other:?}"),
+        }
     }
 }

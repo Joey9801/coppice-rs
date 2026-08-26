@@ -36,7 +36,7 @@ use coppice_api::{
     RecentClusterEvents, StampedEvent,
 };
 use coppice_consensus::{
-    Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, StateViews,
+    Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, Role, StateViews,
 };
 use coppice_core::id::{ClusterId, JobId, NodeId};
 
@@ -119,6 +119,11 @@ impl From<ConsensusError> for LocalWriteError {
 /// this replica's `submitted_at` stamp, and the propose. That is why
 /// forwarding carries the request and never a pre-built [`Command`]
 /// (ADR 0038).
+///
+/// The half of that which reads replicated state runs only on the leader: a
+/// replica that is not the leader stops at the shape checks and reports
+/// [`LocalWriteError::NotLeader`], so its own lagging view can never refuse a
+/// submission the leader would have accepted.
 pub(crate) async fn submit_job_here<C: Consensus>(
     consensus: &C,
     views: &StateViews,
@@ -166,6 +171,38 @@ pub(crate) async fn submit_job_here<C: Consensus>(
             }
         },
     };
+
+    // Everything above this line is shape validation: it reads only the
+    // request, so its verdict is the same on every replica and a follower is
+    // entitled to reach it. Everything below reads *this replica's* applied
+    // state, and a follower's copy of that is by definition behind the
+    // leader's — so a follower must not render a verdict from it (ADR 0038).
+    //
+    // Concretely: a policy update that adds a priority class is committed on
+    // the leader before it applies here. A submission at that priority
+    // arriving in the gap would find no multiplier in this view and be
+    // refused as invalid — a lagging follower vetoing a write the leader
+    // would accept. So leadership is consulted first, and a replica that is
+    // not the leader hands the whole request over instead of judging it.
+    //
+    // Both stale answers are safe. Stale "leader" on a follower: the lookup
+    // runs, the propose below returns `NotLeader` anyway, and forwarding
+    // happens one step later. Stale "follower" on the actual leader: the
+    // request takes one self-directed hop, which the single-hop rule already
+    // handles.
+    //
+    // Only this write path needs the gate. `abort_job_here` and
+    // `configure_quota_entity_here` validate nothing against the view — they
+    // build a command from the request and propose it — so their `NotLeader`
+    // already comes from the propose, which cannot be stale.
+    match consensus.status().borrow().role {
+        Role::Leader { .. } => {}
+        Role::Follower { leader } => return Err(LocalWriteError::NotLeader { leader }),
+        // Mid-election, with no leader to name. Forwarding has no target, so
+        // this is the redirect either way; what it must not be is an
+        // `Invalid` minted from a view nobody is currently authoritative for.
+        Role::Unknown => return Err(LocalWriteError::NotLeader { leader: None }),
+    }
 
     // Multiplier resolution reads the replicated table off the latest
     // view (ADR 0019: apply never sees the raw `priority: i32` in
@@ -1051,6 +1088,66 @@ mod tests {
             Err(ApiError::Invalid(_))
         ));
         assert_eq!(forwarder.calls(), 0);
+    }
+
+    /// A submission at a priority the seeded policy has no multiplier for —
+    /// the shape of a request a *lagging* replica cannot judge, because the
+    /// class may have been added by a policy update it has not applied yet.
+    fn submit_at_an_unconfigured_priority() -> SubmitJobRequest {
+        let mut req = submit_request(JobId::new());
+        req.priority = 5;
+        req
+    }
+
+    #[tokio::test]
+    async fn a_follower_forwards_a_priority_its_own_view_does_not_know_yet() {
+        // The finding this gate exists for: the multiplier table is
+        // replicated, so a follower behind a policy update that added
+        // priority 5 sees no multiplier for it. Judging that locally would
+        // refuse — with INVALID_ARGUMENT, which tells the client to change
+        // the request — a submission the leader would accept. It goes to the
+        // leader instead, which owns the authoritative table.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let response = cp
+            .submit_job(submit_at_an_unconfigured_priority())
+            .await
+            .expect("forwarded, not refused");
+        assert_eq!(response.log_index, 42);
+        assert_eq!(forwarder.leaders(), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_priority_is_still_invalid_on_the_leader() {
+        // The converse, and the reason the check is deferred rather than
+        // dropped: on the replica that *is* authoritative, an unknown
+        // priority is a genuinely malformed request and still gets the 400.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let cp = control_plane(ProposeOutcome::Accepted)
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let result = cp.submit_job(submit_at_an_unconfigured_priority()).await;
+        assert!(matches!(result, Err(ApiError::Invalid(_))), "{result:?}");
+        assert_eq!(forwarder.calls(), 0, "the leader forwards nothing");
+    }
+
+    #[tokio::test]
+    async fn a_follower_with_no_leader_redirects_rather_than_refusing_the_priority() {
+        // Mid-election there is nothing to forward to, but that does not make
+        // this replica's view authoritative: the answer is the redirect
+        // ("ask again"), never `Invalid` ("change your request").
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let cp = control_plane(ProposeOutcome::NotLeader(None))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let result = cp.submit_job(submit_at_an_unconfigured_priority()).await;
+        assert!(
+            matches!(result, Err(ApiError::NotLeader { leader_hint: None })),
+            "{result:?}"
+        );
+        assert_eq!(forwarder.calls(), 0, "no leader to forward to");
     }
 
     #[tokio::test]
