@@ -276,6 +276,27 @@ async fn every_coordinator_renews_onto_the_new_root() {
          means a push failed: {report:?}"
     );
 
+    // The activated (incoming) root's identity, from the leader's own report.
+    // The turnover poll below pins each member to this serial rather than
+    // trusting `leaf_under_active_root` alone: every status field is computed
+    // against the member's OWN applied state, and a follower that has not yet
+    // applied the activation entry reports the STAGE-phase bundle — two roots,
+    // the OUTGOING one still active — under which its outgoing-root leaf
+    // satisfies `leaf_under_active_root`, `installed_matches_replicated`, and
+    // `roots == 2` simultaneously. This suite failed exactly there under CI
+    // load: the poll passed against a lagging member's stage-phase view, and
+    // the on-disk leaf check then found the outgoing-root leaf. Requiring the
+    // member to report the incoming serial at position 0 is requiring it to
+    // have applied the activation locally, which is what makes its
+    // `leaf_under_active_root` mean "renewed under the NEW root".
+    let incoming_serial = report
+        .status
+        .roots
+        .first()
+        .expect("an activated rotation has an active root at position 0")
+        .serial
+        .clone();
+
     // Wait on the daemon's OWN convergence predicate, not on a file-shaped
     // proxy for it.
     //
@@ -324,7 +345,12 @@ async fn every_coordinator_renews_onto_the_new_root() {
                 else {
                     return false;
                 };
-                if !status.installed_matches_replicated
+                let incoming_active_here = status
+                    .roots
+                    .first()
+                    .is_some_and(|root| root.serial == incoming_serial);
+                if !incoming_active_here
+                    || !status.installed_matches_replicated
                     || !status.leaf_under_active_root
                     || status.roots.len() != 2
                 {
@@ -362,12 +388,48 @@ async fn every_coordinator_renews_onto_the_new_root() {
             "member {} should hold both roots during the window",
             member.raft_target()
         );
-        pki::verify_leaf(&new_root_pem, &cert_pem).unwrap_or_else(|e| {
+        if let Err(e) = pki::verify_leaf(&new_root_pem, &cert_pem) {
+            // Forensics before the panic: this assertion has failed flakily
+            // under CI load after the store-level poll above passed, and a bare
+            // `InvalidSignatureForPublicKey` cannot distinguish the candidate
+            // causes — a disk leaf lagging the store, a mis-selected
+            // `new_root_pem`, or a torn multi-file read. Name which known root
+            // (if any) actually signs the leaf we read, and what the member's
+            // own status says right now.
+            let signer = |leaf: &[u8]| -> String {
+                if pki::verify_leaf(original_root_pem.as_bytes(), leaf).is_ok() {
+                    return "the ORIGINAL (outgoing) root".to_string();
+                }
+                for (i, block) in cert_blocks(&ca_pem).into_iter().enumerate() {
+                    if block != original_root_pem
+                        && block.as_bytes() != new_root_pem.as_slice()
+                        && pki::verify_leaf(block.as_bytes(), leaf).is_ok()
+                    {
+                        return format!(
+                            "block {i} of the member's own bundle — a root that is neither \
+                             the formation root nor the leader's incoming root"
+                        );
+                    }
+                }
+                "no root either bundle carries (torn or foreign leaf)".to_string()
+            };
+            let status_now = match member.admin(AdminCall::RotateCaStatus).await {
+                AdminReply::RotationStatus { status } => format!(
+                    "installed_matches_replicated={} leaf_under_active_root={} roots={}",
+                    status.installed_matches_replicated,
+                    status.leaf_under_active_root,
+                    status.roots.len()
+                ),
+                other => format!("unexpected status reply: {other:?}"),
+            };
             panic!(
-                "member {}'s renewed leaf must chain to the new root alone: {e}",
-                member.raft_target()
-            )
-        });
+                "member {}'s renewed leaf must chain to the new root alone: {e}\n\
+                 the on-disk leaf is signed by: {}\n\
+                 the member's live status now says: {status_now}",
+                member.raft_target(),
+                signer(&cert_pem),
+            );
+        }
     }
 
     fleet.stop_all().await;
@@ -412,6 +474,18 @@ async fn complete_is_refused_inside_the_leaf_lifetime_and_retires_the_old_root_u
     // that has not renewed a single leaf — exactly what this wait is here to
     // rule out. Ceiling as in the previous test: 10s over a measured 0.21-0.36s
     // turnover under CPU pressure.
+    //
+    // Pinned to the incoming root's serial for the same reason as the previous
+    // test: a follower that has not yet applied the activation entry satisfies
+    // `leaf_under_active_root` against its stage-phase view (outgoing root
+    // still active) while serving an outgoing-root leaf.
+    let incoming_serial = report
+        .status
+        .roots
+        .first()
+        .expect("an activated rotation has an active root at position 0")
+        .serial
+        .clone();
     poll(
         Duration::from_secs(10),
         "every coordinator renews onto the new root before complete is attempted",
@@ -422,7 +496,14 @@ async fn complete_is_refused_inside_the_leaf_lifetime_and_retires_the_old_root_u
                 else {
                     return false;
                 };
-                if !status.leaf_under_active_root || status.roots.len() != 2 {
+                let incoming_active_here = status
+                    .roots
+                    .first()
+                    .is_some_and(|root| root.serial == incoming_serial);
+                if !incoming_active_here
+                    || !status.leaf_under_active_root
+                    || status.roots.len() != 2
+                {
                     return false;
                 }
             }
