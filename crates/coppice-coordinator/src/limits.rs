@@ -89,7 +89,13 @@ pub const QUEUE_BUCKET_INTERVAL: Duration = Duration::from_secs(30);
 /// task-local, never on the `StateMachine`, never snapshotted).
 pub const QUEUE_WINDOW_MAX_BUCKETS: usize = 120;
 
-/// Housekeeping tick cadence (ADR 0012 / ADR 0017).
+/// Housekeeping tick cadence (ADR 0012 / ADR 0017): how often a leader sweeps
+/// for terminal jobs past the replicated retention TTL and for nodes past the
+/// liveness deadline.
+///
+/// The default rather than the value, since `[pacing] housekeeping_interval`
+/// can shorten it ([`crate::config::PacingConfig`]) — liveness only, so a
+/// shorter tick notices a due job sooner and never makes one due.
 pub const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Agent-liveness deadline before the leader proposes `DeclareNodeLost`

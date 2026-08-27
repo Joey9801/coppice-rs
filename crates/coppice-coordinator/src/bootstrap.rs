@@ -458,6 +458,10 @@ pub async fn run_with(
         {
             crate::config::HistoryMode::None => HistorySink::None,
         },
+        // The `[pacing]` housekeeping knob, alongside the renewal knobs
+        // above: node-local, liveness-only, and 60 s unless the file says
+        // otherwise.
+        resolved.config.pacing.housekeeping_interval,
         Some(shutdown_rx),
     )
     .await?;
@@ -562,6 +566,9 @@ pub async fn serve_runtime(
         // No config in hand on this seam, so production renewal pacing.
         RenewalPacing::default(),
         history,
+        // Likewise the production sweep cadence: an embedder with nothing to
+        // say about pacing gets what a deployment gets.
+        crate::limits::HOUSEKEEPING_INTERVAL,
         shutdown,
     )
     .await
@@ -576,9 +583,12 @@ pub async fn serve_runtime(
 ///
 /// `renewal_pacing` is that same task's `[pacing]` configuration, for the same
 /// reason: the daemon path passes what the config says, the config-less seam
-/// passes the production defaults. `history` is the ADR 0012 `[history]` mode,
-/// which has no such fallback — both seams state it, and the daemon path maps
-/// it from the section `config::load` already validated.
+/// passes the production defaults. `housekeeping_interval` — how often a
+/// leader sweeps terminal jobs past the retention TTL (ADR 0012) — is the same
+/// bargain again, and exists as an argument at all so a test need not sit out
+/// a production tick to watch a TTL expire. `history` is the ADR 0012
+/// `[history]` mode, which has no such fallback — both seams state it, and the
+/// daemon path maps it from the section `config::load` already validated.
 #[allow(clippy::too_many_arguments)] // thin wiring seam over `runtime::run`
 pub async fn serve_runtime_with_serving_sans(
     consensus: Arc<OpenraftConsensus>,
@@ -595,6 +605,7 @@ pub async fn serve_runtime_with_serving_sans(
     serving_sans: Option<Vec<String>>,
     renewal_pacing: RenewalPacing,
     history: HistorySink,
+    housekeeping_interval: std::time::Duration,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -612,6 +623,7 @@ pub async fn serve_runtime_with_serving_sans(
         serving_sans,
         renewal_pacing,
         history,
+        housekeeping_interval,
         shutdown,
     )
     .await

@@ -126,6 +126,10 @@ pub async fn run<C>(
     // seam states it, because "lossy" is a deployment decision and not
     // something a missing argument gets to make (issue #43).
     history: HistorySink,
+    // How often a leader sweeps terminal jobs past the retention TTL: the
+    // `[pacing]` housekeeping knob (ADR 0012). Liveness only — it decides how
+    // promptly a due job is noticed, never which jobs are due.
+    housekeeping_interval: std::time::Duration,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -304,6 +308,7 @@ where
         Arc::clone(&consensus),
         views.clone(),
         history,
+        housekeeping_interval,
         liveness.clone(),
         status.clone(),
         shutdown_rx.clone(),

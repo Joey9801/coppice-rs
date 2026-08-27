@@ -489,8 +489,9 @@ view publisher, and the fanout *precisely so* these paths work off-leader.
   is *surfaced*, not hidden. A follower that cannot bound its lag —
   partitioned, or installing a snapshot — rejects with a redirect to the
   leader.
-- **Eventual.** In today's `history = "none"` mode ([ADR 0012](../decisions/0012-data-retention.md))
-  there is no durable sink for this class to serve from: a job evicted from
+- **Eventual.** In today's `none` history mode (`[history] mode = "none"`,
+  [ADR 0012](../decisions/0012-data-retention.md)) there is no durable sink
+  for this class to serve from: a job evicted from
   replicated state answers 404 on state-backed reads, and ring-backed reads
   (the event fanout, the timeline) remain best-effort, bounded by the ring's
   own window rather than by retention. A future durable mode would serve this

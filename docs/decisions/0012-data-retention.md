@@ -37,11 +37,18 @@ from it, so its loss degrades history, never correctness.
 
 **Running without a history store is supported, and explicitly lossy.**
 Deployments that don't need durable history (dev clusters, ephemeral CI
-fleets, cost-sensitive installs) declare `history = "none"`; the mode is never
-inferred from a missing backend, and in it the system never reports a history
-write as durable. Terminal-job data — jobs, attempts, allocations, usage
-summaries, logs — is retained **best effort** until a configurable TTL, which
-replaces the durable-receipt gate on `EvictTerminalJobs`. Best effort means:
+fleets, cost-sensitive installs) declare the `none` history mode:
+
+```toml
+[history]
+mode = "none"
+```
+
+The mode is never inferred from a missing backend, and in it the system
+never reports a history write as durable. Terminal-job data — jobs,
+attempts, allocations, usage summaries, logs — is retained **best effort**
+until a configurable TTL, which replaces the durable-receipt gate on
+`EvictTerminalJobs`. Best effort means:
 
 - Data stored opportunistically on the agents that ran the jobs (container
   logs, usage detail) rather than in replicated state is not persisted or
@@ -60,8 +67,8 @@ absent history is a normal response, not an error.
 - Users get 90 days of "what happened to my job" without bloating consensus
   state; compliance-driven deployments change one knob per store.
 - Lossy deployments trade durability for zero external dependencies without
-  lying about it: `history = "none"` is a visible configuration choice, and
-  the TTL bounds how long best-effort data lingers.
+  lying about it: `[history] mode = "none"` is a visible configuration
+  choice, and the TTL bounds how long best-effort data lingers.
 - The coordinator needs the housekeeping loop and the history-store write path
   before terminal-job volume matters — early enough to schedule in the first
   milestone after core lifecycle works.

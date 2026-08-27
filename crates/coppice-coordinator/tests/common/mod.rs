@@ -617,6 +617,25 @@ impl RunningCoordinator {
     /// gateway each get their own free localhost port so several can run in one
     /// test process in parallel.
     pub async fn start(cluster_id: ClusterId, ca: &Ca) -> RunningCoordinator {
+        Self::start_with_housekeeping_interval(
+            cluster_id,
+            ca,
+            coppice_coordinator::HOUSEKEEPING_INTERVAL,
+        )
+        .await
+    }
+
+    /// [`start`](Self::start) with the leader's housekeeping sweep on a short
+    /// leash, for the one suite that has to watch a retention TTL actually
+    /// expire (ADR 0012). Every other suite keeps the production 60 s cadence:
+    /// a sweep that fires constantly is a background proposer competing with
+    /// whatever the test under it is trying to observe, and none of them are
+    /// asking about retention.
+    pub async fn start_with_housekeeping_interval(
+        cluster_id: ClusterId,
+        ca: &Ca,
+        housekeeping_interval: Duration,
+    ) -> RunningCoordinator {
         let raft_port = free_port();
         let agent_port = free_port();
         let dir = tempfile::tempdir().expect("create coordinator tempdir");
@@ -747,7 +766,12 @@ log_level = "warn"
         // A detached (non-installing) recorder, so several replicas in one test
         // process never race on the process-global recorder slot (issue #46).
         let metrics = coppice_api::http::MetricsEndpoint::detached_for_tests();
-        let runtime_join = tokio::spawn(bootstrap::serve_runtime(
+        // The wider seam rather than `serve_runtime`: it is the one that takes
+        // the housekeeping cadence, and passing the production defaults for
+        // the two arguments this harness has no opinion about (serving SANs,
+        // renewal pacing) leaves every existing suite running exactly what it
+        // ran before.
+        let runtime_join = tokio::spawn(bootstrap::serve_runtime_with_serving_sans(
             Arc::clone(&consensus),
             views.clone(),
             event_tap,
@@ -759,9 +783,12 @@ log_level = "warn"
             data_dir.clone(),
             metrics,
             readyz,
+            None,
+            coppice_coordinator::RenewalPacing::default(),
             // Explicitly lossy (ADR 0012), matching the `[history]` section
             // these fixtures write: no history store runs behind the suites.
             coppice_coordinator::HistorySink::None,
+            housekeeping_interval,
             Some(shutdown_rx),
         ));
 

@@ -1,4 +1,4 @@
-//! Housekeeping (leader-only, 60 s tick).
+//! Housekeeping (leader-only; a 60 s tick in every deployment).
 //!
 //! Scans the view for terminal jobs past retention and removes them from
 //! replicated state with an `EvictTerminalJobs` proposal. What gates that
@@ -25,7 +25,7 @@
 //! operators and tests that need a snapshot *now*.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio::time::interval;
@@ -39,7 +39,7 @@ use coppice_state::command::{DeclareNodeLost, EvictTerminalJobs};
 use coppice_state::Command;
 
 use crate::leadership;
-use crate::limits::{AGENT_LIVENESS_DEADLINE, HOUSEKEEPING_INTERVAL};
+use crate::limits::AGENT_LIVENESS_DEADLINE;
 use crate::liveness::NodeLiveness;
 
 /// Where this daemon's terminal-job history goes (ADR 0012) — the witness
@@ -77,10 +77,21 @@ pub struct TerminalJobRecord {
 }
 
 /// Run the housekeeping loop until shutdown.
+///
+/// `tick` is how often a leader sweeps: [`limits::HOUSEKEEPING_INTERVAL`] in
+/// every deployment, and a short value only where a test or a dev cluster
+/// would otherwise sit out a production tick to watch one retention TTL
+/// expire ([`crate::config::PacingConfig`]'s `housekeeping_interval`). It is
+/// pure liveness — the sweep's *verdict* is the replicated
+/// `terminal_retention` measured against wall-clock `terminal_at`, so a
+/// faster tick can only notice a due job sooner, never make one due.
+///
+/// [`limits::HOUSEKEEPING_INTERVAL`]: crate::limits::HOUSEKEEPING_INTERVAL
 pub async fn run<C>(
     consensus: Arc<C>,
     views: StateViews,
     history: HistorySink,
+    tick: Duration,
     liveness: NodeLiveness,
     mut status: watch::Receiver<ConsensusStatus>,
     mut shutdown: watch::Receiver<bool>,
@@ -97,7 +108,7 @@ pub async fn run<C>(
         // never declared lost on the first tick of a new leadership term.
         liveness.seed(views.latest().state().nodes.keys().copied(), Instant::now());
 
-        let mut ticker = interval(HOUSEKEEPING_INTERVAL);
+        let mut ticker = interval(tick);
         // The first tick fires immediately; skip it so gaining leadership
         // doesn't itself trigger an instant sweep.
         ticker.tick().await;
@@ -195,14 +206,17 @@ async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history:
         return;
     }
 
-    // The configured mode is the gate. `none` has nothing to write to, so the
-    // TTL that made these jobs due is the whole of it — say so plainly rather
-    // than logging a write that did not happen (ADR 0012, issue #43).
+    // The configured mode is the gate on what has to happen before the
+    // proposal: a durable store is written here first, and `none` has nothing
+    // to write to, so the TTL that made these jobs due is the whole of it
+    // (ADR 0012, issue #43). Nothing is claimed about the *outcome* yet —
+    // eligibility is not eviction, and a proposal can still be rejected or
+    // lost to a leadership change, so the discard is reported below, from the
+    // branch that knows it applied.
     match history {
-        HistorySink::None => tracing::info!(
+        HistorySink::None => tracing::debug!(
             count = due.len(),
-            "housekeeping: history = \"none\", evicting terminal jobs past the TTL; \
-             their history is discarded (ADR 0012 lossy mode)"
+            "housekeeping: terminal jobs past the TTL, proposing eviction (history = \"none\")"
         ),
     }
 
@@ -211,7 +225,16 @@ async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history:
         evicted_at: now,
     });
     match consensus.propose(command).await {
-        Ok(Applied { outcome: Ok(_), .. }) => {}
+        // Applied: the jobs are out of replicated state, so this is the first
+        // point at which anything may be said about what happened to their
+        // history — and under `none` what happened is that it went away.
+        Ok(Applied { outcome: Ok(_), .. }) => match history {
+            HistorySink::None => tracing::info!(
+                count = due.len(),
+                "housekeeping: history = \"none\": evicted terminal jobs past the TTL; \
+                 their history is discarded (ADR 0012 lossy mode)"
+            ),
+        },
         Ok(Applied {
             outcome: Err(reason),
             ..
@@ -280,6 +303,7 @@ mod tests {
     use coppice_core::resource::Resources;
     use coppice_state::{PolicyConfig, StateMachine};
 
+    use crate::limits::HOUSEKEEPING_INTERVAL;
     use crate::test_support::{
         allocation_record, job_record, node_record, view_of, FakeConsensus, ProposeOutcome,
     };
@@ -411,10 +435,10 @@ mod tests {
         assert!(!due_later.contains(&terminal_unstamped));
     }
 
-    /// The loop end to end under `history = "none"`: with no store to write
-    /// to, the replicated retention TTL is the whole gate, and what comes out
-    /// of a tick is exactly one `EvictTerminalJobs` naming exactly the jobs
-    /// past it (ADR 0012's lossy mode).
+    /// The loop end to end under `[history] mode = "none"`: with no store to
+    /// write to, the replicated retention TTL is the whole gate, and what
+    /// comes out of a tick is exactly one `EvictTerminalJobs` naming exactly
+    /// the jobs past it (ADR 0012's lossy mode).
     #[tokio::test(start_paused = true)]
     async fn the_none_mode_evicts_on_the_ttl_alone() {
         let (consensus, mut publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
@@ -448,6 +472,7 @@ mod tests {
             Arc::clone(&consensus),
             views,
             HistorySink::None,
+            HOUSEKEEPING_INTERVAL,
             NodeLiveness::new(),
             status,
             shutdown_rx,

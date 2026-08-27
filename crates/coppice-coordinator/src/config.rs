@@ -628,8 +628,9 @@ impl Default for RaftConfig {
     }
 }
 
-/// Background-loop pacing: the convergence loop (ADR 0037 §6) and the leaf
-/// renewal loop (ADR 0037 §4).
+/// Background-loop pacing: the convergence loop (ADR 0037 §6), the leaf
+/// renewal loop (ADR 0037 §4), and the leader's housekeeping sweep
+/// (ADR 0012).
 ///
 /// Every value here is a *sleep between rounds*, never a timeout or a
 /// deadline: the loops are tick-driven, nothing wakes them early, so these are
@@ -714,6 +715,18 @@ pub(crate) struct PacingConfig {
     /// that recovers a leader renews without operator action.
     #[serde(default = "default_renewal_retry_max", with = "humantime_serde")]
     pub(crate) renewal_retry_max: Duration,
+
+    /// How often a leader's housekeeping loop sweeps for terminal jobs past
+    /// the replicated retention TTL and for nodes past the liveness deadline
+    /// (ADR 0012 / ADR 0009). Liveness only, like its neighbours: the sweep's
+    /// verdict is `policy.terminal_retention` measured from each job's
+    /// `terminal_at`, so a shorter tick notices a due job sooner and can never
+    /// make one due — which is why it is node-local (ADR 0020) and safe to
+    /// vary per replica. Configurable for exactly one reason: a test or a dev
+    /// cluster watching a shrunken TTL expire should not have to sit out a
+    /// production tick to see it happen.
+    #[serde(default = "default_housekeeping_interval", with = "humantime_serde")]
+    pub(crate) housekeeping_interval: Duration,
 }
 
 /// `[token_kdf]`: argon2id cost for hashing enrollment-token secrets
@@ -838,7 +851,8 @@ impl PacingConfig {
 
     /// Every `[pacing]` value is a sleep between rounds of some retry loop —
     /// zero turns that loop into a busy spin (the convergence tick, the
-    /// pre-start park loop, the promote poll, the renewal re-evaluate slice),
+    /// pre-start park loop, the promote poll, the renewal re-evaluate slice,
+    /// the housekeeping sweep),
     /// so zero is a config error, not a speed setting. Both ramps' floors
     /// must not exceed their ceilings: the backoff doubles from `min` and
     /// clamps to `max`, and an inverted pair would "clamp" every wait up to
@@ -857,6 +871,7 @@ impl PacingConfig {
             ),
             ("renewal_retry_min", self.renewal_retry_min),
             ("renewal_retry_max", self.renewal_retry_max),
+            ("housekeeping_interval", self.housekeeping_interval),
         ] {
             if value.is_zero() {
                 anyhow::bail!(
@@ -897,6 +912,7 @@ impl Default for PacingConfig {
             renewal_reevaluate_interval: default_renewal_reevaluate_interval(),
             renewal_retry_min: default_renewal_retry_min(),
             renewal_retry_max: default_renewal_retry_max(),
+            housekeeping_interval: default_housekeeping_interval(),
         }
     }
 }
@@ -1038,6 +1054,12 @@ fn default_renewal_retry_min() -> Duration {
 
 fn default_renewal_retry_max() -> Duration {
     Duration::from_secs(15 * 60)
+}
+
+// Restated from `limits::HOUSEKEEPING_INTERVAL` so the production cadence has
+// one definition: this knob exists to be shrunk, never to move the default.
+fn default_housekeeping_interval() -> Duration {
+    crate::limits::HOUSEKEEPING_INTERVAL
 }
 
 // The `argon2` crate's `Params::default()` values, restated as literals so a
@@ -1651,6 +1673,10 @@ addrs = []
             config.pacing.renewal_retry_max,
             Duration::from_secs(15 * 60)
         );
+        assert_eq!(
+            config.pacing.housekeeping_interval,
+            crate::limits::HOUSEKEEPING_INTERVAL
+        );
 
         let contents = format!(
             "{MINIMAL_EXAMPLE}\n[pacing]\nprobe_interval = \"50ms\"\n\
@@ -1658,7 +1684,8 @@ addrs = []
              park_interval_min = \"50ms\"\npark_interval_max = \"250ms\"\n\
              promote_poll_interval = \"50ms\"\n\
              renewal_reevaluate_interval = \"200ms\"\n\
-             renewal_retry_min = \"300ms\"\nrenewal_retry_max = \"2s\"\n"
+             renewal_retry_min = \"300ms\"\nrenewal_retry_max = \"2s\"\n\
+             housekeeping_interval = \"200ms\"\n"
         );
         let (_guard, path) = write_config(&contents);
         let config = read_config(&path).expect("an explicit [pacing] section parses");
@@ -1677,6 +1704,10 @@ addrs = []
         );
         assert_eq!(config.pacing.renewal_retry_min, Duration::from_millis(300));
         assert_eq!(config.pacing.renewal_retry_max, Duration::from_secs(2));
+        assert_eq!(
+            config.pacing.housekeeping_interval,
+            Duration::from_millis(200)
+        );
 
         // A partial section keeps the defaults for everything it omits.
         let contents = format!("{MINIMAL_EXAMPLE}\n[pacing]\nsettled_interval = \"1s\"\n");
@@ -1858,6 +1889,7 @@ addrs = []
             "renewal_reevaluate_interval",
             "renewal_retry_min",
             "renewal_retry_max",
+            "housekeeping_interval",
         ] {
             let contents = format!("{MINIMAL_EXAMPLE}\n[pacing]\n{zeroed} = \"0s\"\n");
             let (_guard, path) = write_config(&contents);

@@ -16,7 +16,7 @@ waive them.
 
 | ID | Severity | Area | Status | Release impact |
 | --- | --- | --- | --- | --- |
-| [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved 2026-07-10; silent-loss half resolved 2026-08-27, `history = "none"`) | The durable history store (issue #43) has not landed; `history = "none"` deployments never claim durable retention |
+| [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved 2026-07-10; silent-loss half resolved 2026-08-27, `[history] mode = "none"`) | The durable history store (issue #43) has not landed; `[history] mode = "none"` deployments never claim durable retention |
 | [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Resolved (2026-07-10, ADR 0026) | — |
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10; drop-and-gap completeness 2026-07-12) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
@@ -27,7 +27,7 @@ waive them.
 
 - **Severity:** Critical
 - **Status:** Open — the retention-timing half is resolved (2026-07-10); the
-  silent-loss half is resolved (2026-08-27, `history = "none"`); the
+  silent-loss half is resolved (2026-08-27, `[history] mode = "none"`); the
   durable-history half is not (issue #43)
 - **Affected capability:** terminal-job retention and historical queries
 - **Related decisions:** [ADR 0012](../decisions/0012-data-retention.md),
@@ -42,16 +42,17 @@ under (ADR 0012):
 1. the deployment declares a durable history mode, and the full history
    record has been durably and idempotently written to that store before
    eviction; or
-2. the deployment explicitly declares `history = "none"` — a supported,
-   visible, lossy configuration, never inferred from a missing backend —
-   in which case eviction is gated on the configured retention interval
-   alone, and no durable copy is claimed.
+2. the deployment explicitly declares the `none` history mode
+   (`[history] mode = "none"`) — a supported, visible, lossy configuration,
+   never inferred from a missing backend — in which case eviction is gated
+   on the configured retention interval alone, and no durable copy is
+   claimed.
 
 Either way, the configured retention interval must have elapsed since the job
 reached its terminal state. Under a durable mode, an evicted job must remain
 queryable through the eventual-consistency history path promised by ADR 0012;
-under `history = "none"`, API reads degrade gracefully instead — absent or
-partial history is a normal response, not an error.
+under the `none` history mode, API reads degrade gracefully instead — absent
+or partial history is a normal response, not an error.
 
 ### Current violation
 
@@ -73,8 +74,9 @@ count and returned success — letting housekeeping propose
 no config surface saying so.~~ **Resolved 2026-08-27.** `StubHistoryStore` is
 deleted. History mode is now required, declared node config (`[history]`,
 [configuration.md](../operations/configuration.md)); the only implemented
-mode is the ADR 0012 explicit lossy mode, `history = "none"`, under which
-housekeeping gates eviction on the replicated `terminal_retention` TTL alone
+mode is the ADR 0012 explicit lossy mode, `[history] mode = "none"`, under
+which housekeeping gates eviction on the replicated `terminal_retention` TTL
+alone
 and logs the discard — it never claims a durable write it didn't make. The
 job, attempts, and allocations still disappear from replicated state with no
 queryable replacement, but that is now a declared property of the deployment,
@@ -84,8 +86,9 @@ remains unimplemented (issue #43).
 
 ### Impact
 
-- Irrecoverable loss of user-visible job and attempt history in `history =
-  "none"` deployments — expected and declared, not a real store (issue #43).
+- Irrecoverable loss of user-visible job and attempt history in `[history]
+  mode = "none"` deployments — expected and declared, not a real store
+  (issue #43).
 - Eventual/history reads cannot satisfy the full ADR 0012 API contract until
   a durable mode lands; today they degrade gracefully instead of erroring.
 - ~~A long-running job is at greater risk than a short job because its age is
@@ -122,8 +125,9 @@ This issue is resolved when a durable history mode exists such that the
 runtime cannot emit `EvictTerminalJobs` under it without a durable history
 receipt and a correct post-terminal retention calculation, and an
 integration test queries an evicted job from the history path. The
-`history = "none"` mode already meets the honesty bar (no false durability
-claim); it does not, and is not meant to, meet the durability bar.
+`none` history mode (`[history] mode = "none"`) already meets the honesty
+bar (no false durability claim); it does not, and is not meant to, meet
+the durability bar.
 
 ## KOI-2: Job submission is not idempotent across an unknown outcome
 
@@ -526,8 +530,8 @@ No such record existed anywhere in the system, for three compounding reasons:
    in-memory bucket window as tier 3 — both now implemented — but the
    durable tier 2 (the history event table and writer in the ADR 0012 store)
    does not exist; the only history mode implemented today is the explicit
-   lossy `history = "none"` (ADR 0012), which retains nothing durably by
-   design (KOI-1, issue #43).
+   lossy `none` mode (`[history] mode = "none"`, ADR 0012), which retains
+   nothing durably by design (KOI-1, issue #43).
 3. **Replicated state records facts, not transitions.** It carries a handful of
    per-record timestamps (`submitted_at_us`, `terminal_at_us`,
    `started_at_us`) — enough for an age, nowhere near enough to reconstruct a

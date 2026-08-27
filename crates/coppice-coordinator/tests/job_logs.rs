@@ -18,10 +18,11 @@
 //! deleted, and `unreachable` after the listener stops.
 //!
 //! A third test lives here for the same "a read whose data is gone must still
-//! answer honestly" reason: under `history = "none"` (ADR 0012, issue #43) the
-//! retention sweep is the *only* thing standing between a terminal job and
-//! oblivion, so the job routes must degrade to a plain 404 / absent row once it
-//! has been evicted.
+//! answer honestly" reason: under `[history] mode = "none"` (ADR 0012, issue
+//! #43) the retention sweep is the *only* thing standing between a terminal
+//! job and oblivion, so it drives that sweep for real — a live housekeeping
+//! tick, a shrunken TTL — and asserts the job routes degrade to a plain 404 /
+//! absent row once it has fired.
 
 mod common;
 
@@ -52,7 +53,7 @@ use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
 use coppice_discovery::SeedConfig;
-use coppice_state::command::{AbortJob, ConfigureQuotaEntity, EvictTerminalJobs, SubmitJob};
+use coppice_state::command::{AbortJob, ConfigureQuotaEntity, SubmitJob, UpdatePolicy};
 use coppice_state::Command;
 
 use common::{poll, Ca, Node, RunningCoordinator};
@@ -815,16 +816,27 @@ async fn api_get(client: &reqwest::Client, url: &str) -> (u16, serde_json::Value
     (status, body)
 }
 
-/// Reads degrade gracefully when the data is gone — the `history = "none"`
-/// acceptance criterion (ADR 0012, issue #43).
+/// The whole TTL path under `[history] mode = "none"`, end to end — the lossy
+/// mode's acceptance criterion (ADR 0012, issue #43).
 ///
-/// In the lossy mode there is no durable store behind the replicated state, so
-/// `EvictTerminalJobs` really is the end of the job: nothing can serve it
-/// afterwards. What that must NOT mean is a broken read path. The job is driven
-/// to a terminal state by direct command proposals (submit, then abort — an
-/// abort of a job with no live attempt terminates it immediately and stamps the
-/// `terminal_at` the retention scan measures from), read back through the
-/// daemon's own router, evicted, and read again:
+/// Nothing here proposes an eviction. The coordinator is the real daemon
+/// runtime, started with the required `[history]` mode wired through to its
+/// housekeeping loop and that loop on a short tick, and the job leaves
+/// replicated state because the sweep decided it was due: submitted, aborted
+/// (an abort of a job with no live attempt terminates it immediately and
+/// stamps the `terminal_at` the retention scan measures eligibility from),
+/// read back over real HTTP, and then made due by shrinking the replicated
+/// `terminal_retention` to nothing. Its disappearance from the published view
+/// can therefore have come from exactly one place: housekeeping's own
+/// TTL-gated `EvictTerminalJobs` under `HistorySink::None`. That chain —
+/// required mode ▸ real tick ▸ retention measured from `terminal_at` ▸
+/// eviction — is the point of the test, and no direct proposal can stand in
+/// for it.
+///
+/// What the eviction must NOT mean is a broken read path. In the lossy mode
+/// there is no durable store behind the replicated state, so this really is
+/// the end of the job — nothing can serve it afterwards, and every route has
+/// to say so gracefully:
 ///
 /// - `GET /api/v1/jobs/{id}` answers a plain `NOT_FOUND` 404 naming the id —
 ///   the same answer any never-seen id gets, not a 500;
@@ -844,7 +856,15 @@ async fn evicted_terminal_job_reads_degrade_rather_than_erroring() {
 
     let ca = Ca::new();
     let cluster_id = ClusterId::new();
-    let coord = RunningCoordinator::start(cluster_id, &ca).await;
+    // A sweep every 200 ms rather than the production minute: this test waits
+    // on a real housekeeping tick, and the tick is pure liveness — it decides
+    // how soon a due job is noticed, never which jobs are due.
+    let coord = RunningCoordinator::start_with_housekeeping_interval(
+        cluster_id,
+        &ca,
+        Duration::from_millis(200),
+    )
+    .await;
     poll(DEADLINE, "coordinator leadership", || {
         let coord = &coord;
         async move { coord.is_leader() }
@@ -932,21 +952,44 @@ async fn evicted_terminal_job_reads_degrade_rather_than_erroring() {
         "the terminal job must be listed before it is evicted: {body}"
     );
 
-    // -- Evict it, exactly as the retention sweep would (ADR 0012). ---------
-    let evicted = coord
+    // -- Now make it due, and let the sweep do the rest. --------------------
+    // Ordering matters: the abort stamped `terminal_at` at its own
+    // `requested_at`, so a retention of one microsecond makes this job due on
+    // the very next tick. Shrinking it before the reads above would race the
+    // sweep against them and could evict the job out from under a read that
+    // expects to find it. `UpdatePolicy` is a full replacement, and an
+    // otherwise-default policy is fine here because a direct `SubmitJob`
+    // carries its own resolved multiplier.
+    let policy = coppice_state::PolicyConfig {
+        terminal_retention: coppice_core::time::Duration::from_micros(1),
+        ..Default::default()
+    };
+    let updated = coord
         .consensus()
-        .propose(Command::EvictTerminalJobs(EvictTerminalJobs {
-            jobs: vec![job],
-            evicted_at: Timestamp::now(),
+        .propose(Command::UpdatePolicy(UpdatePolicy {
+            policy,
+            updated_at: Timestamp::now(),
         }))
         .await
-        .expect("propose EvictTerminalJobs");
+        .expect("propose UpdatePolicy");
     assert!(
-        evicted.outcome.is_ok(),
-        "EvictTerminalJobs rejected: {:?}",
-        evicted.outcome
+        updated.outcome.is_ok(),
+        "UpdatePolicy rejected: {:?}",
+        updated.outcome
     );
-    let evict_index = evicted.log_index;
+
+    // Nothing else in this process can remove the record: the only writer of
+    // `EvictTerminalJobs` is the housekeeping loop, and it only writes one for
+    // a job whose full `terminal_retention` has elapsed since `terminal_at`.
+    // So this wait *is* the assertion that the TTL path ran.
+    poll(DEADLINE, "housekeeping evicts the job on the TTL", || {
+        let views = views.clone();
+        async move { !views.latest().state().jobs.contains_key(&job) }
+    })
+    .await;
+    // Pin the post-eviction reads to the state that no longer has the job,
+    // rather than to a proposal index this test never learns.
+    let evict_index = views.latest().applied_index();
 
     // -- After eviction: gone, but gone *gracefully*. -----------------------
     let (status, body) = api_get(
