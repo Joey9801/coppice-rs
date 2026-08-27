@@ -619,6 +619,11 @@ ca_path = "{ca}"
 # explicit, never implied). The agent's enrollment token crosses this listener
 # in the clear, which is why its `[enrollment] insecure` says so too.
 insecure = true
+
+[history]
+# Dev clusters are explicitly lossy (ADR 0012): terminal jobs age out of
+# replicated state on the retention TTL, with no durable copy anywhere.
+mode = "none"
 "#,
         cluster_id = layout.cluster_id,
         data_dir = layout.data_dir.display(),

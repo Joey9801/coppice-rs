@@ -188,13 +188,18 @@ followers, which is what lets followers serve reads and event streams.
 10. **Housekeeping** (leader-only, 60 s tick). Scans the view for terminal
    jobs past retention — measured from each job's `terminal_at_us`, never
    from submission, so a job that queued longer than the retention interval
-   still gets the full interval after it finishes (KOI-1) — and **writes
-   them to the SQL job-history store first**
-   — an *external* network call, therefore outside apply, with retries — and
-   only after that write is durable proposes `EvictTerminalJobs`. This is the
-   [ADR 0012](../decisions/0012-data-retention.md) ordering: history-write
-   durability is sequenced *before* the evict proposal, never concurrent with
-   it. Snapshot cadence is **not** housekeeping's job: openraft drives it
+   still gets the full interval after it finishes (KOI-1) — and proposes
+   `EvictTerminalJobs` according to the configured `[history]` mode
+   ([ADR 0012](../decisions/0012-data-retention.md)). A `[history]` section is
+   **required** node config, never inferred from a missing backend; the only
+   implemented mode today is `mode = "none"`, the ADR's explicit lossy mode:
+   eviction is gated on the replicated `terminal_retention` TTL alone — no
+   history write is claimed, and housekeeping logs the discard when it evicts.
+   A future durable mode (issue #43) writes terminal jobs to the backing store
+   first — an *external* network call, therefore outside apply, with retries —
+   and proposes `EvictTerminalJobs` only once that write is durable: the
+   history-write durability is sequenced *before* the evict proposal, never
+   concurrent with it. Snapshot cadence is **not** housekeeping's job: openraft drives it
    from `SnapshotPolicy::LogsSinceLast(snapshot_log_entries)`, and purges
    behind it down to `max_in_snapshot_log_to_keep = snapshot_keep_log_entries`
    ([ADR 0002](../decisions/0002-openraft-with-custom-segment-storage.md)
@@ -204,8 +209,9 @@ followers, which is what lets followers serve reads and event streams.
    node assembly (`coppice-consensus::node`); coalescing and retry live in
    openraft, and `Consensus::trigger_snapshot` remains for operators and
    tests that need a snapshot *now*. Duplicate
-   history writes across a leader change are harmless (idempotent by job id);
-   duplicate evict proposals are absorbed by apply (missing ids are skipped).
+   evict proposals across a leader change are harmless — apply absorbs them
+   (missing ids are skipped) — and in a future durable mode, duplicate history
+   writes would be too (idempotent by job id).
    The same tick is the **leader health monitor** of
    [command-catalog.md](command-catalog.md#declarenodelost): it seeds the
    liveness map on gaining leadership (grace) and proposes `DeclareNodeLost`
@@ -246,15 +252,18 @@ followers, which is what lets followers serve reads and event streams.
     |        +---------------+  +---------------+  +------------------+
     |           | propose          | propose        | propose   \
     v           v                  v                v            v
- ~~~~~~~~ proposal admission: semaphore, 4096 in flight ~~~~~~  [SQL job-
-                          |                                     history
-                          v                                     store]
-        +--------------------------------------+               (external;
-        | openraft core (black box):           |                write is
-        | election, replication, log +         |                durable
-        | segment storage, membership          |                BEFORE the
-        +--------------------------------------+                evict is
-                          |                                     proposed)
+ ~~~~~~~~ proposal admission: semaphore, 4096 in flight ~~~~~~  [history sink:
+                          |                                     mode=none (only
+                          v                                     mode today) —
+        +--------------------------------------+               no write, TTL-
+        | openraft core (black box):           |               gated evict
+        | election, replication, log +         |               only. Future
+        | segment storage, membership          |               durable mode
+        +--------------------------------------+               (issue #43)
+                          |                                     writes here,
+                          |                                     BEFORE the
+                          |                                     evict is
+                          |                                     proposed]
                           | ApplyRequest (mpsc 64;
                           v  adapter awaits each reply)
         +--------------------------------------+
@@ -480,9 +489,13 @@ view publisher, and the fanout *precisely so* these paths work off-leader.
   is *surfaced*, not hidden. A follower that cannot bound its lag —
   partitioned, or installing a snapshot — rejects with a redirect to the
   leader.
-- **Eventual.** Served from the SQL job-history store, outside consensus
-  entirely; a job evicted from replicated state ([ADR 0012](../decisions/0012-data-retention.md))
-  remains queryable there.
+- **Eventual.** In today's `history = "none"` mode ([ADR 0012](../decisions/0012-data-retention.md))
+  there is no durable sink for this class to serve from: a job evicted from
+  replicated state answers 404 on state-backed reads, and ring-backed reads
+  (the event fanout, the timeline) remain best-effort, bounded by the ring's
+  own window rather than by retention. A future durable mode would serve this
+  class from an external history store, outside consensus entirely, so an
+  evicted job would remain queryable there (issue #43).
 
 ## Leader transitions
 
@@ -508,9 +521,11 @@ without distributed locks.
 - in-flight proposals fail retryable (`NotLeader`, per the lifecycle above),
   so no waiter hangs;
 - the scheduler abandons its pass — its `CommitPlacements` would fail anyway;
-- housekeeping may have completed a history write whose `EvictTerminalJobs`
-  proposal now fails — harmless, because the next leader re-does both writes
-  idempotently ([ADR 0012](../decisions/0012-data-retention.md));
+- housekeeping's `EvictTerminalJobs` proposal may fail on the term change —
+  harmless, because the next leader re-scans and re-proposes idempotently
+  ([ADR 0012](../decisions/0012-data-retention.md)); in a future durable mode,
+  a completed history write whose evict proposal then fails is equally
+  harmless for the same reason;
 - the session manager closes agent sessions; agents rediscover the leader and
   re-register. A deposed leader's already-sent `StartJob`/`StopJob` **fail
   closed at the agents** on the term check ([ADR 0009](../decisions/0009-fencing-and-reconciliation.md)).
@@ -540,10 +555,14 @@ Each hazard and the by-construction reason it cannot bite:
 - **Event emission happens inside apply but never blocks it.** The event tap
   `try_send`s and drops on full, synthesizing a gap; apply never awaits
   fanout.
-- **The history-store write is outside apply and sequenced before the evict.**
-  The external network call is a proposer-side obligation of housekeeping, and
-  `EvictTerminalJobs` is proposed only after the write is durable
-  ([ADR 0012](../decisions/0012-data-retention.md)).
+- **The `[history]` mode is declared config, never inferred.** A missing
+  `[history]` section is a startup error; today's only implemented mode,
+  `mode = "none"`, is the ADR's explicit lossy mode and never claims a
+  durable write. A future durable mode's history-store write would sit
+  outside apply and be sequenced before the evict — a proposer-side
+  obligation of housekeeping, with `EvictTerminalJobs` proposed only after
+  the write is durable ([ADR 0012](../decisions/0012-data-retention.md),
+  issue #43).
 - **openraft types are confined to `coppice-consensus`.** The `Consensus`
   seam is the only surface; a rejection is a successful `Applied` result, not
   a `ConsensusError`.

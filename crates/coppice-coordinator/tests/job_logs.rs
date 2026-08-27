@@ -16,6 +16,12 @@
 //! and then asserts, in sequence: entry content/order, `available` sources,
 //! cursor paging across pages, `expired` after the attempt's telemetry is
 //! deleted, and `unreachable` after the listener stops.
+//!
+//! A third test lives here for the same "a read whose data is gone must still
+//! answer honestly" reason: under `history = "none"` (ADR 0012, issue #43) the
+//! retention sweep is the *only* thing standing between a terminal job and
+//! oblivion, so the job routes must degrade to a plain 404 / absent row once it
+//! has been evicted.
 
 mod common;
 
@@ -46,7 +52,7 @@ use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
 use coppice_discovery::SeedConfig;
-use coppice_state::command::{ConfigureQuotaEntity, SubmitJob};
+use coppice_state::command::{AbortJob, ConfigureQuotaEntity, EvictTerminalJobs, SubmitJob};
 use coppice_state::Command;
 
 use common::{poll, Ca, Node, RunningCoordinator};
@@ -791,6 +797,214 @@ async fn follower_serves_job_logs_directly() {
     leader.shutdown().await;
     drop(agent_dir);
     drop(tel_dir);
+}
+
+/// One HTTP GET against the coordinator's own client listener, split into its
+/// status code and JSON body — both wanted at every assertion below, since a
+/// bare status comparison leaves a failure with no record of what was said.
+async fn api_get(client: &reqwest::Client, url: &str) -> (u16, serde_json::Value) {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {url}: {e}"));
+    let status = resp.status().as_u16();
+    let text = resp.text().await.expect("response body text");
+    let body = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("GET {url} answered {status} with non-JSON ({e}): {text}"));
+    (status, body)
+}
+
+/// Reads degrade gracefully when the data is gone — the `history = "none"`
+/// acceptance criterion (ADR 0012, issue #43).
+///
+/// In the lossy mode there is no durable store behind the replicated state, so
+/// `EvictTerminalJobs` really is the end of the job: nothing can serve it
+/// afterwards. What that must NOT mean is a broken read path. The job is driven
+/// to a terminal state by direct command proposals (submit, then abort — an
+/// abort of a job with no live attempt terminates it immediately and stamps the
+/// `terminal_at` the retention scan measures from), read back through the
+/// daemon's own router, evicted, and read again:
+///
+/// - `GET /api/v1/jobs/{id}` answers a plain `NOT_FOUND` 404 naming the id —
+///   the same answer any never-seen id gets, not a 500;
+/// - `GET /api/v1/jobs` answers 200 with the job simply absent;
+/// - `GET /api/v1/jobs/{id}/timeline` still answers 200 from this replica's
+///   fanout ring, which outlives the state record (routes.rs: an evicted job
+///   with surviving ring events is 200, never a 404 dead-end). Only the status
+///   and the shape are asserted — which events survive in the ring is a
+///   tier-1 retention question, not this test's subject.
+///
+/// Driven over real HTTP against the running coordinator's client listener
+/// rather than a hand-built router: the timeline route's verdict depends on the
+/// fanout the runtime attaches, so only the daemon's own plane can answer it.
+#[tokio::test]
+async fn evicted_terminal_job_reads_degrade_rather_than_erroring() {
+    init_tracing();
+
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let coord = RunningCoordinator::start(cluster_id, &ca).await;
+    poll(DEADLINE, "coordinator leadership", || {
+        let coord = &coord;
+        async move { coord.is_leader() }
+    })
+    .await;
+
+    // -- Drive one job to a terminal state. No agent is registered, so the job
+    // -- has nowhere to run and sits queued until the abort resolves it.
+    let entity = QuotaEntityId::new();
+    seed_quota(&coord, entity).await;
+    let job = JobId::new();
+    submit_job(&coord, job, entity).await;
+
+    let aborted = coord
+        .consensus()
+        .propose(Command::AbortJob(AbortJob {
+            job,
+            reason: Some("retention acceptance".into()),
+            requested_at: Timestamp::now(),
+        }))
+        .await
+        .expect("propose AbortJob");
+    assert!(
+        aborted.outcome.is_ok(),
+        "AbortJob rejected: {:?}",
+        aborted.outcome
+    );
+    let abort_index = aborted.log_index;
+
+    let views = coord.views();
+    poll(
+        DEADLINE,
+        "the job is terminal in the published view",
+        || {
+            let views = views.clone();
+            async move {
+                views
+                    .latest()
+                    .state()
+                    .jobs
+                    .get(&job)
+                    .is_some_and(|r| r.state.is_terminal())
+            }
+        },
+    )
+    .await;
+    {
+        let view = views.latest();
+        let record = view.state().jobs.get(&job).expect("the job is still here");
+        assert!(
+            record.state.is_terminal(),
+            "an aborted queued job is terminal, got {:?}",
+            record.state
+        );
+        assert!(
+            record.terminal_at.is_some(),
+            "the terminal transition must stamp `terminal_at` — the clock the \
+             retention sweep measures eviction eligibility from"
+        );
+    }
+
+    // -- Before eviction: the job is a perfectly ordinary read. -------------
+    let client = reqwest::Client::new();
+    let (status, body) = api_get(
+        &client,
+        &coord.api(&format!("/api/v1/jobs/{job}?min_index={abort_index}")),
+    )
+    .await;
+    assert_eq!(status, 200, "the terminal job reads back fine: {body}");
+    assert_eq!(body["id"], job.to_string(), "{body}");
+    assert_eq!(body["state"], "aborted", "{body}");
+
+    let (status, body) = api_get(
+        &client,
+        &coord.api(&format!("/api/v1/jobs?min_index={abort_index}")),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["jobs"]
+            .as_array()
+            .expect("the list response carries a `jobs` array")
+            .iter()
+            .any(|j| j["id"] == job.to_string()),
+        "the terminal job must be listed before it is evicted: {body}"
+    );
+
+    // -- Evict it, exactly as the retention sweep would (ADR 0012). ---------
+    let evicted = coord
+        .consensus()
+        .propose(Command::EvictTerminalJobs(EvictTerminalJobs {
+            jobs: vec![job],
+            evicted_at: Timestamp::now(),
+        }))
+        .await
+        .expect("propose EvictTerminalJobs");
+    assert!(
+        evicted.outcome.is_ok(),
+        "EvictTerminalJobs rejected: {:?}",
+        evicted.outcome
+    );
+    let evict_index = evicted.log_index;
+
+    // -- After eviction: gone, but gone *gracefully*. -----------------------
+    let (status, body) = api_get(
+        &client,
+        &coord.api(&format!("/api/v1/jobs/{job}?min_index={evict_index}")),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "an evicted job must read as an ordinary not-found, never a 5xx: {body}"
+    );
+    assert_eq!(body["code"], "NOT_FOUND", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&job.to_string())),
+        "the 404 must name the id that is gone: {body}"
+    );
+
+    let (status, body) = api_get(
+        &client,
+        &coord.api(&format!("/api/v1/jobs?min_index={evict_index}")),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "listing must still succeed once a job has been evicted: {body}"
+    );
+    assert!(
+        !body["jobs"]
+            .as_array()
+            .expect("the list response carries a `jobs` array")
+            .iter()
+            .any(|j| j["id"] == job.to_string()),
+        "the evicted job must simply be absent from the listing: {body}"
+    );
+
+    // The ring still holds this job's events (it is fed from the same applied
+    // batches, and the eviction itself emits `JobEvicted`), so the timeline is
+    // a best-effort 200 rather than a dead-end 404.
+    let (status, body) = api_get(
+        &client,
+        &coord.api(&format!(
+            "/api/v1/jobs/{job}/timeline?min_index={evict_index}"
+        )),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the timeline is served from the fanout ring, which outlives the \
+         evicted state record: {body}"
+    );
+    assert!(
+        body["events"].is_array(),
+        "the timeline body must still be a well-formed response: {body}"
+    );
+
+    coord.shutdown().await;
 }
 
 /// The node id the agent settles on: read back from `<data_dir>/node-identity`

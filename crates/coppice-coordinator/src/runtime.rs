@@ -19,7 +19,7 @@ use crate::limits::AGENT_INBOUND_CAPACITY;
 use crate::liveness::NodeLiveness;
 use crate::tasks::agent_gateway::{AgentSessionService, Gateway};
 use crate::tasks::api_server::{self, CoordinatorControlPlane};
-use crate::tasks::housekeeping::StubHistoryStore;
+use crate::tasks::housekeeping::HistorySink;
 use crate::tasks::node_client::NodeClient;
 use crate::tasks::{
     agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, learner_gc,
@@ -121,6 +121,11 @@ pub async fn run<C>(
     // How often that task re-examines its conditions, and how hard a failed
     // renewal retries: the `[pacing]` renewal knobs (ADR 0037 §4).
     renewal_pacing: renewal::RenewalPacing,
+    // Where terminal-job history goes (ADR 0012): the `[history]` mode the
+    // daemon path resolved from config. No default — an embedder driving this
+    // seam states it, because "lossy" is a deployment decision and not
+    // something a missing argument gets to make (issue #43).
+    history: HistorySink,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -298,7 +303,7 @@ where
     let housekeeping_join = tokio::spawn(housekeeping::run(
         Arc::clone(&consensus),
         views.clone(),
-        Arc::new(StubHistoryStore),
+        history,
         liveness.clone(),
         status.clone(),
         shutdown_rx.clone(),

@@ -369,6 +369,10 @@ ca_path = "{ca}"
 # explicit, never implied).
 insecure = true
 
+[history]
+# Explicitly lossy (ADR 0012): the integration daemons run no history store.
+mode = "none"
+
 [observability]
 log_level = "warn"
 "#,
@@ -592,6 +596,10 @@ pub struct RunningCoordinator {
     pub views: StateViews,
     /// `localhost:PORT` the agent dials for its `AgentService` session.
     pub agent_endpoint: String,
+    /// The resolved `127.0.0.1:PORT` of the client API listener (bound on `:0`),
+    /// so a test can drive the daemon's *own* router — fanout ring, node handle
+    /// and all — over real HTTP instead of hand-assembling a control plane.
+    client_addr: std::net::SocketAddr,
     /// The coordinator's data directory (CA key + machine identity land here
     /// in tests that manufacture a cluster-owned PKI on this harness).
     pub data_dir: std::path::PathBuf,
@@ -677,6 +685,10 @@ ca_path = "{ca}"
 # explicit, never implied).
 insecure = true
 
+[history]
+# Explicitly lossy (ADR 0012): the integration daemons run no history store.
+mode = "none"
+
 [observability]
 log_level = "warn"
 "#,
@@ -727,6 +739,9 @@ log_level = "warn"
         let client_listener = ClientListener::bind("127.0.0.1:0".parse().expect("client addr"))
             .await
             .expect("bind client API listener");
+        let client_addr = client_listener
+            .local_addr()
+            .expect("resolved client API listener address");
 
         let (runtime_shutdown, shutdown_rx) = watch::channel(false);
         // A detached (non-installing) recorder, so several replicas in one test
@@ -744,6 +759,9 @@ log_level = "warn"
             data_dir.clone(),
             metrics,
             readyz,
+            // Explicitly lossy (ADR 0012), matching the `[history]` section
+            // these fixtures write: no history store runs behind the suites.
+            coppice_coordinator::HistorySink::None,
             Some(shutdown_rx),
         ));
 
@@ -753,6 +771,7 @@ log_level = "warn"
             consensus,
             views,
             agent_endpoint: format!("localhost:{agent_port}"),
+            client_addr,
             runtime_shutdown,
             runtime_join,
             handle,
@@ -767,6 +786,12 @@ log_level = "warn"
 
     pub fn views(&self) -> StateViews {
         self.views.clone()
+    }
+
+    /// A URL on this coordinator's client API listener — the plain-HTTP
+    /// posture the fixture config sets (`[client_tls] insecure = true`).
+    pub fn api(&self, path: &str) -> String {
+        format!("http://{}{path}", self.client_addr)
     }
 
     pub fn is_leader(&self) -> bool {
@@ -945,6 +970,10 @@ ca_path = "{ca}"
 # Plain HTTP on the client listener (ADR 0037 §4: the posture is always
 # explicit, never implied).
 insecure = true
+
+[history]
+# Explicitly lossy (ADR 0012): the integration daemons run no history store.
+mode = "none"
 
 [observability]
 log_level = "warn"

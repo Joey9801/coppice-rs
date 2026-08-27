@@ -105,10 +105,17 @@ liveness deadline that is still schedulable or holds live allocations. See
   `coppice-consensus`; this crate programs against the `Consensus` seam and the
   `StateViews` read handle only.
 - Some subsystems are honest stubs today: the API server holds the real
-  `ControlPlane` impl but no HTTP transport is wired yet (`run_placeholder`), and
-  housekeeping writes terminal jobs through a `StubHistoryStore` until the SQL
-  job-history store lands. Snapshot-trigger and the storage-flush shutdown steps
-  are staged for when the segment storage layer is in place.
+  `ControlPlane` impl but no HTTP transport is wired yet (`run_placeholder`).
+  History is explicit config, not inference — a `[history]` section is
+  required at startup, and the only implemented mode today is `mode = "none"`,
+  the [ADR 0012](../../docs/decisions/0012-data-retention.md) explicit lossy
+  mode: housekeeping evicts terminal jobs once the replicated
+  `terminal_retention` TTL elapses and logs the discard, with no history write
+  claimed. The durable (ClickHouse) mode's write-then-evict path — write
+  terminal jobs to the store first, propose `EvictTerminalJobs` only once that
+  write is durable — remains future work (issue #43). Snapshot-trigger and
+  the storage-flush shutdown steps are staged for when the segment storage
+  layer is in place.
 
 [ADR 0011]: ../../docs/decisions/0011-container-security-posture.md
 [ADR 0009]: ../../docs/decisions/0009-fencing-and-reconciliation.md

@@ -51,6 +51,7 @@ use crate::admin::AdminService;
 use crate::cli::RunArgs;
 use crate::formation::{self, Formation, PhaseState, StartupState};
 use crate::localadmin::{AdminSocket, FormationCall, FormationDone, LocalAdmin};
+use crate::tasks::housekeeping::HistorySink;
 use crate::tasks::node_client::NodeClient;
 use crate::tasks::renewal::RenewalPacing;
 use crate::{config, limits};
@@ -447,6 +448,16 @@ pub async fn run_with(
         // loop above got: same section, same node-local liveness-only
         // character (ADR 0020).
         resolved.config.pacing.renewal(),
+        // The declared `[history]` mode (ADR 0012). `config::load` already
+        // rejected a config that never declared one, so this cannot silently
+        // become the lossy mode by default — it is what the file says.
+        match resolved
+            .config
+            .history_mode()
+            .context("resolving the [history] mode validated at load")?
+        {
+            crate::config::HistoryMode::None => HistorySink::None,
+        },
         Some(shutdown_rx),
     )
     .await?;
@@ -511,6 +522,12 @@ pub async fn run_with(
 /// runtime install its own signal handler (the daemon path); `Some(rx)` hands
 /// it a caller-owned trigger so an integration test can drive [`bootstrap`] and
 /// this runtime directly and shut them down without raising a real signal.
+///
+/// `history` is the `[history]` mode of ADR 0012 — where terminal-job history
+/// goes once housekeeping evicts the job from replicated state. There is no
+/// default: an embedder says which mode it is running, because a deployment
+/// that never declared itself lossy must not be made lossy by an omitted
+/// argument (issue #43).
 #[allow(clippy::too_many_arguments)] // thin wiring seam over `runtime::run`
 pub async fn serve_runtime(
     consensus: Arc<OpenraftConsensus>,
@@ -526,6 +543,7 @@ pub async fn serve_runtime(
     data_dir: std::path::PathBuf,
     metrics: coppice_api::http::MetricsEndpoint,
     readyz: ReadyzEndpoint,
+    history: HistorySink,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     serve_runtime_with_serving_sans(
@@ -543,6 +561,7 @@ pub async fn serve_runtime(
         None,
         // No config in hand on this seam, so production renewal pacing.
         RenewalPacing::default(),
+        history,
         shutdown,
     )
     .await
@@ -557,7 +576,9 @@ pub async fn serve_runtime(
 ///
 /// `renewal_pacing` is that same task's `[pacing]` configuration, for the same
 /// reason: the daemon path passes what the config says, the config-less seam
-/// passes the production defaults.
+/// passes the production defaults. `history` is the ADR 0012 `[history]` mode,
+/// which has no such fallback — both seams state it, and the daemon path maps
+/// it from the section `config::load` already validated.
 #[allow(clippy::too_many_arguments)] // thin wiring seam over `runtime::run`
 pub async fn serve_runtime_with_serving_sans(
     consensus: Arc<OpenraftConsensus>,
@@ -573,6 +594,7 @@ pub async fn serve_runtime_with_serving_sans(
     readyz: ReadyzEndpoint,
     serving_sans: Option<Vec<String>>,
     renewal_pacing: RenewalPacing,
+    history: HistorySink,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -589,6 +611,7 @@ pub async fn serve_runtime_with_serving_sans(
         readyz,
         serving_sans,
         renewal_pacing,
+        history,
         shutdown,
     )
     .await
