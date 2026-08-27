@@ -504,6 +504,10 @@ pub async fn start(
     // per-peer contact instants into this shared handle, and the admin handle
     // reads them for the `?require=healthy` liveness test (ADR 0037 §9).
     let contact = factory.contact();
+    // Likewise taken before the move: the address-repoint break-glass installs
+    // a leader-local dial redirection here to reach a moved node while
+    // membership still records its stale address (ADR 0037 §6).
+    let dial_overrides = factory.dial_overrides();
     let raft = Raft::new(node_id, Arc::new(config), factory, log_store, sm_store)
         .await
         .map_err(|e| NodeStartError::Raft(format!("raft node construction failed: {e}")))?;
@@ -534,6 +538,7 @@ pub async fn start(
         removal_grace,
         learner_expiry,
         evidence,
+        dial_overrides,
     );
     let transport = Server::new(RaftTransportHandler::new(raft.clone(), history_id));
     let handle = NodeHandle {

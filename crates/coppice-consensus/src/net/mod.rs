@@ -24,5 +24,5 @@ mod client;
 mod convert;
 mod server;
 
-pub use client::{GrpcNetworkFactory, PeerContact};
+pub use client::{DialOverrideGuard, DialOverrides, GrpcNetworkFactory, PeerContact};
 pub use server::RaftTransportHandler;

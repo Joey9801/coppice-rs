@@ -95,6 +95,108 @@ impl PeerContact {
     }
 }
 
+/// Leader-local, in-memory redirections of a peer's *dial* address, installed
+/// by the admin plane while it repairs a stale membership address (ADR 0037 §6).
+///
+/// An entry here overrides the address membership records for one peer, for
+/// this process only. It exists to break a specific liveness wedge: a pending
+/// joint/uniform membership entry that can never commit *because* replication
+/// keeps dialing the node's stale address, which in turn makes openraft refuse
+/// the `SetNodes` repoint that would fix the address
+/// ("a configuration change is in progress"). The override lets the stuck entry
+/// drain to the node's real endpoint so the repoint can be accepted; see
+/// [`OpenraftConsensus::set_node_address`].
+///
+/// Security: an override is only ever installed *after* the admin plane has
+/// dial-back-verified that the new endpoint presents the machine identity bound
+/// to that seat (ADR 0037 §6). It is never replicated — it is leader-local
+/// process state that vanishes on restart and is dropped as soon as the repoint
+/// returns — and mTLS still authenticates the peer on the redirected channel,
+/// so redirecting a dial can never reach a node outside the cluster CA's trust.
+///
+/// [`OpenraftConsensus::set_node_address`]: crate::adapter::OpenraftConsensus
+#[derive(Clone, Default)]
+pub struct DialOverrides {
+    inner: Arc<Mutex<OverridesInner>>,
+}
+
+/// Per-node stacks of live installations, each owned by exactly one
+/// [`DialOverrideGuard`] via a unique token.
+///
+/// A stack rather than a single slot, because repoints can overlap: an
+/// operator retries after cancelling a request, and the cancelled RPC's guard
+/// drops at some arbitrary later point. Ownership by `(node, addr)` alone
+/// cannot tell two same-address installations apart (the older drop would
+/// retract the newer, still-live redirection), and a single slot cannot
+/// restore an older installation when a shorter-lived newer one drops first.
+/// With per-installation tokens, a drop removes exactly its own entry and the
+/// newest surviving installation keeps redirecting.
+#[derive(Default)]
+struct OverridesInner {
+    next_token: u64,
+    stacks: HashMap<CoordinatorId, Vec<(u64, String)>>,
+}
+
+impl DialOverrides {
+    /// Redirect every dial of `node` to `addr` until the returned guard drops.
+    ///
+    /// The guard's `Drop` is the release mechanism (rather than an explicit
+    /// call) because the admin RPC future holding it can be cancelled outright
+    /// when the operator's client disconnects mid-repoint. Installations for
+    /// the same node stack: the newest live one wins, and dropping any guard —
+    /// in any order — retracts only its own installation, restoring whatever
+    /// still-live installation is then newest.
+    pub fn install(&self, node: CoordinatorId, addr: String) -> DialOverrideGuard {
+        let mut inner = self.inner.lock().expect("dial override map poisoned");
+        let token = inner.next_token;
+        inner.next_token += 1;
+        inner.stacks.entry(node).or_default().push((token, addr));
+        DialOverrideGuard {
+            overrides: self.clone(),
+            node,
+            token,
+        }
+    }
+
+    /// The address `node` should actually be dialed at: the newest live
+    /// override when any is installed, otherwise the membership address `addr`
+    /// unchanged.
+    fn resolve(&self, node: CoordinatorId, addr: &str) -> String {
+        self.inner
+            .lock()
+            .expect("dial override map poisoned")
+            .stacks
+            .get(&node)
+            .and_then(|stack| stack.last())
+            .map(|(_, overridden)| overridden.clone())
+            .unwrap_or_else(|| addr.to_string())
+    }
+}
+
+/// Holds one [`DialOverrides`] installation alive; retracting exactly it — and
+/// nothing else — on `Drop`.
+pub struct DialOverrideGuard {
+    overrides: DialOverrides,
+    node: CoordinatorId,
+    token: u64,
+}
+
+impl Drop for DialOverrideGuard {
+    fn drop(&mut self) {
+        let mut inner = self
+            .overrides
+            .inner
+            .lock()
+            .expect("dial override map poisoned");
+        if let Some(stack) = inner.stacks.get_mut(&self.node) {
+            stack.retain(|(token, _)| *token != self.token);
+            if stack.is_empty() {
+                inner.stacks.remove(&self.node);
+            }
+        }
+    }
+}
+
 /// Creates one [`GrpcRaftNetwork`] per target, sharing a per-peer channel map.
 ///
 /// Cheap to hold: it keeps the shared TLS store and rebuilds a
@@ -135,6 +237,9 @@ struct Shared {
     /// from `contact` above (which only ever records the raw last-answered
     /// instant for the `/readyz` liveness test and never an attempt).
     evidence: Arc<ContactTracker>,
+    /// Leader-local dial redirections consulted before every dial (ADR 0037
+    /// §6). Normally empty; see [`DialOverrides`].
+    overrides: DialOverrides,
 }
 
 /// Per-peer cache value: the dialed address, the TLS material generation it was
@@ -160,8 +265,17 @@ impl GrpcNetworkFactory {
                 channels: Mutex::new(HashMap::new()),
                 contact: PeerContact::default(),
                 evidence,
+                overrides: DialOverrides::default(),
             }),
         }
+    }
+
+    /// The dial-override handle this factory's networks consult. Taken once at
+    /// assembly (before the factory moves into openraft) and handed to the
+    /// consensus adapter, which installs an override while it repairs a stale
+    /// membership address (ADR 0037 §6).
+    pub fn dial_overrides(&self) -> DialOverrides {
+        self.shared.overrides.clone()
     }
 
     /// The per-peer contact facts this factory's networks record. Taken once
@@ -198,6 +312,12 @@ impl Shared {
     /// the old leaf. Evicting on a generation bump forces a re-dial that rebuilds
     /// the config from the current material.
     fn channel_for(&self, target: CoordinatorId, addr: &str) -> Result<Channel, String> {
+        // Resolve any admin-installed redirection FIRST, then treat the result
+        // as *the* address for both the cache comparison and the dial: an
+        // override appearing (or being retracted) then reads exactly like a
+        // membership address change, so the existing generation-checked cache
+        // drops the stale channel and redials on its own (ADR 0037 §6).
+        let addr = &self.overrides.resolve(target, addr);
         let generation = self.tls.generation();
         let mut map = self.channels.lock().expect("network channel map poisoned");
         if let Some((existing, gen, channel)) = map.get(&target) {
@@ -497,4 +617,88 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
     }
 
     // `backoff()` keeps openraft's default (a constant 500 ms) — no config.
+}
+
+#[cfg(test)]
+mod dial_override_tests {
+    use super::DialOverrides;
+
+    const NODE: crate::CoordinatorId = 7;
+    const MEMBERSHIP_ADDR: &str = "10.0.0.1:7000";
+    const MOVED_ADDR: &str = "10.0.0.2:7100";
+
+    #[test]
+    fn an_override_redirects_the_resolved_address() {
+        let overrides = DialOverrides::default();
+        assert_eq!(
+            overrides.resolve(NODE, MEMBERSHIP_ADDR),
+            MEMBERSHIP_ADDR,
+            "with no override installed the membership address stands"
+        );
+        let _guard = overrides.install(NODE, MOVED_ADDR.to_string());
+        assert_eq!(overrides.resolve(NODE, MEMBERSHIP_ADDR), MOVED_ADDR);
+        // Only the overridden peer is redirected.
+        assert_eq!(
+            overrides.resolve(NODE + 1, MEMBERSHIP_ADDR),
+            MEMBERSHIP_ADDR
+        );
+    }
+
+    #[test]
+    fn dropping_the_guard_restores_the_membership_address() {
+        let overrides = DialOverrides::default();
+        {
+            let _guard = overrides.install(NODE, MOVED_ADDR.to_string());
+            assert_eq!(overrides.resolve(NODE, MEMBERSHIP_ADDR), MOVED_ADDR);
+        }
+        assert_eq!(overrides.resolve(NODE, MEMBERSHIP_ADDR), MEMBERSHIP_ADDR);
+    }
+
+    #[test]
+    fn a_newer_install_survives_an_older_guards_drop() {
+        // A repoint whose admin RPC was cancelled drops its guard *after* a
+        // second repoint installed its own override; the older drop must not
+        // retract the newer redirection.
+        let overrides = DialOverrides::default();
+        let old = overrides.install(NODE, MOVED_ADDR.to_string());
+        let _new = overrides.install(NODE, "10.0.0.3:7200".to_string());
+        drop(old);
+        assert_eq!(overrides.resolve(NODE, MEMBERSHIP_ADDR), "10.0.0.3:7200");
+    }
+
+    #[test]
+    fn a_newer_same_address_install_survives_an_older_guards_drop() {
+        // The operator's retry after a cancellation names the SAME address —
+        // the overwhelmingly common overlap. The two installations must still
+        // be distinguishable: the cancelled call's late drop retracts only its
+        // own, and the live retry keeps redirecting.
+        let overrides = DialOverrides::default();
+        let cancelled = overrides.install(NODE, MOVED_ADDR.to_string());
+        let _retry = overrides.install(NODE, MOVED_ADDR.to_string());
+        drop(cancelled);
+        assert_eq!(
+            overrides.resolve(NODE, MEMBERSHIP_ADDR),
+            MOVED_ADDR,
+            "the live retry's redirection must survive the cancelled call's drop"
+        );
+    }
+
+    #[test]
+    fn an_older_install_is_restored_when_a_newer_guards_drop_comes_first() {
+        // The reverse cancellation order: a short-lived newer repoint drops
+        // while an older one is still live (still waiting out a wedged
+        // membership change). The older installation must come back into
+        // effect, not vanish with the newer one.
+        let overrides = DialOverrides::default();
+        let _old = overrides.install(NODE, MOVED_ADDR.to_string());
+        {
+            let _new = overrides.install(NODE, "10.0.0.3:7200".to_string());
+            assert_eq!(overrides.resolve(NODE, MEMBERSHIP_ADDR), "10.0.0.3:7200");
+        }
+        assert_eq!(
+            overrides.resolve(NODE, MEMBERSHIP_ADDR),
+            MOVED_ADDR,
+            "the older still-live installation must be restored"
+        );
+    }
 }

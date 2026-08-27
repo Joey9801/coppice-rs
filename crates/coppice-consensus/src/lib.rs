@@ -56,6 +56,10 @@ pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
 pub use coppice_net::transport::Server as RaftTransportServer;
 /// The handler the transport server wraps (built by [`start`]).
 pub use net::RaftTransportHandler;
+/// The leader-local dial-redirection handle the address-repoint break-glass
+/// installs into while it repairs a stale membership address (ADR 0037 §6).
+/// Exported because it is a parameter of [`adapter::OpenraftConsensus::new`].
+pub use net::{DialOverrideGuard, DialOverrides};
 
 /// Register descriptions for every metric this crate can emit, recursing into
 /// each submodule that exposes metrics. Call once, after the process installs
