@@ -100,6 +100,11 @@ pub use tasks::renewal::RenewalPacing;
 // more: the ADR 0012 history mode is an argument with no default, so an
 // embedder cannot pass it without being able to name it (issue #43).
 pub use tasks::housekeeping::HistorySink;
+// The production housekeeping cadence, named alongside `HistorySink` for the
+// same seam: `serve_runtime_with_serving_sans` takes the sweep interval, so an
+// embedder that only wants to shorten it for a test still needs to be able to
+// say what "unshortened" is.
+pub use limits::HOUSEKEEPING_INTERVAL;
 
 #[cfg(test)]
 mod test_support;
