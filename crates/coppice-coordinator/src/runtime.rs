@@ -135,6 +135,19 @@ pub async fn run<C>(
 where
     C: Consensus,
 {
+    // The `[pacing]` path already rejects a zero interval at config load, but
+    // the embedder seams take a raw `Duration`: a zero here would reach
+    // `tokio::time::interval` and panic inside the spawned housekeeping task,
+    // whose join result nothing awaits — the runtime would keep serving with
+    // terminal eviction and node-loss detection silently dead. Every entry
+    // path funnels through here, so this is the one check that keeps that an
+    // ordinary startup error instead.
+    anyhow::ensure!(
+        !housekeeping_interval.is_zero(),
+        "housekeeping_interval must be non-zero: a zero tick would busy-spin \
+         the sweep (and panics tokio's interval)"
+    );
+
     let consensus = Arc::new(consensus);
     let status = consensus.status();
 

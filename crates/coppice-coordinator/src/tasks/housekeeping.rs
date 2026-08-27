@@ -225,16 +225,33 @@ async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history:
         evicted_at: now,
     });
     match consensus.propose(command).await {
-        // Applied: the jobs are out of replicated state, so this is the first
-        // point at which anything may be said about what happened to their
-        // history — and under `none` what happened is that it went away.
-        Ok(Applied { outcome: Ok(_), .. }) => match history {
-            HistorySink::None => tracing::info!(
-                count = due.len(),
-                "housekeeping: history = \"none\": evicted terminal jobs past the TTL; \
-                 their history is discarded (ADR 0012 lossy mode)"
-            ),
-        },
+        // Applied: this is the first point at which anything may be said about
+        // what happened to the jobs' history — and under `none` what happened
+        // is that it went away. The count comes from the apply outcome's
+        // `JobEvicted` events, not from `due`: apply skips ids that are
+        // already gone (that skip is what makes duplicate proposals across a
+        // leadership change idempotent), so `due.len()` can overstate what
+        // this proposal actually removed — down to nothing at all, in which
+        // case no history was discarded here and nothing says it was.
+        Ok(Applied {
+            outcome: Ok(applied),
+            ..
+        }) => {
+            let evicted = applied
+                .events
+                .iter()
+                .filter(|e| matches!(e, coppice_state::Event::JobEvicted { .. }))
+                .count();
+            if evicted > 0 {
+                match history {
+                    HistorySink::None => tracing::info!(
+                        count = evicted,
+                        "housekeeping: history = \"none\": evicted terminal jobs past the TTL; \
+                         their history is discarded (ADR 0012 lossy mode)"
+                    ),
+                }
+            }
+        }
         Ok(Applied {
             outcome: Err(reason),
             ..
