@@ -1387,6 +1387,10 @@ ca_path = "{ca}"
 # explicit, never implied).
 insecure = true
 
+[history]
+# Explicitly lossy (ADR 0012): no history store behind these tests.
+mode = "none"
+
 [observability]
 log_level = "warn"
 "#,

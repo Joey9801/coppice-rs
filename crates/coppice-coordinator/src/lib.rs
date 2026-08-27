@@ -96,6 +96,10 @@ pub use tasks::renewal::renew_once as coordinator_renew_once;
 // to be reachable by embedders driving that seam; `[pacing]` itself stays
 // crate-private (`config::PacingConfig::renewal` builds this).
 pub use tasks::renewal::RenewalPacing;
+// Named in both `serve_runtime` signatures for the same reason, and for one
+// more: the ADR 0012 history mode is an argument with no default, so an
+// embedder cannot pass it without being able to name it (issue #43).
+pub use tasks::housekeeping::HistorySink;
 
 #[cfg(test)]
 mod test_support;

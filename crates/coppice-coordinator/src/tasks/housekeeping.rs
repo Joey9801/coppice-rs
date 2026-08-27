@@ -1,10 +1,20 @@
 //! Housekeeping (leader-only, 60 s tick).
 //!
-//! Scans the view for terminal jobs past retention and writes them to the
-//! SQL job-history store first — an external network call, therefore
-//! outside apply, with retries — and only after that write is durable
-//! proposes `EvictTerminalJobs` (ADR 0012 ordering). See
-//! `docs/architecture/coordinator-runtime.md`, "Housekeeping".
+//! Scans the view for terminal jobs past retention and removes them from
+//! replicated state with an `EvictTerminalJobs` proposal. What gates that
+//! proposal is the configured `[history]` mode (ADR 0012), which the daemon
+//! threads in as a [`HistorySink`]:
+//!
+//! - a **durable store** (`clickhouse`, still future work) is written first —
+//!   an external network call, therefore outside apply, with retries — and the
+//!   eviction is proposed only once that write is durable, so a job leaving
+//!   consensus state is always already queryable from history;
+//! - **`none`** is the explicitly lossy mode: there is nothing to write to, so
+//!   the replicated `terminal_retention` TTL is the whole gate and the
+//!   evicted job's history is simply discarded. Nothing in this mode reports a
+//!   history write, durable or otherwise (issue #43).
+//!
+//! See `docs/architecture/coordinator-runtime.md`, "Housekeeping".
 //!
 //! Snapshot cadence is **not** this task's job. openraft drives it from
 //! `SnapshotPolicy::LogsSinceLast(snapshot_log_entries)` with
@@ -14,7 +24,6 @@
 //! purge (ADR 0017) all live there. `Consensus::trigger_snapshot` remains for
 //! operators and tests that need a snapshot *now*.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,24 +42,29 @@ use crate::leadership;
 use crate::limits::{AGENT_LIVENESS_DEADLINE, HOUSEKEEPING_INTERVAL};
 use crate::liveness::NodeLiveness;
 
-/// The job-history sink (ADR 0012).
+/// Where this daemon's terminal-job history goes (ADR 0012) — the witness
+/// that the `[history]` config section was read and stated a mode.
 ///
-/// A sink, not a source: loss degrades history, never correctness.
-pub trait HistoryStore: Send + Sync + 'static {
-    /// Resolve only once the write is DURABLE.
-    ///
-    /// The evict proposal is sequenced after this.
-    fn write_terminal_jobs(
-        &self,
-        jobs: Vec<TerminalJobRecord>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+/// [`None`](HistorySink::None) is the explicitly lossy mode: the replicated
+/// `policy.terminal_retention` TTL is the whole gate on `EvictTerminalJobs`,
+/// standing in for the durable-receipt gate a real store provides, and the
+/// evicted job's history is discarded. Nothing in this mode may ever claim a
+/// history write happened, let alone a durable one — the mode exists so a
+/// deployment can be lossy honestly rather than by accident (issue #43). A
+/// `Durable(...)` variant arrives with the real history store, and the
+/// write-then-evict ordering with it.
+#[derive(Debug, Clone, Copy)]
+pub enum HistorySink {
+    None,
 }
 
 /// A terminal job as handed to the history store.
 ///
-/// `state`/`submitted_at`/`terminal_at` aren't read beyond
-/// construction until a real history store consumes them
-/// (`StubHistoryStore` only logs a count).
+/// Built on every pass and, in the `none` mode, dropped again unread: this is
+/// the seam the future durable store consumes, and keeping it assembled here
+/// means the retention scan — the part that decides *which* jobs leave — does
+/// not have to change when that store lands. Hence
+/// `state`/`submitted_at`/`terminal_at` having no reader yet.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TerminalJobRecord {
@@ -62,32 +76,16 @@ pub struct TerminalJobRecord {
     pub terminal_at: Timestamp,
 }
 
-/// Placeholder history store until the SQL sink lands.
-///
-/// Logs and reports success.
-pub struct StubHistoryStore;
-
-impl HistoryStore for StubHistoryStore {
-    async fn write_terminal_jobs(&self, jobs: Vec<TerminalJobRecord>) -> anyhow::Result<()> {
-        tracing::info!(
-            count = jobs.len(),
-            "housekeeping: (stub) wrote terminal jobs to history"
-        );
-        Ok(())
-    }
-}
-
 /// Run the housekeeping loop until shutdown.
-pub async fn run<C, H>(
+pub async fn run<C>(
     consensus: Arc<C>,
     views: StateViews,
-    history: Arc<H>,
+    history: HistorySink,
     liveness: NodeLiveness,
     mut status: watch::Receiver<ConsensusStatus>,
     mut shutdown: watch::Receiver<bool>,
 ) where
     C: Consensus,
-    H: HistoryStore,
 {
     loop {
         let Some(term) = leadership::wait_for_leadership(&mut status, &mut shutdown).await else {
@@ -110,7 +108,7 @@ pub async fn run<C, H>(
                 _ = leadership::until_leadership_lost(&mut status, term, &mut shutdown) => break,
                 _ = ticker.tick() => {
                     declare_lost_nodes(&consensus, &views, &liveness).await;
-                    run_pass(&consensus, &views, &history).await;
+                    run_pass(&consensus, &views, history).await;
                 }
             }
         }
@@ -185,11 +183,7 @@ fn stale_nodes(view: &StateView, liveness: &NodeLiveness, now: Instant) -> Vec<N
     out
 }
 
-async fn run_pass<C: Consensus, H: HistoryStore>(
-    consensus: &Arc<C>,
-    views: &StateViews,
-    history: &Arc<H>,
-) {
+async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history: HistorySink) {
     let view = views.latest();
     // Proposer-side wall clock: safe here because housekeeping runs outside
     // apply (`docs/architecture/coordinator-runtime.md`, "Housekeeping").
@@ -201,9 +195,15 @@ async fn run_pass<C: Consensus, H: HistoryStore>(
         return;
     }
 
-    if let Err(e) = history.write_terminal_jobs(due.clone()).await {
-        tracing::warn!(error = %e, "housekeeping: history write failed, will retry next tick");
-        return;
+    // The configured mode is the gate. `none` has nothing to write to, so the
+    // TTL that made these jobs due is the whole of it — say so plainly rather
+    // than logging a write that did not happen (ADR 0012, issue #43).
+    match history {
+        HistorySink::None => tracing::info!(
+            count = due.len(),
+            "housekeeping: history = \"none\", evicting terminal jobs past the TTL; \
+             their history is discarded (ADR 0012 lossy mode)"
+        ),
     }
 
     let command = Command::EvictTerminalJobs(EvictTerminalJobs {
@@ -280,7 +280,9 @@ mod tests {
     use coppice_core::resource::Resources;
     use coppice_state::{PolicyConfig, StateMachine};
 
-    use crate::test_support::{allocation_record, job_record, node_record, view_of};
+    use crate::test_support::{
+        allocation_record, job_record, node_record, view_of, FakeConsensus, ProposeOutcome,
+    };
 
     #[test]
     fn stale_nodes_picks_schedulable_and_live_but_not_already_lost_or_fresh() {
@@ -407,5 +409,75 @@ mod tests {
         assert!(due_later.contains(&long_queued_just_done));
         assert!(!due_later.contains(&ancient_but_live));
         assert!(!due_later.contains(&terminal_unstamped));
+    }
+
+    /// The loop end to end under `history = "none"`: with no store to write
+    /// to, the replicated retention TTL is the whole gate, and what comes out
+    /// of a tick is exactly one `EvictTerminalJobs` naming exactly the jobs
+    /// past it (ADR 0012's lossy mode).
+    #[tokio::test(start_paused = true)]
+    async fn the_none_mode_evicts_on_the_ttl_alone() {
+        let (consensus, mut publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
+        let consensus = Arc::new(consensus);
+        let views = consensus.views();
+
+        let evictable = JobId::new();
+        let live = JobId::new();
+        let mut sm = StateMachine::default();
+        // Terminal at the epoch: `Timestamp::now()` is the wall clock, which
+        // tokio's paused timer does not move, so this is a full retention
+        // interval in the past on any machine that runs the test.
+        sm.jobs.insert(
+            evictable,
+            terminal_job(
+                evictable,
+                Timestamp::UNIX_EPOCH,
+                Some(Timestamp::UNIX_EPOCH),
+            ),
+        );
+        sm.jobs
+            .insert(live, job_record(live, "img", Resources::ZERO, None));
+        assert!(
+            Timestamp::now() - Timestamp::UNIX_EPOCH >= PolicyConfig::default().terminal_retention
+        );
+        publisher.publish_now(&sm, 1);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let status = consensus.status();
+        let join = tokio::spawn(run(
+            Arc::clone(&consensus),
+            views,
+            HistorySink::None,
+            NodeLiveness::new(),
+            status,
+            shutdown_rx,
+        ));
+
+        // Let the loop take leadership and arm its ticker before moving the
+        // clock: an `interval` created *after* the advance would measure from
+        // the new time and never fire.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // The immediate first tick was consumed as the ticker was armed (the
+        // loop skips it deliberately), so exactly one interval buys exactly
+        // one sweep — a longer jump would burst several missed ticks at once.
+        tokio::time::advance(HOUSEKEEPING_INTERVAL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        shutdown_tx.send(true).expect("the loop is still running");
+        join.await.expect("the loop joins on shutdown");
+
+        let evictions: Vec<EvictTerminalJobs> = consensus
+            .proposed()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::EvictTerminalJobs(evict) => Some(evict),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(evictions.len(), 1, "one sweep, one proposal");
+        assert_eq!(evictions[0].jobs, vec![evictable]);
     }
 }

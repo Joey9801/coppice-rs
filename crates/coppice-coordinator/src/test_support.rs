@@ -160,6 +160,10 @@ pub enum ReadIndexOutcome {
 /// so callers see the genuine seam behavior for reads.
 pub struct FakeConsensus {
     outcome: Mutex<ProposeOutcome>,
+    /// Every command `propose` was handed, in order — including the ones the
+    /// canned outcome then rejected, since "what did this loop decide to
+    /// propose" is a different question from "what did consensus accept".
+    proposed: Mutex<Vec<Command>>,
     // Retained so the status watch stays open for the lifetime of the fake:
     // the leader-only loops (`leadership::until_leadership_lost`) treat a
     // closed status watch as "leadership lost", so a dropped sender would end
@@ -197,6 +201,7 @@ impl FakeConsensus {
         });
         let consensus = FakeConsensus {
             outcome: Mutex::new(outcome),
+            proposed: Mutex::new(Vec::new()),
             _status_tx: status_tx,
             status_rx,
             views,
@@ -204,6 +209,14 @@ impl FakeConsensus {
             read_index: Mutex::new(ReadIndexOutcome::At(0)),
         };
         (consensus, publisher)
+    }
+
+    /// The commands proposed so far, oldest first.
+    ///
+    /// A snapshot rather than a guard: a test asserting on what a background
+    /// loop proposed must not hold the lock the loop's next `propose` needs.
+    pub fn proposed(&self) -> Vec<Command> {
+        self.proposed.lock().unwrap().clone()
     }
 
     /// Pin the barrier [`Consensus::read_index`] returns (defaults to 0).
@@ -225,7 +238,8 @@ impl FakeConsensus {
 }
 
 impl Consensus for FakeConsensus {
-    async fn propose(&self, _command: Command) -> Result<Applied, ConsensusError> {
+    async fn propose(&self, command: Command) -> Result<Applied, ConsensusError> {
+        self.proposed.lock().unwrap().push(command);
         let mut next_log_index = self.next_log_index.lock().unwrap();
         let log_index = *next_log_index;
         *next_log_index += 1;

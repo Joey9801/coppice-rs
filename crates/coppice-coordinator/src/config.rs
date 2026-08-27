@@ -37,6 +37,7 @@ use serde::Deserialize;
 
 pub(crate) use client_tls::{ClientTlsConfig, ClientTlsPosture};
 pub(crate) use discovery::DiscoveryConfig;
+pub(crate) use history::{HistoryConfig, HistoryMode};
 // The `[enrollment]` table is the SHARED definition in `coppice-enroll` — the
 // same type the agent parses, so the two daemons cannot disagree about what
 // `insecure` means, and its `Secret` token field redacts itself from every
@@ -124,6 +125,43 @@ mod client_tls {
         pub(crate) fn absent() -> anyhow::Error {
             ambiguous("is missing")
         }
+    }
+}
+
+mod history {
+    //! The `[history]` section (ADR 0012): where terminal-job history goes
+    //! once the job leaves replicated state.
+    //!
+    //! Like `[client_tls]`, nothing here defaults. Running without a durable
+    //! history store is a supported deployment shape — dev clusters, ephemeral
+    //! CI fleets, cost-sensitive installs — but it is a *declared* one: the
+    //! lossy mode is never inferred from a missing backend, because the
+    //! difference between "history is safe elsewhere" and "history is
+    //! discarded on a timer" is exactly the thing an operator must not
+    //! discover after the fact (issue #43).
+
+    use serde::Deserialize;
+
+    /// The `[history]` section as written.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct HistoryConfig {
+        pub(crate) mode: HistoryMode,
+    }
+
+    /// How this deployment persists terminal-job history.
+    ///
+    /// One variant so far, and it is the honest one: the durable backends
+    /// (`clickhouse`, per ADR 0012's default) arrive as further modes, and
+    /// until one exists there is no spelling of this section that claims
+    /// durability.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) enum HistoryMode {
+        /// Explicitly lossy: terminal jobs are evicted on the replicated
+        /// `terminal_retention` TTL alone and their history is discarded.
+        /// Nothing writes it anywhere first, and nothing reports that it did.
+        None,
     }
 }
 
@@ -313,6 +351,15 @@ pub(crate) struct Config {
     /// reader goes through [`Config::client_tls_posture`].
     #[serde(default)]
     client_tls: Option<ClientTlsConfig>,
+
+    /// Where terminal-job history is persisted (ADR 0012). **Required** —
+    /// running without a durable history store is a supported deployment
+    /// shape, but it is declared, never inferred from a missing backend
+    /// (issue #43). Optional to *serde* only so the error can explain that
+    /// choice instead of reading "missing field `history`"; every reader goes
+    /// through [`Config::history_mode`].
+    #[serde(default)]
+    history: Option<HistoryConfig>,
 
     /// How this installation enrolls for its own machine leaf when it has none
     /// (ADR 0037 §4). Optional: a formed voter, or one whose material is
@@ -1044,6 +1091,24 @@ impl Config {
         }
     }
 
+    /// How this deployment persists terminal-job history (ADR 0012), or the
+    /// error naming the section and the only mode this build supports.
+    ///
+    /// An absent section is that error rather than a silent `none`: a
+    /// deployment that never said it was lossy must not be made lossy by
+    /// omission (issue #43).
+    pub(crate) fn history_mode(&self) -> Result<HistoryMode> {
+        match &self.history {
+            Some(section) => Ok(section.mode),
+            None => Err(anyhow::anyhow!(
+                "missing [history]: declare how terminal-job history is persisted; this build \
+                 supports only the explicitly lossy `mode = \"none\"`, under which terminal jobs \
+                 are evicted on the replicated retention TTL and their history is discarded \
+                 (ADR 0012)"
+            )),
+        }
+    }
+
     /// This daemon's armed join-pipeline failpoints (ADR 0037 §6), scoped to
     /// it alone. Disarmed for every config without the section — which, in a
     /// release build, is every config that loads at all.
@@ -1092,9 +1157,10 @@ impl ResolvedConfig {
 /// via `serde` field defaults. What this does beyond parsing is reject, at
 /// startup, three things that would otherwise fail much later and much less
 /// clearly — a discovery section that names a backend without its table, a
-/// public listener whose TLS posture was never stated, and an `[enrollment]`
-/// endpoint a token must never be sent to — and resolve `advertise_host` once
-/// so no reader downstream has to.
+/// public listener whose TLS posture was never stated, a `[history]` section
+/// that never said whether this deployment keeps history at all, and an
+/// `[enrollment]` endpoint a token must never be sent to — and resolve
+/// `advertise_host` once so no reader downstream has to.
 pub fn load(path: &Path) -> Result<ResolvedConfig> {
     let mut config = read_config(path)?;
     config
@@ -1107,6 +1173,12 @@ pub fn load(path: &Path) -> Result<ResolvedConfig> {
     // pointed at an unverifiable endpoint must fail before it sends a token.
     config
         .client_tls_posture()
+        .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    // Same rationale one section over: a deployment that never declared how it
+    // keeps terminal-job history must fail before it starts discarding any
+    // (ADR 0012, issue #43), not at the first housekeeping tick an hour in.
+    config
+        .history_mode()
         .with_context(|| format!("reading coordinator config {}", path.display()))?;
     if let Some(enrollment) = &config.enrollment {
         enrollment
@@ -1201,6 +1273,10 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 cert_path = "/etc/coppice/pki/api.example.com.crt"
 key_path  = "/etc/coppice/pki/api.example.com.key"
 
+[history]
+# Explicitly lossy: this deployment runs no durable history store (ADR 0012).
+mode = "none"
+
 [enrollment]
 endpoint = "https://coord.batch.example.com:7070"
 token_path = "/etc/coppice/enroll-token"
@@ -1245,6 +1321,9 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 
 [client_tls]
 insecure = true
+
+[history]
+mode = "none"
 
 [discovery]
 backend = "static"
@@ -1980,6 +2059,61 @@ addrs = []
             assert!(err.contains("key_path"), "{label}: {err}");
             assert!(err.contains("insecure = true"), "{label}: {err}");
         }
+    }
+
+    // ---- [history]: how terminal-job history is kept (ADR 0012) -----------
+
+    #[test]
+    fn history_none_is_an_explicit_lossy_mode() {
+        for (label, example) in [("full", FULL_EXAMPLE), ("minimal", MINIMAL_EXAMPLE)] {
+            let (_guard, path) = write_config(example);
+            let config = read_config(&path).expect("example parses");
+            assert_eq!(
+                config.history_mode().expect("`none` is a mode"),
+                HistoryMode::None,
+                "{label}"
+            );
+        }
+    }
+
+    /// An omitted section parses — `history` is optional to serde alone — but
+    /// must not start a daemon: a deployment that never declared itself lossy
+    /// is not made lossy by omission (issue #43).
+    #[test]
+    fn an_absent_history_section_fails_naming_the_only_supported_mode() {
+        let without = MINIMAL_EXAMPLE.replace("[history]\nmode = \"none\"\n", "");
+        assert_ne!(without, MINIMAL_EXAMPLE, "no [history] section to remove");
+        let (_guard, path) = write_config(&without);
+
+        let config = read_config(&path).expect("the section is optional to serde");
+        let err = format!(
+            "{:#}",
+            config
+                .history_mode()
+                .expect_err("an undeclared history posture is an error")
+        );
+        assert!(err.contains("[history]"), "{err}");
+        assert!(err.contains("\"none\""), "{err}");
+
+        let err = format!(
+            "{:#}",
+            load(&path).expect_err("and it must fail at load, not at first use")
+        );
+        assert!(err.contains("[history]"), "{err}");
+    }
+
+    /// The durable backends of ADR 0012 are named in the ADR but not yet
+    /// built, so a config that asks for one fails loudly rather than falling
+    /// back to the lossy mode.
+    #[test]
+    fn an_unbuilt_history_mode_is_rejected() {
+        let contents = MINIMAL_EXAMPLE.replace("mode = \"none\"", "mode = \"clickhouse\"");
+        let (_guard, path) = write_config(&contents);
+        let err = format!(
+            "{:#}",
+            read_config(&path).expect_err("`clickhouse` is not a mode this build has")
+        );
+        assert!(err.contains("clickhouse"), "{err}");
     }
 
     #[test]

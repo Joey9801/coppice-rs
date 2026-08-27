@@ -21,6 +21,7 @@ node want a different value than its peers?* → config file.
 | Listen/advertise addresses, ports | config file |
 | Data directory | config file (the raft node id is *not* config: minted at init and read from the disk stamp, [ADR 0025](../decisions/0025-self-minted-coordinator-identity.md)) |
 | Machine-plane TLS paths (`[tls]`); client-listener TLS paths (`[client_tls]`); enrollment token path and endpoint | config file |
+| History sink mode (`[history]`) | config file (declares *how* history is retained; the TTL it retains against is policy — [ADR 0012](../decisions/0012-data-retention.md)) |
 | Discovery backend and `cluster_size` | config file (seed-only; consulted before replicated state is reachable — [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)) |
 | Enrollment tokens (hashes), issued-identity revocations | replicated policy (ADR 0037) |
 | SSO issuer, client id, client-secret path | config file |
@@ -225,6 +226,21 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 # [tls] (ADR 0022 break-glass).
 cert_path = "/etc/coppice/pki/api.example.com.crt"
 key_path  = "/etc/coppice/pki/api.example.com.key"
+
+[history]
+# REQUIRED — there is no default and the mode is never inferred from a
+# missing backend (ADR 0012). "none" is the only mode implemented today:
+# explicitly lossy, best-effort retention. Terminal-job data (jobs, attempts,
+# allocations, usage summaries, agent-local logs) is retained until the
+# replicated `terminal_retention` TTL (`coppice-cli policy`) elapses, at which
+# point housekeeping's `EvictTerminalJobs` discards the record — no durable
+# copy is written or claimed. Agent-local data (container logs, usage detail)
+# is lost outright with the agent on drain/decommission/scale-down, and is a
+# valid disk-pressure reclamation target even before the TTL. API reads
+# degrade gracefully: absent or partial history is a normal response, not an
+# error. Future modes add durable backends (issue #43); until then this is
+# the only supported value.
+mode = "none"
 
 [enrollment]
 # How a certless new installation obtains its leaf (ADR 0037 §§4-5):

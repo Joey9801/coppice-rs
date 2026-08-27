@@ -16,7 +16,7 @@ waive them.
 
 | ID | Severity | Area | Status | Release impact |
 | --- | --- | --- | --- | --- |
-| [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved) | Do not enable terminal-job eviction with the stub history sink |
+| [KOI-1](#koi-1-terminal-job-eviction-can-destroy-the-only-history) | Critical | Retention / history | Open (retention timing resolved 2026-07-10; silent-loss half resolved 2026-08-27, `history = "none"`) | The durable history store (issue #43) has not landed; `history = "none"` deployments never claim durable retention |
 | [KOI-2](#koi-2-job-submission-is-not-idempotent-across-an-unknown-outcome) | High | Public API | Resolved (2026-07-10, ADR 0026) | — |
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10; drop-and-gap completeness 2026-07-12) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
@@ -27,23 +27,31 @@ waive them.
 
 - **Severity:** Critical
 - **Status:** Open — the retention-timing half is resolved (2026-07-10); the
-  durable-history half is not
+  silent-loss half is resolved (2026-08-27, `history = "none"`); the
+  durable-history half is not (issue #43)
 - **Affected capability:** terminal-job retention and historical queries
 - **Related decisions:** [ADR 0012](../decisions/0012-data-retention.md),
   [ADR 0007](../decisions/0007-per-endpoint-read-consistency.md)
 
 ### Required invariant
 
-A terminal job is eligible for eviction from replicated state only after both
-of these facts are true:
+A terminal job is eligible for eviction from replicated state only after one
+of two facts is true, and the runtime always knows which one it's operating
+under (ADR 0012):
 
-1. the configured retention interval has elapsed since the job reached its
-   terminal state; and
-2. the full history record has been durably and idempotently written to the
-   history store.
+1. the deployment declares a durable history mode, and the full history
+   record has been durably and idempotently written to that store before
+   eviction; or
+2. the deployment explicitly declares `history = "none"` — a supported,
+   visible, lossy configuration, never inferred from a missing backend —
+   in which case eviction is gated on the configured retention interval
+   alone, and no durable copy is claimed.
 
-After eviction, the job must remain queryable through the eventual-consistency
-history path promised by ADR 0012.
+Either way, the configured retention interval must have elapsed since the job
+reached its terminal state. Under a durable mode, an evicted job must remain
+queryable through the eventual-consistency history path promised by ADR 0012;
+under `history = "none"`, API reads degrade gracefully instead — absent or
+partial history is a normal response, not an error.
 
 ### Current violation
 
@@ -59,19 +67,27 @@ supported pattern for cheap low-priority work — now gets the full configured
 interval after completion. Terminal records predating the field carry no
 stamp and are exempt from eviction (a retention leak, never an early loss).
 
-The production runtime still installs `StubHistoryStore`. That implementation
-only logs a count and returns success, which lets housekeeping propose
-`EvictTerminalJobs` even though no durable historical copy exists. The job,
-attempts, and allocations can then disappear from replicated state with no
-queryable replacement. This half remains open, and is an accepted limitation
-until the SQL history sink lands: eviction still runs, and evicted jobs are
-lost to history.
+~~The production runtime installed `StubHistoryStore`, which only logged a
+count and returned success — letting housekeeping propose
+`EvictTerminalJobs` while claiming a durable write that never happened, with
+no config surface saying so.~~ **Resolved 2026-08-27.** `StubHistoryStore` is
+deleted. History mode is now required, declared node config (`[history]`,
+[configuration.md](../operations/configuration.md)); the only implemented
+mode is the ADR 0012 explicit lossy mode, `history = "none"`, under which
+housekeeping gates eviction on the replicated `terminal_retention` TTL alone
+and logs the discard — it never claims a durable write it didn't make. The
+job, attempts, and allocations still disappear from replicated state with no
+queryable replacement, but that is now a declared property of the deployment,
+not a silent, accidental one. The durable half — an actual history store,
+write receipts, and readback stitching so an evicted job stays queryable —
+remains unimplemented (issue #43).
 
 ### Impact
 
-- Irrecoverable loss of user-visible job and attempt history (until a real
-  history store lands).
-- Eventual/history reads cannot satisfy the API contract after eviction.
+- Irrecoverable loss of user-visible job and attempt history in `history =
+  "none"` deployments — expected and declared, not a real store (issue #43).
+- Eventual/history reads cannot satisfy the full ADR 0012 API contract until
+  a durable mode lands; today they degrade gracefully instead of erroring.
 - ~~A long-running job is at greater risk than a short job because its age is
   measured from submission.~~ Resolved: the retention clock starts at the
   terminal transition.
@@ -85,22 +101,29 @@ lost to history.
   [command-catalog.md](../architecture/command-catalog.md#resolution-on-attempt-terminal).
 - ~~Base eviction eligibility exclusively on that terminal timestamp.~~ Done —
   `due_for_eviction` in housekeeping.
-- Implement a durable, idempotent history store containing the full job,
-  attempt, outcome, usage-summary, and audit data required by ADR 0012.
-- Fail closed: a missing, disabled, or failed history sink must not be treated
-  as a successful durable write. Prefer disabling eviction explicitly over a
-  success-returning stub.
+- ~~Fail closed: a missing, disabled, or failed history sink must not be
+  treated as a successful durable write. Prefer disabling eviction explicitly
+  over a success-returning stub.~~ Done — `[history]` is required config, the
+  success-returning `StubHistoryStore` is gone, and the only mode implemented
+  today never claims durability it doesn't have.
+- Implement a durable, idempotent history store (issue #43) containing the
+  full job, attempt, outcome, usage-summary, and audit data required by
+  ADR 0012, with write-then-evict ordering and eventual-consistency readback.
 - ~~Add tests proving that old submissions receive a full post-terminal
   retention interval~~ (done: `eviction_runs_a_full_retention_from_the_terminal_transition`,
   `terminal_timestamp_is_stamped_by_the_resolving_command`,
   `reconcile_and_node_loss_stamp_the_terminal_timestamp`) and that no eviction
-  is proposed after a failed or stubbed history write (open).
+  is proposed under a durable mode after a failed history write (open —
+  blocked on issue #43).
 
 ### Closure criteria
 
-This issue is resolved when the runtime cannot emit `EvictTerminalJobs` without
-a durable history receipt and a correct post-terminal retention calculation,
-and an integration test queries an evicted job from the history path.
+This issue is resolved when a durable history mode exists such that the
+runtime cannot emit `EvictTerminalJobs` under it without a durable history
+receipt and a correct post-terminal retention calculation, and an
+integration test queries an evicted job from the history path. The
+`history = "none"` mode already meets the honesty bar (no false durability
+claim); it does not, and is not meant to, meet the durability bar.
 
 ## KOI-2: Job submission is not idempotent across an unknown outcome
 
@@ -502,8 +525,9 @@ No such record existed anywhere in the system, for three compounding reasons:
    ADR 0032 sanctions it as the bounded most-recent cache (tier 1) and the
    in-memory bucket window as tier 3 — both now implemented — but the
    durable tier 2 (the history event table and writer in the ADR 0012 store)
-   does not exist; the only durable sink is `StubHistoryStore`, which logs a
-   count (KOI-1).
+   does not exist; the only history mode implemented today is the explicit
+   lossy `history = "none"` (ADR 0012), which retains nothing durably by
+   design (KOI-1, issue #43).
 3. **Replicated state records facts, not transitions.** It carries a handful of
    per-record timestamps (`submitted_at_us`, `terminal_at_us`,
    `started_at_us`) — enough for an age, nowhere near enough to reconstruct a
