@@ -24,9 +24,11 @@
 //! prints a skip line and returns green. On a Docker-equipped host (or CI with
 //! `DOCKER_HOST` pointed at a socket) the body runs for real. The tests are
 //! written to be correct on that first real run: generous timeouts, filtered
-//! exit draining (a live executor's events task sees die events for *every*
-//! coppice container, including other concurrent tests', per §4/§11), and
-//! `observe()`-polling where the exit channel is not itself under test.
+//! exit draining (a live executor's events task is `coppice.node`-scoped, so
+//! it sees die events only for its own node's containers — but a test that
+//! runs several allocations under one executor still interleaves them, per
+//! §4/§11), and `observe()`-polling where the exit channel is not itself
+//! under test.
 //!
 //! # Reuse (S3–S6)
 //!
@@ -132,6 +134,22 @@ mod harness {
     /// Must be called inside a tokio runtime: [`DockerExecutor::new`] spawns the
     /// events task, and dropping the returned executor aborts it (agent death).
     pub async fn executor(docker: Docker) -> (DockerExecutor, watch::Sender<DiskPressure>) {
+        executor_as(docker, NodeId::new()).await
+    }
+
+    /// [`executor`] under a caller-chosen node identity — the seam a test that
+    /// models an *agent restart* needs.
+    ///
+    /// Production persists the node id (`identity.rs`), so a restarted agent
+    /// comes back as the same node; the executor's daemon queries are scoped to
+    /// `coppice.node` so that concurrent agents (and this suite's concurrent
+    /// executors) never reconcile each other's containers. A successor executor
+    /// therefore has to be handed its predecessor's id, or it will not see the
+    /// survivor it is meant to adopt.
+    pub async fn executor_as(
+        docker: Docker,
+        node: NodeId,
+    ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
         let config = ExecutorConfig {
             whole_core_affinity: false,
             ..Default::default()
@@ -139,7 +157,7 @@ mod harness {
         // Existing S2 tests exercise lifecycle behavior and run concurrently;
         // keep them out of the host-global affinity allocator. The dedicated
         // S3 test below opts in explicitly.
-        executor_with(docker, config).await
+        executor_with_node(docker, config, node).await
     }
 
     /// [`executor`] with a caller-supplied [`ExecutorConfig`] — the seam the S4
@@ -151,7 +169,15 @@ mod harness {
         docker: Docker,
         config: ExecutorConfig,
     ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
-        let node = NodeId::new();
+        executor_with_node(docker, config, NodeId::new()).await
+    }
+
+    /// [`executor_with`] under a caller-chosen node identity (see [`executor_as`]).
+    pub async fn executor_with_node(
+        docker: Docker,
+        config: ExecutorConfig,
+        node: NodeId,
+    ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
         let (tx, rx) = watch::channel(DiskPressure::Ok);
         // `None` telemetry: these lifecycle tests do not assert on collection, and
         // the docker-gated telemetry suite (a later phase) wires it explicitly.
@@ -306,9 +332,10 @@ mod harness {
     }
 
     /// Await a natural exit for exactly `alloc` via `next_exit`, draining and
-    /// discarding exits for *other* allocations (fact §4/§11: this executor's
-    /// events task sees die events for every coppice container, including other
-    /// concurrent tests'). Fails on a `secs` timeout.
+    /// discarding exits for *other* allocations. The events task is
+    /// `coppice.node`-scoped (§4/§11), so those can only be unrelated
+    /// allocations of this same executor's node — never other concurrent
+    /// tests'. Fails on a `secs` timeout.
     pub async fn wait_exit(
         exec: &DockerExecutor,
         alloc: AllocationId,
@@ -557,7 +584,7 @@ mod harness {
             &docker_host(),
             1000,
             0,
-            NodeId::new(),
+            node_for_root(root),
             rx,
             cache_options(),
             Some(wiring),
@@ -565,6 +592,25 @@ mod harness {
         .await
         .expect("initialize telemetry executor");
         (exec, tx, hub, sink)
+    }
+
+    /// The node identity of the agent whose telemetry lives under `root`.
+    ///
+    /// The telemetry suite models an agent crash as "drop the executor, build
+    /// another over the SAME root", which is a *restart of one agent* — and a
+    /// restarted agent keeps its persisted node id (`identity.rs`), which the
+    /// `coppice.node`-scoped daemon queries need to see the survivor it adopts.
+    /// Keying the id off the root reproduces that without threading an id
+    /// through every test: same root ⇒ same node, distinct tempdirs ⇒ distinct
+    /// nodes, so concurrent tests stay isolated from each other.
+    pub fn node_for_root(root: &std::path::Path) -> NodeId {
+        static NODES: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, NodeId>>> =
+            std::sync::OnceLock::new();
+        let mut nodes = NODES
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .expect("node registry lock");
+        *nodes.entry(root.to_path_buf()).or_insert_with(NodeId::new)
     }
 
     /// The daemon's own retained log lines for a container, via raw bollard logs
@@ -853,11 +899,14 @@ mod harness {
     /// seam the production-build and empty-sinks tests need, where the wiring comes
     /// from [`telemetry::build`](coppice_agent::telemetry::build) or from an empty
     /// config rather than from [`executor_with_telemetry`]'s single-sink shortcut.
-    /// Same fresh node identity, `Ok`-initial pressure channel, and cache options as
+    /// The node identity is the caller's (see [`executor_as`]): the production-build
+    /// test rebuilds over the same data dir to model a restart, so both halves have
+    /// to run as the same node. `Ok`-initial pressure channel and cache options as
     /// the rest of the harness.
     pub async fn executor_from_wiring(
         docker: Docker,
         wiring: TelemetryWiring,
+        node: NodeId,
     ) -> (DockerExecutor, watch::Sender<DiskPressure>) {
         let config = ExecutorConfig {
             whole_core_affinity: false,
@@ -870,7 +919,7 @@ mod harness {
             &docker_host(),
             1000,
             0,
-            NodeId::new(),
+            node,
             rx,
             cache_options(),
             Some(wiring),
@@ -1186,6 +1235,94 @@ async fn external_sigkill_under_a_memory_limit_is_killed_not_natural() {
     r.unwrap();
 }
 
+/// `observe()` neither reports nor removes a container belonging to a *different*
+/// node (§5): the daemon can be shared by several agents — and by this suite's
+/// own concurrent executors, each with a fresh `NodeId`.
+///
+/// The flake this guards: another owner's container sits in `created` for a beat
+/// between its create and its start. Matched on `coppice.allocation` alone, it
+/// looks exactly like our own crash debris — a created container with no
+/// in-flight start of ours — so `observe()` would remove it, and the real owner's
+/// `start_container` would then fail with a 404. The foreign container here is
+/// deliberately left in that state: created, never started.
+#[tokio::test]
+async fn observe_ignores_other_nodes_containers() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    let (exec, _tx) = harness::executor(docker.clone()).await;
+    let sp = harness::spec(harness::BUSYBOX, &["sleep", "300"], Resources::ZERO);
+    let alloc = sp.allocation;
+    let foreign_alloc = AllocationId::new();
+    let foreign_name = format!("coppice-{foreign_alloc}");
+
+    let r: anyhow::Result<()> = async {
+        // One normal cycle first: it also guarantees the pinned image is present
+        // locally, which the raw create below (no pull of its own) needs.
+        exec.start(sp).await?;
+        harness::wait_observed_running(&exec, alloc, 30).await?;
+
+        // The foreign container, straight at the daemon: our label set, but
+        // another node's id, and left in `created`.
+        let mut labels = HashMap::new();
+        labels.insert("coppice.allocation".to_string(), foreign_alloc.to_string());
+        labels.insert("coppice.attempt".to_string(), AttemptId::new().to_string());
+        labels.insert("coppice.job".to_string(), JobId::new().to_string());
+        labels.insert("coppice.node".to_string(), NodeId::new().to_string());
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&foreign_name)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(harness::BUSYBOX.to_string()),
+                    cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    labels: Some(labels),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow!("creating the foreign container: {e}"))?;
+
+        for _ in 0..2 {
+            let observed = exec.observe().await.map_err(|e| anyhow!("observe: {e}"))?;
+            ensure!(
+                !observed.iter().any(|c| c.allocation == foreign_alloc),
+                "observe reported another node's container {foreign_alloc}"
+            );
+            ensure!(
+                observed.iter().any(|c| c.allocation == alloc),
+                "observe lost this node's own container {alloc}"
+            );
+        }
+
+        docker
+            .inspect_container(
+                &foreign_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| anyhow!("observe removed another node's container as debris: {e}"))?;
+        Ok(())
+    }
+    .await;
+
+    let _ = docker
+        .remove_container(
+            &foreign_name,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+                    .force(true)
+                    .build(),
+            ),
+        )
+        .await;
+    harness::cleanup(&exec, &[alloc]).await;
+    r.unwrap();
+}
+
 // ---- 4. stop grace, TERM-trapping container -----------------------------
 
 /// Stopping a running container that traps SIGTERM and exits 0 during the grace
@@ -1284,6 +1421,10 @@ async fn exit_races_stop_truth_wins() {
 /// executor over a fresh connection re-`observe()`s it Running with the same
 /// attempt/job ids (§5), and re-`start()`ing the same spec adopts the survivor
 /// (Ok) without creating a second container.
+///
+/// Both executors run under one node identity: this is the *same* agent coming
+/// back (production persists the id in `identity.rs`), and observe is scoped to
+/// `coppice.node`.
 #[tokio::test]
 async fn restart_adoption() {
     let Some(docker) = harness::docker().await else {
@@ -1291,10 +1432,11 @@ async fn restart_adoption() {
     };
     let sp = harness::spec(harness::BUSYBOX, &["sleep", "300"], Resources::ZERO);
     let alloc = sp.allocation;
+    let node = NodeId::new();
 
     let r: anyhow::Result<()> = async {
         // Executor A starts the long-lived container, then "dies" (drop).
-        let (exec_a, _tx_a) = harness::executor(docker.clone()).await;
+        let (exec_a, _tx_a) = harness::executor_as(docker.clone(), node).await;
         exec_a.start(sp.clone()).await?;
         let before = harness::wait_observed_running(&exec_a, alloc, 30).await?;
         drop(exec_a); // agent death — the container survives daemon-side.
@@ -1302,7 +1444,7 @@ async fn restart_adoption() {
         // Executor B on a fresh connection adopts the survivor.
         let docker_b = api::connect(&harness::docker_host())
             .map_err(|e| anyhow!("fresh connect for executor B: {e}"))?;
-        let (exec_b, _tx_b) = harness::executor(docker_b).await;
+        let (exec_b, _tx_b) = harness::executor_as(docker_b, node).await;
 
         let observed = exec_b.observe().await?;
         let adopted = observed
@@ -2465,7 +2607,12 @@ async fn daemon_log_rotation_bounds_catchup() {
         labels.insert("coppice.allocation".to_string(), alloc.to_string());
         labels.insert("coppice.attempt".to_string(), attempt.to_string());
         labels.insert("coppice.job".to_string(), job.to_string());
-        labels.insert("coppice.node".to_string(), NodeId::new().to_string());
+        // The node the adopting executor below will run under: observe is
+        // `coppice.node`-scoped, and this container is meant to be *ours*.
+        labels.insert(
+            "coppice.node".to_string(),
+            harness::node_for_root(root.path()).to_string(),
+        );
         // Adoption reads ids + start time for telemetry; disk-mode is stamped the
         // way a real container carries it (§5), harmless to the poll enforcer here.
         labels.insert("coppice.disk-mode".to_string(), "quota".to_string());
@@ -2696,9 +2843,12 @@ async fn production_build_wires_collection_end_to_end() {
         ensure!(telemetry_a.stores.len() == 2, "two sinks configured");
         let store_a = telemetry_a.stores[0].clone(); // metrics-only
         let store_b = telemetry_a.stores[1].clone(); // logs + metrics (the log_store)
+                                                     // A and B are one agent restarting over the same data dir: one node id.
+        let node = harness::node_for_root(&data_dir);
         let (exec_a, _txa) = harness::executor_from_wiring(
             docker.clone(),
             harness::wiring_of(&telemetry_a, &config),
+            node,
         )
         .await;
 
@@ -2738,6 +2888,7 @@ async fn production_build_wires_collection_end_to_end() {
         let (exec_b, _txb) = harness::executor_from_wiring(
             docker.clone(),
             harness::wiring_of(&telemetry_b, &config),
+            node,
         )
         .await;
         let boundary = harness::boundary_floor_micros(&store_b, job, attempt)
@@ -2826,7 +2977,7 @@ async fn empty_sinks_config_spawns_no_collectors() {
         "no sink consumes logs"
     );
 
-    let (exec, _tx) = harness::executor_from_wiring(docker.clone(), wiring).await;
+    let (exec, _tx) = harness::executor_from_wiring(docker.clone(), wiring, NodeId::new()).await;
     let sp = harness::spec(harness::BUSYBOX, PRINTER, Resources::ZERO);
     let alloc = sp.allocation;
 

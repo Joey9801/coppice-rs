@@ -34,10 +34,10 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
-use coppice_core::id::AllocationId;
+use coppice_core::id::{AllocationId, NodeId};
 use coppice_core::time::Timestamp;
 
-use super::{classify, cpuset, lock_state, oom, ExecutorState, LABEL_ALLOCATION};
+use super::{classify, cpuset, lock_state, oom, ExecutorState, LABEL_ALLOCATION, LABEL_NODE};
 use crate::executor::ExitEvent;
 
 /// Backoff between an events-stream error/end and the reconnect-and-resync
@@ -67,12 +67,13 @@ const INSPECT_OPTS: Option<bollard::query_parameters::InspectContainerOptions> =
 /// drop). Captures only clones so the abort is what actually stops it.
 pub(crate) fn spawn(
     docker: Docker,
+    node: NodeId,
     state: Arc<Mutex<ExecutorState>>,
     witness: Arc<oom::OomWitness>,
     cpuset: Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: mpsc::UnboundedSender<ExitEvent>,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(docker, state, witness, cpuset, exit_tx))
+    tokio::spawn(run(docker, node, state, witness, cpuset, exit_tx))
 }
 
 /// One unit of work for the settle task, produced by the pump.
@@ -110,6 +111,7 @@ impl Drop for AbortOnDrop {
 /// queue in the channel rather than being lost.
 async fn run(
     docker: Docker,
+    node: NodeId,
     state: Arc<Mutex<ExecutorState>>,
     witness: Arc<oom::OomWitness>,
     cpuset: Option<Arc<AsyncMutex<cpuset::Allocator>>>,
@@ -119,6 +121,7 @@ async fn run(
     // Held for its drop effect: aborting this task also stops the pump.
     let _pump = AbortOnDrop(tokio::spawn(pump(
         docker.clone(),
+        node,
         Arc::clone(&witness),
         work_tx,
     )));
@@ -131,7 +134,7 @@ async fn run(
                 handle_die(&docker, &state, &witness, &cpuset, &exit_tx, &event).await
             }
             Work::Resync => {
-                if let Err(err) = resync(&docker, &state, &witness, &cpuset, &exit_tx).await {
+                if let Err(err) = resync(&docker, node, &state, &witness, &cpuset, &exit_tx).await {
                     tracing::warn!(error = %err, "events resync failed; relying on later observe/resync");
                 }
             }
@@ -145,7 +148,12 @@ async fn run(
 /// `die` events and resync requests are handed to [`run`]. Because nothing here
 /// blocks, the tail stays live for as long as the subscription does, which is
 /// the property the OOM witness depends on.
-async fn pump(docker: Docker, witness: Arc<oom::OomWitness>, work_tx: mpsc::UnboundedSender<Work>) {
+async fn pump(
+    docker: Docker,
+    node: NodeId,
+    witness: Arc<oom::OomWitness>,
+    work_tx: mpsc::UnboundedSender<Work>,
+) {
     loop {
         // 1. Subscribe (live tail; no `since` — gaps are covered by the resync).
         let mut filters = HashMap::new();
@@ -159,7 +167,12 @@ async fn pump(docker: Docker, witness: Arc<oom::OomWitness>, work_tx: mpsc::Unbo
             "event".to_string(),
             vec!["die".to_string(), "oom".to_string()],
         );
-        filters.insert("label".to_string(), vec![LABEL_ALLOCATION.to_string()]);
+        // Scoped to this node: another agent's containers on a shared daemon
+        // publish the same events, and their exits are not ours to journal.
+        filters.insert(
+            "label".to_string(),
+            vec![LABEL_ALLOCATION.to_string(), format!("{LABEL_NODE}={node}")],
+        );
         let options = EventsOptionsBuilder::new().filters(&filters).build();
         let mut stream = Box::pin(docker.events(Some(options)));
 
@@ -252,7 +265,7 @@ fn dispatch(
     }
 }
 
-/// List all exited/dead labeled containers and, for each with usable evidence
+/// List this node's exited/dead labeled containers and, for each with usable evidence
 /// whose allocation is not already claimed, claim it and enqueue an
 /// [`ExitEvent`]. Unconditional on purpose (see the module docs): an exit that
 /// never flows through `next_exit` is never journaled by the session, so
@@ -260,13 +273,17 @@ fn dispatch(
 /// bounded by the claim set here and the session's idempotency above.
 async fn resync(
     docker: &Docker,
+    node: NodeId,
     state: &Mutex<ExecutorState>,
     witness: &oom::OomWitness,
     cpuset: &Option<Arc<AsyncMutex<cpuset::Allocator>>>,
     exit_tx: &mpsc::UnboundedSender<ExitEvent>,
 ) -> Result<(), bollard::errors::Error> {
     let mut filters = HashMap::new();
-    filters.insert("label".to_string(), vec![LABEL_ALLOCATION.to_string()]);
+    filters.insert(
+        "label".to_string(),
+        vec![LABEL_ALLOCATION.to_string(), format!("{LABEL_NODE}={node}")],
+    );
     filters.insert(
         "status".to_string(),
         vec!["exited".to_string(), "dead".to_string()],
