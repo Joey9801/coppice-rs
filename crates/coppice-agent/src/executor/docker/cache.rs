@@ -38,11 +38,11 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::AllocationId;
+use coppice_core::id::{AllocationId, NodeId};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1 as pb;
 
-use super::{api, classify, LABEL_ALLOCATION, LABEL_IMAGE_DIGEST};
+use super::{api, classify, LABEL_ALLOCATION, LABEL_IMAGE_DIGEST, LABEL_NODE};
 use crate::config::ImageCacheConfig;
 use crate::executor::StartError;
 use crate::pressure::DiskPressure;
@@ -245,6 +245,9 @@ struct Flight {
 /// The shared guts behind every [`ImageCache`] clone.
 struct CacheInner {
     docker: Docker,
+    /// This agent's node id, for the `coppice.node` scope on the re-pin listing:
+    /// on a shared daemon another agent's containers pin nothing of ours.
+    node: NodeId,
     config: ImageCacheConfig,
     /// `None` = in-memory only (tests); else `data_dir/image-cache.json`.
     state_path: Option<PathBuf>,
@@ -308,6 +311,7 @@ impl ImageCache {
     /// [`recover`]: ImageCache::recover
     pub(crate) fn new(
         docker: Docker,
+        node: NodeId,
         pressure: watch::Receiver<DiskPressure>,
         options: CacheOptions,
     ) -> ImageCache {
@@ -318,6 +322,7 @@ impl ImageCache {
         let permits = options.config.max_concurrent_pulls.max(1);
         let inner = CacheInner {
             docker,
+            node,
             config: options.config,
             state_path: options.state_path,
             pressure_paths: options.pressure_paths,
@@ -440,12 +445,19 @@ impl ImageCache {
     }
 
     /// Re-pin running/exited containers from their `coppice.image-digest` label
-    /// (docker-executor.md §7, §5). The `all(true)` label-filtered list is the
-    /// exact `recover_cpu_allocations` shape; the digest is read straight off the
-    /// summary's labels (no inspect needed). Missing/unparseable labels → skip.
+    /// (docker-executor.md §7, §5). The `all(true)` node-scoped label-filtered
+    /// list is the exact `recover_cpu_allocations` shape; the digest is read
+    /// straight off the summary's labels (no inspect needed).
+    /// Missing/unparseable labels → skip.
     async fn repin_from_containers(&self) -> Result<(), crate::executor::ExecutorError> {
         let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![LABEL_ALLOCATION.to_string()]);
+        filters.insert(
+            "label".to_string(),
+            vec![
+                LABEL_ALLOCATION.to_string(),
+                format!("{LABEL_NODE}={}", self.inner.node),
+            ],
+        );
         let options = ListContainersOptionsBuilder::new()
             .all(true)
             .filters(&filters)
@@ -1460,6 +1472,7 @@ mod tests {
         let (_tx, rx) = watch::channel(DiskPressure::Ok);
         ImageCache::new(
             docker,
+            NodeId::new(),
             rx,
             CacheOptions {
                 config: ImageCacheConfig {

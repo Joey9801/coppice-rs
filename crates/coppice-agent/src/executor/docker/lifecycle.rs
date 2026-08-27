@@ -613,12 +613,25 @@ fn grace_to_secs_ceil(grace: Duration) -> i32 {
 
 // ---- observe (docker-executor.md §5) ------------------------------------
 
-/// The full set of labeled containers, mapped by the §3 table into the runtime
-/// half of restart reconciliation. Debris is removed (best-effort) and not
-/// reported; the running snapshot is replaced wholesale and the gauge pushed.
+/// The full set of *this node's* labeled containers, mapped by the §3 table into
+/// the runtime half of restart reconciliation. Debris is removed (best-effort)
+/// and not reported; the running snapshot is replaced wholesale and the gauge
+/// pushed.
+///
+/// The `coppice.node` scope is load-bearing, not hygiene: a daemon can be shared
+/// with other agents (and, in the integration suite, other executors), and their
+/// containers are not ours to reconcile — least of all to remove as debris. One
+/// briefly sitting in `created`, between its owner's create and start, looks
+/// exactly like our own crash debris.
 pub(crate) async fn observe(inner: &Inner) -> Result<Vec<ObservedContainer>, ExecutorError> {
     let mut filters = HashMap::new();
-    filters.insert("label".to_string(), vec![LABEL_ALLOCATION.to_string()]);
+    filters.insert(
+        "label".to_string(),
+        vec![
+            LABEL_ALLOCATION.to_string(),
+            format!("{LABEL_NODE}={}", inner.node),
+        ],
+    );
     let options = ListContainersOptionsBuilder::new()
         .all(true)
         .filters(&filters)

@@ -589,7 +589,7 @@ impl DockerExecutor {
             let allocator = cpuset::Allocator::new(topology, reservation_cpu_millis)
                 .map_err(ExecutorError::Other)?;
             let allocator = Arc::new(AsyncMutex::new(allocator));
-            recover_cpu_allocations(&docker, &allocator).await?;
+            recover_cpu_allocations(&docker, node, &allocator).await?;
             update_fractional_containers(&docker, &mut *allocator.lock().await)
                 .await
                 .map_err(ExecutorError::Other)?;
@@ -604,6 +604,7 @@ impl DockerExecutor {
         let oom_witness = Arc::new(oom::OomWitness::default());
         let events_task = events::spawn(
             docker.clone(),
+            node,
             Arc::clone(&state),
             Arc::clone(&oom_witness),
             cpuset.clone(),
@@ -639,7 +640,7 @@ impl DockerExecutor {
         // the first sweep sees a truthful inventory. The janitor captures only a
         // cache clone and its own pressure receiver — never `Arc<Inner>` — so the
         // abort in `Inner::drop` is what stops it (the mod.rs no-cycle rule).
-        let cache = cache::ImageCache::new(docker.clone(), pressure.clone(), cache);
+        let cache = cache::ImageCache::new(docker.clone(), node, pressure.clone(), cache);
         cache.recover().await;
         let cache_task = cache::spawn_janitor(cache.clone(), pressure.clone());
 
@@ -949,10 +950,14 @@ fn is_active_status(status: ContainerStateStatusEnum) -> bool {
 
 async fn recover_cpu_allocations(
     docker: &Docker,
+    node: NodeId,
     cpuset: &Arc<AsyncMutex<cpuset::Allocator>>,
 ) -> Result<(), ExecutorError> {
     let mut filters = std::collections::HashMap::new();
-    filters.insert("label".to_string(), vec![LABEL_ALLOCATION.to_string()]);
+    filters.insert(
+        "label".to_string(),
+        vec![LABEL_ALLOCATION.to_string(), format!("{LABEL_NODE}={node}")],
+    );
     let options = ListContainersOptionsBuilder::new()
         .all(true)
         .filters(&filters)
