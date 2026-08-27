@@ -26,7 +26,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # With no toolchain argument this installs the *active* toolchain, which
       # rust-toolchain.toml pins — so CI and a developer machine run the very
       # same rustfmt/clippy binaries. Components come from that file too.
@@ -38,7 +38,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       # `--all-targets` reaches tests, benches, and examples — not just the
@@ -49,7 +49,7 @@ jobs:
     name: unit & integration tests (non-fleet)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
         with:
@@ -84,7 +84,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
         with:
@@ -108,7 +108,7 @@ jobs:
     name: sqlx-prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
       # Pinned to the workspace's sqlx minor (0.8): the CLI and the crate's
@@ -130,8 +130,8 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
