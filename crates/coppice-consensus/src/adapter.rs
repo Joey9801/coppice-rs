@@ -33,6 +33,7 @@ use coppice_state::{Command, StateMachine};
 
 use crate::contact::ContactTracker;
 use crate::error::ConsensusError;
+use crate::net::DialOverrides;
 use crate::view::StateViews;
 use crate::{Applied, Consensus, ConsensusStatus, CoordinatorId};
 
@@ -137,6 +138,22 @@ pub const PROMOTION_LAG_MAX: u64 = 256;
 /// on a set the leader has not heard from in two minutes.
 pub const LIVE_CONTACT_STALENESS: Duration = Duration::from_secs(3);
 
+/// How long [`Consensus::set_node_address`] keeps retrying past
+/// `MembershipInProgress` while its dial override drains a stuck membership
+/// change (ADR 0037 §6).
+///
+/// Ten seconds is many replication backoffs (openraft's is a constant 500ms)
+/// and many election timeouts, so a change the override actually unblocks has
+/// long since committed; past it the pending change is stuck on something the
+/// repoint cannot fix, and the operator should see that rather than a call
+/// that never returns.
+const REPOINT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The gap between repoint attempts inside [`REPOINT_DEADLINE`]. Short enough
+/// to follow the unblocked change closely, long enough that the retry loop is
+/// not itself load.
+const REPOINT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 /// What [`Consensus::plan_promotion`] decided, before any key transfer or
 /// membership change happens (ADR 0037 §4/§7).
 ///
@@ -210,6 +227,11 @@ pub struct OpenraftConsensus {
     /// is mid-commit and then remove a brand-new voter — precisely the
     /// background voter reaper ADR 0037 §7 forbids.
     membership_change: tokio::sync::Mutex<()>,
+    /// Leader-local dial redirections the Raft network layer consults before
+    /// every dial. Used by [`Consensus::set_node_address`] to reach a moved
+    /// node at its verified new endpoint while membership still records the
+    /// stale one (ADR 0037 §6).
+    dial_overrides: DialOverrides,
 }
 
 impl OpenraftConsensus {
@@ -234,6 +256,7 @@ impl OpenraftConsensus {
         removal_grace: Duration,
         learner_expiry: Duration,
         contact: Arc<ContactTracker>,
+        dial_overrides: DialOverrides,
     ) -> Self {
         OpenraftConsensus {
             raft,
@@ -245,6 +268,7 @@ impl OpenraftConsensus {
             learner_expiry,
             contact,
             membership_change: tokio::sync::Mutex::new(()),
+            dial_overrides,
         }
     }
 
@@ -868,9 +892,55 @@ impl Consensus for OpenraftConsensus {
         node: CoordinatorId,
         addr: String,
     ) -> Result<(), ConsensusError> {
+        // Redirect this leader's dials of `node` to the verified new endpoint
+        // for the rest of the call, and retry the repoint past
+        // `MembershipInProgress`.
+        //
+        // Installed BEFORE the `membership_change` mutex is acquired,
+        // deliberately: the verbs that mutex serializes hold it *across* their
+        // own blocking `change_membership` call, so the wedge this override
+        // exists to drain can be the mutex's current holder — a promotion
+        // stuck awaiting a commit that dials the stale address. The override
+        // needs no lock to take effect; it lets the holder finish, which is
+        // what releases the mutex for the bounded acquisition below.
+        //
+        // Both halves exist for one wedge, and neither clears it alone. A node
+        // that moved *during* a membership change leaves the leader with a
+        // pending joint (or trailing uniform) entry that carries the node's
+        // OLD address: replication dials that dead address forever, so the
+        // entry can never commit — and openraft refuses every further
+        // `change_membership` while it is pending. The repoint verb, the one
+        // thing that could repair the address, is therefore locked out by the
+        // exact wedge it exists to clear.
+        //
+        // The override breaks the cycle from below: replication of the stuck
+        // entry reaches the node at its real endpoint, the entry commits, and
+        // the configuration change finishes — at which point the retry loop's
+        // next attempt is accepted and rewrites the address in membership for
+        // good. Once that lands the override is redundant, so the guard is
+        // simply dropped on the way out.
+        //
+        // Installing it is safe only because the admin service has already
+        // dial-back-verified that the new endpoint presents the machine
+        // identity bound to this seat (ADR 0037 §6); see [`DialOverrides`].
+        let _override = self.dial_overrides.install(node, addr.clone());
+
         // Serialize with every other membership mutation (see
-        // `membership_change`).
-        let _guard = self.membership_change.lock().await;
+        // `membership_change`) — bounded by the repair window, because the
+        // holder may be exactly the wedged change described above and "wait
+        // forever for the wedge to clear itself" is the outcome this verb
+        // exists to prevent.
+        let deadline = tokio::time::Instant::now() + REPOINT_DEADLINE;
+        let Ok(_guard) = tokio::time::timeout_at(deadline, self.membership_change.lock()).await
+        else {
+            tracing::warn!(
+                node,
+                %addr,
+                "address repoint gave up: another membership mutation held the lock for the \
+                 whole repair window (ADR 0037 §6)"
+            );
+            return Err(ConsensusError::MembershipInProgress);
+        };
 
         // The operator-only break-glass of ADR 0037 §6. `SetNodes` is the one
         // openraft change that can split-brain when misused, which is exactly
@@ -881,14 +951,51 @@ impl Consensus for OpenraftConsensus {
             Some(_) => {}
             None => return Err(ConsensusError::UnknownNode { node }),
         }
-        self.raft
-            .change_membership(
-                ChangeMembers::SetNodes(BTreeMap::from([(node, BasicNode { addr })])),
+
+        loop {
+            // The accepted write is bounded by the SAME absolute deadline as
+            // everything else in this call: openraft blocks here until the
+            // change commits, and a quorum that degrades mid-call (or a
+            // verified endpoint that vanishes again after dial-back) would
+            // otherwise hang this verb forever while it holds both the
+            // membership mutex and the dial override. On expiry the outcome is
+            // UNKNOWN — the entry may still commit later — which is exactly
+            // [`ConsensusError::Timeout`]'s contract for consensus writes.
+            let write = self.raft.change_membership(
+                ChangeMembers::SetNodes(BTreeMap::from([(node, BasicNode { addr: addr.clone() })])),
                 false,
-            )
-            .await
-            .map(|_| ())
-            .map_err(map_client_write_error)
+            );
+            let result = match tokio::time::timeout_at(deadline, write).await {
+                Ok(outcome) => outcome.map(|_| ()).map_err(map_client_write_error),
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        node,
+                        %addr,
+                        "address repoint gave up: the accepted membership rewrite did not \
+                         commit within the repair window; its outcome is unknown (ADR 0037 §6)"
+                    );
+                    return Err(ConsensusError::Timeout);
+                }
+            };
+            match result {
+                Err(ConsensusError::MembershipInProgress) => {
+                    // Only this case is worth waiting on: the override is
+                    // actively draining whatever is pending. Everything else
+                    // (not leader, fatal, ...) is the caller's to handle now.
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            node,
+                            %addr,
+                            "address repoint gave up: a membership change stayed pending for the \
+                             whole repair window (ADR 0037 §6)"
+                        );
+                        return Err(ConsensusError::MembershipInProgress);
+                    }
+                    tokio::time::sleep(REPOINT_RETRY_INTERVAL).await;
+                }
+                other => return other,
+            }
+        }
     }
 
     async fn trigger_snapshot(&self) -> Result<(), ConsensusError> {
@@ -1156,6 +1263,8 @@ mod idempotency_tests {
             // waiting out a wall-clock hour.
             Duration::ZERO,
             Arc::clone(&contact),
+            // The no-op network never dials, so overrides are inert here.
+            crate::net::DialOverrides::default(),
         );
         Harness {
             _dir: dir,

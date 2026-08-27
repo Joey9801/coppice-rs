@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use coppice_consensus::{Consensus, OpenraftConsensus};
+use coppice_consensus::{Consensus, OpenraftConsensus, PromotionPlan};
 use coppice_coordinator::admin;
 use coppice_core::id::{ClusterId, JobId, MachineId, QuotaEntityId};
 use coppice_core::time::Timestamp;
@@ -34,7 +34,7 @@ use coppice_state::command::BumpClusterVersion;
 use coppice_state::Command;
 use coppice_tls::pki;
 
-use common::{poll, wait_converged, Ca, Daemon, Fleet, Leaf, Node};
+use common::{free_port, poll, wait_converged, Ca, Daemon, Fleet, Leaf, Node};
 
 /// ADR 0037 §1, whole: N identical configs plus one `init` become an N-voter
 /// cluster, with nobody told anything about anybody.
@@ -1242,4 +1242,203 @@ async fn derived_startup_intent() {
             "error should mention the identity/cluster mismatch, got: {msg}"
         );
     }
+}
+
+/// The address-repoint break-glass must be able to clear the wedge it exists
+/// for (ADR 0037 §6).
+///
+/// A node that moves *while a membership change is in flight* leaves the
+/// leader holding a joint (or trailing uniform) configuration entry that
+/// carries the node's OLD address. Replication of that entry dials the dead
+/// address forever, so it can never commit — and openraft refuses every
+/// further `change_membership` while it is pending. `set-address`, the one
+/// verb that could repair the address, is therefore locked out by exactly the
+/// wedge it exists to clear: a genuine liveness deadlock, and the root cause
+/// of a real CI hang in `admin_membership.rs`.
+///
+/// This test stages that deadlock deterministically — no load, no sleeps used
+/// as synchronization — and asserts the repoint drills through it: the
+/// leader-local dial override reaches the member at its real endpoint, the
+/// stuck entry drains, and the repoint commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repoint_drills_through_a_membership_change_wedged_on_a_stale_address() {
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+
+    // A one-voter cluster plus a caught-up learner. One voter keeps the
+    // *leader's* own quorum trivial, so nothing below can fail for want of an
+    // election: every stall in this test is the wedge under study.
+    let mut leader = Node::new(1, cluster_id, &ca);
+    leader.boot().await;
+    poll(DEADLINE, "node 1 becomes leader", || async {
+        leader.is_leader()
+    })
+    .await;
+
+    let mut member = Node::new(2, cluster_id, &ca);
+    member.boot_joining().await;
+    let member_id = member.raft_id();
+    let real_addr = member.advertise.clone();
+    leader
+        .consensus()
+        .add_learner(member_id, real_addr.clone())
+        .await
+        .expect("admit the member as a learner");
+
+    // Wait for the member to be genuinely promotable: caught up on the log AND
+    // answering this leader's heartbeats (ADR 0037 §7 counts only acks). Both
+    // are preconditions of the promotion staged next, so waiting on the
+    // planner itself is the precise wait, not a proxy for one.
+    poll(DEADLINE, "the learner plans as promotable", || async {
+        matches!(
+            leader.consensus().plan_promotion(member_id),
+            Ok(PromotionPlan::Ready { .. })
+        )
+    })
+    .await;
+
+    // Stage the move. Repointing membership at a reserved-but-unbound port is
+    // the deterministic equivalent of the node relocating: from this instant
+    // the leader dials an address nothing answers, while the member itself
+    // keeps serving Raft, untouched, at `real_addr`. Doing it this way rather
+    // than by rebinding the member's listener is what makes the test
+    // deterministic — there is no restart window to lose a race in.
+    let dead_addr = format!("localhost:{}", free_port());
+    leader
+        .consensus()
+        .set_node_address(member_id, dead_addr.clone())
+        .await
+        .expect("repointing a member with nothing else in flight just commits");
+
+    // Now wedge the cluster: promote the member. The joint configuration this
+    // appends names the member at `dead_addr`, so it cannot reach a quorum of
+    // the incoming set and can never commit. The call blocks — that is the
+    // point — so it runs in its own task.
+    //
+    // The liveness gate this promotion passes reads the member's last
+    // heartbeat *ack*, which the repoint above did not disturb: acks stay
+    // fresh for `LIVE_CONTACT_STALENESS` (3s) after the dials start failing,
+    // and the two local calls in between take milliseconds.
+    let promoting = {
+        let consensus = leader.consensus();
+        tokio::spawn(async move { consensus.commit_promotion(member_id, None).await })
+    };
+
+    // openraft's effective membership includes the uncommitted entry, so the
+    // member reading as a voter is the signal that the joint change is in the
+    // log — and, with the member unreachable, stuck there.
+    poll(
+        DEADLINE,
+        "the promotion's joint change is pending",
+        || async {
+            leader
+                .summary()
+                .members
+                .iter()
+                .any(|m| m.id == member_id && m.voter)
+        },
+    )
+    .await;
+    assert!(
+        !promoting.is_finished(),
+        "the promotion must still be blocked: with the member unreachable at its \
+         membership address, the joint change cannot commit"
+    );
+
+    // The break-glass, against a cluster that is mid-configuration-change and
+    // cannot finish. Before the dial-override fix this returned
+    // `MembershipInProgress` immediately and kept doing so forever; it must
+    // now redirect the leader's dials to the verified endpoint, let the stuck
+    // change drain, and commit the repoint.
+    leader
+        .consensus()
+        .set_node_address(member_id, real_addr.clone())
+        .await
+        .expect("the repoint must drill through the pending membership change");
+
+    // The wedge is cleared for everyone, not just for the repoint: the
+    // promotion that was blocked on it completes.
+    promoting
+        .await
+        .expect("promotion task")
+        .expect("the unwedged promotion commits");
+
+    poll(
+        DEADLINE,
+        "the member is a voter at its real address",
+        || async {
+            leader
+                .summary()
+                .members
+                .iter()
+                .any(|m| m.id == member_id && m.voter && m.addr == real_addr)
+        },
+    )
+    .await;
+
+    member.graceful_stop().await;
+    leader.graceful_stop().await;
+}
+
+/// The accepted half of a repoint is bounded by the same repair window as the
+/// refused half (ADR 0037 §6).
+///
+/// `SetNodes` with nothing else in flight is *accepted* — appended to the log
+/// — and openraft then blocks the call until it commits. A quorum that
+/// degrades after acceptance (or a dial-back-verified endpoint that vanishes
+/// again) would otherwise hang the verb forever while it holds both the
+/// membership mutex and the dial override. It must instead give up at the
+/// deadline with `Timeout`, whose contract is exactly this: the outcome is
+/// unknown, the entry may still commit later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repoint_accepted_without_quorum_times_out_instead_of_hanging() {
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+
+    let mut leader = Node::new(3, cluster_id, &ca);
+    leader.boot().await;
+    poll(DEADLINE, "node 3 becomes leader", || async {
+        leader.is_leader()
+    })
+    .await;
+
+    let mut member = Node::new(4, cluster_id, &ca);
+    member.boot_joining().await;
+    let member_id = member.raft_id();
+    leader
+        .consensus()
+        .add_learner(member_id, member.advertise.clone())
+        .await
+        .expect("admit the member as a learner");
+    poll(DEADLINE, "the learner plans as promotable", || async {
+        matches!(
+            leader.consensus().plan_promotion(member_id),
+            Ok(PromotionPlan::Ready { .. })
+        )
+    })
+    .await;
+    leader
+        .consensus()
+        .commit_promotion(member_id, None)
+        .await
+        .expect("promote the reachable member");
+
+    // Two voters; now the member dies abruptly. Every commit from here needs a
+    // quorum of two that no longer exists.
+    member.kill().await;
+
+    // The repoint is ACCEPTED — no other membership change is pending — but
+    // can never commit. Before the write itself was deadline-bounded this call
+    // hung forever; now it must return `Timeout` within the repair window.
+    let err = leader
+        .consensus()
+        .set_node_address(member_id, format!("localhost:{}", free_port()))
+        .await
+        .expect_err("a repoint that cannot reach quorum must not report success");
+    assert!(
+        matches!(err, coppice_consensus::ConsensusError::Timeout),
+        "the bounded write surfaces the unknown outcome as Timeout, got: {err:?}"
+    );
+
+    leader.graceful_stop().await;
 }
