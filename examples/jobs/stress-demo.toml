@@ -1,0 +1,56 @@
+# Example job spec for `coppice job submit examples/jobs/stress-demo.toml`.
+#
+# Runs a small Python script (from the official `python` image on Docker
+# Hub) that keeps one CPU core busy and grows its own memory footprint over
+# ~25 seconds, printing a progress line every second. Good for exercising the
+# job-usage metrics (`coppice job usage <job>`) and log streaming
+# (`coppice job logs <job> --follow`) against something with real, visible
+# resource utilization instead of an instantly-exiting `echo`.
+#
+# `quota_entity` below is the entity `coppice dev` seeds out of the box; swap
+# it for a real one on any other cluster.
+
+image = "python:3.12-slim"
+command = [
+  "python3",
+  "-c",
+  """
+import time
+
+start = time.time()
+mem_hog = []
+total_iterations = 25
+chunk_bytes = 4 * 1024 * 1024  # 4 MiB per iteration
+max_chunks = 25  # cap growth at ~100 MiB, under the 512 MiB request below
+
+print(f"[{0.0:7.1f}s] starting stress-demo: {total_iterations} iterations, ~1s CPU burn each", flush=True)
+
+for i in range(total_iterations):
+    deadline = time.time() + 1.0
+    x = 0
+    while time.time() < deadline:
+        x += 1  # busy-loop to keep a full core hot for ~1s
+
+    if len(mem_hog) < max_chunks:
+        mem_hog.append(bytearray(chunk_bytes))
+
+    elapsed = time.time() - start
+    resident_mib = len(mem_hog) * chunk_bytes // (1024 * 1024)
+    print(f"[{elapsed:7.1f}s] iteration {i + 1}/{total_iterations}, resident ~{resident_mib} MiB", flush=True)
+
+print(f"[{time.time() - start:7.1f}s] done", flush=True)
+""",
+]
+
+quota_entity = "quota-00000000-0000-0000-0000-000000000001"
+priority = 0
+max_runtime = "30s"
+
+[resources]
+cpu_millis = 1000
+memory = "512MiB"
+disk = "256MiB"
+
+[retry]
+max_retries = 0
+retry_user_errors = false
