@@ -91,9 +91,10 @@ The format is deliberately **single-job** for now; batches, arrays, and gangs
 are future work.
 
 [`examples/jobs/stress-demo.toml`](../../examples/jobs/stress-demo.toml) is a
-runnable spec that does more than exit: it pins a core and grows its heap for
-~25s while printing a line a second, so `logs` and `usage` have something to
-show.
+runnable spec that does more than exit: a ~4m50s workload whose CPU ramps,
+plateaus, and then square-waves between saturated and idle, and whose memory
+rises to a high-water mark and is then released back down — so `usage` shows
+curves with a shape, and its `mem` and `peak` columns visibly diverge.
 
 ### A dev-cluster walkthrough
 
