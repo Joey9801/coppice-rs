@@ -24,6 +24,26 @@ use coppice_api::http::COPPICE_LEADER;
 /// round-trip, and well below a human's patience for a dead endpoint.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The port a coordinator's client API listens on unless configured otherwise.
+///
+/// This is one number with three users that must agree, or a first run does
+/// not work without flags: the coordinator's own `[listen] client_addr`
+/// default (`0.0.0.0:7070`, `coppice_coordinator::config`), the port
+/// `coppice dev` asks for, and the base every client verb dials when neither
+/// `--api` nor `COPPICE_API` says otherwise. The production ports table in
+/// `docs/operations/configuration.md` documents the same convention
+/// (client 7070, raft 7071, agent gateway 7072).
+pub const DEFAULT_API_PORT: u16 = 7070;
+
+/// The base URL every verb's `--api` falls back to: [`DEFAULT_API_PORT`] on
+/// loopback.
+///
+/// Loopback rather than `0.0.0.0`: this is the address a client *dials*, and
+/// the only coordinator a bare `coppice job …` can reasonably mean is one on
+/// this machine — a local `coppice dev`. Reaching any other cluster is an
+/// explicit act (`--api`, or `COPPICE_API` in the environment).
+pub const DEFAULT_API_BASE: &str = "http://127.0.0.1:7070";
+
 /// The two human contexts one request attaches to its failures: the send and
 /// the body decode. They are separate because they fail for different reasons
 /// — "fetching job status" is a transport problem, "reading job detail" is a
@@ -260,6 +280,22 @@ mod tests {
     fn url_joins_the_api_prefix() {
         let client = ApiClient::new("http://h:7070/api/v1/").unwrap();
         assert_eq!(client.url("/jobs"), "http://h:7070/api/v1/jobs");
+    }
+
+    /// The default base and the default port are two literals that must name
+    /// the same endpoint — `clap`'s `default_value` needs a `&'static str`, so
+    /// the base cannot be built from the port at compile time. This closes the
+    /// gap the other way: if either moves without the other, the CLI's default
+    /// stops pointing at the port `coppice dev` binds.
+    #[test]
+    fn the_default_api_base_names_the_default_api_port() {
+        assert_eq!(
+            DEFAULT_API_BASE,
+            format!("http://127.0.0.1:{DEFAULT_API_PORT}")
+        );
+        // And it must survive normalization unchanged, since every verb feeds
+        // it straight into `ApiClient::new`.
+        assert_eq!(normalize_base(DEFAULT_API_BASE), DEFAULT_API_BASE);
     }
 
     #[test]

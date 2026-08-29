@@ -45,7 +45,7 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, Query};
+use crate::client::{ctx, print_json, render_table, ApiClient, Query, DEFAULT_API_BASE};
 
 // ---------------------------------------------------------------------------
 // Spec file
@@ -199,7 +199,7 @@ pub struct JobArgs {
         long,
         global = true,
         env = "COPPICE_API",
-        default_value = "http://127.0.0.1:7070"
+        default_value = DEFAULT_API_BASE
     )]
     api: String,
 

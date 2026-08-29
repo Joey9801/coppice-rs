@@ -18,8 +18,16 @@ Unless a case says otherwise, every case runs against one shared cluster:
 cargo run -q -p coppice-cli -- dev --executor fake
 ```
 
-`dev` prints a ready summary with the client-API port (ephemeral), the cluster
-id, the registered agent's node id, and a seeded quota entity
+`--executor fake` is pinned deliberately, against the `docker` default: the
+cases below exercise control-plane behaviour (submission, scheduling, state
+transitions, the API surface), none of which needs a container to run, so the
+register stays runnable on a machine with no Docker daemon. The tradeoff is
+that a fake-executor job reaches `running` while executing nothing and captures
+no logs or usage — any case asserting on real container output, job logs, or
+usage samples must say so and run `--executor docker` instead.
+
+`dev` prints a ready summary with the client-API port (7070 by default), the
+cluster id, the registered agent's node id, and a seeded quota entity
 (`quota-00000000-0000-0000-0000-000000000001`, priorities -2..=2). Export
 `API=http://localhost:<client-port>/api/v1` and reuse the same cluster for a
 whole run; cases that mutate state say so and are ordered accordingly.

@@ -23,7 +23,11 @@
 //! directory **resumes**: the coordinator restarts from its manifest stamp,
 //! `init` answers `AlreadyInitialized` (a success, ADR 0037 §3), the agent
 //! finds its leaf already installed and makes no enrollment call at all, and
-//! the ports, cluster id, and node id are the ones the directory remembers.
+//! the cluster id, node id, and every ephemerally-chosen port are the ones the
+//! directory remembers. The client API port is the exception: it defaults to
+//! the well-known [`crate::client::DEFAULT_API_PORT`] a bare `coppice job …`
+//! dials, so it is stable across runs by being fixed rather than by being
+//! remembered — `--client-port 0` opts back into remember-or-mint.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -55,9 +59,11 @@ pub struct DevArgs {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Client API port (0 reuses this data dir's remembered port, or picks a
-    /// free one; logged at startup).
-    #[arg(long, default_value_t = 0)]
+    /// Client API port. Defaults to the well-known 7070, which is what a bare
+    /// `coppice job …` (and the web UI's dev proxy) dials, so a first run needs
+    /// no flags on either side. Pass 0 to reuse this data dir's remembered
+    /// port, or pick a free one — what a second concurrent dev cluster wants.
+    #[arg(long, default_value_t = crate::client::DEFAULT_API_PORT)]
     client_port: u16,
 
     /// Agent-gateway port (0 reuses this data dir's remembered port, or picks
@@ -84,10 +90,13 @@ pub struct DevArgs {
     #[arg(long, default_value_t = 0)]
     metrics_port: u16,
 
-    /// Executor backing the in-process agent. `fake` runs the lifecycle
-    /// without containers (and captures no logs); `docker` is the production
-    /// executor and needs a reachable Docker daemon.
-    #[arg(long, value_enum, default_value_t = DevExecutor::Fake)]
+    /// Executor backing the in-process agent. `docker` is the production
+    /// executor and the default: it runs real containers, so jobs actually
+    /// execute and their logs and usage samples exist. It needs a reachable
+    /// Docker daemon. `fake` drives the lifecycle without containers — useful
+    /// for exercising scheduling without a daemon, but a job "runs" while
+    /// executing nothing, captures no logs, and reports no usage.
+    #[arg(long, value_enum, default_value_t = DevExecutor::Docker)]
     executor: DevExecutor,
 }
 
@@ -176,6 +185,31 @@ fn resolve_port(root: &Path, name: &str, requested: u16) -> Result<u16> {
     remember(listener.local_addr().context("local addr")?.port())
 }
 
+/// Fail early, in `dev`'s own vocabulary, when the client API port is taken.
+///
+/// That port is a fixed well-known default now rather than an ephemeral pick,
+/// so the ordinary collision is no longer bad luck but a second `coppice dev`
+/// (or a real coordinator) already holding it. The coordinator's own bind
+/// error names the address but not the way out, and it arrives later — after
+/// the data dir is locked and formation has begun — so probe first and say
+/// what to pass. Losing the port between this probe and the real bind only
+/// costs the better message; the bind still fails safely.
+fn preflight_client_port(port: u16) -> Result<()> {
+    match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => bail!(
+            "the client API port {port} is already in use — another `coppice dev`, \
+             or a coordinator running on this machine?\n\
+             Stop it, choose another port with `--client-port <PORT>`, or pass \
+             `--client-port 0` to bind a free one (the ready banner prints the \
+             API URL to use)."
+        ),
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "probing client API port {port} before starting the dev coordinator"
+        ))),
+    }
+}
+
 /// Sample every metric tree the dev cluster's single global recorder holds
 /// (issue #46).
 ///
@@ -245,6 +279,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
     let client_port = resolve_port(&root, "client", args.client_port)?;
     let node_service_port = resolve_port(&root, "node-service", args.node_service_port)?;
     let metrics_port = resolve_port(&root, "metrics", args.metrics_port)?;
+    preflight_client_port(client_port)?;
 
     // Install the one process-wide Prometheus recorder this dev cluster shares
     // (issue #46). `coppice dev` runs a coordinator AND an agent in one process,
@@ -999,7 +1034,16 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
         node_service_port = summary.node_service_port,
         metrics_port = summary.metrics_port,
         data_dir = summary.root.display(),
-        executor = summary.executor,
+        // Say what `fake` costs, on the line naming it. A fake-executor job
+        // reaches `running` and is then reaped at max_runtime having executed
+        // nothing, with no logs and no usage to explain why — indistinguishable
+        // from a broken cluster unless the banner says so up front.
+        executor = match summary.executor {
+            DevExecutor::Fake =>
+                "fake (no containers: jobs execute nothing, and no logs or usage are captured)"
+                    .to_string(),
+            DevExecutor::Docker => "docker".to_string(),
+        },
         cluster_id = summary.cluster_id,
         coordinator_raft_id = summary.coordinator_raft_id,
         agent_node = summary.agent_node,
@@ -1011,6 +1055,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::DEFAULT_API_PORT;
 
     #[test]
     fn ready_summary_is_scannable_and_explicit_about_unavailable_surfaces() {
@@ -1050,6 +1095,83 @@ mod tests {
         assert!(summary.contains(&format!(
             "Quota entity    {DEV_QUOTA_ENTITY} (\"dev\", seeded; priorities -2..=2)"
         )));
+    }
+
+    /// The banner's executor line must be self-explanatory about `fake`'s
+    /// silence: a fake-executor job reaches `running`, executes nothing, and is
+    /// reaped at `max_runtime` with no logs and no usage to explain it. The
+    /// default (`docker`) needs no caveat and must not carry one.
+    #[test]
+    fn the_banner_says_what_the_fake_executor_does_not_do() {
+        let summary = |executor| {
+            ready_summary(&ReadySummary {
+                root: Path::new("/tmp/coppice-dev"),
+                persistent: false,
+                cluster_id: "cluster-00000000-0000-0000-0000-000000000001"
+                    .parse()
+                    .expect("cluster id"),
+                coordinator_raft_id: 42,
+                agent_node: "node-00000000-0000-0000-0000-000000000002"
+                    .parse()
+                    .expect("node id"),
+                agent_epoch: 1,
+                raft_port: 7071,
+                agent_port: 7072,
+                client_port: DEFAULT_API_PORT,
+                node_service_port: 7073,
+                metrics_port: 7074,
+                ui_available: false,
+                quota_entity: DEV_QUOTA_ENTITY.parse().expect("quota entity id"),
+                executor,
+            })
+        };
+
+        let fake = summary(DevExecutor::Fake);
+        assert!(
+            fake.contains(
+                "Executor        fake (no containers: jobs execute nothing, and no logs \
+                 or usage are captured)"
+            ),
+            "{fake}"
+        );
+
+        let docker = summary(DevExecutor::Docker);
+        assert!(docker.contains("Executor        docker\n"), "{docker}");
+        assert!(!docker.contains("no containers"), "{docker}");
+    }
+
+    /// `coppice dev`'s default client port and the base a bare `coppice job …`
+    /// dials are the same number by construction — the seam this whole default
+    /// exists to close, and the one a stray edit to either side would reopen.
+    #[test]
+    fn dev_defaults_to_the_port_the_cli_dials() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Cmd {
+            #[command(flatten)]
+            dev: DevArgs,
+        }
+
+        let cmd = Cmd::parse_from(["coppice-dev"]);
+        assert_eq!(cmd.dev.client_port, DEFAULT_API_PORT);
+        assert_eq!(
+            crate::client::DEFAULT_API_BASE,
+            format!("http://127.0.0.1:{}", cmd.dev.client_port)
+        );
+        // And the default must be the real executor: a `fake` default is what
+        // makes a first job look like it runs while executing nothing.
+        assert_eq!(cmd.dev.executor, DevExecutor::Docker);
+        // `0` stays reachable — it is how a second concurrent dev cluster (or
+        // a resumed data dir) avoids fighting over the well-known port.
+        let zero = Cmd::parse_from(["coppice-dev", "--client-port", "0"]);
+        assert_eq!(zero.dev.client_port, 0);
+        assert_eq!(
+            Cmd::parse_from(["coppice-dev", "--executor", "fake"])
+                .dev
+                .executor,
+            DevExecutor::Fake
+        );
     }
 
     /// The generated coordinator config must survive the daemon's own loader —
@@ -1104,6 +1226,26 @@ mod tests {
         assert_eq!(policy.enroll_tokens.len(), 1);
         assert_eq!(policy.enroll_tokens[0].label, DEV_ENROLL_LABEL);
         assert_eq!(policy.enroll_tokens[0].secret, DEV_ENROLL_TOKEN);
+    }
+
+    /// A taken client port must fail with the way out, not just the errno: a
+    /// fixed default makes "something else already has 7070" the ordinary
+    /// collision, and `--client-port 0` is the answer a second dev cluster
+    /// needs.
+    #[test]
+    fn a_taken_client_port_names_the_escape_hatch() {
+        let held = TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let port = held.local_addr().expect("local addr").port();
+
+        let err = preflight_client_port(port).expect_err("the port is held");
+        let message = format!("{err:#}");
+        assert!(message.contains(&port.to_string()), "{message}");
+        assert!(message.contains("--client-port 0"), "{message}");
+
+        // Released, it is fine again — the probe must not itself be what holds
+        // the port for the real bind that follows.
+        drop(held);
+        preflight_client_port(port).expect("a free port passes");
     }
 
     /// An explicit port is honored and remembered; a zero port is minted once
