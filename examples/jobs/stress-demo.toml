@@ -1,11 +1,24 @@
 # Example job spec for `coppice job submit examples/jobs/stress-demo.toml`.
 #
-# Runs a small Python script (from the official `python` image on Docker
-# Hub) that keeps one CPU core busy and grows its own memory footprint over
-# ~25 seconds, printing a progress line every second. Good for exercising the
-# job-usage metrics (`coppice job usage <job>`) and log streaming
-# (`coppice job logs <job> --follow`) against something with real, visible
-# resource utilization instead of an instantly-exiting `echo`.
+# A ~4m50s synthetic workload from the official `python` image on Docker Hub,
+# shaped to make `coppice job usage <job>` worth reading. The agent samples
+# usage every 10s by default, so every phase below is at least 20s — anything
+# shorter aliases away between samples.
+#
+# The curves are deliberately not monotonic:
+#
+#   cpu%   climbs off a low warm-up, holds a high plateau, drops back, then
+#          square-waves between saturated and near-idle three times before
+#          cooling off — so the column shows a ramp, a step down, and an
+#          oscillation rather than one flat line.
+#   mem    rises to a high-water mark of ~320 MiB, is then *released* back to
+#          ~72 MiB, and sawtooths upward again. Because the release is real,
+#          the `mem` and `peak` columns diverge and stay diverged, which is
+#          the point: `peak` is a high-water mark, not a copy of `mem`.
+#
+# Logs land once every ~5s naming the phase, the target duty cycle, and the
+# resident footprint, so `coppice job logs <job> --follow` can be read against
+# the usage table afterwards.
 #
 # `quota_entity` below is the entity `coppice dev` seeds out of the box; swap
 # it for a real one on any other cluster.
@@ -14,37 +27,105 @@ image = "python:3.12-slim"
 command = [
   "python3",
   "-c",
-  """
+  '''
 import time
 
-start = time.time()
-mem_hog = []
-total_iterations = 25
-chunk_bytes = 4 * 1024 * 1024  # 4 MiB per iteration
-max_chunks = 25  # cap growth at ~100 MiB, under the 512 MiB request below
+MIB = 1024 * 1024
+CHUNK = 4 * MIB
+TICK = 0.05  # control-loop period; duty cycle is applied within each tick
 
-print(f"[{0.0:7.1f}s] starting stress-demo: {total_iterations} iterations, ~1s CPU burn each", flush=True)
+# label, seconds, cpu duty at phase start, duty at phase end, memory target MiB.
+# Duty is interpolated across the phase, so equal start/end values hold flat
+# and unequal ones ramp. Memory is moved toward its target the same way.
+PHASES = [
+    ("warmup",   25, 0.10, 0.25,  64),
+    ("ramp-up",  40, 0.25, 0.95,  96),
+    ("climb",    40, 0.95, 0.95, 320),
+    # Hold at the top long enough that a 10s sampler cannot miss the real
+    # high-water mark; without this the peak exists only between two samples
+    # and `peak` reports whatever the climb happened to reach.
+    ("hold",     20, 0.95, 0.95, 320),
+    ("release",  25, 0.30, 0.30,  72),
+    ("burst-1",  20, 1.00, 1.00, 160),
+    ("trough-1", 20, 0.12, 0.12,  72),
+    ("burst-2",  20, 1.00, 1.00, 224),
+    ("trough-2", 20, 0.12, 0.12,  72),
+    ("burst-3",  20, 1.00, 1.00, 288),
+    ("trough-3", 20, 0.12, 0.12,  72),
+    ("cooldown", 20, 0.08, 0.05,  48),
+]
 
-for i in range(total_iterations):
-    deadline = time.time() + 1.0
-    x = 0
-    while time.time() < deadline:
-        x += 1  # busy-loop to keep a full core hot for ~1s
+held = []
+peak_mib = 0
 
-    if len(mem_hog) < max_chunks:
-        mem_hog.append(bytearray(chunk_bytes))
 
-    elapsed = time.time() - start
-    resident_mib = len(mem_hog) * chunk_bytes // (1024 * 1024)
-    print(f"[{elapsed:7.1f}s] iteration {i + 1}/{total_iterations}, resident ~{resident_mib} MiB", flush=True)
+def resident_mib():
+    return len(held) * CHUNK // MIB
 
-print(f"[{time.time() - start:7.1f}s] done", flush=True)
-""",
+
+def set_memory(target_mib):
+    global peak_mib
+    want = max(0, target_mib * MIB // CHUNK)
+    while len(held) < want:
+        # bytearray zero-fills, so each chunk is faulted in on creation and
+        # counts against the cgroup immediately rather than lazily.
+        held.append(bytearray(CHUNK))
+    while len(held) > want:
+        # Dropping the last reference frees the chunk. These are well over
+        # glibc's mmap threshold, so the pages go back to the kernel here and
+        # the cgroup total actually falls.
+        held.pop()
+    peak_mib = max(peak_mib, resident_mib())
+
+
+def spin(seconds):
+    if seconds <= 0:
+        return
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        pass
+
+
+start = time.monotonic()
+total = sum(phase[1] for phase in PHASES)
+print(f"stress-demo: {len(PHASES)} phases, {total}s total", flush=True)
+
+for label, seconds, duty_from, duty_to, mem_to in PHASES:
+    mem_from = resident_mib()
+    phase_start = time.monotonic()
+    next_log = 0.0
+    while True:
+        into = time.monotonic() - phase_start
+        if into >= seconds:
+            break
+        frac = into / seconds
+        duty = duty_from + (duty_to - duty_from) * frac
+        set_memory(int(mem_from + (mem_to - mem_from) * frac))
+        spin(duty * TICK)
+        idle = (1.0 - duty) * TICK
+        if idle > 0:
+            time.sleep(idle)
+        if into >= next_log:
+            elapsed = time.monotonic() - start
+            print(
+                f"[{elapsed:6.1f}s] {label:8s} cpu~{duty * 100:3.0f}%  mem {resident_mib():4d} MiB",
+                flush=True,
+            )
+            next_log = into + 5.0
+    # Land exactly on the target so the next phase interpolates from a clean
+    # starting point rather than from wherever the loop happened to stop.
+    set_memory(mem_to)
+
+print(
+    f"[{time.monotonic() - start:6.1f}s] done (peak {peak_mib} MiB, now {resident_mib()} MiB)",
+    flush=True,
+)
+''',
 ]
 
 quota_entity = "quota-00000000-0000-0000-0000-000000000001"
 priority = 0
-max_runtime = "30s"
+max_runtime = "6m"
 
 [resources]
 cpu_millis = 1000
