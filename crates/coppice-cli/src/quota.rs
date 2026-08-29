@@ -23,7 +23,7 @@ use serde::Deserialize;
 use coppice_api::http::dto;
 use coppice_core::id::QuotaEntityId;
 
-use crate::client::{ctx, print_json, render_table, ApiClient};
+use crate::client::{ctx, print_json, render_table, ApiClient, DEFAULT_API_BASE};
 use crate::cluster::{indent, phase_label};
 
 // ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ pub struct QuotaArgs {
         long,
         global = true,
         env = "COPPICE_API",
-        default_value = "http://127.0.0.1:7070"
+        default_value = DEFAULT_API_BASE
     )]
     api: String,
 

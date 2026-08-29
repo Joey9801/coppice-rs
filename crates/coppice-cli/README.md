@@ -11,9 +11,12 @@ deployment ships exactly one artifact.
   plus an in-process agent over localhost, a throwaway per-run CA (the
   production mTLS paths run unmodified, but there is effectively **no
   authentication** — localhost development only), and a temp data directory
-  unless `--data-dir` pins one for restartable state. `--executor fake`
-  (default) runs the job lifecycle without containers until the Docker
-  executor lands;
+  unless `--data-dir` pins one for restartable state. It runs the real Docker
+  executor by default (so jobs actually execute, and their logs and usage
+  samples exist) and binds the well-known client-API port, so a first run
+  needs no flags on either end; `--executor fake` opts into the container-less
+  lifecycle, which schedules jobs but executes nothing and captures neither
+  logs nor usage;
 - `coppice job …` — client commands over the public API
   ([coppice-api](../coppice-api)), the same surface the web UI is built on
   ([components](../../docs/architecture/components.md)).
@@ -39,9 +42,12 @@ coppice job --api <URL> abort <job> [--reason <text>]
 ```
 
 `--api` is a global flag (it may appear before or after the verb) and also reads
-from `COPPICE_API`; it defaults to `http://127.0.0.1:7070`. Both a bare base URL
-and one ending in `/api/v1` are accepted — the `coppice dev` banner prints the
-latter, so you can paste it verbatim.
+from `COPPICE_API`; it defaults to `http://127.0.0.1:7070`, the well-known
+client-API port a `coppice dev` cluster binds by default. The two defaults are
+one constant (`client::DEFAULT_API_PORT`), so against a local dev cluster the
+flag can simply be omitted. Both a bare base URL and one ending in `/api/v1` are
+accepted — the `coppice dev` banner prints the latter, so you can paste it
+verbatim.
 
 - **submit** loads and validates the spec, mints a job id (or reuses `--job` for
   an idempotent resubmission — the client-minted id is the idempotency key,
@@ -83,6 +89,11 @@ retry_user_errors = false # default false
 
 The format is deliberately **single-job** for now; batches, arrays, and gangs
 are future work.
+
+[`examples/jobs/stress-demo.toml`](../../examples/jobs/stress-demo.toml) is a
+runnable spec that does more than exit: it pins a core and grows its heap for
+~25s while printing a line a second, so `logs` and `usage` have something to
+show.
 
 ### A dev-cluster walkthrough
 

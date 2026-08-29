@@ -17,7 +17,7 @@ use anyhow::{Context as _, Result};
 use coppice_api::http::dto;
 use coppice_core::bytes::ByteSize;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, Query};
+use crate::client::{ctx, print_json, render_table, ApiClient, Query, DEFAULT_API_BASE};
 
 /// `coppice cluster` argument group. `--api` is global, matching `coppice job`.
 #[derive(Debug, clap::Args)]
@@ -28,7 +28,7 @@ pub struct ClusterArgs {
         long,
         global = true,
         env = "COPPICE_API",
-        default_value = "http://127.0.0.1:7070"
+        default_value = DEFAULT_API_BASE
     )]
     api: String,
 

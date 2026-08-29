@@ -26,7 +26,7 @@ use coppice_api::http::dto;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::NodeId;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, Query};
+use crate::client::{ctx, print_json, render_table, ApiClient, Query, DEFAULT_API_BASE};
 
 /// `coppice node` argument group.
 #[derive(Debug, clap::Args)]
@@ -38,7 +38,7 @@ pub struct NodeArgs {
         long,
         global = true,
         env = "COPPICE_API",
-        default_value = "http://127.0.0.1:7070"
+        default_value = DEFAULT_API_BASE
     )]
     pub api: String,
 
