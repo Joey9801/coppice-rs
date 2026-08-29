@@ -36,12 +36,12 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use coppice_agent::config::{
     CapacityConfig, Config as AgentConfig, EffectiveCapacity, ExecutorConfig, ListenConfig,
-    TlsConfig as AgentTls,
+    TelemetryConfig, TlsConfig as AgentTls,
 };
 use coppice_agent::executor::{DockerExecutor, Executor, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{self, Session};
-use coppice_agent::telemetry::FilesystemSink;
+use coppice_agent::telemetry::{FilesystemSink, FilesystemSinkConfig, SinkConfig, SinkKind};
 use coppice_api::http::ReadyzPhase;
 use coppice_consensus::fs::RealFs;
 use coppice_coordinator::bootstrap;
@@ -134,6 +134,16 @@ const DEV_ENROLL_TOKEN: &str = "cpk_coppice-dev-local-agent-token";
 /// The label carrying that token's idempotency (ADR 0037 §5): a re-`init`
 /// mints nothing while a live token holds it.
 const DEV_ENROLL_LABEL: &str = "dev-agent";
+
+/// Dev runs `[history] mode = "none"` (ADR 0012), so once a job ends the
+/// agent's filesystem telemetry sink is the *only* place its usage stats and
+/// logs still exist — the replicated job record itself only survives on the
+/// policy default `terminal_retention` (72h, `coppice-state`). Align the
+/// sink's best-effort retention (and the live-attempt cap, for a long-running
+/// attempt's already-closed segments) with that same window, or
+/// `GetJobUsage` answers "fallen out of retention" for a job `ListJobs` still
+/// lists.
+const DEV_TELEMETRY_RETENTION: Duration = Duration::from_secs(72 * 60 * 60);
 
 /// Read a persisted typed id from `path`, or mint one and persist it.
 fn load_or_mint<T>(path: &Path, mint: impl FnOnce() -> T) -> Result<T>
@@ -392,7 +402,21 @@ pub async fn run(args: DevArgs) -> Result<()> {
         },
         pressure: Default::default(),
         image_cache: Default::default(),
-        telemetry: Default::default(),
+        // The documented default sink (60m, docker-executor.md §8.3) is too
+        // short for `[history] mode = "none"` (the generated coordinator TOML
+        // below): stretch both the
+        // filesystem sink's retention and the live-attempt cap to
+        // `DEV_TELEMETRY_RETENTION`, matching the replicated job record's own
+        // 72h `terminal_retention` default.
+        telemetry: TelemetryConfig {
+            live_retention: DEV_TELEMETRY_RETENTION,
+            sinks: vec![SinkConfig::Filesystem(FilesystemSinkConfig {
+                kinds: vec![SinkKind::Metrics, SinkKind::Logs],
+                retention: DEV_TELEMETRY_RETENTION,
+                dir: None,
+            })],
+            ..Default::default()
+        },
         // The agent-hosted NodeService (ADR 0034): bind 127.0.0.1:<port> and
         // advertise 127.0.0.1, so the in-process coordinator can dial it for job
         // logs. The enrolled leaf carries the node id as a SAN — the cluster
