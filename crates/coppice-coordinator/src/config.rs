@@ -35,6 +35,7 @@ use anyhow::{bail, Context, Result};
 use coppice_core::id::ClusterId;
 use serde::Deserialize;
 
+pub(crate) use auth::{AuthConfig, AuthPosture};
 pub(crate) use client_tls::{ClientTlsConfig, ClientTlsPosture};
 pub(crate) use discovery::DiscoveryConfig;
 pub(crate) use history::{HistoryConfig, HistoryMode};
@@ -125,6 +126,65 @@ mod client_tls {
         pub(crate) fn absent() -> anyhow::Error {
             ambiguous("is missing")
         }
+    }
+}
+
+mod auth {
+    //! The `[auth]` section (issue #45): the coordinator's authentication
+    //! posture, resolved together with the top-level `[sso]` table.
+    //!
+    //! Two honest modes and no third, exactly like `[client_tls]`:
+    //! OIDC-validated requests via `[sso]`, or every request treated as an
+    //! anonymous actor with full admin authority under a conspicuous opt-in.
+    //! Nothing here defaults — a deployment that never said which mode it
+    //! runs must fail at startup, not silently grant full admin authority to
+    //! anyone who can reach the listener.
+
+    use serde::Deserialize;
+
+    /// The `[auth]` section as written. On its own it only ever names the
+    /// insecure opt-in; whether `[sso]` is also present is what
+    /// [`crate::config::Config::auth_posture`] resolves it against.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct AuthConfig {
+        /// Serve every request as an anonymous actor with full admin
+        /// authority. Development/test only: it is the opposite of
+        /// authentication (issue #45).
+        #[serde(default)]
+        pub(crate) insecure_open: bool,
+    }
+
+    /// The resolved authentication posture.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum AuthPosture {
+        /// Validate every request's bearer token against this issuer,
+        /// offline, resource-server style — no client secret is needed.
+        Oidc(super::SsoConfig),
+        /// Serve every request as an anonymous actor with full admin
+        /// authority, explicitly and conspicuously.
+        InsecureOpen,
+    }
+
+    /// The one error message, shared by every combination that does not
+    /// resolve, because the fix is the same: say which of the two modes
+    /// this deployment is in.
+    pub(crate) fn ambiguous(detail: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "auth posture {detail}. Authentication is explicit, never implied: configure \
+             `[sso]` with `issuer` and `client_id` so every request is validated against an \
+             OIDC provider (the production posture), OR set `[auth] insecure_open = true` to \
+             serve every request as an anonymous actor with full admin authority, which is \
+             development/test only because it grants unauthenticated callers complete control \
+             (issue #45)"
+        )
+    }
+
+    /// The posture for a config that carries neither section — the same
+    /// "neither" error as an explicitly-ambiguous one, so a missing table
+    /// and a stated-false one read alike.
+    pub(crate) fn absent() -> anyhow::Error {
+        ambiguous("is unset (neither `[sso]` nor `[auth]` is present)")
     }
 }
 
@@ -371,11 +431,16 @@ pub(crate) struct Config {
 
     /// SSO connection parameters, if this deployment uses SSO. `None` when
     /// the section is absent entirely. Only the *connection* shape lives
-    /// here — role/group-to-admin mappings are policy (ADR 0020). Parsed now;
-    /// the API server that consumes it is a later change.
+    /// here — role/group-to-admin mappings are policy (ADR 0020).
     #[serde(default)]
-    #[allow(dead_code)]
     pub(crate) sso: Option<SsoConfig>,
+
+    /// This deployment's insecure-open opt-out of `[sso]` (issue #45).
+    /// `None` when the section is absent entirely. Resolved together with
+    /// `sso` by [`Config::auth_posture`] — see that method for what
+    /// combinations of the two sections are and are not allowed.
+    #[serde(default)]
+    pub(crate) auth: Option<AuthConfig>,
 
     /// Logging, tracing, and metrics endpoints. Optional: all fields default.
     #[serde(default)]
@@ -932,18 +997,35 @@ pub(crate) struct TlsConfig {
 
 /// SSO connection parameters.
 ///
-/// Parsed but unused for now — the API server task owns SSO. Only the
-/// connection shape lives here; anything authorization-shaped (role
-/// mappings, admin groups) is replicated policy, because two coordinators
-/// must never enforce different admin lists (ADR 0020).
-// Parsed now; the API server that owns SSO consumes these in a later change.
-#[derive(Debug, Clone, Deserialize)]
+/// This is a **resource-server** validator, not an OAuth client: the
+/// coordinator only ever verifies bearer tokens callers already hold against
+/// `issuer`'s published keys (offline JWT validation), so there is no client
+/// secret to configure or hold — nothing here ever authenticates *to* the
+/// issuer. Only the connection shape lives here; anything authorization-shaped
+/// (role mappings, admin groups) is replicated policy, because two
+/// coordinators must never enforce different admin lists (ADR 0020).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 pub(crate) struct SsoConfig {
     pub(crate) issuer: String,
     pub(crate) client_id: String,
-    pub(crate) client_secret_path: PathBuf,
+    /// Expected `aud` claim, if it differs from `client_id`. Optional:
+    /// most deployments mint tokens with `aud == client_id`, so this
+    /// defaults to `client_id` via [`SsoConfig::effective_audience`].
+    #[serde(default)]
+    pub(crate) audience: Option<String>,
+}
+
+impl SsoConfig {
+    /// The `aud` claim this deployment expects: the explicit `audience`
+    /// override, or `client_id` when none was given.
+    ///
+    /// Unused outside tests for now — the OIDC validator that consumes it is
+    /// a later change (issue #45).
+    #[allow(dead_code)]
+    pub(crate) fn effective_audience(&self) -> &str {
+        self.audience.as_deref().unwrap_or(&self.client_id)
+    }
 }
 
 /// Logging, tracing, and metrics settings.
@@ -1113,6 +1195,43 @@ impl Config {
         }
     }
 
+    /// The coordinator's authentication posture (issue #45): OIDC-validated
+    /// requests via `[sso]`, or explicitly-insecure via
+    /// `[auth] insecure_open = true`. Resolved together because the two
+    /// sections state one XOR between them, not two independent settings —
+    /// mirroring [`Config::client_tls_posture`]'s exhaustive match.
+    pub(crate) fn auth_posture(&self) -> Result<AuthPosture> {
+        match (
+            self.sso.is_some(),
+            self.auth.as_ref().map(|section| section.insecure_open),
+        ) {
+            (true, None) => Ok(AuthPosture::Oidc(
+                self.sso.clone().expect("checked Some above"),
+            )),
+            (false, Some(true)) => {
+                tracing::warn!(
+                    "[auth] insecure_open = true: every request will be treated as an \
+                     anonymous actor with full admin authority (issue #45); this posture is \
+                     development/test only"
+                );
+                Ok(AuthPosture::InsecureOpen)
+            }
+            (true, Some(true)) => Err(auth::ambiguous(
+                "configures `[sso]` AND sets `[auth] insecure_open = true`",
+            )),
+            (false, None) => Err(auth::absent()),
+            (false, Some(false)) => Err(auth::ambiguous(
+                "has `[auth]` present with `insecure_open = false`, which states nothing — \
+                 set it to `true` to opt into the insecure posture, or delete the section and \
+                 configure `[sso]` instead",
+            )),
+            (true, Some(false)) => Err(auth::ambiguous(
+                "configures `[sso]` and also carries `[auth]` with `insecure_open = false`, \
+                 which states nothing new — delete the empty `[auth]` section",
+            )),
+        }
+    }
+
     /// How this deployment persists terminal-job history (ADR 0012), or the
     /// error naming the section and the only mode this build supports.
     ///
@@ -1195,6 +1314,14 @@ pub fn load(path: &Path) -> Result<ResolvedConfig> {
     // pointed at an unverifiable endpoint must fail before it sends a token.
     config
         .client_tls_posture()
+        .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    // Same rationale one section over: a deployment that never declared its
+    // authentication posture — OIDC via `[sso]`, or the explicit
+    // `[auth] insecure_open = true` opt-out — must fail before it serves a
+    // single request (issue #45), not the first time a caller notices every
+    // request lands as an anonymous admin.
+    config
+        .auth_posture()
         .with_context(|| format!("reading coordinator config {}", path.display()))?;
     // Same rationale one section over: a deployment that never declared how it
     // keeps terminal-job history must fail before it starts discarding any
@@ -1306,7 +1433,7 @@ token_path = "/etc/coppice/enroll-token"
 [sso]
 issuer = "https://sso.example.com/oidc"
 client_id = "coppice"
-client_secret_path = "/etc/coppice/oidc-secret"
+audience = "coppice"
 
 [observability]
 log_level  = "info"
@@ -1352,6 +1479,10 @@ backend = "static"
 
 [discovery.static]
 addrs = []
+
+[auth]
+# Explicitly insecure: every request is an anonymous admin (issue #45).
+insecure_open = true
 "#;
 
     #[test]
@@ -1409,10 +1540,8 @@ addrs = []
         let sso = config.sso.expect("sso section present");
         assert_eq!(sso.issuer, "https://sso.example.com/oidc");
         assert_eq!(sso.client_id, "coppice");
-        assert_eq!(
-            sso.client_secret_path,
-            PathBuf::from("/etc/coppice/oidc-secret")
-        );
+        assert_eq!(sso.audience.as_deref(), Some("coppice"));
+        assert_eq!(sso.effective_audience(), "coppice");
 
         assert_eq!(config.observability.log_level, "info");
         assert_eq!(config.observability.log_format, "json");
@@ -1447,6 +1576,10 @@ addrs = []
         assert_eq!(config.raft.snapshot_keep_log_entries, 1000);
 
         assert!(config.sso.is_none());
+        assert_eq!(
+            config.auth_posture().expect("insecure_open is a posture"),
+            AuthPosture::InsecureOpen
+        );
 
         assert_eq!(config.observability.log_level, "info");
         assert_eq!(config.observability.log_format, "text");
@@ -2091,6 +2224,102 @@ addrs = []
             assert!(err.contains("key_path"), "{label}: {err}");
             assert!(err.contains("insecure = true"), "{label}: {err}");
         }
+    }
+
+    // ---- [auth]/[sso]: the authentication posture (issue #45) -------------
+
+    #[test]
+    fn sso_alone_resolves_to_the_oidc_posture() {
+        let without_auth = MINIMAL_EXAMPLE.replace(
+            "[auth]\n# Explicitly insecure: every request is an anonymous admin (issue #45).\ninsecure_open = true\n",
+            "",
+        );
+        assert_ne!(without_auth, MINIMAL_EXAMPLE, "no [auth] section to remove");
+        let contents = format!(
+            "{without_auth}\n[sso]\nissuer = \"https://sso.example.com/oidc\"\n\
+             client_id = \"coppice\"\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("sso-only config parses");
+        match config.auth_posture().expect("[sso] alone is a posture") {
+            AuthPosture::Oidc(sso) => {
+                assert_eq!(sso.issuer, "https://sso.example.com/oidc");
+                assert_eq!(sso.client_id, "coppice");
+                assert!(sso.audience.is_none());
+                // Audience defaults to client_id when unset.
+                assert_eq!(sso.effective_audience(), "coppice");
+            }
+            other => panic!("expected Oidc posture, got {other:?}"),
+        }
+        load(&path).expect("[sso] alone is a valid startup posture");
+    }
+
+    #[test]
+    fn sso_audience_override_is_respected() {
+        let without_auth = MINIMAL_EXAMPLE.replace(
+            "[auth]\n# Explicitly insecure: every request is an anonymous admin (issue #45).\ninsecure_open = true\n",
+            "",
+        );
+        let contents = format!(
+            "{without_auth}\n[sso]\nissuer = \"https://sso.example.com/oidc\"\n\
+             client_id = \"coppice\"\naudience = \"coppice-api\"\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let config = read_config(&path).expect("sso config with audience override parses");
+        assert_eq!(
+            config.sso.as_ref().unwrap().audience.as_deref(),
+            Some("coppice-api")
+        );
+        assert_eq!(
+            config.sso.as_ref().unwrap().effective_audience(),
+            "coppice-api"
+        );
+    }
+
+    #[test]
+    fn neither_sso_nor_auth_fails_naming_both_options() {
+        let without_auth = MINIMAL_EXAMPLE.replace(
+            "[auth]\n# Explicitly insecure: every request is an anonymous admin (issue #45).\ninsecure_open = true\n",
+            "",
+        );
+        assert_ne!(without_auth, MINIMAL_EXAMPLE, "no [auth] section to remove");
+        let (_guard, path) = write_config(&without_auth);
+        let err = format!(
+            "{:#}",
+            load(&path).expect_err("neither section is stated must fail startup")
+        );
+        assert!(err.contains("[sso]"), "{err}");
+        assert!(err.contains("insecure_open"), "{err}");
+    }
+
+    #[test]
+    fn both_sso_and_insecure_open_fails_naming_both_options() {
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[sso]\nissuer = \"https://sso.example.com/oidc\"\n\
+             client_id = \"coppice\"\n"
+        );
+        let (_guard, path) = write_config(&contents);
+        let err = format!(
+            "{:#}",
+            load(&path).expect_err("both sections stated must fail startup")
+        );
+        assert!(err.contains("[sso]"), "{err}");
+        assert!(err.contains("insecure_open"), "{err}");
+    }
+
+    #[test]
+    fn auth_section_stating_insecure_open_false_is_rejected() {
+        let without_auth = MINIMAL_EXAMPLE.replace(
+            "[auth]\n# Explicitly insecure: every request is an anonymous admin (issue #45).\ninsecure_open = true\n",
+            "",
+        );
+        let contents = format!("{without_auth}\n[auth]\ninsecure_open = false\n");
+        let (_guard, path) = write_config(&contents);
+        let err = format!(
+            "{:#}",
+            load(&path).expect_err("`insecure_open = false` alone states nothing")
+        );
+        assert!(err.contains("insecure_open"), "{err}");
     }
 
     // ---- [history]: how terminal-job history is kept (ADR 0012) -----------

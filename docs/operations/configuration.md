@@ -24,7 +24,7 @@ node want a different value than its peers?* → config file.
 | History sink mode (`[history]`) | config file (declares *how* history is retained; the TTL it retains against is policy — [ADR 0012](../decisions/0012-data-retention.md)) |
 | Discovery backend and `cluster_size` | config file (seed-only; consulted before replicated state is reachable — [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)) |
 | Enrollment tokens (hashes), issued-identity revocations | replicated policy (ADR 0037) |
-| SSO issuer, client id, client-secret path | config file |
+| SSO issuer, client id, audience | config file |
 | Log level/format, OTLP endpoint, metrics address | config file |
 | Raft election timeout, Raft heartbeat interval, snapshot thresholds | config file (liveness-only; safe to vary per node) |
 | Quota-entity tree, soft quotas, cost weights | replicated policy |
@@ -255,12 +255,41 @@ token_path = "/etc/coppice/enroll-token"
 endpoint = "https://coord.batch.example.com:7070"
 
 [sso]
-# Connection identity only — the groups-claim name and all role bindings
-# are replicated policy (`coppice-cli policy`), per ADRs 0022/0023.
+# The coordinator's authentication posture is REQUIRED and explicit, exactly
+# like [client_tls]'s serving posture above: either this [sso] table is
+# present (OIDC-validated requests) or [auth] states `insecure_open = true`
+# (every request is anonymous with full admin authority) — never both, never
+# neither. A config carrying neither, or carrying both, fails at startup
+# naming both options.
+#
+# This is a RESOURCE-SERVER validator, not an OAuth client: the coordinator
+# only ever verifies bearer tokens callers already hold, offline, against
+# `issuer`'s published keys — it never authenticates *to* the issuer, so
+# there is no client secret to configure or hold. Connection identity only —
+# the groups-claim name and all role bindings are replicated policy
+# (`coppice-cli policy`), per ADRs 0022/0023.
 issuer = "https://sso.example.com/oidc"
 client_id = "coppice"
+# Expected `aud` claim. OPTIONAL — defaults to `client_id`, which is right
+# for most deployments (tokens minted with `aud == client_id`); set this only
+# when the issuer mints a different audience for this resource server.
 audience = "coppice"
-client_secret_path = "/etc/coppice/oidc-secret"
+
+# [auth]
+# THE ALTERNATIVE TO [sso] ABOVE — mutually exclusive with it. Uncomment to
+# run without authentication:
+#
+#   [auth]
+#   insecure_open = true
+#
+# EVERY REQUEST IS THEN SERVED AS AN ANONYMOUS ACTOR WITH FULL ADMIN
+# AUTHORITY. There is no partial version of this: any caller that can reach
+# the client listener can do anything an operator can. This is a
+# development/test posture only (issue #45) — `coppice dev` sets it because
+# a local single-node cluster has no operator to authenticate, but a
+# production deployment should configure [sso] instead. `[auth]` present
+# with `insecure_open = false` (or omitted) is also a startup error: the
+# section states nothing, so either delete it or turn the opt-in on.
 
 [observability]
 log_level  = "info"
