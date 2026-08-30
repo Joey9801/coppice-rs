@@ -803,4 +803,33 @@ ttl = "15m"
             .expect_err("self-parent must be rejected");
         assert!(format!("{err:#}").contains("cycle"), "{err:#}");
     }
+
+    /// Formation seeding proposes **actorless** commands, and must keep
+    /// doing so (ADR 0023).
+    ///
+    /// The regression this pins is the mirror image of PR3's work: the API
+    /// write path now attaches an `Actor` to every command it proposes, and
+    /// an over-eager sweep of the same treatment across the codebase would
+    /// break bootstrap outright. Seeding runs before any operator can hold a
+    /// binding — the bindings list it would be checked against does not exist
+    /// yet — so `actor: None` is not an omission here, it is the only thing
+    /// that can work. `StateMachine::authorize` reads it as "an internal
+    /// proposer carrying the system's own authority" and skips the check.
+    #[test]
+    fn seeding_commands_carry_no_actor() {
+        let policy = FormationPolicy::parse_toml(SAMPLE.as_bytes()).unwrap();
+        let commands = policy
+            .commands(&StateMachine::default(), Timestamp::UNIX_EPOCH, CHEAP_KDF)
+            .expect("seeding commands");
+        assert!(!commands.is_empty(), "the sample seeds something");
+        for command in &commands {
+            let actor = match command {
+                Command::UpdatePolicy(c) => c.actor.as_ref(),
+                Command::ConfigureQuotaEntity(c) => c.actor.as_ref(),
+                Command::MintEnrollToken(_) => continue,
+                other => panic!("unexpected seeding command {other:?}"),
+            };
+            assert!(actor.is_none(), "seeding is not an API-originated write");
+        }
+    }
 }

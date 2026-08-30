@@ -21,7 +21,7 @@ use coppice_core::id::{ClusterId, JobId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
-use coppice_state::{Command, PolicyConfig};
+use coppice_state::{Actor, Command, PolicyConfig};
 
 use common::{poll, Ca, Node};
 
@@ -29,6 +29,21 @@ const DEADLINE: Duration = Duration::from_secs(20);
 /// Promotion retry cadence for the admin wrapper — the in-test twin of the
 /// fixture's `[pacing] promote_poll_interval`, which the daemons run with.
 const POLL: Duration = Duration::from_millis(50);
+
+/// The actor every submission here proposes as.
+///
+/// The open posture (`auth_disabled`), which is what an unconfigured fleet
+/// runs: this test is about idempotent retry across a leader change, and a
+/// cluster seeded with no role bindings would otherwise refuse every write at
+/// apply for reasons that have nothing to do with what it is testing.
+fn actor() -> Actor {
+    Actor {
+        principal: "anonymous".to_string(),
+        groups: Vec::new(),
+        operator_cert: false,
+        auth_disabled: true,
+    }
+}
 
 async fn wait_for_leader(nodes: &[Node], candidates: &[usize], deadline: Duration) -> usize {
     let start = Instant::now();
@@ -159,7 +174,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
             cluster_id,
         );
         let first = cp
-            .submit_job(request.clone())
+            .submit_job(request.clone(), actor())
             .await
             .expect("first submission accepted");
         assert_eq!(first.job, job);
@@ -180,7 +195,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
             nodes[follower].views(),
             cluster_id,
         );
-        let redirected = cp.submit_job(request.clone()).await;
+        let redirected = cp.submit_job(request.clone(), actor()).await;
         assert!(
             matches!(redirected, Err(ApiError::NotLeader { .. })),
             "follower must redirect, got {redirected:?}"
@@ -194,7 +209,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
         cluster_id,
     ));
     let retried = cp
-        .submit_job(request.clone())
+        .submit_job(request.clone(), actor())
         .await
         .expect("retry after unknown outcome must succeed");
     assert_eq!(
@@ -206,7 +221,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
     // Reusing the id with a different payload is a distinct intent: rejected.
     let mut mutated = request.clone();
     mutated.image = "registry/other:latest".into();
-    let mismatch = cp.submit_job(mutated).await;
+    let mismatch = cp.submit_job(mutated, actor()).await;
     assert!(
         matches!(mismatch, Err(ApiError::Rejected(_))),
         "id reuse with a different spec must reject, got {mismatch:?}"

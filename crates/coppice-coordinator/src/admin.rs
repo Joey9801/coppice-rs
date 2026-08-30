@@ -1600,10 +1600,10 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         let (consensus, handle) = self.formed()?;
         Self::check_cluster(&req.history_id, &handle)?;
 
-        let dto = crate::clientwrite::submit_from_pb(req)
+        let (dto, actor) = crate::clientwrite::submit_from_pb(req)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
         let views = consensus.views();
-        let outcome = api_server::submit_job_here(consensus.as_ref(), &views, &dto).await;
+        let outcome = api_server::submit_job_here(consensus.as_ref(), &views, &dto, &actor).await;
         Ok(Response::new(pb::ForwardSubmitJobResponse {
             outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
         }))
@@ -1626,7 +1626,9 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
             .ok_or_else(|| Status::invalid_argument("missing ForwardAbortJobRequest.job"))?
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
-        let outcome = api_server::abort_job_here(consensus.as_ref(), job, req.reason).await;
+        let actor = crate::clientwrite::abort_actor_from_pb(req.actor)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let outcome = api_server::abort_job_here(consensus.as_ref(), job, req.reason, &actor).await;
         Ok(Response::new(pb::ForwardAbortJobResponse {
             // An abort's applied index has no client-visible use (the DTO
             // response is empty), but the outcome message is shared and
@@ -1645,11 +1647,44 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         let (consensus, handle) = self.formed()?;
         Self::check_cluster(&req.history_id, &handle)?;
 
-        let dto = crate::clientwrite::configure_from_pb(req)
+        let (dto, actor) = crate::clientwrite::configure_from_pb(req)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
-        let outcome = api_server::configure_quota_entity_here(consensus.as_ref(), &dto).await;
+        let outcome =
+            api_server::configure_quota_entity_here(consensus.as_ref(), &dto, &actor).await;
         Ok(Response::new(pb::ForwardConfigureQuotaEntityResponse {
             outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
+        }))
+    }
+
+    /// The leader-side half of a forwarded authorization replacement
+    /// (ADR 0023). As the three above, through the same
+    /// [`api_server::update_authorization_here`] the direct path runs — so the
+    /// follow-up `UpdatePolicy` for a changed `groups_claim` happens here too,
+    /// and a forwarded PUT behaves exactly like a direct one.
+    ///
+    /// The second index rides beside the outcome rather than inside it: the
+    /// shared `ForwardWriteOutcome` carries one, and this verb can produce
+    /// two. It is present only on the applied path, because
+    /// `update_authorization_here` reports a failed follow-up as the call's
+    /// failure rather than as a half-success.
+    async fn forward_update_authorization(
+        &self,
+        request: Request<pb::ForwardUpdateAuthorizationRequest>,
+    ) -> Result<Response<pb::ForwardUpdateAuthorizationResponse>, Status> {
+        self.require_operator_or_machine(&request, "ForwardUpdateAuthorization")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        let (dto, actor) = crate::clientwrite::authorization_from_pb(req)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let views = consensus.views();
+        let outcome =
+            api_server::update_authorization_here(consensus.as_ref(), &views, &dto, &actor).await;
+        let policy_log_index = outcome.as_ref().ok().and_then(|r| r.policy_log_index);
+        Ok(Response::new(pb::ForwardUpdateAuthorizationResponse {
+            outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
+            policy_log_index,
         }))
     }
 }
@@ -1683,16 +1718,27 @@ fn forwarded_outcome(
         Err(LocalWriteError::Api(ApiError::Invalid(message))) => {
             Outcome::Invalid(pb::forward_write_outcome::Invalid { message })
         }
+        // Classified as well as rendered (ADR 0023): the follower has to map
+        // this onto a status, and a `PermissionDenied` that arrived as an
+        // unlabelled 409 would tell the client to retry a request it may
+        // never perform.
         Err(LocalWriteError::Api(ApiError::Rejected(reason))) => {
             Outcome::Rejected(pb::forward_write_outcome::Rejected {
+                kind: crate::clientwrite::rejection_kind_to_pb(coppice_api::RejectionKind::of(
+                    &reason,
+                )) as i32,
                 reason: reason.to_string(),
             })
         }
         // A relayed rejection cannot arise here — this replica proposed
         // locally — but it is a rejection all the same, and flattening it
-        // would be a lie about which arm the client should see.
-        Err(LocalWriteError::Api(ApiError::ForwardedRejection(reason))) => {
-            Outcome::Rejected(pb::forward_write_outcome::Rejected { reason })
+        // would be a lie about which arm the client should see. Its
+        // classification is carried through unchanged for the same reason.
+        Err(LocalWriteError::Api(ApiError::ForwardedRejection { kind, reason })) => {
+            Outcome::Rejected(pb::forward_write_outcome::Rejected {
+                kind: crate::clientwrite::rejection_kind_to_pb(kind) as i32,
+                reason,
+            })
         }
         Err(LocalWriteError::Api(ApiError::NotLeader { .. })) => {
             Outcome::NotLeader(pb::forward_write_outcome::NotLeader {})

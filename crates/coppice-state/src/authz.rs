@@ -112,6 +112,32 @@ pub struct Binding {
     pub scope: Option<QuotaEntityId>,
 }
 
+impl Binding {
+    /// Whether this binding's subject names `actor` — the *same* predicate
+    /// [`evaluate`] applies, exposed so a caller that only wants to *show* an
+    /// actor's grants (`GET /api/v1/session`'s authority summary) cannot
+    /// drift from the one that decides them.
+    ///
+    /// Subject matching alone: scope, role, and the implicit grants are
+    /// [`evaluate`]'s business, and a summary that pre-applied them would be
+    /// answering a question nobody asked.
+    pub fn matches(&self, actor: &Actor) -> bool {
+        matches_subject(&self.subject, actor)
+    }
+}
+
+/// Every binding in `bindings` whose subject names `actor`, in stored order.
+///
+/// The list form of [`Binding::matches`], for the session summary. Order is
+/// the replicated list's own — bindings are plain data in list order, and a
+/// summary that re-sorted them would invent a ranking the model does not have.
+pub fn matching_bindings<'a>(
+    bindings: &'a [Binding],
+    actor: &'a Actor,
+) -> impl Iterator<Item = &'a Binding> {
+    bindings.iter().filter(move |b| b.matches(actor))
+}
+
 /// A mutating action to authorize — one arm per actor-carrying command,
 /// each carrying the scope its check needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -900,5 +926,64 @@ mod tests {
         assert!(text.contains("ana"), "{text}");
         assert!(text.contains(&team_a.to_string()), "{text}");
         assert!(text.contains("submitter"), "{text}");
+    }
+
+    /// `matching_bindings` selects on the subject and on nothing else, in the
+    /// replicated list's own order.
+    ///
+    /// It backs the session's authority summary, so what it must *not* do is
+    /// second-guess `evaluate`: no scope filtering, no role collapsing, no
+    /// reordering. It reuses the same `matches_subject` `evaluate` does, which
+    /// is the point of the helper existing at all rather than the API layer
+    /// writing its own predicate.
+    #[test]
+    fn matching_bindings_selects_by_subject_only_and_preserves_order() {
+        let bindings = vec![
+            bound(
+                Subject::Group("batch".into()),
+                Role::Submitter,
+                Some(TEAM_A),
+            ),
+            // Someone else's binding: must not leak into an actor's summary.
+            bound(Subject::Group("sre".into()), Role::Operator, None),
+            bound(Subject::Principal("ana".into()), Role::Operator, None),
+            bound(Subject::Group("batch".into()), Role::Admin, Some(SQUAD)),
+            // A principal binding for a *different* sub with the same
+            // spelling as a group the actor carries: subject kind is part of
+            // the match, not decoration.
+            bound(Subject::Principal("batch".into()), Role::Admin, None),
+        ];
+        let ana = in_groups("ana", &["batch"]);
+
+        let matched: Vec<(Role, Option<QuotaEntityId>)> = matching_bindings(&bindings, &ana)
+            .map(|b| (b.role, b.scope))
+            .collect();
+        assert_eq!(
+            matched,
+            vec![
+                (Role::Submitter, Some(qid(TEAM_A))),
+                (Role::Operator, None),
+                (Role::Admin, Some(qid(SQUAD))),
+            ]
+        );
+
+        // An actor matching nothing gets an empty summary, not a default.
+        assert_eq!(matching_bindings(&bindings, &actor("nobody")).count(), 0);
+    }
+
+    /// The implicit grants are invisible here, and must be: an operator
+    /// certificate is unscoped admin from *outside* the list, so a summary
+    /// that invented an entry for it would be reporting a binding that does
+    /// not exist and cannot be revoked through the list.
+    #[test]
+    fn matching_bindings_never_invents_an_entry_for_an_implicit_admin() {
+        let bindings = vec![bound(Subject::Group("sre".into()), Role::Operator, None)];
+        let operator = Actor {
+            principal: "cert:alice".to_string(),
+            operator_cert: true,
+            ..Actor::default()
+        };
+        assert!(operator.is_implicit_admin());
+        assert_eq!(matching_bindings(&bindings, &operator).count(), 0);
     }
 }

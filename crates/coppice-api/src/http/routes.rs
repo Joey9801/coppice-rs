@@ -31,8 +31,9 @@ use super::dto::{
 use crate::{Consistency, ControlPlane};
 
 use super::authn::RequestActor;
+use super::authorize::{precheck, Intent};
 use super::enroll::EnrollEndpoint;
-use super::error::HttpError;
+use super::error::{authorization_error, HttpError};
 use super::extract::{IdPath, ReadIndexes, ReadQuery};
 use super::metrics::MetricsEndpoint;
 use super::readyz::ReadyzEndpoint;
@@ -246,8 +247,15 @@ fn credential_free_routes<P: ControlPlane>(
 /// as is a route added anywhere else under the prefix.
 fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
     Router::new()
-        // Session / auth (ADR 0022) — local read, no raft involvement.
-        .route("/session", get(get_session))
+        // Session / auth (ADR 0022) — the request's own identity, plus the
+        // ADR 0023 authority summary read from replicated bindings.
+        .route("/session", get(get_session::<P>))
+        // Authorization policy (ADR 0023). The read is an ordinary bounded
+        // read; the write is the unscoped-admin-only full replacement.
+        .route(
+            "/authorization",
+            get(get_authorization::<P>).put(update_authorization::<P>),
+        )
         // Cluster overview — bounded reads.
         .route("/overview", get(get_overview::<P>))
         .route("/queue/stats", get(get_queue_stats::<P>))
@@ -317,32 +325,138 @@ fn auth_config(mode: &coppice_authn::AuthMode) -> dto::GetAuthConfigResponse {
     }
 }
 
-/// `GET /api/v1/session` — echo the identity the authentication layer resolved
-/// for this very request (ADR 0022). A local read of the request itself: no
-/// raft involvement, no state machine, no clock.
+/// `GET /api/v1/session` — the identity the authentication layer resolved for
+/// this very request (ADR 0022), plus what that identity may do (ADR 0023).
 ///
-/// [`ReadQuery`] is extracted and discarded, like every other read route: the
-/// ADR 0007 parameter contract (`?consistency=bogus` is `INVALID_ARGUMENT`)
-/// holds across the whole read surface, including the reads that have nothing
-/// to be consistent about.
+/// Two sources, and the response says which is which. `principal`, `groups`,
+/// and `auth_method` come from the request's own credential and involve no
+/// state at all. `bindings` and `implicit_admin` are the **resolved-authority
+/// summary**: the replicated bindings whose subject names this actor, each
+/// reported faithfully as role + scope.
 ///
-/// **Seam for the role summary (ADR 0023).** This response is the actor and
-/// nothing more; what the actor may *do* — the roles resolved against the
-/// replicated bindings, scoped and unscoped — is the field it gains next, and
-/// the reason `read_state` will appear in this handler when it does.
-async fn get_session(
+/// Faithfully, and not collapsed into one effective role. The union over
+/// matching bindings is `authz::evaluate`'s business, and a server that
+/// answered "you are an operator" would be publishing a second, simpler model
+/// of authority beside the real one — which is exactly how the two come to
+/// disagree. The subject matching itself reuses
+/// [`Binding::matches`](coppice_state::authz::Binding::matches), the same
+/// predicate `evaluate` applies, so this summary cannot drift from the
+/// decisions it describes.
+///
+/// **Eventual** by default: an authority summary is a display, and paying for
+/// a consensus round trip to render one would be the wrong trade — nothing is
+/// authorized on the strength of what this endpoint says.
+///
+/// [`ReadQuery`] is honoured like every other read route, so the ADR 0007
+/// parameter contract (`?consistency=bogus` is `INVALID_ARGUMENT`, and a
+/// caller who *does* want a fresher answer can ask for one) holds here too.
+async fn get_session<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
     RequestActor(actor): RequestActor,
-    ReadQuery(_): ReadQuery,
-) -> impl IntoResponse {
-    Json(dto::GetSessionResponse {
-        principal: actor.principal.clone(),
-        groups: actor.groups.clone(),
-        // Derived from the actor's flags rather than remembered separately, so
-        // the reported method can never disagree with the grants it implies.
-        auth_method: actor.method().as_str().to_string(),
-        bindings: Vec::new(),
-        implicit_admin: actor.is_implicit_admin(),
-    })
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Eventual))
+        .await?;
+    let bindings = coppice_state::authz::matching_bindings(&view.state().bindings, &actor)
+        .map(|b| dto::SessionBinding {
+            role: (&b.role).into(),
+            scope: b.scope,
+        })
+        .collect();
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(dto::GetSessionResponse {
+            principal: actor.principal.clone(),
+            groups: actor.groups.clone(),
+            // Derived from the actor's flags rather than remembered separately,
+            // so the reported method can never disagree with the grants it
+            // implies.
+            auth_method: actor.method().as_str().to_string(),
+            bindings,
+            // An operator certificate or the open posture: unscoped admin from
+            // outside the list, so it could never appear *in* `bindings`.
+            implicit_admin: actor.is_implicit_admin(),
+        }),
+    ))
+}
+
+/// `GET /api/v1/authorization` — the replicated authorization policy: the full
+/// bindings list and the `groups_claim` name (ADR 0023).
+///
+/// **Strong** by default (ADR 0031's table), which puts it in ADR 0007's
+/// configuration-read class alongside [`get_quota_entity`] rather than with
+/// the bounded list reads. The document this serves is the one an operator
+/// edits and PUTs back: a read-modify-write over a stale snapshot silently
+/// reverts whatever landed in between, and full replacement makes that a
+/// deletion rather than a merge conflict.
+///
+/// Role-unchecked, like every read in v1: any authenticated principal may see
+/// the bindings list. It names groups and principals, which the people in it
+/// already know they are, and hiding it would mostly stop an operator from
+/// debugging why their own grant does not apply.
+async fn get_authorization<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Strong))
+        .await?;
+    let state = view.state();
+    let response = dto::GetAuthorizationResponse {
+        groups_claim: state.policy.groups_claim.clone(),
+        bindings: state.bindings.iter().map(Into::into).collect(),
+    };
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `PUT /api/v1/authorization` — full replacement of the replicated bindings
+/// (ADR 0023), an unscoped-admin verb.
+///
+/// Three refusals, in the order they can be reached:
+///
+/// 1. A body whose bindings do not name exactly one of `group`/`principal` is
+///    `INVALID_ARGUMENT` — serde cannot express "exactly one", so the
+///    conversion does, and it is checked before anything is proposed.
+/// 2. An actor without an unscoped admin binding is `PERMISSION_DENIED`, from
+///    the same [`precheck`] every other mutating handler runs.
+/// 3. Apply's own checks — an unknown scope, a malformed subject, a list that
+///    would retain no unscoped admin — come back as rejections, and *this*
+///    endpoint reads them as a malformed document rather than a lost race:
+///    [`authorization_error`] maps them to `INVALID_ARGUMENT` with
+///    distinguishing text. That mapping is endpoint-local by necessity;
+///    `UnknownQuotaEntity` remains a 409 on submit and on the quota upsert.
+async fn update_authorization<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
+    body: Result<Json<dto::UpdateAuthorizationRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let Json(request) = body.map_err(bad_body)?;
+
+    // The exactly-one-subject rule, checked here and discarded: the plane
+    // takes the DTO (like every other write) and converts it itself, but a
+    // violation is a malformed *request*, not a rejection, and must not cost a
+    // consensus round trip to discover.
+    for (i, binding) in request.bindings.iter().enumerate() {
+        coppice_state::authz::Binding::try_from(binding)
+            .map_err(|e| HttpError::invalid(format!("binding {i}: {e}")))?;
+    }
+
+    precheck(&*plane, &actor, Intent::UpdateAuthorization).await?;
+    let response = plane
+        .update_authorization(request, actor)
+        .await
+        .map_err(authorization_error)?;
+    Ok(Json(response))
 }
 
 /// Stub for an unimplemented read route. Extracting [`ReadQuery`] makes the
@@ -454,12 +568,25 @@ async fn list_jobs<P: ControlPlane>(
 /// `POST /api/v1/jobs` — body `SubmitJobRequest`, response
 /// `SubmitJobResponse` (echoed client-minted id + `log_index` for a
 /// read-your-writes `min_index`, ADR 0026/0007).
+///
+/// Gated on `submitter` or higher over the charged quota entity (ADR 0023):
+/// [`precheck`] answers 403 before anything is proposed, and the actor rides
+/// the command for apply's authoritative re-check.
 async fn submit_job<P: ControlPlane>(
     State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
     body: Result<Json<SubmitJobRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
     let Json(request) = body.map_err(bad_body)?;
-    let response = plane.submit_job(request).await?;
+    precheck(
+        &*plane,
+        &actor,
+        Intent::Submit {
+            entity: &request.quota_entity,
+        },
+    )
+    .await?;
+    let response = plane.submit_job(request, actor).await?;
     Ok(Json(response))
 }
 
@@ -467,8 +594,14 @@ async fn submit_job<P: ControlPlane>(
 /// segment is authoritative for the job id: the body's `job` field may be
 /// omitted (`{}` aborts with no reason) and, when present, must match the
 /// path — a mismatch is `INVALID_ARGUMENT`, never silently resolved.
+///
+/// Gated on `operator` or higher over the job's quota entity, **or** on having
+/// submitted the job (ADR 0023's ownership grant, which
+/// `authz::evaluate` applies for free once [`precheck`] has resolved the job's
+/// `submitted_by` from the view).
 async fn abort_job<P: ControlPlane>(
     State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
     IdPath(job): IdPath<JobId>,
     body: Result<Json<AbortJobRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
@@ -482,7 +615,8 @@ async fn abort_job<P: ControlPlane>(
         }
         Some(_) => {}
     }
-    plane.abort_job(request).await?;
+    precheck(&*plane, &actor, Intent::Abort { job }).await?;
+    plane.abort_job(request, actor).await?;
     Ok(Json(AbortJobResponse {}))
 }
 
@@ -490,13 +624,33 @@ async fn abort_job<P: ControlPlane>(
 /// create-or-update upsert (ADR 0031's write class). Response echoes the
 /// client-minted entity id + `log_index` for read-your-writes, exactly like
 /// `SubmitJob`. A cycle / unknown-parent refusal maps to `REJECTED` (409),
-/// the normal committed-and-refused outcome.
+/// the normal committed-and-refused outcome — and stays a 409 here even
+/// though `PUT /api/v1/authorization` reads the same `UnknownQuotaEntity` as a
+/// 400: on this endpoint an unknown parent really is a race with whoever
+/// deleted it, which is what 409 means.
+///
+/// Gated on `admin` covering the entity's position, and — when the request
+/// actually reparents it — covering the new parent too, under a single
+/// binding (ADR 0023: reparenting moves authority, so a cross-subtree move,
+/// like a move to the root, takes unscoped admin). The `new_parent` handed to
+/// the check is the request's `parent` verbatim, including its absence, which
+/// is what makes "move to the root" distinguishable from "not a move".
 async fn configure_quota_entity<P: ControlPlane>(
     State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
     body: Result<Json<ConfigureQuotaEntityRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
     let Json(request) = body.map_err(bad_body)?;
-    let response = plane.configure_quota_entity(request).await?;
+    precheck(
+        &*plane,
+        &actor,
+        Intent::ConfigureQuotaEntity {
+            entity: &request.entity,
+            new_parent: request.parent.as_ref(),
+        },
+    )
+    .await?;
+    let response = plane.configure_quota_entity(request, actor).await?;
     Ok(Json(response))
 }
 
@@ -847,6 +1001,35 @@ mod tests {
         /// The seeded raft summary, or `None` to model a control plane with no
         /// consensus handle attached (→ `coordinator_status` is `Unavailable`).
         coordinator: Option<CoordinatorSummary>,
+        /// The actor each mutating call arrived with, in call order.
+        ///
+        /// Recorded because "the handler answered 200" is only half of what
+        /// the authorization work has to prove: the other half is that the
+        /// identity the authentication layer resolved is the one that reaches
+        /// the plane, since that is what rides the command and what apply
+        /// re-checks. A dropped actor passes every status assertion.
+        actors: std::sync::Mutex<Vec<coppice_state::Actor>>,
+        /// The last `PUT /api/v1/authorization` body the plane was handed.
+        authorization: std::sync::Mutex<Option<dto::UpdateAuthorizationRequest>>,
+    }
+
+    impl StubPlane {
+        /// Every actor that reached a mutating method, in call order.
+        fn actors(&self) -> Vec<coppice_state::Actor> {
+            self.actors.lock().unwrap().clone()
+        }
+
+        /// The single actor a one-write test drove — a sharper assertion than
+        /// indexing, because an unexpected *second* call fails it too.
+        fn only_actor(&self) -> coppice_state::Actor {
+            let actors = self.actors();
+            assert_eq!(actors.len(), 1, "expected exactly one mutating call");
+            actors.into_iter().next().expect("one actor")
+        }
+
+        fn record(&self, actor: coppice_state::Actor) {
+            self.actors.lock().unwrap().push(actor);
+        }
     }
 
     const STUB_CLUSTER: &str = "cluster-00000000-0000-0000-0000-000000000009";
@@ -881,7 +1064,12 @@ mod tests {
                 .ok_or_else(|| ApiError::Unavailable("no consensus handle".into()))
         }
 
-        async fn submit_job(&self, req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
+        async fn submit_job(
+            &self,
+            req: SubmitJobRequest,
+            actor: coppice_state::Actor,
+        ) -> Result<SubmitJobResponse, ApiError> {
+            self.record(actor);
             match self.fail_with {
                 Some(make) => Err(make()),
                 None => Ok(SubmitJobResponse {
@@ -891,7 +1079,12 @@ mod tests {
             }
         }
 
-        async fn abort_job(&self, _req: AbortJobRequest) -> Result<(), ApiError> {
+        async fn abort_job(
+            &self,
+            _req: AbortJobRequest,
+            actor: coppice_state::Actor,
+        ) -> Result<(), ApiError> {
+            self.record(actor);
             match self.fail_with {
                 Some(make) => Err(make()),
                 None => Ok(()),
@@ -901,12 +1094,36 @@ mod tests {
         async fn configure_quota_entity(
             &self,
             req: dto::ConfigureQuotaEntityRequest,
+            actor: coppice_state::Actor,
         ) -> Result<dto::ConfigureQuotaEntityResponse, ApiError> {
+            self.record(actor);
             match self.fail_with {
                 Some(make) => Err(make()),
                 None => Ok(dto::ConfigureQuotaEntityResponse {
                     entity: req.entity,
                     log_index: 7,
+                }),
+            }
+        }
+
+        /// Echoes an accepted replacement, with a `policy_log_index` exactly
+        /// when the request asked for a `groups_claim` change — the
+        /// coordinator's own "only when it differs" rule is tested against a
+        /// real state machine in `coppice-coordinator`; here the point is
+        /// that the field reaches the client.
+        async fn update_authorization(
+            &self,
+            req: dto::UpdateAuthorizationRequest,
+            actor: coppice_state::Actor,
+        ) -> Result<dto::UpdateAuthorizationResponse, ApiError> {
+            self.record(actor);
+            let policy_log_index = req.groups_claim.as_ref().map(|_| 8);
+            *self.authorization.lock().unwrap() = Some(req);
+            match self.fail_with {
+                Some(make) => Err(make()),
+                None => Ok(dto::UpdateAuthorizationResponse {
+                    log_index: 7,
+                    policy_log_index,
                 }),
             }
         }
@@ -964,6 +1181,8 @@ mod tests {
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
             // No handle by default: coordinator-status tests build their own
             // plane with a seeded summary.
             coordinator: None,
@@ -1074,6 +1293,8 @@ mod tests {
             timeline: empty_timeline(),
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
             coordinator: None,
         };
         let response = router(Arc::new(plane))
@@ -1563,6 +1784,8 @@ mod tests {
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
             coordinator: None,
         })
     }
@@ -1604,8 +1827,14 @@ mod tests {
         // Object envelope, never a bare array (ADR 0031).
         assert_eq!(body["entities"][0]["id"], id.to_string());
         assert_eq!(body["entities"][0]["queued_count"], 0);
-        // SSO provenance is omitted, not null.
-        assert!(body["entities"][0].get("origin").is_none());
+        // SSO provenance (ADR 0022) is now a present field, not an omitted
+        // one. Replicated state records no auto-minted entities — nothing
+        // creates one — so every entity reads `configured` with a null
+        // principal, and saying so beats omitting the field: a client can
+        // tell "this entity was configured by an operator" from "this server
+        // does not report provenance", which an absent key cannot.
+        assert_eq!(body["entities"][0]["origin"], "configured");
+        assert_eq!(body["entities"][0]["principal"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -1869,6 +2098,8 @@ mod tests {
             timeline,
             state,
             read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
             coordinator: None,
         })
     }
@@ -2167,6 +2398,8 @@ mod tests {
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
             coordinator: Some(coordinator),
         }))
     }
@@ -2372,6 +2605,8 @@ mod tests {
                 timeline: empty_timeline(),
                 state: coppice_state::StateMachine::default(),
                 read_consistency: std::sync::Mutex::default(),
+                actors: std::sync::Mutex::default(),
+                authorization: std::sync::Mutex::default(),
                 coordinator: None,
             }),
             crate::http::MetricsEndpoint::detached_for_tests(),
@@ -2893,7 +3128,8 @@ mod tests {
     #[tokio::test]
     async fn session_still_validates_the_consistency_parameter() {
         // The ADR 0007 read-parameter contract holds on every read route,
-        // including the one that reads nothing but the request itself.
+        // including /session, which now also reads replicated bindings to
+        // build its authority summary rather than the request alone.
         let response = app(None)
             .oneshot(
                 Request::get("/api/v1/session?consistency=bogus")
@@ -3223,5 +3459,961 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    // ---- Authorization (ADR 0023) ----------------------------------------
+    //
+    // The pre-log check, end to end through the router: a fake-IdP token
+    // carrying a real principal and real groups, evaluated against real
+    // replicated bindings by the same `authz::evaluate` apply uses.
+    //
+    // Every case asserts the *pair* (status, actor-that-reached-the-plane). A
+    // 200 proves only that the request was not refused; that the identity the
+    // token proved is the one that rides the command — groups and
+    // implicit-admin flags included — is the other half, and no status
+    // assertion can see it.
+
+    use coppice_state::authz::{Binding, Role, Subject};
+
+    /// The quota tree every case is scoped against:
+    /// `org` → { `team-a` → `squad`, `team-b` }.
+    ///
+    /// Four entities covering every containment relationship the subtree rule
+    /// has — a parent, a sibling outside the subtree, and a grandchild inside
+    /// it — the same shape `authz`'s own unit tests use.
+    struct Tree {
+        org: QuotaEntityId,
+        team_a: QuotaEntityId,
+        team_b: QuotaEntityId,
+        squad: QuotaEntityId,
+        /// A queued job charging `team_a`, submitted by `"owner"`.
+        job: JobId,
+    }
+
+    /// Build the tree, seed one owned job, and install the bindings `bind`
+    /// derives from the (freshly minted) entity ids.
+    ///
+    /// The closure exists because scopes are ids: a caller cannot name
+    /// `team-a` in a binding until the fixture has minted it.
+    fn authz_fixture(
+        bind: impl FnOnce(&Tree) -> Vec<Binding>,
+    ) -> (coppice_state::StateMachine, Tree) {
+        let tree = Tree {
+            org: QuotaEntityId::new(),
+            team_a: QuotaEntityId::new(),
+            team_b: QuotaEntityId::new(),
+            squad: QuotaEntityId::new(),
+            job: JobId::new(),
+        };
+        let at = Timestamp::from_micros(1_760_000_000_000_000).expect("in range");
+        let entity = |parent: Option<QuotaEntityId>, name: &str| coppice_state::QuotaEntity {
+            parent,
+            name: name.to_string(),
+            quota: coppice_core::quota::CostUnits(1_000_000),
+            usage: coppice_core::quota::UsageState::new(at),
+            created_at: at,
+            updated_at: at,
+        };
+
+        let mut state = coppice_state::StateMachine::default();
+        state.quota_entities.insert(tree.org, entity(None, "org"));
+        state
+            .quota_entities
+            .insert(tree.team_a, entity(Some(tree.org), "team-a"));
+        state
+            .quota_entities
+            .insert(tree.team_b, entity(Some(tree.org), "team-b"));
+        state
+            .quota_entities
+            .insert(tree.squad, entity(Some(tree.team_a), "squad"));
+
+        let mut record = queued_job(tree.job);
+        record.spec.quota_entity = tree.team_a;
+        record.spec.submitted_by = Some("owner".to_string());
+        state.jobs.insert(tree.job, record);
+
+        state.bindings = bind(&tree);
+        (state, tree)
+    }
+
+    fn group_binding(group: &str, role: Role, scope: Option<QuotaEntityId>) -> Binding {
+        Binding {
+            subject: Subject::Group(group.to_string()),
+            role,
+            scope,
+        }
+    }
+
+    fn principal_binding(sub: &str, role: Role, scope: Option<QuotaEntityId>) -> Binding {
+        Binding {
+            subject: Subject::Principal(sub.to_string()),
+            role,
+            scope,
+        }
+    }
+
+    fn submit_body(entity: QuotaEntityId) -> String {
+        format!(
+            r#"{{
+                "image": "busybox",
+                "command": ["run"],
+                "requests": {{ "cpu_millis": 1000, "memory_bytes": 0, "disk_bytes": 0 }},
+                "job": "{}",
+                "quota_entity": "{entity}"
+            }}"#,
+            JobId::new()
+        )
+    }
+
+    fn configure_body(entity: QuotaEntityId, parent: Option<QuotaEntityId>) -> String {
+        let parent = match parent {
+            Some(p) => format!(r#""{p}""#),
+            None => "null".to_string(),
+        };
+        format!(r#"{{ "entity": "{entity}", "parent": {parent}, "name": "n", "quota_ucu": 1000 }}"#)
+    }
+
+    fn put_json(uri: &str, body: &str) -> Request<Body> {
+        Request::put(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// `request`, credentialed as `principal` carrying `groups`.
+    fn as_principal(
+        idp: &coppice_testkit::oidc::FakeIdp,
+        mut request: Request<Body>,
+        principal: &str,
+        groups: &[&str],
+    ) -> Request<Body> {
+        let token = idp.sign(
+            coppice_testkit::oidc::TokenClaims::new(principal)
+                .audience(TEST_CLIENT_ID)
+                .claim("groups", serde_json::json!(groups)),
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        request
+    }
+
+    /// One authorization case: status, body, and the plane it was (or was
+    /// not) proposed to.
+    async fn authz_case(
+        idp: &coppice_testkit::oidc::FakeIdp,
+        chain: Arc<AuthnChain>,
+        state: coppice_state::StateMachine,
+        principal: &str,
+        groups: &[&str],
+        request: Request<Body>,
+    ) -> (StatusCode, serde_json::Value, Arc<StubPlane>) {
+        let plane = stub_plane(state);
+        let response = router_with_authn(Arc::clone(&plane), chain)
+            .oneshot(as_principal(idp, request, principal, groups))
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await, plane)
+    }
+
+    /// A refusal is a 403 with the documented code, and — the assertion that
+    /// matters most — nothing reached the control plane, so nothing was
+    /// proposed and no log entry exists for a request that never applied.
+    fn assert_denied(status: StatusCode, body: &serde_json::Value, plane: &StubPlane) {
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "PERMISSION_DENIED");
+        assert!(
+            plane.actors().is_empty(),
+            "a refused request must not reach the control plane"
+        );
+    }
+
+    /// The actor a 200 handed the plane, asserted to be exactly the token's.
+    fn accepted_actor(plane: &StubPlane, principal: &str, groups: &[&str]) -> coppice_state::Actor {
+        let actor = plane.only_actor();
+        assert_eq!(actor.principal, principal);
+        assert_eq!(
+            actor.groups,
+            groups.iter().map(|g| g.to_string()).collect::<Vec<_>>()
+        );
+        // Neither implicit-admin flag may be invented by the edge for an
+        // ordinary bearer: they are what would make the actor unscoped admin.
+        assert!(!actor.operator_cert, "a bearer is not an operator cert");
+        assert!(!actor.auth_disabled, "the OIDC posture is not open mode");
+        actor
+    }
+
+    #[tokio::test]
+    async fn a_principal_with_no_bindings_is_refused_every_mutating_verb() {
+        // Deny by default, which is the whole model: an authenticated caller
+        // with no binding may do nothing at all — and each refusal is a 403,
+        // not a 401, because they *are* who they say they are.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, tree) = authz_fixture(|_| Vec::new());
+
+        for request in [
+            post_json("/api/v1/jobs", &submit_body(tree.team_a)),
+            post_json(&format!("/api/v1/jobs/{}/abort", tree.job), "{}"),
+            post_json(
+                "/api/v1/quota-entities",
+                &configure_body(tree.team_a, Some(tree.org)),
+            ),
+            put_json("/api/v1/authorization", r#"{ "bindings": [] }"#),
+        ] {
+            let uri = request.uri().to_string();
+            let (status, body, plane) = authz_case(
+                &idp,
+                Arc::clone(&chain),
+                state.clone(),
+                "nobody",
+                &[],
+                request,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert_eq!(body["code"], "PERMISSION_DENIED", "{uri}");
+            assert!(plane.actors().is_empty(), "{uri} must not be proposed");
+        }
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_scoped_submitter_submits_in_scope_and_nowhere_else() {
+        // The subtree rule end to end. `squad` is a descendant of the scope
+        // and `team-b` a sibling of it — the pair that decides whether "scope"
+        // means a subtree or a single entity — and `org` is the ancestor,
+        // which a scoped grant must never reach upward to.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, tree) = authz_fixture(|t| {
+            vec![group_binding(
+                "batch-users",
+                Role::Submitter,
+                Some(t.team_a),
+            )]
+        });
+
+        for (entity, label, expected) in [
+            (tree.team_a, "the scope itself", StatusCode::OK),
+            (tree.squad, "a descendant", StatusCode::OK),
+            (tree.team_b, "a sibling", StatusCode::FORBIDDEN),
+            (tree.org, "the ancestor", StatusCode::FORBIDDEN),
+        ] {
+            let (status, body, plane) = authz_case(
+                &idp,
+                Arc::clone(&chain),
+                state.clone(),
+                "user-42",
+                &["batch-users"],
+                post_json("/api/v1/jobs", &submit_body(entity)),
+            )
+            .await;
+            assert_eq!(status, expected, "{label}: {body}");
+            if expected == StatusCode::OK {
+                accepted_actor(&plane, "user-42", &["batch-users"]);
+            } else {
+                assert_denied(status, &body, &plane);
+            }
+        }
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_principal_subject_binding_grants_exactly_like_a_group_one() {
+        // Subjects are two spellings of the same thing — an exact string
+        // against `sub` or against a groups-claim entry — and neither is
+        // privileged over the other.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, tree) =
+            authz_fixture(|t| vec![principal_binding("svc-ci", Role::Submitter, Some(t.team_a))]);
+
+        // The named principal, carrying no groups at all.
+        let (status, body, plane) = authz_case(
+            &idp,
+            Arc::clone(&chain),
+            state.clone(),
+            "svc-ci",
+            &[],
+            post_json("/api/v1/jobs", &submit_body(tree.team_a)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        accepted_actor(&plane, "svc-ci", &[]);
+
+        // Somebody whose *group* happens to be named `svc-ci` is not that
+        // principal: subject kind is part of the match, not decoration.
+        let (status, body, plane) = authz_case(
+            &idp,
+            chain,
+            state,
+            "impostor",
+            &["svc-ci"],
+            post_json("/api/v1/jobs", &submit_body(tree.team_a)),
+        )
+        .await;
+        assert_denied(status, &body, &plane);
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_operator_aborts_anyones_job_and_a_submitter_does_not() {
+        // Abort composes upward from operator, and submitter is strictly
+        // below it: the same scope, the same job, two different answers.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, tree) = authz_fixture(|t| {
+            vec![
+                group_binding("sre", Role::Operator, Some(t.team_a)),
+                group_binding("batch-users", Role::Submitter, Some(t.team_a)),
+            ]
+        });
+        let abort = || post_json(&format!("/api/v1/jobs/{}/abort", tree.job), "{}");
+
+        let (status, body, plane) = authz_case(
+            &idp,
+            Arc::clone(&chain),
+            state.clone(),
+            "on-call",
+            &["sre"],
+            abort(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        accepted_actor(&plane, "on-call", &["sre"]);
+
+        let (status, body, plane) =
+            authz_case(&idp, chain, state, "user-42", &["batch-users"], abort()).await;
+        assert_denied(status, &body, &plane);
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_submitter_aborts_their_own_job_with_no_binding_at_all() {
+        // ADR 0023's one implicit grant besides the operator cert: the
+        // principal in the job's `submitted_by` may always abort it. The
+        // fixture gives `owner` no binding whatsoever, so a 200 here can only
+        // have come from ownership — and it is the *pre-log* check resolving
+        // the job's owner out of the read view that produces it.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, tree) = authz_fixture(|_| Vec::new());
+
+        let (status, body, plane) = authz_case(
+            &idp,
+            Arc::clone(&chain),
+            state.clone(),
+            "owner",
+            &[],
+            post_json(&format!("/api/v1/jobs/{}/abort", tree.job), "{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        accepted_actor(&plane, "owner", &[]);
+
+        // And ownership is not transitive to anyone else with no binding.
+        let (status, body, plane) = authz_case(
+            &idp,
+            chain,
+            state,
+            "someone-else",
+            &[],
+            post_json(&format!("/api/v1/jobs/{}/abort", tree.job), "{}"),
+        )
+        .await;
+        assert_denied(status, &body, &plane);
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn aborting_a_job_the_view_has_never_seen_is_left_to_apply() {
+        // The pre-check declines to guess. This replica's view may simply be
+        // behind, and both guesses are wrong in a visible way: a 403 would
+        // refuse a caller who may own the job, and a 404 would answer a
+        // different question *and* be an existence oracle for job ids. So the
+        // request goes through, carrying its actor, and apply decides against
+        // the state at its own log position.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, _tree) = authz_fixture(|_| Vec::new());
+
+        let (status, body, plane) = authz_case(
+            &idp,
+            chain,
+            state,
+            "nobody",
+            &[],
+            post_json(&format!("/api/v1/jobs/{}/abort", JobId::new()), "{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        accepted_actor(&plane, "nobody", &[]);
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_scoped_admin_configures_in_subtree_but_cannot_move_an_entity_out_of_it() {
+        // Reparenting moves authority (ADR 0023), so a move must stay inside
+        // one binding's subtree. Reconfiguring `squad` where it already sits
+        // is fine; moving it under `team-b` is a cross-subtree move, and
+        // moving it to the root is inside no subtree at all — both take
+        // unscoped admin, which this actor does not have.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, tree) =
+            authz_fixture(|t| vec![group_binding("platform", Role::Admin, Some(t.team_a))]);
+
+        for (parent, label, expected) in [
+            (Some(tree.team_a), "in place", StatusCode::OK),
+            (Some(tree.team_b), "cross-subtree", StatusCode::FORBIDDEN),
+            (None, "to the root", StatusCode::FORBIDDEN),
+        ] {
+            let (status, body, plane) = authz_case(
+                &idp,
+                Arc::clone(&chain),
+                state.clone(),
+                "admin-a",
+                &["platform"],
+                post_json(
+                    "/api/v1/quota-entities",
+                    &configure_body(tree.squad, parent),
+                ),
+            )
+            .await;
+            assert_eq!(status, expected, "{label}: {body}");
+            if expected == StatusCode::OK {
+                accepted_actor(&plane, "admin-a", &["platform"]);
+            } else {
+                assert_denied(status, &body, &plane);
+            }
+        }
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_authorization_write_takes_an_unscoped_admin_and_a_scoped_one_will_not_do() {
+        // The cluster verbs are the one place the scope's *absence* is the
+        // grant. A subtree admin reshapes their subtree; they do not rewrite
+        // the list that says who administers what.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+
+        let (scoped, _) =
+            authz_fixture(|t| vec![group_binding("platform", Role::Admin, Some(t.team_a))]);
+        let (status, body, plane) = authz_case(
+            &idp,
+            Arc::clone(&chain),
+            scoped,
+            "admin-a",
+            &["platform"],
+            put_json("/api/v1/authorization", r#"{ "bindings": [] }"#),
+        )
+        .await;
+        assert_denied(status, &body, &plane);
+
+        let (unscoped, _) = authz_fixture(|_| vec![group_binding("platform", Role::Admin, None)]);
+        let (status, body, plane) = authz_case(
+            &idp,
+            chain,
+            unscoped,
+            "admin-a",
+            &["platform"],
+            put_json("/api/v1/authorization", r#"{ "bindings": [] }"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        accepted_actor(&plane, "admin-a", &["platform"]);
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_operator_certificate_passes_every_mutating_verb_with_no_bindings() {
+        // Break-glass (ADR 0022): an implicit unscoped admin from *outside*
+        // the bindings list, against a cluster whose list is empty — which is
+        // exactly the lockout it exists to recover from. The flag reaches the
+        // plane, because apply re-derives the same implicit grant from it.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let (ca_pem, leaf_der) = operator_credential("alice");
+        let chain = oidc_chain_with_ca(&idp, Arc::new(move || Some(ca_pem.clone()))).await;
+        let (state, tree) = authz_fixture(|_| Vec::new());
+
+        for request in [
+            post_json("/api/v1/jobs", &submit_body(tree.team_b)),
+            post_json(&format!("/api/v1/jobs/{}/abort", tree.job), "{}"),
+            post_json("/api/v1/quota-entities", &configure_body(tree.squad, None)),
+            put_json("/api/v1/authorization", r#"{ "bindings": [] }"#),
+        ] {
+            let uri = request.uri().to_string();
+            let plane = stub_plane(state.clone());
+            let response = router_with_authn(Arc::clone(&plane), Arc::clone(&chain))
+                .oneshot(with_peer_cert(request, leaf_der.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let actor = plane.only_actor();
+            assert_eq!(actor.principal, "cert:alice", "{uri}");
+            assert!(actor.operator_cert, "{uri}");
+            assert!(actor.is_implicit_admin(), "{uri}");
+        }
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_mode_passes_every_mutating_verb_with_no_bindings() {
+        // The formally-supported open posture: one static anonymous actor
+        // with implicit unscoped admin. `auth_disabled` rides *in* the actor
+        // rather than being read from node config, which is what lets apply
+        // reach the same verdict without consulting anything unreplicated.
+        let (state, tree) = authz_fixture(|_| Vec::new());
+
+        for request in [
+            post_json("/api/v1/jobs", &submit_body(tree.team_b)),
+            post_json(&format!("/api/v1/jobs/{}/abort", tree.job), "{}"),
+            post_json("/api/v1/quota-entities", &configure_body(tree.squad, None)),
+            put_json("/api/v1/authorization", r#"{ "bindings": [] }"#),
+        ] {
+            let uri = request.uri().to_string();
+            let plane = stub_plane(state.clone());
+            let response = router(Arc::clone(&plane)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let actor = plane.only_actor();
+            assert_eq!(actor.principal, "anonymous", "{uri}");
+            assert!(actor.auth_disabled, "{uri}");
+            assert!(actor.is_implicit_admin(), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_apply_time_permission_denial_is_a_403_and_never_a_500() {
+        // The revocation race, which is the reason apply re-checks at all: the
+        // pre-check passed against this replica's view, and by the command's
+        // log position the binding was gone. Apply refuses deterministically,
+        // and that refusal must reach the client as the same 403 the
+        // pre-check would have given — not as the 409 every other rejection
+        // is, and above all not as an INTERNAL.
+        let plane = Arc::new(StubPlane {
+            fail_with: Some(|| {
+                ApiError::Rejected(coppice_state::RejectionReason::PermissionDenied(
+                    "principal \"user-42\" may not submit a job charging quota entity q".into(),
+                ))
+            }),
+            queue_window: QueueWindow::default(),
+            recent: RecentClusterEvents {
+                floor_index: 1,
+                events: Vec::new(),
+            },
+            timeline: empty_timeline(),
+            state: coppice_state::StateMachine::default(),
+            read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
+            coordinator: None,
+        });
+        let response = router(plane)
+            .oneshot(post_json(
+                "/api/v1/jobs",
+                &submit_body(QuotaEntityId::new()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "PERMISSION_DENIED");
+        // The apply's own rendered denial, verbatim — the same sentence the
+        // pre-log check produces, so a client cannot tell which one refused.
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("may not submit a job"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_permission_denial_is_a_403_too() {
+        // The same rejection, relayed across the ADR 0038 hop. The rendered
+        // text is all that used to cross; the classification crosses with it
+        // now, precisely so this status survives a forward.
+        let plane = Arc::new(StubPlane {
+            fail_with: Some(|| ApiError::ForwardedRejection {
+                kind: crate::RejectionKind::PermissionDenied,
+                reason: "permission denied: principal \"user-42\" may not …".into(),
+            }),
+            queue_window: QueueWindow::default(),
+            recent: RecentClusterEvents {
+                floor_index: 1,
+                events: Vec::new(),
+            },
+            timeline: empty_timeline(),
+            state: coppice_state::StateMachine::default(),
+            read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
+            coordinator: None,
+        });
+        let response = router(plane)
+            .oneshot(post_json(
+                "/api/v1/jobs",
+                &submit_body(QuotaEntityId::new()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "PERMISSION_DENIED");
+    }
+
+    /// A rejection with no special classification is still the 409 it always
+    /// was — the new mapping added one status, it did not reclassify the rest.
+    #[tokio::test]
+    async fn an_ordinary_rejection_is_still_a_409() {
+        let response = app(Some(|| {
+            ApiError::Rejected(coppice_state::RejectionReason::JobTerminal(JobId::new()))
+        }))
+        .oneshot(post_json(
+            "/api/v1/jobs",
+            &submit_body(QuotaEntityId::new()),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["code"], "REJECTED");
+    }
+
+    // ---- GET/PUT /api/v1/authorization -----------------------------------
+
+    #[tokio::test]
+    async fn the_authorization_document_round_trips_through_get_and_put() {
+        // What `GET` writes is what `PUT` accepts, field for field — the
+        // property `coppice-cli policy authz get | set` depends on. Both
+        // subject kinds and both scope states, because those are the four
+        // shapes the flat wire form has to keep distinct.
+        let scope = QuotaEntityId::new();
+        let (mut state, _) = authz_fixture(|_| Vec::new());
+        state.policy.groups_claim = "entitlements".to_string();
+        state.bindings = vec![
+            group_binding("platform", Role::Admin, None),
+            principal_binding("svc-ci", Role::Submitter, Some(scope)),
+        ];
+        let plane = stub_plane(state);
+
+        let response = router(Arc::clone(&plane))
+            .oneshot(
+                Request::get("/api/v1/authorization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // A configuration read (ADR 0007), like the quota-entity detail:
+        // the document an operator is about to edit and PUT back.
+        assert_eq!(
+            plane.read_consistency.lock().unwrap().last().copied(),
+            Some(Consistency::Strong)
+        );
+        let document = body_json(response).await;
+        assert_eq!(document["groups_claim"], "entitlements");
+        assert_eq!(
+            document["bindings"],
+            serde_json::json!([
+                { "group": "platform", "role": "admin" },
+                { "principal": "svc-ci", "role": "submitter", "scope": scope.to_string() },
+            ])
+        );
+
+        // The very same document, PUT straight back.
+        let response = router(Arc::clone(&plane))
+            .oneshot(put_json(
+                "/api/v1/authorization",
+                &serde_json::to_string(&document).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let echoed = plane
+            .authorization
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the plane saw the replacement");
+        assert_eq!(echoed.groups_claim.as_deref(), Some("entitlements"));
+        assert_eq!(
+            echoed.bindings.iter().map(|b| b.role).collect::<Vec<_>>(),
+            vec![dto::BindingRole::Admin, dto::BindingRole::Submitter]
+        );
+        assert_eq!(echoed.bindings[0].group.as_deref(), Some("platform"));
+        assert_eq!(echoed.bindings[1].principal.as_deref(), Some("svc-ci"));
+        assert_eq!(echoed.bindings[1].scope, Some(scope));
+    }
+
+    #[tokio::test]
+    async fn a_groups_claim_change_reports_its_own_log_index() {
+        // Two commands, two indexes (ADR 0023): `groups_claim` lives in
+        // `PolicyConfig` and the bindings do not, so changing both is a
+        // bindings replacement plus a policy update — and the response says
+        // so rather than pretending to one transaction.
+        let (state, _) = authz_fixture(|_| Vec::new());
+        let plane = stub_plane(state);
+        let response = router(Arc::clone(&plane))
+            .oneshot(put_json(
+                "/api/v1/authorization",
+                r#"{ "groups_claim": "roles", "bindings": [] }"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["log_index"], 7);
+        assert_eq!(body["policy_log_index"], 8);
+
+        // A request that does not mention the claim leaves it alone, and says
+        // so with an explicit null rather than an absent field.
+        let response = router(plane)
+            .oneshot(put_json("/api/v1/authorization", r#"{ "bindings": [] }"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["log_index"], 7);
+        assert_eq!(body["policy_log_index"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_binding_with_both_or_neither_subject_is_invalid_argument() {
+        // serde cannot express "exactly one of these two", so the conversion
+        // does — and a violation is a malformed request the client must fix,
+        // caught before a consensus round trip, never a rejection.
+        for (label, bindings) in [
+            (
+                "both",
+                r#"[{ "group": "g", "principal": "p", "role": "admin" }]"#,
+            ),
+            ("neither", r#"[{ "role": "admin" }]"#),
+        ] {
+            let plane = stub_plane(coppice_state::StateMachine::default());
+            let response = router(Arc::clone(&plane))
+                .oneshot(put_json(
+                    "/api/v1/authorization",
+                    &format!(r#"{{ "bindings": {bindings} }}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+            let body = body_json(response).await;
+            assert_eq!(body["code"], "INVALID_ARGUMENT", "{label}");
+            // The index is in the message: a long list needs to say *which*.
+            assert!(
+                body["message"].as_str().unwrap().contains("binding 0"),
+                "{label}: {body}"
+            );
+            assert!(
+                plane.actors().is_empty(),
+                "{label}: a malformed body must not be proposed"
+            );
+        }
+    }
+
+    /// Each apply-time authorization rejection is a distinguishable 400 on
+    /// this endpoint — and only on this endpoint.
+    ///
+    /// They are not races the client lost; they are documents the client got
+    /// wrong, and no retry of the identical body will ever land. The detail
+    /// strings differ so an operator editing a bindings TOML learns which of
+    /// the three they hit.
+    #[tokio::test]
+    async fn each_authorization_rejection_is_its_own_400() {
+        /// One canned apply rejection and the phrase the 400 must carry.
+        type Case = (fn() -> ApiError, &'static str);
+
+        let cases: [Case; 3] = [
+            (
+                || {
+                    ApiError::Rejected(coppice_state::RejectionReason::UnknownQuotaEntity(
+                        QuotaEntityId::new(),
+                    ))
+                },
+                "quota entity that does not exist",
+            ),
+            (
+                || {
+                    ApiError::Rejected(coppice_state::RejectionReason::InvalidAuthorization(
+                        "binding 0 names an empty group subject".into(),
+                    ))
+                },
+                "malformed",
+            ),
+            (
+                || ApiError::Rejected(coppice_state::RejectionReason::AuthorizationLockout),
+                "lock the cluster out",
+            ),
+        ];
+
+        let mut messages = Vec::new();
+        for (make, expected_fragment) in cases {
+            let response = app(Some(make))
+                .oneshot(put_json("/api/v1/authorization", r#"{ "bindings": [] }"#))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_json(response).await;
+            assert_eq!(body["code"], "INVALID_ARGUMENT");
+            let message = body["message"].as_str().unwrap().to_string();
+            assert!(message.contains(expected_fragment), "{message}");
+            messages.push(message);
+        }
+        // Distinguishable, not merely all-400: three different documents,
+        // three different things to fix.
+        messages.sort();
+        messages.dedup();
+        assert_eq!(messages.len(), 3, "each rejection must read differently");
+    }
+
+    #[tokio::test]
+    async fn the_same_rejection_carried_across_the_forwarding_hop_is_the_same_400() {
+        // The classification is what makes this work: the leader refused, the
+        // follower answering the client never had a `RejectionReason`, and
+        // matching on the rendered English would be a contract held together
+        // by a string.
+        let response = app(Some(|| ApiError::ForwardedRejection {
+            kind: crate::RejectionKind::AuthorizationLockout,
+            reason: "authorization would retain no unscoped admin binding".into(),
+        }))
+        .oneshot(put_json("/api/v1/authorization", r#"{ "bindings": [] }"#))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("lock the cluster out"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_quota_entity_is_still_a_409_on_submit_and_configure() {
+        // The endpoint-local half of the mapping, stated as the thing it must
+        // not break: `UnknownQuotaEntity` is a documented 409 everywhere else,
+        // because there it really is a race with whoever deleted the entity.
+        let make = || {
+            ApiError::Rejected(coppice_state::RejectionReason::UnknownQuotaEntity(
+                QuotaEntityId::new(),
+            ))
+        };
+        for request in [
+            post_json("/api/v1/jobs", &submit_body(QuotaEntityId::new())),
+            post_json(
+                "/api/v1/quota-entities",
+                &configure_body(QuotaEntityId::new(), None),
+            ),
+        ] {
+            let uri = request.uri().to_string();
+            let response = app(Some(make)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+            assert_eq!(body_json(response).await["code"], "REJECTED", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_authorization_read_is_open_to_any_authenticated_principal() {
+        // Reads are authn-only in v1 (ADR 0031): no role check. Hiding the
+        // bindings list would mostly stop an operator from working out why
+        // their own grant does not apply — everyone in it already knows who
+        // they are.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, _) = authz_fixture(|_| vec![group_binding("platform", Role::Admin, None)]);
+
+        let (status, body, _) = authz_case(
+            &idp,
+            chain,
+            state,
+            "nobody",
+            &[],
+            Request::get("/api/v1/authorization")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["bindings"][0]["group"], "platform");
+        idp.shutdown().await;
+    }
+
+    // ---- Session authority summary (ADR 0023) ----------------------------
+
+    #[tokio::test]
+    async fn the_session_summarizes_every_binding_matching_the_actor() {
+        // Faithfully, not collapsed: one entry per matching binding, scoped
+        // and unscoped, group- and principal-matched, in the replicated
+        // list's own order. A server that answered with a single "effective
+        // role" would be publishing a second model of authority beside
+        // `evaluate`'s, which is how the two come to disagree.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, tree) = authz_fixture(|t| {
+            vec![
+                // Matches by group, scoped.
+                group_binding("batch-users", Role::Submitter, Some(t.team_a)),
+                // Matches nobody in this test — a binding for someone else
+                // must not leak into the summary.
+                group_binding("sre", Role::Operator, None),
+                // Matches by principal, unscoped.
+                principal_binding("user-42", Role::Operator, None),
+                // Matches by group again, deeper in the tree: two matching
+                // bindings for one actor is the ordinary case, not an error.
+                group_binding("batch-users", Role::Admin, Some(t.squad)),
+            ]
+        });
+
+        let (status, body, _) = authz_case(
+            &idp,
+            chain,
+            state,
+            "user-42",
+            &["batch-users"],
+            Request::get("/api/v1/session").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["principal"], "user-42");
+        assert_eq!(body["auth_method"], "bearer");
+        assert_eq!(
+            body["bindings"],
+            serde_json::json!([
+                { "role": "submitter", "scope": tree.team_a.to_string() },
+                { "role": "operator", "scope": null },
+                { "role": "admin", "scope": tree.squad.to_string() },
+            ])
+        );
+        // A bearer holds no authority outside the list, however much of it
+        // the list gives them.
+        assert_eq!(body["implicit_admin"], false);
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_implicit_admin_session_says_so_and_lists_no_bindings() {
+        // Operator certificates and open mode are unscoped admin from outside
+        // the list, so they can never appear *in* it: the flag is the only
+        // place that authority is visible, which is exactly why the field
+        // exists.
+        let (state, _) = authz_fixture(|_| vec![group_binding("platform", Role::Admin, None)]);
+        let response = router(stub_plane(state))
+            .oneshot(Request::get("/api/v1/session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["principal"], "anonymous");
+        assert_eq!(body["implicit_admin"], true);
+        assert_eq!(body["bindings"], serde_json::json!([]));
     }
 }
