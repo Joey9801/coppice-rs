@@ -14,6 +14,11 @@ publish = false
 # coordinator. This crate only knows how to turn credentials into identity.
 
 [dependencies]
+# The `Actor` this crate resolves credentials into is the replicated one
+# (ADR 0023): the same value the API layer attaches to a proposed command, so
+# apply re-checks exactly what the edge authenticated. `groups_claim`'s default
+# name lives there too.
+coppice-state = { workspace = true }
 coppice-tls = { workspace = true }
 jsonwebtoken = { workspace = true }
 metrics = { workspace = true }

@@ -1,69 +1,39 @@
-//! The authenticated identity a request carries, and how it was proved.
+//! How a request's identity was proved, and the constructors that build it.
+//!
+//! The identity itself is **not** defined here: it is
+//! [`coppice_state::Actor`], the same struct that rides actor-carrying
+//! commands into the Raft log (ADR 0023). That unification is deliberate. The
+//! chain resolves a request's credentials into an `Actor`, the API layer puts
+//! it in request extensions, and the proposer attaches *that very value* to the
+//! command it proposes — so what apply re-checks on every replica is what the
+//! edge actually authenticated, with no transcription step in between that
+//! could drift.
+//!
+//! What lives here is what only the authentication edge cares about: the
+//! mechanism that proved the identity ([`AuthMethod`], reported on
+//! `GET /api/v1/session` and on the auth-outcome metric), exposed as an
+//! extension trait because `Actor` is a foreign type now.
 
-/// The identity resolved for one request.
+use coppice_state::Actor;
+
+/// The principal of the open-mode anonymous actor.
+pub const ANONYMOUS_PRINCIPAL: &str = "anonymous";
+
+/// The authentication edge's additions to the replicated [`Actor`].
 ///
-/// This is a **local** definition. The replicated `Actor` (the proto message
-/// that rides actor-carrying commands, ADR 0023) lands separately; the two
-/// unify in a later change, at which point this struct becomes a re-export.
-/// It is defined here so the authentication edge can be built and tested
-/// without waiting on the state-machine half.
-///
-/// The last two fields are the two implicit-unscoped-admin grants: an operator
-/// certificate (the break-glass path of ADR 0022) and an explicitly open
-/// deployment. Both are recorded *in* the actor rather than consulted from
-/// node config at authorization time, so authorization stays a pure function
-/// of `(state, command)` on every replica.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Actor {
-    /// The principal string: an OIDC `sub` for bearer auth, `cert:<CN>` for an
-    /// operator certificate, `anonymous` in open mode. Opaque — there is no
-    /// user table behind it.
-    pub principal: String,
-    /// Group names read from the token's groups claim. Empty for the
-    /// non-bearer mechanisms, which do not carry groups.
-    pub groups: Vec<String>,
-    /// The principal proved itself with an operator certificate.
-    pub operator_cert: bool,
-    /// The deployment is running in open mode; no credential was required.
-    pub auth_disabled: bool,
-}
-
-impl Actor {
-    /// The anonymous actor of an open-mode deployment.
-    pub fn anonymous() -> Actor {
-        Actor {
-            principal: ANONYMOUS_PRINCIPAL.to_string(),
-            groups: Vec::new(),
-            operator_cert: false,
-            auth_disabled: true,
-        }
-    }
-
-    /// The actor for a verified operator leaf with common name `cn`.
-    pub fn operator(cn: &str) -> Actor {
-        Actor {
-            principal: format!("cert:{cn}"),
-            groups: Vec::new(),
-            operator_cert: true,
-            auth_disabled: false,
-        }
-    }
-
-    /// The actor for a validated bearer token.
-    pub fn bearer(sub: String, groups: Vec<String>) -> Actor {
-        Actor {
-            principal: sub,
-            groups,
-            operator_cert: false,
-            auth_disabled: false,
-        }
-    }
-
+/// An extension trait rather than inherent methods: `Actor` belongs to
+/// `coppice-state`, which knows nothing about HTTP credentials and must not
+/// grow a dependency on this crate to learn about them.
+pub trait ActorExt {
     /// Which mechanism authenticated this actor.
     ///
     /// Derived from the flags rather than stored, so the method reported on
     /// `/session` can never disagree with the flags authorization reads.
-    pub fn method(&self) -> AuthMethod {
+    fn method(&self) -> AuthMethod;
+}
+
+impl ActorExt for Actor {
+    fn method(&self) -> AuthMethod {
         if self.operator_cert {
             AuthMethod::OperatorCert
         } else if self.auth_disabled {
@@ -74,8 +44,39 @@ impl Actor {
     }
 }
 
-/// The principal of the open-mode anonymous actor.
-pub const ANONYMOUS_PRINCIPAL: &str = "anonymous";
+/// The anonymous actor of an open-mode deployment.
+///
+/// Crate-internal, like its two siblings: the chain is the only thing that may
+/// mint an actor, because an actor that no mechanism produced is an
+/// unauthenticated request wearing an identity.
+pub(crate) fn anonymous() -> Actor {
+    Actor {
+        principal: ANONYMOUS_PRINCIPAL.to_string(),
+        groups: Vec::new(),
+        operator_cert: false,
+        auth_disabled: true,
+    }
+}
+
+/// The actor for a verified operator leaf with common name `cn`.
+pub(crate) fn operator(cn: &str) -> Actor {
+    Actor {
+        principal: format!("cert:{cn}"),
+        groups: Vec::new(),
+        operator_cert: true,
+        auth_disabled: false,
+    }
+}
+
+/// The actor for a validated bearer token.
+pub(crate) fn bearer(sub: String, groups: Vec<String>) -> Actor {
+    Actor {
+        principal: sub,
+        groups,
+        operator_cert: false,
+        auth_disabled: false,
+    }
+}
 
 /// The mechanism that authenticated a request. The `as_str` spellings are the
 /// wire values of `GET /api/v1/session`'s `method` field.
@@ -113,12 +114,20 @@ mod tests {
 
     #[test]
     fn method_is_derived_from_the_flags() {
-        assert_eq!(Actor::anonymous().method(), AuthMethod::Open);
-        assert_eq!(Actor::operator("alice").method(), AuthMethod::OperatorCert);
-        assert_eq!(
-            Actor::bearer("sub-1".into(), vec![]).method(),
-            AuthMethod::Bearer
-        );
-        assert_eq!(Actor::operator("alice").principal, "cert:alice");
+        assert_eq!(anonymous().method(), AuthMethod::Open);
+        assert_eq!(operator("alice").method(), AuthMethod::OperatorCert);
+        assert_eq!(bearer("sub-1".into(), vec![]).method(), AuthMethod::Bearer);
+        assert_eq!(operator("alice").principal, "cert:alice");
+    }
+
+    /// The two implicit-unscoped-admin grants of ADR 0022 are exactly the two
+    /// credential-less mechanisms — asserted here, on the actors this crate
+    /// actually mints, because it is `coppice-state`'s
+    /// [`is_implicit_admin`](Actor::is_implicit_admin) that reads them.
+    #[test]
+    fn open_mode_and_operator_certs_mint_implicit_admins() {
+        assert!(anonymous().is_implicit_admin());
+        assert!(operator("alice").is_implicit_admin());
+        assert!(!bearer("sub-1".into(), vec![]).is_implicit_admin());
     }
 }

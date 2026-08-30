@@ -19,6 +19,9 @@ use axum::{Json, Router};
 
 use serde::Deserialize;
 
+// `method()` on the resolved actor: the actor is `coppice_state::Actor`, so
+// the authentication edge's view of it arrives as an extension trait.
+use coppice_authn::ActorExt;
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 
@@ -41,16 +44,22 @@ use super::readyz::ReadyzEndpoint;
 /// top-level `/metrics` route is deliberately **not** under `/api/v1` — it is
 /// the Prometheus scrape target, not part of the JSON API — and carries its own
 /// captured [`MetricsEndpoint`], state that is entirely separate from the
-/// `ControlPlane`. Nested-router misses under `/api/v1` fall through to the
-/// outer [`fallback`](super::ui::fallback) with the full original path intact,
-/// so `/api/*` misses still answer the JSON 404 and everything else reaches the
-/// UI, exactly as before the nesting refactor.
+/// `ControlPlane`.
+///
+/// `/api/v1` misses are answered by that nested router's **own** JSON-404
+/// fallback rather than falling through to the outer
+/// [`fallback`](super::ui::fallback) — that is what puts them inside the
+/// authentication boundary (see [`api_v1_routes`]). The outer fallback still
+/// owns everything else, unchanged: `/api/*` paths outside `/api/v1` (a
+/// hypothetical `/api/v2`, or `/api/anything`) answer the same JSON 404, and
+/// every other path reaches the UI (static assets + SPA shell, ADR 0031
+/// "Serving the UI").
 ///
 /// `authn` is the deployment's authentication posture (ADR 0022), built by the
-/// coordinator: [`api_v1_routes`] layers it over the protected half of the
-/// `/api/v1` tree. `/metrics` and `/readyz` are outside `/api/v1` and
-/// therefore outside authentication — a scrape and a readiness probe are
-/// operational surfaces, and the listener's own posture is what guards them.
+/// coordinator: [`api_v1_routes`] layers it over the whole `/api/v1` tree.
+/// `/metrics` and `/readyz` are outside `/api/v1` and therefore outside
+/// authentication — a scrape and a readiness probe are operational surfaces,
+/// and the listener's own posture is what guards them.
 pub fn router<P: ControlPlane>(
     plane: Arc<P>,
     metrics: MetricsEndpoint,
@@ -66,9 +75,9 @@ pub fn router<P: ControlPlane>(
     // (ADR 0037 §4).
     operational_routes(metrics, readyz)
         .nest("/api/v1", api_v1_routes::<P>(enroll, authn))
-        // Everything unrouted: `/api/*` misses stay JSON 404s; anything
-        // else serves the embedded web UI (static assets + SPA fallback,
-        // ADR 0031 "Serving the UI").
+        // Everything unrouted *outside* `/api/v1`: other `/api/*` paths stay
+        // JSON 404s; anything else serves the embedded web UI (static assets +
+        // SPA fallback, ADR 0031 "Serving the UI").
         .fallback(super::ui::fallback)
         .with_state(plane)
 }
@@ -127,38 +136,75 @@ fn operational_routes<S: Clone + Send + Sync + 'static>(
 /// the ADR 0031 table; they become code (`ReadParams::class(default)`) as each
 /// read handler is implemented.
 ///
-/// The tree is split in two by authentication (ADR 0022). [`public_routes`] is
-/// the closed set of routes a caller reaches *without* a credential;
-/// [`protected_routes`] is everything else, and carries the
-/// [`authn::authenticate`](super::authn::authenticate) layer. The split is
-/// structural rather than a per-handler check precisely so that adding a route
-/// cannot accidentally leave it unauthenticated: a new `.route(…)` lands in
-/// whichever sub-router it is written in, and the protected one is the one
-/// every route below `/session` is written in.
+/// ## One table, one boundary
+///
+/// This is a single flat route table — there is deliberately no
+/// public/protected split of the router any more. Authentication (ADR 0022) is
+/// a property of the **namespace**: the
+/// [`authenticate`](super::authn::authenticate) layer wraps this whole router,
+/// its own 404 fallback included, so *every* request under `/api/v1` runs the
+/// chain. That closes the two holes a route-registration split left open — an
+/// unrouted `/api/v1/…` path fell through to the outer fallback and answered
+/// 404 uncredentialed, and a method-miss on a public path answered 405 the
+/// same way — and it means a route added below cannot ship unauthenticated by
+/// being written in the wrong sub-router, because there is no wrong
+/// sub-router.
+///
+/// The two credential-less endpoints are instead named, once, in
+/// [`UNAUTHENTICATED_ROUTES`](super::authn::UNAUTHENTICATED_ROUTES): exact
+/// method-and-path pairs the middleware waves through. That list is the single
+/// source of truth for "reachable without a credential", and it is checked
+/// against the request rather than against how a handler was registered, so
+/// the two can never drift.
+///
+/// The fallback matters as much as the routes: without one here, an `/api/v1`
+/// miss would leave the nested router entirely and be answered by the outer
+/// fallback, *outside* the layer. It renders the same JSON 404 the outer
+/// fallback gives an `/api/*` path — every request that reaches it is under
+/// `/api/v1` by construction, so it needs no path test to know it is an API
+/// miss and not a UI route.
 fn api_v1_routes<P: ControlPlane>(
     enroll: EnrollEndpoint,
     authn: Arc<coppice_authn::AuthnChain>,
 ) -> Router<Arc<P>> {
-    protected_routes::<P>()
+    all_routes::<P>(enroll, Arc::clone(&authn))
+        .fallback(api_not_found)
         .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&authn),
+            authn,
             super::authn::authenticate,
         ))
-        .merge(public_routes::<P>(enroll, authn))
 }
 
-/// The `/api/v1` routes served **without** authentication.
+/// The JSON 404 for an `/api/v1` path that matches no route.
 ///
-/// Exactly two, each for a reason that is about the credential itself:
+/// Byte-identical to what [`super::ui::fallback`] answers an `/api/*` miss —
+/// the same [`HttpError::not_found`] with the same message — because it is the
+/// same contract; the only difference is that this one sits *inside* the
+/// authentication layer, so an anonymous caller is told 401 and never learns
+/// which `/api/v1` paths exist.
+async fn api_not_found() -> HttpError {
+    HttpError::not_found("no such route")
+}
+
+/// Every `/api/v1` route, in one table.
+fn all_routes<P: ControlPlane>(
+    enroll: EnrollEndpoint,
+    authn: Arc<coppice_authn::AuthnChain>,
+) -> Router<Arc<P>> {
+    credential_free_routes::<P>(enroll, authn).merge(state_routes::<P>())
+}
+
+/// The two routes the middleware's exemption table lets through
+/// uncredentialed (see
+/// [`UNAUTHENTICATED_ROUTES`](super::authn::UNAUTHENTICATED_ROUTES) for *why*
+/// each is exempt).
 ///
-/// - `POST /enroll` is a machine's certless first contact, authenticated by
-///   its own role-scoped enrollment token (ADR 0037 §4). An enrollee has no
-///   user identity to present and the endpoint's refusal contract — one
-///   constant body, no validity oracle — is not the API's 401.
-/// - `GET /auth/config` is how a client discovers *how to authenticate*.
-///   Requiring a credential to learn which credential to obtain would be a
-///   loop with no entry point.
-fn public_routes<P: ControlPlane>(
+/// They are grouped here only because they share a shape — neither is a
+/// `ControlPlane` operation and neither extracts a
+/// [`RequestActor`] — not because grouping them is what makes them public.
+/// Moving a route out of this function grants it nothing and revokes nothing;
+/// the exemption table is the only thing that decides.
+fn credential_free_routes<P: ControlPlane>(
     enroll: EnrollEndpoint,
     authn: Arc<coppice_authn::AuthnChain>,
 ) -> Router<Arc<P>> {
@@ -191,10 +237,14 @@ fn public_routes<P: ControlPlane>(
         )
 }
 
-/// The authenticated `/api/v1` routes: everything that reads or writes this
-/// cluster's state. [`api_v1_routes`] layers authentication over the whole
-/// sub-router, so a route added here is authenticated by construction.
-fn protected_routes<P: ControlPlane>() -> Router<Arc<P>> {
+/// Everything that reads or writes this cluster's state — that is, every
+/// `/api/v1` route but the two credential-free ones.
+///
+/// A separate function purely for readability; it is merged into one table by
+/// [`all_routes`] and authenticated by [`api_v1_routes`]'s layer along with
+/// everything else, so a route added here is authenticated by construction —
+/// as is a route added anywhere else under the prefix.
+fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
     Router::new()
         // Session / auth (ADR 0022) — local read, no raft involvement.
         .route("/session", get(get_session))
@@ -2647,6 +2697,29 @@ mod tests {
         idp: &coppice_testkit::oidc::FakeIdp,
         ca: coppice_authn::CaProvider,
     ) -> Arc<AuthnChain> {
+        oidc_chain_with(
+            idp,
+            ca,
+            coppice_authn::static_groups_claim(coppice_authn::DEFAULT_GROUPS_CLAIM),
+        )
+        .await
+    }
+
+    /// [`oidc_chain`] with an explicit groups-claim provider, for the tests
+    /// that care that the claim *name* is read per request rather than pinned
+    /// when the chain is built.
+    async fn oidc_chain_with_groups_claim(
+        idp: &coppice_testkit::oidc::FakeIdp,
+        groups_claim: coppice_authn::GroupsClaimProvider,
+    ) -> Arc<AuthnChain> {
+        oidc_chain_with(idp, no_ca(), groups_claim).await
+    }
+
+    async fn oidc_chain_with(
+        idp: &coppice_testkit::oidc::FakeIdp,
+        ca: coppice_authn::CaProvider,
+        groups_claim: coppice_authn::GroupsClaimProvider,
+    ) -> Arc<AuthnChain> {
         let config = coppice_authn::OidcConfig {
             issuer: idp.issuer(),
             client_id: TEST_CLIENT_ID.to_string(),
@@ -2661,12 +2734,7 @@ mod tests {
             .await
             .expect("the fake IdP serves discovery and a JWKS");
         let validator = coppice_authn::Validator::new(cache, config.clone());
-        Arc::new(AuthnChain::oidc(
-            validator,
-            coppice_authn::static_groups_claim(coppice_authn::DEFAULT_GROUPS_CLAIM),
-            ca,
-            config,
-        ))
+        Arc::new(AuthnChain::oidc(validator, groups_claim, ca, config))
     }
 
     /// The client id (and, by the "defaults to client_id" rule, the audience)
@@ -2927,5 +2995,231 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["cluster_id"], STUB_CLUSTER);
         idp.shutdown().await;
+    }
+
+    // ---- The authentication boundary is the whole namespace ---------------
+
+    /// An unrouted `/api/v1` path is 401, not 404, to an anonymous caller.
+    ///
+    /// The regression this pins: while the layer sat on a protected
+    /// *sub-router*, a path matching no route left the nested tree entirely
+    /// and was answered by the outer UI fallback — outside the layer — so an
+    /// uncredentialed probe got a 404 and could map the namespace by
+    /// elimination. The `/api/v1` router now owns its own fallback and the
+    /// layer wraps it too.
+    #[tokio::test]
+    async fn an_unrouted_api_path_is_unauthenticated_before_it_is_not_found() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let response = router_with_authn(stub_plane(Default::default()), oidc_chain(&idp).await)
+            .oneshot(
+                Request::get("/api/v1/not-a-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(response).await["code"], "UNAUTHENTICATED");
+        idp.shutdown().await;
+    }
+
+    /// The wrong method on either credential-free path is authenticated like
+    /// anything else: the exemption table is keyed on `(method, path)`, so
+    /// `POST /auth/config` and `GET /enroll` are simply not those endpoints.
+    ///
+    /// Both used to answer 405 uncredentialed — the method-miss was decided by
+    /// the public sub-router, which the layer did not cover.
+    #[tokio::test]
+    async fn a_wrong_method_on_a_credential_free_path_is_still_authenticated() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        for request in [
+            post_json("/api/v1/auth/config", "{}"),
+            Request::get("/api/v1/enroll").body(Body::empty()).unwrap(),
+        ] {
+            let uri = request.uri().to_string();
+            let response = router_with_authn(stub_plane(Default::default()), Arc::clone(&chain))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            assert_eq!(
+                body_json(response).await["code"],
+                "UNAUTHENTICATED",
+                "{uri}"
+            );
+        }
+        idp.shutdown().await;
+    }
+
+    /// The exemption table is matched against the **prefix-stripped** path.
+    ///
+    /// The layer lives inside the nested router, and axum strips the nest's
+    /// prefix from the request URI before the nested service — middleware
+    /// included — runs, so the table is written as `/auth/config`, not
+    /// `/api/v1/auth/config`. This test is the empirical proof of that: both
+    /// exempt pairs are reachable with no credential in the OIDC posture,
+    /// which is only true if the stripped spelling is the one that matches.
+    #[tokio::test]
+    async fn unauthenticated_routes_are_matched_on_the_prefix_stripped_path() {
+        assert_eq!(
+            crate::http::authn::UNAUTHENTICATED_ROUTES
+                .iter()
+                .map(|(m, p)| (m.as_str(), *p))
+                .collect::<Vec<_>>(),
+            vec![("GET", "/auth/config"), ("POST", "/enroll")],
+        );
+
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+
+        // `GET /auth/config`: the discovery document, served to a caller with
+        // no credential at all.
+        let response = router_with_authn(stub_plane(Default::default()), Arc::clone(&chain))
+            .oneshot(
+                Request::get("/api/v1/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["mode"], "oidc");
+
+        // `POST /enroll`: the endpoint's own uniform refusal, not the API's
+        // 401 — the same assertion `enrollment_is_not_touched_by_the_authn_layer`
+        // makes, restated here as the second half of the pair.
+        let response = router_with_authn(stub_plane(Default::default()), chain)
+            .oneshot(enroll_request(None, CSR_BODY))
+            .await
+            .unwrap();
+        let (status, body) = refusal_parts(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, crate::http::REFUSED_BODY.as_bytes());
+
+        idp.shutdown().await;
+    }
+
+    /// Once authenticated, the ordinary HTTP contract is restored: an unrouted
+    /// `/api/v1` path is the JSON 404, and a method-miss on a real path is a
+    /// 405. Authentication moves *when* a caller learns those answers, never
+    /// what they are.
+    #[tokio::test]
+    async fn an_authenticated_caller_still_gets_404_and_405() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let token =
+            idp.sign(coppice_testkit::oidc::TokenClaims::new("user-42").audience(TEST_CLIENT_ID));
+
+        let response = router_with_authn(stub_plane(Default::default()), Arc::clone(&chain))
+            .oneshot(bearer_request("/api/v1/not-a-route", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+
+        let mut request = post_json("/api/v1/auth/config", "{}");
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let response = router_with_authn(stub_plane(Default::default()), chain)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        idp.shutdown().await;
+    }
+
+    /// The nested router's fallback claims `/api/v1` misses and nothing else:
+    /// other `/api/*` paths still reach the outer fallback's JSON 404, and
+    /// non-`/api` paths still reach the UI.
+    #[tokio::test]
+    async fn the_api_v1_fallback_does_not_annex_the_outer_one() {
+        let response = app(None)
+            .oneshot(Request::get("/api/v2/nodes").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+
+        // And a bare `/api/…` path, which is neither.
+        let response = app(None)
+            .oneshot(Request::get("/api/whatever").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    }
+
+    /// The groups-claim name is read from the provider on **every request**,
+    /// not captured when the chain is built.
+    ///
+    /// That is what makes `PolicyConfig.groups_claim` (ADR 0022) a live knob:
+    /// an operator who changes it in replicated policy changes what the next
+    /// request's groups are read from, with no coordinator restart. Here the
+    /// provider is a shared cell rather than the replicated view — the
+    /// coordinator's own test covers the view-backed one — and the token
+    /// carries *both* candidate claims, so which one comes back on `/session`
+    /// is unambiguous proof of which name was used.
+    #[tokio::test]
+    async fn the_groups_claim_name_is_read_per_request() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let claim = Arc::new(std::sync::RwLock::new("roles".to_string()));
+        let chain = {
+            let claim = Arc::clone(&claim);
+            oidc_chain_with_groups_claim(&idp, Arc::new(move || claim.read().unwrap().clone()))
+                .await
+        };
+        let token = idp.sign(
+            coppice_testkit::oidc::TokenClaims::new("user-42")
+                .audience(TEST_CLIENT_ID)
+                .claim("roles", serde_json::json!(["a", "b"]))
+                .claim("groups", serde_json::json!(["x"])),
+        );
+
+        // The non-default name wins while policy names it...
+        let response = router_with_authn(stub_plane(Default::default()), Arc::clone(&chain))
+            .oneshot(bearer_request("/api/v1/session", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["groups"],
+            serde_json::json!(["a", "b"])
+        );
+
+        // ...and the very next request through the same chain follows the
+        // change, with the same token.
+        *claim.write().unwrap() = "groups".to_string();
+        let response = router_with_authn(stub_plane(Default::default()), chain)
+            .oneshot(bearer_request("/api/v1/session", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["groups"],
+            serde_json::json!(["x"])
+        );
+
+        idp.shutdown().await;
+    }
+
+    /// Open mode authenticates *everything*, so an `/api/v1` miss there is the
+    /// plain 404 it always was — the boundary changed who is refused, not what
+    /// an authenticated deployment answers.
+    #[tokio::test]
+    async fn open_mode_still_answers_api_v1_misses_with_the_json_404() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/not-a-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["code"], "NOT_FOUND");
     }
 }

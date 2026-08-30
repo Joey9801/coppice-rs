@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use coppice_tls::pki::{self, Profile};
 
+use crate::actor;
 use crate::metrics;
 use crate::validator::{ValidateError, Validator};
-use crate::{Actor, AuthMethod, AuthMode, OidcConfig};
+use crate::{Actor, ActorExt, AuthMethod, AuthMode, OidcConfig};
 
 /// What the HTTP edge pulled off one request.
 ///
@@ -44,15 +45,16 @@ pub fn no_ca() -> CaProvider {
     Arc::new(|| None)
 }
 
-/// A `GroupsClaimProvider` pinned to one name. The policy-backed provider
-/// replaces this when the replicated policy surface lands.
+/// A `GroupsClaimProvider` pinned to one name.
+///
+/// For tests and for any caller with no replicated view to read: a serving
+/// coordinator builds the policy-backed provider instead
+/// (`coppice_coordinator::runtime::groups_claim_provider`), so a `groups_claim`
+/// change takes effect on the next request without a restart.
 pub fn static_groups_claim(name: impl Into<String>) -> GroupsClaimProvider {
     let name = name.into();
     Arc::new(move || name.clone())
 }
-
-/// The default groups-claim name (ADR 0022).
-pub const DEFAULT_GROUPS_CLAIM: &str = "groups";
 
 /// The result of offering one request's credentials to one mechanism.
 enum Step {
@@ -194,7 +196,7 @@ impl Authenticator {
                 validator,
                 groups_claim,
             } => bearer(validator, groups_claim, creds).await,
-            Authenticator::Open => Step::Authenticated(Box::new(Actor::anonymous())),
+            Authenticator::Open => Step::Authenticated(Box::new(actor::anonymous())),
         }
     }
 }
@@ -213,7 +215,7 @@ fn operator_cert(ca: &CaProvider, strict: bool, creds: Credentials<'_>) -> Step 
 
     match pki::verify_leaf(&ca_pem, leaf) {
         Ok(verified) => match verified.profile {
-            Profile::Operator { cn } => Step::Authenticated(Box::new(Actor::operator(&cn))),
+            Profile::Operator { cn } => Step::Authenticated(Box::new(actor::operator(&cn))),
             // A coordinator or agent leaf is a real cluster identity, but not
             // an *operator* one: those certificates authenticate machines on
             // the internal planes and carry no human accountability. Granting
@@ -266,7 +268,7 @@ async fn bearer(
     }
     match validator.validate(token, &groups_claim()).await {
         Ok(validated) => {
-            Step::Authenticated(Box::new(Actor::bearer(validated.sub, validated.groups)))
+            Step::Authenticated(Box::new(actor::bearer(validated.sub, validated.groups)))
         }
         Err(e) => Step::Rejected(Unauthenticated::InvalidBearer(e)),
     }

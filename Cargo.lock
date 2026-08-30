@@ -1201,6 +1201,7 @@ dependencies = [
 name = "coppice-authn"
 version = "0.0.1"
 dependencies = [
+ "coppice-state",
  "coppice-testkit",
  "coppice-tls",
  "jsonwebtoken",

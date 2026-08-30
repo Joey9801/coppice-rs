@@ -26,18 +26,38 @@ use crate::tasks::{
     renewal, scheduler_driver,
 };
 
+/// The groups-claim name (ADR 0022) as the serving replica sees it *now*, read
+/// from replicated policy on every call.
+///
+/// The same shape, and the same reason, as
+/// [`ClusterCa::from_views`](crate::clientedge::ClusterCa::from_views):
+/// `PolicyConfig.groups_claim` is replicated state, so it changes under the
+/// edge's feet when an operator commits a new policy. A closure over the live
+/// views means the *next* request reads the new name — no restart, and no
+/// window in which two coordinators disagree about which claim carries a
+/// principal's groups.
+///
+/// Reading it per request costs one `watch` borrow and one `String` clone, on
+/// a path that is already about to verify a JWT signature.
+pub fn groups_claim_provider(views: StateViews) -> coppice_authn::GroupsClaimProvider {
+    Arc::new(move || views.latest().state().policy.groups_claim.clone())
+}
+
 /// Build the public edge's authentication chain from the resolved posture
 /// (ADR 0022), returning it alongside the JWKS refresh task the OIDC posture
 /// needs.
 ///
-/// Two things are deliberately *not* decided here. The cluster CA is the
-/// listener's own [`ClusterCa`](crate::clientedge::ClusterCa) closure, so
-/// operator-certificate verification tracks a re-root with no restart. And the
-/// groups-claim name is pinned to the ADR 0022 default: it is replicated policy
-/// (`PolicyConfig.groups_claim`), and the provider seam
-/// ([`GroupsClaimProvider`](coppice_authn::GroupsClaimProvider)) is a closure
-/// precisely so the policy-backed one can replace this without touching the
-/// chain — that is the next change, not this one.
+/// Nothing replicated is *pinned* here. The cluster CA is the listener's own
+/// [`ClusterCa`](crate::clientedge::ClusterCa) closure, so
+/// operator-certificate verification tracks a re-root with no restart; the
+/// groups-claim name is [`groups_claim_provider`] over the same views, for the
+/// same reason. Both reach the chain as closures, so this function decides
+/// posture and lifetime only — never policy.
+///
+/// The remaining ADR 0023 seam is on the *other* side of the edge: attaching
+/// the resolved [`Actor`](coppice_state::Actor) to the commands the API layer
+/// proposes, so apply can re-check the same identity. The actor this chain
+/// produces is already that type; only the attachment is outstanding.
 ///
 /// Startup never blocks on the IdP. The cache begins empty and the refresh task
 /// fills it; until it does, bearer authentication fails while operator
@@ -46,6 +66,7 @@ use crate::tasks::{
 fn build_authn(
     auth: coppice_authn::AuthMode,
     cluster_ca: &crate::clientedge::ClusterCa,
+    views: &StateViews,
     shutdown_rx: &watch::Receiver<bool>,
 ) -> (
     Arc<coppice_authn::AuthnChain>,
@@ -63,7 +84,7 @@ fn build_authn(
             let validator = coppice_authn::Validator::new(cache, config.clone());
             let chain = coppice_authn::AuthnChain::oidc(
                 validator,
-                coppice_authn::static_groups_claim(coppice_authn::DEFAULT_GROUPS_CLAIM),
+                groups_claim_provider(views.clone()),
                 ca,
                 config,
             );
@@ -315,7 +336,7 @@ where
     // tokens at all. Spawned here with the other every-replica tasks so it
     // drains on the same shutdown watch; in open mode there is nothing to
     // refresh and nothing is spawned.
-    let (authn, jwks_join) = build_authn(auth, &cluster_ca, &shutdown_rx);
+    let (authn, jwks_join) = build_authn(auth, &cluster_ca, &views, &shutdown_rx);
 
     let api_join = tokio::spawn(api_server::run(
         client_listener,
@@ -474,4 +495,61 @@ where
     tracing::info!("coordinator runtime stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use coppice_consensus::{ViewPublisher, ViewPublisherConfig};
+    use coppice_state::StateMachine;
+
+    /// A state machine whose policy names `claim` as the groups claim.
+    fn state_with_groups_claim(claim: &str) -> StateMachine {
+        let mut state = StateMachine::default();
+        state.policy.groups_claim = claim.to_string();
+        state
+    }
+
+    /// The provider reads the *live* view, not a value captured when the
+    /// chain was built: publishing a new policy changes what the next call
+    /// returns, which is what makes `PolicyConfig.groups_claim` (ADR 0022) a
+    /// knob an operator can turn without restarting a coordinator.
+    #[test]
+    fn the_groups_claim_provider_tracks_replicated_policy() {
+        let (mut publisher, views) = ViewPublisher::new(
+            state_with_groups_claim("roles"),
+            0,
+            ViewPublisherConfig::default(),
+        );
+        let provider = groups_claim_provider(views);
+
+        // The seeded view: a non-default name, so this cannot pass by
+        // accidentally agreeing with the default.
+        assert_eq!(provider(), "roles");
+        assert_ne!(provider(), coppice_authn::DEFAULT_GROUPS_CLAIM);
+
+        // A committed policy change, as the apply task would publish it.
+        publisher.publish_now(&state_with_groups_claim("entitlements"), 1);
+        assert_eq!(provider(), "entitlements");
+
+        // ...and back to the default, through the same closure.
+        publisher.publish_now(
+            &state_with_groups_claim(coppice_authn::DEFAULT_GROUPS_CLAIM),
+            2,
+        );
+        assert_eq!(provider(), coppice_authn::DEFAULT_GROUPS_CLAIM);
+    }
+
+    /// A fresh cluster's policy carries the documented default, so a
+    /// deployment that never writes a policy authenticates against `groups`.
+    #[test]
+    fn an_untouched_policy_yields_the_default_claim_name() {
+        let (_publisher, views) =
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
+        assert_eq!(
+            groups_claim_provider(views)(),
+            coppice_authn::DEFAULT_GROUPS_CLAIM
+        );
+    }
 }
