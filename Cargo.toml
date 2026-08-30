@@ -6,6 +6,7 @@ members = [
     "crates/coppice-proto",
     "crates/coppice-net",
     "crates/coppice-tls",
+    "crates/coppice-authn",
     "crates/coppice-state",
     "crates/coppice-consensus",
     "crates/coppice-scheduler",
@@ -32,6 +33,7 @@ coppice-enroll = { path = "crates/coppice-enroll" }
 coppice-proto = { path = "crates/coppice-proto" }
 coppice-net = { path = "crates/coppice-net" }
 coppice-tls = { path = "crates/coppice-tls" }
+coppice-authn = { path = "crates/coppice-authn" }
 coppice-agent = { path = "crates/coppice-agent" }
 coppice-state = { path = "crates/coppice-state" }
 coppice-consensus = { path = "crates/coppice-consensus" }
@@ -85,6 +87,14 @@ fs2 = "0.4"
 # snapshot capture clone the whole state in O(1) instead of deep-copying
 # millions of entries on the sole apply task.
 imbl = "7"
+# Offline JWT validation for the OIDC bearer path (ADR 0022): decode a JWKS
+# into per-`kid` verification keys and check signature, `iss`, `aud`, `exp`
+# and `nbf` on every request without ever calling the IdP. Confined to
+# `coppice-authn`. Its default backend is `ring`, which is the same provider
+# the workspace's rustls 0.23 pin uses — the alternative resource-server
+# stacks (`openidconnect`, anything on `aws-lc-rs`) would put a second crypto
+# toolchain in the tree for no validation we cannot do here.
+jsonwebtoken = "9"
 # openraft drives election, replication, and membership; the app data types
 # (`Command`, `Applied`, `RejectionReason`) do not implement serde, so the
 # "serde" feature is deliberately left off (ADR 0002). Default features cover

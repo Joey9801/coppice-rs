@@ -16,6 +16,10 @@
 //!   every un-fsynced write at a simulated crash.
 //! - [`harness`] — the crash-injection driver: enumerate crash points,
 //!   crash, recover, assert the durability invariants.
+//! - [`oidc`] — [`FakeIdp`](oidc::FakeIdp), a fake OpenID Connect provider
+//!   (real HTTP, real ES256 JWTs) for `coppice-authn`'s validator and JWKS
+//!   cache tests: discovery, key rotation, going dark, and deliberately
+//!   malformed/mis-keyed tokens.
 //! - [`toy`] — a miniature reference storage engine implementing the
 //!   ADR 0017 protocol (segments, manifest, vote, snapshot, recovery)
 //!   against the fs seam. It exists to prove the harness catches real bugs
@@ -31,6 +35,7 @@
 //! of other crates, never in a shipping dependency graph.
 
 pub mod harness;
+pub mod oidc;
 pub mod rng;
 pub mod simfs;
 pub mod synth;
