@@ -831,6 +831,9 @@ mod tests {
             crate::http::MetricsEndpoint::detached_for_tests(),
             crate::http::ReadyzEndpoint::detached_for_tests(),
             crate::http::EnrollEndpoint::detached_for_tests(),
+            // Open mode: these tests are about the usage/log walk, not
+            // authentication, so every request resolves to the anonymous actor.
+            Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
         );
         let response = router
             .oneshot(Request::get(uri).body(Body::empty()).unwrap())

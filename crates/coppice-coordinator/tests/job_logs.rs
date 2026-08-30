@@ -482,6 +482,10 @@ async fn best_effort_job_logs_full_read_path() {
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
         coppice_api::http::EnrollEndpoint::detached_for_tests(),
+        // This suite exercises the job-log read path, not authentication:
+        // open mode resolves every request to the anonymous actor, so the
+        // assertions below are unchanged.
+        Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
     );
 
     // -- 1. Content + order + `available`, in one ascending page. ----------
@@ -585,6 +589,7 @@ async fn best_effort_job_logs_full_read_path() {
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
         coppice_api::http::EnrollEndpoint::detached_for_tests(),
+        Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
     );
     let (status, body) = get_logs(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);
@@ -747,6 +752,7 @@ async fn follower_serves_job_logs_directly() {
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
         coppice_api::http::EnrollEndpoint::detached_for_tests(),
+        Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
     );
 
     let applied_before = follower_a.views().latest().applied_index();

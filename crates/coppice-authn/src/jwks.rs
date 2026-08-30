@@ -188,8 +188,10 @@ impl JwksCache {
 
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    // A dropped sender means the runtime is gone; treat it as
+                    // shutdown rather than spinning on an immediate Err.
+                    if changed.is_err() || *shutdown.borrow() {
                         return;
                     }
                 }

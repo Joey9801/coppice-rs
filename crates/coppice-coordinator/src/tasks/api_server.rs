@@ -783,6 +783,7 @@ fn no_leader_here(leader: Option<CoordinatorId>) -> ApiError {
 /// its [`MetricsEndpoint`](coppice_api::http::MetricsEndpoint) here, so the
 /// coordinator has no separate metrics port — the endpoint rides the client
 /// API edge.
+#[allow(clippy::too_many_arguments)] // wiring seam: each is a distinct runtime input
 pub async fn run<C: Consensus>(
     listener: crate::bootstrap::ClientListener,
     control_plane: Arc<CoordinatorControlPlane<C>>,
@@ -790,9 +791,13 @@ pub async fn run<C: Consensus>(
     readyz: coppice_api::http::ReadyzEndpoint,
     enroll: coppice_api::http::EnrollEndpoint,
     cluster_ca: crate::clientedge::ClusterCa,
+    // The deployment's authentication posture (ADR 0022), built by the runtime
+    // (which owns the JWKS cache's refresh task). This task only hands it to
+    // the router, exactly as it does the control plane.
+    authn: Arc<coppice_authn::AuthnChain>,
     shutdown: watch::Receiver<bool>,
 ) {
-    let app = coppice_api::http::router(control_plane, metrics, readyz, enroll);
+    let app = coppice_api::http::router(control_plane, metrics, readyz, enroll, authn);
     let (socket, tls) = listener.into_parts();
     tracing::debug!("API server ready");
     // The serving posture (`[client_tls]`, ADR 0037 §4) was decided at config

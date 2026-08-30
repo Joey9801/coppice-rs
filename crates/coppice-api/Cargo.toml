@@ -10,6 +10,10 @@ authors.workspace = true
 
 [dependencies]
 axum.workspace = true
+# The authentication edge (ADR 0022): this crate owns the axum seam
+# (`http::authn`) and nothing else — the chain, the JWKS cache and the token
+# validator live there, constructed by the coordinator and injected here.
+coppice-authn.workspace = true
 coppice-core.workspace = true
 # The `/enroll` wire contract (ADR 0037 §4). The DTOs are defined once, in the
 # crate both this server and the enrolling daemons depend on, so the two halves
@@ -32,6 +36,12 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The fake IdP (`coppice_testkit::oidc`) the middleware's bearer tests mint
+# real tokens from, and the PKI the operator-certificate tests mint a root CA
+# and an operator leaf with.
+coppice-testkit.workspace = true
+coppice-tls.workspace = true
+rustls-pemfile.workspace = true
 tokio.workspace = true
 tower.workspace = true
 

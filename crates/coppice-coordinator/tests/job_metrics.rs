@@ -545,6 +545,10 @@ async fn best_effort_job_usage_full_read_path() {
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
         coppice_api::http::EnrollEndpoint::detached_for_tests(),
+        // This suite exercises the job-metrics read path, not authentication:
+        // open mode resolves every request to the anonymous actor, so the
+        // assertions below are unchanged.
+        Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
     );
 
     // -- 1. Exact round-trip, ascending default order, two `available`. ----
@@ -673,6 +677,7 @@ async fn best_effort_job_usage_full_read_path() {
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
         coppice_api::http::EnrollEndpoint::detached_for_tests(),
+        Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
     );
     let (status, body) = get_usage(&router2, job, "order=asc&limit=200").await;
     assert_eq!(status, StatusCode::OK);

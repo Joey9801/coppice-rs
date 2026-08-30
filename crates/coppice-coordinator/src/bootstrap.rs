@@ -462,6 +462,26 @@ pub async fn run_with(
         // above: node-local, liveness-only, and 60 s unless the file says
         // otherwise.
         resolved.config.pacing.housekeeping_interval,
+        // The declared auth posture (ADR 0022, issue #45): `[sso]` or the
+        // conspicuous `[auth] insecure_open = true`. `config::load` already
+        // rejected a config that declared neither (or both), so this cannot
+        // silently become open by default — it is what the file says. The
+        // effective audience is resolved here, once, so nothing downstream
+        // re-applies the "defaults to client_id" rule.
+        match resolved
+            .config
+            .auth_posture()
+            .context("resolving the auth posture validated at load")?
+        {
+            crate::config::AuthPosture::InsecureOpen => coppice_authn::AuthMode::Open,
+            crate::config::AuthPosture::Oidc(sso) => {
+                coppice_authn::AuthMode::Oidc(coppice_authn::OidcConfig {
+                    issuer: sso.issuer.clone(),
+                    client_id: sso.client_id.clone(),
+                    audience: sso.effective_audience().to_string(),
+                })
+            }
+        },
         Some(shutdown_rx),
     )
     .await?;
@@ -548,6 +568,7 @@ pub async fn serve_runtime(
     metrics: coppice_api::http::MetricsEndpoint,
     readyz: ReadyzEndpoint,
     history: HistorySink,
+    auth: coppice_authn::AuthMode,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     serve_runtime_with_serving_sans(
@@ -569,6 +590,7 @@ pub async fn serve_runtime(
         // Likewise the production sweep cadence: an embedder with nothing to
         // say about pacing gets what a deployment gets.
         crate::limits::HOUSEKEEPING_INTERVAL,
+        auth,
         shutdown,
     )
     .await
@@ -606,6 +628,7 @@ pub async fn serve_runtime_with_serving_sans(
     renewal_pacing: RenewalPacing,
     history: HistorySink,
     housekeeping_interval: std::time::Duration,
+    auth: coppice_authn::AuthMode,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -624,6 +647,7 @@ pub async fn serve_runtime_with_serving_sans(
         renewal_pacing,
         history,
         housekeeping_interval,
+        auth,
         shutdown,
     )
     .await

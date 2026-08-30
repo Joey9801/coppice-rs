@@ -797,6 +797,10 @@ log_level = "warn"
             // these fixtures write: no history store runs behind the suites.
             coppice_coordinator::HistorySink::None,
             housekeeping_interval,
+            // The test fleet's config harness runs the open posture (the same
+            // `[auth] insecure_open = true` a dev cluster uses), so the fleet
+            // tests drive the API without credentials exactly as before.
+            coppice_authn::AuthMode::Open,
             Some(shutdown_rx),
         ));
 

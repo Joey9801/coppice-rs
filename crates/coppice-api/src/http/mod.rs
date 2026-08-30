@@ -14,6 +14,7 @@
 //! and `web/src/api/types.ts` for their response shapes until each DTO
 //! lands.
 
+mod authn;
 pub mod dto;
 mod enroll;
 mod error;
@@ -27,6 +28,7 @@ mod routes;
 mod ui;
 mod usage;
 
+pub use authn::{authenticate, RequestActor};
 pub use enroll::{
     EnrollCall, EnrollEndpoint, EnrollRefusal, PeerCertificates, MAX_ENROLL_BODY, REFUSED_BODY,
 };
