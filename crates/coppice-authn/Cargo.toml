@@ -1,0 +1,41 @@
+[package]
+name = "coppice-authn"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# The authentication edge (ADR 0022): OIDC discovery, the JWKS cache, offline
+# bearer-token validation, and the ordered authenticator chain that turns a
+# request's credentials into an `Actor`.
+#
+# Deliberately free of any HTTP-server or state-machine dependency: the axum
+# extractor lives in `coppice-api` and the long-lived pieces (the JWKS cache
+# and its background refresh task) are constructed and injected by the
+# coordinator. This crate only knows how to turn credentials into identity.
+
+[dependencies]
+coppice-tls = { workspace = true }
+jsonwebtoken = { workspace = true }
+metrics = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+coppice-testkit = { workspace = true }
+# The operator-certificate arm of the chain is tested against a real throwaway
+# cluster CA and a real operator leaf, minted through the same `pki` entry
+# points formation uses — not a stubbed verifier.
+rcgen = { workspace = true }
+# The edge hands the chain a DER leaf (what rustls exposes on a connection),
+# so the tests convert the minted PEM the same way rather than relying on
+# `verify_leaf`'s PEM tolerance.
+rustls-pemfile = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
