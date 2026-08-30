@@ -642,6 +642,9 @@ pub struct JobSummary {
     pub quota_entity_name: String,
     pub priority: i32,
     pub submitted_at: Timestamp,
+    /// The principal that submitted the job (ADR 0023); `null` for a job
+    /// with no actor on its submit command.
+    pub submitted_by: Option<String>,
     pub terminal_at: Option<Timestamp>,
     /// Node of the current attempt, when one exists.
     pub node: Option<NodeId>,
@@ -706,9 +709,9 @@ pub const MAX_FILTER_NODES: usize = 64;
 /// The job-list filter AST (mirrors `JobFilter` in `types.ts`).
 ///
 /// Externally tagged: every node is a JSON object with exactly one key, so
-/// an unknown key (`label`, `submitted_by` — reserved, not implemented) or
-/// a two-key object is a deserialization error, surfaced as
-/// `INVALID_ARGUMENT`. The remaining shape rules that serde cannot express
+/// an unknown key (`label` — reserved, not implemented) or a two-key object
+/// is a deserialization error, surfaced as `INVALID_ARGUMENT`. The
+/// remaining shape rules that serde cannot express
 /// — non-empty combinator/`in` lists, depth and node caps, at-least-one
 /// bound, ordered bounds — are checked in [`JobFilter::validate`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -728,6 +731,10 @@ pub enum JobFilter {
     /// Case-insensitive substring over the job id string OR the image.
     Search(String),
     Submitted(SubmittedFilter),
+    /// Exact match on the submitting principal (`Job.submitted_by`,
+    /// ADR 0023). A job with no submitter (internal or pre-authz) matches
+    /// nothing.
+    SubmittedBy(String),
     Requests(RequestsFilter),
 }
 
@@ -883,7 +890,8 @@ impl JobFilter {
             JobFilter::Entity(_)
             | JobFilter::Node(_)
             | JobFilter::Image(_)
-            | JobFilter::Search(_) => {}
+            | JobFilter::Search(_)
+            | JobFilter::SubmittedBy(_) => {}
         }
         Ok(())
     }
@@ -912,12 +920,26 @@ where
     Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::INFINITY))
 }
 
+/// How a quota entity came to exist (mirrors `QuotaEntityOrigin` in
+/// `types.ts`).
+///
+/// `Sso` marks the auto-populated user tree `types.ts` sketches (an entity
+/// minted the first time the coordinator sees an OIDC principal). No such
+/// minting path exists yet, so today every entity is `Configured`; the
+/// variant is declared so the wire vocabulary is stable when it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaEntityOrigin {
+    Configured,
+    Sso,
+}
+
 /// One node of the quota-entity tree for the list/detail views (mirrors
 /// `QuotaEntityNode` in `types.ts`).
 ///
-/// `origin`/`principal` — the ADR 0022 SSO provenance — are **omitted, not
-/// null**: replicated state records no SSO origin, so there is nothing to
-/// project; the fields return when an identity subsystem backs them. `name`
+/// `origin`/`principal` are the ADR 0022 SSO provenance: replicated state
+/// records no auto-minted entities yet, so `origin` is uniformly
+/// `configured` and `principal` is `null` until that subsystem lands. `name`
 /// is the entity's own stored segment, not the slash-joined path `types.ts`
 /// sketches (no path is stored). `usage_ucu`, `over_quota_ratio`, and
 /// `penalty` are decayed to read time (the same lazy decay `score.rs`
@@ -927,6 +949,9 @@ pub struct QuotaEntityNode {
     pub id: QuotaEntityId,
     pub name: String,
     pub parent: Option<QuotaEntityId>,
+    pub origin: QuotaEntityOrigin,
+    /// OIDC `sub` the entity was auto-minted for; only on `sso` entities.
+    pub principal: Option<String>,
     pub quota_ucu: u64,
     /// Decayed usage as of read time.
     pub usage_ucu: u64,
@@ -1048,6 +1073,10 @@ pub struct JobSpecView {
     pub max_runtime_seconds: Option<i64>,
     pub quota_entity: QuotaEntityId,
     pub retry: RetryPolicy,
+    /// The principal that submitted the job, stamped at apply from the
+    /// command's verified actor (ADR 0023) — never client-supplied. `null`
+    /// for a job whose submit command carried no actor.
+    pub submitted_by: Option<String>,
 }
 
 /// A committed abort request on a job (mirrors the `abortRequested` field of
@@ -1922,10 +1951,12 @@ pub struct GetAuthConfigResponse {
 /// endpoint reports *who the credential proved you are*, so it cannot be
 /// reached without one.
 ///
-/// The scoped-role summary of ADR 0023 (what this principal may actually do,
-/// evaluated against the replicated bindings) is the field this DTO is missing
-/// and gains next; it is a pure addition, and clients switch on `auth_method`
-/// meanwhile.
+/// `bindings` + `implicit_admin` are the ADR 0023 resolved-authority
+/// summary: the replicated bindings whose subject matches this actor's
+/// principal or groups, reported faithfully (role + scope each, one entry
+/// per matching binding). The server does not collapse them into a single
+/// effective role — union semantics belong to `authz::evaluate`, and a
+/// client that wants a headline can derive one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSessionResponse {
     /// The principal: an OIDC `sub`, `cert:<CN>` for an operator certificate,
@@ -1937,6 +1968,153 @@ pub struct GetSessionResponse {
     /// How the principal proved itself: `"bearer"`, `"operator_cert"`, or
     /// `"open"`.
     pub auth_method: String,
+    /// The replicated bindings matching this actor, in stored order.
+    pub bindings: Vec<SessionBinding>,
+    /// `true` when the actor is an unscoped admin outside the bindings
+    /// list: an operator certificate, or the open (auth-disabled) posture.
+    pub implicit_admin: bool,
+}
+
+/// One matching binding in the session's resolved-authority summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionBinding {
+    pub role: BindingRole,
+    /// Subtree root the role is scoped to; `null` = cluster-wide.
+    pub scope: Option<QuotaEntityId>,
+}
+
+/// The closed ADR 0023 role set, in wire form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingRole {
+    Submitter,
+    Operator,
+    Admin,
+}
+
+// ---------------------------------------------------------------------------
+// Authorization policy (GET/PUT /api/v1/authorization, ADR 0023)
+// ---------------------------------------------------------------------------
+
+/// One role binding on the wire (mirrors the `Binding` payload of
+/// `UpdateAuthorization` in the command catalog).
+///
+/// Flat subject: exactly one of `group` / `principal` must be present —
+/// serde cannot express "exactly one", so [`BindingDto::subject`] checks it
+/// and the handler surfaces a violation as `INVALID_ARGUMENT`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingDto {
+    /// Group-claim subject; exactly one of `group`/`principal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Principal (`sub`) subject; exactly one of `group`/`principal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    pub role: BindingRole,
+    /// Subtree root the role is scoped to; absent = unscoped (cluster-wide).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<QuotaEntityId>,
+}
+
+/// `GET /api/v1/authorization` — the current replicated authorization
+/// policy: the full bindings list plus the groups-claim name (which lives in
+/// `PolicyConfig`, not the bindings list, but travels here because the two
+/// are edited as one document by `coppice-cli policy authz`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetAuthorizationResponse {
+    /// The token claim group names are read from (replicated policy,
+    /// ADR 0022).
+    pub groups_claim: String,
+    pub bindings: Vec<BindingDto>,
+}
+
+/// `PUT /api/v1/authorization` — the full-replacement `UpdateAuthorization`
+/// command (ADR 0023): the body's `bindings` wholly replace the replicated
+/// list. `groups_claim`, when present and different from the current policy,
+/// is applied as a follow-up `UpdatePolicy` that changes only that field —
+/// two commands, each atomic, last-writer-wins like every policy edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAuthorizationRequest {
+    /// Absent = leave the current groups-claim name unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups_claim: Option<String>,
+    pub bindings: Vec<BindingDto>,
+}
+
+/// `PUT /api/v1/authorization` response.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct UpdateAuthorizationResponse {
+    /// Raft log index at which the `UpdateAuthorization` applied; pair with
+    /// `?min_index=` on a subsequent read for read-your-writes (ADR 0007).
+    pub log_index: u64,
+    /// Apply index of the follow-up `UpdatePolicy`, when the request also
+    /// changed `groups_claim`; `null` when it did not.
+    pub policy_log_index: Option<u64>,
+}
+
+impl From<&coppice_state::authz::Role> for BindingRole {
+    fn from(r: &coppice_state::authz::Role) -> Self {
+        use coppice_state::authz::Role as R;
+        match r {
+            R::Submitter => BindingRole::Submitter,
+            R::Operator => BindingRole::Operator,
+            R::Admin => BindingRole::Admin,
+        }
+    }
+}
+
+impl From<BindingRole> for coppice_state::authz::Role {
+    fn from(r: BindingRole) -> Self {
+        use coppice_state::authz::Role as R;
+        match r {
+            BindingRole::Submitter => R::Submitter,
+            BindingRole::Operator => R::Operator,
+            BindingRole::Admin => R::Admin,
+        }
+    }
+}
+
+impl From<&coppice_state::authz::Binding> for BindingDto {
+    fn from(b: &coppice_state::authz::Binding) -> Self {
+        use coppice_state::authz::Subject;
+        let (group, principal) = match &b.subject {
+            Subject::Group(name) => (Some(name.clone()), None),
+            Subject::Principal(sub) => (None, Some(sub.clone())),
+        };
+        BindingDto {
+            group,
+            principal,
+            role: (&b.role).into(),
+            scope: b.scope,
+        }
+    }
+}
+
+impl TryFrom<&BindingDto> for coppice_state::authz::Binding {
+    type Error = String;
+
+    /// Wire → domain, enforcing the exactly-one subject rule serde cannot.
+    /// Empty subject strings pass through: apply owns that rejection
+    /// (`InvalidAuthorization`), and pre-empting it here would fork the
+    /// error vocabulary.
+    fn try_from(b: &BindingDto) -> Result<Self, String> {
+        use coppice_state::authz::{Binding, Subject};
+        let subject = match (&b.group, &b.principal) {
+            (Some(name), None) => Subject::Group(name.clone()),
+            (None, Some(sub)) => Subject::Principal(sub.clone()),
+            (Some(_), Some(_)) => {
+                return Err("a binding names exactly one of `group`/`principal`, not both".into())
+            }
+            (None, None) => return Err("a binding names exactly one of `group`/`principal`".into()),
+        };
+        Ok(Binding {
+            subject,
+            role: b.role.into(),
+            scope: b.scope,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2408,6 +2586,7 @@ mod tests {
             quota_entity_name: "team-a".to_string(),
             priority: 1,
             submitted_at: ts(9_500_000),
+            submitted_by: Some("user-42".to_string()),
             terminal_at: None,
             node: Some(node),
             attempt_state: Some(AttemptState::Accruing),
@@ -2427,6 +2606,7 @@ mod tests {
                 "quota_entity_name": "team-a",
                 "priority": 1,
                 "submitted_at": "1970-01-01T00:00:09.500000Z",
+                "submitted_by": "user-42",
                 // Absent optionals are explicit null, never omitted.
                 "terminal_at": null,
                 "node": "node-00000000-0000-0000-0000-000000000003",
@@ -2462,6 +2642,8 @@ mod tests {
             id,
             name: "platform".to_string(),
             parent: Some(parent),
+            origin: QuotaEntityOrigin::Configured,
+            principal: None,
             quota_ucu: 1_000_000,
             usage_ucu: 500_000,
             over_quota_ratio: 0.5,
@@ -2478,6 +2660,8 @@ mod tests {
                 "id": "quota-00000000-0000-0000-0000-000000000001",
                 "name": "platform",
                 "parent": "quota-00000000-0000-0000-0000-000000000002",
+                "origin": "configured",
+                "principal": null,
                 "quota_ucu": 1_000_000,
                 "usage_ucu": 500_000,
                 "over_quota_ratio": 0.5,
@@ -2488,10 +2672,6 @@ mod tests {
                 "running_count": 2,
             })
         );
-        // `origin`/`principal` are omitted, not null — no SSO provenance in
-        // replicated state.
-        assert!(json.get("origin").is_none());
-        assert!(json.get("principal").is_none());
     }
 
     #[test]
@@ -2528,6 +2708,8 @@ mod tests {
             id,
             name: "root".to_string(),
             parent: None,
+            origin: QuotaEntityOrigin::Configured,
+            principal: None,
             quota_ucu: 0,
             usage_ucu: 1,
             over_quota_ratio: f64::INFINITY,

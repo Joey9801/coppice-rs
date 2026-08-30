@@ -623,6 +623,8 @@ impl FilterContext {
                 record.spec.id.to_string().to_lowercase().contains(&needle)
                     || record.spec.image.to_lowercase().contains(&needle)
             }
+            // Exact principal match; a job with no submitter matches nothing.
+            F::SubmittedBy(p) => record.spec.submitted_by.as_deref() == Some(p.as_str()),
             // `after` inclusive (≥), `before` exclusive (<) — the contract's
             // half-open window.
             F::Submitted(sf) => {
@@ -756,6 +758,7 @@ fn job_summary(state: &StateMachine, record: &JobRecord) -> dto::JobSummary {
             .unwrap_or_default(),
         priority: record.spec.priority,
         submitted_at: record.submitted_at,
+        submitted_by: record.spec.submitted_by.clone(),
         terminal_at: record.terminal_at,
         node: attempt.map(|ar| ar.attempt.node),
         attempt_state: attempt.map(|ar| (&ar.attempt.state).into()),
@@ -1053,6 +1056,7 @@ pub fn get_job(state: &StateMachine, id: &JobId, now: Timestamp) -> Option<dto::
                 max_retries: spec.retry.max_retries,
                 retry_user_errors: spec.retry.retry_user_errors,
             },
+            submitted_by: spec.submitted_by.clone(),
         },
         submitted_at: record.submitted_at,
         state_since: state_since(state, record),
@@ -1143,6 +1147,10 @@ fn quota_entity_node(
         id: *id,
         name: e.name.clone(),
         parent: e.parent,
+        // No auto-minted (SSO) entity path exists yet, so provenance is
+        // uniformly "configured" — see the `QuotaEntityOrigin` DTO doc.
+        origin: dto::QuotaEntityOrigin::Configured,
+        principal: None,
         quota_ucu: e.quota.0,
         usage_ucu,
         over_quota_ratio,
