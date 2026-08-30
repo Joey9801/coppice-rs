@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
-use crate::ApiError;
+use crate::{ApiError, RejectionKind};
 
 use super::COPPICE_LEADER;
 
@@ -108,15 +108,81 @@ impl HttpError {
     }
 }
 
+impl HttpError {
+    pub fn permission_denied(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::PermissionDenied, message)
+    }
+}
+
+/// The status a rejection carries **everywhere** — the global half of the
+/// mapping, the half that is a property of the rejection itself rather than of
+/// the endpoint that provoked it.
+///
+/// Exactly one distinction lives here: apply's ADR 0023 re-check is a 403, not
+/// a 409. It has to be global, because the re-check can refuse *any* mutating
+/// verb — a revocation landing between the API's pre-check and the command's
+/// log position is the whole reason the re-check exists, and answering it with
+/// a 409 (or worse, letting it fall through to a 500) would tell the client
+/// "retry, you raced" when the truth is "you may not do this".
+///
+/// The three authorization-shaped rejections are deliberately **not** here:
+/// `UnknownQuotaEntity` is a documented 409 on submit and on the quota upsert,
+/// and only `PUT /api/v1/authorization` reads it as a malformed body. That is
+/// an endpoint's judgement, so it is made at the endpoint
+/// ([`authorization_error`]).
+fn rejection_code(kind: RejectionKind) -> ErrorCode {
+    match kind {
+        RejectionKind::PermissionDenied => ErrorCode::PermissionDenied,
+        RejectionKind::Other
+        | RejectionKind::UnknownQuotaEntity
+        | RejectionKind::InvalidAuthorization
+        | RejectionKind::AuthorizationLockout => ErrorCode::Rejected,
+    }
+}
+
+/// `PUT /api/v1/authorization`'s error mapping: the global one, plus the three
+/// rejections that endpoint reads as a malformed request body.
+///
+/// A bindings list scoped to an entity that does not exist, one with an empty
+/// subject, or one that would leave the cluster with no unscoped admin are not
+/// races the client lost — they are documents the client got wrong, and no
+/// retry of the identical body will ever land. So they are `INVALID_ARGUMENT`
+/// (400), each with its own detail text, and each keeps the leading phrase of
+/// the rejection it came from so the three stay distinguishable.
+pub fn authorization_error(e: ApiError) -> HttpError {
+    let kind = match &e {
+        ApiError::Rejected(r) => RejectionKind::of(r),
+        ApiError::ForwardedRejection { kind, .. } => *kind,
+        _ => return e.into(),
+    };
+    match kind {
+        RejectionKind::UnknownQuotaEntity => HttpError::invalid(format!(
+            "the bindings list scopes a role to a quota entity that does not exist: {e}"
+        )),
+        RejectionKind::InvalidAuthorization => {
+            HttpError::invalid(format!("the bindings list is malformed: {e}"))
+        }
+        RejectionKind::AuthorizationLockout => HttpError::invalid(format!(
+            "the bindings list would lock the cluster out of its own authorization: {e}"
+        )),
+        RejectionKind::PermissionDenied | RejectionKind::Other => e.into(),
+    }
+}
+
 impl From<ApiError> for HttpError {
     fn from(e: ApiError) -> Self {
         match e {
             ApiError::Invalid(m) => HttpError::new(ErrorCode::InvalidArgument, m),
-            ApiError::Rejected(r) => HttpError::new(ErrorCode::Rejected, r.to_string()),
-            // Byte-identical to the arm above: a rejection is a rejection
-            // whether apply refused it on this replica or on the leader this
-            // one forwarded to (ADR 0038).
-            ApiError::ForwardedRejection(m) => HttpError::new(ErrorCode::Rejected, m),
+            ApiError::Rejected(ref r) => {
+                HttpError::new(rejection_code(RejectionKind::of(r)), r.to_string())
+            }
+            // The same mapping as the arm above, off the classification the
+            // leader sent rather than off a `RejectionReason` this replica
+            // never had: a rejection is a rejection whether apply refused it
+            // here or on the leader this one forwarded to (ADR 0038).
+            ApiError::ForwardedRejection { kind, reason } => {
+                HttpError::new(rejection_code(kind), reason)
+            }
             ApiError::NotLeader { leader_hint } => HttpError {
                 code: ErrorCode::NotLeader,
                 message: "not the leader".to_string(),

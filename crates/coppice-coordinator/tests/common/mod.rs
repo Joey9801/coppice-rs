@@ -1587,6 +1587,7 @@ impl coppice_api::ControlPlane for NoopPlane {
     async fn submit_job(
         &self,
         _req: coppice_api::http::dto::SubmitJobRequest,
+        _actor: coppice_state::Actor,
     ) -> Result<coppice_api::http::dto::SubmitJobResponse, coppice_api::ApiError> {
         Err(unattached())
     }
@@ -1594,6 +1595,7 @@ impl coppice_api::ControlPlane for NoopPlane {
     async fn abort_job(
         &self,
         _req: coppice_api::http::dto::AbortJobRequest,
+        _actor: coppice_state::Actor,
     ) -> Result<(), coppice_api::ApiError> {
         Err(unattached())
     }
@@ -1601,7 +1603,18 @@ impl coppice_api::ControlPlane for NoopPlane {
     async fn configure_quota_entity(
         &self,
         _req: coppice_api::http::dto::ConfigureQuotaEntityRequest,
+        _actor: coppice_state::Actor,
     ) -> Result<coppice_api::http::dto::ConfigureQuotaEntityResponse, coppice_api::ApiError> {
+        Err(unattached())
+    }
+
+    // This plane exists solely to serve the `/enroll` route independence
+    // test; it has no cluster behind it, so authorization writes never land.
+    async fn update_authorization(
+        &self,
+        _req: coppice_api::http::dto::UpdateAuthorizationRequest,
+        _actor: coppice_state::Actor,
+    ) -> Result<coppice_api::http::dto::UpdateAuthorizationResponse, coppice_api::ApiError> {
         Err(unattached())
     }
 

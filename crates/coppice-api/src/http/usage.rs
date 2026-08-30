@@ -667,17 +667,35 @@ mod tests {
         fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
             Err(ApiError::Unavailable("no consensus handle".into()))
         }
-        async fn submit_job(&self, _req: SubmitJobRequest) -> Result<SubmitJobResponse, ApiError> {
+        async fn submit_job(
+            &self,
+            _req: SubmitJobRequest,
+            _actor: coppice_state::Actor,
+        ) -> Result<SubmitJobResponse, ApiError> {
             unimplemented!("usage tests never submit")
         }
-        async fn abort_job(&self, _req: AbortJobRequest) -> Result<(), ApiError> {
+        async fn abort_job(
+            &self,
+            _req: AbortJobRequest,
+            _actor: coppice_state::Actor,
+        ) -> Result<(), ApiError> {
             unimplemented!("usage tests never abort")
         }
         async fn configure_quota_entity(
             &self,
             _req: ConfigureQuotaEntityRequest,
+            _actor: coppice_state::Actor,
         ) -> Result<ConfigureQuotaEntityResponse, ApiError> {
             unimplemented!("usage tests never configure")
+        }
+        // This fake exists for the metrics-fetch RPC-budget walk; it never
+        // needs to serve authorization writes.
+        async fn update_authorization(
+            &self,
+            _req: crate::http::dto::UpdateAuthorizationRequest,
+            _actor: coppice_state::Actor,
+        ) -> Result<crate::http::dto::UpdateAuthorizationResponse, ApiError> {
+            unimplemented!("usage tests never update authorization")
         }
         async fn read_state(&self, _opts: ReadOptions) -> Result<ReadView, ApiError> {
             Ok(ReadView::new(self.state.clone(), 1, 1))

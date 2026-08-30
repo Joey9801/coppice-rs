@@ -13,6 +13,7 @@ syntax = "proto3";
 
 package coppice.raft.v1;
 
+import "coppice/core/v1/authz.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
 import "coppice/core/v1/pki.proto";
@@ -268,6 +269,13 @@ service RaftAdminService {
   rpc ForwardAbortJob(ForwardAbortJobRequest) returns (ForwardAbortJobResponse);
   rpc ForwardConfigureQuotaEntity(ForwardConfigureQuotaEntityRequest)
       returns (ForwardConfigureQuotaEntityResponse);
+  // The fourth: `PUT /api/v1/authorization` (ADR 0023). Unlike the three
+  // above it may produce TWO commands on the leader — the bindings
+  // replacement, and a policy update when the request also changes
+  // groups_claim — which is why its response carries a second index rather
+  // than reusing the shared outcome alone.
+  rpc ForwardUpdateAuthorization(ForwardUpdateAuthorizationRequest)
+      returns (ForwardUpdateAuthorizationResponse);
 }
 
 // ---- Enrollment tokens and identity revocation (ADR 0037 §5) -------------
@@ -398,6 +406,33 @@ message ForwardWriteOutcome {
   // ever sees the rendered text anyway (ADR 0038).
   message Rejected {
     string reason = 1;
+    // Which rejection this is, to the extent the HTTP status mapping cares
+    // (ADR 0023). Rendered text was enough while every rejection was a 409;
+    // now that PermissionDenied is a 403 and three of the authorization
+    // rejections are 400s on one endpoint, the follower needs the
+    // classification rather than a substring match on English.
+    RejectionKind kind = 2;
+  }
+
+  // The rejections whose identity changes the status a client sees.
+  //
+  // Deliberately not one value per RejectionReason: this is not a wire
+  // encoding of that type (there is none — the rendered text is what
+  // crosses), it is the small closed set the status mapping turns on.
+  // UNSPECIFIED is the ordinary 409 that every rejection was before ADR
+  // 0023, and is what a peer that does not classify its rejections sends.
+  enum RejectionKind {
+    REJECTION_KIND_UNSPECIFIED = 0;
+    // Apply's ADR 0023 re-check refused the actor: 403, on every endpoint.
+    REJECTION_KIND_PERMISSION_DENIED = 1;
+    // A binding scoped to a quota entity that does not exist. A 400 on
+    // PUT /api/v1/authorization only; still the documented 409 on submit
+    // and on the quota-entity upsert.
+    REJECTION_KIND_UNKNOWN_QUOTA_ENTITY = 2;
+    // A malformed bindings list (an empty subject).
+    REJECTION_KIND_INVALID_AUTHORIZATION = 3;
+    // A bindings list retaining no unscoped admin binding.
+    REJECTION_KIND_AUTHORIZATION_LOCKOUT = 4;
   }
   // The receiver is not the leader (the forwarder's view was stale, or
   // leadership moved under it). It never forwards again — the originating
@@ -443,6 +478,16 @@ message ForwardSubmitJobRequest {
   coppice.core.v1.QuotaEntityId quota_entity = 15;
   // Absent = the platform default policy.
   coppice.core.v1.RetryPolicy retry = 16;
+  // Who asked (ADR 0022/0023), as the *originating* replica's
+  // authentication layer resolved it from the client's verified credential.
+  //
+  // It has to cross the hop, and the leader has to take it as given: the
+  // credential was presented to the follower and cannot be re-verified here.
+  // That is safe exactly because this surface is coordinator-to-coordinator
+  // over mTLS and unreachable by any client — a peer that could forge an
+  // actor here could already propose the command itself. Absent means an
+  // actorless proposal, which no client write ever is.
+  coppice.core.v1.Actor actor = 17;
 }
 
 message ForwardSubmitJobResponse {
@@ -455,6 +500,10 @@ message ForwardAbortJobRequest {
   bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   coppice.core.v1.JobId job = 8;
   optional string reason = 9;
+  // As ForwardSubmitJobRequest.actor. Load-bearing beyond the role check
+  // here: ADR 0023's ownership grant compares this principal to the job's
+  // submitted_by, so a lost actor would turn an owner's abort into a 403.
+  coppice.core.v1.Actor actor = 10;
 }
 
 message ForwardAbortJobResponse {
@@ -472,8 +521,38 @@ message ForwardConfigureQuotaEntityRequest {
   optional coppice.core.v1.QuotaEntityId parent = 9;
   string name = 10;
   uint64 quota_ucu = 11; // soft quota as a stock in µCU (ADR 0019).
+  // As ForwardSubmitJobRequest.actor.
+  coppice.core.v1.Actor actor = 12;
 }
 
 message ForwardConfigureQuotaEntityResponse {
   ForwardWriteOutcome outcome = 1;
+}
+
+// A follower's forwarding of `PUT /api/v1/authorization` (ADR 0023): the
+// full-replacement bindings list, and optionally a new groups_claim name.
+message ForwardUpdateAuthorizationRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  // The whole list, replacing whatever is there. An empty list is a
+  // meaningful request and is refused at apply by the lockout guard, not
+  // confused with "no bindings field".
+  repeated coppice.core.v1.Binding bindings = 8;
+  // Absent leaves PolicyConfig.groups_claim alone. Present and different
+  // from the current value produces a SECOND command on the leader.
+  optional string groups_claim = 9;
+  // As ForwardSubmitJobRequest.actor. This verb takes an unscoped admin
+  // binding, so the actor is the entire authorization input.
+  coppice.core.v1.Actor actor = 10;
+}
+
+message ForwardUpdateAuthorizationResponse {
+  // The UpdateAuthorization command's own outcome. Its Applied.log_index is
+  // the bindings replacement's apply index.
+  ForwardWriteOutcome outcome = 1;
+  // The follow-up UpdatePolicy's apply index, present only when the request
+  // changed groups_claim AND the outcome above was Applied. Two commands,
+  // each atomic, neither conditional on the other — so this is a second
+  // index rather than a second outcome: a failure of the follow-up is
+  // reported as the call's failure, never as a half-applied success.
+  optional uint64 policy_log_index = 2;
 }

@@ -60,7 +60,9 @@ pub struct Job {
     pub abort_requested: Option<AbortRequest>,
     /// The principal that submitted this job, stamped by apply from the
     /// command's actor (ADR 0023). `None` for a job submitted with no actor
-    /// — an internal proposer, or a deployment running the open posture.
+    /// at all — an internal proposer; the open posture resolves to a static
+    /// anonymous actor (principal `"anonymous"`), so it stamps `Some`, not
+    /// `None`.
     ///
     /// Ownership reads this: a principal may always abort and retry a job it
     /// submitted, with no role binding at all.

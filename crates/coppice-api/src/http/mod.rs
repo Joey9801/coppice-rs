@@ -15,6 +15,7 @@
 //! lands.
 
 mod authn;
+mod authorize;
 pub mod dto;
 mod enroll;
 mod error;

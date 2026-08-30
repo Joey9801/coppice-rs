@@ -110,6 +110,8 @@ mutations are `POST` with a request-message body. One route per
 | `GET  /api/v1/quota-entities` | `ListQuotaEntities*` | bounded |
 | `GET  /api/v1/quota-entities/{entity}` | `GetQuotaEntity*` | strong |
 | `POST /api/v1/quota-entities` | `ConfigureQuotaEntity*` (upsert, ADR-0023-gated) | write |
+| `GET  /api/v1/authorization` | `GetAuthorization*` | strong |
+| `PUT  /api/v1/authorization` | `UpdateAuthorization*` (full replacement, ADR 0023, unscoped admin only) | write |
 | `GET  /api/v1/events?cursor=` | ADR 0008 subscription (SSE) | **reserved** |
 
 Path ids are the typed string forms (ADR 0024); a prefix/uuid that fails
@@ -144,6 +146,20 @@ The table's "message pair" naming survives the wire-format amendment
 unchanged: the pairs are the same-named DTOs in
 `coppice-api::http::dto`, which are the sole definition of each pair
 (per the 2026-07-16 amendment above, there is no proto mirror).
+
+*(Authorization endpoints added alongside the write-path `Actor` threading,
+per ADR 0023: `GetAuthorization` returns the full replicated role-binding
+list plus the `groups_claim` name read off `PolicyConfig`, so a caller can
+see both "who can do what" and which ID-token claim group membership is
+sourced from in one response — this is `strong`, not `bounded`, matching
+`GetQuotaEntity` rather than the list endpoints: it is the input an operator
+reasons about before granting or revoking access, and a stale answer here
+has a different failure mode than a stale job list. `UpdateAuthorization`
+is a full-replacement `PUT`, not a patch — the same collection-replaces-
+collection shape `ConfigureQuotaEntity` uses for a single entity, scaled up
+because role bindings are one small policy object, not a sharded
+collection — and is gated to unscoped admin only, since it can grant itself
+broader access than any binding it replaces.)*
 
 ### Consistency plumbing (ADR 0007 made concrete)
 
@@ -204,18 +220,49 @@ Errors are `application/json`:
 This is the JSON rendering of `coppice_api::ApiError` plus the read-side
 codes; the web client maps it onto its `ApiError` at its boundary.
 
+`PERMISSION_DENIED` now has real producers (previously a placeholder row):
+every mutating endpoint pre-checks `coppice_state::authz::evaluate` against
+a read view before proposing, returning 403 without ever reaching the log;
+apply carries out its own re-check regardless, and when a revocation lands
+between the pre-check and the command's log position that later rejection
+surfaces to the caller as the same `PERMISSION_DENIED` 403, not `REJECTED`
+409 — the caller cannot tell the two checks apart, nor should it need to.
+`PUT /api/v1/authorization` maps its `UnknownQuotaEntity` / `InvalidAuthorization`
+/ `AuthorizationLockout` rejections to `INVALID_ARGUMENT` 400 with
+distinguishing detail strings, endpoint-locally — this does not change the
+existing, documented contract that `UnknownQuotaEntity` stays a `REJECTED`
+409 on `SubmitJob` and `ConfigureQuotaEntity`.
+
 ### AuthN/Z
 
-`Authorization: Bearer <OIDC JWT>` validated offline per ADR 0022; the
-authn middleware resolves it to the `Actor` that every proposed command
-already carries, and `GET /api/v1/session` echoes the resolved principal.
-Until the middleware lands, the listener is open and `session` returns the
-static dev principal (matching the web UI's "Demo User" stub) — the
-middleware is a seam in `coppice-api::http`, not a redesign. Operator-cert
-break-glass (ADR 0023) authenticates on the mTLS admin plane, not this
-listener. TLS on the client listener follows the deployment posture
-(terminate here via the node-config `[tls]` server cert, or in front of
-it); it is config, not contract.
+`Authorization: Bearer <OIDC JWT>` validated offline per ADR 0022. The authn
+middleware landed in `crates/coppice-api/src/http/authn.rs`: it is layered
+over the whole `/api/v1` namespace and resolves the bearer token to the
+`Actor` that every proposed command already carries, with an exact-pair
+exemption table covering `GET /auth/config` and `POST /enroll` (the routes
+a client needs before it has a token). As of this PR the resolved `Actor`
+rides the actor-carrying commands through the write path and is re-checked
+at apply (see the error contract's `PERMISSION_DENIED` note above); reads
+stay authn-only in v1 — a valid, resolved principal is required, but no
+role-binding check gates what a read returns. `GET /api/v1/session` echoes
+the resolved principal and, since ADR 0023, the bindings matching it (role +
+scope each, one entry per match, uncollapsed) plus an `implicit_admin` flag.
+
+Operator-cert break-glass (ADR 0022) authenticates **on this listener**, not
+only on the mTLS admin plane: a leaf presented on the `[client_tls]`
+connection and verified against the cluster CA resolves to principal
+`cert:<CN>` with implicit unscoped admin, which is what makes it a recovery
+path for a bindings list that locked its own admins out. (An earlier revision
+of this ADR said otherwise; PR2 settled it.) Beyond the credential, such a
+request is ordinary: it proposes the same actor-carrying commands, and is
+audited like any other. The third posture is open mode (`[auth]
+insecure_open`), where every request resolves to a static anonymous actor
+that is likewise an implicit unscoped admin.
+
+TLS on the client listener follows the deployment posture (terminate here via
+the node-config `[tls]` server cert, or in front of it); it is config, not
+contract — except that operator-cert authentication requires terminating
+here, since a proxy in front leaves no peer certificate to verify.
 
 ### Serving the UI
 

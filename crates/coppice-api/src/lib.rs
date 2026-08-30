@@ -17,7 +17,7 @@ use std::future::Future;
 use coppice_core::time::Timestamp;
 use http::dto::{
     AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest,
-    SubmitJobResponse,
+    SubmitJobResponse, UpdateAuthorizationRequest, UpdateAuthorizationResponse,
 };
 
 /// Consistency class for read operations (ADR 0007).
@@ -250,15 +250,65 @@ pub enum ApiError {
     /// internal forwarding hop (ADR 0038), carrying the leader's *rendered*
     /// reason rather than the reason itself: `RejectionReason` has no proto
     /// encoding to reconstruct from, and the rendered text is all a client
-    /// ever sees of it. Same error code, same status, same body — the
-    /// distinction exists only in this enum.
-    #[error("rejected: {0}")]
-    ForwardedRejection(String),
+    /// ever sees of it.
+    ///
+    /// `kind` is the one structured thing that does survive the hop. Rendered
+    /// text alone was enough while every rejection was a 409; since ADR 0023
+    /// the status a rejection deserves depends on *which* rejection it is —
+    /// `PermissionDenied` is a 403 and three of the authorization rejections
+    /// are 400s on one endpoint — and deciding that by matching on English
+    /// would be a contract held together by a string. So the leader classifies
+    /// its own rejection and the follower maps the classification.
+    #[error("rejected: {reason}")]
+    ForwardedRejection { kind: RejectionKind, reason: String },
 
     /// The write did not resolve to a replicated decision: a timeout,
     /// overload, or the seam shutting down. The caller may retry.
     #[error("unavailable: {0}")]
     Unavailable(String),
+}
+
+/// The rejections whose *identity* changes the HTTP status a client sees, as
+/// a closed classification that survives the ADR 0038 forwarding hop.
+///
+/// Deliberately not one arm per [`coppice_state::RejectionReason`]: this is
+/// not a wire re-encoding of that enum (there is none — the rendered text is
+/// what crosses), it is the small set of distinctions the status mapping
+/// actually turns on. Everything else is [`Other`](Self::Other), the 409 that
+/// every rejection was before ADR 0023.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RejectionKind {
+    /// An ordinary committed-and-refused race outcome: `REJECTED` (409).
+    #[default]
+    Other,
+    /// Apply's own ADR 0023 re-check refused the actor: `PERMISSION_DENIED`
+    /// (403), everywhere, so a revocation landing between the API's
+    /// pre-check and the command's log position never surfaces as a 500.
+    PermissionDenied,
+    /// A binding scoped to a quota entity that does not exist. A 400 on
+    /// `PUT /api/v1/authorization` only — on submit and configure it stays
+    /// the documented 409.
+    UnknownQuotaEntity,
+    /// A malformed bindings list (an empty subject).
+    InvalidAuthorization,
+    /// A bindings list retaining no unscoped admin (ADR 0023's loud
+    /// accident guard).
+    AuthorizationLockout,
+}
+
+impl RejectionKind {
+    /// Classify a local rejection for the hop — the one place the mapping
+    /// from `RejectionReason` to [`RejectionKind`] lives.
+    pub fn of(reason: &coppice_state::RejectionReason) -> RejectionKind {
+        use coppice_state::RejectionReason as R;
+        match reason {
+            R::PermissionDenied(_) => RejectionKind::PermissionDenied,
+            R::UnknownQuotaEntity(_) => RejectionKind::UnknownQuotaEntity,
+            R::InvalidAuthorization(_) => RejectionKind::InvalidAuthorization,
+            R::AuthorizationLockout => RejectionKind::AuthorizationLockout,
+            _ => RejectionKind::Other,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,23 +528,62 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// anything.
     fn cluster_id(&self) -> coppice_core::id::ClusterId;
 
+    /// Propose the submission on behalf of `actor` (ADR 0023).
+    ///
+    /// `actor` is the identity the authentication layer resolved for the
+    /// request, and it rides the proposed command: apply stamps it onto
+    /// `Job.submitted_by` and re-evaluates the authorization decision against
+    /// the bindings as of the command's own log position. The HTTP layer has
+    /// already pre-checked the same decision against a read view and answered
+    /// 403 if it failed — the pre-check is the fast, friendly half, and this
+    /// re-check is the authoritative one, which is what makes a revocation
+    /// racing an in-flight write resolve in log order rather than by luck.
     fn submit_job(
         &self,
         req: SubmitJobRequest,
+        actor: coppice_state::Actor,
     ) -> impl Future<Output = Result<SubmitJobResponse, ApiError>> + Send;
 
-    fn abort_job(&self, req: AbortJobRequest) -> impl Future<Output = Result<(), ApiError>> + Send;
+    /// Propose the abort on behalf of `actor`; same two-check arrangement as
+    /// [`submit_job`](ControlPlane::submit_job). Ownership rides along for
+    /// free: apply compares the actor's principal to the job's `submitted_by`.
+    fn abort_job(
+        &self,
+        req: AbortJobRequest,
+        actor: coppice_state::Actor,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
-    /// Propose the `ConfigureQuotaEntity` upsert (ADR 0031's write class).
-    /// Resolves once committed and applied; a cycle or unknown-parent refusal
-    /// surfaces as [`ApiError::Rejected`] (a normal 409 race outcome). No
-    /// authz today — `submit_job`/`abort_job` ship unauthenticated and this
-    /// follows the same precedent; ADR 0023 enforcement is a separate future
-    /// subsystem, not gated here.
+    /// Propose the `ConfigureQuotaEntity` upsert (ADR 0031's write class) on
+    /// behalf of `actor`. Resolves once committed and applied; a cycle or
+    /// unknown-parent refusal surfaces as [`ApiError::Rejected`] (a normal 409
+    /// race outcome), and an authorization refusal as
+    /// `RejectionReason::PermissionDenied` (403).
+    ///
+    /// Authorization follows the same arrangement as
+    /// [`submit_job`](ControlPlane::submit_job): the API layer pre-checks
+    /// against a read view and apply re-checks at the log position (ADR 0023).
     fn configure_quota_entity(
         &self,
         req: ConfigureQuotaEntityRequest,
+        actor: coppice_state::Actor,
     ) -> impl Future<Output = Result<ConfigureQuotaEntityResponse, ApiError>> + Send;
+
+    /// Replace the replicated role bindings wholesale on behalf of `actor`
+    /// (`PUT /api/v1/authorization`, ADR 0023) — an unscoped-admin verb.
+    ///
+    /// Up to **two** commands, each atomic on its own and neither conditional
+    /// on the other: the `UpdateAuthorization` always, and — when the request
+    /// carries a `groups_claim` different from the one in replicated policy —
+    /// a follow-up `UpdatePolicy` that clones the current policy and changes
+    /// only that field. There is no transaction spanning them, by design:
+    /// `groups_claim` lives in `PolicyConfig` and the bindings do not, and
+    /// inventing a combined command to edit two unrelated pieces of policy
+    /// together would be a worse thing than last-writer-wins.
+    fn update_authorization(
+        &self,
+        req: UpdateAuthorizationRequest,
+        actor: coppice_state::Actor,
+    ) -> impl Future<Output = Result<UpdateAuthorizationResponse, ApiError>> + Send;
 
     /// Resolve a read at the requested consistency and return a snapshot of
     /// the replicated state with its staleness metadata.
