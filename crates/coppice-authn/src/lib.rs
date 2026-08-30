@@ -43,12 +43,28 @@ pub mod jwks;
 mod metrics;
 mod validator;
 
-pub use actor::{Actor, AuthMethod, ANONYMOUS_PRINCIPAL};
+pub use actor::{ActorExt, AuthMethod, ANONYMOUS_PRINCIPAL};
 pub use chain::{
     no_ca, static_groups_claim, AuthnChain, CaProvider, Credentials, GroupsClaimProvider,
-    Unauthenticated, DEFAULT_GROUPS_CLAIM,
+    Unauthenticated,
 };
+
+/// The identity one request resolved to — **the replicated actor itself**
+/// ([`coppice_state::Actor`]), not a copy of its shape.
+///
+/// Re-exported so a consumer of the authentication edge needs one import, and
+/// so it is visible here that the chain's output and the value that rides a
+/// proposed command (ADR 0023) are the same type. The edge's own additions to
+/// it are the [`ActorExt`] trait.
+pub use coppice_state::Actor;
+
 pub use config::{AuthMode, OidcConfig};
+/// The default groups-claim name (ADR 0022) — owned by `coppice-state`, where
+/// it is also what an absent `PolicyConfig.groups_claim` decodes to.
+///
+/// Re-exported rather than restated: two constants that must agree is one
+/// constant with extra steps.
+pub use coppice_state::DEFAULT_GROUPS_CLAIM;
 pub use http::default_http_client;
 pub use jwks::{JwksCache, JwksError, JwksTimings};
 pub use validator::{ValidateError, ValidatedToken, Validator, CLOCK_SKEW_LEEWAY_SECS};

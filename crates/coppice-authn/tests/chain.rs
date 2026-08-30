@@ -6,8 +6,8 @@ mod common;
 use std::io::Cursor;
 
 use coppice_authn::{
-    no_ca, static_groups_claim, AuthMethod, AuthMode, AuthnChain, CaProvider, Credentials,
-    Unauthenticated, DEFAULT_GROUPS_CLAIM,
+    no_ca, static_groups_claim, ActorExt, AuthMethod, AuthMode, AuthnChain, CaProvider,
+    Credentials, Unauthenticated, DEFAULT_GROUPS_CLAIM,
 };
 use coppice_testkit::oidc::{FakeIdp, TokenClaims};
 use coppice_tls::pki;
