@@ -9,6 +9,7 @@
 
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::Duration;
+use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
     ConfigureQuotaEntity, ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost,
@@ -16,9 +17,11 @@ use coppice_state::command::{
     RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
     RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
     RecordStagedKeyTransferIntent, RegisterNode, RetireMachineBinding, RevokeEnrollToken,
-    RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdateAuthorization, UpdatePolicy,
 };
-use coppice_state::{CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity};
+use coppice_state::{
+    CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_GROUPS_CLAIM,
+};
 
 use super::core::{labels_from_pb, labels_to_pb, multipliers_from_pb, multipliers_to_pb};
 use super::{nonnegative_duration, req, timestamp, ConvertError};
@@ -46,6 +49,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::EvictTerminalJobs(c) => Body::EvictTerminalJobs(c.into()),
         Command::ConfigureQuotaEntity(c) => Body::ConfigureQuotaEntity(c.into()),
         Command::UpdatePolicy(c) => Body::UpdatePolicy(c.into()),
+        Command::UpdateAuthorization(c) => Body::UpdateAuthorization(c.into()),
         Command::BumpClusterVersion(c) => Body::BumpClusterVersion(c.into()),
         Command::RecordCaCertificate(c) => Body::RecordCaCertificate(c.into()),
         Command::BindMachineIdentity(c) => Body::BindMachineIdentity(c.into()),
@@ -88,6 +92,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::EvictTerminalJobs(c) => Command::EvictTerminalJobs(c.try_into()?),
         Body::ConfigureQuotaEntity(c) => Command::ConfigureQuotaEntity(c.try_into()?),
         Body::UpdatePolicy(c) => Command::UpdatePolicy(c.try_into()?),
+        Body::UpdateAuthorization(c) => Command::UpdateAuthorization(c.try_into()?),
         Body::BumpClusterVersion(c) => Command::BumpClusterVersion(c.try_into()?),
         Body::RecordCaCertificate(c) => Command::RecordCaCertificate(c.try_into()?),
         Body::BindMachineIdentity(c) => Command::BindMachineIdentity(c.try_into()?),
@@ -114,6 +119,7 @@ impl From<&SubmitJob> for pb::SubmitJob {
         pb::SubmitJob {
             job: Some((&c.job).into()),
             multiplier_q32_32: c.multiplier.0,
+            actor: c.actor.as_ref().map(Into::into),
             submitted_at_us: c.submitted_at.as_micros(),
         }
     }
@@ -126,6 +132,7 @@ impl TryFrom<pb::SubmitJob> for SubmitJob {
         Ok(SubmitJob {
             job: req(c.job, "SubmitJob.job")?.try_into()?,
             multiplier: PriorityMultiplier(c.multiplier_q32_32),
+            actor: c.actor.map(Into::into),
             submitted_at: timestamp(c.submitted_at_us, "SubmitJob.submitted_at_us")?,
         })
     }
@@ -136,6 +143,7 @@ impl From<&AbortJob> for pb::AbortJob {
         pb::AbortJob {
             job: Some(c.job.into()),
             reason: c.reason.clone(),
+            actor: c.actor.as_ref().map(Into::into),
             requested_at_us: c.requested_at.as_micros(),
         }
     }
@@ -148,6 +156,7 @@ impl TryFrom<pb::AbortJob> for AbortJob {
         Ok(AbortJob {
             job: req(c.job, "AbortJob.job")?.try_into()?,
             reason: c.reason,
+            actor: c.actor.map(Into::into),
             requested_at: timestamp(c.requested_at_us, "AbortJob.requested_at_us")?,
         })
     }
@@ -439,6 +448,7 @@ impl From<&SetNodeSchedulable> for pb::SetNodeSchedulable {
         pb::SetNodeSchedulable {
             node: Some(c.node.into()),
             schedulable: c.schedulable,
+            actor: c.actor.as_ref().map(Into::into),
             updated_at_us: c.updated_at.as_micros(),
         }
     }
@@ -451,6 +461,7 @@ impl TryFrom<pb::SetNodeSchedulable> for SetNodeSchedulable {
         Ok(SetNodeSchedulable {
             node: req(c.node, "SetNodeSchedulable.node")?.try_into()?,
             schedulable: c.schedulable,
+            actor: c.actor.map(Into::into),
             updated_at: timestamp(c.updated_at_us, "SetNodeSchedulable.updated_at_us")?,
         })
     }
@@ -482,6 +493,97 @@ impl TryFrom<pb::EvictTerminalJobs> for EvictTerminalJobs {
     }
 }
 
+// ---- Authorization vocabulary (ADR 0023; shared with the snapshot's
+// ClusterStateRecord) ----
+
+impl From<&Actor> for pbcore::Actor {
+    fn from(actor: &Actor) -> Self {
+        pbcore::Actor {
+            principal: actor.principal.clone(),
+            groups: actor.groups.clone(),
+            operator_cert: actor.operator_cert,
+            auth_disabled: actor.auth_disabled,
+        }
+    }
+}
+
+impl From<pbcore::Actor> for Actor {
+    fn from(actor: pbcore::Actor) -> Self {
+        // Total: every wire shape is a domain value. An empty principal or a
+        // duplicated group is the API layer's problem to not produce, and
+        // authorization denies on it rather than failing to decode.
+        Actor {
+            principal: actor.principal,
+            groups: actor.groups,
+            operator_cert: actor.operator_cert,
+            auth_disabled: actor.auth_disabled,
+        }
+    }
+}
+
+/// The `Role` domain enum → its closed proto enum.
+pub fn role_to_pb(role: Role) -> pbcore::Role {
+    match role {
+        Role::Submitter => pbcore::Role::Submitter,
+        Role::Operator => pbcore::Role::Operator,
+        Role::Admin => pbcore::Role::Admin,
+    }
+}
+
+/// The closed proto `Role` → its domain enum. Unspecified and unknown values
+/// are decode failures, never a silent default: authority may not be
+/// invented by a codec.
+pub fn role_from_pb(value: i32, field: &'static str) -> Result<Role, ConvertError> {
+    match pbcore::Role::try_from(value) {
+        Ok(pbcore::Role::Submitter) => Ok(Role::Submitter),
+        Ok(pbcore::Role::Operator) => Ok(Role::Operator),
+        Ok(pbcore::Role::Admin) => Ok(Role::Admin),
+        _ => Err(ConvertError::UnknownEnum { field, value }),
+    }
+}
+
+impl From<&Binding> for pbcore::Binding {
+    fn from(binding: &Binding) -> Self {
+        use crate::pb::core::v1::binding as b;
+        let subject = match &binding.subject {
+            Subject::Group(name) => b::Subject::Group(b::Group { name: name.clone() }),
+            Subject::Principal(sub) => b::Subject::Principal(b::Principal { sub: sub.clone() }),
+        };
+        pbcore::Binding {
+            subject: Some(subject),
+            role: role_to_pb(binding.role) as i32,
+            scope: binding.scope.map(Into::into),
+        }
+    }
+}
+
+impl TryFrom<pbcore::Binding> for Binding {
+    type Error = ConvertError;
+
+    fn try_from(binding: pbcore::Binding) -> Result<Self, ConvertError> {
+        use crate::pb::core::v1::binding as b;
+        // An unset oneof names nobody — there is no "everyone" subject, and
+        // inventing one would be a silent grant.
+        let subject = match req(binding.subject, "Binding.subject")? {
+            b::Subject::Group(g) => Subject::Group(g.name),
+            b::Subject::Principal(p) => Subject::Principal(p.sub),
+        };
+        Ok(Binding {
+            subject,
+            role: role_from_pb(binding.role, "Binding.role")?,
+            scope: binding.scope.map(TryInto::try_into).transpose()?,
+        })
+    }
+}
+
+/// The bindings of an `UpdateAuthorization` or a snapshot's cluster record.
+///
+/// Per-binding errors already name the offending field (`Binding.subject`,
+/// `Binding.role`), so this adds no context of its own.
+pub fn bindings_from_pb(bindings: Vec<pbcore::Binding>) -> Result<Vec<Binding>, ConvertError> {
+    bindings.into_iter().map(TryInto::try_into).collect()
+}
+
 // ---- Admin / policy ----
 
 impl From<&ConfigureQuotaEntity> for pb::ConfigureQuotaEntity {
@@ -491,6 +593,7 @@ impl From<&ConfigureQuotaEntity> for pb::ConfigureQuotaEntity {
             parent: c.parent.map(Into::into),
             name: c.name.clone(),
             quota_ucu: c.quota.0,
+            actor: c.actor.as_ref().map(Into::into),
             updated_at_us: c.updated_at.as_micros(),
         }
     }
@@ -505,6 +608,7 @@ impl TryFrom<pb::ConfigureQuotaEntity> for ConfigureQuotaEntity {
             parent: c.parent.map(TryInto::try_into).transpose()?,
             name: c.name,
             quota: CostUnits(c.quota_ucu),
+            actor: c.actor.map(Into::into),
             updated_at: timestamp(c.updated_at_us, "ConfigureQuotaEntity.updated_at_us")?,
         })
     }
@@ -514,6 +618,7 @@ impl From<&UpdatePolicy> for pb::UpdatePolicy {
     fn from(c: &UpdatePolicy) -> Self {
         pb::UpdatePolicy {
             policy: Some((&c.policy).into()),
+            actor: c.actor.as_ref().map(Into::into),
             updated_at_us: c.updated_at.as_micros(),
         }
     }
@@ -525,7 +630,33 @@ impl TryFrom<pb::UpdatePolicy> for UpdatePolicy {
     fn try_from(c: pb::UpdatePolicy) -> Result<Self, ConvertError> {
         Ok(UpdatePolicy {
             policy: req(c.policy, "UpdatePolicy.policy")?.try_into()?,
+            actor: c.actor.map(Into::into),
             updated_at: timestamp(c.updated_at_us, "UpdatePolicy.updated_at_us")?,
+        })
+    }
+}
+
+impl From<&UpdateAuthorization> for pb::UpdateAuthorization {
+    fn from(c: &UpdateAuthorization) -> Self {
+        pb::UpdateAuthorization {
+            bindings: c.bindings.iter().map(Into::into).collect(),
+            actor: c.actor.as_ref().map(Into::into),
+            updated_at_us: c.updated_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::UpdateAuthorization> for UpdateAuthorization {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::UpdateAuthorization) -> Result<Self, ConvertError> {
+        Ok(UpdateAuthorization {
+            // Shape rules the catalog assigns to apply — non-empty subjects,
+            // scopes that exist, the retained unscoped admin — stay apply's,
+            // so this only enforces what the wire itself cannot express.
+            bindings: bindings_from_pb(c.bindings)?,
+            actor: c.actor.map(Into::into),
+            updated_at: timestamp(c.updated_at_us, "UpdateAuthorization.updated_at_us")?,
         })
     }
 }
@@ -534,6 +665,7 @@ impl From<&BumpClusterVersion> for pb::BumpClusterVersion {
     fn from(c: &BumpClusterVersion) -> Self {
         pb::BumpClusterVersion {
             to: c.to,
+            actor: c.actor.as_ref().map(Into::into),
             bumped_at_us: c.bumped_at.as_micros(),
         }
     }
@@ -545,6 +677,7 @@ impl TryFrom<pb::BumpClusterVersion> for BumpClusterVersion {
     fn try_from(c: pb::BumpClusterVersion) -> Result<Self, ConvertError> {
         Ok(BumpClusterVersion {
             to: c.to,
+            actor: c.actor.map(Into::into),
             bumped_at: timestamp(c.bumped_at_us, "BumpClusterVersion.bumped_at_us")?,
         })
     }
@@ -886,6 +1019,7 @@ impl From<&PolicyConfig> for pbcore::PolicyConfig {
             abort_grace_us: policy.abort_grace.as_micros(),
             unbounded_runtime_multiplier_q32_32: Some(policy.unbounded_runtime_multiplier.0),
             refund_fraction_milli: Some(policy.refund_fraction_milli),
+            groups_claim: Some(policy.groups_claim.clone()),
         }
     }
 }
@@ -913,6 +1047,11 @@ impl TryFrom<pbcore::PolicyConfig> for PolicyConfig {
                 .unbounded_runtime_multiplier_q32_32
                 .map_or(PriorityMultiplier::ONE, PriorityMultiplier),
             refund_fraction_milli: policy.refund_fraction_milli.unwrap_or(1000),
+            // Absent decodes to the documented default, following fields 9
+            // and 10 above.
+            groups_claim: policy
+                .groups_claim
+                .unwrap_or_else(|| DEFAULT_GROUPS_CLAIM.to_string()),
         })
     }
 }

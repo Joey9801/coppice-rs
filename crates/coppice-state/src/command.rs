@@ -9,6 +9,25 @@
 //! (`coppice.command.v1`, ADR 0003) is frozen from that document, and these
 //! domain types mirror it field for field — `coppice_proto::convert` maps
 //! between the two at the wire boundary.
+//!
+//! # Actor-carrying commands
+//!
+//! Seven commands — [`SubmitJob`], [`AbortJob`], [`SetNodeSchedulable`],
+//! [`ConfigureQuotaEntity`], [`UpdatePolicy`], [`UpdateAuthorization`], and
+//! [`BumpClusterVersion`] — carry an `actor: Option<Actor>` (ADR 0023). They
+//! are exactly the commands reachable through the public API, and the
+//! `Option` is the structural distinction between the two kinds of proposer:
+//!
+//! - `Some(actor)` — API-originated. The API transcribed the actor from a
+//!   *verified* credential and already rejected unauthorized requests with a
+//!   403; apply re-evaluates the identical decision against the replicated
+//!   bindings **at this command's log position**, so a revocation racing an
+//!   in-flight command resolves in log order on every replica
+//!   ([`crate::authz::evaluate`]).
+//! - `None` — an internal proposal (scheduler, ingestion, node lifecycle,
+//!   housekeeping) carrying the system's own authority. Apply skips the
+//!   check entirely, so these commands behave exactly as they did before
+//!   authorization existed.
 
 use std::collections::BTreeMap;
 
@@ -21,6 +40,7 @@ use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 
+use crate::authz::{Actor, Binding};
 use crate::{CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity};
 
 /// A committed mutation to the authoritative state. One arm of the versioned
@@ -47,6 +67,7 @@ pub enum Command {
     // Admin / policy.
     ConfigureQuotaEntity(ConfigureQuotaEntity),
     UpdatePolicy(UpdatePolicy),
+    UpdateAuthorization(UpdateAuthorization),
     BumpClusterVersion(BumpClusterVersion),
     // Cluster PKI / identity (ADR 0037).
     RecordCaCertificate(RecordCaCertificate),
@@ -88,6 +109,7 @@ impl Command {
             Command::EvictTerminalJobs(c) => c.evicted_at,
             Command::ConfigureQuotaEntity(c) => c.updated_at,
             Command::UpdatePolicy(c) => c.updated_at,
+            Command::UpdateAuthorization(c) => c.updated_at,
             Command::BumpClusterVersion(c) => c.bumped_at,
             Command::RecordCaCertificate(c) => c.recorded_at,
             Command::BindMachineIdentity(c) => c.bound_at,
@@ -116,6 +138,8 @@ pub struct SubmitJob {
     /// Resolved by the API from the replicated multiplier table; apply never
     /// sees the raw `priority: i32` in arithmetic (ADR 0019).
     pub multiplier: PriorityMultiplier,
+    /// Who asked — see the module note on actor-carrying commands.
+    pub actor: Option<Actor>,
     pub submitted_at: Timestamp,
 }
 
@@ -128,6 +152,8 @@ pub struct SubmitJob {
 pub struct AbortJob {
     pub job: JobId,
     pub reason: Option<String>,
+    /// Who asked — see the module note on actor-carrying commands.
+    pub actor: Option<Actor>,
     pub requested_at: Timestamp,
 }
 
@@ -280,6 +306,8 @@ pub struct DeclareNodeLost {
 pub struct SetNodeSchedulable {
     pub node: NodeId,
     pub schedulable: bool,
+    /// Who asked — see the module note on actor-carrying commands.
+    pub actor: Option<Actor>,
     pub updated_at: Timestamp,
 }
 
@@ -306,6 +334,8 @@ pub struct ConfigureQuotaEntity {
     pub name: String,
     /// A stock in µCU; the CLI converts human rates (ADR 0019).
     pub quota: CostUnits,
+    /// Who asked — see the module note on actor-carrying commands.
+    pub actor: Option<Actor>,
     pub updated_at: Timestamp,
 }
 
@@ -317,6 +347,24 @@ pub struct ConfigureQuotaEntity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePolicy {
     pub policy: PolicyConfig,
+    /// Who asked — see the module note on actor-carrying commands.
+    pub actor: Option<Actor>,
+    pub updated_at: Timestamp,
+}
+
+/// Full replacement of the replicated role-binding list (ADR 0023).
+///
+/// Mirrors [`UpdatePolicy`]: the CLI reads, edits, and writes the whole
+/// list, and concurrent edits resolve last-writer-wins in log order. Takes
+/// effect for every command ordered after this one, so a revocation racing
+/// an in-flight command resolves deterministically at that command's own log
+/// position. Operator certificates are an implicit unscoped admin outside
+/// this list and cannot be revoked through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateAuthorization {
+    pub bindings: Vec<Binding>,
+    /// Who asked — see the module note on actor-carrying commands.
+    pub actor: Option<Actor>,
     pub updated_at: Timestamp,
 }
 
@@ -327,6 +375,8 @@ pub struct UpdatePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BumpClusterVersion {
     pub to: u32,
+    /// Who asked — see the module note on actor-carrying commands.
+    pub actor: Option<Actor>,
     pub bumped_at: Timestamp,
 }
 
@@ -547,6 +597,7 @@ mod tests {
             job: JobId::new(),
             reason: None,
             requested_at: ts(7),
+            actor: None,
         });
         assert_eq!(abort.stamped_at(), ts(7));
 
@@ -568,6 +619,7 @@ mod tests {
         let bump = Command::BumpClusterVersion(BumpClusterVersion {
             to: 2,
             bumped_at: ts(13),
+            actor: None,
         });
         assert_eq!(bump.stamped_at(), ts(13));
     }

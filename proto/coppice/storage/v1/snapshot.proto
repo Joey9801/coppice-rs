@@ -22,6 +22,7 @@ package coppice.storage.v1;
 
 import "coppice/core/v1/allocation.proto";
 import "coppice/core/v1/attempt.proto";
+import "coppice/core/v1/authz.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
 import "coppice/core/v1/node.proto";
@@ -195,6 +196,10 @@ message ClusterStateRecord {
   // by cluster size, so it rides this singleton record rather than a section
   // of its own.
   optional StagedRootRecord staged_root = 6;
+  // The replicated role-binding list (ADR 0023). Bounded (an operator-sized
+  // list, not job-scaled), so it rides this singleton record rather than a
+  // section of its own — same reasoning as the staged root above.
+  repeated coppice.core.v1.Binding bindings = 7;
 }
 
 // One coordinator installation's binding to a raft seat (ADR 0037 §7). Keyed

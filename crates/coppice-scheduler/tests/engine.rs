@@ -46,6 +46,7 @@ fn submit_exact_runtime(
         quota_entity: ROOT,
         retry: coppice_core::job::RetryPolicy::default(),
         abort_requested: None,
+        submitted_by: None,
     };
     apply_ok(
         sm,
@@ -53,6 +54,7 @@ fn submit_exact_runtime(
             job: spec,
             multiplier: PriorityMultiplier::ONE,
             submitted_at: base_ts(),
+            actor: None,
         }),
     );
 }

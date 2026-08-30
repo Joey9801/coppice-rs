@@ -155,6 +155,7 @@ impl From<&Job> for pb::Job {
             quota_entity: Some(job.quota_entity.into()),
             retry: Some(job.retry.into()),
             abort_requested: job.abort_requested.as_ref().map(Into::into),
+            submitted_by: job.submitted_by.clone(),
         }
     }
 }
@@ -193,6 +194,9 @@ impl TryFrom<pb::Job> for Job {
             quota_entity: req(job.quota_entity, "Job.quota_entity")?.try_into()?,
             retry: req(job.retry, "Job.retry")?.into(),
             abort_requested: job.abort_requested.map(TryInto::try_into).transpose()?,
+            // Apply-stamped, never client-supplied; an absent value is a job
+            // submitted with no actor (ADR 0023).
+            submitted_by: job.submitted_by,
         })
     }
 }

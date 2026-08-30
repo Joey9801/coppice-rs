@@ -209,6 +209,7 @@ async fn seed_quota(coord: &RunningCoordinator, entity: QuotaEntityId) {
             name: "root".into(),
             quota: CostUnits(1_000_000_000_000),
             updated_at: Timestamp::now(),
+            actor: None,
         }))
         .await
         .expect("propose ConfigureQuotaEntity");
@@ -237,9 +238,11 @@ async fn submit_job(coord: &RunningCoordinator, job: JobId, entity: QuotaEntityI
                     retry_user_errors: false,
                 },
                 abort_requested: None,
+                submitted_by: None,
             },
             multiplier: PriorityMultiplier::ONE,
             submitted_at: Timestamp::now(),
+            actor: None,
         }))
         .await
         .expect("propose SubmitJob");
@@ -884,6 +887,7 @@ async fn evicted_terminal_job_reads_degrade_rather_than_erroring() {
             job,
             reason: Some("retention acceptance".into()),
             requested_at: Timestamp::now(),
+            actor: None,
         }))
         .await
         .expect("propose AbortJob");
@@ -969,6 +973,7 @@ async fn evicted_terminal_job_reads_degrade_rather_than_erroring() {
         .propose(Command::UpdatePolicy(UpdatePolicy {
             policy,
             updated_at: Timestamp::now(),
+            actor: None,
         }))
         .await
         .expect("propose UpdatePolicy");

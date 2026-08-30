@@ -15,8 +15,9 @@ use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{command_from_pb, command_to_pb, ConvertError};
 use coppice_proto::pb;
+use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::*;
-use coppice_state::{EnrollRole, PolicyConfig, RevokedIdentity};
+use coppice_state::{EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_GROUPS_CLAIM};
 use prost::Message;
 use uuid::Uuid;
 
@@ -47,6 +48,40 @@ fn job(n: u128) -> Job {
         quota_entity: QuotaEntityId(Uuid::from_u128(0xEE)),
         retry: RetryPolicy::default(),
         abort_requested: None,
+        submitted_by: Some("user-42".into()),
+    }
+}
+
+/// A token-derived actor: a plain principal carrying group membership, no
+/// break-glass flags.
+fn grouped_actor() -> Actor {
+    Actor {
+        principal: "user-42".into(),
+        groups: vec!["platform".into(), "ml-team".into()],
+        operator_cert: false,
+        auth_disabled: false,
+    }
+}
+
+/// The operator-certificate break-glass path (ADR 0022): an implicit
+/// unscoped admin outside the bindings list.
+fn operator_cert_actor() -> Actor {
+    Actor {
+        principal: "cert:node-7".into(),
+        groups: vec![],
+        operator_cert: true,
+        auth_disabled: false,
+    }
+}
+
+/// The open posture (`[auth] insecure_open`): a static anonymous actor with
+/// implicit unscoped admin, distinct from an operator certificate.
+fn open_posture_actor() -> Actor {
+    Actor {
+        principal: String::new(),
+        groups: vec![],
+        operator_cert: false,
+        auth_disabled: true,
     }
 }
 
@@ -59,11 +94,13 @@ fn every_command() -> Vec<Command> {
             job: job(1),
             multiplier: PriorityMultiplier::from_integer(3),
             submitted_at: ts(),
+            actor: Some(grouped_actor()),
         }),
         Command::AbortJob(AbortJob {
             job: jid(1),
             reason: Some("wrong dataset".into()),
             requested_at: ts(),
+            actor: Some(operator_cert_actor()),
         }),
         Command::CommitPlacements(CommitPlacements {
             expected_version: 41,
@@ -132,6 +169,7 @@ fn every_command() -> Vec<Command> {
             node,
             schedulable: false,
             updated_at: ts(),
+            actor: Some(open_posture_actor()),
         }),
         Command::EvictTerminalJobs(EvictTerminalJobs {
             jobs: vec![jid(1), jid(2)],
@@ -143,6 +181,7 @@ fn every_command() -> Vec<Command> {
             name: "team".into(),
             quota: CostUnits(1_000_000_000),
             updated_at: ts(),
+            actor: None,
         }),
         Command::UpdatePolicy(UpdatePolicy {
             policy: PolicyConfig {
@@ -153,10 +192,38 @@ fn every_command() -> Vec<Command> {
                 ..PolicyConfig::default()
             },
             updated_at: ts(),
+            actor: Some(grouped_actor()),
+        }),
+        Command::UpdateAuthorization(UpdateAuthorization {
+            bindings: vec![
+                Binding {
+                    subject: Subject::Group("platform".into()),
+                    role: Role::Submitter,
+                    scope: Some(QuotaEntityId(Uuid::from_u128(0xE1))),
+                },
+                Binding {
+                    subject: Subject::Principal("user-42".into()),
+                    role: Role::Operator,
+                    scope: None,
+                },
+                Binding {
+                    subject: Subject::Group("sre".into()),
+                    role: Role::Admin,
+                    scope: Some(QuotaEntityId(Uuid::from_u128(0xEE))),
+                },
+                Binding {
+                    subject: Subject::Principal("root@cluster".into()),
+                    role: Role::Admin,
+                    scope: None,
+                },
+            ],
+            actor: Some(open_posture_actor()),
+            updated_at: ts(),
         }),
         Command::BumpClusterVersion(BumpClusterVersion {
             to: 2,
             bumped_at: ts(),
+            actor: None,
         }),
         // ---- Cluster PKI / identity (ADR 0037) ----
         Command::RecordCaCertificate(RecordCaCertificate {
@@ -322,6 +389,7 @@ fn abort_requests_roundtrip_inside_job_specs() {
         job: spec,
         multiplier: PriorityMultiplier::ONE,
         submitted_at: ts(),
+        actor: None,
     });
     let (_, back) = command_from_pb(command_to_pb(&submit, 1)).unwrap();
     assert_eq!(back, submit);
@@ -336,6 +404,7 @@ fn absent_entrypoints_roundtrip_inside_job_specs() {
         job: spec,
         multiplier: PriorityMultiplier::ONE,
         submitted_at: ts(),
+        actor: None,
     });
     let (_, back) = command_from_pb(command_to_pb(&submit, 1)).unwrap();
     assert_eq!(back, submit);
@@ -592,6 +661,102 @@ fn policy_config_absent_incentive_knobs_are_neutral() {
     let back: PolicyConfig = encoded.try_into().expect("policy must convert");
     assert_eq!(back.unbounded_runtime_multiplier, PriorityMultiplier::ONE);
     assert_eq!(back.refund_fraction_milli, 1000);
+}
+
+#[test]
+fn absent_submitted_by_roundtrips_inside_job_specs() {
+    // `job()` covers the Some side; None must also survive, distinct from an
+    // empty string — a job proposed internally, with no actor, carries no
+    // submitter identity at all.
+    let mut spec = job(1);
+    spec.submitted_by = None;
+    let submit = Command::SubmitJob(SubmitJob {
+        job: spec,
+        multiplier: PriorityMultiplier::ONE,
+        submitted_at: ts(),
+        actor: None,
+    });
+    let (_, back) = command_from_pb(command_to_pb(&submit, 1)).unwrap();
+    assert_eq!(back, submit);
+}
+
+#[test]
+fn policy_config_groups_claim_roundtrips() {
+    // A non-default claim name (ADR 0022's `groups_claim` knob) must survive
+    // unchanged, not just fall back to the default.
+    let policy = PolicyConfig {
+        groups_claim: "cognito:groups".into(),
+        ..PolicyConfig::default()
+    };
+    let encoded: pb::core::v1::PolicyConfig = (&policy).into();
+    assert_eq!(encoded.groups_claim, Some("cognito:groups".to_string()));
+    let back: PolicyConfig = encoded.try_into().expect("policy must convert");
+    assert_eq!(back, policy, "groups_claim roundtrip must be lossless");
+}
+
+#[test]
+fn policy_config_absent_groups_claim_is_the_documented_default() {
+    // A policy written before ADR 0023 omits the field entirely; it must
+    // decode to `DEFAULT_GROUPS_CLAIM` ("groups"), not an empty string.
+    let mut encoded: pb::core::v1::PolicyConfig = (&PolicyConfig::default()).into();
+    encoded.groups_claim = None;
+    let back: PolicyConfig = encoded.try_into().expect("policy must convert");
+    assert_eq!(back.groups_claim, DEFAULT_GROUPS_CLAIM);
+}
+
+#[test]
+fn unspecified_role_is_rejected_at_the_boundary() {
+    // Role is a closed enum: the zero (UNSPECIFIED) value and any unknown
+    // value must fail to decode, never silently default (ADR 0023).
+    for role in [0i32, 99] {
+        let envelope = pb::command::v1::Command {
+            version: 1,
+            body: Some(pb::command::v1::command::Body::UpdateAuthorization(
+                pb::command::v1::UpdateAuthorization {
+                    bindings: vec![pb::core::v1::Binding {
+                        subject: Some(pb::core::v1::binding::Subject::Principal(
+                            pb::core::v1::binding::Principal { sub: "u".into() },
+                        )),
+                        role,
+                        scope: None,
+                    }],
+                    actor: None,
+                    updated_at_us: ts().as_micros(),
+                },
+            )),
+        };
+        assert_eq!(
+            command_from_pb(envelope),
+            Err(ConvertError::UnknownEnum {
+                field: "Binding.role",
+                value: role,
+            })
+        );
+    }
+}
+
+#[test]
+fn unset_binding_subject_oneof_is_rejected_at_the_boundary() {
+    // An unset Binding.subject oneof names nobody — there is no "everyone"
+    // subject, and inventing one would be a silent grant.
+    let envelope = pb::command::v1::Command {
+        version: 1,
+        body: Some(pb::command::v1::command::Body::UpdateAuthorization(
+            pb::command::v1::UpdateAuthorization {
+                bindings: vec![pb::core::v1::Binding {
+                    subject: None,
+                    role: pb::core::v1::Role::Operator as i32,
+                    scope: None,
+                }],
+                actor: None,
+                updated_at_us: ts().as_micros(),
+            },
+        )),
+    };
+    assert_eq!(
+        command_from_pb(envelope),
+        Err(ConvertError::MissingField("Binding.subject"))
+    );
 }
 
 #[test]

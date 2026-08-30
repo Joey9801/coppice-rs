@@ -190,6 +190,7 @@ mod tests {
         coppice_state::Command::BumpClusterVersion(BumpClusterVersion {
             to,
             bumped_at: ts(to as i64 * 100),
+            actor: None,
         })
     }
 

@@ -18,6 +18,7 @@ use coppice_core::quota::{self, ChargeRecord, CostUnits, TrueUp, UsageState};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 
+use crate::authz::{self, Actor, Role, Subject, Verb};
 use crate::command::{
     AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
     ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost, DispatchAttempt,
@@ -25,7 +26,7 @@ use crate::command::{
     RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate,
     RecordEnrolledIdentity, RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode,
     RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob,
-    UpdatePolicy,
+    UpdateAuthorization, UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -58,6 +59,7 @@ impl StateMachine {
             Command::EvictTerminalJobs(c) => self.evict_terminal_jobs(c),
             Command::ConfigureQuotaEntity(c) => self.configure_quota_entity(c),
             Command::UpdatePolicy(c) => self.update_policy(c),
+            Command::UpdateAuthorization(c) => self.update_authorization(c),
             Command::BumpClusterVersion(c) => self.bump_cluster_version(c),
             Command::RecordCaCertificate(c) => self.record_ca_certificate(c),
             Command::BindMachineIdentity(c) => self.bind_machine_identity(c),
@@ -74,6 +76,20 @@ impl StateMachine {
         };
         self.version += 1;
         result
+    }
+
+    /// Re-evaluate an API-originated command's authorization against the
+    /// bindings *at this log position* (ADR 0023) — the deterministic
+    /// backstop behind the API layer's synchronous 403, and what makes a
+    /// revocation racing an in-flight command resolve in log order.
+    ///
+    /// A command with no actor is an internal proposal carrying the system's
+    /// own authority: it applies exactly as it did before authorization
+    /// existed.
+    fn authorize(&self, actor: Option<&Actor>, verb: Verb<'_>) -> Result<(), RejectionReason> {
+        let Some(actor) = actor else { return Ok(()) };
+        authz::evaluate(&self.bindings, &self.quota_entities, actor, verb)
+            .map_err(|denial| RejectionReason::PermissionDenied(denial.to_string()))
     }
 
     // ---- API-proposed ----
@@ -93,6 +109,16 @@ impl StateMachine {
             // success and the original JobId. An id reused with a different
             // payload is a distinct intent and rejects.
             return if same_submission(&existing.spec, &c.job) {
+                // Even the accepted no-op re-checks authority at its own log
+                // position (ADR 0023): a retry racing a revocation rejects
+                // rather than silently succeeding. The original commit — and
+                // its `submitted_by` — stands either way.
+                self.authorize(
+                    c.actor.as_ref(),
+                    Verb::Submit {
+                        entity: &c.job.quota_entity,
+                    },
+                )?;
                 Ok(Applied::default())
             } else {
                 Err(RejectionReason::SubmitSpecMismatch(c.job.id))
@@ -101,11 +127,23 @@ impl StateMachine {
         if !self.quota_entities.contains_key(&c.job.quota_entity) {
             return Err(RejectionReason::UnknownQuotaEntity(c.job.quota_entity));
         }
+        self.authorize(
+            c.actor.as_ref(),
+            Verb::Submit {
+                entity: &c.job.quota_entity,
+            },
+        )?;
         let job = c.job.id;
+        let mut spec = c.job.clone();
+        // Ownership is stamped from the *verified* actor, never from what the
+        // client put in the payload (ADR 0023).
+        if let Some(actor) = c.actor.as_ref() {
+            spec.submitted_by = Some(actor.principal.clone());
+        }
         self.jobs.insert(
             job,
             JobRecord {
-                spec: c.job.clone(),
+                spec,
                 state: JobState::Queued,
                 multiplier: c.multiplier,
                 submitted_at: c.submitted_at,
@@ -134,11 +172,20 @@ impl StateMachine {
     }
 
     fn abort_job(&mut self, c: &AbortJob) -> ApplyResult {
-        let state = match self.jobs.get(&c.job) {
+        let (state, entity, submitted_by) = match self.jobs.get(&c.job) {
             None => return Err(RejectionReason::UnknownJob(c.job)),
             Some(r) if r.state.is_terminal() => return Err(RejectionReason::JobTerminal(c.job)),
-            Some(r) => r.state,
+            Some(r) => (r.state, r.spec.quota_entity, r.spec.submitted_by.clone()),
         };
+        // Ownership comes from state, so it is re-derived here rather than
+        // trusted from the proposer.
+        self.authorize(
+            c.actor.as_ref(),
+            Verb::Abort {
+                entity: &entity,
+                submitted_by: submitted_by.as_deref(),
+            },
+        )?;
         let mut events = Vec::new();
         if let Some(r) = self.jobs.get_mut(&c.job) {
             // A repeated abort is an accepted no-op: the first request wins.
@@ -800,15 +847,20 @@ impl StateMachine {
     }
 
     fn set_node_schedulable(&mut self, c: &SetNodeSchedulable) -> ApplyResult {
-        match self.nodes.get_mut(&c.node) {
-            None => Err(RejectionReason::UnknownNode(c.node)),
-            Some(rec) => {
-                // Drain blocks new placements only: running work continues
-                // and existing accruals keep funding.
-                rec.node.schedulable = c.schedulable;
-                Ok(Applied::default())
-            }
+        // Existence first, then authority — the catalog's validation order,
+        // so an actor-less command's rejections are exactly what they were.
+        if !self.nodes.contains_key(&c.node) {
+            return Err(RejectionReason::UnknownNode(c.node));
         }
+        // Drain is a cluster verb (ADR 0023): an unscoped operator binding.
+        self.authorize(c.actor.as_ref(), Verb::Drain)?;
+        let Some(rec) = self.nodes.get_mut(&c.node) else {
+            return Err(RejectionReason::UnknownNode(c.node));
+        };
+        // Drain blocks new placements only: running work continues and
+        // existing accruals keep funding.
+        rec.node.schedulable = c.schedulable;
+        Ok(Applied::default())
     }
 
     // ---- Housekeeping ----
@@ -875,6 +927,13 @@ impl StateMachine {
                 return Err(RejectionReason::QuotaEntityCycle(c.entity));
             }
         }
+        self.authorize(
+            c.actor.as_ref(),
+            Verb::ConfigureQuotaEntity {
+                entity: &c.entity,
+                new_parent: c.parent.as_ref(),
+            },
+        )?;
         match self.quota_entities.get_mut(&c.entity) {
             // Usage and `created_at` are preserved on update: reconfiguration
             // is not an amnesty, and the creation instant never moves.
@@ -923,11 +982,58 @@ impl StateMachine {
                 quota::FULL_REFUND_MILLI
             )));
         }
+        self.authorize(c.actor.as_ref(), Verb::UpdatePolicy)?;
         // In-flight charge records keep their recorded rate and multiplier;
         // decay re-times from each entity's next touch (ADR 0019).
         self.policy = c.policy.clone();
         Ok(Applied {
             events: vec![Event::PolicyUpdated],
+        })
+    }
+
+    /// Replace the replicated bindings wholesale (ADR 0023).
+    ///
+    /// Read-only validation in the catalog's order — authority, then shape,
+    /// then referential integrity, then the lockout guard — before a single
+    /// byte of state moves.
+    fn update_authorization(&mut self, c: &UpdateAuthorization) -> ApplyResult {
+        self.authorize(c.actor.as_ref(), Verb::UpdateAuthorization)?;
+        // Roles are a closed set by construction: the domain `Role` enum has
+        // no other inhabitants, and an unknown wire value fails conversion
+        // (a deterministic `InvalidCommand`) long before apply. So the only
+        // shape check left is the non-empty subject.
+        for (i, binding) in c.bindings.iter().enumerate() {
+            if binding.subject.name().is_empty() {
+                let kind = match binding.subject {
+                    Subject::Group(_) => "group",
+                    Subject::Principal(_) => "principal",
+                };
+                return Err(RejectionReason::InvalidAuthorization(format!(
+                    "binding {i} names an empty {kind} subject"
+                )));
+            }
+        }
+        for binding in &c.bindings {
+            if let Some(scope) = binding.scope {
+                if !self.quota_entities.contains_key(&scope) {
+                    return Err(RejectionReason::UnknownQuotaEntity(scope));
+                }
+            }
+        }
+        // Operator certificates make lockout recoverable rather than fatal,
+        // but they are outside this list by design and so do NOT count here:
+        // an empty admin list is almost always an accident, and this is the
+        // one-line check that keeps the accident loud.
+        let retains_admin = c
+            .bindings
+            .iter()
+            .any(|b| b.role == Role::Admin && b.scope.is_none());
+        if !retains_admin {
+            return Err(RejectionReason::AuthorizationLockout);
+        }
+        self.bindings = c.bindings.clone();
+        Ok(Applied {
+            events: vec![Event::AuthorizationUpdated],
         })
     }
 
@@ -938,6 +1044,7 @@ impl StateMachine {
                 requested: c.to,
             });
         }
+        self.authorize(c.actor.as_ref(), Verb::BumpClusterVersion)?;
         self.cluster_version = c.to;
         Ok(Applied {
             events: vec![Event::ClusterVersionBumped { to: c.to }],

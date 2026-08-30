@@ -87,6 +87,8 @@ function renderEvent(event: TimelineEvent): RenderedEvent {
       }
     case 'PolicyUpdated':
       return { icon: Settings2, body: <>Cluster policy updated</> }
+    case 'AuthorizationUpdated':
+      return { icon: Settings2, body: <>Cluster authorization updated</> }
     case 'ClusterVersionBumped':
       return { icon: Tag, body: <>Cluster version bumped to {event.to}</> }
     default: {

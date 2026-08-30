@@ -58,6 +58,13 @@ pub struct Job {
     /// stopped it — a natural exit that wins the race keeps its real outcome,
     /// with this flag still visible in history.
     pub abort_requested: Option<AbortRequest>,
+    /// The principal that submitted this job, stamped by apply from the
+    /// command's actor (ADR 0023). `None` for a job submitted with no actor
+    /// — an internal proposer, or a deployment running the open posture.
+    ///
+    /// Ownership reads this: a principal may always abort and retry a job it
+    /// submitted, with no role binding at all.
+    pub submitted_by: Option<String>,
 }
 
 /// Per-job retry policy.

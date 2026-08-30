@@ -24,7 +24,7 @@ use coppice_state::{
     MachineBinding, NodeRecord, QuotaEntity, RevokedIdentity, StagedRoot, StateMachine,
 };
 
-use super::command::{enroll_role_from_pb, enroll_role_to_pb};
+use super::command::{bindings_from_pb, enroll_role_from_pb, enroll_role_to_pb};
 use super::{req, timestamp, ConvertError};
 use crate::pb::core::v1 as pbcore;
 use crate::pb::storage::v1 as pb;
@@ -632,6 +632,7 @@ pub fn cluster_record(state: &StateMachine) -> pb::ClusterStateRecord {
         next_allocation_seq: state.next_allocation_seq,
         ca: state.ca.as_ref().map(Into::into),
         staged_root: state.staged_root.as_ref().map(Into::into),
+        bindings: state.bindings.iter().map(Into::into).collect(),
     }
 }
 
@@ -775,6 +776,7 @@ pub fn state_from_records(records: StateRecords) -> Result<StateMachine, Convert
     state.next_allocation_seq = cluster.next_allocation_seq;
     state.ca = cluster.ca.map(TryInto::try_into).transpose()?;
     state.staged_root = cluster.staged_root.map(TryInto::try_into).transpose()?;
+    state.bindings = bindings_from_pb(cluster.bindings)?;
 
     Ok(state)
 }

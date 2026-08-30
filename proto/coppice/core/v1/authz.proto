@@ -1,0 +1,77 @@
+// Authorization vocabulary shared by the command log and the snapshot
+// (ADR 0023). Three built-in roles, deny by default, bindings optionally
+// scoped to a quota-entity subtree — the quota tree is the one hierarchy,
+// serving authority as well as accounting.
+//
+// The `Actor` here is who *asked*, transcribed by the API layer from a
+// verified credential at proposal time (ADR 0022). It is a claim about the
+// request, never about replicated state: group membership is a token claim,
+// so it must ride the command for apply to stay a pure function of
+// (state, command).
+
+syntax = "proto3";
+
+package coppice.core.v1;
+
+import "coppice/core/v1/ids.proto";
+
+// Who proposed an API-originated command (ADR 0023). Present only on the
+// seven actor-carrying commands; internal proposers (scheduler, ingestion,
+// node lifecycle, housekeeping) carry no actor and act with the system's own
+// authority.
+message Actor {
+  // The OIDC `sub`, an opaque string — or `cert:<CN>` for an operator
+  // certificate. No principal lifecycle, no user table (ADR 0022).
+  string principal = 1;
+  // The token's groups claim (name per PolicyConfig.groups_claim). Matched
+  // by exact string against Binding.Group.
+  repeated string groups = 2;
+  // The request authenticated with an operator certificate: an implicit
+  // unscoped admin that is neither representable in nor removable through
+  // the bindings list (ADR 0022 break-glass).
+  bool operator_cert = 3;
+  // The node serving the request runs in the formally-supported open
+  // posture (`[auth] insecure_open`), where every request resolves to a
+  // static anonymous actor with implicit unscoped admin. Represented IN the
+  // actor, never consulted from node config at apply time — apply must be a
+  // pure function of (state, command) and node config is neither.
+  bool auth_disabled = 4;
+}
+
+// The three built-in roles (ADR 0023). Closed set: verbs compose upward
+// (submitter < operator < admin) and there are no custom roles, which is
+// what keeps apply-side evaluation a total function. Treated as closed at
+// the boundary — an unspecified or unknown value in a committed payload is
+// a decode failure, not a silent default.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_SUBMITTER = 1;
+  ROLE_OPERATOR = 2;
+  ROLE_ADMIN = 3;
+}
+
+// One role binding: a subject holds a role, cluster-wide or over one
+// quota-entity subtree. Effective authority is the union over every binding
+// the actor's principal or groups match; there are no negative grants.
+message Binding {
+  // Everyone in an identity-provider group of this name.
+  message Group {
+    string name = 1;
+  }
+  // One principal, matched exactly against the token's `sub`.
+  message Principal {
+    string sub = 1;
+  }
+
+  // A rich enum, so a oneof of per-variant messages per schema-style.md.
+  oneof subject {
+    Group group = 1;
+    Principal principal = 2;
+  }
+  Role role = 3;
+  // The subtree this binding grants over: the entity itself and every
+  // descendant. Absent (a message field, so absence is representable) means
+  // unscoped — cluster-wide, and the only kind of binding that carries the
+  // cluster verbs (drain, policy, authorization, cluster version).
+  QuotaEntityId scope = 4;
+}

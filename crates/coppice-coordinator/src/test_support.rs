@@ -120,6 +120,7 @@ pub fn job_record(
             quota_entity: QuotaEntityId::new(),
             retry: RetryPolicy::default(),
             abort_requested: None,
+            submitted_by: None,
         },
         state: JobState::Queued,
         multiplier: PriorityMultiplier(0),

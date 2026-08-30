@@ -412,6 +412,7 @@ type WireTimelineEventBody =
   | { kind: 'job_evicted'; job: JobId }
   | { kind: 'quota_entity_configured'; entity: QuotaEntityId }
   | { kind: 'policy_updated' }
+  | { kind: 'authorization_updated' }
   | { kind: 'cluster_version_bumped'; to: number }
 
 interface WireTimelineEvent {
@@ -463,6 +464,8 @@ function mapTimelineEventBody(e: WireTimelineEvent): TimelineEventBody {
       return { kind: 'QuotaEntityConfigured', entity: e.entity as QuotaEntityId }
     case 'policy_updated':
       return { kind: 'PolicyUpdated' }
+    case 'authorization_updated':
+      return { kind: 'AuthorizationUpdated' }
     case 'cluster_version_bumped':
       return { kind: 'ClusterVersionBumped', to: e.to as number }
   }

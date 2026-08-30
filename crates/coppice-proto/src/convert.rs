@@ -31,7 +31,10 @@ mod command;
 mod core;
 mod snapshot;
 
-pub use command::{command_from_pb, command_to_pb, enroll_role_from_pb, enroll_role_to_pb};
+pub use command::{
+    bindings_from_pb, command_from_pb, command_to_pb, enroll_role_from_pb, enroll_role_to_pb,
+    role_from_pb, role_to_pb,
+};
 pub use snapshot::{
     allocation_records, attempt_records, cluster_record, enroll_token_records,
     enrolled_identity_records, job_records, key_confirmation_records, key_transfer_intent_records,

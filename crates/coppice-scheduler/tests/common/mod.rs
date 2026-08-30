@@ -117,6 +117,7 @@ pub fn update_policy_cmd(policy: PolicyConfig) -> Command {
     Command::UpdatePolicy(UpdatePolicy {
         policy,
         updated_at: base_ts(),
+        actor: None,
     })
 }
 
@@ -127,6 +128,7 @@ pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>
         name: "entity".into(),
         quota: CostUnits(1_000_000_000_000),
         updated_at: base_ts(),
+        actor: None,
     })
 }
 
@@ -159,9 +161,11 @@ pub fn submit_cmd(
             quota_entity: ROOT,
             retry: RetryPolicy::default(),
             abort_requested: None,
+            submitted_by: None,
         },
         multiplier,
         submitted_at: at,
+        actor: None,
     })
 }
 
@@ -212,6 +216,7 @@ pub fn abort_cmd(job: JobId, at: Timestamp) -> Command {
         job,
         reason: Some("test".into()),
         requested_at: at,
+        actor: None,
     })
 }
 
@@ -220,6 +225,7 @@ pub fn drain_cmd(node: NodeId, at: Timestamp) -> Command {
         node,
         schedulable: false,
         updated_at: at,
+        actor: None,
     })
 }
 

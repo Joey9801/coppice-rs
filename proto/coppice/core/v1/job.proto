@@ -44,6 +44,11 @@ message Job {
   repeated string command = 9;
   // Entrypoint override; absent runs the image's own entrypoint.
   Entrypoint entrypoint = 10;
+  // The principal that submitted this job, stamped by apply from the
+  // command's actor (ADR 0023). Absent for a job submitted by an internal
+  // proposer or through an unauthenticated path. A principal may always
+  // abort and retry a job it submitted — the ownership grant reads this.
+  optional string submitted_by = 11;
 }
 
 // An entrypoint override for a job's container. A message rather than a

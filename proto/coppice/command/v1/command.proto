@@ -14,6 +14,7 @@ syntax = "proto3";
 package coppice.command.v1;
 
 import "coppice/core/v1/attempt.proto";
+import "coppice/core/v1/authz.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
 import "coppice/core/v1/node.proto";
@@ -65,6 +66,7 @@ message Command {
     ConfigureQuotaEntity configure_quota_entity = 70;
     UpdatePolicy update_policy = 71;
     BumpClusterVersion bump_cluster_version = 72;
+    UpdateAuthorization update_authorization = 73;
 
     RecordCaCertificate record_ca_certificate = 90;
     BindMachineIdentity bind_machine_identity = 91;
@@ -93,6 +95,9 @@ message SubmitJob {
   // time; apply never sees the raw priority in arithmetic (ADR 0019).
   uint64 multiplier_q32_32 = 2;
   int64 submitted_at_us = 3;
+  // Who submitted (ADR 0023). Absent on an internal proposal; present on
+  // every API-originated one, and apply stamps `job.submitted_by` from it.
+  coppice.core.v1.Actor actor = 4;
 }
 
 // Request an abort: sets the job's abort record, terminates immediately
@@ -102,6 +107,8 @@ message AbortJob {
   coppice.core.v1.JobId job = 1;
   optional string reason = 2;
   int64 requested_at_us = 3;
+  // Who asked (ADR 0023). Absent on an internal proposal.
+  coppice.core.v1.Actor actor = 4;
 }
 
 // One scheduler pass's atomic batch of placements and revocations.
@@ -223,6 +230,9 @@ message SetNodeSchedulable {
   coppice.core.v1.NodeId node = 1;
   bool schedulable = 2;
   int64 updated_at_us = 3;
+  // Who asked (ADR 0023). Drain is a cluster verb: an unscoped operator or
+  // admin binding, never a scoped one.
+  coppice.core.v1.Actor actor = 4;
 }
 
 // Remove terminal jobs from replicated state (ADR 0012). Proposed only
@@ -243,6 +253,9 @@ message ConfigureQuotaEntity {
   // (ADR 0019).
   uint64 quota_ucu = 4;
   int64 updated_at_us = 5;
+  // Who asked (ADR 0023). A scoped admin may configure entities whose
+  // position — including any new parent — stays inside their subtree.
+  coppice.core.v1.Actor actor = 6;
 }
 
 // Full replacement of the replicated policy. In-flight charge records keep
@@ -250,6 +263,21 @@ message ConfigureQuotaEntity {
 message UpdatePolicy {
   coppice.core.v1.PolicyConfig policy = 1;
   int64 updated_at_us = 2;
+  // Who asked (ADR 0023). Policy is a cluster verb: unscoped admin only.
+  coppice.core.v1.Actor actor = 3;
+}
+
+// Full replacement of the replicated role-binding list (ADR 0023), mirroring
+// UpdatePolicy: the CLI reads, edits, and writes the whole list, and
+// concurrent edits resolve last-writer-wins in log order. Takes effect for
+// every command ordered after this one, so a revocation resolves in log
+// order on every replica identically.
+message UpdateAuthorization {
+  repeated coppice.core.v1.Binding bindings = 1;
+  // Who asked (ADR 0023). Unscoped admin only — a scoped admin cannot touch
+  // bindings (delegated binding management is deferred).
+  coppice.core.v1.Actor actor = 2;
+  int64 updated_at_us = 3;
 }
 
 // Bump the semantic feature gate (ADR 0003). The leader refuses to propose
@@ -258,6 +286,8 @@ message UpdatePolicy {
 message BumpClusterVersion {
   uint32 to = 1;
   int64 bumped_at_us = 2;
+  // Who asked (ADR 0023). A cluster verb: unscoped admin only.
+  coppice.core.v1.Actor actor = 3;
 }
 
 // ---- Cluster PKI / identity (ADR 0037) ----

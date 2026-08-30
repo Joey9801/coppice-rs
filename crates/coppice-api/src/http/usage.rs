@@ -778,6 +778,7 @@ mod tests {
                 quota_entity: coppice_core::id::QuotaEntityId::new(),
                 retry: Default::default(),
                 abort_requested: None,
+                submitted_by: None,
             },
             state: JobState::Queued,
             multiplier: PriorityMultiplier::ONE,

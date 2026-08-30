@@ -19,6 +19,14 @@ pub mod command {
 
 pub mod raft {
     pub mod v1 {
+        // `Entry.payload` is a oneof whose `Normal` arm carries a whole
+        // `Command`, so it dwarfs the membership and blank arms. That size
+        // gap is inherent to the wire format — a log entry *is* mostly its
+        // command — and boxing it would only move the allocation, so the
+        // shape is deliberate and the lint is not actionable here. The
+        // layout of generated code is the schema's to decide, not ours.
+        #![allow(clippy::large_enum_variant)]
+
         include!(concat!(env!("OUT_DIR"), "/coppice.raft.v1.rs"));
     }
 }
