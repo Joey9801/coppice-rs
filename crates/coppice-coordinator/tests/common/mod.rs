@@ -373,6 +373,10 @@ insecure = true
 # Explicitly lossy (ADR 0012): the integration daemons run no history store.
 mode = "none"
 
+[auth]
+# Explicitly insecure: every request is an anonymous admin (issue #45).
+insecure_open = true
+
 [observability]
 log_level = "warn"
 "#,
@@ -708,6 +712,10 @@ insecure = true
 # Explicitly lossy (ADR 0012): the integration daemons run no history store.
 mode = "none"
 
+[auth]
+# Explicitly insecure: every request is an anonymous admin (issue #45).
+insecure_open = true
+
 [observability]
 log_level = "warn"
 "#,
@@ -1001,6 +1009,10 @@ insecure = true
 [history]
 # Explicitly lossy (ADR 0012): the integration daemons run no history store.
 mode = "none"
+
+[auth]
+# Explicitly insecure: every request is an anonymous admin (issue #45).
+insecure_open = true
 
 [observability]
 log_level = "warn"

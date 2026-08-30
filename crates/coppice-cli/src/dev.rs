@@ -683,6 +683,12 @@ insecure = true
 # Dev clusters are explicitly lossy (ADR 0012): terminal jobs age out of
 # replicated state on the retention TTL, with no durable copy anywhere.
 mode = "none"
+
+[auth]
+# Dev clusters are completely open (issue #45): with no `[sso]` configured,
+# every request is served as an anonymous actor with full admin authority.
+# This is a development/test-only posture — never set it in production.
+insecure_open = true
 "#,
         cluster_id = layout.cluster_id,
         data_dir = layout.data_dir.display(),
