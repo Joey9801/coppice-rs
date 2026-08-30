@@ -27,6 +27,7 @@ use super::dto::{
 };
 use crate::{Consistency, ControlPlane};
 
+use super::authn::RequestActor;
 use super::enroll::EnrollEndpoint;
 use super::error::HttpError;
 use super::extract::{IdPath, ReadIndexes, ReadQuery};
@@ -44,11 +45,18 @@ use super::readyz::ReadyzEndpoint;
 /// outer [`fallback`](super::ui::fallback) with the full original path intact,
 /// so `/api/*` misses still answer the JSON 404 and everything else reaches the
 /// UI, exactly as before the nesting refactor.
+///
+/// `authn` is the deployment's authentication posture (ADR 0022), built by the
+/// coordinator: [`api_v1_routes`] layers it over the protected half of the
+/// `/api/v1` tree. `/metrics` and `/readyz` are outside `/api/v1` and
+/// therefore outside authentication — a scrape and a readiness probe are
+/// operational surfaces, and the listener's own posture is what guards them.
 pub fn router<P: ControlPlane>(
     plane: Arc<P>,
     metrics: MetricsEndpoint,
     readyz: ReadyzEndpoint,
     enroll: EnrollEndpoint,
+    authn: Arc<coppice_authn::AuthnChain>,
 ) -> Router {
     // The scrape and readiness handlers capture their own state, so they need
     // no router state and compose with the `Arc<P>` state the rest of the tree
@@ -57,7 +65,7 @@ pub fn router<P: ControlPlane>(
     // reason: certificate issuance is not a `ControlPlane` operation
     // (ADR 0037 §4).
     operational_routes(metrics, readyz)
-        .nest("/api/v1", api_v1_routes::<P>(enroll))
+        .nest("/api/v1", api_v1_routes::<P>(enroll, authn))
         // Everything unrouted: `/api/*` misses stay JSON 404s; anything
         // else serves the embedded web UI (static assets + SPA fallback,
         // ADR 0031 "Serving the UI").
@@ -118,7 +126,42 @@ fn operational_routes<S: Clone + Send + Sync + 'static>(
 /// restores it with `.nest("/api/v1", …)`. Consistency defaults per route are
 /// the ADR 0031 table; they become code (`ReadParams::class(default)`) as each
 /// read handler is implemented.
-fn api_v1_routes<P: ControlPlane>(enroll: EnrollEndpoint) -> Router<Arc<P>> {
+///
+/// The tree is split in two by authentication (ADR 0022). [`public_routes`] is
+/// the closed set of routes a caller reaches *without* a credential;
+/// [`protected_routes`] is everything else, and carries the
+/// [`authn::authenticate`](super::authn::authenticate) layer. The split is
+/// structural rather than a per-handler check precisely so that adding a route
+/// cannot accidentally leave it unauthenticated: a new `.route(…)` lands in
+/// whichever sub-router it is written in, and the protected one is the one
+/// every route below `/session` is written in.
+fn api_v1_routes<P: ControlPlane>(
+    enroll: EnrollEndpoint,
+    authn: Arc<coppice_authn::AuthnChain>,
+) -> Router<Arc<P>> {
+    protected_routes::<P>()
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&authn),
+            super::authn::authenticate,
+        ))
+        .merge(public_routes::<P>(enroll, authn))
+}
+
+/// The `/api/v1` routes served **without** authentication.
+///
+/// Exactly two, each for a reason that is about the credential itself:
+///
+/// - `POST /enroll` is a machine's certless first contact, authenticated by
+///   its own role-scoped enrollment token (ADR 0037 §4). An enrollee has no
+///   user identity to present and the endpoint's refusal contract — one
+///   constant body, no validity oracle — is not the API's 401.
+/// - `GET /auth/config` is how a client discovers *how to authenticate*.
+///   Requiring a credential to learn which credential to obtain would be a
+///   loop with no entry point.
+fn public_routes<P: ControlPlane>(
+    enroll: EnrollEndpoint,
+    authn: Arc<coppice_authn::AuthnChain>,
+) -> Router<Arc<P>> {
     Router::new()
         // Enrollment (ADR 0037 §4): certless first contact, authenticated
         // solely by a role-scoped bearer token, and served only here — the
@@ -137,8 +180,24 @@ fn api_v1_routes<P: ControlPlane>(enroll: EnrollEndpoint) -> Router<Arc<P>> {
                 super::enroll::MAX_ENROLL_BODY,
             )),
         )
+        // The auth posture (ADR 0022), captured like `/enroll` captures its
+        // endpoint: the chain is not a `ControlPlane` operation either.
+        .route(
+            "/auth/config",
+            get(move || {
+                let authn = Arc::clone(&authn);
+                async move { Json(auth_config(authn.mode())) }
+            }),
+        )
+}
+
+/// The authenticated `/api/v1` routes: everything that reads or writes this
+/// cluster's state. [`api_v1_routes`] layers authentication over the whole
+/// sub-router, so a route added here is authenticated by construction.
+fn protected_routes<P: ControlPlane>() -> Router<Arc<P>> {
+    Router::new()
         // Session / auth (ADR 0022) — local read, no raft involvement.
-        .route("/session", get(unimplemented_read("GetSession")))
+        .route("/session", get(get_session))
         // Cluster overview — bounded reads.
         .route("/overview", get(get_overview::<P>))
         .route("/queue/stats", get(get_queue_stats::<P>))
@@ -183,6 +242,55 @@ fn api_v1_routes<P: ControlPlane>(enroll: EnrollEndpoint) -> Router<Arc<P>> {
         .route("/quota-entities/:entity", get(get_quota_entity::<P>))
         // Reserved: ADR 0008 event subscription (SSE, cursor-resumed).
         .route("/events", get(unimplemented_read("SubscribeEvents")))
+}
+
+/// `GET /api/v1/auth/config` — project the resolved posture (ADR 0022) into
+/// its public DTO. Pure: everything it serves came from node config at
+/// startup, so there is no state to read and no failure mode.
+fn auth_config(mode: &coppice_authn::AuthMode) -> dto::GetAuthConfigResponse {
+    match mode {
+        coppice_authn::AuthMode::Oidc(config) => dto::GetAuthConfigResponse {
+            mode: mode.as_str().to_string(),
+            issuer: Some(config.issuer.clone()),
+            client_id: Some(config.client_id.clone()),
+            // The effective audience, already resolved by whoever built the
+            // chain — a client is told what its token must actually carry,
+            // never asked to re-apply the "defaults to client_id" rule.
+            audience: Some(config.audience.clone()),
+        },
+        coppice_authn::AuthMode::Open => dto::GetAuthConfigResponse {
+            mode: mode.as_str().to_string(),
+            issuer: None,
+            client_id: None,
+            audience: None,
+        },
+    }
+}
+
+/// `GET /api/v1/session` — echo the identity the authentication layer resolved
+/// for this very request (ADR 0022). A local read of the request itself: no
+/// raft involvement, no state machine, no clock.
+///
+/// [`ReadQuery`] is extracted and discarded, like every other read route: the
+/// ADR 0007 parameter contract (`?consistency=bogus` is `INVALID_ARGUMENT`)
+/// holds across the whole read surface, including the reads that have nothing
+/// to be consistent about.
+///
+/// **Seam for the role summary (ADR 0023).** This response is the actor and
+/// nothing more; what the actor may *do* — the roles resolved against the
+/// replicated bindings, scoped and unscoped — is the field it gains next, and
+/// the reason `read_state` will appear in this handler when it does.
+async fn get_session(
+    RequestActor(actor): RequestActor,
+    ReadQuery(_): ReadQuery,
+) -> impl IntoResponse {
+    Json(dto::GetSessionResponse {
+        principal: actor.principal.clone(),
+        groups: actor.groups.clone(),
+        // Derived from the actor's flags rather than remembered separately, so
+        // the reported method can never disagree with the grants it implies.
+        auth_method: actor.method().as_str().to_string(),
+    })
 }
 
 /// Stub for an unimplemented read route. Extracting [`ReadQuery`] makes the
@@ -628,6 +736,7 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
+    use coppice_authn::{no_ca, AuthnChain};
     use tower::ServiceExt;
 
     use super::super::dto::SubmitJobResponse;
@@ -643,12 +752,27 @@ mod tests {
     /// global recorder is touched and parallel tests in one process never
     /// conflict. This shadows the crate [`super::router`] for the whole tests
     /// module so every existing call site stays a single `router(plane)`.
+    ///
+    /// The authn posture defaults to **open**: a route test is about the route,
+    /// and open mode resolves every request to the anonymous actor and carries
+    /// on, so the assertions here mean what they meant before authentication
+    /// existed. The authentication tests build their own chain with
+    /// [`router_with_authn`].
     fn router<P: ControlPlane>(plane: Arc<P>) -> Router {
+        router_with_authn(plane, Arc::new(coppice_authn::AuthnChain::open(no_ca())))
+    }
+
+    /// [`router`] with an explicit authentication posture.
+    fn router_with_authn<P: ControlPlane>(
+        plane: Arc<P>,
+        authn: Arc<coppice_authn::AuthnChain>,
+    ) -> Router {
         super::router(
             plane,
             crate::http::MetricsEndpoint::detached_for_tests(),
             crate::http::ReadyzEndpoint::detached_for_tests(),
             crate::http::EnrollEndpoint::detached_for_tests(),
+            authn,
         )
     }
 
@@ -819,14 +943,20 @@ mod tests {
 
     #[tokio::test]
     async fn stub_routes_answer_501_with_the_endpoint_name() {
+        // `/events` rather than `/session`: the latter is a real handler now
+        // (ADR 0022), and the reserved subscription route is the remaining
+        // parameterless stub.
         let response = app(None)
-            .oneshot(Request::get("/api/v1/session").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
         assert_eq!(body["code"], "UNIMPLEMENTED");
-        assert!(body["message"].as_str().unwrap().contains("GetSession"));
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("SubscribeEvents"));
     }
 
     #[tokio::test]
@@ -2195,6 +2325,9 @@ mod tests {
             crate::http::MetricsEndpoint::detached_for_tests(),
             crate::http::ReadyzEndpoint::detached_for_tests(),
             crate::http::EnrollEndpoint::new(issue),
+            // `/enroll` is on the public sub-router, so the posture is
+            // irrelevant to every assertion below; open is the quiet choice.
+            Arc::new(AuthnChain::open(no_ca())),
         )
     }
 
@@ -2493,5 +2626,306 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- Authentication (ADR 0022) ---------------------------------------
+
+    /// A router in the OIDC posture against a running fake IdP, with the JWKS
+    /// already fetched.
+    ///
+    /// The fetch is explicit rather than left to the unknown-`kid` on-demand
+    /// path so a failure here reads as "the fixture is not serving keys" and
+    /// not as "the middleware rejected the token" — the on-demand refetch has
+    /// its own tests, in the crate that owns it.
+    async fn oidc_chain(idp: &coppice_testkit::oidc::FakeIdp) -> Arc<AuthnChain> {
+        oidc_chain_with_ca(idp, no_ca()).await
+    }
+
+    /// [`oidc_chain`] with an explicit cluster CA, for the operator-certificate
+    /// tests.
+    async fn oidc_chain_with_ca(
+        idp: &coppice_testkit::oidc::FakeIdp,
+        ca: coppice_authn::CaProvider,
+    ) -> Arc<AuthnChain> {
+        let config = coppice_authn::OidcConfig {
+            issuer: idp.issuer(),
+            client_id: TEST_CLIENT_ID.to_string(),
+            audience: TEST_CLIENT_ID.to_string(),
+        };
+        let cache = coppice_authn::JwksCache::new(
+            coppice_authn::default_http_client(),
+            config.issuer.clone(),
+        );
+        cache
+            .refresh_now()
+            .await
+            .expect("the fake IdP serves discovery and a JWKS");
+        let validator = coppice_authn::Validator::new(cache, config.clone());
+        Arc::new(AuthnChain::oidc(
+            validator,
+            coppice_authn::static_groups_claim(coppice_authn::DEFAULT_GROUPS_CLAIM),
+            ca,
+            config,
+        ))
+    }
+
+    /// The client id (and, by the "defaults to client_id" rule, the audience)
+    /// every OIDC-posture test mints tokens for.
+    const TEST_CLIENT_ID: &str = "coppice-test";
+
+    fn bearer_request(uri: &str, token: &str) -> Request<Body> {
+        Request::get(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A freshly-minted cluster CA and an operator leaf under it, as the DER
+    /// the TLS layer would hand the router.
+    fn operator_credential(cn: &str) -> (Vec<u8>, Vec<u8>) {
+        let ca = coppice_tls::pki::mint_root_ca().expect("mint a root CA");
+        let signer =
+            coppice_tls::pki::CaSigner::load(&ca.cert_pem, &ca.key_pem).expect("load the signer");
+        let (leaf_pem, _key_pem) =
+            coppice_tls::pki::mint_operator_local(&signer, cn).expect("mint an operator leaf");
+        let leaf_der = rustls_pemfile::certs(&mut leaf_pem.as_slice())
+            .next()
+            .expect("the leaf PEM holds a certificate")
+            .expect("the leaf PEM parses")
+            .to_vec();
+        (ca.cert_pem, leaf_der)
+    }
+
+    /// `request`, as it would arrive over a connection that presented `leaf`.
+    ///
+    /// The extension is what `clientedge::serve` inserts after a successful
+    /// handshake — end-entity first, exactly as rustls hands over the chain —
+    /// so driving the router through `oneshot` exercises the same code the
+    /// listener does.
+    fn with_peer_cert(mut request: Request<Body>, leaf_der: Vec<u8>) -> Request<Body> {
+        request
+            .extensions_mut()
+            .insert(crate::http::PeerCertificates(Arc::new(vec![leaf_der])));
+        request
+    }
+
+    #[tokio::test]
+    async fn oidc_mode_refuses_a_request_with_no_credentials() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let response = router_with_authn(stub_plane(Default::default()), oidc_chain(&idp).await)
+            .oneshot(Request::get("/api/v1/session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "UNAUTHENTICATED");
+        // The documented body is exactly the two fields, and the message says
+        // what was missing without inventing a credential that was not sent.
+        assert_eq!(body.as_object().unwrap().len(), 2);
+        assert_eq!(body["message"], "no credentials were presented");
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oidc_mode_admits_a_valid_bearer_and_session_echoes_the_actor() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let token = idp.sign(
+            coppice_testkit::oidc::TokenClaims::new("user-42")
+                .audience(TEST_CLIENT_ID)
+                .claim("groups", serde_json::json!(["batch-users", "sre"])),
+        );
+        let response = router_with_authn(stub_plane(Default::default()), oidc_chain(&idp).await)
+            .oneshot(bearer_request("/api/v1/session", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["principal"], "user-42");
+        assert_eq!(body["groups"], serde_json::json!(["batch-users", "sre"]));
+        assert_eq!(body["auth_method"], "bearer");
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oidc_mode_refuses_a_garbage_bearer() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let response = router_with_authn(stub_plane(Default::default()), oidc_chain(&idp).await)
+            .oneshot(bearer_request("/api/v1/session", "not-a-jwt"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "UNAUTHENTICATED");
+        // The refusal names the mechanism, never the credential.
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("bearer token"), "{message}");
+        assert!(!message.contains("not-a-jwt"), "{message}");
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_operator_certificate_authenticates_as_its_common_name() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let (ca_pem, leaf_der) = operator_credential("alice");
+        let chain = oidc_chain_with_ca(&idp, Arc::new(move || Some(ca_pem.clone()))).await;
+        let response = router_with_authn(stub_plane(Default::default()), chain)
+            .oneshot(with_peer_cert(
+                Request::get("/api/v1/session").body(Body::empty()).unwrap(),
+                leaf_der,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["principal"], "cert:alice");
+        assert_eq!(body["groups"], serde_json::json!([]));
+        assert_eq!(body["auth_method"], "operator_cert");
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_operator_certificate_wins_over_a_bearer_on_the_same_request() {
+        // Break-glass that a stale token in the client's environment could
+        // shadow would not be much of a break-glass (ADR 0022): the
+        // certificate decides, and the token is never even validated.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let (ca_pem, leaf_der) = operator_credential("breakglass");
+        let token =
+            idp.sign(coppice_testkit::oidc::TokenClaims::new("user-42").audience(TEST_CLIENT_ID));
+        let chain = oidc_chain_with_ca(&idp, Arc::new(move || Some(ca_pem.clone()))).await;
+        let response = router_with_authn(stub_plane(Default::default()), chain)
+            .oneshot(with_peer_cert(
+                bearer_request("/api/v1/session", &token),
+                leaf_der,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["principal"], "cert:breakglass");
+        assert_eq!(body["auth_method"], "operator_cert");
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_mode_resolves_every_request_to_the_anonymous_actor() {
+        let response = app(None)
+            .oneshot(Request::get("/api/v1/session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["principal"], "anonymous");
+        assert_eq!(body["groups"], serde_json::json!([]));
+        assert_eq!(body["auth_method"], "open");
+    }
+
+    #[tokio::test]
+    async fn session_still_validates_the_consistency_parameter() {
+        // The ADR 0007 read-parameter contract holds on every read route,
+        // including the one that reads nothing but the request itself.
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/session?consistency=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn auth_config_is_public_and_describes_the_open_posture() {
+        let response = app(None)
+            .oneshot(
+                Request::get("/api/v1/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Exactly one field: an open deployment has no OIDC configuration to
+        // describe, and three nulls would invite a login form.
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"mode": "open"})
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_config_is_public_and_describes_the_oidc_posture() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let issuer = idp.issuer();
+        // No credentials: this is what a client reads to learn how to obtain
+        // one, so requiring one would be a loop with no entry point.
+        let response = router_with_authn(stub_plane(Default::default()), oidc_chain(&idp).await)
+            .oneshot(
+                Request::get("/api/v1/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({
+                "mode": "oidc",
+                "issuer": issuer,
+                "client_id": TEST_CLIENT_ID,
+                // The *effective* audience, already resolved: a client is
+                // never asked to re-apply the "defaults to client_id" rule.
+                "audience": TEST_CLIENT_ID,
+            })
+        );
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn enrollment_is_not_touched_by_the_authn_layer() {
+        // `/enroll` is on the public sub-router: a certless enrollee has no
+        // user credential to present, and its own uniform refusal (ADR 0037
+        // §4) must be what a caller sees — not the API's 401. The detached
+        // endpoint refuses every token, so reaching that refusal, byte for
+        // byte, is the proof the layer did not intercept.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let response = router_with_authn(stub_plane(Default::default()), oidc_chain(&idp).await)
+            .oneshot(enroll_request(None, CSR_BODY))
+            .await
+            .unwrap();
+        let (status, body) = refusal_parts(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, crate::http::REFUSED_BODY.as_bytes());
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_layer_covers_the_whole_protected_tree_not_just_session() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+
+        let response = router_with_authn(stub_plane(Default::default()), Arc::clone(&chain))
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(response).await["code"], "UNAUTHENTICATED");
+
+        let token =
+            idp.sign(coppice_testkit::oidc::TokenClaims::new("user-42").audience(TEST_CLIENT_ID));
+        let response = router_with_authn(stub_plane(Default::default()), chain)
+            .oneshot(bearer_request("/api/v1/overview", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["cluster_id"], STUB_CLUSTER);
+        idp.shutdown().await;
     }
 }

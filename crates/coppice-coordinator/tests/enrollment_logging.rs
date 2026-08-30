@@ -212,6 +212,12 @@ async fn no_enrollment_path_ever_logs_the_token_secret() {
         coppice_api::http::MetricsEndpoint::detached_for_tests(),
         coppice_api::http::ReadyzEndpoint::detached_for_tests(),
         endpoint,
+        // `/api/v1/enroll` is on a public sub-router with no authentication
+        // layer at all, so enrollment behaviour is unaffected regardless of
+        // this chain; this suite exercises the log-scrubbing plumbing, not
+        // authentication, so open mode resolves every other request to the
+        // anonymous actor and the assertions are unchanged.
+        Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
     );
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let serving = tokio::spawn(async move {

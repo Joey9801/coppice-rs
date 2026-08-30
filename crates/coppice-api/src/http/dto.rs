@@ -1885,6 +1885,60 @@ impl UsageCursor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session and auth configuration (GET /api/v1/session, /api/v1/auth/config)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/auth/config` (ADR 0022) — the **public**, pre-authentication
+/// description of this deployment's auth posture. A client cannot obtain a
+/// credential without it: the web UI bootstraps its authorization-code + PKCE
+/// login from `issuer`/`client_id`/`audience`, and a CLI learns from `mode`
+/// alone whether a token is wanted at all.
+///
+/// The OIDC fields are **omitted**, not null, in open mode — the one place
+/// this module departs from its "absent optionals as explicit null" rule, and
+/// deliberately: `{"mode":"open"}` says there is no OIDC configuration, where
+/// three nulls would invite a client to render an empty login form. Nothing
+/// secret is exposed either way; every field here is public IdP metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetAuthConfigResponse {
+    /// `"oidc"` or `"open"`.
+    pub mode: String,
+    /// The OIDC issuer URL; OIDC mode only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// The client id the UI logs in with; OIDC mode only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// The audience this cluster requires in an access token — the effective
+    /// one (node config's `audience`, or `client_id` when it is unset), so a
+    /// client never has to re-derive the default. OIDC mode only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+}
+
+/// `GET /api/v1/session` (ADR 0022) — the resolved identity of the calling
+/// request, echoed back. Authenticated like every other protected route: this
+/// endpoint reports *who the credential proved you are*, so it cannot be
+/// reached without one.
+///
+/// The scoped-role summary of ADR 0023 (what this principal may actually do,
+/// evaluated against the replicated bindings) is the field this DTO is missing
+/// and gains next; it is a pure addition, and clients switch on `auth_method`
+/// meanwhile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSessionResponse {
+    /// The principal: an OIDC `sub`, `cert:<CN>` for an operator certificate,
+    /// or `anonymous` in open mode. Opaque — there is no user table behind it.
+    pub principal: String,
+    /// Groups from the token's groups claim; `[]` for the mechanisms that
+    /// carry none.
+    pub groups: Vec<String>,
+    /// How the principal proved itself: `"bearer"`, `"operator_cert"`, or
+    /// `"open"`.
+    pub auth_method: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

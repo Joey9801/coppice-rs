@@ -79,6 +79,19 @@ impl ClusterCa {
     fn current(&self) -> Option<Vec<u8>> {
         (self.0)()
     }
+
+    /// The same anchor, as the authentication chain's
+    /// [`CaProvider`](coppice_authn::CaProvider).
+    ///
+    /// The two consumers ask different questions of one answer: this acceptor
+    /// reads it per accept to decide whether to *request* a client certificate
+    /// at all, and `coppice-authn` reads it per request to decide whether a
+    /// presented certificate is an operator credential for this cluster
+    /// (ADR 0022). Sharing the closure rather than building a second one is
+    /// what keeps those two from disagreeing across a re-root.
+    pub fn provider(&self) -> coppice_authn::CaProvider {
+        Arc::clone(&self.0)
+    }
 }
 
 impl std::fmt::Debug for ClusterCa {

@@ -1020,9 +1020,6 @@ impl SsoConfig {
     /// The `aud` claim this deployment expects: the explicit `audience`
     /// override, or `client_id` when none was given.
     ///
-    /// Unused outside tests for now — the OIDC validator that consumes it is
-    /// a later change (issue #45).
-    #[allow(dead_code)]
     pub(crate) fn effective_audience(&self) -> &str {
         self.audience.as_deref().unwrap_or(&self.client_id)
     }

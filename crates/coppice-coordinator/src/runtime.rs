@@ -26,6 +26,52 @@ use crate::tasks::{
     renewal, scheduler_driver,
 };
 
+/// Build the public edge's authentication chain from the resolved posture
+/// (ADR 0022), returning it alongside the JWKS refresh task the OIDC posture
+/// needs.
+///
+/// Two things are deliberately *not* decided here. The cluster CA is the
+/// listener's own [`ClusterCa`](crate::clientedge::ClusterCa) closure, so
+/// operator-certificate verification tracks a re-root with no restart. And the
+/// groups-claim name is pinned to the ADR 0022 default: it is replicated policy
+/// (`PolicyConfig.groups_claim`), and the provider seam
+/// ([`GroupsClaimProvider`](coppice_authn::GroupsClaimProvider)) is a closure
+/// precisely so the policy-backed one can replace this without touching the
+/// chain — that is the next change, not this one.
+///
+/// Startup never blocks on the IdP. The cache begins empty and the refresh task
+/// fills it; until it does, bearer authentication fails while operator
+/// certificates keep working. That is the intended outage posture (ADR 0022),
+/// and the reason no fetch happens on this path.
+fn build_authn(
+    auth: coppice_authn::AuthMode,
+    cluster_ca: &crate::clientedge::ClusterCa,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> (
+    Arc<coppice_authn::AuthnChain>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let ca = cluster_ca.provider();
+    match auth {
+        coppice_authn::AuthMode::Open => (Arc::new(coppice_authn::AuthnChain::open(ca)), None),
+        coppice_authn::AuthMode::Oidc(config) => {
+            let cache = coppice_authn::JwksCache::new(
+                coppice_authn::default_http_client(),
+                config.issuer.clone(),
+            );
+            let join = tokio::spawn(Arc::clone(&cache).run(shutdown_rx.clone()));
+            let validator = coppice_authn::Validator::new(cache, config.clone());
+            let chain = coppice_authn::AuthnChain::oidc(
+                validator,
+                coppice_authn::static_groups_claim(coppice_authn::DEFAULT_GROUPS_CLAIM),
+                ca,
+                config,
+            );
+            (Arc::new(chain), Some(join))
+        }
+    }
+}
+
 /// How often the detached upkeep task drains the recorder's histogram buckets.
 /// Matches the exporter's own default upkeep timeout in its `install` path, so
 /// a scrape never sees buckets older than this regardless of scrape cadence.
@@ -130,6 +176,11 @@ pub async fn run<C>(
     // `[pacing]` housekeeping knob (ADR 0012). Liveness only — it decides how
     // promptly a due job is noticed, never which jobs are due.
     housekeeping_interval: std::time::Duration,
+    // How the public HTTP edge authenticates its callers (ADR 0022): the
+    // posture the daemon path resolved from `[sso]` / `[auth]`. Like
+    // `history`, it has no default at either seam — "authentication is off" is
+    // a deployment decision, and a missing argument does not get to make it.
+    auth: coppice_authn::AuthMode,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -253,13 +304,27 @@ where
         Arc::clone(&machine_tls),
     )
     .endpoint();
+
+    // The client listener's two uses of the cluster CA are the same closure:
+    // the TLS acceptor reads it per accept to decide whether to *request* a
+    // client certificate, and the authn chain reads it per request to decide
+    // what a presented one *means* (ADR 0022). One source, so a re-root or a
+    // just-formed cluster can never leave the two disagreeing.
+    let cluster_ca = crate::clientedge::ClusterCa::from_views(views.clone());
+    // The JWKS cache's background refresh, when this deployment validates
+    // tokens at all. Spawned here with the other every-replica tasks so it
+    // drains on the same shutdown watch; in open mode there is nothing to
+    // refresh and nothing is spawned.
+    let (authn, jwks_join) = build_authn(auth, &cluster_ca, &shutdown_rx);
+
     let api_join = tokio::spawn(api_server::run(
         client_listener,
         control_plane,
         metrics,
         readyz,
         enroll,
-        crate::clientedge::ClusterCa::from_views(views.clone()),
+        cluster_ca,
+        authn,
         shutdown_rx.clone(),
     ));
     tracing::debug!("runtime: API server up");
@@ -388,6 +453,12 @@ where
     let _ = agent_server_join.await;
     let _ = router_join.await;
     let _ = renewal_join.await;
+    // The JWKS refresh serves the API edge and nothing else, so it drains with
+    // it. Its loop watches the same shutdown flag; awaiting the handle just
+    // keeps the runtime from returning while a fetch is still in flight.
+    if let Some(join) = jwks_join {
+        let _ = join.await;
+    }
     tracing::debug!("runtime: API control plane and agent gateway down");
 
     let _ = ingestion_join.await;

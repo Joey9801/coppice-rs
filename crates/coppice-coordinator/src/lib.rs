@@ -140,6 +140,7 @@ pub use runtime::install_metrics_recorder;
 /// so of ADR 0020's `[observability]` fields only `otlp_endpoint` stays
 /// parsed-but-unused.
 pub fn describe_metrics() {
+    coppice_authn::describe_metrics();
     coppice_consensus::describe_metrics();
     coppice_tls::describe_metrics();
     tasks::event_fanout::describe_metrics();
@@ -150,6 +151,7 @@ pub fn describe_metrics() {
 /// same modules as [`describe_metrics`]. The `/metrics` endpoint calls this
 /// immediately before rendering each scrape.
 pub fn gather_metrics() {
+    coppice_authn::gather_metrics();
     coppice_consensus::gather_metrics();
     coppice_tls::gather_metrics();
     tasks::event_fanout::gather_metrics();

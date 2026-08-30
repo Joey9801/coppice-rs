@@ -16,6 +16,10 @@ coppice-state.workspace = true
 coppice-consensus.workspace = true
 coppice-scheduler.workspace = true
 coppice-api.workspace = true
+# The authentication posture the public HTTP edge runs under (ADR 0022): this
+# daemon resolves it from `[sso]`/`[auth]`, owns the JWKS cache's refresh task,
+# and injects the resulting chain into `coppice-api`'s router.
+coppice-authn.workspace = true
 # Seed discovery (ADR 0037 §2): the `Discovery` trait, the four backends, the
 # `[discovery]` table shapes, and the `file`-backend registration handle — the
 # same crate the agent consults, so the two daemons cannot disagree about a

@@ -1391,6 +1391,11 @@ insecure = true
 # Explicitly lossy (ADR 0012): no history store behind these tests.
 mode = "none"
 
+[auth]
+# The open posture (ADR 0022): the same explicit-or-refuse rule as
+# `[client_tls]` above, and these tests never bind the client listener at all.
+insecure_open = true
+
 [observability]
 log_level = "warn"
 "#,
