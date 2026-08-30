@@ -17,20 +17,13 @@ use anyhow::{Context as _, Result};
 use coppice_api::http::dto;
 use coppice_core::bytes::ByteSize;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, Query, DEFAULT_API_BASE};
+use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection, Query};
 
 /// `coppice cluster` argument group. `--api` is global, matching `coppice job`.
 #[derive(Debug, clap::Args)]
 pub struct ClusterArgs {
-    /// Base URL of the coordinator's client API. Accepts either a bare base
-    /// (`http://host:7070`) or one already ending in `/api/v1`.
-    #[arg(
-        long,
-        global = true,
-        env = "COPPICE_API",
-        default_value = DEFAULT_API_BASE
-    )]
-    api: String,
+    #[command(flatten)]
+    connection: ApiConnection,
 
     #[command(subcommand)]
     pub command: ClusterCommand,
@@ -49,7 +42,7 @@ pub enum ClusterCommand {
 
 /// Run the selected `coppice cluster` verb.
 pub async fn run(args: ClusterArgs) -> Result<()> {
-    let client = ApiClient::new(&args.api)?;
+    let client = args.connection.client()?;
     match args.command {
         ClusterCommand::Status { json } => status(&client, json).await,
     }

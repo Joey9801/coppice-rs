@@ -24,6 +24,7 @@ mod cluster;
 mod dev;
 mod job;
 mod node;
+mod policy;
 mod quota;
 #[cfg(test)]
 mod testsupport;
@@ -62,6 +63,10 @@ enum Command {
 
     /// Quota-entity operations against a cluster's API.
     Quota(quota::QuotaArgs),
+
+    /// Replicated policy operations against a cluster's API (authorization
+    /// bindings today).
+    Policy(policy::PolicyArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -115,6 +120,10 @@ async fn main() -> Result<()> {
         Command::Quota(args) => {
             init_tracing();
             quota::run(args).await
+        }
+        Command::Policy(args) => {
+            init_tracing();
+            policy::run(args).await
         }
     }
 }
@@ -406,6 +415,8 @@ mod tests {
             "busybox",
             "--search",
             "hello",
+            "--submitted-by",
+            "user-42",
             "--submitted-after",
             "2026-07-16T09:30:00Z",
             "--requests",
@@ -436,6 +447,7 @@ mod tests {
                 assert_eq!(filter.entity_scope, Some(job::ScopeArg::Exact));
                 assert_eq!(filter.image.as_deref(), Some("busybox"));
                 assert_eq!(filter.search.as_deref(), Some("hello"));
+                assert_eq!(filter.submitted_by.as_deref(), Some("user-42"));
                 assert!(filter.submitted_after.is_some());
                 assert_eq!(filter.requests, Some(job::ResourceArg::CpuMillis));
                 assert_eq!(filter.requests_min, Some(500));
@@ -594,6 +606,49 @@ mod tests {
             "team-a",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn policy_authz_get_and_set_parse() {
+        let cli = Cli::parse_from(["coppice", "policy", "authz", "get", "--json"]);
+        match cli.command {
+            Command::Policy(policy::PolicyArgs {
+                command:
+                    policy::PolicyCommand::Authz {
+                        command: policy::AuthzCommand::Get { json },
+                    },
+                ..
+            }) => assert!(json),
+            other => panic!("expected policy authz get, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(["coppice", "policy", "authz", "set", "--file", "authz.toml"]);
+        match cli.command {
+            Command::Policy(policy::PolicyArgs {
+                command:
+                    policy::PolicyCommand::Authz {
+                        command: policy::AuthzCommand::Set { file, json },
+                    },
+                ..
+            }) => {
+                assert_eq!(file, PathBuf::from("authz.toml"));
+                assert!(!json);
+            }
+            other => panic!("expected policy authz set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_token_flag_is_global_before_or_after_the_verb() {
+        for argv in [
+            vec!["coppice", "policy", "--token", "t", "authz", "get"],
+            vec!["coppice", "policy", "authz", "get", "--token", "t"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv.clone()).is_ok(),
+                "expected {argv:?} to parse"
+            );
+        }
     }
 
     #[test]

@@ -64,6 +64,38 @@ pub const fn ctx(sending: &'static str, reading: &'static str) -> Ctx {
 /// A query string as the verbs build it: borrowed keys, owned values.
 pub type Query = Vec<(&'static str, String)>;
 
+/// The shared `--api`/`--token` connection flags, flattened
+/// (`#[command(flatten)]`) into every HTTP verb group's argument struct so
+/// the pair is declared exactly once — the same reuse move `node admin`
+/// makes for the coordinator's own verb enum. One nuance lives at a verb,
+/// not here: `coppice node`'s admin verbs speak the mTLS channel and ignore
+/// both flags (said on its `NodeArgs`).
+#[derive(Debug, clap::Args)]
+pub struct ApiConnection {
+    /// Base URL of the coordinator's client API. Accepts either a bare base
+    /// (`http://host:7070`) or one already ending in `/api/v1`.
+    #[arg(
+        long,
+        global = true,
+        env = "COPPICE_API",
+        default_value = DEFAULT_API_BASE
+    )]
+    pub api: String,
+
+    /// Bearer token attached as `Authorization: Bearer <token>` on every
+    /// request. No login flow, no cache, no refresh — a cluster requiring
+    /// authentication expects this from an out-of-band credential.
+    #[arg(long, global = true, env = "COPPICE_TOKEN", hide_env_values = true)]
+    pub token: Option<String>,
+}
+
+impl ApiConnection {
+    /// The [`ApiClient`] these flags describe.
+    pub fn client(&self) -> Result<ApiClient> {
+        ApiClient::with_token(&self.api, self.token.as_deref())
+    }
+}
+
 /// A client bound to one coordinator's `/api/v1` surface.
 ///
 /// Holds the normalized base URL and a single `reqwest::Client`, so a verb
@@ -73,11 +105,29 @@ pub type Query = Vec<(&'static str, String)>;
 pub struct ApiClient {
     base: String,
     http: reqwest::Client,
+    /// The bearer token from `--token`/`COPPICE_TOKEN`, when set and
+    /// non-empty. Attached as `Authorization: Bearer <token>` on every
+    /// request; `None` sends no `Authorization` header at all (the open-mode
+    /// posture `coppice dev` runs in needs none).
+    token: Option<String>,
 }
 
 impl ApiClient {
-    /// Build a client for an `--api` value, normalizing the base URL.
+    /// Build a client for an `--api` value, normalizing the base URL, with no
+    /// bearer token attached. Every verb's `run()` goes through
+    /// [`Self::with_token`] instead (there is always a `--token` flag to
+    /// thread through, even when unset); this convenience constructor is for
+    /// tests that do not exercise the token path.
+    #[cfg(test)]
     pub fn new(api: &str) -> Result<ApiClient> {
+        ApiClient::with_token(api, None)
+    }
+
+    /// Build a client for an `--api` value and an optional bearer token
+    /// (`--token`/`COPPICE_TOKEN`). An empty token string is treated the same
+    /// as `None` — no `Authorization` header — since clap surfaces `env =
+    /// "COPPICE_TOKEN"` as `Some("")` when the variable is set but empty.
+    pub fn with_token(api: &str, token: Option<&str>) -> Result<ApiClient> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -85,12 +135,25 @@ impl ApiClient {
         Ok(ApiClient {
             base: normalize_base(api),
             http,
+            token: token
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
         })
     }
 
     /// The absolute URL for an `/api/v1`-relative path (`"/jobs"`).
     pub fn url(&self, path: &str) -> String {
         format!("{}/api/v1{path}", self.base)
+    }
+
+    /// Attach `Authorization: Bearer <token>` to a request builder when a
+    /// token is configured, otherwise pass it through unchanged.
+    fn authed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     /// GET a path and decode its JSON body.
@@ -104,13 +167,8 @@ impl ApiClient {
         query: &Query,
         ctx: Ctx,
     ) -> Result<T> {
-        let response = self
-            .http
-            .get(self.url(path))
-            .query(query)
-            .send()
-            .await
-            .context(ctx.sending)?;
+        let request = self.authed(self.http.get(self.url(path)).query(query));
+        let response = request.send().await.context(ctx.sending)?;
         if !response.status().is_success() {
             return Err(api_error(response).await);
         }
@@ -140,6 +198,22 @@ impl ApiClient {
         Ok(())
     }
 
+    /// PUT a JSON body and decode the JSON response — the full-replacement
+    /// counterpart to [`Self::post_json`], used by `policy authz set`.
+    pub async fn put_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        ctx: Ctx,
+    ) -> Result<T> {
+        let request = self.authed(self.http.put(self.url(path)).json(body));
+        let response = request.send().await.context(ctx.sending)?;
+        if !response.status().is_success() {
+            return Err(api_error(response).await);
+        }
+        response.json().await.context(ctx.reading)
+    }
+
     /// The shared POST half: send, and map a non-2xx to a rich error.
     async fn send_post<B: Serialize>(
         &self,
@@ -147,13 +221,8 @@ impl ApiClient {
         body: &B,
         sending: &'static str,
     ) -> Result<reqwest::Response> {
-        let response = self
-            .http
-            .post(self.url(path))
-            .json(body)
-            .send()
-            .await
-            .context(sending)?;
+        let request = self.authed(self.http.post(self.url(path)).json(body));
+        let response = request.send().await.context(sending)?;
         if !response.status().is_success() {
             return Err(api_error(response).await);
         }
@@ -204,6 +273,12 @@ pub async fn api_error(response: reqwest::Response) -> anyhow::Error {
         if let Some(leader) = leader {
             message.push_str(&format!("; retry against the leader at {leader}"));
         }
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        message.push_str(
+            "; this cluster requires authentication — set COPPICE_TOKEN to a bearer token, \
+             or use a dev cluster (`coppice dev`), which runs in open mode and needs none",
+        );
     }
     anyhow::anyhow!(message)
 }
@@ -262,6 +337,118 @@ pub fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use axum::routing::get;
+    use axum::Router;
+
+    use crate::testsupport::{error_body, spawn};
+
+    /// `--token`/`COPPICE_TOKEN`, when set and non-empty, attaches
+    /// `Authorization: Bearer <token>` to every request.
+    #[tokio::test]
+    async fn token_attaches_the_authorization_header() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let router = {
+            let captured = captured.clone();
+            Router::new().route(
+                "/api/v1/session",
+                get(move |headers: axum::http::HeaderMap| {
+                    let captured = captured.clone();
+                    async move {
+                        let auth = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        captured.lock().unwrap().replace(auth.unwrap_or_default());
+                        axum::Json(serde_json::json!({}))
+                    }
+                }),
+            )
+        };
+        let base = spawn(router).await;
+        let client = ApiClient::with_token(&base, Some("secret-token")).unwrap();
+        let _: serde_json::Value = client
+            .get_json("/session", &Vec::new(), ctx("fetching", "reading"))
+            .await
+            .unwrap();
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("Bearer secret-token")
+        );
+    }
+
+    /// No `--token` means no `Authorization` header at all — the header's
+    /// mere presence is what the open-mode posture must never see.
+    #[tokio::test]
+    async fn no_token_sends_no_authorization_header() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<bool>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let router = {
+            let captured = captured.clone();
+            Router::new().route(
+                "/api/v1/session",
+                get(move |headers: axum::http::HeaderMap| {
+                    let captured = captured.clone();
+                    async move {
+                        let present = headers.contains_key(axum::http::header::AUTHORIZATION);
+                        captured.lock().unwrap().replace(present);
+                        axum::Json(serde_json::json!({}))
+                    }
+                }),
+            )
+        };
+        let base = spawn(router).await;
+        let client = ApiClient::new(&base).unwrap();
+        let _: serde_json::Value = client
+            .get_json("/session", &Vec::new(), ctx("fetching", "reading"))
+            .await
+            .unwrap();
+        assert_eq!(*captured.lock().unwrap(), Some(false));
+    }
+
+    /// An empty `COPPICE_TOKEN` (clap surfaces the env var set-but-empty as
+    /// `Some("")`) must behave exactly like no token at all.
+    #[tokio::test]
+    async fn empty_token_sends_no_authorization_header() {
+        let router = Router::new().route(
+            "/api/v1/session",
+            get(|headers: axum::http::HeaderMap| async move {
+                assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
+                axum::Json(serde_json::json!({}))
+            }),
+        );
+        let base = spawn(router).await;
+        let client = ApiClient::with_token(&base, Some("")).unwrap();
+        let _: serde_json::Value = client
+            .get_json("/session", &Vec::new(), ctx("fetching", "reading"))
+            .await
+            .unwrap();
+    }
+
+    /// A 401 error message mentions `COPPICE_TOKEN` and that dev clusters run
+    /// in open mode — the two facts an operator needs to unblock themselves.
+    #[tokio::test]
+    async fn unauthorized_error_mentions_coppice_token_and_open_mode() {
+        let router = Router::new().route(
+            "/api/v1/session",
+            get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(error_body("UNAUTHENTICATED", "no credentials")),
+                )
+            }),
+        );
+        let base = spawn(router).await;
+        let client = ApiClient::new(&base).unwrap();
+        let err = client
+            .get_json::<serde_json::Value>("/session", &Vec::new(), ctx("fetching", "reading"))
+            .await
+            .expect_err("401 fails");
+        let message = format!("{err:#}");
+        assert!(message.contains("COPPICE_TOKEN"), "{message}");
+        assert!(message.contains("open mode"), "{message}");
+    }
 
     #[test]
     fn api_base_normalizes_to_one_form() {
