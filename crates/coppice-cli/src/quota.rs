@@ -492,6 +492,8 @@ mod tests {
             id,
             name: "team-a".to_string(),
             parent,
+            origin: dto::QuotaEntityOrigin::Configured,
+            principal: None,
             quota_ucu: 1000,
             usage_ucu: 250,
             over_quota_ratio: 0.25,

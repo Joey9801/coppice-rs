@@ -340,6 +340,8 @@ async fn get_session(
         // Derived from the actor's flags rather than remembered separately, so
         // the reported method can never disagree with the grants it implies.
         auth_method: actor.method().as_str().to_string(),
+        bindings: Vec::new(),
+        implicit_admin: actor.is_implicit_admin(),
     })
 }
 
