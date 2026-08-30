@@ -26,21 +26,17 @@ use coppice_api::http::dto;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::NodeId;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, Query, DEFAULT_API_BASE};
+use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection, Query};
 
 /// `coppice node` argument group.
+///
+/// `--api`/`--token` serve the HTTP reads (`list`, `show`); the admin verbs
+/// speak the mTLS channel (`--target`/`--ca`/`--cert`/`--key`) and ignore
+/// both.
 #[derive(Debug, clap::Args)]
 pub struct NodeArgs {
-    /// Base URL of the coordinator's client API, used by `list` and `show`.
-    /// Accepts a bare base (`http://host:7070`) or one already ending in
-    /// `/api/v1`.
-    #[arg(
-        long,
-        global = true,
-        env = "COPPICE_API",
-        default_value = DEFAULT_API_BASE
-    )]
-    pub api: String,
+    #[command(flatten)]
+    pub connection: ApiConnection,
 
     /// The `host:port` of a coordinator's admin surface. Required by the
     /// enrollment-token and identity verbs; unused by `list` and `show`.
@@ -95,11 +91,11 @@ pub enum NodeVerb {
 pub async fn run(args: NodeArgs) -> Result<()> {
     match args.verb {
         NodeVerb::List { json } => {
-            let client = ApiClient::new(&args.api)?;
+            let client = args.connection.client()?;
             list(&client, json).await
         }
         NodeVerb::Show { node, json } => {
-            let client = ApiClient::new(&args.api)?;
+            let client = args.connection.client()?;
             show(&client, node, json).await
         }
         NodeVerb::Admin(verb) => {

@@ -23,7 +23,7 @@ use serde::Deserialize;
 use coppice_api::http::dto;
 use coppice_core::id::QuotaEntityId;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, DEFAULT_API_BASE};
+use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection};
 use crate::cluster::{indent, phase_label};
 
 // ---------------------------------------------------------------------------
@@ -34,15 +34,8 @@ use crate::cluster::{indent, phase_label};
 /// and `coppice cluster`.
 #[derive(Debug, clap::Args)]
 pub struct QuotaArgs {
-    /// Base URL of the coordinator's client API. Accepts either a bare base
-    /// (`http://host:7070`) or one already ending in `/api/v1`.
-    #[arg(
-        long,
-        global = true,
-        env = "COPPICE_API",
-        default_value = DEFAULT_API_BASE
-    )]
-    api: String,
+    #[command(flatten)]
+    connection: ApiConnection,
 
     #[command(subcommand)]
     pub command: QuotaCommand,
@@ -100,7 +93,7 @@ pub enum QuotaCommand {
 
 /// Run the selected `coppice quota` verb.
 pub async fn run(args: QuotaArgs) -> Result<()> {
-    let client = ApiClient::new(&args.api)?;
+    let client = args.connection.client()?;
     match args.command {
         QuotaCommand::List { json } => list(&client, json).await,
         QuotaCommand::Show { entity, json } => show(&client, entity, json).await,
@@ -541,6 +534,8 @@ mod tests {
             "id": id.to_string(),
             "name": "starved",
             "parent": null,
+            "origin": "configured",
+            "principal": null,
             "quota_ucu": 0,
             "usage_ucu": 42,
             "over_quota_ratio": null,

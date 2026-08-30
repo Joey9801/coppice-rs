@@ -45,7 +45,7 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, Query, DEFAULT_API_BASE};
+use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection, Query};
 
 // ---------------------------------------------------------------------------
 // Spec file
@@ -192,21 +192,18 @@ impl JobSpec {
 /// `coppice job submit … --api URL` both work).
 #[derive(Debug, clap::Args)]
 pub struct JobArgs {
-    /// Base URL of the coordinator's client API. Accepts either a bare base
-    /// (`http://host:7070`) or one already ending in `/api/v1` (what the
-    /// `coppice dev` banner prints), normalized to the same thing.
-    #[arg(
-        long,
-        global = true,
-        env = "COPPICE_API",
-        default_value = DEFAULT_API_BASE
-    )]
-    api: String,
+    #[command(flatten)]
+    connection: ApiConnection,
 
     #[command(subcommand)]
     pub command: JobCommand,
 }
 
+// `List`'s flattened `JobFilterArgs` (one field per `job list` flag, now
+// including `--submitted-by`) makes this enum's variants uneven in size —
+// inherent to a clap subcommand enum with a flattened filter-flags struct,
+// not a hot-path allocation concern for a CLI parsed once per invocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, clap::Subcommand)]
 pub enum JobCommand {
     /// List jobs, newest first, filtered by the flags below.
@@ -289,8 +286,8 @@ pub enum JobCommand {
 /// `any`, `not`, nested combinators — is deliberately not expressible from the
 /// command line: it is a JSON tree, and a flag grammar for it would be worse
 /// than the JSON. Only leaves the server actually implements appear: the
-/// contract reserves `label` and `submitted_by` without backing them, so no
-/// flag pretends to offer them.
+/// contract reserves `label` without backing it, so no flag pretends to
+/// offer it.
 #[derive(Debug, Default, clap::Args)]
 pub struct JobFilterArgs {
     /// Match jobs in these display phases (repeatable).
@@ -314,6 +311,10 @@ pub struct JobFilterArgs {
     /// Case-insensitive substring over the job id or the image.
     #[arg(long)]
     pub search: Option<String>,
+    /// Match jobs submitted by this principal exactly (`Job.submitted_by`,
+    /// ADR 0023). A job with no recorded submitter matches nothing.
+    #[arg(long)]
+    pub submitted_by: Option<String>,
     /// Match jobs submitted at or after this instant (RFC 3339, e.g.
     /// `2026-07-16T09:30:00Z`).
     #[arg(long, value_parser = parse_timestamp)]
@@ -434,6 +435,9 @@ fn build_filter(args: &JobFilterArgs) -> Result<Option<serde_json::Value>> {
     if let Some(search) = &args.search {
         leaves.push(json!({ "search": search }));
     }
+    if let Some(submitted_by) = &args.submitted_by {
+        leaves.push(json!({ "submitted_by": submitted_by }));
+    }
     if args.submitted_after.is_some() || args.submitted_before.is_some() {
         if let (Some(after), Some(before)) = (args.submitted_after, args.submitted_before) {
             if after > before {
@@ -504,7 +508,7 @@ const FOLLOW_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Run the selected `coppice job` verb.
 pub async fn run(args: JobArgs) -> Result<()> {
-    let client = ApiClient::new(&args.api)?;
+    let client = args.connection.client()?;
     match args.command {
         JobCommand::List {
             filter,
@@ -1373,6 +1377,7 @@ fn render_status(detail: &dto::JobDetail) -> String {
         kv("entrypoint", &entrypoint.join(" "));
     }
     kv("quota entity", &spec.quota_entity.to_string());
+    kv("submitted by", spec.submitted_by.as_deref().unwrap_or("-"));
     kv("priority", &spec.priority.to_string());
     kv(
         "requests",
@@ -1756,6 +1761,16 @@ retry_user_errors = true
             filter,
             dto::JobFilter::Image(dto::ImageFilter::Equals("busybox:1.36".to_string()))
         );
+    }
+
+    #[test]
+    fn submitted_by_builds_the_right_leaf() {
+        let filter = round_trip(&JobFilterArgs {
+            submitted_by: Some("user-42".to_string()),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(filter, dto::JobFilter::SubmittedBy("user-42".to_string()));
     }
 
     #[test]
@@ -2163,6 +2178,16 @@ retry_user_errors = true
             "{rendered}"
         );
         assert!(rendered.contains("cost (charged)  1234 uCU"), "{rendered}");
+        assert!(rendered.contains("submitted by    -"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn status_renders_the_submitting_principal_when_present() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let mut detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        detail.spec.submitted_by = Some("user-42".to_string());
+        let rendered = render_status(&detail);
+        assert!(rendered.contains("submitted by    user-42"), "{rendered}");
     }
 
     fn log_entry(attempt: AttemptId, at_us: i64, text: &str) -> dto::LogEntry {
