@@ -101,4 +101,10 @@ message PolicyConfig {
   // overdeclaration. Explicit presence: absent decodes to the neutral 1000
   // (full refund), so a pre-0029 policy round-trips to the old behaviour.
   optional uint32 refund_fraction_milli = 10;
+  // Name of the token claim carrying a principal's groups (ADR 0022/0023).
+  // Replicated policy, not node config: two replicas reading different claim
+  // names would disagree about authority. Explicit presence, following the
+  // documented-default convention of fields 9 and 10: absent decodes to
+  // "groups".
+  optional string groups_claim = 11;
 }

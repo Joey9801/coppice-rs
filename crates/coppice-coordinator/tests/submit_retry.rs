@@ -114,6 +114,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
             name: "root".into(),
             quota: CostUnits(1_000_000),
             updated_at: Timestamp::from_micros(1).expect("in range"),
+            actor: None,
         }))
         .await
         .expect("configure quota entity")
@@ -127,6 +128,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
         .propose(Command::UpdatePolicy(UpdatePolicy {
             policy,
             updated_at: Timestamp::from_micros(2).expect("in range"),
+            actor: None,
         }))
         .await
         .expect("update policy")

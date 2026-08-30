@@ -288,9 +288,18 @@ Rust domain types drop the `_us` suffix and carry a `Timestamp` or a
 maps between them at the boundary. See `coppice_core::time`.
 
 Every **API-proposed** command additionally carries
-`actor: Actor { principal: string, groups: string[], operator_cert: bool }`,
-transcribed by the API layer from the verified token or operator
-certificate ([ADR 0023](../decisions/0023-scoped-role-bindings.md)). Apply
+`actor: Actor { principal: string, groups: string[], operator_cert: bool,
+auth_disabled: bool }`, transcribed by the API layer from the verified token
+or operator certificate ([ADR 0023](../decisions/0023-scoped-role-bindings.md)).
+`auth_disabled` marks a node running the formally-supported open posture,
+where every request resolves to a static anonymous actor with implicit
+unscoped admin: auth posture is node config, and apply may never read node
+config, so the posture rides *in* the actor. Together with `operator_cert`
+it is the pair of implicit unscoped-admin grants — neither representable in,
+nor revocable through, the bindings list. The field is **optional** on the
+wire, and that optionality is the structural distinction between an
+API-originated command and an internal proposal: a command with no actor
+carries the system's own authority and skips the check entirely. Apply
 re-checks the actor's authority against the replicated bindings and job
 ownership in its read-only validation phase — a pure lookup, rejecting
 `PermissionDenied` — so authorization races resolve in log order. The
@@ -308,7 +317,7 @@ reachable through the API.
 | --- | --- |
 | Proposer | API layer, after synchronous admission checks |
 | Payload | `job: Job` (id — **client-minted**, the submission's idempotency identity per ADR 0026 —, image, `requests: Resources`, `priority: i32`, `max_runtime_us: optional uint64`, `quota_entity: QuotaEntityId`, `retry: RetryPolicy { max_retries: u32, retry_user_errors: bool }`), `multiplier: PriorityMultiplier` (Q32.32 — the API resolves the user's `priority` through the replicated multiplier table at proposal time; apply never sees the raw `i32` in arithmetic, per ADR 0019), `actor: Actor`, `submitted_at_us` |
-| Validation | `abort_requested` unset. If `job.id` is already in state (including terminal jobs not yet evicted): identical client-supplied spec → **accepted no-op** (idempotent resubmission, no events — the retryer observes success and the original job; the no-op creates nothing, so it skips the authorization check and never changes `submitted_by`); different spec → `SubmitSpecMismatch`. Otherwise `quota_entity` exists and the actor holds `submitter` (or higher) over it (ADR 0023). |
+| Validation | `abort_requested` unset. If `job.id` is already in state (including terminal jobs not yet evicted): identical client-supplied spec → **accepted no-op** (idempotent resubmission, no events — the retryer observes success and the original job; the no-op still re-checks the actor's submit authority at its own log position, per the revocation guarantee, but never changes `submitted_by`); different spec → `SubmitSpecMismatch`. Otherwise `quota_entity` exists and the actor holds `submitter` (or higher) over it (ADR 0023). |
 | Apply effects | Insert the job record with `submitted_by = actor.principal`; walk `Submitted → Accepted → Queued` in this one apply (admission is synchronous in v1 — the intermediate states exist for observability and appear as distinct events). No quota charge: cost is charged at placement, not submission. |
 | Rejections | `SubmitSpecMismatch`, `UnknownQuotaEntity`, `InvalidCommand` (pre-set abort flag), `PermissionDenied` |
 
@@ -438,7 +447,7 @@ reachable through the API.
 | --- | --- |
 | Proposer | Admin API / `coppice-cli policy` (bootstrap tree included — ADR 0020: the node config file never seeds policy) |
 | Payload | `entity: QuotaEntityId`, `parent: optional QuotaEntityId`, `name: string`, `quota: CostUnits` (a *stock* in µCU; the CLI converts human rates, per ADR 0019), `actor: Actor`, `updated_at_us` |
-| Validation | Parent (if any) exists and is not the entity itself; the new parent chain is acyclic and within the depth cap (32); actor holds `admin` whose scope covers both the entity's current position and its new parent (unscoped admin covers everything — ADR 0023) |
+| Validation | Parent (if any) exists and is not the entity itself; the new parent chain is acyclic and within the depth cap (32); actor holds `admin` whose scope covers the entity's current position, and — when the command actually *moves* the entity — **one single binding** whose scope covers both the entity and its new parent, since reparenting carries authority with it and two disjoint scoped grants must not compose into a cross-subtree move. Re-asserting an entity's existing parent is not a move and needs only coverage of the current position. The tree root lies inside no subtree, so a move to it — like any cross-subtree move — takes unscoped `admin`, which covers everything (ADR 0023) |
 | Apply effects | Create (usage accumulator initialized zero at `updated_at_us`) or update (parent/name/quota replaced; **usage is preserved** — reconfiguring an entity is not an amnesty). No delete command in v1: entities with historical charges stay; removal is a future decision. |
 | Rejections | `UnknownQuotaEntity` (parent), `QuotaEntityCycle`, `PermissionDenied` |
 
@@ -466,7 +475,7 @@ same commands.
 | | |
 | --- | --- |
 | Proposer | Admin API / `coppice-cli policy` — full replacement of the role-binding list, mirroring `UpdatePolicy` (concurrent edits resolve last-writer-wins in log order) |
-| Payload | `bindings: Binding[]` where `Binding = { subject: oneof { group: string, principal: string }, role: Role (submitter \| operator \| admin), scope: optional QuotaEntityId }`; plus `actor: Actor`, `updated_at_us` |
+| Payload | `bindings: Binding[]` where `Binding = { subject: oneof { Group { name: string }, Principal { sub: string } }, role: Role (submitter \| operator \| admin), scope: optional QuotaEntityId }` — a rich enum, so a oneof of per-variant messages per [schema-style](schema-style.md); plus `actor: Actor`, `updated_at_us` |
 | Validation | Actor holds unscoped `admin`; every role is from the closed set and every subject non-empty; every `scope` references an existing quota entity; the new list retains at least one unscoped `admin` binding (lockout prevention — operator certs make lockout recoverable, but an empty admin list is almost always an accident, per ADR 0023) |
 | Apply effects | Replace the replicated bindings. Takes effect for every command ordered after this one — in-flight commands proposed under the old bindings re-validate against the new ones at their own log position. Operator certificates (`actor.operator_cert`) are an implicit unscoped `admin` outside this list and cannot be revoked through it. |
 | Rejections | `PermissionDenied`, `UnknownQuotaEntity` (scope), `InvalidAuthorization`, `AuthorizationLockout` |
@@ -628,7 +637,7 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | `QuotaEntityCycle` | Parent edit would create a cycle or exceed the depth cap |
 | `InvalidPolicy` | Policy payload failed validation |
 | `PermissionDenied` | Actor lacks the role/scope (or ownership) the command requires (ADR 0023) |
-| `InvalidAuthorization` | Bindings payload failed validation (unknown role, empty subject) |
+| `InvalidAuthorization` | Bindings payload failed validation (empty subject). An unknown *role* never reaches apply: `Role` is a closed proto enum, so an unknown value is a decode failure at the conversion boundary (a deterministic `InvalidCommand`) |
 | `AuthorizationLockout` | Bindings replacement would leave no unscoped admin |
 | `ClusterVersionNotMonotonic` | Bump not strictly increasing |
 | `MachineIdentityConflict` | Machine↔raft-node binding would break the one-machine-one-seat invariant (ADR 0037 §7) |

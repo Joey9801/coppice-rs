@@ -742,6 +742,7 @@ async fn propose_bump(node: &Node, to: u32) -> u64 {
         .propose(Command::BumpClusterVersion(BumpClusterVersion {
             to,
             bumped_at: Timestamp::from_micros(to as i64).expect("in range"),
+            actor: None,
         }))
         .await
         .unwrap_or_else(|e| panic!("propose bump to={to} failed: {e:?}"));
@@ -952,6 +953,7 @@ async fn three_node_cluster_lifecycle() {
                 .propose(Command::BumpClusterVersion(BumpClusterVersion {
                     to,
                     bumped_at: Timestamp::from_micros(to as i64).expect("in range"),
+                    actor: None,
                 }))
                 .await
                 .unwrap_or_else(|e| panic!("offline-window bump to={to} failed: {e:?}"));

@@ -775,6 +775,7 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
             node: nid(1),
             schedulable: false,
             updated_at: base_ts(),
+            actor: None,
         }),
     );
     let epoch_before = sm.nodes[&nid(1)].epoch;
@@ -823,6 +824,7 @@ fn drained_node_rejects_placements_but_keeps_funding() {
             node: nid(1),
             schedulable: false,
             updated_at: base_ts(),
+            actor: None,
         }),
     );
     apply_ok(
@@ -1081,6 +1083,7 @@ fn quota_entity_timestamps_stamp_on_create_and_advance_only_updated() {
             name: name.into(),
             quota: CostUnits(1_000_000_000_000),
             updated_at: at,
+            actor: None,
         })
     };
 
@@ -1131,6 +1134,7 @@ fn cluster_version_bumps_are_monotonic() {
         Command::BumpClusterVersion(BumpClusterVersion {
             to: 2,
             bumped_at: base_ts(),
+            actor: None,
         }),
     );
     assert_eq!(sm.cluster_version, 2);
@@ -1138,6 +1142,7 @@ fn cluster_version_bumps_are_monotonic() {
         .apply(&Command::BumpClusterVersion(BumpClusterVersion {
             to: 2,
             bumped_at: base_ts(),
+            actor: None,
         }))
         .unwrap_err();
     assert_eq!(

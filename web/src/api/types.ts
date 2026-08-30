@@ -482,6 +482,7 @@ export type TimelineEventBody =
   | { kind: 'JobEvicted'; job: JobId }
   | { kind: 'QuotaEntityConfigured'; entity: QuotaEntityId }
   | { kind: 'PolicyUpdated' }
+  | { kind: 'AuthorizationUpdated' }
   | { kind: 'ClusterVersionBumped'; to: number }
 
 export type TimelineEvent = {

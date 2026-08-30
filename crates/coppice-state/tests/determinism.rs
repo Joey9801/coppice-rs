@@ -27,9 +27,10 @@ use coppice_core::quota::CostUnits;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{state_from_records, state_to_records, StateRecords};
+use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
-    ReconcileNode, RegisterNode, SetNodeSchedulable,
+    ReconcileNode, RegisterNode, SetNodeSchedulable, UpdateAuthorization,
 };
 use coppice_state::{Command, StateMachine};
 use proptest::prelude::*;
@@ -120,13 +121,22 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 declared_at: ts,
             })
         }),
-        (0usize..NODES as usize, any::<bool>(), arb_ts()).prop_map(|(n, schedulable, ts)| {
-            Command::SetNodeSchedulable(SetNodeSchedulable {
-                node: node_of(n),
-                schedulable,
-                updated_at: ts,
-            })
-        }),
+        (
+            0usize..NODES as usize,
+            any::<bool>(),
+            any::<bool>(),
+            arb_ts()
+        )
+            .prop_map(|(n, schedulable, with_who, ts)| {
+                Command::SetNodeSchedulable(SetNodeSchedulable {
+                    node: node_of(n),
+                    schedulable,
+                    updated_at: ts,
+                    // A cluster verb: whether this is accepted depends on the
+                    // bindings installed earlier in the same sequence.
+                    actor: with_who.then(|| actor("root")),
+                })
+            }),
         (any::<u8>(), arb_ts()).prop_map(|(mask, ts)| {
             Command::EvictTerminalJobs(EvictTerminalJobs {
                 jobs: (0..MAX_JOBS)
@@ -143,12 +153,44 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 name: "team".into(),
                 quota: CostUnits(1_000_000_000),
                 updated_at: ts,
+                actor: None,
             })
         }),
         (1u32..6, arb_ts()).prop_map(|(to, ts)| {
-            Command::BumpClusterVersion(BumpClusterVersion { to, bumped_at: ts })
+            Command::BumpClusterVersion(BumpClusterVersion {
+                to,
+                bumped_at: ts,
+                actor: None,
+            })
         }),
         (0u32..5,).prop_map(|(k,)| update_policy_cmd(test_policy(k))),
+        // Authorization edits ride the same id pools: some scopes exist and
+        // some do not, some lists retain an unscoped admin and some do not,
+        // and roughly half the commands carry an actor whose authority
+        // depends on whatever list a previous command happened to install.
+        // Accepted and rejected alike must be deterministic.
+        (0u128..4, 0usize..3, any::<bool>(), any::<bool>(), arb_ts()).prop_map(
+            |(e, role_ix, unscoped_admin, with_who, ts)| {
+                let role = [Role::Submitter, Role::Operator, Role::Admin][role_ix];
+                let mut bindings = vec![Binding {
+                    subject: Subject::Group("batch-users".into()),
+                    role,
+                    scope: Some(qid(0xE0 + e)),
+                }];
+                if unscoped_admin {
+                    bindings.push(Binding {
+                        subject: Subject::Principal("root".into()),
+                        role: Role::Admin,
+                        scope: None,
+                    });
+                }
+                Command::UpdateAuthorization(UpdateAuthorization {
+                    bindings,
+                    actor: with_who.then(|| actor("root")),
+                    updated_at: ts,
+                })
+            }
+        ),
         (
             0usize..NODES as usize,
             1u64..4,

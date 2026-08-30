@@ -1495,12 +1495,13 @@ fn timeline_description(body: &dto::TimelineEventBody) -> String {
             allocation, node, ..
         } => format!("stop requested for allocation {allocation} on node {node}"),
         B::JobEvicted { .. } => "evicted".to_string(),
-        // The four cluster-scoped events never fall inside a job-filtered
+        // The five cluster-scoped events never fall inside a job-filtered
         // window, but the match stays exhaustive — this repo forbids wildcard
         // arms on wire enums — with a plain generic description each.
         B::NodeEpochBumped { .. } => "node epoch bumped".to_string(),
         B::QuotaEntityConfigured { .. } => "quota entity configured".to_string(),
         B::PolicyUpdated => "policy updated".to_string(),
+        B::AuthorizationUpdated => "authorization updated".to_string(),
         B::ClusterVersionBumped { .. } => "cluster version bumped".to_string(),
     }
 }

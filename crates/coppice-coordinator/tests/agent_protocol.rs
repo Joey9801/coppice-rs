@@ -220,6 +220,7 @@ async fn seed_quota(coord: &RunningCoordinator, entity: QuotaEntityId) {
             name: "root".into(),
             quota: CostUnits(1_000_000_000_000),
             updated_at: Timestamp::now(),
+            actor: None,
         }))
         .await
         .expect("propose ConfigureQuotaEntity");
@@ -253,9 +254,11 @@ async fn submit_job(
                     retry_user_errors: false,
                 },
                 abort_requested: None,
+                submitted_by: None,
             },
             multiplier: PriorityMultiplier::ONE,
             submitted_at: Timestamp::now(),
+            actor: None,
         }))
         .await
         .expect("propose SubmitJob");

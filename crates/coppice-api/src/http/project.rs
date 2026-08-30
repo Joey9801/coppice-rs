@@ -1486,6 +1486,7 @@ mod tests {
                 quota_entity: QuotaEntityId::new(),
                 retry: Default::default(),
                 abort_requested: None,
+                submitted_by: None,
             },
             state,
             multiplier: PriorityMultiplier::ONE,

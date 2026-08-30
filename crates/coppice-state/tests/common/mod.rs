@@ -11,10 +11,11 @@ use coppice_core::job::{Job, RetryPolicy};
 use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
+use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::{
-    AbortJob, AllocationSpec, CommitPlacements, ConfigureQuotaEntity, DispatchAttempt, Placement,
-    RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RegisterNode, SubmitJob,
-    UpdatePolicy,
+    AbortJob, AllocationSpec, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
+    DispatchAttempt, Placement, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
+    RegisterNode, SetNodeSchedulable, SubmitJob, UpdateAuthorization, UpdatePolicy,
 };
 use coppice_state::{Applied, Command, PolicyConfig, StateMachine};
 use uuid::Uuid;
@@ -90,6 +91,7 @@ pub fn update_policy_cmd(policy: PolicyConfig) -> Command {
     Command::UpdatePolicy(UpdatePolicy {
         policy,
         updated_at: base_ts(),
+        actor: None,
     })
 }
 
@@ -100,6 +102,7 @@ pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>
         name: "entity".into(),
         quota: CostUnits(1_000_000_000_000),
         updated_at: base_ts(),
+        actor: None,
     })
 }
 
@@ -131,9 +134,11 @@ pub fn submit_cmd(
             quota_entity: ROOT,
             retry,
             abort_requested: None,
+            submitted_by: None,
         },
         multiplier: PriorityMultiplier::ONE,
         submitted_at: base_ts(),
+        actor: None,
     })
 }
 
@@ -205,6 +210,116 @@ pub fn abort_cmd(job: JobId, at: Timestamp) -> Command {
         job,
         reason: Some("test".into()),
         requested_at: at,
+        actor: None,
+    })
+}
+
+// ---- Authorization fixtures (ADR 0023) ----
+
+/// An ordinary authenticated principal carrying no groups.
+pub fn actor(principal: &str) -> Actor {
+    Actor {
+        principal: principal.into(),
+        ..Actor::default()
+    }
+}
+
+/// An authenticated principal whose token carries `groups`.
+pub fn actor_in(principal: &str, groups: &[&str]) -> Actor {
+    Actor {
+        principal: principal.into(),
+        groups: groups.iter().map(|g| (*g).to_string()).collect(),
+        ..Actor::default()
+    }
+}
+
+/// A request authenticated by an operator certificate — implicit unscoped
+/// admin, outside the bindings list.
+pub fn operator_cert(cn: &str) -> Actor {
+    Actor {
+        principal: format!("cert:{cn}"),
+        operator_cert: true,
+        ..Actor::default()
+    }
+}
+
+pub fn group_binding(name: &str, role: Role, scope: Option<QuotaEntityId>) -> Binding {
+    Binding {
+        subject: Subject::Group(name.into()),
+        role,
+        scope,
+    }
+}
+
+pub fn principal_binding(sub: &str, role: Role, scope: Option<QuotaEntityId>) -> Binding {
+    Binding {
+        subject: Subject::Principal(sub.into()),
+        role,
+        scope,
+    }
+}
+
+/// Attach an actor to an actor-carrying command, so the plain builders above
+/// serve both the internal-proposer and the API-originated cases.
+///
+/// Exhaustive over the arms that take one: a new actor-carrying command
+/// fails to compile here rather than silently applying unauthorized.
+pub fn with_actor(command: Command, actor: Actor) -> Command {
+    match command {
+        Command::SubmitJob(c) => Command::SubmitJob(SubmitJob {
+            actor: Some(actor),
+            ..c
+        }),
+        Command::AbortJob(c) => Command::AbortJob(AbortJob {
+            actor: Some(actor),
+            ..c
+        }),
+        Command::SetNodeSchedulable(c) => Command::SetNodeSchedulable(SetNodeSchedulable {
+            actor: Some(actor),
+            ..c
+        }),
+        Command::ConfigureQuotaEntity(c) => Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+            actor: Some(actor),
+            ..c
+        }),
+        Command::UpdatePolicy(c) => Command::UpdatePolicy(UpdatePolicy {
+            actor: Some(actor),
+            ..c
+        }),
+        Command::UpdateAuthorization(c) => Command::UpdateAuthorization(UpdateAuthorization {
+            actor: Some(actor),
+            ..c
+        }),
+        Command::BumpClusterVersion(c) => Command::BumpClusterVersion(BumpClusterVersion {
+            actor: Some(actor),
+            ..c
+        }),
+        other => panic!("{other:?} carries no actor"),
+    }
+}
+
+pub fn update_authorization_cmd(bindings: Vec<Binding>) -> Command {
+    Command::UpdateAuthorization(UpdateAuthorization {
+        bindings,
+        actor: None,
+        updated_at: base_ts(),
+    })
+}
+
+pub fn set_schedulable_cmd(node: NodeId, schedulable: bool) -> Command {
+    Command::SetNodeSchedulable(SetNodeSchedulable {
+        node,
+        schedulable,
+        actor: None,
+        updated_at: base_ts(),
+    })
+}
+
+pub fn bump_version_cmd(to: u32) -> Command {
+    Command::BumpClusterVersion(BumpClusterVersion {
+        to,
+        actor: None,
+        bumped_at: base_ts(),
     })
 }
 

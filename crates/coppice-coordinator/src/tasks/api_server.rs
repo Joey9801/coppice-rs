@@ -295,9 +295,11 @@ pub(crate) async fn submit_job_here<C: Consensus>(
             quota_entity: req.quota_entity,
             retry: req.retry.map(Into::into).unwrap_or_default(),
             abort_requested: None,
+            submitted_by: None,
         },
         multiplier,
         submitted_at: Timestamp::now(),
+        actor: None,
     });
 
     match consensus.propose(command).await {
@@ -328,6 +330,7 @@ pub(crate) async fn abort_job_here<C: Consensus>(
         job,
         reason,
         requested_at: Timestamp::now(),
+        actor: None,
     });
 
     match consensus.propose(command).await {
@@ -360,6 +363,7 @@ pub(crate) async fn configure_quota_entity_here<C: Consensus>(
         name: req.name.clone(),
         quota: CostUnits(req.quota_ucu),
         updated_at: Timestamp::now(),
+        actor: None,
     });
 
     match consensus.propose(command).await {

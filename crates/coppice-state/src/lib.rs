@@ -35,8 +35,10 @@ use coppice_core::quota::{
 use coppice_core::time::{Duration, Timestamp};
 
 mod apply;
+pub mod authz;
 pub mod command;
 
+pub use authz::{Actor, Binding, Denial, Role, Subject, Verb};
 pub use command::Command;
 
 /// The authoritative, replicated control-plane state.
@@ -79,6 +81,15 @@ pub struct StateMachine {
     pub next_allocation_seq: u64,
     /// Replicated cluster policy (ADR 0020: never in node config files).
     pub policy: PolicyConfig,
+    /// The replicated role-binding list (ADR 0023), replaced wholesale by
+    /// `UpdateAuthorization`. Plain data in list order — evaluation
+    /// ([`authz::evaluate`]) is a union scan over it, and no derived or
+    /// memoized index of it may live on this struct.
+    ///
+    /// Empty on a fresh cluster: deny by default, so until the first
+    /// `UpdateAuthorization` commits, only operator certificates (and the
+    /// open posture) can act.
+    pub bindings: Vec<Binding>,
     /// Semantic feature gate (ADR 0003), bumped only by `BumpClusterVersion`.
     pub cluster_version: u32,
     /// The cluster CA certificate bundle (ADR 0037 §4), or `None` before the
@@ -555,6 +566,11 @@ pub struct QuotaEntity {
     pub updated_at: Timestamp,
 }
 
+/// The default name of the token claim carrying a principal's groups
+/// (ADR 0022). Also the value an absent `groups_claim` decodes to, so a
+/// policy written without one keeps the documented default.
+pub const DEFAULT_GROUPS_CLAIM: &str = "groups";
+
 /// Maximum quota-tree depth.
 ///
 /// Bounds the ancestor walk during charging so no command can turn apply
@@ -595,6 +611,14 @@ pub struct PolicyConfig {
     pub terminal_retention: Duration,
     /// Default SIGTERM→SIGKILL grace for aborts.
     pub abort_grace: Duration,
+    /// Name of the token claim carrying a principal's groups (ADR 0022/0023),
+    /// `"groups"` by default.
+    ///
+    /// Replicated policy rather than node config: replicas reading different
+    /// claim names would disagree about authority. Apply never reads it —
+    /// the resolved groups ride the command's [`Actor`] — but the API layer
+    /// needs one cluster-wide answer.
+    pub groups_claim: String,
 }
 
 impl Default for PolicyConfig {
@@ -610,6 +634,7 @@ impl Default for PolicyConfig {
             refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
             terminal_retention: Duration::from_hours(72),
             abort_grace: Duration::from_secs(30),
+            groups_claim: DEFAULT_GROUPS_CLAIM.to_string(),
         }
     }
 }
@@ -668,6 +693,15 @@ pub enum RejectionReason {
     QuotaEntityCycle(QuotaEntityId),
     #[error("invalid policy: {0}")]
     InvalidPolicy(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("invalid authorization: {0}")]
+    InvalidAuthorization(String),
+    #[error(
+        "authorization would retain no unscoped admin binding; at least one is required so an \
+         accidental lockout stays loud (ADR 0023)"
+    )]
+    AuthorizationLockout,
     #[error("cluster version {requested} is not above current {current}")]
     ClusterVersionNotMonotonic { current: u32, requested: u32 },
     #[error("machine {machine} / raft node {raft_node_id} binding conflicts with an existing one")]
@@ -779,6 +813,7 @@ pub enum Event {
         entity: QuotaEntityId,
     },
     PolicyUpdated,
+    AuthorizationUpdated,
     ClusterVersionBumped {
         to: u32,
     },

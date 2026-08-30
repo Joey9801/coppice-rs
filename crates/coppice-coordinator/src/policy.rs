@@ -252,6 +252,7 @@ impl FormationPolicy {
             commands.push(Command::UpdatePolicy(UpdatePolicy {
                 policy,
                 updated_at: now,
+                actor: None,
             }));
         }
 
@@ -266,6 +267,7 @@ impl FormationPolicy {
                     name: qe.name.clone(),
                     quota: CostUnits(qe.quota),
                     updated_at: now,
+                    actor: None,
                 }));
             }
         }

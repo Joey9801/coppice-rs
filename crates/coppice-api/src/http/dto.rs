@@ -474,6 +474,7 @@ pub enum TimelineEventBody {
         entity: QuotaEntityId,
     },
     PolicyUpdated,
+    AuthorizationUpdated,
     ClusterVersionBumped {
         to: u32,
     },
@@ -527,6 +528,7 @@ impl From<&coppice_state::Event> for TimelineEventBody {
                 TimelineEventBody::QuotaEntityConfigured { entity: *entity }
             }
             E::PolicyUpdated => TimelineEventBody::PolicyUpdated,
+            E::AuthorizationUpdated => TimelineEventBody::AuthorizationUpdated,
             E::ClusterVersionBumped { to } => TimelineEventBody::ClusterVersionBumped { to: *to },
         }
     }

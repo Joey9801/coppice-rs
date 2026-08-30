@@ -30,6 +30,7 @@ use coppice_core::node::Node;
 use coppice_core::quota::{self, ChargeRecord, CostUnits, PriorityMultiplier, UsageState};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
+use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::{
     AllocationRecord, AttemptRecord, JobRecord, NodeRecord, PolicyConfig, QuotaEntity, StateMachine,
 };
@@ -74,6 +75,10 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
 
     let policy = PolicyConfig {
         priority_multipliers: build_priority_table(),
+        // Deliberately not the default: a snapshot round-trip that only ever
+        // saw "groups" could not tell an encoded value from a decode-time
+        // default (ADR 0023).
+        groups_claim: "coppice_groups".to_string(),
         ..PolicyConfig::default()
     };
     let priorities: Vec<i32> = policy.priority_multipliers.keys().copied().collect();
@@ -318,6 +323,13 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             quota_entity: leaf,
             retry,
             abort_requested,
+            // Most jobs arrive through an authenticated API (ADR 0023); some
+            // carry no actor, so both encodings appear in a snapshot.
+            submitted_by: if rng.chance(80, 100) {
+                Some(format!("user-{}", rng.range(0, 64)))
+            } else {
+                None
+            },
         };
         // Stamped like the real terminal path: a job aborted before any
         // attempt existed terminates in the abort apply itself, so its
@@ -350,6 +362,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
     bufs.attempts.sort_unstable_by_key(|(id, _)| *id);
     bufs.allocations.sort_unstable_by_key(|(id, _)| *id);
     bufs.accrual.sort_unstable_by_key(|(key, _)| *key);
+    let bindings = build_bindings(&quota_tree);
     let mut entities = quota_tree.entities;
     entities.sort_unstable_by_key(|(id, _)| *id);
 
@@ -362,6 +375,9 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         accrual_queue: bufs.accrual.into_iter().collect(),
         next_allocation_seq: next_seq,
         policy,
+        // A small, realistic binding list: an unscoped admin group, a
+        // principal bound over one subtree, and a scoped submitter group.
+        bindings,
         cluster_version: 1,
         // ADR 0037 PKI/identity facts are not part of the job-scaled synthetic
         // state; the dedicated PKI tests populate them directly.
@@ -375,6 +391,30 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         key_transfer_intents: Default::default(),
         version: cfg.jobs as u64 * 8,
     }
+}
+
+/// A representative role-binding list over the synthesized quota tree
+/// (ADR 0023), so snapshot round-trips carry every subject kind, every role,
+/// and both scoped and unscoped bindings.
+fn build_bindings(tree: &QuotaTree) -> Vec<Binding> {
+    let mut bindings = vec![Binding {
+        subject: Subject::Group("platform-admins".to_string()),
+        role: Role::Admin,
+        scope: None,
+    }];
+    if let Some(leaf) = tree.leaves.first() {
+        bindings.push(Binding {
+            subject: Subject::Principal("user-7".to_string()),
+            role: Role::Operator,
+            scope: Some(*leaf),
+        });
+        bindings.push(Binding {
+            subject: Subject::Group("batch-users".to_string()),
+            role: Role::Submitter,
+            scope: Some(*leaf),
+        });
+    }
+    bindings
 }
 
 /// A uniform random span in `[lo, hi)`, drawn at microsecond granularity.
