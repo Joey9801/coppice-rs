@@ -270,7 +270,10 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
 
         // Periodic liveness + running-set invariant check (ADR 0009 last
         // paragraph). ImageCacheInventory is observed-only soft-scoring input
-        // (ADR 0010) — never a command; ignored in v1.
+        // (ADR 0010) — never a command; ignored in v1. `used` is likewise
+        // observed-only and must never reach a command: it is deliberately not
+        // read here, and the consumer that will peel it off lives beside
+        // `liveness.mark`, outside the normalizer.
         Body::Heartbeat(hb) => {
             let Some(node_record) = view.state().nodes.get(&node) else {
                 tracing::debug!(%node, "ingestion: heartbeat for unknown node, dropping");
@@ -670,6 +673,7 @@ mod tests {
             capacity: None,
             running: running.iter().map(|a| (*a).into()).collect(),
             image_cache: None,
+            used: None,
         })
     }
 

@@ -45,6 +45,7 @@ crates/coppice-agent/src/
     cache.rs                   image cache manager (§7)
     stats.rs                   per-container metrics sampler (§8.1)
     logs.rs                    log follower + at-least-once resume (§8.2)
+    usage.rs                   job-attributable node usage fold (§8.1)
   telemetry/
     mod.rs                     TelemetryHub: fan-out, batching, backpressure
     sink.rs                    MetricsSink / LogSink traits

@@ -20,6 +20,7 @@ pub mod observed;
 pub mod pressure;
 pub mod session;
 pub mod telemetry;
+pub mod usage;
 
 use std::sync::Arc;
 
@@ -114,6 +115,7 @@ pub fn describe_metrics() {
     executor::docker::describe_metrics();
     telemetry::describe_metrics();
     node_service::describe_metrics();
+    usage::describe_metrics();
 }
 
 /// Run any point-in-time sampling behind agent metrics, recursing the same
@@ -124,6 +126,10 @@ pub fn gather_metrics() {
     executor::docker::gather_metrics();
     telemetry::gather_metrics();
     node_service::gather_metrics();
+    // The one genuinely *sampled* entry in this fan-out (usage.rs): it asks the
+    // session-installed executor handle for a fresh node-usage fold rather than
+    // reading a value some earlier event pushed.
+    usage::gather_metrics();
 }
 
 /// How often the detached upkeep task drains the recorder's histogram buckets.
@@ -364,7 +370,9 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         state,
         docker_executor,
     )
-    .with_service_addr(config.service_addr());
+    .with_service_addr(config.service_addr())
+    // Publish the executor as the `/metrics` node-usage source (usage.rs).
+    .with_usage_metrics();
 
     tracing::info!("coppice agent started; entering the session loop");
     session::run(session, &config, tls_store).await

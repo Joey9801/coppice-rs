@@ -837,6 +837,9 @@ pub(crate) async fn reap(inner: &Inner, allocation: AllocationId) -> Result<(), 
         st.claimed.remove(&allocation);
         st.running.remove(&allocation);
         st.starting.remove(&allocation);
+        // Usually already gone (the exit claim drops it with the sampler); this
+        // is the backstop for a container reaped without one.
+        st.live_usage.remove(&allocation);
         // The kill marker is deliberately not cleared when `stop` returns: the
         // die event it exists for can land after that, and the entry is
         // meaningless once the container is gone anyway.

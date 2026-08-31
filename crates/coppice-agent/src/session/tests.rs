@@ -5,6 +5,7 @@
 
 use coppice_consensus::fs::RealFs;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::Duration;
@@ -901,4 +902,56 @@ async fn recovery_reports_journaled_stop_outcome_over_runtime_code() {
         !observes(&forked, alloc).await,
         "recovery still reaps the journaled survivor"
     );
+}
+
+// ---- node usage on the heartbeat ----------------------------------------
+
+/// The presence rule: an executor that measures nothing reports no `used` at
+/// all. Absent is "not measured" — a zero vector would claim an idle node.
+#[tokio::test]
+async fn heartbeat_omits_usage_when_the_executor_measures_nothing() {
+    let (_dir, session, _exec) = session();
+    let Some(pb::agent_report::Body::Heartbeat(hb)) = session.heartbeat_report().await.body else {
+        panic!("heartbeat_report must produce a Heartbeat body");
+    };
+    assert_eq!(
+        hb.used, None,
+        "an unmeasured node reports no NodeUsage, not a zero one"
+    );
+}
+
+/// A measured fold rides the heartbeat verbatim, stamped with a sample time.
+/// A measured *zero* is still a report — the distinction absence carries is
+/// "not measured", not "idle".
+#[tokio::test]
+async fn heartbeat_carries_the_measured_usage_fold() {
+    let (_dir, session, exec) = session();
+    let used = Resources {
+        cpu_millis: 1_500,
+        memory: ByteSize::from_bytes(3 << 30),
+        disk: ByteSize::from_bytes(7 << 30),
+    };
+    exec.set_usage(Some(used));
+
+    let before = Timestamp::now();
+    let Some(pb::agent_report::Body::Heartbeat(hb)) = session.heartbeat_report().await.body else {
+        panic!("heartbeat_report must produce a Heartbeat body");
+    };
+    let usage = hb.used.expect("a measured fold is reported");
+    let (reported, sampled_at) =
+        coppice_proto::convert::node_usage_from_pb(usage).expect("the report decodes");
+    assert_eq!(reported, used);
+    assert!(
+        sampled_at >= before && sampled_at <= Timestamp::now(),
+        "the fold is stamped when it was taken"
+    );
+
+    exec.set_usage(Some(Resources::ZERO));
+    let Some(pb::agent_report::Body::Heartbeat(hb)) = session.heartbeat_report().await.body else {
+        panic!("heartbeat_report must produce a Heartbeat body");
+    };
+    let usage = hb.used.expect("a measured zero is still a measurement");
+    let (reported, _) =
+        coppice_proto::convert::node_usage_from_pb(usage).expect("the report decodes");
+    assert_eq!(reported, Resources::ZERO);
 }
