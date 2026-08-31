@@ -31,7 +31,7 @@ use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use coppice_authn::{Actor, AuthnChain, Credentials};
+use coppice_authn::{Actor, AuthnChain, Credentials, Presentation};
 
 use super::enroll::PeerCertificates;
 use super::error::{ErrorCode, HttpError};
@@ -65,6 +65,38 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestActor {
                 ))
             }
         }
+    }
+}
+
+/// The presentation-only claims (ADR 0022) a bearer token carried, as
+/// handlers see them.
+///
+/// Never store this and never let it near [`coppice_state::Actor`] or a
+/// proposed command — `name` and `email` exist only so `GET /api/v1/session`
+/// can hand them back to the caller who presented them. Falls back to
+/// [`Presentation::default`] (both fields `None`) if the layer did not insert
+/// one, which in practice only the operator-certificate and open-mode paths
+/// do deliberately; a missing extension is not an error here the way a
+/// missing [`Actor`] is, because a request with no presentation claims is
+/// entirely ordinary.
+// Not yet read by any handler — the session DTO wiring that consumes this is
+// the main session's follow-up work; this type is the seam it extracts
+// through. Exercised directly in this module's own tests below.
+#[derive(Debug, Clone)]
+pub(super) struct RequestPresentation(pub Presentation);
+
+#[axum::async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for RequestPresentation {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(RequestPresentation(
+            parts
+                .extensions
+                .get::<Presentation>()
+                .cloned()
+                .unwrap_or_default(),
+        ))
     }
 }
 
@@ -141,8 +173,14 @@ pub async fn authenticate(
     };
 
     match chain.authenticate(creds).await {
-        Ok(actor) => {
-            request.extensions_mut().insert(actor);
+        Ok(authenticated) => {
+            request.extensions_mut().insert(authenticated.actor);
+            // Inserted alongside the actor, never folded into it: this is the
+            // presentation-only seam `GET /api/v1/session` reads through
+            // `RequestPresentation`. Every path through the chain inserts one
+            // (bearer fills it, the others insert `Presentation::default()`),
+            // so `RequestPresentation`'s own fallback is belt-and-braces.
+            request.extensions_mut().insert(authenticated.presentation);
             next.run(request).await
         }
         // The `Unauthenticated` display text names the mechanism that failed
@@ -174,5 +212,52 @@ fn credential_value(value: &axum::http::HeaderValue) -> String {
     match raw.split_once(' ') {
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => rest.trim().to_string(),
         _ => raw.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::FromRequestParts;
+    use axum::http::Request;
+
+    use super::*;
+
+    /// A request that never passed through [`authenticate`] (or one that did,
+    /// on the certificate/open path, which inserts
+    /// `Presentation::default()` anyway) still yields a usable
+    /// `RequestPresentation` rather than a rejection — `name`/`email` are
+    /// optional display data, not a precondition the way `RequestActor`'s
+    /// `Actor` is.
+    #[tokio::test]
+    async fn request_presentation_falls_back_to_default_when_absent() {
+        let request = Request::builder().body(()).expect("build a bare request");
+        let (mut parts, ()) = request.into_parts();
+
+        let RequestPresentation(presentation) =
+            RequestPresentation::from_request_parts(&mut parts, &())
+                .await
+                .expect("the fallback never errors");
+
+        assert_eq!(presentation, Presentation::default());
+    }
+
+    /// The happy path: the middleware's own insertion is what a handler
+    /// downstream of it actually sees.
+    #[tokio::test]
+    async fn request_presentation_reads_the_inserted_extension() {
+        let request = Request::builder().body(()).expect("build a bare request");
+        let (mut parts, ()) = request.into_parts();
+        parts.extensions.insert(Presentation {
+            name: Some("Alice Example".to_string()),
+            email: Some("alice@example.com".to_string()),
+        });
+
+        let RequestPresentation(presentation) =
+            RequestPresentation::from_request_parts(&mut parts, &())
+                .await
+                .expect("the fallback never errors");
+
+        assert_eq!(presentation.name.as_deref(), Some("Alice Example"));
+        assert_eq!(presentation.email.as_deref(), Some("alice@example.com"));
     }
 }

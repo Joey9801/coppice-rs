@@ -642,6 +642,7 @@ impl From<&UpdateAuthorization> for pb::UpdateAuthorization {
             bindings: c.bindings.iter().map(Into::into).collect(),
             actor: c.actor.as_ref().map(Into::into),
             updated_at_us: c.updated_at.as_micros(),
+            groups_claim: c.groups_claim.clone(),
         }
     }
 }
@@ -657,6 +658,9 @@ impl TryFrom<pb::UpdateAuthorization> for UpdateAuthorization {
             bindings: bindings_from_pb(c.bindings)?,
             actor: c.actor.map(Into::into),
             updated_at: timestamp(c.updated_at_us, "UpdateAuthorization.updated_at_us")?,
+            // Absent = leave the claim name alone; the emptiness check is
+            // apply's, beside the other shape rules.
+            groups_claim: c.groups_claim,
         })
     }
 }

@@ -313,10 +313,6 @@ impl LeaderWrites for AdminForwarder {
         })
     }
 
-    /// The one forwarded write with a second index to carry back: the
-    /// follow-up `UpdatePolicy` the leader proposes when the request also
-    /// changes `groups_claim` (see `api_server::update_authorization_here`).
-    ///
     /// The bindings themselves cross as
     /// [`coppice.core.v1.Binding`](coppice_proto::pb::core::v1::Binding) — the
     /// same message the command log carries — rather than a second encoding of
@@ -334,12 +330,8 @@ impl LeaderWrites for AdminForwarder {
             let wire = authorization_to_pb(history_id, req, actor)?;
             let response =
                 under_timeout(deadline, client.forward_update_authorization(wire)).await?;
-            let policy_log_index = response.policy_log_index;
             let log_index = applied_index(response.outcome)?;
-            Ok(UpdateAuthorizationResponse {
-                log_index,
-                policy_log_index,
-            })
+            Ok(UpdateAuthorizationResponse { log_index })
         })
     }
 }

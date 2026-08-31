@@ -571,14 +571,15 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// Replace the replicated role bindings wholesale on behalf of `actor`
     /// (`PUT /api/v1/authorization`, ADR 0023) — an unscoped-admin verb.
     ///
-    /// Up to **two** commands, each atomic on its own and neither conditional
-    /// on the other: the `UpdateAuthorization` always, and — when the request
-    /// carries a `groups_claim` different from the one in replicated policy —
-    /// a follow-up `UpdatePolicy` that clones the current policy and changes
-    /// only that field. There is no transaction spanning them, by design:
-    /// `groups_claim` lives in `PolicyConfig` and the bindings do not, and
-    /// inventing a combined command to edit two unrelated pieces of policy
-    /// together would be a worse thing than last-writer-wins.
+    /// Exactly **one** command: `UpdateAuthorization` carries the bindings
+    /// and, optionally, the `groups_claim` rename, and apply installs both at
+    /// one log position. The two edits are only safe together — split across
+    /// two commands, the second is authorized at *its own* position against
+    /// the bindings the first just installed, while the actor's groups are
+    /// still read under the old claim name, so a rename that also swaps the
+    /// admin group denies its own second half. `groups_claim` still lives in
+    /// `PolicyConfig`, and `UpdatePolicy` still replaces it wholesale;
+    /// concurrent editors resolve last-writer-wins in log order.
     fn update_authorization(
         &self,
         req: UpdateAuthorizationRequest,

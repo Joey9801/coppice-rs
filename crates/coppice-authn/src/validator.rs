@@ -25,6 +25,18 @@ pub struct ValidatedToken {
     pub sub: String,
     /// The groups claim's contents, or empty when the claim is absent.
     pub groups: Vec<String>,
+    /// The `name` claim, if present and a non-empty string.
+    ///
+    /// Presentation-only (ADR 0022): this rides alongside the resolved
+    /// identity for display purposes — `GET /api/v1/session` reports it — and
+    /// is never stored, never replicated, and never part of
+    /// [`coppice_state::Actor`].
+    pub name: Option<String>,
+    /// The `email` claim, if present and a non-empty string.
+    ///
+    /// Same presentation-only rule as [`name`](Self::name): display only,
+    /// never stored, never replicated.
+    pub email: Option<String>,
 }
 
 /// Validates bearer tokens against a [`JwksCache`] and an [`OidcConfig`].
@@ -121,9 +133,32 @@ impl Validator {
             .to_string();
 
         let groups = extract_groups(&claims, groups_claim)?;
+        let name = extract_string_claim(&claims, "name");
+        let email = extract_string_claim(&claims, "email");
 
-        Ok(ValidatedToken { sub, groups })
+        Ok(ValidatedToken {
+            sub,
+            groups,
+            name,
+            email,
+        })
     }
+}
+
+/// Read a presentation-only string claim: `Some` only for a non-empty string,
+/// `None` for anything else (absent, `null`, a number, an object, an empty
+/// string).
+///
+/// Unlike [`extract_groups`], an unreadable shape here is never an error —
+/// `name` and `email` carry no authorization meaning, so there is nothing to
+/// guess at and refusing a token over a display field would be a real outage
+/// caused by a cosmetic claim.
+fn extract_string_claim(claims: &Map<String, Value>, name: &str) -> Option<String> {
+    claims
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Read the groups claim by name.
@@ -281,6 +316,30 @@ mod tests {
             extract_groups(&c, "groups"),
             Err(ValidateError::UnreadableGroupsClaim(_))
         ));
+    }
+
+    #[test]
+    fn string_claim_shapes() {
+        let c = claims(json!({ "name": "Alice Example" }));
+        assert_eq!(
+            extract_string_claim(&c, "name"),
+            Some("Alice Example".to_string())
+        );
+
+        let c = claims(json!({ "sub": "x" }));
+        assert_eq!(extract_string_claim(&c, "name"), None);
+
+        let c = claims(json!({ "name": 42 }));
+        assert_eq!(extract_string_claim(&c, "name"), None);
+
+        let c = claims(json!({ "name": { "first": "Alice" } }));
+        assert_eq!(extract_string_claim(&c, "name"), None);
+
+        let c = claims(json!({ "name": "" }));
+        assert_eq!(extract_string_claim(&c, "name"), None);
+
+        let c = claims(json!({ "name": null }));
+        assert_eq!(extract_string_claim(&c, "name"), None);
     }
 
     #[test]

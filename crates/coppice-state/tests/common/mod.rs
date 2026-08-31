@@ -303,6 +303,18 @@ pub fn update_authorization_cmd(bindings: Vec<Binding>) -> Command {
         bindings,
         actor: None,
         updated_at: base_ts(),
+        groups_claim: None,
+    })
+}
+
+/// The same, plus the optional `groups_claim` rename the command carries so
+/// that a claim change and a binding change land at one log position.
+pub fn update_authorization_cmd_with_claim(bindings: Vec<Binding>, claim: &str) -> Command {
+    Command::UpdateAuthorization(UpdateAuthorization {
+        bindings,
+        actor: None,
+        updated_at: base_ts(),
+        groups_claim: Some(claim.to_string()),
     })
 }
 

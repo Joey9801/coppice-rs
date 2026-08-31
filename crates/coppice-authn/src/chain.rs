@@ -56,6 +56,33 @@ pub fn static_groups_claim(name: impl Into<String>) -> GroupsClaimProvider {
     Arc::new(move || name.clone())
 }
 
+/// Presentation-only claims from a verified bearer token.
+///
+/// ADR 0022: `name` and `email` exist only to be *shown back* to the caller
+/// who presented them — `GET /api/v1/session` is the one consumer — and carry
+/// no authorization meaning. They are never stored, never replicated, and
+/// never touch [`coppice_state::Actor`] or anything derived from it; a value
+/// here rides alongside the actor for exactly the duration of one request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Presentation {
+    /// The token's `name` claim, if it carried a non-empty one.
+    pub name: Option<String>,
+    /// The token's `email` claim, if it carried a non-empty one.
+    pub email: Option<String>,
+}
+
+/// What one request authenticated as: the [`Actor`] a proposed command would
+/// carry, plus the presentation-only claims that ride alongside it for
+/// display but never join the replicated value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authenticated {
+    /// The resolved identity — the same value ADR 0023 attaches to commands.
+    pub actor: Actor,
+    /// Presentation-only claims from the credential, if any. `Default` (both
+    /// fields `None`) for every mechanism but the bearer path.
+    pub presentation: Presentation,
+}
+
 /// The result of offering one request's credentials to one mechanism.
 enum Step {
     /// This mechanism has nothing to say about this request — no certificate
@@ -63,7 +90,7 @@ enum Step {
     /// in this posture. The chain moves on.
     NotApplicable,
     /// This mechanism authenticated the request. The chain stops.
-    Authenticated(Box<Actor>),
+    Authenticated(Box<Authenticated>),
     /// A credential *for this mechanism* was presented and it is bad. The
     /// chain stops with a 401; it does not fall through to a weaker mechanism.
     Rejected(Unauthenticated),
@@ -169,13 +196,16 @@ impl AuthnChain {
     /// presented-and-invalid credential must never degrade into a weaker
     /// identity than the caller asked for, so a bad bearer token in the OIDC
     /// posture is a 401 and not, say, an anonymous read.
-    pub async fn authenticate(&self, creds: Credentials<'_>) -> Result<Actor, Unauthenticated> {
+    pub async fn authenticate(
+        &self,
+        creds: Credentials<'_>,
+    ) -> Result<Authenticated, Unauthenticated> {
         for authenticator in &self.authenticators {
             match authenticator.attempt(creds).await {
                 Step::NotApplicable => continue,
-                Step::Authenticated(actor) => {
-                    metrics::record_auth_outcome(actor.method().as_str(), "ok");
-                    return Ok(*actor);
+                Step::Authenticated(authenticated) => {
+                    metrics::record_auth_outcome(authenticated.actor.method().as_str(), "ok");
+                    return Ok(*authenticated);
                 }
                 Step::Rejected(err) => {
                     metrics::record_auth_outcome(err.attempted_method().as_str(), "rejected");
@@ -196,7 +226,10 @@ impl Authenticator {
                 validator,
                 groups_claim,
             } => bearer(validator, groups_claim, creds).await,
-            Authenticator::Open => Step::Authenticated(Box::new(actor::anonymous())),
+            Authenticator::Open => Step::Authenticated(Box::new(Authenticated {
+                actor: actor::anonymous(),
+                presentation: Presentation::default(),
+            })),
         }
     }
 }
@@ -215,7 +248,10 @@ fn operator_cert(ca: &CaProvider, strict: bool, creds: Credentials<'_>) -> Step 
 
     match pki::verify_leaf(&ca_pem, leaf) {
         Ok(verified) => match verified.profile {
-            Profile::Operator { cn } => Step::Authenticated(Box::new(actor::operator(&cn))),
+            Profile::Operator { cn } => Step::Authenticated(Box::new(Authenticated {
+                actor: actor::operator(&cn),
+                presentation: Presentation::default(),
+            })),
             // A coordinator or agent leaf is a real cluster identity, but not
             // an *operator* one: those certificates authenticate machines on
             // the internal planes and carry no human accountability. Granting
@@ -267,9 +303,13 @@ async fn bearer(
         )));
     }
     match validator.validate(token, &groups_claim()).await {
-        Ok(validated) => {
-            Step::Authenticated(Box::new(actor::bearer(validated.sub, validated.groups)))
-        }
+        Ok(validated) => Step::Authenticated(Box::new(Authenticated {
+            actor: actor::bearer(validated.sub, validated.groups),
+            presentation: Presentation {
+                name: validated.name,
+                email: validated.email,
+            },
+        })),
         Err(e) => Step::Rejected(Unauthenticated::InvalidBearer(e)),
     }
 }

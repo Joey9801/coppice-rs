@@ -44,9 +44,7 @@ use crate::tasks::node_client::NodeClient;
 use coppice_core::job::Job;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::command::{
-    AbortJob, ConfigureQuotaEntity, SubmitJob, UpdateAuthorization, UpdatePolicy,
-};
+use coppice_state::command::{AbortJob, ConfigureQuotaEntity, SubmitJob, UpdateAuthorization};
 use coppice_state::{Actor, Command};
 
 use crate::tasks::event_fanout::{EventFilter, FanoutHandle};
@@ -408,29 +406,19 @@ pub(crate) async fn configure_quota_entity_here<C: Consensus>(
 /// Replace the replicated bindings on this replica, with no forwarding
 /// (ADR 0023).
 ///
-/// **Up to two commands, and that is the contract, not a shortcut.** The
-/// bindings list and `PolicyConfig.groups_claim` live in different places in
-/// replicated state, and there is no command that edits both. So this proposes
-/// the `UpdateAuthorization` always, and — only when the request carries a
-/// `groups_claim` that differs from the one in the latest view — a follow-up
-/// `UpdatePolicy` that clones the current policy and changes that single
-/// field. The clone-and-change shape is the same one `FormationPolicy::commands`
-/// uses for the priority table, and for the same reason: `UpdatePolicy` is a
-/// full replacement, so anything not carried forward is silently erased.
+/// **One command, always.** The bindings list and
+/// `PolicyConfig.groups_claim` live in different places in replicated state,
+/// but `UpdateAuthorization` carries both, so apply installs them at a single
+/// log position — no follow-up, no read-back of the policy, no window in
+/// which a claim rename that also swaps the admin group could be authorized
+/// against the bindings it just replaced.
 ///
-/// Each command is atomic on its own; together they are not. Two admins
-/// editing concurrently resolve last-writer-wins in log order, per field, like
-/// every other policy edit in the system. A caller that saw both indexes knows
-/// both landed; a caller that saw an error after the first landed knows only
-/// that the bindings changed — which is why the response reports the two
-/// indexes separately rather than pretending to one transaction.
-///
-/// The follow-up failing is reported as the call's failure. Re-driving the
-/// whole request then re-applies the `UpdateAuthorization` too, which is
-/// harmless: it is a full replacement of the same list with itself.
+/// Two admins editing concurrently still resolve last-writer-wins in log
+/// order, like every other policy edit in the system; `UpdatePolicy` remains
+/// the other writer of `groups_claim` (as a full replacement) and races this
+/// one the same way.
 pub(crate) async fn update_authorization_here<C: Consensus>(
     consensus: &C,
-    views: &StateViews,
     req: &UpdateAuthorizationRequest,
     actor: &Actor,
 ) -> Result<UpdateAuthorizationResponse, LocalWriteError> {
@@ -451,6 +439,11 @@ pub(crate) async fn update_authorization_here<C: Consensus>(
         bindings,
         actor: Some(actor.clone()),
         updated_at: Timestamp::now(),
+        // Absent leaves the claim name alone. Present-and-identical is not
+        // filtered out here: this command is a full replacement either way,
+        // and comparing against a possibly-stale view is exactly the read
+        // this shape exists to avoid.
+        groups_claim: req.groups_claim.clone(),
     });
     let log_index = match consensus.propose(command).await {
         Ok(Applied {
@@ -464,42 +457,7 @@ pub(crate) async fn update_authorization_here<C: Consensus>(
         Err(e) => return Err(e.into()),
     };
 
-    // Read the policy *after* the bindings applied, so the comparison and the
-    // clone both see the freshest view this replica has. Nothing is serialized
-    // against a concurrent policy edit — see the doc comment.
-    let policy = views.latest().state().policy.clone();
-    let policy_log_index = match &req.groups_claim {
-        // Absent leaves it alone; present-and-identical proposes nothing, so
-        // a client that PUTs the document it just GET-ed does not write an
-        // entry saying nothing changed.
-        None => None,
-        Some(claim) if *claim == policy.groups_claim => None,
-        Some(claim) => {
-            let mut policy = policy;
-            policy.groups_claim = claim.clone();
-            let command = Command::UpdatePolicy(UpdatePolicy {
-                policy,
-                actor: Some(actor.clone()),
-                updated_at: Timestamp::now(),
-            });
-            match consensus.propose(command).await {
-                Ok(Applied {
-                    outcome: Ok(_),
-                    log_index,
-                }) => Some(log_index),
-                Ok(Applied {
-                    outcome: Err(rejection),
-                    ..
-                }) => return Err(LocalWriteError::Api(ApiError::Rejected(rejection))),
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
-
-    Ok(UpdateAuthorizationResponse {
-        log_index,
-        policy_log_index,
-    })
+    Ok(UpdateAuthorizationResponse { log_index })
 }
 
 /// Implements [`ControlPlane`] by proposing through the consensus seam.
@@ -686,7 +644,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         req: UpdateAuthorizationRequest,
         actor: Actor,
     ) -> Result<UpdateAuthorizationResponse, ApiError> {
-        match update_authorization_here(&*self.consensus, &self.views, &req, &actor).await {
+        match update_authorization_here(&*self.consensus, &req, &actor).await {
             Ok(response) => Ok(response),
             Err(LocalWriteError::Api(e)) => Err(e),
             Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
@@ -1160,10 +1118,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>> {
             Box::pin(async move {
                 let log_index = self.record(leader, None, actor)?;
-                Ok(UpdateAuthorizationResponse {
-                    log_index,
-                    policy_log_index: None,
-                })
+                Ok(UpdateAuthorizationResponse { log_index })
             })
         }
     }
@@ -1809,7 +1764,7 @@ mod tests {
         }
     }
 
-    // ---- UpdateAuthorization's two commands (ADR 0023) -------------------
+    // ---- UpdateAuthorization is one command (ADR 0023) -------------------
 
     fn authorization_request(groups_claim: Option<&str>) -> dto::UpdateAuthorizationRequest {
         dto::UpdateAuthorizationRequest {
@@ -1823,12 +1778,8 @@ mod tests {
         }
     }
 
-    /// A request that does not change `groups_claim` proposes exactly one
-    /// command, and reports no policy index.
-    ///
-    /// Not merely an optimization: `UpdatePolicy` is a full replacement, so a
-    /// gratuitous one is a real write that can clobber a concurrent policy
-    /// edit — for a field the request never asked to change.
+    /// A request without a `groups_claim` proposes exactly one command, and
+    /// that command leaves the claim name alone.
     #[tokio::test]
     async fn an_authorization_replacement_alone_proposes_one_command() {
         let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
@@ -1837,73 +1788,41 @@ mod tests {
             .update_authorization(authorization_request(None), test_actor())
             .await
             .expect("accepted");
-        assert_eq!(response.policy_log_index, None);
         assert!(response.log_index > 0);
-        assert!(matches!(
-            consensus.proposed().as_slice(),
-            [Command::UpdateAuthorization(_)]
-        ));
+        match consensus.proposed().as_slice() {
+            [Command::UpdateAuthorization(auth)] => assert_eq!(auth.groups_claim, None),
+            other => panic!("expected one command, got {other:?}"),
+        }
     }
 
-    /// A `groups_claim` identical to the replicated one is not a change, and
-    /// proposes nothing extra — so a client that PUTs back the document it
-    /// just GET-ed does not write an entry saying nothing happened.
-    #[tokio::test]
-    async fn an_unchanged_groups_claim_proposes_no_policy_update() {
-        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
-        let current = cp.views.latest().state().policy.groups_claim.clone();
-
-        let response = cp
-            .update_authorization(authorization_request(Some(&current)), test_actor())
-            .await
-            .expect("accepted");
-        assert_eq!(response.policy_log_index, None);
-        assert_eq!(consensus.proposed().len(), 1);
-    }
-
-    /// A changed `groups_claim` proposes a second command — a `UpdatePolicy`
-    /// cloning the current policy and touching only that one field.
+    /// A `groups_claim` change is still one command — it rides the bindings
+    /// replacement instead of following it.
     ///
-    /// The clone is what the assertion is really about. `UpdatePolicy`
-    /// replaces the whole `PolicyConfig`, so building one from a default
-    /// would silently erase the priority table, the decay settings, and every
-    /// other field an operator configured — while succeeding.
+    /// This is the whole point of the shape: a follow-up `UpdatePolicy` would
+    /// be authorized at *its own* log position, against the bindings this
+    /// command just installed, with the actor's groups still read under the
+    /// old claim name. A claim rename that also swaps the admin group would
+    /// therefore deny its own second half and leave the cluster half-updated.
+    /// One command cannot half-apply. It also means no read-back of the
+    /// policy, so a lagging view cannot feed a stale full-replacement clone
+    /// that silently reverts other policy fields.
     #[tokio::test]
-    async fn a_changed_groups_claim_proposes_a_policy_update_that_preserves_everything_else() {
+    async fn a_changed_groups_claim_rides_the_same_command() {
         let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
-        let before = cp.views.latest().state().policy.clone();
-        // The seeded fixture configures a multiplier for priority 0; that is
-        // the field whose survival proves the clone.
-        assert!(!before.priority_multipliers.is_empty());
 
         let response = cp
             .update_authorization(authorization_request(Some("entitlements")), test_actor())
             .await
             .expect("accepted");
-        assert_eq!(response.policy_log_index, Some(2));
+        assert!(response.log_index > 0);
 
         match consensus.proposed().as_slice() {
-            [Command::UpdateAuthorization(auth), Command::UpdatePolicy(policy)] => {
-                // Order matters: the bindings replacement is the request's
-                // subject, the policy edit its rider.
+            [Command::UpdateAuthorization(auth)] => {
                 assert_eq!(auth.bindings.len(), 1);
                 assert_eq!(auth.actor, Some(test_actor()));
-                assert_eq!(policy.actor, Some(test_actor()));
-                assert_eq!(policy.policy.groups_claim, "entitlements");
-                assert_eq!(
-                    policy.policy.priority_multipliers, before.priority_multipliers,
-                    "the policy is cloned and edited, never rebuilt"
-                );
-                assert_eq!(
-                    coppice_state::PolicyConfig {
-                        groups_claim: before.groups_claim.clone(),
-                        ..policy.policy.clone()
-                    },
-                    before,
-                    "groups_claim is the only field that changed"
-                );
+                assert_eq!(auth.groups_claim.as_deref(), Some("entitlements"));
             }
-            other => panic!("expected two commands, got {other:?}"),
+            other => panic!("expected exactly one command, got {other:?}"),
         }
     }
 
@@ -1923,11 +1842,10 @@ mod tests {
         assert!(consensus.proposed().is_empty());
     }
 
-    /// An apply-time refusal of the bindings replacement surfaces as a
-    /// rejection and stops the follow-up: the `groups_claim` edit is a rider
-    /// on a replacement that did not happen.
+    /// An apply-time refusal surfaces as a rejection, and there is nothing
+    /// left half-applied behind it: the claim rename was in the same command.
     #[tokio::test]
-    async fn a_rejected_replacement_does_not_propose_the_policy_follow_up() {
+    async fn a_rejected_replacement_leaves_nothing_behind() {
         let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Rejected(
             coppice_state::RejectionReason::AuthorizationLockout,
         ));
@@ -1939,7 +1857,7 @@ mod tests {
                 coppice_state::RejectionReason::AuthorizationLockout
             ))
         ));
-        assert_eq!(consensus.proposed().len(), 1, "only the replacement");
+        assert_eq!(consensus.proposed().len(), 1, "one command, refused");
     }
 
     // ---- Forwarding (ADR 0038) carries the actor and the classification --

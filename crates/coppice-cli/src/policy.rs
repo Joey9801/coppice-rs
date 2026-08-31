@@ -215,16 +215,10 @@ async fn set(client: &ApiClient, file: &Path, json: bool) -> Result<()> {
     }
     let response: dto::UpdateAuthorizationResponse =
         serde_json::from_value(body).context("reading update response")?;
-    match response.policy_log_index {
-        Some(policy_log_index) => println!(
-            "updated authorization policy (log index {}, policy log index {})",
-            response.log_index, policy_log_index
-        ),
-        None => println!(
-            "updated authorization policy (log index {})",
-            response.log_index
-        ),
-    }
+    println!(
+        "updated authorization policy (log index {})",
+        response.log_index
+    );
     Ok(())
 }
 
@@ -412,7 +406,6 @@ mod tests {
                         Json(
                             serde_json::to_value(dto::UpdateAuthorizationResponse {
                                 log_index: 11,
-                                policy_log_index: Some(12),
                             })
                             .unwrap(),
                         )
