@@ -869,6 +869,15 @@ fn write_operator_material(root: &Path, operator: &OperatorPem) -> Result<()> {
 // Readiness polling over the client API
 // ---------------------------------------------------------------------------
 
+/// A `reqwest::Client` for polling `coppice dev`'s own in-process coordinator
+/// at `http://127.0.0.1:<port>` — never anything else, so it always takes the
+/// plain-HTTP fast path in [`crate::client::plain_http_builder`].
+fn local_readiness_client() -> Result<reqwest::Client> {
+    crate::client::plain_http_builder("http://127.0.0.1")
+        .build()
+        .context("building the dev readiness HTTP client")
+}
+
 /// Wait until the client listener answers, i.e. the task runtime is serving.
 ///
 /// Formation returns as soon as the replica is started; the API edge (and with
@@ -877,7 +886,10 @@ async fn wait_for_client_api(
     api: &str,
     coordinator: &mut tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    // Always a plain `http://127.0.0.1` base (see `local_readiness_client`'s
+    // doc) — skip the native-root-store enumeration `reqwest::Client::new()`
+    // would otherwise pay on every `coppice dev` launch.
+    let client = local_readiness_client()?;
     let url = format!("{api}/api/v1/nodes");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -899,7 +911,7 @@ async fn wait_for_client_api(
 /// Wait for the in-process agent's registration to land in applied state,
 /// returning its epoch (ADR 0009).
 async fn wait_for_agent(api: &str, agent_node: NodeId) -> Result<u64> {
-    let client = reqwest::Client::new();
+    let client = local_readiness_client()?;
     let url = format!("{api}/api/v1/nodes/{agent_node}");
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
