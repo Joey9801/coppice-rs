@@ -122,6 +122,14 @@ user-declared whale flag.
   the top-K are seated normally whenever they fit, and quota decay keeps
   effective scores moving so the protected window rotates rather than being
   camped on.
+- **A node accrues for at most one job** (ADR 0027, hardcoded — no knob). Two
+  accruals queued behind each other on one node share the same release
+  events, so the second's bound is only ever the worse one, and the node is
+  lend-free for both. One accrual per node keeps every hold on capacity that
+  is actually next in line for it. Apply refuses any batch that would leave a
+  node accruing for more than one job; a same-batch swap (revoke the sitting
+  accrual, open another there) is fine, since the rule reads the post-batch
+  state.
 - An accrual is a hold, not a destination commitment. The scheduler re-plans
   every pass; if the job's slot appears on a different node first it is
   seated there and the accrual is revoked, and an accrual is moved to

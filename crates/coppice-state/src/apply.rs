@@ -501,13 +501,19 @@ impl StateMachine {
         None
     }
 
-    /// Simulate the batch and count distinct jobs left holding accruing
-    /// allocations.
+    /// Simulate the batch and check both accrual guards (ADR 0027): the
+    /// cluster-wide cap on distinct jobs holding accruing allocations, and the
+    /// per-node invariant that a node never ends a batch accruing for more
+    /// than one job.
     ///
-    /// Mirrors the pledge arithmetic of the effects phase. A batch may not
-    /// grow the accruing set beyond K; a cluster already over the limit
-    /// (after a policy change) may keep operating and swap accruals, it
-    /// just cannot add more.
+    /// Mirrors the pledge arithmetic of the effects phase. The cluster cap may
+    /// not be grown past K by a batch; a cluster already over the limit (after
+    /// a policy change) may keep operating and swap accruals, it just cannot
+    /// add more. The per-node rule has no such grandfathering — it is a plain
+    /// assertion about the post-batch state, so a same-batch swap (revoke the
+    /// sitting accrual, open another on that node) passes and nothing else
+    /// does. Only nodes the batch touches are examined: a node with neither a
+    /// revocation nor a placement ends the batch exactly as it started.
     fn check_accrual_limit(
         &self,
         c: &CommitPlacements,
@@ -537,6 +543,8 @@ impl StateMachine {
             }
         }
         let mut sim_free: BTreeMap<NodeId, Resources> = BTreeMap::new();
+        // Jobs still accruing on each touched node once the batch has landed.
+        let mut per_node: BTreeMap<NodeId, BTreeSet<JobId>> = BTreeMap::new();
         for node in &touched {
             let mut free = self.free_capacity(node, Some(used));
             for id in revoked {
@@ -546,8 +554,13 @@ impl StateMachine {
                     }
                 }
             }
+            let node_jobs = per_node.entry(*node).or_default();
             // Freed capacity flows to the surviving queue in commit order
-            // before any new placement sees it.
+            // before any new placement sees it. The walk runs to the end of the
+            // node's queue rather than stopping once `free` is exhausted: the
+            // survivors past that point are exactly the ones still accruing,
+            // and the per-node set needs them. The queue is one deep under the
+            // invariant below, so there is nothing to save by stopping early.
             for ((_, _), alloc_id) in self.accrual_queue.range((*node, 0)..=(*node, u64::MAX)) {
                 if revoked.contains(alloc_id) {
                     continue;
@@ -563,9 +576,8 @@ impl StateMachine {
                 free = free.saturating_sub(&pledge);
                 if pledge == need {
                     accruing_jobs.remove(&rec.allocation.job);
-                }
-                if free.is_zero() {
-                    break;
+                } else {
+                    node_jobs.insert(rec.allocation.job);
                 }
             }
             sim_free.insert(*node, free);
@@ -582,12 +594,19 @@ impl StateMachine {
             *free = free.saturating_sub(&pledge);
             if pledge != spec.requested {
                 accruing_jobs.insert(p.job);
+                per_node.entry(spec.node).or_default().insert(p.job);
             }
         }
         let after = accruing_jobs.len();
         let limit = self.policy.accrual_limit;
+        // The cluster-wide cap is the coarser gate, so it answers first.
         if after > limit as usize && after > before {
             return Some(RejectionReason::AccrualLimitExceeded { limit });
+        }
+        for (node, jobs) in &per_node {
+            if jobs.len() > 1 {
+                return Some(RejectionReason::PerNodeAccrualExceeded { node: *node });
+            }
         }
         None
     }

@@ -8,7 +8,7 @@ mod common;
 use common::*;
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
-use coppice_core::id::GroupId;
+use coppice_core::id::{AllocationId, GroupId};
 use coppice_core::job::{JobState, RetryPolicy};
 use coppice_core::quota::{CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
 use coppice_core::time::Duration;
@@ -161,54 +161,30 @@ fn funding_follows_commit_order_not_id_order() {
     let mut sm = setup();
     apply_ok(
         &mut sm,
-        submit_cmd(jid(1), cpu(10_000), Some(3_600), RetryPolicy::default()),
-    );
-    apply_ok(
-        &mut sm,
-        place_cmd(
-            placement(jid(1), aid(11), alid(111), nid(1), cpu(10_000)),
-            base_ts(),
-        ),
-    );
-    apply_ok(&mut sm, dispatch_cmd(aid(11), base_ts()));
-    apply_ok(&mut sm, started_cmd(aid(11), base_ts()));
-
-    // First-committed whale gets a *larger* AllocationId than the second, so
-    // id-ordered funding would fund the wrong one.
-    apply_ok(
-        &mut sm,
         submit_cmd(jid(2), cpu(6_000), Some(3_600), RetryPolicy::default()),
-    );
-    apply_ok(
-        &mut sm,
-        place_cmd(
-            placement(jid(2), aid(22), alid(0xFF), nid(1), cpu(6_000)),
-            base_ts(),
-        ),
     );
     apply_ok(
         &mut sm,
         submit_cmd(jid(3), cpu(6_000), Some(3_600), RetryPolicy::default()),
     );
+    // Two 6-core placements against a 10-core node in one batch. The
+    // first-committed carries a *larger* AllocationId than the second, so
+    // id-ordered funding would fund the wrong one. Only the second is left
+    // accruing, so the batch also clears the per-node accrual ceiling.
     apply_ok(
         &mut sm,
-        place_cmd(
-            placement(jid(3), aid(33), alid(0x01), nid(1), cpu(6_000)),
-            base_ts(),
-        ),
+        Command::CommitPlacements(CommitPlacements {
+            expected_version: 0,
+            revocations: vec![],
+            placements: vec![
+                placement(jid(2), aid(22), alid(0xFF), nid(1), cpu(6_000)),
+                placement(jid(3), aid(33), alid(0x01), nid(1), cpu(6_000)),
+            ],
+            proposed_at: base_ts(),
+        }),
     );
-
-    apply_ok(
-        &mut sm,
-        outcome_cmd(
-            aid(11),
-            AttemptOutcome::Exited { code: 0 },
-            60,
-            ts(TS_US + 1),
-        ),
-    );
-    // 10 cores freed: first-committed (seq order) fully funds, the later one
-    // takes the remainder.
+    // First-committed (seq order) fully funds, the later one takes the
+    // remainder.
     assert_eq!(
         sm.allocations[&alid(0xFF)].allocation.state,
         AllocationState::Funded
@@ -665,6 +641,104 @@ fn accrual_limit_bounds_concurrent_whales() {
         JobState::Queued,
         "rejected batch must have no effects"
     );
+}
+
+#[test]
+fn a_node_accrues_for_at_most_one_job() {
+    // Two full nodes, so every fresh placement accrues. The cluster cap is the
+    // default 4 and never binds here: the per-node ceiling of one is what
+    // decides each batch below (ADR 0027).
+    let mut sm = setup();
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(10_000), base_ts()));
+    for n in 1..=2u128 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(
+                jid(100 + n),
+                cpu(10_000),
+                Some(3_600),
+                RetryPolicy::default(),
+            ),
+        );
+        apply_ok(
+            &mut sm,
+            place_cmd(
+                placement(
+                    jid(100 + n),
+                    aid(100 + n),
+                    alid(100 + n),
+                    nid(n),
+                    cpu(10_000),
+                ),
+                base_ts(),
+            ),
+        );
+        apply_ok(&mut sm, dispatch_cmd(aid(100 + n), base_ts()));
+    }
+    for j in 2..=4u128 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(jid(j), cpu(10_000), Some(3_600), RetryPolicy::default()),
+        );
+    }
+
+    // Two jobs accruing on one node in one batch: refused whole.
+    let rejection = sm
+        .apply(&Command::CommitPlacements(CommitPlacements {
+            expected_version: 0,
+            revocations: vec![],
+            placements: vec![
+                placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)),
+                placement(jid(3), aid(33), alid(333), nid(1), cpu(10_000)),
+            ],
+            proposed_at: base_ts(),
+        }))
+        .unwrap_err();
+    assert_eq!(
+        rejection,
+        RejectionReason::PerNodeAccrualExceeded { node: nid(1) }
+    );
+    assert_eq!(
+        sm.jobs[&jid(2)].state,
+        JobState::Queued,
+        "rejected batch must have no effects"
+    );
+
+    // The same two accruals, one per node: accepted.
+    apply_ok(
+        &mut sm,
+        Command::CommitPlacements(CommitPlacements {
+            expected_version: 0,
+            revocations: vec![],
+            placements: vec![
+                placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)),
+                placement(jid(3), aid(33), alid(333), nid(2), cpu(10_000)),
+            ],
+            proposed_at: base_ts(),
+        }),
+    );
+    assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Accruing);
+    assert_eq!(sm.attempts[&aid(33)].attempt.state, AttemptState::Accruing);
+
+    // A swap on an occupied node — revoke the sitting accrual, open another in
+    // the same batch — passes: the check is on the post-batch state.
+    apply_ok(
+        &mut sm,
+        Command::CommitPlacements(CommitPlacements {
+            expected_version: 0,
+            revocations: vec![alid(222)],
+            placements: vec![placement(jid(4), aid(44), alid(444), nid(1), cpu(10_000))],
+            proposed_at: ts(TS_US + 1),
+        }),
+    );
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Queued);
+    assert_eq!(sm.attempts[&aid(44)].attempt.state, AttemptState::Accruing);
+    let on_node_1: Vec<AllocationId> = sm
+        .accrual_queue
+        .range((nid(1), 0)..=(nid(1), u64::MAX))
+        .map(|(_, id)| *id)
+        .collect();
+    assert_eq!(on_node_1, vec![alid(444)]);
 }
 
 #[test]
