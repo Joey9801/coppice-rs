@@ -8,9 +8,9 @@ import { createRealClient } from './real-client'
  * The delegation table below flips one `CoppiceApi` method at a time from
  * the mock to the real HTTP client as its coordinator endpoint lands (see
  * "How to replace a mock endpoint with a real one" in CLAUDE.md) — most
- * reads are real now; `getSession`, `getNodeUtilization`, `getNodeHistory`,
- * `getNodeLogs`, `getCoordinatorLogs` stay on the mock because their routes
- * still answer `501 UNIMPLEMENTED` server-side. Keep the mock compiling —
+ * reads are real now; `getNodeUtilization`, `getNodeHistory`, `getNodeLogs`,
+ * `getCoordinatorLogs` stay on the mock because their routes still answer
+ * `501 UNIMPLEMENTED` server-side. Keep the mock compiling —
  * it also backs tests and `npm run dev` without a running coordinator.
  *
  * `VITE_COPPICE_MOCK` (a build-time Vite env flag, set via `.env` or the
@@ -28,6 +28,8 @@ export const api: CoppiceApi = import.meta.env.VITE_COPPICE_MOCK
       const real = createRealClient()
       return {
         ...mock,
+        getSession: real.getSession,
+
         getClusterOverview: real.getClusterOverview,
         getQueueStats: real.getQueueStats,
 

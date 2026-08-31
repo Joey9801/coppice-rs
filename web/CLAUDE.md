@@ -118,5 +118,15 @@ the world, not by hardcoding values in components.
   is no more separate "UI's own shape" for this endpoint. A CPU
   instantaneous rate is derived by differencing consecutive samples at
   the point of use (`job-usage-section.tsx`), not served pre-computed.
-- **Auth is a stub.** `src/auth/session.tsx` documents the SSO seam
-  (ADRs 0022/0023). Everyone is "Demo User" until then.
+- **Auth is real, and thin.** `src/auth/oidc.ts` runs the
+  authorization-code + PKCE login (ADR 0022) against the issuer named by
+  `GET /api/v1/auth/config`, holding tokens in memory only; the real client
+  attaches the bearer token and `getSession()` maps the server's ADR 0023
+  authority summary onto `Session`. A 401 anywhere restarts the login from
+  `src/api/query-client.ts`. What the UI does _not_ have yet: any use of
+  per-binding subtree scope (`canConfigureEntities` is all-or-nothing), and
+  any role-aware chrome beyond that one check. `src/auth/auth-chrome.tsx` is
+  the one place that decides how much auth chrome a posture gets: in
+  `mode: "open"` there is no login and no identity at all, only the
+  insecure-deployment badge. Under `VITE_COPPICE_MOCK` the mock client still
+  answers "Demo User" with no coordinator attached.

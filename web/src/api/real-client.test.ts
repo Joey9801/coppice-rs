@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from './client'
+import { setTokensForTests } from '@/auth/oidc'
 import { createRealClient } from './real-client'
 
 /**
@@ -322,9 +323,121 @@ describe('error translation', () => {
     }
   })
 
+  it('maps a bodyless 401 by status so the re-login still fires', async () => {
+    // A 401 from something in front of the coordinator (a reverse proxy, an
+    // auth gateway) carries no `{ code, message }` body at all; falling back
+    // to `Internal` would silently disable the centralized re-login.
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 401 }))
+    await expect(createRealClient().listNodes()).rejects.toMatchObject({
+      code: 'Unauthenticated',
+      message: 'request failed with status 401',
+    })
+  })
+
+  it('maps a non-JSON 403 by status', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response('<html>Forbidden</html>', {
+        status: 403,
+        headers: { 'Content-Type': 'text/html' },
+      }),
+    )
+    await expect(createRealClient().listNodes()).rejects.toMatchObject({
+      code: 'PermissionDenied',
+    })
+  })
+
   it('translates a network failure to Unavailable', async () => {
     fetchMock.mockRejectedValueOnce(new TypeError('fetch failed'))
     const client = createRealClient()
     await expect(client.listNodes()).rejects.toMatchObject({ code: 'Unavailable' })
+  })
+})
+
+describe('getSession', () => {
+  it('summarizes the ADR 0023 bindings into flat roles', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        principal: 'auth0|42',
+        groups: ['batch-users'],
+        auth_method: 'bearer',
+        name: 'Ada Lovelace',
+        email: 'ada@example.test',
+        bindings: [
+          { role: 'admin', scope: 'quota-00000000-0000-0000-0000-000000000001' },
+          { role: 'submitter', scope: null },
+          { role: 'submitter', scope: 'quota-00000000-0000-0000-0000-000000000002' },
+        ],
+        implicit_admin: false,
+      }),
+    )
+    const session = await createRealClient().getSession()
+    expect(fetchMock.mock.calls[0]![0]).toBe('/api/v1/session')
+    expect(session).toEqual({
+      subject: 'auth0|42',
+      name: 'Ada Lovelace',
+      email: 'ada@example.test',
+      roles: ['submitter', 'admin'],
+      implicitAdmin: false,
+    })
+  })
+
+  it('honors implicit_admin for a principal with no bindings', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        principal: 'cert:ops-laptop',
+        groups: [],
+        auth_method: 'operator_cert',
+        name: null,
+        email: null,
+        bindings: [],
+        implicit_admin: true,
+      }),
+    )
+    const session = await createRealClient().getSession()
+    expect(session.roles).toEqual([])
+    expect(session.implicitAdmin).toBe(true)
+    // No name or email claim: the opaque principal is what gets rendered.
+    expect(session.name).toBe('cert:ops-laptop')
+  })
+
+  it('falls back to the email claim for a display name', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        principal: 'auth0|43',
+        groups: [],
+        auth_method: 'bearer',
+        name: null,
+        email: 'grace@example.test',
+        bindings: [{ role: 'operator', scope: null }],
+        implicit_admin: false,
+      }),
+    )
+    const session = await createRealClient().getSession()
+    expect(session.name).toBe('grace@example.test')
+  })
+})
+
+describe('bearer credentials', () => {
+  afterEach(() => {
+    setTokensForTests(null)
+  })
+
+  it('attaches the held access token to every request', async () => {
+    setTokensForTests({
+      accessToken: 'at-live',
+      refreshToken: null,
+      expiresAt: Date.now() + 300_000,
+    })
+    fetchMock.mockResolvedValueOnce(jsonResponse({ nodes: [] }))
+    await createRealClient().listNodes()
+    const headers = (fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer at-live')
+  })
+
+  it('sends no Authorization header when no token is held (open mode)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ nodes: [] }))
+    await createRealClient().listNodes()
+    const headers = (fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>
+    expect(headers.Authorization).toBeUndefined()
   })
 })

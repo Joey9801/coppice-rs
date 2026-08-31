@@ -827,12 +827,28 @@ export interface LogChunk {
 }
 
 // ---------------------------------------------------------------------------
-// Session (auth stub — real SSO lands with ADRs 0022/0023)
+// Session (ADRs 0022/0023)
 // ---------------------------------------------------------------------------
 
+/**
+ * The resolved identity behind the current credential, flattened for
+ * display and for the one authorization question the UI asks
+ * (`canConfigureEntities`). The server's richer answer — matching bindings
+ * with their subtree scopes, the groups claim, the auth mechanism — is
+ * summarized by `real-client.ts`; widen this type when a UI actually needs
+ * more of it.
+ */
 export interface Session {
+  /** The OIDC `sub`, `cert:<CN>`, or `anonymous`. Opaque. */
   subject: string
+  /** Presentation only: the `name` claim, else email, else the subject. */
   name: string
   email: string | null
+  /** Roles held through matching role bindings, at any scope. */
   roles: string[]
+  /**
+   * Unscoped admin held outside the bindings list and not removable through
+   * it: an operator certificate, or an open (unauthenticated) deployment.
+   */
+  implicitAdmin: boolean
 }

@@ -17,6 +17,7 @@ import { Route as EntitiesIndexRouteImport } from './routes/entities.index'
 import { Route as NodesNodeIdRouteImport } from './routes/nodes.$nodeId'
 import { Route as JobsJobIdRouteImport } from './routes/jobs.$jobId'
 import { Route as EntitiesEntityIdRouteImport } from './routes/entities.$entityId'
+import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
 
 const CoordinatorsRoute = CoordinatorsRouteImport.update({
   id: '/coordinators',
@@ -58,10 +59,16 @@ const EntitiesEntityIdRoute = EntitiesEntityIdRouteImport.update({
   path: '/entities/$entityId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AuthCallbackRoute = AuthCallbackRouteImport.update({
+  id: '/auth/callback',
+  path: '/auth/callback',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/coordinators': typeof CoordinatorsRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/entities/$entityId': typeof EntitiesEntityIdRoute
   '/jobs/$jobId': typeof JobsJobIdRoute
   '/nodes/$nodeId': typeof NodesNodeIdRoute
@@ -72,6 +79,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/coordinators': typeof CoordinatorsRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/entities/$entityId': typeof EntitiesEntityIdRoute
   '/jobs/$jobId': typeof JobsJobIdRoute
   '/nodes/$nodeId': typeof NodesNodeIdRoute
@@ -83,6 +91,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/coordinators': typeof CoordinatorsRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/entities/$entityId': typeof EntitiesEntityIdRoute
   '/jobs/$jobId': typeof JobsJobIdRoute
   '/nodes/$nodeId': typeof NodesNodeIdRoute
@@ -95,6 +104,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/coordinators'
+    | '/auth/callback'
     | '/entities/$entityId'
     | '/jobs/$jobId'
     | '/nodes/$nodeId'
@@ -105,6 +115,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/coordinators'
+    | '/auth/callback'
     | '/entities/$entityId'
     | '/jobs/$jobId'
     | '/nodes/$nodeId'
@@ -115,6 +126,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/coordinators'
+    | '/auth/callback'
     | '/entities/$entityId'
     | '/jobs/$jobId'
     | '/nodes/$nodeId'
@@ -126,6 +138,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   CoordinatorsRoute: typeof CoordinatorsRoute
+  AuthCallbackRoute: typeof AuthCallbackRoute
   EntitiesEntityIdRoute: typeof EntitiesEntityIdRoute
   JobsJobIdRoute: typeof JobsJobIdRoute
   NodesNodeIdRoute: typeof NodesNodeIdRoute
@@ -192,12 +205,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof EntitiesEntityIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/auth/callback': {
+      id: '/auth/callback'
+      path: '/auth/callback'
+      fullPath: '/auth/callback'
+      preLoaderRoute: typeof AuthCallbackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   CoordinatorsRoute: CoordinatorsRoute,
+  AuthCallbackRoute: AuthCallbackRoute,
   EntitiesEntityIdRoute: EntitiesEntityIdRoute,
   JobsJobIdRoute: JobsJobIdRoute,
   NodesNodeIdRoute: NodesNodeIdRoute,

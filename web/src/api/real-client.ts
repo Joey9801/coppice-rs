@@ -1,3 +1,4 @@
+import { getAccessToken } from '@/auth/oidc'
 import type { CoppiceApi } from './client'
 import { ApiError } from './client'
 import type { ApiErrorCode } from './client'
@@ -43,6 +44,7 @@ import {
   type QuotaEntityStats,
   type QuotaEntityView,
   type Resources,
+  type Session,
   type TimelineEvent,
   type TimelineEventBody,
 } from './types'
@@ -77,9 +79,7 @@ type TrueUpKind = NonNullable<CostReport['trueUp']>['kind']
  */
 export function createRealClient(): CoppiceApi {
   return {
-    getSession: () => {
-      throw new Error('getSession has no real implementation — route through the mock')
-    },
+    getSession: () => getJson('/session', mapSession),
 
     getClusterOverview: () => getJson('/overview', mapClusterOverview),
     getQueueStats: () => getJson('/queue/stats', mapQueueStats),
@@ -143,12 +143,40 @@ const WIRE_ERROR_CODES: Record<string, ApiErrorCode> = {
   INTERNAL: 'Internal',
 }
 
+/**
+ * Fallback when the body is missing, not JSON, or carries a code this client
+ * does not know: not every 401 the browser sees comes from the coordinator's
+ * error layer (a reverse proxy or an auth gateway in front of it can answer
+ * with an HTML page, or nothing at all), and an `Unauthenticated` that
+ * degrades to `Internal` silently disables the centralized re-login in
+ * `query-client.ts`. Only the two statuses the UI actually branches on are
+ * mapped here — a credential problem (401) and an authority problem (403);
+ * everything else stays `Internal`, since nothing downstream distinguishes
+ * those and inventing a domain code from a proxy's status would be a guess.
+ */
+const STATUS_ERROR_CODES: Record<number, ApiErrorCode> = {
+  401: 'Unauthenticated',
+  403: 'PermissionDenied',
+}
+
+/**
+ * Every call carries the bearer token whenever one is held (ADR 0022). It is
+ * read per request rather than captured at client construction so a token
+ * refresh takes effect immediately; when no token is held — open mode, or
+ * before the first login — the header is simply absent and the server
+ * decides. An explicit `Authorization` in `init.headers` still wins.
+ */
 async function request(path: string, init?: RequestInit): Promise<Response> {
   let response: Response
+  const token = getAccessToken()
   try {
     response = await fetch(`/api/v1${path}`, {
       ...init,
-      headers: { Accept: 'application/json', ...init?.headers },
+      headers: {
+        Accept: 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...init?.headers,
+      },
     })
   } catch (err) {
     throw new ApiError('Unavailable', err instanceof Error ? err.message : 'network request failed')
@@ -159,9 +187,10 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
       body = (await response.json()) as WireErrorBody
     } catch {
       // Non-JSON error body (e.g. a proxy's HTML error page) — fall through
-      // to the generic message below.
+      // to the status-derived code below.
     }
-    const code = (body && WIRE_ERROR_CODES[body.code]) ?? 'Internal'
+    const code =
+      (body && WIRE_ERROR_CODES[body.code]) ?? STATUS_ERROR_CODES[response.status] ?? 'Internal'
     const message = body?.message ?? `request failed with status ${response.status}`
     const leaderHint = response.headers.get('coppice-leader') ?? undefined
     throw new ApiError(code, message, leaderHint)
@@ -213,6 +242,53 @@ interface WireResources {
 
 function mapResources(r: WireResources): Resources {
   return { cpuMillis: r.cpu_millis, memoryBytes: r.memory_bytes, diskBytes: r.disk_bytes }
+}
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+type WireBindingRole = 'submitter' | 'operator' | 'admin'
+
+interface WireSessionBinding {
+  role: WireBindingRole
+  /** Subtree root the role is scoped to; `null` = cluster-wide. */
+  scope: QuotaEntityId | null
+}
+
+interface WireGetSessionResponse {
+  principal: string
+  groups: string[]
+  auth_method: 'bearer' | 'operator_cert' | 'open'
+  name: string | null
+  email: string | null
+  bindings: WireSessionBinding[]
+  implicit_admin: boolean
+}
+
+/**
+ * The ADR 0023 authority summary → the flat `Session` the UI consumes.
+ *
+ * `roles` is the deduplicated set of roles from the matching bindings, in the
+ * closed role set's own order rather than the wire's, so it reads the same
+ * however the bindings happen to be stored. The per-binding `scope` is
+ * deliberately dropped here: no UI consumes subtree scoping yet (see
+ * `canConfigureEntities`), and inventing a scoped shape before there is a
+ * consumer would be guessing at the eventual one.
+ *
+ * `name` is presentation-only and frequently absent — the `name` claim, else
+ * the `email` claim, else the opaque principal, which is always something to
+ * render (`cert:<CN>` for an operator certificate, `anonymous` in open mode).
+ */
+function mapSession(s: WireGetSessionResponse): Session {
+  const roles: WireBindingRole[] = ['submitter', 'operator', 'admin']
+  return {
+    subject: s.principal,
+    name: s.name ?? s.email ?? s.principal,
+    email: s.email,
+    roles: roles.filter((role) => s.bindings.some((b) => b.role === role)),
+    implicitAdmin: s.implicit_admin,
+  }
 }
 
 // ---------------------------------------------------------------------------
