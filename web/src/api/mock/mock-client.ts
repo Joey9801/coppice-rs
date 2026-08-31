@@ -43,6 +43,7 @@ export function createMockClient(): CoppiceApi {
       name: 'Demo User',
       email: null,
       roles: ['admin'],
+      implicitAdmin: false,
     }),
 
     getClusterOverview: () => settle(() => world.buildClusterOverview()),

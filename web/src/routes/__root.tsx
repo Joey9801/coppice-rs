@@ -1,7 +1,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { Link, Outlet, createRootRouteWithContext } from '@tanstack/react-router'
 import { Boxes, Gauge, ListTodo, Moon, Network, ServerCog, Sun } from 'lucide-react'
-import { useSession } from '@/auth/session'
+import { AuthChrome } from '@/auth/auth-chrome'
 import { useTheme } from '@/lib/theme'
 
 interface RouterContext {
@@ -50,7 +50,7 @@ function AppShell() {
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 items-center justify-end gap-3 border-b px-6">
           <ThemeToggle />
-          <UserBadge />
+          <AuthChrome />
         </header>
         <main className="min-w-0 flex-1 p-6">
           <Outlet />
@@ -71,22 +71,5 @@ function ThemeToggle() {
     >
       {theme === 'dark' ? <Sun className="size-4" /> : <Moon className="size-4" />}
     </button>
-  )
-}
-
-function UserBadge() {
-  const { data: session } = useSession()
-  if (!session) return null
-  return (
-    <div className="flex items-center gap-2">
-      <span className="flex size-7 items-center justify-center rounded-full bg-primary text-xs font-semibold text-primary-foreground">
-        {session.name
-          .split(' ')
-          .map((w) => w[0])
-          .join('')
-          .slice(0, 2)}
-      </span>
-      <span className="text-sm text-muted-foreground">{session.name}</span>
-    </div>
   )
 }
