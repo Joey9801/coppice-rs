@@ -131,6 +131,24 @@ impl<F: Fs, E: Executor> Session<F, E> {
         self
     }
 
+    /// Publish this session's executor as the process's node-usage source, so
+    /// the `/metrics` scrape can fold usage on demand
+    /// ([`usage`](crate::usage) explains why that handle is a static). A
+    /// builder setter like [`Session::with_service_addr`], and opt-in for the
+    /// same reason: the many test sessions have no recorder to publish into.
+    ///
+    /// The extra `Clone + Send + Sync + 'static` bounds live on this method
+    /// rather than the type: only this one path needs an executor handle that
+    /// outlives the session's own borrow.
+    pub fn with_usage_metrics(self) -> Session<F, E>
+    where
+        E: Clone + Send + Sync + 'static,
+    {
+        let executor = self.executor.clone();
+        crate::usage::install_sampler(Box::new(move || executor.sample_usage()));
+        self
+    }
+
     // ---- test / loop accessors ----
 
     pub fn state(&self) -> &JournalState {
@@ -639,7 +657,8 @@ impl<F: Fs, E: Executor> Session<F, E> {
     }
 
     /// A periodic heartbeat: capacity, the currently-running allocation set,
-    /// and the (v1-empty) image-cache inventory.
+    /// the (v1-empty) image-cache inventory, and this node's best-effort
+    /// job-attributable usage.
     ///
     /// The `running` set is the agent's *accountability* set, not the raw
     /// runtime state: a container observed `Exited` under a journaled intent
@@ -678,10 +697,18 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 Vec::new()
             }
         };
+        // Best-effort job-attributable usage, folded from samples the executor
+        // already holds. `None` is "not measured" and rides as an absent field
+        // — never a zero vector (agent.proto's `Heartbeat.used`).
+        let used = self
+            .executor
+            .sample_usage()
+            .map(|used| coppice_proto::convert::node_usage_to_pb(&used, Timestamp::now()));
         self.report(pb::agent_report::Body::Heartbeat(pb::Heartbeat {
             capacity: Some((&self.capacity).into()),
             running,
             image_cache: Some(self.executor.cache_inventory()),
+            used,
         }))
     }
 

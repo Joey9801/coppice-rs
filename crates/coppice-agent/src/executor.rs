@@ -251,6 +251,27 @@ pub trait Executor: Send + Sync + 'static {
     fn evict_image(&self, digest: String) {
         let _ = digest;
     }
+
+    /// This node's **job-attributable** resource usage, folded from whatever
+    /// per-container samples the runtime already collects: cpu (milli-CPU),
+    /// memory, and disk all count only what this node's containers consumed,
+    /// never a host-level reading.
+    ///
+    /// Best-effort and deliberately cheap — the heartbeat path calls it, so an
+    /// implementation reads its own already-collected state and never queries
+    /// the container runtime here.
+    ///
+    /// `None` means **not measured**, never zero: this runtime measures
+    /// nothing, or has no fresh reading. A zero-usage node reports
+    /// `Some(Resources::ZERO)`; the distinction survives all the way to the
+    /// wire (`agent.proto`'s `Heartbeat.used`).
+    ///
+    /// Sync (like the two hint methods) both because the answer is a local read
+    /// and because a sync default body sidesteps the async-fn-in-trait
+    /// default-body `Send` hazard.
+    fn sample_usage(&self) -> Option<Resources> {
+        None
+    }
 }
 
 // ---- FakeExecutor -------------------------------------------------------
@@ -279,6 +300,10 @@ struct FakeInner {
     /// kernel's OOM kill (or the disk enforcer's) landing as our stop takes
     /// effect (docker-executor.md §4's carve-out on the 204 path).
     stop_causes: std::collections::BTreeMap<AllocationId, ExitCause>,
+    /// What [`Executor::sample_usage`] answers. `None` (the default) is the
+    /// honest reading for a runtime that measures nothing; tests that drive the
+    /// usage pipeline set it via [`FakeExecutor::set_usage`].
+    usage: Option<Resources>,
 }
 
 impl Default for FakeInner {
@@ -290,6 +315,7 @@ impl Default for FakeInner {
             start_counts: std::collections::BTreeMap::new(),
             now: Timestamp::now(),
             stop_causes: std::collections::BTreeMap::new(),
+            usage: None,
         }
     }
 }
@@ -396,6 +422,13 @@ impl FakeExecutor {
     pub fn plan_stop_cause(&self, allocation: AllocationId, cause: ExitCause) {
         self.lock().stop_causes.insert(allocation, cause);
     }
+
+    /// Set what [`Executor::sample_usage`] answers — the test control over the
+    /// node-usage pipeline (heartbeat → coordinator) without a docker daemon.
+    /// `None` restores the default "not measured" reading.
+    pub fn set_usage(&self, usage: Option<Resources>) {
+        self.lock().usage = usage;
+    }
 }
 
 impl Executor for FakeExecutor {
@@ -481,6 +514,12 @@ impl Executor for FakeExecutor {
                 tokio::time::sleep(StdDuration::from_millis(1)).await;
             }
         }
+    }
+
+    /// Whatever [`FakeExecutor::set_usage`] last installed — `None` by default,
+    /// since a fake runtime genuinely measures nothing.
+    fn sample_usage(&self) -> Option<Resources> {
+        self.lock().usage
     }
 }
 

@@ -34,8 +34,9 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 /// the recorder handle that renders the exposition text and a pointer to the
 /// crate-root [`gather_metrics`](crate::gather_metrics), invoked before each
 /// render so any point-in-time gauges are sampled fresh. The agent's metrics
-/// are all push-style counters today, so `gather` is effectively a no-op, but
-/// the pointer keeps the contract honest as sampled metrics are added.
+/// are mostly push-style counters whose `gather` half is a no-op; the node
+/// usage gauges ([`usage`](crate::usage)) are the sampled exception the pointer
+/// exists for.
 struct MetricsEndpoint {
     handle: PrometheusHandle,
     gather: fn(),

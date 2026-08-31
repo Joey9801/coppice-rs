@@ -11,6 +11,8 @@
 //! [`sample_from_stats`], unit-tested without a daemon (§12): the daemon-shaped
 //! I/O is the loop, the correctness-bearing field mapping is the function.
 
+use std::sync::{Arc, Mutex};
+
 use bollard::models::ContainerStatsResponse;
 use bollard::query_parameters::StatsOptionsBuilder;
 use bollard::Docker;
@@ -19,13 +21,16 @@ use tokio_stream::StreamExt;
 
 use coppice_core::time::{Duration as CoreDuration, Timestamp};
 
-use super::{classify, disk, ContainerIds};
+use super::{classify, disk, lock_state, usage, ContainerIds, ExecutorState};
 use crate::telemetry::{MetricSample, TelemetryHub};
 
 /// Spawn the metrics sampler for one container (docker-executor.md §8.1),
 /// returning its handle. Captures only clones (the docker client, the hub, the
-/// disk-readings map) — never an `Arc<Inner>` — so an abort is what stops it (the
-/// mod.rs no-cycle rule).
+/// disk-readings map, the shared executor state) — never an `Arc<Inner>` — so an
+/// abort is what stops it (the mod.rs no-cycle rule).
+// Every argument is a distinct captured clone or knob; bundling them into a
+// struct would only rename the same list (cf. `logs::spawn_follower`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_sampler(
     docker: Docker,
     hub: TelemetryHub,
@@ -34,6 +39,7 @@ pub(crate) fn spawn_sampler(
     interval: std::time::Duration,
     image_bytes: u64,
     readings: disk::DiskReadings,
+    state: Arc<Mutex<ExecutorState>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // `Delay` measures the interval from the *end* of the prior sample, so a
@@ -86,6 +92,21 @@ pub(crate) fn spawn_sampler(
                 disk_writable_bytes,
                 image_bytes,
                 &mut running_peak,
+            );
+            // Feed the node-usage window (usage.rs) before handing the sample
+            // off: `sample_usage` folds these readings on the heartbeat path,
+            // so this tick is the only place the daemon is ever asked.
+            lock_state(&state).note_usage_sample(
+                ids.allocation,
+                usage::Reading {
+                    at: sample.at,
+                    cpu_total: sample.cpu_usage_total,
+                    memory_bytes: sample.memory_used_bytes,
+                    // §6.2's definition of a job's disk usage: writable + image.
+                    disk_bytes: sample
+                        .disk_writable_bytes
+                        .saturating_add(sample.disk_image_bytes),
+                },
             );
             hub.append_metrics(vec![sample]);
         }

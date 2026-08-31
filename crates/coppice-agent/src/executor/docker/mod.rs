@@ -29,6 +29,7 @@ pub mod state;
 // wires up at start/adoption.
 mod logs;
 mod stats;
+mod usage;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -298,6 +299,12 @@ pub(crate) struct ExecutorState {
     /// [`Active`](CollectorSlot::Active). Absent when telemetry is disabled
     /// (unit-test executors never populate it).
     pub(crate) collectors: HashMap<AllocationId, CollectorSlot>,
+    /// The last two metrics readings per live container, written by each
+    /// sampler tick and folded by [`Executor::sample_usage`](crate::executor::Executor::sample_usage)
+    /// into this node's job-attributable usage (usage.rs). Entries are removed
+    /// when a container's sampler stops — at exit claim and again at reap — so
+    /// a dead container never contributes to the fold.
+    pub(crate) live_usage: HashMap<AllocationId, usage::LiveUsage>,
 }
 
 impl ExecutorState {
@@ -305,6 +312,14 @@ impl ExecutorState {
     /// of `running`, so the pushed value never lags the set.
     pub(crate) fn push_running_gauge(&self) {
         metrics::gauge!(AGENT_RUNNING_JOBS).set(self.running.len() as f64);
+    }
+
+    /// Record one container's metrics reading in its usage window (usage.rs).
+    /// Called at the end of every sampler tick, under the lock like every other
+    /// mutation here; the fold reads the window without touching the daemon.
+    pub(crate) fn note_usage_sample(&mut self, allocation: AllocationId, reading: usage::Reading) {
+        let entry = usage::LiveUsage::push(self.live_usage.get(&allocation).copied(), reading);
+        self.live_usage.insert(allocation, entry);
     }
 
     /// Note that an allocation's exit was claimed (docker-executor.md §8.2): abort
@@ -325,6 +340,9 @@ impl ExecutorState {
     /// carries it forward and aborts the sampler then (§8.2), so the forced-drain
     /// clock is never lost to the race.
     pub(crate) fn note_exit_claimed(&mut self, allocation: AllocationId, now: Timestamp) {
+        // The sampler stops here, so its readings stop too: drop the usage
+        // window rather than let it age out of the fold's freshness filter.
+        self.live_usage.remove(&allocation);
         match self.collectors.get_mut(&allocation) {
             Some(CollectorSlot::Active(collectors)) => {
                 if let Some(sampler) = collectors.sampler.take() {
@@ -1071,6 +1089,21 @@ impl Executor for DockerExecutor {
         self.inner.cache.prepare(image);
     }
 
+    /// Fold the live per-container windows into this node's job-attributable
+    /// usage (usage.rs). One mutex read and some arithmetic — deliberately no
+    /// daemon call, because the session calls this on the heartbeat path.
+    ///
+    /// `None` when job telemetry is disabled (no configured sink ⇒ no sampler
+    /// ever runs, so there is genuinely nothing measured) or when no container
+    /// has a reading fresher than `2 × metrics_interval`.
+    fn sample_usage(&self) -> Option<coppice_core::resource::Resources> {
+        let interval = self.inner.telemetry.as_ref()?.metrics_interval;
+        let interval_us = i64::try_from(interval.as_micros()).unwrap_or(i64::MAX);
+        let max_age = coppice_core::time::Duration::from_micros(interval_us.saturating_mul(2));
+        let state = lock_state(&self.inner.state);
+        usage::fold(&state.live_usage, Timestamp::now(), max_age)
+    }
+
     fn evict_image(&self, digest: String) {
         self.inner.cache.evict_hint(digest);
     }
@@ -1267,6 +1300,7 @@ pub(crate) async fn spawn_collectors(
             telemetry.metrics_interval,
             image_bytes,
             inner.disk.readings(),
+            Arc::clone(&inner.state),
         )
     });
     // No follower ⇒ pre-set `drained = true`: there is nothing for reap to wait on.
