@@ -29,15 +29,39 @@ Flows by client kind:
 
 - **Web UI** — static single-page client, authorization-code + PKCE, bearer
   tokens; no server-side sessions on coordinators.
-- **CLI** — authorization-code + PKCE with loopback redirect; device flow
-  for headless hosts; token cache in `~/.config/coppice/` (0600).
+- **CLI** — reads a bearer token from the `COPPICE_TOKEN` environment
+  variable (or `--token`) and attaches it to every request; no login flow,
+  no token cache, no refresh. Interactive login (authorization-code + PKCE
+  with a loopback redirect, device flow for headless hosts — ADR 0022's
+  "flows per client kind") is **deferred**: obtain a token out-of-band from
+  the cluster's configured issuer (whatever the IdP's own CLI/device flow
+  or token-issuing tooling for that OIDC client is) and export it as
+  `COPPICE_TOKEN`. A cluster running in open mode (below) needs none.
 - **Services** — OAuth2 client-credentials against the same issuer. Service
   onboarding is an IdP operation; Coppice stores nothing.
 
-Connection parameters (`issuer`, `client_id`, `audience`, client-secret
-path) are node config; the **groups-claim name and everything
+Connection parameters (`issuer`, `client_id`, `audience`) are node config
+(`[sso]`); there is no client-secret configuration — the coordinator is a
+resource server that only ever validates tokens offline, never
+authenticates itself to the issuer. The **groups-claim name and everything
 authorization-shaped are replicated policy**
 ([ADR 0020](../decisions/0020-node-config-vs-replicated-policy.md)).
+
+### Open mode: the explicit no-authentication posture
+
+Authentication is a no-default, either/or node-config choice, mirroring
+`[client_tls]`: a deployment configures `[sso]` (above), or opts into
+`[auth] insecure_open = true` — every request is then served as an
+anonymous actor with implicit unscoped admin authority, with no partial
+version. Exactly one of the two must be present; a config with neither, or
+both, fails at startup naming both options
+([operations/configuration.md](configuration.md)). Open mode is a
+**formally supported posture**, not a stopgap: `coppice dev` runs in it by
+default, since a local single-node cluster has no operator to
+authenticate, but it is intentionally unsafe — any caller that can reach
+the client listener can do anything an operator can — so it belongs only
+on development/test deployments, never a production cluster reachable by
+anyone but its operators.
 
 ### Operator certificates (break-glass and day 0)
 

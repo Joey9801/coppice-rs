@@ -139,6 +139,20 @@ unstated; [operations/security.md](../operations/security.md) now says it.
 Where those coordinator certificates come from in a templated deployment
 (and the reload seam for short-lived leaves) remains OD-14.
 
+### Amendment (2026-08-31): open mode is a formally supported posture
+
+Earlier drafts of the client listener served every request unauthenticated
+as a temporary gap, closed once the authn middleware landed. That framing
+is superseded: `[auth] insecure_open = true` is now a **formally
+supported** deployment posture, not a stopgap — the explicit, conspicuous
+alternative to `[sso]` that every coordinator config must choose one of
+(neither or both present is a startup error). `coppice dev` runs in this
+posture by default. It remains intentionally unsafe — every request
+resolves to an anonymous actor with implicit unscoped admin authority — so
+it is documented as development/test only, never a production posture. See
+[operations/configuration.md](../operations/configuration.md) for the
+config syntax and startup-validation behavior.
+
 ## Consequences
 
 - Authentication is replica-local and IdP-free on the request path: adding
