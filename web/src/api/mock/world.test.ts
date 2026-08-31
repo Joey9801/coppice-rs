@@ -165,18 +165,6 @@ describe('MockWorld construction', () => {
     // Advance far enough that ticks emit submissions and transitions.
     world.advanceTo(NOW_US + 120_000_000)
 
-    const { events, floorIndex } = world.buildClusterOverview().recentEvents
-    expect(events.length).toBeGreaterThan(0)
-    // Newest first, strictly ordered by identity — never by `at` (ADR 0032).
-    for (let i = 1; i < events.length; i += 1) {
-      const [newer, older] = [events[i - 1]!, events[i]!]
-      expect(
-        newer.index > older.index || (newer.index === older.index && newer.ordinal > older.ordinal),
-      ).toBe(true)
-    }
-    // The exclusive coverage cursor sits strictly below everything served.
-    expect(floorIndex).toBeLessThan(events[events.length - 1]!.index)
-
     // Per-job timelines share the same identity ordering, oldest first.
     const { jobs } = world.listJobs({ limit: 1000 })
     const withTimeline = jobs.find((j) => world.buildJobTimeline(j.id).length > 1)

@@ -42,9 +42,11 @@ function AppShell() {
             </Link>
           ))}
         </nav>
-        <div className="mt-auto p-3 text-[11px] text-muted-foreground">
-          Serving mock data — no coordinator attached
-        </div>
+        {import.meta.env.VITE_COPPICE_MOCK ? (
+          <div className="mt-auto p-3 text-[11px] text-muted-foreground">
+            Serving mock data — no coordinator attached
+          </div>
+        ) : null}
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">

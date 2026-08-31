@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
+use coppice_api::http::is_accruing;
 use coppice_api::{QueueBucket, QueueWindow};
 use coppice_consensus::StateViews;
 use coppice_core::job::JobState;
@@ -103,13 +104,22 @@ impl WindowState {
     }
 }
 
-/// Jobs currently in `Queued`, from the latest published view.
+/// Jobs waiting for capacity, from the latest published view: those in
+/// `Queued` plus those whose current attempt is still `Accruing`.
+///
+/// Load-bearing: this is the same predicate the API's `QueueStats::depth`
+/// projects ([`is_accruing`], shared verbatim), so the history buckets this
+/// task publishes and the headline depth the overview serves can never
+/// disagree about what "in the queue" means.
 fn sample_depth(views: &StateViews) -> u32 {
     let view = views.latest();
-    view.state()
+    let state = view.state();
+    state
         .jobs
         .iter()
-        .filter(|(_, record)| matches!(record.state, JobState::Queued))
+        .filter(|(_, record)| {
+            matches!(record.state, JobState::Queued) || is_accruing(state, record)
+        })
         .count()
         .try_into()
         .unwrap_or(u32::MAX)

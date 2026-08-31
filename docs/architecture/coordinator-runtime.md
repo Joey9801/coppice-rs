@@ -130,17 +130,23 @@ followers, which is what lets followers serve reads and event streams.
    Subscribers receive `(ordinal, event)` pairs — ordinals assigned per full
    batch before any filtering, so an event's `(index, ordinal)` identity is
    scope-invariant ([ADR 0032](../decisions/0032-advisory-event-timestamps.md))
-   — and the ring doubles as the bounded most-recent cache behind the
-   overview's `recent_events` (a query on the fanout inbox). Exports the
-   `proposer_skew` histogram.
+   — and the ring backs `SubscribeEvents` replay on reconnect plus the
+   tier-1 window behind `GetJobTimeline` (a query on the fanout inbox).
+   Exports the `proposer_skew` histogram.
 
 5. **Derived stats** (every replica). Subscribes to the fanout (`All` scope)
    and counts queue transitions into 30 s rolling buckets (≤ 1 h retained,
    task-local — [ADR 0032](../decisions/0032-advisory-event-timestamps.md)
-   tier 3), sampling queue depth from `views.latest()` at each bucket close.
-   Publishes the closed-bucket window over a watch the API's overview
-   handler projects rates and history from. An event-stream gap drops the
-   whole window: a bucket's presence is the claim its counts are complete.
+   tier 3), sampling queue depth from `views.latest()` at each bucket close —
+   `sample_depth` counts jobs `Queued` plus jobs whose current attempt is
+   `Accruing`, the identical predicate the overview's headline `depth` uses,
+   so `history[].depth` matches it. Publishes the closed-bucket window over a
+   watch the API's overview handler projects rates and history from. An
+   event-stream gap drops the whole window: a bucket's presence is the claim
+   its counts are complete. The rates are narrower than the depth predicate:
+   `arrival_rate_per_minute`/`drain_rate_per_minute` count only `Queued`
+   transitions, so a job opening an accrual counts as a drain without
+   lowering `depth`.
 
 6. **Agent gateway.** A session manager plus one task per agent session.
    **Sessions terminate on the leader only** — a follower refuses an agent
@@ -395,7 +401,7 @@ full" is the crux: it is what makes the blocking graph acyclic.
 | apply requests | openraft sm-adapter → apply task | mpsc | 64 | **await** (backpressure into openraft replication) |
 | proposal admission | proposers → openraft | semaphore | 4096 in-flight | **await permit** (backpressure to proposers) |
 | event tap | apply task → fanout | mpsc | 4096 batches | **`try_send`; on full DROP the batch** — the receiver synthesizes a gap from the dense tap sequence ([ADR 0008](../decisions/0008-event-delivery-guarantees.md) drop+gap). Apply NEVER awaits fanout. |
-| fanout ring | fanout-internal | ring | 1 h / 1M events | **evict oldest** — it is a reconnection buffer, not history; doubles as the bounded most-recent cache for the overview's `recent_events` ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 1) |
+| fanout ring | fanout-internal | ring | 1 h / 1M events | **evict oldest** — it is a reconnection buffer, not history; backs `SubscribeEvents` replay and the `GetJobTimeline` tier-1 window ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 1) |
 | per-subscriber queue | fanout → client conn | mpsc | 1024 | **`try_send`; on full mark the subscriber gapped**, drop its backlog, deliver `Gap{earliest_available}`; client resyncs via query ([ADR 0008](../decisions/0008-event-delivery-guarantees.md)) |
 | queue-window watch | derived stats → API server | watch | latest-value | **overwrite** — the overview projects rates/history from whatever window is current ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 3) |
 | agent inbound | session tasks → ingestion | mpsc (shared) | 8192 | **await** ⇒ the session stops reading its socket ⇒ TCP backpressure to the agent. Never touches apply. |

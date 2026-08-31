@@ -598,7 +598,7 @@ mod tests {
     use crate::http::dto::{ConfigureQuotaEntityResponse, SubmitJobResponse};
     use crate::{
         ApiError, CoordinatorSummary, JobTimelineWindow, LogFetchError, LogFetchOutcome,
-        LogFetchRequest, MetricSample, QueueWindow, ReadOptions, ReadView, RecentClusterEvents,
+        LogFetchRequest, MetricSample, QueueWindow, ReadOptions, ReadView,
     };
 
     /// A `ControlPlane` that serves a seeded state and canned per-attempt
@@ -645,12 +645,6 @@ mod tests {
         }
         fn queue_window(&self) -> QueueWindow {
             QueueWindow::default()
-        }
-        async fn recent_events(&self, _limit: usize) -> RecentClusterEvents {
-            RecentClusterEvents {
-                floor_index: 1,
-                events: Vec::new(),
-            }
         }
         async fn job_timeline(
             &self,

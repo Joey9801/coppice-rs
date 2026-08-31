@@ -252,9 +252,6 @@ function JobLogsCard({ jobId }: { jobId: JobId }) {
       </CardHeader>
       <CardContent className="space-y-2 p-4">
         <LogViewer entries={logs.data?.entries ?? []} loading={logs.isLoading} />
-        <p className="text-xs text-muted-foreground">
-          Mock data — log storage is not designed in the backend yet.
-        </p>
       </CardContent>
     </Card>
   )

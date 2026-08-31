@@ -44,12 +44,6 @@ export interface CoppiceApi {
   getSession(): Promise<Session>
 
   // Cluster overview
-  //
-  // `recentEvents` is a bounded most-recent-N window, NOT an event stream:
-  // a large cluster can emit far more events than a browser can render, so
-  // the server owns windowing/coalescing. If a live feed is ever wanted,
-  // it must be a server-throttled subscription (ADR 0008 cursors), still
-  // delivering bounded batches — never the raw firehose.
   getClusterOverview(): Promise<ClusterOverview>
   getQueueStats(): Promise<QueueStats>
 

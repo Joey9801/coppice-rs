@@ -55,7 +55,6 @@ import type {
   QuotaEntityOrigin,
   QuotaEntityStats,
   QuotaEntityView,
-  RecentEventsWindow,
   Resources,
   TimelineEvent,
   TimelineEventBody,
@@ -1797,41 +1796,28 @@ export class MockWorld {
         allocated,
         used,
       },
-      recentEvents: this.buildRecentEvents(20),
     }
-  }
-
-  /**
-   * The bounded most-recent window with its exclusive coverage cursor
-   * (ADR 0032): complete strictly above `floorIndex`, which rises when the
-   * ring evicted or the limit truncated.
-   */
-  private buildRecentEvents(limit: number): RecentEventsWindow {
-    const events = [...this.events]
-      .reverse()
-      .slice(0, limit)
-      .map((e) => ({ ...e }))
-    const oldest = events[events.length - 1]
-    const floorIndex = oldest !== undefined ? oldest.index - 1 : this.nextEventIndex - 1
-    return { floorIndex, events }
   }
 
   buildQueueStats(): QueueStats {
     const byState = {} as Record<JobPhase, number>
     for (const s of JOB_PHASES) byState[s] = 0
     let oldestQueuedAgeUs: number | null = null
+    let accruing = 0
     for (const job of this.jobs.values()) {
       byState[this.jobPhase(job)] += 1
       if (job.state.kind === 'Queued') {
         const age = this.nowUs - job.submittedAtUs
         if (oldestQueuedAgeUs === null || age > oldestQueuedAgeUs) oldestQueuedAgeUs = age
       }
+      if (this.currentAttempt(job)?.state === 'Accruing') accruing += 1
     }
     const recent = this.queueHistory.slice(-6)
     const avg = (pick: (b: QueueBucket) => number) =>
       recent.length ? recent.reduce((s, b) => s + pick(b), 0) / recent.length : 0
     return {
-      depth: byState.Queued,
+      depth: byState.Queued + accruing,
+      accruing,
       drainRatePerMinute: Math.round(avg((b) => b.drainedPerMinute)),
       arrivalRatePerMinute: Math.round(avg((b) => b.arrivedPerMinute)),
       oldestQueuedAgeSeconds: oldestQueuedAgeUs === null ? null : secondsOf(oldestQueuedAgeUs),

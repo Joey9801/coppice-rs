@@ -449,6 +449,7 @@ interface WireQueueSample {
 
 interface WireQueueStats {
   depth: number
+  accruing: number
   drain_rate_per_minute: number | null
   arrival_rate_per_minute: number | null
   oldest_queued_age_seconds: number | null
@@ -459,6 +460,7 @@ interface WireQueueStats {
 function mapQueueStats(q: WireQueueStats): QueueStats {
   return {
     depth: q.depth,
+    accruing: q.accruing,
     drainRatePerMinute: q.drain_rate_per_minute,
     arrivalRatePerMinute: q.arrival_rate_per_minute,
     oldestQueuedAgeSeconds: q.oldest_queued_age_seconds,
@@ -575,16 +577,10 @@ interface WireClusterCapacity {
   used: WireResources
 }
 
-interface WireRecentEventsWindow {
-  floor_index: number
-  events: WireTimelineEvent[]
-}
-
 interface WireGetClusterOverviewResponse {
   cluster_id: string
   queue: WireQueueStats
   capacity: WireClusterCapacity
-  recent_events: WireRecentEventsWindow
 }
 
 function mapClusterOverview(o: WireGetClusterOverviewResponse): ClusterOverview {
@@ -596,10 +592,6 @@ function mapClusterOverview(o: WireGetClusterOverviewResponse): ClusterOverview 
       capacity: mapResources(o.capacity.capacity),
       allocated: mapResources(o.capacity.allocated),
       used: mapResources(o.capacity.used),
-    },
-    recentEvents: {
-      floorIndex: o.recent_events.floor_index,
-      events: o.recent_events.events.map(mapTimelineEvent),
     },
   }
 }

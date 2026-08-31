@@ -503,17 +503,6 @@ export type TimelineEvent = {
   at: Date
 } & TimelineEventBody
 
-/**
- * A bounded most-recent window of events (ADR 0032, tier 1). `floorIndex`
- * is an exclusive coverage cursor: the window is complete for every index
- * strictly above it and claims nothing at or below. Empty `events` with a
- * high cursor is a freshly restarted coordinator, not a quiet cluster.
- */
-export interface RecentEventsWindow {
-  floorIndex: number
-  events: TimelineEvent[]
-}
-
 // ---------------------------------------------------------------------------
 // Usage / utilization series
 // ---------------------------------------------------------------------------
@@ -718,8 +707,22 @@ export interface ConfigureQuotaEntityInput {
 // ---------------------------------------------------------------------------
 
 export interface QueueStats {
-  /** Jobs currently in `Queued`. */
+  /**
+   * Jobs currently in `Queued` PLUS jobs whose current attempt is
+   * `Accruing`: a job is counted once here even though `accruing` below is
+   * a subset breakdown of it, never a second, additive figure.
+   */
   depth: number
+  /**
+   * The subset of `depth` whose current attempt is `Accruing`. Note
+   * `drainRatePerMinute`/`arrivalRatePerMinute` are defined only on
+   * `Queued` transitions (a job entering/leaving `Queued`), NOT on
+   * `depth` itself — so a job opening an accrual (`Queued` → `Attempting`)
+   * counts as a drain without lowering `depth`, since it is still counted
+   * via `accruing`. Known wart: don't expect `drainRatePerMinute` to
+   * reconcile against the delta of `depth` across samples.
+   */
+  accruing: number
   /**
    * Jobs leaving the queue (placed) per minute, recent window. `null` means
    * the serving replica has no windowed coverage yet (fresh restart or a
@@ -751,8 +754,6 @@ export interface ClusterOverview {
   clusterId: string
   queue: QueueStats
   capacity: ClusterCapacity
-  /** Most recent cluster events, newest first, with its coverage cursor. */
-  recentEvents: RecentEventsWindow
 }
 
 // ---------------------------------------------------------------------------

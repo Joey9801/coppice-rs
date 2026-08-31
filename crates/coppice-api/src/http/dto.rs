@@ -325,6 +325,10 @@ impl JobPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct QueueSample {
     pub t: Timestamp,
+    /// The depth sampled when the bucket closed, on the same
+    /// `Queued` + accruing predicate as [`QueueStats::depth`] — the two are
+    /// derived from one shared helper so the series and the headline can
+    /// never disagree.
     pub depth: u32,
     pub drained_per_minute: f64,
     pub arrived_per_minute: f64,
@@ -336,15 +340,28 @@ pub struct QueueSample {
 /// in-memory bucket window, coverage-annotated, replica-local.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueStats {
-    /// Jobs currently in `Queued` — the same number as
+    /// Jobs waiting for capacity: those in `Queued` plus those whose current
+    /// attempt is still `Accruing`. An accruing job has a node and a partial
+    /// allocation but has not started, so counting only `Queued` would report
+    /// a drained queue while work is still waiting — hence
+    /// `by_state[JobPhase::Queued] + accruing`, not
     /// `by_state[JobPhase::Queued]`.
     pub depth: u32,
+    /// The accruing part of [`depth`](Self::depth): jobs whose current attempt
+    /// is `Accruing` (a subset of `by_state[JobPhase::Preparing]`, since an
+    /// accruing attempt reads as `Preparing`).
+    pub accruing: u32,
     /// Jobs leaving / entering the queue per minute over the recent window
     /// (the newest derived buckets).
     ///
     /// `null` when the window has no coverage — a freshly (re)started
     /// replica, or one that just lost the event stream — which is a gap,
     /// not the claim `0.0` would make ("nothing is draining").
+    ///
+    /// Known wart: these rates are still defined on `Queued` *transitions*
+    /// only, while `depth` now spans `Queued` + accruing. A job opening an
+    /// accrual therefore counts as a drain without lowering `depth`, so the
+    /// rates and the depth series answer slightly different questions.
     pub drain_rate_per_minute: Option<f64>,
     pub arrival_rate_per_minute: Option<f64>,
     /// Age of the longest-waiting `Queued` job, measured at read time
@@ -412,9 +429,8 @@ impl From<coppice_core::job::JobState> for JobStateKind {
     }
 }
 
-/// ADR 0032's one timeline-event wire shape, shared by the overview's
-/// `recent_events`, `GetJobTimeline`, and the ADR 0008 subscription payload
-/// — no endpoint invents its own.
+/// ADR 0032's one timeline-event wire shape, shared by `GetJobTimeline`
+/// and the ADR 0008 subscription payload — no endpoint invents its own.
 ///
 /// `(index, ordinal)` is the event's identity: the ordering and
 /// deduplication key everywhere. `at` is the advisory proposer stamp —
@@ -534,18 +550,6 @@ impl From<&coppice_state::Event> for TimelineEventBody {
     }
 }
 
-/// The overview's window of recent cluster events (ADR 0032, tier 1),
-/// newest first, served from this replica's fanout ring.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecentEventsWindow {
-    /// Exclusive coverage cursor: the window is complete for every applied
-    /// index *strictly above* this, and claims nothing at or below it
-    /// (ADR 0032's honest-absence vocabulary). Empty `events` with a high
-    /// cursor is a freshly restarted coordinator, not a quiet cluster.
-    pub floor_index: u64,
-    pub events: Vec<TimelineEvent>,
-}
-
 /// `GET /api/v1/jobs/{job}/timeline` — one job's transition timeline
 /// (ADR 0032), served from this replica's fanout ring (tier 1) and honestly
 /// partial.
@@ -610,15 +614,14 @@ impl TimelineCursor {
 ///
 /// Consistency is per-field (ADR 0032 amending ADR 0031): `queue.depth`,
 /// `by_state`, and `capacity` are bounded reads of replicated state, while
-/// the queue rates/history (derived buckets) and `recent_events` (fanout
-/// ring) are derived, replica-local, and coverage-annotated.
+/// the queue rates/history (derived buckets) are derived, replica-local, and
+/// coverage-annotated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetClusterOverviewResponse {
     /// The cluster this replica belongs to (node config, ADR 0020).
     pub cluster_id: ClusterId,
     pub queue: QueueStats,
     pub capacity: ClusterCapacity,
-    pub recent_events: RecentEventsWindow,
 }
 
 // ---------------------------------------------------------------------------
@@ -2194,36 +2197,27 @@ mod tests {
         let cluster: ClusterId = "cluster-00000000-0000-0000-0000-000000000001"
             .parse()
             .unwrap();
-        let job: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
         let response = GetClusterOverviewResponse {
             cluster_id: cluster,
             queue: QueueStats {
-                depth: 1,
+                depth: 2,
+                accruing: 1,
                 drain_rate_per_minute: None,
                 arrival_rate_per_minute: None,
                 oldest_queued_age_seconds: Some(5),
                 by_state: JobPhase::ALL
                     .iter()
-                    .map(|phase| (*phase, u32::from(*phase == JobPhase::Queued)))
+                    .map(|phase| {
+                        let count =
+                            u32::from(matches!(phase, JobPhase::Queued | JobPhase::Preparing));
+                        (*phase, count)
+                    })
                     .collect(),
                 history: vec![QueueSample {
                     t: ts(10),
                     depth: 1,
                     drained_per_minute: 2.0,
                     arrived_per_minute: 4.0,
-                }],
-            },
-            recent_events: RecentEventsWindow {
-                floor_index: 3,
-                events: vec![TimelineEvent {
-                    index: 7,
-                    ordinal: 2,
-                    at: ts(5_000_100),
-                    body: TimelineEventBody::JobStateChanged {
-                        job,
-                        from: JobStateKind::Accepted,
-                        to: JobStateKind::Queued,
-                    },
                 }],
             },
             capacity: ClusterCapacity {
@@ -2256,7 +2250,9 @@ mod tests {
             serde_json::json!({
                 "cluster_id": "cluster-00000000-0000-0000-0000-000000000001",
                 "queue": {
-                    "depth": 1,
+                    // One queued job plus one accruing: `depth` spans both.
+                    "depth": 2,
+                    "accruing": 1,
                     // A window with no coverage keeps `null` rates — never a
                     // fabricated 0.0 (see `QueueStats`).
                     "drain_rate_per_minute": null,
@@ -2267,7 +2263,7 @@ mod tests {
                         "submitted": 0,
                         "accepted": 0,
                         "queued": 1,
-                        "preparing": 0,
+                        "preparing": 1,
                         "running": 0,
                         "finalizing": 0,
                         "succeeded": 0,
@@ -2286,20 +2282,6 @@ mod tests {
                     "capacity": { "cpu_millis": 4000, "memory_bytes": 0, "disk_bytes": 0 },
                     "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
                     "used": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
-                },
-                // ADR 0032's shared timeline shape: identity `(index,
-                // ordinal)` + advisory `at`, kind and scope keys flat.
-                "recent_events": {
-                    "floor_index": 3,
-                    "events": [{
-                        "index": 7,
-                        "ordinal": 2,
-                        "at": "1970-01-01T00:00:05.000100Z",
-                        "kind": "job_state_changed",
-                        "job": "job-00000000-0000-0000-0000-000000000002",
-                        "from": "accepted",
-                        "to": "queued",
-                    }],
                 },
             })
         );

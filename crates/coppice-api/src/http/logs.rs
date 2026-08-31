@@ -604,7 +604,6 @@ mod tests {
     use crate::{
         ApiError, CoordinatorSummary, JobTimelineWindow, LogChunk, LogPage, MetricsFetchError,
         MetricsFetchOutcome, MetricsFetchRequest, QueueWindow, ReadOptions, ReadView,
-        RecentClusterEvents,
     };
 
     /// A `ControlPlane` that serves a seeded state and canned per-attempt log
@@ -645,12 +644,6 @@ mod tests {
         }
         fn queue_window(&self) -> QueueWindow {
             QueueWindow::default()
-        }
-        async fn recent_events(&self, _limit: usize) -> RecentClusterEvents {
-            RecentClusterEvents {
-                floor_index: 1,
-                events: Vec::new(),
-            }
         }
         async fn job_timeline(
             &self,

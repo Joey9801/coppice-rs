@@ -661,14 +661,9 @@ async fn configure_quota_entity<P: ControlPlane>(
     Ok(Json(response))
 }
 
-/// Events served in the overview's `recent_events` window — a display
-/// window, deliberately smaller than the ring behind it (a client wanting
-/// more history uses the timeline/subscription endpoints).
-const RECENT_EVENTS_LIMIT: usize = 50;
-
 /// `GET /api/v1/overview` — bounded by default (ADR 0031) for the
-/// replicated-state fields; the rates/history and `recent_events` are
-/// derived, replica-local reads (ADR 0032).
+/// replicated-state fields; the rates/history are derived, replica-local
+/// reads (ADR 0032).
 async fn get_overview<P: ControlPlane>(
     State(plane): State<Arc<P>>,
     ReadQuery(params): ReadQuery,
@@ -677,7 +672,6 @@ async fn get_overview<P: ControlPlane>(
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
     let window = plane.queue_window();
-    let recent = plane.recent_events(RECENT_EVENTS_LIMIT).await;
     // Only reads sample the clock — they are not replicated, so a handler
     // may (an *apply* may never: `coppice-state`'s determinism contract).
     // It feeds read-time ages like `oldest_queued_age_seconds`, never
@@ -687,7 +681,6 @@ async fn get_overview<P: ControlPlane>(
         plane.cluster_id(),
         Timestamp::now(),
         &window,
-        &recent,
     );
     Ok((
         ReadIndexes {
@@ -955,7 +948,7 @@ mod tests {
     use super::super::dto::SubmitJobResponse;
     use crate::{
         ApiError, CoordinatorMemberSummary, CoordinatorSummary, JobTimelineWindow, QueueWindow,
-        ReadOptions, ReadView, RecentClusterEvents, StampedEvent,
+        ReadOptions, ReadView, StampedEvent,
     };
 
     use crate::http::COPPICE_LEADER;
@@ -996,7 +989,6 @@ mod tests {
     struct StubPlane {
         fail_with: Option<fn() -> ApiError>,
         queue_window: QueueWindow,
-        recent: RecentClusterEvents,
         /// The ring window `job_timeline` serves, regardless of the job asked
         /// (the tier-1 backstop is exercised for its envelope/paging, not its
         /// filtering — that is unit-tested on the ring itself).
@@ -1048,12 +1040,6 @@ mod tests {
 
         fn queue_window(&self) -> QueueWindow {
             self.queue_window.clone()
-        }
-
-        async fn recent_events(&self, limit: usize) -> RecentClusterEvents {
-            let mut recent = self.recent.clone();
-            recent.events.truncate(limit);
-            recent
         }
 
         async fn job_timeline(
@@ -1175,12 +1161,6 @@ mod tests {
         router(Arc::new(StubPlane {
             fail_with,
             queue_window: QueueWindow::default(),
-            recent: RecentClusterEvents {
-                // ReadView serves applied index 1, so "nothing covered" is
-                // the exclusive cursor sitting at it.
-                floor_index: 1,
-                events: Vec::new(),
-            },
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -1192,9 +1172,8 @@ mod tests {
         }))
     }
 
-    /// A `job_timeline` window covering nothing (a fresh replica), like the
-    /// default `recent`: floor at the ReadView's applied index 1, no events,
-    /// no continuation.
+    /// A `job_timeline` window covering nothing (a fresh replica): floor at
+    /// the ReadView's applied index 1, no events, no continuation.
     fn empty_timeline() -> JobTimelineWindow {
         JobTimelineWindow {
             floor_index: 1,
@@ -1260,19 +1239,16 @@ mod tests {
         );
         assert_eq!(body["queue"]["by_state"]["queued"], 0);
         assert_eq!(body["capacity"]["nodes"]["total"], 0);
-        // No derived coverage: rates null, and the empty events window still
-        // carries its exclusive coverage cursor (ADR 0032).
+        // No derived coverage: rates null rather than a fabricated 0.0
+        // (ADR 0032).
         assert_eq!(
             body["queue"]["drain_rate_per_minute"],
             serde_json::Value::Null
         );
-        assert_eq!(body["recent_events"]["floor_index"], 1);
-        assert_eq!(body["recent_events"]["events"], serde_json::json!([]));
     }
 
     #[tokio::test]
-    async fn overview_serves_derived_rates_history_and_recent_events() {
-        let job = JobId::new();
+    async fn overview_serves_derived_rates_and_history() {
         let plane = StubPlane {
             fail_with: None,
             queue_window: QueueWindow {
@@ -1282,15 +1258,6 @@ mod tests {
                     depth: 4,
                     arrivals: 2,
                     drains: 1,
-                }],
-            },
-            recent: RecentClusterEvents {
-                floor_index: 5,
-                events: vec![crate::StampedEvent {
-                    index: 8,
-                    ordinal: 0,
-                    at: Timestamp::from_micros(90_000_000).expect("in range"),
-                    event: coppice_state::Event::JobSubmitted { job },
                 }],
             },
             timeline: empty_timeline(),
@@ -1317,13 +1284,6 @@ mod tests {
             body["queue"]["history"][0]["t"],
             "1970-01-01T00:01:00.000000Z"
         );
-        assert_eq!(body["recent_events"]["floor_index"], 5);
-        let event = &body["recent_events"]["events"][0];
-        assert_eq!(event["index"], 8);
-        assert_eq!(event["ordinal"], 0);
-        assert_eq!(event["at"], "1970-01-01T00:01:30.000000Z");
-        assert_eq!(event["kind"], "job_submitted");
-        assert_eq!(event["job"], job.to_string());
     }
 
     #[tokio::test]
@@ -1780,10 +1740,6 @@ mod tests {
         Arc::new(StubPlane {
             fail_with: None,
             queue_window: QueueWindow::default(),
-            recent: RecentClusterEvents {
-                floor_index: 1,
-                events: Vec::new(),
-            },
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2094,10 +2050,6 @@ mod tests {
         Arc::new(StubPlane {
             fail_with: None,
             queue_window: QueueWindow::default(),
-            recent: RecentClusterEvents {
-                floor_index: 1,
-                events: Vec::new(),
-            },
             timeline,
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2394,10 +2346,6 @@ mod tests {
         router(Arc::new(StubPlane {
             fail_with: None,
             queue_window: QueueWindow::default(),
-            recent: RecentClusterEvents {
-                floor_index: 1,
-                events: Vec::new(),
-            },
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2601,10 +2549,6 @@ mod tests {
             Arc::new(StubPlane {
                 fail_with: None,
                 queue_window: QueueWindow::default(),
-                recent: RecentClusterEvents {
-                    floor_index: 1,
-                    events: Vec::new(),
-                },
                 timeline: empty_timeline(),
                 state: coppice_state::StateMachine::default(),
                 read_consistency: std::sync::Mutex::default(),
@@ -4036,10 +3980,6 @@ mod tests {
                 ))
             }),
             queue_window: QueueWindow::default(),
-            recent: RecentClusterEvents {
-                floor_index: 1,
-                events: Vec::new(),
-            },
             timeline: empty_timeline(),
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),
@@ -4079,10 +4019,6 @@ mod tests {
                 reason: "permission denied: principal \"user-42\" may not …".into(),
             }),
             queue_window: QueueWindow::default(),
-            recent: RecentClusterEvents {
-                floor_index: 1,
-                events: Vec::new(),
-            },
             timeline: empty_timeline(),
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),

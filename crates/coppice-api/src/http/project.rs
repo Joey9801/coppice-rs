@@ -20,7 +20,7 @@ use coppice_state::{
     AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
 
-use crate::{CoordinatorSummary, JobTimelineWindow, QueueWindow, RecentClusterEvents};
+use crate::{CoordinatorSummary, JobTimelineWindow, QueueWindow};
 
 use super::dto;
 
@@ -167,45 +167,26 @@ pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<dto::GetNodeRespons
 ///
 /// `now` is the reader's wall clock, used only for `oldest_queued_age_seconds`
 /// — a *read-time* age, not replicated state (apply never reads a clock).
-/// The caller passes it in so this stays a pure function of its inputs, as
-/// are the two derived sources: `window` (this replica's queue buckets,
-/// ADR 0032 tier 3) and `recent` (its fanout ring's newest events, tier 1).
+/// The caller passes it in so this stays a pure function of its inputs, as is
+/// the derived source `window` (this replica's queue buckets, ADR 0032 tier 3).
 pub fn cluster_overview(
     state: &StateMachine,
     cluster_id: ClusterId,
     now: Timestamp,
     window: &QueueWindow,
-    recent: &RecentClusterEvents,
 ) -> dto::GetClusterOverviewResponse {
     dto::GetClusterOverviewResponse {
         cluster_id,
         queue: queue_stats(state, now, window),
         capacity: cluster_capacity(state),
-        recent_events: recent_events(recent),
-    }
-}
-
-fn recent_events(recent: &RecentClusterEvents) -> dto::RecentEventsWindow {
-    dto::RecentEventsWindow {
-        floor_index: recent.floor_index,
-        events: recent
-            .events
-            .iter()
-            .map(|e| dto::TimelineEvent {
-                index: e.index,
-                ordinal: e.ordinal,
-                at: e.at,
-                body: (&e.event).into(),
-            })
-            .collect(),
     }
 }
 
 /// `GET /api/v1/jobs/{job}/timeline` — project the ring window (ADR 0032,
 /// tier 1) onto the wire shape, ascending by `(index, ordinal)`. Pure over
 /// the window: the 404-vs-empty verdict and cursor parsing stay in the
-/// handler. Mirrors [`recent_events`], and the `next` content coordinate
-/// becomes the opaque [`dto::TimelineCursor`].
+/// handler. The `next` content coordinate becomes the opaque
+/// [`dto::TimelineCursor`].
 pub fn job_timeline(window: &JobTimelineWindow) -> dto::GetJobTimelineResponse {
     dto::GetJobTimelineResponse {
         events: window
@@ -277,9 +258,13 @@ pub(crate) fn queue_stats(
     let mut by_state: BTreeMap<dto::JobPhase, u32> =
         dto::JobPhase::ALL.iter().map(|phase| (*phase, 0)).collect();
     let mut oldest_queued_age: Option<Duration> = None;
+    let mut accruing: u32 = 0;
 
     for (_, record) in &state.jobs {
         *by_state.entry(job_phase(state, record)).or_default() += 1;
+        if is_accruing(state, record) {
+            accruing += 1;
+        }
 
         if record.state == JobState::Queued {
             // A `submitted_at` in the future (proposer clock skew) is an age
@@ -292,7 +277,12 @@ pub(crate) fn queue_stats(
     let rates = queue_rates(window);
 
     dto::QueueStats {
-        depth: by_state[&dto::JobPhase::Queued],
+        // Waiting-for-capacity, not just `Queued`: an accruing job holds a
+        // partial allocation and has not started (see `dto::QueueStats::depth`).
+        // The two sets are disjoint — an accruing job is `Attempting`, never
+        // `Queued` — so this never double-counts.
+        depth: by_state[&dto::JobPhase::Queued] + accruing,
+        accruing,
         drain_rate_per_minute: rates.drains_per_minute,
         arrival_rate_per_minute: rates.arrivals_per_minute,
         oldest_queued_age_seconds: oldest_queued_age.map(Duration::as_secs),
@@ -356,6 +346,21 @@ fn queue_history(window: &QueueWindow) -> Vec<dto::QueueSample> {
             }
         })
         .collect()
+}
+
+/// Whether the job's current attempt is `Accruing` — the predicate behind
+/// both `QueueStats::accruing` (and so the queue depth it feeds) and the
+/// coordinator's `derived_stats` depth sampler, which must agree with it or
+/// the queue history chart and the stat card disagree.
+///
+/// A job with no current attempt, or one whose attempt is missing from the
+/// map, is not accruing.
+pub fn is_accruing(state: &StateMachine, record: &JobRecord) -> bool {
+    record
+        .state
+        .attempt()
+        .and_then(|id| state.attempts.get(&id))
+        .is_some_and(|ar| matches!(ar.attempt.state, AttemptState::Accruing))
 }
 
 /// The read-time join of a job's state with its attempt's (ADR 0030).
@@ -1517,17 +1522,10 @@ mod tests {
         CLUSTER.parse().unwrap()
     }
 
-    fn no_recent() -> RecentClusterEvents {
-        RecentClusterEvents {
-            floor_index: 0,
-            events: Vec::new(),
-        }
-    }
-
-    /// [`cluster_overview`] with empty derived sources — what a replica with
-    /// no bucket or ring coverage serves.
+    /// [`cluster_overview`] with an empty derived source — what a replica
+    /// with no bucket coverage serves.
     fn overview(state: &StateMachine, now: Timestamp) -> dto::GetClusterOverviewResponse {
-        cluster_overview(state, cluster(), now, &QueueWindow::default(), &no_recent())
+        cluster_overview(state, cluster(), now, &QueueWindow::default())
     }
 
     #[test]
@@ -1615,7 +1613,34 @@ mod tests {
         assert_eq!(queue.by_state[&dto::JobPhase::Queued], 1);
         assert_eq!(queue.by_state[&dto::JobPhase::Preparing], 1);
         assert_eq!(queue.by_state[&dto::JobPhase::Running], 1);
-        assert_eq!(queue.depth, 1);
+        // Depth spans both waiting sets: the queued job and the accruing one
+        // (which is `Preparing`, not `Queued`), each counted once.
+        assert_eq!(queue.accruing, 1);
+        assert_eq!(queue.depth, 2);
+    }
+
+    /// A `Preparing` job past accrual (`Ready`/`Dispatching`) is no longer
+    /// waiting for capacity, so it leaves `depth` while staying `Preparing`.
+    #[test]
+    fn queue_depth_counts_accruing_attempts_but_not_ready_ones() {
+        let node = NodeId::new();
+        let ready_job = JobId::new();
+        let ready_attempt = AttemptId::new();
+
+        let mut state = StateMachine::default();
+        state.jobs.insert(
+            ready_job,
+            test_job(ready_job, JobState::Attempting(ready_attempt), ts(0)),
+        );
+        state.attempts.insert(
+            ready_attempt,
+            test_attempt(ready_attempt, ready_job, node, AttemptState::Ready),
+        );
+
+        let queue = overview(&state, ts(0)).queue;
+        assert_eq!(queue.by_state[&dto::JobPhase::Preparing], 1);
+        assert_eq!(queue.accruing, 0);
+        assert_eq!(queue.depth, 0);
     }
 
     #[test]
@@ -1755,44 +1780,10 @@ mod tests {
     #[test]
     fn overview_serves_rates_and_history_from_the_window() {
         let window = window_of(vec![bucket(0, 5, 2, 1)]);
-        let queue = cluster_overview(
-            &StateMachine::default(),
-            cluster(),
-            ts(0),
-            &window,
-            &no_recent(),
-        )
-        .queue;
+        let queue = cluster_overview(&StateMachine::default(), cluster(), ts(0), &window).queue;
         assert_eq!(queue.arrival_rate_per_minute, Some(4.0));
         assert_eq!(queue.drain_rate_per_minute, Some(2.0));
         assert_eq!(queue.history.len(), 1);
-    }
-
-    #[test]
-    fn recent_events_keep_their_identity_and_stamp() {
-        let job = JobId::new();
-        let recent = RecentClusterEvents {
-            floor_index: 4,
-            events: vec![crate::StampedEvent {
-                index: 9,
-                ordinal: 3,
-                at: ts(1_234),
-                event: coppice_state::Event::JobSubmitted { job },
-            }],
-        };
-        let rendered = cluster_overview(
-            &StateMachine::default(),
-            cluster(),
-            ts(0),
-            &QueueWindow::default(),
-            &recent,
-        )
-        .recent_events;
-        assert_eq!(rendered.floor_index, 4);
-        assert_eq!(rendered.events.len(), 1);
-        let event = &rendered.events[0];
-        assert_eq!((event.index, event.ordinal, event.at), (9, 3, ts(1_234)));
-        assert_eq!(event.body, dto::TimelineEventBody::JobSubmitted { job });
     }
 
     #[test]

@@ -99,20 +99,6 @@ pub struct StampedEvent {
     pub event: Event,
 }
 
-/// The most recent events the ring retains, newest first.
-///
-/// `floor_index` is an **exclusive coverage cursor**, the same convention as
-/// the ring's replay floor: the window is complete for every applied index
-/// *strictly above* it, and claims nothing at or below it. That is ADR
-/// 0032's honest-absence vocabulary — an empty `events` on a freshly
-/// restarted coordinator carries the recovery index as its cursor,
-/// distinguishable from a quiet cluster whose cursor is 0.
-#[derive(Debug, Clone)]
-pub struct RecentEvents {
-    pub floor_index: u64,
-    pub events: Vec<StampedEvent>,
-}
-
 /// An ascending, filtered slice of the ring for a point-in-time read — the
 /// tier-1 backstop behind `GetJobTimeline` (ADR 0032), served identically by
 /// every replica.
@@ -172,13 +158,6 @@ struct SubscribeRequest {
 /// One request on the fanout task's inbox.
 enum Request {
     Subscribe(SubscribeRequest),
-    /// The most recent `limit` events from the ring, newest first — the
-    /// bounded most-recent cache behind the overview's `recent_events`
-    /// (ADR 0032, tier 1). A point-in-time copy, not a subscription.
-    Recent {
-        limit: usize,
-        reply: oneshot::Sender<RecentEvents>,
-    },
     /// An ascending, filtered window of the ring resuming after `after` — the
     /// tier-1 backstop behind `GetJobTimeline` (ADR 0032). Like `Recent`, a
     /// point-in-time copy with an HTTP handler blocked on its reply.
@@ -217,20 +196,6 @@ impl FanoutHandle {
             .await
             .map_err(|_| FanoutClosed)?;
         reply_rx.await.map_err(|_| FanoutClosed)?
-    }
-
-    /// The most recent `limit` events retained by the ring, newest first,
-    /// with the coverage floor (see [`RecentEvents`]).
-    pub async fn recent(&self, limit: usize) -> Result<RecentEvents, FanoutClosed> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Request::Recent {
-                limit,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| FanoutClosed)?;
-        reply_rx.await.map_err(|_| FanoutClosed)
     }
 
     /// An ascending, `filter`-scoped window of the ring resuming strictly after
@@ -330,39 +295,6 @@ impl Ring {
 
     fn iter(&self) -> impl Iterator<Item = &EventBatch> {
         self.entries.iter().map(|(_, batch)| batch)
-    }
-
-    /// The most recent `limit` events, newest first, each with its
-    /// batch-assigned ordinal and stamp.
-    ///
-    /// The returned cursor is the coverage the *response* can claim,
-    /// exclusive like [`Ring::floor`]: the ring's own floor when everything
-    /// retained fit, raised to the cut batch's index when `limit` truncated
-    /// (a partially served batch is not covered — the response must not
-    /// claim to be the complete record at that index).
-    fn recent(&self, limit: usize) -> RecentEvents {
-        let mut events = Vec::with_capacity(limit.min(self.event_count));
-        let mut floor_index = self.floor();
-        'outer: for (_, batch) in self.entries.iter().rev() {
-            for (ordinal, event) in batch.events.iter().enumerate().rev() {
-                if events.len() == limit {
-                    // This event did not fit: coverage is complete only
-                    // strictly above its batch's index.
-                    floor_index = floor_index.max(batch.applied_index);
-                    break 'outer;
-                }
-                events.push(StampedEvent {
-                    index: batch.applied_index,
-                    ordinal: ordinal as u32,
-                    at: batch.at,
-                    event: event.clone(),
-                });
-            }
-        }
-        RecentEvents {
-            floor_index,
-            events,
-        }
     }
 
     /// An ascending, `filter`-scoped window of the ring, resuming strictly
@@ -563,10 +495,6 @@ fn handle_request(
         Request::Subscribe(req) => {
             *next_id += 1;
             handle_subscribe(subscribers, *next_id, ring, req);
-        }
-        Request::Recent { limit, reply } => {
-            // The caller may be gone already; nothing to do.
-            let _ = reply.send(ring.recent(limit));
         }
         Request::Window {
             filter,
@@ -933,9 +861,9 @@ mod tests {
 
     /// A tap that never goes idle must not starve the request inbox: the
     /// biased select polls the tap first, so requests are drained between
-    /// tap items instead (an HTTP handler is blocked on the `Recent` reply).
+    /// tap items instead (an HTTP handler is blocked on the `Window` reply).
     #[tokio::test]
-    async fn recent_is_served_under_sustained_event_traffic() {
+    async fn ring_reads_are_served_under_sustained_event_traffic() {
         let (mut tap, tap_rx) = coppice_consensus::EventTap::channel(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (handle, join) = spawn(tap_rx, 0, shutdown_rx);
@@ -951,20 +879,23 @@ mod tests {
             }
         });
 
-        // Every `recent` round-trip below competes with the saturated tap;
+        // Every ring-read round-trip below competes with the saturated tap;
         // under the old biased-select-only loop none of them ever resolved.
-        let recent = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let window = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let recent = handle.recent(3).await.expect("fanout alive");
-                if recent.events.len() == 3 {
-                    return recent;
+                let window = handle
+                    .window(EventFilter::All, None, 3)
+                    .await
+                    .expect("fanout alive");
+                if window.events.len() == 3 {
+                    return window;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("recent must not starve behind sustained tap traffic");
-        assert_eq!(recent.events.len(), 3);
+        .expect("ring reads must not starve behind sustained tap traffic");
+        assert_eq!(window.events.len(), 3);
 
         producer.abort();
         let _ = shutdown_tx.send(true);
@@ -989,7 +920,9 @@ mod tests {
         let flooders: Vec<_> = (0..64)
             .map(|_| {
                 let handle = handle.clone();
-                tokio::spawn(async move { while handle.recent(1).await.is_ok() {} })
+                tokio::spawn(async move {
+                    while handle.window(EventFilter::All, None, 1).await.is_ok() {}
+                })
             })
             .collect();
 
@@ -1018,59 +951,6 @@ mod tests {
             flooder.abort();
         }
         let _ = join.await;
-    }
-
-    #[test]
-    fn recent_serves_newest_first_with_the_ring_floor() {
-        let mut ring = Ring::new(2);
-        ring.push(batch_of(5, vec![job_event(JobId::new())]));
-        ring.push(batch_of(
-            7,
-            vec![job_event(JobId::new()), job_event(JobId::new())],
-        ));
-
-        let recent = ring.recent(10);
-        // Everything retained fit, so coverage is the ring's own exclusive
-        // floor: complete strictly above 2 — which *includes* the oldest
-        // served batch at 5.
-        assert_eq!(recent.floor_index, 2);
-        let identities: Vec<(u64, u32)> =
-            recent.events.iter().map(|e| (e.index, e.ordinal)).collect();
-        // Newest first: batch 7's events (in reverse batch order), then 5's.
-        assert_eq!(identities, vec![(7, 1), (7, 0), (5, 0)]);
-    }
-
-    /// A `limit` that cuts a batch must not claim coverage of that batch's
-    /// index: the cursor rises to it, so coverage is complete only strictly
-    /// above.
-    #[test]
-    fn recent_truncated_by_limit_raises_its_coverage_floor() {
-        let mut ring = Ring::new(0);
-        ring.push(batch_of(
-            5,
-            vec![job_event(JobId::new()), job_event(JobId::new())],
-        ));
-        ring.push(batch_of(7, vec![job_event(JobId::new())]));
-
-        // Room for batch 7 and only one of batch 5's two events.
-        let recent = ring.recent(2);
-        assert_eq!(
-            recent.events.iter().map(|e| e.index).collect::<Vec<_>>(),
-            vec![7, 5]
-        );
-        assert_eq!(recent.floor_index, 5, "batch 5 was cut, so not covered");
-    }
-
-    /// ADR 0032's honest-absence vocabulary: an empty window on a restarted
-    /// coordinator carries the recovery index as its cursor ("nothing above
-    /// 42 has been missed") — distinguishable from a quiet cluster whose
-    /// cursor is 0.
-    #[test]
-    fn recent_on_an_empty_ring_reports_the_floor_not_a_quiet_cluster() {
-        let ring = Ring::new(42);
-        let recent = ring.recent(10);
-        assert!(recent.events.is_empty());
-        assert_eq!(recent.floor_index, 42);
     }
 
     // ---- Ring::window (GetJobTimeline backstop, ADR 0032 tier 1) ---------
