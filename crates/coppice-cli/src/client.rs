@@ -128,12 +128,13 @@ impl ApiClient {
     /// as `None` — no `Authorization` header — since clap surfaces `env =
     /// "COPPICE_TOKEN"` as `Some("")` when the variable is set but empty.
     pub fn with_token(api: &str, token: Option<&str>) -> Result<ApiClient> {
-        let http = reqwest::Client::builder()
+        let base = normalize_base(api);
+        let http = plain_http_builder(&base)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("building the HTTP client")?;
         Ok(ApiClient {
-            base: normalize_base(api),
+            base,
             http,
             token: token
                 .map(str::trim)
@@ -240,6 +241,27 @@ pub fn normalize_base(raw: &str) -> String {
         .unwrap_or(trimmed)
         .trim_end_matches('/')
         .to_string()
+}
+
+/// A `reqwest::ClientBuilder` for a *normalized* base ([`normalize_base`]),
+/// skipping the platform's native root certificate store when the base is
+/// not `https://`.
+///
+/// `rustls-tls-native-roots` (this workspace's TLS backend) enumerates the
+/// macOS keychain eagerly inside `ClientBuilder::build`, before any request —
+/// ~3.3s cold — even for a plain `http://127.0.0.1` base that will never
+/// touch TLS. Every base this CLI dials today (`DEFAULT_API_BASE`, `--api`
+/// for an intranet coordinator, `coppice dev`'s own readiness polling) is
+/// plain HTTP, so that cost buys nothing. A future `https://` `--api` (or the
+/// `coppice token` IdP flow) keeps native roots automatically under this same
+/// scheme check.
+pub fn plain_http_builder(base: &str) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if base.starts_with("https://") {
+        builder
+    } else {
+        builder.tls_built_in_native_certs(false)
+    }
 }
 
 /// The wire error body (ADR 0031). The API's own `ErrorBody` is private and
@@ -467,6 +489,29 @@ mod tests {
     fn url_joins_the_api_prefix() {
         let client = ApiClient::new("http://h:7070/api/v1/").unwrap();
         assert_eq!(client.url("/jobs"), "http://h:7070/api/v1/jobs");
+    }
+
+    /// `plain_http_builder` skips native root loading for a bare host and an
+    /// `http://` base, and keeps it for `https://` — the scheme rule that
+    /// avoids paying the macOS keychain cost on every plain-HTTP launch.
+    #[test]
+    fn plain_http_builder_skips_native_roots_for_non_https_bases() {
+        for base in ["h:7070", "http://h:7070", "http://127.0.0.1:7070"] {
+            assert!(
+                plain_http_builder(base).build().is_ok(),
+                "builder failed for {base}"
+            );
+        }
+        assert!(plain_http_builder("https://h:7070").build().is_ok());
+    }
+
+    /// A client builds successfully for both an http and an https base — the
+    /// scheme-dependent native-root toggle in `plain_http_builder` must not
+    /// break construction either way.
+    #[test]
+    fn client_constructs_for_http_and_https_bases() {
+        assert!(ApiClient::new("http://h:7070").is_ok());
+        assert!(ApiClient::new("https://h:7070").is_ok());
     }
 
     /// The default base and the default port are two literals that must name
