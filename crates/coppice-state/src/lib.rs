@@ -687,6 +687,8 @@ pub enum RejectionReason {
     RequestExceedsNodeCapacity(AllocationId),
     #[error("batch would leave more than {limit} jobs accruing")]
     AccrualLimitExceeded { limit: u32 },
+    #[error("batch would leave node {node} accruing for more than one job")]
+    PerNodeAccrualExceeded { node: NodeId },
     #[error("placement shape unsupported in v1 (one allocation, singleton group)")]
     UnsupportedPlacementShape,
     #[error("quota entity {0} parent chain would cycle or exceed the depth cap")]

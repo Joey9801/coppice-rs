@@ -19,7 +19,7 @@
 //! `coppice-state/src/apply.rs`), so consumers see the same shapes apply
 //! would have produced.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState};
@@ -90,6 +90,8 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         accrual: Vec::new(),
     };
     let mut next_seq: u64 = 0;
+    // Nodes already carrying an accruing allocation — one apiece (ADR 0027).
+    let mut accruing_nodes: BTreeSet<NodeId> = BTreeSet::new();
 
     for _ in 0..cfg.jobs {
         let job_id = JobId(next_uuid(&mut rng));
@@ -189,9 +191,13 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
                 &mut next_seq,
                 &mut bufs,
             );
+            // A node hosts at most one accruing allocation (ADR 0027), so an
+            // accrual is only drawn while its node is still free of one; a
+            // draw onto an occupied node lands `Ready` instead, the state the
+            // scheduler would have produced there.
             let kind = match rng.below(3) {
-                0 => AttemptKind::Accruing,
-                1 => AttemptKind::Ready,
+                0 if accruing_nodes.insert(node) => AttemptKind::Accruing,
+                0 | 1 => AttemptKind::Ready,
                 _ => AttemptKind::Dispatching,
             };
             let seq = next_seq;
@@ -903,6 +909,25 @@ pub fn check_consistency(sm: &StateMachine) {
         sm.accrual_queue, expected,
         "accrual_queue must match Accruing allocations exactly"
     );
+
+    // At most one accruing job per node (ADR 0027) — apply refuses any batch
+    // that would leave a node holding more.
+    let mut accruing_per_node: BTreeMap<NodeId, BTreeSet<JobId>> = BTreeMap::new();
+    for alloc in sm.accrual_queue.values() {
+        if let Some(r) = sm.allocations.get(alloc) {
+            accruing_per_node
+                .entry(r.allocation.node)
+                .or_default()
+                .insert(r.allocation.job);
+        }
+    }
+    for (node, jobs) in &accruing_per_node {
+        assert!(
+            jobs.len() <= 1,
+            "node {node} accrues for {} jobs; at most one is legal",
+            jobs.len()
+        );
+    }
 
     // Aggregate half of "at most one attempt in flight per job" (ADR 0030):
     // the job's own link is structural (`Attempting(id)` can't disagree with

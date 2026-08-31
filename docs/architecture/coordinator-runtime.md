@@ -180,7 +180,8 @@ followers, which is what lets followers serve reads and event streams.
    the CPU-heavy `Scheduler::schedule` pass in `spawn_blocking` (the trait
    stays *sync* — it is pure CPU over an immutable view), propose
    `CommitPlacements`, await the outcome. **At most one proposal is in flight
-   by construction.** A rejection (`InvalidBatch`, `AccrualLimitExceeded`) is
+   by construction.** A rejection (`InvalidBatch`, `AccrualLimitExceeded`,
+   `PerNodeAccrualExceeded`) is
    a recompute, the normal path of [scheduling-model.md](../scheduling/scheduling-model.md#operating-model).
    `expected_version` comes from `StateView::version()` — see the [two
    coordinates](#the-two-coordinates-trap) distinction.

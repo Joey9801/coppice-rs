@@ -1,16 +1,19 @@
 //! Behavioural tests for the `HeuristicScheduler` against real apply-built
 //! states: resource-fit filtering, best-fit choice, the accrual cap K,
 //! per-cycle work caps, emitted command shape, the strict-backfill boundary
-//! (ADR 0014), and the finite projected-ready protection rules (ADR 0027).
+//! (ADR 0014), and the finite projected-ready protection rules and per-node
+//! accrual ceiling (ADR 0027).
 
 mod common;
 
 use common::*;
 
+use std::collections::BTreeSet;
+
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::AllocationId;
+use coppice_core::id::{AllocationId, NodeId};
 use coppice_core::job::JobState;
 use coppice_core::quota::PriorityMultiplier;
 use coppice_core::resource::Resources;
@@ -245,30 +248,36 @@ fn honours_the_placement_cap() {
 
 #[test]
 fn accrual_opening_respects_the_cap_k() {
-    // A node whose free capacity is already partly consumed, and three whales
-    // that each need the whole node — they fit total capacity (so apply admits
-    // them) but not free capacity, so each seating is an accrual open. With
-    // K = 2 only two may hold accruing allocations at once.
+    // Three nodes whose free capacity is each already partly consumed, and
+    // three whales that each need a whole node — they fit total capacity (so
+    // apply admits them) but not free capacity, so each seating is an accrual
+    // open. One node apiece keeps the per-node ceiling out of the way, leaving
+    // K = 2 as the only thing capping the batch.
     let mut sm = setup(cpu(8_000), 2);
-    apply_ok(
-        &mut sm,
-        submit_cmd(
-            jid(10),
-            cpu(2_000),
-            Some(600),
-            PriorityMultiplier::ONE,
-            base_ts(),
-        ),
-    );
-    apply_ok(
-        &mut sm,
-        place_cmd(
-            placement(jid(10), aid(10), alid(10), nid(1), cpu(2_000)),
-            base_ts(),
-        ),
-    );
-    apply_ok(&mut sm, dispatch_cmd(aid(10), base_ts()));
-    apply_ok(&mut sm, started_cmd(aid(10), base_ts()));
+    for n in 2..=3u128 {
+        apply_ok(&mut sm, register_node_cmd(nid(n), cpu(8_000), base_ts()));
+    }
+    for n in 1..=3u128 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(
+                jid(10 + n),
+                cpu(2_000),
+                Some(600),
+                PriorityMultiplier::ONE,
+                base_ts(),
+            ),
+        );
+        apply_ok(
+            &mut sm,
+            place_cmd(
+                placement(jid(10 + n), aid(10 + n), alid(10 + n), nid(n), cpu(2_000)),
+                base_ts(),
+            ),
+        );
+        apply_ok(&mut sm, dispatch_cmd(aid(10 + n), base_ts()));
+        apply_ok(&mut sm, started_cmd(aid(10 + n), base_ts()));
+    }
     for i in 1..=3u128 {
         apply_ok(
             &mut sm,
@@ -296,6 +305,59 @@ fn accrual_opening_respects_the_cap_k() {
     // A second pass adds nothing: the cap is already reached.
     let again = schedule(&sm, ts(TS_US + 2));
     assert!(again.is_empty(), "no third accrual past K");
+}
+
+#[test]
+fn at_most_one_accrual_opens_per_node() {
+    // Two nodes, each already running a slice, and three whales that fit
+    // neither node's free capacity and declare no `max_runtime` (so no lend is
+    // available either). K = 4 leaves the cluster cap slack throughout: the
+    // per-node ceiling of one accruing job (ADR 0027) is the only thing that
+    // stops the third open.
+    let mut sm = setup(cpu(8_000), 4);
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(8_000), base_ts()));
+    for n in 1..=2u128 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(
+                jid(10 + n),
+                cpu(2_000),
+                Some(600),
+                PriorityMultiplier::ONE,
+                base_ts(),
+            ),
+        );
+        apply_ok(
+            &mut sm,
+            place_cmd(
+                placement(jid(10 + n), aid(10 + n), alid(10 + n), nid(n), cpu(2_000)),
+                base_ts(),
+            ),
+        );
+        apply_ok(&mut sm, dispatch_cmd(aid(10 + n), base_ts()));
+        apply_ok(&mut sm, started_cmd(aid(10 + n), base_ts()));
+    }
+    for i in 1..=3u128 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(jid(i), cpu(8_000), None, PriorityMultiplier::ONE, base_ts()),
+        );
+    }
+
+    let proposal = schedule(&sm, ts(TS_US + 1));
+    assert_eq!(
+        proposal.placements.len(),
+        2,
+        "one accrual per node, not three on the best-scoring one"
+    );
+    let nodes: BTreeSet<NodeId> = proposal.placements.iter().map(|p| p.node).collect();
+    assert_eq!(nodes.len(), 2, "the two opens land on different nodes");
+    assert!(proposal.placements.iter().all(|p| !p.expect_funded));
+    commit(&mut sm, &proposal).expect("one accrual per node applies");
+
+    // Both nodes are occupied now, so the third whale has nowhere to accrue.
+    let again = schedule(&sm, ts(TS_US + 2));
+    assert!(again.is_empty(), "no second accrual on an occupied node");
 }
 
 #[test]

@@ -8,7 +8,7 @@
 //! one (ADR 0027). Every proposal it emits is shaped so the apply
 //! side (`coppice_state::apply::commit_placements`) accepts it: the engine
 //! carries its own faithful simulator of apply's funding arithmetic and accrual
-//! guard, and never proposes a batch that simulator would see rejected. No
+//! guards, and never proposes a batch that simulator would see rejected. No
 //! clocks, no randomness, no I/O; iteration is over `BTreeMap`s only, and `f64`
 //! scores order the pass and are discarded (ADR 0019).
 //!
@@ -406,6 +406,18 @@ impl<'a> Pass<'a> {
             if self.placed_nodes.contains(&source) {
                 continue;
             }
+            // Moving one accrual off a node that holds several would leave the
+            // rest behind, and apply refuses a batch that ends with a node
+            // accruing for more than one job (ADR 0027). Unreachable while the
+            // invariant holds — one accrual is all a node ever has — so this
+            // only keeps a hand-built state from producing a doomed proposal.
+            if self
+                .node_index
+                .get(&source)
+                .is_some_and(|&i| self.nodes[i].accruals.len() > 1)
+            {
+                continue;
+            }
             let requested = jr.spec.requests;
             let required = required_labels(&jr.spec);
             if let Some(target_idx) =
@@ -468,8 +480,7 @@ impl<'a> Pass<'a> {
             requested: *requested,
             expect_funded: false,
         });
-        if simulate_batch(self.snapshot, &self.base_free, &revocations, &placements).rejects_accrual
-        {
+        if simulate_batch(self.snapshot, &self.base_free, &revocations, &placements).rejected() {
             return false;
         }
         self.revoke_accrual_on_source(source, alloc);
@@ -533,6 +544,14 @@ impl<'a> Pass<'a> {
             }
             let pledge = nm.sim_free.component_min(requested);
             let remaining = requested.saturating_sub(&pledge);
+            // At most one accruing job per node (ADR 0027). A move that lands
+            // short still accrues, so it needs a node holding no other accrual
+            // — existing or opened by this batch. A full immediate fit accrues
+            // nothing and is unconstrained.
+            if !remaining.is_zero() && (!nm.accruals.is_empty() || !nm.pending_accruals.is_empty())
+            {
+                continue;
+            }
             let ready = if remaining.is_zero() {
                 // A full immediate fit: the best possible bound. Reached only
                 // on accrual-hosting nodes — `best_reseat_target` already took
@@ -737,6 +756,14 @@ impl<'a> Pass<'a> {
             if !nm.node.schedulable || nm.accruals.is_empty() {
                 continue;
             }
+            // A lend reseats every survivor on the same node, so the node ends
+            // the batch accruing for as many jobs as it started with. Under
+            // ADR 0027's one-accruing-job-per-node invariant that is at most
+            // one; the guard is belt and braces against a state that reached
+            // this pass violating it.
+            if nm.accruals.len() > 1 {
+                continue;
+            }
             // One lend per node per pass; keep it off any node the batch has
             // already touched so revocation-before-placement holds.
             if self.placed_nodes.contains(&nm.node.id) || self.revoked_nodes.contains(&nm.node.id) {
@@ -801,8 +828,7 @@ impl<'a> Pass<'a> {
                 expect_funded: false,
             });
         }
-        if simulate_batch(self.snapshot, &self.base_free, &revocations, &placements).rejects_accrual
-        {
+        if simulate_batch(self.snapshot, &self.base_free, &revocations, &placements).rejected() {
             return false;
         }
 
@@ -864,6 +890,13 @@ impl<'a> Pass<'a> {
             {
                 continue;
             }
+            // At most one accruing job per node (ADR 0027): the node must hold
+            // no accrual of its own and none opened earlier in this batch. The
+            // same filter `best_reseat_target` applies, one step stricter
+            // because an open never fully funds.
+            if !nm.accruals.is_empty() || !nm.pending_accruals.is_empty() {
+                continue;
+            }
             // Nonzero: a full free fit was already taken by `try_free_fit`,
             // which scans the same nodes under the same filters.
             let remaining = requested.saturating_sub(&nm.sim_free.component_min(requested));
@@ -899,7 +932,7 @@ impl<'a> Pass<'a> {
             &self.revocations,
             &placements,
         )
-        .rejects_accrual
+        .rejected()
         {
             return false;
         }
@@ -1069,8 +1102,20 @@ fn candidate_projected_ready(nm: &NodeModel, remaining: &Resources) -> Option<Ti
 struct BatchSim {
     /// Per placement (payload order): whether apply funds it fully.
     funded: Vec<bool>,
-    /// Whether apply's accrual guard would reject the batch.
+    /// Whether apply's cluster-wide accrual cap would reject the batch.
     rejects_accrual: bool,
+    /// Whether apply's per-node invariant — at most one accruing job on a node
+    /// once the batch has landed (ADR 0027) — would reject the batch.
+    rejects_per_node: bool,
+}
+
+impl BatchSim {
+    /// Whether apply would refuse this batch on either accrual guard. The one
+    /// verdict every proposal path consults; neither guard is re-derived at a
+    /// call site.
+    fn rejected(&self) -> bool {
+        self.rejects_accrual || self.rejects_per_node
+    }
 }
 
 /// Replay a batch through apply's effects exactly (`commit_placements` +
@@ -1078,6 +1123,10 @@ struct BatchSim {
 /// surviving accruals in `seq` order), then placements in payload order, each
 /// funded from the recomputed free capacity. Reads only the snapshot and the
 /// precomputed base free capacity; never mutates.
+///
+/// Both of apply's accrual verdicts are decided here and nowhere else — the
+/// cluster-wide cap on distinct accruing jobs, and the per-node ceiling of one
+/// (ADR 0027) — so a proposal path never re-derives either.
 fn simulate_batch(
     snapshot: &StateMachine,
     base_free: &BTreeMap<NodeId, Resources>,
@@ -1108,6 +1157,8 @@ fn simulate_batch(
     }
 
     let mut sim_free: BTreeMap<NodeId, Resources> = BTreeMap::new();
+    // Jobs still accruing on each touched node once the batch has landed.
+    let mut per_node: BTreeMap<NodeId, BTreeSet<JobId>> = BTreeMap::new();
     for node in &touched {
         let mut free = base_free.get(node).copied().unwrap_or(Resources::ZERO);
         for id in revocations {
@@ -1117,6 +1168,7 @@ fn simulate_batch(
                 }
             }
         }
+        let node_jobs = per_node.entry(*node).or_default();
         for (_, alloc_id) in snapshot.accrual_queue.range((*node, 0)..=(*node, u64::MAX)) {
             if revoked.contains(alloc_id) {
                 continue;
@@ -1132,9 +1184,8 @@ fn simulate_batch(
             free = free.saturating_sub(&pledge);
             if pledge == need {
                 accruing.remove(&rec.allocation.job);
-            }
-            if free.is_zero() {
-                break;
+            } else {
+                node_jobs.insert(rec.allocation.job);
             }
         }
         sim_free.insert(*node, free);
@@ -1152,6 +1203,7 @@ fn simulate_batch(
         funded.push(full);
         if !full {
             accruing.insert(p.job);
+            per_node.entry(p.node).or_default().insert(p.job);
         }
     }
 
@@ -1160,6 +1212,7 @@ fn simulate_batch(
     BatchSim {
         funded,
         rejects_accrual: after > limit && after > before,
+        rejects_per_node: per_node.values().any(|jobs| jobs.len() > 1),
     }
 }
 

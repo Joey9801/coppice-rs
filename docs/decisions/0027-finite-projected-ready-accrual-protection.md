@@ -1,4 +1,4 @@
-# 27. Finite projected-ready bounds govern lending and accrual placement
+# 27. Finite projected-ready bounds, and one accruing job per node
 
 - **Status:** Accepted
 - **Date:** 2026-07-10
@@ -41,9 +41,18 @@ considered and rejected:
   counter and a policy knob for a problem not yet observed, so it is
   deferred, not adopted.
 
+A second gap sits alongside it. ADR 0014 caps the number of *jobs* accruing
+cluster-wide (K) but says nothing about how they may stack on one node. A
+queue of accruals behind each other on a single node is the worst shape the
+model can produce: they compete for one stream of release events, so every
+accrual past the first has a bound no better than the one ahead of it and
+usually worse, while rule 1 below makes the node lend-free for all of them at
+once. The protection K is meant to buy is spent on holds that are not next in
+line for the capacity they are waiting on.
+
 ## Decision
 
-Four rules replace "`None` counts as satisfied":
+Five rules replace "`None` counts as satisfied":
 
 1. **No finite bound, no lend (`None => false`).** A strict-backfill lend on
    a node is legal only when *every* surviving accrual `A` on that node has a
@@ -56,7 +65,8 @@ Four rules replace "`None` counts as satisfied":
    new accruing allocation, it must not select a node on which the accrual's
    `projected_ready` would be indefinite while some eligible node would give
    it a finite one. Candidate bounds are computed with the ADR 0014 sweep, as
-   if the new accrual were appended behind the node's existing accrual queue.
+   if the new accrual were appended behind the node's existing accrual queue
+   — a queue rule 5 keeps empty on every node still eligible to take one.
    Finite candidates are ranked by earliest `projected_ready`, ties by the
    largest immediately-pledged fraction, then `NodeId`; indefinite candidates
    keep the previous largest-pledge ranking among themselves.
@@ -89,6 +99,25 @@ Four rules replace "`None` counts as satisfied":
    the honest one: the specific unbounded holders it waits on, plus its
    protected status.
 
+5. **One accruing job per node.** After any applied batch, no node holds
+   accruing allocations for more than one distinct job. The bound is
+   hardcoded at one — not a policy knob, because there is no operational
+   question to tune: a second accrual on a node is strictly worse than the
+   same accrual anywhere else, or than not opening it at all. The rule is a
+   plain assertion about the post-batch state, checked on the nodes the batch
+   touches, with no grandfathering clause: a same-batch swap (revoke the
+   sitting accrual, open another on that node) passes, and a batch that would
+   leave two behind is refused whole with `PerNodeAccrualExceeded`. The
+   scheduler mirrors it as a candidate filter — a node holding an accrual, or
+   one this batch already opened an accrual on, is not an eligible target for
+   an open or for a move that would land short — so a legal proposal never
+   depends on the verdict firing.
+
+   Under this rule a node's accrual queue is one deep, which does not make
+   the `seq`-ordered pledge machinery of ADR 0014 vacuous: funding order
+   still decides among the placements of a single batch, and a revocation's
+   freed capacity still flows to a survivor before any new placement sees it.
+
 Together these give every accruing allocation a well-defined projected start
 answer — a finite `projected_ready` wherever one is achievable, and a
 protected, monotone accrual where none is.
@@ -119,6 +148,13 @@ from its seating):
   to a five-minute job. The exposure is bounded by K nodes (default 4). If
   operators measure this to matter, the remedy is the deferred lend-credit
   mechanism, not a return to `None => true`.
+- **K accruing jobs now means K distinct nodes.** The protected window can
+  only be as wide as the cluster: a cluster with fewer than K schedulable
+  nodes cannot reach K accruing jobs, and a blocked job on a cluster whose
+  nodes are all occupied by accruals waits unprotected until one clears
+  rather than stacking behind another. That is the intended reading — a
+  second hold on an already-spoken-for node was never protection — and it
+  makes the accrual set an honest map of which capacity is promised to whom.
 - Incentives stay aligned and sharpen: declaring an enforced `max_runtime`
   remains the only way to backfill, and running without one now also
   implicitly repels accruals from your nodes (rule 2) — no new user-facing
