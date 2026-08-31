@@ -100,10 +100,6 @@ the world, not by hardcoding values in components.
 
 ## Known gaps (deliberate)
 
-- **Events are a window, not a stream.** `ClusterOverview.recentEvents` is
-  a bounded most-recent-N snapshot; the server owns windowing/coalescing.
-  Do not build UI that assumes it sees every cluster event.
-
 - **Logs are invented, and now partially reconciled.** The real log API
   landed (ADR 0034, `GetJobLogsResponse`/`LogEntry` in dto.rs) with a
   richer per-attempt shape (`attempt`, `stream`, per-attempt `sources`

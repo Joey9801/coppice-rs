@@ -127,25 +127,12 @@ pub struct StampedEvent {
     pub event: coppice_state::Event,
 }
 
-/// The most recent cluster events, newest first, served from the fanout
-/// ring (ADR 0032, tier 1).
-///
-/// `floor_index` is an exclusive coverage cursor: the window is complete
-/// for every applied index *strictly above* it and claims nothing at or
-/// below it. An empty `events` with a high cursor is a freshly restarted
-/// coordinator, not a quiet cluster.
-#[derive(Debug, Clone)]
-pub struct RecentClusterEvents {
-    pub floor_index: u64,
-    pub events: Vec<StampedEvent>,
-}
-
 /// One job's timeline window, ascending by `(index, ordinal)`, served from
 /// this replica's fanout ring (ADR 0032, tier 1) — the honestly-partial
 /// backstop behind `GetJobTimeline`.
 ///
-/// `floor_index` is the same exclusive coverage cursor as
-/// [`RecentClusterEvents`]: the timeline is complete for every applied index
+/// `floor_index` is an exclusive coverage cursor: the timeline is complete
+/// for every applied index
 /// *strictly above* it and claims nothing at or below it, so a window is
 /// complete-from-submission only when it actually contains the job's
 /// `job_submitted` event. `next` is the `(index, ordinal)` content coordinate
@@ -602,11 +589,6 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// absence. Cheap: a clone of the latest published window, no locks
     /// held, no consensus involvement.
     fn queue_window(&self) -> QueueWindow;
-
-    /// The most recent cluster events this replica's fanout ring retains
-    /// (ADR 0032, tier 1), newest first, at most `limit` — derived class,
-    /// replica-local, with the coverage floor.
-    fn recent_events(&self, limit: usize) -> impl Future<Output = RecentClusterEvents> + Send;
 
     /// One job's transition timeline (ADR 0032), ascending by `(index,
     /// ordinal)`, resuming strictly after `after` and bounded by `limit`

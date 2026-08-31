@@ -543,9 +543,8 @@ served as of 2026-07-15: `GET /api/v1/overview`
 ([routes](../../crates/coppice-api/src/http/routes.rs),
 [projection](../../crates/coppice-api/src/http/project.rs)) serves queue
 rates and `history` from the derived-stats task's 30 s buckets (`null`/empty
-exactly when the window has no coverage), and a `recent_events` window in
-ADR 0032's shared `TimelineEvent` shape with the ring's coverage floor
-([dto](../../crates/coppice-api/src/http/dto.rs)).
+exactly when the window has no coverage;
+[dto](../../crates/coppice-api/src/http/dto.rs)).
 
 `GetJobTimeline` is served ring-backed as of this change:
 `GET /api/v1/jobs/{job}/timeline`

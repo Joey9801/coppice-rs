@@ -327,6 +327,7 @@ mod tests {
         by_state.insert(dto::JobPhase::Queued, 3);
         dto::QueueStats {
             depth: 3,
+            accruing: 0,
             drain_rate_per_minute: Some(1.5),
             arrival_rate_per_minute: None,
             oldest_queued_age_seconds: Some(42),
@@ -360,10 +361,6 @@ mod tests {
                     memory_bytes: 0,
                     disk_bytes: 0,
                 },
-            },
-            recent_events: dto::RecentEventsWindow {
-                floor_index: 7,
-                events: Vec::new(),
             },
         }
     }

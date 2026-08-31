@@ -32,8 +32,7 @@ use coppice_api::http::dto::{
 use coppice_api::{
     ApiError, Consistency, ControlPlane, CoordinatorMemberSummary, CoordinatorSummary,
     JobTimelineWindow, LogFetchError, LogFetchOutcome, LogFetchRequest, MetricsFetchError,
-    MetricsFetchOutcome, MetricsFetchRequest, QueueWindow, ReadOptions, ReadView,
-    RecentClusterEvents, StampedEvent,
+    MetricsFetchOutcome, MetricsFetchRequest, QueueWindow, ReadOptions, ReadView, StampedEvent,
 };
 use coppice_consensus::{
     Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, Role, StateView, StateViews,
@@ -474,7 +473,7 @@ pub struct CoordinatorControlPlane<C> {
     /// watch — an honest "no coverage", which is also what tests that never
     /// spawn the task serve.
     queue_window: watch::Receiver<QueueWindow>,
-    /// Handle to the fanout's ring for `recent_events` (ADR 0032, tier 1);
+    /// Handle to the fanout's ring for `job_timeline` (ADR 0032, tier 1);
     /// `None` (again: no coverage) until `with_derived`.
     fanout: Option<FanoutHandle>,
     /// Admin handle to the consensus node, for `coordinator_status`'s raft-level
@@ -730,35 +729,6 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         self.queue_window.borrow().clone()
     }
 
-    async fn recent_events(&self, limit: usize) -> RecentClusterEvents {
-        // "No ring" and "ring unreachable at shutdown" both serve the same
-        // honest answer: nothing covered — the exclusive cursor sits at
-        // everything this replica has applied, with no events.
-        let uncovered = || RecentClusterEvents {
-            floor_index: self.views.latest().applied_index(),
-            events: Vec::new(),
-        };
-        let Some(fanout) = &self.fanout else {
-            return uncovered();
-        };
-        match fanout.recent(limit).await {
-            Ok(recent) => RecentClusterEvents {
-                floor_index: recent.floor_index,
-                events: recent
-                    .events
-                    .into_iter()
-                    .map(|e| StampedEvent {
-                        index: e.index,
-                        ordinal: e.ordinal,
-                        at: e.at,
-                        event: e.event,
-                    })
-                    .collect(),
-            },
-            Err(_closed) => uncovered(),
-        }
-    }
-
     async fn job_timeline(
         &self,
         job: JobId,
@@ -766,7 +736,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         limit: usize,
     ) -> JobTimelineWindow {
         // "No ring" and "ring unreachable at shutdown" both serve the same
-        // honest answer as `recent_events`: nothing covered — the exclusive
+        // honest answer: nothing covered — the exclusive
         // floor sits at everything this replica has applied, with no events
         // and no continuation (there is nothing to continue).
         let uncovered = || JobTimelineWindow {
@@ -799,7 +769,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
     fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
         // No handle attached is "no coverage": the replicated-state reads still
         // work, but this raft-level view cannot be produced (mirrors the
-        // missing-fanout branch in `recent_events`, but as an error — the raft
+        // missing-fanout branch in `job_timeline`, but as an error — the raft
         // view *is* the endpoint, so there is no honest partial answer).
         let Some(handle) = &self.node_handle else {
             return Err(ApiError::Unavailable(
@@ -1657,8 +1627,8 @@ mod tests {
     #[tokio::test]
     async fn job_timeline_without_a_fanout_is_honestly_empty() {
         // No ring attached (the plane is built without `with_derived`): the
-        // honest answer is the same as `recent_events` — floor at everything
-        // applied (the publisher seeded index 1), no events, no continuation.
+        // honest answer is floor at everything applied (the publisher seeded
+        // index 1), no events, no continuation.
         let cp = control_plane(ProposeOutcome::Accepted);
         let window = cp.job_timeline(JobId::new(), None, 100).await;
         assert_eq!(window.floor_index, 1);

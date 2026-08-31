@@ -1714,13 +1714,6 @@ impl coppice_api::ControlPlane for NoopPlane {
         coppice_api::QueueWindow::default()
     }
 
-    async fn recent_events(&self, _limit: usize) -> coppice_api::RecentClusterEvents {
-        coppice_api::RecentClusterEvents {
-            floor_index: 0,
-            events: Vec::new(),
-        }
-    }
-
     async fn job_timeline(
         &self,
         _job: coppice_core::id::JobId,

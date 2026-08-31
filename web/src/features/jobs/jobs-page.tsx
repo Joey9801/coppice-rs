@@ -243,7 +243,7 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
               </TableCell>
               <TableCell className="text-right tabular-nums">{formatUcu(job.costUcu)}</TableCell>
               <TableCell>
-                {job.outcome && phase !== 'Succeeded' ? (
+                {job.outcome ? (
                   outcomePill(job.outcome)
                 ) : (
                   <span className="text-muted-foreground">—</span>

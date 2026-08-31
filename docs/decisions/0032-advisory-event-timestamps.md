@@ -120,14 +120,13 @@ Alternatives considered and rejected:
 
    | Tier | Contents | Bounds | Serves |
    | --- | --- | --- | --- |
-   | Fanout ring (exists) | `EventBatch` incl. `at_us` | 1 h / 1M events, reconnection buffer, unchanged | `SubscribeEvents` replay; a bounded most-recent cache for the overview's `recent_events` |
+   | Fanout ring (exists) | `EventBatch` incl. `at_us` | 1 h / 1M events, reconnection buffer, unchanged | `SubscribeEvents` replay; the tier-1 window behind `GetJobTimeline` |
    | History event table (new, in the ADR 0012 store) | one row per event: `(applied_index, ordinal)` PK, `at_us`, kind, scope keys, payload | 90 days, daily partitions dropped whole | `GetJobTimeline`, `GetNodeHistory`; the durable substrate for any later windowed projection |
-   | Derived stats (new, in-memory per replica) | 30 s rolling buckets: queue arrivals/drains counted from the event stream; utilization-`allocated` and quota usage sampled from published views | ≤ 1 h of buckets, task-local, never on `StateMachine`, never snapshotted | queue `history` and both rates; `GetNodeUtilization` (allocated); `QuotaEntityStats.usageHistory` |
+   | Derived stats (new, in-memory per replica) | 30 s rolling buckets: queue arrivals/drains counted from the event stream; queue depth sampled from published views (`Queued` plus jobs whose current attempt is `Accruing`); utilization-`allocated` and quota usage sampled from published views | ≤ 1 h of buckets, task-local, never on `StateMachine`, never snapshotted | queue `history` and both rates; `GetNodeUtilization` (allocated); `QuotaEntityStats.usageHistory` |
 
    One wire shape — the timeline event carrying `(index, ordinal, at_us)`
-   plus kind and scope fields — is shared by the overview's `recent_events`,
-   `GetJobTimeline`, and the ADR 0008 subscription payload. No endpoint
-   invents its own event shape.
+   plus kind and scope fields — is shared by `GetJobTimeline` and the ADR
+   0008 subscription payload. No endpoint invents its own event shape.
 
 5. **History pipeline: best-effort, honest gaps, guaranteed backstop.** A
    leader-scoped history-writer task consumes the event stream and batch-
@@ -159,7 +158,7 @@ Alternatives considered and rejected:
 
 6. **Honest absence gets a vocabulary.** A window that is not retained is
    absent (`null`), never `0` — unchanged. A window that is *partially*
-   covered now says so: `recent_events` carries the coverage floor (the
+   covered now says so: `GetJobTimeline` carries the coverage floor (the
    ring's earliest-available index), and bucketed series mark buckets that
    predate the process or a gap as missing rather than zero. An empty ring on
    a freshly restarted coordinator is thereby distinguishable from a quiet

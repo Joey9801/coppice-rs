@@ -14,7 +14,6 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
-import { EventsFeed } from './events-feed'
 import { QueueChart } from './queue-chart'
 
 /** `null` is a coverage gap (ADR 0032), rendered as absent — never `0.0`. */
@@ -42,7 +41,7 @@ export function OverviewPage() {
     )
   }
 
-  const { clusterId, queue, capacity, recentEvents } = data
+  const { clusterId, queue, capacity } = data
   const depthSeries = queue.history.map((h) => ({ t: h.t.getTime(), v: h.depth }))
   const drainSeries = queue.history.map((h) => ({ t: h.t.getTime(), v: h.drainedPerMinute }))
   const nonzeroStates = JOB_PHASES.filter((s) => queue.byState[s] > 0)
@@ -84,7 +83,7 @@ export function OverviewPage() {
         <StatTile
           label="Running jobs"
           value={queue.byState.Running}
-          hint={`${queue.byState.Preparing} preparing / ${queue.byState.Finalizing} finalizing`}
+          hint={`${queue.accruing} accruing / ${queue.byState.Preparing - queue.accruing} preparing`}
         />
 
         <StatTile
@@ -144,7 +143,7 @@ export function OverviewPage() {
         </Card>
       </div>
 
-      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+      <div className="mt-4">
         <Card>
           <CardHeader>
             <CardTitle>Capacity</CardTitle>
@@ -155,19 +154,6 @@ export function OverviewPage() {
               allocated={capacity.allocated}
               used={capacity.used}
             />
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Recent events</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {recentEvents.events.length > 0 ? (
-              <EventsFeed events={recentEvents.events} />
-            ) : (
-              <EmptyState title="No recent events" />
-            )}
           </CardContent>
         </Card>
       </div>
@@ -188,10 +174,7 @@ function OverviewSkeleton() {
         <Skeleton className="h-72 lg:col-span-2" />
         <Skeleton className="h-72" />
       </div>
-      <div className="mt-4 grid gap-4 lg:grid-cols-2">
-        <Skeleton className="h-56" />
-        <Skeleton className="h-56" />
-      </div>
+      <Skeleton className="mt-4 h-56" />
     </div>
   )
 }

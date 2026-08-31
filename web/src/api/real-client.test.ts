@@ -38,6 +38,7 @@ describe('getClusterOverview', () => {
         cluster_id: 'cluster-00000000-0000-0000-0000-000000000001',
         queue: {
           depth: 3,
+          accruing: 1,
           drain_rate_per_minute: 1.5,
           arrival_rate_per_minute: null,
           oldest_queued_age_seconds: 42,
@@ -57,7 +58,6 @@ describe('getClusterOverview', () => {
           allocated: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
           used: { cpu_millis: 50, memory_bytes: 0, disk_bytes: 0 },
         },
-        recent_events: { floor_index: 1, events: [] },
       }),
     )
     const client = createRealClient()
@@ -66,6 +66,7 @@ describe('getClusterOverview', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/overview', expect.anything())
     expect(overview.clusterId).toBe('cluster-00000000-0000-0000-0000-000000000001')
     expect(overview.queue.depth).toBe(3)
+    expect(overview.queue.accruing).toBe(1)
     expect(overview.queue.drainRatePerMinute).toBe(1.5)
     expect(overview.queue.arrivalRatePerMinute).toBeNull()
     expect(overview.queue.byState.Queued).toBe(3)
