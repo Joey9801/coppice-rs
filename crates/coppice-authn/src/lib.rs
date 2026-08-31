@@ -45,8 +45,8 @@ mod validator;
 
 pub use actor::{ActorExt, AuthMethod, ANONYMOUS_PRINCIPAL};
 pub use chain::{
-    no_ca, static_groups_claim, AuthnChain, CaProvider, Credentials, GroupsClaimProvider,
-    Unauthenticated,
+    no_ca, static_groups_claim, Authenticated, AuthnChain, CaProvider, Credentials,
+    GroupsClaimProvider, Presentation, Unauthenticated,
 };
 
 /// The identity one request resolved to — **the replicated actor itself**

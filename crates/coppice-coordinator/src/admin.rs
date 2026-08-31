@@ -1658,15 +1658,9 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
 
     /// The leader-side half of a forwarded authorization replacement
     /// (ADR 0023). As the three above, through the same
-    /// [`api_server::update_authorization_here`] the direct path runs — so the
-    /// follow-up `UpdatePolicy` for a changed `groups_claim` happens here too,
-    /// and a forwarded PUT behaves exactly like a direct one.
-    ///
-    /// The second index rides beside the outcome rather than inside it: the
-    /// shared `ForwardWriteOutcome` carries one, and this verb can produce
-    /// two. It is present only on the applied path, because
-    /// `update_authorization_here` reports a failed follow-up as the call's
-    /// failure rather than as a half-success.
+    /// [`api_server::update_authorization_here`] the direct path runs — so a
+    /// forwarded PUT behaves exactly like a direct one, including the
+    /// `groups_claim` rename that rides the single command.
     async fn forward_update_authorization(
         &self,
         request: Request<pb::ForwardUpdateAuthorizationRequest>,
@@ -1678,13 +1672,9 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
 
         let (dto, actor) = crate::clientwrite::authorization_from_pb(req)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
-        let views = consensus.views();
-        let outcome =
-            api_server::update_authorization_here(consensus.as_ref(), &views, &dto, &actor).await;
-        let policy_log_index = outcome.as_ref().ok().and_then(|r| r.policy_log_index);
+        let outcome = api_server::update_authorization_here(consensus.as_ref(), &dto, &actor).await;
         Ok(Response::new(pb::ForwardUpdateAuthorizationResponse {
             outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
-            policy_log_index,
         }))
     }
 }

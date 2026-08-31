@@ -537,8 +537,8 @@ message ForwardUpdateAuthorizationRequest {
   // meaningful request and is refused at apply by the lockout guard, not
   // confused with "no bindings field".
   repeated coppice.core.v1.Binding bindings = 8;
-  // Absent leaves PolicyConfig.groups_claim alone. Present and different
-  // from the current value produces a SECOND command on the leader.
+  // Absent leaves PolicyConfig.groups_claim alone. Present, it rides the
+  // single UpdateAuthorization command the leader proposes.
   optional string groups_claim = 9;
   // As ForwardSubmitJobRequest.actor. This verb takes an unscoped admin
   // binding, so the actor is the entire authorization input.
@@ -546,13 +546,9 @@ message ForwardUpdateAuthorizationRequest {
 }
 
 message ForwardUpdateAuthorizationResponse {
-  // The UpdateAuthorization command's own outcome. Its Applied.log_index is
-  // the bindings replacement's apply index.
+  // The single UpdateAuthorization command's outcome. Its Applied.log_index
+  // covers the bindings replacement AND any groups_claim rename, which apply
+  // installs together at one log position.
   ForwardWriteOutcome outcome = 1;
-  // The follow-up UpdatePolicy's apply index, present only when the request
-  // changed groups_claim AND the outcome above was Applied. Two commands,
-  // each atomic, neither conditional on the other — so this is a second
-  // index rather than a second outcome: a failure of the follow-up is
-  // reported as the call's failure, never as a half-applied success.
-  optional uint64 policy_log_index = 2;
+  reserved 2; // was policy_log_index, back when the rename was a 2nd command.
 }

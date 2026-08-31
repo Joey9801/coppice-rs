@@ -441,6 +441,155 @@ fn update_authorization_refuses_an_unknown_scope() {
     assert_eq!(sm.bindings, before);
 }
 
+// ---- The groups_claim rider (ADR 0022/0023) ----
+
+/// The rider applies with the bindings, in one apply: after this single
+/// command, `sm.bindings` is the new list AND `policy.groups_claim` is the
+/// new name. There is no intermediate state in which one landed and the
+/// other did not.
+#[test]
+fn update_authorization_installs_bindings_and_claim_together() {
+    let mut sm = tree_setup();
+    install(&mut sm, vec![principal_binding("root", Role::Admin, None)]);
+    let before_policy = sm.policy.clone();
+
+    let next = vec![
+        principal_binding("root", Role::Admin, None),
+        group_binding("batch-users", Role::Submitter, Some(qid(TEAM_A))),
+    ];
+    let applied = apply_ok(
+        &mut sm,
+        with_actor(
+            update_authorization_cmd_with_claim(next.clone(), "entitlements"),
+            actor("root"),
+        ),
+    );
+    assert_eq!(applied.events, vec![Event::AuthorizationUpdated]);
+    assert_eq!(sm.bindings, next);
+    assert_eq!(sm.policy.groups_claim, "entitlements");
+    // Only that one policy field moved — the rider is not a full replacement.
+    assert_eq!(
+        coppice_state::PolicyConfig {
+            groups_claim: before_policy.groups_claim.clone(),
+            ..sm.policy.clone()
+        },
+        before_policy,
+        "groups_claim is the only policy field the rider touches"
+    );
+}
+
+/// The lockout the two-command shape used to produce, now impossible.
+///
+/// A group-matched admin renames the claim AND swaps the admin group in one
+/// request. Under a follow-up `UpdatePolicy` the second command would be
+/// authorized at its own log position — against the bindings the first
+/// command just installed (`new-admins`), with the actor's groups still
+/// extracted under the OLD claim name (`old-admins`) — so it would be denied
+/// and leave the cluster half-updated. One command is authorized once,
+/// against the bindings in force before it, and both halves land.
+#[test]
+fn a_claim_rename_that_swaps_the_admin_group_applies_atomically() {
+    let mut sm = tree_setup();
+    install(
+        &mut sm,
+        vec![group_binding("old-admins", Role::Admin, None)],
+    );
+    // The admin holds authority only through the old group, read under the
+    // old claim name — exactly the actor the reviewer's scenario locks out.
+    let ana = actor_in("ana", &["old-admins"]);
+
+    let next = vec![group_binding("new-admins", Role::Admin, None)];
+    apply_ok(
+        &mut sm,
+        with_actor(
+            update_authorization_cmd_with_claim(next.clone(), "roles"),
+            ana.clone(),
+        ),
+    );
+    assert_eq!(sm.bindings, next);
+    assert_eq!(sm.policy.groups_claim, "roles");
+
+    // And the proof that the split shape was the hazard: the same actor,
+    // proposing anything admin-gated at a LATER log position, is now denied —
+    // which is what the follow-up `UpdatePolicy` would have been.
+    let reason = sm
+        .apply(&with_actor(update_policy_cmd(test_policy(5)), ana))
+        .expect_err("the old group no longer grants admin");
+    assert!(denied(&reason), "{reason:?}");
+}
+
+/// A blank claim name matches no JWT claim, so every group-based binding
+/// would quietly stop resolving. It is refused before any mutation — the
+/// bindings are untouched too, which is the whole point of validating the
+/// rider in the read-only phase.
+#[test]
+fn update_authorization_refuses_a_blank_claim_without_mutating() {
+    let mut sm = tree_setup();
+    install(&mut sm, vec![principal_binding("root", Role::Admin, None)]);
+    let before_bindings = sm.bindings.clone();
+    let before_claim = sm.policy.groups_claim.clone();
+
+    for blank in ["", "   "] {
+        let reason = sm
+            .apply(&with_actor(
+                update_authorization_cmd_with_claim(
+                    vec![principal_binding("lead", Role::Admin, None)],
+                    blank,
+                ),
+                actor("root"),
+            ))
+            .expect_err("a blank claim name matches nothing");
+        assert!(
+            matches!(reason, RejectionReason::InvalidAuthorization(_)),
+            "{reason:?}"
+        );
+        assert_eq!(sm.bindings, before_bindings, "bindings untouched");
+        assert_eq!(sm.policy.groups_claim, before_claim, "claim untouched");
+    }
+}
+
+/// A rejection for any other reason leaves BOTH halves alone: the rider is
+/// not applied ahead of the list it rides on.
+#[test]
+fn a_rejected_replacement_leaves_the_claim_untouched() {
+    let mut sm = tree_setup();
+    install(&mut sm, vec![principal_binding("root", Role::Admin, None)]);
+    let before_bindings = sm.bindings.clone();
+    let before_claim = sm.policy.groups_claim.clone();
+
+    // Lockout: a valid claim rename riding an invalid list.
+    let reason = sm
+        .apply(&with_actor(
+            update_authorization_cmd_with_claim(vec![], "roles"),
+            actor("root"),
+        ))
+        .expect_err("an empty admin list is refused");
+    assert!(matches!(reason, RejectionReason::AuthorizationLockout));
+    assert_eq!(sm.bindings, before_bindings);
+    assert_eq!(sm.policy.groups_claim, before_claim);
+}
+
+/// An absent rider leaves the policy entirely alone — the common case, where
+/// the request only edits bindings.
+#[test]
+fn an_absent_groups_claim_leaves_the_policy_alone() {
+    let mut sm = tree_setup();
+    install(&mut sm, vec![principal_binding("root", Role::Admin, None)]);
+    let before_policy = sm.policy.clone();
+
+    apply_ok(
+        &mut sm,
+        with_actor(
+            update_authorization_cmd(vec![
+                principal_binding("root", Role::Admin, None),
+                principal_binding("lead", Role::Operator, None),
+            ]),
+            actor("root"),
+        ),
+    );
+    assert_eq!(sm.policy, before_policy);
+}
+
 /// The lockout guard: the resulting list must retain at least one unscoped
 /// admin. Operator certificates make lockout recoverable, but they are
 /// outside the list by design and so do not count here.

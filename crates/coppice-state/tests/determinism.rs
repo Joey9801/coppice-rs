@@ -188,6 +188,7 @@ fn arb_global() -> impl Strategy<Value = Command> {
                     bindings,
                     actor: with_who.then(|| actor("root")),
                     updated_at: ts,
+                    groups_claim: with_who.then(|| "roles".to_string()),
                 })
             }
         ),

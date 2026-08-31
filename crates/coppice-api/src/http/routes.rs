@@ -30,7 +30,7 @@ use super::dto::{
 };
 use crate::{Consistency, ControlPlane};
 
-use super::authn::RequestActor;
+use super::authn::{RequestActor, RequestPresentation};
 use super::authorize::{precheck, Intent};
 use super::enroll::EnrollEndpoint;
 use super::error::{authorization_error, HttpError};
@@ -353,6 +353,7 @@ fn auth_config(mode: &coppice_authn::AuthMode) -> dto::GetAuthConfigResponse {
 async fn get_session<P: ControlPlane>(
     State(plane): State<Arc<P>>,
     RequestActor(actor): RequestActor,
+    RequestPresentation(presentation): RequestPresentation,
     ReadQuery(params): ReadQuery,
 ) -> Result<impl IntoResponse, HttpError> {
     let view = plane
@@ -376,6 +377,10 @@ async fn get_session<P: ControlPlane>(
             // so the reported method can never disagree with the grants it
             // implies.
             auth_method: actor.method().as_str().to_string(),
+            // Presentation claims from the verified token, per request and
+            // never stored (ADR 0022); both null for operator-cert/open.
+            name: presentation.name,
+            email: presentation.email,
             bindings,
             // An operator certificate or the open posture: unscoped admin from
             // outside the list, so it could never appear *in* `bindings`.
@@ -420,7 +425,9 @@ async fn get_authorization<P: ControlPlane>(
 }
 
 /// `PUT /api/v1/authorization` — full replacement of the replicated bindings
-/// (ADR 0023), an unscoped-admin verb.
+/// (ADR 0023), an unscoped-admin verb. A `groups_claim` in the body rides the
+/// same command and lands in the same apply, so renaming the claim while
+/// swapping the admin group is one atomic edit, never a half-applied pair.
 ///
 /// Three refusals, in the order they can be reached:
 ///
@@ -1106,25 +1113,21 @@ mod tests {
             }
         }
 
-        /// Echoes an accepted replacement, with a `policy_log_index` exactly
-        /// when the request asked for a `groups_claim` change — the
-        /// coordinator's own "only when it differs" rule is tested against a
-        /// real state machine in `coppice-coordinator`; here the point is
-        /// that the field reaches the client.
+        /// Echoes an accepted replacement under one log index — the plane
+        /// proposes a single command whether or not the request renames
+        /// `groups_claim`. That the rename actually lands atomically is tested
+        /// against a real state machine in `coppice-state`; here the point is
+        /// that the field reaches the plane at all.
         async fn update_authorization(
             &self,
             req: dto::UpdateAuthorizationRequest,
             actor: coppice_state::Actor,
         ) -> Result<dto::UpdateAuthorizationResponse, ApiError> {
             self.record(actor);
-            let policy_log_index = req.groups_claim.as_ref().map(|_| 8);
             *self.authorization.lock().unwrap() = Some(req);
             match self.fail_with {
                 Some(make) => Err(make()),
-                None => Ok(dto::UpdateAuthorizationResponse {
-                    log_index: 7,
-                    policy_log_index,
-                }),
+                None => Ok(dto::UpdateAuthorizationResponse { log_index: 7 }),
             }
         }
 
@@ -3048,6 +3051,35 @@ mod tests {
         assert_eq!(body["principal"], "user-42");
         assert_eq!(body["groups"], serde_json::json!(["batch-users", "sre"]));
         assert_eq!(body["auth_method"], "bearer");
+        // No `name`/`email` claims on this token: explicit nulls, per the
+        // wire convention for absent optionals.
+        assert_eq!(body["name"], serde_json::Value::Null);
+        assert_eq!(body["email"], serde_json::Value::Null);
+        idp.shutdown().await;
+    }
+
+    /// The token's `name`/`email` claims reach the session response as
+    /// presentation data (ADR 0022): read from the verified token on this
+    /// request, reported back, and stored nowhere — nothing but this
+    /// response ever carries them.
+    #[tokio::test]
+    async fn the_session_reports_presentation_claims_from_the_token() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let token = idp.sign(
+            coppice_testkit::oidc::TokenClaims::new("user-42")
+                .audience(TEST_CLIENT_ID)
+                .claim("name", serde_json::json!("Ana Batch"))
+                .claim("email", serde_json::json!("ana@example.com")),
+        );
+        let response = router_with_authn(stub_plane(Default::default()), oidc_chain(&idp).await)
+            .oneshot(bearer_request("/api/v1/session", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["principal"], "user-42");
+        assert_eq!(body["name"], "Ana Batch");
+        assert_eq!(body["email"], "ana@example.com");
         idp.shutdown().await;
     }
 
@@ -3085,6 +3117,9 @@ mod tests {
         assert_eq!(body["principal"], "cert:alice");
         assert_eq!(body["groups"], serde_json::json!([]));
         assert_eq!(body["auth_method"], "operator_cert");
+        // Certificates carry no presentation claims.
+        assert_eq!(body["name"], serde_json::Value::Null);
+        assert_eq!(body["email"], serde_json::Value::Null);
         idp.shutdown().await;
     }
 
@@ -4151,11 +4186,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_groups_claim_change_reports_its_own_log_index() {
-        // Two commands, two indexes (ADR 0023): `groups_claim` lives in
-        // `PolicyConfig` and the bindings do not, so changing both is a
-        // bindings replacement plus a policy update — and the response says
-        // so rather than pretending to one transaction.
+    async fn a_groups_claim_change_reports_one_log_index() {
+        // One command, one index (ADR 0023): `groups_claim` rides the
+        // `UpdateAuthorization` that replaces the bindings, so a rename and a
+        // binding swap share a log position and the response has a single
+        // index to report — there is no second one, present or null.
         let (state, _) = authz_fixture(|_| Vec::new());
         let plane = stub_plane(state);
         let response = router(Arc::clone(&plane))
@@ -4168,18 +4203,38 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["log_index"], 7);
-        assert_eq!(body["policy_log_index"], 8);
+        assert!(body.get("policy_log_index").is_none());
+        assert_eq!(
+            plane
+                .authorization
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|r| r.groups_claim.clone())
+                .as_deref(),
+            Some("roles"),
+            "the rename reaches the plane, which carries it on the command"
+        );
 
-        // A request that does not mention the claim leaves it alone, and says
-        // so with an explicit null rather than an absent field.
-        let response = router(plane)
+        // A request that does not mention the claim leaves it alone, and the
+        // response shape does not change.
+        let response = router(Arc::clone(&plane))
             .oneshot(put_json("/api/v1/authorization", r#"{ "bindings": [] }"#))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["log_index"], 7);
-        assert_eq!(body["policy_log_index"], serde_json::Value::Null);
+        assert!(body.get("policy_log_index").is_none());
+        assert_eq!(
+            plane
+                .authorization
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|r| r.groups_claim.clone()),
+            None
+        );
     }
 
     #[tokio::test]

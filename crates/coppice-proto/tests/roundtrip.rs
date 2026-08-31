@@ -219,6 +219,9 @@ fn every_command() -> Vec<Command> {
             ],
             actor: Some(open_posture_actor()),
             updated_at: ts(),
+            // The optional claim rename that rides this command — carried so
+            // the corpus exercises the `Some` arm of the conversion.
+            groups_claim: Some("entitlements".into()),
         }),
         Command::BumpClusterVersion(BumpClusterVersion {
             to: 2,
@@ -722,6 +725,7 @@ fn unspecified_role_is_rejected_at_the_boundary() {
                     }],
                     actor: None,
                     updated_at_us: ts().as_micros(),
+                    groups_claim: None,
                 },
             )),
         };
@@ -750,6 +754,7 @@ fn unset_binding_subject_oneof_is_rejected_at_the_boundary() {
                 }],
                 actor: None,
                 updated_at_us: ts().as_micros(),
+                groups_claim: None,
             },
         )),
     };

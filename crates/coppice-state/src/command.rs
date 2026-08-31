@@ -366,6 +366,16 @@ pub struct UpdateAuthorization {
     /// Who asked — see the module note on actor-carrying commands.
     pub actor: Option<Actor>,
     pub updated_at: Timestamp,
+    /// Optional rename of [`PolicyConfig::groups_claim`], installed by the
+    /// same apply as the bindings above. `None` leaves the field alone.
+    ///
+    /// It rides this command rather than a follow-up `UpdatePolicy` because
+    /// the two edits are only safe together: a rename that also swaps the
+    /// admin group would otherwise have its second command authorized at its
+    /// own log position, against the *new* bindings, with groups read under
+    /// the *old* claim name — locking out the very admin making the change.
+    /// One command, one log position, one authorization decision.
+    pub groups_claim: Option<String>,
 }
 
 /// Bump the semantic feature gate (ADR 0003).

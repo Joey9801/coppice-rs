@@ -1968,6 +1968,14 @@ pub struct GetSessionResponse {
     /// How the principal proved itself: `"bearer"`, `"operator_cert"`, or
     /// `"open"`.
     pub auth_method: String,
+    /// Display name from the token's `name` claim (ADR 0022
+    /// presentation-only: read from the verified token per request, never
+    /// stored, never on the replicated actor). `null` when the claim is
+    /// absent or not a non-empty string, and always `null` for the
+    /// operator-cert and open mechanisms.
+    pub name: Option<String>,
+    /// As `name`, for the token's `email` claim.
+    pub email: Option<String>,
     /// The replicated bindings matching this actor, in stored order.
     pub bindings: Vec<SessionBinding>,
     /// `true` when the actor is an unscoped admin outside the bindings
@@ -2031,9 +2039,10 @@ pub struct GetAuthorizationResponse {
 
 /// `PUT /api/v1/authorization` — the full-replacement `UpdateAuthorization`
 /// command (ADR 0023): the body's `bindings` wholly replace the replicated
-/// list. `groups_claim`, when present and different from the current policy,
-/// is applied as a follow-up `UpdatePolicy` that changes only that field —
-/// two commands, each atomic, last-writer-wins like every policy edit.
+/// list. `groups_claim`, when present, rides the same command and is
+/// installed by the same apply, so a rename and a binding swap can never be
+/// half-applied; last-writer-wins against `UpdatePolicy` like every policy
+/// edit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateAuthorizationRequest {
@@ -2046,12 +2055,11 @@ pub struct UpdateAuthorizationRequest {
 /// `PUT /api/v1/authorization` response.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UpdateAuthorizationResponse {
-    /// Raft log index at which the `UpdateAuthorization` applied; pair with
-    /// `?min_index=` on a subsequent read for read-your-writes (ADR 0007).
+    /// Raft log index at which the `UpdateAuthorization` applied — bindings
+    /// and any `groups_claim` rename together, since one command carries
+    /// both; pair with `?min_index=` on a subsequent read for
+    /// read-your-writes (ADR 0007).
     pub log_index: u64,
-    /// Apply index of the follow-up `UpdatePolicy`, when the request also
-    /// changed `groups_claim`; `null` when it did not.
-    pub policy_log_index: Option<u64>,
 }
 
 impl From<&coppice_state::authz::Role> for BindingRole {

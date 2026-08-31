@@ -278,6 +278,13 @@ message UpdateAuthorization {
   // bindings (delegated binding management is deferred).
   coppice.core.v1.Actor actor = 2;
   int64 updated_at_us = 3;
+  // Optionally renames the OIDC groups claim in the same apply. Absent leaves
+  // PolicyConfig.groups_claim unchanged. Present, this command installs the
+  // bindings AND the claim name at one log position, so a rename that swaps
+  // the admin group cannot lock its own author out between two commands.
+  // UpdatePolicy remains the other writer of the field (full replacement),
+  // and the two resolve last-writer-wins in log order.
+  optional string groups_claim = 4;
 }
 
 // Bump the semantic feature gate (ADR 0003). The leader refuses to propose

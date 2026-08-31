@@ -991,11 +991,19 @@ impl StateMachine {
         })
     }
 
-    /// Replace the replicated bindings wholesale (ADR 0023).
+    /// Replace the replicated bindings wholesale, and optionally rename the
+    /// groups claim in the same breath (ADR 0023).
     ///
     /// Read-only validation in the catalog's order — authority, then shape,
     /// then referential integrity, then the lockout guard — before a single
     /// byte of state moves.
+    ///
+    /// `groups_claim` rides this command instead of a follow-up
+    /// `UpdatePolicy` precisely so that both land at one log position: the
+    /// authorization decision above is made once, against the bindings in
+    /// force *before* this command, with groups extracted under the claim
+    /// name in force before it. Splitting the two lets a rename that also
+    /// swaps the admin group lock out its own author halfway through.
     fn update_authorization(&mut self, c: &UpdateAuthorization) -> ApplyResult {
         self.authorize(c.actor.as_ref(), Verb::UpdateAuthorization)?;
         // Roles are a closed set by construction: the domain `Role` enum has
@@ -1020,6 +1028,17 @@ impl StateMachine {
                 }
             }
         }
+        // A blank claim name matches no JWT claim, so every group-based
+        // binding would silently stop resolving. `UpdatePolicy` has no such
+        // check because it carries the whole document; this path exists to
+        // *change* the one field, so the change must be meaningful.
+        if let Some(claim) = &c.groups_claim {
+            if claim.trim().is_empty() {
+                return Err(RejectionReason::InvalidAuthorization(
+                    "groups_claim is empty or whitespace-only".to_string(),
+                ));
+            }
+        }
         // Operator certificates make lockout recoverable rather than fatal,
         // but they are outside this list by design and so do NOT count here:
         // an empty admin list is almost always an accident, and this is the
@@ -1031,7 +1050,11 @@ impl StateMachine {
         if !retains_admin {
             return Err(RejectionReason::AuthorizationLockout);
         }
+        // Both mutations, past every check, at this one log position.
         self.bindings = c.bindings.clone();
+        if let Some(claim) = &c.groups_claim {
+            self.policy.groups_claim = claim.clone();
+        }
         Ok(Applied {
             events: vec![Event::AuthorizationUpdated],
         })

@@ -67,7 +67,8 @@ async fn an_operator_certificate_authenticates_as_its_common_name() {
             peer_leaf_der: Some(&pki.operator_leaf_der),
         })
         .await
-        .expect("a verified operator leaf authenticates");
+        .expect("a verified operator leaf authenticates")
+        .actor;
 
     assert_eq!(actor.principal, "cert:alice");
     assert!(actor.operator_cert);
@@ -99,7 +100,8 @@ async fn the_operator_certificate_wins_over_a_bearer_token() {
             peer_leaf_der: Some(&pki.operator_leaf_der),
         })
         .await
-        .expect("the certificate decides");
+        .expect("the certificate decides")
+        .actor;
 
     assert_eq!(actor.principal, "cert:alice");
     assert!(actor.operator_cert);
@@ -114,7 +116,9 @@ async fn a_valid_bearer_token_authenticates_as_its_subject() {
     let token = idp.sign(
         TokenClaims::new("user-42")
             .audience(AUDIENCE)
-            .claim(DEFAULT_GROUPS_CLAIM, serde_json::json!(["sre"])),
+            .claim(DEFAULT_GROUPS_CLAIM, serde_json::json!(["sre"]))
+            .claim("name", serde_json::json!("Alice Example"))
+            .claim("email", serde_json::json!("alice@example.com")),
     );
 
     let chain = AuthnChain::oidc(
@@ -124,13 +128,14 @@ async fn a_valid_bearer_token_authenticates_as_its_subject() {
         config(&idp.issuer()),
     );
 
-    let actor = chain
+    let authenticated = chain
         .authenticate(Credentials {
             bearer: Some(&token),
             peer_leaf_der: None,
         })
         .await
         .expect("a valid token authenticates");
+    let actor = &authenticated.actor;
 
     assert_eq!(actor.principal, "user-42");
     assert_eq!(actor.groups, vec!["sre"]);
@@ -138,6 +143,17 @@ async fn a_valid_bearer_token_authenticates_as_its_subject() {
     assert!(!actor.auth_disabled);
     assert_eq!(actor.method(), AuthMethod::Bearer);
     assert!(matches!(chain.mode(), AuthMode::Oidc(_)));
+
+    // Presentation-only claims ride alongside the actor but never join it —
+    // this is the whole point of the separate field.
+    assert_eq!(
+        authenticated.presentation.name.as_deref(),
+        Some("Alice Example")
+    );
+    assert_eq!(
+        authenticated.presentation.email.as_deref(),
+        Some("alice@example.com")
+    );
 
     idp.shutdown().await;
 }
@@ -228,7 +244,8 @@ async fn open_mode_resolves_to_the_anonymous_actor() {
     let actor = chain
         .authenticate(Credentials::default())
         .await
-        .expect("open mode authenticates everything");
+        .expect("open mode authenticates everything")
+        .actor;
 
     assert_eq!(actor.principal, "anonymous");
     assert!(actor.auth_disabled);
@@ -250,7 +267,8 @@ async fn open_mode_ignores_a_bearer_token_it_cannot_judge() {
             peer_leaf_der: None,
         })
         .await
-        .expect("open mode still authenticates");
+        .expect("open mode still authenticates")
+        .actor;
 
     assert_eq!(actor.principal, "anonymous");
     assert!(actor.auth_disabled);
@@ -267,7 +285,8 @@ async fn open_mode_still_records_an_operator_certificate() {
             peer_leaf_der: Some(&pki.operator_leaf_der),
         })
         .await
-        .expect("a verified operator leaf authenticates");
+        .expect("a verified operator leaf authenticates")
+        .actor;
 
     // Strictly more information in the audit trail, at no cost: open mode
     // grants unscoped admin either way.
@@ -291,7 +310,8 @@ async fn open_mode_falls_through_an_unverifiable_certificate() {
             peer_leaf_der: Some(&theirs.operator_leaf_der),
         })
         .await
-        .expect("open mode falls through to anonymous");
+        .expect("open mode falls through to anonymous")
+        .actor;
 
     assert_eq!(actor.principal, "anonymous");
     assert!(actor.auth_disabled);
@@ -319,7 +339,8 @@ async fn a_certificate_presented_before_formation_falls_through() {
             peer_leaf_der: Some(&pki.operator_leaf_der),
         })
         .await
-        .expect("the bearer token still authenticates");
+        .expect("the bearer token still authenticates")
+        .actor;
     assert_eq!(actor.principal, "user-42");
 
     idp.shutdown().await;
