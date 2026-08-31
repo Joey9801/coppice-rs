@@ -801,6 +801,10 @@ log_level = "warn"
             // `[auth] insecure_open = true` a dev cluster uses), so the fleet
             // tests drive the API without credentials exactly as before.
             coppice_authn::AuthMode::Open,
+            // Nothing armed: `[test_failpoints]` is a per-daemon config
+            // section, and this harness hand-assembles its replica rather
+            // than going through `run_with`.
+            coppice_coordinator::failpoints::Failpoints::default(),
             Some(shutdown_rx),
         ));
 
@@ -1129,6 +1133,48 @@ log_level = "warn"
             ),
         )
         .expect("write config");
+    }
+
+    /// Arm this daemon's write-path gates (see
+    /// [`coppice_coordinator::failpoints`]), scoped to it alone exactly like
+    /// [`Daemon::arm_failpoints`]. A gate parks the daemon at a named line
+    /// until [`Daemon::release_gate`] lets it go, rather than parking it
+    /// forever.
+    pub fn arm_gates(&self, names: &[&str]) {
+        let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+        let toml = self.config_without_failpoints();
+        std::fs::write(
+            &self.config_path,
+            format!(
+                "{toml}\n[test_failpoints]\ngate_at = [{}]\n",
+                quoted.join(", ")
+            ),
+        )
+        .expect("write config");
+    }
+
+    /// Wait until this daemon has parked at the gate `name`.
+    ///
+    /// Like [`Daemon::await_halted_at`] this waits on a durable file, so the
+    /// observer cannot lose the race: once the marker exists, the gated line
+    /// has been reached and nothing past it has run.
+    pub async fn await_gate(&self, name: &str) {
+        let marker = coppice_coordinator::failpoints::gate_reached_marker(&self.data_dir(), name);
+        poll(
+            Duration::from_secs(30),
+            &format!("the daemon parks at the {name} gate"),
+            || {
+                let marker = marker.clone();
+                async move { marker.exists() }
+            },
+        )
+        .await;
+    }
+
+    /// Release a daemon parked at the gate `name`.
+    pub fn release_gate(&self, name: &str) {
+        let marker = coppice_coordinator::failpoints::gate_release_marker(&self.data_dir(), name);
+        std::fs::write(&marker, name).expect("write the gate release marker");
     }
 
     /// Arm this daemon's join-pipeline failpoints (ADR 0037 §6), scoped to it

@@ -853,9 +853,10 @@ impl Default for TokenKdfConfig {
     }
 }
 
-/// `[test_failpoints]`: where this daemon's join pipeline stops dead
-/// (ADR 0037 §6). See [`crate::failpoints`] for what a failpoint is and why it
-/// is carried per daemon instead of in an environment variable.
+/// `[test_failpoints]`: where this daemon stops dead (`halt_at`, the join
+/// pipeline, ADR 0037 §6) or parks until a test releases it (`gate_at`, the
+/// API write path, ADR 0023). See [`crate::failpoints`] for what a failpoint
+/// is and why it is carried per daemon instead of in an environment variable.
 ///
 /// **Not production-legal, and not merely discouraged.** `[pacing]` and
 /// `[token_kdf]` are knobs a test fleet sets to extreme values; this is a
@@ -870,6 +871,11 @@ pub(crate) struct TestFailpointConfig {
     /// [`crate::failpoints::ALL`].
     #[serde(default)]
     pub(crate) halt_at: Vec<String>,
+    /// The gate names this daemon parks at until the test releases it, from
+    /// [`crate::failpoints::ALL_GATES`]. Same section, same debug-build-only
+    /// refusal; the difference is only that a gate resumes.
+    #[serde(default)]
+    pub(crate) gate_at: Vec<String>,
 }
 
 impl TestFailpointConfig {
@@ -894,6 +900,15 @@ impl TestFailpointConfig {
                     "[test_failpoints] halt_at names an unknown failpoint {name:?}; the \
                      failpoints this build has are: {}",
                     crate::failpoints::ALL.join(", ")
+                );
+            }
+        }
+        for name in &self.gate_at {
+            if !crate::failpoints::ALL_GATES.contains(&name.as_str()) {
+                bail!(
+                    "[test_failpoints] gate_at names an unknown gate {name:?}; the \
+                     gates this build has are: {}",
+                    crate::failpoints::ALL_GATES.join(", ")
                 );
             }
         }
@@ -1247,12 +1262,17 @@ impl Config {
         }
     }
 
-    /// This daemon's armed join-pipeline failpoints (ADR 0037 §6), scoped to
-    /// it alone. Disarmed for every config without the section — which, in a
-    /// release build, is every config that loads at all.
+    /// This daemon's armed failpoints — join-pipeline halts (ADR 0037 §6) and
+    /// write-path gates (ADR 0023) alike — scoped to it alone. Disarmed for
+    /// every config without the section, which, in a release build, is every
+    /// config that loads at all.
     pub(crate) fn failpoints(&self) -> crate::failpoints::Failpoints {
         match &self.test_failpoints {
-            Some(section) => crate::failpoints::Failpoints::new(&section.halt_at, &self.data_dir),
+            Some(section) => crate::failpoints::Failpoints::new(
+                &section.halt_at,
+                &section.gate_at,
+                &self.data_dir,
+            ),
             None => crate::failpoints::Failpoints::default(),
         }
     }
@@ -1774,6 +1794,61 @@ insecure_open = true
             assert!(
                 !config.failpoints().is_armed_for_tests(name),
                 "{name} must be disarmed without the section"
+            );
+        }
+        for name in crate::failpoints::ALL_GATES {
+            assert!(
+                !config.failpoints().is_gate_armed_for_tests(name),
+                "the {name} gate must be disarmed without the section"
+            );
+        }
+    }
+
+    /// `gate_at` is the same section on the same terms as `halt_at`: it names
+    /// a real gate or the config does not load, in any build.
+    ///
+    /// Gates and halts are separate lists rather than one, because arming the
+    /// wrong kind is not a near miss — a caller that asked for a gate and got
+    /// a permanent halt would hang its own test, and one that asked for a halt
+    /// and got a gate would sail past the crash window it staged.
+    #[test]
+    fn gate_at_arms_only_real_gates() {
+        let contents = format!(
+            "{MINIMAL_EXAMPLE}\n[test_failpoints]\ngate_at = [\"{}\"]\n",
+            crate::failpoints::API_SUBMIT_BEFORE_PROPOSE
+        );
+        let (_guard, path) = write_config(&contents);
+        let loaded = load(&path);
+        assert_eq!(
+            loaded.is_ok(),
+            cfg!(debug_assertions),
+            "a gate is the same debug-build-only section a halt is"
+        );
+        match loaded {
+            Ok(resolved) => {
+                let failpoints = resolved.config.failpoints();
+                assert!(failpoints
+                    .is_gate_armed_for_tests(crate::failpoints::API_SUBMIT_BEFORE_PROPOSE));
+                for name in crate::failpoints::ALL {
+                    assert!(
+                        !failpoints.is_armed_for_tests(name),
+                        "arming a gate must not arm the permanent halt {name}"
+                    );
+                }
+            }
+            Err(e) => assert!(format!("{e:#}").contains("debug-build-only"), "{e:#}"),
+        }
+
+        let contents =
+            format!("{MINIMAL_EXAMPLE}\n[test_failpoints]\ngate_at = [\"gate-after-lunch\"]\n");
+        let (_guard, path) = write_config(&contents);
+        let err = load(&path).expect_err("an unknown gate name must fail at load");
+        let rendered = format!("{err:#}");
+        if cfg!(debug_assertions) {
+            assert!(
+                rendered.contains("gate-after-lunch")
+                    && rendered.contains(crate::failpoints::API_SUBMIT_BEFORE_PROPOSE),
+                "the refusal must name the bad entry and the real ones: {rendered}"
             );
         }
     }
