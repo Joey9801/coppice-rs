@@ -202,6 +202,11 @@ pub async fn run<C>(
     // `history`, it has no default at either seam — "authentication is off" is
     // a deployment decision, and a missing argument does not get to make it.
     auth: coppice_authn::AuthMode,
+    // This daemon's armed `[test_failpoints]` set, carried here for the one
+    // gate that sits on the API write path (ADR 0023's revocation race). It is
+    // per daemon, not per process, so a fleet in one test process arms one
+    // member; it cannot load at all in a release build.
+    failpoints: crate::failpoints::Failpoints,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -312,7 +317,8 @@ where
             .with_forwarder(crate::clientwrite::AdminForwarder::new(
                 node_handle.clone(),
                 Arc::clone(&machine_tls),
-            )),
+            ))
+            .with_failpoints(failpoints),
     );
     // `POST /api/v1/enroll` (ADR 0037 §4). Captured by the router directly,
     // not reached through the `ControlPlane`: issuing a certificate needs the

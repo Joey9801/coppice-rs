@@ -482,6 +482,11 @@ pub async fn run_with(
                 })
             }
         },
+        // The same per-daemon armed set the convergence loop got, for the same
+        // reason: a test fleet in one process arms one member's write path
+        // without arming any other's (ADR 0023's revocation race). Always
+        // disarmed in a release build — the section cannot load there.
+        resolved.config.failpoints(),
         Some(shutdown_rx),
     )
     .await?;
@@ -591,6 +596,10 @@ pub async fn serve_runtime(
         // say about pacing gets what a deployment gets.
         crate::limits::HOUSEKEEPING_INTERVAL,
         auth,
+        // No config in hand on this seam, so nothing is armed — which is also
+        // what every release build gets, since `[test_failpoints]` cannot load
+        // there at all.
+        crate::failpoints::Failpoints::default(),
         shutdown,
     )
     .await
@@ -629,6 +638,7 @@ pub async fn serve_runtime_with_serving_sans(
     history: HistorySink,
     housekeeping_interval: std::time::Duration,
     auth: coppice_authn::AuthMode,
+    failpoints: crate::failpoints::Failpoints,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -648,6 +658,7 @@ pub async fn serve_runtime_with_serving_sans(
         history,
         housekeeping_interval,
         auth,
+        failpoints,
         shutdown,
     )
     .await

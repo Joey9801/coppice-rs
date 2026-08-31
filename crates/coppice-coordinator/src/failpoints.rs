@@ -91,6 +91,30 @@ pub const ALL: [&str; 3] = [
     JOIN_PROMOTE_VOTER_ISSUED,
 ];
 
+/// Hold a job submission in the gap between the API layer's authorization
+/// pre-check and the proposal that follows it (ADR 0023).
+///
+/// A **gate**, not a halt: the daemon parks at this line until the test
+/// releases it, then carries on and proposes normally. It exists because
+/// ADR 0023's revocation-race guarantee — a command whose pre-check passed
+/// against bindings that were then replaced is refused at apply, in log
+/// order — is a claim about an interleaving no external observer can stage.
+/// The pre-check reads an *eventual* view and the proposal lands wherever the
+/// leader puts it; "pre-check first, revocation second, proposal third" is
+/// otherwise a timing hope, and a sleep long enough to make it likely is both
+/// slow and still not a proof.
+///
+/// With the gate, the test holds the window open explicitly: it waits for the
+/// reached marker (so the pre-check has demonstrably run and passed), commits
+/// the `UpdateAuthorization` and reads back *its* log index, then releases —
+/// so the submission's own log position is provably later than the
+/// revocation's.
+pub const API_SUBMIT_BEFORE_PROPOSE: &str = "api-submit-before-propose";
+
+/// Every name `[test_failpoints] gate_at` accepts, on the same terms as
+/// [`ALL`]: an unknown name is a config error, never a silently inert setting.
+pub const ALL_GATES: [&str; 1] = [API_SUBMIT_BEFORE_PROPOSE];
+
 /// Where a halted daemon records that it reached `name`, inside its own data
 /// directory. Public so the integration harness computes the same path from
 /// the same constant instead of copying a format string.
@@ -98,30 +122,63 @@ pub fn halt_marker(data_dir: &Path, name: &str) -> PathBuf {
     data_dir.join(format!("failpoint-{name}.halted"))
 }
 
+/// Where a daemon parked at the gate `name` records that it got there — the
+/// file the test waits on before staging anything behind its back.
+pub fn gate_reached_marker(data_dir: &Path, name: &str) -> PathBuf {
+    data_dir.join(format!("failpoint-{name}.reached"))
+}
+
+/// The file whose existence releases a daemon parked at the gate `name` — the
+/// test writes it when it is done staging.
+pub fn gate_release_marker(data_dir: &Path, name: &str) -> PathBuf {
+    data_dir.join(format!("failpoint-{name}.release"))
+}
+
+/// How often a parked daemon looks for its release file. Short enough that
+/// the release is not itself a source of test latency; a poll rather than a
+/// notification because the observer is another *process's* view of a
+/// directory in the general case, and inotify-shaped machinery would be a
+/// dependency bought for a debug-only path.
+const GATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long a parked daemon waits before giving up and carrying on. A gate
+/// that is never released is a broken test, and the failure it should produce
+/// is that test's own assertion — not a wedged CI job whose log says nothing.
+const GATE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// One daemon's armed failpoints, as its config declared them.
 ///
 /// [`Failpoints::default`] is the disarmed value every real deployment gets
 /// (and every release build gets unconditionally, since the section cannot
 /// load there), and it holds no allocation: the check on the hot path is one
 /// `Option` discriminant.
+///
+/// Public only because it crosses the `bootstrap::serve_runtime*` seams on its
+/// way from config to the write path; nothing outside this crate can arm one,
+/// since [`Failpoints::new`] is crate-private and the config section that
+/// calls it refuses to load in a release build.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Failpoints(Option<Arc<Armed>>);
+pub struct Failpoints(Option<Arc<Armed>>);
 
 #[derive(Debug)]
 struct Armed {
-    names: Vec<String>,
+    /// `[test_failpoints] halt_at` — park forever.
+    halt_at: Vec<String>,
+    /// `[test_failpoints] gate_at` — park until released.
+    gate_at: Vec<String>,
     data_dir: PathBuf,
 }
 
 impl Failpoints {
     /// The armed set for a daemon whose config carries `[test_failpoints]`.
-    /// An empty list is disarmed — the section exists, but names nothing.
-    pub(crate) fn new(names: &[String], data_dir: &Path) -> Failpoints {
-        if names.is_empty() {
+    /// Two empty lists are disarmed — the section exists, but names nothing.
+    pub(crate) fn new(halt_at: &[String], gate_at: &[String], data_dir: &Path) -> Failpoints {
+        if halt_at.is_empty() && gate_at.is_empty() {
             return Failpoints(None);
         }
         Failpoints(Some(Arc::new(Armed {
-            names: names.to_vec(),
+            halt_at: halt_at.to_vec(),
+            gate_at: gate_at.to_vec(),
             data_dir: data_dir.to_path_buf(),
         })))
     }
@@ -129,7 +186,13 @@ impl Failpoints {
     fn armed(&self, name: &str) -> Option<&Armed> {
         self.0
             .as_deref()
-            .filter(|armed| armed.names.iter().any(|n| n == name))
+            .filter(|armed| armed.halt_at.iter().any(|n| n == name))
+    }
+
+    fn gate_armed(&self, name: &str) -> Option<&Armed> {
+        self.0
+            .as_deref()
+            .filter(|armed| armed.gate_at.iter().any(|n| n == name))
     }
 
     /// Whether `name` would fire, without firing it — the only way to assert
@@ -137,6 +200,63 @@ impl Failpoints {
     #[cfg(test)]
     pub(crate) fn is_armed_for_tests(&self, name: &str) -> bool {
         self.armed(name).is_some()
+    }
+
+    /// Whether the gate `name` would fire, without firing it.
+    #[cfg(test)]
+    pub(crate) fn is_gate_armed_for_tests(&self, name: &str) -> bool {
+        self.gate_armed(name).is_some()
+    }
+
+    /// Park here until the test releases this gate, if `name` is armed;
+    /// otherwise return immediately.
+    ///
+    /// Unlike [`halt_if_armed`](Self::halt_if_armed) this *does* return, and
+    /// everything after the call site runs exactly as it would have — the gate
+    /// moves a line's execution later in wall-clock time and changes nothing
+    /// else. One request at a time: a second caller arriving while the first
+    /// is parked would share the same two files, which is why the only gate
+    /// that exists sits on a path a test drives with a single in-flight
+    /// request.
+    pub(crate) async fn gate_if_armed(&self, name: &'static str) {
+        let Some(armed) = self.gate_armed(name) else {
+            return;
+        };
+        let reached = gate_reached_marker(&armed.data_dir, name);
+        let release = gate_release_marker(&armed.data_dir, name);
+
+        // A release left behind by an earlier pass would wave this one
+        // straight through, which is the one way this mechanism could fail
+        // *silently* — the test would see a released gate it never released
+        // and conclude an interleaving it never staged.
+        let _ = std::fs::remove_file(&release);
+        if let Err(e) = std::fs::write(&reached, name) {
+            tracing::error!(
+                failpoint = name,
+                marker = %reached.display(),
+                error = %e,
+                "test failpoint: could not write the gate's reached marker"
+            );
+        }
+        tracing::warn!(
+            failpoint = name,
+            "test failpoint: parked at a gate until released (test-only; \
+             [test_failpoints] cannot load in a release build)"
+        );
+
+        let deadline = std::time::Instant::now() + GATE_MAX_WAIT;
+        while !release.exists() {
+            if std::time::Instant::now() >= deadline {
+                tracing::error!(
+                    failpoint = name,
+                    "test failpoint: gate never released; carrying on so the \
+                     test fails on its own assertion rather than hanging"
+                );
+                break;
+            }
+            tokio::time::sleep(GATE_POLL_INTERVAL).await;
+        }
+        let _ = std::fs::remove_file(&reached);
     }
 
     /// Stop this daemon's convergence permanently if `name` is armed;

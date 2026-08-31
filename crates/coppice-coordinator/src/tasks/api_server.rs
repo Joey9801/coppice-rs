@@ -501,6 +501,12 @@ pub struct CoordinatorControlPlane<C> {
     ///
     /// [`with_forwarder`]: Self::with_forwarder
     forwarder: Option<Arc<dyn LeaderWrites>>,
+    /// This daemon's armed `[test_failpoints]` set. Disarmed unless a
+    /// debug-build config named a gate, and disarmable at all only in a debug
+    /// build — a release binary refuses the section outright, so the check in
+    /// [`ControlPlane::submit_job`] is a single `Option` discriminant against
+    /// a `None` that nothing can make `Some`.
+    failpoints: crate::failpoints::Failpoints,
 }
 
 impl<C> CoordinatorControlPlane<C> {
@@ -517,7 +523,17 @@ impl<C> CoordinatorControlPlane<C> {
             node_handle: None,
             node_log_client: None,
             forwarder: None,
+            failpoints: crate::failpoints::Failpoints::default(),
         }
+    }
+
+    /// Arm this plane's write-path gates from the daemon's own config
+    /// (see [`crate::failpoints`]). Every caller but `runtime::run` leaves
+    /// the disarmed default, which is also what a release build can only
+    /// ever have.
+    pub(crate) fn with_failpoints(mut self, failpoints: crate::failpoints::Failpoints) -> Self {
+        self.failpoints = failpoints;
+        self
     }
 
     /// Attach the replica-local derived read sources: the derived-stats
@@ -585,6 +601,14 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         req: SubmitJobRequest,
         actor: Actor,
     ) -> Result<SubmitJobResponse, ApiError> {
+        // ADR 0023's revocation race, staged: the HTTP layer's authorization
+        // pre-check has already run and passed by the time control reaches
+        // here, and nothing has been proposed yet, so this is exactly the
+        // window a test needs to hold open while it commits the revocation.
+        // Disarmed — and unarmable — in every real deployment.
+        self.failpoints
+            .gate_if_armed(crate::failpoints::API_SUBMIT_BEFORE_PROPOSE)
+            .await;
         match submit_job_here(&*self.consensus, &self.views, &req, &actor).await {
             Ok(response) => Ok(response),
             Err(LocalWriteError::Api(e)) => Err(e),
