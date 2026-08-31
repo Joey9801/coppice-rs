@@ -30,6 +30,7 @@ not (
     | binary(rotate_ca)
     | binary(rotate_ca_durability)
     | binary(refleet)
+    | binary(sso_fleet)
 )
 '''
 
@@ -61,6 +62,7 @@ binary(cluster)
 | binary(rotate_ca)
 | binary(rotate_ca_durability)
 | binary(refleet)
+| binary(sso_fleet)
 '''
 test-group = 'fleet-serial'
 
@@ -111,6 +113,12 @@ test-group = 'fleet-serial'
 #            address_move, rotate_ca                           ~4m40s
 #   shard 4  rotate_ca_durability                              ~2m34s
 #
+# sso_fleet (issue #45) joins shard 4, the lightest by a wide margin. It is one
+# test that boots a 3-daemon fleet, forms it, and stages one gated write: 5.0s
+# of local wall over three consecutive runs, so ~5s of CI even before netting
+# out this file's per-test dev-host overhead. Shard 4 stays the lightest shard
+# and the fleet job's critical path is untouched.
+#
 # A shard profile is only as real as the CI job that runs it:
 # .github/workflows/ci.yml's `matrix: shard:` list must name every ci-fleet-N,
 # or that shard's suites are silently skipped. check-fleet-shards.sh now
@@ -133,6 +141,7 @@ not (
     | binary(rotate_ca)
     | binary(rotate_ca_durability)
     | binary(refleet)
+    | binary(sso_fleet)
 )
 '''
 fail-fast = false
@@ -160,7 +169,7 @@ binary(key_custody)
 fail-fast = false
 
 [profile.ci-fleet-4]
-default-filter = 'binary(rotate_ca_durability)'
+default-filter = 'binary(rotate_ca_durability) | binary(sso_fleet)'
 fail-fast = false
 
 # The whole suite in one run — what CI's {ci, ci-fleet-*} jobs add up to.
@@ -189,4 +198,5 @@ binary(cluster)
 | binary(rotate_ca)
 | binary(rotate_ca_durability)
 | binary(refleet)
+| binary(sso_fleet)
 '''
