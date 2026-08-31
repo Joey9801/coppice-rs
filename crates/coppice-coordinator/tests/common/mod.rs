@@ -1135,6 +1135,38 @@ log_level = "warn"
         .expect("write config");
     }
 
+    /// The `[auth] insecure_open = true` block every fixture config carries,
+    /// verbatim — the thing [`Daemon::set_sso`] swaps out.
+    const OPEN_AUTH_BLOCK: &'static str =
+        "[auth]\n# Explicitly insecure: every request is an anonymous admin (issue #45).\n\
+         insecure_open = true\n";
+
+    /// Switch this daemon from the open posture to OIDC (issue #45): replace
+    /// the `[auth] insecure_open = true` block with an `[sso]` table pointing
+    /// at `issuer`. The two are mutually exclusive and one of them is
+    /// required, so this is a replacement and never an addition.
+    ///
+    /// Call before [`Daemon::start`]: the posture is resolved at config load.
+    pub fn set_sso(&self, issuer: &str, client_id: &str) {
+        self.set_sso_block(&format!(
+            "[sso]\nissuer = \"{issuer}\"\nclient_id = \"{client_id}\"\n"
+        ));
+    }
+
+    /// [`set_sso`](Self::set_sso) with the `[sso]` table supplied verbatim —
+    /// what the documented-example test needs, since the whole point there is
+    /// that the TOML came out of `docs/operations/configuration.md` rather
+    /// than out of this file.
+    pub fn set_sso_block(&self, sso_toml: &str) {
+        let toml = std::fs::read_to_string(&self.config_path).expect("read config");
+        let updated = toml.replace(Daemon::OPEN_AUTH_BLOCK, sso_toml);
+        assert_ne!(
+            toml, updated,
+            "no [auth] block to replace — the fixture template must have changed"
+        );
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
     /// Arm this daemon's write-path gates (see
     /// [`coppice_coordinator::failpoints`]), scoped to it alone exactly like
     /// [`Daemon::arm_failpoints`]. A gate parks the daemon at a named line
@@ -1407,6 +1439,12 @@ log_level = "warn"
     /// client must trust, and the `https://` base URL.
     ///
     /// Call before [`Daemon::start`]: the posture is resolved at config load.
+    ///
+    /// Rewrites the `[client_tls]` posture **line in its own section**, not
+    /// every `insecure = true` in the file: [`Daemon::set_enrollment`] appends
+    /// a section carrying the same line for an entirely different reason (the
+    /// enrolling *client*'s opt-in to a plain-HTTP endpoint), and a blanket
+    /// replace would turn that into two stray path keys under `[enrollment]`.
     pub fn set_client_tls(&self, ca: &Ca) -> (Vec<u8>, String) {
         let leaf = ca.leaf();
         let cert = self.dir.path().join("api.crt");
@@ -1415,13 +1453,14 @@ log_level = "warn"
         std::fs::write(&key, &leaf.key_pem).expect("write client-tls key");
 
         let toml = std::fs::read_to_string(&self.config_path).expect("read config");
-        let updated = toml.replace(
+        let updated = toml.replacen(
             "insecure = true",
             &format!(
                 "cert_path = \"{}\"\nkey_path = \"{}\"",
                 cert.display(),
                 key.display()
             ),
+            1,
         );
         assert_ne!(toml, updated, "no [client_tls] posture line to rewrite");
         std::fs::write(&self.config_path, updated).expect("write config");
