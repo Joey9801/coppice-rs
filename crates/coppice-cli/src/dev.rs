@@ -99,6 +99,17 @@ pub struct DevArgs {
     /// executing nothing, captures no logs, and reports no usage.
     #[arg(long, value_enum, default_value_t = DevExecutor::Docker)]
     executor: DevExecutor,
+
+    /// Override the advertised disk capacity for the `docker` executor (e.g.
+    /// `500gib`, `2tib`). Disk capacity cannot be read from the Docker daemon
+    /// the way cpu/mem can (`docker info` has no disk field), and on a
+    /// VM-backed local daemon (Docker Desktop, Colima) the daemon's storage
+    /// lives inside a VM disk this process cannot `statvfs` — dev falls back
+    /// to a conservative guess in that case (64 GiB, the Colima default) and
+    /// warns; pass this flag to state the real number instead. Ignored by
+    /// `--executor fake`, which already advertises a fixed 1 TiB.
+    #[arg(long)]
+    disk_capacity: Option<ByteSize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -385,19 +396,24 @@ pub async fn run(args: DevArgs) -> Result<()> {
         // old generous, hardcoded overrides on every dimension: a dev cluster
         // must not become capacity-bound because the laptop running it is
         // small, nor fail to start because a dimension could not be detected
-        // (A3). `Docker` leaves every field unset here and lets real detection
-        // run below — `capacity::detect()`/`effective_capacity()` for disk
-        // (statvfs on `data_dir`) always, and, once the daemon is reachable,
-        // `docker::api::daemon_capacity()` for cpu/mem (the VM the daemon
-        // schedules containers in in Docker Desktop/Colima setups, not the
-        // host `capacity::detect()` would read).
+        // (A3). `Docker` leaves cpu/mem unset here and lets real detection run
+        // below — `docker::api::daemon_capacity()`, once the daemon is
+        // reachable (the VM the daemon schedules containers in on Docker
+        // Desktop/Colima setups, not the host `capacity::detect()` would
+        // read). Disk is set explicitly below, once the daemon's data-root is
+        // known: containers/images consume the *daemon's* storage, which on a
+        // VM-backed daemon is not the host filesystem `statvfs(data_dir)`
+        // would read either — see the docker-executor arm.
         capacity: match args.executor {
             DevExecutor::Fake => CapacityConfig {
                 cpu_millis: Some(16_000),
                 memory: Some(ByteSize::from_gib(16)),
                 disk: Some(ByteSize::from_tib(1)),
             },
-            DevExecutor::Docker => CapacityConfig::default(),
+            DevExecutor::Docker => CapacityConfig {
+                disk: args.disk_capacity,
+                ..Default::default()
+            },
         },
         reservation: Default::default(),
         heartbeat_interval: Duration::from_secs(2),
@@ -513,13 +529,12 @@ pub async fn run(args: DevArgs) -> Result<()> {
             let data_root =
                 coppice_agent::executor::docker::api::data_root(&docker, &docker_host).await?;
             // The daemon connects only here — after `agent_config` is already
-            // built — so cpu/mem overrides are patched in now rather than the
-            // config being reordered around the connect. On macOS-style
+            // built — so cpu/mem/disk overrides are patched in now rather than
+            // the config being reordered around the connect. On macOS-style
             // Docker-Desktop/Colima setups the daemon runs containers inside a
             // VM sized smaller than the host; the daemon's own `docker info`
             // reading is the number that matters, not `capacity::detect()`'s
-            // host reading. Disk is untouched here: it falls through to real
-            // `statvfs` detection of `data_dir` below.
+            // host reading.
             //
             // (A3) must not fail to start because a dimension could not be
             // detected: on a failed daemon query, fall back to the old
@@ -537,6 +552,52 @@ pub async fn run(args: DevArgs) -> Result<()> {
                     agent_config.capacity.cpu_millis = Some(16_000);
                     agent_config.capacity.memory = Some(ByteSize::from_gib(16));
                 }
+            }
+            // Disk: `--disk-capacity` (folded into `agent_config.capacity.disk`
+            // when the config was built above) always wins. Otherwise,
+            // containers and images consume the *daemon's* storage
+            // (`data_root`), not the agent host's — `capacity::detect()`'s
+            // `statvfs(data_dir)` reading below is the wrong filesystem for
+            // this dimension on `docker` and must never be presented as docker
+            // disk capacity (unlike `fake`, where nothing is real anyway). A
+            // native Linux daemon's `data_root` is a real local path, so
+            // `statvfs` it directly and reuse that reading; a VM-backed daemon
+            // (Docker Desktop, Colima) reports a path that does not exist on
+            // this filesystem at all — the same case `pressure.rs` already
+            // detects and warns on — and there is no way to observe the VM's
+            // disk size from here, so fall back to a conservative guess rather
+            // than either the host's (likely much larger) disk or an
+            // unbounded default.
+            if agent_config.capacity.disk.is_none() {
+                const VM_DISK_FALLBACK: ByteSize = ByteSize::from_gib(64);
+                agent_config.capacity.disk = Some(match &data_root {
+                    Some(root) if root.exists() => {
+                        match coppice_agent::capacity::detect_disk_at(root) {
+                            Ok(bytes) => ByteSize::from_bytes(bytes),
+                            Err(err) => {
+                                tracing::warn!(
+                                    %err,
+                                    root = %root.display(),
+                                    "could not statvfs the docker daemon's data-root for disk \
+                                     capacity detection; falling back to a conservative default \
+                                     of {VM_DISK_FALLBACK} — pass --disk-capacity to state the \
+                                     real size"
+                                );
+                                VM_DISK_FALLBACK
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "dev could not observe the docker daemon's own disk size (it runs \
+                             in a VM this process cannot see, e.g. Docker Desktop or Colima); \
+                             falling back to a conservative default of {VM_DISK_FALLBACK} \
+                             rather than the host filesystem's — pass --disk-capacity <SIZE> \
+                             (e.g. --disk-capacity 200gib) to state the real number"
+                        );
+                        VM_DISK_FALLBACK
+                    }
+                });
             }
             let detected = coppice_agent::capacity::detect(&agent_config.data_dir);
             let effective = agent_config
