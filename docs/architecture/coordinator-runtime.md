@@ -161,8 +161,10 @@ followers, which is what lets followers serve reads and event streams.
    window (and their sink entry) at the next close. Because agent sessions
    terminate on the leader, a follower's buckets carry capacity and allocated
    but never `used` — honestly absent, and deliberately not forwarded.
-   Publishes over a watch backing both the API's usage reads and the
-   `coppice_node_*` `/metrics` gauges.
+   Publishes over a watch backing the API's usage reads — and, through the
+   same read, the `coppice_node_*` `/metrics` series, which `/metrics`
+   renders directly from the live view at scrape time so a departed node's
+   series disappears rather than freezing.
 
 7. **Agent gateway.** A session manager plus one task per agent session.
    **Sessions terminate on the leader only** — a follower refuses an agent

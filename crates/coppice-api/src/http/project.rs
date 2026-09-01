@@ -248,19 +248,25 @@ fn cluster_capacity(state: &StateMachine, usage: &UsageSnapshot) -> dto::Cluster
     }
 
     // The sum of the per-node readings that exist, over the nodes still in
-    // state — never a zero standing in for "nobody reported" (ADR 0039).
+    // state — never a zero standing in for "nobody reported" (ADR 0039) — and
+    // counted, so the wire carries how much of the cluster the sum covers
+    // rather than leaving a partial sum to read as a total.
     let mut used: Option<Resources> = None;
+    let mut reporting_nodes: u32 = 0;
     for id in state.nodes.keys() {
         if let Some(sample) = usage.current.get(id) {
+            reporting_nodes += 1;
             used = Some(used.unwrap_or(Resources::ZERO).saturating_add(&sample.used));
         }
     }
 
     dto::ClusterCapacity {
+        total_nodes: nodes.total,
         nodes,
         capacity: (&capacity).into(),
         allocated: (&allocated).into(),
         used: used.as_ref().map(Into::into),
+        reporting_nodes,
         history: capacity_history(usage),
     }
 }
@@ -1648,9 +1654,54 @@ mod tests {
         assert_eq!(capacity.capacity.cpu_millis, 8000);
         assert_eq!(capacity.allocated.cpu_millis, 1000);
         // No telemetry: measured use is honestly absent, as on every node
-        // summary — never a zero vector (ADR 0039).
+        // summary — never a zero vector (ADR 0039) — and coverage says zero
+        // of the two nodes stand behind it.
         assert_eq!(capacity.used, None);
+        assert_eq!(capacity.reporting_nodes, 0);
+        assert_eq!(capacity.total_nodes, 2);
         assert!(capacity.history.is_empty());
+    }
+
+    /// A partial `used` is served *with its coverage*: the sum over the one
+    /// reporting node of two, plus the pair that says so. Without them a
+    /// client renders half the cluster's consumption as the cluster's.
+    #[test]
+    fn overview_reports_the_coverage_behind_a_partial_used_total() {
+        let (reporting, silent) = (NodeId::new(), NodeId::new());
+        let mut state = StateMachine::default();
+        state.nodes.insert(reporting, test_node(reporting));
+        state.nodes.insert(silent, test_node(silent));
+
+        let usage = UsageSnapshot {
+            current: std::collections::BTreeMap::from([(
+                reporting,
+                crate::NodeUsageSample {
+                    used: coppice_core::resource::Resources {
+                        cpu_millis: 1_500,
+                        memory: coppice_core::bytes::ByteSize::ZERO,
+                        disk: coppice_core::bytes::ByteSize::ZERO,
+                    },
+                    // Advisory, and deliberately absurd: the projection must
+                    // not read the agent's clock for anything.
+                    sampled_at: ts(999_999_999),
+                    received_at: ts(1_000),
+                },
+            )]),
+            history: Default::default(),
+        };
+        let capacity = cluster_overview(
+            &state,
+            cluster(),
+            ts(1_000),
+            &QueueWindow::default(),
+            &usage,
+        )
+        .capacity;
+
+        assert_eq!(capacity.used.unwrap().cpu_millis, 1_500);
+        assert_eq!(capacity.reporting_nodes, 1);
+        assert_eq!(capacity.total_nodes, 2);
+        assert_eq!(capacity.total_nodes, capacity.nodes.total);
     }
 
     #[test]

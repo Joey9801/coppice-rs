@@ -150,7 +150,6 @@ pub fn describe_metrics() {
     coppice_tls::describe_metrics();
     tasks::event_fanout::describe_metrics();
     tasks::node_client::describe_metrics();
-    usage::describe_metrics();
 }
 
 /// Run any point-in-time sampling behind coordinator metrics, recursing the
@@ -162,7 +161,6 @@ pub fn gather_metrics() {
     coppice_tls::gather_metrics();
     tasks::event_fanout::gather_metrics();
     tasks::node_client::gather_metrics();
-    usage::gather_metrics();
 }
 
 /// Parse-and-dispatch entry point the binary calls.

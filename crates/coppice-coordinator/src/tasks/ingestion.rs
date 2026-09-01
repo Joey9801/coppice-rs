@@ -249,10 +249,9 @@ fn record_usage(usage: &NodeUsage, report: &InboundReport) {
         return;
     };
     match coppice_proto::convert::node_usage_from_pb(reported) {
-        Ok((used, sampled_at)) => usage.record(
-            report.node,
-            coppice_api::NodeUsageSample { used, sampled_at },
-        ),
+        // The sink stamps its own receipt time: `sampled_at` is the agent's
+        // clock and stays advisory (ADR 0039).
+        Ok((used, sampled_at)) => usage.record(report.node, used, sampled_at),
         Err(e) => {
             tracing::debug!(%report.node, error = %e, "ingestion: malformed heartbeat usage, dropping");
         }

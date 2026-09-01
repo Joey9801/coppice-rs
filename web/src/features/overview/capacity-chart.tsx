@@ -10,6 +10,7 @@ import {
 import type { CapacitySample } from '@/api/types'
 import { formatCpu, formatTimeOfDay } from '@/lib/format'
 import { EmptyState } from '@/components'
+import { formatUsedTooltip } from './capacity-coverage'
 
 const AXIS_TICK = { fill: 'var(--muted-foreground)', fontSize: 11 } as const
 
@@ -39,6 +40,8 @@ export function CapacityChart({ history }: { history: CapacitySample[] }) {
     capacity: h.capacity.cpuMillis,
     allocated: h.allocated.cpuMillis,
     used: h.used?.cpuMillis ?? null,
+    reportingNodes: h.reportingNodes,
+    totalNodes: h.totalNodes,
   }))
 
   return (
@@ -64,10 +67,20 @@ export function CapacityChart({ history }: { history: CapacitySample[] }) {
           <Tooltip
             contentStyle={TOOLTIP_CONTENT_STYLE}
             labelFormatter={(ms) => formatTimeOfDay(new Date(Number(ms)))}
-            formatter={(value, name) => [
-              value == null ? 'not reported' : formatCpu(Number(value)),
-              name,
-            ]}
+            formatter={(value, name, item) => {
+              if (name === 'Used') {
+                const datum = item.payload as (typeof data)[number]
+                return [
+                  formatUsedTooltip(
+                    value == null ? null : Number(value),
+                    datum.reportingNodes,
+                    datum.totalNodes,
+                  ),
+                  name,
+                ]
+              }
+              return [value == null ? 'not reported' : formatCpu(Number(value)), name]
+            }}
           />
           <Line
             type="monotone"

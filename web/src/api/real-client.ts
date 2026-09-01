@@ -590,6 +590,8 @@ interface WireClusterCapacity {
   capacity: WireResources
   allocated: WireResources
   used: WireResources | null
+  reporting_nodes: number
+  total_nodes: number
   history: WireCapacitySample[]
 }
 
@@ -619,6 +621,8 @@ function mapClusterOverview(o: WireGetClusterOverviewResponse): ClusterOverview 
       capacity: mapResources(o.capacity.capacity),
       allocated: mapResources(o.capacity.allocated),
       used: mapResourcesOrNull(o.capacity.used),
+      reportingNodes: o.capacity.reporting_nodes,
+      totalNodes: o.capacity.total_nodes,
       history: o.capacity.history.map(mapCapacitySample),
     },
   }

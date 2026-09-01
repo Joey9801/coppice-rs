@@ -15,8 +15,8 @@
 //!
 //! Task-local state only: nothing touches the `StateMachine`, the log, or a
 //! snapshot, and none of it survives a restart or a leadership move. Long-term
-//! retention is Prometheus's job, off the `coppice_node_*` gauges this
-//! module's sink also feeds (`crate::usage`).
+//! retention is Prometheus's job, off the `coppice_node_*` series the
+//! `/metrics` scrape renders from the same live view this task publishes.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -194,9 +194,9 @@ fn sample_readings(views: &StateViews) -> BTreeMap<NodeId, NodeReading> {
 ///
 /// Returns the watch the API's `usage_window` read serves its history from
 /// (seeded empty: no closed bucket exists until the first interval elapses)
-/// and the task's `JoinHandle`. Also installs the pair as the process's
-/// `/metrics` usage source (`crate::usage`), which is why the sink comes in
-/// here rather than being read only by the loop.
+/// and the task's `JoinHandle`. The `/metrics` usage surface reads the same
+/// watch through that API read (`coppice_api::http`'s usage-metrics section),
+/// so nothing is installed process-wide here.
 pub fn spawn(
     views: StateViews,
     usage: NodeUsage,
@@ -206,7 +206,6 @@ pub fn spawn(
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, rx) = watch::channel(Arc::new(ClusterUsage::default()));
-    crate::usage::install_metrics_source(usage.clone(), rx.clone());
     let join = tokio::spawn(run(views, usage, tx, shutdown));
     (rx, join)
 }
@@ -279,6 +278,7 @@ mod tests {
         NodeUsageSample {
             used: res(cpu, 256),
             sampled_at: at,
+            received_at: at,
         }
     }
 
@@ -401,7 +401,7 @@ mod tests {
         let (_publisher, views) = ViewPublisher::new(sm, 1, ViewPublisherConfig::default());
 
         let usage = NodeUsage::new();
-        usage.record(node, sample(900, Timestamp::now()));
+        usage.record(node, res(900, 256), Timestamp::now());
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (mut rx, _join) = spawn(views, usage, shutdown_rx);

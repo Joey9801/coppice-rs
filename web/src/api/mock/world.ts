@@ -1890,6 +1890,8 @@ export class MockWorld {
         capacity: snapshot.capacity,
         allocated: snapshot.allocated,
         used: snapshot.used,
+        reportingNodes: snapshot.reportingNodes,
+        totalNodes: snapshot.totalNodes,
         history: this.capacityHistory.map((b) => ({
           t: at(b.tUs),
           capacity: b.capacity,

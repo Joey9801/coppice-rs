@@ -75,16 +75,24 @@ zero, and no layer substitutes one:
 
 - The proto field is `optional`; the agent omits it when its executor has
   nothing fresh.
-- The coordinator's sink drops readings older than `USAGE_SAMPLE_MAX_AGE`
-  (90 s, matched to the ADR 0009 liveness deadline — a reading that outlives
-  the deadline has no claim to describe anything current).
+- The coordinator's sink drops readings it *received* longer ago than
+  `USAGE_SAMPLE_MAX_AGE` (90 s, matched to the ADR 0009 liveness deadline —
+  a reading that outlives the deadline has no claim to describe anything
+  current). Freshness is measured on the coordinator's own receipt clock,
+  never the reporter's: the agent's `sampled_at` is advisory metadata, and
+  an agent whose clock runs an hour fast must not be able to keep its last
+  reading alive for an hour after the node goes silent.
 - `NodeSummary.used` and `ClusterCapacity.used` are `null` when nothing is
   reported. A rolling-window bucket carries `used: null` for a node that
   reported nothing during it, which the charts render as a **gap**.
-- The `coppice_node_used_*` gauges are simply not emitted for a
+- The `coppice_node_used_*` series are simply not rendered for a
   non-reporting node.
-- A cluster total is a *partial* sum, and every bucket carries
-  `reporting_nodes` / `total_nodes` so it cannot be mistaken for a total.
+- A cluster total is a *partial* sum, and it never travels without its
+  coverage: every history bucket carries `reporting_nodes` /
+  `total_nodes`, `ClusterCapacity` carries the same pair for the current
+  figure, and `/metrics` renders
+  `coppice_cluster_usage_reporting_nodes` / `_total_nodes` beside the
+  cluster totals. A UI that shows the sum shows the coverage with it.
 
 ### In-memory, leader-only, one rolling hour
 
@@ -116,16 +124,27 @@ The one-hour window exists to draw a chart. Long-term retention is not the
 coordinator's job, and the coordinator's `/metrics` endpoint (issue #46)
 already exists: this ADR adds `coppice_node_used_*`,
 `coppice_node_allocated_*`, `coppice_node_capacity_*`,
-`coppice_node_usage_sample_age_seconds`, and the cluster totals, all through
-the repo's `describe_metrics()` / `gather_metrics()` pattern.
+`coppice_node_usage_sample_age_seconds`, and the cluster totals.
 
-These are the tree's first *sampled* gauges on the coordinator — every other
-module's `gather_metrics` is a no-op because its metrics are pushed at the
-event that changes them, and a usage fold has no such event. The
-node-labelled series are **not** garbage-collected when a node leaves: a
-departed node's last label set lingers until the process restarts.
-Prometheus's own staleness handling is the answer; a bespoke label-GC layer
-would only add a way for the two to disagree.
+These series are **rendered directly at scrape time**, not pushed into the
+process's metrics recorder — the one place in the tree that departs from the
+`describe_metrics()` / `gather_metrics()` pattern, and the reason is
+lifecycle. A recorder holds every series it is ever handed until the process
+exits, so a node-labelled `used` gauge would keep rendering a departed or
+silent node's last reading forever: exactly the "absence is not zero" rule
+above, violated at the one surface an operator alerts off. The recorder's
+only eviction knob is a *global* idle timeout, which would also evict the
+event-time gauges other modules must keep, so it is not available.
+
+Instead the `/metrics` route asks the control plane for the same
+`usage_window` view the API serves and renders the section itself: one line
+per currently-valid node, and nothing at all for a node with no fresh
+reading. Prometheus's own staleness handling then does what it is designed
+to do — a series that stops appearing goes stale — with no bookkeeping layer
+to disagree with. `allocated` and `capacity` come from replicated state and
+so are rendered for every tracked node, reporting or not; `used` and
+`coppice_node_usage_sample_age_seconds` require a fresh sample, and the age
+is measured from receipt time.
 
 The `agent_node_used_*` gauges the agent exports (its own fold, before any
 coordinator sees it) keep the `agent_` prefix precisely so `coppice dev` —
@@ -136,8 +155,9 @@ one process, one recorder, both roles — cannot collide them.
 - The capacity card and the node utilization panel show real numbers, and
   the `used: Resources::ZERO` placeholder is gone from the projection.
 - `NodeSummary.used` and `ClusterCapacity.used` are now nullable in the DTO
-  and in `types.ts`; every consumer must render absence rather than
-  formatting a zero. This is a breaking change to the read shape, which
+  and in `types.ts`, and `ClusterCapacity` carries `reporting_nodes` /
+  `total_nodes`; every consumer must render absence rather than formatting a
+  zero, and must label a partial sum as partial rather than as "Used". This is a breaking change to the read shape, which
   costs nothing today (there are no deployments) and is the whole point.
 - `GET /api/v1/nodes/{node}/utilization` leaves provisional status. It still
   404s an unknown node — an unknown node and a known-but-uncollected one are

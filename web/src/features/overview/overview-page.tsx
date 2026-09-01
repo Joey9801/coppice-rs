@@ -15,6 +15,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { CapacityChart } from './capacity-chart'
+import { capacityCoverageNote } from './capacity-coverage'
 import { QueueChart } from './queue-chart'
 
 /** `null` is a coverage gap (ADR 0032), rendered as absent — never `0.0`. */
@@ -46,6 +47,7 @@ export function OverviewPage() {
   const depthSeries = queue.history.map((h) => ({ t: h.t.getTime(), v: h.depth }))
   const drainSeries = queue.history.map((h) => ({ t: h.t.getTime(), v: h.drainedPerMinute }))
   const nonzeroStates = JOB_PHASES.filter((s) => queue.byState[s] > 0)
+  const coverageNote = capacityCoverageNote(capacity.reportingNodes, capacity.totalNodes)
 
   return (
     <div>
@@ -150,6 +152,7 @@ export function OverviewPage() {
             <CardTitle>Capacity</CardTitle>
           </CardHeader>
           <CardContent>
+            {coverageNote && <p className="mb-2 text-xs text-muted-foreground">{coverageNote}</p>}
             <ResourceTriple
               capacity={capacity.capacity}
               allocated={capacity.allocated}

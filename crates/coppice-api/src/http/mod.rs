@@ -28,6 +28,7 @@ mod readyz;
 mod routes;
 mod ui;
 mod usage;
+mod usage_metrics;
 
 pub use authn::{authenticate, RequestActor};
 pub use enroll::{
