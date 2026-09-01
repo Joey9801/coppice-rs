@@ -111,6 +111,19 @@ pub fn detect(data_dir: &Path) -> DetectedCapacity {
     }
 }
 
+/// The total size, in bytes, of the filesystem holding `path`.
+///
+/// The same `statvfs` reading [`detect`] uses for the agent's own `data_dir`
+/// (§Disk above), exposed so callers with a *second* filesystem worth sizing —
+/// notably a local Docker daemon's `data_root` (`docker-executor.md` §9) — can
+/// reuse the exact arithmetic rather than re-deriving it. `path` must exist for
+/// `statvfs` to resolve it; a VM-backed daemon's reported root commonly does
+/// not exist on the local filesystem at all, which callers must check for
+/// themselves before calling this (see `docker::api::data_root`'s caveats).
+pub fn detect_disk_at(path: &Path) -> DetectResult {
+    detect_disk(path)
+}
+
 // -- CPU ---------------------------------------------------------------------
 
 /// Host parallelism × 1000, intersected with the cgroup v2 quota on Linux.
