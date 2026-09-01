@@ -22,7 +22,11 @@
 //!   [`crate::capacity`]'s `hw.memsize` read, this shells out because the
 //!   workspace forbids `unsafe_code` and no crate in the tree wraps these
 //!   sysctls; macOS is a development platform here, so one `execve` at startup
-//!   is the cheaper trade against a new dependency.
+//!   is the cheaper trade against a new dependency. An unsupported key (common
+//!   in VMs, e.g. `machdep.cpu.brand_string`) makes `sysctl` exit nonzero, but
+//!   it still writes every key it resolved to stdout first, so the parse runs
+//!   on whatever stdout arrived regardless of exit status, keeping the
+//!   per-field best-effort contract even when one key in the batch fails.
 //! * **Everywhere** — `os` and `arch` from `std::env::consts`, the logical core
 //!   count from [`std::thread::available_parallelism`], and the agent version
 //!   from `CARGO_PKG_VERSION`.
@@ -199,23 +203,7 @@ mod macos {
 
     pub(super) fn fill(facts: &mut HostFacts) {
         let Some(raw) = sysctl() else { return };
-        let values = super::parse_sysctl(&raw);
-        let get = |key: &str| values.get(key).cloned().unwrap_or_default();
-
-        facts.os_version = get("kern.osproductversion");
-        facts.kernel_version = get("kern.osrelease");
-        // The brand string is the human-meaningful name ("Apple M2 Pro"); the
-        // board id ("Mac14,9") is the fallback when a VM omits the former.
-        facts.cpu_model = match get("machdep.cpu.brand_string") {
-            brand if !brand.is_empty() => brand,
-            _ => get("hw.model"),
-        };
-        facts.physical_cores = get("hw.physicalcpu").parse().unwrap_or(0);
-        // Prefer the sysctl over `available_parallelism`, which reports the
-        // *available* (QoS-clamped) count rather than what the box has.
-        if let Ok(logical) = get("hw.logicalcpu").parse() {
-            facts.logical_cores = logical;
-        }
+        super::fill_from_sysctl(facts, &raw);
     }
 
     /// One `sysctl` covering [`KEYS`]. Deliberately *not* `-n`: with bare
@@ -223,12 +211,28 @@ mod macos {
     /// every later line onto the wrong field, and the failure mode would be a
     /// kernel version rendered as a CPU model rather than an honest blank.
     /// Keyed output costs nothing and is order-independent.
+    ///
+    /// A key `sysctl` does not recognize (common in VMs, e.g.
+    /// `machdep.cpu.brand_string`) makes the whole invocation exit nonzero,
+    /// but the process still writes every key it *did* resolve to stdout
+    /// before that — only the unknown keys' errors go to stderr. So this
+    /// returns the captured stdout whenever there is any, even on a nonzero
+    /// exit, and lets the keyed parse in [`super::fill_from_sysctl`] fill
+    /// whatever fields the process managed to answer.
     fn sysctl() -> Option<String> {
         let out = std::process::Command::new("/usr/sbin/sysctl")
             .args(KEYS)
             .output();
         match out {
             Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into()),
+            Ok(out) if !out.stdout.is_empty() => {
+                tracing::debug!(
+                    status = %out.status,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "sysctl exited nonzero; using the keys it did resolve",
+                );
+                Some(String::from_utf8_lossy(&out.stdout).into())
+            }
             Ok(out) => {
                 tracing::debug!(status = %out.status, "sysctl failed; no macOS host facts");
                 None
@@ -238,6 +242,32 @@ mod macos {
                 None
             }
         }
+    }
+}
+
+/// Fill the sysctl-sourced fields of `facts` from raw keyed `sysctl` output.
+///
+/// Pulled out of the `macos` module so it is a pure function over an owned
+/// string — testable on any OS without running `sysctl` — matching the
+/// module's convention for the other per-platform parsers.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn fill_from_sysctl(facts: &mut coppice_core::node::HostFacts, raw: &str) {
+    let values = parse_sysctl(raw);
+    let get = |key: &str| values.get(key).cloned().unwrap_or_default();
+
+    facts.os_version = get("kern.osproductversion");
+    facts.kernel_version = get("kern.osrelease");
+    // The brand string is the human-meaningful name ("Apple M2 Pro"); the
+    // board id ("Mac14,9") is the fallback when a VM omits the former.
+    facts.cpu_model = match get("machdep.cpu.brand_string") {
+        brand if !brand.is_empty() => brand,
+        _ => get("hw.model"),
+    };
+    facts.physical_cores = get("hw.physicalcpu").parse().unwrap_or(0);
+    // Prefer the sysctl over `available_parallelism`, which reports the
+    // *available* (QoS-clamped) count rather than what the box has.
+    if let Ok(logical) = get("hw.logicalcpu").parse() {
+        facts.logical_cores = logical;
     }
 }
 
@@ -345,6 +375,47 @@ mod tests {
         assert_eq!(values["kern.a"], "x: y");
         assert!(!values.contains_key("kern.b"), "empty value is unknown");
         assert!(!values.contains_key("garbage"));
+    }
+
+    #[test]
+    fn fill_from_sysctl_fills_present_fields_and_leaves_missing_empty() {
+        // As `sysctl` would emit when `machdep.cpu.brand_string` is
+        // unsupported (the VM case this exists to tolerate): every other key
+        // resolved, that one did not, and the real invocation would have
+        // exited nonzero here — but the parse never sees the exit status.
+        let raw = "kern.osproductversion: 15.5\n\
+                   kern.osrelease: 24.5.0\n\
+                   hw.model: VirtualMac2,1\n\
+                   hw.physicalcpu: 4\n\
+                   hw.logicalcpu: 8\n";
+        let mut facts = coppice_core::node::HostFacts::default();
+        fill_from_sysctl(&mut facts, raw);
+
+        assert_eq!(facts.os_version, "15.5");
+        assert_eq!(facts.kernel_version, "24.5.0");
+        // Falls back to the board id when the brand string is absent.
+        assert_eq!(facts.cpu_model, "VirtualMac2,1");
+        assert_eq!(facts.physical_cores, 4);
+        assert_eq!(facts.logical_cores, 8);
+    }
+
+    #[test]
+    fn fill_from_sysctl_empty_stdout_leaves_defaults() {
+        // The genuinely-nothing-resolved case: every field stays at its
+        // zero/empty default, "unknown" on the wire, rather than panicking.
+        let mut facts = coppice_core::node::HostFacts {
+            logical_cores: 3, // pre-seeded by the cross-platform fallback
+            ..coppice_core::node::HostFacts::default()
+        };
+        fill_from_sysctl(&mut facts, "");
+
+        assert_eq!(facts.os_version, "");
+        assert_eq!(facts.kernel_version, "");
+        assert_eq!(facts.cpu_model, "");
+        assert_eq!(facts.physical_cores, 0);
+        // No logical-core key resolved, so the pre-seeded value is untouched
+        // rather than being clobbered with zero.
+        assert_eq!(facts.logical_cores, 3);
     }
 
     #[test]
