@@ -370,6 +370,10 @@ mod tests {
                     memory_bytes: 512 * 1024 * 1024,
                     disk_bytes: 1024 * 1024 * 1024,
                 }),
+                // One of the two nodes is reporting: a partial sum,
+                // labelled as one.
+                reporting_nodes: 1,
+                total_nodes: 2,
                 history: Vec::new(),
             },
         }

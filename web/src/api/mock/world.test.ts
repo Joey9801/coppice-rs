@@ -178,6 +178,14 @@ describe('MockWorld construction', () => {
     }
   })
 
+  it('exposes partial usage coverage on cluster capacity (one node has no sampler)', () => {
+    const world = new MockWorld(NOW_US)
+    const { capacity } = world.buildClusterOverview()
+    expect(capacity.totalNodes).toBe(16)
+    expect(capacity.reportingNodes).toBeGreaterThan(0)
+    expect(capacity.reportingNodes).toBeLessThan(capacity.totalNodes)
+  })
+
   it('has coordinators with a single leader and plausible snapshot', () => {
     const world = new MockWorld(NOW_US)
     const status = world.buildCoordinatorStatus()

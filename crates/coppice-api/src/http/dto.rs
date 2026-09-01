@@ -398,9 +398,16 @@ pub struct ClusterCapacity {
     pub allocated: Resources,
     /// Sum of the [`NodeSummary::used`] readings that exist, `null` when no
     /// node is reporting at all (ADR 0039). A partial sum is still reported —
-    /// `history[].reporting_nodes` is what says how much of the cluster it
-    /// actually covers.
+    /// `reporting_nodes` / `total_nodes` are what say how much of the cluster
+    /// it actually covers, and a client that renders `used` without them is
+    /// presenting a partial sum as a total.
     pub used: Option<Resources>,
+    /// Nodes contributing a reading to `used` right now.
+    pub reporting_nodes: u32,
+    /// Nodes in the replicated state — the denominator `reporting_nodes` is
+    /// partial against. Equal to `nodes.total`, repeated here so the coverage
+    /// pair reads the same way as a `history[]` sample's.
+    pub total_nodes: u32,
     /// The rolling capacity/allocated/used history, oldest first — the
     /// leader's in-memory usage window (ADR 0039). Empty on a follower and
     /// until the first bucket closes; missing coverage is a missing sample,
@@ -2288,8 +2295,10 @@ mod tests {
                     disk_bytes: 0,
                 },
                 // Nothing reported: `used` is absent, never a zero vector
-                // (ADR 0039).
+                // (ADR 0039), and the coverage pair says so.
                 used: None,
+                reporting_nodes: 0,
+                total_nodes: 1,
                 history: vec![CapacitySample {
                     t: ts(4_970_000),
                     capacity: Resources {
@@ -2346,8 +2355,12 @@ mod tests {
                     "nodes": { "total": 1, "schedulable": 1, "lost": 0 },
                     "capacity": { "cpu_millis": 4000, "memory_bytes": 0, "disk_bytes": 0 },
                     "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
-                    // Absence, not zero: no node is reporting usage (ADR 0039).
+                    // Absence, not zero: no node is reporting usage (ADR 0039),
+                    // and the current figure carries its coverage the same way
+                    // a history sample does.
                     "used": null,
+                    "reporting_nodes": 0,
+                    "total_nodes": 1,
                     "history": [{
                         "t": "1970-01-01T00:00:04.970000Z",
                         "capacity": { "cpu_millis": 4000, "memory_bytes": 0, "disk_bytes": 0 },

@@ -9,10 +9,18 @@
 //! call `gather_metrics()` immediately before rendering each scrape so any
 //! point-in-time gauges are sampled fresh.
 //!
-//! [`MetricsEndpoint`] captures exactly the two process-specific pieces that
-//! contract needs — the recorder's [`PrometheusHandle`] and a pointer to the
-//! crate-root `gather_metrics` — behind a transport-agnostic handler, so
-//! neither daemon's router has to know anything about the recorder internals.
+//! [`MetricsEndpoint`] captures exactly the process-specific pieces that
+//! contract needs — the recorder's [`PrometheusHandle`], a pointer to the
+//! crate-root `gather_metrics`, and any directly-rendered *sections* — behind
+//! a transport-agnostic handler, so neither daemon's router has to know
+//! anything about the recorder internals.
+//!
+//! A section exists for the series a recorder's lifecycle gets wrong: it is
+//! rendered from the live view on each scrape, so a series that is no longer
+//! valid is simply absent rather than frozen at its last value (ADR 0039's
+//! node usage, via [`super::usage_metrics`]).
+
+use std::sync::Arc;
 
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
@@ -47,6 +55,21 @@ pub struct MetricsEndpoint {
     /// current. Push-style counters need nothing here, so a no-op `|| {}` is a
     /// valid gather for a process (or a test) with no sampled metrics.
     gather: fn(),
+    /// Exposition text this process renders *itself*, appended after the
+    /// recorder's render.
+    ///
+    /// The escape hatch for a series whose lifecycle the recorder gets wrong.
+    /// A recorder holds every series it is handed until the process exits, so
+    /// a gauge describing a thing that can go away — a node's usage, ADR 0039
+    /// — would keep rendering its last value forever, and the recorder's only
+    /// eviction knob is a *global* idle timeout that would also evict
+    /// event-time gauges other modules must keep. A section renders from the
+    /// live view at scrape time instead: what is no longer valid simply has
+    /// no line, and Prometheus's own staleness handling takes it from there.
+    ///
+    /// Sections must be cheap and non-blocking — they run inline on the
+    /// scrape — and must emit their own `# HELP`/`# TYPE` headers.
+    sections: Vec<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 impl MetricsEndpoint {
@@ -59,7 +82,21 @@ impl MetricsEndpoint {
     /// here. This type never installs anything — installation is a
     /// once-per-process concern that belongs to the daemon, not the transport.
     pub fn new(handle: PrometheusHandle, gather: fn()) -> MetricsEndpoint {
-        MetricsEndpoint { handle, gather }
+        MetricsEndpoint {
+            handle,
+            gather,
+            sections: Vec::new(),
+        }
+    }
+
+    /// Add a directly-rendered section, appended to every scrape after the
+    /// recorder's own render. See [`sections`](Self::sections).
+    pub fn with_section(
+        mut self,
+        section: impl Fn() -> String + Send + Sync + 'static,
+    ) -> MetricsEndpoint {
+        self.sections.push(Arc::new(section));
+        self
     }
 
     /// A detached endpoint for tests: a non-installing recorder's handle and a
@@ -77,8 +114,9 @@ impl MetricsEndpoint {
         MetricsEndpoint::new(recorder.handle(), || {})
     }
 
-    /// Handle one scrape: sample point-in-time metrics, then render the
-    /// Prometheus exposition text. Pure gather + render — no recorder upkeep.
+    /// Handle one scrape: sample point-in-time metrics, render the recorder's
+    /// exposition text, then append each directly-rendered section. Pure
+    /// gather + render — no recorder upkeep.
     ///
     /// Draining the recorder's histogram buckets is not a scrape concern:
     /// `run_upkeep` runs on a fixed-interval task the installer spawns
@@ -87,7 +125,10 @@ impl MetricsEndpoint {
     /// scrape latency and memory stay bounded regardless of scrape cadence.
     pub async fn render(&self) -> impl IntoResponse {
         (self.gather)();
-        let body = self.handle.render();
+        let mut body = self.handle.render();
+        for section in &self.sections {
+            body.push_str(&section());
+        }
         ([(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)], body)
     }
 }
@@ -130,6 +171,30 @@ mod tests {
                 .unwrap(),
             PROMETHEUS_CONTENT_TYPE
         );
+    }
+
+    /// A section is appended to the recorder's own render, and the recorder's
+    /// metrics are untouched by it.
+    #[tokio::test]
+    async fn metrics_endpoint_appends_directly_rendered_sections() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("test_recorder_total").increment(1);
+        });
+        let endpoint = MetricsEndpoint::new(handle, || {}).with_section(|| {
+            "# HELP test_section gauge help\n# TYPE test_section gauge\ntest_section 7\n"
+                .to_string()
+        });
+
+        let response = metrics_app(endpoint)
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("test_recorder_total"), "got:\n{body}");
+        assert!(body.contains("test_section 7"), "got:\n{body}");
     }
 
     #[tokio::test]

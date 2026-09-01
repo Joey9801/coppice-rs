@@ -45,7 +45,9 @@ use super::readyz::ReadyzEndpoint;
 /// top-level `/metrics` route is deliberately **not** under `/api/v1` — it is
 /// the Prometheus scrape target, not part of the JSON API — and carries its own
 /// captured [`MetricsEndpoint`], state that is entirely separate from the
-/// `ControlPlane`.
+/// `ControlPlane`. Its one link to the plane is the ADR 0039 usage *section*
+/// attached below: a scrape-time render of `usage_window`, which is what makes
+/// a departed node's series disappear instead of freezing.
 ///
 /// `/api/v1` misses are answered by that nested router's **own** JSON-404
 /// fallback rather than falling through to the outer
@@ -74,6 +76,20 @@ pub fn router<P: ControlPlane>(
     // `/enroll` captures its own [`EnrollEndpoint`] the same way, for the same
     // reason: certificate issuance is not a `ControlPlane` operation
     // (ADR 0037 §4).
+    // The one route that reads the plane *outside* `/api/v1`: the usage
+    // section of a scrape (ADR 0039) renders from the live view at scrape
+    // time, because a node-labelled gauge parked in the recorder would keep
+    // rendering a departed node's last reading forever. `closed_router` has
+    // no plane and therefore no such section — a pre-formation daemon has no
+    // usage to report.
+    let usage_plane = Arc::clone(&plane);
+    let metrics = metrics.with_section(move || {
+        super::usage_metrics::render(
+            &usage_plane.usage_window(),
+            coppice_core::time::Timestamp::now(),
+        )
+    });
+
     operational_routes(metrics, readyz)
         .nest("/api/v1", api_v1_routes::<P>(enroll, authn))
         // Everything unrouted *outside* `/api/v1`: other `/api/*` paths stay

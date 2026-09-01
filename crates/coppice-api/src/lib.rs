@@ -117,12 +117,25 @@ pub struct QueueWindow {
 /// directly comparable to that node's `allocated`, never a host-level total.
 ///
 /// A node with no entry is not reporting: absence means "not measured", never
-/// zero (ADR 0039). `sampled_at` is the *agent's* clock at the fold, so it is
-/// advisory — it drives a staleness cutoff and an age gauge, nothing ordered.
+/// zero (ADR 0039).
+///
+/// Two stamps, and only one of them decides anything. `received_at` is the
+/// *coordinator's* clock when the leader peeled the reading off a heartbeat:
+/// every freshness question — the sink's staleness cutoff, a bucket's
+/// used-coverage, the scrape's sample-age — is answered from it, because it
+/// is the only stamp a remote clock cannot move. `sampled_at` is the agent's
+/// clock at its own fold, kept as advisory metadata (how far behind the
+/// reading was on the reporter's side) and never used as a cutoff: an agent
+/// an hour fast would otherwise keep a dead node's last reading "fresh" for
+/// an hour after it went silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeUsageSample {
     pub used: coppice_core::resource::Resources,
+    /// The reporting agent's clock at its fold. **Advisory only.**
     pub sampled_at: Timestamp,
+    /// The coordinator's clock when this reading arrived. Every freshness
+    /// and TTL decision uses this.
+    pub received_at: Timestamp,
 }
 
 /// One closed bucket of a node's capacity/allocated/used accounting (ADR

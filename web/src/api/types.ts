@@ -770,9 +770,16 @@ export interface ClusterCapacity {
   allocated: Resources
   /**
    * Aggregate measured consumption, as last reported. `null` when no node
-   * is currently reporting usage — never a fabricated zero.
+   * is currently reporting usage — never a fabricated zero. `used` is a sum
+   * over `reportingNodes` of `totalNodes`: a PARTIAL figure whenever
+   * `reportingNodes < totalNodes`, never a fabricated cluster-wide total —
+   * always pair it with a coverage indicator when they differ.
    */
   used: Resources | null
+  /** Nodes that currently have a fresh usage sample (see `used`). */
+  reportingNodes: number
+  /** Nodes in replicated state (see `used`). */
+  totalNodes: number
   /** Recent history for the capacity chart, oldest first. */
   history: CapacitySample[]
 }

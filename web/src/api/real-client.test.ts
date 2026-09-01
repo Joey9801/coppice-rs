@@ -57,6 +57,8 @@ describe('getClusterOverview', () => {
           capacity: { cpu_millis: 1000, memory_bytes: 2, disk_bytes: 3 },
           allocated: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
           used: { cpu_millis: 50, memory_bytes: 0, disk_bytes: 0 },
+          reporting_nodes: 1,
+          total_nodes: 2,
           history: [
             {
               t: '2026-01-01T00:00:00.000000Z',
@@ -86,6 +88,8 @@ describe('getClusterOverview', () => {
     expect(overview.queue.history[0]!.t.toISOString()).toBe('2026-01-01T00:00:00.000Z')
     expect(overview.capacity.capacity.cpuMillis).toBe(1000)
     expect(overview.capacity.used).toEqual({ cpuMillis: 50, memoryBytes: 0, diskBytes: 0 })
+    expect(overview.capacity.reportingNodes).toBe(1)
+    expect(overview.capacity.totalNodes).toBe(2)
     expect(overview.capacity.history).toHaveLength(1)
     expect(overview.capacity.history[0]!.used).toBeNull()
     expect(overview.capacity.history[0]!.reportingNodes).toBe(1)
@@ -109,6 +113,8 @@ describe('getClusterOverview', () => {
           capacity: { cpu_millis: 1000, memory_bytes: 2, disk_bytes: 3 },
           allocated: { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 },
           used: null,
+          reporting_nodes: 0,
+          total_nodes: 1,
           history: [],
         },
         recent_events: { floor_index: 0, events: [] },
@@ -118,6 +124,8 @@ describe('getClusterOverview', () => {
     const overview = await client.getClusterOverview()
 
     expect(overview.capacity.used).toBeNull()
+    expect(overview.capacity.reportingNodes).toBe(0)
+    expect(overview.capacity.totalNodes).toBe(1)
     expect(overview.capacity.history).toEqual([])
   })
 })
