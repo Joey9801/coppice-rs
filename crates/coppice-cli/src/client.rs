@@ -234,11 +234,21 @@ impl ApiClient {
 /// Reduce an `--api` value to a bare base URL. Trims a trailing slash, then a
 /// trailing `/api/v1` (the form the dev banner prints and users paste), then
 /// any slash that exposes — so every accepted form maps to the same base.
+/// The scheme is canonicalized to lowercase (RFC 3986 §3.1: schemes are
+/// case-insensitive), so downstream scheme checks can compare literally.
 pub fn normalize_base(raw: &str) -> String {
     let trimmed = raw.trim_end_matches('/');
-    trimmed
+    let canonical = match trimmed.find("://") {
+        Some(scheme_end) => {
+            let (scheme, rest) = trimmed.split_at(scheme_end);
+            format!("{}{rest}", scheme.to_ascii_lowercase())
+        }
+        None => trimmed.to_string(),
+    };
+
+    canonical
         .strip_suffix("/api/v1")
-        .unwrap_or(trimmed)
+        .unwrap_or(&canonical)
         .trim_end_matches('/')
         .to_string()
 }
@@ -257,7 +267,9 @@ pub fn normalize_base(raw: &str) -> String {
 /// scheme check.
 pub fn plain_http_builder(base: &str) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder();
-    if base.starts_with("https://") {
+    // Case-insensitive as a belt against un-normalized callers; a normalized
+    // base already carries a lowercase scheme.
+    if base.len() >= 8 && base[..8].eq_ignore_ascii_case("https://") {
         builder
     } else {
         builder.tls_built_in_native_certs(false)
@@ -543,5 +555,37 @@ mod tests {
         assert_eq!(lines[0], "id         state");
         assert_eq!(lines[1], "a          queued");
         assert_eq!(lines[2], "longer-id  running");
+    }
+
+    /// Schemes are case-insensitive per RFC 3986. `normalize_base` must
+    /// canonicalize them to lowercase so all forms normalize to the same base.
+    #[test]
+    fn scheme_normalization_is_case_insensitive() {
+        let base_https_lower = normalize_base("https://h:7070");
+        let base_https_upper = normalize_base("HTTPS://h:7070");
+        let base_https_mixed = normalize_base("HtTpS://h:7070");
+
+        assert_eq!(base_https_lower, base_https_upper);
+        assert_eq!(base_https_lower, base_https_mixed);
+        assert_eq!(base_https_lower, "https://h:7070");
+
+        // HTTP variants should also normalize consistently
+        let base_http_lower = normalize_base("http://h:7070");
+        let base_http_upper = normalize_base("HTTP://h:7070");
+        let base_http_mixed = normalize_base("HtTp://h:7070");
+
+        assert_eq!(base_http_lower, base_http_upper);
+        assert_eq!(base_http_lower, base_http_mixed);
+        assert_eq!(base_http_lower, "http://h:7070");
+    }
+
+    /// A client must construct successfully for uppercase and mixed-case HTTPS
+    /// schemes, preserving the TLS native roots behavior (which requires the
+    /// scheme to be recognized as https regardless of case).
+    #[test]
+    fn client_constructs_for_case_insensitive_https_schemes() {
+        assert!(ApiClient::new("HTTPS://h:7070").is_ok());
+        assert!(ApiClient::new("HtTpS://h:7070").is_ok());
+        assert!(ApiClient::new("https://h:7070").is_ok());
     }
 }
