@@ -185,8 +185,11 @@ collects. Every dimension — cpu, memory, disk — is *job-attributable*:
 it counts only what this node's containers consumed, never a host-level
 reading, so a node's `used` is comparable to its `allocated`. The field
 is `optional` and its absence means **not measured** (no runtime
-telemetry, or no reading fresher than twice the sampler interval) — never
-zero, which would misreport a wedged agent as an idle node. Like the
+telemetry, or live containers with no reading fresher than twice the
+sampler interval) — never zero, which would misreport a wedged agent as
+an idle node. The converse holds too: an agent with no containers at all
+reports a present, all-zero vector, because an idle node's usage is a
+measured fact rather than an unknown. Like the
 image-cache inventory, usage is observed-only: the leader consumes it
 outside the normalizer and it never becomes a Raft command.
 

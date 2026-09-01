@@ -481,11 +481,21 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // the SAME recorder handle and `dev_gather`, so both render the identical
     // union of coordinator + agent metrics; the second endpoint exists only so
     // dev exercises the real agent scrape path, not because the views differ.
+    //
+    // One thing only this endpoint carries: the `agent_node_used_*` series are
+    // not in the recorder at all (they are rendered per scrape so they can go
+    // absent when unmeasured — see `coppice_agent::usage`), so they reach a
+    // scrape only through this extra-render hook.
     if let Some(metrics_addr) = agent_config.metrics_addr {
         let listener = coppice_agent::metrics_server::prepare_listener(metrics_addr)
             .await
             .context("binding the dev agent metrics server")?;
-        coppice_agent::metrics_server::serve(listener, metrics_handle.clone(), dev_gather);
+        coppice_agent::metrics_server::serve(
+            listener,
+            metrics_handle.clone(),
+            dev_gather,
+            coppice_agent::usage::render_exposition,
+        );
     }
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
     // happens per concrete executor type rather than in a generic helper. The

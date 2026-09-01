@@ -11,9 +11,13 @@
 //!
 //! - **No daemon call.** [`fold`] reads the shared state under the executor
 //!   mutex and nothing else, so a heartbeat never waits on docker.
-//! - **Absent means not measured.** A fold over zero *fresh* entries answers
-//!   `None`, never `Resources::ZERO` — an agent with a wedged sampler must not
-//!   look like an idle node. Freshness is `2 × metrics_interval`: one missed
+//! - **Absent means not measured — but idle is measured zero.** Absence is
+//!   reserved for the one case that is genuinely unknown: containers *are*
+//!   live and none of them has a fresh reading, i.e. a wedged or stalled
+//!   sampler. A node with **no live containers at all** has nothing to
+//!   attribute and answers `Some(Resources::ZERO)`: that is a healthy idle
+//!   node, a fact, and reporting it absent would leave every idle node
+//!   permanently unmeasured. Freshness is `2 × metrics_interval`: one missed
 //!   tick is tolerated, two are not.
 //!
 //! CPU is the only derived dimension. Docker reports cumulative CPU time, so
@@ -109,11 +113,19 @@ fn cpu_rate_millis(prev: Reading, last: Reading) -> u64 {
 /// All three come from the same set of windows, so they stay attributable to
 /// one set of containers.
 ///
-/// Entries whose last reading is older than `max_age` are skipped as stale. If
-/// nothing survives that filter the answer is `None`: "not measured", never a
-/// zero vector (see the module docs).
+/// Entries whose last reading is older than `max_age` are skipped as stale.
+/// When nothing survives that filter, `live_containers` — the executor's count
+/// of containers it currently has live (running, starting, or holding a
+/// telemetry collector) — decides between the two very different reasons the
+/// window set can be empty:
+///
+/// - `live_containers == 0`: nothing to attribute. `Some(Resources::ZERO)` —
+///   an idle node's usage is known, and it is zero.
+/// - otherwise: containers are running but nobody is reporting on them.
+///   `None`, "not measured" (see the module docs).
 pub(crate) fn fold(
     live: &HashMap<AllocationId, LiveUsage>,
+    live_containers: usize,
     now: Timestamp,
     max_age: Duration,
 ) -> Option<Resources> {
@@ -132,7 +144,11 @@ pub(crate) fn fold(
             .disk
             .saturating_add(ByteSize::from_bytes(entry.last.disk_bytes));
     }
-    (fresh > 0).then_some(used)
+    if fresh > 0 || live_containers == 0 {
+        Some(used)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -200,24 +216,41 @@ mod tests {
                 window(reading(8, 0, 512, 200), reading(10, 4_000_000, 4_096, 200)),
             ),
         ]);
-        let used = fold(&live, ts(10), Duration::from_secs(10)).expect("both are fresh");
+        let used = fold(&live, 2, ts(10), Duration::from_secs(10)).expect("both are fresh");
         assert_eq!(used.cpu_millis, 2_500);
         assert_eq!(used.memory, ByteSize::from_bytes(6_144));
         assert_eq!(used.disk, ByteSize::from_bytes(300));
     }
 
     #[test]
-    fn stale_entries_are_skipped_and_an_empty_fold_is_absent() {
+    fn a_stale_window_under_a_live_container_is_unmeasured() {
         let live = HashMap::from([(
             AllocationId::new(),
             window(reading(0, 0, 0, 0), reading(2, 1_000_000, 4_096, 4_096)),
         )]);
         // Fresh at 2× the 5 s interval…
-        assert!(fold(&live, ts(12), Duration::from_secs(10)).is_some());
-        // …and past it, the node reports "not measured" rather than zero.
-        assert_eq!(fold(&live, ts(13), Duration::from_secs(10)), None);
-        // As does a node with no live containers at all: a fold over nothing is
-        // unmeasured, not idle.
-        assert_eq!(fold(&HashMap::new(), ts(2), Duration::from_secs(10)), None);
+        assert!(fold(&live, 1, ts(12), Duration::from_secs(10)).is_some());
+        // …and past it, with the container still live, the node reports "not
+        // measured" rather than a zero it cannot vouch for.
+        assert_eq!(fold(&live, 1, ts(13), Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn a_container_awaiting_its_first_reading_is_unmeasured() {
+        // Live container, no window for it yet (the sampler has not ticked):
+        // there is something to attribute and no reading to attribute it from.
+        assert_eq!(
+            fold(&HashMap::new(), 1, ts(2), Duration::from_secs(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_idle_node_measures_zero() {
+        // No live containers: nothing to attribute, and that is a measurement.
+        assert_eq!(
+            fold(&HashMap::new(), 0, ts(2), Duration::from_secs(10)),
+            Some(Resources::ZERO)
+        );
     }
 }
