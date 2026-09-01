@@ -899,6 +899,126 @@ async fn node_lost_then_reappearing_container_is_stopped() {
     drop(agent_dir);
 }
 
+// ---- Test 5 --------------------------------------------------------------
+
+/// One HTTP GET against the coordinator's own client listener, split into its
+/// status code and JSON body — both wanted at every assertion, since a bare
+/// status comparison leaves a failure with no record of what was said.
+async fn api_get(client: &reqwest::Client, url: &str) -> (u16, serde_json::Value) {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {url}: {e}"));
+    let status = resp.status().as_u16();
+    let text = resp.text().await.expect("response body text");
+    let body = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("GET {url} answered {status} with non-JSON ({e}): {text}"));
+    (status, body)
+}
+
+/// The ADR 0039 pipeline end to end over the real protocol: the executor's
+/// fold rides a heartbeat, ingestion peels it into the leader's sink, and the
+/// read surfaces serve it as a measured `used` rather than a zero.
+///
+/// The *rolling* half is deliberately not asserted here. A bucket closes on
+/// `limits::USAGE_BUCKET_INTERVAL` (30 s), so waiting for one would add half
+/// a minute to the suite to re-observe what
+/// `tasks::usage_history`'s virtual-time test already covers instantly. What
+/// this test is uniquely able to check is the *live* path — the one that runs
+/// on every dashboard poll — plus the shape of the utilization route now that
+/// it is no longer a 501: a known node answers 200 with its capacity and a
+/// well-formed (possibly still-empty) series, and an unknown one 404s.
+#[tokio::test]
+async fn node_usage_rides_the_heartbeat_to_the_read_surfaces() {
+    init_tracing();
+    let world = run_to_running().await;
+
+    // What the agent's executor will fold and report on its next heartbeat.
+    let used = coppice_core::resource::Resources {
+        cpu_millis: 1_750,
+        memory: coppice_core::bytes::ByteSize::from_mib(384),
+        disk: coppice_core::bytes::ByteSize::from_mib(96),
+    };
+    world.executor.set_usage(Some(used));
+
+    let client = reqwest::Client::new();
+    let node = world.node;
+    let overview_url = world.coord.api("/api/v1/overview");
+
+    // The next heartbeat carries it; the overview's cluster total is the sum
+    // of the per-node readings that exist, so with one node it is exactly it.
+    poll(DEADLINE, "overview reports measured usage", || {
+        let (client, url) = (client.clone(), overview_url.clone());
+        async move {
+            let (status, body) = api_get(&client, &url).await;
+            status == 200 && body["capacity"]["used"]["cpu_millis"] == 1_750
+        }
+    })
+    .await;
+
+    let (_, overview) = api_get(&client, &overview_url).await;
+    assert_eq!(overview["capacity"]["used"]["memory_bytes"], 384 << 20);
+    assert_eq!(overview["capacity"]["used"]["disk_bytes"], 96 << 20);
+
+    // The same reading on the node's own summary — one source, so the two
+    // surfaces can never disagree.
+    let (status, detail) =
+        api_get(&client, &world.coord.api(&format!("/api/v1/nodes/{node}"))).await;
+    assert_eq!(status, 200);
+    assert_eq!(detail["summary"]["used"]["cpu_millis"], 1_750);
+
+    // The utilization route is real now (ADR 0039 amends ADR 0031's 501).
+    let (status, util) = api_get(
+        &client,
+        &world
+            .coord
+            .api(&format!("/api/v1/nodes/{node}/utilization")),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        util["capacity"]["cpu_millis"],
+        advertised_cpu_millis(&world),
+        "utilization reports the node's registered capacity"
+    );
+    assert!(
+        util["samples"].is_array(),
+        "a known node answers with a series, empty or not: {util}"
+    );
+
+    // An unknown node is still a 404 — distinct from a known node the leader
+    // has collected nothing for.
+    let (status, _) = api_get(
+        &client,
+        &world
+            .coord
+            .api(&format!("/api/v1/nodes/{}/utilization", NodeId::new())),
+    )
+    .await;
+    assert_eq!(status, 404);
+
+    stop_agent(world.agent).await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+/// The node's registered cpu capacity, read back from the replicated state
+/// the coordinator actually applied (rather than recomputed from config).
+fn advertised_cpu_millis(world: &RunningJob) -> u64 {
+    world
+        .coord
+        .views()
+        .latest()
+        .state()
+        .nodes
+        .get(&world.node)
+        .expect("the node registered")
+        .node
+        .capacity
+        .cpu_millis
+}
+
 /// The node id the agent settles on: read back from `<data_dir>/node-identity`
 /// exactly as the daemon does (deployment-story A1).
 fn node_identity(config: &Config) -> NodeId {

@@ -89,6 +89,27 @@ pub const QUEUE_BUCKET_INTERVAL: Duration = Duration::from_secs(30);
 /// task-local, never on the `StateMachine`, never snapshotted).
 pub const QUEUE_WINDOW_MAX_BUCKETS: usize = 120;
 
+/// Width of one node-usage bucket (ADR 0039).
+///
+/// The usage-history task closes a bucket of per-node capacity/allocated/used
+/// at this cadence; the node utilization panel and the overview's capacity
+/// chart are projections over the closed buckets. Matched to
+/// [`QUEUE_BUCKET_INTERVAL`] so the two charts share an x-axis granularity.
+pub const USAGE_BUCKET_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Closed usage buckets retained per node (ADR 0039: ≤ 1 h of 30 s buckets,
+/// task-local, never on the `StateMachine`, never snapshotted). Long-term
+/// retention is Prometheus's job, off the `/metrics` gauges.
+pub const USAGE_WINDOW_MAX_BUCKETS: usize = 120;
+
+/// How old a node's usage reading may be before it reads as absent
+/// (ADR 0039).
+///
+/// Matched to [`AGENT_LIVENESS_DEADLINE`]: a node whose last report is older
+/// than this is a candidate for `DeclareNodeLost`, so a usage reading that
+/// outlives the deadline has no claim to describe anything current.
+pub const USAGE_SAMPLE_MAX_AGE: Duration = Duration::from_secs(90);
+
 /// Housekeeping tick cadence (ADR 0012 / ADR 0017): how often a leader sweeps
 /// for terminal jobs past the replicated retention TTL and for nodes past the
 /// liveness deadline.

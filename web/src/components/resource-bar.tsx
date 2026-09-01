@@ -4,7 +4,13 @@ export interface ResourceBarProps {
   label: string
   capacity: number
   allocated?: number
-  used?: number
+  /**
+   * `undefined` means the caller does not track `used` at all (omitted from
+   * the caption entirely). `null` means the caller does track it but it was
+   * not reported for this reading (measured value absent — renders a muted
+   * "not reported" instead of a fabricated 0).
+   */
+  used?: number | null
   format: (n: number) => string
   className?: string
 }
@@ -22,11 +28,11 @@ export function ResourceBar({
   format,
   className,
 }: ResourceBarProps) {
-  const pct = (n: number | undefined) =>
+  const pct = (n: number | undefined | null) =>
     n == null || capacity <= 0 ? 0 : Math.max(0, Math.min(1, n / capacity)) * 100
 
   const caption = [
-    used != null ? `${format(used)} used` : null,
+    used === null ? 'not reported' : used != null ? `${format(used)} used` : null,
     allocated != null ? `${format(allocated)} alloc` : null,
     `${format(capacity)} cap`,
   ]

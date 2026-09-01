@@ -302,6 +302,12 @@ interface MNode {
   epoch: number
   lastHeartbeatUs: number | null
   /**
+   * Whether this node has a usage sampler at all. `false` models a node with
+   * no sampler wired up (never reports `used`) — the mock's counterpart to
+   * the real coordinator's "not measured" case. Most nodes report.
+   */
+  reportsUsage: boolean
+  /**
    * Stored utilization ring (oldest first), appended every UTIL_BUCKET_US
    * tick and seeded at construction — history must be a stable recording,
    * never regenerated per request.
@@ -386,6 +392,16 @@ interface MCoordinator {
   lagEntries: number
   host: { cpuFraction: number; memoryFraction: number; diskFraction: number }
   lastSeenUs: number
+}
+
+/** One recorded point of the cluster-wide capacity history ring. */
+interface CapacityBucket {
+  tUs: number
+  capacity: Resources
+  allocated: Resources
+  used: Resources | null
+  reportingNodes: number
+  totalNodes: number
 }
 
 interface QueueBucket {
@@ -479,6 +495,7 @@ export class MockWorld {
    */
   private nextEventIndex = 1
   private queueHistory: QueueBucket[] = []
+  private capacityHistory: CapacityBucket[] = []
 
   private seqCounter = 0
   private lastBucketUs = 0
@@ -509,6 +526,7 @@ export class MockWorld {
     this.buildCoordinators()
     this.buildJobs()
     this.seedQueueHistory()
+    this.seedCapacityHistory()
     this.seedUtilHistories()
     this.seedQuotaHistories()
     this.recomputeQueueRanks()
@@ -520,7 +538,10 @@ export class MockWorld {
    * stepping by a job-sized chunk (placements/releases), with `used`
    * wobbling smoothly beneath `allocated` — so the allocated line is
    * piecewise-constant over time instead of flat, and the most recent
-   * sample agrees with live state.
+   * sample agrees with live state. A node with no sampler
+   * (`reportsUsage: false`) gets `used: null` throughout; reporting nodes
+   * occasionally get a null point too, modeling a sample that aged out —
+   * both exercise the chart's gap rendering (`connectNulls={false}`).
    */
   private seedUtilHistories(): void {
     for (const node of this.nodes.values()) {
@@ -531,11 +552,14 @@ export class MockWorld {
       for (let i = 0; i < UTIL_BUCKETS; i += 1) {
         const tUs = this.nowUs - i * UTIL_BUCKET_US
         factor = Math.min(0.9, Math.max(0.4, factor + rng.range(-0.04, 0.04)))
-        const used = res(
-          Math.round(alloc.cpuMillis * factor),
-          Math.round(alloc.memoryBytes * Math.min(1, factor + 0.1)),
-          Math.round(alloc.diskBytes * Math.min(1, factor + 0.15)),
-        )
+        const used =
+          node.reportsUsage && !rng.bool(0.03)
+            ? res(
+                Math.round(alloc.cpuMillis * factor),
+                Math.round(alloc.memoryBytes * Math.min(1, factor + 0.1)),
+                Math.round(alloc.diskBytes * Math.min(1, factor + 0.15)),
+              )
+            : null
         backward.push({ t: at(tUs), used, allocated: { ...alloc } })
         if (rng.bool(0.12)) {
           // A placement or release happened at this point (walking backward).
@@ -768,6 +792,7 @@ export class MockWorld {
       const diskTiB = this.rng.range(0.5, 8)
       const draining = i === 3 // one node draining (schedulable false, still runs work)
       const lost = i === 7 // one node Lost (stale heartbeat)
+      const noSampler = i === 10 // one node with no usage sampler wired up
       const node: MNode = {
         id: this.rng.mintId('node'),
         capacity: res(cores * 1000, memGiB * GIB, Math.round(diskTiB * TIB)),
@@ -778,6 +803,7 @@ export class MockWorld {
         lastHeartbeatUs: lost
           ? this.nowUs - this.rng.range(18 * MINUTE_US, 22 * MINUTE_US)
           : this.nowUs - this.rng.range(SECOND_US, 15 * SECOND_US),
+        reportsUsage: !noSampler,
         utilHistory: [],
       }
       this.nodes.set(node.id, node)
@@ -1222,6 +1248,29 @@ export class MockWorld {
     this.lastBucketUs = this.nowUs
   }
 
+  /**
+   * Pre-fill the same ~30-minute window as `seedQueueHistory`, at the same
+   * cadence, so the capacity chart is full on first load and doesn't jump
+   * when live ticks take over from the seed.
+   */
+  private seedCapacityHistory(): void {
+    const start = this.nowUs - QUEUE_HISTORY_BUCKETS * QUEUE_BUCKET_US
+    const histRng = new Rng(hashSeed(this.clusterId + 'capacity-seed'))
+    const snapshot = this.capacitySnapshot()
+    for (let i = 0; i < QUEUE_HISTORY_BUCKETS; i += 1) {
+      const tUs = start + i * QUEUE_BUCKET_US
+      const wobble = histRng.range(0.85, 1.05)
+      this.capacityHistory.push({
+        tUs,
+        capacity: snapshot.capacity,
+        allocated: scaleRes(snapshot.allocated, wobble),
+        used: snapshot.used ? scaleRes(snapshot.used, wobble) : null,
+        reportingNodes: snapshot.reportingNodes,
+        totalNodes: snapshot.totalNodes,
+      })
+    }
+  }
+
   // ---- simulation ----------------------------------------------------------
 
   /** Process elapsed 1s ticks up to `nowUs`, then pin the clock to `nowUs`. */
@@ -1542,13 +1591,20 @@ export class MockWorld {
     }
   }
 
-  /** Append a real (allocated, used) sample to every node's ring. */
+  /**
+   * Append a real (allocated, used) sample to every node's ring. `used` is
+   * `null` for a node with no sampler wired up (`reportsUsage: false`), and
+   * — for reporting nodes — occasionally null anyway to model a sample that
+   * aged out, so gap rendering (`connectNulls={false}`) is exercised beyond
+   * the one always-absent node.
+   */
   private tickUtilHistory(): void {
     if (this.nowUs - this.lastUtilBucketUs < UTIL_BUCKET_US) return
     for (const node of this.nodes.values()) {
+      const agedOut = node.reportsUsage && this.rng.bool(0.03)
       node.utilHistory.push({
         t: at(this.nowUs),
-        used: this.nodeUsed(node.id),
+        used: agedOut ? null : this.nodeUsedOrNull(node.id),
         allocated: this.nodeAllocated(node.id),
       })
       if (node.utilHistory.length > UTIL_BUCKETS) node.utilHistory.shift()
@@ -1566,6 +1622,9 @@ export class MockWorld {
       arrivedPerMinute: Math.round(this.arrivalsThisBucket / windowMin),
     })
     if (this.queueHistory.length > QUEUE_HISTORY_BUCKETS) this.queueHistory.shift()
+    const snapshot = this.capacitySnapshot()
+    this.capacityHistory.push({ tUs: this.nowUs, ...snapshot })
+    if (this.capacityHistory.length > QUEUE_HISTORY_BUCKETS) this.capacityHistory.shift()
     this.lastBucketUs = this.nowUs
     this.arrivalsThisBucket = 0
     this.drainsThisBucket = 0
@@ -1756,6 +1815,13 @@ export class MockWorld {
     return total
   }
 
+  /** `nodeUsed`, but `null` when the node has no usage sampler wired up (ADR-mirroring absence). */
+  private nodeUsedOrNull(nodeId: string): Resources | null {
+    const node = this.nodes.get(nodeId)
+    if (!node || !node.reportsUsage) return null
+    return this.nodeUsed(nodeId)
+  }
+
   private nodeCounts(nodeId: string): { running: number; accruing: number } {
     let running = 0
     let accruing = 0
@@ -1771,30 +1837,67 @@ export class MockWorld {
   // View builders (public API surface). All return freshly built objects.
   // ===========================================================================
 
-  buildClusterOverview(): ClusterOverview {
+  /**
+   * Aggregate capacity/allocated/used across all nodes for one instant.
+   * `capacity` excludes Lost nodes (they contribute no schedulable
+   * capacity); `allocated` and `used` sum across every node, mirroring
+   * `nodeSummary`'s per-node fields. `used` is `null` only when no node is
+   * currently reporting usage — never a fabricated zero — and
+   * `reportingNodes` records how many nodes contributed to it.
+   */
+  private capacitySnapshot(): {
+    capacity: Resources
+    allocated: Resources
+    used: Resources | null
+    reportingNodes: number
+    totalNodes: number
+  } {
     let capacity = zeroRes()
     let allocated = zeroRes()
     let used = zeroRes()
+    let reportingNodes = 0
+    for (const node of this.nodes.values()) {
+      if (node.health !== 'Lost') capacity = addRes(capacity, node.capacity)
+      allocated = addRes(allocated, this.nodeAllocated(node.id))
+      const nodeUsed = this.nodeUsedOrNull(node.id)
+      if (nodeUsed !== null) {
+        used = addRes(used, nodeUsed)
+        reportingNodes += 1
+      }
+    }
+    return {
+      capacity,
+      allocated,
+      used: reportingNodes > 0 ? used : null,
+      reportingNodes,
+      totalNodes: this.nodes.size,
+    }
+  }
+
+  buildClusterOverview(): ClusterOverview {
     let schedulable = 0
     let lost = 0
     for (const node of this.nodes.values()) {
-      if (node.health === 'Lost') {
-        lost += 1
-      } else {
-        capacity = addRes(capacity, node.capacity)
-        if (node.schedulable) schedulable += 1
-      }
-      allocated = addRes(allocated, this.nodeAllocated(node.id))
-      used = addRes(used, this.nodeUsed(node.id))
+      if (node.health === 'Lost') lost += 1
+      else if (node.schedulable) schedulable += 1
     }
+    const snapshot = this.capacitySnapshot()
     return {
       clusterId: this.clusterId,
       queue: this.buildQueueStats(),
       capacity: {
         nodes: { total: this.nodes.size, schedulable, lost },
-        capacity,
-        allocated,
-        used,
+        capacity: snapshot.capacity,
+        allocated: snapshot.allocated,
+        used: snapshot.used,
+        history: this.capacityHistory.map((b) => ({
+          t: at(b.tUs),
+          capacity: b.capacity,
+          allocated: b.allocated,
+          used: b.used,
+          reportingNodes: b.reportingNodes,
+          totalNodes: b.totalNodes,
+        })),
       },
     }
   }
@@ -2595,7 +2698,7 @@ export class MockWorld {
       id: node.id,
       capacity: { ...node.capacity },
       allocated: this.nodeAllocated(node.id),
-      used: this.nodeUsed(node.id),
+      used: this.nodeUsedOrNull(node.id),
       labels: { ...node.labels },
       schedulable: node.schedulable,
       health: node.health,
@@ -2632,7 +2735,7 @@ export class MockWorld {
       capacity: { ...node.capacity },
       samples: node.utilHistory.map((s) => ({
         t: s.t,
-        used: { ...s.used },
+        used: s.used ? { ...s.used } : null,
         allocated: { ...s.allocated },
       })),
     }

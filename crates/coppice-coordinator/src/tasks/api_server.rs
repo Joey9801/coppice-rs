@@ -30,9 +30,10 @@ use coppice_api::http::dto::{
     SubmitJobResponse, UpdateAuthorizationRequest, UpdateAuthorizationResponse,
 };
 use coppice_api::{
-    ApiError, Consistency, ControlPlane, CoordinatorMemberSummary, CoordinatorSummary,
-    JobTimelineWindow, LogFetchError, LogFetchOutcome, LogFetchRequest, MetricsFetchError,
-    MetricsFetchOutcome, MetricsFetchRequest, QueueWindow, ReadOptions, ReadView, StampedEvent,
+    ApiError, ClusterUsage, Consistency, ControlPlane, CoordinatorMemberSummary,
+    CoordinatorSummary, JobTimelineWindow, LogFetchError, LogFetchOutcome, LogFetchRequest,
+    MetricsFetchError, MetricsFetchOutcome, MetricsFetchRequest, QueueWindow, ReadOptions,
+    ReadView, StampedEvent, UsageSnapshot,
 };
 use coppice_consensus::{
     Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, Role, StateView, StateViews,
@@ -506,6 +507,15 @@ pub struct CoordinatorControlPlane<C> {
     /// [`ControlPlane::submit_job`] is a single `Option` discriminant against
     /// a `None` that nothing can make `Some`.
     failpoints: crate::failpoints::Failpoints,
+    /// The leader's heartbeat usage sink (ADR 0039), when
+    /// [`with_usage`](Self::with_usage) attached one. `None` — and an empty
+    /// `usage_history` watch — is the "nothing measured" posture every read
+    /// serves as `used: null`.
+    usage: Option<crate::usage::NodeUsage>,
+    /// The usage-history task's published rolling window. Seeded with an empty
+    /// `ClusterUsage` whose sender is dropped immediately, exactly as
+    /// `queue_window` is.
+    usage_history: watch::Receiver<Arc<ClusterUsage>>,
 }
 
 impl<C> CoordinatorControlPlane<C> {
@@ -513,11 +523,14 @@ impl<C> CoordinatorControlPlane<C> {
         // A watch whose sender is dropped immediately: borrows keep serving
         // the seeded empty window.
         let (_, queue_window) = watch::channel(QueueWindow::default());
+        let (_, usage_history) = watch::channel(Arc::new(ClusterUsage::default()));
         CoordinatorControlPlane {
             consensus,
             views,
             cluster_id,
             queue_window,
+            usage: None,
+            usage_history,
             fanout: None,
             node_handle: None,
             node_log_client: None,
@@ -532,6 +545,21 @@ impl<C> CoordinatorControlPlane<C> {
     /// ever have.
     pub(crate) fn with_failpoints(mut self, failpoints: crate::failpoints::Failpoints) -> Self {
         self.failpoints = failpoints;
+        self
+    }
+
+    /// Attach the best-effort node-usage sources (ADR 0039): the leader's
+    /// heartbeat sample sink and the usage-history task's published window.
+    /// The runtime calls this; a control plane without them serves an empty
+    /// snapshot, which renders as `used: null` everywhere rather than as zero
+    /// — the same posture a follower has with them attached.
+    pub fn with_usage(
+        mut self,
+        usage: crate::usage::NodeUsage,
+        history: watch::Receiver<Arc<ClusterUsage>>,
+    ) -> Self {
+        self.usage = Some(usage);
+        self.usage_history = history;
         self
     }
 
@@ -727,6 +755,21 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
 
     fn queue_window(&self) -> QueueWindow {
         self.queue_window.borrow().clone()
+    }
+
+    fn usage_window(&self) -> UsageSnapshot {
+        UsageSnapshot {
+            // Read live rather than from the published window: a node that
+            // has just reported should show up now, not at the next 30 s
+            // bucket close. The staleness cutoff is applied here so a silent
+            // node's last reading turns back into absence.
+            current: self
+                .usage
+                .as_ref()
+                .map(|sink| sink.snapshot(Timestamp::now(), crate::limits::USAGE_SAMPLE_MAX_AGE))
+                .unwrap_or_default(),
+            history: self.usage_history.borrow().clone(),
+        }
     }
 
     async fn job_timeline(

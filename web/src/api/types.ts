@@ -563,8 +563,12 @@ export interface GetJobUsageResponse {
 
 export interface UtilizationSample {
   t: Date
-  /** Actually consumed. */
-  used: Resources
+  /**
+   * Actually consumed, as last reported. `null` means not measured at this
+   * instant — the serving replica had no sampler coverage, or the sample
+   * aged out — never a fabricated zero.
+   */
+  used: Resources | null
   /** Funded/reserved by allocations at that instant. */
   allocated: Resources
 }
@@ -591,8 +595,13 @@ export interface NodeSummary {
   capacity: Resources
   /** Sum of funded resources of non-Released allocations. */
   allocated: Resources
-  /** Actual measured consumption. */
-  used: Resources
+  /**
+   * Measured job-attributable consumption, as last reported. `null` means
+   * not reporting — the replica serving the read has no sampler for this
+   * node, or its last sample aged out — never a zero standing in for
+   * absence.
+   */
+  used: Resources | null
   labels: Record<string, string>
   /** False = draining: no new placements, running work continues. */
   schedulable: boolean
@@ -743,11 +752,29 @@ export interface QueueStats {
   }>
 }
 
+/** One point of the cluster-wide capacity/allocated/used history (oldest first). */
+export interface CapacitySample {
+  t: Date
+  capacity: Resources
+  allocated: Resources
+  /** `null` when no node contributing to this sample was reporting usage. */
+  used: Resources | null
+  /** Nodes that contributed a measured `used` figure to this sample. */
+  reportingNodes: number
+  totalNodes: number
+}
+
 export interface ClusterCapacity {
   nodes: { total: number; schedulable: number; lost: number }
   capacity: Resources
   allocated: Resources
-  used: Resources
+  /**
+   * Aggregate measured consumption, as last reported. `null` when no node
+   * is currently reporting usage — never a fabricated zero.
+   */
+  used: Resources | null
+  /** Recent history for the capacity chart, oldest first. */
+  history: CapacitySample[]
 }
 
 export interface ClusterOverview {

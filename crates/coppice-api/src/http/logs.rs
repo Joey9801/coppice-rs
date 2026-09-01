@@ -645,6 +645,9 @@ mod tests {
         fn queue_window(&self) -> QueueWindow {
             QueueWindow::default()
         }
+        fn usage_window(&self) -> crate::UsageSnapshot {
+            crate::UsageSnapshot::default()
+        }
         async fn job_timeline(
             &self,
             _job: JobId,

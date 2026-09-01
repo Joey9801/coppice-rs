@@ -240,8 +240,11 @@ pub struct NodeSummary {
     pub capacity: Resources,
     /// Sum of funded resources across non-Released allocations.
     pub allocated: Resources,
-    /// Actual measured consumption; zero until agent telemetry lands.
-    pub used: Resources,
+    /// Measured job-attributable consumption, as the node last reported it
+    /// (ADR 0039). `null` means the node is not reporting usage — a
+    /// follower serving the read, an executor with no sampler, or a node
+    /// whose last sample aged out. Never a zero standing in for absence.
+    pub used: Option<Resources>,
     pub labels: BTreeMap<String, String>,
     /// False = draining: no new placements, running work continues.
     pub schedulable: bool,
@@ -386,16 +389,64 @@ pub struct NodeCounts {
 }
 
 /// Cluster-wide capacity, summed over the nodes in [`NodeCounts`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterCapacity {
     pub nodes: NodeCounts,
     /// Registered capacity, excluding lost nodes.
     pub capacity: Resources,
     /// Sum of funded resources across non-Released allocations.
     pub allocated: Resources,
-    /// Actual measured consumption; zero until agent telemetry lands, like
-    /// [`NodeSummary::used`] it sums.
-    pub used: Resources,
+    /// Sum of the [`NodeSummary::used`] readings that exist, `null` when no
+    /// node is reporting at all (ADR 0039). A partial sum is still reported —
+    /// `history[].reporting_nodes` is what says how much of the cluster it
+    /// actually covers.
+    pub used: Option<Resources>,
+    /// The rolling capacity/allocated/used history, oldest first — the
+    /// leader's in-memory usage window (ADR 0039). Empty on a follower and
+    /// until the first bucket closes; missing coverage is a missing sample,
+    /// never a zero.
+    pub history: Vec<CapacitySample>,
+}
+
+/// One closed bucket of the cluster's capacity history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacitySample {
+    /// Bucket start.
+    pub t: Timestamp,
+    pub capacity: Resources,
+    pub allocated: Resources,
+    /// Summed measured consumption over `reporting_nodes`; `null` when none
+    /// of them reported in this bucket.
+    pub used: Option<Resources>,
+    /// Nodes that contributed a `used` reading to this bucket.
+    pub reporting_nodes: u32,
+    /// Nodes registered at bucket close — `reporting_nodes` out of this many
+    /// is the honesty annotation on `used`.
+    pub total_nodes: u32,
+}
+
+/// `GET /api/v1/nodes/{node}/utilization` — one node's rolling
+/// allocated-vs-used history against its capacity (ADR 0039).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetNodeUtilizationResponse {
+    /// The node's registered capacity now (not per-sample: capacity only
+    /// changes on re-registration).
+    pub capacity: Resources,
+    /// Closed buckets, oldest first. Empty on a follower and until the first
+    /// bucket closes.
+    pub samples: Vec<UtilizationSample>,
+}
+
+/// One closed bucket of a node's utilization history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UtilizationSample {
+    /// Bucket start.
+    pub t: Timestamp,
+    /// Funded resources across non-Released allocations at bucket close.
+    pub allocated: Resources,
+    /// Measured job-attributable consumption; `null` when the node reported
+    /// nothing fresh in this bucket (a gap in the chart, never a zero).
+    pub used: Option<Resources>,
 }
 
 /// A job's lifecycle state as event payloads render it — the raw
@@ -2153,11 +2204,11 @@ mod tests {
                 memory_bytes: 1_000_000,
                 disk_bytes: 0,
             },
-            used: Resources {
-                cpu_millis: 0,
-                memory_bytes: 0,
+            used: Some(Resources {
+                cpu_millis: 2_500,
+                memory_bytes: 3_000_000_000,
                 disk_bytes: 0,
-            },
+            }),
             labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
             schedulable: true,
             health: NodeHealth::Unknown,
@@ -2174,7 +2225,7 @@ mod tests {
                 "id": "node-00000000-0000-0000-0000-000000000001",
                 "capacity": { "cpu_millis": 4000, "memory_bytes": 8_000_000_000u64, "disk_bytes": 0 },
                 "allocated": { "cpu_millis": 1000, "memory_bytes": 1_000_000, "disk_bytes": 0 },
-                "used": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
+                "used": { "cpu_millis": 2500, "memory_bytes": 3_000_000_000u64, "disk_bytes": 0 },
                 "labels": { "zone": "a" },
                 "schedulable": true,
                 "health": "unknown",
@@ -2236,11 +2287,25 @@ mod tests {
                     memory_bytes: 0,
                     disk_bytes: 0,
                 },
-                used: Resources {
-                    cpu_millis: 0,
-                    memory_bytes: 0,
-                    disk_bytes: 0,
-                },
+                // Nothing reported: `used` is absent, never a zero vector
+                // (ADR 0039).
+                used: None,
+                history: vec![CapacitySample {
+                    t: ts(4_970_000),
+                    capacity: Resources {
+                        cpu_millis: 4000,
+                        memory_bytes: 0,
+                        disk_bytes: 0,
+                    },
+                    allocated: Resources {
+                        cpu_millis: 0,
+                        memory_bytes: 0,
+                        disk_bytes: 0,
+                    },
+                    used: None,
+                    reporting_nodes: 0,
+                    total_nodes: 1,
+                }],
             },
         };
 
@@ -2281,7 +2346,16 @@ mod tests {
                     "nodes": { "total": 1, "schedulable": 1, "lost": 0 },
                     "capacity": { "cpu_millis": 4000, "memory_bytes": 0, "disk_bytes": 0 },
                     "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
-                    "used": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
+                    // Absence, not zero: no node is reporting usage (ADR 0039).
+                    "used": null,
+                    "history": [{
+                        "t": "1970-01-01T00:00:04.970000Z",
+                        "capacity": { "cpu_millis": 4000, "memory_bytes": 0, "disk_bytes": 0 },
+                        "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
+                        "used": null,
+                        "reporting_nodes": 0,
+                        "total_nodes": 1,
+                    }],
                 },
             })
         );

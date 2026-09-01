@@ -188,7 +188,7 @@ fn render_status(
     );
     kv(&mut out, "capacity", &resources(&capacity.capacity));
     kv(&mut out, "allocated", &resources(&capacity.allocated));
-    kv(&mut out, "used", &resources(&capacity.used));
+    kv(&mut out, "used", &measured(capacity.used.as_ref()));
 
     let _ = writeln!(out);
     kv(&mut out, "queue depth", &queue.depth.to_string());
@@ -260,6 +260,15 @@ fn rate(per_minute: Option<f64>) -> String {
     match per_minute {
         Some(rate) => format!("{rate:.2}/min"),
         None => "(no window coverage)".to_string(),
+    }
+}
+
+/// A measured `used` triple, or the honest absence of one (ADR 0039): no node
+/// is reporting usage, which is not the same as a cluster consuming nothing.
+fn measured(r: Option<&dto::Resources>) -> String {
+    match r {
+        Some(r) => resources(r),
+        None => "(not reported)".to_string(),
     }
 }
 
@@ -356,11 +365,12 @@ mod tests {
                     memory_bytes: 1024 * 1024 * 1024,
                     disk_bytes: 1024 * 1024 * 1024,
                 },
-                used: dto::Resources {
-                    cpu_millis: 0,
-                    memory_bytes: 0,
-                    disk_bytes: 0,
-                },
+                used: Some(dto::Resources {
+                    cpu_millis: 250,
+                    memory_bytes: 512 * 1024 * 1024,
+                    disk_bytes: 1024 * 1024 * 1024,
+                }),
+                history: Vec::new(),
             },
         }
     }

@@ -14,6 +14,7 @@ import {
   type AttemptView,
   type ClusterOverview,
   type ConfigureQuotaEntityInput,
+  type CapacitySample,
   type CoordinatorMember,
   type CoordinatorRole,
   type CoordinatorStatus,
@@ -35,6 +36,7 @@ import {
   type NodeHealth,
   type NodeId,
   type NodeSummary,
+  type NodeUtilization,
   type OutcomeClass,
   type QueuePositionExplainer,
   type QueueStats,
@@ -96,9 +98,8 @@ export function createRealClient(): CoppiceApi {
     listNodes: () =>
       getJson('/nodes', (body: WireListNodesResponse) => body.nodes.map(mapNodeSummary)),
     getNode: (id) => getJson(`/nodes/${encodeURIComponent(id)}`, mapNodeDetail),
-    getNodeUtilization: () => {
-      throw new Error('getNodeUtilization has no real implementation — route through the mock')
-    },
+    getNodeUtilization: (id) =>
+      getJson(`/nodes/${encodeURIComponent(id)}/utilization`, mapNodeUtilization),
     getNodeHistory: () => {
       throw new Error('getNodeHistory has no real implementation — route through the mock')
     },
@@ -242,6 +243,11 @@ interface WireResources {
 
 function mapResources(r: WireResources): Resources {
   return { cpuMillis: r.cpu_millis, memoryBytes: r.memory_bytes, diskBytes: r.disk_bytes }
+}
+
+/** `used` fields are `Resources | null` on the wire — absence, never a fabricated zero. */
+function mapResourcesOrNull(r: WireResources | null): Resources | null {
+  return r === null ? null : mapResources(r)
 }
 
 // ---------------------------------------------------------------------------
@@ -570,11 +576,32 @@ interface WireNodeCounts {
   lost: number
 }
 
+interface WireCapacitySample {
+  t: string
+  capacity: WireResources
+  allocated: WireResources
+  used: WireResources | null
+  reporting_nodes: number
+  total_nodes: number
+}
+
 interface WireClusterCapacity {
   nodes: WireNodeCounts
   capacity: WireResources
   allocated: WireResources
-  used: WireResources
+  used: WireResources | null
+  history: WireCapacitySample[]
+}
+
+function mapCapacitySample(s: WireCapacitySample): CapacitySample {
+  return {
+    t: toDate(s.t),
+    capacity: mapResources(s.capacity),
+    allocated: mapResources(s.allocated),
+    used: mapResourcesOrNull(s.used),
+    reportingNodes: s.reporting_nodes,
+    totalNodes: s.total_nodes,
+  }
 }
 
 interface WireGetClusterOverviewResponse {
@@ -591,7 +618,8 @@ function mapClusterOverview(o: WireGetClusterOverviewResponse): ClusterOverview 
       nodes: o.capacity.nodes,
       capacity: mapResources(o.capacity.capacity),
       allocated: mapResources(o.capacity.allocated),
-      used: mapResources(o.capacity.used),
+      used: mapResourcesOrNull(o.capacity.used),
+      history: o.capacity.history.map(mapCapacitySample),
     },
   }
 }
@@ -1049,7 +1077,7 @@ interface WireNodeSummary {
   id: NodeId
   capacity: WireResources
   allocated: WireResources
-  used: WireResources
+  used: WireResources | null
   labels: Record<string, string>
   schedulable: boolean
   health: WireNodeHealth
@@ -1064,7 +1092,7 @@ function mapNodeSummary(n: WireNodeSummary): NodeSummary {
     id: n.id,
     capacity: mapResources(n.capacity),
     allocated: mapResources(n.allocated),
-    used: mapResources(n.used),
+    used: mapResourcesOrNull(n.used),
     labels: n.labels,
     schedulable: n.schedulable,
     health: snakeToPascal(n.health) as NodeHealth,
@@ -1090,6 +1118,28 @@ function mapNodeDetail(n: WireGetNodeResponse): NodeDetail {
     summary: mapNodeSummary(n.summary),
     activeAttempts: n.active_attempts.map(mapAttemptView),
     accrualQueue: n.accrual_queue.map(mapAccrualView),
+  }
+}
+
+interface WireUtilizationSample {
+  t: string
+  allocated: WireResources
+  used: WireResources | null
+}
+
+interface WireGetNodeUtilizationResponse {
+  capacity: WireResources
+  samples: WireUtilizationSample[]
+}
+
+function mapNodeUtilization(n: WireGetNodeUtilizationResponse): NodeUtilization {
+  return {
+    capacity: mapResources(n.capacity),
+    samples: n.samples.map((s) => ({
+      t: toDate(s.t),
+      allocated: mapResources(s.allocated),
+      used: mapResourcesOrNull(s.used),
+    })),
   }
 }
 

@@ -57,6 +57,16 @@ describe('getClusterOverview', () => {
           capacity: { cpu_millis: 1000, memory_bytes: 2, disk_bytes: 3 },
           allocated: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
           used: { cpu_millis: 50, memory_bytes: 0, disk_bytes: 0 },
+          history: [
+            {
+              t: '2026-01-01T00:00:00.000000Z',
+              capacity: { cpu_millis: 1000, memory_bytes: 2, disk_bytes: 3 },
+              allocated: { cpu_millis: 90, memory_bytes: 1, disk_bytes: 1 },
+              used: null,
+              reporting_nodes: 1,
+              total_nodes: 2,
+            },
+          ],
         },
       }),
     )
@@ -75,6 +85,40 @@ describe('getClusterOverview', () => {
     expect(overview.queue.history[0]!.t).toBeInstanceOf(Date)
     expect(overview.queue.history[0]!.t.toISOString()).toBe('2026-01-01T00:00:00.000Z')
     expect(overview.capacity.capacity.cpuMillis).toBe(1000)
+    expect(overview.capacity.used).toEqual({ cpuMillis: 50, memoryBytes: 0, diskBytes: 0 })
+    expect(overview.capacity.history).toHaveLength(1)
+    expect(overview.capacity.history[0]!.used).toBeNull()
+    expect(overview.capacity.history[0]!.reportingNodes).toBe(1)
+    expect(overview.capacity.history[0]!.totalNodes).toBe(2)
+  })
+
+  it('maps a null cluster-wide `used` (no node reporting) through as null', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        cluster_id: 'cluster-00000000-0000-0000-0000-000000000001',
+        queue: {
+          depth: 0,
+          drain_rate_per_minute: null,
+          arrival_rate_per_minute: null,
+          oldest_queued_age_seconds: null,
+          by_state: {},
+          history: [],
+        },
+        capacity: {
+          nodes: { total: 1, schedulable: 1, lost: 0 },
+          capacity: { cpu_millis: 1000, memory_bytes: 2, disk_bytes: 3 },
+          allocated: { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 },
+          used: null,
+          history: [],
+        },
+        recent_events: { floor_index: 0, events: [] },
+      }),
+    )
+    const client = createRealClient()
+    const overview = await client.getClusterOverview()
+
+    expect(overview.capacity.used).toBeNull()
+    expect(overview.capacity.history).toEqual([])
   })
 })
 
@@ -173,6 +217,43 @@ describe('getJobUsage', () => {
     expect(usage.samples[0]!.cpuUsageTotalUs).toBe(500_000)
     expect(usage.samples[0]!.at).toBeInstanceOf(Date)
     expect(usage.sources[0]!.availability).toBe('available')
+  })
+})
+
+describe('getNodeUtilization', () => {
+  it('fetches the node utilization route and maps null `used` samples through as null', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        capacity: { cpu_millis: 8000, memory_bytes: 1000, disk_bytes: 2000 },
+        samples: [
+          {
+            t: '2026-01-01T00:00:00.000000Z',
+            allocated: { cpu_millis: 4000, memory_bytes: 500, disk_bytes: 1000 },
+            used: { cpu_millis: 3000, memory_bytes: 400, disk_bytes: 900 },
+          },
+          {
+            t: '2026-01-01T00:00:30.000000Z',
+            allocated: { cpu_millis: 4000, memory_bytes: 500, disk_bytes: 1000 },
+            used: null,
+          },
+        ],
+      }),
+    )
+    const client = createRealClient()
+    const utilization = await client.getNodeUtilization('node-00000000-0000-0000-0000-000000000001')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/nodes/node-00000000-0000-0000-0000-000000000001/utilization',
+      expect.anything(),
+    )
+    expect(utilization.capacity.cpuMillis).toBe(8000)
+    expect(utilization.samples[0]!.used).toEqual({
+      cpuMillis: 3000,
+      memoryBytes: 400,
+      diskBytes: 900,
+    })
+    expect(utilization.samples[1]!.used).toBeNull()
+    expect(utilization.samples[1]!.t).toBeInstanceOf(Date)
   })
 })
 

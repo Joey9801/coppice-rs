@@ -20,7 +20,7 @@ use coppice_state::{
     AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
 
-use crate::{CoordinatorSummary, JobTimelineWindow, QueueWindow};
+use crate::{CoordinatorSummary, JobTimelineWindow, QueueWindow, UsageSnapshot};
 
 use super::dto;
 
@@ -79,12 +79,18 @@ fn node_summary(
     node_id: &NodeId,
     record: &coppice_state::NodeRecord,
     memo: &NodeMemo,
+    usage: &UsageSnapshot,
 ) -> dto::NodeSummary {
     dto::NodeSummary {
         id: *node_id,
         capacity: (&record.node.capacity).into(),
         allocated: (&memo.allocated).into(),
-        used: (&Resources::ZERO).into(),
+        // Absent when this node is not reporting (ADR 0039) — which is every
+        // node when a follower serves the read.
+        used: usage
+            .current
+            .get(node_id)
+            .map(|sample| (&sample.used).into()),
         labels: record.node.labels.clone(),
         schedulable: record.node.schedulable,
         health: node_health(record),
@@ -95,7 +101,7 @@ fn node_summary(
     }
 }
 
-pub fn list_nodes(state: &StateMachine) -> dto::ListNodesResponse {
+pub fn list_nodes(state: &StateMachine, usage: &UsageSnapshot) -> dto::ListNodesResponse {
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
 
@@ -104,20 +110,24 @@ pub fn list_nodes(state: &StateMachine) -> dto::ListNodesResponse {
         .iter()
         .map(|(id, record)| {
             let memo = memos.get(id).unwrap_or(&empty);
-            node_summary(id, record, memo)
+            node_summary(id, record, memo, usage)
         })
         .collect();
 
     dto::ListNodesResponse { nodes }
 }
 
-pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<dto::GetNodeResponse> {
+pub fn get_node(
+    state: &StateMachine,
+    id: &NodeId,
+    usage: &UsageSnapshot,
+) -> Option<dto::GetNodeResponse> {
     let record = state.nodes.get(id)?;
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
     let memo = memos.get(id).unwrap_or(&empty);
 
-    let summary = node_summary(id, record, memo);
+    let summary = node_summary(id, record, memo, usage);
 
     let active_attempts = state
         .attempts
@@ -167,18 +177,21 @@ pub fn get_node(state: &StateMachine, id: &NodeId) -> Option<dto::GetNodeRespons
 ///
 /// `now` is the reader's wall clock, used only for `oldest_queued_age_seconds`
 /// — a *read-time* age, not replicated state (apply never reads a clock).
-/// The caller passes it in so this stays a pure function of its inputs, as is
-/// the derived source `window` (this replica's queue buckets, ADR 0032 tier 3).
+/// The caller passes it in so this stays a pure function of its inputs, as
+/// are the two derived sources: `window` (this replica's queue buckets,
+/// ADR 0032 tier 3) and `usage` (the leader's best-effort node-usage
+/// snapshot, ADR 0039).
 pub fn cluster_overview(
     state: &StateMachine,
     cluster_id: ClusterId,
     now: Timestamp,
     window: &QueueWindow,
+    usage: &UsageSnapshot,
 ) -> dto::GetClusterOverviewResponse {
     dto::GetClusterOverviewResponse {
         cluster_id,
         queue: queue_stats(state, now, window),
-        capacity: cluster_capacity(state),
+        capacity: cluster_capacity(state, usage),
     }
 }
 
@@ -204,7 +217,7 @@ pub fn job_timeline(window: &JobTimelineWindow) -> dto::GetJobTimelineResponse {
     }
 }
 
-fn cluster_capacity(state: &StateMachine) -> dto::ClusterCapacity {
+fn cluster_capacity(state: &StateMachine, usage: &UsageSnapshot) -> dto::ClusterCapacity {
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
 
@@ -234,14 +247,74 @@ fn cluster_capacity(state: &StateMachine) -> dto::ClusterCapacity {
         allocated = allocated.saturating_add(&memo.allocated);
     }
 
+    // The sum of the per-node readings that exist, over the nodes still in
+    // state — never a zero standing in for "nobody reported" (ADR 0039).
+    let mut used: Option<Resources> = None;
+    for id in state.nodes.keys() {
+        if let Some(sample) = usage.current.get(id) {
+            used = Some(used.unwrap_or(Resources::ZERO).saturating_add(&sample.used));
+        }
+    }
+
     dto::ClusterCapacity {
         nodes,
         capacity: (&capacity).into(),
         allocated: (&allocated).into(),
-        // The sum of the per-node zeros of `NodeSummary::used`: no agent
-        // telemetry exists to measure actual consumption yet.
-        used: (&Resources::ZERO).into(),
+        used: used.as_ref().map(Into::into),
+        history: capacity_history(usage),
     }
+}
+
+/// The cluster's rolling capacity history, oldest first (ADR 0039). Missing
+/// coverage is a missing sample — a bucket the leader never produced simply
+/// is not here — and a bucket in which no node reported carries `used: null`
+/// rather than a zero.
+fn capacity_history(usage: &UsageSnapshot) -> Vec<dto::CapacitySample> {
+    usage
+        .history
+        .cluster
+        .iter()
+        .map(|b| dto::CapacitySample {
+            t: b.bucket.start,
+            capacity: (&b.bucket.capacity).into(),
+            allocated: (&b.bucket.allocated).into(),
+            used: b.bucket.used.as_ref().map(Into::into),
+            reporting_nodes: b.reporting_nodes,
+            total_nodes: b.total_nodes,
+        })
+        .collect()
+}
+
+/// `GET /api/v1/nodes/{node}/utilization` (ADR 0039). `None` when the node is
+/// not in the replicated state — a 404, distinct from a known node whose
+/// window is empty because nothing has been collected for it yet.
+pub fn node_utilization(
+    state: &StateMachine,
+    id: &NodeId,
+    usage: &UsageSnapshot,
+) -> Option<dto::GetNodeUtilizationResponse> {
+    let record = state.nodes.get(id)?;
+    let samples = usage
+        .history
+        .nodes
+        .get(id)
+        .map(|window| {
+            window
+                .buckets
+                .iter()
+                .map(|b| dto::UtilizationSample {
+                    t: b.start,
+                    allocated: (&b.allocated).into(),
+                    used: b.used.as_ref().map(Into::into),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(dto::GetNodeUtilizationResponse {
+        capacity: (&record.node.capacity).into(),
+        samples,
+    })
 }
 
 /// `GET /api/v1/queue/stats`. The `queue` field of the overview, served on
@@ -1382,7 +1455,7 @@ mod tests {
     #[test]
     fn list_nodes_returns_empty_for_no_nodes() {
         let state = StateMachine::default();
-        let response = list_nodes(&state);
+        let response = list_nodes(&state, &no_usage());
         assert!(response.nodes.is_empty());
     }
 
@@ -1394,7 +1467,7 @@ mod tests {
         state.nodes.insert(n1, test_node(n1));
         state.nodes.insert(n2, test_node(n2));
 
-        let response = list_nodes(&state);
+        let response = list_nodes(&state, &no_usage());
         assert_eq!(response.nodes.len(), 2);
     }
 
@@ -1439,7 +1512,7 @@ mod tests {
             ),
         );
 
-        let response = list_nodes(&state);
+        let response = list_nodes(&state, &no_usage());
         assert_eq!(response.nodes.len(), 1);
         let summary = &response.nodes[0];
         assert_eq!(summary.running_count, 1);
@@ -1452,14 +1525,14 @@ mod tests {
         let mut state = StateMachine::default();
         state.nodes.insert(node, test_node(node));
 
-        let response = list_nodes(&state);
+        let response = list_nodes(&state, &no_usage());
         assert_eq!(response.nodes[0].health, dto::NodeHealth::Unknown);
     }
 
     #[test]
     fn get_node_returns_none_for_missing() {
         let state = StateMachine::default();
-        assert!(get_node(&state, &NodeId::new()).is_none());
+        assert!(get_node(&state, &NodeId::new(), &no_usage()).is_none());
     }
 
     #[test]
@@ -1480,7 +1553,7 @@ mod tests {
             test_allocation(alloc, job, attempt, node, AllocationState::Active),
         );
 
-        let response = get_node(&state, &node).unwrap();
+        let response = get_node(&state, &node, &no_usage()).unwrap();
         assert_eq!(response.active_attempts.len(), 1);
         assert_eq!(response.active_attempts[0].rate_ucu_per_second, 100);
         assert_eq!(response.active_attempts[0].outcome, None);
@@ -1522,10 +1595,17 @@ mod tests {
         CLUSTER.parse().unwrap()
     }
 
-    /// [`cluster_overview`] with an empty derived source — what a replica
-    /// with no bucket coverage serves.
+    /// The usage snapshot a replica with no measurements serves — a
+    /// follower, or a leader no agent has reported to yet. Every `used`
+    /// projected from it is honestly absent (ADR 0039).
+    fn no_usage() -> UsageSnapshot {
+        UsageSnapshot::default()
+    }
+
+    /// [`cluster_overview`] with empty derived sources — what a replica with
+    /// no bucket coverage serves.
     fn overview(state: &StateMachine, now: Timestamp) -> dto::GetClusterOverviewResponse {
-        cluster_overview(state, cluster(), now, &QueueWindow::default())
+        cluster_overview(state, cluster(), now, &QueueWindow::default(), &no_usage())
     }
 
     #[test]
@@ -1567,8 +1647,10 @@ mod tests {
         assert_eq!(capacity.nodes.lost, 0);
         assert_eq!(capacity.capacity.cpu_millis, 8000);
         assert_eq!(capacity.allocated.cpu_millis, 1000);
-        // No telemetry: measured use is zero, as on every node summary.
-        assert_eq!(capacity.used.cpu_millis, 0);
+        // No telemetry: measured use is honestly absent, as on every node
+        // summary — never a zero vector (ADR 0039).
+        assert_eq!(capacity.used, None);
+        assert!(capacity.history.is_empty());
     }
 
     #[test]
@@ -1780,7 +1862,14 @@ mod tests {
     #[test]
     fn overview_serves_rates_and_history_from_the_window() {
         let window = window_of(vec![bucket(0, 5, 2, 1)]);
-        let queue = cluster_overview(&StateMachine::default(), cluster(), ts(0), &window).queue;
+        let queue = cluster_overview(
+            &StateMachine::default(),
+            cluster(),
+            ts(0),
+            &window,
+            &no_usage(),
+        )
+        .queue;
         assert_eq!(queue.arrival_rate_per_minute, Some(4.0));
         assert_eq!(queue.drain_rate_per_minute, Some(2.0));
         assert_eq!(queue.history.len(), 1);

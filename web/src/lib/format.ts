@@ -229,8 +229,25 @@ export function formatPercent(fraction: number, digits = 0): string {
   return `${(fraction * 100).toFixed(digits)}%`
 }
 
-/** Per-dimension fraction of `part` over `whole` (0 when whole is 0). */
-export function resourceFractions(part: Resources, whole: Resources) {
+/**
+ * Per-dimension fraction of `part` over `whole` (0 when whole is 0). `part`
+ * null (measured `used` not reported) yields null fractions — an absence,
+ * never a fabricated 0%. Overloaded so a non-null `part` (e.g. `allocated`,
+ * always known) keeps a non-null return type at call sites.
+ */
+export function resourceFractions(
+  part: Resources,
+  whole: Resources,
+): { cpu: number; memory: number; disk: number }
+export function resourceFractions(
+  part: Resources | null,
+  whole: Resources,
+): { cpu: number | null; memory: number | null; disk: number | null }
+export function resourceFractions(
+  part: Resources | null,
+  whole: Resources,
+): { cpu: number | null; memory: number | null; disk: number | null } {
+  if (part === null) return { cpu: null, memory: null, disk: null }
   const frac = (a: number, b: number) => (b > 0 ? a / b : 0)
   return {
     cpu: frac(part.cpuMillis, whole.cpuMillis),

@@ -23,7 +23,7 @@ use crate::tasks::housekeeping::HistorySink;
 use crate::tasks::node_client::NodeClient;
 use crate::tasks::{
     agent_gateway, derived_stats, dispatch, event_fanout, housekeeping, ingestion, learner_gc,
-    renewal, scheduler_driver,
+    renewal, scheduler_driver, usage_history,
 };
 
 /// The groups-claim name (ADR 0022) as the serving replica sees it *now*, read
@@ -242,6 +242,11 @@ where
     // Leader-only health-monitor state, shared (not a channel) between
     // ingestion (marks) and housekeeping (seeds/reads) — see `crate::liveness`.
     let liveness = NodeLiveness::new();
+    // Its ADR 0039 twin: heartbeat `used` readings, peeled off by ingestion
+    // and read by the usage-history task, the `/metrics` gather, and the API's
+    // usage reads. Same shape, same leader-only lifetime, same reason it is a
+    // shared map rather than a channel (`crate::usage`).
+    let usage = crate::usage::NodeUsage::new();
 
     // ---- Channels (capacities from `crate::limits`) ----
     let (inbound_tx, inbound_rx) = mpsc::channel(AGENT_INBOUND_CAPACITY);
@@ -260,6 +265,15 @@ where
     let (queue_window, derived_stats_join) =
         derived_stats::spawn(fanout.clone(), views.clone(), shutdown_rx.clone());
     tracing::debug!("runtime: derived stats up");
+
+    // Rolling node-usage history (ADR 0039): samples capacity/allocated from
+    // the published view and `used` from the sink into 30 s buckets, and
+    // installs the pair as this process's `/metrics` usage source. Runs on
+    // every replica — a follower's sink is simply empty, so its buckets carry
+    // honestly-absent `used`.
+    let (cluster_usage, usage_history_join) =
+        usage_history::spawn(views.clone(), usage.clone(), shutdown_rx.clone());
+    tracing::debug!("runtime: usage history up");
 
     let Gateway {
         router,
@@ -308,6 +322,7 @@ where
     let control_plane = Arc::new(
         CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
             .with_derived(queue_window, fanout.clone())
+            .with_usage(usage.clone(), cluster_usage)
             .with_node_handle(node_handle.clone())
             .with_log_client(node_log_client)
             // Writes that land here while this replica follows go to the
@@ -376,6 +391,7 @@ where
         views.clone(),
         router.clone(),
         liveness.clone(),
+        usage,
         inbound_rx,
         status.clone(),
         shutdown_rx.clone(),
@@ -495,6 +511,9 @@ where
     let _ = learner_gc_join.await;
     tracing::debug!("runtime: leader-only loops down");
 
+    // Usage history subscribes to nothing, but its watch backs live reads:
+    // drain it with the other derived producers, before the fanout.
+    let _ = usage_history_join.await;
     // Derived stats subscribes to the fanout, so it drains before it.
     let _ = derived_stats_join.await;
     let _ = fanout_join.await;
