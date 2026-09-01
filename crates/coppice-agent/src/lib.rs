@@ -115,21 +115,25 @@ pub fn describe_metrics() {
     executor::docker::describe_metrics();
     telemetry::describe_metrics();
     node_service::describe_metrics();
-    usage::describe_metrics();
+    // Note the absence of `usage`: the node-usage series are rendered directly
+    // onto each scrape rather than recorded, precisely so they can vanish when
+    // unmeasured (see [`usage`]), and a recorder that never sees them has
+    // nothing to describe.
 }
 
 /// Run any point-in-time sampling behind agent metrics, recursing the same
 /// modules as [`describe_metrics`]. The `/metrics` server calls this
 /// immediately before rendering each scrape.
+///
+/// Every agent metric today is *pushed* at the event that changes it, so every
+/// arm here is a no-op; the one genuinely sampled surface, node usage, cannot
+/// live in a recorder at all ([`usage::render_exposition`] explains why) and is
+/// appended to the scrape instead.
 pub fn gather_metrics() {
     coppice_tls::gather_metrics();
     executor::docker::gather_metrics();
     telemetry::gather_metrics();
     node_service::gather_metrics();
-    // The one genuinely *sampled* entry in this fan-out (usage.rs): it asks the
-    // session-installed executor handle for a fresh node-usage fold rather than
-    // reading a value some earlier event pushed.
-    usage::gather_metrics();
 }
 
 /// How often the detached upkeep task drains the recorder's histogram buckets.
@@ -359,7 +363,12 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
             .await
             .context("binding the metrics server listener")?;
         tracing::info!(%metrics_addr, "Prometheus metrics server bound at /metrics (issue #46)");
-        metrics_server::serve(listener, metrics_handle, gather_metrics);
+        metrics_server::serve(
+            listener,
+            metrics_handle,
+            gather_metrics,
+            usage::render_exposition,
+        );
     }
 
     let session = session::Session::new(

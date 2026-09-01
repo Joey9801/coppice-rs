@@ -314,6 +314,27 @@ impl ExecutorState {
         metrics::gauge!(AGENT_RUNNING_JOBS).set(self.running.len() as f64);
     }
 
+    /// How many containers this executor currently has live, for usage.rs's
+    /// idle-versus-unmeasured decision: the union of the observed `running`
+    /// set, the starts in flight here, and the allocations still holding a
+    /// telemetry collector.
+    ///
+    /// Deliberately the *union* rather than `running.len()`. `running` is an
+    /// `observe` snapshot, so on its own it would read empty in the window
+    /// between a start and the next observation — and an empty count is what
+    /// licenses reporting zero usage. Every set that can hold a container the
+    /// fold ought to be accounting for is counted, so "idle" is claimed only
+    /// when the executor has nothing whatsoever in flight.
+    pub(crate) fn live_container_count(&self) -> usize {
+        self.running
+            .iter()
+            .chain(self.starting.iter())
+            .chain(self.collectors.keys())
+            .chain(self.live_usage.keys())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
     /// Record one container's metrics reading in its usage window (usage.rs).
     /// Called at the end of every sampler tick, under the lock like every other
     /// mutation here; the fold reads the window without touching the daemon.
@@ -1094,14 +1115,21 @@ impl Executor for DockerExecutor {
     /// daemon call, because the session calls this on the heartbeat path.
     ///
     /// `None` when job telemetry is disabled (no configured sink ⇒ no sampler
-    /// ever runs, so there is genuinely nothing measured) or when no container
-    /// has a reading fresher than `2 × metrics_interval`.
+    /// ever runs, so there is genuinely nothing measured) or when containers
+    /// are live but none has a reading fresher than `2 × metrics_interval` (a
+    /// stalled sampler). An executor with **no** live containers answers
+    /// `Some(Resources::ZERO)` — an idle node's usage is measured, and zero.
     fn sample_usage(&self) -> Option<coppice_core::resource::Resources> {
         let interval = self.inner.telemetry.as_ref()?.metrics_interval;
         let interval_us = i64::try_from(interval.as_micros()).unwrap_or(i64::MAX);
         let max_age = coppice_core::time::Duration::from_micros(interval_us.saturating_mul(2));
         let state = lock_state(&self.inner.state);
-        usage::fold(&state.live_usage, Timestamp::now(), max_age)
+        usage::fold(
+            &state.live_usage,
+            state.live_container_count(),
+            Timestamp::now(),
+            max_age,
+        )
     }
 
     fn evict_image(&self, digest: String) {

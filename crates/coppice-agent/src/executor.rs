@@ -262,9 +262,12 @@ pub trait Executor: Send + Sync + 'static {
     /// the container runtime here.
     ///
     /// `None` means **not measured**, never zero: this runtime measures
-    /// nothing, or has no fresh reading. A zero-usage node reports
-    /// `Some(Resources::ZERO)`; the distinction survives all the way to the
-    /// wire (`agent.proto`'s `Heartbeat.used`).
+    /// nothing, or it has live containers and no fresh reading for any of them
+    /// (a wedged sampler). An implementation with **no live containers** must
+    /// answer `Some(Resources::ZERO)` instead — a healthy idle node has nothing
+    /// to attribute, which is a measurement, not an unknown. A zero-usage node
+    /// likewise reports `Some(Resources::ZERO)`; the distinction survives all
+    /// the way to the wire (`agent.proto`'s `Heartbeat.used`).
     ///
     /// Sync (like the two hint methods) both because the answer is a local read
     /// and because a sync default body sidesteps the async-fn-in-trait
@@ -425,7 +428,8 @@ impl FakeExecutor {
 
     /// Set what [`Executor::sample_usage`] answers — the test control over the
     /// node-usage pipeline (heartbeat → coordinator) without a docker daemon.
-    /// `None` restores the default "not measured" reading.
+    /// `None` restores the default "not measured" reading; `Some(Resources::ZERO)`
+    /// stands in for the docker executor's idle node, which measures zero.
     pub fn set_usage(&self, usage: Option<Resources>) {
         self.lock().usage = usage;
     }
@@ -517,7 +521,9 @@ impl Executor for FakeExecutor {
     }
 
     /// Whatever [`FakeExecutor::set_usage`] last installed — `None` by default,
-    /// since a fake runtime genuinely measures nothing.
+    /// since a fake runtime genuinely measures nothing (the idle-node
+    /// `Some(Resources::ZERO)` rule belongs to runtimes that do measure; a test
+    /// asks for it explicitly).
     fn sample_usage(&self) -> Option<Resources> {
         self.lock().usage
     }
