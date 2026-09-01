@@ -88,6 +88,11 @@ mod runtime;
 // serve, STOPPING=1 at shutdown. Silent no-op off systemd.
 mod systemd;
 mod tasks;
+// The best-effort node-usage sink (ADR 0039) and its `coppice_node_*` scrape
+// surface: heartbeat samples in, charts and gauges out. Private — the runtime
+// constructs one and hands it to ingestion, the history task, and the control
+// plane; nothing outside this crate holds one.
+mod usage;
 // The real coordinator renewal attempt (leader-local branch included),
 // exposed so integration tests can drive it without waiting out the timer.
 #[doc(hidden)]
@@ -145,6 +150,7 @@ pub fn describe_metrics() {
     coppice_tls::describe_metrics();
     tasks::event_fanout::describe_metrics();
     tasks::node_client::describe_metrics();
+    usage::describe_metrics();
 }
 
 /// Run any point-in-time sampling behind coordinator metrics, recursing the
@@ -156,6 +162,7 @@ pub fn gather_metrics() {
     coppice_tls::gather_metrics();
     tasks::event_fanout::gather_metrics();
     tasks::node_client::gather_metrics();
+    usage::gather_metrics();
 }
 
 /// Parse-and-dispatch entry point the binary calls.

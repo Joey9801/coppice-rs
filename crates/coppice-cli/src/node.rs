@@ -312,7 +312,16 @@ fn render_detail(response: &dto::GetNodeResponse) -> String {
     kv(&mut out, "epoch", &summary.epoch.to_string());
     kv(&mut out, "capacity", &resources(&summary.capacity));
     kv(&mut out, "allocated", &resources(&summary.allocated));
-    kv(&mut out, "used", &resources(&summary.used));
+    kv(
+        &mut out,
+        "used",
+        // Absence, never a zero triple: the node is not reporting usage
+        // (ADR 0039).
+        &match summary.used.as_ref() {
+            Some(used) => resources(used),
+            None => "(not reported)".to_string(),
+        },
+    );
     kv(
         &mut out,
         "last heartbeat",
@@ -408,11 +417,11 @@ mod tests {
                 memory_bytes: 1024 * 1024 * 1024,
                 disk_bytes: 1024 * 1024 * 1024,
             },
-            used: dto::Resources {
-                cpu_millis: 0,
-                memory_bytes: 0,
+            used: Some(dto::Resources {
+                cpu_millis: 250,
+                memory_bytes: 512 * 1024 * 1024,
                 disk_bytes: 0,
-            },
+            }),
             labels,
             schedulable: true,
             health: dto::NodeHealth::Unknown,

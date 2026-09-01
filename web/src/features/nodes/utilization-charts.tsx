@@ -23,10 +23,13 @@ const TOOLTIP_CONTENT_STYLE = {
 const LEGEND_STYLE = { fontSize: 11 } as const
 
 /// Recharts scales a numeric axis, so the series carries epoch
-/// milliseconds; `Date` is reconstructed only to format a tick.
+/// milliseconds; `Date` is reconstructed only to format a tick. `used: null`
+/// (not measured at that instant) renders as a gap, never a fabricated 0 —
+/// `connectNulls={false}` on the `used` area keeps the gap visible instead
+/// of bridging across it.
 interface SeriesPoint {
   tMs: number
-  used: number
+  used: number | null
   allocated: number
 }
 
@@ -69,7 +72,10 @@ function UtilizationAreaChart({ data, format, gradientId }: UtilizationAreaChart
         <Tooltip
           contentStyle={TOOLTIP_CONTENT_STYLE}
           labelFormatter={(ms) => formatTimeOfDay(new Date(Number(ms)))}
-          formatter={(value, name) => [format(Number(value)), name]}
+          formatter={(value, name) => [
+            value == null ? 'not reported' : format(Number(value)),
+            name,
+          ]}
         />
         <Legend wrapperStyle={LEGEND_STYLE} />
         <Area
@@ -89,6 +95,7 @@ function UtilizationAreaChart({ data, format, gradientId }: UtilizationAreaChart
           strokeWidth={2}
           fill={`url(#${gradientId}-used)`}
           isAnimationActive={false}
+          connectNulls={false}
         />
       </AreaChart>
     </ResponsiveContainer>
@@ -98,12 +105,12 @@ function UtilizationAreaChart({ data, format, gradientId }: UtilizationAreaChart
 export function UtilizationCharts({ utilization }: { utilization: NodeUtilization }) {
   const cpu = utilization.samples.map((s) => ({
     tMs: s.t.getTime(),
-    used: s.used.cpuMillis,
+    used: s.used?.cpuMillis ?? null,
     allocated: s.allocated.cpuMillis,
   }))
   const memory = utilization.samples.map((s) => ({
     tMs: s.t.getTime(),
-    used: s.used.memoryBytes,
+    used: s.used?.memoryBytes ?? null,
     allocated: s.allocated.memoryBytes,
   }))
 

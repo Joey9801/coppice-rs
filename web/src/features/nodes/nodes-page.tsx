@@ -129,7 +129,13 @@ function NodeRow({ node }: { node: NodeSummary }) {
       <TableCell>
         <MiniBar fraction={allocFrac.memory} />
       </TableCell>
-      <TableCell className="text-right tabular-nums">{formatPercent(usedFrac.cpu)}</TableCell>
+      <TableCell className="text-right tabular-nums">
+        {usedFrac.cpu != null ? (
+          formatPercent(usedFrac.cpu)
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        )}
+      </TableCell>
       <TableCell className="text-right tabular-nums">
         {node.runningCount} / {node.accruingCount}
       </TableCell>

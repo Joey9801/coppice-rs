@@ -128,8 +128,16 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatTile label="Running attempts" value={summary.runningCount} />
         <StatTile label="Accruing allocations" value={summary.accruingCount} />
-        <StatTile label="CPU used" value={formatPercent(usedFrac.cpu)} hint="of capacity" />
-        <StatTile label="Memory used" value={formatPercent(usedFrac.memory)} hint="of capacity" />
+        <StatTile
+          label="CPU used"
+          value={usedFrac.cpu != null ? formatPercent(usedFrac.cpu) : '—'}
+          hint={usedFrac.cpu != null ? 'of capacity' : 'not reported'}
+        />
+        <StatTile
+          label="Memory used"
+          value={usedFrac.memory != null ? formatPercent(usedFrac.memory) : '—'}
+          hint={usedFrac.memory != null ? 'of capacity' : 'not reported'}
+        />
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">

@@ -36,6 +36,7 @@ use crate::leadership;
 use crate::liveness::NodeLiveness;
 use crate::tasks::agent_gateway::{InboundReport, RouteCommand, RouterHandle};
 use crate::tasks::dispatch::{register_accepted_command, stop_job_command};
+use crate::usage::NodeUsage;
 
 use coppice_proto::pb::agent::v1::agent_report::Body;
 
@@ -66,11 +67,13 @@ impl Normalized {
 }
 
 /// Run the ingestion loop until shutdown.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<C: Consensus>(
     consensus: Arc<C>,
     views: StateViews,
     router: RouterHandle,
     liveness: NodeLiveness,
+    usage: NodeUsage,
     mut inbound: mpsc::Receiver<InboundReport>,
     mut status: watch::Receiver<ConsensusStatus>,
     mut shutdown: watch::Receiver<bool>,
@@ -89,6 +92,7 @@ pub async fn run<C: Consensus>(
             &views,
             &router,
             &liveness,
+            &usage,
             &mut inbound,
             &mut status,
             term,
@@ -113,6 +117,7 @@ async fn drain<C: Consensus>(
     views: &StateViews,
     router: &RouterHandle,
     liveness: &NodeLiveness,
+    usage: &NodeUsage,
     inbound: &mut mpsc::Receiver<InboundReport>,
     status: &mut watch::Receiver<ConsensusStatus>,
     term: u64,
@@ -126,7 +131,9 @@ async fn drain<C: Consensus>(
             }
             report = inbound.recv() => {
                 let Some(report) = report else { return false };
-                if let Some(lost) = ingest(consensus, views, router, liveness, &report).await {
+                if let Some(lost) =
+                    ingest(consensus, views, router, liveness, usage, &report).await
+                {
                     return lost;
                 }
             }
@@ -141,6 +148,7 @@ async fn ingest<C: Consensus>(
     views: &StateViews,
     router: &RouterHandle,
     liveness: &NodeLiveness,
+    usage: &NodeUsage,
     report: &InboundReport,
 ) -> Option<bool> {
     let node = report.node;
@@ -151,6 +159,7 @@ async fn ingest<C: Consensus>(
     if normalized.liveness {
         liveness.mark(node);
     }
+    record_usage(usage, report);
 
     // Propose every log command; remember a successful RegisterNode's index so
     // we can read-our-writes before stamping RegisterAccepted.
@@ -216,6 +225,38 @@ async fn ingest<C: Consensus>(
     }
 
     None
+}
+
+/// Peel a heartbeat's `used` reading off into the leader's usage sink (ADR
+/// 0039) — beside `liveness.mark`, and deliberately outside [`normalize`].
+///
+/// Structurally, not just by convention: `normalize` returns a [`Normalized`]
+/// whose only outputs are log commands and stop routes, so a field read here
+/// has nowhere to become a command even by mistake. Usage is observed-only —
+/// it is never replicated, never snapshotted, and never priced.
+///
+/// Best-effort like liveness: no epoch check (a stale-epoch heartbeat is still
+/// this node reporting its own containers), and a malformed `NodeUsage` is
+/// dropped with a debug line rather than failing the report.
+fn record_usage(usage: &NodeUsage, report: &InboundReport) {
+    let Some(Body::Heartbeat(hb)) = report.report.body.as_ref() else {
+        return;
+    };
+    let Some(reported) = hb.used.clone() else {
+        // Absent = "not measured" (agent.proto). Nothing is recorded, so the
+        // node's previous reading ages out rather than being overwritten with
+        // a zero.
+        return;
+    };
+    match coppice_proto::convert::node_usage_from_pb(reported) {
+        Ok((used, sampled_at)) => usage.record(
+            report.node,
+            coppice_api::NodeUsageSample { used, sampled_at },
+        ),
+        Err(e) => {
+            tracing::debug!(%report.node, error = %e, "ingestion: malformed heartbeat usage, dropping");
+        }
+    }
 }
 
 /// Normalize one agent report into a [`Normalized`] verdict.
@@ -677,6 +718,16 @@ mod tests {
         })
     }
 
+    /// A heartbeat carrying a `used` reading (ADR 0039).
+    fn heartbeat_with_usage(used: &Resources, sampled_at: Timestamp) -> Body {
+        Body::Heartbeat(Heartbeat {
+            capacity: None,
+            running: Vec::new(),
+            image_cache: None,
+            used: Some(coppice_proto::convert::node_usage_to_pb(used, sampled_at)),
+        })
+    }
+
     fn attempt_status(attempt: AttemptId, observed: &AttemptState, runtime_us: u64) -> Body {
         Body::AttemptStatus(AttemptStatus {
             allocation: Some(AllocationId::new().into()),
@@ -1127,6 +1178,67 @@ mod tests {
         assert!(out.commands.is_empty());
     }
 
+    /// ADR 0039's structural rule: `used` reaches the usage sink and **never**
+    /// the log. The normalizer does not read the field, so a heartbeat
+    /// carrying one produces exactly the commands it would have produced
+    /// without it — here, none.
+    #[test]
+    fn heartbeat_usage_reaches_the_sink_and_never_a_command() {
+        let node = NodeId::new();
+        let mut sm = StateMachine::default();
+        sm.nodes.insert(node, node_record(node, 5, true));
+        let view = view_of(sm);
+
+        let used = requested();
+        let report = report(node, 5, heartbeat_with_usage(&used, now()));
+
+        let out = normalize(&view, &report, now());
+        assert!(
+            out.commands.is_empty(),
+            "a heartbeat's usage must never become a command"
+        );
+        assert!(out.stops.is_empty());
+
+        let usage = NodeUsage::new();
+        record_usage(&usage, &report);
+        let snapshot = usage.snapshot(now(), std::time::Duration::from_secs(90));
+        assert_eq!(snapshot[&node].used, used);
+        assert_eq!(snapshot[&node].sampled_at, now());
+    }
+
+    /// A heartbeat with no `used` records nothing: absence means "not
+    /// measured", so the node's previous reading is left to age out rather
+    /// than being overwritten (with a zero or anything else).
+    #[test]
+    fn a_heartbeat_without_usage_leaves_the_previous_reading_alone() {
+        let node = NodeId::new();
+        let usage = NodeUsage::new();
+        record_usage(
+            &usage,
+            &report(node, 5, heartbeat_with_usage(&requested(), now())),
+        );
+        record_usage(&usage, &report(node, 5, heartbeat(&[])));
+
+        let snapshot = usage.snapshot(now(), std::time::Duration::from_secs(90));
+        assert_eq!(snapshot[&node].used, requested());
+    }
+
+    /// Usage is best-effort, not fenced: a stale-epoch heartbeat produces no
+    /// commands (as it always has) but its reading is still this node
+    /// describing its own containers, so it is recorded.
+    #[test]
+    fn a_stale_epoch_heartbeat_still_reports_usage() {
+        let node = NodeId::new();
+        let usage = NodeUsage::new();
+        record_usage(
+            &usage,
+            &report(node, 1, heartbeat_with_usage(&requested(), now())),
+        );
+        assert!(usage
+            .snapshot(now(), std::time::Duration::from_secs(90))
+            .contains_key(&node));
+    }
+
     #[tokio::test]
     async fn register_routes_accepted_after_view_catches_up() {
         use coppice_consensus::Consensus;
@@ -1138,6 +1250,7 @@ mod tests {
         let consensus = Arc::new(consensus);
         let views = consensus.views();
         let liveness = NodeLiveness::new();
+        let usage = NodeUsage::new();
         let (router, mut router_rx) = RouterHandle::channel_for_test();
 
         let reg = Body::Register(Register {
@@ -1152,9 +1265,10 @@ mod tests {
             let views = views.clone();
             let router = router.clone();
             let liveness = liveness.clone();
-            tokio::spawn(
-                async move { ingest(&consensus, &views, &router, &liveness, &inbound).await },
-            )
+            let usage = usage.clone();
+            tokio::spawn(async move {
+                ingest(&consensus, &views, &router, &liveness, &usage, &inbound).await
+            })
         };
 
         // Let the task propose (FakeConsensus assigns the RegisterNode log

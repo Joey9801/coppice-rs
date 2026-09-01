@@ -74,6 +74,7 @@ followers, which is what lets followers serve reads and event streams.
 | API server | `coppice-coordinator` (handlers in `coppice-api`) | no | client connections | HTTP requests |
 | Event fanout | `coppice-coordinator` | no | the reconnection ring, subscriptions | event-tap batches, subscribe/unsubscribe, recent-events queries |
 | Derived stats | `coppice-coordinator` | no | the queue-bucket window ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 3) | its fanout subscription, a 30 s bucket tick |
+| Usage history | `coppice-coordinator` | no (but only the leader has samples) | the per-node/cluster usage window ([ADR 0039](../decisions/0039-best-effort-node-usage-telemetry.md)) | a 30 s bucket tick |
 | Agent gateway (session mgr + per-session tasks) | `coppice-coordinator` | accept: yes | agent sockets, session state | socket reads, router sends |
 | Ingestion / normalizer | `coppice-coordinator` | yes | the ObservedSet diff, dedupe state | agent inbound reports |
 | Dispatch loop | `coppice-coordinator` | yes | in-flight dispatch bookkeeping | the event stream |
@@ -148,7 +149,22 @@ followers, which is what lets followers serve reads and event streams.
    transitions, so a job opening an accrual counts as a drain without
    lowering `depth`.
 
-6. **Agent gateway.** A session manager plus one task per agent session.
+6. **Usage history** (every replica). The sampling sibling of derived stats:
+   at each 30 s tick it reads capacity and funded allocations from
+   `views.latest()` and the freshest heartbeat `used` readings from the
+   leader's in-memory usage sink, and closes one bucket per node plus a
+   cluster bucket (≤ 1 h retained, task-local —
+   [ADR 0039](../decisions/0039-best-effort-node-usage-telemetry.md)). It
+   subscribes to nothing, so there is no coverage to lose: each bucket is a
+   standalone reading, and a node that reported nothing records `used: null`
+   rather than a zero. Nodes that leave the replicated state lose their
+   window (and their sink entry) at the next close. Because agent sessions
+   terminate on the leader, a follower's buckets carry capacity and allocated
+   but never `used` — honestly absent, and deliberately not forwarded.
+   Publishes over a watch backing both the API's usage reads and the
+   `coppice_node_*` `/metrics` gauges.
+
+7. **Agent gateway.** A session manager plus one task per agent session.
    **Sessions terminate on the leader only** — a follower refuses an agent
    connection with a leader hint. The justification is not arbitrary: every
    inbound report must be normalized and proposed by the leader anyway (the
@@ -158,7 +174,7 @@ followers, which is what lets followers serve reads and event streams.
    *measured* bottleneck. Sessions re-fence with the new
    `(leader_term, node_epoch)` on every leader change ([ADR 0009](../decisions/0009-fencing-and-reconciliation.md)).
 
-7. **Ingestion / normalizer** (leader-only). The boundary of
+8. **Ingestion / normalizer** (leader-only). The boundary of
    [command-catalog.md](command-catalog.md#the-agent-report-ingestion-boundary):
    fencing check, dedupe by `(AttemptId, attempt_state)`, timestamping, and
    the ObservedSet diff — then `propose` (`RecordAttempt*`, `ReconcileNode`,
@@ -172,7 +188,7 @@ followers, which is what lets followers serve reads and event streams.
    also marks node liveness (a shared map, not a channel) for the health
    monitor in housekeeping.
 
-8. **Dispatch loop** (leader-only). Consumes the event stream. On an attempt
+9. **Dispatch loop** (leader-only). Consumes the event stream. On an attempt
    reaching `Ready` it proposes `DispatchAttempt`, and **only after that
    applies** does it send `StartJob` — the commit-before-send ordering of
    [command-catalog.md](command-catalog.md#dispatchattempt). A crash in the
@@ -182,7 +198,7 @@ followers, which is what lets followers serve reads and event streams.
    pending aborts; at-least-once delivery plus idempotent commands make the
    rescan safe.
 
-9. **Scheduler driver** (leader-only). A loop of: take `views.latest()`, run
+10. **Scheduler driver** (leader-only). A loop of: take `views.latest()`, run
    the CPU-heavy `Scheduler::schedule` pass in `spawn_blocking` (the trait
    stays *sync* — it is pure CPU over an immutable view), propose
    `CommitPlacements`, await the outcome. **At most one proposal is in flight
@@ -192,7 +208,7 @@ followers, which is what lets followers serve reads and event streams.
    `expected_version` comes from `StateView::version()` — see the [two
    coordinates](#the-two-coordinates-trap) distinction.
 
-10. **Housekeeping** (leader-only, 60 s tick). Scans the view for terminal
+11. **Housekeeping** (leader-only, 60 s tick). Scans the view for terminal
    jobs past retention — measured from each job's `terminal_at_us`, never
    from submission, so a job that queued longer than the retention interval
    still gets the full interval after it finishes (KOI-1) — and proposes
@@ -228,7 +244,7 @@ followers, which is what lets followers serve reads and event streams.
    today; [configuration.md](../operations/configuration.md) records it as
    replicated policy, where it migrates once the policy schema grows it.
 
-11. **Snapshot builder.** Serializes the `Arc`'d state handed out by the
+12. **Snapshot builder.** Serializes the `Arc`'d state handed out by the
     apply task and writes it through the storage layer, keeping CPU and IO
     off the apply path.
 

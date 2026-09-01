@@ -272,10 +272,7 @@ fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
         // provisional.
         .route("/nodes", get(list_nodes::<P>))
         .route("/nodes/:node", get(get_node::<P>))
-        .route(
-            "/nodes/:node/utilization",
-            get(unimplemented_id_read::<NodeId>("GetNodeUtilization")),
-        )
+        .route("/nodes/:node/utilization", get(get_node_utilization::<P>))
         .route(
             "/nodes/:node/history",
             get(unimplemented_id_read::<NodeId>("GetNodeHistory")),
@@ -681,6 +678,7 @@ async fn get_overview<P: ControlPlane>(
         plane.cluster_id(),
         Timestamp::now(),
         &window,
+        &plane.usage_window(),
     );
     Ok((
         ReadIndexes {
@@ -723,7 +721,7 @@ async fn list_nodes<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    let response = super::project::list_nodes(view.state());
+    let response = super::project::list_nodes(view.state(), &plane.usage_window());
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -742,7 +740,33 @@ async fn get_node<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    let response = super::project::get_node(view.state(), &id)
+    let response = super::project::get_node(view.state(), &id, &plane.usage_window())
+        .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
+    Ok((
+        ReadIndexes {
+            applied_index: view.applied_index(),
+            committed_index: view.committed_index(),
+        },
+        Json(response),
+    ))
+}
+
+/// `GET /api/v1/nodes/{node}/utilization` — eventual by default (ADR 0031:
+/// a derived read). The replicated half (the node's existence and capacity)
+/// comes from the read view, the samples from this replica's in-memory usage
+/// window (ADR 0039) — so a follower answers 200 with an empty `samples`,
+/// never a redirect. 404 when the node is not in the read view, exactly as
+/// [`get_node`]: an unknown node and a known-but-uncollected one are
+/// different answers.
+async fn get_node_utilization<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    IdPath(id): IdPath<NodeId>,
+    ReadQuery(params): ReadQuery,
+) -> Result<impl IntoResponse, HttpError> {
+    let view = plane
+        .read_state(params.into_options(Consistency::Eventual))
+        .await?;
+    let response = super::project::node_utilization(view.state(), &id, &plane.usage_window())
         .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
     Ok((
         ReadIndexes {
@@ -948,7 +972,7 @@ mod tests {
     use super::super::dto::SubmitJobResponse;
     use crate::{
         ApiError, CoordinatorMemberSummary, CoordinatorSummary, JobTimelineWindow, QueueWindow,
-        ReadOptions, ReadView, StampedEvent,
+        ReadOptions, ReadView, StampedEvent, UsageSnapshot,
     };
 
     use crate::http::COPPICE_LEADER;
@@ -989,6 +1013,9 @@ mod tests {
     struct StubPlane {
         fail_with: Option<fn() -> ApiError>,
         queue_window: QueueWindow,
+        /// The ADR 0039 usage snapshot the plane serves; the default is a
+        /// replica with nothing measured (every `used` absent).
+        usage: UsageSnapshot,
         /// The ring window `job_timeline` serves, regardless of the job asked
         /// (the tier-1 backstop is exercised for its envelope/paging, not its
         /// filtering — that is unit-tested on the ring itself).
@@ -1040,6 +1067,10 @@ mod tests {
 
         fn queue_window(&self) -> QueueWindow {
             self.queue_window.clone()
+        }
+
+        fn usage_window(&self) -> UsageSnapshot {
+            self.usage.clone()
         }
 
         async fn job_timeline(
@@ -1161,6 +1192,7 @@ mod tests {
         router(Arc::new(StubPlane {
             fail_with,
             queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -1170,6 +1202,58 @@ mod tests {
             // plane with a seeded summary.
             coordinator: None,
         }))
+    }
+
+    /// [`app_with_state`] with an ADR 0039 usage snapshot attached, for the
+    /// utilization route.
+    fn app_with_usage(state: coppice_state::StateMachine, usage: UsageSnapshot) -> Router {
+        router(Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            usage,
+            timeline: empty_timeline(),
+            state,
+            read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
+            coordinator: None,
+        }))
+    }
+
+    /// An 8-core node for the utilization tests.
+    fn utilization_node(id: NodeId) -> coppice_state::NodeRecord {
+        coppice_state::NodeRecord {
+            node: coppice_core::node::Node {
+                id,
+                capacity: coppice_core::resource::Resources {
+                    cpu_millis: 8_000,
+                    memory: coppice_core::bytes::ByteSize::from_mib(16_384),
+                    disk: coppice_core::bytes::ByteSize::ZERO,
+                },
+                labels: Default::default(),
+                schedulable: true,
+                service_addr: None,
+            },
+            epoch: 1,
+        }
+    }
+
+    /// One 30 s usage bucket opening at `at_secs`, with `used` present or
+    /// honestly absent.
+    fn utilization_bucket(at_secs: i64, used_cpu: Option<u64>) -> crate::UsageBucket {
+        let millis = |cpu: u64| coppice_core::resource::Resources {
+            cpu_millis: cpu,
+            memory: coppice_core::bytes::ByteSize::ZERO,
+            disk: coppice_core::bytes::ByteSize::ZERO,
+        };
+        let at = |s: i64| Timestamp::UNIX_EPOCH + coppice_core::time::Duration::from_secs(s);
+        crate::UsageBucket {
+            start: at(at_secs),
+            end: at(at_secs + 30),
+            capacity: millis(8_000),
+            allocated: millis(1_000),
+            used: used_cpu.map(millis),
+        }
     }
 
     /// A `job_timeline` window covering nothing (a fresh replica): floor at
@@ -1251,6 +1335,7 @@ mod tests {
     async fn overview_serves_derived_rates_and_history() {
         let plane = StubPlane {
             fail_with: None,
+            usage: UsageSnapshot::default(),
             queue_window: QueueWindow {
                 buckets: vec![crate::QueueBucket {
                     start: Timestamp::from_micros(60_000_000).expect("in range"),
@@ -1369,27 +1454,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn well_formed_stub_reads_answer_501() {
-        // A still-unimplemented id read (node utilization) with valid id and
-        // read params answers 501 with its endpoint name — the timeline route
-        // is now implemented and no longer part of this set.
-        let node = NodeId::new();
+    async fn node_utilization_404s_an_unknown_node() {
+        // An unknown node and a known-but-uncollected one are different
+        // answers (ADR 0039): the 404 comes from the read view, not from the
+        // usage window being empty.
         let response = app(None)
             .oneshot(
-                Request::get(format!(
-                    "/api/v1/nodes/{node}/utilization?consistency=strong&min_index=3"
-                ))
-                .body(Body::empty())
-                .unwrap(),
+                Request::get(format!("/api/v1/nodes/{}/utilization", NodeId::new()))
+                    .body(Body::empty())
+                    .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn node_utilization_serves_the_buckets_the_window_holds() {
+        let node = NodeId::new();
+        let mut state = coppice_state::StateMachine::default();
+        state.nodes.insert(node, utilization_node(node));
+
+        // One bucket that measured usage and one that did not — the second
+        // must serialize as `null`, never as a zero vector.
+        let usage = crate::UsageSnapshot {
+            current: Default::default(),
+            history: std::sync::Arc::new(crate::ClusterUsage {
+                nodes: std::collections::BTreeMap::from([(
+                    node,
+                    crate::UsageWindow {
+                        buckets: vec![
+                            utilization_bucket(0, Some(2_000)),
+                            utilization_bucket(30, None),
+                        ],
+                    },
+                )]),
+                cluster: Vec::new(),
+            }),
+        };
+
+        let response = app_with_usage(state, usage)
+            .oneshot(
+                Request::get(format!("/api/v1/nodes/{node}/utilization"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("GetNodeUtilization"));
+        assert_eq!(body["capacity"]["cpu_millis"], 8_000);
+        assert_eq!(body["samples"].as_array().unwrap().len(), 2);
+        assert_eq!(body["samples"][0]["used"]["cpu_millis"], 2_000);
+        assert_eq!(body["samples"][0]["allocated"]["cpu_millis"], 1_000);
+        assert_eq!(body["samples"][1]["used"], serde_json::Value::Null);
+    }
+
+    /// A known node the leader has collected nothing for answers 200 with an
+    /// empty series — the honest "no coverage" answer a follower always gives.
+    #[tokio::test]
+    async fn node_utilization_of_an_uncollected_node_is_empty_not_absent() {
+        let node = NodeId::new();
+        let mut state = coppice_state::StateMachine::default();
+        state.nodes.insert(node, utilization_node(node));
+
+        let response = app_with_state(None, state)
+            .oneshot(
+                Request::get(format!("/api/v1/nodes/{node}/utilization"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["samples"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -1740,6 +1878,7 @@ mod tests {
         Arc::new(StubPlane {
             fail_with: None,
             queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2050,6 +2189,7 @@ mod tests {
         Arc::new(StubPlane {
             fail_with: None,
             queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
             timeline,
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2346,6 +2486,7 @@ mod tests {
         router(Arc::new(StubPlane {
             fail_with: None,
             queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2549,6 +2690,7 @@ mod tests {
             Arc::new(StubPlane {
                 fail_with: None,
                 queue_window: QueueWindow::default(),
+                usage: UsageSnapshot::default(),
                 timeline: empty_timeline(),
                 state: coppice_state::StateMachine::default(),
                 read_consistency: std::sync::Mutex::default(),
@@ -3980,6 +4122,7 @@ mod tests {
                 ))
             }),
             queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
             timeline: empty_timeline(),
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),
@@ -4019,6 +4162,7 @@ mod tests {
                 reason: "permission denied: principal \"user-42\" may not …".into(),
             }),
             queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
             timeline: empty_timeline(),
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),

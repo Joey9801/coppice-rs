@@ -1714,6 +1714,9 @@ impl coppice_api::ControlPlane for NoopPlane {
         coppice_api::QueueWindow::default()
     }
 
+    fn usage_window(&self) -> coppice_api::UsageSnapshot {
+        coppice_api::UsageSnapshot::default()
+    }
     async fn job_timeline(
         &self,
         _job: coppice_core::id::JobId,

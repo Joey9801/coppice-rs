@@ -112,6 +112,93 @@ pub struct QueueWindow {
     pub buckets: Vec<QueueBucket>,
 }
 
+/// One node's freshest usage reading, as the leader last heard it on a
+/// heartbeat (ADR 0039). `used` is job-attributable on all three dimensions —
+/// directly comparable to that node's `allocated`, never a host-level total.
+///
+/// A node with no entry is not reporting: absence means "not measured", never
+/// zero (ADR 0039). `sampled_at` is the *agent's* clock at the fold, so it is
+/// advisory — it drives a staleness cutoff and an age gauge, nothing ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeUsageSample {
+    pub used: coppice_core::resource::Resources,
+    pub sampled_at: Timestamp,
+}
+
+/// One closed bucket of a node's capacity/allocated/used accounting (ADR
+/// 0039), sampled by the leader's usage-history task — best-effort,
+/// in-memory, never replicated and never snapshotted.
+///
+/// `capacity` and `allocated` are read from the replicated state at bucket
+/// close, so they are always present; `used` is `None` for a bucket in which
+/// the node reported nothing fresh. A bucket that was never produced (the
+/// process wasn't leading, or wasn't running) is simply absent from the
+/// window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageBucket {
+    /// Bucket start (inclusive).
+    pub start: Timestamp,
+    /// Bucket close (exclusive). Nominally 30 s, but a stalled producer
+    /// closes one *long* bucket rather than back-filling, so a consumer that
+    /// scales anything by the span must read it here.
+    pub end: Timestamp,
+    pub capacity: coppice_core::resource::Resources,
+    pub allocated: coppice_core::resource::Resources,
+    /// Measured job-attributable consumption at close; `None` when the node
+    /// had no fresh sample (absence, never a zero).
+    pub used: Option<coppice_core::resource::Resources>,
+}
+
+/// The rolling window of one node's closed usage buckets, oldest first.
+#[derive(Debug, Clone, Default)]
+pub struct UsageWindow {
+    pub buckets: Vec<UsageBucket>,
+}
+
+/// A cluster-wide usage bucket: the per-node buckets summed, plus how many
+/// nodes actually contributed a `used` reading.
+///
+/// `reporting_nodes` is what keeps the cluster total honest — a sum over 2 of
+/// 5 nodes is not the cluster's consumption, and the ratio is the only thing
+/// that says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterUsageBucket {
+    pub bucket: UsageBucket,
+    /// Nodes whose bucket carried a `used` reading.
+    pub reporting_nodes: u32,
+    /// Nodes present in the replicated state at bucket close.
+    pub total_nodes: u32,
+}
+
+/// The leader's rolling usage history for every node it is tracking (ADR
+/// 0039), published wholesale by the usage-history task and shared by
+/// `Arc` — a read never copies it.
+///
+/// Departed nodes are dropped as they leave the replicated state, so a key
+/// here is a node that existed at the last tick.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterUsage {
+    pub nodes: std::collections::BTreeMap<coppice_core::id::NodeId, UsageWindow>,
+    pub cluster: Vec<ClusterUsageBucket>,
+}
+
+/// What a usage read sees: the freshest per-node samples *now*, plus the
+/// shared rolling history behind them.
+///
+/// Two sources with different cadences on purpose. `current` is read live
+/// from the leader's heartbeat sink at request time, so a node that has just
+/// reported shows up immediately rather than at the next 30 s bucket close;
+/// `history` is the task's last published window. On a follower — where no
+/// agent sessions terminate — `current` is empty and `history` has no
+/// buckets, and every `used` renders as honestly absent.
+#[derive(Debug, Clone, Default)]
+pub struct UsageSnapshot {
+    /// Nodes with a reading fresher than the staleness cutoff. Absent =
+    /// not measured.
+    pub current: std::collections::BTreeMap<coppice_core::id::NodeId, NodeUsageSample>,
+    pub history: std::sync::Arc<ClusterUsage>,
+}
+
 /// One event with the identity and stamp of ADR 0032's shared timeline
 /// shape: ordered and deduplicated by `(index, ordinal)`, rendered at the
 /// advisory `at`.
@@ -589,6 +676,17 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// absence. Cheap: a clone of the latest published window, no locks
     /// held, no consensus involvement.
     fn queue_window(&self) -> QueueWindow;
+
+    /// This replica's best-effort node-usage view (ADR 0039): the freshest
+    /// heartbeat samples plus the rolling per-node/cluster history behind
+    /// them. Derived class, in-memory, never replicated — and **leader-only
+    /// in practice**, since agent sessions terminate on the leader. A
+    /// follower answers with an empty snapshot, which reads as `used: null`
+    /// everywhere rather than as zero.
+    ///
+    /// Cheap: a live read of a small map plus an `Arc` clone of the published
+    /// history, no locks held across an await and no consensus involvement.
+    fn usage_window(&self) -> UsageSnapshot;
 
     /// One job's transition timeline (ADR 0032), ascending by `(index,
     /// ordinal)`, resuming strictly after `after` and bounded by `limit`

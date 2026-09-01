@@ -5,8 +5,19 @@ import { ResourceBar } from '@/components/resource-bar'
 export interface ResourceTripleProps {
   capacity: Resources
   allocated?: Resources
-  used?: Resources
+  /** `null`/absent renders as "not reported", never a fabricated zero. */
+  used?: Resources | null
   className?: string
+}
+
+/**
+ * `null` (explicit "not measured") is preserved through to `ResourceBar`
+ * distinct from `undefined` (caller does not track `used` at all) — plain
+ * optional chaining would collapse both to `undefined` and lose that
+ * distinction.
+ */
+function dimension(used: Resources | null | undefined, pick: (r: Resources) => number) {
+  return used === null ? null : used === undefined ? undefined : pick(used)
 }
 
 /** CPU / memory / disk capacity bars stacked, formatted per dimension. */
@@ -18,21 +29,21 @@ export function ResourceTriple({ capacity, allocated, used, className }: Resourc
           label="CPU"
           capacity={capacity.cpuMillis}
           allocated={allocated?.cpuMillis}
-          used={used?.cpuMillis}
+          used={dimension(used, (r) => r.cpuMillis)}
           format={formatCpu}
         />
         <ResourceBar
           label="Memory"
           capacity={capacity.memoryBytes}
           allocated={allocated?.memoryBytes}
-          used={used?.memoryBytes}
+          used={dimension(used, (r) => r.memoryBytes)}
           format={formatBytes}
         />
         <ResourceBar
           label="Disk"
           capacity={capacity.diskBytes}
           allocated={allocated?.diskBytes}
-          used={used?.diskBytes}
+          used={dimension(used, (r) => r.diskBytes)}
           format={formatBytes}
         />
       </div>

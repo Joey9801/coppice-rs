@@ -14,6 +14,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
+import { CapacityChart } from './capacity-chart'
 import { QueueChart } from './queue-chart'
 
 /** `null` is a coverage gap (ADR 0032), rendered as absent — never `0.0`. */
@@ -154,6 +155,9 @@ export function OverviewPage() {
               allocated={capacity.allocated}
               used={capacity.used}
             />
+            <div className="mt-4">
+              <CapacityChart history={capacity.history} />
+            </div>
           </CardContent>
         </Card>
       </div>
@@ -174,7 +178,7 @@ function OverviewSkeleton() {
         <Skeleton className="h-72 lg:col-span-2" />
         <Skeleton className="h-72" />
       </div>
-      <Skeleton className="mt-4 h-56" />
+      <Skeleton className="mt-4 h-80" />
     </div>
   )
 }

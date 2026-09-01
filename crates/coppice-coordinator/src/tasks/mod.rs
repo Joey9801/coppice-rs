@@ -20,3 +20,7 @@ pub mod node_client;
 // locally while leader and over the admin channel otherwise.
 pub mod renewal;
 pub mod scheduler_driver;
+// Rolling best-effort node-usage history (ADR 0039): samples the replicated
+// state and the leader's heartbeat sink into 30 s buckets, and feeds both the
+// utilization/capacity charts and the `coppice_node_*` gauges.
+pub mod usage_history;
