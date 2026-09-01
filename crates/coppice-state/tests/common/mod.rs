@@ -113,6 +113,29 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Co
         labels: BTreeMap::new(),
         registered_at: at,
         service_addr: None,
+        host_facts: None,
+        detected_capacity: None,
+    })
+}
+
+/// [`register_node_cmd`] plus the display-only host description, for the tests
+/// that care how those fields survive re-registration. `detected_capacity`
+/// mirrors `capacity` here — the un-overridden case, which keeps the fixture
+/// about the overwrite rule rather than about override arithmetic.
+pub fn register_node_cmd_with_host(
+    node: NodeId,
+    capacity: Resources,
+    at: Timestamp,
+    host_facts: Option<coppice_core::node::HostFacts>,
+) -> Command {
+    Command::RegisterNode(RegisterNode {
+        node,
+        capacity,
+        labels: BTreeMap::new(),
+        registered_at: at,
+        service_addr: None,
+        detected_capacity: host_facts.as_ref().map(|_| capacity),
+        host_facts,
     })
 }
 

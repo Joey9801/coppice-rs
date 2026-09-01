@@ -818,6 +818,8 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
                     labels,
                     schedulable,
                     service_addr: None,
+                    host_facts: None,
+                    detected_capacity: None,
                 },
                 epoch,
             },

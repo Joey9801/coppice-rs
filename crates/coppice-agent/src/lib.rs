@@ -12,6 +12,7 @@
 pub mod capacity;
 pub mod config;
 pub mod executor;
+pub mod hostinfo;
 pub mod identity;
 pub mod journal;
 pub mod metrics_server;
@@ -380,6 +381,9 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         docker_executor,
     )
     .with_service_addr(config.service_addr())
+    // Static host description + what detection read before `[capacity]`
+    // overrides, so the node detail view can explain the advertised vector.
+    .with_host_facts(hostinfo::collect(&detected), detected.as_resources())
     // Publish the executor as the `/metrics` node-usage source (usage.rs).
     .with_usage_metrics();
 

@@ -516,6 +516,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
                 &agent_config,
                 agent_node,
                 agent_dir_lock,
+                detected,
                 effective,
                 FakeExecutor::new(),
             )?;
@@ -666,6 +667,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
                 &agent_config,
                 agent_node,
                 agent_dir_lock,
+                detected,
                 effective,
                 executor,
             )?;
@@ -1071,10 +1073,11 @@ async fn daemon_error(
 /// over `executor`. `dir_lock` is the data-dir `LOCK` taken before the
 /// identity was minted (the same ordering as `run_daemon`); its ownership
 /// moves into the journal here.
-fn build_session<E: Executor + Clone>(
+fn build_session<E: Executor + Clone + Send + Sync + 'static>(
     config: &AgentConfig,
     node: NodeId,
     dir_lock: <RealFs as coppice_consensus::fs::Fs>::Lock,
+    detected: coppice_agent::capacity::DetectedCapacity,
     effective: EffectiveCapacity,
     executor: E,
 ) -> Result<Session<RealFs, E>> {
@@ -1091,7 +1094,15 @@ fn build_session<E: Executor + Clone>(
     )
     // Advertise the NodeService endpoint at registration (ADR 0034) so the
     // coordinator learns where to dial for this node's job logs.
-    .with_service_addr(config.service_addr()))
+    .with_service_addr(config.service_addr())
+    // The same registration extras `run_daemon` wires: the host description
+    // plus the pre-override detection reading (node detail view), and the
+    // executor as the agent `/metrics` node-usage source.
+    .with_host_facts(
+        coppice_agent::hostinfo::collect(&detected),
+        detected.as_resources(),
+    )
+    .with_usage_metrics())
 }
 
 /// Bind and serve the agent-hosted NodeService (ADR 0034/0036) from the

@@ -216,6 +216,13 @@ message RegisterNode {
   // normalized from `Register.service_addr`. Re-registration overwrites it,
   // so a restart with a new address heals. Absent or empty means no service.
   optional string service_addr = 5;
+  // Host description reported by the agent (display-only). Re-registration
+  // overwrites it like capacity and labels.
+  optional coppice.core.v1.HostFacts host_facts = 6;
+  // What capacity detection read on that host before `[capacity]` overrides,
+  // so a reader can show advertised-vs-detected. Absent when the agent
+  // detected nothing.
+  optional coppice.core.v1.Resources detected_capacity = 7;
 }
 
 // Node missed the replicated heartbeat deadline: epoch bump, unschedulable,

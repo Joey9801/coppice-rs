@@ -36,6 +36,7 @@ use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
 };
 use coppice_core::job::Job;
+use coppice_core::node::HostFacts;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -287,6 +288,13 @@ pub struct RegisterNode {
     /// (ADR 0034), normalized from `Register.service_addr`. `None` when the
     /// agent hosts no service; re-registration overwrites it.
     pub service_addr: Option<String>,
+    /// What the agent's host looks like (display-only). Overwritten by
+    /// re-registration like capacity and labels.
+    pub host_facts: Option<HostFacts>,
+    /// What capacity detection read on that host before the agent's
+    /// `[capacity]` overrides, so a reader can explain an advertised capacity
+    /// that differs from the hardware.
+    pub detected_capacity: Option<Resources>,
 }
 
 /// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,

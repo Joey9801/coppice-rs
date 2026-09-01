@@ -113,6 +113,8 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 labels: BTreeMap::new(),
                 registered_at: ts,
                 service_addr: None,
+                host_facts: None,
+                detected_capacity: None,
             })
         }),
         (0usize..NODES as usize, arb_ts()).prop_map(|(n, ts)| {

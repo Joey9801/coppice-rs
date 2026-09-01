@@ -402,9 +402,9 @@ reachable through the API.
 | | |
 | --- | --- |
 | Proposer | Leader, on agent (re)registration |
-| Payload | `node: Node` (id, `capacity: Resources`, labels), `registered_at_us` |
+| Payload | `node: Node` (id, `capacity: Resources`, labels), `registered_at_us`, `service_addr`, `host_facts`, `detected_capacity` |
 | Validation | None beyond shape — registration is always legal |
-| Apply effects | New node: insert with `epoch = 1`, `schedulable = true`. Existing node: **bump `node_epoch`** (invalidating all commands issued under earlier epochs, per ADR 0009), update capacity and labels; the drain flag is **not** cleared — drain is desired state owned by the admin, and an agent restart must not undo it. Live allocations are untouched (the ObservedSet reconciliation that follows registration settles them). If capacity grew, run a pledge pass. |
+| Apply effects | New node: insert with `epoch = 1`, `schedulable = true`. Existing node: **bump `node_epoch`** (invalidating all commands issued under earlier epochs, per ADR 0009), update capacity, labels, `service_addr`, and the display-only `host_facts` / `detected_capacity` (overwritten wholesale — a re-imaged host must not leave half the previous machine's story behind); the drain flag is **not** cleared — drain is desired state owned by the admin, and an agent restart must not undo it. Live allocations are untouched (the ObservedSet reconciliation that follows registration settles them). If capacity grew, run a pledge pass. |
 | Rejections | — (structurally infallible) |
 
 #### `DeclareNodeLost`

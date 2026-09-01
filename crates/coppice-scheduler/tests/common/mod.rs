@@ -139,6 +139,8 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Co
         labels: BTreeMap::new(),
         registered_at: at,
         service_addr: None,
+        host_facts: None,
+        detected_capacity: None,
     })
 }
 

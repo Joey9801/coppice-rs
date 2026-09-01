@@ -32,6 +32,7 @@ import {
   type ListJobsRequest,
   type LogChunk,
   type LogEntry,
+  type HostFacts,
   type NodeDetail,
   type NodeHealth,
   type NodeId,
@@ -1111,8 +1112,38 @@ interface WireListNodesResponse {
   nodes: WireNodeSummary[]
 }
 
+interface WireHostFacts {
+  os: string
+  os_version: string
+  kernel_version: string
+  arch: string
+  cpu_model: string
+  physical_cores: number
+  logical_cores: number
+  total_memory_bytes: number
+  total_disk_bytes: number
+  agent_version: string
+}
+
+function mapHostFacts(h: WireHostFacts): HostFacts {
+  return {
+    os: h.os,
+    osVersion: h.os_version,
+    kernelVersion: h.kernel_version,
+    arch: h.arch,
+    cpuModel: h.cpu_model,
+    physicalCores: h.physical_cores,
+    logicalCores: h.logical_cores,
+    totalMemoryBytes: h.total_memory_bytes,
+    totalDiskBytes: h.total_disk_bytes,
+    agentVersion: h.agent_version,
+  }
+}
+
 interface WireGetNodeResponse {
   summary: WireNodeSummary
+  host: WireHostFacts | null
+  detected_capacity: WireResources | null
   active_attempts: WireAttemptView[]
   accrual_queue: WireAccrualView[]
 }
@@ -1120,6 +1151,8 @@ interface WireGetNodeResponse {
 function mapNodeDetail(n: WireGetNodeResponse): NodeDetail {
   return {
     summary: mapNodeSummary(n.summary),
+    host: n.host === null ? null : mapHostFacts(n.host),
+    detectedCapacity: n.detected_capacity === null ? null : mapResources(n.detected_capacity),
     activeAttempts: n.active_attempts.map(mapAttemptView),
     accrualQueue: n.accrual_queue.map(mapAccrualView),
   }

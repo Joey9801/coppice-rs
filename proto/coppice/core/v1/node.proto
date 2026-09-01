@@ -31,4 +31,49 @@ message Node {
   // authoritative addressing lives in replicated membership, and readers dial
   // this to fetch job logs. Absent or empty means the agent hosts no service.
   optional string service_addr = 5;
+  // What the agent's host looks like, reported at registration. Display-only:
+  // no scheduling decision reads it. Absent when the agent reported none.
+  optional HostFacts host_facts = 6;
+  // What capacity *detection* read on that host before the agent's
+  // `[capacity]` overrides applied. `capacity` above stays the authoritative
+  // advertised vector; this is display-only context explaining a node that
+  // advertises something other than its hardware. Absent when undetected.
+  optional Resources detected_capacity = 7;
+}
+
+// Static description of the machine an agent runs on, collected once at
+// startup and refreshed only by re-registration.
+//
+// Every field is **best-effort and independently optional**: a reading the
+// agent could not take is left at its zero value, which reads as "unknown"
+// (empty string, zero count). Nothing here is authoritative — capacity is what
+// `Node.capacity` advertises, and these facts only explain where that number
+// came from. Deliberately flat: no NUMA topology, no per-device breakdown.
+message HostFacts {
+  // Operating system family, e.g. "linux", "macos" (`std::env::consts::OS`).
+  string os = 1;
+  // Human-readable OS release: `/etc/os-release`'s `PRETTY_NAME` on Linux,
+  // `kern.osproductversion` on macOS.
+  string os_version = 2;
+  // Kernel release string (`uname -r`): `/proc/sys/kernel/osrelease` on Linux,
+  // `kern.osrelease` on macOS.
+  string kernel_version = 3;
+  // CPU architecture, e.g. "x86_64", "aarch64" (`std::env::consts::ARCH`).
+  string arch = 4;
+  // Marketing name of the CPU: `/proc/cpuinfo`'s `model name` on Linux,
+  // `machdep.cpu.brand_string` (falling back to `hw.model`) on macOS.
+  string cpu_model = 5;
+  // Physical cores, ignoring SMT siblings. Zero = not determined.
+  uint32 physical_cores = 6;
+  // Hardware threads the OS schedules on. Zero = not determined.
+  uint32 logical_cores = 7;
+  // Total installed RAM in bytes, the same reading capacity detection took.
+  // Zero = not determined.
+  uint64 total_memory_bytes = 8;
+  // Total size of the filesystem holding the agent's data directory, in bytes
+  // — the same reading capacity detection took. Zero = not determined.
+  uint64 total_disk_bytes = 9;
+  // The agent binary's own version (`CARGO_PKG_VERSION`), so a mixed-version
+  // fleet is visible without dialing each node.
+  string agent_version = 10;
 }

@@ -1111,6 +1111,8 @@ fn register_report(node: NodeId) -> pbagent::AgentReport {
             }),
             labels: Vec::new(),
             service_addr: None,
+            host_facts: None,
+            detected_capacity: None,
         })),
     }
 }

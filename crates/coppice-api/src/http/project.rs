@@ -168,6 +168,8 @@ pub fn get_node(
 
     Some(dto::GetNodeResponse {
         summary,
+        host: record.node.host_facts.as_ref().map(Into::into),
+        detected_capacity: record.node.detected_capacity.as_ref().map(Into::into),
         active_attempts,
         accrual_queue,
     })
@@ -1403,6 +1405,8 @@ mod tests {
                 labels: BTreeMap::new(),
                 schedulable: true,
                 service_addr: None,
+                host_facts: None,
+                detected_capacity: None,
             },
             epoch: 1,
         }
@@ -1563,6 +1567,56 @@ mod tests {
         assert_eq!(response.active_attempts.len(), 1);
         assert_eq!(response.active_attempts[0].rate_ucu_per_second, 100);
         assert_eq!(response.active_attempts[0].outcome, None);
+    }
+
+    /// Host facts are detail-only and pass through verbatim; the summary the
+    /// list view renders stays lean, which is the whole reason they live on
+    /// `GetNodeResponse` rather than `NodeSummary`.
+    #[test]
+    fn get_node_carries_host_facts_and_the_detected_vector() {
+        let node = NodeId::new();
+        let mut record = test_node(node);
+        record.node.host_facts = Some(coppice_core::node::HostFacts {
+            os: "linux".into(),
+            os_version: "Debian GNU/Linux 12 (bookworm)".into(),
+            kernel_version: "6.1.0-21-amd64".into(),
+            arch: "x86_64".into(),
+            cpu_model: "AMD EPYC 7763 64-Core Processor".into(),
+            physical_cores: 8,
+            logical_cores: 16,
+            total_memory_bytes: 64 << 30,
+            total_disk_bytes: 512 << 30,
+            agent_version: "0.0.1".into(),
+        });
+        // An operator override: the box detects 16 cores, the node advertises
+        // the 4 the fixture's capacity carries.
+        record.node.detected_capacity = Some(Resources {
+            cpu_millis: 16_000,
+            memory: ByteSize::from_bytes(64 << 30),
+            disk: ByteSize::from_bytes(512 << 30),
+        });
+
+        let mut state = StateMachine::default();
+        state.nodes.insert(node, record);
+
+        let response = get_node(&state, &node, &no_usage()).expect("the node exists");
+        let host = response.host.expect("facts pass through");
+        assert_eq!(host.cpu_model, "AMD EPYC 7763 64-Core Processor");
+        assert_eq!(host.physical_cores, 8);
+        assert_eq!(host.total_disk_bytes, 512 << 30);
+        assert_eq!(
+            response.detected_capacity.map(|d| d.cpu_millis),
+            Some(16_000),
+            "the detected vector rides beside the advertised one"
+        );
+        assert_eq!(response.summary.capacity.cpu_millis, 4000);
+
+        // A node whose agent reported nothing reads as unknown, not as zeros.
+        let bare = NodeId::new();
+        state.nodes.insert(bare, test_node(bare));
+        let response = get_node(&state, &bare, &no_usage()).expect("the node exists");
+        assert!(response.host.is_none());
+        assert!(response.detected_capacity.is_none());
     }
 
     fn test_job(id: JobId, state: JobState, submitted_at: Timestamp) -> coppice_state::JobRecord {

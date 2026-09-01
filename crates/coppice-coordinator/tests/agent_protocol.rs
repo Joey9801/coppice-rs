@@ -149,6 +149,7 @@ fn build_session(config: &Config, executor: FakeExecutor) -> Session<RealFs, Fak
     std::fs::create_dir_all(&config.data_dir).expect("create agent data dir");
     let fs = RealFs::new(config.data_dir.clone());
     let (journal, state) = Journal::open(fs).expect("open agent journal");
+    let detected = coppice_agent::capacity::detect(&config.data_dir);
     Session::new(
         node_identity(config),
         advertised(config),
@@ -156,6 +157,12 @@ fn build_session(config: &Config, executor: FakeExecutor) -> Session<RealFs, Fak
         journal,
         state,
         executor,
+    )
+    // The daemon describes its host on every registration; the harness does
+    // the same so the facts path is the real one end to end.
+    .with_host_facts(
+        coppice_agent::hostinfo::collect(&detected),
+        detected.as_resources(),
     )
 }
 
@@ -625,6 +632,78 @@ async fn assert_never<F: Fn() -> bool>(window: Duration, label: &str, cond: F) {
 /// ADR 0009 "a deposed leader's commands fail closed at every agent (term
 /// check)": the agent rejects a StartJob whose term is below its watermark or
 /// whose epoch is stale, and treats a re-delivered seq as idempotent.
+/// Host facts collected by the agent survive the whole registration path —
+/// `hostinfo::collect` → `Register` → ingestion's normalizer → `RegisterNode`
+/// → apply → replicated state, which is what the node-detail projection
+/// behind `GET /api/v1/nodes/{node}` reads. (This harness stands up no HTTP
+/// server; the projection's own half is covered by `project.rs`'s unit test.)
+///
+/// The assertions are deliberately shape-level: the values are whatever this
+/// machine happens to report, and a CI box may legitimately answer "unknown"
+/// for the OS release or the CPU model. What must hold is that the fields the
+/// agent can *always* fill arrive intact and unswapped, and that the detected
+/// vector rides alongside the advertised one — the harness overrides all three
+/// capacity dimensions, so the two genuinely differ here, which is exactly the
+/// confusion the host card exists to explain.
+#[tokio::test]
+async fn host_facts_survive_registration_to_the_node_detail() {
+    let ca = Ca::new();
+    let coord = RunningCoordinator::start(ClusterId::new(), &ca).await;
+    poll(DEADLINE, "coordinator leadership", || {
+        let coord = &coord;
+        async move { coord.is_leader() }
+    })
+    .await;
+
+    let node = NodeId::new();
+    let agent_dir = tempfile::tempdir().expect("agent tempdir");
+    let config = agent_config(
+        node,
+        agent_dir.path().join("data"),
+        &coord.agent_endpoint,
+        &ca,
+        agent_dir.path(),
+    );
+    let agent = spawn_agent(config, FakeExecutor::new());
+
+    let views = coord.views();
+    poll(DEADLINE, "node registered (epoch >= 1)", || {
+        let views = views.clone();
+        async move { node_epoch(&views, node).is_some_and(|e| e >= 1) }
+    })
+    .await;
+
+    let view = views.latest();
+    let record = &view.state().nodes[&node];
+
+    let host = record
+        .node
+        .host_facts
+        .clone()
+        .expect("the agent described its host");
+    assert_eq!(host.os, std::env::consts::OS);
+    assert_eq!(host.arch, std::env::consts::ARCH);
+    assert!(
+        !host.agent_version.is_empty(),
+        "the agent version rides too"
+    );
+    assert!(host.logical_cores >= 1, "at least one hardware thread");
+
+    // Advertised capacity is the harness's overrides minus the reservation;
+    // the detected vector is what the machine actually reported.
+    let detected = record
+        .node
+        .detected_capacity
+        .expect("every dimension detects on a test host");
+    assert_ne!(
+        detected, record.node.capacity,
+        "the harness overrides all three dimensions, so the two must differ"
+    );
+    assert!(detected.cpu_millis >= 1_000, "a real core count");
+
+    stop_agent(agent).await;
+}
+
 #[tokio::test]
 async fn stale_fenced_command_is_rejected_by_the_agent() {
     init_tracing();

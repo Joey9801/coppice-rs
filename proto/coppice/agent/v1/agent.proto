@@ -139,6 +139,15 @@ message Register {
   // registration and heals on reconnect. Absent or empty means the agent
   // hosts no NodeService and its logs are unreachable off-node.
   optional string service_addr = 3;
+  // What this agent's host looks like (display-only). Absent when the agent
+  // collected nothing at all; individual unknown fields are empty in place.
+  optional coppice.core.v1.HostFacts host_facts = 4;
+  // What capacity *detection* read off the host, before `[capacity]`
+  // overrides. `capacity` above is the advertised (post-override, post-
+  // reservation) vector; carrying both lets a reader show why an agent
+  // advertises something other than what its hardware suggests. Absent when
+  // no dimension could be detected.
+  optional coppice.core.v1.Resources detected_capacity = 5;
 }
 
 // Periodic liveness, inventory, and running-set signal. The coordinator

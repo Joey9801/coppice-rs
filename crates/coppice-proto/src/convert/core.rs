@@ -7,7 +7,7 @@ use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState};
 use coppice_core::bytes::ByteSize;
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
-use coppice_core::node::Node;
+use coppice_core::node::{HostFacts, Node};
 use coppice_core::quota::{
     ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, UsageState,
 };
@@ -478,6 +478,8 @@ impl From<&Node> for pb::Node {
             labels: labels_to_pb(&node.labels),
             schedulable: node.schedulable,
             service_addr: node.service_addr.clone(),
+            host_facts: node.host_facts.as_ref().map(Into::into),
+            detected_capacity: node.detected_capacity.as_ref().map(Into::into),
         }
     }
 }
@@ -494,7 +496,54 @@ impl TryFrom<pb::Node> for Node {
             // Empty string is a second spelling of "no service"; canonicalize
             // it to None so absent and present-but-empty read identically.
             service_addr: node.service_addr.filter(|s| !s.is_empty()),
+            host_facts: node.host_facts.map(Into::into),
+            detected_capacity: node
+                .detected_capacity
+                .map(Resources::try_from)
+                .transpose()?,
         })
+    }
+}
+
+// ---- Host facts ----
+//
+// Every field is best-effort, so decoding is infallible: an unknown reading is
+// the zero value on both sides and there is nothing to reject. The `From`
+// direction is the ordinary domain → pb, and the reverse is a plain `From` too
+// rather than the usual `TryFrom` — the only conversion in this module with
+// nothing that can fail.
+
+impl From<&HostFacts> for pb::HostFacts {
+    fn from(facts: &HostFacts) -> Self {
+        pb::HostFacts {
+            os: facts.os.clone(),
+            os_version: facts.os_version.clone(),
+            kernel_version: facts.kernel_version.clone(),
+            arch: facts.arch.clone(),
+            cpu_model: facts.cpu_model.clone(),
+            physical_cores: facts.physical_cores,
+            logical_cores: facts.logical_cores,
+            total_memory_bytes: facts.total_memory_bytes,
+            total_disk_bytes: facts.total_disk_bytes,
+            agent_version: facts.agent_version.clone(),
+        }
+    }
+}
+
+impl From<pb::HostFacts> for HostFacts {
+    fn from(facts: pb::HostFacts) -> Self {
+        HostFacts {
+            os: facts.os,
+            os_version: facts.os_version,
+            kernel_version: facts.kernel_version,
+            arch: facts.arch,
+            cpu_model: facts.cpu_model,
+            physical_cores: facts.physical_cores,
+            logical_cores: facts.logical_cores,
+            total_memory_bytes: facts.total_memory_bytes,
+            total_disk_bytes: facts.total_disk_bytes,
+            agent_version: facts.agent_version,
+        }
     }
 }
 

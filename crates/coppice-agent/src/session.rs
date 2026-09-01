@@ -22,6 +22,7 @@
 use coppice_consensus::fs::Fs;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
+use coppice_core::node::HostFacts;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1 as pb;
@@ -93,6 +94,14 @@ pub struct Session<F: Fs, E: Executor> {
     /// `Register` so coordinators can dial this node for job logs. `None` when
     /// no `[listen]` listener is configured — the node hosts no service.
     service_addr: Option<String>,
+    /// Static description of this host, echoed in every `Register` for the
+    /// node detail view (`hostinfo.rs`). `None` for sessions that were never
+    /// given any — every test session, and nothing else.
+    host_facts: Option<HostFacts>,
+    /// What capacity detection read before `[capacity]` overrides applied, so
+    /// a reader can see why `capacity` above differs from the hardware. `None`
+    /// when no dimension could be detected.
+    detected_capacity: Option<Resources>,
 }
 
 impl<F: Fs, E: Executor> Session<F, E> {
@@ -120,6 +129,8 @@ impl<F: Fs, E: Executor> Session<F, E> {
             armed_watchdogs: Vec::new(),
             pending_reaps: Vec::new(),
             service_addr: None,
+            host_facts: None,
+            detected_capacity: None,
         }
     }
 
@@ -128,6 +139,20 @@ impl<F: Fs, E: Executor> Session<F, E> {
     /// need not thread a `None` through [`Session::new`].
     pub fn with_service_addr(mut self, service_addr: Option<String>) -> Session<F, E> {
         self.service_addr = service_addr;
+        self
+    }
+
+    /// Set the host description and the pre-override detection reading echoed
+    /// in every `Register` (`hostinfo.rs`). A builder setter like
+    /// [`Session::with_service_addr`]: the many test sessions describe no host,
+    /// and display-only fields are not worth threading through every one.
+    pub fn with_host_facts(
+        mut self,
+        host_facts: HostFacts,
+        detected_capacity: Option<Resources>,
+    ) -> Session<F, E> {
+        self.host_facts = Some(host_facts);
+        self.detected_capacity = detected_capacity;
         self
     }
 
@@ -652,6 +677,11 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 // The advertised NodeService endpoint (ADR 0034), from the agent
                 // `[listen]` config; `None` when the node hosts no service.
                 service_addr: self.service_addr.clone(),
+                // Display-only host description and the reading capacity
+                // detection took before `[capacity]` overrides; both ride
+                // registration so re-registration heals a re-imaged machine.
+                host_facts: self.host_facts.as_ref().map(Into::into),
+                detected_capacity: self.detected_capacity.as_ref().map(Into::into),
             })),
         }
     }

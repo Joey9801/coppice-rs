@@ -481,6 +481,8 @@ mod tests {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let body = serde_json::to_value(dto::GetNodeResponse {
             summary: sample_summary(),
+            host: None,
+            detected_capacity: None,
             active_attempts: Vec::new(),
             accrual_queue: Vec::new(),
         })
@@ -533,6 +535,8 @@ mod tests {
     fn detail_reports_empty_sections_and_the_heartbeat_gap() {
         let rendered = render_detail(&dto::GetNodeResponse {
             summary: sample_summary(),
+            host: None,
+            detected_capacity: None,
             active_attempts: Vec::new(),
             accrual_queue: Vec::new(),
         });
@@ -592,6 +596,8 @@ mod tests {
     fn unbounded_projected_start_is_spelled_out() {
         let rendered = render_detail(&dto::GetNodeResponse {
             summary: sample_summary(),
+            host: None,
+            detected_capacity: None,
             active_attempts: Vec::new(),
             accrual_queue: vec![dto::AccrualView {
                 allocation: dto::AllocationView {
