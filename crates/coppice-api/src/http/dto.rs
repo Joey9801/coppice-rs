@@ -270,10 +270,67 @@ pub struct ListNodesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetNodeResponse {
     pub summary: NodeSummary,
+    /// What the node's machine is, as its agent reported at registration.
+    /// Detail-only: [`NodeSummary`] stays lean because the list view renders
+    /// dozens of them. `null` when the agent reported no facts.
+    pub host: Option<HostFacts>,
+    /// What capacity detection read on that host *before* the agent's
+    /// `[capacity]` overrides. Differs from `summary.capacity` exactly when an
+    /// operator overrode a dimension or the system reservation withheld room;
+    /// `null` when the agent detected nothing.
+    pub detected_capacity: Option<Resources>,
     /// Attempts currently dispatching/running/finalizing on this node.
     pub active_attempts: Vec<AttemptView>,
     /// Accruing allocations queued against this node, in funding order.
     pub accrual_queue: Vec<AccrualView>,
+}
+
+/// Static description of a node's machine (mirrors `HostFacts` in `types.ts`).
+///
+/// Every field is best-effort: an empty string or a zero count is "the agent
+/// could not read this", never a claim about the hardware. Nothing here is
+/// authoritative — `NodeSummary.capacity` is what the node advertises, and
+/// these facts only explain where that number came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostFacts {
+    /// Operating system family, e.g. `linux`, `macos`.
+    pub os: String,
+    /// Human-readable OS release.
+    pub os_version: String,
+    /// Kernel release string, as `uname -r` prints it.
+    pub kernel_version: String,
+    /// CPU architecture, e.g. `x86_64`, `aarch64`.
+    pub arch: String,
+    /// Marketing name of the CPU.
+    pub cpu_model: String,
+    /// Physical cores, ignoring SMT siblings. Zero = not determined.
+    pub physical_cores: u32,
+    /// Hardware threads the OS schedules on. Zero = not determined.
+    pub logical_cores: u32,
+    /// Total installed RAM in bytes. Zero = not determined.
+    pub total_memory_bytes: u64,
+    /// Total size of the filesystem holding the agent's data directory, in
+    /// bytes. Zero = not determined.
+    pub total_disk_bytes: u64,
+    /// The version of the agent binary running on the node.
+    pub agent_version: String,
+}
+
+impl From<&coppice_core::node::HostFacts> for HostFacts {
+    fn from(f: &coppice_core::node::HostFacts) -> Self {
+        HostFacts {
+            os: f.os.clone(),
+            os_version: f.os_version.clone(),
+            kernel_version: f.kernel_version.clone(),
+            arch: f.arch.clone(),
+            cpu_model: f.cpu_model.clone(),
+            physical_cores: f.physical_cores,
+            logical_cores: f.logical_cores,
+            total_memory_bytes: f.total_memory_bytes,
+            total_disk_bytes: f.total_disk_bytes,
+            agent_version: f.agent_version.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

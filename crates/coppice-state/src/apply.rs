@@ -791,6 +791,12 @@ impl StateMachine {
                 // agent restarting with a new NodeService address heals on
                 // reconnect (ADR 0034).
                 rec.node.service_addr = c.service_addr.clone();
+                // Host facts and the detection reading are agent-reported
+                // description, overwritten wholesale for the same reason: a
+                // rebuilt or upgraded machine re-registers with new facts, and
+                // a half-updated record would be worse than either.
+                rec.node.host_facts = c.host_facts.clone();
+                rec.node.detected_capacity = c.detected_capacity;
                 events.push(Event::NodeEpochBumped {
                     node: c.node,
                     epoch: rec.epoch,
@@ -806,6 +812,8 @@ impl StateMachine {
                             labels: c.labels.clone(),
                             schedulable: true,
                             service_addr: c.service_addr.clone(),
+                            host_facts: c.host_facts.clone(),
+                            detected_capacity: c.detected_capacity,
                         },
                         epoch: 1,
                     },

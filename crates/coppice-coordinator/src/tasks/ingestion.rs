@@ -299,12 +299,23 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
             // Advertised NodeService address (ADR 0034); an empty string is a
             // second spelling of "no service", canonicalized to None.
             let service_addr = reg.service_addr.clone().filter(|addr| !addr.is_empty());
+            // Host facts are display-only, so a malformed reading is never
+            // worth dropping a registration over: unknown fields are already
+            // the zero value, and a `detected_capacity` that fails to convert
+            // simply reads as "not detected".
+            let host_facts = reg.host_facts.clone().map(Into::into);
+            let detected_capacity = reg
+                .detected_capacity
+                .clone()
+                .and_then(|c| Resources::try_from(c).ok());
             out.commands.push(Command::RegisterNode(RegisterNode {
                 node,
                 capacity,
                 labels,
                 registered_at: now,
                 service_addr,
+                host_facts,
+                detected_capacity,
             }));
         }
 
@@ -679,7 +690,7 @@ mod tests {
     use coppice_proto::pb::agent::v1::{
         AgentReport, AttemptStatus, Heartbeat, ObservedAllocation, ObservedSet, Register,
     };
-    use coppice_proto::pb::core::v1::Label;
+    use coppice_proto::pb::core::v1::{HostFacts, Label};
 
     use crate::test_support::{allocation_record, attempt_record, node_record, view_of};
 
@@ -765,6 +776,13 @@ mod tests {
                 value: "a".into(),
             }],
             service_addr: Some("10.0.0.7:9443".into()),
+            host_facts: Some(HostFacts {
+                os: "linux".into(),
+                cpu_model: "AMD EPYC 7763 64-Core Processor".into(),
+                physical_cores: 8,
+                ..Default::default()
+            }),
+            detected_capacity: Some((&requested()).into()),
         });
 
         let out = normalize(&view, &report(node, 0, reg), now());
@@ -779,6 +797,11 @@ mod tests {
                 assert_eq!(rn.labels.get("zone").map(String::as_str), Some("a"));
                 assert_eq!(rn.registered_at, now());
                 assert_eq!(rn.service_addr.as_deref(), Some("10.0.0.7:9443"));
+                // Display-only facts ride the same command, unread by apply.
+                let facts = rn.host_facts.as_ref().expect("host facts carried");
+                assert_eq!(facts.cpu_model, "AMD EPYC 7763 64-Core Processor");
+                assert_eq!(facts.physical_cores, 8);
+                assert_eq!(rn.detected_capacity, Some(requested()));
             }
             other => panic!("expected RegisterNode, got {other:?}"),
         }
@@ -1256,6 +1279,8 @@ mod tests {
             capacity: Some((&requested()).into()),
             labels: vec![],
             service_addr: None,
+            host_facts: None,
+            detected_capacity: None,
         });
         let inbound = report(node, 0, reg);
 

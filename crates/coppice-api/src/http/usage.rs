@@ -749,6 +749,8 @@ mod tests {
                     labels: Default::default(),
                     schedulable: true,
                     service_addr,
+                    host_facts: None,
+                    detected_capacity: None,
                 },
                 epoch: 1,
             },

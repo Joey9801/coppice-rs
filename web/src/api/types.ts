@@ -625,10 +625,56 @@ export interface NodeHistoryEntry {
 
 export interface NodeDetail {
   summary: NodeSummary
+  /**
+   * What the node's machine is, as its agent reported at registration.
+   * Detail-only — the list view renders dozens of summaries and does not need
+   * it. `null` when the agent reported no facts.
+   */
+  host: HostFacts | null
+  /**
+   * What capacity detection read on that host *before* the agent's
+   * `[capacity]` overrides. Differs from `summary.capacity` exactly when an
+   * operator overrode a dimension or the system reservation withheld room;
+   * `null` when the agent detected nothing.
+   */
+  detectedCapacity: Resources | null
   /** Attempts currently running/dispatching/finalizing on this node. */
   activeAttempts: AttemptView[]
   /** Accruing allocations queued against this node, in funding order. */
   accrualQueue: AccrualView[]
+}
+
+/**
+ * Static description of a node's machine, collected once at agent startup and
+ * refreshed only by re-registration.
+ *
+ * Every field is best-effort: an empty string or a zero count means "the agent
+ * could not read this", never a claim about the hardware — render those as
+ * unknown rather than as `0`. Nothing here is authoritative;
+ * `NodeSummary.capacity` is what the node advertises and these facts only
+ * explain where that number came from.
+ */
+export interface HostFacts {
+  /** Operating system family, e.g. `linux`, `macos`. */
+  os: string
+  /** Human-readable OS release. */
+  osVersion: string
+  /** Kernel release string, as `uname -r` prints it. */
+  kernelVersion: string
+  /** CPU architecture, e.g. `x86_64`, `aarch64`. */
+  arch: string
+  /** Marketing name of the CPU. */
+  cpuModel: string
+  /** Physical cores, ignoring SMT siblings. Zero = not determined. */
+  physicalCores: number
+  /** Hardware threads the OS schedules on. Zero = not determined. */
+  logicalCores: number
+  /** Total installed RAM in bytes. Zero = not determined. */
+  totalMemoryBytes: number
+  /** Total size of the filesystem holding the agent data dir. Zero = unknown. */
+  totalDiskBytes: number
+  /** The version of the agent binary running on the node. */
+  agentVersion: string
 }
 
 // ---------------------------------------------------------------------------

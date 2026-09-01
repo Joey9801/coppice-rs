@@ -40,6 +40,8 @@
 use std::path::Path;
 
 use anyhow::Result;
+use coppice_core::bytes::ByteSize;
+use coppice_core::resource::Resources;
 
 /// One dimension's detected value, or why it could not be read. The error is a
 /// plain string so [`DetectedCapacity`] stays `Clone` — callers only ever
@@ -78,6 +80,24 @@ pub struct DetectedCapacity {
     pub memory: DetectResult,
     /// Total size in bytes of the filesystem holding the data directory.
     pub disk: DetectResult,
+}
+
+impl DetectedCapacity {
+    /// The three readings as one [`Resources`] vector, for the agent to report
+    /// alongside its advertised capacity (`Register.detected_capacity`).
+    ///
+    /// `None` unless *every* dimension read: a vector with a failed dimension
+    /// zero-filled is indistinguishable from a host that genuinely detected
+    /// nothing on it, and would render as a confident "0 cores" on the node
+    /// detail view. Partial readings are not worth that; the per-dimension
+    /// errors still reach the operator through the startup log.
+    pub fn as_resources(&self) -> Option<Resources> {
+        Some(Resources {
+            cpu_millis: *self.cpu_millis.as_ref().ok()?,
+            memory: ByteSize::from_bytes(*self.memory.as_ref().ok()?),
+            disk: ByteSize::from_bytes(*self.disk.as_ref().ok()?),
+        })
+    }
 }
 
 /// Settle one dimension: an operator override always wins, else the detected

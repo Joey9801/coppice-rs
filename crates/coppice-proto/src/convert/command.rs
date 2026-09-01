@@ -8,6 +8,7 @@
 //! them itself.
 
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::resource::Resources;
 use coppice_core::time::Duration;
 use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::{
@@ -404,6 +405,8 @@ impl From<&RegisterNode> for pb::RegisterNode {
             labels: labels_to_pb(&c.labels),
             registered_at_us: c.registered_at.as_micros(),
             service_addr: c.service_addr.clone(),
+            host_facts: c.host_facts.as_ref().map(Into::into),
+            detected_capacity: c.detected_capacity.as_ref().map(Into::into),
         }
     }
 }
@@ -419,6 +422,8 @@ impl TryFrom<pb::RegisterNode> for RegisterNode {
             registered_at: timestamp(c.registered_at_us, "RegisterNode.registered_at_us")?,
             // Empty string canonicalizes to None (see Node conversion).
             service_addr: c.service_addr.filter(|s| !s.is_empty()),
+            host_facts: c.host_facts.map(Into::into),
+            detected_capacity: c.detected_capacity.map(Resources::try_from).transpose()?,
         })
     }
 }

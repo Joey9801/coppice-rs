@@ -4,12 +4,16 @@ import { ArrowLeft, ArrowRight, Boxes, Inbox, ListTree } from 'lucide-react'
 import type {
   AccrualView,
   AttemptView,
+  HostFacts,
   NodeDetail,
   NodeHistoryEntry,
   NodeSummary,
+  Resources,
 } from '@/api/types'
 import { useNode, useNodeHistory, useNodeLogs, useNodeUtilization } from '@/api/queries'
 import {
+  formatBytes,
+  formatCpu,
   formatDuration,
   formatPercent,
   formatTimeUntil,
@@ -154,7 +158,16 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           </CardContent>
         </Card>
 
-        <Card className="lg:col-span-2">
+        <Card className="lg:col-span-1">
+          <CardHeader>
+            <CardTitle>Host</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <HostCard host={detail.host} summary={summary} detected={detail.detectedCapacity} />
+          </CardContent>
+        </Card>
+
+        <Card className="lg:col-span-1">
           <CardHeader>
             <CardTitle>Utilization history</CardTitle>
           </CardHeader>
@@ -199,6 +212,139 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           <LogsSection nodeId={nodeId} />
         </CardContent>
       </Card>
+    </div>
+  )
+}
+
+/**
+ * What the machine is, and — when they disagree — why what it advertises is
+ * not what it has.
+ *
+ * Every fact is best-effort at the agent, so an empty string or a zero count
+ * means "not determined" and renders as `unknown` rather than as a confident
+ * `0`. A node whose agent reported nothing at all is not an error: older
+ * agents and hosts whose readings all failed both land here.
+ */
+function HostCard({
+  host,
+  summary,
+  detected,
+}: {
+  host: HostFacts | null
+  summary: NodeSummary
+  detected: Resources | null
+}) {
+  if (host === null) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        This node&rsquo;s agent reported no host details.
+      </p>
+    )
+  }
+
+  const cores =
+    host.physicalCores > 0 && host.logicalCores > 0
+      ? `${host.physicalCores} physical / ${host.logicalCores} logical`
+      : host.logicalCores > 0
+        ? `${host.logicalCores} logical`
+        : null
+
+  // Advertised capacity is what the scheduler places against; detection is
+  // what the box reported before `[capacity]` overrides and the system
+  // reservation. Showing both only earns its space when they differ.
+  const overridden =
+    detected !== null &&
+    (detected.cpuMillis !== summary.capacity.cpuMillis ||
+      detected.memoryBytes !== summary.capacity.memoryBytes ||
+      detected.diskBytes !== summary.capacity.diskBytes)
+
+  return (
+    <div className="space-y-4">
+      <dl className="space-y-2 text-sm">
+        <HostFact label="OS" value={host.osVersion || host.os} />
+        <HostFact label="Kernel" value={host.kernelVersion} mono />
+        <HostFact label="Arch" value={host.arch} mono />
+        <HostFact label="CPU" value={host.cpuModel} />
+        <HostFact label="Cores" value={cores} />
+        <HostFact
+          label="Memory"
+          value={host.totalMemoryBytes > 0 ? formatBytes(host.totalMemoryBytes) : null}
+        />
+        <HostFact
+          label="Disk"
+          value={host.totalDiskBytes > 0 ? formatBytes(host.totalDiskBytes) : null}
+        />
+        <HostFact label="Agent" value={host.agentVersion} mono />
+      </dl>
+
+      {overridden && detected !== null ? (
+        <div className="space-y-2 border-t border-border pt-3">
+          <p className="text-xs text-muted-foreground">
+            Advertised capacity differs from what this host detected — an operator override or the
+            system reservation.
+          </p>
+          <dl className="space-y-1 text-sm">
+            <CapacityDelta
+              label="CPU"
+              advertised={formatCpu(summary.capacity.cpuMillis)}
+              detected={formatCpu(detected.cpuMillis)}
+              differs={detected.cpuMillis !== summary.capacity.cpuMillis}
+            />
+            <CapacityDelta
+              label="Memory"
+              advertised={formatBytes(summary.capacity.memoryBytes)}
+              detected={formatBytes(detected.memoryBytes)}
+              differs={detected.memoryBytes !== summary.capacity.memoryBytes}
+            />
+            <CapacityDelta
+              label="Disk"
+              advertised={formatBytes(summary.capacity.diskBytes)}
+              detected={formatBytes(detected.diskBytes)}
+              differs={detected.diskBytes !== summary.capacity.diskBytes}
+            />
+          </dl>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** One host fact; a missing reading reads as `unknown`, never as a value. */
+function HostFact({ label, value, mono }: { label: string; value: string | null; mono?: boolean }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3">
+      <dt className="shrink-0 text-muted-foreground">{label}</dt>
+      <dd
+        className={cn(
+          'text-right break-all',
+          mono && 'font-mono text-[13px]',
+          !value && 'text-muted-foreground italic',
+        )}
+      >
+        {value || 'unknown'}
+      </dd>
+    </div>
+  )
+}
+
+function CapacityDelta({
+  label,
+  advertised,
+  detected,
+  differs,
+}: {
+  label: string
+  advertised: string
+  detected: string
+  differs: boolean
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-3">
+      <dt className="shrink-0 text-muted-foreground">{label}</dt>
+      <dd className="text-right tabular-nums">
+        <span className={cn(differs && 'font-medium')}>{advertised}</span>
+        <span className="text-muted-foreground"> of {detected} detected</span>
+      </dd>
     </div>
   )
 }

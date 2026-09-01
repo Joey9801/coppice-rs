@@ -10,6 +10,7 @@ use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
 };
 use coppice_core::job::{Job, JobState, RetryPolicy};
+use coppice_core::node::HostFacts;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -160,6 +161,23 @@ fn every_command() -> Vec<Command> {
             labels: BTreeMap::from([("zone".into(), "a".into()), ("gpu".into(), "none".into())]),
             registered_at: ts(),
             service_addr: Some("10.0.0.7:9443".into()),
+            host_facts: Some(HostFacts {
+                os: "linux".into(),
+                os_version: "Debian GNU/Linux 12 (bookworm)".into(),
+                kernel_version: "6.1.0-21-amd64".into(),
+                arch: "x86_64".into(),
+                cpu_model: "AMD EPYC 7763 64-Core Processor".into(),
+                physical_cores: 8,
+                logical_cores: 16,
+                total_memory_bytes: ByteSize::from_gib(64).as_u64(),
+                total_disk_bytes: ByteSize::from_gib(512).as_u64(),
+                agent_version: "0.0.1".into(),
+            }),
+            detected_capacity: Some(Resources {
+                cpu_millis: 16_000,
+                memory: ByteSize::from_gib(64),
+                disk: ByteSize::from_gib(512),
+            }),
         }),
         Command::DeclareNodeLost(DeclareNodeLost {
             node,

@@ -134,6 +134,37 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
   }
 }
 
+describe('host facts', () => {
+  it('describes every node, never advertising more than it detected', () => {
+    const world = new MockWorld(NOW_US)
+    const nodes = world.buildNodeSummaries()
+
+    for (const node of nodes) {
+      const detail = world.buildNodeDetail(node.id)
+      const host = detail.host
+      expect(host).not.toBeNull()
+      expect(host!.os).toMatch(/^(linux|macos)$/)
+      expect(host!.logicalCores).toBeGreaterThan(0)
+      expect(host!.agentVersion).not.toBe('')
+
+      // An override may withhold capacity; it may never invent it.
+      const detected = detail.detectedCapacity!
+      expect(fits(node.capacity, detected)).toBe(true)
+      // The host's totals agree with what detection reported.
+      expect(host!.totalMemoryBytes).toBe(detected.memoryBytes)
+      expect(host!.totalDiskBytes).toBe(detected.diskBytes)
+    }
+
+    // At least one node advertises less than it detected, so the detail
+    // view's advertised-vs-detected split is actually exercised offline.
+    const overridden = nodes.filter((n) => {
+      const detected = world.buildNodeDetail(n.id).detectedCapacity!
+      return detected.cpuMillis !== n.capacity.cpuMillis
+    })
+    expect(overridden.length).toBeGreaterThan(0)
+  })
+})
+
 describe('MockWorld construction', () => {
   it('holds all coherence invariants on a fresh world', () => {
     const world = new MockWorld(NOW_US)

@@ -10,6 +10,7 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::{AllocationId, GroupId};
 use coppice_core::job::{JobState, RetryPolicy};
+use coppice_core::node::HostFacts;
 use coppice_core::quota::{CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
 use coppice_core::time::Duration;
 use coppice_state::command::{
@@ -863,6 +864,63 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
         !sm.nodes[&nid(1)].node.schedulable,
         "an agent restart must not undo a drain"
     );
+}
+
+/// Host facts and the detection reading are agent-reported description, so
+/// re-registration overwrites them wholesale — the same rule as capacity,
+/// labels, and `service_addr`. A re-imaged or upgraded machine must not leave
+/// half of the previous host's story behind.
+#[test]
+fn reregistration_overwrites_host_facts() {
+    let mut sm = setup();
+
+    let first = HostFacts {
+        os: "linux".into(),
+        os_version: "Debian GNU/Linux 11 (bullseye)".into(),
+        kernel_version: "5.10.0-28-amd64".into(),
+        arch: "x86_64".into(),
+        cpu_model: "AMD EPYC 7763 64-Core Processor".into(),
+        physical_cores: 8,
+        logical_cores: 16,
+        total_memory_bytes: 64 << 30,
+        total_disk_bytes: 512 << 30,
+        agent_version: "0.0.1".into(),
+    };
+    apply_ok(
+        &mut sm,
+        register_node_cmd_with_host(nid(1), cpu(20_000), ts(TS_US + 1), Some(first.clone())),
+    );
+    assert_eq!(sm.nodes[&nid(1)].node.host_facts.as_ref(), Some(&first));
+    assert_eq!(sm.nodes[&nid(1)].node.detected_capacity, Some(cpu(20_000)));
+
+    // The box is re-imaged: a newer distro, a newer agent, fewer cores.
+    let second = HostFacts {
+        os_version: "Debian GNU/Linux 12 (bookworm)".into(),
+        kernel_version: "6.1.0-21-amd64".into(),
+        physical_cores: 4,
+        logical_cores: 8,
+        agent_version: "0.0.2".into(),
+        ..first.clone()
+    };
+    apply_ok(
+        &mut sm,
+        register_node_cmd_with_host(nid(1), cpu(8_000), ts(TS_US + 2), Some(second.clone())),
+    );
+    assert_eq!(
+        sm.nodes[&nid(1)].node.host_facts.as_ref(),
+        Some(&second),
+        "the new facts replace the old ones outright, field for field"
+    );
+    assert_eq!(sm.nodes[&nid(1)].node.detected_capacity, Some(cpu(8_000)));
+
+    // An agent that reports nothing clears them: absent is a real state, not
+    // "keep whatever you had".
+    apply_ok(
+        &mut sm,
+        register_node_cmd_with_host(nid(1), cpu(8_000), ts(TS_US + 3), None),
+    );
+    assert_eq!(sm.nodes[&nid(1)].node.host_facts, None);
+    assert_eq!(sm.nodes[&nid(1)].node.detected_capacity, None);
 }
 
 #[test]

@@ -41,6 +41,7 @@ import type {
   LogChunk,
   LogEntry,
   LogLevel,
+  HostFacts,
   NodeDetail,
   NodeHealth,
   NodeHistoryEntry,
@@ -313,6 +314,14 @@ interface MNode {
    * never regenerated per request.
    */
   utilHistory: UtilizationSample[]
+  /** Static host description, as an agent would have reported it. */
+  host: HostFacts
+  /**
+   * What detection read before the operator's `[capacity]` overrides. Equal to
+   * `capacity` on most nodes; a couple of simulated nodes are overridden so
+   * the detail view's advertised-vs-detected split has something to show.
+   */
+  detectedCapacity: Resources
 }
 
 interface MAlloc {
@@ -793,9 +802,31 @@ export class MockWorld {
       const draining = i === 3 // one node draining (schedulable false, still runs work)
       const lost = i === 7 // one node Lost (stale heartbeat)
       const noSampler = i === 10 // one node with no usage sampler wired up
+      // Two nodes advertise less than they detect, the way an operator's
+      // `[capacity]` override or a system reservation does on a real cluster —
+      // the case the detail view's detected column exists to explain.
+      const overridden = i === 2 || i === 9
+      const detected = res(cores * 1000, memGiB * GIB, Math.round(diskTiB * TIB))
+      const linux = i % 3 !== 0
       const node: MNode = {
         id: this.rng.mintId('node'),
-        capacity: res(cores * 1000, memGiB * GIB, Math.round(diskTiB * TIB)),
+        capacity: overridden
+          ? res(Math.round(cores * 1000 * 0.75), memGiB * GIB, Math.round(diskTiB * TIB))
+          : detected,
+        detectedCapacity: detected,
+        host: {
+          os: linux ? 'linux' : 'macos',
+          osVersion: linux ? 'Debian GNU/Linux 12 (bookworm)' : '15.5',
+          kernelVersion: linux ? '6.1.0-21-amd64' : '24.5.0',
+          arch: linux ? 'x86_64' : 'aarch64',
+          cpuModel: linux ? 'AMD EPYC 7763 64-Core Processor' : 'Apple M2 Pro',
+          // Hyperthreaded on x86; one thread per core on the Apple parts.
+          physicalCores: linux ? cores / 2 : cores,
+          logicalCores: cores,
+          totalMemoryBytes: memGiB * GIB,
+          totalDiskBytes: Math.round(diskTiB * TIB),
+          agentVersion: '0.0.1',
+        },
         labels: { zone: this.rng.pick(zones), pool },
         schedulable: !draining,
         health: lost ? 'Lost' : 'Healthy',
@@ -2728,7 +2759,13 @@ export class MockWorld {
       }
     }
     accrualQueue.sort((a, b) => a.allocation.seq - b.allocation.seq)
-    return { summary: this.nodeSummary(node), activeAttempts, accrualQueue }
+    return {
+      summary: this.nodeSummary(node),
+      host: { ...node.host },
+      detectedCapacity: { ...node.detectedCapacity },
+      activeAttempts,
+      accrualQueue,
+    }
   }
 
   buildNodeUtilization(id: string): NodeUtilization {

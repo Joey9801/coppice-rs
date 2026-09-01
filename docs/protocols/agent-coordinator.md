@@ -90,8 +90,17 @@ CN↔NodeId binding is the stable part.
 
 ### Connect, register, reconcile, work
 
-1. **Connect** (mTLS) and send `Register { capacity, labels }` with
-   `node_epoch = 0`.
+1. **Connect** (mTLS) and send
+   `Register { capacity, labels, service_addr, host_facts, detected_capacity }`
+   with `node_epoch = 0`. `capacity` is the **advertised** vector — detection
+   with `[capacity]` overrides applied, minus the system reservation —
+   while `detected_capacity` is what detection alone read and `host_facts`
+   describes the machine (OS, kernel, CPU model, core counts, totals, agent
+   version). The last two are display-only: nothing schedules on them, and
+   every one of their fields is independently best-effort, so an unreadable
+   value arrives empty rather than blocking registration. Registration is
+   their only refresh — a re-imaged host publishes new facts by
+   re-registering, which overwrites the previous set wholesale.
 2. The leader's ingestion proposes `RegisterNode`; the apply bumps the
    node's epoch. The gateway then sends **`RegisterAccepted`** — an empty
    command whose `CommandHeader` carries the fresh fencing token. This is

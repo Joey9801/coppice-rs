@@ -36,6 +36,8 @@ pub fn node_record(id: NodeId, epoch: u64, schedulable: bool) -> NodeRecord {
             labels: BTreeMap::new(),
             schedulable,
             service_addr: None,
+            host_facts: None,
+            detected_capacity: None,
         },
         epoch,
     }
