@@ -150,6 +150,26 @@ message Heartbeat {
   // Summarized cache inventory (ADR 0010): observed state for soft scoring
   // only, never replicated.
   ImageCacheInventory image_cache = 3;
+  // Best-effort node usage. Absent means "not measured" — never zero: a node
+  // whose runtime measures nothing, or whose samples are all stale, reports
+  // no `used` at all rather than a misleading floor.
+  optional NodeUsage used = 4;
+}
+
+// Job-attributable resource usage observed on a node, folded by the agent from
+// its per-container samplers: every dimension counts only what this node's
+// containers consumed, never a host-level reading.
+//
+// Like `ImageCacheInventory`, this is observed state the leader consumes for
+// display and scoring, and it is **never replicated** — the leader peels it off
+// at ingestion and it never becomes a coppice.command.v1 fact.
+message NodeUsage {
+  // The folded job-attributable vector (cpu/memory/disk). Every dimension is
+  // present, since a fold over zero fresh containers reports no NodeUsage at
+  // all rather than a zero vector.
+  coppice.core.v1.Resources used = 1;
+  // When the fold was taken, so a consumer can age it out.
+  int64 sampled_at_us = 2;
 }
 
 // An observed attempt transition. Attempt-scoped and idempotent: the

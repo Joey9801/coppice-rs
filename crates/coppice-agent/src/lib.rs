@@ -20,6 +20,7 @@ pub mod observed;
 pub mod pressure;
 pub mod session;
 pub mod telemetry;
+pub mod usage;
 
 use std::sync::Arc;
 
@@ -114,11 +115,20 @@ pub fn describe_metrics() {
     executor::docker::describe_metrics();
     telemetry::describe_metrics();
     node_service::describe_metrics();
+    // Note the absence of `usage`: the node-usage series are rendered directly
+    // onto each scrape rather than recorded, precisely so they can vanish when
+    // unmeasured (see [`usage`]), and a recorder that never sees them has
+    // nothing to describe.
 }
 
 /// Run any point-in-time sampling behind agent metrics, recursing the same
 /// modules as [`describe_metrics`]. The `/metrics` server calls this
 /// immediately before rendering each scrape.
+///
+/// Every agent metric today is *pushed* at the event that changes it, so every
+/// arm here is a no-op; the one genuinely sampled surface, node usage, cannot
+/// live in a recorder at all ([`usage::render_exposition`] explains why) and is
+/// appended to the scrape instead.
 pub fn gather_metrics() {
     coppice_tls::gather_metrics();
     executor::docker::gather_metrics();
@@ -353,7 +363,12 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
             .await
             .context("binding the metrics server listener")?;
         tracing::info!(%metrics_addr, "Prometheus metrics server bound at /metrics (issue #46)");
-        metrics_server::serve(listener, metrics_handle, gather_metrics);
+        metrics_server::serve(
+            listener,
+            metrics_handle,
+            gather_metrics,
+            usage::render_exposition,
+        );
     }
 
     let session = session::Session::new(
@@ -364,7 +379,9 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
         state,
         docker_executor,
     )
-    .with_service_addr(config.service_addr());
+    .with_service_addr(config.service_addr())
+    // Publish the executor as the `/metrics` node-usage source (usage.rs).
+    .with_usage_metrics();
 
     tracing::info!("coppice agent started; entering the session loop");
     session::run(session, &config, tls_store).await

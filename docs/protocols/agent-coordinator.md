@@ -70,8 +70,8 @@ The wire schema is `coppice.agent.v1`
 (`proto/coppice/agent/v1/agent.proto`): `AgentCommand` carries the fencing
 token and `command_seq` in one common `CommandHeader` on every
 coordinator→agent command, and `AgentReport` covers registration,
-heartbeats (capacity, running set, image-cache inventory), attempt status,
-and the ObservedSet. That file is the code-side anchor for this document;
+heartbeats (capacity, running set, image-cache inventory, node usage),
+attempt status, and the ObservedSet. That file is the code-side anchor for this document;
 evolution follows [schema-style](../architecture/schema-style.md).
 
 ## The session, as implemented
@@ -100,8 +100,8 @@ CN↔NodeId binding is the stable part.
    from its journal plus the container runtime — *before accepting any new
    work*.
 4. Normal operation: heartbeats every `heartbeat_interval` (capacity,
-   running allocations, image-cache inventory), `AttemptStatus` reports on
-   observed transitions, commands down.
+   running allocations, image-cache inventory, node usage), `AttemptStatus`
+   reports on observed transitions, commands down.
 5. Any stream break: reconnect with backoff and go to step 1. At-least-once
    reporting is achieved by the reliable stream plus this full resync on
    every reconnect; there are no per-report acks on the wire.
@@ -178,6 +178,20 @@ and is never claimed, and neither is a runtime-only recovery survivor
 (exited, no intent record): those are reported terminal once in the
 registration ObservedSet, and a claim would draw a `StopJob` the agent
 has no intent to resolve.
+
+A heartbeat also carries **node usage** (`Heartbeat.used`), the agent's
+best-effort fold of the per-container samples its executor already
+collects. Every dimension — cpu, memory, disk — is *job-attributable*:
+it counts only what this node's containers consumed, never a host-level
+reading, so a node's `used` is comparable to its `allocated`. The field
+is `optional` and its absence means **not measured** (no runtime
+telemetry, or live containers with no reading fresher than twice the
+sampler interval) — never zero, which would misreport a wedged agent as
+an idle node. The converse holds too: an agent with no containers at all
+reports a present, all-zero vector, because an idle node's usage is a
+measured fact rather than an unknown. Like the
+image-cache inventory, usage is observed-only: the leader consumes it
+outside the normalizer and it never becomes a Raft command.
 
 Node liveness is bookkept from report arrival times; the leader's
 housekeeping tick proposes `DeclareNodeLost` for a node silent past the

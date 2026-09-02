@@ -128,12 +128,13 @@ impl ApiClient {
     /// as `None` — no `Authorization` header — since clap surfaces `env =
     /// "COPPICE_TOKEN"` as `Some("")` when the variable is set but empty.
     pub fn with_token(api: &str, token: Option<&str>) -> Result<ApiClient> {
-        let http = reqwest::Client::builder()
+        let base = normalize_base(api);
+        let http = plain_http_builder(&base)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("building the HTTP client")?;
         Ok(ApiClient {
-            base: normalize_base(api),
+            base,
             http,
             token: token
                 .map(str::trim)
@@ -233,13 +234,50 @@ impl ApiClient {
 /// Reduce an `--api` value to a bare base URL. Trims a trailing slash, then a
 /// trailing `/api/v1` (the form the dev banner prints and users paste), then
 /// any slash that exposes — so every accepted form maps to the same base.
+/// The scheme is canonicalized to lowercase (RFC 3986 §3.1: schemes are
+/// case-insensitive), so downstream scheme checks can compare literally.
 pub fn normalize_base(raw: &str) -> String {
     let trimmed = raw.trim_end_matches('/');
-    trimmed
+    let canonical = match trimmed.find("://") {
+        Some(scheme_end) => {
+            let (scheme, rest) = trimmed.split_at(scheme_end);
+            format!("{}{rest}", scheme.to_ascii_lowercase())
+        }
+        None => trimmed.to_string(),
+    };
+
+    canonical
         .strip_suffix("/api/v1")
-        .unwrap_or(trimmed)
+        .unwrap_or(&canonical)
         .trim_end_matches('/')
         .to_string()
+}
+
+/// A `reqwest::ClientBuilder` for a *normalized* base ([`normalize_base`]),
+/// skipping the platform's native root certificate store when the base is
+/// not `https://`.
+///
+/// `rustls-tls-native-roots` (this workspace's TLS backend) enumerates the
+/// macOS keychain eagerly inside `ClientBuilder::build`, before any request —
+/// ~3.3s cold — even for a plain `http://127.0.0.1` base that will never
+/// touch TLS. Every base this CLI dials today (`DEFAULT_API_BASE`, `--api`
+/// for an intranet coordinator, `coppice dev`'s own readiness polling) is
+/// plain HTTP, so that cost buys nothing. A future `https://` `--api` (or the
+/// `coppice token` IdP flow) keeps native roots automatically under this same
+/// scheme check.
+pub fn plain_http_builder(base: &str) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    // Case-insensitive as a belt against un-normalized callers; a normalized
+    // base already carries a lowercase scheme.
+    let is_https = base
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"));
+    if is_https {
+        builder
+    } else {
+        builder.tls_built_in_native_certs(false)
+    }
 }
 
 /// The wire error body (ADR 0031). The API's own `ErrorBody` is private and
@@ -469,6 +507,41 @@ mod tests {
         assert_eq!(client.url("/jobs"), "http://h:7070/api/v1/jobs");
     }
 
+    /// `plain_http_builder` skips native root loading for a bare host and an
+    /// `http://` base, and keeps it for `https://` — the scheme rule that
+    /// avoids paying the macOS keychain cost on every plain-HTTP launch.
+    #[test]
+    fn plain_http_builder_skips_native_roots_for_non_https_bases() {
+        for base in ["h:7070", "http://h:7070", "http://127.0.0.1:7070"] {
+            assert!(
+                plain_http_builder(base).build().is_ok(),
+                "builder failed for {base}"
+            );
+        }
+        assert!(plain_http_builder("https://h:7070").build().is_ok());
+    }
+
+    /// A base whose first eight BYTES straddle a multi-byte character must
+    /// not panic the scheme check — the prefix is compared as bytes, never
+    /// sliced as `str`. `a\u{e9}\u{e9}\u{e9}\u{e9}://host` is 8 bytes into the
+    /// middle of an `\u{e9}` at index 8.
+    #[test]
+    fn a_non_ascii_scheme_does_not_panic_the_builder() {
+        for base in ["a\u{e9}\u{e9}\u{e9}\u{e9}://host", "\u{e9}", "short"] {
+            let _ = plain_http_builder(base);
+            let _ = ApiClient::new(base);
+        }
+    }
+
+    /// A client builds successfully for both an http and an https base — the
+    /// scheme-dependent native-root toggle in `plain_http_builder` must not
+    /// break construction either way.
+    #[test]
+    fn client_constructs_for_http_and_https_bases() {
+        assert!(ApiClient::new("http://h:7070").is_ok());
+        assert!(ApiClient::new("https://h:7070").is_ok());
+    }
+
     /// The default base and the default port are two literals that must name
     /// the same endpoint — `clap`'s `default_value` needs a `&'static str`, so
     /// the base cannot be built from the port at compile time. This closes the
@@ -498,5 +571,37 @@ mod tests {
         assert_eq!(lines[0], "id         state");
         assert_eq!(lines[1], "a          queued");
         assert_eq!(lines[2], "longer-id  running");
+    }
+
+    /// Schemes are case-insensitive per RFC 3986. `normalize_base` must
+    /// canonicalize them to lowercase so all forms normalize to the same base.
+    #[test]
+    fn scheme_normalization_is_case_insensitive() {
+        let base_https_lower = normalize_base("https://h:7070");
+        let base_https_upper = normalize_base("HTTPS://h:7070");
+        let base_https_mixed = normalize_base("HtTpS://h:7070");
+
+        assert_eq!(base_https_lower, base_https_upper);
+        assert_eq!(base_https_lower, base_https_mixed);
+        assert_eq!(base_https_lower, "https://h:7070");
+
+        // HTTP variants should also normalize consistently
+        let base_http_lower = normalize_base("http://h:7070");
+        let base_http_upper = normalize_base("HTTP://h:7070");
+        let base_http_mixed = normalize_base("HtTp://h:7070");
+
+        assert_eq!(base_http_lower, base_http_upper);
+        assert_eq!(base_http_lower, base_http_mixed);
+        assert_eq!(base_http_lower, "http://h:7070");
+    }
+
+    /// A client must construct successfully for uppercase and mixed-case HTTPS
+    /// schemes, preserving the TLS native roots behavior (which requires the
+    /// scheme to be recognized as https regardless of case).
+    #[test]
+    fn client_constructs_for_case_insensitive_https_schemes() {
+        assert!(ApiClient::new("HTTPS://h:7070").is_ok());
+        assert!(ApiClient::new("HtTpS://h:7070").is_ok());
+        assert!(ApiClient::new("https://h:7070").is_ok());
     }
 }

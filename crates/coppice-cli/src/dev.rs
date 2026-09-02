@@ -49,6 +49,7 @@ use coppice_coordinator::config as coord_config;
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{ClusterId, NodeId, QuotaEntityId};
+use coppice_core::resource::Resources;
 use coppice_discovery::SeedConfig;
 use coppice_enroll::{EnrollmentConfig, Secret};
 
@@ -98,6 +99,17 @@ pub struct DevArgs {
     /// executing nothing, captures no logs, and reports no usage.
     #[arg(long, value_enum, default_value_t = DevExecutor::Docker)]
     executor: DevExecutor,
+
+    /// Override the advertised disk capacity for the `docker` executor (e.g.
+    /// `500gib`, `2tib`). Disk capacity cannot be read from the Docker daemon
+    /// the way cpu/mem can (`docker info` has no disk field), and on a
+    /// VM-backed local daemon (Docker Desktop, Colima) the daemon's storage
+    /// lives inside a VM disk this process cannot `statvfs` — dev falls back
+    /// to a conservative guess in that case (64 GiB, the Colima default) and
+    /// warns; pass this flag to state the real number instead. Ignored by
+    /// `--executor fake`, which already advertises a fixed 1 TiB.
+    #[arg(long)]
+    disk_capacity: Option<ByteSize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -358,7 +370,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // -- Agent: in-process, enrolling, dialing the gateway over localhost. --
     let agent_pki = root.join("agent-pki");
     std::fs::create_dir_all(&agent_pki).context("creating the agent PKI dir")?;
-    let agent_config = AgentConfig {
+    let mut agent_config = AgentConfig {
         data_dir: agent_data,
         // The dev coordinator is this same process on localhost, so the static
         // backend names it directly (ADR 0037 §2).
@@ -380,13 +392,28 @@ pub async fn run(args: DevArgs) -> Result<()> {
             token_path: None,
             insecure: true,
         }),
-        // Generous capacity, overridden on every dimension: a dev cluster must
-        // not become capacity-bound because the laptop running it is small, nor
-        // fail to start because a dimension could not be detected (A3).
-        capacity: CapacityConfig {
-            cpu_millis: Some(16_000),
-            memory: Some(ByteSize::from_gib(16)),
-            disk: Some(ByteSize::from_tib(1)),
+        // `Fake` runs no containers and detects nothing real, so it keeps the
+        // old generous, hardcoded overrides on every dimension: a dev cluster
+        // must not become capacity-bound because the laptop running it is
+        // small, nor fail to start because a dimension could not be detected
+        // (A3). `Docker` leaves cpu/mem unset here and lets real detection run
+        // below — `docker::api::daemon_capacity()`, once the daemon is
+        // reachable (the VM the daemon schedules containers in on Docker
+        // Desktop/Colima setups, not the host `capacity::detect()` would
+        // read). Disk is set explicitly below, once the daemon's data-root is
+        // known: containers/images consume the *daemon's* storage, which on a
+        // VM-backed daemon is not the host filesystem `statvfs(data_dir)`
+        // would read either — see the docker-executor arm.
+        capacity: match args.executor {
+            DevExecutor::Fake => CapacityConfig {
+                cpu_millis: Some(16_000),
+                memory: Some(ByteSize::from_gib(16)),
+                disk: Some(ByteSize::from_tib(1)),
+            },
+            DevExecutor::Docker => CapacityConfig {
+                disk: args.disk_capacity,
+                ..Default::default()
+            },
         },
         reservation: Default::default(),
         heartbeat_interval: Duration::from_secs(2),
@@ -448,34 +475,43 @@ pub async fn run(args: DevArgs) -> Result<()> {
         .await
         .context("enrolling the dev agent")?;
 
-    // Settle the agent's capacity exactly as `run_daemon` does (A3). Every
-    // dimension is overridden above, so this never depends on the host — but it
-    // runs through the same `effective_capacity` path, reservation check
-    // included, rather than around it.
-    let detected = coppice_agent::capacity::detect(&agent_config.data_dir);
-    let effective = agent_config
-        .effective_capacity(&detected)
-        .context("settling the dev agent's capacity")?;
-
     // Bind and serve the agent's `/metrics` endpoint before the executor match
     // moves `agent_config` into the session task (issue #46). Both dev scrape
     // URLs — this one and the coordinator's client-listener `/metrics` — share
     // the SAME recorder handle and `dev_gather`, so both render the identical
     // union of coordinator + agent metrics; the second endpoint exists only so
     // dev exercises the real agent scrape path, not because the views differ.
+    //
+    // One thing only this endpoint carries: the `agent_node_used_*` series are
+    // not in the recorder at all (they are rendered per scrape so they can go
+    // absent when unmeasured — see `coppice_agent::usage`), so they reach a
+    // scrape only through this extra-render hook.
     if let Some(metrics_addr) = agent_config.metrics_addr {
         let listener = coppice_agent::metrics_server::prepare_listener(metrics_addr)
             .await
             .context("binding the dev agent metrics server")?;
-        coppice_agent::metrics_server::serve(listener, metrics_handle.clone(), dev_gather);
+        coppice_agent::metrics_server::serve(
+            listener,
+            metrics_handle.clone(),
+            dev_gather,
+            coppice_agent::usage::render_exposition,
+        );
     }
     // async-fn-in-trait futures carry no generic `Send` bound, so the spawn
     // happens per concrete executor type rather than in a generic helper. The
     // second tuple element holds the telemetry handle (Docker executor only)
     // alive for the dev cluster's lifetime, so its retention janitors are not
     // dropped early (§8.4).
-    let (agent_join, _telemetry_guard) = match args.executor {
+    let (agent_join, _telemetry_guard, effective) = match args.executor {
         DevExecutor::Fake => {
+            // Every dimension is overridden above with the hardcoded fake
+            // values, so this never depends on the host — but it runs through
+            // the same `effective_capacity` path, reservation check included,
+            // rather than around it (A3).
+            let detected = coppice_agent::capacity::detect(&agent_config.data_dir);
+            let effective = agent_config
+                .effective_capacity(&detected)
+                .context("settling the dev agent's capacity")?;
             let session = build_session(
                 &agent_config,
                 agent_node,
@@ -486,7 +522,11 @@ pub async fn run(args: DevArgs) -> Result<()> {
             // The fake executor captures no container output, so the NodeService
             // serves no stores: every fetch honestly answers UnknownAttempt.
             serve_node_service(&agent_config, None, None)?;
-            (tokio::spawn(run_agent(session, agent_config)), None)
+            (
+                tokio::spawn(run_agent(session, agent_config)),
+                None,
+                effective,
+            )
         }
         DevExecutor::Docker => {
             // Mirror `run_daemon`'s wiring: connect the daemon, spawn the shared
@@ -498,6 +538,81 @@ pub async fn run(args: DevArgs) -> Result<()> {
             let docker = coppice_agent::executor::docker::api::connect(&docker_host)?;
             let data_root =
                 coppice_agent::executor::docker::api::data_root(&docker, &docker_host).await?;
+            // The daemon connects only here — after `agent_config` is already
+            // built — so cpu/mem/disk overrides are patched in now rather than
+            // the config being reordered around the connect. On macOS-style
+            // Docker-Desktop/Colima setups the daemon runs containers inside a
+            // VM sized smaller than the host; the daemon's own `docker info`
+            // reading is the number that matters, not `capacity::detect()`'s
+            // host reading.
+            //
+            // (A3) must not fail to start because a dimension could not be
+            // detected: on a failed daemon query, fall back to the old
+            // hardcoded dev values rather than propagating the error.
+            match coppice_agent::executor::docker::api::daemon_capacity(&docker).await {
+                Some((cpu_millis, memory_bytes)) => {
+                    agent_config.capacity.cpu_millis = Some(u64::from(cpu_millis));
+                    agent_config.capacity.memory = Some(ByteSize::from_bytes(memory_bytes));
+                }
+                None => {
+                    tracing::warn!(
+                        "could not read docker daemon cpu/mem for capacity detection; \
+                         falling back to the hardcoded dev defaults (16 cores / 16 GiB)"
+                    );
+                    agent_config.capacity.cpu_millis = Some(16_000);
+                    agent_config.capacity.memory = Some(ByteSize::from_gib(16));
+                }
+            }
+            // Disk: `--disk-capacity` (folded into `agent_config.capacity.disk`
+            // when the config was built above) always wins. Otherwise,
+            // containers and images consume the *daemon's* storage
+            // (`data_root`), not the agent host's — `capacity::detect()`'s
+            // `statvfs(data_dir)` reading below is the wrong filesystem for
+            // this dimension on `docker` and must never be presented as docker
+            // disk capacity (unlike `fake`, where nothing is real anyway). A
+            // native Linux daemon's `data_root` is a real local path, so
+            // `statvfs` it directly and reuse that reading; a VM-backed daemon
+            // (Docker Desktop, Colima) reports a path that does not exist on
+            // this filesystem at all — the same case `pressure.rs` already
+            // detects and warns on — and there is no way to observe the VM's
+            // disk size from here, so fall back to a conservative guess rather
+            // than either the host's (likely much larger) disk or an
+            // unbounded default.
+            if agent_config.capacity.disk.is_none() {
+                const VM_DISK_FALLBACK: ByteSize = ByteSize::from_gib(64);
+                agent_config.capacity.disk = Some(match &data_root {
+                    Some(root) if root.exists() => {
+                        match coppice_agent::capacity::detect_disk_at(root) {
+                            Ok(bytes) => ByteSize::from_bytes(bytes),
+                            Err(err) => {
+                                tracing::warn!(
+                                    %err,
+                                    root = %root.display(),
+                                    "could not statvfs the docker daemon's data-root for disk \
+                                     capacity detection; falling back to a conservative default \
+                                     of {VM_DISK_FALLBACK} — pass --disk-capacity to state the \
+                                     real size"
+                                );
+                                VM_DISK_FALLBACK
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "dev could not observe the docker daemon's own disk size (it runs \
+                             in a VM this process cannot see, e.g. Docker Desktop or Colima); \
+                             falling back to a conservative default of {VM_DISK_FALLBACK} \
+                             rather than the host filesystem's — pass --disk-capacity <SIZE> \
+                             (e.g. --disk-capacity 200gib) to state the real number"
+                        );
+                        VM_DISK_FALLBACK
+                    }
+                });
+            }
+            let detected = coppice_agent::capacity::detect(&agent_config.data_dir);
+            let effective = agent_config
+                .effective_capacity(&detected)
+                .context("settling the dev agent's capacity")?;
             let mut pressure_paths = vec![agent_config.data_dir.clone()];
             if let Some(root) = data_root {
                 pressure_paths.push(root);
@@ -565,6 +680,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
             (
                 tokio::spawn(run_agent(session, agent_config)),
                 Some(telemetry),
+                effective,
             )
         }
     };
@@ -593,6 +709,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
             ui_available: coppice_api::http::ui_available(),
             quota_entity: DEV_QUOTA_ENTITY.parse().expect("dev quota entity id"),
             executor: args.executor,
+            capacity: effective.capacity,
         })
     );
 
@@ -869,6 +986,15 @@ fn write_operator_material(root: &Path, operator: &OperatorPem) -> Result<()> {
 // Readiness polling over the client API
 // ---------------------------------------------------------------------------
 
+/// A `reqwest::Client` for polling `coppice dev`'s own in-process coordinator
+/// at `http://127.0.0.1:<port>` — never anything else, so it always takes the
+/// plain-HTTP fast path in [`crate::client::plain_http_builder`].
+fn local_readiness_client() -> Result<reqwest::Client> {
+    crate::client::plain_http_builder("http://127.0.0.1")
+        .build()
+        .context("building the dev readiness HTTP client")
+}
+
 /// Wait until the client listener answers, i.e. the task runtime is serving.
 ///
 /// Formation returns as soon as the replica is started; the API edge (and with
@@ -877,7 +1003,10 @@ async fn wait_for_client_api(
     api: &str,
     coordinator: &mut tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    // Always a plain `http://127.0.0.1` base (see `local_readiness_client`'s
+    // doc) — skip the native-root-store enumeration `reqwest::Client::new()`
+    // would otherwise pay on every `coppice dev` launch.
+    let client = local_readiness_client()?;
     let url = format!("{api}/api/v1/nodes");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -899,7 +1028,7 @@ async fn wait_for_client_api(
 /// Wait for the in-process agent's registration to land in applied state,
 /// returning its epoch (ADR 0009).
 async fn wait_for_agent(api: &str, agent_node: NodeId) -> Result<u64> {
-    let client = reqwest::Client::new();
+    let client = local_readiness_client()?;
     let url = format!("{api}/api/v1/nodes/{agent_node}");
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -1026,6 +1155,10 @@ struct ReadySummary<'a> {
     ui_available: bool,
     quota_entity: QuotaEntityId,
     executor: DevExecutor,
+    /// Resolved node capacity (post-detection, pre-reservation): hardcoded for
+    /// `fake`, real detection for `docker` (item 10) — printed so it is
+    /// obvious which path ran.
+    capacity: Resources,
 }
 
 fn ready_summary(summary: &ReadySummary<'_>) -> String {
@@ -1047,6 +1180,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
          \x20 Metrics (agent) http://127.0.0.1:{metrics_port}/metrics\n\
          \x20 Data            {data_dir} ({data_lifetime})\n\
          \x20 Executor        {executor}\n\
+         \x20 Capacity        {cpu_millis} millicpu, {memory} memory, {disk} disk\n\
          \x20 Cluster         {cluster_id} (Raft node {coordinator_raft_id})\n\
          \x20 Agent           {agent_node} (enrolled, epoch {agent_epoch})\n\
          \x20 Quota entity    {quota_entity} (\"dev\", seeded; priorities -2..=2)\n\
@@ -1074,6 +1208,9 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
                     .to_string(),
             DevExecutor::Docker => "docker".to_string(),
         },
+        cpu_millis = summary.capacity.cpu_millis,
+        memory = summary.capacity.memory,
+        disk = summary.capacity.disk,
         cluster_id = summary.cluster_id,
         coordinator_raft_id = summary.coordinator_raft_id,
         agent_node = summary.agent_node,
@@ -1108,6 +1245,11 @@ mod tests {
             ui_available: false,
             quota_entity: DEV_QUOTA_ENTITY.parse().expect("quota entity id"),
             executor: DevExecutor::Fake,
+            capacity: Resources {
+                cpu_millis: 16_000,
+                memory: ByteSize::from_gib(16),
+                disk: ByteSize::from_tib(1),
+            },
         });
 
         assert!(summary.starts_with("\nCoppice dev is ready\n\n"));
@@ -1125,6 +1267,44 @@ mod tests {
         assert!(summary.contains(&format!(
             "Quota entity    {DEV_QUOTA_ENTITY} (\"dev\", seeded; priorities -2..=2)"
         )));
+        assert!(summary.contains("Capacity        16000 millicpu, 16 GiB memory, 1 TiB disk"));
+    }
+
+    /// The banner's capacity line must reflect whatever capacity was actually
+    /// resolved for the run (item 10) — a mismatch there is exactly the "1004
+    /// GiB disk" confusion the fix exists to end.
+    #[test]
+    fn the_banner_prints_the_resolved_capacity() {
+        let summary = ready_summary(&ReadySummary {
+            root: Path::new("/tmp/coppice-dev"),
+            persistent: false,
+            cluster_id: "cluster-00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("cluster id"),
+            coordinator_raft_id: 42,
+            agent_node: "node-00000000-0000-0000-0000-000000000002"
+                .parse()
+                .expect("node id"),
+            agent_epoch: 1,
+            raft_port: 7071,
+            agent_port: 7072,
+            client_port: DEFAULT_API_PORT,
+            node_service_port: 7073,
+            metrics_port: 7074,
+            ui_available: false,
+            quota_entity: DEV_QUOTA_ENTITY.parse().expect("quota entity id"),
+            executor: DevExecutor::Docker,
+            capacity: Resources {
+                cpu_millis: 4_000,
+                memory: ByteSize::from_gib(6),
+                disk: ByteSize::from_gib(512),
+            },
+        });
+
+        assert!(
+            summary.contains("Capacity        4000 millicpu, 6 GiB memory, 512 GiB disk"),
+            "{summary}"
+        );
     }
 
     /// The banner's executor line must be self-explanatory about `fake`'s
@@ -1153,6 +1333,11 @@ mod tests {
                 ui_available: false,
                 quota_entity: DEV_QUOTA_ENTITY.parse().expect("quota entity id"),
                 executor,
+                capacity: Resources {
+                    cpu_millis: 16_000,
+                    memory: ByteSize::from_gib(16),
+                    disk: ByteSize::from_tib(1),
+                },
             })
         };
 

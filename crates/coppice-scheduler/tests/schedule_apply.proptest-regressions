@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f51951e55b76803e1f74d141653cd87153ef55bfd1df17032d671516f5a1dc87 # shrinks to scenario = Scenario { nodes: [Resources { cpu_millis: 20043, memory: 30.73 GiB, disk: 200 GiB }], accrual_limit: 1, jobs: [JobGen { requests: Resources { cpu_millis: 4755, memory: 256 MiB, disk: 0 B }, max_runtime_s: None, multiplier_n: 1, seed_running: true }, JobGen { requests: Resources { cpu_millis: 15289, memory: 256 MiB, disk: 0 B }, max_runtime_s: None, multiplier_n: 1, seed_running: true }, JobGen { requests: Resources { cpu_millis: 250, memory: 256 MiB, disk: 0 B }, max_runtime_s: None, multiplier_n: 1, seed_running: true }] }

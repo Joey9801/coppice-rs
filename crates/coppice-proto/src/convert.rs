@@ -27,10 +27,12 @@
 use coppice_core::time::{Duration, Timestamp};
 use thiserror::Error;
 
+mod agent;
 mod command;
 mod core;
 mod snapshot;
 
+pub use agent::{node_usage_from_pb, node_usage_to_pb};
 pub use command::{
     bindings_from_pb, command_from_pb, command_to_pb, enroll_role_from_pb, enroll_role_to_pb,
     role_from_pb, role_to_pb,

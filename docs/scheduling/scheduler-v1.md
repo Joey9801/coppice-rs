@@ -96,13 +96,19 @@ K guard allows it:
 
 ```
 after > max(before, policy.accrual_limit)   → forbidden
+any node accruing for > 1 job after         → forbidden
 ```
 
 mirroring apply's `check_accrual_limit` exactly (`before`/`after` count
-distinct jobs holding accruing allocations in the pass's batch simulator).
-If some node passes the hard filters on total capacity and labels, and
-opening one more accrual would not push the accruing-job count over the
-limit, the job is placed there with `expect_funded = false`.
+distinct jobs holding accruing allocations in the pass's batch simulator;
+the per-node count is over the same simulated post-batch state, on the
+nodes the batch touches). If some node passes the hard filters on total
+capacity and labels, and opening one more accrual would breach neither
+guard, the job is placed there with `expect_funded = false`.
+
+The per-node ceiling is hardcoded at one (ADR 0027) and is a filter on the
+candidate scan, not just a verdict: a node already holding an accrual, or
+one this batch has already opened an accrual on, is not an eligible target.
 
 Node choice prefers a **finite `projected_ready`** (ADR 0027): for each
 eligible node the pass computes the bound the new accrual would get —
@@ -166,6 +172,12 @@ Among nodes that pass, the pass picks the one minimizing borrowed capacity
    original `seq` order. They re-accrue with whatever capacity remains —
    almost always still `Accruing`, not `Funded`.
 
+Under the per-node ceiling that survivor set is a single accrual, so the
+"wholesale" revocation is one allocation and the reseat is one placement;
+the plural shape is kept because the funding order it encodes is what makes
+the lend legal, and the pass declines a node carrying more than one accrual
+rather than assuming it cannot happen.
+
 At most one lend is planned per node per pass, to keep the revoke/reseat
 ordering untangled; the batch simulator still verifies the full sequence
 mirrors apply's effects exactly before it is emitted.
@@ -210,9 +222,12 @@ Before the seating loop, the pass looks at every existing accruing job
    `replan_min_improvement_us` (scheduler config, default 300 s) between
    finite bounds — revoke and reseat it there, usually re-accruing. An
    immediate fit is just the degenerate case `projected_ready = now`, and
-   a node whose bound would be indefinite is never a move target. The
-   move's batch shape is a lend's revoke-then-reseat, so it is gated on
-   the exact batch simulator the same way.
+   a node whose bound would be indefinite is never a move target. A move
+   that would land short still accrues, so its target must hold no other
+   accrual (existing or opened by this batch); a full immediate fit accrues
+   nothing and is unconstrained. The move's batch shape is a lend's
+   revoke-then-reseat, so it is gated on the exact batch simulator the same
+   way.
 
 Both tiers obey the same anti-churn rule as everything else: a revocation
 is only planned when it enables a concrete, strictly better reseat in the

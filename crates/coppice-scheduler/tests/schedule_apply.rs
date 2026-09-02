@@ -124,7 +124,9 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
 ///
 /// A subset of jobs is seeded as running (funded on the first node while free
 /// capacity lasts) so later passes see consumed capacity and guaranteed
-/// release events; the rest stay queued.
+/// release events; the first that no longer fits is seeded as an accrual on
+/// that node, so passes also start against an occupied node — the case the
+/// per-node accrual ceiling governs. The rest stay queued.
 fn build_state(s: &Scenario) -> StateMachine {
     let mut sm = StateMachine::default();
     apply_ok(&mut sm, configure_entity_cmd(ROOT, None));
@@ -136,8 +138,7 @@ fn build_state(s: &Scenario) -> StateMachine {
         );
     }
 
-    let first_cap = s.nodes[0];
-    let mut used_on_first = Resources::ZERO;
+    let mut accrual_seeded = false;
     for (i, job) in s.jobs.iter().enumerate() {
         let job_id = jid((i + 1) as u128);
         let multiplier = PriorityMultiplier(job.multiplier_n << 32);
@@ -151,26 +152,25 @@ fn build_state(s: &Scenario) -> StateMachine {
                 base_ts(),
             ),
         );
-        if job.seed_running {
-            let after = used_on_first.saturating_add(&job.requests);
-            // Seed only when it funds fully on the first node — a partial seed
-            // would be a fresh accrual, and stacking those past K would make
-            // the seeding command itself illegal.
-            if after.fits_within(&first_cap) {
-                let attempt = aid(1_000 + i as u128);
-                let alloc = alid(1_000 + i as u128);
-                apply_ok(
-                    &mut sm,
-                    place_cmd(
-                        placement(job_id, attempt, alloc, nid(1), job.requests),
-                        base_ts(),
-                    ),
-                );
-                if sm.allocations[&alloc].allocation.state == AllocationState::Funded {
-                    apply_ok(&mut sm, dispatch_cmd(attempt, base_ts()));
-                    apply_ok(&mut sm, started_cmd(attempt, base_ts()));
-                    used_on_first = after;
-                }
+        // Seeding stops at the node's first accrual: a second would break the
+        // per-node ceiling, making the seeding command itself illegal.
+        if job.seed_running && !accrual_seeded {
+            let attempt = aid(1_000 + i as u128);
+            let alloc = alid(1_000 + i as u128);
+            apply_ok(
+                &mut sm,
+                place_cmd(
+                    placement(job_id, attempt, alloc, nid(1), job.requests),
+                    base_ts(),
+                ),
+            );
+            if sm.allocations[&alloc].allocation.state == AllocationState::Funded {
+                apply_ok(&mut sm, dispatch_cmd(attempt, base_ts()));
+                apply_ok(&mut sm, started_cmd(attempt, base_ts()));
+            } else {
+                // Partially funded: the node's one accrual, left `Accruing` so
+                // passes start against an occupied node.
+                accrual_seeded = true;
             }
         }
     }

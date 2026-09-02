@@ -215,6 +215,47 @@ pub async fn data_root(
         .map(PathBuf::from))
 }
 
+/// Read the daemon's own view of cpu/memory (`docker info` → `NCPU`/`MemTotal`)
+/// as an override for capacity detection.
+///
+/// This exists because host detection is *wrong* for these two dimensions on a
+/// VM-backed local daemon (Docker Desktop, Colima on macOS): containers are
+/// scheduled inside the VM, whose cpu/mem allotment is normally much smaller
+/// than the host it runs on, so a host reading overcommits. The daemon reports
+/// what the VM (or, on native Linux, the host itself) actually has, which is
+/// always the right number for containers scheduled through it. Disk is not
+/// covered here — `data_root`'s caveats about the daemon's path namespace
+/// apply just as much to a size reading, so disk stays on `statvfs` detection
+/// of the agent's own `data_dir`.
+///
+/// Returns `None` on any missing/unusable field rather than erring — callers
+/// treat this as one more optional reading, falling back to whatever they'd
+/// otherwise use.
+pub async fn daemon_capacity(docker: &Docker) -> Option<(u32, u64)> {
+    let info = match docker.info().await {
+        Ok(info) => info,
+        Err(err) => {
+            tracing::warn!(%err, "querying docker info for capacity detection");
+            return None;
+        }
+    };
+    let cpu_millis = match info.ncpu {
+        Some(ncpu) if ncpu > 0 => (ncpu as u32) * 1000,
+        _ => {
+            tracing::warn!("docker info reported no usable NCPU for capacity detection");
+            return None;
+        }
+    };
+    let memory_bytes = match info.mem_total {
+        Some(mem_total) if mem_total > 0 => mem_total as u64,
+        _ => {
+            tracing::warn!("docker info reported no usable MemTotal for capacity detection");
+            return None;
+        }
+    };
+    Some((cpu_millis, memory_bytes))
+}
+
 /// The HTTP status code carried by a bollard error, when it is a server-side
 /// response error. The lifecycle layer matches on 404/409 (304 never surfaces
 /// here — bollard treats it as success, see `lifecycle::stop`).
