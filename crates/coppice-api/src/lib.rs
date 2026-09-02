@@ -203,13 +203,24 @@ pub struct ClusterUsage {
 /// reported shows up immediately rather than at the next 30 s bucket close;
 /// `history` is the task's last published window. On a follower — where no
 /// agent sessions terminate — `current` is empty and `history` has no
-/// buckets, and every `used` renders as honestly absent.
+/// buckets, and every `used` renders as honestly absent — as does every
+/// `last_heartbeat` and node health derived from `heartbeats`.
 #[derive(Debug, Clone, Default)]
 pub struct UsageSnapshot {
     /// Nodes with a reading fresher than the staleness cutoff. Absent =
     /// not measured.
     pub current: std::collections::BTreeMap<coppice_core::id::NodeId, NodeUsageSample>,
     pub history: std::sync::Arc<ClusterUsage>,
+    /// Wall-clock stamp of the last report of any shape heard from each
+    /// node — the source of `NodeSummary.last_heartbeat` and the read-time
+    /// health derivation. Leader-local like `current` (agent sessions
+    /// terminate on the leader), so a follower's map is empty and every
+    /// `last_heartbeat` renders as null with health `unknown`. Unlike
+    /// `current` there is no staleness cutoff: "last heard at T" stays a
+    /// fact as T ages, and that age is exactly what health and the UI's
+    /// "ago" rendering are derived from.
+    pub heartbeats:
+        std::collections::BTreeMap<coppice_core::id::NodeId, coppice_core::time::Timestamp>,
     /// Nodes in replicated state right now — the live denominator for
     /// coverage, read at snapshot time rather than from the history task's
     /// tracked set (which is empty until the first bucket closes and can lag

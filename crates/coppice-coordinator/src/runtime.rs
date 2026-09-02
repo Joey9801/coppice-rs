@@ -322,7 +322,7 @@ where
     let control_plane = Arc::new(
         CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
             .with_derived(queue_window, fanout.clone())
-            .with_usage(usage.clone(), cluster_usage)
+            .with_usage(usage.clone(), liveness.clone(), cluster_usage)
             .with_node_handle(node_handle.clone())
             .with_log_client(node_log_client)
             // Writes that land here while this replica follows go to the

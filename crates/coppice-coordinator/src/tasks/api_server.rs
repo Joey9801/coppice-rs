@@ -512,6 +512,11 @@ pub struct CoordinatorControlPlane<C> {
     /// `usage_history` watch — is the "nothing measured" posture every read
     /// serves as `used: null`.
     usage: Option<crate::usage::NodeUsage>,
+    /// The leader's liveness marks, when `with_usage` attached them: the
+    /// wall-clock side feeds `NodeSummary.last_heartbeat` and the read-time
+    /// health derivation. `None` serves an empty map — every heartbeat null
+    /// and every health `unknown`, the same posture a follower has.
+    liveness: Option<crate::liveness::NodeLiveness>,
     /// The usage-history task's published rolling window. Seeded with an empty
     /// `ClusterUsage` whose sender is dropped immediately, exactly as
     /// `queue_window` is.
@@ -530,6 +535,7 @@ impl<C> CoordinatorControlPlane<C> {
             cluster_id,
             queue_window,
             usage: None,
+            liveness: None,
             usage_history,
             fanout: None,
             node_handle: None,
@@ -549,16 +555,21 @@ impl<C> CoordinatorControlPlane<C> {
     }
 
     /// Attach the best-effort node-usage sources (ADR 0039): the leader's
-    /// heartbeat sample sink and the usage-history task's published window.
-    /// The runtime calls this; a control plane without them serves an empty
-    /// snapshot, which renders as `used: null` everywhere rather than as zero
-    /// — the same posture a follower has with them attached.
+    /// heartbeat sample sink, its liveness marks (whose wall-clock side
+    /// backs `last_heartbeat` and node health), and the usage-history task's
+    /// published window. The runtime calls this; a control plane without
+    /// them serves an empty snapshot, which renders as `used: null`,
+    /// `last_heartbeat: null`, and health `unknown` everywhere rather than
+    /// as fabricated values — the same posture a follower has with them
+    /// attached.
     pub fn with_usage(
         mut self,
         usage: crate::usage::NodeUsage,
+        liveness: crate::liveness::NodeLiveness,
         history: watch::Receiver<Arc<ClusterUsage>>,
     ) -> Self {
         self.usage = Some(usage);
+        self.liveness = Some(liveness);
         self.usage_history = history;
         self
     }
@@ -769,6 +780,13 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 .map(|sink| sink.snapshot(Timestamp::now(), crate::limits::USAGE_SAMPLE_MAX_AGE))
                 .unwrap_or_default(),
             history: self.usage_history.borrow().clone(),
+            // No cutoff, unlike `current`: a stale last-heard stamp is still
+            // a fact, and its age is what the health derivation reads.
+            heartbeats: self
+                .liveness
+                .as_ref()
+                .map(|liveness| liveness.heartbeats())
+                .unwrap_or_default(),
             total_nodes: self
                 .views
                 .latest()

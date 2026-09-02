@@ -57,12 +57,13 @@ impl From<&coppice_core::resource::Resources> for Resources {
     }
 }
 
-/// Liveness, eventually derived from agent heartbeats (epoch fencing per
-/// ADR 0009). `Unknown` is the only value produced today: the replicated
-/// state records no health input (`DeclareNodeLost` bumps the epoch and
-/// clears `schedulable`, indistinguishable from an operator drain), and
-/// heartbeat liveness is not wired yet — reporting `Healthy` would be a
-/// lie for a definitively lost node.
+/// Liveness, derived at read time from the leader's heartbeat marks
+/// (ADR 0009) — the same marks its health monitor declares losses from.
+/// Heard from within the liveness deadline is `healthy`; tracked but silent
+/// past it is `lost`. `Unknown` is the honest "no marks to judge by": a
+/// follower serving the read (the marks are leader-local, like `used`), a
+/// leader no agent has reported to yet, or a node inside its seeded grace
+/// window after a leadership gain — never a fabricated `healthy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeHealth {
@@ -251,7 +252,11 @@ pub struct NodeSummary {
     pub health: NodeHealth,
     /// Bumps on (re)registration or loss; fences stale agent commands.
     pub epoch: u64,
-    /// Last heartbeat from the agent; `null` until agents report.
+    /// Wall-clock stamp of the last report of any shape heard from this
+    /// node's agent. Leader-local, like `used`: `null` on a follower, and on
+    /// a leader that has not heard from the node this process's lifetime —
+    /// never a fabricated stamp. No staleness cutoff: the stamp stays as it
+    /// ages (its age is what [`NodeHealth`] is derived from).
     pub last_heartbeat: Option<Timestamp>,
     /// Attempts currently `Running` on this node.
     pub running_count: u32,
@@ -440,8 +445,9 @@ pub struct NodeCounts {
     pub total: u32,
     /// Registered, not draining, and not lost.
     pub schedulable: u32,
-    /// Nodes reported [`NodeHealth::Lost`] — always 0 until liveness has an
-    /// input (see [`NodeHealth`]), never a fabricated count.
+    /// Nodes reported [`NodeHealth::Lost`]. Leader-local like the health it
+    /// counts: a follower — with no heartbeat marks to judge by — reports 0,
+    /// never a fabricated count.
     pub lost: u32,
 }
 

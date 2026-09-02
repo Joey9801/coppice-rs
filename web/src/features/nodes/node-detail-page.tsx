@@ -98,7 +98,7 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
         title={
           <span className="flex flex-wrap items-center gap-3">
             <span className="font-mono text-lg break-all">{summary.id}</span>
-            <StatePill state={lost ? 'Lost' : 'Healthy'} />
+            <StatePill state={summary.health} />
             {summary.schedulable === false ? <StatePill state="Draining" /> : null}
           </span>
         }

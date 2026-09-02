@@ -88,7 +88,9 @@ function NodesSummaryLine({ nodes }: { nodes: NodeSummary[] | undefined }) {
 function statusPill(node: NodeSummary) {
   if (node.health === 'Lost') return <StatePill state="Lost" />
   if (!node.schedulable) return <StatePill state="Draining" />
-  return <StatePill state="Healthy" />
+  // `Unknown` renders as itself: with no heartbeat marks to judge by (a
+  // follower serving the read), "Healthy" would be a fabrication.
+  return <StatePill state={node.health} />
 }
 
 function NodeRow({ node }: { node: NodeSummary }) {
