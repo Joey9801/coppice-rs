@@ -269,7 +269,11 @@ pub fn plain_http_builder(base: &str) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder();
     // Case-insensitive as a belt against un-normalized callers; a normalized
     // base already carries a lowercase scheme.
-    if base.len() >= 8 && base[..8].eq_ignore_ascii_case("https://") {
+    let is_https = base
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"));
+    if is_https {
         builder
     } else {
         builder.tls_built_in_native_certs(false)
@@ -515,6 +519,18 @@ mod tests {
             );
         }
         assert!(plain_http_builder("https://h:7070").build().is_ok());
+    }
+
+    /// A base whose first eight BYTES straddle a multi-byte character must
+    /// not panic the scheme check — the prefix is compared as bytes, never
+    /// sliced as `str`. `a\u{e9}\u{e9}\u{e9}\u{e9}://host` is 8 bytes into the
+    /// middle of an `\u{e9}` at index 8.
+    #[test]
+    fn a_non_ascii_scheme_does_not_panic_the_builder() {
+        for base in ["a\u{e9}\u{e9}\u{e9}\u{e9}://host", "\u{e9}", "short"] {
+            let _ = plain_http_builder(base);
+            let _ = ApiClient::new(base);
+        }
     }
 
     /// A client builds successfully for both an http and an https base — the
