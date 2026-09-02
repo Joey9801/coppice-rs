@@ -265,12 +265,11 @@ pub fn render(usage: &UsageSnapshot, now: Timestamp) -> String {
     }
 
     // Coverage, always emitted (0 reporting is a fact worth alerting on, not
-    // an absence). `total` is the node set the leader is tracking; before the
-    // first bucket closes that set is empty while samples may already exist,
-    // so the live count is the floor.
-    let reporting = usage.current.len();
-    reporting_nodes.push(reporting);
-    total_nodes.push(usage.history.nodes.len().max(reporting));
+    // an absence). The denominator is the live replicated node count carried
+    // on the snapshot — one reporting node in a sixteen-node cluster must
+    // read 1/16, not 1/1, even before the first history bucket closes.
+    reporting_nodes.push(usage.current.len());
+    total_nodes.push(usage.total_nodes);
 
     let mut out = String::new();
     used.render_into(&mut out);
@@ -376,7 +375,28 @@ mod tests {
         UsageSnapshot {
             current,
             history: Arc::new(ClusterUsage { nodes, cluster }),
+            total_nodes: tracked.len() as u32,
         }
+    }
+
+    /// One reporting node in a big cluster reads 1/N before the first
+    /// history bucket closes — the denominator is the live replicated count,
+    /// never floored to the reporting count.
+    #[test]
+    fn coverage_uses_the_live_node_count_not_the_history_window() {
+        let node = NodeId::new();
+        let mut snap = snapshot(Some((node, ts(100))), &[node]);
+        snap.history = Arc::new(ClusterUsage::default());
+        snap.total_nodes = 16;
+        let out = render(&snap, ts(101));
+        assert!(
+            out.contains("coppice_cluster_usage_reporting_nodes 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("coppice_cluster_usage_total_nodes 16"),
+            "{out}"
+        );
     }
 
     #[test]

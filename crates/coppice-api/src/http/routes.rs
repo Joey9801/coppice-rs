@@ -1507,6 +1507,7 @@ mod tests {
                 )]),
                 cluster: Vec::new(),
             }),
+            total_nodes: 1,
         };
 
         let response = app_with_usage(state, usage)

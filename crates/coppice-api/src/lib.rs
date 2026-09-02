@@ -210,6 +210,11 @@ pub struct UsageSnapshot {
     /// not measured.
     pub current: std::collections::BTreeMap<coppice_core::id::NodeId, NodeUsageSample>,
     pub history: std::sync::Arc<ClusterUsage>,
+    /// Nodes in replicated state right now — the live denominator for
+    /// coverage, read at snapshot time rather than from the history task's
+    /// tracked set (which is empty until the first bucket closes and can lag
+    /// membership changes by a bucket).
+    pub total_nodes: u32,
 }
 
 /// One event with the identity and stamp of ADR 0032's shared timeline
