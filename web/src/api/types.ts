@@ -583,10 +583,12 @@ export interface NodeUtilization {
 // ---------------------------------------------------------------------------
 
 /**
- * Liveness, derived from agent heartbeats (epoch fencing per ADR 0009).
- * `Unknown` is what the real API reports until heartbeat liveness is
- * wired server-side — the replicated state records no health input, and
- * a `DeclareNodeLost` is indistinguishable from an operator drain there.
+ * Liveness, derived at read time from the leader's heartbeat marks
+ * (ADR 0009) — heard from within the liveness deadline is `Healthy`,
+ * silent past it is `Lost`. `Unknown` is the honest "no marks to judge
+ * by": a follower serving the read (the marks are leader-local, like
+ * `used`), or a leader that has not heard from the node — never a
+ * fabricated `Healthy`.
  */
 export type NodeHealth = 'Unknown' | 'Healthy' | 'Lost'
 

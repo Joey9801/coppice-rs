@@ -737,7 +737,10 @@ async fn list_nodes<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    let response = super::project::list_nodes(view.state(), &plane.usage_window());
+    // A read may sample the clock (an apply may not): `now` feeds only the
+    // heartbeat-age health derivation, never anything stored.
+    let response =
+        super::project::list_nodes(view.state(), &plane.usage_window(), Timestamp::now());
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -756,8 +759,9 @@ async fn get_node<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    let response = super::project::get_node(view.state(), &id, &plane.usage_window())
-        .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
+    let response =
+        super::project::get_node(view.state(), &id, &plane.usage_window(), Timestamp::now())
+            .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -1495,6 +1499,7 @@ mod tests {
         // must serialize as `null`, never as a zero vector.
         let usage = crate::UsageSnapshot {
             current: Default::default(),
+            heartbeats: Default::default(),
             history: std::sync::Arc::new(crate::ClusterUsage {
                 nodes: std::collections::BTreeMap::from([(
                     node,
@@ -1525,6 +1530,49 @@ mod tests {
         assert_eq!(body["samples"][0]["used"]["cpu_millis"], 2_000);
         assert_eq!(body["samples"][0]["allocated"]["cpu_millis"], 1_000);
         assert_eq!(body["samples"][1]["used"], serde_json::Value::Null);
+    }
+
+    /// The nodes list serves the leader's last-heard marks: a fresh mark
+    /// reads `healthy` with its wall stamp, no mark reads `unknown` with a
+    /// null stamp (the follower answer — and what every node served before
+    /// liveness was wired through).
+    #[tokio::test]
+    async fn list_nodes_serves_last_heartbeat_and_derived_health() {
+        let (heard, unheard) = (NodeId::new(), NodeId::new());
+        let mut state = coppice_state::StateMachine::default();
+        state.nodes.insert(heard, utilization_node(heard));
+        state.nodes.insert(unheard, utilization_node(unheard));
+
+        // The handler derives health against its real clock, so the fixture
+        // mark must be "now" to read fresh.
+        let at = Timestamp::now();
+        let usage = crate::UsageSnapshot {
+            heartbeats: std::collections::BTreeMap::from([(heard, at)]),
+            ..Default::default()
+        };
+
+        let response = app_with_usage(state, usage)
+            .oneshot(Request::get("/api/v1/nodes").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let by_id: std::collections::BTreeMap<&str, &serde_json::Value> = body["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| (n["id"].as_str().unwrap(), n))
+            .collect();
+
+        let heard = &by_id[heard.to_string().as_str()];
+        assert_eq!(heard["health"], "healthy");
+        assert_eq!(
+            heard["last_heartbeat"].as_str().unwrap(),
+            serde_json::to_value(at).unwrap().as_str().unwrap()
+        );
+        let unheard = &by_id[unheard.to_string().as_str()];
+        assert_eq!(unheard["health"], "unknown");
+        assert_eq!(unheard["last_heartbeat"], serde_json::Value::Null);
     }
 
     /// A known node the leader has collected nothing for answers 200 with an
