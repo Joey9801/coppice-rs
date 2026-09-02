@@ -1688,6 +1688,7 @@ mod tests {
                 },
             )]),
             history: Default::default(),
+            total_nodes: 2,
         };
         let capacity = cluster_overview(
             &state,

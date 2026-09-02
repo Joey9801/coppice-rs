@@ -769,6 +769,14 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 .map(|sink| sink.snapshot(Timestamp::now(), crate::limits::USAGE_SAMPLE_MAX_AGE))
                 .unwrap_or_default(),
             history: self.usage_history.borrow().clone(),
+            total_nodes: self
+                .views
+                .latest()
+                .state()
+                .nodes
+                .len()
+                .try_into()
+                .unwrap_or(u32::MAX),
         }
     }
 
