@@ -349,6 +349,13 @@ impl Consensus for FakeConsensus {
         Ok(())
     }
 
+    /// A no-op: this fake holds no membership configuration at all, so it can
+    /// never be joint. The real repair is exercised against a live openraft in
+    /// `coppice-consensus`'s adapter tests.
+    async fn finish_pending_membership_change(&self) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
     /// A no-op like the other membership verbs: no test in this crate drives
     /// the operator-only break-glass repoint (ADR 0037 §6), and a fake that
     /// held membership state would be a second implementation of it.

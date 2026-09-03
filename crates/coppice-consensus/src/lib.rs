@@ -276,6 +276,28 @@ pub trait Consensus: Send + Sync + 'static {
         retire: Option<Command>,
     ) -> impl Future<Output = Result<bool, ConsensusError>> + Send;
 
+    /// Drive a half-finished joint membership configuration to its uniform
+    /// destination, or do nothing when membership is already uniform
+    /// (ADR 0037 §7).
+    ///
+    /// openraft's `change_membership` is two sequential proposals — the joint
+    /// configuration, then the uniform one — and its own documentation warns
+    /// that a leader which loses leadership or crashes between them leaves the
+    /// cluster in the joint config. A membership verb that abandons the call
+    /// on its commit deadline strands it the same way, from a leader that is
+    /// still healthy and therefore never triggers any other repair. A joint
+    /// cluster silently enforces the OLD quorum requirement as well as the new
+    /// one, so this is a real availability loss that no status surface reports.
+    ///
+    /// Every membership verb calls this before its own gates, but no verb runs
+    /// unprompted; the leader-only learner-GC loop therefore calls it directly,
+    /// on gaining leadership and on every pass, so a stranded change is
+    /// repaired even when nobody retries. Idempotent and cheap: uniform
+    /// membership proposes nothing at all.
+    fn finish_pending_membership_change(
+        &self,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send;
+
     /// Repoint an existing member's dial address (ADR 0037 §6, operator-only
     /// break-glass). There is no self-service address repair: the admin
     /// service dial-back-verifies the new address before calling this.

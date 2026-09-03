@@ -173,7 +173,22 @@ const REPOINT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// (ADR 0037 §6): the caller's retry, arriving at whichever leader now exists,
 /// either observes the change already landed (and returns success) or
 /// re-proposes it there.
+#[cfg(not(test))]
 const MEMBERSHIP_COMMIT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The same budget, shortened for this crate's own unit tests.
+///
+/// The half-finished-joint-configuration regression below has to actually
+/// *reach* this timeout: abandoning a `change_membership` future between its
+/// two proposals is the only way to produce the stranded joint state
+/// [`OpenraftConsensus::finish_joint_config`] repairs, so the production
+/// thirty seconds would spend half a minute of wall clock per test for no
+/// extra coverage. A compile-time split rather than a runtime knob,
+/// deliberately: nothing in production — no config file, no operator — may
+/// shorten a membership commit window, because a window too short to absorb a
+/// slow joint commit is precisely how a leader strands one.
+#[cfg(test)]
+const MEMBERSHIP_COMMIT_DEADLINE: Duration = Duration::from_secs(2);
 
 /// What [`Consensus::plan_promotion`] decided, before any key transfer or
 /// membership change happens (ADR 0037 §4/§7).
@@ -315,6 +330,117 @@ impl OpenraftConsensus {
             .membership_config
             .voter_ids()
             .collect()
+    }
+
+    /// Whether membership is a single, *uniform* configuration — i.e. no
+    /// membership change is half-finished.
+    ///
+    /// The distinction matters to every idempotency short-circuit below,
+    /// because [`voter_ids`](Self::voter_ids) is `Membership::voter_ids`,
+    /// which is the **union across both configurations** of a joint
+    /// membership. A node named by the incoming half of an unfinished change
+    /// therefore reads as a sitting voter long before it is one, and a gate
+    /// that answers "already the shape you asked for" from that union
+    /// declares the change settled while the cluster is still carrying both
+    /// quorum requirements. Uniform is the only state in which the union is
+    /// the answer.
+    fn membership_is_uniform(&self) -> bool {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .len()
+            == 1
+    }
+
+    /// The destination of a membership change some earlier attempt left
+    /// half-finished, or `None` when membership is uniform.
+    ///
+    /// openraft's `change_membership` is TWO sequential proposals — a joint
+    /// configuration `[old, new]`, then, once *that* entry commits, the
+    /// uniform `[new]` — and openraft says so itself: "If it loses leadership
+    /// or crashed before committing the second uniform config log, the cluster
+    /// is left in the joint config." Our bounded `timeout_at` around that call
+    /// strands it a third way, and the worst one: dropping the future between
+    /// the two phases leaves this node still leader and still healthy, so no
+    /// election, no restart, and no other verb's retry ever repairs it. The
+    /// cluster then sits in, say, `[{1,2,3},{1,2,3,4}]` indefinitely —
+    /// silently keeping the OLD quorum requirement *as well as* the new one,
+    /// which is reduced availability while `/readyz` reports health.
+    ///
+    /// The last entry is the destination: openraft always appends the incoming
+    /// configuration second, and `Membership::change` bases every change on
+    /// `get_joint_config().last()`. Re-proposing it is exactly what the
+    /// abandoned second phase would have done.
+    fn joint_destination(&self) -> Option<BTreeSet<CoordinatorId>> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        let configs = m.membership_config.membership().get_joint_config();
+        if configs.len() < 2 {
+            return None;
+        }
+        configs.last().cloned()
+    }
+
+    /// Drive a half-finished joint configuration to its uniform destination
+    /// (ADR 0037 §7), or do nothing at all when membership is already uniform.
+    ///
+    /// **Must be called with the
+    /// [`membership_change`](Self::membership_change) mutex already held.**
+    /// This proposes a membership change, so it is a mutation like any other
+    /// on that lock's charter; more sharply, every verb that calls it does so
+    /// to make the gates it is about to run see a coherent membership, and a
+    /// concurrent mutation slipping in between the repair and those gates
+    /// would defeat the point.
+    ///
+    /// `ReplaceAllVoters(destination)` with `retain = false` is what openraft's
+    /// own second phase issues: `Membership::change` takes
+    /// `get_joint_config().last()` as its base and asks `find_coherent` for
+    /// the next step, which collapses `[old, destination]` to `[destination]`
+    /// when the goal *is* the destination. One proposal, and the change is
+    /// finished.
+    ///
+    /// A joint entry that has not itself committed yet answers
+    /// [`ConsensusError::MembershipInProgress`], which propagates: "nothing to
+    /// finish yet" is the correct verdict, not a failure to paper over — the
+    /// caller retries, and openraft's own second phase may well get there
+    /// first.
+    async fn finish_joint_config(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConsensusError> {
+        let Some(destination) = self.joint_destination() else {
+            return Ok(());
+        };
+        tracing::info!(
+            ?destination,
+            "finishing a membership change a previous attempt left half-done: membership is \
+             still in the joint configuration openraft passes through between its two \
+             proposals, so the cluster is carrying both the old and the new quorum \
+             requirement until the destination is re-proposed (ADR 0037 §7)"
+        );
+        // Bounded by the caller's absolute deadline, like every other
+        // membership commit here: this repair blocks until the uniform entry
+        // commits and applies, and a leader that steps down mid-repair never
+        // answers the write at all. Giving up leaves exactly the state we
+        // arrived in — still joint, still repairable — and the next caller
+        // (or the learner-GC loop) tries again.
+        let write = self
+            .raft
+            .change_membership(ChangeMembers::ReplaceAllVoters(destination), false);
+        match tokio::time::timeout_at(deadline, write).await {
+            Ok(outcome) => outcome.map(|_| ()).map_err(map_client_write_error),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "finishing the half-done membership change gave up: the uniform \
+                     configuration did not commit within the commit window; membership stays \
+                     joint and the next attempt repairs it (ADR 0037 §7)"
+                );
+                Err(ConsensusError::Timeout)
+            }
+        }
     }
 
     /// Whether `node` appears in membership at all (voter or learner).
@@ -487,12 +613,17 @@ impl OpenraftConsensus {
         planning: bool,
     ) -> Result<ReplacementPlan, ConsensusError> {
         let voters = self.voter_ids();
+        // Both short-circuits below read `voters`, which is the union across
+        // a joint membership's two configurations (see
+        // [`membership_is_uniform`](Self::membership_is_uniform)). A seat in
+        // that union is a settled voter only when membership is uniform.
+        let uniform = self.membership_is_uniform();
 
         // The §6 idempotency short-circuit, first: "already the shape you
         // asked for" — `new` a voter and `old` gone from membership entirely
         // — is a plain success. (`old == new` can never satisfy it: one id
         // cannot be both a voter and absent.)
-        if voters.contains(&new) && !self.is_member(old) {
+        if uniform && voters.contains(&new) && !self.is_member(old) {
             return Ok(ReplacementPlan::Settled);
         }
         // The verb replaces a *voter*: naming a learner or a stranger as
@@ -507,6 +638,18 @@ impl OpenraftConsensus {
         // not grant this verb. This also answers `old == new` naming a
         // voter.
         if voters.contains(&new) {
+            if !uniform {
+                // ...but a seat in the union of an *unfinished* joint change
+                // is not a sitting voter, and refusing here would make the
+                // stranded state permanent: the operator's retry would read
+                // `NewAlreadyVoter` forever while the cluster kept carrying
+                // both quorum requirements. Route to the commit path instead,
+                // which finishes the change under the membership lock and then
+                // re-runs these gates against a uniform membership — where
+                // this pair answers `Settled` if the replacement already
+                // landed, or proceeds on its merits if it did not.
+                return Ok(ReplacementPlan::Ready);
+            }
             return Err(ConsensusError::NewAlreadyVoter { node: new });
         }
         if !self.is_member(new) {
@@ -595,7 +738,26 @@ impl Consensus for OpenraftConsensus {
         // forever. "Already the shape you asked for" is success.
         let voters = self.voter_ids();
         if voters.contains(&promote) {
-            return Ok(PromotionPlan::AlreadyVoter);
+            // ...but only a *uniform* membership makes that reading sound. A
+            // seat in the union of an unfinished joint change (see
+            // [`membership_is_uniform`](Self::membership_is_uniform)) is not a
+            // settled voter: answering `AlreadyVoter` there is how the admin
+            // handler returns success without ever calling `commit_promotion`,
+            // which is the one thing that would finish the change — so the
+            // cluster stays joint forever, keeping both quorum requirements.
+            // Route to the commit path, which repairs it under the membership
+            // lock and then answers from a coherent membership.
+            //
+            // Deliberately returned HERE, ahead of the lag gate, the §7
+            // ceiling and the postconditions: every one of them would be
+            // reasoning about a voter set that already counts `promote` on
+            // both sides of the change, and would misfire.
+            if self.membership_is_uniform() {
+                return Ok(PromotionPlan::AlreadyVoter);
+            }
+            return Ok(PromotionPlan::Ready {
+                evidence_removal: None,
+            });
         }
         // Promoting something membership has never heard of is terminal,
         // not "behind": nothing is replicating to it to catch up.
@@ -684,6 +846,16 @@ impl Consensus for OpenraftConsensus {
             );
             return Err(ConsensusError::MembershipInProgress);
         };
+
+        // Before ANY gate: finish a membership change an earlier attempt left
+        // half-done (see [`finish_joint_config`](Self::finish_joint_config)).
+        // The gates below are written against a coherent voter set, and a
+        // joint membership's union is not one — with it, `promote` reads as a
+        // settled voter and the settled-check below returns success without
+        // appending anything, leaving the cluster joint for good. Repair
+        // first, and every check after this point is answering the question it
+        // was written to answer.
+        self.finish_joint_config(deadline).await?;
 
         // Re-run the cheap gates: `plan_promotion` ran before the key
         // transfer, which is a network round-trip and a replicated write, so
@@ -790,6 +962,17 @@ impl Consensus for OpenraftConsensus {
             );
             return Err(ConsensusError::MembershipInProgress);
         };
+
+        // Before the gates, for the reason spelled out on
+        // [`finish_joint_config`](Self::finish_joint_config): a replacement
+        // whose uniform half was abandoned leaves `new` sitting in the joint
+        // union, where `replacement_gates` can neither call it settled nor
+        // refuse it. Finishing the change first is what makes the re-run below
+        // meaningful — it then reads a uniform membership and answers
+        // `Settled`, which is the idempotent success ADR 0037 §6 promises the
+        // operator's retry.
+        self.finish_joint_config(deadline).await?;
+
         if self.replacement_gates(old, new, false)? == ReplacementPlan::Settled {
             return Ok(());
         }
@@ -844,6 +1027,14 @@ impl Consensus for OpenraftConsensus {
             );
             return Err(ConsensusError::MembershipInProgress);
         };
+
+        // Before any gate, per [`finish_joint_config`](Self::finish_joint_config):
+        // openraft refuses a change while an earlier one is still pending, and
+        // the voter-set arithmetic below (the continuing set, the §4 custody
+        // postcondition) would in any case be computed from the union of two
+        // configurations rather than from the set this removal actually acts
+        // on.
+        self.finish_joint_config(deadline).await?;
 
         // ADR 0037 §6: a node that is already absent is the state the caller
         // asked for, so a retried removal succeeds instead of erroring.
@@ -974,6 +1165,17 @@ impl Consensus for OpenraftConsensus {
             return Err(ConsensusError::MembershipInProgress);
         };
 
+        // Before the eligibility re-check, per
+        // [`finish_joint_config`](Self::finish_joint_config). This is the one
+        // caller that runs unprompted on a leader that is otherwise idle, so
+        // it is also the sweep that repairs a change no operator is waiting on
+        // — see [`Consensus::finish_pending_membership_change`], which the GC
+        // loop calls directly for exactly that reason. The re-check needs it
+        // too: "still a learner" is decided from the voter set, and the union
+        // of a joint change counts a node the incoming half has already
+        // promoted.
+        self.finish_joint_config(deadline).await?;
+
         if self.member_address(node).is_none() {
             // Already gone (a crash between a prior reap's retirement and
             // removal re-arrives here: the retirement stands, and the
@@ -1052,6 +1254,25 @@ impl Consensus for OpenraftConsensus {
             }
         }
         Ok(true)
+    }
+
+    async fn finish_pending_membership_change(&self) -> Result<(), ConsensusError> {
+        // Serialize with every other membership mutation (see
+        // `membership_change`) — the repair is itself one — and bound the
+        // acquisition by [`MEMBERSHIP_COMMIT_DEADLINE`] like every other
+        // holder: this runs on a background sweep, so waiting forever on a
+        // wedged holder would silently stop the repair rather than failing
+        // this pass and retrying on the next.
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_COMMIT_DEADLINE;
+        let Ok(_guard) = tokio::time::timeout_at(deadline, self.membership_change.lock()).await
+        else {
+            tracing::debug!(
+                "finishing a half-done membership change: another membership mutation held the \
+                 lock for the whole commit window; retrying on the next pass (ADR 0037 §7)"
+            );
+            return Err(ConsensusError::MembershipInProgress);
+        };
+        self.finish_joint_config(deadline).await
     }
 
     async fn set_node_address(
@@ -1233,13 +1454,14 @@ mod idempotency_tests {
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use openraft::error::{
         Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
     };
-    use openraft::network::RPCOption;
+    use openraft::network::{Backoff, RPCOption};
     use openraft::raft::{
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
     };
@@ -1253,19 +1475,38 @@ mod idempotency_tests {
 
     use super::{OpenraftConsensus, PromotionPlan, TypeConfig};
 
-    /// A network that never reaches a peer: `new_client` builds a lazy
-    /// handle per openraft's contract (no dial on construction), and every
-    /// RPC method fails `Unreachable`.
+    /// A network with a switch.
+    ///
+    /// While `connected` is false — the default, and what every gate test here
+    /// wants — no peer is ever reached: `new_client` builds a lazy handle per
+    /// openraft's contract (no dial on construction), and every RPC method
+    /// fails `Unreachable`.
+    ///
+    /// Flipped to true, every peer becomes a perfect one: `append_entries`
+    /// answers `Success`, which is openraft's signal that the target now
+    /// matches at the request's `prev_log_id`, so the leader advances that
+    /// peer's matched index and an entry needing the peer's vote can actually
+    /// reach quorum and commit. Nothing short of that can express the
+    /// half-finished-joint regression below, which needs a joint entry that
+    /// COMMITS (so openraft's first phase returns and its second is the one
+    /// abandoned) and then a cluster able to commit the entry that finishes
+    /// it.
     #[derive(Clone)]
-    struct NoopNetworkFactory;
+    struct NoopNetworkFactory {
+        connected: Arc<AtomicBool>,
+    }
 
-    struct NoopNetwork;
+    struct NoopNetwork {
+        connected: Arc<AtomicBool>,
+    }
 
     impl RaftNetworkFactory<TypeConfig> for NoopNetworkFactory {
         type Network = NoopNetwork;
 
         async fn new_client(&mut self, _target: CoordinatorId, _node: &BasicNode) -> NoopNetwork {
-            NoopNetwork
+            NoopNetwork {
+                connected: Arc::clone(&self.connected),
+            }
         }
     }
 
@@ -1278,35 +1519,60 @@ mod idempotency_tests {
             AppendEntriesResponse<CoordinatorId>,
             RPCError<CoordinatorId, BasicNode, RaftError<CoordinatorId>>,
         > {
-            Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
-                "idempotency_tests: no real network",
-            ))))
+            if !self.connected.load(Ordering::SeqCst) {
+                return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                    "idempotency_tests: no real network",
+                ))));
+            }
+            // `Success` means "the target now matches at `prev_log_id`" — the
+            // one answer that advances this peer's matched index on the leader,
+            // and so the one that lets a membership entry commit.
+            Ok(AppendEntriesResponse::Success)
         }
 
         async fn vote(
             &mut self,
-            _rpc: VoteRequest<CoordinatorId>,
+            rpc: VoteRequest<CoordinatorId>,
             _option: RPCOption,
         ) -> Result<
             VoteResponse<CoordinatorId>,
             RPCError<CoordinatorId, BasicNode, RaftError<CoordinatorId>>,
         > {
-            Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
-                "idempotency_tests: no real network",
-            ))))
+            if !self.connected.load(Ordering::SeqCst) {
+                return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                    "idempotency_tests: no real network",
+                ))));
+            }
+            Ok(VoteResponse {
+                vote: rpc.vote,
+                vote_granted: true,
+                last_log_id: rpc.last_log_id,
+            })
         }
 
         async fn full_snapshot(
             &mut self,
-            _vote: Vote<CoordinatorId>,
+            vote: Vote<CoordinatorId>,
             _snapshot: Snapshot<TypeConfig>,
             _cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
             _option: RPCOption,
         ) -> Result<SnapshotResponse<CoordinatorId>, StreamingError<TypeConfig, Fatal<CoordinatorId>>>
         {
-            Err(StreamingError::Unreachable(Unreachable::new(
-                &io::Error::other("idempotency_tests: no real network"),
-            )))
+            if !self.connected.load(Ordering::SeqCst) {
+                return Err(StreamingError::Unreachable(Unreachable::new(
+                    &io::Error::other("idempotency_tests: no real network"),
+                )));
+            }
+            Ok(SnapshotResponse::new(vote))
+        }
+
+        /// openraft's default is a flat 500ms between retries of an
+        /// unreachable peer. Shorten it: the regression below flips
+        /// `connected` on and then waits for replication to notice, and half a
+        /// second per attempt is dead wall clock. No test here asserts
+        /// anything about the retry cadence itself.
+        fn backoff(&self) -> Backoff {
+            Backoff::new(std::iter::repeat(Duration::from_millis(20)))
         }
     }
 
@@ -1324,9 +1590,73 @@ mod idempotency_tests {
         node_id: CoordinatorId,
         contact: Arc<ContactTracker>,
         published: std::sync::Mutex<(ViewPublisher, coppice_state::StateMachine, u64)>,
+        /// The network switch (see [`NoopNetworkFactory`]). False for every
+        /// test that only needs local gates decided; flipped on by the ones
+        /// that need an entry to actually commit.
+        connected: Arc<AtomicBool>,
     }
 
     impl Harness {
+        /// Let replication through. Peers do not become live at the flip: the
+        /// leader notices on the next backoff retry of each stalled stream, so
+        /// callers wait on a real condition afterwards rather than on a sleep.
+        fn connect(&self) {
+            self.connected.store(true, Ordering::SeqCst);
+        }
+
+        /// Membership's configurations, straight from the leader's metrics:
+        /// one entry is uniform, two is the joint state openraft passes
+        /// through between its two proposals.
+        fn membership_configs(&self) -> Vec<std::collections::BTreeSet<CoordinatorId>> {
+            self.consensus
+                .raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .get_joint_config()
+                .clone()
+        }
+
+        fn last_log_index(&self) -> u64 {
+            self.consensus
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index
+                .unwrap_or(0)
+        }
+
+        /// Block until the effective membership entry has been applied — i.e.
+        /// committed.
+        ///
+        /// openraft refuses a fresh `change_membership` while the last one is
+        /// still uncommitted (`ChangeMembershipError::InProgress`), so a
+        /// repair issued the instant replication is restored would race that
+        /// refusal. Waiting here is not papering over the race: propagating
+        /// `MembershipInProgress` is the *correct* answer to "finish the
+        /// change" when there is nothing committed to finish yet, and what
+        /// these tests are about is the state after it commits.
+        async fn await_membership_committed(&self) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                {
+                    let metrics = self.consensus.raft.metrics();
+                    let m = metrics.borrow();
+                    let membership_index = m.membership_config.log_id().map(|id| id.index);
+                    let applied = m.last_applied.map(|id| id.index);
+                    if applied >= membership_index {
+                        return;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the membership entry never committed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
         /// Give this cluster a CA of its own (ADR 0037 §4): the replicated
         /// certificate is what turns key custody into a membership invariant
         /// at all, so the postcondition only bites once it exists.
@@ -1394,9 +1724,21 @@ mod idempotency_tests {
         .validate()
         .expect("valid config");
 
-        let raft = Raft::new(node_id, Arc::new(config), NoopNetworkFactory, log, sm)
-            .await
-            .expect("raft construction");
+        // Disconnected by default: every gate test here is decided from local
+        // metrics before an RPC would be sent, and the ones that need a real
+        // commit flip the switch themselves.
+        let connected = Arc::new(AtomicBool::new(false));
+        let raft = Raft::new(
+            node_id,
+            Arc::new(config),
+            NoopNetworkFactory {
+                connected: Arc::clone(&connected),
+            },
+            log,
+            sm,
+        )
+        .await
+        .expect("raft construction");
 
         raft.initialize(BTreeMap::from([(
             node_id,
@@ -1439,6 +1781,7 @@ mod idempotency_tests {
             node_id,
             contact,
             published: std::sync::Mutex::new((publisher, state, last_applied_index)),
+            connected,
         }
     }
 
@@ -1916,5 +2259,155 @@ mod idempotency_tests {
             consensus.is_member(learner_id),
             "the learner must still be in membership after the reap declined"
         );
+    }
+
+    /// Strand a promotion in the joint configuration, exactly the way
+    /// production does: `commit_promotion` accepts the change, openraft
+    /// appends the joint entry `[{leader}, {leader, learner}]`, and the
+    /// bounded `timeout_at` around the call drops the future before openraft's
+    /// second proposal — the uniform one — is ever made. The cluster is left
+    /// carrying both quorum requirements from a leader that is still perfectly
+    /// healthy, so nothing else will ever repair it (ADR 0037 §7).
+    ///
+    /// Returns the learner's id.
+    async fn strand_a_joint_promotion(h: &Harness) -> CoordinatorId {
+        let consensus = &h.consensus;
+        let learner_id = h.node_id + 1000;
+        consensus
+            .add_learner(learner_id, "127.0.0.1:1".to_string())
+            .await
+            .expect("add_learner");
+        // The continuing set is {leader, learner}: a strict majority of two
+        // needs the incoming learner live, proven by a fresh ack.
+        h.contact.note_attempt(learner_id);
+        h.contact.note_ack(learner_id);
+
+        // Replication is off, so the joint entry cannot reach quorum and the
+        // call burns its whole commit window.
+        let result = consensus.commit_promotion(learner_id, None).await;
+        assert!(
+            matches!(result, Err(ConsensusError::Timeout)),
+            "the joint commit must be abandoned on the deadline, not answered: {result:?}"
+        );
+        assert_eq!(
+            h.membership_configs().len(),
+            2,
+            "the abandoned change must leave membership joint — that is the bug under repair"
+        );
+        learner_id
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_joint_change_is_finished_by_the_next_commit() {
+        // The end-to-end regression. Left alone, a joint configuration this
+        // leader stranded is permanent: `voter_ids` is the union across both
+        // configurations, so every idempotency short-circuit reads the
+        // promoted node as a settled voter and returns success without
+        // appending anything — while the cluster quietly keeps enforcing the
+        // OLD quorum requirement as well as the new one.
+        let h = single_voter(0).await;
+        let consensus = &h.consensus;
+        let learner_id = strand_a_joint_promotion(&h).await;
+
+        // Restore replication and let the stranded joint entry commit.
+        // openraft refuses a fresh change while the last one is uncommitted,
+        // and "nothing committed to finish yet" is a correct
+        // `MembershipInProgress`, not the state this test is about.
+        h.connect();
+        h.await_membership_committed().await;
+
+        let before = h.last_log_index();
+        let result = consensus.commit_promotion(learner_id, None).await;
+        assert!(
+            result.is_ok(),
+            "the retried promotion must finish the half-done change and succeed: {result:?}"
+        );
+
+        let configs = h.membership_configs();
+        assert_eq!(
+            configs.len(),
+            1,
+            "membership must be uniform again, not still joint: {configs:?}"
+        );
+        assert!(
+            configs[0].contains(&learner_id),
+            "the uniform configuration must be the destination the interrupted change was \
+             heading for: {configs:?}"
+        );
+        assert!(
+            h.last_log_index() > before,
+            "the repair must actually append the uniform configuration entry — a retry that \
+             returns Ok having proposed nothing IS the bug (ADR 0037 §7)"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_promotion_on_a_joint_membership_is_not_already_voter() {
+        // `AlreadyVoter` makes the admin handler return success without ever
+        // calling `commit_promotion` — the one verb that would finish the
+        // change. Answered from a joint membership's union, it is how the
+        // stranded state becomes permanent.
+        let h = single_voter(0).await;
+        let learner_id = strand_a_joint_promotion(&h).await;
+
+        let plan = h.consensus.plan_promotion(learner_id);
+        assert!(
+            !matches!(plan, Ok(PromotionPlan::AlreadyVoter)),
+            "a seat in the union of an unfinished joint change is not a settled voter: {plan:?}"
+        );
+        assert!(
+            matches!(
+                plan,
+                Ok(PromotionPlan::Ready {
+                    evidence_removal: None
+                })
+            ),
+            "it must route to the commit path, which is what repairs it: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_gates_on_a_joint_membership_do_not_refuse_the_incoming_node() {
+        // The mirror-image failure: where promotion reads the union as
+        // settled, replacement reads it as a conflict and refuses
+        // `NewAlreadyVoter` — forever, since nothing else finishes the change
+        // either. It must reach the commit path instead.
+        let h = single_voter(0).await;
+        let learner_id = strand_a_joint_promotion(&h).await;
+
+        let planned = h.consensus.plan_replacement(h.node_id, learner_id);
+        assert!(
+            !matches!(planned, Err(ConsensusError::NewAlreadyVoter { .. })),
+            "a node named by the incoming half of an unfinished joint change is not yet a \
+             sitting voter: {planned:?}"
+        );
+        assert!(
+            matches!(planned, Ok(crate::ReplacementPlan::Ready)),
+            "the pair must route to `replace_voter`, which repairs and re-runs these gates: \
+             {planned:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_a_uniform_membership_proposes_nothing() {
+        // The repair runs at the top of every membership verb and on every
+        // learner-GC pass, so the ordinary case — nothing to finish — must
+        // cost a metrics read and not a replicated write.
+        let h = single_voter(0).await;
+        let before = h.last_log_index();
+        assert_eq!(h.membership_configs().len(), 1);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        h.consensus
+            .finish_joint_config(deadline)
+            .await
+            .expect("a uniform membership needs no repair");
+
+        assert_eq!(
+            h.last_log_index(),
+            before,
+            "finishing an already-uniform membership must append no entry at all"
+        );
+        assert_eq!(h.membership_configs().len(), 1);
     }
 }
