@@ -219,7 +219,7 @@ function stateHint(job: JobDetail, phase: JobPhase, now: Date): ReactNode {
       return `admitted, entering queue · ${inState}`
     case 'Queued':
       return job.queue
-        ? `#${job.queue.rank} of ${job.queue.queueDepth} in queue · waiting ${inState}`
+        ? `in queue, ranked by priority and quota usage · waiting ${inState}`
         : `waiting ${inState}`
     case 'Accruing': {
       if (job.accrual) {

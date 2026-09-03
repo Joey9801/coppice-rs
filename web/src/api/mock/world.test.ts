@@ -98,13 +98,25 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
       expect(active).toBeDefined()
     }
 
-    // Queued job: no allocation, a rank in 1..depth, an accrual-free explainer.
+    // Queued job: no allocation, a truthful ranking explainer (terms only,
+    // never a literal position), no accrual.
     if (detail.state.kind === 'Queued') {
       expect(detail.accrual).toBeNull()
       expect(detail.queue).not.toBeNull()
       const q = detail.queue!
-      expect(q.rank).toBeGreaterThanOrEqual(1)
-      expect(q.rank).toBeLessThanOrEqual(q.queueDepth)
+      expect(q.multiplier).toBeGreaterThanOrEqual(1)
+      expect(q.ageSeconds).toBeGreaterThanOrEqual(0)
+      expect(q.penaltyChain.length).toBeGreaterThanOrEqual(1)
+      // The penalty product is the product of the chain's links (and every
+      // link is ≥ 1), so the explainer is internally consistent.
+      const product = q.penaltyChain.reduce((p, c) => p * c.penalty, 1)
+      if (Number.isFinite(q.penaltyProduct)) {
+        expect(q.penaltyProduct).toBeCloseTo(product, 9)
+      } else {
+        expect(q.penaltyProduct).toBe(Number.POSITIVE_INFINITY)
+        expect(product).toBe(Number.POSITIVE_INFINITY)
+      }
+      expect(q.penaltyProduct).toBeGreaterThanOrEqual(1)
       // No attempt has a live (non-terminal) allocation for a queued job.
       for (const attempt of detail.attempts) {
         expect(attempt.state).toBe('Terminal')
@@ -135,10 +147,18 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
     }
   }
 
-  // Queue ranks (from each job's detail explainer) form 1..depth with no gaps.
+  // Every queued job's explainer carries the same truthful terms: the
+  // product of its own chain, and no fabricated position fields.
   const queued = jobs.filter((j) => j.state.kind === 'Queued')
-  const ranks = queued.map((j) => world.buildJobDetail(j.id).queue!.rank).sort((a, b) => a - b)
-  ranks.forEach((r, i) => expect(r).toBe(i + 1))
+  for (const job of queued) {
+    const q = world.buildJobDetail(job.id).queue!
+    expect(Object.keys(q).sort()).toEqual([
+      'ageSeconds',
+      'multiplier',
+      'penaltyChain',
+      'penaltyProduct',
+    ])
+  }
 
   // Recompute per-node allocated independently from allocations exposed via
   // node details and compare to the summary (defense in depth on the Σ bound).

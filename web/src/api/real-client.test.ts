@@ -376,10 +376,17 @@ describe('getJob queue explainer', () => {
     expect(job.queue!.penaltyChain[0]!.overQuotaRatio).toBe(Infinity)
     expect(job.queue!.penaltyChain[0]!.penalty).toBe(Infinity)
     expect(job.queue!.penaltyProduct).toBe(Infinity)
-    // An infinite penalty product means the job's effective score is the
-    // lowest possible (multiplier / Infinity), not the finite fallback used
-    // for a not-yet-computed (zero) penalty product.
-    expect(job.queue!.score).toBe(0)
+    // The explainer carries exactly the server's terms — no fabricated
+    // position or composed score: `null` on the wire is the honest
+    // in-memory Infinity, and age passes through untouched.
+    expect(job.queue!.multiplier).toBe(1)
+    expect(job.queue!.ageSeconds).toBe(5)
+    expect(Object.keys(job.queue!).sort()).toEqual([
+      'ageSeconds',
+      'multiplier',
+      'penaltyChain',
+      'penaltyProduct',
+    ])
   })
 })
 

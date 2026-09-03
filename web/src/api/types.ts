@@ -301,15 +301,22 @@ export interface JobSummary {
 }
 
 /**
- * Queue-position explainer for a `Queued` job (ADR 0021):
- * `score = multiplier / penaltyProduct + wAge * ageSeconds / ageHorizonSeconds`.
+ * Queue-ranking explainer for a `Queued` job — the terms of the scheduler's
+ * effective score the server can answer truthfully from replicated state:
+ * the priority multiplier, the per-ancestor quota penalty chain and its
+ * product, and the job's age.
+ *
+ * A literal queue position is **deliberately absent, not zero**: ranking the
+ * queued set would mean either an O(queue) scan per read or duplicating
+ * scheduler-owned scoring inputs (`w_age`, the age horizon) that would drift
+ * from what the scheduler actually applies. The scheduler also adds a small
+ * age credit on top of `multiplier / penaltyProduct`, so even this quotient
+ * is a ranking *term*, not a total the UI may present as final. If a true
+ * position ever ships, it must come from a scheduler-published ranking
+ * snapshot, never be recomputed per request.
  */
 export interface QueuePositionExplainer {
-  /** 1-based position in the ranked queue. */
-  rank: number
-  queueDepth: number
-  score: number
-  /** Priority multiplier m(j) from the job's priority class. */
+  /** Priority multiplier m(j) from the job's priority class (≥ 1). */
   multiplier: number
   /** One entry per quota entity from leaf to root. */
   penaltyChain: Array<{
@@ -322,13 +329,10 @@ export interface QueuePositionExplainer {
     /** This entity's multiplicative penalty ≥ 1. */
     penalty: number
   }>
-  /** Product of the chain penalties, P(j). */
+  /** Product of the chain penalties, P(j). Infinite when any link is. */
   penaltyProduct: number
+  /** Seconds since submission (the input to the scheduler's age credit). */
   ageSeconds: number
-  ageHorizonSeconds: number
-  wAge: number
-  /** The additive aging term, wAge * ageSeconds / ageHorizonSeconds. */
-  ageBonus: number
 }
 
 /** Funding progress of an accruing allocation (ADR 0027). */
