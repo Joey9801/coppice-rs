@@ -174,13 +174,19 @@ function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
         label="Runtime"
         value={runtimeSeconds != null ? formatDuration(runtimeSeconds) : '—'}
         hint={
-          runtimeSeconds == null
-            ? lastAttempt?.state === 'Terminal' && lastAttempt.startedAt == null
-              ? 'never started'
-              : 'not started'
-            : job.spec.maxRuntimeSeconds != null
+          runtimeSeconds != null
+            ? job.spec.maxRuntimeSeconds != null
               ? `limit ${formatDuration(job.spec.maxRuntimeSeconds)}`
               : 'no runtime limit'
+            : // Three honest absences: no attempt yet; a terminal attempt
+              // that ended without ever starting; or a started attempt
+              // whose end stamp predates the field (restored from an older
+              // snapshot) — its runtime is simply not knowable.
+              lastAttempt == null || lastAttempt.startedAt == null
+              ? lastAttempt?.state === 'Terminal'
+                ? 'never started'
+                : 'not started'
+              : 'runtime unavailable'
         }
       />
       <StatTile

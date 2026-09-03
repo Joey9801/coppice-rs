@@ -427,6 +427,7 @@ type WireJobPhase =
   | 'submitted'
   | 'accepted'
   | 'queued'
+  | 'accruing'
   | 'preparing'
   | 'running'
   | 'finalizing'
