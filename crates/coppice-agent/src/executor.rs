@@ -188,6 +188,22 @@ pub fn classify_exit(exit: &ExitInfo) -> AttemptOutcome {
     }
 }
 
+/// Classify an observed exit with the durable knowledge that an abort had
+/// already been requested for this allocation.
+///
+/// [`ExitCause::Killed`] deliberately carries no attribution on its own: it is
+/// the shape Docker exposes for either an external SIGKILL or an OOM whose
+/// daemon notification was lost. A journaled abort tombstone supplies the
+/// missing attribution, so that otherwise-ambiguous kill is `Aborted`. Stronger
+/// runtime evidence still wins: confirmed limit kills and natural exits keep
+/// their ordinary classification.
+pub(crate) fn classify_exit_after_abort(exit: &ExitInfo) -> AttemptOutcome {
+    match exit.cause {
+        ExitCause::Killed => AttemptOutcome::Aborted,
+        _ => classify_exit(exit),
+    }
+}
+
 /// The container runtime. Every method is executor-agnostic from the agent
 /// core's point of view; classification and journaling happen above it.
 ///
@@ -562,6 +578,22 @@ mod tests {
         assert_eq!(
             classify_exit(&exit(137, ExitCause::DiskKilled)),
             AttemptOutcome::DiskLimitExceeded
+        );
+    }
+
+    #[test]
+    fn abort_attribution_only_resolves_an_unconfirmed_kill() {
+        assert_eq!(
+            classify_exit_after_abort(&exit(137, ExitCause::Killed)),
+            AttemptOutcome::Aborted
+        );
+        assert_eq!(
+            classify_exit_after_abort(&exit(137, ExitCause::OomKilled)),
+            AttemptOutcome::MemoryLimitExceeded
+        );
+        assert_eq!(
+            classify_exit_after_abort(&exit(3, ExitCause::Natural)),
+            AttemptOutcome::Exited { code: 3 }
         );
     }
 

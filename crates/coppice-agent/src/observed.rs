@@ -10,7 +10,9 @@ use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
 use coppice_core::time::Duration;
 
-use crate::executor::{classify_exit, ContainerState, ObservedContainer};
+use crate::executor::{
+    classify_exit, classify_exit_after_abort, ContainerState, ObservedContainer,
+};
 use crate::journal::JournalState;
 
 /// One entry of the ObservedSet. `outcome` is `None` while `running`; when the
@@ -31,8 +33,10 @@ pub struct ObservedAllocation {
 ///
 /// 1. Every runtime container appears, with its true state — running →
 ///    `running = true`; exited with no journaled exit → `running = false`
-///    with the *runtime-observed* classification (OOM vs. exit code). Runtime
-///    evidence wins even if the journal intent is missing entirely (a
+///    with the *runtime-observed* classification (OOM vs. exit code). A
+///    tombstone supplies abort attribution for an otherwise-unconfirmed
+///    SIGKILL; confirmed limit kills and natural exits remain runtime truth.
+///    Runtime evidence wins even if the journal intent is missing entirely (a
 ///    survivor is never forgotten). Ids come from the container labels.
 /// 2. A journaled exit → `running = false` with the *journaled* outcome and
 ///    runtime, whether or not the exited container survives. When both
@@ -77,7 +81,10 @@ pub fn build_observed_set(
             let journaled_exit = journal.exits.get(&allocation);
             if matches!(container.state, ContainerState::Running { .. }) || journaled_exit.is_none()
             {
-                out.push(from_runtime(container));
+                out.push(from_runtime(
+                    container,
+                    journal.tombstones.contains(&allocation),
+                ));
                 continue;
             }
             // Both sources say exited: fall through to rule 2 — the journaled
@@ -112,7 +119,7 @@ pub fn build_observed_set(
     out
 }
 
-fn from_runtime(container: &ObservedContainer) -> ObservedAllocation {
+fn from_runtime(container: &ObservedContainer, abort_requested: bool) -> ObservedAllocation {
     match container.state {
         ContainerState::Running { runtime } => ObservedAllocation {
             allocation: container.allocation,
@@ -127,7 +134,11 @@ fn from_runtime(container: &ObservedContainer) -> ObservedAllocation {
             attempt: container.attempt,
             job: container.job,
             running: false,
-            outcome: Some(classify_exit(&exit)),
+            outcome: Some(if abort_requested {
+                classify_exit_after_abort(&exit)
+            } else {
+                classify_exit(&exit)
+            }),
             runtime: exit.runtime,
         },
     }
@@ -215,6 +226,61 @@ mod tests {
         assert!(!set[0].running);
         assert_eq!(set[0].outcome, Some(AttemptOutcome::Aborted));
         assert_eq!(set[0].runtime, Duration::from_micros(7));
+    }
+
+    #[test]
+    fn tombstone_attributes_unconfirmed_kill_after_restart() {
+        // Crash after the abort tombstone was fsynced but before the exit was
+        // journaled: the tombstone is the durable attribution Docker lacks.
+        let (a, at, j) = ids();
+        let mut state = JournalState::default();
+        state.tombstones.insert(a);
+        state.intents.insert(
+            a,
+            IntentRec {
+                allocation: a,
+                attempt: at,
+                job: j,
+                node_epoch: 1,
+            },
+        );
+        let runtime = vec![ObservedContainer {
+            allocation: a,
+            attempt: at,
+            job: j,
+            state: ContainerState::Exited(ExitInfo {
+                code: 137,
+                cause: ExitCause::Killed,
+                runtime: Duration::from_micros(9),
+                finished_at: Timestamp::UNIX_EPOCH,
+            }),
+        }];
+
+        let set = build_observed_set(&state, &runtime);
+        assert_eq!(set.len(), 1);
+        assert!(!set[0].running);
+        assert_eq!(set[0].outcome, Some(AttemptOutcome::Aborted));
+    }
+
+    #[test]
+    fn tombstone_does_not_override_confirmed_oom_after_restart() {
+        let (a, at, j) = ids();
+        let mut state = JournalState::default();
+        state.tombstones.insert(a);
+        let runtime = vec![ObservedContainer {
+            allocation: a,
+            attempt: at,
+            job: j,
+            state: ContainerState::Exited(ExitInfo {
+                code: 137,
+                cause: ExitCause::OomKilled,
+                runtime: Duration::from_micros(9),
+                finished_at: Timestamp::UNIX_EPOCH,
+            }),
+        }];
+
+        let set = build_observed_set(&state, &runtime);
+        assert_eq!(set[0].outcome, Some(AttemptOutcome::MemoryLimitExceeded));
     }
 
     #[test]

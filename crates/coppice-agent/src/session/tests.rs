@@ -415,6 +415,41 @@ async fn stop_of_running_container_is_aborted() {
     assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Aborted));
 }
 
+#[tokio::test]
+async fn abort_tombstone_attributes_an_unconfirmed_sigkill() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+
+    // Docker can expose the abort's exit before the stop request returns, with
+    // neither OOMKilled nor an oom event to attribute its SIGKILL. StopJob
+    // journals the durable abort tombstone before classifying that evidence.
+    exec.finish(
+        alloc,
+        ExitInfo {
+            code: 137,
+            cause: ExitCause::Killed,
+            runtime: Duration::from_micros(5),
+            finished_at: exec.now(),
+        },
+    );
+    let reports = session
+        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .await
+        .unwrap();
+
+    assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Aborted));
+    assert_eq!(
+        session.state().exits[&alloc].outcome,
+        AttemptOutcome::Aborted,
+        "the resolved attribution must be durable across restart"
+    );
+}
+
 /// The §4 carve-out (docker-executor.md): a stop whose evidence shows a limit
 /// kill landed as it took effect must record the limit breach, never claim the
 /// stop (abort / max-runtime) terminated the container.

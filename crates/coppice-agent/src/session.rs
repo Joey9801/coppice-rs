@@ -28,7 +28,9 @@ use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1 as pb;
 use coppice_proto::pb::core::v1 as pbcore;
 
-use crate::executor::{classify_exit, Executor, ExitCause, ExitInfo, StartSpec, StopOutcome};
+use crate::executor::{
+    classify_exit, classify_exit_after_abort, Executor, ExitCause, ExitInfo, StartSpec, StopOutcome,
+};
 use crate::journal::{ExitRec, IntentRec, Journal, JournalState, Watermark};
 use crate::observed::{build_observed_set, ObservedAllocation};
 
@@ -554,7 +556,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 )])
             }
             Ok(StopOutcome::AlreadyExited(exit)) => {
-                let outcome = classify_exit(&exit);
+                // A SIGKILL whose cause Docker could not confirm is no longer
+                // ambiguous once paired with this durable abort tombstone.
+                // Confirmed limit kills and natural exits still win the race.
+                let outcome = if kill_outcome == AttemptOutcome::Aborted {
+                    classify_exit_after_abort(&exit)
+                } else {
+                    classify_exit(&exit)
+                };
                 self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;
                 self.pending_reaps.push(alloc);
                 Ok(vec![self.terminal_status(
@@ -615,7 +624,11 @@ impl<F: Fs, E: Executor> Session<F, E> {
             tracing::warn!(node = %self.node, %alloc, "observed exit for an allocation with no intent; ignoring");
             return Ok(Vec::new());
         };
-        let outcome = classify_exit(&exit);
+        let outcome = if self.state.tombstones.contains(&alloc) {
+            classify_exit_after_abort(&exit)
+        } else {
+            classify_exit(&exit)
+        };
         self.record_exit(
             alloc,
             intent.attempt,
