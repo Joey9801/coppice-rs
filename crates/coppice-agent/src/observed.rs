@@ -10,9 +10,7 @@ use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
 use coppice_core::time::Duration;
 
-use crate::executor::{
-    classify_exit, classify_exit_after_abort, ContainerState, ObservedContainer,
-};
+use crate::executor::{classify_exit, ContainerState, ObservedContainer};
 use crate::journal::JournalState;
 
 /// One entry of the ObservedSet. `outcome` is `None` while `running`; when the
@@ -81,10 +79,7 @@ pub fn build_observed_set(
             let journaled_exit = journal.exits.get(&allocation);
             if matches!(container.state, ContainerState::Running { .. }) || journaled_exit.is_none()
             {
-                out.push(from_runtime(
-                    container,
-                    journal.tombstones.contains(&allocation),
-                ));
+                out.push(from_runtime(container, journal));
                 continue;
             }
             // Both sources say exited: fall through to rule 2 — the journaled
@@ -119,7 +114,7 @@ pub fn build_observed_set(
     out
 }
 
-fn from_runtime(container: &ObservedContainer, abort_requested: bool) -> ObservedAllocation {
+fn from_runtime(container: &ObservedContainer, journal: &JournalState) -> ObservedAllocation {
     match container.state {
         ContainerState::Running { runtime } => ObservedAllocation {
             allocation: container.allocation,
@@ -134,11 +129,10 @@ fn from_runtime(container: &ObservedContainer, abort_requested: bool) -> Observe
             attempt: container.attempt,
             job: container.job,
             running: false,
-            outcome: Some(if abort_requested {
-                classify_exit_after_abort(&exit)
-            } else {
-                classify_exit(&exit)
-            }),
+            outcome: Some(classify_exit(
+                &exit,
+                journal.tombstones.contains(&container.allocation),
+            )),
             runtime: exit.runtime,
         },
     }

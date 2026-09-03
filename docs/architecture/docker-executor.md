@@ -210,9 +210,13 @@ through `stop()`, and the caller assigns `Aborted` /
 An abort tombstone is durable kill attribution. If Docker can report only
 `ExitCause::Killed` (exit 137 under a memory limit, with neither an
 `OOMKilled` flag nor an `oom` event), a tombstone resolves that otherwise
-ambiguous kill to `Aborted`, including during restart reconciliation. It does
-not override stronger evidence: a confirmed memory/disk limit kill or a
-natural exit retains its ordinary outcome.
+ambiguous kill to `Aborted`, including during restart reconciliation and when
+the kill was observed just before the `StopJob` request. The latter makes the
+same attribution trade already made for a process that exits during the
+SIGTERM grace period. It does not override stronger evidence: a confirmed
+memory/disk limit kill or a natural exit retains its ordinary outcome. This
+rule is abort-only: max-runtime enforcement has no durable marker, so after a
+crash its otherwise-unattributable kill remains `Exited{137}`.
 
 **Stop-vs-natural-exit race discrimination.** The verdict must never be
 inferred from timestamps or event ordering on our side — the Docker

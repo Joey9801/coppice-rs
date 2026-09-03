@@ -170,13 +170,21 @@ pub enum ExecutorError {
     Other(String),
 }
 
-/// Classify a *naturally* observed exit (ADR 0013): the kernel's OOM kill, or
-/// the container's own exit code. Kill-initiated outcomes (abort, max-runtime)
-/// are assigned by the caller that initiated the kill, never inferred here.
-pub fn classify_exit(exit: &ExitInfo) -> AttemptOutcome {
+/// Classify an observed exit (ADR 0013): the kernel's OOM kill, the container's
+/// own exit code, or an otherwise-unattributable SIGKILL paired with an abort
+/// tombstone.
+///
+/// [`ExitCause::Killed`] deliberately carries no attribution on its own: it is
+/// the shape Docker exposes for either an external SIGKILL or an OOM whose
+/// daemon notification was lost. `abort_requested` supplies the missing
+/// attribution, so that otherwise-ambiguous kill is `Aborted`. Stronger runtime
+/// evidence still wins: confirmed limit kills and natural exits keep their
+/// ordinary classification.
+pub fn classify_exit(exit: &ExitInfo, abort_requested: bool) -> AttemptOutcome {
     match exit.cause {
         ExitCause::OomKilled => AttemptOutcome::MemoryLimitExceeded,
         ExitCause::DiskKilled => AttemptOutcome::DiskLimitExceeded,
+        ExitCause::Killed if abort_requested => AttemptOutcome::Aborted,
         // A kill we could not attribute reports the same *outcome* as a plain
         // exit — the code (137) is the only fact we have, and the replicated
         // outcome taxonomy has no "killed, cause unknown" variant to name it.
@@ -185,22 +193,6 @@ pub fn classify_exit(exit: &ExitInfo) -> AttemptOutcome {
         // evidence layer records the distinction now so that decision is a
         // mapping change here and nothing else.
         ExitCause::Natural | ExitCause::Killed => AttemptOutcome::Exited { code: exit.code },
-    }
-}
-
-/// Classify an observed exit with the durable knowledge that an abort had
-/// already been requested for this allocation.
-///
-/// [`ExitCause::Killed`] deliberately carries no attribution on its own: it is
-/// the shape Docker exposes for either an external SIGKILL or an OOM whose
-/// daemon notification was lost. A journaled abort tombstone supplies the
-/// missing attribution, so that otherwise-ambiguous kill is `Aborted`. Stronger
-/// runtime evidence still wins: confirmed limit kills and natural exits keep
-/// their ordinary classification.
-pub(crate) fn classify_exit_after_abort(exit: &ExitInfo) -> AttemptOutcome {
-    match exit.cause {
-        ExitCause::Killed => AttemptOutcome::Aborted,
-        _ => classify_exit(exit),
     }
 }
 
@@ -568,15 +560,15 @@ mod tests {
     #[test]
     fn classify_distinguishes_cause_from_exit_code() {
         assert_eq!(
-            classify_exit(&exit(0, ExitCause::Natural)),
+            classify_exit(&exit(0, ExitCause::Natural), false),
             AttemptOutcome::Exited { code: 0 }
         );
         assert_eq!(
-            classify_exit(&exit(137, ExitCause::OomKilled)),
+            classify_exit(&exit(137, ExitCause::OomKilled), false),
             AttemptOutcome::MemoryLimitExceeded
         );
         assert_eq!(
-            classify_exit(&exit(137, ExitCause::DiskKilled)),
+            classify_exit(&exit(137, ExitCause::DiskKilled), false),
             AttemptOutcome::DiskLimitExceeded
         );
     }
@@ -584,15 +576,15 @@ mod tests {
     #[test]
     fn abort_attribution_only_resolves_an_unconfirmed_kill() {
         assert_eq!(
-            classify_exit_after_abort(&exit(137, ExitCause::Killed)),
+            classify_exit(&exit(137, ExitCause::Killed), true),
             AttemptOutcome::Aborted
         );
         assert_eq!(
-            classify_exit_after_abort(&exit(137, ExitCause::OomKilled)),
+            classify_exit(&exit(137, ExitCause::OomKilled), true),
             AttemptOutcome::MemoryLimitExceeded
         );
         assert_eq!(
-            classify_exit_after_abort(&exit(3, ExitCause::Natural)),
+            classify_exit(&exit(3, ExitCause::Natural), true),
             AttemptOutcome::Exited { code: 3 }
         );
     }
