@@ -1,5 +1,4 @@
-import type { HostFacts, Resources } from '@/api/types'
-import { formatBytes, formatCpu } from '@/lib/format'
+import type { HostFacts } from '@/api/types'
 
 const OS_LABELS: Record<string, string> = {
   aix: 'AIX',
@@ -38,12 +37,8 @@ export function formatHostKernel(host: Pick<HostFacts, 'os' | 'kernelVersion'>):
   return label ? addLabel(value, label) : value
 }
 
-export function formatNodeCapacity(capacity: Resources): string {
-  return `${formatCpu(capacity.cpuMillis)} · ${formatBytes(capacity.memoryBytes)} · ${formatBytes(capacity.diskBytes)}`
-}
-
 function osLabel(os: string): string | null {
-  return OS_LABELS[os.trim().toLowerCase()] ?? (os.trim() || null)
+  return OS_LABELS[os.trim().toLowerCase()] ?? null
 }
 
 function kernelLabel(os: string): string | null {

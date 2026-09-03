@@ -124,8 +124,7 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           ) : (
             <TimeAgo t={summary.lastHeartbeat} className="font-medium" />
           )}
-          . Node connection reset at generation {summary.epoch}; running attempts will be marked
-          lost.
+          . Running attempts from registration epoch {summary.epoch} will be marked lost.
         </Banner>
       ) : draining ? (
         <Banner tone="amber">Draining — no new placements; existing work continues.</Banner>
@@ -361,7 +360,7 @@ function HeaderDescription({ summary }: { summary: NodeSummary }) {
         </Badge>
       ))}
       <span className="text-sm text-muted-foreground">
-        generation {summary.epoch} · last heartbeat{' '}
+        epoch {summary.epoch} · last heartbeat{' '}
         {summary.lastHeartbeat == null ? 'never' : <TimeAgo t={summary.lastHeartbeat} />}
       </span>
     </span>
@@ -558,6 +557,9 @@ function LogsSection({ nodeId }: { nodeId: string }) {
   return (
     <div className="space-y-2">
       <LogViewer entries={data?.entries ?? []} loading={isPending} />
+      <p className="text-xs text-muted-foreground">
+        Sample data — log collection is not available yet.
+      </p>
       {isError ? (
         <p className="text-xs text-muted-foreground">Agent log collection is unavailable.</p>
       ) : null}

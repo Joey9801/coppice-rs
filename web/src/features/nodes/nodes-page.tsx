@@ -2,7 +2,7 @@ import { useNavigate } from '@tanstack/react-router'
 import { Boxes } from 'lucide-react'
 import type { NodeSummary } from '@/api/types'
 import { useNodes } from '@/api/queries'
-import { formatPercent, resourceFractions } from '@/lib/format'
+import { formatNodeCapacity, formatPercent, resourceFractions } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { EmptyState, IdLink, PageHeader, StatePill, TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
@@ -18,7 +18,6 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { sortedLabels } from './lib'
-import { formatNodeCapacity } from './host-facts'
 
 export function NodesPage() {
   const { data: nodes, isPending, isError } = useNodes()
@@ -58,7 +57,7 @@ export function NodesPage() {
                 <TableHead className="w-40">Mem alloc</TableHead>
                 <TableHead className="text-right">Used CPU</TableHead>
                 <TableHead className="text-right">Run / Accr</TableHead>
-                <TableHead className="text-right">Generation</TableHead>
+                <TableHead className="text-right">Epoch</TableHead>
                 <TableHead className="text-right">Heartbeat</TableHead>
               </TableRow>
             </TableHeader>

@@ -119,7 +119,7 @@ function eventSentence(event: TimelineEvent): ReactNode {
     case 'NodeEpochBumped':
       return (
         <>
-          Node <IdLink id={event.node} /> connection reset to generation <Mono>{event.epoch}</Mono>
+          Node <IdLink id={event.node} /> registration epoch advanced to <Mono>{event.epoch}</Mono>
         </>
       )
     case 'JobEvicted':

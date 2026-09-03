@@ -53,6 +53,11 @@ export function formatResources(r: Resources): string {
   return `${formatCpu(r.cpuMillis)} · ${formatBytes(r.memoryBytes)} · ${formatBytes(r.diskBytes)} disk`
 }
 
+/** Compact capacity summary for node tables. */
+export function formatNodeCapacity(r: Resources): string {
+  return `${formatCpu(r.cpuMillis)} · ${formatBytes(r.memoryBytes)} · ${formatBytes(r.diskBytes)}`
+}
+
 /** µCU → CU with sensible precision: "12.4 CU", "0.003 CU". */
 export function formatUcu(ucu: number): string {
   const cu = ucu / MICRO_PER_COST_UNIT

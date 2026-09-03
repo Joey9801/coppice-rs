@@ -77,11 +77,7 @@ export function CoordinatorsPage() {
             </span>
           }
         />
-        <StatTile
-          label="Applied updates"
-          value={stateVersion.toLocaleString()}
-          hint="commands applied"
-        />
+        <StatTile label="Applied updates" value={stateVersion.toLocaleString()} />
         <StatTile
           label="Since snapshot"
           value={`${snapshot.entriesSinceSnapshot.toLocaleString()} entries`}

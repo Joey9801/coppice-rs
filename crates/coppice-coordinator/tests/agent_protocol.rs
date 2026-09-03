@@ -690,10 +690,23 @@ async fn host_facts_survive_registration_to_the_node_detail() {
     assert!(host.logical_cores >= 1, "at least one hardware thread");
 
     // Advertised capacity is the harness's overrides minus the reservation;
-    // the detected vector is what the machine actually reported. It is
-    // optional when a platform cannot provide one of the readings (for
-    // example, a restricted macOS test runner), so check its invariants only
-    // when the complete vector is available.
+    // the detected vector is what the machine actually reported. Linux must
+    // provide the complete vector in CI. Other platforms may omit a reading
+    // when the test runner restricts a system API, so check their invariants
+    // only when the complete vector is available.
+    #[cfg(target_os = "linux")]
+    {
+        let detected = record
+            .node
+            .detected_capacity
+            .expect("every dimension detects on a Linux test host");
+        assert_ne!(
+            detected, record.node.capacity,
+            "the harness overrides all three dimensions, so the two must differ"
+        );
+        assert!(detected.cpu_millis >= 1_000, "a real core count");
+    }
+    #[cfg(not(target_os = "linux"))]
     if let Some(detected) = record.node.detected_capacity {
         assert_ne!(
             detected, record.node.capacity,

@@ -46,9 +46,10 @@ pub struct Node {
 pub struct HostFacts {
     /// Operating system family, e.g. `linux`, `macos`.
     pub os: String,
-    /// Human-readable OS release, including a family label when available.
+    /// Human-readable OS release. Linux values preserve their useful
+    /// `PRETTY_NAME`; known non-Linux families receive a label when normalized.
     pub os_version: String,
-    /// Human-readable kernel release, including a family label when available.
+    /// Human-readable kernel release, including a family label when normalized.
     pub kernel_version: String,
     /// CPU architecture, e.g. `x86_64`, `aarch64`.
     pub arch: String,
@@ -68,15 +69,17 @@ pub struct HostFacts {
 }
 
 impl HostFacts {
-    /// Add an OS or kernel family label when a release is otherwise only a
-    /// bare version number.
+    /// Return OS and kernel releases with family labels where a bare release
+    /// would otherwise be ambiguous.
     ///
-    /// New agents call this before registration. The operation is also safe
-    /// for older persisted values, so read paths can use it to present one
-    /// consistent contract without changing the stored record in place.
-    pub fn normalize_versions(&mut self) {
-        self.os_version = normalize_os_version(&self.os, &self.os_version);
-        self.kernel_version = normalize_kernel_version(&self.os, &self.kernel_version);
+    /// This is applied at the API boundary so older persisted registrations
+    /// and new registrations share the same response contract without storing
+    /// presentation strings in replicated state.
+    pub fn normalized_versions(&self) -> (String, String) {
+        (
+            normalize_os_version(&self.os, &self.os_version),
+            normalize_kernel_version(&self.os, &self.kernel_version),
+        )
     }
 }
 
@@ -157,14 +160,13 @@ mod tests {
     use super::HostFacts;
 
     fn versions(os: &str, os_version: &str, kernel_version: &str) -> (String, String) {
-        let mut facts = HostFacts {
+        let facts = HostFacts {
             os: os.into(),
             os_version: os_version.into(),
             kernel_version: kernel_version.into(),
             ..HostFacts::default()
         };
-        facts.normalize_versions();
-        (facts.os_version, facts.kernel_version)
+        facts.normalized_versions()
     }
 
     #[test]

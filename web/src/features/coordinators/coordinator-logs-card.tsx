@@ -45,6 +45,9 @@ export function CoordinatorLogsCard({ members, className }: CoordinatorLogsCardP
             ))}
           </Tabs>
         ) : null}
+        <p className="mt-3 text-xs text-muted-foreground">
+          Sample data — log collection is not available yet.
+        </p>
       </CardContent>
     </Card>
   )
