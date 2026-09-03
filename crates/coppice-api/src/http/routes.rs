@@ -756,7 +756,9 @@ async fn get_node<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    let response = super::project::get_node(view.state(), &id, &plane.usage_window())
+    // The node's accrual `projected_start` sweep is memoized per published
+    // view, so polling node details does not rescan the allocation map.
+    let response = super::project::get_node(view.state(), &id, &plane.usage_window(), view.memos())
         .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
     Ok((
         ReadIndexes {
@@ -804,8 +806,10 @@ async fn get_job<P: ControlPlane>(
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
     // A read may sample the clock (an apply may not): `now` feeds the
-    // read-time entity-usage decay, queue age, and penalty product.
-    let response = super::project::get_job(view.state(), &id, Timestamp::now())
+    // read-time entity-usage decay, queue age, and penalty product. The
+    // view's memo table makes the accrual `projected_start` sweep a
+    // once-per-published-view cost, not a per-request one.
+    let response = super::project::get_job(view.state(), &id, Timestamp::now(), view.memos())
         .ok_or_else(|| HttpError::not_found(format!("job {id} not found")))?;
     Ok((
         ReadIndexes {

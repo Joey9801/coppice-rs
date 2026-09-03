@@ -13,8 +13,10 @@
 pub mod http;
 
 use std::future::Future;
+use std::sync::Arc;
 
 use coppice_core::time::Timestamp;
+use coppice_state::ViewMemos;
 use http::dto::{
     AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest,
     SubmitJobResponse, UpdateAuthorizationRequest, UpdateAuthorizationResponse,
@@ -44,10 +46,19 @@ pub struct ReadOptions {
 /// The `StateMachine` clone is O(1) (persistent maps, ADR 0028). Handlers
 /// project the state into their response type and attach the indexes as
 /// response headers.
+///
+/// The view also carries a typed memo table ([`ViewMemos`]): read-model
+/// projections that would otherwise rescan the whole state per request are
+/// computed once per published view and shared by every read served from it.
+/// A table is only sound against the state it was published with — pair
+/// them via [`with_memos`](ReadView::with_memos) from the same
+/// consensus view, as the production control plane does; a bare [`new`](ReadView::new)
+/// starts with an empty table, which is always correct (merely uncached).
 pub struct ReadView {
     state: coppice_state::StateMachine,
     applied_index: u64,
     committed_index: u64,
+    memos: Arc<ViewMemos>,
 }
 
 impl ReadView {
@@ -60,7 +71,21 @@ impl ReadView {
             state,
             applied_index,
             committed_index,
+            memos: Arc::new(ViewMemos::default()),
         }
+    }
+
+    /// Pair this view's state with the memo table of the consensus view it
+    /// was cloned from, so per-view projections are computed once however
+    /// many reads are served from the same published state.
+    pub fn with_memos(mut self, memos: Arc<ViewMemos>) -> Self {
+        self.memos = memos;
+        self
+    }
+
+    /// The view's memo table — the only sound partner for the state here.
+    pub fn memos(&self) -> &ViewMemos {
+        &self.memos
     }
 
     pub fn state(&self) -> &coppice_state::StateMachine {
@@ -806,4 +831,32 @@ pub trait ControlPlane: Send + Sync + 'static {
         addr: &str,
         req: MetricsFetchRequest,
     ) -> impl Future<Output = Result<MetricsFetchOutcome, MetricsFetchError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The memo table travels with the state it was published with: a view
+    /// paired via `with_memos` shares one table across reads, and a bare
+    /// `new` starts its own empty table — always correct, merely uncached.
+    #[test]
+    fn a_read_view_carries_the_memo_table_it_is_paired_with() {
+        let shared = Arc::new(ViewMemos::default());
+        let view = ReadView::new(coppice_state::StateMachine::default(), 1, 1)
+            .with_memos(Arc::clone(&shared));
+
+        let a = view.memos().memo(|| String::from("projection"));
+        assert!(Arc::ptr_eq(
+            &a,
+            &shared.memo(|| String::from("ignored — already cached"))
+        ));
+
+        // A view built without a pairing starts empty, so its first memo
+        // computation runs and its table is its own.
+        let bare = ReadView::new(coppice_state::StateMachine::default(), 1, 1);
+        let b = bare.memos().memo(|| String::from("projection"));
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(&*a, &*b);
+    }
 }

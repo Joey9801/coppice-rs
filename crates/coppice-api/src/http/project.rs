@@ -11,13 +11,14 @@ use std::ops::Bound;
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::{AllocationId, ClusterId, JobId, NodeId, QuotaEntityId};
+use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::JobState;
 use coppice_core::quota::{self, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
+use coppice_scheduler::{projected_starts_cached, ProjectedStarts};
 use coppice_state::{
-    AllocationRecord, AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine,
+    AllocationRecord, AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, ViewMemos,
     QUOTA_TREE_DEPTH_CAP,
 };
 
@@ -147,10 +148,15 @@ pub fn list_nodes(state: &StateMachine, usage: &UsageSnapshot) -> dto::ListNodes
     dto::ListNodesResponse { nodes }
 }
 
+/// `GET /api/v1/nodes/{node}` — the node detail projection. `view_memos` is
+/// the published view's memo table (a `ReadView` carries its state's own
+/// table), so the accrual `projected_start` sweep runs once per published
+/// view rather than once per request.
 pub fn get_node(
     state: &StateMachine,
     id: &NodeId,
     usage: &UsageSnapshot,
+    view_memos: &ViewMemos,
 ) -> Option<dto::GetNodeResponse> {
     let record = state.nodes.get(id)?;
     let memos = build_node_memos(state);
@@ -172,7 +178,7 @@ pub fn get_node(
         .map(|(_, ar)| attempt_view(ar))
         .collect();
 
-    let accrual_starts = coppice_scheduler::projected_starts(state);
+    let accrual_starts = projected_starts_cached(state, view_memos);
     let accrual_queue = state
         .accrual_queue
         .iter()
@@ -1027,14 +1033,11 @@ fn queue_explainer(
 /// the two surfaces cannot disagree about the same allocation.
 ///
 /// `projected_start` comes from the scheduler's read projection
-/// ([`coppice_scheduler::projected_starts`]): the same guaranteed-release
-/// sweep (ADR 0014/0027) the scheduling pass runs at its start, recomputed
-/// here from committed state — `None` stays the honest "unbounded", never a
+/// ([`projected_starts_cached`]): the same guaranteed-release sweep
+/// (ADR 0014/0027) the scheduling pass runs at its start, recomputed here
+/// from committed state — `None` stays the honest "unbounded", never a
 /// fabricated time.
-fn accrual_view(
-    alloc_record: &AllocationRecord,
-    starts: &BTreeMap<AllocationId, Option<Timestamp>>,
-) -> dto::AccrualView {
+fn accrual_view(alloc_record: &AllocationRecord, starts: &ProjectedStarts) -> dto::AccrualView {
     let alloc = &alloc_record.allocation;
     dto::AccrualView {
         allocation: dto::AllocationView {
@@ -1054,13 +1057,17 @@ fn accrual_view(
 
 /// The `accrual` field — `Some` only while the current attempt is `Accruing`,
 /// built from the attempt's allocation exactly as [`get_node`]'s accrual queue.
-fn job_accrual(state: &StateMachine, record: &JobRecord) -> Option<dto::AccrualView> {
+fn job_accrual(
+    state: &StateMachine,
+    record: &JobRecord,
+    view_memos: &ViewMemos,
+) -> Option<dto::AccrualView> {
     let attempt = state.attempts.get(&record.state.attempt()?)?;
     if !matches!(attempt.attempt.state, AttemptState::Accruing) {
         return None;
     }
     let alloc_record = state.allocations.get(&attempt.attempt.allocation)?;
-    let starts = coppice_scheduler::projected_starts(state);
+    let starts = projected_starts_cached(state, view_memos);
     Some(accrual_view(alloc_record, &starts))
 }
 
@@ -1168,7 +1175,16 @@ fn cost_report(state: &StateMachine, record: &JobRecord) -> dto::CostReport {
 /// `GET /api/v1/jobs/{job}`. `None` when the id is not in the view (a 404 at
 /// the handler). `now` is the reader's wall clock, feeding the read-time
 /// entity-usage decay, queue age, and penalty product — never replicated.
-pub fn get_job(state: &StateMachine, id: &JobId, now: Timestamp) -> Option<dto::JobDetail> {
+/// `view_memos` is the published view's memo table (a `ReadView` carries its
+/// state's own table), so the accrual `projected_start` sweep runs once per
+/// published view rather than once per request — job-scaled maps can hold
+/// millions of entries, and an accrued job's detail is polled.
+pub fn get_job(
+    state: &StateMachine,
+    id: &JobId,
+    now: Timestamp,
+    view_memos: &ViewMemos,
+) -> Option<dto::JobDetail> {
     let record = state.jobs.get(id)?;
     let spec = &record.spec;
 
@@ -1208,7 +1224,7 @@ pub fn get_job(state: &StateMachine, id: &JobId, now: Timestamp) -> Option<dto::
             .map(attempt_view)
             .collect(),
         queue: queue_explainer(state, record, now),
-        accrual: job_accrual(state, record),
+        accrual: job_accrual(state, record, view_memos),
         cost: cost_report(state, record),
     })
 }
@@ -1736,7 +1752,7 @@ mod tests {
     #[test]
     fn get_node_returns_none_for_missing() {
         let state = StateMachine::default();
-        assert!(get_node(&state, &NodeId::new(), &no_usage()).is_none());
+        assert!(get_node(&state, &NodeId::new(), &no_usage(), &no_memos()).is_none());
     }
 
     #[test]
@@ -1757,7 +1773,7 @@ mod tests {
             test_allocation(alloc, job, attempt, node, AllocationState::Active),
         );
 
-        let response = get_node(&state, &node, &no_usage()).unwrap();
+        let response = get_node(&state, &node, &no_usage(), &no_memos()).unwrap();
         assert_eq!(response.active_attempts.len(), 1);
         assert_eq!(response.active_attempts[0].rate_ucu_per_second, 100);
         assert_eq!(response.active_attempts[0].outcome, None);
@@ -1793,7 +1809,7 @@ mod tests {
         let mut state = StateMachine::default();
         state.nodes.insert(node, record);
 
-        let response = get_node(&state, &node, &no_usage()).expect("the node exists");
+        let response = get_node(&state, &node, &no_usage(), &no_memos()).expect("the node exists");
         let host = response.host.expect("facts pass through");
         assert_eq!(host.os_version, "macOS 15.5");
         assert_eq!(host.kernel_version, "Darwin 24.5.0");
@@ -1810,7 +1826,7 @@ mod tests {
         // A node whose agent reported nothing reads as unknown, not as zeros.
         let bare = NodeId::new();
         state.nodes.insert(bare, test_node(bare));
-        let response = get_node(&state, &bare, &no_usage()).expect("the node exists");
+        let response = get_node(&state, &bare, &no_usage(), &no_memos()).expect("the node exists");
         assert!(response.host.is_none());
         assert!(response.detected_capacity.is_none());
     }
@@ -1856,6 +1872,13 @@ mod tests {
     /// projected from it is honestly absent (ADR 0039).
     fn no_usage() -> UsageSnapshot {
         UsageSnapshot::default()
+    }
+
+    /// An empty per-view memo table — what a read of a view nobody has yet
+    /// projected carries. Each call gets a fresh table, so a test never
+    /// inherits a memo from another.
+    fn no_memos() -> ViewMemos {
+        ViewMemos::default()
     }
 
     /// [`cluster_overview`] with empty derived sources — what a replica with
@@ -1983,7 +2006,7 @@ mod tests {
         let record = state.jobs.get_mut(&job).unwrap();
         record.state = JobState::Attempting(live);
 
-        let detail = get_job(&state, &job, ts(10_000)).unwrap();
+        let detail = get_job(&state, &job, ts(10_000), &no_memos()).unwrap();
         let by_id = |id| detail.attempts.iter().find(|a| a.id == id).unwrap();
         assert_eq!(by_id(live).ended_at, None, "a live attempt has no end");
         assert_eq!(
@@ -2765,7 +2788,7 @@ mod tests {
     #[test]
     fn get_job_returns_none_for_missing() {
         let state = StateMachine::default();
-        assert!(get_job(&state, &job_id(1), ts(0)).is_none());
+        assert!(get_job(&state, &job_id(1), ts(0), &no_memos()).is_none());
     }
 
     #[test]
@@ -2785,7 +2808,7 @@ mod tests {
         record.spec.max_runtime = Some(Duration::from_secs(3600));
         state.jobs.insert(id, record);
 
-        let detail = get_job(&state, &id, now).unwrap();
+        let detail = get_job(&state, &id, now, &no_memos()).unwrap();
         assert_eq!(detail.id, id);
         assert_eq!(detail.spec.image, "alpine:3");
         assert_eq!(detail.spec.command, vec!["sh", "-c"]);
@@ -2810,7 +2833,7 @@ mod tests {
         let mut rec = test_job(term, JobState::Succeeded, ts(0));
         rec.terminal_at = Some(ts(5_000_000));
         state.jobs.insert(term, rec);
-        let detail = get_job(&state, &term, now).unwrap();
+        let detail = get_job(&state, &term, now, &no_memos()).unwrap();
         assert_eq!(detail.state_since, ts(5_000_000));
         // A terminal job is never queued and never accruing.
         assert!(detail.queue.is_none());
@@ -2827,7 +2850,9 @@ mod tests {
         arec.started_at = Some(ts(3_000_000));
         state.attempts.insert(attempt, arec);
         assert_eq!(
-            get_job(&state, &running, now).unwrap().state_since,
+            get_job(&state, &running, now, &no_memos())
+                .unwrap()
+                .state_since,
             ts(3_000_000)
         );
 
@@ -2838,7 +2863,9 @@ mod tests {
             test_job(queued_j, JobState::Queued, ts(2_000_000)),
         );
         assert_eq!(
-            get_job(&state, &queued_j, now).unwrap().state_since,
+            get_job(&state, &queued_j, now, &no_memos())
+                .unwrap()
+                .state_since,
             ts(2_000_000)
         );
     }
@@ -2858,7 +2885,7 @@ mod tests {
         rec.multiplier = PriorityMultiplier::from_integer(2);
         state.jobs.insert(id, rec);
 
-        let cost = get_job(&state, &id, now).unwrap().cost;
+        let cost = get_job(&state, &id, now, &no_memos()).unwrap().cost;
         assert_eq!(cost.rate_ucu_per_second, 1_000_000);
         assert_eq!(cost.rate_breakdown.cpu, 1_000_000);
         assert_eq!(cost.rate_breakdown.memory, 0);
@@ -2895,7 +2922,7 @@ mod tests {
         rec.spec.max_runtime = None;
         state.jobs.insert(id, rec);
 
-        let cost = get_job(&state, &id, now).unwrap().cost;
+        let cost = get_job(&state, &id, now, &no_memos()).unwrap().cost;
         assert_eq!(cost.unbounded_multiplier, 2.0);
         assert_eq!(cost.priority_multiplier, 1.0);
         assert_eq!(cost.effective_rate_ucu_per_second, 2_000_000);
@@ -2926,7 +2953,7 @@ mod tests {
         ra.multiplier = PriorityMultiplier::from_integer(2);
         state.jobs.insert(a, ra);
 
-        let qa = get_job(&state, &a, now)
+        let qa = get_job(&state, &a, now, &no_memos())
             .unwrap()
             .queue
             .expect("A is queued");
@@ -2965,7 +2992,7 @@ mod tests {
             test_allocation(alloc, job, attempt, node, AllocationState::Accruing),
         );
 
-        let detail = get_job(&state, &job, now).unwrap();
+        let detail = get_job(&state, &job, now, &no_memos()).unwrap();
         let accrual = detail.accrual.expect("accruing");
         assert_eq!(accrual.allocation.id, alloc);
         // The attempt is surfaced too.
@@ -3048,15 +3075,19 @@ mod tests {
         // accrual's remaining 3000 cpu.
         let expected = Some(ts(1_000_000) + Duration::from_secs(3600));
 
-        let node_view = get_node(&state, &node, &no_usage()).unwrap();
+        // One published view, one memo table, both surfaces — exactly how a
+        // pair of polls against the same view would share the sweep.
+        let memos = ViewMemos::default();
+
+        let node_view = get_node(&state, &node, &no_usage(), &memos).unwrap();
         assert_eq!(node_view.accrual_queue.len(), 1);
         assert_eq!(node_view.accrual_queue[0].allocation.id, waiter_alloc);
         assert_eq!(node_view.accrual_queue[0].projected_start, expected);
 
-        let job_view = get_job(&state, &waiter, ts(1_000_000)).unwrap();
+        let job_view = get_job(&state, &waiter, ts(1_000_000), &memos).unwrap();
         let accrual = job_view.accrual.expect("accruing");
         assert_eq!(accrual.allocation.id, waiter_alloc);
-        // The one answer, shown twice.
+        // The one answer, shown twice — from the memo the node read filled.
         assert_eq!(accrual.projected_start, expected);
         assert_eq!(
             accrual.projected_start,
@@ -3070,10 +3101,10 @@ mod tests {
         // observes it, so both views report the honest `None`.
         let (state, node, waiter, _) = state_with_runner_and_accrual(None);
 
-        let node_view = get_node(&state, &node, &no_usage()).unwrap();
+        let node_view = get_node(&state, &node, &no_usage(), &no_memos()).unwrap();
         assert_eq!(node_view.accrual_queue[0].projected_start, None);
 
-        let job_view = get_job(&state, &waiter, ts(1_000_000)).unwrap();
+        let job_view = get_job(&state, &waiter, ts(1_000_000), &no_memos()).unwrap();
         assert_eq!(job_view.accrual.expect("accruing").projected_start, None);
     }
 

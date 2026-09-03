@@ -15,6 +15,7 @@ mod common;
 use common::*;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::bytes::ByteSize;
@@ -22,7 +23,11 @@ use coppice_core::id::AllocationId;
 use coppice_core::quota::PriorityMultiplier;
 use coppice_core::resource::Resources;
 use coppice_core::time::Duration;
-use coppice_scheduler::{projected_starts, HeuristicScheduler, PlacementProposal, Scheduler};
+use coppice_scheduler::{
+    projected_starts, projected_starts_cached, HeuristicScheduler, PlacementProposal,
+    ProjectedStarts, Scheduler,
+};
+use coppice_state::ViewMemos;
 use coppice_state::{AllocationRecord, Command, StateMachine};
 
 fn res(cpu_millis: u64, memory: ByteSize, disk: ByteSize) -> Resources {
@@ -382,4 +387,77 @@ fn the_projection_only_covers_queued_accruals() {
         BTreeMap::from([(alid(50), Some(base_ts() + Duration::from_secs(3600)))]),
         starts
     );
+}
+
+// ---- queue records missing from the allocation map ----
+
+/// A queue entry whose allocation record is missing (a hand-built state)
+/// must drop out of the result without shifting its neighbours' projections
+/// onto the wrong ids — the id stays glued to its own need through the
+/// per-node filter.
+#[test]
+fn a_missing_queue_record_does_not_shift_neighbours() {
+    let mut sm = setup(cpu(64_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(16_000), Some(3600));
+
+    // seq 0 has no allocation record at all; the valid accrual sits behind
+    // it (seq 1) and needs exactly the one guaranteed release.
+    sm.accrual_queue.insert((nid(1), 0), alid(99));
+    seed_accrual(
+        &mut sm,
+        alid(50),
+        jid(2),
+        nid(1),
+        cpu(32_000),
+        cpu(16_000),
+        1,
+    );
+
+    let starts = projected_starts(&sm);
+    assert_eq!(
+        BTreeMap::from([(alid(50), Some(base_ts() + Duration::from_secs(3600)))]),
+        starts,
+        "the valid accrual keeps its own projection; the missing id is absent"
+    );
+}
+
+// ---- per-view memoization ----
+
+/// The cached entry point computes once per memo table and always answers
+/// exactly what a fresh sweep of the same state would.
+#[test]
+fn the_cached_projection_is_shared_per_view_and_correct() {
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(16_000), Some(3600));
+    seed_accrual(
+        &mut sm,
+        alid(50),
+        jid(2),
+        nid(1),
+        cpu(32_000),
+        cpu(16_000),
+        1,
+    );
+
+    let memos = ViewMemos::default();
+    let first = projected_starts_cached(&sm, &memos);
+    let second = projected_starts_cached(&sm, &memos);
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "one view, one computation: later reads share the memo"
+    );
+
+    let expected: BTreeMap<_, _> =
+        BTreeMap::from([(alid(50), Some(base_ts() + Duration::from_secs(3600)))]);
+    assert_eq!(&**first, &expected);
+    assert_eq!(
+        &**projected_starts_cached(&sm, &ViewMemos::default()),
+        &expected
+    );
+
+    // The cached map derefs to the plain projection of the same state.
+    let plain: BTreeMap<_, _> = projected_starts(&sm);
+    let wrapped: &BTreeMap<_, _> = &first;
+    assert_eq!(wrapped, &plain);
+    let _typed: &ProjectedStarts = &first;
 }

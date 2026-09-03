@@ -759,11 +759,15 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             .known_committed
             .max(view.applied_index());
 
-        Ok(ReadView::new(
-            view.state().clone(),
-            view.applied_index(),
-            committed_index,
-        ))
+        // Carry the consensus view's memo table alongside the state it
+        // belongs to, so per-view read-model projections (e.g. the accrual
+        // `projected_start` sweep) are computed once per publish however
+        // many reads the view serves. The indexes travel with it, keeping
+        // every read of one view consistent.
+        Ok(
+            ReadView::new(view.state().clone(), view.applied_index(), committed_index)
+                .with_memos(view.memos()),
+        )
     }
 
     fn queue_window(&self) -> QueueWindow {

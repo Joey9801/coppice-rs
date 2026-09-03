@@ -37,9 +37,11 @@ use coppice_core::time::{Duration, Timestamp};
 mod apply;
 pub mod authz;
 pub mod command;
+pub mod view_memos;
 
 pub use authz::{Actor, Binding, Denial, Role, Subject, Verb};
 pub use command::Command;
+pub use view_memos::ViewMemos;
 
 /// The authoritative, replicated control-plane state.
 ///
