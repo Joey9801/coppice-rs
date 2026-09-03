@@ -204,28 +204,47 @@ pub struct ClusterUsage {
 /// `history` is the task's last published window. On a follower — where no
 /// agent sessions terminate — `current` is empty and `history` has no
 /// buckets, and every `used` renders as honestly absent — as does every
-/// `last_heartbeat` and node health derived from `heartbeats`.
+/// `last_heartbeat` and node health derived from `liveness`.
 #[derive(Debug, Clone, Default)]
 pub struct UsageSnapshot {
     /// Nodes with a reading fresher than the staleness cutoff. Absent =
     /// not measured.
     pub current: std::collections::BTreeMap<coppice_core::id::NodeId, NodeUsageSample>,
     pub history: std::sync::Arc<ClusterUsage>,
-    /// Wall-clock stamp of the last report of any shape heard from each
-    /// node — the source of `NodeSummary.last_heartbeat` and the read-time
-    /// health derivation. Leader-local like `current` (agent sessions
-    /// terminate on the leader), so a follower's map is empty and every
-    /// `last_heartbeat` renders as null with health `unknown`. Unlike
-    /// `current` there is no staleness cutoff: "last heard at T" stays a
-    /// fact as T ages, and that age is exactly what health and the UI's
-    /// "ago" rendering are derived from.
-    pub heartbeats:
-        std::collections::BTreeMap<coppice_core::id::NodeId, coppice_core::time::Timestamp>,
+    /// The leader's liveness marks for the term it currently leads — the
+    /// source of `NodeSummary.last_heartbeat` and the read-time health
+    /// derivation. Leader-local like `current` (agent sessions terminate on
+    /// the leader) and scoped to the current leadership term, so the map is
+    /// empty on a follower, on a replica that has stepped down, and on a
+    /// newly elected leader until its health monitor seeds the term —
+    /// every `last_heartbeat` then renders as null with health `unknown`.
+    /// Unlike `current` there is no staleness cutoff: "last heard at T"
+    /// stays a fact as T ages, and the monotonic age beside it is exactly
+    /// what health is derived from.
+    pub liveness: std::collections::BTreeMap<coppice_core::id::NodeId, LivenessMark>,
     /// Nodes in replicated state right now — the live denominator for
     /// coverage, read at snapshot time rather than from the history task's
     /// tracked set (which is empty until the first bucket closes and can lag
     /// membership changes by a bucket).
     pub total_nodes: u32,
+}
+
+/// One node's standing in the leader's liveness map (ADR 0009's health
+/// monitor input), as of the instant the [`UsageSnapshot`] was taken.
+///
+/// Two clocks, two jobs. `silent_for` is the *monotonic* span since the
+/// leader last heard from the node — or, for a node it has only granted a
+/// grace window since gaining leadership, since that grant — measured on the
+/// coordinator's own `Instant` clock at snapshot time. It is the only input
+/// to a health verdict: the same span the health monitor measures against
+/// the liveness deadline, so the read and the monitor cannot be pushed apart
+/// by a wall-clock step. `last_heartbeat` is the wall stamp of the last
+/// actual report, for display only, and absent for a node granted grace but
+/// not yet heard from this term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LivenessMark {
+    pub last_heartbeat: Option<coppice_core::time::Timestamp>,
+    pub silent_for: std::time::Duration,
 }
 
 /// One event with the identity and stamp of ADR 0032's shared timeline

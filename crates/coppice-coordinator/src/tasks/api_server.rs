@@ -513,9 +513,11 @@ pub struct CoordinatorControlPlane<C> {
     /// serves as `used: null`.
     usage: Option<crate::usage::NodeUsage>,
     /// The leader's liveness marks, when `with_usage` attached them: the
-    /// wall-clock side feeds `NodeSummary.last_heartbeat` and the read-time
-    /// health derivation. `None` serves an empty map — every heartbeat null
-    /// and every health `unknown`, the same posture a follower has.
+    /// wall-clock side feeds `NodeSummary.last_heartbeat`, the monotonic
+    /// side the read-time health derivation. Read only while this replica
+    /// leads, and only for the term it leads. `None` serves an empty map —
+    /// every heartbeat null and every health `unknown`, the same posture a
+    /// follower has.
     liveness: Option<crate::liveness::NodeLiveness>,
     /// The usage-history task's published rolling window. Seeded with an empty
     /// `ClusterUsage` whose sender is dropped immediately, exactly as
@@ -555,13 +557,13 @@ impl<C> CoordinatorControlPlane<C> {
     }
 
     /// Attach the best-effort node-usage sources (ADR 0039): the leader's
-    /// heartbeat sample sink, its liveness marks (whose wall-clock side
-    /// backs `last_heartbeat` and node health), and the usage-history task's
-    /// published window. The runtime calls this; a control plane without
-    /// them serves an empty snapshot, which renders as `used: null`,
-    /// `last_heartbeat: null`, and health `unknown` everywhere rather than
-    /// as fabricated values — the same posture a follower has with them
-    /// attached.
+    /// heartbeat sample sink, its liveness marks (behind `last_heartbeat`
+    /// and node health, served only while — and for the term — this replica
+    /// leads), and the usage-history task's published window. The runtime
+    /// calls this; a control plane without them serves an empty snapshot,
+    /// which renders as `used: null`, `last_heartbeat: null`, and health
+    /// `unknown` everywhere rather than as fabricated values — the same
+    /// posture a follower has with them attached.
     pub fn with_usage(
         mut self,
         usage: crate::usage::NodeUsage,
@@ -780,13 +782,18 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 .map(|sink| sink.snapshot(Timestamp::now(), crate::limits::USAGE_SAMPLE_MAX_AGE))
                 .unwrap_or_default(),
             history: self.usage_history.borrow().clone(),
-            // No cutoff, unlike `current`: a stale last-heard stamp is still
-            // a fact, and its age is what the health derivation reads.
-            heartbeats: self
-                .liveness
-                .as_ref()
-                .map(|liveness| liveness.heartbeats())
-                .unwrap_or_default(),
+            // Served for the term this replica leads *right now*, per the
+            // status watch — the map's own term gate then drops anything a
+            // prior term left behind, so a stepped-down or freshly re-elected
+            // replica serves nothing rather than old marks. No cutoff, unlike
+            // `current`: a silent node's mark is still a fact, and its
+            // monotonic age is what the health derivation reads.
+            liveness: match (&self.liveness, &self.consensus.status().borrow().role) {
+                (Some(liveness), Role::Leader { term }) => {
+                    liveness.snapshot(*term, std::time::Instant::now())
+                }
+                _ => Default::default(),
+            },
             total_nodes: self
                 .views
                 .latest()
@@ -1028,6 +1035,53 @@ mod tests {
 
     fn control_plane(outcome: ProposeOutcome) -> CoordinatorControlPlane<FakeConsensus> {
         control_plane_and_publisher(outcome).0
+    }
+
+    /// The liveness marks a read serves follow leadership, not the process:
+    /// a leader serves the marks of the term it leads; a replica that has
+    /// stepped down serves none (never a stale `healthy` decaying into
+    /// `lost`); a re-elected one serves none until its monitor seeds the
+    /// new term, and then only the new term's grace grants and reports.
+    #[test]
+    fn usage_window_serves_liveness_for_the_led_term_only() {
+        use coppice_consensus::Role;
+        use std::time::Instant;
+
+        let (plane, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        let liveness = crate::liveness::NodeLiveness::new();
+        let (_, history) = watch::channel(Arc::new(ClusterUsage::default()));
+        let plane = plane.with_usage(crate::usage::NodeUsage::new(), liveness.clone(), history);
+        let node = NodeId::new();
+
+        // Leader of term 1 (the fake's default): the marks are served.
+        liveness.seed(1, [node], Instant::now());
+        liveness.mark(1, node);
+        let served = plane.usage_window().liveness;
+        assert!(served[&node].last_heartbeat.is_some());
+
+        // Step-down: same map, same marks, nothing served.
+        consensus.set_role(Role::Follower { leader: Some(2) });
+        assert!(plane.usage_window().liveness.is_empty());
+
+        // Re-elected for term 3: still nothing until the monitor seeds the
+        // term, and then the old term's report is gone — the node is inside
+        // its new grace window with no heartbeat, not lost or healthy on
+        // term 1's say-so.
+        consensus.set_role(Role::Leader { term: 3 });
+        assert!(plane.usage_window().liveness.is_empty());
+        liveness.seed(3, [node], Instant::now());
+        let served = plane.usage_window().liveness;
+        assert_eq!(served[&node].last_heartbeat, None);
+        assert!(served[&node].silent_for < std::time::Duration::from_secs(1));
+
+        // A report from the stale term changes nothing; one from the led
+        // term is served.
+        liveness.mark(1, node);
+        assert_eq!(plane.usage_window().liveness[&node].last_heartbeat, None);
+        liveness.mark(3, node);
+        assert!(plane.usage_window().liveness[&node]
+            .last_heartbeat
+            .is_some());
     }
 
     /// What a [`FakeForwarder`] pretends the leader said.
