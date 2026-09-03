@@ -5,7 +5,21 @@
 //! them linger for an unambiguous period — but under instance churn they
 //! accumulate in membership, and each keeps a machine-identity binding alive
 //! against a machine that is never coming back. This task, leader-only, is
-//! what keeps membership records bounded.
+//! what keeps membership records coherent and bounded.
+//!
+//! Bounded is the stale-learner half. Coherent is the other way membership
+//! goes wrong, and it has no operator waiting on it: openraft's
+//! `change_membership` is two sequential proposals — a joint configuration,
+//! then the uniform one — and a leader that loses leadership, crashes, or
+//! merely abandons the call on its commit deadline between them leaves the
+//! cluster in the joint config. Joint membership silently enforces the OLD
+//! quorum requirement as well as the new one, so availability is reduced while
+//! every status surface reports health, and — because the seat already appears
+//! in the joint union — the joiner's convergence loop declares itself a voter
+//! and stops retrying. Nothing else would ever repair it. So this loop calls
+//! [`Consensus::finish_pending_membership_change`] on gaining leadership (which
+//! also catches the case openraft documents: a predecessor that died between
+//! the two phases) and at the start of every pass.
 //!
 //! Three rules make it safe:
 //!
@@ -73,6 +87,22 @@ pub async fn run<C: Consensus>(
         };
         tracing::debug!(term, "learner-gc: gained leadership");
 
+        // Immediately, before the first sweep and before any contact evidence
+        // has had time to accumulate: a membership change stranded in the
+        // joint configuration by the *previous* leader — the case openraft's
+        // own documentation calls out — is repaired by whoever holds the term
+        // next, and this is the first moment this node can do it. Failures are
+        // debug-logged and retried on the next tick, like the reap errors
+        // below.
+        if let Err(e) = consensus.finish_pending_membership_change().await {
+            tracing::debug!(
+                term,
+                error = %e,
+                "learner-gc: could not finish a half-done membership change on gaining \
+                 leadership; retrying next tick"
+            );
+        }
+
         let mut ticker = interval(period);
         // The first tick fires immediately; skip it so gaining leadership
         // does not itself trigger a sweep before any contact evidence has
@@ -89,7 +119,8 @@ pub async fn run<C: Consensus>(
     }
 }
 
-/// One sweep: retire and release every learner past `learner_expiry`.
+/// One sweep: finish any half-done membership change, then retire and release
+/// every learner past `learner_expiry`.
 ///
 /// [`Consensus::expired_learners`] is only a candidate list; the destructive
 /// half runs entirely inside [`Consensus::reap_expired_learner`], which
@@ -100,6 +131,19 @@ pub async fn run<C: Consensus>(
 /// never touched, and this task can never become the background voter reaper
 /// §7 forbids.
 async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews) {
+    // First, because it is the repair nobody else retries (see the module
+    // doc), and because a joint membership's voter set is the union of two
+    // configurations — so the "is this candidate still a learner" question the
+    // reap below turns on cannot be answered coherently until the change
+    // finishes. A uniform membership proposes nothing, so this costs a metrics
+    // read on every ordinary pass.
+    if let Err(e) = consensus.finish_pending_membership_change().await {
+        tracing::debug!(
+            error = %e,
+            "learner-gc: could not finish a half-done membership change; retrying next tick"
+        );
+    }
+
     for learner in consensus.expired_learners() {
         let machine = views
             .latest()

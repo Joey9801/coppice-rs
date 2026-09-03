@@ -1680,6 +1680,12 @@ impl Consensus for SharedConsensus {
         self.0.remove_node(node)
     }
 
+    fn finish_pending_membership_change(
+        &self,
+    ) -> impl Future<Output = Result<(), ConsensusError>> + Send {
+        self.0.finish_pending_membership_change()
+    }
+
     fn set_node_address(
         &self,
         node: CoordinatorId,
