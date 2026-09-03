@@ -535,7 +535,8 @@ describe('bearer credentials', () => {
 describe('getCoordinatorStatus', () => {
   const baseStatus = {
     cluster_id: 'coppice-prod-1',
-    leader: 7234980239847294,
+    // A random 64-bit raft id: above 2^53, so it MUST travel as a string.
+    leader: '7234980239847293847',
     term: 7,
     known_committed: 42000,
     last_applied: 41998,
@@ -549,7 +550,7 @@ describe('getCoordinatorStatus', () => {
     },
     members: [
       {
-        id: 7234980239847294,
+        id: '7234980239847293847',
         addr: 'coord-1.internal:7071',
         role: 'leader',
         voter: true,
@@ -557,7 +558,7 @@ describe('getCoordinatorStatus', () => {
         replication_lag_entries: 0,
       },
       {
-        id: 7235980239847294,
+        id: '7235980239847293848',
         addr: 'coord-2.internal:7071',
         role: 'follower',
         voter: true,
@@ -573,7 +574,7 @@ describe('getCoordinatorStatus', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/coordinators', expect.anything())
     expect(status.snapshot).toBeNull()
-    expect(status.leader).toBe(7234980239847294)
+    expect(status.leader).toBe('7234980239847293847')
     expect(status.term).toBe(7)
     expect(status.knownCommitted).toBe(42000)
     expect(status.lastApplied).toBe(41998)
@@ -601,7 +602,7 @@ describe('getCoordinatorStatus', () => {
     })
     // Only the serving replica reports its applied index and lag.
     expect(status.members[0]).toMatchObject({
-      id: 7234980239847294,
+      id: '7234980239847293847',
       addr: 'coord-1.internal:7071',
       role: 'Leader',
       voter: true,

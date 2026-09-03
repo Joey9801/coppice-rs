@@ -32,8 +32,14 @@ export type NodeId = string
 export type AttemptId = string
 export type AllocationId = string
 export type QuotaEntityId = string
-/** Raft identity of a coordinator replica (`CoordinatorId = u64` in Rust). */
-export type CoordinatorId = number
+/**
+ * Raft identity of a coordinator replica (`CoordinatorId = u64` in Rust).
+ * Carried as a decimal string across the JSON boundary: these ids are random
+ * 64-bit values, and a JS `number` silently loses precision above 2^53
+ * (`Number.MAX_SAFE_INTEGER`) — 7234980239847293847 would round to …294000,
+ * corrupting the label, tooltip and copy affordance alike.
+ */
+export type CoordinatorId = string
 
 // ---------------------------------------------------------------------------
 // Resources

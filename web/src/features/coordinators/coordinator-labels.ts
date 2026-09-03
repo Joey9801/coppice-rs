@@ -12,7 +12,7 @@ import type { CoordinatorId } from '@/api/types'
  * short label. Ids shorter than the minimum prefix are shown in full.
  */
 export function shortCoordinatorLabels(ids: CoordinatorId[]): Map<CoordinatorId, string> {
-  const items = ids.map((id) => ({ id, digits: id.toString() }))
+  const items = ids.map((id) => ({ id, digits: id }))
   const MIN_PREFIX = 4
   const labels = new Map<CoordinatorId, string>()
   for (const { id, digits } of items) {

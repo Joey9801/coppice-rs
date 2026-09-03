@@ -26,6 +26,7 @@ import type {
   AttemptState,
   AttemptView,
   ClusterOverview,
+  CoordinatorId,
   CoordinatorMember,
   CoordinatorStatus,
   CostReport,
@@ -399,8 +400,12 @@ interface MJob {
 }
 
 interface MCoordinator {
-  /** Minted allocate-once Raft identity (random 64-bit, like the real backend). */
-  id: number
+  /**
+   * Minted allocate-once Raft identity (random 64-bit, like the real
+   * backend), carried as a decimal string exactly as the wire does — ids
+   * above 2^53 would lose precision as JS numbers.
+   */
+  id: CoordinatorId
   addr: string
   role: 'Leader' | 'Follower' | 'Learner'
   voter: boolean
@@ -849,11 +854,12 @@ export class MockWorld {
   }
 
   private buildCoordinators(): void {
-    // Raft identities are minted random 64-bit integers (ADR 0025); stay
-    // under 2^53 so they survive JSON round-trips exactly. Addresses come
-    // from member config and are independent of the minted identity.
+    // Raft identities are minted random 64-bit integers (ADR 0025); like the
+    // real wire, they are decimal strings (kept 16 digits so the value below
+    // is still representative). Addresses come from member config and are
+    // independent of the minted identity.
     for (let i = 1; i <= 3; i += 1) {
-      const id = Math.floor(this.rng.range(1e15, 8.9e15))
+      const id = String(Math.floor(this.rng.range(1e15, 8.9e15)))
       this.coordinators.push({
         id,
         addr: `coord-${i}.internal:7071`,
@@ -2870,7 +2876,7 @@ export class MockWorld {
     return pageLogs(this.nodeLogLines(node), cursor)
   }
 
-  buildCoordinatorLogs(id: number, cursor: string | null): LogChunk {
+  buildCoordinatorLogs(id: CoordinatorId, cursor: string | null): LogChunk {
     const c = this.coordinators.find((m) => m.id === id)
     if (!c) throw new NotFound(`coordinator ${id}`)
     return pageLogs(this.coordinatorLogLines(c), cursor)

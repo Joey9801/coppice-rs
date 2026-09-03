@@ -1323,7 +1323,9 @@ interface WireCoordinatorStateCounts {
 type WireCoordinatorRole = 'leader' | 'follower' | 'learner'
 
 interface WireCoordinatorMember {
-  id: number
+  // Raft ids are u64 on the server and cross as decimal strings — a JSON
+  // number would be rounded above 2^53 by browser parsing.
+  id: string
   addr: string
   role: WireCoordinatorRole
   voter: boolean
@@ -1355,7 +1357,7 @@ function mapCoordinatorMember(m: WireCoordinatorMember, now: Date): CoordinatorM
 
 interface WireGetCoordinatorStatusResponse {
   cluster_id: string
-  leader: number | null
+  leader: string | null
   term: number
   known_committed: number
   last_applied: number

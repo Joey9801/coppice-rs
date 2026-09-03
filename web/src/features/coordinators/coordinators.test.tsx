@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import type { CoordinatorMember, CoordinatorStatus } from '@/api/types'
 import { CoordinatorsPage } from './coordinators-page'
@@ -14,16 +14,16 @@ vi.mock('@/api/queries', () => ({
 
 import { useCoordinatorStatus } from '@/api/queries'
 
-// Two 19-digit-scale identities sharing a 4-digit prefix (like the random
-// 64-bit raft ids the backend mints) plus a short one. Kept under 2^53 so
-// they survive JSON round-trips exactly.
-const LONG_A = 7234100239847294
-const LONG_B = 7234980239847294
-const SHORT_C = 3
+// Two random 64-bit raft ids sharing a 4-digit prefix (like the backend
+// mints) plus a short one. Both long ids are above 2^53 — as JS numbers
+// they would round to the same double; as strings they must survive exactly.
+const LONG_A = '7234100239847293847'
+const LONG_B = '7234980239847293847'
+const SHORT_C = '3'
 
 function member(overrides: Partial<CoordinatorMember>): CoordinatorMember {
   return {
-    id: 1,
+    id: '1',
     addr: 'coord-1.internal:7071',
     role: 'Follower',
     voter: true,
@@ -93,6 +93,18 @@ describe('MembershipCard', () => {
     expect(screen.getAllByLabelText('Copy coordinator id')).toHaveLength(3)
     expect(screen.getByLabelText('leader')).toBeInTheDocument()
   })
+
+  it('copies ids above 2^53 exactly, without float rounding', async () => {
+    // Number('7234100239847293847') is 7234100239847294000 — the copy
+    // affordance must never round-trip the id through a number.
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.assign(navigator, { clipboard: { writeText } })
+    render(<MembershipCard members={MEMBERS} leader={LONG_A} labels={LABELS} />)
+
+    const row = screen.getByText('c-72341…').closest('tr')!
+    fireEvent.click(within(row).getByLabelText('Copy coordinator id'))
+    await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith('7234100239847293847'))
+  })
 })
 
 describe('SnapshotCard', () => {
@@ -153,6 +165,23 @@ describe('CoordinatorLogsCard', () => {
     expect(screen.getByText('c-72341…')).toBeInTheDocument()
     expect(screen.getByText('c-72349…')).toBeInTheDocument()
     expect(screen.getByText('c-3')).toBeInTheDocument()
+  })
+
+  it('keeps Radix arrow-key tab navigation working (no focusable label inside a tab)', () => {
+    render(<CoordinatorLogsCard members={MEMBERS} labels={LABELS} />)
+
+    const first = screen.getByRole('tab', { name: 'c-72341…' })
+    // The label span must not be an extra focus stop inside the tab button:
+    // if it grabs focus, ArrowRight originates outside the tab and Radix
+    // ignores it.
+    expect(within(first).getByText('c-72341…')).not.toHaveAttribute('tabindex')
+
+    fireEvent.keyDown(first, { key: 'ArrowRight' })
+    // jsdom does not fire focus from keydown; Radix moves focus to the next
+    // tab and selection follows focus.
+    const second = screen.getByRole('tab', { name: 'c-72349…' })
+    fireEvent.focus(second)
+    expect(second).toHaveAttribute('aria-selected', 'true')
   })
 })
 

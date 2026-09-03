@@ -225,6 +225,10 @@ describe('MockWorld construction', () => {
     // A freshly formed cluster has taken no snapshot yet — null, not zeroed.
     expect(status.snapshot).toBeNull()
     expect(status.stateCounts.nodes).toBe(16)
+    // Ids are decimal strings end to end (u64 ids exceed 2^53 as numbers).
+    const leader = status.members.find((m) => m.role === 'Leader')!
+    expect(status.leader).toEqual(leader.id)
+    expect(typeof leader.id).toBe('string')
   })
 
   it('takes a first snapshot once entries accrue past the log origin', () => {

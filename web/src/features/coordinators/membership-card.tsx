@@ -87,7 +87,7 @@ export function MembershipCard({ members, leader, labels, className }: Membershi
                     ) : null}
                     <CoordinatorLabel
                       id={m.id}
-                      shortLabel={labels.get(m.id) ?? m.id.toString()}
+                      shortLabel={labels.get(m.id) ?? m.id}
                       addr={m.addr}
                     />
                   </span>
