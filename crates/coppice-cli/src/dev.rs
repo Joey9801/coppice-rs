@@ -131,6 +131,17 @@ impl std::fmt::Display for DevExecutor {
 /// so submit examples keep working verbatim across dev clusters.
 const DEV_QUOTA_ENTITY: &str = "quota-00000000-0000-0000-0000-000000000001";
 
+/// What a CU buys in a dev cluster (see [`dev_policy_toml`]): one CPU
+/// core-hour, two GiB-hours of memory, or fifteen GiB-hours of disk. The ratio
+/// is the point — CPU is the expensive dimension, disk the cheap one — and the
+/// numbers are round enough to check a printed cost against a job's runtime by
+/// hand.
+const DEV_CORE_HOURS_PER_CU: u32 = 1;
+/// Memory GiB-hours per CU. See [`DEV_CORE_HOURS_PER_CU`].
+const DEV_MEMORY_GIB_HOURS_PER_CU: u32 = 2;
+/// Disk GiB-hours per CU. See [`DEV_CORE_HOURS_PER_CU`].
+const DEV_DISK_GIB_HOURS_PER_CU: u32 = 15;
+
 /// The agent-role enrollment token `init` seeds and the in-process agent
 /// presents (ADR 0037 §5).
 ///
@@ -824,14 +835,21 @@ insecure_open = true
 /// replicated state a dev cluster needs before it can do anything.
 ///
 /// A new cluster's policy has an **empty** priority-multiplier table, so every
-/// `SubmitJob` fails synchronous validation until one commits, and there is no
-/// quota entity to charge a job to. In production that is deliberate: policy
+/// `SubmitJob` fails synchronous validation until one commits, there is no
+/// quota entity to charge a job to, and its cost weights are all zero, so
+/// every job that does run is free. In production that is deliberate: policy
 /// is replicated state an operator configures explicitly, and the node config
 /// file never seeds it (ADR 0020). Dev has no operator, so it hands `init` the
 /// same document an operator would: multipliers for priorities `-2..=2`
 /// (doubling per step — monotone in priority, as ADR 0021's ranking expects),
-/// the well-known "dev" quota entity, and the agent-role enrollment token the
-/// in-process agent presents.
+/// the well-known "dev" quota entity, resource prices, and the agent-role
+/// enrollment token the in-process agent presents.
+///
+/// The prices are non-zero on purpose. Free jobs make every cost surface —
+/// `job status`, the usage series, the quota entity's accrued usage, the UI's
+/// cost column — a column of zeros, which demonstrates nothing and hides
+/// arithmetic bugs; [`DEV_CORE_HOURS_PER_CU`] and its siblings are round
+/// numbers a reader can check against a job's runtime in their head.
 ///
 /// Every entry is idempotent by construction on the server side, so a re-run
 /// against an existing cluster changes nothing — which is what lets `dev`
@@ -844,7 +862,17 @@ fn dev_policy_toml() -> String {
             multiplier = 2f64.powi(priority),
         ));
     }
-    // ~1e6 CU: deep enough that dev jobs never starve on quota, far enough
+    out.push_str(&format!(
+        "[cost_weights]\n\
+         core_hours_per_cu = {DEV_CORE_HOURS_PER_CU}\n\
+         memory_gib_hours_per_cu = {DEV_MEMORY_GIB_HOURS_PER_CU}\n\
+         disk_gib_hours_per_cu = {DEV_DISK_GIB_HOURS_PER_CU}\n\n",
+        DEV_CORE_HOURS_PER_CU = DEV_CORE_HOURS_PER_CU as f64,
+        DEV_MEMORY_GIB_HOURS_PER_CU = DEV_MEMORY_GIB_HOURS_PER_CU as f64,
+        DEV_DISK_GIB_HOURS_PER_CU = DEV_DISK_GIB_HOURS_PER_CU as f64,
+    ));
+    // ~1e6 CU: deep enough that dev jobs never starve on quota at the prices
+    // above (a 1-core job would have to run for a million hours), far enough
     // from u64::MAX to stay clear of saturation.
     out.push_str(&format!(
         "[[quota_entity]]\nid = \"{DEV_QUOTA_ENTITY}\"\nname = \"dev\"\nquota = 1000000000000\n\n"
@@ -1195,6 +1223,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
          \x20 Cluster         {cluster_id} (Raft node {coordinator_raft_id})\n\
          \x20 Agent           {agent_node} (enrolled, epoch {agent_epoch})\n\
          \x20 Quota entity    {quota_entity} (\"dev\", seeded; priorities -2..=2)\n\
+         \x20 Pricing         1 CU = {core_hours} core-hour, {memory_gib_hours} GiB-hours memory, or {disk_gib_hours} GiB-hours disk\n\
          \n\
          \x20 Local development only: authentication is effectively disabled.\n\
          \x20 Press Ctrl-C to stop.\n",
@@ -1227,6 +1256,9 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
         agent_node = summary.agent_node,
         agent_epoch = summary.agent_epoch,
         quota_entity = summary.quota_entity,
+        core_hours = DEV_CORE_HOURS_PER_CU,
+        memory_gib_hours = DEV_MEMORY_GIB_HOURS_PER_CU,
+        disk_gib_hours = DEV_DISK_GIB_HOURS_PER_CU,
     )
 }
 
@@ -1279,6 +1311,12 @@ mod tests {
             "Quota entity    {DEV_QUOTA_ENTITY} (\"dev\", seeded; priorities -2..=2)"
         )));
         assert!(summary.contains("Capacity        16000 millicpu, 16 GiB memory, 1 TiB disk"));
+        // The seeded prices are on the banner: a reader who is about to watch
+        // a cost column move should not have to read the source to know what
+        // the numbers mean.
+        assert!(summary.contains(
+            "Pricing         1 CU = 1 core-hour, 2 GiB-hours memory, or 15 GiB-hours disk"
+        ));
     }
 
     /// The banner's capacity line must reflect whatever capacity was actually
@@ -1427,7 +1465,8 @@ mod tests {
     }
 
     /// The seeding policy `dev` hands `init` must parse under the daemon's own
-    /// schema, and must carry all three things a dev cluster needs.
+    /// schema, and must carry everything a dev cluster needs: the priority
+    /// table, the quota entity, the resource prices, and the agent's token.
     #[test]
     fn the_seeding_policy_parses_and_seeds_everything_dev_needs() {
         let toml = dev_policy_toml();
@@ -1452,6 +1491,15 @@ mod tests {
         assert_eq!(policy.enroll_tokens.len(), 1);
         assert_eq!(policy.enroll_tokens[0].label, DEV_ENROLL_LABEL);
         assert_eq!(policy.enroll_tokens[0].secret, DEV_ENROLL_TOKEN);
+
+        // Non-zero prices, quoted in the same numbers the banner prints. What
+        // those prices *charge* is asserted where the conversion lives
+        // (`coppice_coordinator::policy`); what this test owns is that dev
+        // seeds them at all, so no dev cluster ever runs everything for free.
+        let weights = policy.cost_weights.expect("dev seeds resource prices");
+        assert_eq!(weights.core_hours_per_cu, Some(1.0));
+        assert_eq!(weights.memory_gib_hours_per_cu, Some(2.0));
+        assert_eq!(weights.disk_gib_hours_per_cu, Some(15.0));
     }
 
     /// A taken client port must fail with the way out, not just the errno: a

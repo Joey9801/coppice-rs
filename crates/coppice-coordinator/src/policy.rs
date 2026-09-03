@@ -5,11 +5,12 @@
 //! coordinator, which applies it as part of formation and re-applies it
 //! idempotently if formation is re-run. The schema is deliberately
 //! minimal: it seeds exactly the replicated state a fresh cluster needs before
-//! it can accept a job — the priority-multiplier table and one or more quota
-//! entities — and `coppice dev` seeds its state through this same schema via
-//! its local `init`, so the two never drift. Everything else in [`coppice_state::PolicyConfig`] (cost
-//! weights, decay, surcharges) keeps its booted defaults and is left to the
-//! ordinary admin tooling; this is not a general policy-editing surface.
+//! it can accept a job — the priority-multiplier table, the resource prices,
+//! and one or more quota entities — and `coppice dev` seeds its state through
+//! this same schema via its local `init`, so the two never drift. Everything
+//! else in [`coppice_state::PolicyConfig`] (decay, surcharges) keeps its
+//! booted defaults and is left to the ordinary admin tooling; this is not a
+//! general policy-editing surface.
 //!
 //! The command construction lives here, shared by the server-side
 //! `apply_formation_policy` (which parses operator TOML) and by `coppice dev`
@@ -18,17 +19,21 @@
 //!
 //! - the priority table is seeded with one full-replacement `UpdatePolicy`
 //!   **only while the replicated table is still empty** — so re-application is
-//!   a no-op and an operator's later edits survive;
+//!   a no-op and an operator's later edits survive; the `[cost_weights]`
+//!   prices ride the same command under the same rule, seeded only while the
+//!   replicated weights are still all-zero (the booted "everything is free"
+//!   default);
 //! - each quota entity is created **only when absent** by id — an existing
 //!   entity is left untouched (reconfiguration is not an amnesty, and re-init
 //!   must not reset accumulated usage);
 //! - each `[[enroll_token]]` is minted **only when no live token carries its
 //!   label** (ADR 0037 §5), which is why labels are required and unique here.
 //!
-//! Human-facing multipliers are floats in the TOML; they are converted to the
-//! replicated Q32.32 fixed-point [`PriorityMultiplier`] here, at the parse
-//! edge, exactly as other human forms (rates, half-lives) are converted before
-//! proposal (ADR 0019). No float is ever replicated.
+//! Human-facing multipliers and prices are floats in the TOML; they are
+//! converted to the replicated Q32.32 fixed-point [`PriorityMultiplier`] and
+//! [`CostWeights`] here, at the parse edge, exactly as other human forms
+//! (rates, half-lives) are converted before proposal (ADR 0019). No float is
+//! ever replicated.
 
 use std::collections::BTreeMap;
 
@@ -36,7 +41,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use coppice_core::id::{EnrollTokenId, QuotaEntityId};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier, MICRO_PER_COST_UNIT};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{ConfigureQuotaEntity, MintEnrollToken, UpdatePolicy};
 use coppice_state::{Command, EnrollRole, StateMachine};
@@ -57,6 +62,11 @@ pub struct FormationPolicy {
     /// entries. Empty = leave the replicated table untouched.
     #[serde(default, rename = "priority_multiplier")]
     pub priority_multipliers: Vec<PriorityMultiplierSpec>,
+    /// What a CU buys, as the `[cost_weights]` table. Absent = leave the
+    /// replicated weights untouched (a fresh cluster's are all zero, i.e.
+    /// every job is free).
+    #[serde(default)]
+    pub cost_weights: Option<CostWeightsSpec>,
     /// The quota entities to create, as `[[quota_entity]]` array entries.
     #[serde(default, rename = "quota_entity")]
     pub quota_entities: Vec<QuotaEntitySpec>,
@@ -133,6 +143,189 @@ pub struct PriorityMultiplierSpec {
     pub multiplier: f64,
 }
 
+/// The `[cost_weights]` table: what one CU buys of each resource, written the
+/// way pricing is stated rather than the way it is stored.
+///
+/// The replicated [`CostWeights`] are Q32.32 µCU per (unit × second) — a
+/// per-byte-second price is a number no human should have to write. Operators
+/// price a resource by saying how much of it a CU buys:
+///
+/// ```toml
+/// [cost_weights]
+/// core_hours_per_cu = 1.0        # 1 core-hour costs 1 CU
+/// memory_gib_hours_per_cu = 2.0  # 2 GiB-hours of memory cost 1 CU
+/// disk_gib_hours_per_cu = 15.0   # 15 GiB-hours of disk cost 1 CU
+/// ```
+///
+/// Bytes are binary throughout Coppice (`ByteSize` prints and parses `GiB`),
+/// so a "GiB-hour" here is 2³⁰ bytes held for an hour — the same unit a job
+/// spec's `memory = "256MiB"` counts in.
+///
+/// An omitted dimension is **free**, which is what a fresh cluster's default
+/// weights already say; a zero or negative value is rejected rather than
+/// silently meaning "free", because "0 core-hours per CU" reads as infinitely
+/// expensive, not as free.
+///
+/// # Prices a Q32.32 weight cannot hold
+///
+/// The byte-granular dimensions are where the representation runs out. One
+/// Q32.32 tick is ~2.3×10⁻¹⁰ µCU per byte-second, which is a price of ~1100
+/// GiB-hours per CU — so a price near or beyond that rounds to a *materially*
+/// different number, and past it to zero, i.e. free. Quoting
+/// `disk_gib_hours_per_cu = 3000` and silently getting free disk is the
+/// failure this guards: [`CostWeightsSpec::weights`] converts back and
+/// **rejects** any price whose stored form differs by more than
+/// [`PRICE_TOLERANCE`], naming the price it would actually have charged.
+///
+/// A rejected price is not a dead end. Cost is a scalar with no external unit
+/// — only the ratios between the dimensions and the quota stock mean anything
+/// — so an operator who wants disk very cheap relative to CPU prices *CPU up*
+/// (and scales the quota entities to match) rather than pricing disk below
+/// what a weight can hold.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostWeightsSpec {
+    /// CPU core-hours that cost one CU.
+    #[serde(default)]
+    pub core_hours_per_cu: Option<f64>,
+    /// Memory GiB-hours that cost one CU.
+    #[serde(default)]
+    pub memory_gib_hours_per_cu: Option<f64>,
+    /// Disk GiB-hours that cost one CU.
+    #[serde(default)]
+    pub disk_gib_hours_per_cu: Option<f64>,
+}
+
+/// Seconds in an hour, the time unit every `*_per_cu` price is quoted over.
+const SECONDS_PER_HOUR: f64 = 3600.0;
+/// Milli-CPU in a core: the unit `Resources::cpu_millis` counts in.
+const MILLI_PER_CORE: f64 = 1000.0;
+/// Bytes in a GiB: the unit `Resources::memory`/`disk` count in.
+const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
+
+/// How far a stored Q32.32 weight may sit from the price that was quoted: 5%.
+///
+/// Rounding to a whole tick is the only error this bounds, and it is
+/// negligible until a byte-granular price is down to its last few ticks — so
+/// the bar's job is to catch prices that are *materially* wrong (a price that
+/// charges half, or nothing), not to promise exactness the charge path does
+/// not offer anyway: `resource_rate` truncates the summed rate to whole µCU
+/// per second, which already moves a small job's charge by more than a
+/// percent. Tighter than this would reject ordinary cheap-storage prices
+/// while buying no real accuracy.
+const PRICE_TOLERANCE: f64 = 0.05;
+
+impl CostWeightsSpec {
+    /// The replicated Q32.32 weights this table describes, or an error naming
+    /// a price the representation cannot hold faithfully.
+    ///
+    /// Each weight is `1 CU / (units × seconds that CU buys)`, in µCU, scaled
+    /// by 2³². The result is rounded to a whole tick and then converted *back*
+    /// to a price: a stored price further than [`PRICE_TOLERANCE`] from the
+    /// quoted one — including the two extremes, a price so cheap it rounds to
+    /// zero (free) and one so expensive it overflows `u64` — is an error at
+    /// this edge rather than a silent mispricing in replicated state.
+    fn weights(&self) -> Result<CostWeights> {
+        Ok(CostWeights {
+            per_cpu_milli_second: Self::weight(
+                "core_hours_per_cu",
+                self.core_hours_per_cu,
+                MILLI_PER_CORE,
+            )?,
+            per_memory_byte_second: Self::weight(
+                "memory_gib_hours_per_cu",
+                self.memory_gib_hours_per_cu,
+                BYTES_PER_GIB,
+            )?,
+            per_disk_byte_second: Self::weight(
+                "disk_gib_hours_per_cu",
+                self.disk_gib_hours_per_cu,
+                BYTES_PER_GIB,
+            )?,
+        })
+    }
+
+    /// One dimension's Q32.32 weight: `units_per_quantity` is how many of the
+    /// unit the *replicated* resource counts in (milli-CPU, bytes) make up one
+    /// of the unit the price is quoted in (a core, a GiB).
+    fn weight(field: &str, per_cu: Option<f64>, units_per_quantity: f64) -> Result<u64> {
+        // Absent = free, the booted default for that dimension.
+        let Some(per_cu) = per_cu else {
+            return Ok(0);
+        };
+        // `validate` rejected non-finite and non-positive prices already, so
+        // `exact` is finite and positive here.
+        let unit_seconds = per_cu * units_per_quantity * SECONDS_PER_HOUR;
+        let exact = (MICRO_PER_COST_UNIT as f64 / unit_seconds) * Q32_SCALE;
+
+        // Too expensive to represent: the weight would saturate `u64` (a
+        // float-to-int cast clamps silently, which is exactly the mispricing
+        // this rejects).
+        if exact > u64::MAX as f64 {
+            bail!(
+                "[cost_weights] {field} = {per_cu} is too expensive to price: one unit-second \
+                 would cost more than a cost weight can hold"
+            );
+        }
+        let stored = exact.round() as u64;
+        // Too cheap to represent: the weight rounds to zero, which does not
+        // mean "nearly free", it means free.
+        if stored == 0 {
+            bail!(
+                "[cost_weights] {field} = {per_cu} is too cheap to price: it rounds to a weight \
+                 of zero, which would make the resource free. The cheapest representable price \
+                 is about {cheapest:.0}; price the other dimensions up instead — only the ratios \
+                 between prices and quota stocks mean anything.",
+                cheapest = Self::price_of(1, units_per_quantity),
+            );
+        }
+        // Representable, but is it the price that was asked for? Convert the
+        // stored weight back and compare.
+        let charged = Self::price_of(stored, units_per_quantity);
+        let error = (charged - per_cu).abs() / per_cu;
+        if error > PRICE_TOLERANCE {
+            bail!(
+                "[cost_weights] {field} = {per_cu} cannot be priced accurately: the nearest \
+                 representable weight charges as {charged:.4} units per CU ({percent:.1}% off, \
+                 over the {tolerance:.0}% this schema allows). Prices this cheap run out of \
+                 cost-weight resolution — price the other dimensions up instead, since only the \
+                 ratios between prices and quota stocks mean anything.",
+                percent = error * 100.0,
+                tolerance = PRICE_TOLERANCE * 100.0,
+            );
+        }
+        Ok(stored)
+    }
+
+    /// The price, in units per CU, that a stored Q32.32 `weight` actually
+    /// charges — the inverse of the conversion in [`Self::weight`].
+    fn price_of(weight: u64, units_per_quantity: f64) -> f64 {
+        (MICRO_PER_COST_UNIT as f64 * Q32_SCALE)
+            / (weight as f64 * units_per_quantity * SECONDS_PER_HOUR)
+    }
+
+    /// Reject prices serde cannot: non-finite, negative, or zero.
+    fn validate(&self) -> Result<()> {
+        let check = |field: &str, value: Option<f64>| -> Result<()> {
+            match value {
+                None => Ok(()),
+                Some(price) if price.is_finite() && price > 0.0 => Ok(()),
+                Some(price) => bail!(
+                    "[cost_weights] {field} must be a finite, positive number of units per CU \
+                     (got {price}); omit the field to leave that resource free"
+                ),
+            }
+        };
+        check("core_hours_per_cu", self.core_hours_per_cu)?;
+        check("memory_gib_hours_per_cu", self.memory_gib_hours_per_cu)?;
+        check("disk_gib_hours_per_cu", self.disk_gib_hours_per_cu)?;
+        // Fidelity is part of validity: a price that cannot be stored as the
+        // price it quotes fails here, at parse, not at seeding time.
+        self.weights()?;
+        Ok(())
+    }
+}
+
 /// One `[[quota_entity]]` entry: a quota leaf jobs charge against.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -177,6 +370,9 @@ impl FormationPolicy {
             if !seen_index.insert(pm.index) {
                 bail!("duplicate priority multiplier for index {}", pm.index);
             }
+        }
+        if let Some(weights) = &self.cost_weights {
+            weights.validate()?;
         }
         let mut seen_id = std::collections::BTreeSet::new();
         for qe in &self.quota_entities {
@@ -243,12 +439,31 @@ impl FormationPolicy {
     ) -> Result<Vec<Command>> {
         let mut commands = Vec::new();
 
-        // Priority table: seed only while the replicated table is still empty.
-        // `UpdatePolicy` is a full replacement, so clone the current policy and
-        // change only the table — every other field keeps its booted default.
-        if !self.priority_multipliers.is_empty() && state.policy.priority_multipliers.is_empty() {
+        // Priority table and resource prices: seed each only while the
+        // replicated value is still its booted default — an empty table, and
+        // all-zero (free) weights. `UpdatePolicy` is a full replacement, so
+        // clone the current policy and change only what this document seeds;
+        // every other field keeps its booted default, and an operator's later
+        // edits survive a re-apply.
+        let seeds_multipliers =
+            !self.priority_multipliers.is_empty() && state.policy.priority_multipliers.is_empty();
+        // Compare the weights this document *produces*, not the presence of
+        // the table: a `[cost_weights]` that prices nothing (every field
+        // omitted) converts to the default weights, and proposing those over
+        // the identical replicated ones would be a no-op command emitted on
+        // every re-run.
+        let weights = self.cost_weights.map(|spec| spec.weights()).transpose()?;
+        let seeds_weights = weights.is_some_and(|weights| {
+            weights != CostWeights::default() && state.policy.cost_weights == CostWeights::default()
+        });
+        if seeds_multipliers || seeds_weights {
             let mut policy = state.policy.clone();
-            policy.priority_multipliers = self.multiplier_table();
+            if seeds_multipliers {
+                policy.priority_multipliers = self.multiplier_table();
+            }
+            if let (true, Some(weights)) = (seeds_weights, weights) {
+                policy.cost_weights = weights;
+            }
             commands.push(Command::UpdatePolicy(UpdatePolicy {
                 policy,
                 updated_at: now,
@@ -420,6 +635,8 @@ pub async fn propose_all<C: coppice_consensus::Consensus>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coppice_core::bytes::ByteSize;
+    use coppice_core::resource::Resources;
 
     /// Minimal argon2 cost: these tests assert seeding logic, not KDF
     /// strength, and the default cost is ~300ms per hash in a debug build.
@@ -550,6 +767,214 @@ quota = 1000000000000
             .policy
             .priority_multipliers
             .insert(0, PriorityMultiplier(9 << 32));
+        assert!(policy
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
+            .expect("valid policy")
+            .is_empty());
+    }
+
+    // ---- resource prices (`[cost_weights]`) ------------------------------
+
+    const PRICES: &str = r#"
+[cost_weights]
+core_hours_per_cu = 1.0
+memory_gib_hours_per_cu = 2.0
+disk_gib_hours_per_cu = 15.0
+"#;
+
+    /// The gross cost, in µCU, of holding `requests` for an hour at the
+    /// document's prices — the number the quoted prices are a statement
+    /// about.
+    fn cost_per_hour(weights: &CostWeights, requests: Resources) -> u64 {
+        let rate = coppice_core::quota::resource_rate(&requests, weights);
+        coppice_core::quota::cost_from_rate(rate, 3600, PriorityMultiplier::ONE).0
+    }
+
+    /// The prices mean what they say: one core-hour, two GiB-hours of memory,
+    /// and fifteen GiB-hours of disk each cost one CU. Two roundings sit
+    /// between the quote and the charge — the Q32.32 weight, and
+    /// `resource_rate`'s truncation to whole µCU per second — so assert to
+    /// within a percent rather than exactly.
+    #[test]
+    fn quoted_prices_charge_what_they_quote() {
+        let policy = FormationPolicy::parse_toml(PRICES.as_bytes()).expect("prices parse");
+        let weights = policy
+            .cost_weights
+            .expect("weights present")
+            .weights()
+            .expect("prices are representable");
+
+        let one_cu = MICRO_PER_COST_UNIT;
+        let tolerance = one_cu / 100;
+        for (what, requests) in [
+            (
+                "1 core for an hour",
+                Resources {
+                    cpu_millis: 1000,
+                    memory: ByteSize::ZERO,
+                    disk: ByteSize::ZERO,
+                },
+            ),
+            (
+                "2 GiB of memory for an hour",
+                Resources {
+                    cpu_millis: 0,
+                    memory: ByteSize::from_gib(2),
+                    disk: ByteSize::ZERO,
+                },
+            ),
+            (
+                "15 GiB of disk for an hour",
+                Resources {
+                    cpu_millis: 0,
+                    memory: ByteSize::ZERO,
+                    disk: ByteSize::from_gib(15),
+                },
+            ),
+        ] {
+            let charged = cost_per_hour(&weights, requests);
+            assert!(
+                charged.abs_diff(one_cu) <= tolerance,
+                "{what} should cost ~1 CU, charged {charged} µCU"
+            );
+        }
+    }
+
+    /// An omitted dimension is free, and leaves the other two priced.
+    #[test]
+    fn an_omitted_dimension_is_free() {
+        let policy = FormationPolicy::parse_toml(b"[cost_weights]\ncore_hours_per_cu = 1.0\n")
+            .expect("partial table parses");
+        let weights = policy
+            .cost_weights
+            .expect("weights present")
+            .weights()
+            .expect("prices are representable");
+        assert_eq!(weights.per_memory_byte_second, 0);
+        assert_eq!(weights.per_disk_byte_second, 0);
+        assert!(weights.per_cpu_milli_second > 0);
+    }
+
+    #[test]
+    fn a_zero_or_negative_price_is_rejected() {
+        for bad in [
+            "[cost_weights]\ncore_hours_per_cu = 0.0\n",
+            "[cost_weights]\nmemory_gib_hours_per_cu = -2.0\n",
+        ] {
+            let err = FormationPolicy::parse_toml(bad.as_bytes()).expect_err("rejected");
+            assert!(
+                format!("{err:#}").contains("positive number of units per CU"),
+                "{err:#}"
+            );
+        }
+    }
+
+    /// A price the Q32.32 weight cannot hold is rejected at parse, naming what
+    /// it would actually have charged. `3000` GiB-hours per CU rounds to a
+    /// zero weight (free disk); `2000` rounds to one tick, ~1100 GiB-hours per
+    /// CU — nearly half price; and an absurdly small price saturates.
+    #[test]
+    fn a_price_the_weight_cannot_hold_is_rejected() {
+        let too_cheap = FormationPolicy::parse_toml(
+            b"[cost_weights]\ndisk_gib_hours_per_cu = 3000.0\n" as &[u8],
+        )
+        .expect_err("free disk is rejected");
+        assert!(
+            format!("{too_cheap:#}").contains("too cheap to price"),
+            "{too_cheap:#}"
+        );
+
+        let inaccurate = FormationPolicy::parse_toml(
+            b"[cost_weights]\ndisk_gib_hours_per_cu = 2000.0\n" as &[u8],
+        )
+        .expect_err("a materially different price is rejected");
+        let message = format!("{inaccurate:#}");
+        assert!(message.contains("cannot be priced accurately"), "{message}");
+        assert!(message.contains("units per CU"), "{message}");
+
+        let too_dear = FormationPolicy::parse_toml(
+            b"[cost_weights]\nmemory_gib_hours_per_cu = 1e-30\n" as &[u8],
+        )
+        .expect_err("a saturating price is rejected");
+        assert!(
+            format!("{too_dear:#}").contains("too expensive to price"),
+            "{too_dear:#}"
+        );
+    }
+
+    /// The accuracy bar is a boundary, not a vibe. One Q32.32 tick on a byte
+    /// dimension is a price of ~1100 GiB-hours per CU, so prices are exact
+    /// while they round to many ticks and get coarse as the ticks run out;
+    /// the bar sits where the rounding starts to matter.
+    #[test]
+    fn the_accuracy_bar_is_where_the_ticks_run_out() {
+        // Tens of ticks or more: the dev disk price and its neighbourhood.
+        for price in ["1.0", "15.0", "100.0"] {
+            let doc = format!("[cost_weights]\ndisk_gib_hours_per_cu = {price}\n");
+            FormationPolicy::parse_toml(doc.as_bytes())
+                .unwrap_or_else(|e| panic!("{price} GiB-hours per CU should price: {e:#}"));
+        }
+        // A handful of ticks or fewer: rounding moves the charge by more than
+        // the bar allows, so the price is refused rather than approximated.
+        for price in ["500.0", "1000.0", "2000.0"] {
+            let doc = format!("[cost_weights]\ndisk_gib_hours_per_cu = {price}\n");
+            let err = FormationPolicy::parse_toml(doc.as_bytes())
+                .err()
+                .unwrap_or_else(|| panic!("{price} GiB-hours per CU should be rejected"));
+            assert!(
+                format!("{err:#}").contains("cannot be priced accurately"),
+                "{err:#}"
+            );
+        }
+    }
+
+    /// A `[cost_weights]` table that prices nothing is a no-op, not a command:
+    /// it converts to the same all-zero weights the cluster already has, and
+    /// emitting an `UpdatePolicy` for it would grow the raft log on every
+    /// `init` re-run (which is idempotent by construction).
+    #[test]
+    fn an_empty_price_table_proposes_nothing_however_often_it_is_applied() {
+        let policy = FormationPolicy::parse_toml(b"[cost_weights]\n").expect("empty table parses");
+        let state = StateMachine::default();
+        for _ in 0..3 {
+            assert!(policy
+                .commands(&state, Timestamp::now(), CHEAP_KDF)
+                .expect("valid policy")
+                .is_empty());
+        }
+    }
+
+    /// Prices ride the one `UpdatePolicy` the priority table already emits,
+    /// rather than a second full-replacement command that would race it.
+    #[test]
+    fn prices_and_the_table_seed_in_one_command() {
+        let doc = format!("{SAMPLE}{PRICES}");
+        let policy = FormationPolicy::parse_toml(doc.as_bytes()).expect("doc parses");
+        let commands = policy
+            .commands(&StateMachine::default(), Timestamp::now(), CHEAP_KDF)
+            .expect("valid policy");
+        let updates: Vec<_> = commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::UpdatePolicy(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert!(!updates[0].policy.priority_multipliers.is_empty());
+        assert_ne!(updates[0].policy.cost_weights, CostWeights::default());
+    }
+
+    /// Already-priced weights are an operator's, not ours: a re-apply leaves
+    /// them alone, exactly as it leaves a seeded priority table alone.
+    #[test]
+    fn prices_are_skipped_when_already_seeded() {
+        let policy = FormationPolicy::parse_toml(PRICES.as_bytes()).expect("prices parse");
+        let mut state = StateMachine::default();
+        state.policy.cost_weights = CostWeights {
+            per_cpu_milli_second: 7,
+            ..CostWeights::default()
+        };
         assert!(policy
             .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect("valid policy")

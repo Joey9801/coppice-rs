@@ -325,3 +325,34 @@ human-friendly forms into the exact replicated representations:
 - Conversions like decay half-life → Q0.64 per-tick factor and quota rate →
   quota stock happen here, in tooling — never inside the state machine
   ([ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md)).
+
+The bootstrap policy document seeds the priority-multiplier table, the
+quota entities a job can charge against, the enrollment tokens a fleet
+presents, and the **resource prices** — the `[cost_weights]` table, which
+states what one CU buys rather than the replicated Q32.32 µCU per
+unit-second it converts to:
+
+```toml
+[cost_weights]
+core_hours_per_cu = 1.0        # 1 CPU core-hour costs 1 CU
+memory_gib_hours_per_cu = 2.0  # 2 GiB-hours of memory cost 1 CU
+disk_gib_hours_per_cu = 15.0   # 15 GiB-hours of disk cost 1 CU
+```
+
+An omitted dimension is free. A fresh cluster's weights are all zero, so
+a cluster formed without this table runs every job for free until an
+operator prices it; the three values above are exactly what `coppice dev`
+seeds, so a dev cluster's cost columns show real arithmetic. Like the
+priority table, prices are seeded only while the replicated weights are
+still all-zero — a re-run of `init` never overwrites an operator's, and a
+table that prices nothing proposes nothing.
+
+Very cheap byte-granular prices run out of representation: one Q32.32
+weight tick is a price of roughly 1100 GiB-hours per CU, so a price near
+or beyond that cannot be stored as the price it quotes. Rather than
+silently charging a different number (or nothing), `init` **rejects** a
+price whose stored form is more than 5% off, naming what it would have
+charged. Cost is a scalar with no external unit — only the ratios between
+prices and quota stocks mean anything — so the fix is to price the other
+dimensions up and scale the quota entities, not to price one dimension
+below what a weight can hold.
