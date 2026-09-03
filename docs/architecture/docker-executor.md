@@ -141,12 +141,13 @@ taxonomy and it exists because both alternatives are false statements: the
 container was SIGKILLed, so it did not "exit on its own", and an external
 SIGKILL of a memory-limited container is indistinguishable from an OOM
 whose notification the daemon lost, so `OomKilled` would be a fabricated
-limit breach. `classify_exit` maps `Killed` to `Exited{code}` today — the
-replicated outcome taxonomy has no "killed, cause unknown" variant, and
-adding one is a contract change (core enum + proto + descriptor gate +
-coordinator + journal) that wants its own ADR; recording the distinction at
-the evidence layer makes that a one-line mapping change if it is taken.
-Every `Killed` is metered (`agent_oom_unconfirmed_total`) and warned.
+limit breach. `classify_exit` maps `Killed` to `Exited{code}` when there is no
+other attribution. A durable abort tombstone resolves it to `Aborted`; this is
+the one case where the ambiguity is answered above the evidence layer. The
+replicated outcome taxonomy has no "killed, cause unknown" variant, and adding
+one is a contract change (core enum + proto + descriptor gate + coordinator +
+journal) that wants its own ADR. Every `Killed` is metered
+(`agent_oom_unconfirmed_total`) and warned.
 
 The window is 5 s, bounded by the fact that the settle task drains its
 queue serially. Two things keep that from being a stall: a verdict is
@@ -205,6 +206,17 @@ table.
 **Caller-initiated kills** are unchanged: abort and max-runtime kills go
 through `stop()`, and the caller assigns `Aborted` /
 `RuntimeLimitExceeded`.
+
+An abort tombstone is durable kill attribution. If Docker can report only
+`ExitCause::Killed` (exit 137 under a memory limit, with neither an
+`OOMKilled` flag nor an `oom` event), a tombstone resolves that otherwise
+ambiguous kill to `Aborted`, including during restart reconciliation and when
+the kill was observed just before the `StopJob` request. The latter makes the
+same attribution trade already made for a process that exits during the
+SIGTERM grace period. It does not override stronger evidence: a confirmed
+memory/disk limit kill or a natural exit retains its ordinary outcome. This
+rule is abort-only: max-runtime enforcement has no durable marker, so after a
+crash its otherwise-unattributable kill remains `Exited{137}`.
 
 **Stop-vs-natural-exit race discrimination.** The verdict must never be
 inferred from timestamps or event ordering on our side — the Docker
@@ -992,4 +1004,3 @@ thousands; no lock-free cleverness warranted.
   a CI job on an xfs loopback mount, or stays manually verified if CI
   can't provide one — the strategy split is behind `DiskEnforcer` either
   way.
-

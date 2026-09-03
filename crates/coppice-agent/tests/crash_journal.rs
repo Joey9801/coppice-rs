@@ -241,7 +241,7 @@ fn check_invariants(
                     .exits
                     .get(&container.allocation)
                     .map(|rec| rec.outcome.clone())
-                    .unwrap_or_else(|| classify_exit(&info));
+                    .unwrap_or_else(|| classify_exit(&info, false));
                 assert_eq!(
                     entry.outcome,
                     Some(expected),

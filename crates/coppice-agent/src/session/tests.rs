@@ -415,6 +415,76 @@ async fn stop_of_running_container_is_aborted() {
     assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Aborted));
 }
 
+#[tokio::test]
+async fn abort_tombstone_attributes_an_unconfirmed_sigkill() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+
+    // Docker can expose the abort's exit before the stop request returns, with
+    // neither OOMKilled nor an oom event to attribute its SIGKILL. StopJob
+    // journals the durable abort tombstone before classifying that evidence.
+    exec.finish(
+        alloc,
+        ExitInfo {
+            code: 137,
+            cause: ExitCause::Killed,
+            runtime: Duration::from_micros(5),
+            finished_at: exec.now(),
+        },
+    );
+    let reports = session
+        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .await
+        .unwrap();
+
+    assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Aborted));
+    assert_eq!(
+        session.state().exits[&alloc].outcome,
+        AttemptOutcome::Aborted,
+        "the resolved attribution must be journaled"
+    );
+}
+
+#[tokio::test]
+async fn watcher_uses_tombstone_after_stop_cannot_find_the_container() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+
+    let exit = ExitInfo {
+        code: 137,
+        cause: ExitCause::Killed,
+        runtime: Duration::from_micros(5),
+        finished_at: exec.now(),
+    };
+    exec.finish(alloc, exit);
+    exec.reap(alloc).await.unwrap();
+
+    // The container vanished before stop could inspect it, but StopJob still
+    // durably records the tombstone. The already-queued watcher evidence must
+    // use that attribution when it arrives afterward.
+    let stop_reports = session
+        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .await
+        .unwrap();
+    assert!(stop_reports.is_empty());
+
+    let exit_reports = session.handle_observed_exit(alloc, exit).await.unwrap();
+    assert_eq!(
+        terminal_outcome(&exit_reports),
+        Some(AttemptOutcome::Aborted)
+    );
+}
+
 /// The §4 carve-out (docker-executor.md): a stop whose evidence shows a limit
 /// kill landed as it took effect must record the limit breach, never claim the
 /// stop (abort / max-runtime) terminated the container.

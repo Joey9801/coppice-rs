@@ -1781,9 +1781,9 @@ async fn poll_mode_disk_kill() {
                 info.code
             );
             ensure!(
-                classify_exit(&info) == AttemptOutcome::DiskLimitExceeded,
+                classify_exit(&info, false) == AttemptOutcome::DiskLimitExceeded,
                 "DiskKilled must classify as DiskLimitExceeded, got {:?}",
-                classify_exit(&info)
+                classify_exit(&info, false)
             );
 
             // Evidence survives until reap (§5): observe still reports it Exited.
