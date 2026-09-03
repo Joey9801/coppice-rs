@@ -1,12 +1,17 @@
 import { Network } from 'lucide-react'
+import type { ReactNode } from 'react'
 import { useCoordinatorStatus } from '@/api/queries'
-import { formatBytes, formatTimestamp } from '@/lib/format'
+import type { CoordinatorSnapshot } from '@/api/types'
+import { formatBytes } from '@/lib/format'
 import { EmptyState, KeyValueGrid, PageHeader, StatTile, TimeAgo } from '@/components'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { MembershipCard } from './membership-card'
 import { CoordinatorLogsCard } from './coordinator-logs-card'
+import { CoordinatorLabel } from './coordinator-label'
+import { shortCoordinatorLabels } from './coordinator-labels'
+import { SnapshotCard } from './snapshot-card'
 
 export function CoordinatorsPage() {
   const { data, isLoading, isError } = useCoordinatorStatus()
@@ -41,6 +46,8 @@ export function CoordinatorsPage() {
   } = data
 
   const applyLagging = lastApplied < knownCommitted
+  const labels = shortCoordinatorLabels(members.map((m) => m.id))
+  const labelOf = (id: number) => labels.get(id) ?? id.toString()
 
   return (
     <div>
@@ -60,7 +67,7 @@ export function CoordinatorsPage() {
           label="Leader"
           value={
             leader != null ? (
-              `coordinator ${leader}`
+              <CoordinatorLabel id={leader} shortLabel={labelOf(leader)} />
             ) : (
               <span className="text-red-600 dark:text-red-400">no leader</span>
             )
@@ -80,17 +87,30 @@ export function CoordinatorsPage() {
         <StatTile label="Applied updates" value={stateVersion.toLocaleString()} />
         <StatTile
           label="Since snapshot"
-          value={`${snapshot.entriesSinceSnapshot.toLocaleString()} entries`}
+          value={
+            snapshot ? (
+              `${snapshot.entriesSinceSnapshot.toLocaleString()} entries`
+            ) : (
+              <span className="text-muted-foreground">no snapshot yet</span>
+            )
+          }
           hint={
-            <>
-              {formatBytes(snapshot.sizeBytes)} · taken <TimeAgo t={snapshot.takenAt} />
-            </>
+            snapshot ? (
+              <SnapshotTileHint snapshot={snapshot} />
+            ) : (
+              'The first snapshot has not been taken.'
+            )
           }
         />
       </div>
 
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
-        <MembershipCard members={members} leader={leader} className="lg:col-span-2" />
+        <MembershipCard
+          members={members}
+          leader={leader}
+          labels={labels}
+          className="lg:col-span-2"
+        />
 
         <Card>
           <CardHeader>
@@ -116,43 +136,34 @@ export function CoordinatorsPage() {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Snapshot</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <KeyValueGrid
-              items={[
-                { label: 'Size', value: formatBytes(snapshot.sizeBytes) },
-                {
-                  label: 'Last included index',
-                  value: snapshot.lastIncludedIndex.toLocaleString(),
-                },
-                {
-                  label: 'Taken',
-                  value: (
-                    <span>
-                      {formatTimestamp(snapshot.takenAt)} (
-                      <TimeAgo t={snapshot.takenAt} />)
-                    </span>
-                  ),
-                },
-                {
-                  label: 'Entries since snapshot',
-                  value: snapshot.entriesSinceSnapshot.toLocaleString(),
-                },
-              ]}
-            />
-            <p className="text-xs text-muted-foreground">
-              A coordinator that falls behind can use this snapshot to catch up faster than
-              replaying every stored entry.
-            </p>
-          </CardContent>
-        </Card>
+        <SnapshotCard snapshot={snapshot} lastApplied={lastApplied} />
 
-        <CoordinatorLogsCard members={members} className="lg:col-span-2" />
+        <CoordinatorLogsCard members={members} labels={labels} className="lg:col-span-2" />
       </div>
     </div>
+  )
+}
+
+/** Size and age line under the "Since snapshot" tile; omits unreported metadata. */
+function SnapshotTileHint({ snapshot }: { snapshot: CoordinatorSnapshot }) {
+  const parts: ReactNode[] = []
+  if (snapshot.sizeBytes != null) parts.push(formatBytes(snapshot.sizeBytes))
+  if (snapshot.takenAt)
+    parts.push(
+      <span key="taken">
+        taken <TimeAgo t={snapshot.takenAt} />
+      </span>,
+    )
+  if (parts.length === 0) return 'snapshot metadata not reported'
+  return (
+    <>
+      {parts.map((p, i) => (
+        <span key={i}>
+          {i > 0 ? ' · ' : ''}
+          {p}
+        </span>
+      ))}
+    </>
   )
 }
 

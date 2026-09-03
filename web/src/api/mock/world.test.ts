@@ -217,13 +217,25 @@ describe('MockWorld construction', () => {
     expect(capacity.reportingNodes).toBeLessThan(capacity.totalNodes)
   })
 
-  it('has coordinators with a single leader and plausible snapshot', () => {
+  it('has coordinators with a single leader and no snapshot when young', () => {
     const world = new MockWorld(NOW_US)
     const status = world.buildCoordinatorStatus()
     expect(status.members.length).toBe(3)
     expect(status.members.filter((m) => m.role === 'Leader').length).toBe(1)
-    expect(status.snapshot.entriesSinceSnapshot).toBeGreaterThan(0)
+    // A freshly formed cluster has taken no snapshot yet — null, not zeroed.
+    expect(status.snapshot).toBeNull()
     expect(status.stateCounts.nodes).toBe(16)
+  })
+
+  it('takes a first snapshot once entries accrue past the log origin', () => {
+    const world = new MockWorld(NOW_US)
+    world.advanceTo(NOW_US + 120_000_000)
+    const status = world.buildCoordinatorStatus()
+    expect(status.snapshot).not.toBeNull()
+    const { snapshot } = status
+    expect(snapshot!.entriesSinceSnapshot).toBeGreaterThan(0)
+    expect(snapshot!.lastIncludedIndex).toBeLessThan(status.knownCommitted)
+    expect(snapshot!.takenAt!.getTime()).toBeGreaterThan(0) // not the epoch
   })
 })
 

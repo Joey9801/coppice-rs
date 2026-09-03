@@ -89,6 +89,11 @@ const TICK_US = SECOND_US
 /** Cap on ticks processed in one advanceTo, so a long-idle tab can't hang. */
 const MAX_TICKS_PER_ADVANCE = 4000
 
+/** The mock world's Raft log starts here (its history predates the session). */
+const RAFT_LOG_ORIGIN_INDEX = 42_000
+/** Entries past the log origin before the first snapshot is taken (~1 min of ticks). */
+const FIRST_SNAPSHOT_ENTRIES = 150
+
 // The simulation clock is microseconds throughout — it is a pinned pseudo-clock
 // (`advanceTo(nowUs)`), never a wall clock, and integer µs keeps every tick
 // reproducible. The *view* types are `Date`/seconds (see ../types.ts), so these
@@ -394,6 +399,7 @@ interface MJob {
 }
 
 interface MCoordinator {
+  /** Minted allocate-once Raft identity (random 64-bit, like the real backend). */
   id: number
   addr: string
   role: 'Leader' | 'Follower' | 'Learner'
@@ -515,14 +521,15 @@ export class MockWorld {
   private clusterId = 'coppice-prod-1'
   private raftIndex = 0
   private stateVersion = 0
-  private snapshotIndex = 0
-  private snapshotAtUs = 0
+  /** Log index the last snapshot covers, or null while none has been taken. */
+  private lastSnapshotIndex: number | null = null
+  private snapshotTakenAtUs = 0
 
   constructor(nowUs: number, seed: number = DEFAULT_SEED) {
     this.rng = new Rng(seed)
     this.nowUs = nowUs
     this.lastTickUs = nowUs
-    this.raftIndex = 42000
+    this.raftIndex = RAFT_LOG_ORIGIN_INDEX
     this.stateVersion = 61000
     this.build()
   }
@@ -842,13 +849,17 @@ export class MockWorld {
   }
 
   private buildCoordinators(): void {
-    for (let id = 1; id <= 3; id += 1) {
+    // Raft identities are minted random 64-bit integers (ADR 0025); stay
+    // under 2^53 so they survive JSON round-trips exactly. Addresses come
+    // from member config and are independent of the minted identity.
+    for (let i = 1; i <= 3; i += 1) {
+      const id = Math.floor(this.rng.range(1e15, 8.9e15))
       this.coordinators.push({
         id,
-        addr: `coord-${id}.internal:7071`,
-        role: id === 1 ? 'Leader' : 'Follower',
+        addr: `coord-${i}.internal:7071`,
+        role: i === 1 ? 'Leader' : 'Follower',
         voter: true,
-        lagEntries: id === 1 ? 0 : this.rng.int(0, 2),
+        lagEntries: i === 1 ? 0 : this.rng.int(0, 2),
         host: {
           cpuFraction: this.rng.range(0.1, 0.6),
           memoryFraction: this.rng.range(0.2, 0.7),
@@ -857,8 +868,8 @@ export class MockWorld {
         lastSeenUs: this.nowUs - this.rng.range(SECOND_US, 4 * SECOND_US),
       })
     }
-    this.snapshotIndex = this.raftIndex - this.rng.int(1200, 2500)
-    this.snapshotAtUs = this.nowUs - this.rng.range(50 * MINUTE_US, 70 * MINUTE_US)
+    // A young cluster has taken no snapshot yet; the first one appears once
+    // enough entries have accrued since the log origin (see tickCoordinators).
   }
 
   /** Placeable nodes = healthy (draining node still hosts existing work). */
@@ -1616,9 +1627,15 @@ export class MockWorld {
       c.lastSeenUs = this.nowUs - this.rng.range(SECOND_US, 3 * SECOND_US)
       if (c.role !== 'Leader') c.lagEntries = this.rng.int(0, 2)
     }
-    if (this.raftIndex - this.snapshotIndex > 3000) {
-      this.snapshotIndex = this.raftIndex - this.rng.int(50, 150)
-      this.snapshotAtUs = this.nowUs
+    // Snapshots: none until enough entries accrue since the log origin,
+    // then re-taken once `raftIndex` outgrows the last one by 3000.
+    if (
+      this.lastSnapshotIndex === null
+        ? this.raftIndex - RAFT_LOG_ORIGIN_INDEX >= FIRST_SNAPSHOT_ENTRIES
+        : this.raftIndex - this.lastSnapshotIndex > 3000
+    ) {
+      this.lastSnapshotIndex = this.raftIndex - this.rng.int(50, 150)
+      this.snapshotTakenAtUs = this.nowUs
     }
   }
 
@@ -2819,12 +2836,17 @@ export class MockWorld {
       knownCommitted: this.raftIndex,
       lastApplied: this.raftIndex - (leader ? leader.lagEntries : 0),
       stateVersion: this.stateVersion,
-      snapshot: {
-        sizeBytes: 40 * 1024 * 1024,
-        lastIncludedIndex: this.snapshotIndex,
-        takenAt: at(this.snapshotAtUs),
-        entriesSinceSnapshot: this.raftIndex - this.snapshotIndex,
-      },
+      // A freshly formed cluster has no snapshot yet — null, not a zeroed
+      // stand-in (the page says so instead of showing epoch-relative ages).
+      snapshot:
+        this.lastSnapshotIndex === null
+          ? null
+          : {
+              sizeBytes: 40 * 1024 * 1024,
+              lastIncludedIndex: this.lastSnapshotIndex,
+              takenAt: at(this.snapshotTakenAtUs),
+              entriesSinceSnapshot: this.raftIndex - this.lastSnapshotIndex,
+            },
       stateCounts: {
         jobs: this.jobs.size,
         attempts: this.attempts.size,
