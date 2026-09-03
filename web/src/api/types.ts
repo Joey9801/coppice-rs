@@ -659,9 +659,9 @@ export interface NodeDetail {
 export interface HostFacts {
   /** Operating system family, e.g. `linux`, `macos`. */
   os: string
-  /** Human-readable OS release, including a family label when available. */
+  /** Human-readable OS release; Linux preserves its useful PRETTY_NAME. */
   osVersion: string
-  /** Human-readable kernel release, including a family label when available. */
+  /** Human-readable kernel release, including a family label in API responses. */
   kernelVersion: string
   /** CPU architecture, e.g. `x86_64`, `aarch64`. */
   arch: string

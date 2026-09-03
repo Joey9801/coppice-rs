@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { HostFacts } from '@/api/types'
-import { formatHostKernel, formatHostOs, formatNodeCapacity } from './host-facts'
+import { formatHostKernel, formatHostOs } from './host-facts'
 
 function host(overrides: Partial<HostFacts> = {}): HostFacts {
   return {
@@ -49,13 +49,11 @@ describe('host facts display', () => {
     expect(formatHostKernel(host({ os: 'macos', kernelVersion: '' }))).toBeNull()
   })
 
-  it('includes disk capacity in the node-list display value', () => {
-    expect(
-      formatNodeCapacity({
-        cpuMillis: 16_000,
-        memoryBytes: 64 * 1024 ** 3,
-        diskBytes: 2 * 1024 ** 4,
-      }),
-    ).toBe('16 cores · 64 GiB · 2 TiB')
+  it('keeps unknown families consistent with the server fallback', () => {
+    expect(formatHostOs(host({ os: 'windows', osVersion: '10.0.19045' }))).toBe('10.0.19045')
+    expect(formatHostKernel(host({ os: 'windows', kernelVersion: '10.0.19045' }))).toBe(
+      '10.0.19045',
+    )
+    expect(formatHostOs(host({ os: 'windows', osVersion: '' }))).toBeNull()
   })
 })

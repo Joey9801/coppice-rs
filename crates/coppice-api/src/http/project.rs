@@ -1754,9 +1754,9 @@ mod tests {
         let node = NodeId::new();
         let mut record = test_node(node);
         record.node.host_facts = Some(coppice_core::node::HostFacts {
-            os: "linux".into(),
-            os_version: "Debian GNU/Linux 12 (bookworm)".into(),
-            kernel_version: "6.1.0-21-amd64".into(),
+            os: "macos".into(),
+            os_version: "15.5".into(),
+            kernel_version: "24.5.0".into(),
             arch: "x86_64".into(),
             cpu_model: "AMD EPYC 7763 64-Core Processor".into(),
             physical_cores: 8,
@@ -1778,8 +1778,8 @@ mod tests {
 
         let response = get_node(&state, &node, &no_usage()).expect("the node exists");
         let host = response.host.expect("facts pass through");
-        assert_eq!(host.os_version, "Debian GNU/Linux 12 (bookworm)");
-        assert_eq!(host.kernel_version, "Linux 6.1.0-21-amd64");
+        assert_eq!(host.os_version, "macOS 15.5");
+        assert_eq!(host.kernel_version, "Darwin 24.5.0");
         assert_eq!(host.cpu_model, "AMD EPYC 7763 64-Core Processor");
         assert_eq!(host.physical_cores, 8);
         assert_eq!(host.total_disk_bytes, 512 << 30);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatUnitPrice } from './format'
+import { formatNodeCapacity, formatUnitPrice } from './format'
 
 const GIB = 2 ** 30
 const TIB = 2 ** 40
@@ -48,5 +48,17 @@ describe('formatUnitPrice', () => {
 
   it('returns null when nothing was requested', () => {
     expect(formatUnitPrice(0, 'bytes', 0)).toBeNull()
+  })
+})
+
+describe('formatNodeCapacity', () => {
+  it('includes disk capacity in the node-list display value', () => {
+    expect(
+      formatNodeCapacity({
+        cpuMillis: 16_000,
+        memoryBytes: 64 * 1024 ** 3,
+        diskBytes: 2 * 1024 ** 4,
+      }),
+    ).toBe('16 cores · 64 GiB · 2 TiB')
   })
 })

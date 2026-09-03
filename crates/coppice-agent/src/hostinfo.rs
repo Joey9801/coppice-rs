@@ -64,10 +64,6 @@ pub fn collect(detected: &DetectedCapacity) -> HostFacts {
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     unix::fill(&mut facts);
 
-    // Keep the wire values self-describing for every platform, while making
-    // this idempotent so older or partially labeled readings remain safe to
-    // pass through the same normalization at other boundaries.
-    facts.normalize_versions();
     facts
 }
 
@@ -294,8 +290,6 @@ fn fill_from_sysctl(facts: &mut coppice_core::node::HostFacts, raw: &str) {
     if let Ok(logical) = get("hw.logicalcpu").parse() {
         facts.logical_cores = logical;
     }
-
-    facts.normalize_versions();
 }
 
 /// Parse keyed `sysctl` output (`kern.osrelease: 24.5.0`) into a map.
@@ -415,14 +409,11 @@ mod tests {
                    hw.model: VirtualMac2,1\n\
                    hw.physicalcpu: 4\n\
                    hw.logicalcpu: 8\n";
-        let mut facts = coppice_core::node::HostFacts {
-            os: "macos".into(),
-            ..coppice_core::node::HostFacts::default()
-        };
+        let mut facts = coppice_core::node::HostFacts::default();
         fill_from_sysctl(&mut facts, raw);
 
-        assert_eq!(facts.os_version, "macOS 15.5");
-        assert_eq!(facts.kernel_version, "Darwin 24.5.0");
+        assert_eq!(facts.os_version, "15.5");
+        assert_eq!(facts.kernel_version, "24.5.0");
         // Falls back to the board id when the brand string is absent.
         assert_eq!(facts.cpu_model, "VirtualMac2,1");
         assert_eq!(facts.physical_cores, 4);
