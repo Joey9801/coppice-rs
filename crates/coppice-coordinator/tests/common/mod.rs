@@ -914,6 +914,37 @@ struct RunningDaemon {
     runtime: tokio::runtime::Runtime,
 }
 
+/// How long [`Daemon::stop`] waits for a signalled daemon to actually exit.
+///
+/// The daemon's own graceful shutdown is bounded (its drain has a deadline of
+/// its own, ~15s all told), so any wait longer than that is not a slow
+/// shutdown but a wedged one — a task parked on an await that will never
+/// resolve. 60s is comfortably above the product's bound, so a legitimately
+/// slow drain on an oversubscribed host still passes, while a deadlock fails
+/// the test in a minute instead of hanging the whole shard until CI's job
+/// limit kills it (issue #111).
+const STOP_JOIN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a single `/readyz` request may take before it counts as a failed
+/// attempt.
+///
+/// `/readyz` does no I/O and no consensus round-trip: it reads status the
+/// daemon already holds, so it either answers effectively immediately or is
+/// not answering at all. reqwest 0.12 defaults to *no* request timeout and
+/// *no* connect timeout, so without this a daemon whose port is bound but
+/// unserved (the parked -> formed listener handover, or a wedged runtime)
+/// parks the caller in the accept backlog forever and the polling helpers'
+/// own deadlines are never reached. Same reasoning as [`Daemon::probe`]'s 3s
+/// bound on the mTLS handshake — with a little more headroom, because a
+/// daemon's 2-worker runtime on an oversubscribed shard can be slow to
+/// *schedule* the handler even though the handler itself does no work.
+const READYZ_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The budget for the single best-effort `/readyz` read taken while building a
+/// [`Daemon::stop`] timeout panic. Deliberately tiny: the daemon is already
+/// known to be misbehaving, and a diagnostic must not itself hang.
+const READYZ_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
+
 impl Daemon {
     /// Lay down a fresh daemon's tempdir (certs + config) without starting it.
     ///
@@ -1316,14 +1347,62 @@ log_level = "warn"
 
     /// Stop the daemon and return what `run_with` returned — `Err` for the
     /// `formation-failed` fail-stop, `Ok` otherwise.
+    ///
+    /// The join is bounded by [`STOP_JOIN_DEADLINE`], the same shape
+    /// [`Daemon::await_exit`] already gives the identical join. An unbounded
+    /// wait here is how a daemon bug becomes an undiagnosable test: a graceful
+    /// shutdown that deadlocks on an in-flight consensus write leaves this
+    /// `await` parked forever, the test never fails, and the CI job runs to its
+    /// six-hour limit and is killed from the outside with no output (issue
+    /// #111). On expiry we panic loudly instead, quoting the daemon's
+    /// last-known `/readyz` body so the failure can be diagnosed from the CI
+    /// log alone rather than reproduced locally.
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         let running = self.running.take().expect("daemon is not running");
         let _ = running.shutdown.send(true);
-        let out = running.join.await.expect("daemon task joined");
+        let out = match tokio::time::timeout(STOP_JOIN_DEADLINE, running.join).await {
+            Ok(joined) => joined.expect("daemon task joined"),
+            Err(_) => {
+                // Read `/readyz` before tearing the runtime down — afterwards
+                // there is nothing left to answer. Not via `readyz()`: that
+                // helper budgets 30s and panics when nothing answers, and we
+                // are already on the way to a panic against a daemon that may
+                // never answer at all.
+                let last = self.readyz_snapshot().await;
+                // Still wind the runtime down, so the test process is not left
+                // running a daemon it has given up on.
+                running.runtime.shutdown_background();
+                panic!(
+                    "daemon's graceful shutdown did not complete within {STOP_JOIN_DEADLINE:?}: \
+                     the shutdown signal was sent but `run_with` never returned, so something in \
+                     the drain is wedged. Last /readyz: {last}"
+                );
+            }
+        };
         // Wind the daemon's runtime down without blocking the test's: the
         // graceful path has already drained everything that matters.
         running.runtime.shutdown_background();
         out
+    }
+
+    /// A single best-effort `/readyz` read for diagnostics, never a panic.
+    ///
+    /// Returns the body (or the status/error) as a string, or `"<no answer>"`
+    /// when the daemon does not answer inside
+    /// [`READYZ_DIAGNOSTIC_TIMEOUT`]. Used only to enrich a failure message.
+    async fn readyz_snapshot(&self) -> String {
+        let url = self.api("/readyz");
+        let attempt = async {
+            let client = reqwest::Client::new();
+            let resp = client.get(&url).send().await.ok()?;
+            let status = resp.status().as_u16();
+            let body = resp.text().await.ok()?;
+            Some(format!("{status} {body}"))
+        };
+        match tokio::time::timeout(READYZ_DIAGNOSTIC_TIMEOUT, attempt).await {
+            Ok(Some(s)) => s,
+            _ => "<no answer>".to_string(),
+        }
     }
 
     /// Kill the daemon abruptly: no shutdown signal — the daemon's whole
@@ -1486,28 +1565,63 @@ log_level = "warn"
 
     /// Poll `/readyz` until it answers, returning `(status, body)`.
     ///
-    /// The budget is generous because "the listener is not up yet" is a real
-    /// wait, not a failure: a replica restarting into a cluster that lost
+    /// The outer budget is generous because "the listener is not up yet" is a
+    /// real wait, not a failure: a replica restarting into a cluster that lost
     /// quorum while it was down must first see an election complete, which
     /// takes seconds, not milliseconds. Only a daemon that never serves at all
     /// should fail here.
+    ///
+    /// Each *attempt* is bounded by [`READYZ_ATTEMPT_TIMEOUT`], and that bound
+    /// is what makes the outer budget mean anything. reqwest 0.12 defaults to
+    /// no request timeout and no connect timeout, and the loop below only
+    /// consults its deadline *between* attempts — so one `send()` that never
+    /// resolves (a port that is bound but not accepting, a response whose body
+    /// never arrives) hangs the caller forever, and with it every helper that
+    /// routes through here: [`poll`], [`Daemon::await_phase`],
+    /// [`Daemon::await_phase_in`], `Fleet::await_voters`. That is how issue
+    /// #111's wedged daemon turned into a six-hour CI job with no failure
+    /// output. Compare [`Daemon::probe`], which carries a 3s bound for exactly
+    /// the same reason on the mTLS plane.
+    ///
+    /// A timed-out attempt is an ordinary retryable error, not a failure: the
+    /// endpoint answers off state the daemon already holds, so a stall means
+    /// the listener is mid-handover (parked -> formed) rather than broken, and
+    /// retrying is the correct response. Only exhausting the outer budget is a
+    /// verdict.
     pub async fn readyz(&self) -> (u16, serde_json::Value) {
+        // The whole attempt — connect, request, *and* body — is wrapped in one
+        // `tokio::time::timeout` rather than leaning on reqwest's own
+        // `timeout()`/`connect_timeout()` builders. Both would do, but one
+        // wrapper is the obviously-correct version: there is no question left
+        // about which phases of the exchange the bound does and does not cover.
         let client = reqwest::Client::new();
         let url = self.api("/readyz");
-        let mut last = None;
+        let mut last: Option<String> = None;
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    let body: serde_json::Value = resp.json().await.expect("readyz json");
-                    return (status, body);
-                }
-                Err(e) => {
-                    last = Some(e);
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+            let attempt = async {
+                let resp = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("request failed: {e}"))?;
+                let status = resp.status().as_u16();
+                // A body that will not decode is retried rather than panicked
+                // on, for the same reason a stall is: mid-handover the answer
+                // can be truncated, and the next attempt gets a whole one. If
+                // it never decodes, the message lands in the panic below.
+                let body: serde_json::Value =
+                    resp.json().await.map_err(|e| format!("readyz json: {e}"))?;
+                Ok::<_, String>((status, body))
+            };
+            match tokio::time::timeout(READYZ_ATTEMPT_TIMEOUT, attempt).await {
+                Ok(Ok(answer)) => return answer,
+                Ok(Err(e)) => last = Some(e),
+                Err(_) => {
+                    last = Some(format!("no answer within {READYZ_ATTEMPT_TIMEOUT:?}"));
                 }
             }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("/readyz never answered: {last:?}");
     }

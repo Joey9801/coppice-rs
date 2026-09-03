@@ -98,6 +98,48 @@ fn build_authn(
 /// a scrape never sees buckets older than this regardless of scrape cadence.
 const METRICS_UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the whole shutdown drain gets before the runtime stops waiting on
+/// tasks that are not making progress. See [`drain`] and the shutdown block at
+/// the end of [`run`].
+///
+/// This is one budget for the *entire* sequence, not a per-task one: the point
+/// is to cap how long `run` can take to return, and a per-task budget
+/// multiplies by the number of tasks. The bound is load-bearing rather than
+/// defensive. Steps 2-4 of the shutdown order
+/// (`docs/architecture/coordinator-runtime.md`, "Shutdown order") wait for
+/// in-flight handlers to finish, but a handler parked on a consensus write —
+/// `propose`, `change_membership`, `views.at_least` — is released only by
+/// openraft's shutdown, which is step 5 and runs *after* this function
+/// returns, in `bootstrap`. So a replica that cannot commit at the moment the
+/// stop signal arrives (quorum lost, leader unreachable) has an in-flight
+/// write that will never complete, and an unbounded wait here is not a slow
+/// stop but a permanent one: `systemctl stop` hangs until `TimeoutStopSec`
+/// SIGKILLs the daemon (issue #111). Anything still running at the deadline is
+/// by definition blocked on something only a later step can unblock, so it is
+/// dropped and the sequence moves on.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Await one task's exit against the shared shutdown `deadline`, dropping it
+/// if it has not finished by then.
+///
+/// `label` names the task in the warning, because "which task failed to
+/// drain?" is the only question worth asking when this fires and the answer is
+/// not otherwise recoverable from a stopped process. The abort handle is taken
+/// before the await since the await consumes the join handle.
+async fn drain<T>(label: &str, join: tokio::task::JoinHandle<T>, deadline: tokio::time::Instant) {
+    let abort = join.abort_handle();
+    if tokio::time::timeout_at(deadline, join).await.is_err() {
+        tracing::warn!(
+            task = label,
+            budget = ?SHUTDOWN_DRAIN,
+            "runtime: task did not drain within the shutdown budget; dropping it so \
+             shutdown can reach consensus (which is what releases a handler parked on \
+             a consensus write)"
+        );
+        abort.abort();
+    }
+}
+
 /// Install the process-wide Prometheus recorder and return its scrape handle
 /// (issue #46).
 ///
@@ -492,31 +534,52 @@ where
     // shutdown draining the apply task's request queue, and the storage
     // layer flushing and closing — have no code here yet: they belong to
     // `bootstrap` once the segment storage layer and openraft node exist.
-    let _ = api_join.await;
-    let _ = agent_server_join.await;
-    let _ = router_join.await;
-    let _ = renewal_join.await;
+    //
+    // The order below is the dependency order and does not change. What is
+    // bounded is how long the sequence may take: every step waits on a task
+    // that may itself be waiting on an in-flight handler, and a handler parked
+    // on a consensus write is released only by step 5 — which `bootstrap` runs
+    // after this function returns. Waiting here without a deadline therefore
+    // deadlocks a replica that has lost quorum with a write in flight, so all
+    // the awaits below share one absolute deadline ([`SHUTDOWN_DRAIN`]) and a
+    // task that misses it is named in a warning and dropped ([`drain`]).
+    //
+    // Step 1 — the watch flips — is waited for EXPLICITLY here, and that is
+    // load-bearing rather than tidy: control reaches this line the instant the
+    // last task is spawned, seconds into the daemon's life. Before the drain
+    // had a deadline the joins below *were* the wait, so there was nothing to
+    // start; a budget started here instead of at the flip would expire while
+    // the daemon was serving normally and abort its whole runtime out from
+    // under it. An `Err` (the sender dropped) means the same thing as `true`
+    // and drains the same way.
+    let mut flipped = shutdown_rx.clone();
+    let _ = flipped.wait_for(|stop| *stop).await;
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN;
+    drain("api", api_join, deadline).await;
+    drain("agent-server", agent_server_join, deadline).await;
+    drain("agent-router", router_join, deadline).await;
+    drain("renewal", renewal_join, deadline).await;
     // The JWKS refresh serves the API edge and nothing else, so it drains with
     // it. Its loop watches the same shutdown flag; awaiting the handle just
     // keeps the runtime from returning while a fetch is still in flight.
     if let Some(join) = jwks_join {
-        let _ = join.await;
+        drain("jwks", join, deadline).await;
     }
     tracing::debug!("runtime: API control plane and agent gateway down");
 
-    let _ = ingestion_join.await;
-    let _ = dispatch_join.await;
-    let _ = scheduler_join.await;
-    let _ = housekeeping_join.await;
-    let _ = learner_gc_join.await;
+    drain("ingestion", ingestion_join, deadline).await;
+    drain("dispatch", dispatch_join, deadline).await;
+    drain("scheduler", scheduler_join, deadline).await;
+    drain("housekeeping", housekeeping_join, deadline).await;
+    drain("learner-gc", learner_gc_join, deadline).await;
     tracing::debug!("runtime: leader-only loops down");
 
     // Usage history subscribes to nothing, but its watch backs live reads:
     // drain it with the other derived producers, before the fanout.
-    let _ = usage_history_join.await;
+    drain("usage-history", usage_history_join, deadline).await;
     // Derived stats subscribes to the fanout, so it drains before it.
-    let _ = derived_stats_join.await;
-    let _ = fanout_join.await;
+    drain("derived-stats", derived_stats_join, deadline).await;
+    drain("fanout", fanout_join, deadline).await;
     tracing::info!("coordinator runtime stopped");
 
     Ok(())

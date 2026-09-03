@@ -67,6 +67,36 @@ const CA_VISIBILITY_WAIT: Duration = Duration::from_secs(5);
 /// Poll cadence for [`CA_VISIBILITY_WAIT`].
 const CA_VISIBILITY_POLL: Duration = Duration::from_millis(25);
 
+/// How long [`admin_channel`] may spend establishing a connection before it
+/// gives up.
+///
+/// tonic's default is *no* connect timeout at all, so a dial to a black-holed
+/// endpoint — a host that dropped off the network, a firewall that swallows
+/// SYNs, an address that moved — parks the caller forever. Several of those
+/// callers are request handlers (dial-back verification runs inside the
+/// `AddLearner` handler) or single-threaded loops (convergence, §6), where one
+/// unbounded dial stalls the whole verb. Ten seconds is well past any healthy
+/// LAN or WAN handshake and comfortably inside the deadlines the callers
+/// themselves impose.
+///
+/// Deliberately *only* a connect timeout: no blanket per-request deadline is
+/// set on the channel, because some admin RPCs (a promotion that waits for a
+/// joint commit, a key transfer) legitimately run long and already carry
+/// bounds of their own.
+const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long leader-side dial-back verification waits for the claimed endpoint
+/// to answer `ProbeCluster` (ADR 0037 §6).
+///
+/// Matches the 15s handshake bound `coppice_tls::read_serving_leaf` already
+/// applies to the sibling fact (`serving_machine`), so both halves of the
+/// dial-back cost the same worst case. Bounded for the same reason
+/// [`crate::convergence::Convergence::probe`] bounds its own probe: a
+/// black-holed address must cost one timeout, not a hung tick — and here the
+/// hung caller would be the `AddLearner` *handler*, which holds up the joiner
+/// and, during shutdown, the daemon's drain of in-flight requests.
+const DIAL_BACK_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ---------------------------------------------------------------------------
 // Machine-readable status markers
 // ---------------------------------------------------------------------------
@@ -1830,18 +1860,36 @@ impl<C: Consensus> AdminService<C> {
     /// the endpoint really is the stamped data directory claiming the seat.
     async fn probe_endpoint_node(&self, addr: &str, node_id: CoordinatorId) -> Result<(), Status> {
         let tls = self.tls()?;
-        let mut client = admin_channel_from_store(addr, &tls).await.map_err(|e| {
-            endpoint_unverified_status(format_args!("dialing {addr} to probe it: {e:#}"))
-        })?;
-        let probe = client
-            .probe_cluster(pb::ProbeClusterRequest {
-                cluster_id: self.inner.phase.probe().cluster_id,
-            })
-            .await
-            .map_err(|s| {
-                endpoint_unverified_status(format_args!("probing {addr}: {}", s.message()))
-            })?
-            .into_inner();
+        let cluster_id = self.inner.phase.probe().cluster_id;
+        let round = async {
+            let mut client = admin_channel_from_store(addr, &tls).await.map_err(|e| {
+                endpoint_unverified_status(format_args!("dialing {addr} to probe it: {e:#}"))
+            })?;
+            client
+                .probe_cluster(pb::ProbeClusterRequest { cluster_id })
+                .await
+                .map_err(|s| {
+                    endpoint_unverified_status(format_args!("probing {addr}: {}", s.message()))
+                })
+        };
+        // Bounded by [`DIAL_BACK_PROBE_TIMEOUT`], exactly as
+        // [`crate::convergence::Convergence::probe`] is and for the same
+        // reason: "a black-holed address must cost one timeout, not a hung
+        // tick". This round runs *inside* the `AddLearner` handler, so an
+        // endpoint that completes the TCP connect and then never answers would
+        // otherwise park the handler — and with it the joiner's verb and the
+        // daemon's shutdown drain — indefinitely. The sibling dial-back fact
+        // (`serving_machine`) is already bounded by the TLS layer's
+        // handshake timeout; this makes the two symmetric.
+        let probe = match tokio::time::timeout(DIAL_BACK_PROBE_TIMEOUT, round).await {
+            Ok(result) => result?.into_inner(),
+            Err(_elapsed) => {
+                return Err(endpoint_unverified_status(format_args!(
+                    "{addr} did not answer the dial-back probe within \
+                     {DIAL_BACK_PROBE_TIMEOUT:?}"
+                )))
+            }
+        };
         if probe.node_id != Some(node_id) {
             return Err(endpoint_unverified_status(format_args!(
                 "{addr} reports raft node {:?}, not the claimed {node_id}",
@@ -2625,6 +2673,9 @@ pub async fn admin_channel(
         .with_context(|| format!("invalid admin target {target}"))?
         .tls_config(tls)
         .context("configuring admin client TLS")?
+        // See [`ADMIN_CONNECT_TIMEOUT`]: bound the dial only, never the
+        // requests that follow it.
+        .connect_timeout(ADMIN_CONNECT_TIMEOUT)
         .connect()
         .await
         .with_context(|| format!("connecting to admin target {target}"))?;

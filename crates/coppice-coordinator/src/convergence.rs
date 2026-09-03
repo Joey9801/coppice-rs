@@ -373,6 +373,27 @@ const SUPERSESSION_ROUNDS: u32 = 3;
 /// test fleet as in production so nothing depends on the tempo.
 const SUPERSESSION_READYZ_GRACE: Duration = Duration::from_secs(1);
 
+/// How long one join RPC against the leader may run before this tick abandons
+/// it and starts the next pass from the top (ADR 0037 §6).
+///
+/// `AddLearner`, `ClusterStatus` and `PromoteVoter` all reach a *leader*, and
+/// two of them block that leader on a membership commit, so the bound is much
+/// looser than the probe round's: twenty seconds lets a legitimately slow
+/// joint commit finish rather than churning the join. It exists because the
+/// failure it prevents is unbounded: a leader that accepts the request and
+/// then stops answering — it is shutting down, or it stepped down with the
+/// entry still pending, which openraft never answers — would park this tick
+/// FOREVER. The loop would then never tick again, never re-derive its dial
+/// targets, and never retarget the leader that replaced it: a mid-join
+/// newcomer stranded by a leader change, with no local symptom but silence.
+///
+/// Abandoning a tick mid-verb costs nothing, because every join verb is
+/// idempotent by contract — that is exactly why this loop is stateless and
+/// "a pass is safe to repeat from the top however the last one ended"
+/// ([`Convergence::attempt_join`]). The next pass re-probes for the current
+/// leader and re-issues whatever is still needed.
+const JOIN_RPC_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The marker every history-superseded refusal message begins with, matching
 /// the `/readyz` phase name ([`ReadyzPhase::HistorySuperseded`]) so a log line
 /// and a status document are greppable by the same string.
@@ -1043,13 +1064,34 @@ impl Convergence {
         self.failpoints
             .halt_if_armed(crate::failpoints::JOIN_BEFORE_ADD_LEARNER)
             .await;
-        let admitted = client
-            .add_learner(pb::AddLearnerRequest {
+        // Bounded by [`JOIN_RPC_TIMEOUT`]: the leader blocks this call across
+        // its own membership commit, and a leader that stops answering
+        // mid-commit must cost this tick, not the loop.
+        let admitted = match tokio::time::timeout(
+            JOIN_RPC_TIMEOUT,
+            client.add_learner(pb::AddLearnerRequest {
                 history_id: history_id.to_vec(),
                 node_id,
                 address: self.advertise_addr.clone(),
-            })
-            .await;
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::debug!(
+                    leader = %leader_addr,
+                    node_id,
+                    "convergence: AddLearner did not answer within the join-RPC deadline; \
+                     retrying"
+                );
+                // Same outcome as a failed dial, and for the same reason: the
+                // admission may or may not have committed, and the next pass
+                // re-runs the idempotent verb against whichever leader exists
+                // then.
+                return JoinStep::Retry;
+            }
+        };
         // Deliberately between the `await` and the inspection below: an armed
         // daemon halts holding an answer it never looks at, which is exactly
         // the state a crash on the wire produces — the leader may have
@@ -1076,12 +1118,29 @@ impl Convergence {
         // on how far behind this learner is — the local `known_committed` is
         // not, because a learner that has not yet received a single append
         // reads zero lag against its own frozen frontier.
-        match client
-            .cluster_status(pb::ClusterStatusRequest {
+        // Bounded like the other two join RPCs (see [`JOIN_RPC_TIMEOUT`]):
+        // this one commits nothing, but it is served by the same leader, and a
+        // leader that has stopped answering stops answering everything.
+        let status = tokio::time::timeout(
+            JOIN_RPC_TIMEOUT,
+            client.cluster_status(pb::ClusterStatusRequest {
                 history_id: history_id.to_vec(),
-            })
-            .await
-        {
+            }),
+        )
+        .await;
+        let status = match status {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::debug!(
+                    leader = %leader_addr,
+                    node_id,
+                    "convergence: ClusterStatus did not answer within the join-RPC deadline; \
+                     retrying"
+                );
+                return JoinStep::Retry;
+            }
+        };
+        match status {
             Ok(resp) => {
                 let resp = resp.into_inner();
                 let floor = resp.last_applied_index.saturating_sub(PROMOTION_LAG_MAX);
@@ -1100,12 +1159,34 @@ impl Convergence {
         // for one — because a machine credential may never remove anyone
         // (ADR 0037 §7). Where a removal is warranted the leader folds it in
         // itself, under its own replication evidence.
-        let promoted = client
-            .promote_voter(pb::PromoteVoterRequest {
+        // Bounded by [`JOIN_RPC_TIMEOUT`] for the reason that constant spells
+        // out: the leader holds its membership mutex across this commit, so a
+        // leader that steps down with the promotion entry pending never
+        // answers — and an unbounded await here is precisely how a mid-join
+        // newcomer ends up stranded by a leader change.
+        let promoted = match tokio::time::timeout(
+            JOIN_RPC_TIMEOUT,
+            client.promote_voter(pb::PromoteVoterRequest {
                 history_id: history_id.to_vec(),
                 promote_node_id: node_id,
-            })
-            .await;
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::debug!(
+                    leader = %leader_addr,
+                    node_id,
+                    "convergence: PromoteVoter did not answer within the join-RPC deadline; \
+                     retrying"
+                );
+                // The promotion may still commit on that leader; the next pass
+                // re-checks membership and re-issues the idempotent verb, so
+                // both outcomes converge.
+                return JoinStep::Retry;
+            }
+        };
         // The in-flight promotion instant, for the same reason and in the same
         // place as the admission one above: the seat may already be this
         // replica's while this replica still believes it is a learner.
