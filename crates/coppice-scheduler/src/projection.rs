@@ -24,13 +24,14 @@
 //! No clocks, no I/O; pure over the snapshot.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
 use coppice_core::id::{AllocationId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
-use coppice_state::StateMachine;
+use coppice_state::{StateMachine, ViewMemos};
 
 /// A guaranteed future capacity release on a node (ADR 0014): at `at`, the
 /// allocation with this `seq` (used only to break ties when two releases land
@@ -63,21 +64,67 @@ pub fn projected_starts(snapshot: &StateMachine) -> BTreeMap<AllocationId, Optio
     for (node, allocs) in queues {
         let mut evs = events.remove(&node).unwrap_or_default();
         sort_release_events(&mut evs);
-        let needs: Vec<Resources> = allocs
-            .iter()
-            .filter_map(|id| snapshot.allocations.get(id))
-            .map(|rec| {
-                rec.allocation
-                    .requested
-                    .saturating_sub(&rec.allocation.funded)
+        // Keep each allocation id glued to its own remaining need through the
+        // filter below, so a record missing from the allocation map (a
+        // hand-built state) drops out of the result rather than shifting its
+        // neighbours' projections onto the wrong ids.
+        let queue: Vec<(AllocationId, Resources)> = allocs
+            .into_iter()
+            .filter_map(|id| {
+                snapshot.allocations.get(&id).map(|rec| {
+                    let need = rec
+                        .allocation
+                        .requested
+                        .saturating_sub(&rec.allocation.funded);
+                    (id, need)
+                })
             })
             .collect();
+        let needs: Vec<Resources> = queue.iter().map(|(_, need)| *need).collect();
         let ready = sweep_projected_ready(&evs, &needs);
-        for (alloc_id, t) in allocs.into_iter().zip(ready) {
+        for ((alloc_id, _), t) in queue.into_iter().zip(ready) {
             out.insert(alloc_id, t);
         }
     }
     out
+}
+
+/// The memoized projection of one published view: a map from accrual
+/// allocation id to its `projected_ready` bound (see [`projected_starts`]).
+///
+/// A dedicated newtype so the memo table's type key can only ever name this
+/// projection.
+#[derive(Debug, Default)]
+pub struct ProjectedStarts(BTreeMap<AllocationId, Option<Timestamp>>);
+
+impl std::ops::Deref for ProjectedStarts {
+    type Target = BTreeMap<AllocationId, Option<Timestamp>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// The projection behind a `projected_start` read view — computed once per
+/// published view and shared by every read served from it.
+///
+/// The full sweep collects release events over the whole allocation map
+/// (job-scaled, potentially millions of entries), so per-request
+/// recomputation would put an O(all allocations) scan behind every accrued
+/// job poll. Instead the caller passes the memo table of the published view
+/// that owns `state` — the consensus layer's `StateView::memos`, carried
+/// through the API's `ReadView`: the first read computes the projection,
+/// concurrent and later reads of the same view share it, and a newer view
+/// starts from an empty table so a memo can never outlive the state it
+/// describes.
+///
+/// Pairing table and state is the caller's obligation: a memo computed from
+/// one view's state must never be served against another's.
+pub fn projected_starts_cached(state: &StateMachine, memos: &ViewMemos) -> Arc<ProjectedStarts> {
+    // Warm path is a hash lookup plus an `Arc` clone; the first request for
+    // a view pays the full sweep once, and concurrent first requests share
+    // that single computation instead of racing to rescan the state.
+    memos.memo(|| ProjectedStarts(projected_starts(state)))
 }
 
 /// Guaranteed release events per node: an allocation whose attempt is

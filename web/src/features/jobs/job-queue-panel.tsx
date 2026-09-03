@@ -80,8 +80,9 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
               {formatDuration(queue.ageSeconds)}
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
-              Waiting jobs earn a growing credit, so even heavily discounted jobs eventually rank
-              first.
+              Waiting earns a growing credit that quota pressure cannot reduce. Every waiting job's
+              credit grows at the same rate, so waiting narrows the gap to less-penalized jobs but
+              cannot by itself take the lead over an equally penalized one.
             </p>
           </div>
         </div>
@@ -128,8 +129,8 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
             </Table>
           </div>
           <p className="mt-2 text-xs text-muted-foreground">
-            Each entity's usage decays over time (a 24-hour half-life), so pressure fades as
-            finished work ages out of the window.
+            Each entity's usage decays over time — halving every configured half-life (24 hours by
+            default) — so pressure fades as finished work ages out of the window.
           </p>
         </div>
 

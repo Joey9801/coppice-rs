@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
 
-use coppice_state::StateMachine;
+use coppice_state::{StateMachine, ViewMemos};
 
 use crate::error::ConsensusError;
 
@@ -91,6 +91,12 @@ pub(crate) fn gather_metrics() {
 pub struct StateView {
     state: Arc<StateMachine>,
     applied_index: u64,
+    /// Typed memoization for this view — read-model projections that would
+    /// otherwise rescan the (millions-of-entries) state per request are
+    /// computed once per view and shared by every read served from it. A
+    /// fresh view publishes a fresh table, so a memo can never outlive the
+    /// state it was computed from; clones of one view share the table.
+    memos: Arc<ViewMemos>,
 }
 
 impl StateView {
@@ -118,6 +124,14 @@ impl StateView {
     /// for the other.
     pub fn version(&self) -> u64 {
         self.state.version
+    }
+
+    /// This view's memo table, to carry alongside the state into whatever
+    /// read view serves it (the API layer's `ReadView`). Pairing table and
+    /// state is the caller's obligation: a memo computed from one view's
+    /// state must never be served against another's.
+    pub fn memos(&self) -> Arc<ViewMemos> {
+        Arc::clone(&self.memos)
     }
 }
 
@@ -232,6 +246,7 @@ impl ViewPublisher {
         let view = StateView {
             state: Arc::new(initial),
             applied_index,
+            memos: Arc::new(ViewMemos::default()),
         };
         let (tx, rx) = watch::channel(view);
         let demand = Arc::new(ViewDemand {
@@ -316,6 +331,9 @@ impl ViewPublisher {
         let view = StateView {
             state: Arc::new(cloned),
             applied_index,
+            // A new view: its memos start empty — anything a previous view
+            // cached described state this view no longer reflects.
+            memos: Arc::new(ViewMemos::default()),
         };
         self.published_index = applied_index;
         self.last_published = Some(now);
@@ -346,6 +364,27 @@ mod tests {
         let (_publisher, views) =
             ViewPublisher::new(StateMachine::default(), 100, ViewPublisherConfig::default());
         assert_eq!(views.latest().applied_index(), 100);
+    }
+
+    /// A view's memo table is shared by every clone of that view — one
+    /// published state, one computation — and a fresh publish starts a fresh
+    /// table, so a memo can never outlive the state it was computed from.
+    #[test]
+    fn memos_are_shared_per_view_and_fresh_per_publish() {
+        let (mut publisher, views) =
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
+
+        let seed = views.latest();
+        let a = seed.memos().memo(|| 1u8);
+        // A later clone of the *same* view shares the table.
+        let b = views.latest().memos().memo(|| 2u8);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(*b, 1);
+
+        publisher.publish_now(&StateMachine::default(), 1);
+        let c = views.latest().memos().memo(|| 3u8);
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(*c, 3, "the new view's table starts empty");
     }
 
     #[tokio::test]

@@ -38,7 +38,7 @@ pub mod projection;
 pub mod score;
 
 pub use engine::HeuristicScheduler;
-pub use projection::projected_starts;
+pub use projection::{projected_starts, projected_starts_cached, ProjectedStarts};
 
 /// Scheduler-side tuning knobs.
 ///
