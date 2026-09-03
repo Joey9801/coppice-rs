@@ -147,6 +147,7 @@ pub use runtime::install_metrics_recorder;
 pub fn describe_metrics() {
     coppice_authn::describe_metrics();
     coppice_consensus::describe_metrics();
+    coppice_scheduler::describe_metrics();
     coppice_tls::describe_metrics();
     tasks::event_fanout::describe_metrics();
     tasks::node_client::describe_metrics();

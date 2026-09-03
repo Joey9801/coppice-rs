@@ -41,6 +41,7 @@ describe('JobAccrualPanel projected start', () => {
     expect(screen.getByText(/^in \d/)).toBeInTheDocument()
     // The bounded case never carries the unbounded warning.
     expect(screen.queryByText(/unbounded/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/overdue/)).not.toBeInTheDocument()
   })
 
   it('says so honestly when the projection is unbounded', () => {
@@ -49,5 +50,13 @@ describe('JobAccrualPanel projected start', () => {
     expect(
       screen.getByText(/unbounded — no guaranteed release covers this yet/),
     ).toBeInTheDocument()
+  })
+
+  it('flags an overdue guarantee instead of rendering a lingering "now"', () => {
+    // The bounded runner passed start + max_runtime; apply has not reaped
+    // the release yet. "now" would read as imminent — the truth is overdue.
+    render(<JobAccrualPanel accrual={accrual(new Date(Date.now() - 5 * 60 * 1000))} />)
+
+    expect(screen.getByText(/due now \(release overdue\)/)).toBeInTheDocument()
   })
 })

@@ -218,6 +218,8 @@ function stateHint(job: JobDetail, phase: JobPhase, now: Date): ReactNode {
     case 'Accepted':
       return `admitted, entering queue · ${inState}`
     case 'Queued':
+      // Presence (not the fields) is what matters here: a queue explainer
+      // means the scheduler produced ranking terms for this job at all.
       return job.queue
         ? `in queue, ranked by priority and quota usage · waiting ${inState}`
         : `waiting ${inState}`

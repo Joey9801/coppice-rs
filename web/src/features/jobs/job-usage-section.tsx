@@ -120,6 +120,8 @@ function placeholderText(job: JobDetail): string {
     case 'Accepted':
       return "The job hasn't started yet — it is still being admitted."
     case 'Queued':
+      // Presence (not the fields) is what matters here: a queue explainer
+      // means the scheduler produced ranking terms for this job at all.
       return job.queue
         ? 'The job is queued; the scheduler admits jobs by priority, discounted for quota pressure. Usage appears once it starts running.'
         : 'The job is queued; usage appears once it starts running.'

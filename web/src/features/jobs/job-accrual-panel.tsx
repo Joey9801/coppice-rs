@@ -58,12 +58,16 @@ export function JobAccrualPanel({ accrual }: { accrual: AccrualView }) {
 
         <div className="text-sm">
           <span className="text-muted-foreground">Projected start: </span>
-          {accrual.projectedStart != null ? (
-            <span className="text-foreground">{formatTimeUntil(accrual.projectedStart)}</span>
-          ) : (
+          {accrual.projectedStart == null ? (
             <span className="text-amber-600 dark:text-amber-400">
               unbounded — no guaranteed release covers this yet
             </span>
+          ) : formatTimeUntil(accrual.projectedStart) === 'now' ? (
+            // The guarantee has lapsed but apply has not reaped the release
+            // yet: an honest "overdue", never an "imminent" that lingers.
+            <span className="text-amber-600 dark:text-amber-400">due now (release overdue)</span>
+          ) : (
+            <span className="text-foreground">{formatTimeUntil(accrual.projectedStart)}</span>
           )}
         </div>
       </CardContent>
