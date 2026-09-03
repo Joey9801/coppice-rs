@@ -1514,8 +1514,10 @@ pub struct ConfigureQuotaEntityResponse {
 pub struct GetCoordinatorStatusResponse {
     /// The cluster this replica belongs to (node config, ADR 0020).
     pub cluster_id: ClusterId,
-    /// The current leader's raft id, when one is known.
-    pub leader: Option<u64>,
+    /// The current leader's raft id, when one is known. A decimal string:
+    /// ids are random 64-bit values and browsers parse JSON numbers as f64,
+    /// which silently corrupts anything above 2^53 (Number.MAX_SAFE_INTEGER).
+    pub leader: Option<String>,
     /// The current raft term.
     pub term: u64,
     /// Highest committed log index known to the serving replica.
@@ -1580,8 +1582,9 @@ pub enum CoordinatorRole {
 /// One cluster member in a [`GetCoordinatorStatusResponse`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinatorMember {
-    /// The member's raft id.
-    pub id: u64,
+    /// The member's raft id. A decimal string — see [`
+    /// GetCoordinatorStatusResponse::leader`] for why it is not a JSON number.
+    pub id: String,
     /// The address peers dial (host:port).
     pub addr: String,
     /// Derived role (see [`CoordinatorRole`]).

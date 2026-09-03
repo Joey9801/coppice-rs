@@ -1,7 +1,7 @@
 import { Network } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useCoordinatorStatus } from '@/api/queries'
-import type { CoordinatorSnapshot } from '@/api/types'
+import type { CoordinatorId, CoordinatorSnapshot } from '@/api/types'
 import { formatBytes } from '@/lib/format'
 import { EmptyState, KeyValueGrid, PageHeader, StatTile, TimeAgo } from '@/components'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -47,7 +47,7 @@ export function CoordinatorsPage() {
 
   const applyLagging = lastApplied < knownCommitted
   const labels = shortCoordinatorLabels(members.map((m) => m.id))
-  const labelOf = (id: number) => labels.get(id) ?? id.toString()
+  const labelOf = (id: CoordinatorId) => labels.get(id) ?? id
 
   return (
     <div>

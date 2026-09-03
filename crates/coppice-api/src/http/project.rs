@@ -564,7 +564,7 @@ pub fn coordinator_status(
                 dto::CoordinatorRole::Follower
             };
             dto::CoordinatorMember {
-                id: m.id,
+                id: m.id.to_string(),
                 addr: m.addr.clone(),
                 role,
                 voter: m.voter,
@@ -593,7 +593,9 @@ pub fn coordinator_status(
 
     dto::GetCoordinatorStatusResponse {
         cluster_id,
-        leader: summary.leader,
+        // u64 raft ids cross the JSON boundary as decimal strings — see the
+        // `leader` doc comment on the DTO.
+        leader: summary.leader.map(|id| id.to_string()),
         term: summary.term,
         known_committed: summary.known_committed,
         last_applied: summary.last_applied,

@@ -33,13 +33,13 @@ export function CoordinatorLogsCard({ members, labels, className }: CoordinatorL
       </CardHeader>
       <CardContent>
         {first ? (
-          <Tabs defaultValue={String(first.id)}>
+          <Tabs defaultValue={first.id}>
             <TabsList className="max-w-full flex-wrap">
               {members.map((m) => (
-                <TabsTrigger key={m.id} value={String(m.id)}>
+                <TabsTrigger key={m.id} value={m.id}>
                   <CoordinatorLabel
                     id={m.id}
-                    shortLabel={labels.get(m.id) ?? m.id.toString()}
+                    shortLabel={labels.get(m.id) ?? m.id}
                     copyable={false}
                   />
                 </TabsTrigger>

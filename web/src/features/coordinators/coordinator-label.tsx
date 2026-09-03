@@ -36,8 +36,16 @@ export function CoordinatorLabel({
       <TooltipProvider delayDuration={300}>
         <Tooltip>
           <TooltipTrigger asChild>
+            {/*
+             * Focusable only with the copy affordance. Inside a TabsTrigger
+             * (copyable=false) a focusable child would steal keyboard focus
+             * from the tab: Radix's roving focus ignores ArrowLeft/Right
+             * that originate outside the tab itself, and the label adds an
+             * extra tab stop in every tab. There the tooltip is hover-only
+             * and the tab button keeps the keyboard.
+             */}
             <span
-              tabIndex={0}
+              {...(copyable ? { tabIndex: 0 } : {})}
               className="min-w-0 cursor-default truncate font-mono text-sm tabular-nums text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               c-{shortLabel}
@@ -45,13 +53,13 @@ export function CoordinatorLabel({
           </TooltipTrigger>
           <TooltipContent>
             <div className="text-xs">
-              <div className="font-mono">coordinator {id.toString()}</div>
+              <div className="font-mono">coordinator {id}</div>
               {addr ? <div className="font-mono text-muted-foreground">{addr}</div> : null}
             </div>
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
-      {copyable ? <CopyButton value={id.toString()} ariaLabel="Copy coordinator id" /> : null}
+      {copyable ? <CopyButton value={id} ariaLabel="Copy coordinator id" /> : null}
     </span>
   )
 }

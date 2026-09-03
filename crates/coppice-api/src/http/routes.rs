@@ -2615,7 +2615,9 @@ mod tests {
             .contains_key(super::super::COPPICE_APPLIED_INDEX));
 
         let body = body_json(response).await;
-        assert_eq!(body["leader"], 1);
+        // Raft ids cross the JSON boundary as decimal strings (random u64s
+        // exceed 2^53; a JSON number would be rounded by browser parsing).
+        assert_eq!(body["leader"], "1");
         assert_eq!(body["term"], 5);
         assert_eq!(body["known_committed"], 100);
         assert_eq!(body["last_applied"], 100);
@@ -2623,6 +2625,7 @@ mod tests {
         // Roles derive from leader id + voter flag.
         let members = body["members"].as_array().unwrap();
         assert_eq!(members.len(), 3);
+        assert_eq!(members[0]["id"], "1");
         assert_eq!(members[0]["role"], "leader");
         assert_eq!(members[1]["role"], "follower");
         assert_eq!(members[2]["role"], "learner");
@@ -2646,6 +2649,29 @@ mod tests {
         assert_eq!(body["snapshot"]["entries_since_snapshot"], 36); // 100 − 64
         assert_eq!(body["snapshot"]["size_bytes"], serde_json::Value::Null);
         assert_eq!(body["snapshot"]["taken_at"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn coordinators_serve_ids_as_decimal_strings_above_safe_integer() {
+        // Random 64-bit raft ids routinely exceed 2^53 (Number.MAX_SAFE_INTEGER);
+        // as JSON numbers, a browser's f64 parse would silently round them.
+        let mut summary = seeded_summary();
+        let huge = 7_234_980_239_847_293_847u64;
+        summary.leader = Some(huge);
+        summary.members[0].id = huge;
+        let body = body_json(
+            coordinator_app(summary, coppice_state::StateMachine::default())
+                .oneshot(
+                    Request::get("/api/v1/coordinators")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["leader"], "7234980239847293847");
+        assert_eq!(body["members"][0]["id"], "7234980239847293847");
     }
 
     #[tokio::test]

@@ -127,7 +127,7 @@ fn render_status(
         "leader",
         &coordinators
             .leader
-            .map(|id| id.to_string())
+            .clone()
             .unwrap_or_else(|| "(none known)".to_string()),
     );
     kv(&mut out, "term", &coordinators.term.to_string());
@@ -226,7 +226,7 @@ fn render_status(
         .iter()
         .map(|m| {
             vec![
-                m.id.to_string(),
+                m.id.clone(),
                 role_label(m.role).to_string(),
                 m.addr.clone(),
                 if m.voter { "voter" } else { "learner" }.to_string(),
@@ -382,7 +382,7 @@ mod tests {
     fn sample_coordinators() -> dto::GetCoordinatorStatusResponse {
         dto::GetCoordinatorStatusResponse {
             cluster_id: cluster_id(),
-            leader: Some(1),
+            leader: Some(1.to_string()),
             term: 9,
             known_committed: 120,
             last_applied: 118,
@@ -401,7 +401,7 @@ mod tests {
                 quota_entities: 1,
             },
             members: vec![dto::CoordinatorMember {
-                id: 1,
+                id: 1.to_string(),
                 addr: "10.0.0.1:7071".to_string(),
                 role: dto::CoordinatorRole::Leader,
                 voter: true,
@@ -420,9 +420,27 @@ mod tests {
         let decoded: dto::GetCoordinatorStatusResponse =
             serde_json::from_value(value).expect("the DTO decodes its own output");
         assert_eq!(decoded.cluster_id, cluster_id());
-        assert_eq!(decoded.leader, Some(1));
+        assert_eq!(decoded.leader, Some(1.to_string()));
         assert_eq!(decoded.members.len(), 1);
         assert_eq!(decoded.members[0].role, dto::CoordinatorRole::Leader);
+    }
+
+    /// Raft ids are random u64s that routinely exceed 2^53; they must cross
+    /// the JSON boundary as decimal strings or a browser's f64 parsing would
+    /// silently round them (the UI would copy/label the wrong id).
+    #[test]
+    fn coordinator_ids_survive_above_safe_integer_as_strings() {
+        let mut sample = sample_coordinators();
+        let huge = 7_234_980_239_847_293_847u64; // > u64::MAX_SAFE f64 (2^53)
+        sample.leader = Some(huge.to_string());
+        sample.members[0].id = huge.to_string();
+        let value = serde_json::to_value(&sample).unwrap();
+        assert_eq!(value["leader"], "7234980239847293847");
+        assert_eq!(value["members"][0]["id"], "7234980239847293847");
+        let decoded: dto::GetCoordinatorStatusResponse =
+            serde_json::from_value(value).expect("the DTO decodes its own output");
+        assert_eq!(decoded.leader.as_deref(), Some("7234980239847293847"));
+        assert_eq!(decoded.members[0].id, "7234980239847293847");
     }
 
     /// The paths a spawned fake server was asked for, in order.
