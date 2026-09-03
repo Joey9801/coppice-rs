@@ -8,7 +8,7 @@
  *   and `coppice dev`'s default). There is no identity to show: the server
  *   answers every request as the same anonymous implicit admin, so an
  *   identity badge would be pure noise dressed up as an account. The single
- *   piece of chrome is the standing insecure-deployment warning.
+ *   piece of chrome is the standing no-auth warning.
  * - `oidc` — the real login; the identity badge names whoever the token
  *   belongs to, and there is nothing insecure to warn about.
  * - unknown (`null`) — the bootstrap failed, or `VITE_COPPICE_MOCK` is
@@ -18,6 +18,7 @@
  */
 import { ShieldAlert } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { useAuthMode, useSession } from './session'
 
 export function AuthChrome() {
@@ -32,13 +33,19 @@ export function AuthChrome() {
  */
 function OpenModeIndicator() {
   return (
-    <Badge
-      variant="destructive"
-      title="This deployment has authentication disabled: every request is an unauthenticated admin."
-    >
-      <ShieldAlert className="size-3.5" />
-      Insecure deployment
-    </Badge>
+    <TooltipProvider delayDuration={300}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge variant="destructive" tabIndex={0}>
+            <ShieldAlert className="size-3.5" />
+            No auth configured
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent>
+          Authentication is disabled; every request has administrative access.
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   )
 }
 

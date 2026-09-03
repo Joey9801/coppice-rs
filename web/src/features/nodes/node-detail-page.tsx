@@ -45,6 +45,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { isNotFound, sortedLabels } from './lib'
+import { formatHostKernel, formatHostOs } from './host-facts'
 import { UtilizationCharts } from './utilization-charts'
 
 export function NodeDetailPage({ nodeId }: { nodeId: string }) {
@@ -123,7 +124,8 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           ) : (
             <TimeAgo t={summary.lastHeartbeat} className="font-medium" />
           )}
-          . Epoch fenced at {summary.epoch}; running attempts will be declared NodeLost.
+          . Node connection reset at generation {summary.epoch}; running attempts will be marked
+          lost.
         </Banner>
       ) : draining ? (
         <Banner tone="amber">Draining — no new placements; existing work continues.</Banner>
@@ -261,8 +263,8 @@ function HostCard({
   return (
     <div className="space-y-4">
       <dl className="space-y-2 text-sm">
-        <HostFact label="OS" value={host.osVersion || host.os} />
-        <HostFact label="Kernel" value={host.kernelVersion} mono />
+        <HostFact label="OS" value={formatHostOs(host)} />
+        <HostFact label="Kernel" value={formatHostKernel(host)} mono />
         <HostFact label="Arch" value={host.arch} mono />
         <HostFact label="CPU" value={host.cpuModel} />
         <HostFact label="Cores" value={cores} />
@@ -359,7 +361,7 @@ function HeaderDescription({ summary }: { summary: NodeSummary }) {
         </Badge>
       ))}
       <span className="text-sm text-muted-foreground">
-        epoch {summary.epoch} · last heartbeat{' '}
+        generation {summary.epoch} · last heartbeat{' '}
         {summary.lastHeartbeat == null ? 'never' : <TimeAgo t={summary.lastHeartbeat} />}
       </span>
     </span>
@@ -446,7 +448,7 @@ function AccrualQueueTable({ queue }: { queue: AccrualView[] }) {
             <TableHead>Job</TableHead>
             <TableHead className="w-72">Funding</TableHead>
             <TableHead>Projected start</TableHead>
-            <TableHead className="text-right">Seq</TableHead>
+            <TableHead className="text-right">Funding order</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -477,7 +479,7 @@ function AccrualQueueTable({ queue }: { queue: AccrualView[] }) {
         </TableBody>
       </Table>
       <p className="text-xs text-muted-foreground">
-        Allocations fund in commit order as capacity frees (ADR 0027).
+        Allocations are funded in sequence as capacity becomes available.
       </p>
     </div>
   )
@@ -552,13 +554,13 @@ function HistoryTable({ entries }: { entries: NodeHistoryEntry[] }) {
 }
 
 function LogsSection({ nodeId }: { nodeId: string }) {
-  const { data, isPending } = useNodeLogs(nodeId)
+  const { data, isPending, isError } = useNodeLogs(nodeId)
   return (
     <div className="space-y-2">
       <LogViewer entries={data?.entries ?? []} loading={isPending} />
-      <p className="text-xs text-muted-foreground">
-        Mock data — agent log shipping is not designed in the backend yet.
-      </p>
+      {isError ? (
+        <p className="text-xs text-muted-foreground">Agent log collection is unavailable.</p>
+      ) : null}
     </div>
   )
 }

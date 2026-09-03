@@ -1746,9 +1746,9 @@ mod tests {
         assert_eq!(response.active_attempts[0].outcome, None);
     }
 
-    /// Host facts are detail-only and pass through verbatim; the summary the
-    /// list view renders stays lean, which is the whole reason they live on
-    /// `GetNodeResponse` rather than `NodeSummary`.
+    /// Host facts are detail-only and are normalized for display; the summary
+    /// the list view renders stays lean, which is the whole reason they live
+    /// on `GetNodeResponse` rather than `NodeSummary`.
     #[test]
     fn get_node_carries_host_facts_and_the_detected_vector() {
         let node = NodeId::new();
@@ -1778,6 +1778,8 @@ mod tests {
 
         let response = get_node(&state, &node, &no_usage()).expect("the node exists");
         let host = response.host.expect("facts pass through");
+        assert_eq!(host.os_version, "Debian GNU/Linux 12 (bookworm)");
+        assert_eq!(host.kernel_version, "Linux 6.1.0-21-amd64");
         assert_eq!(host.cpu_model, "AMD EPYC 7763 64-Core Processor");
         assert_eq!(host.physical_cores, 8);
         assert_eq!(host.total_disk_bytes, 512 << 30);

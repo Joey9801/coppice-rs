@@ -303,9 +303,9 @@ pub struct GetNodeResponse {
 pub struct HostFacts {
     /// Operating system family, e.g. `linux`, `macos`.
     pub os: String,
-    /// Human-readable OS release.
+    /// Human-readable OS release, including a family label when available.
     pub os_version: String,
-    /// Kernel release string, as `uname -r` prints it.
+    /// Human-readable kernel release, including a family label when available.
     pub kernel_version: String,
     /// CPU architecture, e.g. `x86_64`, `aarch64`.
     pub arch: String,
@@ -326,17 +326,21 @@ pub struct HostFacts {
 
 impl From<&coppice_core::node::HostFacts> for HostFacts {
     fn from(f: &coppice_core::node::HostFacts) -> Self {
+        // Apply the same idempotent normalization used by agents so nodes
+        // registered by older agents remain self-describing in API responses.
+        let mut normalized = f.clone();
+        normalized.normalize_versions();
         HostFacts {
-            os: f.os.clone(),
-            os_version: f.os_version.clone(),
-            kernel_version: f.kernel_version.clone(),
-            arch: f.arch.clone(),
-            cpu_model: f.cpu_model.clone(),
-            physical_cores: f.physical_cores,
-            logical_cores: f.logical_cores,
-            total_memory_bytes: f.total_memory_bytes,
-            total_disk_bytes: f.total_disk_bytes,
-            agent_version: f.agent_version.clone(),
+            os: normalized.os,
+            os_version: normalized.os_version,
+            kernel_version: normalized.kernel_version,
+            arch: normalized.arch,
+            cpu_model: normalized.cpu_model,
+            physical_cores: normalized.physical_cores,
+            logical_cores: normalized.logical_cores,
+            total_memory_bytes: normalized.total_memory_bytes,
+            total_disk_bytes: normalized.total_disk_bytes,
+            agent_version: normalized.agent_version,
         }
     }
 }
