@@ -80,9 +80,10 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
               {formatDuration(queue.ageSeconds)}
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
-              Waiting earns a growing credit that quota pressure cannot reduce. Every waiting job's
-              credit grows at the same rate, so waiting narrows the gap to less-penalized jobs but
-              cannot by itself take the lead over an equally penalized one.
+              Waiting earns a credit that quota pressure cannot reduce, giving this job a permanent
+              head start over anything submitted after it. Every queued job's credit grows at the
+              same rate, so waiting does not reorder jobs already in the queue — that shifts as
+              quota usage decays.
             </p>
           </div>
         </div>

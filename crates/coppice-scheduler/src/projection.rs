@@ -21,10 +21,18 @@
 //! deliberately stops at committed state — a proposal that has not landed
 //! must not be shown as a start time.
 //!
-//! No clocks, no I/O; pure over the snapshot.
+//! One deliberate divergence from the pass: the read projection covers
+//! accruals queued on nodes absent from `state.nodes` (a hand-built state),
+//! which the pass never walks. Harmless, and more honest for reads; the
+//! drift only exists for states apply could not have built.
+//!
+//! No clocks, no I/O; pure over the snapshot. (The memoized entry point
+//! times the sweep for metrics only — a side channel that never feeds a
+//! decision.)
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
@@ -32,6 +40,34 @@ use coppice_core::id::{AllocationId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
 use coppice_state::{StateMachine, ViewMemos};
+
+// ---- metrics (facade pattern; described via this crate root) -------------
+
+/// Duration of one full `projected_starts` sweep, i.e. one miss on a view's
+/// memo table. Steady state under accrual-detail polling is roughly one of
+/// these per publish cadence per replica, so the histogram's rate × duration
+/// is the number that says what the per-view memo buys (and what a future
+/// index would save).
+const PROJECTED_STARTS_SWEEP_SECONDS: &str = "scheduler_projected_starts_sweep_seconds";
+
+/// Full sweeps computed. Divide by elapsed time to read the effective sweep
+/// rate; the gap to the request rate is the memo's hit rate.
+const PROJECTED_STARTS_SWEEPS_TOTAL: &str = "scheduler_projected_starts_sweeps_total";
+
+/// Describe this crate's metrics (the workspace facade pattern; the
+/// coordinator calls this once when it installs the recorder).
+pub fn describe_metrics() {
+    metrics::describe_histogram!(
+        PROJECTED_STARTS_SWEEP_SECONDS,
+        metrics::Unit::Seconds,
+        "Duration of one full projected-starts sweep (a view-memo miss)."
+    );
+    metrics::describe_counter!(
+        PROJECTED_STARTS_SWEEPS_TOTAL,
+        metrics::Unit::Count,
+        "Full projected-starts sweeps computed (view-memo misses)."
+    );
+}
 
 /// A guaranteed future capacity release on a node (ADR 0014): at `at`, the
 /// allocation with this `seq` (used only to break ties when two releases land
@@ -122,9 +158,16 @@ impl std::ops::Deref for ProjectedStarts {
 /// one view's state must never be served against another's.
 pub fn projected_starts_cached(state: &StateMachine, memos: &ViewMemos) -> Arc<ProjectedStarts> {
     // Warm path is a hash lookup plus an `Arc` clone; the first request for
-    // a view pays the full sweep once, and concurrent first requests share
-    // that single computation instead of racing to rescan the state.
-    memos.memo(|| ProjectedStarts(projected_starts(state)))
+    // a view pays the full sweep once, and a concurrent first request may
+    // recompute (the memo computes outside its lock) but cannot skew the
+    // answer — both sweeps read the same published state.
+    memos.memo(|| {
+        let started = Instant::now();
+        let map = projected_starts(state);
+        metrics::histogram!(PROJECTED_STARTS_SWEEP_SECONDS).record(started.elapsed().as_secs_f64());
+        metrics::counter!(PROJECTED_STARTS_SWEEPS_TOTAL).increment(1);
+        ProjectedStarts(map)
+    })
 }
 
 /// Guaranteed release events per node: an allocation whose attempt is

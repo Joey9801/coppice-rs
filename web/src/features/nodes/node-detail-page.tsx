@@ -466,6 +466,12 @@ function AccrualQueueTable({ queue }: { queue: AccrualView[] }) {
               <TableCell>
                 {entry.projectedStart == null ? (
                   <span className="text-amber-700 dark:text-amber-300">unbounded</span>
+                ) : formatTimeUntil(entry.projectedStart) === 'now' ? (
+                  // The guarantee lapsed before apply reaped the release:
+                  // say so, never an "imminent" that lingers.
+                  <span className="text-amber-700 dark:text-amber-300">
+                    due now (release overdue)
+                  </span>
                 ) : (
                   <span className="tabular-nums">{formatTimeUntil(entry.projectedStart)}</span>
                 )}

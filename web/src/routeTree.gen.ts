@@ -9,49 +9,24 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as IndexRouteImport } from './routes/index'
 import { Route as CoordinatorsRouteImport } from './routes/coordinators'
-import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
-import { Route as EntitiesIndexRouteImport } from './routes/entities.index'
-import { Route as EntitiesEntityIdRouteImport } from './routes/entities.$entityId'
-import { Route as JobsIndexRouteImport } from './routes/jobs.index'
-import { Route as JobsJobIdRouteImport } from './routes/jobs.$jobId'
+import { Route as IndexRouteImport } from './routes/index'
 import { Route as NodesIndexRouteImport } from './routes/nodes.index'
+import { Route as JobsIndexRouteImport } from './routes/jobs.index'
+import { Route as EntitiesIndexRouteImport } from './routes/entities.index'
 import { Route as NodesNodeIdRouteImport } from './routes/nodes.$nodeId'
+import { Route as JobsJobIdRouteImport } from './routes/jobs.$jobId'
+import { Route as EntitiesEntityIdRouteImport } from './routes/entities.$entityId'
+import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
 
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const CoordinatorsRoute = CoordinatorsRouteImport.update({
   id: '/coordinators',
   path: '/coordinators',
   getParentRoute: () => rootRouteImport,
 } as any)
-const AuthCallbackRoute = AuthCallbackRouteImport.update({
-  id: '/auth/callback',
-  path: '/auth/callback',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const EntitiesIndexRoute = EntitiesIndexRouteImport.update({
-  id: '/entities/',
-  path: '/entities/',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const EntitiesEntityIdRoute = EntitiesEntityIdRouteImport.update({
-  id: '/entities/$entityId',
-  path: '/entities/$entityId',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const JobsIndexRoute = JobsIndexRouteImport.update({
-  id: '/jobs/',
-  path: '/jobs/',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const JobsJobIdRoute = JobsJobIdRouteImport.update({
-  id: '/jobs/$jobId',
-  path: '/jobs/$jobId',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const NodesIndexRoute = NodesIndexRouteImport.update({
@@ -59,9 +34,34 @@ const NodesIndexRoute = NodesIndexRouteImport.update({
   path: '/nodes/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const JobsIndexRoute = JobsIndexRouteImport.update({
+  id: '/jobs/',
+  path: '/jobs/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const EntitiesIndexRoute = EntitiesIndexRouteImport.update({
+  id: '/entities/',
+  path: '/entities/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const NodesNodeIdRoute = NodesNodeIdRouteImport.update({
   id: '/nodes/$nodeId',
   path: '/nodes/$nodeId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const JobsJobIdRoute = JobsJobIdRouteImport.update({
+  id: '/jobs/$jobId',
+  path: '/jobs/$jobId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const EntitiesEntityIdRoute = EntitiesEntityIdRouteImport.update({
+  id: '/entities/$entityId',
+  path: '/entities/$entityId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AuthCallbackRoute = AuthCallbackRouteImport.update({
+  id: '/auth/callback',
+  path: '/auth/callback',
   getParentRoute: () => rootRouteImport,
 } as any)
 
@@ -149,13 +149,6 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/coordinators': {
       id: '/coordinators'
       path: '/coordinators'
@@ -163,39 +156,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CoordinatorsRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/auth/callback': {
-      id: '/auth/callback'
-      path: '/auth/callback'
-      fullPath: '/auth/callback'
-      preLoaderRoute: typeof AuthCallbackRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/entities/': {
-      id: '/entities/'
-      path: '/entities'
-      fullPath: '/entities/'
-      preLoaderRoute: typeof EntitiesIndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/entities/$entityId': {
-      id: '/entities/$entityId'
-      path: '/entities/$entityId'
-      fullPath: '/entities/$entityId'
-      preLoaderRoute: typeof EntitiesEntityIdRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/jobs/': {
-      id: '/jobs/'
-      path: '/jobs'
-      fullPath: '/jobs/'
-      preLoaderRoute: typeof JobsIndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/jobs/$jobId': {
-      id: '/jobs/$jobId'
-      path: '/jobs/$jobId'
-      fullPath: '/jobs/$jobId'
-      preLoaderRoute: typeof JobsJobIdRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/nodes/': {
@@ -205,11 +170,46 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof NodesIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/jobs/': {
+      id: '/jobs/'
+      path: '/jobs'
+      fullPath: '/jobs/'
+      preLoaderRoute: typeof JobsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/entities/': {
+      id: '/entities/'
+      path: '/entities'
+      fullPath: '/entities/'
+      preLoaderRoute: typeof EntitiesIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/nodes/$nodeId': {
       id: '/nodes/$nodeId'
       path: '/nodes/$nodeId'
       fullPath: '/nodes/$nodeId'
       preLoaderRoute: typeof NodesNodeIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/jobs/$jobId': {
+      id: '/jobs/$jobId'
+      path: '/jobs/$jobId'
+      fullPath: '/jobs/$jobId'
+      preLoaderRoute: typeof JobsJobIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/entities/$entityId': {
+      id: '/entities/$entityId'
+      path: '/entities/$entityId'
+      fullPath: '/entities/$entityId'
+      preLoaderRoute: typeof EntitiesEntityIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/auth/callback': {
+      id: '/auth/callback'
+      path: '/auth/callback'
+      fullPath: '/auth/callback'
+      preLoaderRoute: typeof AuthCallbackRouteImport
       parentRoute: typeof rootRouteImport
     }
   }

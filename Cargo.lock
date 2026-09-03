@@ -1402,6 +1402,7 @@ dependencies = [
  "coppice-core",
  "coppice-state",
  "coppice-testkit",
+ "metrics",
  "proptest",
  "uuid",
 ]

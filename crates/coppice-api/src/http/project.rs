@@ -11,7 +11,7 @@ use std::ops::Bound;
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
+use coppice_core::id::{AllocationId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::JobState;
 use coppice_core::quota::{self, PriorityMultiplier};
 use coppice_core::resource::Resources;
@@ -178,16 +178,27 @@ pub fn get_node(
         .map(|(_, ar)| attempt_view(ar))
         .collect();
 
-    let accrual_starts = projected_starts_cached(state, view_memos);
-    let accrual_queue = state
+    // Only this node's queue slice, ranged rather than filtered over the
+    // whole map, and only then the memoized sweep: a node detail read with
+    // no accruals anywhere must not pay the O(all allocations) sweep for a
+    // view whose memo table has not been filled yet.
+    let queued_allocs: Vec<AllocationId> = state
         .accrual_queue
-        .iter()
-        .filter(|((node, _), _)| *node == *id)
-        .filter_map(|((_, _), alloc_id)| {
-            let alloc_record = state.allocations.get(alloc_id)?;
-            Some(accrual_view(alloc_record, &accrual_starts))
-        })
+        .range((*id, 0)..=(*id, u64::MAX))
+        .map(|(_, alloc_id)| *alloc_id)
         .collect();
+    let accrual_queue = if queued_allocs.is_empty() {
+        Vec::new()
+    } else {
+        let accrual_starts = projected_starts_cached(state, view_memos);
+        queued_allocs
+            .iter()
+            .filter_map(|alloc_id| {
+                let alloc_record = state.allocations.get(alloc_id)?;
+                Some(accrual_view(alloc_record, &accrual_starts))
+            })
+            .collect()
+    };
 
     Some(dto::GetNodeResponse {
         summary,

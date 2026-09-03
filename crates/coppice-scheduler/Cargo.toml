@@ -11,6 +11,10 @@ authors.workspace = true
 [dependencies]
 coppice-core.workspace = true
 coppice-state.workspace = true
+# The per-view sweep metrics (`scheduler_projected_starts_*`): the facade is
+# the workspace-wide `metrics` crate, described/gathered via this crate root
+# like every other module that exposes metrics.
+metrics.workspace = true
 
 [dev-dependencies]
 # Property tests for the ADR 0021 score formula and the zero-rejection

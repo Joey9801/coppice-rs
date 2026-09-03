@@ -461,3 +461,72 @@ fn the_cached_projection_is_shared_per_view_and_correct() {
     assert_eq!(wrapped, &plain);
     let _typed: &ProjectedStarts = &first;
 }
+
+// ---- cost at target scale ----
+
+/// What a view-memo miss costs at the scale the job-scaled maps are expected
+/// to reach (KOI-5: millions of entries). `#[ignore]`d like the other
+/// 1M-scale tests — run it before/after touching the sweep:
+///
+/// ```text
+/// cargo test -p coppice-scheduler --test projection \
+///   sweep_cost_at_one_million_allocations -- --ignored --nocapture
+/// ```
+///
+/// The recorded `scheduler_projected_starts_sweep_seconds` histogram is the
+/// production-visible form of the same number.
+#[test]
+#[ignore = "1M-scale measurement; run explicitly"]
+fn sweep_cost_at_one_million_allocations() {
+    let mut sm = setup(cpu(64_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(16_000), Some(3600));
+
+    // One million live allocations that contribute no release events (their
+    // attempts are absent), plus the one accrual the sweep must bound.
+    for i in 0..1_000_000u128 {
+        let alloc = AllocationId(uuid::Uuid::from_u128(1 << 120 | i));
+        sm.allocations.insert(
+            alloc,
+            AllocationRecord {
+                allocation: Allocation {
+                    id: alloc,
+                    job: jid(1),
+                    attempt: aid(0),
+                    node: nid(2),
+                    requested: cpu(1),
+                    funded: cpu(1),
+                    state: AllocationState::Active,
+                },
+                seq: u64::from(u32::try_from(i).expect("fits u32")),
+            },
+        );
+    }
+    seed_accrual(
+        &mut sm,
+        alid(50),
+        jid(2),
+        nid(1),
+        cpu(32_000),
+        cpu(16_000),
+        1,
+    );
+
+    let memos = ViewMemos::default();
+    let started = std::time::Instant::now();
+    let starts = projected_starts_cached(&sm, &memos);
+    let cold = started.elapsed();
+    // Warm path: a memo hit, no second sweep.
+    let warm_started = std::time::Instant::now();
+    let _again = projected_starts_cached(&sm, &memos);
+    let warm = warm_started.elapsed();
+
+    assert_eq!(
+        starts.get(&alid(50)),
+        Some(&Some(base_ts() + Duration::from_secs(3600)))
+    );
+    println!("cold sweep over 1M allocations: {cold:?}; warm memo hit: {warm:?}");
+    assert!(
+        warm < cold,
+        "the memo hit must be far cheaper than the sweep"
+    );
+}
