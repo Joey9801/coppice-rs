@@ -859,6 +859,23 @@ export interface CoordinatorMember {
   lastSeen: Date
 }
 
+/**
+ * The serving replica's last snapshot. A replica that has taken no snapshot
+ * yet reports `null` for the whole object, and individual fields may be
+ * `null` when the backend cannot report them (the Raft snapshot metadata
+ * carries neither size nor timestamp).
+ */
+export interface CoordinatorSnapshot {
+  /** Snapshot size on disk in bytes, or null when not reported. */
+  sizeBytes: number | null
+  /** Log index the last snapshot covers. */
+  lastIncludedIndex: number
+  /** When the snapshot was taken, or null when not reported. */
+  takenAt: Date | null
+  /** Applied entries since the snapshot (`lastApplied − lastIncludedIndex`). */
+  entriesSinceSnapshot: number
+}
+
 export interface CoordinatorStatus {
   clusterId: string
   leader: CoordinatorId | null
@@ -869,13 +886,8 @@ export interface CoordinatorStatus {
   lastApplied: number
   /** State-machine command count (distinct from the Raft log index). */
   stateVersion: number
-  snapshot: {
-    sizeBytes: number
-    /** Log index the last snapshot covers. */
-    lastIncludedIndex: number
-    takenAt: Date
-    entriesSinceSnapshot: number
-  }
+  /** The replica's last snapshot, or null when none has been taken yet. */
+  snapshot: CoordinatorSnapshot | null
   /** Object counts in the replicated state machine. */
   stateCounts: {
     jobs: number

@@ -1,5 +1,5 @@
 import { Crown } from 'lucide-react'
-import type { CoordinatorMember, CoordinatorRole } from '@/api/types'
+import type { CoordinatorId, CoordinatorMember, CoordinatorRole } from '@/api/types'
 import { formatPercent } from '@/lib/format'
 import { TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
@@ -14,6 +14,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
+import { CoordinatorLabel } from './coordinator-label'
 
 const ROLE_VARIANT: Record<CoordinatorRole, 'default' | 'secondary' | 'outline'> = {
   Leader: 'default',
@@ -50,11 +51,13 @@ function HostBars({ host }: { host: CoordinatorMember['host'] }) {
 
 export interface MembershipCardProps {
   members: CoordinatorMember[]
-  leader: number | null
+  leader: CoordinatorId | null
+  /** Short labels from `shortCoordinatorLabels`, shared across the page. */
+  labels: Map<CoordinatorId, string>
   className?: string
 }
 
-export function MembershipCard({ members, leader, className }: MembershipCardProps) {
+export function MembershipCard({ members, leader, labels, className }: MembershipCardProps) {
   return (
     <Card className={className}>
       <CardHeader>
@@ -78,14 +81,23 @@ export function MembershipCard({ members, leader, className }: MembershipCardPro
             {members.map((m) => (
               <TableRow key={m.id}>
                 <TableCell className="font-medium">
-                  <span className="flex items-center gap-1.5">
+                  <span className="flex min-w-0 items-center gap-1.5">
                     {m.id === leader ? (
-                      <Crown className="size-3.5 text-amber-500" aria-label="leader" />
+                      <Crown className="size-3.5 shrink-0 text-amber-500" aria-label="leader" />
                     ) : null}
-                    coordinator {m.id}
+                    <CoordinatorLabel
+                      id={m.id}
+                      shortLabel={labels.get(m.id) ?? m.id.toString()}
+                      addr={m.addr}
+                    />
                   </span>
                 </TableCell>
-                <TableCell className="font-mono text-xs text-muted-foreground">{m.addr}</TableCell>
+                <TableCell
+                  className="max-w-[16rem] truncate font-mono text-xs text-muted-foreground"
+                  title={m.addr}
+                >
+                  {m.addr}
+                </TableCell>
                 <TableCell>
                   <Badge variant={ROLE_VARIANT[m.role]}>{m.role}</Badge>
                 </TableCell>

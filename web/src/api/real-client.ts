@@ -1374,20 +1374,21 @@ function mapCoordinatorStatus(c: WireGetCoordinatorStatusResponse): CoordinatorS
     knownCommitted: c.known_committed,
     lastApplied: c.last_applied,
     stateVersion: c.state_version,
+    /**
+     * `null` when this replica has taken no snapshot yet — preserved as
+     * absent rather than zeroed. Inside a present snapshot, `sizeBytes` and
+     * `takenAt` stay `null` when the wire omits them (the Raft snapshot
+     * metadata carries neither); the UI renders "not reported" instead of
+     * fabricating `0 B` or an epoch timestamp.
+     */
     snapshot: c.snapshot
       ? {
-          sizeBytes: c.snapshot.size_bytes ?? 0,
+          sizeBytes: c.snapshot.size_bytes,
           lastIncludedIndex: c.snapshot.last_included_index,
-          takenAt: toDateOrNull(c.snapshot.taken_at) ?? new Date(0),
+          takenAt: toDateOrNull(c.snapshot.taken_at),
           entriesSinceSnapshot: c.snapshot.entries_since_snapshot,
         }
-      : // No snapshot taken yet on this replica — zeroed, not fabricated.
-        {
-          sizeBytes: 0,
-          lastIncludedIndex: 0,
-          takenAt: new Date(0),
-          entriesSinceSnapshot: c.last_applied,
-        },
+      : null,
     stateCounts: {
       jobs: c.state_counts.jobs,
       attempts: c.state_counts.attempts,

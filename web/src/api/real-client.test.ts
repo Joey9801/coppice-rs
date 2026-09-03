@@ -531,3 +531,108 @@ describe('bearer credentials', () => {
     expect(headers.Authorization).toBeUndefined()
   })
 })
+
+describe('getCoordinatorStatus', () => {
+  const baseStatus = {
+    cluster_id: 'coppice-prod-1',
+    leader: 7234980239847294,
+    term: 7,
+    known_committed: 42000,
+    last_applied: 41998,
+    state_version: 61000,
+    state_counts: {
+      jobs: 3,
+      attempts: 5,
+      allocations: 4,
+      nodes: 16,
+      quota_entities: 2,
+    },
+    members: [
+      {
+        id: 7234980239847294,
+        addr: 'coord-1.internal:7071',
+        role: 'leader',
+        voter: true,
+        last_applied: 41998,
+        replication_lag_entries: 0,
+      },
+      {
+        id: 7235980239847294,
+        addr: 'coord-2.internal:7071',
+        role: 'follower',
+        voter: true,
+        last_applied: null,
+        replication_lag_entries: null,
+      },
+    ],
+  }
+
+  it('preserves an absent snapshot as null (no synthetic zeroed snapshot)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...baseStatus, snapshot: null }))
+    const status = await createRealClient().getCoordinatorStatus()
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/coordinators', expect.anything())
+    expect(status.snapshot).toBeNull()
+    expect(status.leader).toBe(7234980239847294)
+    expect(status.term).toBe(7)
+    expect(status.knownCommitted).toBe(42000)
+    expect(status.lastApplied).toBe(41998)
+  })
+
+  it('maps a present snapshot and nullable per-member metadata', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        ...baseStatus,
+        snapshot: {
+          size_bytes: 40 * 1024 * 1024,
+          last_included_index: 41000,
+          taken_at: '2026-01-01T00:00:00.000000Z',
+          entries_since_snapshot: 998,
+        },
+      }),
+    )
+    const status = await createRealClient().getCoordinatorStatus()
+
+    expect(status.snapshot).toEqual({
+      sizeBytes: 40 * 1024 * 1024,
+      lastIncludedIndex: 41000,
+      takenAt: new Date('2026-01-01T00:00:00.000000Z'),
+      entriesSinceSnapshot: 998,
+    })
+    // Only the serving replica reports its applied index and lag.
+    expect(status.members[0]).toMatchObject({
+      id: 7234980239847294,
+      addr: 'coord-1.internal:7071',
+      role: 'Leader',
+      voter: true,
+      lastApplied: 41998,
+      replicationLagEntries: 0,
+    })
+    expect(status.members[1]).toMatchObject({
+      role: 'Follower',
+      lastApplied: 0,
+      replicationLagEntries: 0,
+    })
+  })
+
+  it('keeps nullable snapshot metadata (size, taken_at) as null when absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        ...baseStatus,
+        snapshot: {
+          size_bytes: null,
+          last_included_index: 41000,
+          taken_at: null,
+          entries_since_snapshot: 998,
+        },
+      }),
+    )
+    const status = await createRealClient().getCoordinatorStatus()
+
+    expect(status.snapshot).not.toBeNull()
+    expect(status.snapshot!.sizeBytes).toBeNull()
+    expect(status.snapshot!.takenAt).toBeNull()
+    expect(status.snapshot!.lastIncludedIndex).toBe(41000)
+    expect(status.snapshot!.entriesSinceSnapshot).toBe(998)
+  })
+})
