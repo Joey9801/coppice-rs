@@ -737,10 +737,7 @@ async fn list_nodes<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    // A read may sample the clock (an apply may not): `now` feeds only the
-    // heartbeat-age health derivation, never anything stored.
-    let response =
-        super::project::list_nodes(view.state(), &plane.usage_window(), Timestamp::now());
+    let response = super::project::list_nodes(view.state(), &plane.usage_window());
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -759,9 +756,8 @@ async fn get_node<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    let response =
-        super::project::get_node(view.state(), &id, &plane.usage_window(), Timestamp::now())
-            .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
+    let response = super::project::get_node(view.state(), &id, &plane.usage_window())
+        .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -1499,7 +1495,7 @@ mod tests {
         // must serialize as `null`, never as a zero vector.
         let usage = crate::UsageSnapshot {
             current: Default::default(),
-            heartbeats: Default::default(),
+            liveness: Default::default(),
             history: std::sync::Arc::new(crate::ClusterUsage {
                 nodes: std::collections::BTreeMap::from([(
                     node,
@@ -1532,7 +1528,7 @@ mod tests {
         assert_eq!(body["samples"][1]["used"], serde_json::Value::Null);
     }
 
-    /// The nodes list serves the leader's last-heard marks: a fresh mark
+    /// The nodes list serves the leader's liveness marks: a fresh mark
     /// reads `healthy` with its wall stamp, no mark reads `unknown` with a
     /// null stamp (the follower answer — and what every node served before
     /// liveness was wired through).
@@ -1543,11 +1539,17 @@ mod tests {
         state.nodes.insert(heard, utilization_node(heard));
         state.nodes.insert(unheard, utilization_node(unheard));
 
-        // The handler derives health against its real clock, so the fixture
-        // mark must be "now" to read fresh.
-        let at = Timestamp::now();
+        // Health reads the mark's monotonic silence, so the wall stamp can
+        // be anything the fixture likes; it is served back verbatim.
+        let at = Timestamp::UNIX_EPOCH + coppice_core::time::Duration::from_secs(1_700_000_000);
         let usage = crate::UsageSnapshot {
-            heartbeats: std::collections::BTreeMap::from([(heard, at)]),
+            liveness: std::collections::BTreeMap::from([(
+                heard,
+                crate::LivenessMark {
+                    last_heartbeat: Some(at),
+                    silent_for: std::time::Duration::from_secs(5),
+                },
+            )]),
             ..Default::default()
         };
 

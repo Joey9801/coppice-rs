@@ -132,7 +132,7 @@ async fn drain<C: Consensus>(
             report = inbound.recv() => {
                 let Some(report) = report else { return false };
                 if let Some(lost) =
-                    ingest(consensus, views, router, liveness, usage, &report).await
+                    ingest(consensus, views, router, liveness, usage, term, &report).await
                 {
                     return lost;
                 }
@@ -141,14 +141,17 @@ async fn drain<C: Consensus>(
     }
 }
 
-/// Normalize and act on one report. Returns `Some(lost_leadership)` if the
-/// drain loop should stop, `None` to keep draining.
+/// Normalize and act on one report under leadership of `term`. Returns
+/// `Some(lost_leadership)` if the drain loop should stop, `None` to keep
+/// draining.
+#[allow(clippy::too_many_arguments)]
 async fn ingest<C: Consensus>(
     consensus: &Arc<C>,
     views: &StateViews,
     router: &RouterHandle,
     liveness: &NodeLiveness,
     usage: &NodeUsage,
+    term: u64,
     report: &InboundReport,
 ) -> Option<bool> {
     let node = report.node;
@@ -157,7 +160,9 @@ async fn ingest<C: Consensus>(
     let normalized = normalize(&view, report, now);
 
     if normalized.liveness {
-        liveness.mark(node);
+        // Scoped to the term this drain runs under: a report that lands
+        // after leadership moved is not evidence for whoever leads now.
+        liveness.mark(term, node);
     }
     record_usage(usage, report);
 
@@ -1266,7 +1271,7 @@ mod tests {
             let liveness = liveness.clone();
             let usage = usage.clone();
             tokio::spawn(async move {
-                ingest(&consensus, &views, &router, &liveness, &usage, &inbound).await
+                ingest(&consensus, &views, &router, &liveness, &usage, 1, &inbound).await
             })
         };
 

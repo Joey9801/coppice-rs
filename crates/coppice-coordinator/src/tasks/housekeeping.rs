@@ -106,7 +106,13 @@ pub async fn run<C>(
 
         // Grant every known node a fresh liveness grace window so a node is
         // never declared lost on the first tick of a new leadership term.
-        liveness.seed(views.latest().state().nodes.keys().copied(), Instant::now());
+        // Seeding the term also retires whatever a prior term left in the
+        // map (`crate::liveness`).
+        liveness.seed(
+            term,
+            views.latest().state().nodes.keys().copied(),
+            Instant::now(),
+        );
 
         let mut ticker = interval(tick);
         // The first tick fires immediately; skip it so gaining leadership
@@ -362,8 +368,8 @@ mod tests {
         let view = view_of(sm);
 
         let liveness = NodeLiveness::new();
-        liveness.seed([schedulable_stale, drained_live, drained_lost], overdue);
-        liveness.seed([fresh], now);
+        liveness.seed(1, [schedulable_stale, drained_live, drained_lost], overdue);
+        liveness.seed(1, [fresh], now);
 
         let stale: BTreeSet<NodeId> = stale_nodes(&view, &liveness, now).into_iter().collect();
         assert!(stale.contains(&schedulable_stale));

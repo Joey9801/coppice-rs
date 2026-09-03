@@ -20,7 +20,7 @@ use coppice_state::{
     AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
 
-use crate::{CoordinatorSummary, JobTimelineWindow, QueueWindow, UsageSnapshot};
+use crate::{CoordinatorSummary, JobTimelineWindow, LivenessMark, QueueWindow, UsageSnapshot};
 
 use super::dto;
 
@@ -30,13 +30,14 @@ use super::dto;
 /// the rate). The full retained hour still ships in `history`.
 const RATE_WINDOW_BUCKETS: usize = 10;
 
-/// How silent a node may be — measured against its last-heard wall stamp
-/// (`UsageSnapshot::heartbeats`) — before a read reports it `lost` rather
-/// than `healthy`. Matched to the coordinator's `AGENT_LIVENESS_DEADLINE`:
-/// the leader's health monitor declares `DeclareNodeLost` from the same
-/// marks at the same age, so the health a read derives is the verdict the
-/// monitor reaches (give or take a housekeeping tick).
-const HEARTBEAT_LIVENESS_HORIZON: Duration = Duration::from_secs(90);
+/// How silent a node may be — its monotonic `silent_for` in
+/// `UsageSnapshot::liveness` — before a read reports it `lost`. Matched to
+/// the coordinator's `AGENT_LIVENESS_DEADLINE`, comparison included (the
+/// monitor declares loss at *exactly* the deadline): the leader's health
+/// monitor proposes `DeclareNodeLost` from the same marks at the same span,
+/// so the health a read derives is the verdict the monitor reaches (give or
+/// take a housekeeping tick).
+const HEARTBEAT_LIVENESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[derive(Default)]
 struct NodeMemo {
@@ -72,24 +73,29 @@ fn build_node_memos(state: &StateMachine) -> BTreeMap<NodeId, NodeMemo> {
     memos
 }
 
-/// A node's health at read time, from the leader-local last-heard marks
-/// (`UsageSnapshot::heartbeats`): heard from within the horizon is
-/// `healthy`; tracked but silent past it is `lost` — the verdict the health
-/// monitor's `DeclareNodeLost` reaches from the same marks (the read may
-/// show it a housekeeping tick early, or keep showing it after the loss is
-/// applied, since `DeclareNodeLost` leaves no replicated flag to project);
-/// never heard from by this process is `unknown` rather than a fabricated
-/// `healthy` — which is every node when a follower serves the read, and a
-/// node still inside its seeded grace window after a leadership gain.
+/// A node's health at read time, from the leader's liveness marks for the
+/// term it leads (`UsageSnapshot::liveness`). The verdict reads only the
+/// mark's monotonic `silent_for`, never its wall stamp: silent for the
+/// deadline or longer is `lost` — the verdict the health monitor's
+/// `DeclareNodeLost` reaches from the same span (the read may show it a
+/// housekeeping tick early, or keep showing it after the loss is applied,
+/// since `DeclareNodeLost` leaves no replicated flag to project); heard
+/// from within it is `healthy`. `unknown` is the honest "nothing to judge
+/// by": no mark at all — every node when a follower serves the read — or a
+/// node still inside the grace window a new leader granted it, which is a
+/// courtesy of the monitor's, not a report.
 ///
 /// One function so the node views and the cluster's `lost` count can never
 /// disagree about what a node's health is.
-fn node_health(last_heartbeat: Option<Timestamp>, now: Timestamp) -> dto::NodeHealth {
-    match last_heartbeat {
-        // A stamp ahead of our clock reads as fresh, never as lost.
-        Some(at) if (now - at) <= HEARTBEAT_LIVENESS_HORIZON => dto::NodeHealth::Healthy,
-        Some(_) => dto::NodeHealth::Lost,
+fn node_health(mark: Option<&LivenessMark>) -> dto::NodeHealth {
+    match mark {
         None => dto::NodeHealth::Unknown,
+        Some(mark) if mark.silent_for >= HEARTBEAT_LIVENESS_DEADLINE => dto::NodeHealth::Lost,
+        Some(LivenessMark {
+            last_heartbeat: Some(_),
+            ..
+        }) => dto::NodeHealth::Healthy,
+        Some(_) => dto::NodeHealth::Unknown,
     }
 }
 
@@ -98,9 +104,8 @@ fn node_summary(
     record: &coppice_state::NodeRecord,
     memo: &NodeMemo,
     usage: &UsageSnapshot,
-    now: Timestamp,
 ) -> dto::NodeSummary {
-    let last_heartbeat = usage.heartbeats.get(node_id).copied();
+    let mark = usage.liveness.get(node_id);
     dto::NodeSummary {
         id: *node_id,
         capacity: (&record.node.capacity).into(),
@@ -113,21 +118,19 @@ fn node_summary(
             .map(|sample| (&sample.used).into()),
         labels: record.node.labels.clone(),
         schedulable: record.node.schedulable,
-        health: node_health(last_heartbeat, now),
+        health: node_health(mark),
         epoch: record.epoch,
-        last_heartbeat,
+        // The wall stamp is display-only: health above never reads it.
+        last_heartbeat: mark.and_then(|mark| mark.last_heartbeat),
         running_count: memo.running_count,
         accruing_count: memo.accruing_count,
     }
 }
 
-/// `GET /api/v1/nodes`. `now` is the reader's wall clock (never replicated),
-/// feeding only the heartbeat-age health derivation.
-pub fn list_nodes(
-    state: &StateMachine,
-    usage: &UsageSnapshot,
-    now: Timestamp,
-) -> dto::ListNodesResponse {
+/// `GET /api/v1/nodes`. Pure over the state and the leader's usage
+/// snapshot: node health comes from the snapshot's monotonic marks, so no
+/// reader clock is involved.
+pub fn list_nodes(state: &StateMachine, usage: &UsageSnapshot) -> dto::ListNodesResponse {
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
 
@@ -136,7 +139,7 @@ pub fn list_nodes(
         .iter()
         .map(|(id, record)| {
             let memo = memos.get(id).unwrap_or(&empty);
-            node_summary(id, record, memo, usage, now)
+            node_summary(id, record, memo, usage)
         })
         .collect();
 
@@ -147,14 +150,13 @@ pub fn get_node(
     state: &StateMachine,
     id: &NodeId,
     usage: &UsageSnapshot,
-    now: Timestamp,
 ) -> Option<dto::GetNodeResponse> {
     let record = state.nodes.get(id)?;
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
     let memo = memos.get(id).unwrap_or(&empty);
 
-    let summary = node_summary(id, record, memo, usage, now);
+    let summary = node_summary(id, record, memo, usage);
 
     let active_attempts = state
         .attempts
@@ -218,7 +220,7 @@ pub fn cluster_overview(
     dto::GetClusterOverviewResponse {
         cluster_id,
         queue: queue_stats(state, now, window),
-        capacity: cluster_capacity(state, usage, now),
+        capacity: cluster_capacity(state, usage),
     }
 }
 
@@ -244,11 +246,7 @@ pub fn job_timeline(window: &JobTimelineWindow) -> dto::GetJobTimelineResponse {
     }
 }
 
-fn cluster_capacity(
-    state: &StateMachine,
-    usage: &UsageSnapshot,
-    now: Timestamp,
-) -> dto::ClusterCapacity {
+fn cluster_capacity(state: &StateMachine, usage: &UsageSnapshot) -> dto::ClusterCapacity {
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
 
@@ -264,7 +262,7 @@ fn cluster_capacity(
         nodes.total += 1;
         // A lost node's capacity is not the cluster's to schedule against, so
         // it is excluded from the total rather than counted and discounted.
-        if node_health(usage.heartbeats.get(id).copied(), now) == dto::NodeHealth::Lost {
+        if node_health(usage.liveness.get(id)) == dto::NodeHealth::Lost {
             nodes.lost += 1;
         } else {
             capacity = capacity.saturating_add(&record.node.capacity);
@@ -1492,7 +1490,7 @@ mod tests {
     #[test]
     fn list_nodes_returns_empty_for_no_nodes() {
         let state = StateMachine::default();
-        let response = list_nodes(&state, &no_usage(), ts(0));
+        let response = list_nodes(&state, &no_usage());
         assert!(response.nodes.is_empty());
     }
 
@@ -1504,7 +1502,7 @@ mod tests {
         state.nodes.insert(n1, test_node(n1));
         state.nodes.insert(n2, test_node(n2));
 
-        let response = list_nodes(&state, &no_usage(), ts(0));
+        let response = list_nodes(&state, &no_usage());
         assert_eq!(response.nodes.len(), 2);
     }
 
@@ -1549,7 +1547,7 @@ mod tests {
             ),
         );
 
-        let response = list_nodes(&state, &no_usage(), ts(0));
+        let response = list_nodes(&state, &no_usage());
         assert_eq!(response.nodes.len(), 1);
         let summary = &response.nodes[0];
         assert_eq!(summary.running_count, 1);
@@ -1564,60 +1562,115 @@ mod tests {
         let mut state = StateMachine::default();
         state.nodes.insert(node, test_node(node));
 
-        let response = list_nodes(&state, &no_usage(), ts(0));
+        let response = list_nodes(&state, &no_usage());
         assert_eq!(response.nodes[0].health, dto::NodeHealth::Unknown);
         assert_eq!(response.nodes[0].last_heartbeat, None);
     }
 
-    /// The heartbeats a snapshot carries at fixture times, for the health
-    /// derivation tests.
-    fn heartbeats_at(marks: &[(NodeId, Timestamp)]) -> UsageSnapshot {
+    /// A snapshot carrying the given liveness marks, for the health
+    /// derivation tests: each is (node, wall stamp of its last report if
+    /// any, monotonic silence since its last report or grace grant).
+    fn liveness_of(marks: &[(NodeId, Option<Timestamp>, std::time::Duration)]) -> UsageSnapshot {
         UsageSnapshot {
-            heartbeats: marks.iter().copied().collect(),
+            liveness: marks
+                .iter()
+                .map(|(node, last_heartbeat, silent_for)| {
+                    (
+                        *node,
+                        LivenessMark {
+                            last_heartbeat: *last_heartbeat,
+                            silent_for: *silent_for,
+                        },
+                    )
+                })
+                .collect(),
             ..UsageSnapshot::default()
         }
     }
 
     #[test]
     fn node_health_and_last_heartbeat_derive_from_the_leaders_marks() {
-        let now = ts(1_000_000_000);
-        let (fresh, silent, unheard) = (NodeId::new(), NodeId::new(), NodeId::new());
+        let heard_at = ts(1_000_000_000);
+        let (fresh, silent, seeded, seeded_overdue, unheard) = (
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+            NodeId::new(),
+        );
         let mut state = StateMachine::default();
-        for id in [fresh, silent, unheard] {
+        for id in [fresh, silent, seeded, seeded_overdue, unheard] {
             state.nodes.insert(id, test_node(id));
         }
 
-        // Exactly at the horizon still counts (matching the monitor's "missed
-        // the deadline", not "reached it"); one microsecond past does not.
-        let at_horizon = now - HEARTBEAT_LIVENESS_HORIZON;
-        let past_horizon = at_horizon - Duration::from_micros(1);
-        let usage = heartbeats_at(&[(fresh, at_horizon), (silent, past_horizon)]);
+        // Silent for exactly the deadline is lost — the monitor's own
+        // comparison (`>=`), so a read never calls a node healthy that the
+        // monitor is declaring lost on the same tick; a nanosecond short of
+        // it is still healthy.
+        let just_inside = HEARTBEAT_LIVENESS_DEADLINE - std::time::Duration::from_nanos(1);
+        let usage = liveness_of(&[
+            (fresh, Some(heard_at), just_inside),
+            (silent, Some(heard_at), HEARTBEAT_LIVENESS_DEADLINE),
+            // Granted grace on leadership gain, no report yet: nothing to
+            // call healthy, but the grant does start the monitor's clock.
+            (seeded, None, just_inside),
+            (seeded_overdue, None, HEARTBEAT_LIVENESS_DEADLINE),
+        ]);
 
-        let by_id: BTreeMap<_, _> = list_nodes(&state, &usage, now)
+        let by_id: BTreeMap<_, _> = list_nodes(&state, &usage)
             .nodes
             .into_iter()
             .map(|n| (n.id, n))
             .collect();
 
         assert_eq!(by_id[&fresh].health, dto::NodeHealth::Healthy);
-        assert_eq!(by_id[&fresh].last_heartbeat, Some(at_horizon));
-        // The stale stamp is still served — its age is the whole story.
+        assert_eq!(by_id[&fresh].last_heartbeat, Some(heard_at));
+        // The stamp is still served — silence is the whole story for health.
         assert_eq!(by_id[&silent].health, dto::NodeHealth::Lost);
-        assert_eq!(by_id[&silent].last_heartbeat, Some(past_horizon));
+        assert_eq!(by_id[&silent].last_heartbeat, Some(heard_at));
+        assert_eq!(by_id[&seeded].health, dto::NodeHealth::Unknown);
+        assert_eq!(by_id[&seeded].last_heartbeat, None);
+        assert_eq!(by_id[&seeded_overdue].health, dto::NodeHealth::Lost);
+        assert_eq!(by_id[&seeded_overdue].last_heartbeat, None);
         assert_eq!(by_id[&unheard].health, dto::NodeHealth::Unknown);
         assert_eq!(by_id[&unheard].last_heartbeat, None);
     }
 
+    /// Health reads the monotonic silence and nothing else: a wall-clock
+    /// step in either direction moves the displayed stamp's apparent age,
+    /// never the verdict — which stays the monitor's.
     #[test]
-    fn a_heartbeat_stamped_ahead_of_our_clock_reads_healthy() {
-        let now = ts(1_000_000_000);
-        let node = NodeId::new();
+    fn health_ignores_the_wall_stamp_entirely() {
+        let (stepped_forward, stepped_back) = (NodeId::new(), NodeId::new());
         let mut state = StateMachine::default();
-        state.nodes.insert(node, test_node(node));
+        state
+            .nodes
+            .insert(stepped_forward, test_node(stepped_forward));
+        state.nodes.insert(stepped_back, test_node(stepped_back));
 
-        let usage = heartbeats_at(&[(node, now + Duration::from_secs(30))]);
-        let response = list_nodes(&state, &usage, now);
-        assert_eq!(response.nodes[0].health, dto::NodeHealth::Healthy);
+        let usage = liveness_of(&[
+            // Stamped an hour "ago" on the wall clock (the clock jumped
+            // forward), but heard from a second ago: healthy.
+            (
+                stepped_forward,
+                Some(ts(1_000_000_000) - Duration::from_secs(3600)),
+                std::time::Duration::from_secs(1),
+            ),
+            // Stamped in the wall clock's "future" (the clock jumped back),
+            // but silent past the deadline: lost.
+            (
+                stepped_back,
+                Some(ts(1_000_000_000) + Duration::from_secs(3600)),
+                HEARTBEAT_LIVENESS_DEADLINE + std::time::Duration::from_secs(1),
+            ),
+        ]);
+        let by_id: BTreeMap<_, _> = list_nodes(&state, &usage)
+            .nodes
+            .into_iter()
+            .map(|n| (n.id, n))
+            .collect();
+        assert_eq!(by_id[&stepped_forward].health, dto::NodeHealth::Healthy);
+        assert_eq!(by_id[&stepped_back].health, dto::NodeHealth::Lost);
     }
 
     /// A lost node leaves the cluster's schedulable capacity — the read-side
@@ -1639,11 +1692,12 @@ mod tests {
             test_allocation(alloc, job, attempt, lost, AllocationState::Active),
         );
 
-        let usage = heartbeats_at(&[
-            (live, now),
+        let usage = liveness_of(&[
+            (live, Some(now), std::time::Duration::from_secs(1)),
             (
                 lost,
-                now - HEARTBEAT_LIVENESS_HORIZON - Duration::from_secs(1),
+                Some(now),
+                HEARTBEAT_LIVENESS_DEADLINE + std::time::Duration::from_secs(1),
             ),
         ]);
         let capacity =
@@ -1661,7 +1715,7 @@ mod tests {
     #[test]
     fn get_node_returns_none_for_missing() {
         let state = StateMachine::default();
-        assert!(get_node(&state, &NodeId::new(), &no_usage(), ts(0)).is_none());
+        assert!(get_node(&state, &NodeId::new(), &no_usage()).is_none());
     }
 
     #[test]
@@ -1682,7 +1736,7 @@ mod tests {
             test_allocation(alloc, job, attempt, node, AllocationState::Active),
         );
 
-        let response = get_node(&state, &node, &no_usage(), ts(0)).unwrap();
+        let response = get_node(&state, &node, &no_usage()).unwrap();
         assert_eq!(response.active_attempts.len(), 1);
         assert_eq!(response.active_attempts[0].rate_ucu_per_second, 100);
         assert_eq!(response.active_attempts[0].outcome, None);
@@ -1811,7 +1865,7 @@ mod tests {
                 },
             )]),
             history: Default::default(),
-            heartbeats: Default::default(),
+            liveness: Default::default(),
             total_nodes: 2,
         };
         let capacity = cluster_overview(

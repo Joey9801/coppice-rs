@@ -57,13 +57,15 @@ impl From<&coppice_core::resource::Resources> for Resources {
     }
 }
 
-/// Liveness, derived at read time from the leader's heartbeat marks
-/// (ADR 0009) — the same marks its health monitor declares losses from.
-/// Heard from within the liveness deadline is `healthy`; tracked but silent
-/// past it is `lost`. `Unknown` is the honest "no marks to judge by": a
-/// follower serving the read (the marks are leader-local, like `used`), a
-/// leader no agent has reported to yet, or a node inside its seeded grace
-/// window after a leadership gain — never a fabricated `healthy`.
+/// Liveness, derived at read time from the leader's heartbeat marks for
+/// the term it currently leads (ADR 0009) — the same marks, on the same
+/// monotonic clock, its health monitor declares losses from. Heard from
+/// within the liveness deadline is `healthy`; tracked but silent for the
+/// deadline or longer is `lost`. `Unknown` is the honest "no marks to judge
+/// by": a follower or stepped-down replica serving the read (the marks are
+/// leader-local, like `used`), a leader no agent has reported to yet, or a
+/// node inside the grace window a new leader granted it — never a
+/// fabricated `healthy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeHealth {
@@ -254,9 +256,10 @@ pub struct NodeSummary {
     pub epoch: u64,
     /// Wall-clock stamp of the last report of any shape heard from this
     /// node's agent. Leader-local, like `used`: `null` on a follower, and on
-    /// a leader that has not heard from the node this process's lifetime —
+    /// a leader that has not heard from the node in the term it leads —
     /// never a fabricated stamp. No staleness cutoff: the stamp stays as it
-    /// ages (its age is what [`NodeHealth`] is derived from).
+    /// ages. Display only — [`NodeHealth`] is derived from the coordinator's
+    /// monotonic clock, so a wall-clock step never moves it.
     pub last_heartbeat: Option<Timestamp>,
     /// Attempts currently `Running` on this node.
     pub running_count: u32,

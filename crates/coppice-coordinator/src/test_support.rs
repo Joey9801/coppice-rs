@@ -168,8 +168,8 @@ pub struct FakeConsensus {
     // Retained so the status watch stays open for the lifetime of the fake:
     // the leader-only loops (`leadership::until_leadership_lost`) treat a
     // closed status watch as "leadership lost", so a dropped sender would end
-    // a drain loop before it processed anything.
-    _status_tx: watch::Sender<ConsensusStatus>,
+    // a drain loop before it processed anything. Also what `set_role` drives.
+    status_tx: watch::Sender<ConsensusStatus>,
     status_rx: watch::Receiver<ConsensusStatus>,
     views: StateViews,
     next_log_index: Mutex<u64>,
@@ -203,7 +203,7 @@ impl FakeConsensus {
         let consensus = FakeConsensus {
             outcome: Mutex::new(outcome),
             proposed: Mutex::new(Vec::new()),
-            _status_tx: status_tx,
+            status_tx,
             status_rx,
             views,
             next_log_index: Mutex::new(1),
@@ -218,6 +218,13 @@ impl FakeConsensus {
     /// loop proposed must not hold the lock the loop's next `propose` needs.
     pub fn proposed(&self) -> Vec<Command> {
         self.proposed.lock().unwrap().clone()
+    }
+
+    /// Publish a role change on the status watch, as a real replica does on
+    /// a leadership transition. `propose` keeps answering its canned outcome
+    /// — a test that needs the two to disagree is testing exactly that.
+    pub fn set_role(&self, role: Role) {
+        self.status_tx.send_modify(|status| status.role = role);
     }
 
     /// Pin the barrier [`Consensus::read_index`] returns (defaults to 0).
