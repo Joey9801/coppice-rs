@@ -46,9 +46,9 @@ pub struct Node {
 pub struct HostFacts {
     /// Operating system family, e.g. `linux`, `macos`.
     pub os: String,
-    /// Human-readable OS release (`PRETTY_NAME`, `kern.osproductversion`).
+    /// Human-readable OS release, including a family label when available.
     pub os_version: String,
-    /// Kernel release string, as `uname -r` prints it.
+    /// Human-readable kernel release, including a family label when available.
     pub kernel_version: String,
     /// CPU architecture, e.g. `x86_64`, `aarch64`.
     pub arch: String,
@@ -65,4 +65,150 @@ pub struct HostFacts {
     pub total_disk_bytes: u64,
     /// The agent binary's own version.
     pub agent_version: String,
+}
+
+impl HostFacts {
+    /// Add an OS or kernel family label when a release is otherwise only a
+    /// bare version number.
+    ///
+    /// New agents call this before registration. The operation is also safe
+    /// for older persisted values, so read paths can use it to present one
+    /// consistent contract without changing the stored record in place.
+    pub fn normalize_versions(&mut self) {
+        self.os_version = normalize_os_version(&self.os, &self.os_version);
+        self.kernel_version = normalize_kernel_version(&self.os, &self.kernel_version);
+    }
+}
+
+fn normalize_os_version(os: &str, value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() || os.trim().eq_ignore_ascii_case("linux") {
+        return value.to_string();
+    }
+
+    match os_label(os) {
+        Some(label) => prefix_if_missing(value, label),
+        None => value.to_string(),
+    }
+}
+
+fn normalize_kernel_version(os: &str, value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+
+    match kernel_label(os) {
+        Some(label) => prefix_if_missing(value, label),
+        None => value.to_string(),
+    }
+}
+
+fn os_label(os: &str) -> Option<&'static str> {
+    match os.trim().to_ascii_lowercase().as_str() {
+        "macos" | "darwin" => Some("macOS"),
+        "linux" => Some("Linux"),
+        "android" => Some("Android"),
+        "freebsd" => Some("FreeBSD"),
+        "openbsd" => Some("OpenBSD"),
+        "netbsd" => Some("NetBSD"),
+        "dragonfly" => Some("DragonFly BSD"),
+        "solaris" => Some("Solaris"),
+        "illumos" => Some("illumos"),
+        "aix" => Some("AIX"),
+        "ios" => Some("iOS"),
+        _ => None,
+    }
+}
+
+fn kernel_label(os: &str) -> Option<&'static str> {
+    match os.trim().to_ascii_lowercase().as_str() {
+        "macos" | "darwin" | "ios" => Some("Darwin"),
+        "android" => Some("Linux"),
+        "solaris" => Some("SunOS"),
+        _ => os_label(os),
+    }
+}
+
+fn prefix_if_missing(value: &str, prefix: &str) -> String {
+    if has_prefix(value, prefix) {
+        value.to_string()
+    } else {
+        format!("{prefix} {value}")
+    }
+}
+
+fn has_prefix(value: &str, prefix: &str) -> bool {
+    let Some(head) = value.get(..prefix.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(prefix) {
+        return false;
+    }
+
+    match value[prefix.len()..].chars().next() {
+        None => true,
+        Some(ch) => ch.is_whitespace(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostFacts;
+
+    fn versions(os: &str, os_version: &str, kernel_version: &str) -> (String, String) {
+        let mut facts = HostFacts {
+            os: os.into(),
+            os_version: os_version.into(),
+            kernel_version: kernel_version.into(),
+            ..HostFacts::default()
+        };
+        facts.normalize_versions();
+        (facts.os_version, facts.kernel_version)
+    }
+
+    #[test]
+    fn normalizes_mac_os_and_kernel_versions() {
+        assert_eq!(
+            versions("macos", "15.5", "24.5.0"),
+            ("macOS 15.5".into(), "Darwin 24.5.0".into())
+        );
+    }
+
+    #[test]
+    fn preserves_already_labeled_and_linux_pretty_names() {
+        assert_eq!(
+            versions("macos", "macOS 15.5", "Darwin 24.5.0"),
+            ("macOS 15.5".into(), "Darwin 24.5.0".into())
+        );
+        assert_eq!(
+            versions("linux", "Debian GNU/Linux 12 (bookworm)", "6.1.0-21-amd64"),
+            (
+                "Debian GNU/Linux 12 (bookworm)".into(),
+                "Linux 6.1.0-21-amd64".into()
+            )
+        );
+    }
+
+    #[test]
+    fn labels_other_supported_unix_families() {
+        assert_eq!(
+            versions("freebsd", "14.1-RELEASE", "14.1-RELEASE"),
+            ("FreeBSD 14.1-RELEASE".into(), "FreeBSD 14.1-RELEASE".into())
+        );
+        assert_eq!(
+            versions("solaris", "11.4", "5.11"),
+            ("Solaris 11.4".into(), "SunOS 5.11".into())
+        );
+        assert_eq!(versions("illumos", "", ""), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn missing_values_stay_missing_and_unknown_families_stay_unchanged() {
+        assert_eq!(versions("macos", "", "  "), (String::new(), String::new()));
+        assert_eq!(
+            versions("custom-unix", "7.2", "kernel-1"),
+            ("7.2".into(), "kernel-1".into())
+        );
+    }
 }

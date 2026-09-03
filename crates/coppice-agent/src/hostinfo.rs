@@ -61,6 +61,13 @@ pub fn collect(detected: &DetectedCapacity) -> HostFacts {
     #[cfg(target_os = "macos")]
     macos::fill(&mut facts);
 
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    unix::fill(&mut facts);
+
+    // Keep the wire values self-describing for every platform, while making
+    // this idempotent so older or partially labeled readings remain safe to
+    // pass through the same normalization at other boundaries.
+    facts.normalize_versions();
     facts
 }
 
@@ -245,6 +252,24 @@ mod macos {
     }
 }
 
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+mod unix {
+    use coppice_core::node::HostFacts;
+
+    /// Read the portable Unix kernel release when the platform has no
+    /// dedicated host-facts reader yet. A failed command leaves the reading
+    /// unknown, just like the platform-specific readers above.
+    pub(super) fn fill(facts: &mut HostFacts) {
+        match std::process::Command::new("uname").arg("-r").output() {
+            Ok(out) if out.status.success() => {
+                facts.kernel_version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+            Ok(out) => tracing::debug!(status = %out.status, "uname failed; no Unix kernel fact"),
+            Err(err) => tracing::debug!(error = %err, "running uname for Unix host facts"),
+        }
+    }
+}
+
 /// Fill the sysctl-sourced fields of `facts` from raw keyed `sysctl` output.
 ///
 /// Pulled out of the `macos` module so it is a pure function over an owned
@@ -269,6 +294,8 @@ fn fill_from_sysctl(facts: &mut coppice_core::node::HostFacts, raw: &str) {
     if let Ok(logical) = get("hw.logicalcpu").parse() {
         facts.logical_cores = logical;
     }
+
+    facts.normalize_versions();
 }
 
 /// Parse keyed `sysctl` output (`kern.osrelease: 24.5.0`) into a map.
@@ -388,11 +415,14 @@ mod tests {
                    hw.model: VirtualMac2,1\n\
                    hw.physicalcpu: 4\n\
                    hw.logicalcpu: 8\n";
-        let mut facts = coppice_core::node::HostFacts::default();
+        let mut facts = coppice_core::node::HostFacts {
+            os: "macos".into(),
+            ..coppice_core::node::HostFacts::default()
+        };
         fill_from_sysctl(&mut facts, raw);
 
-        assert_eq!(facts.os_version, "15.5");
-        assert_eq!(facts.kernel_version, "24.5.0");
+        assert_eq!(facts.os_version, "macOS 15.5");
+        assert_eq!(facts.kernel_version, "Darwin 24.5.0");
         // Falls back to the board id when the brand string is absent.
         assert_eq!(facts.cpu_model, "VirtualMac2,1");
         assert_eq!(facts.physical_cores, 4);

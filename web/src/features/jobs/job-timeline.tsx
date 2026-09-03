@@ -119,11 +119,11 @@ function eventSentence(event: TimelineEvent): ReactNode {
     case 'NodeEpochBumped':
       return (
         <>
-          Node <IdLink id={event.node} /> epoch bumped to <Mono>{event.epoch}</Mono>
+          Node <IdLink id={event.node} /> connection reset to generation <Mono>{event.epoch}</Mono>
         </>
       )
     case 'JobEvicted':
-      return 'Evicted from replicated state'
+      return 'Job history removed after retention expired'
     default:
       return 'Unknown event'
   }

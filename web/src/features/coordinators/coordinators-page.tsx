@@ -50,7 +50,7 @@ export function CoordinatorsPage() {
           <span>
             <span className="font-mono text-muted-foreground">{clusterId}</span>
             <span className="mx-1.5">·</span>
-            term {term.toLocaleString()}
+            election term {term.toLocaleString()}
           </span>
         }
       />
@@ -65,19 +65,20 @@ export function CoordinatorsPage() {
               <span className="text-red-600 dark:text-red-400">no leader</span>
             )
           }
-          hint={`term ${term.toLocaleString()}`}
+          hint={`election term ${term.toLocaleString()}`}
         />
         <StatTile
-          label="Committed index"
+          label="Committed position"
           value={knownCommitted.toLocaleString()}
           hint={
             <span className={cn(applyLagging && 'text-amber-600 dark:text-amber-400')}>
               applied {lastApplied.toLocaleString()}
+              {applyLagging ? ` (${(knownCommitted - lastApplied).toLocaleString()} behind)` : ''}
             </span>
           }
         />
         <StatTile
-          label="State version"
+          label="Applied updates"
           value={stateVersion.toLocaleString()}
           hint="commands applied"
         />
@@ -97,7 +98,7 @@ export function CoordinatorsPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>Replicated state</CardTitle>
+            <CardTitle>Cluster data</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
             <KeyValueGrid
@@ -108,13 +109,13 @@ export function CoordinatorsPage() {
                 { label: 'Nodes', value: stateCounts.nodes.toLocaleString() },
                 { label: 'Quota entities', value: stateCounts.quotaEntities.toLocaleString() },
                 { label: 'Last applied', value: lastApplied.toLocaleString() },
-                { label: 'Known committed', value: knownCommitted.toLocaleString() },
-                { label: 'State version', value: stateVersion.toLocaleString() },
+                { label: 'Committed position', value: knownCommitted.toLocaleString() },
+                { label: 'Applied updates', value: stateVersion.toLocaleString() },
               ]}
             />
             <p className="text-xs text-muted-foreground">
-              The state machine is deterministic — every replica applies the same command log;
-              version counts applied commands, distinct from the Raft log index.
+              Every coordinator keeps the same cluster data. Applied updates are counted separately
+              from the committed log position shown above.
             </p>
           </CardContent>
         </Card>
@@ -147,7 +148,8 @@ export function CoordinatorsPage() {
               ]}
             />
             <p className="text-xs text-muted-foreground">
-              Followers that fall behind the retained log receive this snapshot instead of replay.
+              A coordinator that falls behind can use this snapshot to catch up faster than
+              replaying every stored entry.
             </p>
           </CardContent>
         </Card>

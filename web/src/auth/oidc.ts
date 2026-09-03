@@ -30,8 +30,8 @@
  *   surfaces as a 401 and the centralized handler re-runs the flow.
  * - **Open mode is not a degraded OIDC mode.** `mode: "open"` means the
  *   deployment has no authentication at all; there is nothing to log into,
- *   so every login path is a no-op and the UI shows an insecure-deployment
- *   badge instead of auth chrome.
+ *   so every login path is a no-op and the UI shows a no-auth warning instead
+ *   of auth chrome.
  */
 
 /** Where the IdP redirects back to; must match the client's registered URI. */

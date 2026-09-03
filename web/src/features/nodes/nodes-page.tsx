@@ -2,7 +2,7 @@ import { useNavigate } from '@tanstack/react-router'
 import { Boxes } from 'lucide-react'
 import type { NodeSummary } from '@/api/types'
 import { useNodes } from '@/api/queries'
-import { formatBytes, formatCpu, formatPercent, resourceFractions } from '@/lib/format'
+import { formatPercent, resourceFractions } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { EmptyState, IdLink, PageHeader, StatePill, TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
@@ -18,6 +18,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { sortedLabels } from './lib'
+import { formatNodeCapacity } from './host-facts'
 
 export function NodesPage() {
   const { data: nodes, isPending, isError } = useNodes()
@@ -46,7 +47,7 @@ export function NodesPage() {
         </Card>
       ) : (
         <Card className="overflow-hidden">
-          <Table>
+          <Table className="min-w-max">
             <TableHeader>
               <TableRow>
                 <TableHead>Node</TableHead>
@@ -57,7 +58,7 @@ export function NodesPage() {
                 <TableHead className="w-40">Mem alloc</TableHead>
                 <TableHead className="text-right">Used CPU</TableHead>
                 <TableHead className="text-right">Run / Accr</TableHead>
-                <TableHead className="text-right">Epoch</TableHead>
+                <TableHead className="text-right">Generation</TableHead>
                 <TableHead className="text-right">Heartbeat</TableHead>
               </TableRow>
             </TableHeader>
@@ -123,7 +124,7 @@ function NodeRow({ node }: { node: NodeSummary }) {
         )}
       </TableCell>
       <TableCell className="whitespace-nowrap tabular-nums text-muted-foreground">
-        {formatCpu(node.capacity.cpuMillis)} · {formatBytes(node.capacity.memoryBytes)}
+        {formatNodeCapacity(node.capacity)}
       </TableCell>
       <TableCell>
         <MiniBar fraction={allocFrac.cpu} />

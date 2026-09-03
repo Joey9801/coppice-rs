@@ -45,9 +45,6 @@ export function CoordinatorLogsCard({ members, className }: CoordinatorLogsCardP
             ))}
           </Tabs>
         ) : null}
-        <p className="mt-3 text-xs text-muted-foreground">
-          Mock data — coordinator log shipping is not designed in the backend yet.
-        </p>
       </CardContent>
     </Card>
   )

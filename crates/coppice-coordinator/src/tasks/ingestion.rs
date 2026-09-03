@@ -308,7 +308,14 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
             // worth dropping a registration over: unknown fields are already
             // the zero value, and a `detected_capacity` that fails to convert
             // simply reads as "not detected".
-            let host_facts = reg.host_facts.clone().map(Into::into);
+            let host_facts = reg.host_facts.clone().map(Into::into).map(
+                |mut facts: coppice_core::node::HostFacts| {
+                    // Older agents sent bare macOS and Unix release values;
+                    // normalize them before the registration is persisted.
+                    facts.normalize_versions();
+                    facts
+                },
+            );
             let detected_capacity = reg
                 .detected_capacity
                 .clone()
@@ -782,7 +789,9 @@ mod tests {
             }],
             service_addr: Some("10.0.0.7:9443".into()),
             host_facts: Some(HostFacts {
-                os: "linux".into(),
+                os: "macos".into(),
+                os_version: "15.5".into(),
+                kernel_version: "24.5.0".into(),
                 cpu_model: "AMD EPYC 7763 64-Core Processor".into(),
                 physical_cores: 8,
                 ..Default::default()
@@ -806,6 +815,8 @@ mod tests {
                 let facts = rn.host_facts.as_ref().expect("host facts carried");
                 assert_eq!(facts.cpu_model, "AMD EPYC 7763 64-Core Processor");
                 assert_eq!(facts.physical_cores, 8);
+                assert_eq!(facts.os_version, "macOS 15.5");
+                assert_eq!(facts.kernel_version, "Darwin 24.5.0");
                 assert_eq!(rn.detected_capacity, Some(requested()));
             }
             other => panic!("expected RegisterNode, got {other:?}"),

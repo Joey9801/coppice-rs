@@ -14,7 +14,7 @@
  * In `mode: "open"` (an intentionally unauthenticated deployment, including
  * `coppice dev`) there is nothing to log into: the server answers every
  * request as the anonymous implicit admin, and the only auth chrome is the
- * insecure-deployment badge — no identity badge, since there is no identity
+ * no-auth badge — no identity badge, since there is no identity
  * (`./auth-chrome.tsx` owns that decision). Under `VITE_COPPICE_MOCK` the
  * mock client still answers "Demo User" with no coordinator at all.
  *

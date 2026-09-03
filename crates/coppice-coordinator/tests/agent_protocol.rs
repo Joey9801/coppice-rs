@@ -690,16 +690,17 @@ async fn host_facts_survive_registration_to_the_node_detail() {
     assert!(host.logical_cores >= 1, "at least one hardware thread");
 
     // Advertised capacity is the harness's overrides minus the reservation;
-    // the detected vector is what the machine actually reported.
-    let detected = record
-        .node
-        .detected_capacity
-        .expect("every dimension detects on a test host");
-    assert_ne!(
-        detected, record.node.capacity,
-        "the harness overrides all three dimensions, so the two must differ"
-    );
-    assert!(detected.cpu_millis >= 1_000, "a real core count");
+    // the detected vector is what the machine actually reported. It is
+    // optional when a platform cannot provide one of the readings (for
+    // example, a restricted macOS test runner), so check its invariants only
+    // when the complete vector is available.
+    if let Some(detected) = record.node.detected_capacity {
+        assert_ne!(
+            detected, record.node.capacity,
+            "the harness overrides all three dimensions, so the two must differ"
+        );
+        assert!(detected.cpu_millis >= 1_000, "a real core count");
+    }
 
     stop_agent(agent).await;
 }

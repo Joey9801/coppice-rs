@@ -38,7 +38,7 @@ export function JobAccrualPanel({ accrual }: { accrual: AccrualView }) {
         <p className="text-sm text-foreground">
           Accruing capacity on <IdLink id={allocation.node} /> — allocation{' '}
           <span className="font-mono text-xs">{shortId(allocation.id)}</span>{' '}
-          <StatePill state={allocation.state} />, commit seq{' '}
+          <StatePill state={allocation.state} />, funding sequence{' '}
           <span className="tabular-nums">{allocation.seq}</span>
         </p>
 

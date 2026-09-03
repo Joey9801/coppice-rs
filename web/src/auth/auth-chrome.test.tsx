@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { queryKeys } from '@/api/queries'
 import type { Session } from '@/api/types'
@@ -8,7 +8,7 @@ import { bootstrapAuth, resetAuthForTests } from './oidc'
 
 /**
  * How much auth chrome each posture gets. The rule this guards: an open
- * deployment shows the insecure-deployment badge and *nothing else* — no
+ * deployment shows the no-auth badge and *nothing else* — no
  * identity, because there is no identity, only the anonymous implicit admin
  * every request is answered as.
  */
@@ -62,23 +62,32 @@ afterEach(() => {
 })
 
 describe('AuthChrome', () => {
-  it('shows the insecure-deployment badge and no identity in open mode', async () => {
+  it('shows the no-auth badge and explains its access in open mode', async () => {
     stubAuthConfig('open')
     await bootstrapAuth()
 
     renderChrome()
 
-    expect(screen.getByText('Insecure deployment')).toBeInTheDocument()
+    const badge = screen.getByText('No auth configured')
+    expect(badge).toBeInTheDocument()
+    expect(badge).toHaveAttribute('tabindex', '0')
+    expect(badge).not.toHaveAttribute('title')
+    fireEvent.focus(badge)
+    await waitFor(() => {
+      expect(screen.getByRole('tooltip')).toHaveTextContent(
+        'Authentication is disabled; every request has administrative access.',
+      )
+    })
     expect(screen.queryByText(SESSION.name)).not.toBeInTheDocument()
   })
 
-  it('shows the identity and no insecure badge in oidc mode', async () => {
+  it('shows the identity without an auth-warning badge in oidc mode', async () => {
     stubAuthConfig('oidc')
     await bootstrapAuth()
 
     renderChrome()
 
     expect(screen.getByText(SESSION.name)).toBeInTheDocument()
-    expect(screen.queryByText('Insecure deployment')).not.toBeInTheDocument()
+    expect(screen.queryByText('No auth configured')).not.toBeInTheDocument()
   })
 })

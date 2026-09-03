@@ -44,7 +44,7 @@ function AppShell() {
         </nav>
         {import.meta.env.VITE_COPPICE_MOCK ? (
           <div className="mt-auto p-3 text-[11px] text-muted-foreground">
-            Serving mock data — no coordinator attached
+            Demo mode — showing sample data without a live coordinator
           </div>
         ) : null}
       </aside>
