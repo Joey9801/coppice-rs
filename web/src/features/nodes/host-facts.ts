@@ -1,5 +1,6 @@
 import type { HostFacts } from '@/api/types'
 
+// Keep this display fallback aligned with the canonical Rust labels in crates/coppice-core/src/node.rs.
 const OS_LABELS: Record<string, string> = {
   aix: 'AIX',
   android: 'Android',
@@ -18,7 +19,7 @@ const OS_LABELS: Record<string, string> = {
 /** Display a host OS value, including a family label for older bare readings. */
 export function formatHostOs(host: Pick<HostFacts, 'os' | 'osVersion'>): string | null {
   const value = host.osVersion.trim()
-  if (!value) return osLabel(host.os)
+  if (!value) return osLabel(host.os) ?? (host.os.trim() || null)
 
   // Linux PRETTY_NAME values are already the useful human-readable name
   // (for example, "Debian GNU/Linux 12 (bookworm)"); do not prefix them.

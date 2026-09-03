@@ -54,6 +54,6 @@ describe('host facts display', () => {
     expect(formatHostKernel(host({ os: 'windows', kernelVersion: '10.0.19045' }))).toBe(
       '10.0.19045',
     )
-    expect(formatHostOs(host({ os: 'windows', osVersion: '' }))).toBeNull()
+    expect(formatHostOs(host({ os: 'windows', osVersion: '' }))).toBe('windows')
   })
 })

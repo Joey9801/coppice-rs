@@ -553,16 +553,13 @@ function HistoryTable({ entries }: { entries: NodeHistoryEntry[] }) {
 }
 
 function LogsSection({ nodeId }: { nodeId: string }) {
-  const { data, isPending, isError } = useNodeLogs(nodeId)
+  const { data, isPending } = useNodeLogs(nodeId)
   return (
     <div className="space-y-2">
       <LogViewer entries={data?.entries ?? []} loading={isPending} />
       <p className="text-xs text-muted-foreground">
         Sample data — log collection is not available yet.
       </p>
-      {isError ? (
-        <p className="text-xs text-muted-foreground">Agent log collection is unavailable.</p>
-      ) : null}
     </div>
   )
 }
