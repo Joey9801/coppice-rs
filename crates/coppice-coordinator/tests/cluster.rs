@@ -254,6 +254,92 @@ async fn a_mid_join_newcomer_converges_via_the_new_leader_after_the_old_one_stop
     fleet.stop_all().await;
 }
 
+/// A graceful shutdown that catches an in-flight write which can never commit
+/// must still finish (issue #111).
+///
+/// The daemon's shutdown drains its serving surfaces before it shuts consensus
+/// down (`coordinator-runtime.md`, "Shutdown order"), and a drain waits for
+/// in-flight request handlers. But a handler parked on a consensus write is
+/// released by exactly one thing — the openraft shutdown that runs *after* the
+/// drain. So an unbounded drain is not a slow stop, it is a deadlock, and the
+/// only reason it is rare is that the write has to be un-committable at the
+/// instant the signal arrives. That is not a contrived state: it is what a
+/// leader stopped mid-membership-change looks like from the inside, which is
+/// how issue #111 burned a six-hour CI shard.
+///
+/// Staged rather than raced, because "the leader steps down holding a pending
+/// entry" is not an interleaving an external observer can schedule: killing
+/// two of three voters leaves the survivor leader with no quorum, so the one
+/// write left in flight through its API can never commit and never will.
+/// Every assertion here is about the *shutdown*, not the write — whose fate is
+/// legitimately unknown and is never inspected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_with_an_uncommittable_write_in_flight_still_shuts_down() {
+    init_tracing();
+    let ca = Ca::new();
+    let mut fleet = Fleet::new(3, &ca);
+    fleet.start_all();
+    // A submitted job needs a priority multiplier; a quota entity does not, so
+    // the fleet's ordinary seeding policy is enough for the write below.
+    fleet.init().await;
+    fleet.await_voters(3).await;
+
+    let leader_idx = fleet_leader_index(&fleet, 3).await;
+    let url = fleet.members[leader_idx].api("/api/v1/quota-entities");
+
+    // Take quorum away abruptly (no membership change, no graceful removal):
+    // the survivor keeps its seat and keeps accepting writes it can never
+    // commit — precisely the leader-side state a stopped-mid-join leader is in.
+    for (i, member) in fleet.members.iter_mut().enumerate() {
+        if i != leader_idx {
+            member.kill().await;
+        }
+    }
+
+    // One write, left parked inside the API server's request handler.
+    let inflight = tokio::spawn(async move {
+        let entity = QuotaEntityId::new();
+        reqwest::Client::new()
+            .post(&url)
+            .json(&serde_json::json!({
+                "entity": entity.to_string(),
+                "parent": null,
+                "name": "issue-111-uncommittable",
+                "quota_ucu": 1_000_000_000_000u64,
+            }))
+            .send()
+            .await
+    });
+
+    // Long enough for the request to reach the handler and park in the
+    // proposal, and to prove it is parked rather than already answered — a
+    // write that returned would stage nothing at all.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !inflight.is_finished(),
+        "the staged write must still be in flight when the daemon is stopped: \
+         a quorum-less leader must park it, not answer it"
+    );
+
+    // The assertion: the daemon stops. Not quickly — the drain deliberately
+    // gives in-flight work a real chance first — but finitely, on its own,
+    // with no external kill.
+    let started = Instant::now();
+    fleet.members[leader_idx]
+        .stop()
+        .await
+        .expect("the leader stops cleanly even with a write it can never commit");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "graceful shutdown took {elapsed:?}: the drain must be bounded, so an \
+         in-flight write that can never commit cannot hold the daemon open"
+    );
+
+    let _ = inflight.await;
+    fleet.stop_all().await;
+}
+
 /// `formed` answers shape, `?require=healthy` answers redundancy, and killing
 /// a voter must split them (ADR 0037 §9): the leader keeps reporting
 /// `formed: true` and its own plain `/readyz` stays 200, while the

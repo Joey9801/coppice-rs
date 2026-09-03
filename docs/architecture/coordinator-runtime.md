@@ -572,6 +572,19 @@ re-proposal by the new leader resolves deterministically (above).
    when the adapter drops the `mpsc(64)`;
 6. the storage layer flushes and closes.
 
+**Every drain step is bounded**, and the bound is correctness, not politeness.
+Steps 2-4 wait for in-flight handlers to finish, but a handler parked on a
+consensus write (`propose`, `change_membership`, a view wait) is released only
+by step 5 — so on a replica that cannot commit when the watch flips (quorum
+lost, leader unreachable), an unbounded drain is a deadlock, not a slow stop:
+the daemon never exits and `systemctl stop` hangs until `TimeoutStopSec`
+SIGKILLs it (issue #111). `runtime::run` therefore gives its whole task-join
+sequence one absolute deadline, `SHUTDOWN_DRAIN` (10 s), naming and dropping
+any task still running at it, and `bootstrap` bounds tonic's graceful shutdown
+of the raft/admin transport with `RAFT_SERVER_DRAIN` (5 s) before proceeding to
+step 5. Dropping such a request is safe: it is blocked on exactly the step the
+wait is delaying, and its caller retries against a coordinator that is still up.
+
 ## Traps appendix
 
 Each hazard and the by-construction reason it cannot bite:

@@ -154,6 +154,27 @@ const REPOINT_DEADLINE: Duration = Duration::from_secs(10);
 /// not itself load.
 const REPOINT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long a membership commit may block before the verb gives up and leaves
+/// the retry to its caller.
+///
+/// Every `change_membership` call below returns only once the configuration
+/// entry has committed *and* applied, so the window has to be generous: thirty
+/// seconds absorbs a legitimately slow joint commit on a starved host (a
+/// CPU-starved shard, a follower still catching up) without turning a slow
+/// cluster into a failed verb. It is short enough to matter for the opposite
+/// case: a leader that steps down with the entry still pending never answers
+/// that client write at all, so an unbounded await would hold the
+/// [`membership_change`](OpenraftConsensus::membership_change) mutex forever
+/// and block *every* subsequent membership mutation on this node — and a
+/// request handler parked there also pins the daemon's graceful-shutdown
+/// drain, which waits for in-flight handlers.
+///
+/// Giving up is safe because every membership verb is idempotent by contract
+/// (ADR 0037 §6): the caller's retry, arriving at whichever leader now exists,
+/// either observes the change already landed (and returns success) or
+/// re-proposes it there.
+const MEMBERSHIP_COMMIT_DEADLINE: Duration = Duration::from_secs(30);
+
 /// What [`Consensus::plan_promotion`] decided, before any key transfer or
 /// membership change happens (ADR 0037 §4/§7).
 ///
@@ -648,8 +669,21 @@ impl Consensus for OpenraftConsensus {
     ) -> Result<(), ConsensusError> {
         // Serialize with every other membership mutation (see
         // `membership_change`): the checks below and the change they guard
-        // must be one indivisible decision.
-        let _guard = self.membership_change.lock().await;
+        // must be one indivisible decision. Bounded by
+        // [`MEMBERSHIP_COMMIT_DEADLINE`], because the current holder may itself
+        // be parked on a commit that will never answer, and inheriting that
+        // wedge would strand this promotion — and the request handler running
+        // it — for as long as the process lives.
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_COMMIT_DEADLINE;
+        let Ok(_guard) = tokio::time::timeout_at(deadline, self.membership_change.lock()).await
+        else {
+            tracing::warn!(
+                node = promote,
+                "promotion commit gave up: another membership mutation held the lock for the \
+                 whole commit window (ADR 0037 §7)"
+            );
+            return Err(ConsensusError::MembershipInProgress);
+        };
 
         // Re-run the cheap gates: `plan_promotion` ran before the key
         // transfer, which is a network round-trip and a replicated write, so
@@ -701,11 +735,28 @@ impl Consensus for OpenraftConsensus {
         // `retain = false`: a voter dropped by the change is removed outright,
         // not demoted to learner — the departed node id is never reused
         // (ADR 0016).
-        self.raft
-            .change_membership(changes, false)
-            .await
-            .map(|_| ())
-            .map_err(map_client_write_error)
+        //
+        // The accepted write is bounded by the SAME absolute deadline as the
+        // acquisition above: openraft blocks here until the change commits and
+        // applies, and a leader that loses leadership with this entry pending
+        // never answers the write — which would hang the verb forever while it
+        // holds the membership mutex. On expiry the outcome is UNKNOWN (the
+        // entry may still commit later), which is exactly
+        // [`ConsensusError::Timeout`]'s contract for consensus writes; the
+        // learner's next poll re-plans against fresh membership, which is the
+        // repair (ADR 0037 §6: the verb is idempotent).
+        let write = self.raft.change_membership(changes, false);
+        match tokio::time::timeout_at(deadline, write).await {
+            Ok(outcome) => outcome.map(|_| ()).map_err(map_client_write_error),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    node = promote,
+                    "promotion commit gave up: the accepted membership change did not commit \
+                     within the commit window; its outcome is unknown (ADR 0037 §7)"
+                );
+                Err(ConsensusError::Timeout)
+            }
+        }
     }
 
     fn plan_replacement(
@@ -724,8 +775,21 @@ impl Consensus for OpenraftConsensus {
         // Serialize with every other membership mutation (see
         // `membership_change`), and re-run the full gate sequence: the plan
         // the caller acted on predates the key transfer, so nothing from it
-        // is trusted here.
-        let _guard = self.membership_change.lock().await;
+        // is trusted here. Bounded by [`MEMBERSHIP_COMMIT_DEADLINE`] for the
+        // same reason `commit_promotion` bounds it: the holder may be wedged on
+        // a commit no leader will ever answer, and waiting for that forever is
+        // how one stuck change becomes a permanently unmutatable membership.
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_COMMIT_DEADLINE;
+        let Ok(_guard) = tokio::time::timeout_at(deadline, self.membership_change.lock()).await
+        else {
+            tracing::warn!(
+                old,
+                new,
+                "voter replacement gave up: another membership mutation held the lock for the \
+                 whole commit window (ADR 0037 §7)"
+            );
+            return Err(ConsensusError::MembershipInProgress);
+        };
         if self.replacement_gates(old, new, false)? == ReplacementPlan::Settled {
             return Ok(());
         }
@@ -739,17 +803,47 @@ impl Consensus for OpenraftConsensus {
         // durable key receipt before this call — the continuing set holds the
         // signing key even when `old` was the last other holder (the
         // single-voter replacement case).
-        self.raft
-            .change_membership(ChangeMembers::ReplaceAllVoters(continuing), false)
-            .await
-            .map(|_| ())
-            .map_err(map_client_write_error)
+        //
+        // Bounded by the same absolute deadline as the acquisition above:
+        // openraft blocks until the joint change commits and applies, and a
+        // leader that steps down mid-change never answers this write at all. On
+        // expiry the outcome is UNKNOWN — the entry may still commit later —
+        // which is [`ConsensusError::Timeout`]'s contract, and the operator's
+        // retry against the new leader is the repair (the verb is idempotent
+        // per ADR 0037 §6: a replacement already landed returns `Settled`).
+        let write = self
+            .raft
+            .change_membership(ChangeMembers::ReplaceAllVoters(continuing), false);
+        match tokio::time::timeout_at(deadline, write).await {
+            Ok(outcome) => outcome.map(|_| ()).map_err(map_client_write_error),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    old,
+                    new,
+                    "voter replacement gave up: the accepted membership change did not commit \
+                     within the commit window; its outcome is unknown (ADR 0037 §7)"
+                );
+                Err(ConsensusError::Timeout)
+            }
+        }
     }
 
     async fn remove_node(&self, node: CoordinatorId) -> Result<(), ConsensusError> {
         // Serialize with every other membership mutation (see
-        // `membership_change`).
-        let _guard = self.membership_change.lock().await;
+        // `membership_change`), bounded by [`MEMBERSHIP_COMMIT_DEADLINE`]: the
+        // holder may be parked on a commit that never answers, and a removal
+        // that waits for that forever also pins the request handler that runs
+        // it.
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_COMMIT_DEADLINE;
+        let Ok(_guard) = tokio::time::timeout_at(deadline, self.membership_change.lock()).await
+        else {
+            tracing::warn!(
+                node,
+                "node removal gave up: another membership mutation held the lock for the whole \
+                 commit window (ADR 0037 §7)"
+            );
+            return Err(ConsensusError::MembershipInProgress);
+        };
 
         // ADR 0037 §6: a node that is already absent is the state the caller
         // asked for, so a retried removal succeeds instead of erroring.
@@ -782,21 +876,47 @@ impl Consensus for OpenraftConsensus {
             // from the node map), so no follow-up `RemoveNodes` is needed —
             // and the seat is gone outright rather than demoted to learner,
             // which is what "the departed node id is never reused" requires.
-            return self
+            //
+            // Bounded by the same absolute deadline as the acquisition above,
+            // for the reason spelled out on [`MEMBERSHIP_COMMIT_DEADLINE`]: an
+            // entry left pending by a leader that steps down is never answered,
+            // and a removal that outlives its own leader must not keep the
+            // membership mutex. On expiry the outcome is UNKNOWN, and the
+            // operator's retry is safe — a removal of an already-absent node
+            // returns `Ok` above (ADR 0037 §6).
+            let write = self
                 .raft
-                .change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([node])), false)
-                .await
-                .map(|_| ())
-                .map_err(map_client_write_error);
+                .change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([node])), false);
+            return match tokio::time::timeout_at(deadline, write).await {
+                Ok(outcome) => outcome.map(|_| ()).map_err(map_client_write_error),
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        node,
+                        "voter removal gave up: the accepted membership change did not commit \
+                         within the commit window; its outcome is unknown (ADR 0037 §7)"
+                    );
+                    Err(ConsensusError::Timeout)
+                }
+            };
         }
 
         // A learner: no voter-set change at all, so no key postcondition to
         // enforce. This is also the learner-GC task's removal path (§7).
-        self.raft
-            .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node])), false)
-            .await
-            .map(|_| ())
-            .map_err(map_client_write_error)
+        // Bounded like every other membership commit here.
+        let write = self
+            .raft
+            .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node])), false);
+        match tokio::time::timeout_at(deadline, write).await {
+            Ok(outcome) => outcome.map(|_| ()).map_err(map_client_write_error),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    node,
+                    "learner removal gave up: the accepted membership change did not commit \
+                     within the commit window; its outcome is unknown (ADR 0037 §7)"
+                );
+                Err(ConsensusError::Timeout)
+            }
+        }
     }
 
     fn learner_expiry(&self) -> Duration {
@@ -838,7 +958,21 @@ impl Consensus for OpenraftConsensus {
         // identity would orphan a live seat. Every check therefore re-runs
         // here, at the destructive point, under the same lock promotion
         // commits hold.
-        let _guard = self.membership_change.lock().await;
+        //
+        // Bounded by [`MEMBERSHIP_COMMIT_DEADLINE`], like every other holder of
+        // this mutex: GC is a background tick, so a reap that waits forever for
+        // a wedged holder would silently stop reaping altogether rather than
+        // failing this candidate and retrying on the next tick.
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_COMMIT_DEADLINE;
+        let Ok(_guard) = tokio::time::timeout_at(deadline, self.membership_change.lock()).await
+        else {
+            tracing::warn!(
+                node,
+                "learner-gc reap: another membership mutation held the lock for the whole commit \
+                 window; leaving the seat for the next tick (ADR 0037 §7)"
+            );
+            return Err(ConsensusError::MembershipInProgress);
+        };
 
         if self.member_address(node).is_none() {
             // Already gone (a crash between a prior reap's retirement and
@@ -865,7 +999,26 @@ impl Consensus for OpenraftConsensus {
         // removal is proposed, and a *rejected* retirement aborts the reap:
         // the seat is never released with its identity still re-admittable.
         if let Some(command) = retire {
-            let applied = <Self as Consensus>::propose(self, command).await?;
+            // Bounded by the same absolute deadline as the rest of the reap:
+            // this proposal is made while HOLDING the membership mutex, so an
+            // unanswerable client write here wedges every membership mutation
+            // on this leader just as surely as an unanswerable
+            // `change_membership` would. A retirement whose outcome is unknown
+            // is safe to abandon — the command is idempotent, and the next tick
+            // re-runs the whole sequence from the eligibility check.
+            let propose = <Self as Consensus>::propose(self, command);
+            let applied = match tokio::time::timeout_at(deadline, propose).await {
+                Ok(outcome) => outcome?,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        node,
+                        "learner-gc reap: retiring the machine binding did not commit within the \
+                         commit window; its outcome is unknown, leaving the seat in place \
+                         (ADR 0037 §7)"
+                    );
+                    return Err(ConsensusError::Timeout);
+                }
+            };
             if let Err(reason) = applied.outcome {
                 tracing::warn!(
                     node,
@@ -878,11 +1031,25 @@ impl Consensus for OpenraftConsensus {
         }
 
         if self.member_address(node).is_some() {
-            self.raft
-                .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node])), false)
-                .await
-                .map(|_| ())
-                .map_err(map_client_write_error)?;
+            // Bounded by the same absolute deadline (see
+            // [`MEMBERSHIP_COMMIT_DEADLINE`]): the retirement is already
+            // committed, so abandoning the removal leaves exactly the
+            // crash-shaped state the top of this function already handles — the
+            // binding is marked and the next tick completes the removal.
+            let write = self
+                .raft
+                .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node])), false);
+            match tokio::time::timeout_at(deadline, write).await {
+                Ok(outcome) => outcome.map(|_| ()).map_err(map_client_write_error)?,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        node,
+                        "learner-gc reap: the accepted removal did not commit within the commit \
+                         window; its outcome is unknown (ADR 0037 §7)"
+                    );
+                    return Err(ConsensusError::Timeout);
+                }
+            }
         }
         Ok(true)
     }

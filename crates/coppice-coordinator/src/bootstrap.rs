@@ -507,11 +507,23 @@ pub async fn run_with(
 
     tracing::info!("shutdown: stopping raft/admin transport (no new peer traffic)");
     let _ = raft_server_shutdown.send(());
-    match raft_server.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "shutdown: raft/admin server ended with an error"),
-        Err(e) => {
+    let raft_server_abort = raft_server.abort_handle();
+    match tokio::time::timeout(RAFT_SERVER_DRAIN, raft_server).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "shutdown: raft/admin server ended with an error")
+        }
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "shutdown: raft/admin server task did not join cleanly")
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?RAFT_SERVER_DRAIN,
+                "shutdown: raft/admin RPCs were still in flight at the deadline; dropping \
+                 them so consensus can shut down, which is what releases a handler parked \
+                 on a write"
+            );
+            raft_server_abort.abort();
         }
     }
 
@@ -1296,6 +1308,23 @@ impl ClosedSurface {
 /// How long in-flight pre-formation requests get to finish before the
 /// handover proceeds without them. See [`ClosedSurface::shutdown`].
 const CLOSED_SURFACE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long in-flight raft/admin RPCs get to finish before consensus is shut
+/// down without them.
+///
+/// [`CLOSED_SURFACE_DRAIN`]'s hazard, on the formed surface: tonic's graceful
+/// shutdown stops accepting immediately and then waits, without a deadline,
+/// for every open connection to close. The formed surface is worse than the
+/// pre-formation one, because its handlers can park on a consensus write
+/// (`ChangeMembership`, an admin proposal) and the only thing that releases
+/// such a handler is `handle.shutdown()` — the *next* statement. Waiting
+/// forever here is therefore a deadlock rather than a slow stop (issue #111):
+/// on a replica that has lost quorum the RPC never completes, and `systemctl
+/// stop` hangs until `TimeoutStopSec` SIGKILLs the daemon. An RPC still open
+/// at the deadline is blocked on exactly the step this wait is delaying, so it
+/// is dropped; its caller sees a broken connection and retries against a
+/// coordinator that is still up.
+const RAFT_SERVER_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Duplicate a bound listener's descriptor.
 ///

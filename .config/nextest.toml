@@ -34,6 +34,30 @@ not (
 )
 '''
 
+# Kill a wedged test instead of letting it run to the CI job limit.
+#
+# The fleet suites boot real multi-daemon fleets and then wait on real
+# surfaces — a daemon's graceful shutdown, a `/readyz` poll, an election. When
+# one of those never completes, the test is *hung*, not slow: no amount of
+# further waiting changes the outcome. Without a `terminate-after`, nextest
+# marks such a test SLOW every `period` and then waits for it forever, so the
+# whole shard burns to GitHub's 6h job limit and the job is killed from the
+# outside — which means no failure output, no backtrace, and nothing to
+# diagnose from. That is exactly what issue #111 cost: one wedged daemon
+# shutdown in `cluster`, six hours of a shard, and a log ending in SLOW lines.
+#
+# `period = "60s"` is nextest's own default (the SLOW markers in that job
+# ticked at 60s), so nothing about existing output changes; `terminate-after =
+# 5` is the new part, capping a wedge at five minutes of wall time. Five
+# minutes sits far above the slowest legitimate test in the workspace — the
+# longest fleet tests measure well under a minute, and the shard walls above
+# are the *sums* of dozens of them — while putting the cost of a hang at
+# something anyone can afford to re-run.
+#
+# Custom profiles inherit from profile.default, so this covers ci, heavy,
+# ci-full, and every ci-fleet-* shard with one setting.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # Assign the heavy tests to the rate-limited group.
 #
 # Custom profiles inherit from profile.default, including its overrides, so this
