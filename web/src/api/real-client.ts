@@ -74,11 +74,9 @@ type TrueUpKind = NonNullable<CostReport['trueUp']>['kind']
  *
  * A handful of `types.ts` fields have no source in the current wire
  * contract (documented inline at each call site, e.g. quota-entity SSO
- * `origin`/`principal`, per-member coordinator `host`/`lastSeen`, and the
- * `QueuePositionExplainer` ranking fields the server deliberately does not
- * compute — see `crates/coppice-api/src/http/dto.rs`). Those are filled
- * with an honest, documented default rather than left to crash; when the
- * server grows the data, only the mapping here needs to change.
+ * `origin`/`principal` and per-member coordinator `host`/`lastSeen`). Those
+ * are filled with an honest, documented default rather than left to crash;
+ * when the server grows the data, only the mapping here needs to change.
  */
 export function createRealClient(): CoppiceApi {
   return {
@@ -795,27 +793,15 @@ function orInfinity(n: number | null): number {
 }
 
 /**
- * The server deliberately omits `rank`/`queueDepth`/`score`/`wAge`/
- * `ageHorizonSeconds`/`ageBonus` (an O(queue) ranking scan the dto.rs
- * `QueuePositionExplainer` comment says was cut rather than served badly).
- * `types.ts` still requires them, so this fills the rankless fields with 0
- * (an honest "not computed", not a fabricated position) and computes
- * `score` from only the terms the server does provide (no age bonus).
+ * The server serves exactly the terms it can answer truthfully — priority
+ * multiplier, penalty chain/product, and age. It deliberately omits a
+ * literal queue position and the age-term inputs (`wAge`, the age horizon):
+ * ranking would mean an O(queue) scan per read, and those scoring knobs are
+ * scheduler-local, so a recomputed "score" would drift from what the
+ * scheduler actually applies. The type mirrors the wire one-to-one.
  */
 function mapQueuePositionExplainer(q: WireQueuePositionExplainer): QueuePositionExplainer {
   return {
-    rank: 0,
-    queueDepth: 0,
-    // `null` penalty_product means infinite (see `orInfinity`): the job's
-    // effective score is then 0 (multiplier / Infinity), the lowest
-    // priority, not the `q.multiplier` fallback used for the finite
-    // non-positive case (penalty_product not yet computed).
-    score:
-      q.penalty_product === null
-        ? 0
-        : q.penalty_product > 0
-          ? q.multiplier / q.penalty_product
-          : q.multiplier,
     multiplier: q.multiplier,
     penaltyChain: q.penalty_chain.map((p) => ({
       entity: p.entity,
@@ -827,9 +813,6 @@ function mapQueuePositionExplainer(q: WireQueuePositionExplainer): QueuePosition
     })),
     penaltyProduct: orInfinity(q.penalty_product),
     ageSeconds: q.age_seconds,
-    ageHorizonSeconds: 0,
-    wAge: 0,
-    ageBonus: 0,
   }
 }
 

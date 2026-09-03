@@ -11,40 +11,85 @@ import {
   TableRow,
 } from '@/components/ui/table'
 
-/** Trim to a few significant figures for the score arithmetic. */
+/** Trim to a few significant figures for the secondary score arithmetic. */
 function sig(n: number, digits = 4): string {
-  if (!Number.isFinite(n)) return '—'
+  if (!Number.isFinite(n)) return '∞'
   return Number(n.toPrecision(digits)).toString()
 }
 
-/** Why the job sits where it does in the queue (ADR 0021 effective score). */
+/**
+ * Why a queued job sits where it does, in operator terms.
+ *
+ * The scheduler ranks queued jobs by an effective score with three inputs:
+ * the job's priority class, the quota pressure along its entity path, and a
+ * small credit that grows as the job waits. This panel explains each input
+ * from the terms the server actually provides — it never shows a literal
+ * queue position or a "final" score, because the server does not compute
+ * one: ranking happens inside the scheduler pass, and the age term's weight
+ * is scheduler-local. The quotient below is the priority term only; raw
+ * arithmetic is secondary detail, not the headline.
+ */
 export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
+  const overQuota = queue.penaltyChain.filter((l) => l.overQuotaRatio > 1)
+  const pressure = queue.penaltyProduct
+
   return (
     <Card>
       <CardHeader className="p-4 pb-0">
-        <CardTitle className="text-sm">Queue position</CardTitle>
+        <CardTitle className="text-sm">Queue ranking</CardTitle>
       </CardHeader>
       <CardContent className="space-y-6 p-4">
-        <div className="flex items-baseline gap-2">
-          <span className="text-3xl font-semibold tabular-nums text-foreground">#{queue.rank}</span>
-          <span className="text-sm text-muted-foreground">of {queue.queueDepth} queued</span>
-        </div>
+        <p className="text-sm text-muted-foreground">
+          The scheduler admits queued jobs by <span className="text-foreground">priority</span>,
+          discounted by <span className="text-foreground">quota pressure</span> and lifted by a{' '}
+          <span className="text-foreground">waiting credit</span>. This is what it sees for this
+          job:
+        </p>
 
-        <div className="rounded-lg border bg-muted/30 p-4">
-          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 font-mono text-sm">
-            <span className="text-muted-foreground">score =</span>
-            <span title="priority multiplier">{sig(queue.multiplier)}</span>
-            <span className="text-muted-foreground">÷</span>
-            <span title="penalty product">{sig(queue.penaltyProduct)}</span>
-            <span className="text-muted-foreground">+</span>
-            <span title="age bonus">{sig(queue.ageBonus)}</span>
-            <span className="text-muted-foreground">=</span>
-            <span className="font-semibold text-foreground">{sig(queue.score)}</span>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div className="rounded-lg border bg-muted/30 p-3">
+            <div className="text-xs text-muted-foreground">Priority</div>
+            <div className="mt-1 text-lg font-semibold tabular-nums text-foreground">
+              ×{sig(queue.multiplier)}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              The job's priority class multiplies its ranking directly.
+            </p>
+          </div>
+          <div className="rounded-lg border bg-muted/30 p-3">
+            <div className="text-xs text-muted-foreground">Quota pressure</div>
+            <div
+              className={cn(
+                'mt-1 text-lg font-semibold tabular-nums',
+                pressure > 1 ? 'text-red-600 dark:text-red-400' : 'text-foreground',
+              )}
+            >
+              ÷{sig(pressure)}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {overQuota.length === 0
+                ? 'Every entity on the path is within quota — no discount.'
+                : overQuota.length === 1 && overQuota[0]
+                  ? `${overQuota[0].name} is over quota, discounting the ranking.`
+                  : `${overQuota.length} entities are over quota, discounting the ranking.`}
+            </p>
+          </div>
+          <div className="rounded-lg border bg-muted/30 p-3">
+            <div className="text-xs text-muted-foreground">Waiting</div>
+            <div className="mt-1 text-lg font-semibold tabular-nums text-foreground">
+              {formatDuration(queue.ageSeconds)}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Waiting jobs earn a growing credit, so even heavily discounted jobs eventually rank
+              first.
+            </p>
           </div>
         </div>
 
         <div>
-          <h3 className="mb-2 text-sm font-medium text-foreground">Penalty chain (leaf → root)</h3>
+          <h3 className="mb-2 text-sm font-medium text-foreground">
+            Quota pressure, entity by entity (leaf → root)
+          </h3>
           <div className="rounded-lg border">
             <Table>
               <TableHeader>
@@ -52,8 +97,8 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
                   <TableHead>Entity</TableHead>
                   <TableHead className="text-right">Usage</TableHead>
                   <TableHead className="text-right">Quota</TableHead>
-                  <TableHead className="text-right">Over quota</TableHead>
-                  <TableHead className="text-right">Penalty</TableHead>
+                  <TableHead className="text-right">Share of quota used</TableHead>
+                  <TableHead className="text-right">Ranking discount</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -82,18 +127,32 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
               </TableBody>
             </Table>
           </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Each entity's usage decays over time (a 24-hour half-life), so pressure fades as
+            finished work ages out of the window.
+          </p>
         </div>
 
-        <div className="space-y-1 text-sm">
-          <p className="text-foreground">
-            aged {formatDuration(queue.ageSeconds)} of {formatDuration(queue.ageHorizonSeconds)}{' '}
-            horizon · age credit +{sig(queue.ageBonus)}
+        <details className="text-sm">
+          <summary className="cursor-pointer text-muted-foreground">Score arithmetic</summary>
+          <div className="mt-2 rounded-lg border bg-muted/30 p-3 font-mono text-xs">
+            priority term = <span title="priority multiplier">{sig(queue.multiplier)}</span>
+            <span className="text-muted-foreground"> ÷ </span>
+            <span title="penalty product">{sig(pressure)}</span>
+            <span className="text-muted-foreground"> = </span>
+            <span className="font-semibold text-foreground">
+              {sig(queue.multiplier / pressure)}
+            </span>
+            <span className="text-muted-foreground">
+              {' '}
+              + waiting credit (computed by the scheduler)
+            </span>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            The scheduler ranks by this priority term plus a waiting credit it computes itself, so
+            the total is not shown here. Entities over quota divide the ranking; waiting adds to it.
           </p>
-          <p className="text-muted-foreground">
-            Queued jobs are ranked by this score; it improves as your entities' usage decays (24h
-            half-life) and as the job ages toward the horizon.
-          </p>
-        </div>
+        </details>
       </CardContent>
     </Card>
   )

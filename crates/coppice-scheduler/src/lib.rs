@@ -34,9 +34,11 @@ use coppice_state::command::{AllocationSpec, CommitPlacements, Placement};
 use coppice_state::StateMachine;
 
 mod engine;
+pub mod projection;
 pub mod score;
 
 pub use engine::HeuristicScheduler;
+pub use projection::projected_starts;
 
 /// Scheduler-side tuning knobs.
 ///

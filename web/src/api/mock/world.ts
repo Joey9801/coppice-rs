@@ -14,7 +14,7 @@
  *  - Σ funded over non-Released allocations on a node ≤ node capacity
  *  - a Running job has one current attempt Running + an Active allocation
  *  - Queued jobs hold no allocation; terminal jobs have an outcome + time
- *  - queue ranks are 1..depth, consistent with descending score
+ *  - admission picks the highest effective-score queued job (mock tickAdmissions)
  */
 
 import type {
@@ -550,7 +550,6 @@ export class MockWorld {
     this.seedCapacityHistory()
     this.seedUtilHistories()
     this.seedQuotaHistories()
-    this.recomputeQueueRanks()
   }
 
   /**
@@ -1384,7 +1383,6 @@ export class MockWorld {
     }
     this.lastTickUs = nowUs
     this.nowUs = nowUs
-    this.recomputeQueueRanks()
   }
 
   private tick(): void {
@@ -1842,17 +1840,6 @@ export class MockWorld {
     const ageUs = this.nowUs - job.submittedAtUs
     return this.multiplier(job.spec.priority) / penaltyProduct + (W_AGE * ageUs) / AGE_HORIZON_US
   }
-
-  private recomputeQueueRanks(): void {
-    const queued = [...this.jobs.values()].filter((j) => j.state.kind === 'Queued')
-    queued.sort((a, b) => this.score(b) - this.score(a))
-    this.queuedRank.clear()
-    queued.forEach((job, i) => this.queuedRank.set(job.id, i + 1))
-    this.queueDepth = queued.length
-  }
-
-  private queuedRank = new Map<string, number>()
-  private queueDepth = 0
 
   // ---- lookups -------------------------------------------------------------
 
@@ -2467,18 +2454,14 @@ export class MockWorld {
     const penaltyProduct = chain.reduce((p, c) => p * c.penalty, 1)
     const multiplier = this.multiplier(job.spec.priority)
     const ageUs = this.nowUs - job.submittedAtUs
-    const ageBonus = (W_AGE * ageUs) / AGE_HORIZON_US
+    // Same terms the server serves: the ranking inputs only — no literal
+    // queue position, and no age-term total (the scheduler composes that
+    // with its own `w_age`/horizon knobs; see types.ts).
     return {
-      rank: this.queuedRank.get(job.id) ?? 1,
-      queueDepth: this.queueDepth,
-      score: multiplier / penaltyProduct + ageBonus,
       multiplier,
       penaltyChain: chain,
       penaltyProduct,
       ageSeconds: secondsOf(ageUs),
-      ageHorizonSeconds: secondsOf(AGE_HORIZON_US),
-      wAge: W_AGE,
-      ageBonus,
     }
   }
 

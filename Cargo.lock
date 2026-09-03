@@ -1181,6 +1181,7 @@ dependencies = [
  "coppice-authn",
  "coppice-core",
  "coppice-enroll",
+ "coppice-scheduler",
  "coppice-state",
  "coppice-testkit",
  "coppice-tls",

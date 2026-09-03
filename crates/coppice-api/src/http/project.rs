@@ -11,13 +11,14 @@ use std::ops::Bound;
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
+use coppice_core::id::{AllocationId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::JobState;
 use coppice_core::quota::{self, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::{
-    AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, QUOTA_TREE_DEPTH_CAP,
+    AllocationRecord, AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine,
+    QUOTA_TREE_DEPTH_CAP,
 };
 
 use crate::{CoordinatorSummary, JobTimelineWindow, LivenessMark, QueueWindow, UsageSnapshot};
@@ -171,27 +172,14 @@ pub fn get_node(
         .map(|(_, ar)| attempt_view(ar))
         .collect();
 
+    let accrual_starts = coppice_scheduler::projected_starts(state);
     let accrual_queue = state
         .accrual_queue
         .iter()
         .filter(|((node, _), _)| *node == *id)
         .filter_map(|((_, _), alloc_id)| {
             let alloc_record = state.allocations.get(alloc_id)?;
-            let alloc = &alloc_record.allocation;
-            Some(dto::AccrualView {
-                allocation: dto::AllocationView {
-                    id: alloc.id,
-                    job: alloc.job,
-                    attempt: alloc.attempt,
-                    node: alloc.node,
-                    requested: (&alloc.requested).into(),
-                    funded: (&alloc.funded).into(),
-                    state: alloc.state.into(),
-                    seq: alloc_record.seq,
-                },
-                funded_fraction: funded_fraction(&alloc.funded, &alloc.requested),
-                projected_start: None,
-            })
+            Some(accrual_view(alloc_record, &accrual_starts))
         })
         .collect();
 
@@ -1034,16 +1022,21 @@ fn queue_explainer(
     })
 }
 
-/// The `accrual` field — `Some` only while the current attempt is `Accruing`,
-/// built from the attempt's allocation exactly as [`get_node`]'s accrual queue.
-fn job_accrual(state: &StateMachine, record: &JobRecord) -> Option<dto::AccrualView> {
-    let attempt = state.attempts.get(&record.state.attempt()?)?;
-    if !matches!(attempt.attempt.state, AttemptState::Accruing) {
-        return None;
-    }
-    let alloc_record = state.allocations.get(&attempt.attempt.allocation)?;
+/// The `AccrualView` for one accruing allocation — the one shape behind both
+/// the node detail's `accrual_queue` and the job detail's `accrual` field, so
+/// the two surfaces cannot disagree about the same allocation.
+///
+/// `projected_start` comes from the scheduler's read projection
+/// ([`coppice_scheduler::projected_starts`]): the same guaranteed-release
+/// sweep (ADR 0014/0027) the scheduling pass runs at its start, recomputed
+/// here from committed state — `None` stays the honest "unbounded", never a
+/// fabricated time.
+fn accrual_view(
+    alloc_record: &AllocationRecord,
+    starts: &BTreeMap<AllocationId, Option<Timestamp>>,
+) -> dto::AccrualView {
     let alloc = &alloc_record.allocation;
-    Some(dto::AccrualView {
+    dto::AccrualView {
         allocation: dto::AllocationView {
             id: alloc.id,
             job: alloc.job,
@@ -1055,8 +1048,20 @@ fn job_accrual(state: &StateMachine, record: &JobRecord) -> Option<dto::AccrualV
             seq: alloc_record.seq,
         },
         funded_fraction: funded_fraction(&alloc.funded, &alloc.requested),
-        projected_start: None,
-    })
+        projected_start: starts.get(&alloc.id).copied().flatten(),
+    }
+}
+
+/// The `accrual` field — `Some` only while the current attempt is `Accruing`,
+/// built from the attempt's allocation exactly as [`get_node`]'s accrual queue.
+fn job_accrual(state: &StateMachine, record: &JobRecord) -> Option<dto::AccrualView> {
+    let attempt = state.attempts.get(&record.state.attempt()?)?;
+    if !matches!(attempt.attempt.state, AttemptState::Accruing) {
+        return None;
+    }
+    let alloc_record = state.allocations.get(&attempt.attempt.allocation)?;
+    let starts = coppice_scheduler::projected_starts(state);
+    Some(accrual_view(alloc_record, &starts))
 }
 
 /// The `state_since` approximation — see the doc on [`dto::JobDetail::state_since`].
@@ -2967,6 +2972,109 @@ mod tests {
         assert_eq!(detail.attempts.len(), 1);
         // Attempting, not queued: no queue explainer.
         assert!(detail.queue.is_none());
+    }
+
+    /// A node holding a bounded-or-unbounded runner (started at
+    /// `ts(1_000_000)`) and one accruing allocation queued behind it, plus
+    /// the ids the assertions read. The runner holds 3000 of the node's
+    /// 4000 cpu; the accrual holds the last 1000 and still needs 3000.
+    fn state_with_runner_and_accrual(
+        runner_max_runtime: Option<Duration>,
+    ) -> (StateMachine, NodeId, JobId, AllocationId) {
+        let node = NodeId::new();
+        let runner = job_id(1);
+        let waiter = job_id(2);
+        let runner_attempt = AttemptId::new();
+        let waiter_attempt = AttemptId::new();
+        let runner_alloc = AllocationId::new();
+        let waiter_alloc = AllocationId::new();
+        let start = ts(1_000_000);
+
+        let mut state = StateMachine::default();
+        state.nodes.insert(node, test_node(node));
+
+        let mut rec = test_job(runner, JobState::Attempting(runner_attempt), start);
+        rec.spec.max_runtime = runner_max_runtime;
+        rec.attempts = vec![runner_attempt];
+        state.jobs.insert(runner, rec);
+
+        let mut rec = test_job(waiter, JobState::Attempting(waiter_attempt), start);
+        rec.attempts = vec![waiter_attempt];
+        state.jobs.insert(waiter, rec);
+
+        let mut arec = test_attempt(runner_attempt, runner, node, AttemptState::Running);
+        arec.attempt.allocation = runner_alloc;
+        arec.started_at = Some(start);
+        state.attempts.insert(runner_attempt, arec);
+
+        let mut arec = test_attempt(waiter_attempt, waiter, node, AttemptState::Accruing);
+        arec.attempt.allocation = waiter_alloc;
+        arec.started_at = None;
+        state.attempts.insert(waiter_attempt, arec);
+
+        let mut r = test_allocation(
+            runner_alloc,
+            runner,
+            runner_attempt,
+            node,
+            AllocationState::Active,
+        );
+        r.allocation.requested.cpu_millis = 3000;
+        r.allocation.funded.cpu_millis = 3000;
+        r.seq = 0;
+        state.allocations.insert(runner_alloc, r);
+
+        let mut w = test_allocation(
+            waiter_alloc,
+            waiter,
+            waiter_attempt,
+            node,
+            AllocationState::Accruing,
+        );
+        w.allocation.requested.cpu_millis = 4000;
+        w.allocation.funded.cpu_millis = 1000;
+        w.seq = 1;
+        state.allocations.insert(waiter_alloc, w);
+        state.accrual_queue.insert((node, 1), waiter_alloc);
+
+        (state, node, waiter, waiter_alloc)
+    }
+
+    #[test]
+    fn accrual_projected_start_agrees_between_job_and_node_views() {
+        let (state, node, waiter, waiter_alloc) =
+            state_with_runner_and_accrual(Some(Duration::from_secs(3600)));
+        // The runner's guaranteed release at start + 3600 s frees exactly the
+        // accrual's remaining 3000 cpu.
+        let expected = Some(ts(1_000_000) + Duration::from_secs(3600));
+
+        let node_view = get_node(&state, &node, &no_usage()).unwrap();
+        assert_eq!(node_view.accrual_queue.len(), 1);
+        assert_eq!(node_view.accrual_queue[0].allocation.id, waiter_alloc);
+        assert_eq!(node_view.accrual_queue[0].projected_start, expected);
+
+        let job_view = get_job(&state, &waiter, ts(1_000_000)).unwrap();
+        let accrual = job_view.accrual.expect("accruing");
+        assert_eq!(accrual.allocation.id, waiter_alloc);
+        // The one answer, shown twice.
+        assert_eq!(accrual.projected_start, expected);
+        assert_eq!(
+            accrual.projected_start,
+            node_view.accrual_queue[0].projected_start
+        );
+    }
+
+    #[test]
+    fn accrual_projected_start_stays_unbounded_without_guaranteed_releases() {
+        // The runner declared no max_runtime: capacity frees only when apply
+        // observes it, so both views report the honest `None`.
+        let (state, node, waiter, _) = state_with_runner_and_accrual(None);
+
+        let node_view = get_node(&state, &node, &no_usage()).unwrap();
+        assert_eq!(node_view.accrual_queue[0].projected_start, None);
+
+        let job_view = get_job(&state, &waiter, ts(1_000_000)).unwrap();
+        assert_eq!(job_view.accrual.expect("accruing").projected_start, None);
     }
 
     // ---- quota entities ---------------------------------------------------

@@ -19,6 +19,11 @@ coppice-core.workspace = true
 # crate both this server and the enrolling daemons depend on, so the two halves
 # cannot drift.
 coppice-enroll.workspace = true
+# The read-model projections serve the scheduler's `projected_ready` bounds
+# (`AccrualView::projected_start`): recomputed at read time through the same
+# sweep the scheduling pass uses, so job and node views cannot drift from
+# scheduler semantics (ADR 0027).
+coppice-scheduler.workspace = true
 coppice-state.workspace = true
 # The `/metrics` endpoint (issue #46): renders the process's Prometheus
 # recorder. The facade for the same, so the test-only local recorder can be
