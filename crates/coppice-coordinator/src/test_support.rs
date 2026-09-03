@@ -69,6 +69,7 @@ pub fn attempt_record(
         rate_ucu_per_second: 0,
         multiplier: PriorityMultiplier(0),
         started_at,
+        ended_at: None,
     }
 }
 

@@ -1068,23 +1068,31 @@ export class MockWorld {
     for (let i = 0; i < target; i += 1) {
       const submittedAtUs = this.nowUs - this.rng.range(30 * SECOND_US, 15 * MINUTE_US)
       const job = this.newJob({ kind: 'Queued' }, submittedAtUs)
-      // Accrue against the node with the most headroom (partial funding).
-      const nodeId = this.pickAccrualNode(placeable, free)
+      // A job with free capacity lands `Ready` (fully funded, not started);
+      // one that must wait accrues against the node with the most headroom
+      // (partial funding) — both are pre-start, but they are different waits.
+      const nodeId = this.rng.bool(0.3)
+        ? this.findFit(job.spec.requests, free, placeable)
+        : this.pickAccrualNode(placeable, free)
       if (!nodeId) {
-        // Fall back to Queued if nothing can host an accrual (already set).
+        // Fall back to Queued if nothing can host it (already set).
         continue
       }
-      const attempt = this.newAttempt(job, nodeId, 'Accruing')
+      const ready = fitsRes(job.spec.requests, free.get(nodeId) ?? zeroRes())
+      const attempt = this.newAttempt(job, nodeId, ready ? 'Ready' : 'Accruing')
       attempt.startedAtUs = null
       // Charged in full at placement, even while still accruing capacity.
       attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
-      const frac = this.rng.range(0.2, 0.8)
-      const funded = this.clampFunded(scaleRes(job.spec.requests, frac), free.get(nodeId))
-      const alloc = this.newAlloc(job, attempt, nodeId, funded, 'Accruing')
+      const funded = ready
+        ? { ...job.spec.requests }
+        : this.clampFunded(scaleRes(job.spec.requests, this.rng.range(0.2, 0.8)), free.get(nodeId))
+      const alloc = this.newAlloc(job, attempt, nodeId, funded, ready ? 'Funded' : 'Accruing')
       job.state = { kind: 'Attempting', attempt: attempt.id }
-      job.projectedStartUs = this.rng.bool(0.75)
-        ? this.nowUs + this.rng.range(1 * MINUTE_US, 25 * MINUTE_US)
-        : null
+      job.projectedStartUs = ready
+        ? this.nowUs + this.rng.range(5 * SECOND_US, 2 * MINUTE_US)
+        : this.rng.bool(0.75)
+          ? this.nowUs + this.rng.range(1 * MINUTE_US, 25 * MINUTE_US)
+          : null
       const cur = free.get(nodeId)
       if (cur) free.set(nodeId, subRes(cur, alloc.funded))
     }
@@ -1115,24 +1123,58 @@ export class MockWorld {
       else state = { kind: 'Succeeded' }
       const job = this.newJob(state, submittedAtUs)
 
+      // Aborted jobs split across the three abort stories so each is
+      // inspectable in the UI: aborted while queued (never had an attempt),
+      // aborted while accruing (an attempt that ended without starting), and
+      // aborted after start (a ran-then-stopped attempt).
+      // Index-round-robin, not random: the seeded mix is small, so a random
+      // split could leave one of the three stories empty for a given seed.
+      const abortStory = state.kind === 'Aborted' ? i % 3 : 2
+      if (abortStory === 0) {
+        // Aborted while still queued: no attempt exists, so there is no
+        // attempt outcome to show — the abort request and the terminal time
+        // carry the whole story.
+        const abortedAtUs = submittedAtUs + this.rng.range(5 * SECOND_US, 10 * MINUTE_US)
+        job.terminalAtUs = abortedAtUs
+        job.abortRequested = {
+          reason: this.rng.pick(['user requested', 'superseded', 'cost cap', null]),
+          requestedAtUs: abortedAtUs,
+        }
+        continue
+      }
+
       const runForUs = this.rng.range(1 * MINUTE_US, 5 * HOUR_US)
       const startedAtUs = submittedAtUs + this.rng.range(2 * SECOND_US, 3 * MINUTE_US)
       const endedAtUs = Math.min(this.nowUs - MINUTE_US, startedAtUs + runForUs)
       job.terminalAtUs = endedAtUs
 
-      this.maybeAddRetries(job, startedAtUs)
+      if (abortStory !== 0) this.maybeAddRetries(job, startedAtUs)
 
       const node = this.rng.pick([...this.nodes.values()])
       const attempt = this.newAttempt(job, node.id, 'Terminal')
-      attempt.startedAtUs = startedAtUs
-      attempt.endedAtUs = endedAtUs
       attempt.outcome = this.finalOutcome(state, job)
       attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
-      this.seedUsage(attempt, job.spec.requests, startedAtUs, endedAtUs)
+      if (abortStory === 1) {
+        // Aborted while accruing: the attempt never started, so it ends
+        // without a start stamp and with a zero net charge (the real apply
+        // refunds an unstarted attempt's upfront charge in full).
+        attempt.startedAtUs = null
+        attempt.endedAtUs = endedAtUs
+        attempt.outcome = { kind: 'Aborted', class: 'UserRequest' }
+        job.abortRequested = {
+          reason: this.rng.pick(['user requested', 'superseded', 'cost cap', null]),
+          requestedAtUs: endedAtUs - this.rng.range(SECOND_US, 30 * SECOND_US),
+        }
+        job.actualUcu = 0
+        job.trueUp = { kind: 'Refund', amountUcu: attempt.chargedUcu }
+      } else {
+        attempt.startedAtUs = startedAtUs
+        attempt.endedAtUs = endedAtUs
+        this.seedUsage(attempt, job.spec.requests, startedAtUs, endedAtUs)
+        this.applyTrueUp(job, attempt, state)
+      }
       // Released allocation: recorded for history, excluded from capacity.
       this.newAlloc(job, attempt, node.id, { ...job.spec.requests }, 'Released')
-
-      this.applyTrueUp(job, attempt, state)
     }
   }
 
@@ -1188,7 +1230,13 @@ export class MockWorld {
       (attempt.endedAtUs ?? this.nowUs) - (attempt.startedAtUs ?? this.nowUs),
     )
     const unusedUs = Math.max(0, model.chargeWindowUs - ranUs)
-    const fraction = attempt.outcome?.class === 'Platform' ? 1 : model.refundFraction
+    // An attempt that never started refunds in full — the real apply's
+    // actual-cost-zero path — regardless of the job's declared refund
+    // fraction (which only retains cost the job actually incurred).
+    const fraction =
+      attempt.startedAtUs === null || attempt.outcome?.class === 'Platform'
+        ? 1
+        : model.refundFraction
     const refund = Math.min(
       charged,
       Math.round(model.effectiveRate * (unusedUs / SECOND_US) * fraction),
@@ -1485,9 +1533,28 @@ export class MockWorld {
     const free = this.nodeFreeCapacity()
     for (const job of this.jobs.values()) {
       const attempt = this.currentAttempt(job)
-      if (!attempt || attempt.state !== 'Accruing') continue
+      if (!attempt || (attempt.state !== 'Accruing' && attempt.state !== 'Ready')) continue
       const alloc = this.allocs.get(attempt.allocation)
-      if (!alloc || alloc.state !== 'Accruing') continue
+      if (!alloc || (alloc.state !== 'Accruing' && alloc.state !== 'Funded')) continue
+      // A `Ready` attempt is fully funded and waiting only for the agent
+      // roundtrip (dispatch → start report). A short dwell, then it runs.
+      if (attempt.state === 'Ready') {
+        if (this.rng.bool(0.15)) {
+          alloc.state = 'Active'
+          attempt.state = 'Running'
+          attempt.startedAtUs = this.nowUs
+          this.seedUsage(attempt, job.spec.requests, this.nowUs - SECOND_US, this.nowUs)
+          this.pushEvent({
+            atUs: this.nowUs,
+            kind: 'AttemptStateChanged',
+            attempt: attempt.id,
+            job: job.id,
+            node: alloc.node,
+            state: 'Running',
+          })
+        }
+        continue
+      }
       // A projection that has come and gone without funding was optimistic;
       // re-project the way a scheduler pass would recompute the bound.
       if (job.projectedStartUs !== null && job.projectedStartUs <= this.nowUs) {
@@ -1574,16 +1641,20 @@ export class MockWorld {
       }
       const placedNode = fitNode ?? accrualNode
       if (!placedNode) break
-      const attempt = this.newAttempt(job, placedNode, 'Accruing')
+      // Mirrors the real apply: with capacity immediately available the
+      // accrual is skipped and the attempt lands `Ready`/`Funded` (the
+      // start report flips it to `Running`); only a tight fit accrues.
+      const ready = fitNode !== null
+      const attempt = this.newAttempt(job, placedNode, ready ? 'Ready' : 'Accruing')
       // Placement charges the full window upfront (trued up at finalization).
       attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
-      const funded = fitNode
+      const funded = ready
         ? { ...job.spec.requests }
         : this.clampFunded(
             scaleRes(job.spec.requests, this.rng.range(0.15, 0.5)),
             free.get(placedNode),
           )
-      const alloc = this.newAlloc(job, attempt, placedNode, funded, 'Accruing')
+      const alloc = this.newAlloc(job, attempt, placedNode, funded, ready ? 'Funded' : 'Accruing')
       job.projectedStartUs = this.nowUs + this.rng.range(1 * MINUTE_US, 20 * MINUTE_US)
       this.transition(job, { kind: 'Attempting', attempt: attempt.id })
       counts.set(placedNode, (counts.get(placedNode) ?? 0) + 1)

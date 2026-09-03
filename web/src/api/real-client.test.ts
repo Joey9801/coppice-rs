@@ -383,6 +383,82 @@ describe('getJob queue explainer', () => {
   })
 })
 
+describe('getJob attempts', () => {
+  it('maps attempt started_at/ended_at to Dates, honestly absent when null', async () => {
+    const attempt = (overrides: Record<string, unknown>) => ({
+      id: 'attempt-00000000-0000-0000-0000-00000000000a',
+      job: 'job-00000000-0000-0000-0000-000000000001',
+      node: 'node-00000000-0000-0000-0000-000000000001',
+      allocation: 'alloc-00000000-0000-0000-0000-000000000001',
+      state: 'Terminal',
+      outcome: { kind: 'Exited', exit_code: 0, class: 'Success' },
+      started_at: '2026-01-01T00:01:00.000000Z',
+      ended_at: '2026-01-01T00:05:00.000000Z',
+      rate_ucu_per_second: 1,
+      charged_ucu: 240,
+      ...overrides,
+    })
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: 'job-00000000-0000-0000-0000-000000000001',
+        state: 'succeeded',
+        spec: {
+          image: 'busybox',
+          command: [],
+          entrypoint: null,
+          requests: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
+          priority: 0,
+          max_runtime_seconds: null,
+          quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
+          retry: { max_retries: 0, retry_user_errors: false },
+        },
+        submitted_at: '2026-01-01T00:00:00.000000Z',
+        state_since: '2026-01-01T00:05:00.000000Z',
+        terminal_at: '2026-01-01T00:05:00.000000Z',
+        retries_used: 0,
+        abort_requested: null,
+        entity_chain: [],
+        attempts: [
+          // A terminal attempt with both stamps.
+          attempt({}),
+          // A live attempt: no end yet — the field stays null on the wire,
+          // never a fabricated instant.
+          attempt({
+            id: 'attempt-00000000-0000-0000-0000-00000000000b',
+            state: 'Running',
+            outcome: null,
+            ended_at: null,
+          }),
+        ],
+        queue: null,
+        accrual: null,
+        cost: {
+          rate_ucu_per_second: 0,
+          rate_breakdown: { cpu: 0, memory: 0, disk: 0 },
+          priority_multiplier: 1,
+          unbounded_multiplier: 1,
+          effective_rate_ucu_per_second: 0,
+          charge_window_seconds: 0,
+          charge_window_is_default: true,
+          estimated_ucu: 0,
+          charged_ucu: 0,
+          refund_fraction: 0,
+          actual_ucu: null,
+          true_up: null,
+        },
+      }),
+    )
+    const client = createRealClient()
+    const job = await client.getJob('job-00000000-0000-0000-0000-000000000001')
+
+    const [ended, live] = job.attempts
+    expect(ended!.startedAt).toBeInstanceOf(Date)
+    expect(ended!.endedAt).toBeInstanceOf(Date)
+    expect(ended!.endedAt!.toISOString()).toBe('2026-01-01T00:05:00.000Z')
+    expect(live!.endedAt).toBeNull()
+  })
+})
+
 describe('error translation', () => {
   it('maps a wire error code to the matching ApiErrorCode', async () => {
     fetchMock.mockResolvedValueOnce(

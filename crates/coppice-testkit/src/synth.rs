@@ -578,7 +578,21 @@ fn build_attempt(
         job: ctx.job,
         allocation: allocation_id,
         node,
-        state: attempt_state,
+        state: attempt_state.clone(),
+    };
+    // Terminal attempts end at an authoritative stamp after their start (or,
+    // for ones that never started — aborted while accruing, revocations,
+    // pull/start failures — shortly after the charge): the same shape apply
+    // produces, so projections over synthetic state read like real state.
+    let ended_at = match attempt_state {
+        AttemptState::Terminal(_) => {
+            let end = match started_at {
+                None => charged_at + rand_span(rng, Duration::ZERO, Duration::from_mins(1)),
+                Some(s) => s + rand_span(rng, Duration::from_secs(1), Duration::from_mins(1)),
+            };
+            Some(end)
+        }
+        _ => None,
     };
     bufs.attempts.push((
         attempt_id,
@@ -594,6 +608,7 @@ fn build_attempt(
             rate_ucu_per_second: ctx.rate,
             multiplier: ctx.multiplier,
             started_at,
+            ended_at,
         },
     ));
     let allocation = Allocation {

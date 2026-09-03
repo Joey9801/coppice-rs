@@ -258,7 +258,8 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
 }
 
 function WhereCell({ job, phase }: { job: JobSummary; phase: JobPhase }) {
-  if (phase === 'Preparing' && job.fundingFraction != null) {
+  // Funding progress exists only while the attempt is accruing — its phase.
+  if (phase === 'Accruing' && job.fundingFraction != null) {
     return (
       <span className="tabular-nums text-amber-600 dark:text-amber-400">
         {formatPercent(job.fundingFraction)} funded

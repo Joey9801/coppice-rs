@@ -419,6 +419,7 @@ impl StateMachine {
                     rate_ucu_per_second: rate,
                     multiplier,
                     started_at: None,
+                    ended_at: None,
                 },
             );
             events.push(Event::AttemptStateChanged {
@@ -1528,6 +1529,16 @@ impl StateMachine {
         let multiplier = a.multiplier;
 
         self.attempt_transition(attempt, AttemptState::Terminal(outcome.clone()), events);
+        // The attempt's own end stamp, from the same `at` the true-up and the
+        // job resolution use — one replicated instant, never a reader's clock.
+        // Every path into here has already checked the attempt is non-terminal,
+        // but the field stays first-write-wins so a duplicate terminal command
+        // cannot move an end that has already been recorded.
+        if let Some(a) = self.attempts.get_mut(&attempt) {
+            if a.ended_at.is_none() {
+                a.ended_at = Some(at);
+            }
+        }
         self.release_allocation(allocation, pledge, events, used);
 
         // True-up (ADR 0019): an attempt that never reached Running has

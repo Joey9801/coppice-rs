@@ -24,6 +24,7 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { JobAccrualPanel } from './job-accrual-panel'
+import { attemptRuntimeSeconds } from './attempt-runtime'
 import { JobAttemptsCard } from './job-attempts-card'
 import { JobCostCard } from './job-cost-card'
 import { JobQueuePanel } from './job-queue-panel'
@@ -162,14 +163,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
 function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
   const lastAttempt = currentOrLastAttempt(job)
   const now = new Date()
-
-  const runtimeSeconds =
-    lastAttempt?.startedAt != null
-      ? Math.max(
-          0,
-          ((lastAttempt.endedAt ?? now).getTime() - lastAttempt.startedAt.getTime()) / 1000,
-        )
-      : null
+  const runtimeSeconds = attemptRuntimeSeconds(lastAttempt, now)
 
   // Cost lives entirely in the JobCostCard now — the tiles cover the rest of
   // the "how is it doing" story (state, runtime, retries).
@@ -181,7 +175,9 @@ function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
         value={runtimeSeconds != null ? formatDuration(runtimeSeconds) : '—'}
         hint={
           runtimeSeconds == null
-            ? 'not started'
+            ? lastAttempt?.state === 'Terminal' && lastAttempt.startedAt == null
+              ? 'never started'
+              : 'not started'
             : job.spec.maxRuntimeSeconds != null
               ? `limit ${formatDuration(job.spec.maxRuntimeSeconds)}`
               : 'no runtime limit'
@@ -219,14 +215,16 @@ function stateHint(job: JobDetail, phase: JobPhase, now: Date): ReactNode {
       return job.queue
         ? `#${job.queue.rank} of ${job.queue.queueDepth} in queue · waiting ${inState}`
         : `waiting ${inState}`
-    case 'Preparing': {
+    case 'Accruing': {
       if (job.accrual) {
         const f = job.accrual.fundedFraction
         const funded = Math.min(f.cpu, f.memory, f.disk)
         return `accruing capacity · ${formatPercent(funded)} funded · ${inState}`
       }
-      return `placing on a node · ${inState}`
+      return `waiting for capacity · ${inState}`
     }
+    case 'Preparing':
+      return `placing on a node · ${inState}`
     case 'Running':
       return `for ${inState}`
     case 'Finalizing':

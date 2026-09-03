@@ -77,6 +77,7 @@ impl From<&AttemptRecord> for pb::AttemptRecord {
             rate_ucu_per_second: r.rate_ucu_per_second,
             multiplier_q32_32: r.multiplier.0,
             started_at_us: r.started_at.map(|t| t.as_micros()),
+            ended_at_us: r.ended_at.map(|t| t.as_micros()),
         }
     }
 }
@@ -94,6 +95,10 @@ impl TryFrom<pb::AttemptRecord> for AttemptRecord {
             started_at: r
                 .started_at_us
                 .map(|us| timestamp(us, "AttemptRecord.started_at_us"))
+                .transpose()?,
+            ended_at: r
+                .ended_at_us
+                .map(|us| timestamp(us, "AttemptRecord.ended_at_us"))
                 .transpose()?,
         })
     }

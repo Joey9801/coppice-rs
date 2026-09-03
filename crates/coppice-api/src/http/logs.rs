@@ -779,6 +779,7 @@ mod tests {
             rate_ucu_per_second: 0,
             multiplier: PriorityMultiplier::ONE,
             started_at: started.then(|| ts(1000)),
+            ended_at: None,
         }
     }
 

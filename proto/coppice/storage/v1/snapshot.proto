@@ -140,6 +140,9 @@ message AttemptRecord {
   // Set when the attempt is observed Running; an attempt that never started
   // has actual cost zero at true-up.
   optional int64 started_at_us = 6;
+  // Set when the attempt reaches Terminal — the terminating command's
+  // proposer stamp. Absent while the attempt is live.
+  optional int64 ended_at_us = 7;
 }
 
 // An allocation's replicated record plus its commit-order sequence. Keyed

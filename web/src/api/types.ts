@@ -120,6 +120,7 @@ export type JobPhase =
   | 'Submitted'
   | 'Accepted'
   | 'Queued'
+  | 'Accruing'
   | 'Preparing'
   | 'Running'
   | 'Finalizing'
@@ -131,6 +132,7 @@ export const JOB_PHASES: readonly JobPhase[] = [
   'Submitted',
   'Accepted',
   'Queued',
+  'Accruing',
   'Preparing',
   'Running',
   'Finalizing',
@@ -144,14 +146,29 @@ export const TERMINAL_JOB_PHASES: readonly JobPhase[] = ['Succeeded', 'Failed', 
 /**
  * Join a job state with its current attempt's state (null when the job
  * carries no attempt, e.g. `Queued`) into the flat phase the UI shows.
- * `Accruing`/`Ready`/`Dispatching` all read as `Preparing` — the UI has
- * never distinguished them; a `Terminal` attempt means resolution is
- * completing in the same apply, which reads as `Finalizing` a beat longer.
+ *
+ * This is the ONE canonical phase derivation — every surface that colors,
+ * filters, or counts a job by phase renders its output, so no two surfaces
+ * can disagree about what an `Attempting` job is called. The lifecycle
+ * vocabulary, in order:
+ *
+ * - `Queued` — waiting, unpinned; no attempt exists yet.
+ * - `Accruing` — the attempt holds a partially funded allocation: it has a
+ *   node but has not started. A subset of queue depth (`queueStats.depth`
+ *   counts `Queued + Accruing`, and `queueStats.accruing` equals
+ *   `byState.Accruing`).
+ * - `Preparing` — the attempt is `Ready`/`Dispatching`: placed and fully
+ *   funded, awaiting the agent's start report. Kept separate from `Accruing`
+ *   so "where is my job" never folds two different waits into one label.
+ * - `Running`, `Finalizing` (the attempt is winding down or already
+ *   `Terminal` — resolution completes in the same apply), and the
+ *   pre-admission/terminal job states, all as named.
  */
 export function derivePhase(state: JobState, attemptState: AttemptState | null): JobPhase {
   if (state.kind !== 'Attempting') return state.kind
   switch (attemptState) {
     case 'Accruing':
+      return 'Accruing'
     case 'Ready':
     case 'Dispatching':
       return 'Preparing'
@@ -777,7 +794,9 @@ export interface QueueStats {
    */
   depth: number
   /**
-   * The subset of `depth` whose current attempt is `Accruing`. Note
+   * The subset of `depth` whose current attempt is `Accruing` — exactly
+   * `byState.Accruing`, carried as a separate field so the depth figure's
+   * composition is self-describing. Note
    * `drainRatePerMinute`/`arrivalRatePerMinute` are defined only on
    * `Queued` transitions (a job entering/leaving `Queued`), NOT on
    * `depth` itself — so a job opening an accrual (`Queued` → `Attempting`)

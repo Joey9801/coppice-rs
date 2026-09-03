@@ -390,7 +390,10 @@ pub(crate) fn queue_stats(
         // Waiting-for-capacity, not just `Queued`: an accruing job holds a
         // partial allocation and has not started (see `dto::QueueStats::depth`).
         // The two sets are disjoint — an accruing job is `Attempting`, never
-        // `Queued` — so this never double-counts.
+        // `Queued` — so this never double-counts. `accruing` is exactly
+        // `by_state[JobPhase::Accruing]`: the job_phase join and `is_accruing`
+        // read the same attempt state, so the breakdown can never disagree
+        // with the totals.
         depth: by_state[&dto::JobPhase::Queued] + accruing,
         accruing,
         drain_rate_per_minute: rates.drains_per_minute,
@@ -475,6 +478,13 @@ pub fn is_accruing(state: &StateMachine, record: &JobRecord) -> bool {
 
 /// The read-time join of a job's state with its attempt's (ADR 0030).
 ///
+/// The one canonical phase derivation: every surface that counts or colors a
+/// job by phase (overview `by_state`, entity stats, list filters, the job
+/// list/detail pills) calls this or its web mirror, so no two surfaces can
+/// disagree about what an `Attempting` job is called. `Accruing` and
+/// `Preparing` are deliberately separate phases — see the `JobPhase` doc for
+/// the vocabulary and the subset relationships (accruing ⊂ queue depth).
+///
 /// An `Attempting` job whose attempt is missing from the map cannot happen
 /// (apply mints the attempt in the same command), but it reads as
 /// `Finalizing` — the same as a `Terminal` attempt — rather than panicking on
@@ -491,9 +501,8 @@ fn job_phase(state: &StateMachine, record: &JobRecord) -> dto::JobPhase {
     };
 
     match state.attempts.get(&attempt).map(|ar| &ar.attempt.state) {
-        Some(AttemptState::Accruing | AttemptState::Ready | AttemptState::Dispatching) => {
-            dto::JobPhase::Preparing
-        }
+        Some(AttemptState::Accruing) => dto::JobPhase::Accruing,
+        Some(AttemptState::Ready | AttemptState::Dispatching) => dto::JobPhase::Preparing,
         Some(AttemptState::Running) => dto::JobPhase::Running,
         Some(AttemptState::Finalizing | AttemptState::Terminal(_)) | None => {
             dto::JobPhase::Finalizing
@@ -513,7 +522,7 @@ fn attempt_view(ar: &AttemptRecord) -> dto::AttemptView {
             _ => None,
         },
         started_at: ar.started_at,
-        ended_at: None,
+        ended_at: ar.ended_at,
         rate_ucu_per_second: ar.rate_ucu_per_second,
         charged_ucu: ar.charge.amount.0,
     }
@@ -1461,6 +1470,7 @@ mod tests {
             rate_ucu_per_second: 100,
             multiplier: PriorityMultiplier::ONE,
             started_at: Some(ts(1000)),
+            ended_at: None,
         }
     }
 
@@ -1862,6 +1872,122 @@ mod tests {
         assert!(response.queue.by_state.values().all(|count| *count == 0));
     }
 
+    /// Regression: the accruing/preparing split must reconcile. An accruing
+    /// attempt is its own `Accruing` phase — never folded into `Preparing` —
+    /// so `accruing == by_state[Accruing]`, `depth == by_state[Queued] +
+    /// accruing`, and no job is counted under two labels.
+    #[test]
+    fn accruing_and_preparing_phases_reconcile_in_the_overview() {
+        let mut state = StateMachine::default();
+        let entity = QuotaEntityId::new();
+
+        // Helper: a job in `Attempting(attempt)` whose attempt is in `state`.
+        let add_attempting = |state_map: &mut StateMachine,
+                              attempt: AttemptId,
+                              attempt_state: AttemptState,
+                              attempts_of_job: u32| {
+            let job = JobId::new();
+            let mut record = test_job(job, JobState::Attempting(attempt), ts(1_000));
+            record.spec.quota_entity = entity;
+            record.attempts = (0..attempts_of_job).map(|_| AttemptId::new()).collect();
+            record.attempts.push(attempt);
+            state_map.jobs.insert(job, record);
+            state_map.attempts.insert(
+                attempt,
+                test_attempt(attempt, job, NodeId::new(), attempt_state),
+            );
+        };
+
+        // 2 queued, 1 accruing, 1 ready (preparing), 1 running, 1 succeeded.
+        for _ in 0..2 {
+            let job = JobId::new();
+            let mut record = test_job(job, JobState::Queued, ts(1_000));
+            record.spec.quota_entity = entity;
+            state.jobs.insert(job, record);
+        }
+        add_attempting(&mut state, AttemptId::new(), AttemptState::Accruing, 0);
+        add_attempting(&mut state, AttemptId::new(), AttemptState::Ready, 0);
+        add_attempting(&mut state, AttemptId::new(), AttemptState::Running, 0);
+        let done = JobId::new();
+        state
+            .jobs
+            .insert(done, test_job(done, JobState::Succeeded, ts(1_000)));
+
+        let queue = overview(&state, ts(2_000)).queue;
+        assert_eq!(queue.by_state[&dto::JobPhase::Queued], 2);
+        assert_eq!(queue.by_state[&dto::JobPhase::Accruing], 1);
+        assert_eq!(queue.by_state[&dto::JobPhase::Preparing], 1);
+        assert_eq!(queue.by_state[&dto::JobPhase::Running], 1);
+        assert_eq!(queue.by_state[&dto::JobPhase::Succeeded], 1);
+        // The subset/aggregate identities hold exactly.
+        assert_eq!(queue.accruing, queue.by_state[&dto::JobPhase::Accruing]);
+        assert_eq!(
+            queue.depth,
+            queue.by_state[&dto::JobPhase::Queued] + queue.accruing
+        );
+        // The phase counts partition the jobs: nothing is double-counted.
+        let total: u32 = queue.by_state.values().sum();
+        assert_eq!(total, 6);
+        // Filters over the same derivation agree with the counts: the
+        // accruing job matches `phase: accruing` and not `preparing`.
+        let accruing_filter = dto::JobFilter::Phase(dto::PhaseFilter {
+            r#in: vec![dto::JobPhase::Accruing],
+        });
+        let preparing_filter = dto::JobFilter::Phase(dto::PhaseFilter {
+            r#in: vec![dto::JobPhase::Preparing],
+        });
+        assert_eq!(
+            list_jobs(&state, Some(&accruing_filter), None, 100)
+                .jobs
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_jobs(&state, Some(&preparing_filter), None, 100)
+                .jobs
+                .len(),
+            1
+        );
+    }
+
+    /// Regression: `AttemptView.ended_at` is the attempt's replicated end
+    /// stamp — set on terminal attempts, absent while live. Never fabricated.
+    #[test]
+    fn attempt_views_carry_the_replicated_ended_at() {
+        let mut state = StateMachine::default();
+        let job = JobId::new();
+        let live = AttemptId::new();
+        let ended = AttemptId::new();
+        let mut record = test_job(job, JobState::Queued, ts(1_000));
+        record.attempts = vec![live, ended];
+        state.jobs.insert(job, record);
+
+        state.attempts.insert(
+            live,
+            test_attempt(live, job, NodeId::new(), AttemptState::Running),
+        );
+        let mut terminal = test_attempt(
+            ended,
+            job,
+            NodeId::new(),
+            AttemptState::Terminal(coppice_core::attempt::AttemptOutcome::Exited { code: 0 }),
+        );
+        terminal.ended_at = Some(ts(9_000));
+        state.attempts.insert(ended, terminal);
+
+        let record = state.jobs.get_mut(&job).unwrap();
+        record.state = JobState::Attempting(live);
+
+        let detail = get_job(&state, &job, ts(10_000)).unwrap();
+        let by_id = |id| detail.attempts.iter().find(|a| a.id == id).unwrap();
+        assert_eq!(by_id(live).ended_at, None, "a live attempt has no end");
+        assert_eq!(
+            by_id(ended).ended_at,
+            Some(ts(9_000)),
+            "a terminal attempt carries its replicated end stamp"
+        );
+    }
+
     #[test]
     fn overview_sums_capacity_over_nodes_and_allocations() {
         let n1 = NodeId::new();
@@ -1979,12 +2105,15 @@ mod tests {
         let queue = overview(&state, ts(0)).queue;
 
         // `Attempting` is never reported raw: an accruing attempt reads as
-        // `Preparing`, a running one as `Running` (ADR 0030's read-time join).
+        // `Accruing`, a running one as `Running` (ADR 0030's read-time join).
+        // `Accruing` is its own phase — the overview's separate accruing count
+        // is exactly `by_state[Accruing]`, never a slice of `Preparing`.
         assert_eq!(queue.by_state[&dto::JobPhase::Queued], 1);
-        assert_eq!(queue.by_state[&dto::JobPhase::Preparing], 1);
+        assert_eq!(queue.by_state[&dto::JobPhase::Accruing], 1);
+        assert_eq!(queue.by_state[&dto::JobPhase::Preparing], 0);
         assert_eq!(queue.by_state[&dto::JobPhase::Running], 1);
-        // Depth spans both waiting sets: the queued job and the accruing one
-        // (which is `Preparing`, not `Queued`), each counted once.
+        // Depth spans both waiting sets: the queued job and the accruing one,
+        // each counted once.
         assert_eq!(queue.accruing, 1);
         assert_eq!(queue.depth, 2);
     }
