@@ -528,6 +528,18 @@ pub struct AttemptRecord {
     ///
     /// An attempt that never started has actual cost zero at true-up.
     pub started_at: Option<Timestamp>,
+    /// Set when the attempt reaches `Terminal` — the terminating command's
+    /// proposer stamp (`RecordAttemptOutcome.observed_at`, the abort's
+    /// `requested_at`, the revocation's `proposed_at`, the node loss's
+    /// `declared_at`). Absent while the attempt is live, and on a terminal
+    /// attempt only if the record predates the field (snapshot compatibility).
+    ///
+    /// Unlike a client-side guess, this is replicated state: it is the same
+    /// instant the true-up and the job resolution used, so an attempt's
+    /// `started_at..ended_at` span is exactly what it was charged for. An
+    /// attempt aborted before it ever started still carries it — that is what
+    /// distinguishes "ended without starting" from "never ended".
+    pub ended_at: Option<Timestamp>,
 }
 
 /// An allocation's replicated record plus its commit-order sequence.

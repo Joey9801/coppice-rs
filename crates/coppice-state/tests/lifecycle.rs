@@ -255,6 +255,124 @@ fn abort_while_accruing_releases_and_refunds() {
     assert_eq!(sm.quota_entities[&ROOT].usage.usage, usage_before_whale);
 }
 
+/// The terminal-attempt end stamp: every terminal attempt carries an
+/// authoritative `ended_at` (the terminating command's proposer stamp),
+/// started attempts get `started_at ≤ ended_at`, and an abort before the
+/// attempt ever started still ends the attempt — meaningfully — while an
+/// abort with no attempt at all means the job never left the queue.
+#[test]
+fn terminal_attempts_carry_an_ended_at_stamp() {
+    // Abort before start: the attempt accrues, never runs, and ends Aborted
+    // with a stamp but no start — "ended without starting", not "never ended".
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(8_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(8_000)),
+            base_ts(),
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), base_ts()));
+    apply_ok(&mut sm, started_cmd(aid(11), base_ts()));
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(2), cpu(10_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(2), aid(22), alid(222), nid(1), cpu(10_000)),
+            base_ts(),
+        ),
+    );
+    assert_eq!(sm.attempts[&aid(22)].attempt.state, AttemptState::Accruing);
+    apply_ok(&mut sm, abort_cmd(jid(2), ts(TS_US + 5)));
+    assert_eq!(sm.jobs[&jid(2)].state, JobState::Aborted);
+    let aborted = &sm.attempts[&aid(22)];
+    assert_eq!(
+        aborted.attempt.state,
+        AttemptState::Terminal(AttemptOutcome::Aborted)
+    );
+    assert_eq!(aborted.started_at, None);
+    assert_eq!(aborted.ended_at, Some(ts(TS_US + 5)));
+
+    // Abort after start: both stamps present and ordered.
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(3), cpu(1_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(3), aid(33), alid(333), nid(1), cpu(1_000)),
+            ts(TS_US + 6),
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(33), ts(TS_US + 6)));
+    apply_ok(&mut sm, started_cmd(aid(33), ts(TS_US + 7)));
+    apply_ok(&mut sm, abort_cmd(jid(3), ts(TS_US + 8)));
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(33), AttemptOutcome::Aborted, 2, ts(TS_US + 9)),
+    );
+    let aborted_after_start = &sm.attempts[&aid(33)];
+    assert_eq!(
+        aborted_after_start.attempt.state,
+        AttemptState::Terminal(AttemptOutcome::Aborted)
+    );
+    assert_eq!(aborted_after_start.started_at, Some(ts(TS_US + 7)));
+    assert_eq!(aborted_after_start.ended_at, Some(ts(TS_US + 9)));
+
+    // Natural exits stamp the end at the outcome report, success and failure
+    // alike.
+    for (n, code, expected) in [(4u128, 0i32, JobState::Succeeded), (5, 7, JobState::Failed)] {
+        let job = jid(n);
+        let attempt = aid(n * 11);
+        apply_ok(
+            &mut sm,
+            submit_cmd(job, cpu(1_000), Some(3_600), RetryPolicy::default()),
+        );
+        apply_ok(
+            &mut sm,
+            place_cmd(
+                placement(job, attempt, alid(n * 111), nid(1), cpu(1_000)),
+                ts(TS_US + 10),
+            ),
+        );
+        apply_ok(&mut sm, dispatch_cmd(attempt, ts(TS_US + 10)));
+        apply_ok(&mut sm, started_cmd(attempt, ts(TS_US + 11)));
+        apply_ok(&mut sm, exited_cmd(attempt, ts(TS_US + 70)));
+        apply_ok(
+            &mut sm,
+            outcome_cmd(attempt, AttemptOutcome::Exited { code }, 59, ts(TS_US + 71)),
+        );
+        assert_eq!(sm.jobs[&job].state, expected);
+        assert_eq!(sm.attempts[&attempt].started_at, Some(ts(TS_US + 11)));
+        assert_eq!(sm.attempts[&attempt].ended_at, Some(ts(TS_US + 71)));
+    }
+}
+
+/// An abort with no attempt is the queue-abort story: the job goes terminal
+/// immediately and no attempt (so no ended stamp) ever exists — the honest
+/// contrast to `terminal_attempts_carry_an_ended_at_stamp`'s abort-before-start.
+#[test]
+fn abort_while_queued_never_mints_an_attempt() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(&mut sm, abort_cmd(jid(1), ts(TS_US + 5)));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Aborted);
+    assert!(sm.attempts.is_empty());
+    assert!(sm.jobs[&jid(1)].terminal_at.is_some());
+    assert!(sm.jobs[&jid(1)].spec.abort_requested.is_some());
+}
+
 #[test]
 fn abort_while_running_signals_stop_and_truth_wins() {
     let mut sm = setup();

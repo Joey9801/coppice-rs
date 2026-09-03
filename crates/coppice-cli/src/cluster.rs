@@ -289,6 +289,7 @@ pub fn phase_label(phase: dto::JobPhase) -> &'static str {
         P::Submitted => "submitted",
         P::Accepted => "accepted",
         P::Queued => "queued",
+        P::Accruing => "accruing",
         P::Preparing => "preparing",
         P::Running => "running",
         P::Finalizing => "finalizing",

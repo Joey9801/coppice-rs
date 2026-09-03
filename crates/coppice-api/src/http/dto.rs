@@ -354,15 +354,31 @@ impl From<&coppice_core::node::HostFacts> for HostFacts {
 /// state machine stores `Attempting(attempt)` and the attempt's own state,
 /// and every UI surface that shows a single job status renders this join.
 ///
-/// `Accruing`/`Ready`/`Dispatching` all read as `Preparing`; a `Terminal`
-/// attempt under a still-`Attempting` job means resolution is completing in
-/// the same apply, which reads as `Finalizing`.
+/// The lifecycle vocabulary, in order:
+///
+/// - `Queued` — waiting, unpinned; no attempt exists yet.
+/// - `Accruing` — the current attempt holds a partially funded allocation;
+///   it has a node but has not started. A **subset of queue depth**: these
+///   jobs still wait for capacity, which is why [`QueueStats::depth`] counts
+///   `Queued + Accruing` and [`QueueStats::accruing`] equals
+///   `by_state[JobPhase::Accruing]` (kept as a separate field so depth's
+///   composition is self-describing).
+/// - `Preparing` — the current attempt is `Ready` or `Dispatching`: placed
+///   and fully funded, awaiting the agent's start report. Distinct from
+///   `Accruing` so "where is my job" never folds two different waits into
+///   one label.
+/// - `Running` — the current attempt is observed running.
+/// - `Finalizing` — the attempt is `Finalizing` or already `Terminal` (the
+///   resolution completes in the same apply, so this shows a beat longer).
+/// - `Submitted`/`Accepted` — pre-admission, and `Succeeded`/`Failed`/
+///   `Aborted` — terminal, all as named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobPhase {
     Submitted,
     Accepted,
     Queued,
+    Accruing,
     Preparing,
     Running,
     Finalizing,
@@ -375,10 +391,11 @@ impl JobPhase {
     /// Every phase, in lifecycle order. [`QueueStats::by_state`] reports a
     /// count for each one, so a caller never has to tell "zero" from
     /// "absent"; `Ord` follows this order, so the map iterates in it.
-    pub const ALL: [JobPhase; 9] = [
+    pub const ALL: [JobPhase; 10] = [
         JobPhase::Submitted,
         JobPhase::Accepted,
         JobPhase::Queued,
+        JobPhase::Accruing,
         JobPhase::Preparing,
         JobPhase::Running,
         JobPhase::Finalizing,
@@ -420,8 +437,9 @@ pub struct QueueStats {
     /// `by_state[JobPhase::Queued]`.
     pub depth: u32,
     /// The accruing part of [`depth`](Self::depth): jobs whose current attempt
-    /// is `Accruing` (a subset of `by_state[JobPhase::Preparing]`, since an
-    /// accruing attempt reads as `Preparing`).
+    /// is `Accruing`. Exactly `by_state[JobPhase::Accruing]` — a separate
+    /// field so the depth figure's composition is self-describing without a
+    /// client having to know the phase breakdown.
     pub accruing: u32,
     /// Jobs leaving / entering the queue per minute over the recent window
     /// (the newest derived buckets).
@@ -2339,8 +2357,10 @@ mod tests {
                 by_state: JobPhase::ALL
                     .iter()
                     .map(|phase| {
-                        let count =
-                            u32::from(matches!(phase, JobPhase::Queued | JobPhase::Preparing));
+                        let count = u32::from(matches!(
+                            phase,
+                            JobPhase::Queued | JobPhase::Accruing | JobPhase::Preparing
+                        ));
                         (*phase, count)
                     })
                     .collect(),
@@ -2410,6 +2430,7 @@ mod tests {
                         "submitted": 0,
                         "accepted": 0,
                         "queued": 1,
+                        "accruing": 1,
                         "preparing": 1,
                         "running": 0,
                         "finalizing": 0,

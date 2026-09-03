@@ -677,6 +677,7 @@ const JOB_PHASE_WIRE: Record<JobPhase, string> = {
   Submitted: 'submitted',
   Accepted: 'accepted',
   Queued: 'queued',
+  Accruing: 'accruing',
   Preparing: 'preparing',
   Running: 'running',
   Finalizing: 'finalizing',

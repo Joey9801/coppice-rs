@@ -86,7 +86,11 @@ export function OverviewPage() {
         <StatTile
           label="Running jobs"
           value={queue.byState.Running}
-          hint={`${queue.accruing} accruing / ${queue.byState.Preparing - queue.accruing} preparing`}
+          hint={
+            <>
+              {queue.accruing} accruing &middot; {queue.byState.Preparing} preparing
+            </>
+          }
         />
 
         <StatTile

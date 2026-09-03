@@ -44,13 +44,29 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
     const detail = world.buildJobDetail(summary.id)
     const terminal = isTerminalJobState(detail.state)
 
-    // Terminal jobs: outcome + terminalAt ≥ submittedAt.
+    // Terminal jobs: outcome + terminalAt ≥ submittedAt. The one honest
+    // exception: a job aborted while still queued never had an attempt, so
+    // there is no attempt outcome — only the abort request and terminal time.
     if (terminal) {
       expect(detail.terminalAt).not.toBeNull()
       expect(detail.terminalAt!.getTime()).toBeGreaterThanOrEqual(detail.submittedAt.getTime())
-      expect(summary.outcome).not.toBeNull()
+      if (detail.attempts.length > 0) expect(summary.outcome).not.toBeNull()
+      else expect(detail.state.kind).toBe('Aborted')
     } else {
       expect(detail.terminalAt).toBeNull()
+    }
+
+    // Attempt stamps: every terminal attempt carries an authoritative end;
+    // a start, when present, precedes it.
+    for (const attempt of detail.attempts) {
+      if (attempt.state === 'Terminal') {
+        expect(attempt.endedAt).not.toBeNull()
+        if (attempt.startedAt != null) {
+          expect(attempt.startedAt.getTime()).toBeLessThanOrEqual(attempt.endedAt!.getTime())
+        }
+      } else {
+        expect(attempt.endedAt).toBeNull()
+      }
     }
 
     // entityChain runs root → leaf, matches parent links, ends at the owner.
@@ -176,10 +192,51 @@ describe('MockWorld construction', () => {
     const stats = world.buildQueueStats()
     expect(stats.byState.Running).toBeGreaterThan(10)
     expect(stats.byState.Queued).toBeGreaterThan(5)
+    // Both pre-start phases are exercised: partially funded accruals and
+    // fully funded attempts awaiting their start report.
+    expect(stats.byState.Accruing).toBeGreaterThan(0)
     expect(stats.byState.Preparing).toBeGreaterThan(0)
     const terminal = stats.byState.Succeeded + stats.byState.Failed + stats.byState.Aborted
     expect(terminal).toBeGreaterThan(100)
     expect(stats.byState.Failed).toBeGreaterThan(0)
+  })
+
+  it('reconciles the accruing breakdown with the phase counts', () => {
+    const world = new MockWorld(NOW_US)
+    const stats = world.buildQueueStats()
+    // The separate accruing figure is exactly the Accruing phase's count —
+    // one derivation, no subtracted slices that can contradict each other.
+    expect(stats.accruing).toBe(stats.byState.Accruing)
+    expect(stats.depth).toBe(stats.byState.Queued + stats.accruing)
+  })
+
+  it('exercises all three abort stories', () => {
+    const world = new MockWorld(NOW_US)
+    const aborted = world.listJobs({ limit: 1000 }).jobs.filter((j) => j.state.kind === 'Aborted')
+    expect(aborted.length).toBeGreaterThan(0)
+
+    let abortedQueued = 0
+    let abortedBeforeStart = 0
+    let abortedAfterStart = 0
+    for (const summary of aborted) {
+      const detail = world.buildJobDetail(summary.id)
+      expect(detail.state.kind).toBe('Aborted')
+      expect(detail.abortRequested).not.toBeNull()
+      if (detail.attempts.length === 0) {
+        // Aborted while queued: no attempt, so no attempt outcome.
+        abortedQueued += 1
+      } else {
+        const attempt = detail.attempts[detail.attempts.length - 1]!
+        expect(attempt.state).toBe('Terminal')
+        expect(attempt.outcome?.kind).toBe('Aborted')
+        expect(attempt.endedAt).not.toBeNull()
+        if (attempt.startedAt == null) abortedBeforeStart += 1
+        else abortedAfterStart += 1
+      }
+    }
+    expect(abortedQueued).toBeGreaterThan(0)
+    expect(abortedBeforeStart).toBeGreaterThan(0)
+    expect(abortedAfterStart).toBeGreaterThan(0)
   })
 
   it('pre-seeds a full queue-stats history for sparklines', () => {
