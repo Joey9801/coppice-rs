@@ -73,6 +73,8 @@ export interface CapacitySeries {
   hasUsage: boolean
   /** At least one sample has no measured `used` (a gap the chart must show). */
   hasCoverageGap: boolean
+  /** At least one sample had allocation left over its measured usage. */
+  hasAllocatedUnused: boolean
   /** At least one sample measured more usage than was allocated. */
   hasOverAllocation: boolean
   /** At least one sample has capacity nobody has allocated. */
@@ -98,6 +100,7 @@ export function toCapacitySeries(
 ): CapacitySeries {
   let hasUsage = false
   let hasCoverageGap = false
+  let hasAllocatedUnused = false
   let hasOverAllocation = false
   let hasUnallocated = false
   let max = 0
@@ -121,6 +124,7 @@ export function toCapacitySeries(
     const committed = Math.max(allocated, used ?? allocated)
     const unallocatedCapacity = used === null ? null : Math.max(0, capacity - committed)
 
+    if (allocatedUnused !== null && allocatedUnused > 0) hasAllocatedUnused = true
     if (usedOverAllocated !== null && usedOverAllocated > 0) hasOverAllocation = true
     if (unallocatedCapacity !== null && unallocatedCapacity > 0) hasUnallocated = true
     max = Math.max(max, capacity, allocated, used ?? 0)
@@ -139,5 +143,13 @@ export function toCapacitySeries(
     }
   })
 
-  return { points, hasUsage, hasCoverageGap, hasOverAllocation, hasUnallocated, max }
+  return {
+    points,
+    hasUsage,
+    hasCoverageGap,
+    hasAllocatedUnused,
+    hasOverAllocation,
+    hasUnallocated,
+    max,
+  }
 }
