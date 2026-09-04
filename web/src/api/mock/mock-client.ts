@@ -59,7 +59,6 @@ export function createMockClient(): CoppiceApi {
     listNodes: () => settle(() => world.buildNodeSummaries()),
     getNode: (id: NodeId) => settle(() => world.buildNodeDetail(id)),
     getNodeUtilization: (id: NodeId) => settle(() => world.buildNodeUtilization(id)),
-    getNodeHistory: (id: NodeId) => settle(() => world.buildNodeHistory(id)),
     getNodeLogs: (id: NodeId, cursor: string | null) =>
       settle(() => world.buildNodeLogs(id, cursor)),
 

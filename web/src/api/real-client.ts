@@ -99,9 +99,6 @@ export function createRealClient(): CoppiceApi {
     getNode: (id) => getJson(`/nodes/${encodeURIComponent(id)}`, mapNodeDetail),
     getNodeUtilization: (id) =>
       getJson(`/nodes/${encodeURIComponent(id)}/utilization`, mapNodeUtilization),
-    getNodeHistory: () => {
-      throw new Error('getNodeHistory has no real implementation — route through the mock')
-    },
     getNodeLogs: () => {
       throw new Error('getNodeLogs has no real implementation — route through the mock')
     },

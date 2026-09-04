@@ -11,7 +11,6 @@ import type {
   ListJobsRequest,
   LogChunk,
   NodeDetail,
-  NodeHistoryEntry,
   NodeId,
   NodeSummary,
   NodeUtilization,
@@ -64,7 +63,6 @@ export interface CoppiceApi {
   listNodes(): Promise<NodeSummary[]>
   getNode(id: NodeId): Promise<NodeDetail>
   getNodeUtilization(id: NodeId): Promise<NodeUtilization>
-  getNodeHistory(id: NodeId): Promise<NodeHistoryEntry[]>
   getNodeLogs(id: NodeId, cursor: string | null): Promise<LogChunk>
 
   // Coordinators

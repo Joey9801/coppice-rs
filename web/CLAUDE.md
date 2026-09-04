@@ -40,7 +40,7 @@ All run from `web/`:
    `var(--chart-1..5)`), never raw palette classes like `bg-zinc-800`,
    so light and dark themes both work. Reusable primitives live in
    `src/components/ui/` (vendored shadcn/ui style); shared app widgets
-   (StatTile, ResourceBar, StatePill, IdLink, LogViewer, …) in
+   (StatTile, CapacityHistory, StatePill, IdLink, LogViewer, …) in
    `src/components/`. Look there before writing a new one.
 
 ## How to add a new page

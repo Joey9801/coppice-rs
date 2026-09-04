@@ -4,9 +4,9 @@ import { JOB_PHASES, type JobPhase } from '@/api/types'
 import { useClusterOverview } from '@/api/queries'
 import { formatDuration } from '@/lib/format'
 import {
+  CapacityHistory,
   EmptyState,
   PageHeader,
-  ResourceTriple,
   SparkLine,
   StatePill,
   StatTile,
@@ -14,8 +14,6 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
-import { CapacityChart } from './capacity-chart'
-import { capacityCoverageNote } from './capacity-coverage'
 import { QueueChart } from './queue-chart'
 
 /** `null` is a coverage gap (ADR 0032), rendered as absent — never `0.0`. */
@@ -47,7 +45,6 @@ export function OverviewPage() {
   const depthSeries = queue.history.map((h) => ({ t: h.t.getTime(), v: h.depth }))
   const drainSeries = queue.history.map((h) => ({ t: h.t.getTime(), v: h.drainedPerMinute }))
   const nonzeroStates = JOB_PHASES.filter((s) => queue.byState[s] > 0)
-  const coverageNote = capacityCoverageNote(capacity.reportingNodes, capacity.totalNodes)
 
   return (
     <div>
@@ -156,15 +153,19 @@ export function OverviewPage() {
             <CardTitle>Capacity</CardTitle>
           </CardHeader>
           <CardContent>
-            {coverageNote && <p className="mb-2 text-xs text-muted-foreground">{coverageNote}</p>}
-            <ResourceTriple
-              capacity={capacity.capacity}
-              allocated={capacity.allocated}
-              used={capacity.used}
+            <CapacityHistory
+              idPrefix="cluster-capacity"
+              history={capacity.history}
+              latest={{
+                capacity: capacity.capacity,
+                allocated: capacity.allocated,
+                used: capacity.used,
+              }}
+              coverage={{
+                reportingNodes: capacity.reportingNodes,
+                totalNodes: capacity.totalNodes,
+              }}
             />
-            <div className="mt-4">
-              <CapacityChart history={capacity.history} />
-            </div>
           </CardContent>
         </Card>
       </div>

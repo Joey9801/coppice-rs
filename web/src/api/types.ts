@@ -642,16 +642,6 @@ export interface NodeSummary {
   accruingCount: number
 }
 
-/** A finished attempt in the node's recent history. */
-export interface NodeHistoryEntry {
-  attempt: AttemptId
-  job: JobId
-  image: string
-  outcome: AttemptOutcome
-  startedAt: Date | null
-  endedAt: Date
-}
-
 export interface NodeDetail {
   summary: NodeSummary
   /**

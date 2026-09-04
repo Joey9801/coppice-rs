@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowLeft, ArrowRight, Boxes, Inbox, ListTree } from 'lucide-react'
 import type {
@@ -6,15 +6,13 @@ import type {
   AttemptView,
   HostFacts,
   NodeDetail,
-  NodeHistoryEntry,
   NodeSummary,
   Resources,
 } from '@/api/types'
-import { useNode, useNodeHistory, useNodeLogs, useNodeUtilization } from '@/api/queries'
+import { useNode, useNodeLogs, useNodeUtilization } from '@/api/queries'
 import {
   formatBytes,
   formatCpu,
-  formatDuration,
   formatPercent,
   formatTimeUntil,
   formatUcu,
@@ -22,15 +20,14 @@ import {
 } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
+  CapacityHistory,
   EmptyState,
   IdLink,
   LogViewer,
   PageHeader,
-  ResourceTriple,
   StatePill,
   StatTile,
   TimeAgo,
-  outcomePill,
 } from '@/components'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -44,9 +41,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { isNotFound, sortedLabels } from './lib'
+import { isNotFound, nodeCapacityHistory, sortedLabels } from './lib'
 import { formatHostKernel, formatHostOs } from './host-facts'
-import { UtilizationCharts } from './utilization-charts'
 
 export function NodeDetailPage({ nodeId }: { nodeId: string }) {
   const { data: detail, isPending, isError, error } = useNode(nodeId)
@@ -145,20 +141,16 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
         />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card className="lg:col-span-1">
-          <CardHeader>
-            <CardTitle>Capacity</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ResourceTriple
-              capacity={summary.capacity}
-              allocated={summary.allocated}
-              used={summary.used}
-            />
-          </CardContent>
-        </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Capacity</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <CapacitySection nodeId={nodeId} summary={summary} />
+        </CardContent>
+      </Card>
 
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <Card className="lg:col-span-1">
           <CardHeader>
             <CardTitle>Host</CardTitle>
@@ -168,24 +160,15 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           </CardContent>
         </Card>
 
-        <Card className="lg:col-span-1">
+        <Card className="lg:col-span-2">
           <CardHeader>
-            <CardTitle>Utilization history</CardTitle>
+            <CardTitle>Active attempts</CardTitle>
           </CardHeader>
           <CardContent>
-            <UtilizationSection nodeId={nodeId} />
+            <ActiveAttemptsTable attempts={detail.activeAttempts} />
           </CardContent>
         </Card>
       </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Active attempts</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <ActiveAttemptsTable attempts={detail.activeAttempts} />
-        </CardContent>
-      </Card>
 
       <Card>
         <CardHeader>
@@ -193,15 +176,6 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
         </CardHeader>
         <CardContent>
           <AccrualQueueTable queue={detail.accrualQueue} />
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Recent history</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <HistorySection nodeId={nodeId} />
         </CardContent>
       </Card>
 
@@ -382,13 +356,37 @@ function Banner({ tone, children }: { tone: 'destructive' | 'amber'; children: R
   )
 }
 
-function UtilizationSection({ nodeId }: { nodeId: string }) {
+/**
+ * The node's capacity in one place: the current advertised/funded/measured
+ * figures beside the same three charts the cluster overview uses, over this
+ * node's utilization history. A failed or empty history still renders the
+ * current figures — they come from the node read, not from this query.
+ */
+function CapacitySection({ nodeId, summary }: { nodeId: string; summary: NodeSummary }) {
   const { data, isPending, isError } = useNodeUtilization(nodeId)
-  if (isPending) return <Skeleton className="h-[396px]" />
-  if (isError || data.samples.length === 0) {
-    return <EmptyState title="No utilization samples" description="No history recorded yet." />
-  }
-  return <UtilizationCharts utilization={data} />
+  const history = useMemo(() => (data ? nodeCapacityHistory(data) : []), [data])
+
+  if (isPending) return <Skeleton className="h-[220px]" />
+
+  return (
+    <div className="space-y-3">
+      {isError ? (
+        <p className="text-xs text-muted-foreground">
+          Utilization history is unavailable right now; the figures below are the node&rsquo;s
+          latest reading.
+        </p>
+      ) : null}
+      <CapacityHistory
+        idPrefix="node-capacity"
+        history={history}
+        latest={{
+          capacity: summary.capacity,
+          allocated: summary.allocated,
+          used: summary.used,
+        }}
+      />
+    </div>
+  )
 }
 
 function ActiveAttemptsTable({ attempts }: { attempts: AttemptView[] }) {
@@ -499,62 +497,6 @@ function FundingBar({ label, fraction }: { label: string; fraction: number }) {
         {formatPercent(fraction)}
       </span>
     </div>
-  )
-}
-
-function HistorySection({ nodeId }: { nodeId: string }) {
-  const { data, isPending, isError } = useNodeHistory(nodeId)
-  if (isPending) {
-    return (
-      <div className="space-y-2">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <Skeleton key={i} className="h-9" />
-        ))}
-      </div>
-    )
-  }
-  if (isError || data.length === 0) {
-    return <EmptyState icon={Inbox} title="No recent history" />
-  }
-  return <HistoryTable entries={data} />
-}
-
-function HistoryTable({ entries }: { entries: NodeHistoryEntry[] }) {
-  return (
-    <Table>
-      <TableHeader>
-        <TableRow>
-          <TableHead>Job</TableHead>
-          <TableHead>Image</TableHead>
-          <TableHead>Outcome</TableHead>
-          <TableHead className="text-right">Duration</TableHead>
-          <TableHead className="text-right">Ended</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {entries.map((e) => (
-          <TableRow key={e.attempt}>
-            <TableCell>
-              <IdLink id={e.job} />
-            </TableCell>
-            <TableCell className="max-w-[16rem] truncate font-mono text-xs text-muted-foreground">
-              {e.image}
-            </TableCell>
-            <TableCell>{outcomePill(e.outcome)}</TableCell>
-            <TableCell className="text-right tabular-nums">
-              {e.startedAt == null ? (
-                <span className="text-muted-foreground">—</span>
-              ) : (
-                formatDuration((e.endedAt.getTime() - e.startedAt.getTime()) / 1000)
-              )}
-            </TableCell>
-            <TableCell className="text-right">
-              <TimeAgo t={e.endedAt} className="text-sm text-muted-foreground" />
-            </TableCell>
-          </TableRow>
-        ))}
-      </TableBody>
-    </Table>
   )
 }
 

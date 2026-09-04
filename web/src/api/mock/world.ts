@@ -45,7 +45,6 @@ import type {
   HostFacts,
   NodeDetail,
   NodeHealth,
-  NodeHistoryEntry,
   NodeSummary,
   NodeUtilization,
   OutcomeClass,
@@ -2855,26 +2854,6 @@ export class MockWorld {
         allocated: { ...s.allocated },
       })),
     }
-  }
-
-  buildNodeHistory(id: string): NodeHistoryEntry[] {
-    this.nodeOrThrow(id)
-    const entries: NodeHistoryEntry[] = []
-    for (const attempt of this.attempts.values()) {
-      if (attempt.node !== id || attempt.state !== 'Terminal' || !attempt.outcome) continue
-      if (attempt.endedAtUs === null) continue
-      const job = this.jobs.get(attempt.job)
-      entries.push({
-        attempt: attempt.id,
-        job: attempt.job,
-        image: job?.spec.image ?? 'unknown',
-        outcome: { ...attempt.outcome },
-        startedAt: attempt.startedAtUs === null ? null : at(attempt.startedAtUs),
-        // Non-null: the loop skips attempts that have not ended.
-        endedAt: at(attempt.endedAtUs),
-      })
-    }
-    return entries.sort((a, b) => b.endedAt.getTime() - a.endedAt.getTime()).slice(0, 50)
   }
 
   buildCoordinatorStatus(): CoordinatorStatus {
