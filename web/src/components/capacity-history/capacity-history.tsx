@@ -75,7 +75,7 @@ export interface CapacityHistoryProps {
    * already says whether it reported.
    */
   coverage?: { reportingNodes: number; totalNodes: number } | null
-  /** Scopes this instance's SVG gradient ids; unique per mounted panel. */
+  /** Scopes this instance's SVG pattern ids; unique per mounted panel. */
   idPrefix: string
   className?: string
 }
@@ -89,7 +89,8 @@ export interface CapacityHistoryProps {
  * boundaries on top: measured `used`, funded `allocated`, and advertised
  * `capacity` as a dotted line so it survives equality with `allocated`.
  * Nothing is clamped: usage past allocation gets its own band, and an
- * unreported `used` is a gap in both the band and the line, never a zero.
+ * instant with no usage sample is a gap in every band and in the used
+ * line — never a zero — with allocated and capacity still drawn across it.
  */
 export function CapacityHistory({
   history,
@@ -112,7 +113,7 @@ export function CapacityHistory({
             dimension={dimension}
             series={series[i]!}
             latest={latest}
-            gradientId={`${idPrefix}-${dimension.key}`}
+            patternId={`${idPrefix}-${dimension.key}`}
           />
         ))}
       </div>
@@ -132,12 +133,12 @@ function DimensionPanel({
   dimension,
   series,
   latest,
-  gradientId,
+  patternId,
 }: {
   dimension: Dimension
   series: CapacitySeries
   latest: CapacityHistoryProps['latest']
-  gradientId: string
+  patternId: string
 }) {
   const { format, pick, label } = dimension
   const used = latest.used === null ? null : pick(latest.used)
@@ -162,7 +163,7 @@ function DimensionPanel({
           series={series}
           format={format}
           makeTicks={dimension.ticks}
-          gradientId={gradientId}
+          patternId={patternId}
         />
       )}
     </div>
@@ -173,12 +174,12 @@ function CapacityDimensionChart({
   series,
   format,
   makeTicks,
-  gradientId,
+  patternId,
 }: {
   series: CapacitySeries
   format: (n: number) => string
   makeTicks: (max: number) => number[]
-  gradientId: string
+  patternId: string
 }) {
   const ticks = makeTicks(series.max)
   const top = ticks[ticks.length - 1] ?? series.max
@@ -188,7 +189,7 @@ function CapacityDimensionChart({
       <ComposedChart data={series.points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
         <defs>
           <pattern
-            id={`${gradientId}-unallocated`}
+            id={`${patternId}-unallocated`}
             width={6}
             height={6}
             patternTransform="rotate(45)"
@@ -276,7 +277,7 @@ function CapacityDimensionChart({
           name="Unallocated capacity"
           stroke="none"
           connectNulls={false}
-          fill={`url(#${gradientId}-unallocated)`}
+          fill={`url(#${patternId}-unallocated)`}
           isAnimationActive={false}
           activeDot={false}
         />
