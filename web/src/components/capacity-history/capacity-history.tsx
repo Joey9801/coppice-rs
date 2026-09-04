@@ -100,8 +100,7 @@ export function CapacityHistory({
 }: CapacityHistoryProps) {
   const series = useMemo(() => DIMENSIONS.map((d) => toCapacitySeries(history, d.pick)), [history])
   const note = coverage ? capacityCoverageNote(coverage.reportingNodes, coverage.totalNodes) : null
-  const anyOverAllocation = series.some((s) => s.hasOverAllocation)
-  const anyGap = series.some((s) => s.hasCoverageGap)
+  const charted = series.some((s) => s.points.length > 0)
 
   return (
     <div className={cn('space-y-3', className)}>
@@ -117,7 +116,14 @@ export function CapacityHistory({
           />
         ))}
       </div>
-      <CapacityLegend showOverAllocation={anyOverAllocation} showGap={anyGap} />
+      {charted ? (
+        <CapacityLegend
+          showUsed={series.some((s) => s.hasUsage)}
+          showOverAllocation={series.some((s) => s.hasOverAllocation)}
+          showUnallocated={series.some((s) => s.hasUnallocated)}
+          showGap={series.some((s) => s.hasCoverageGap)}
+        />
+      ) : null}
     </div>
   )
 }
@@ -395,17 +401,19 @@ function TooltipRow({
 function Swatch({
   color,
   dashed,
+  line,
   hatched,
 }: {
   color?: string
   dashed?: boolean
+  line?: boolean
   hatched?: boolean
 }) {
-  if (dashed) {
+  if (dashed || line) {
     return (
       <span
         aria-hidden
-        className="inline-block h-0 w-4 shrink-0 border-t-2 border-dashed"
+        className={cn('inline-block h-0 w-4 shrink-0 border-t-2', dashed && 'border-dashed')}
         style={{ borderColor: color }}
       />
     )
@@ -432,24 +440,37 @@ function Swatch({
 
 /** What each mark means, and whether it is a reading or derived for drawing. */
 function CapacityLegend({
+  showUsed,
   showOverAllocation,
+  showUnallocated,
   showGap,
 }: {
+  showUsed: boolean
   showOverAllocation: boolean
+  showUnallocated: boolean
   showGap: boolean
 }) {
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-      <LegendItem swatch={<Swatch color={BAND_COLOR.used} />}>Used (measured)</LegendItem>
-      <LegendItem swatch={<Swatch color={BAND_COLOR.allocated} />}>
-        Allocated, unused (derived)
-      </LegendItem>
+      {showUsed ? (
+        <>
+          <LegendItem swatch={<Swatch color={BAND_COLOR.used} />}>Used (measured)</LegendItem>
+          <LegendItem swatch={<Swatch color={BAND_COLOR.allocated} />}>
+            Allocated, unused (derived)
+          </LegendItem>
+        </>
+      ) : null}
       {showOverAllocation ? (
         <LegendItem swatch={<Swatch color={BAND_COLOR.overAllocation} />}>
           Above allocation (measured)
         </LegendItem>
       ) : null}
-      <LegendItem swatch={<Swatch hatched />}>Capacity not allocated (derived)</LegendItem>
+      {showUnallocated ? (
+        <LegendItem swatch={<Swatch hatched />}>Capacity not allocated (derived)</LegendItem>
+      ) : null}
+      <LegendItem swatch={<Swatch color={BAND_COLOR.allocated} line />}>
+        Allocated (funded)
+      </LegendItem>
       <LegendItem swatch={<Swatch color={BAND_COLOR.capacity} dashed />}>
         Capacity (advertised)
       </LegendItem>

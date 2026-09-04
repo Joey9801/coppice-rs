@@ -97,6 +97,7 @@ describe('CapacityHistory', () => {
     expect(screen.getByText('Used (measured)')).toBeInTheDocument()
     expect(screen.getByText('Allocated, unused (derived)')).toBeInTheDocument()
     expect(screen.getByText('Capacity not allocated (derived)')).toBeInTheDocument()
+    expect(screen.getByText('Allocated (funded)')).toBeInTheDocument()
     expect(screen.getByText('Capacity (advertised)')).toBeInTheDocument()
     // Nothing exceeded its allocation here, so that band is not claimed.
     expect(screen.queryByText('Above allocation (measured)')).not.toBeInTheDocument()
@@ -116,6 +117,10 @@ describe('CapacityHistory', () => {
     })
 
     expect(screen.getByText('not reported / 5 cores alloc / 8 cores cap')).toBeInTheDocument()
+    // With nothing measured there are no bands to name — only the two lines.
+    expect(screen.queryByText('Used (measured)')).not.toBeInTheDocument()
+    expect(screen.queryByText('Allocated, unused (derived)')).not.toBeInTheDocument()
+    expect(screen.getByText('Allocated (funded)')).toBeInTheDocument()
     expect(
       screen.getByText(
         'Gaps in the bands are instants with no usage sample; allocated and capacity stay drawn as lines.',
@@ -140,6 +145,8 @@ describe('CapacityHistory', () => {
 
     expect(screen.getAllByText('No history yet')).toHaveLength(3)
     expect(screen.getByText('2 cores used / 5 cores alloc / 8 cores cap')).toBeInTheDocument()
+    // Nothing is charted, so the legend claims nothing.
+    expect(screen.queryByText('Capacity (advertised)')).not.toBeInTheDocument()
     expect(container.querySelectorAll('svg.recharts-surface')).toHaveLength(0)
   })
 })
