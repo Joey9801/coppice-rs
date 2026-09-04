@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { capacityCoverageNote, formatUsedTooltip } from './capacity-coverage'
+import { capacityCoverageNote, coverageSuffix } from './coverage'
 
 describe('capacityCoverageNote', () => {
   it('is null when every node is reporting (full coverage)', () => {
@@ -15,16 +15,16 @@ describe('capacityCoverageNote', () => {
   })
 })
 
-describe('formatUsedTooltip', () => {
-  it('reads "not reported" for a null value (coverage gap)', () => {
-    expect(formatUsedTooltip(null, 0, 16)).toBe('not reported')
+describe('coverageSuffix', () => {
+  it('annotates a partial reading', () => {
+    expect(coverageSuffix(3, 16)).toBe('3/16 nodes reporting')
   })
 
-  it('annotates coverage when the sample is partial', () => {
-    expect(formatUsedTooltip(1_500, 3, 16)).toBe('1.5 cores (3/16 nodes reporting)')
+  it('has nothing to say at full coverage', () => {
+    expect(coverageSuffix(16, 16)).toBeNull()
   })
 
-  it('has no annotation when coverage is complete', () => {
-    expect(formatUsedTooltip(1_500, 16, 16)).toBe('1.5 cores')
+  it('has nothing to say for a single node, which carries no counts', () => {
+    expect(coverageSuffix(null, null)).toBeNull()
   })
 })

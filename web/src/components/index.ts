@@ -8,8 +8,11 @@ export { StatePill, outcomePill, type StatePillProps, type PillState } from './s
 export { IdLink, type IdLinkProps } from './id-link'
 export { CopyButton, type CopyButtonProps } from './copy-button'
 export { TimeAgo, type TimeAgoProps } from './time-ago'
-export { ResourceBar, type ResourceBarProps } from './resource-bar'
-export { ResourceTriple, type ResourceTripleProps } from './resource-triple'
+export {
+  CapacityHistory,
+  type CapacityHistoryProps,
+  type CapacityHistorySample,
+} from './capacity-history'
 export { LogViewer, type LogViewerProps } from './log-viewer'
 export { EmptyState, type EmptyStateProps } from './empty-state'
 export { KeyValueGrid, type KeyValueGridProps } from './key-value-grid'

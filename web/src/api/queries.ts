@@ -42,7 +42,6 @@ export const queryKeys = {
   nodes: ['nodes'] as const,
   node: (id: NodeId) => ['node', id] as const,
   nodeUtilization: (id: NodeId) => ['node', id, 'utilization'] as const,
-  nodeHistory: (id: NodeId) => ['node', id, 'history'] as const,
   nodeLogs: (id: NodeId) => ['node', id, 'logs'] as const,
   coordinators: ['coordinators'] as const,
   coordinatorLogs: (id: CoordinatorId) => ['coordinators', id, 'logs'] as const,
@@ -146,14 +145,6 @@ export function useNodeUtilization(id: NodeId) {
   return useQuery({
     queryKey: queryKeys.nodeUtilization(id),
     queryFn: () => api.getNodeUtilization(id),
-    ...LIVE,
-  })
-}
-
-export function useNodeHistory(id: NodeId) {
-  return useQuery({
-    queryKey: queryKeys.nodeHistory(id),
-    queryFn: () => api.getNodeHistory(id),
     ...LIVE,
   })
 }
