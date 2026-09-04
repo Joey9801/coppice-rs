@@ -120,6 +120,7 @@ export function CapacityHistory({
       {charted ? (
         <CapacityLegend
           showUsed={series.some((s) => s.hasUsage)}
+          showAllocatedUnused={series.some((s) => s.hasAllocatedUnused)}
           showOverAllocation={series.some((s) => s.hasOverAllocation)}
           showUnallocated={series.some((s) => s.hasUnallocated)}
           showGap={series.some((s) => s.hasCoverageGap)}
@@ -442,11 +443,13 @@ function Swatch({
 /** What each mark means, and whether it is a reading or derived for drawing. */
 function CapacityLegend({
   showUsed,
+  showAllocatedUnused,
   showOverAllocation,
   showUnallocated,
   showGap,
 }: {
   showUsed: boolean
+  showAllocatedUnused: boolean
   showOverAllocation: boolean
   showUnallocated: boolean
   showGap: boolean
@@ -454,12 +457,12 @@ function CapacityLegend({
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
       {showUsed ? (
-        <>
-          <LegendItem swatch={<Swatch color={BAND_COLOR.used} />}>Used (measured)</LegendItem>
-          <LegendItem swatch={<Swatch color={BAND_COLOR.allocated} />}>
-            Allocated, unused (derived)
-          </LegendItem>
-        </>
+        <LegendItem swatch={<Swatch color={BAND_COLOR.used} />}>Used (measured)</LegendItem>
+      ) : null}
+      {showAllocatedUnused ? (
+        <LegendItem swatch={<Swatch color={BAND_COLOR.allocated} />}>
+          Allocated, unused (derived)
+        </LegendItem>
       ) : null}
       {showOverAllocation ? (
         <LegendItem swatch={<Swatch color={BAND_COLOR.overAllocation} />}>

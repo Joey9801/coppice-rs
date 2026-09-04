@@ -55,6 +55,7 @@ describe('toCapacitySeries', () => {
     expect(series).toMatchObject({
       hasUsage: true,
       hasCoverageGap: false,
+      hasAllocatedUnused: true,
       hasOverAllocation: false,
       hasUnallocated: true,
       max: 8_000,
@@ -160,6 +161,7 @@ describe('toCapacitySeries', () => {
       points: [],
       hasUsage: false,
       hasCoverageGap: false,
+      hasAllocatedUnused: false,
       hasOverAllocation: false,
       hasUnallocated: false,
       max: 0,
@@ -174,5 +176,36 @@ describe('toCapacitySeries', () => {
     expect(memory.points[0]!.capacity).toBe(8_000 * 1024)
     expect(disk.points[0]!.capacity).toBe(0)
     expect(disk.max).toBe(0)
+  })
+
+  it('claims no allocated-unused band when every sample is fully used', () => {
+    // usage == allocation throughout: the band is zero everywhere, so it is
+    // not something the chart draws or the legend may name.
+    const series = toCapacitySeries([sample(8_000, 5_000, 5_000), sample(8_000, 4_000, 4_000)], cpu)
+
+    expect(series.points.map((p) => p.allocatedUnused)).toEqual([0, 0])
+    expect(series.hasAllocatedUnused).toBe(false)
+    expect(series.hasUsage).toBe(true)
+  })
+
+  it('claims no allocated-unused band when usage is above allocation throughout', () => {
+    const series = toCapacitySeries([sample(8_000, 3_000, 4_500), sample(8_000, 3_000, 6_000)], cpu)
+
+    expect(series.hasAllocatedUnused).toBe(false)
+    expect(series.hasOverAllocation).toBe(true)
+  })
+
+  it('claims the allocated-unused band as soon as one sample has headroom', () => {
+    const series = toCapacitySeries([sample(8_000, 5_000, 5_000), sample(8_000, 5_000, 4_000)], cpu)
+
+    expect(series.hasAllocatedUnused).toBe(true)
+  })
+
+  it('claims no allocated-unused band when nothing was measured', () => {
+    // The band is null (a gap), not zero — but either way there is nothing
+    // to name in the legend.
+    const series = toCapacitySeries([sample(8_000, 5_000, null)], cpu)
+
+    expect(series.hasAllocatedUnused).toBe(false)
   })
 })

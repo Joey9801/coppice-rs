@@ -46,6 +46,15 @@ function history(count = 4, used: Resources | null = USED): CapacityHistorySampl
   }))
 }
 
+/** Every coordinate pair in a path's `d`, whatever the command mix. */
+function vertices(path: Element): Array<{ x: number; y: number }> {
+  const d = path.getAttribute('d') ?? ''
+  return [...d.matchAll(/(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/g)].map((m) => ({
+    x: Number(m[1]),
+    y: Number(m[2]),
+  }))
+}
+
 function renderPanel(props: Partial<Parameters<typeof CapacityHistory>[0]> = {}) {
   return render(
     <CapacityHistory
@@ -103,11 +112,73 @@ describe('CapacityHistory', () => {
     expect(screen.queryByText('Above allocation (measured)')).not.toBeInTheDocument()
   })
 
+  it('does not name the allocated-unused band when every sample is fully used', () => {
+    // `used >= allocated` throughout: the band is zero everywhere, so naming
+    // it would claim a mark the charts never draw.
+    const fullyUsed = history().map((s) => ({ ...s, used: s.allocated }))
+    renderPanel({
+      history: fullyUsed,
+      latest: { capacity: CAPACITY, allocated: ALLOCATED, used: ALLOCATED },
+    })
+
+    expect(screen.getByText('Used (measured)')).toBeInTheDocument()
+    expect(screen.queryByText('Allocated, unused (derived)')).not.toBeInTheDocument()
+  })
+
   it('names the over-allocation band only when usage actually exceeded allocation', () => {
     const over = history().map((s) => ({ ...s, used: res(6_500, 24, 60) }))
     renderPanel({ history: over })
 
     expect(screen.getByText('Above allocation (measured)')).toBeInTheDocument()
+  })
+
+  /**
+   * Recharts stacks a `null` point as `[0, 0]`, so the honest gap depends
+   * entirely on `connectNulls={false}` breaking each band's curve there. If
+   * it ever stopped doing so the bands would dive to the baseline at an
+   * unreported sample and read as "measured zero" — the exact lie this
+   * component exists to avoid — so assert on the rendered geometry, not on
+   * the props.
+   */
+  it('breaks every band at an unreported sample instead of dropping to the baseline', () => {
+    const withGap = history(5).map((s, i) => (i === 2 ? { ...s, used: null } : s))
+    const { container } = renderPanel({
+      history: withGap,
+      latest: { capacity: CAPACITY, allocated: ALLOCATED, used: USED },
+    })
+
+    // The CPU chart: four band fills, then the allocated/used/capacity lines.
+    const cpuChart = container.querySelectorAll('svg.recharts-surface')[0]!
+    const paths = [...cpuChart.querySelectorAll('path.recharts-curve')]
+    const bands = paths.filter((p) => p.getAttribute('fill') !== 'none')
+    const lines = paths.filter((p) => p.getAttribute('fill') === 'none')
+    expect(bands).toHaveLength(4)
+    expect(lines).toHaveLength(3)
+
+    // With five evenly spaced samples the gap sits at the midpoint of the
+    // plot area; the baseline is the largest y any band reaches.
+    const xs = bands.flatMap((p) => vertices(p).map((v) => v.x))
+    const gapX = (Math.min(...xs) + Math.max(...xs)) / 2
+    const baselineY = Math.max(...bands.flatMap((p) => vertices(p).map((v) => v.y)))
+
+    for (const band of bands) {
+      const d = band.getAttribute('d') ?? ''
+      // Two subpaths: one either side of the gap, not one curve through it.
+      expect(d.match(/M/g) ?? []).toHaveLength(2)
+      // No geometry at all at the missing sample — in particular no point on
+      // the baseline, which is what a null-as-zero stack would draw.
+      for (const v of vertices(band)) {
+        expect(Math.abs(v.x - gapX)).toBeGreaterThan(1)
+      }
+      expect(vertices(band).some((v) => v.y === baselineY && Math.abs(v.x - gapX) < 1)).toBe(false)
+    }
+
+    // The measured line breaks too; allocated and capacity carry on across
+    // the gap, because those readings are still known there.
+    const [allocatedLine, usedLine, capacityLine] = lines
+    expect((usedLine!.getAttribute('d') ?? '').match(/M/g) ?? []).toHaveLength(2)
+    expect((allocatedLine!.getAttribute('d') ?? '').match(/M/g) ?? []).toHaveLength(1)
+    expect((capacityLine!.getAttribute('d') ?? '').match(/M/g) ?? []).toHaveLength(1)
   })
 
   it('says usage was not reported instead of showing a zero', () => {
