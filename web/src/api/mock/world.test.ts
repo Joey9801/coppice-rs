@@ -849,3 +849,23 @@ describe('MockWorld listJobs semantics', () => {
     invalid({ limit: 1001 })
   })
 })
+
+describe('mock directional logs', () => {
+  it('returns chronological head/tail windows with stable identities across overlaps', () => {
+    const world = new MockWorld(NOW_US)
+    const id = world.buildNodeSummaries()[0]!.id
+    const head = world.buildNodeLogs(id, null, { order: 'asc', limit: 1000 })
+    const tail = world.buildNodeLogs(id, null, { order: 'desc', limit: 5 })
+    expect(tail.entries.map((e) => e.id)).toEqual(head.entries.slice(-5).map((e) => e.id))
+    const older = world.buildNodeLogs(id, tail.nextCursor, { order: 'desc', limit: 5 })
+    expect(older.entries.at(-1)!.t.getTime()).toBeLessThanOrEqual(tail.entries[0]!.t.getTime())
+    const newer = world.buildNodeLogs(id, null, { order: 'asc', from: tail.entries.at(-1)!.at })
+    expect(newer.entries[0]!.id).toBe(tail.entries.at(-1)!.id)
+    expect(new Set(head.entries.map((e) => e.id)).size).toBe(head.entries.length)
+    world.advanceTo(NOW_US + 30_000_000)
+    const later = world.buildNodeLogs(id, null, { order: 'asc', limit: 1000 })
+    expect(later.entries.slice(0, head.entries.length).map((e) => e.id)).toEqual(
+      head.entries.map((e) => e.id),
+    )
+  })
+})

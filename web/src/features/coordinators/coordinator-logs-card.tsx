@@ -7,14 +7,8 @@ import { CoordinatorLabel } from './coordinator-label'
 
 /** One tab body — calls the log hook for exactly the mounted (active) member. */
 function CoordinatorLogTab({ id }: { id: CoordinatorId }) {
-  const { data, isLoading, isError } = useCoordinatorLogs(id)
-  return (
-    <LogViewer
-      entries={data?.entries ?? []}
-      loading={isLoading}
-      emptyText={isError ? "Couldn't load coordinator logs." : 'No log entries.'}
-    />
-  )
+  const logs = useCoordinatorLogs(id)
+  return <LogViewer controller={logs} structured />
 }
 
 export interface CoordinatorLogsCardProps {
@@ -52,7 +46,6 @@ export function CoordinatorLogsCard({ members, labels, className }: CoordinatorL
             ))}
           </Tabs>
         ) : null}
-        <p className="mt-3 text-xs text-muted-foreground">Log collection is not available yet.</p>
       </CardContent>
     </Card>
   )

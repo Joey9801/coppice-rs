@@ -289,6 +289,7 @@ async fn walk<P: ControlPlane>(
     let mut rpcs: u32 = 0;
     let mut bytes: usize = 0;
     let mut next_cursor: Option<LogCursor> = None;
+    let mut resume_cursor = request.cursor;
 
     let n = list.len();
     let mut i = start_index;
@@ -439,6 +440,11 @@ async fn walk<P: ControlPlane>(
                 for chunk in &page.chunks {
                     bytes += chunk.payload.len();
                     entries.push(LogEntry {
+                        id: if chunk.id.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}:{}", attempt_id, chunk.id)
+                        },
                         attempt: attempt_id,
                         at: Timestamp::from_micros(chunk.at_us)
                             .unwrap_or_else(Timestamp::min_value),
@@ -448,6 +454,30 @@ async fn walk<P: ControlPlane>(
                         },
                         text: String::from_utf8_lossy(&chunk.payload).into_owned(),
                         truncated: chunk.truncated,
+                    });
+                }
+
+                if order == LogOrder::Asc {
+                    // Keep an exclusive high-water mark even on an exhausted page.
+                    // An empty new attempt must remain pollable from its beginning.
+                    resume_cursor = Some(if let Some(last) = page.chunks.last() {
+                        let count = page
+                            .chunks
+                            .iter()
+                            .rev()
+                            .take_while(|c| c.at_us == last.at_us)
+                            .count() as u64;
+                        LogCursor {
+                            order,
+                            attempt: attempt_id,
+                            at_us: last.at_us,
+                            skip: count
+                                + resume
+                                    .filter(|r| r.at_us == last.at_us)
+                                    .map_or(0, |r| r.skip),
+                        }
+                    } else {
+                        cursor_at(order, attempt_id, resume)
                     });
                 }
 
@@ -478,6 +508,8 @@ async fn walk<P: ControlPlane>(
     }
 
     Ok(GetJobLogsResponse {
+        resume_cursor: resume_cursor.map(|c| c.format()),
+        live: !record.state.is_terminal(),
         entries,
         sources,
         next_cursor: next_cursor.map(|c| c.format()),
@@ -813,6 +845,7 @@ mod tests {
 
     fn chunk(at_us: i64, text: &str) -> LogChunk {
         LogChunk {
+            id: format!("fixture:{at_us}:{text}"),
             at_us,
             stream: LogStreamSelector::Stdout,
             payload: text.as_bytes().to_vec(),
@@ -926,6 +959,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_ascending_page_keeps_polling_cursor_and_identity() {
+        let (job, attempts, plane) = multi_available(1);
+        let (status, body) =
+            get(plane.clone(), &format!("/api/v1/jobs/{job}/logs?order=asc")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["live"], true);
+        assert!(body["entries"][0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with(&attempts[0].to_string()));
+        assert!(body["next_cursor"].is_null());
+        let token = body["resume_cursor"].as_str().unwrap();
+        let cursor = LogCursor::parse(token).unwrap();
+        assert_eq!(cursor.order, LogOrder::Asc);
+        assert_eq!(cursor.attempt, attempts[0]);
+        assert_eq!(cursor.skip, 1);
+        plane.seed(attempts[0], page(vec![chunk(cursor.at_us, "new write")]));
+        let (status, next) = get(
+            plane,
+            &format!("/api/v1/jobs/{job}/logs?order=asc&cursor={token}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // A new write at the same microsecond accumulates the skip instead of
+        // resetting it to one.
+        assert_eq!(
+            LogCursor::parse(next["resume_cursor"].as_str().unwrap())
+                .unwrap()
+                .skip,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_job_disables_live_polling() {
+        let job = JobId::new();
+        let mut state = StateMachine::default();
+        let mut record = job_rec(job, vec![]);
+        record.state = JobState::Succeeded;
+        state.jobs.insert(job, record);
+        let (_, body) = get(
+            Arc::new(FakePlane::new(state)),
+            &format!("/api/v1/jobs/{job}/logs"),
+        )
+        .await;
+        assert_eq!(body["live"], false);
+    }
+
+    #[tokio::test]
     async fn oversized_chunk_entry_is_flagged_truncated_and_stays_within_the_cap() {
         // The store cut a single oversized chunk down to the page byte budget and
         // marked it (ADR 0034 bypass fix). The handler must surface that on the
@@ -942,6 +1024,7 @@ mod tests {
         let plane = Arc::new(FakePlane::new(state));
         // A chunk already truncated by the store to a modest prefix.
         let cut = LogChunk {
+            id: String::new(),
             at_us: 1_000_000,
             stream: LogStreamSelector::Stdout,
             payload: b"0123".to_vec(),

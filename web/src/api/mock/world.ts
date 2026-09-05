@@ -40,6 +40,7 @@ import type {
   JobSummary,
   ListJobsRequest,
   LogChunk,
+  LogRequest,
   LogEntry,
   LogLevel,
   HostFacts,
@@ -529,9 +530,12 @@ export class MockWorld {
   private lastSnapshotIndex: number | null = null
   private snapshotTakenAtUs = 0
 
+  private readonly logEpochUs: number
+
   constructor(nowUs: number, seed: number = DEFAULT_SEED) {
     this.rng = new Rng(seed)
     this.nowUs = nowUs
+    this.logEpochUs = nowUs
     this.lastTickUs = nowUs
     this.raftIndex = RAFT_LOG_ORIGIN_INDEX
     this.stateVersion = 61000
@@ -2899,20 +2903,34 @@ export class MockWorld {
 
   // ---- logs ----------------------------------------------------------------
 
-  buildJobLogs(id: string, cursor: string | null): LogChunk {
+  buildJobLogs(id: string, cursor: string | null, request: LogRequest = {}): LogChunk {
     const job = this.jobOrThrow(id)
-    return pageLogs(this.jobLogLines(job), cursor)
+    return {
+      ...pageLogs(
+        this.jobLogLines(job).map(({ level: _level, ...line }) => ({
+          ...line,
+          stream: 'stdout' as const,
+        })),
+        cursor,
+        request,
+      ),
+      live: !['Succeeded', 'Failed', 'Aborted'].includes(job.state.kind),
+    }
   }
 
-  buildNodeLogs(id: string, cursor: string | null): LogChunk {
+  buildNodeLogs(id: string, cursor: string | null, request: LogRequest = {}): LogChunk {
     const node = this.nodeOrThrow(id)
-    return pageLogs(this.nodeLogLines(node), cursor)
+    return pageLogs(this.nodeLogLines(node), cursor, request)
   }
 
-  buildCoordinatorLogs(id: CoordinatorId, cursor: string | null): LogChunk {
+  buildCoordinatorLogs(
+    id: CoordinatorId,
+    cursor: string | null,
+    request: LogRequest = {},
+  ): LogChunk {
     const c = this.coordinators.find((m) => m.id === id)
     if (!c) throw new NotFound(`coordinator ${id}`)
-    return pageLogs(this.coordinatorLogLines(c), cursor)
+    return pageLogs(this.coordinatorLogLines(c), cursor, request)
   }
 
   private jobLogLines(job: MJob): LogEntry[] {
@@ -2942,6 +2960,7 @@ export class MockWorld {
     let t = start + 3 * SECOND_US
     for (let i = 0; i < appLines && t < end; i += 1) {
       t += rng.range(2 * SECOND_US, 90 * SECOND_US)
+      if (t > end) break
       const level = rng.weighted([
         ['info', 8],
         ['debug', 3],
@@ -2966,8 +2985,8 @@ export class MockWorld {
   private nodeLogLines(node: MNode): LogEntry[] {
     const rng = new Rng(hashSeed(node.id + 'log'))
     const lines: LogEntry[] = []
-    const count = 100
-    let t = this.nowUs - count * 15 * SECOND_US
+    const count = 100 + Math.floor((this.nowUs - this.logEpochUs) / (15 * SECOND_US))
+    let t = this.logEpochUs - 100 * 15 * SECOND_US
     for (let i = 0; i < count; i += 1) {
       t += rng.range(8 * SECOND_US, 20 * SECOND_US)
       const roll = rng.float()
@@ -3003,7 +3022,7 @@ export class MockWorld {
     }
     if (node.health === 'Lost') {
       lines.push({
-        t: at(this.nowUs),
+        t: at(this.logEpochUs),
         level: 'error',
         target: 'agent.heartbeat',
         message: 'heartbeat timeout; marking node Lost',
@@ -3015,9 +3034,9 @@ export class MockWorld {
   private coordinatorLogLines(c: MCoordinator): LogEntry[] {
     const rng = new Rng(hashSeed(String(c.id) + 'coordlog'))
     const lines: LogEntry[] = []
-    const count = 100
-    let t = this.nowUs - count * 10 * SECOND_US
-    let idx = this.raftIndex - count * 3
+    const count = 100 + Math.floor((this.nowUs - this.logEpochUs) / (10 * SECOND_US))
+    let t = this.logEpochUs - 100 * 10 * SECOND_US
+    let idx = RAFT_LOG_ORIGIN_INDEX - 100 * 3
     for (let i = 0; i < count; i += 1) {
       t += rng.range(4 * SECOND_US, 14 * SECOND_US)
       idx += rng.int(1, 5)
@@ -3129,17 +3148,26 @@ function usagePointsFromRing(attempt: string, ring: MockUsageSample[]): UsagePoi
   return points
 }
 
-const LOG_PAGE = 40
-
-/** Cursor-paged newest-first; cursor is a stringified offset. */
-function pageLogs(all: LogEntry[], cursor: string | null): LogChunk {
-  const newestFirst = [...all].sort((a, b) => b.t.getTime() - a.t.getTime())
-  const offset = cursor ? Math.max(0, Number.parseInt(cursor, 10) || 0) : 0
-  const slice = newestFirst.slice(offset, offset + LOG_PAGE)
-  const nextOffset = offset + LOG_PAGE
+/** Stable content coordinates, chronological output in either walk direction. */
+function pageLogs(all: LogEntry[], cursor: string | null, request: LogRequest = {}): LogChunk {
+  const counts = new Map<string, number>()
+  const ordered = [...all]
+    .sort((a, b) => a.t.getTime() - b.t.getTime())
+    .map((entry) => {
+      const base = `${entry.t.toISOString()}:${entry.target}:${entry.message}`
+      const occurrence = counts.get(base) ?? 0
+      counts.set(base, occurrence + 1)
+      return { ...entry, at: entry.t.toISOString(), id: `${base}:${occurrence}` }
+    })
+    .filter((entry) => !request.from || entry.at >= request.from)
+  const walk = request.order === 'asc' ? ordered : ordered.reverse()
+  const offset = cursor ? walk.findIndex((e) => e.id === cursor) + 1 : 0
+  const page = walk.slice(offset, offset + (request.limit ?? 40))
   return {
-    entries: slice.map((e) => ({ ...e })),
-    nextCursor: nextOffset < newestFirst.length ? String(nextOffset) : null,
+    entries: request.order === 'asc' ? page : [...page].reverse(),
+    nextCursor: offset + page.length < walk.length ? page.at(-1)!.id : null,
+    resumeCursor: page.at(-1)?.id ?? cursor,
+    live: true,
   }
 }
 

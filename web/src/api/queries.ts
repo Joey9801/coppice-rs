@@ -1,3 +1,5 @@
+import { useCallback } from 'react'
+import { useLogController } from './log-controller'
 import {
   keepPreviousData,
   useInfiniteQuery,
@@ -12,6 +14,7 @@ import type {
   CoordinatorId,
   JobId,
   ListJobsRequest,
+  LogRequest,
   NodeId,
   QuotaEntityId,
 } from './types'
@@ -118,11 +121,19 @@ export function useJobUsage(id: JobId, attempt: AttemptId | null = null) {
 }
 
 export function useJobLogs(id: JobId) {
-  return useQuery({
-    queryKey: queryKeys.jobLogs(id),
-    queryFn: () => api.getJobLogs(id, null),
-    ...LIVE,
-  })
+  const client = useQueryClient()
+  const fetchPage = useCallback(
+    (cursor: string | null, request: LogRequest) =>
+      client.fetchQuery({
+        queryKey: [...queryKeys.jobLogs(id), cursor, request],
+        queryFn: () => api.getJobLogs(id, cursor, request),
+        staleTime: 0,
+        gcTime: 0,
+        retry: false,
+      }),
+    [client, id],
+  )
+  return useLogController(fetchPage)
 }
 
 export function useNodes() {
@@ -150,11 +161,19 @@ export function useNodeUtilization(id: NodeId) {
 }
 
 export function useNodeLogs(id: NodeId) {
-  return useQuery({
-    queryKey: queryKeys.nodeLogs(id),
-    queryFn: () => api.getNodeLogs(id, null),
-    ...LIVE,
-  })
+  const client = useQueryClient()
+  const fetchPage = useCallback(
+    (cursor: string | null, request: LogRequest) =>
+      client.fetchQuery({
+        queryKey: [...queryKeys.nodeLogs(id), cursor, request],
+        queryFn: () => api.getNodeLogs(id, cursor, request),
+        staleTime: 0,
+        gcTime: 0,
+        retry: false,
+      }),
+    [client, id],
+  )
+  return useLogController(fetchPage)
 }
 
 export function useCoordinatorStatus() {
@@ -166,11 +185,19 @@ export function useCoordinatorStatus() {
 }
 
 export function useCoordinatorLogs(id: CoordinatorId) {
-  return useQuery({
-    queryKey: queryKeys.coordinatorLogs(id),
-    queryFn: () => api.getCoordinatorLogs(id, null),
-    ...LIVE,
-  })
+  const client = useQueryClient()
+  const fetchPage = useCallback(
+    (cursor: string | null, request: LogRequest) =>
+      client.fetchQuery({
+        queryKey: [...queryKeys.coordinatorLogs(id), cursor, request],
+        queryFn: () => api.getCoordinatorLogs(id, cursor, request),
+        staleTime: 0,
+        gcTime: 0,
+        retry: false,
+      }),
+    [client, id],
+  )
+  return useLogController(fetchPage)
 }
 
 export function useQuotaEntities() {

@@ -465,6 +465,7 @@ fn response_from_pb(resp: apb::FetchLogsResponse) -> Result<LogFetchOutcome, Log
                     .chunks
                     .into_iter()
                     .map(|c| LogChunk {
+                        id: c.id,
                         at_us: c.at_us,
                         stream: chunk_stream(c.stream),
                         payload: c.payload,
@@ -636,12 +637,14 @@ mod tests {
             outcome: Some(apb::fetch_logs_response::Outcome::Chunks(apb::Chunks {
                 chunks: vec![
                     apb::LogChunk {
+                        id: "segment:1".to_owned(),
                         at_us: 1,
                         stream: apb::LogStream::Stdout as i32,
                         payload: b"hello".to_vec(),
                         truncated: false,
                     },
                     apb::LogChunk {
+                        id: String::new(),
                         at_us: 2,
                         stream: apb::LogStream::Stderr as i32,
                         payload: b"world".to_vec(),
@@ -657,6 +660,7 @@ mod tests {
             panic!("expected chunks");
         };
         assert_eq!(page.chunks.len(), 2);
+        assert_eq!(page.chunks[0].id, "segment:1");
         assert_eq!(page.chunks[0].stream, LogStreamSelector::Stdout);
         assert_eq!(page.chunks[1].stream, LogStreamSelector::Stderr);
         assert!(!page.exhausted);
@@ -911,6 +915,7 @@ mod tests {
         let outcome = apb::FetchLogsResponse {
             outcome: Some(apb::fetch_logs_response::Outcome::Chunks(apb::Chunks {
                 chunks: vec![apb::LogChunk {
+                    id: String::new(),
                     at_us: 5,
                     stream: apb::LogStream::Stdout as i32,
                     payload: b"line".to_vec(),

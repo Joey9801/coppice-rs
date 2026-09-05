@@ -31,6 +31,7 @@ import {
   type JobSummary,
   type ListJobsRequest,
   type LogChunk,
+  type LogRequest,
   type LogEntry,
   type HostFacts,
   type NodeDetail,
@@ -92,21 +93,22 @@ export function createRealClient(): CoppiceApi {
         body.events.map(mapTimelineEvent),
       ),
     getJobUsage: (id, attempt) => getJobUsage(id, attempt ?? null),
-    getJobLogs: (id, cursor) => getJobLogs(id, cursor),
+    getJobLogs: (id, cursor, request) => getJobLogs(id, cursor, request),
 
     listNodes: () =>
       getJson('/nodes', (body: WireListNodesResponse) => body.nodes.map(mapNodeSummary)),
     getNode: (id) => getJson(`/nodes/${encodeURIComponent(id)}`, mapNodeDetail),
     getNodeUtilization: (id) =>
       getJson(`/nodes/${encodeURIComponent(id)}/utilization`, mapNodeUtilization),
-    getNodeLogs: () => {
-      throw new Error('getNodeLogs has no real implementation — route through the mock')
-    },
+    getNodeLogs: async () => ({ entries: [], nextCursor: null, live: false, unsupported: true }),
 
     getCoordinatorStatus: () => getJson('/coordinators', mapCoordinatorStatus),
-    getCoordinatorLogs: () => {
-      throw new Error('getCoordinatorLogs has no real implementation — route through the mock')
-    },
+    getCoordinatorLogs: async () => ({
+      entries: [],
+      nextCursor: null,
+      live: false,
+      unsupported: true,
+    }),
 
     listQuotaEntities: () =>
       getJson('/quota-entities', (body: WireListQuotaEntitiesResponse) =>
@@ -1000,6 +1002,7 @@ type WireLogStreamName = 'stdout' | 'stderr'
 type WireLogAvailability = 'available' | 'expired' | 'unreachable' | 'not_started'
 
 interface WireLogEntry {
+  id: string
   attempt: AttemptId
   at: string
   stream: WireLogStreamName
@@ -1017,39 +1020,49 @@ interface WireLogSourceRecord {
 }
 
 interface WireGetJobLogsResponse {
+  resume_cursor: string | null
+  live: boolean
   entries: WireLogEntry[]
   sources: WireLogSourceRecord[]
   next_cursor: string | null
 }
 
-/**
- * `LogChunk`/`LogEntry` in `types.ts` predate the real log DTO (ADR 0034)
- * and use a generic `{ t, level, target, message }` shape that has no
- * `attempt`/`stream`/per-attempt `sources` on it. Rather than widen that
- * type here (out of scope for this pass — see the "Logs are invented" note
- * in CLAUDE.md), each wire entry is mapped losslessly enough to render: the
- * stream becomes a level (`stderr` reads as `error`, `stdout` as `info`)
- * and the attempt id becomes the `target`. A follow-up that threads
- * `attempt`/`stream`/`sources` through `LogChunk` should replace this.
- */
 function mapLogEntry(e: WireLogEntry): LogEntry {
   return {
+    id: e.id,
     t: toDate(e.at),
-    level: e.stream === 'stderr' ? 'error' : 'info',
+    at: e.at,
+    attempt: e.attempt,
+    stream: e.stream,
+    truncated: e.truncated,
     target: e.attempt,
     message: e.text,
   }
 }
 
-function getJobLogs(id: JobId, cursor: string | null): Promise<LogChunk> {
+function getJobLogs(id: JobId, cursor: string | null, request: LogRequest = {}): Promise<LogChunk> {
   const params = new URLSearchParams()
   if (cursor) params.set('cursor', cursor)
-  const qs = params.toString()
+  params.set('order', request.order ?? 'desc')
+  params.set('limit', String(request.limit ?? 200))
+  if (request.from) params.set('from', request.from)
   return getJson(
-    `/jobs/${encodeURIComponent(id)}/logs${qs ? `?${qs}` : ''}`,
+    `/jobs/${encodeURIComponent(id)}/logs?${params}`,
     (body: WireGetJobLogsResponse): LogChunk => ({
-      entries: body.entries.map(mapLogEntry),
+      entries: (request.order === 'asc' ? body.entries : [...body.entries].reverse()).map(
+        mapLogEntry,
+      ),
       nextCursor: body.next_cursor,
+      live: body.live,
+      resumeCursor: body.resume_cursor,
+      sources: body.sources.map((source) => ({
+        attempt: source.attempt,
+        node: source.node,
+        availability: source.availability,
+        truncated: source.truncated,
+        reason: source.reason,
+        earliestAvailableAt: toDateOrNull(source.earliest_available_at),
+      })),
     }),
   )
 }
