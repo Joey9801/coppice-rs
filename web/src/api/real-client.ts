@@ -100,13 +100,10 @@ export function createRealClient(): CoppiceApi {
     getNode: (id) => getJson(`/nodes/${encodeURIComponent(id)}`, mapNodeDetail),
     getNodeUtilization: (id) =>
       getJson(`/nodes/${encodeURIComponent(id)}/utilization`, mapNodeUtilization),
-    getNodeLogs: async () => ({ entries: [], nextCursor: null, live: false, unsupported: true }),
+    getNodeLogs: async () => ({ unsupported: true }),
 
     getCoordinatorStatus: () => getJson('/coordinators', mapCoordinatorStatus),
     getCoordinatorLogs: async () => ({
-      entries: [],
-      nextCursor: null,
-      live: false,
       unsupported: true,
     }),
 
@@ -1030,7 +1027,6 @@ interface WireGetJobLogsResponse {
 function mapLogEntry(e: WireLogEntry): LogEntry {
   return {
     id: e.id,
-    t: toDate(e.at),
     at: e.at,
     attempt: e.attempt,
     stream: e.stream,
@@ -1040,11 +1036,11 @@ function mapLogEntry(e: WireLogEntry): LogEntry {
   }
 }
 
-function getJobLogs(id: JobId, cursor: string | null, request: LogRequest = {}): Promise<LogChunk> {
+function getJobLogs(id: JobId, cursor: string | null, request: LogRequest): Promise<LogChunk> {
   const params = new URLSearchParams()
   if (cursor) params.set('cursor', cursor)
-  params.set('order', request.order ?? 'desc')
-  params.set('limit', String(request.limit ?? 200))
+  params.set('order', request.order)
+  params.set('limit', String(request.limit))
   if (request.from) params.set('from', request.from)
   return getJson(
     `/jobs/${encodeURIComponent(id)}/logs?${params}`,

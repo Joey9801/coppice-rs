@@ -1,21 +1,15 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mergeLogs, useLogController } from './log-controller'
-import type { LogChunk, LogEntry } from './types'
+import { logEntry, logPage as page } from '@/test/log-fixtures'
+import type { LogChunk, LogPage } from './types'
+function supported(chunk: LogChunk): LogPage {
+  if (chunk.unsupported) throw new Error('Expected supported page')
+  return chunk
+}
 
-const entry = (id: string, micros = id): LogEntry => ({
-  id,
-  at: `2026-01-01T00:00:00.${micros.padStart(6, '0')}Z`,
-  t: new Date(0),
-  target: 'test',
-  message: 'same output',
-})
-const page = (entries: LogEntry[], extra: Partial<LogChunk> = {}): LogChunk => ({
-  entries,
-  nextCursor: null,
-  live: true,
-  ...extra,
-})
+const entry = (id: string, micros = id) =>
+  logEntry({ id, at: `2026-01-01T00:00:00.${micros.padStart(6, '0')}Z`, message: 'same output' })
 async function flush() {
   await act(async () => {
     await Promise.resolve()
@@ -62,17 +56,26 @@ describe('log controller', () => {
       limit: 200,
       from: entry('6').at,
     })
-    expect(result.current.data.entries.map((e) => e.id)).toEqual(['3', '4', '5', '6', '7', '8'])
+    expect(supported(result.current.data).entries.map((e) => e.id)).toEqual([
+      '3',
+      '4',
+      '5',
+      '6',
+      '7',
+      '8',
+    ])
     expect(result.current.hasOlder).toBe(true)
   })
 
-  it('reselecting Tail refreshes the window after reading history', async () => {
+  it('leaves a completed Tail alone, including reselecting it', async () => {
+    vi.useFakeTimers()
     const fetch = vi.fn().mockResolvedValue(page([entry('1')], { live: false }))
     const { result } = renderHook(() => useLogController(fetch))
-    await waitFor(() => expect(result.current.loading).toBe(false))
+    await flush()
     act(() => result.current.setMode('tail'))
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
-    expect(fetch).toHaveBeenLastCalledWith(null, { order: 'desc', limit: 200 })
+    await act(async () => vi.advanceTimersByTime(20000))
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(result.current.hasNewer).toBe(false)
   })
 
   it('head and page size request a fresh window and stop polling completed sources', async () => {
@@ -107,14 +110,48 @@ describe('log controller', () => {
     expect(fetch).toHaveBeenCalledTimes(2)
     act(() => result.current.togglePlaying())
     await act(async () => resolve(page([entry('2')])))
-    expect(result.current.data.entries.map((e) => e.id)).toEqual(['1'])
+    expect(supported(result.current.data).entries.map((e) => e.id)).toEqual(['1'])
     await act(async () => vi.advanceTimersByTime(20000))
     expect(fetch).toHaveBeenCalledTimes(2)
     act(() => result.current.togglePlaying())
     await act(async () => vi.advanceTimersByTime(2000))
-    expect(result.current.data.entries.map((e) => e.id)).toEqual(['1', '2'])
+    expect(supported(result.current.data).entries.map((e) => e.id)).toEqual(['1', '2'])
     await act(async () => vi.advanceTimersByTime(2000))
     expect(fetch).toHaveBeenLastCalledWith('watermark', expect.objectContaining({ order: 'asc' }))
+  })
+
+  it('queues manual history behind a poll and keeps its loading state distinct', async () => {
+    vi.useFakeTimers()
+    let resolve!: (value: LogChunk) => void
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(page([entry('3')], { nextCursor: 'older' }))
+      .mockImplementationOnce(
+        () =>
+          new Promise<LogChunk>((done) => {
+            resolve = done
+          }),
+      )
+      .mockResolvedValueOnce(page([entry('2')]))
+    const { result } = renderHook(() => useLogController(fetch))
+    await flush()
+    await act(async () => vi.advanceTimersByTime(2000))
+    expect(result.current.polling).toBe(true)
+    expect(result.current.loading).toBe(false)
+    let manual!: Promise<void>
+    act(() => {
+      manual = result.current.loadOlder()
+    })
+    expect(result.current.loading).toBe(true)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      resolve(page([entry('4')]))
+      await manual
+    })
+    expect(fetch).toHaveBeenLastCalledWith('older', { order: 'desc', limit: 200 })
+    expect(supported(result.current.data).entries.map((entry) => entry.id)).toEqual(['2', '3'])
+    expect(result.current.loading).toBe(false)
+    expect(result.current.polling).toBe(false)
   })
 
   it('ignores an old source response, preserves data on errors, and stops automatic retries', async () => {
@@ -136,10 +173,10 @@ describe('log controller', () => {
     rerender({ fetch: fresh })
     await flush()
     await act(async () => resolve(page([entry('1')])))
-    expect(result.current.data.entries[0]!.id).toBe('9')
+    expect(supported(result.current.data).entries[0]!.id).toBe('9')
     await act(async () => vi.advanceTimersByTime(2000))
     expect(result.current.error).toBe('offline')
-    expect(result.current.data.entries[0]!.id).toBe('9')
+    expect(supported(result.current.data).entries[0]!.id).toBe('9')
     await act(async () => vi.advanceTimersByTime(20000))
     expect(fresh).toHaveBeenCalledTimes(2)
   })

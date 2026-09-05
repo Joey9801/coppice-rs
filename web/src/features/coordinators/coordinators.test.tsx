@@ -9,7 +9,7 @@ import { SnapshotCard } from './snapshot-card'
 
 vi.mock('@/api/queries', () => ({
   useCoordinatorStatus: vi.fn(),
-  useCoordinatorLogs: () => ({ data: { entries: [] }, isLoading: false, isError: false }),
+  useCoordinatorLogs: () => ({ data: { unsupported: true }, loading: false, polling: false }),
 }))
 
 import { useCoordinatorStatus } from '@/api/queries'

@@ -723,7 +723,7 @@ pub enum LogQuery {
 /// A log chunk as stored (the attempt/job identity is the caller's; §8.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredLogChunk {
-    /// Stable local segment/row identity for paged reads; empty for legacy unpaged reads.
+    /// Stable local segment/row identity across all read modes.
     pub id: String,
     /// Docker's per-line timestamp.
     pub at: Timestamp,
@@ -926,8 +926,12 @@ impl FilesystemSink {
                         continue;
                     };
                     let rows = log_range_rows(&mut conn, from, to, stream_filter).await?;
-                    for (at, raw_stream, bytes) in rows {
-                        if let Some(chunk) = stored_chunk(at, raw_stream, bytes) {
+                    let segment = path
+                        .file_stem()
+                        .expect("segment path has a file stem")
+                        .to_string_lossy();
+                    for (id, at, raw_stream, bytes) in rows {
+                        if let Some(chunk) = stored_chunk(&segment, id, at, raw_stream, bytes) {
                             out.push(chunk);
                         }
                     }
@@ -946,8 +950,12 @@ impl FilesystemSink {
                     };
                     let mut rows = log_tail_rows(&mut conn, stream_filter, n as i64).await?;
                     rows.reverse(); // (at DESC, id DESC) → this segment's write order
-                    for (at, raw_stream, bytes) in rows {
-                        if let Some(chunk) = stored_chunk(at, raw_stream, bytes) {
+                    let segment = path
+                        .file_stem()
+                        .expect("segment path has a file stem")
+                        .to_string_lossy();
+                    for (id, at, raw_stream, bytes) in rows {
+                        if let Some(chunk) = stored_chunk(&segment, id, at, raw_stream, bytes) {
                             collected.push(chunk);
                         }
                     }
@@ -1153,8 +1161,12 @@ impl FilesystemSink {
                     );
                 }
                 need -= rows.len() as i64;
+                let segment = path
+                    .file_stem()
+                    .expect("segment path has a file stem")
+                    .to_string_lossy();
                 boundary_walk.extend(rows.into_iter().map(|mut row| {
-                    row.id = format!("{}:{}", path.file_stem().unwrap().to_string_lossy(), row.id);
+                    row.id = format!("{segment}:{}", row.id);
                     row
                 }));
             }
@@ -1236,12 +1248,15 @@ impl FilesystemSink {
             }
             collected.extend(rows.iter().map(|r| r.at.as_micros()));
             sort_walk(&mut collected);
+            let segment = path
+                .file_stem()
+                .expect("segment path has a file stem")
+                .to_string_lossy();
             pulled.insert(
                 start,
                 rows.into_iter()
                     .map(|mut row| {
-                        row.id =
-                            format!("{}:{}", path.file_stem().unwrap().to_string_lossy(), row.id);
+                        row.id = format!("{segment}:{}", row.id);
                         row
                     })
                     .collect(),
@@ -1776,7 +1791,7 @@ impl FilesystemSink {
     }
 }
 
-/// Fetch a `Range` query's log rows from one segment, as `(at, stream, bytes)`
+/// Fetch a `Range` query's log rows from one segment, as `(id, at, stream, bytes)`
 /// tuples. Two static queries keep the optional stream filter compile-checked
 /// without a runtime `IS NULL` param.
 async fn log_range_rows(
@@ -1784,12 +1799,12 @@ async fn log_range_rows(
     from: Timestamp,
     to: Timestamp,
     stream: Option<i64>,
-) -> Result<Vec<(i64, i64, Vec<u8>)>, StoreError> {
+) -> Result<Vec<(i64, i64, i64, Vec<u8>)>, StoreError> {
     let from = from.as_micros();
     let to = to.as_micros();
     let rows = match stream {
         Some(stream) => sqlx::query!(
-            r#"SELECT at AS "at!: i64", stream AS "stream!: i64", bytes AS "bytes!: Vec<u8>"
+            r#"SELECT id AS "id!: i64", at AS "at!: i64", stream AS "stream!: i64", bytes AS "bytes!: Vec<u8>"
                FROM log_chunks WHERE at BETWEEN ? AND ? AND stream = ? ORDER BY at, id"#,
             from,
             to,
@@ -1798,10 +1813,10 @@ async fn log_range_rows(
         .fetch_all(conn)
         .await?
         .into_iter()
-        .map(|row| (row.at, row.stream, row.bytes))
+        .map(|row| (row.id, row.at, row.stream, row.bytes))
         .collect(),
         None => sqlx::query!(
-            r#"SELECT at AS "at!: i64", stream AS "stream!: i64", bytes AS "bytes!: Vec<u8>"
+            r#"SELECT id AS "id!: i64", at AS "at!: i64", stream AS "stream!: i64", bytes AS "bytes!: Vec<u8>"
                FROM log_chunks WHERE at BETWEEN ? AND ? ORDER BY at, id"#,
             from,
             to,
@@ -1809,22 +1824,22 @@ async fn log_range_rows(
         .fetch_all(conn)
         .await?
         .into_iter()
-        .map(|row| (row.at, row.stream, row.bytes))
+        .map(|row| (row.id, row.at, row.stream, row.bytes))
         .collect(),
     };
     Ok(rows)
 }
 
 /// Fetch a `Tail` query's newest rows from one segment, in `(at DESC, id DESC)`
-/// order, as `(at, stream, bytes)` tuples.
+/// order, as `(id, at, stream, bytes)` tuples.
 async fn log_tail_rows(
     conn: &mut SqliteConnection,
     stream: Option<i64>,
     limit: i64,
-) -> Result<Vec<(i64, i64, Vec<u8>)>, StoreError> {
+) -> Result<Vec<(i64, i64, i64, Vec<u8>)>, StoreError> {
     let rows = match stream {
         Some(stream) => sqlx::query!(
-            r#"SELECT at AS "at!: i64", stream AS "stream!: i64", bytes AS "bytes!: Vec<u8>"
+            r#"SELECT id AS "id!: i64", at AS "at!: i64", stream AS "stream!: i64", bytes AS "bytes!: Vec<u8>"
                FROM log_chunks WHERE stream = ? ORDER BY at DESC, id DESC LIMIT ?"#,
             stream,
             limit,
@@ -1832,17 +1847,17 @@ async fn log_tail_rows(
         .fetch_all(conn)
         .await?
         .into_iter()
-        .map(|row| (row.at, row.stream, row.bytes))
+        .map(|row| (row.id, row.at, row.stream, row.bytes))
         .collect(),
         None => sqlx::query!(
-            r#"SELECT at AS "at!: i64", stream AS "stream!: i64", bytes AS "bytes!: Vec<u8>"
+            r#"SELECT id AS "id!: i64", at AS "at!: i64", stream AS "stream!: i64", bytes AS "bytes!: Vec<u8>"
                FROM log_chunks ORDER BY at DESC, id DESC LIMIT ?"#,
             limit,
         )
         .fetch_all(conn)
         .await?
         .into_iter()
-        .map(|row| (row.at, row.stream, row.bytes))
+        .map(|row| (row.id, row.at, row.stream, row.bytes))
         .collect(),
     };
     Ok(rows)
@@ -2538,9 +2553,15 @@ async fn metric_beyond_rows(
 }
 
 /// Rebuild a [`StoredLogChunk`], skipping a row whose micros are out of range.
-fn stored_chunk(at: i64, stream: i64, bytes: Vec<u8>) -> Option<StoredLogChunk> {
+fn stored_chunk(
+    segment: &str,
+    id: i64,
+    at: i64,
+    stream: i64,
+    bytes: Vec<u8>,
+) -> Option<StoredLogChunk> {
     Some(StoredLogChunk {
-        id: String::new(),
+        id: format!("{segment}:{id}"),
         at: Timestamp::from_micros(at)?,
         stream: LogStream::from_i64(stream),
         bytes: bytes::Bytes::from(bytes),
@@ -4261,6 +4282,24 @@ mod tests {
         );
         assert_eq!(asc.chunks[0].id, desc.chunks[1].id);
         assert_eq!(asc.chunks[1].id, desc.chunks[0].id);
+        let range = sink
+            .log_chunks(
+                &job,
+                &attempt,
+                None,
+                LogQuery::Range {
+                    from: at(5),
+                    to: at(5),
+                },
+            )
+            .await
+            .unwrap();
+        let tail = sink
+            .log_chunks(&job, &attempt, None, LogQuery::Tail { n: 2 })
+            .await
+            .unwrap();
+        assert_eq!(range, asc.chunks);
+        assert_eq!(tail, asc.chunks);
         let mut query = page_query(LogOrder::Ascending);
         query.max_bytes = 1;
         let cut = sink.log_page(&job, &attempt, &query).await.unwrap();

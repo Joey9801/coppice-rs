@@ -3,8 +3,8 @@
 All log panels use the same controller and view. Tail is selected initially;
 entries read chronologically from top to bottom. Head requests the first page,
 Tail requests the last page, and the page size is configurable (50–1000, default
-200). The unit is a captured entry: job stdout/stderr chunks can contain multiple
-lines and are preserved verbatim. Page byte and RPC budgets can return fewer
+200). Page size counts captured chunks, which can contain multiple text lines. Job
+stdout/stderr chunks are preserved verbatim. Page byte and RPC budgets can return fewer
 entries; a continuation token, not page length, determines whether more remain.
 
 | Source | Real deployment | Demo mode |
@@ -23,7 +23,7 @@ entries, so empty filtered pages can still have more history.
 Pause preserves the current entries and stops automatic fetching. An in-flight
 poll is ignored after pausing. Manual boundary buttons remain available. A paused
 running tail can have both older and newer output. Source/window changes ignore
-stale responses; only one request per controller is active at a time, every poll
+stale responses; manual history requests wait for an active poll rather than being dropped, every poll
 waits two seconds, and an error stops polling until Retry. Retry repeats the failed
 direction. Terminal sources stop polling after outstanding forward pages drain.
 The viewport follows only in Tail while playing and already at the bottom;
@@ -45,8 +45,7 @@ The additive response fields are:
 
 - `entries[].id`: attempt plus opaque segment/row identity supplied by the agent,
   stable across direction, overlapping pages and payload truncation. Two identical
-  writes at the same timestamp remain distinct. Older agents without identities
-  cannot drive this viewer and produce an explicit upgrade error.
+  writes at the same timestamp remain distinct. Every storage read mode supplies an identity.
 - `live`: whether the replicated job state can still produce output.
 - `resume_cursor`: ascending exclusive high-water mark even when `next_cursor`
   is null. It retains accumulated same-microsecond skips, allowing bounded polling
@@ -61,7 +60,13 @@ page is truncated and immediate history remains. An empty initial tail probes
 from the start, which also handles jobs that have not started their first attempt.
 A new attempt is reachable after the previous attempt's high-water mark.
 
-The protobuf identity addition is backward compatible. No node/coordinator
-collection endpoint is invented, and real mode no longer silently delegates those
-reads to the demo world. Production polling requires the updated agent and
-coordinator. Existing CLI consumers can ignore the additive HTTP fields.
+Log request direction and limit, entry metadata, and supported-page fields are
+required. `at` is the entry's only timestamp; structured infrastructure entries
+use null for attempt and stream because neither applies. Unsupported sources are
+a distinct result containing only `unsupported: true`. Demo agent/coordinator
+sources intentionally remain live so the polling controls can be exercised.
+
+The protobuf fields are numbered in declaration order, starting with identity.
+There are no deployed versions to accommodate; server and CLI use the same strict
+response contract. No node/coordinator collection endpoint is invented, and real
+mode never delegates those reads to the demo world.

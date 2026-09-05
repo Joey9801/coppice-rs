@@ -762,6 +762,7 @@ describe('log contracts', () => {
       order: 'desc',
       limit: 50,
     })
+    if (chunk.unsupported) throw new Error('Job logs must be supported')
     const url = String(fetchMock.mock.calls[0]![0])
     expect(url).toContain('cursor=cursor')
     expect(url).toContain('order=desc')
@@ -796,14 +797,16 @@ describe('log contracts', () => {
     expect(
       await api.getJobLogs('job-a', 'watermark', {
         order: 'asc',
+        limit: 200,
         from: '2026-01-01T00:00:00.000001Z',
       }),
     ).toMatchObject({ resumeCursor: 'watermark', live: false })
     expect(String(fetchMock.mock.calls[0]![0])).toContain('from=2026-01-01T00%3A00%3A00.000001Z')
-    expect(await api.getNodeLogs('node-a', null)).toMatchObject({ unsupported: true, entries: [] })
-    expect(await api.getCoordinatorLogs('1', null)).toMatchObject({
+    expect(await api.getNodeLogs('node-a', null, { order: 'desc', limit: 200 })).toMatchObject({
       unsupported: true,
-      entries: [],
+    })
+    expect(await api.getCoordinatorLogs('1', null, { order: 'desc', limit: 200 })).toMatchObject({
+      unsupported: true,
     })
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })

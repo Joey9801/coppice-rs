@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { LogChunk, LogEntry, LogRequest, LogSource } from './types'
+import type { LogChunk, LogEntry, LogPage, LogRequest, LogSource } from './types'
 
 export type LogFetcher = (cursor: string | null, request: LogRequest) => Promise<LogChunk>
 type Direction = 'initial' | 'older' | 'newer'
+const emptyPage: LogPage = {
+  entries: [],
+  sources: [],
+  nextCursor: null,
+  resumeCursor: null,
+  live: false,
+}
 
 /** Merge identities, never content: identical repeated writes are separate entries. */
 export function mergeLogs(previous: LogEntry[], incoming: LogEntry[]): LogEntry[] {
@@ -14,56 +21,69 @@ export function mergeLogs(previous: LogEntry[], incoming: LogEntry[]): LogEntry[
   return [...merged.values()].sort(
     (a, b) =>
       (a.attempt ?? '').localeCompare(b.attempt ?? '') ||
-      Date.parse(a.at ?? a.t.toISOString()) - Date.parse(b.at ?? b.t.toISOString()) ||
-      (a.at?.match(/\.(\d+)/)?.[1] ?? '')
+      Date.parse(a.at) - Date.parse(b.at) ||
+      // Date.parse drops micros, so compare the fractional part textually.
+      (a.at.match(/\.(\d+)/)?.[1] ?? '')
         .padEnd(6, '0')
-        .localeCompare((b.at?.match(/\.(\d+)/)?.[1] ?? '').padEnd(6, '0')) ||
-      (a.id ?? '').localeCompare(b.id ?? '', undefined, { numeric: true }),
+        .localeCompare((b.at.match(/\.(\d+)/)?.[1] ?? '').padEnd(6, '0')) ||
+      a.id.localeCompare(b.id, undefined, { numeric: true }),
   )
 }
 
 function mergeSources(previous: LogSource[], incoming: LogSource[]): LogSource[] {
   const sources = new Map(previous.map((source) => [source.attempt, source]))
-  for (const source of incoming) {
+  for (const source of incoming)
     sources.set(source.attempt, {
       ...source,
       truncated: source.truncated || Boolean(sources.get(source.attempt)?.truncated),
     })
-  }
   return [...sources.values()]
 }
 
-/** One bounded request at a time. Generation guards isolate source/window changes. */
-export function useLogController(fetchPage: LogFetcher) {
-  const [mode, setMode] = useState<'head' | 'tail'>('tail')
-  const [limit, setLimit] = useState(200)
-  const [windowVersion, setWindowVersion] = useState(0)
-  const [playing, setPlaying] = useState(true)
-  const [data, setData] = useState<LogChunk>({ entries: [], nextCursor: null })
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [revision, setRevision] = useState(0)
-  const [boundaries, setBoundaries] = useState({ older: false, newer: false })
-  const failedDirection = useRef<Direction>('initial')
-  const state = useRef({
-    generation: 0,
-    busy: false,
+function newSession(generation: number) {
+  return {
+    generation,
+    pending: null as Promise<void> | null,
     older: null as string | null,
     newer: null as string | null,
     from: undefined as string | undefined,
     hasNewer: false,
-    playing: true,
     pauseEpoch: 0,
-  })
+  }
+}
+
+/** Serialize page requests; manual loads wait for polls instead of being dropped. */
+export function useLogController(fetchPage: LogFetcher) {
+  const [mode, setMode] = useState<'head' | 'tail'>('tail')
+  const [limit, setLimit] = useState(200)
+  const [playing, setPlaying] = useState(true)
+  const [data, setData] = useState<LogChunk>(emptyPage)
+  const [loading, setLoading] = useState(false)
+  const [polling, setPolling] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [revision, setRevision] = useState(0)
+  const [boundaries, setBoundaries] = useState({ older: false, newer: false })
+  const failedDirection = useRef<Direction>('initial')
+  const state = useRef(newSession(0))
 
   const load = useCallback(
     async (direction: Direction, automatic = false) => {
       const current = state.current
-      if (current.busy) return
-      current.busy = true
       const generation = current.generation
+      if (automatic && current.pending) return
+      if (!automatic) {
+        setLoading(true)
+        // Prioritize the reader's request; don't append a poll while a prepend is queued.
+        if (current.pending) current.pauseEpoch += 1
+      }
+      while (current.pending) await current.pending
+      if (state.current !== current || generation !== current.generation) return
+      let release!: () => void
+      current.pending = new Promise<void>((resolve) => {
+        release = resolve
+      })
       const pauseEpoch = current.pauseEpoch
-      setLoading(true)
+      if (automatic) setPolling(true)
       setError(null)
       failedDirection.current = direction
       const order =
@@ -82,38 +102,43 @@ export function useLogController(fetchPage: LogFetcher) {
           (automatic && pauseEpoch !== current.pauseEpoch)
         )
           return
-        if (page.entries.some((entry) => !entry.id))
-          throw new Error(
-            'Stable log identities unavailable. Update the log source to enable this viewer.',
-          )
+        if (page.unsupported) {
+          setData(page)
+          return
+        }
         if (direction === 'initial') {
           current.older = mode === 'tail' ? page.nextCursor : null
-          current.newer = mode === 'head' ? (page.nextCursor ?? page.resumeCursor ?? null) : null
+          current.newer = mode === 'head' ? (page.nextCursor ?? page.resumeCursor) : null
           current.from = mode === 'tail' ? page.entries.at(-1)?.at : undefined
-          // A tail needs a forward probe even after completion: data may arrive between reads.
-          current.hasNewer = mode === 'tail' || page.nextCursor !== null
+          current.hasNewer = mode === 'tail' ? page.live : page.nextCursor !== null
         } else if (direction === 'older') current.older = page.nextCursor
         else {
           current.newer = page.nextCursor ?? page.resumeCursor ?? current.newer
           current.hasNewer = page.nextCursor !== null
         }
         setBoundaries({ older: current.older !== null, newer: current.hasNewer })
-        setData((previous) => ({
-          ...page,
-          entries:
-            direction === 'initial' ? page.entries : mergeLogs(previous.entries, page.entries),
-          sources: mergeSources(
-            direction === 'initial' ? [] : (previous.sources ?? []),
-            page.sources ?? [],
-          ),
-        }))
+        setData((previous) =>
+          direction === 'initial' || previous.unsupported
+            ? page
+            : {
+                ...page,
+                entries: mergeLogs(previous.entries, page.entries),
+                sources: mergeSources(previous.sources, page.sources),
+              },
+        )
       } catch (reason) {
-        if (state.current === current && (!automatic || pauseEpoch === current.pauseEpoch))
+        if (
+          state.current === current &&
+          generation === current.generation &&
+          (!automatic || pauseEpoch === current.pauseEpoch)
+        )
           setError(reason instanceof Error ? reason.message : 'Could not load logs.')
       } finally {
-        if (state.current === current) {
-          current.busy = false
-          setLoading(false)
+        current.pending = null
+        release()
+        if (state.current === current && generation === current.generation) {
+          if (automatic) setPolling(false)
+          else setLoading(false)
           setRevision((n) => n + 1)
         }
       }
@@ -122,56 +147,52 @@ export function useLogController(fetchPage: LogFetcher) {
   )
 
   useEffect(() => {
-    const current = {
-      generation: state.current.generation + 1,
-      busy: false,
-      older: null,
-      newer: null,
-      from: undefined,
-      hasNewer: false,
-      playing: state.current.playing,
-      pauseEpoch: 0,
-    }
+    const current = newSession(state.current.generation + 1)
     state.current = current
-    // This effect synchronizes a new external source/window with the rendered snapshot.
+    // Synchronize the new external source/window with its rendered snapshot.
     // oxlint-disable-next-line react/set-state-in-effect
-    setData({ entries: [], nextCursor: null })
+    setData(emptyPage)
     setBoundaries({ older: false, newer: false })
+    setPolling(false)
     void load('initial')
     return () => {
       current.generation += 1
     }
-  }, [load, windowVersion])
+  }, [load])
 
   useEffect(() => {
-    if (!playing || loading || error || data.unsupported || (!data.live && !state.current.hasNewer))
+    if (
+      !playing ||
+      loading ||
+      polling ||
+      error ||
+      data.unsupported ||
+      (!data.live && !boundaries.newer)
+    )
       return
     const timer = setTimeout(() => {
       void load('newer', true)
     }, 2000)
     return () => clearTimeout(timer)
-  }, [playing, loading, error, data, load, revision])
+  }, [playing, loading, polling, error, data, load, revision, boundaries.newer])
 
   const togglePlaying = () => {
-    state.current.playing = !state.current.playing
     state.current.pauseEpoch += 1
-    setPlaying(state.current.playing)
+    setPlaying((value) => !value)
   }
   return {
     data,
     loading,
+    polling,
     error,
     mode,
-    setMode: (next: 'head' | 'tail') => {
-      setMode(next)
-      setWindowVersion((version) => version + 1)
-    },
+    setMode,
     limit,
     setLimit,
     playing,
     togglePlaying,
     hasOlder: boundaries.older,
-    hasNewer: boundaries.newer || Boolean(data.live),
+    hasNewer: boundaries.newer || (!data.unsupported && data.live),
     loadOlder: () => load('older'),
     loadNewer: () => load('newer'),
     retry: () => load(failedDirection.current),
