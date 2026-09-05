@@ -1,5 +1,5 @@
 import { useCallback } from 'react'
-import { useLogController } from './log-controller'
+import { useLogController, type LogFetcher } from './log-controller'
 import {
   keepPreviousData,
   useInfiniteQuery,
@@ -14,7 +14,6 @@ import type {
   CoordinatorId,
   JobId,
   ListJobsRequest,
-  LogRequest,
   NodeId,
   QuotaEntityId,
 } from './types'
@@ -120,20 +119,28 @@ export function useJobUsage(id: JobId, attempt: AttemptId | null = null) {
   })
 }
 
-export function useJobLogs(id: JobId) {
+function useLogPager(source: 'job' | 'node' | 'coordinator', id: string, fetchPage: LogFetcher) {
   const client = useQueryClient()
-  const fetchPage = useCallback(
-    (cursor: string | null, request: LogRequest) =>
+  const fetch = useCallback<LogFetcher>(
+    (cursor, request) =>
       client.fetchQuery({
-        queryKey: [...queryKeys.jobLogs(id), cursor, request],
-        queryFn: () => api.getJobLogs(id, cursor, request),
+        queryKey: [...queryKeys[`${source}Logs`](id), cursor, request],
+        queryFn: () => fetchPage(cursor, request),
         staleTime: 0,
         gcTime: 0,
         retry: false,
       }),
-    [client, id],
+    [client, source, id, fetchPage],
   )
-  return useLogController(fetchPage)
+  return useLogController(fetch)
+}
+
+export function useJobLogs(id: JobId) {
+  const fetchPage = useCallback<LogFetcher>(
+    (cursor, request) => api.getJobLogs(id, cursor, request),
+    [id],
+  )
+  return useLogPager('job', id, fetchPage)
 }
 
 export function useNodes() {
@@ -161,19 +168,11 @@ export function useNodeUtilization(id: NodeId) {
 }
 
 export function useNodeLogs(id: NodeId) {
-  const client = useQueryClient()
-  const fetchPage = useCallback(
-    (cursor: string | null, request: LogRequest) =>
-      client.fetchQuery({
-        queryKey: [...queryKeys.nodeLogs(id), cursor, request],
-        queryFn: () => api.getNodeLogs(id, cursor, request),
-        staleTime: 0,
-        gcTime: 0,
-        retry: false,
-      }),
-    [client, id],
+  const fetchPage = useCallback<LogFetcher>(
+    (cursor, request) => api.getNodeLogs(id, cursor, request),
+    [id],
   )
-  return useLogController(fetchPage)
+  return useLogPager('node', id, fetchPage)
 }
 
 export function useCoordinatorStatus() {
@@ -185,19 +184,11 @@ export function useCoordinatorStatus() {
 }
 
 export function useCoordinatorLogs(id: CoordinatorId) {
-  const client = useQueryClient()
-  const fetchPage = useCallback(
-    (cursor: string | null, request: LogRequest) =>
-      client.fetchQuery({
-        queryKey: [...queryKeys.coordinatorLogs(id), cursor, request],
-        queryFn: () => api.getCoordinatorLogs(id, cursor, request),
-        staleTime: 0,
-        gcTime: 0,
-        retry: false,
-      }),
-    [client, id],
+  const fetchPage = useCallback<LogFetcher>(
+    (cursor, request) => api.getCoordinatorLogs(id, cursor, request),
+    [id],
   )
-  return useLogController(fetchPage)
+  return useLogPager('coordinator', id, fetchPage)
 }
 
 export function useQuotaEntities() {

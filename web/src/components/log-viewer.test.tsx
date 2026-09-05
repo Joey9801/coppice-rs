@@ -1,33 +1,14 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { LogController } from '@/api/log-controller'
+import { beforeEach, describe, expect, it } from 'vitest'
+import { logController, logPage, logEntry } from '@/test/log-fixtures'
 import { LogViewer } from './log-viewer'
 import type { LogEntry } from '@/api/types'
 
-const entries: LogEntry[] = ['debug', 'info', 'warn', 'error'].map((level, i) => ({
-  id: level,
-  t: new Date('2026-01-01T12:34:56Z'),
-  level: level as LogEntry['level'],
-  target: 'agent',
-  message: `message ${i}`,
-}))
-const controller = (extra: Partial<LogController> = {}): LogController => ({
-  data: { entries, nextCursor: null, live: true },
-  loading: false,
-  error: null,
-  mode: 'tail',
-  setMode: vi.fn(),
-  limit: 200,
-  setLimit: vi.fn(),
-  playing: true,
-  togglePlaying: vi.fn(),
-  hasOlder: true,
-  hasNewer: true,
-  loadOlder: vi.fn(async () => {}),
-  loadNewer: vi.fn(async () => {}),
-  retry: vi.fn(async () => {}),
-  ...extra,
-})
+const entries = ['debug', 'info', 'warn', 'error'].map((level, i) =>
+  logEntry({ id: level, level: level as LogEntry['level'], message: `message ${i}` }),
+)
+const controller = (extra: Parameters<typeof logController>[0] = {}) =>
+  logController({ data: logPage(entries), ...extra })
 beforeEach(() => {
   HTMLDialogElement.prototype.showModal = function () {
     this.open = true
@@ -36,7 +17,7 @@ beforeEach(() => {
 
 describe('log viewer', () => {
   it('toggles UI timestamps and applies inclusive structured thresholds, never job severity', () => {
-    const { rerender } = render(<LogViewer entries={entries} structured />)
+    const { rerender } = render(<LogViewer controller={controller()} structured />)
     expect(screen.queryByText('message 0')).not.toBeInTheDocument()
     expect(screen.getByText('message 1')).toBeVisible()
     fireEvent.change(screen.getByLabelText('Verbosity'), { target: { value: 'warn' } })
@@ -47,7 +28,7 @@ describe('log viewer', () => {
     expect(screen.getByText('message 0')).toBeVisible()
     fireEvent.click(screen.getByLabelText('Timestamps'))
     expect(screen.queryByText(/12:34/)).not.toBeInTheDocument()
-    rerender(<LogViewer entries={entries} />)
+    rerender(<LogViewer controller={controller()} />)
     expect(screen.queryByLabelText('Verbosity')).not.toBeInTheDocument()
     expect(screen.queryByText('ERROR')).not.toBeInTheDocument()
   })
@@ -66,6 +47,21 @@ describe('log viewer', () => {
     expect(logs.loadNewer).toHaveBeenCalledOnce()
   })
 
+  it('keeps navigation enabled during polls and disables finished-source forward controls', () => {
+    const { rerender } = render(<LogViewer controller={controller({ polling: true })} />)
+    for (const name of ['Head', 'Tail', 'Load older lines'])
+      expect(screen.getByText(name)).toBeEnabled()
+    expect(screen.getByLabelText('Entries per page')).toBeEnabled()
+    rerender(
+      <LogViewer
+        controller={controller({ data: logPage(entries, { live: false }), hasNewer: false })}
+      />,
+    )
+    expect(screen.getByText('Source finished')).toBeVisible()
+    expect(screen.getByLabelText('Pause log updates')).toBeDisabled()
+    expect(screen.queryByText('Load newer lines')).not.toBeInTheDocument()
+  })
+
   it('uses a modal dialog, Escape restores focus, and unsupported controls are disabled', async () => {
     const { rerender } = render(<LogViewer controller={controller()} />)
     fireEvent.click(screen.getByLabelText('Maximize log viewer'))
@@ -73,12 +69,7 @@ describe('log viewer', () => {
     expect(modal).toHaveAttribute('open')
     fireEvent(modal, new Event('cancel', { bubbles: true, cancelable: true }))
     await waitFor(() => expect(screen.getByLabelText('Maximize log viewer')).toHaveFocus())
-    rerender(
-      <LogViewer
-        controller={controller({ data: { entries: [], nextCursor: null, unsupported: true } })}
-        structured
-      />,
-    )
+    rerender(<LogViewer controller={{ ...controller(), data: { unsupported: true } }} structured />)
     expect(screen.getByText('Log collection is not available for this source.')).toBeVisible()
     expect(screen.getByText('Tail')).toBeDisabled()
     expect(screen.getByLabelText('Verbosity')).toBeDisabled()

@@ -4,6 +4,7 @@ import type { ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { useJobLogs, useNodeLogs, useCoordinatorLogs } from './queries'
 import { api } from './index'
+import { logPage } from '@/test/log-fixtures'
 vi.mock('./index', () => ({
   api: { getJobLogs: vi.fn(), getNodeLogs: vi.fn(), getCoordinatorLogs: vi.fn() },
 }))
@@ -14,7 +15,7 @@ describe('shared log query wiring', () => {
     [useNodeLogs, 'getNodeLogs'],
     [useCoordinatorLogs, 'getCoordinatorLogs'],
   ] as const)('forwards window options through a source-scoped query', async (hook, method) => {
-    vi.mocked(api[method]).mockResolvedValue({ entries: [], nextCursor: null, live: false })
+    vi.mocked(api[method]).mockResolvedValue(logPage([], { live: false }))
     const client = new QueryClient()
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>

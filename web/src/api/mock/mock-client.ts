@@ -55,17 +55,17 @@ export function createMockClient(): CoppiceApi {
     getJobTimeline: (id: JobId) => settle(() => world.buildJobTimeline(id)),
     getJobUsage: (id: JobId, attempt?: AttemptId | null) =>
       settle(() => world.buildJobUsage(id, attempt ?? null)),
-    getJobLogs: (id: JobId, cursor: string | null, request?: LogRequest) =>
+    getJobLogs: (id: JobId, cursor: string | null, request: LogRequest) =>
       settle(() => world.buildJobLogs(id, cursor, request)),
 
     listNodes: () => settle(() => world.buildNodeSummaries()),
     getNode: (id: NodeId) => settle(() => world.buildNodeDetail(id)),
     getNodeUtilization: (id: NodeId) => settle(() => world.buildNodeUtilization(id)),
-    getNodeLogs: (id: NodeId, cursor: string | null, request?: LogRequest) =>
+    getNodeLogs: (id: NodeId, cursor: string | null, request: LogRequest) =>
       settle(() => world.buildNodeLogs(id, cursor, request)),
 
     getCoordinatorStatus: () => settle(() => world.buildCoordinatorStatus()),
-    getCoordinatorLogs: (id: CoordinatorId, cursor: string | null, request?: LogRequest) =>
+    getCoordinatorLogs: (id: CoordinatorId, cursor: string | null, request: LogRequest) =>
       settle(() => world.buildCoordinatorLogs(id, cursor, request)),
 
     // The demo session always holds `admin`, so the mock never rejects with

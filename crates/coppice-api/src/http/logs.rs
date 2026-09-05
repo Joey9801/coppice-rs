@@ -440,11 +440,7 @@ async fn walk<P: ControlPlane>(
                 for chunk in &page.chunks {
                     bytes += chunk.payload.len();
                     entries.push(LogEntry {
-                        id: if chunk.id.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{}:{}", attempt_id, chunk.id)
-                        },
+                        id: format!("{}:{}", attempt_id, chunk.id),
                         attempt: attempt_id,
                         at: Timestamp::from_micros(chunk.at_us)
                             .unwrap_or_else(Timestamp::min_value),

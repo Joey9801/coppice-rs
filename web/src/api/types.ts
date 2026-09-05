@@ -925,21 +925,21 @@ export interface CoordinatorStatus {
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error'
 
 export interface LogEntry {
-  id?: string
-  t: Date
-  /** Preserve microsecond precision for pagination and ordering. */
-  at?: string
+  id: string
+  /** RFC3339 timestamp retaining microsecond precision. */
+  at: string
   level?: LogLevel
   target: string
   message: string
-  attempt?: AttemptId
-  stream?: 'stdout' | 'stderr'
-  truncated?: boolean
+  /** Structured infrastructure logs have no job attempt or stdout/stderr stream. */
+  attempt: AttemptId | null
+  stream: 'stdout' | 'stderr' | null
+  truncated: boolean
 }
 
 export interface LogRequest {
-  order?: 'asc' | 'desc'
-  limit?: number
+  order: 'asc' | 'desc'
+  limit: number
   /** Inclusive lower bound; retained across all continuation requests. */
   from?: string
 }
@@ -953,14 +953,16 @@ export interface LogSource {
   reason: string | null
 }
 
-export interface LogChunk {
-  resumeCursor?: string | null
+export type LogChunk = { unsupported: true } | LogPage
+
+export interface LogPage {
+  unsupported?: false
+  resumeCursor: string | null
   /** Always chronological; cursor direction is selected by the request. */
   entries: LogEntry[]
   nextCursor: string | null
-  sources?: LogSource[]
-  live?: boolean
-  unsupported?: boolean
+  sources: LogSource[]
+  live: boolean
 }
 
 // ---------------------------------------------------------------------------
