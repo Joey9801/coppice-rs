@@ -515,6 +515,8 @@ pub struct LogFetchRequest {
 /// stream. Bytes are returned verbatim; UTF-8 decoding happens at the HTTP edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogChunk {
+    /// Opaque segment/row identity supplied by the agent.
+    pub id: String,
     pub at_us: i64,
     pub stream: LogStreamSelector,
     pub payload: Vec<u8>,

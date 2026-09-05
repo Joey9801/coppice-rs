@@ -1708,6 +1708,9 @@ pub enum LogAvailability {
 /// into `text`; raw bytes are not recoverable through this API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// Stable identity; distinct repeated writes remain distinct entries.
+    #[serde(default)]
+    pub id: String,
     pub attempt: AttemptId,
     pub at: Timestamp,
     pub stream: LogStreamName,
@@ -1743,6 +1746,12 @@ pub struct LogSourceRecord {
 /// `GET /api/v1/jobs/{job}/logs` — the never-bare-array envelope (ADR 0031).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetJobLogsResponse {
+    /// Ascending high-water mark, valid even when this page exhausts current output.
+    #[serde(default)]
+    pub resume_cursor: Option<String>,
+    /// Whether the job can still produce output (polling is best effort).
+    #[serde(default)]
+    pub live: bool,
     pub entries: Vec<LogEntry>,
     pub sources: Vec<LogSourceRecord>,
     /// Opaque continuation token ([`LogCursor`]); `null` iff the walk is truly

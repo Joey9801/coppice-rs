@@ -365,6 +365,7 @@ fn chunks_response(page: crate::telemetry::LogPage) -> pb::FetchLogsResponse {
         .chunks
         .into_iter()
         .map(|chunk| pb::LogChunk {
+            id: chunk.id,
             at_us: chunk.at.as_micros(),
             stream: pb_stream(chunk.stream) as i32,
             payload: chunk.bytes.to_vec(),

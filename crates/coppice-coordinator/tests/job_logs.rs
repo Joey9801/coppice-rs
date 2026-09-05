@@ -544,6 +544,30 @@ async fn best_effort_job_logs_full_read_path() {
     );
     assert_eq!(pages, 3, "five lines at limit=2 span exactly three pages");
 
+    // Stable identity and live polling survive the full SQLite → protobuf → HTTP path.
+    assert!(body.live);
+    let (_, tail) = get_logs(&router, job, "order=desc&limit=2").await;
+    assert_eq!(tail.entries[0].id, body.entries[4].id);
+    assert_eq!(tail.entries[1].id, body.entries[3].id);
+    let watermark = body
+        .resume_cursor
+        .as_ref()
+        .expect("ascending high-water mark");
+    let repeat = seed_chunk(job, attempt, alloc, BASE + 4_000, "line-4");
+    LogSink::append(&sink, &[repeat.clone(), repeat]).await;
+    let (_, fresh) = get_logs(&router, job, &format!("order=asc&cursor={watermark}")).await;
+    assert_eq!(
+        fresh.entries.len(),
+        2,
+        "only the new identical writes are returned"
+    );
+    assert_ne!(fresh.entries[0].id, fresh.entries[1].id);
+    assert_ne!(fresh.entries[0].id, body.entries[4].id);
+    let next_watermark = fresh.resume_cursor.as_ref().unwrap();
+    let (_, empty) = get_logs(&router, job, &format!("order=asc&cursor={next_watermark}")).await;
+    assert!(empty.entries.is_empty());
+    assert_eq!(empty.resume_cursor.as_ref(), Some(next_watermark));
+
     // -- 3. `expired`: the attempt's telemetry is deleted from the sink. ----
     // Retention deletes whole attempt directories; simulate that by removing
     // this attempt's directory. The store then answers UnknownAttempt, and the

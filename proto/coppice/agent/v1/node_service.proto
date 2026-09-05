@@ -175,6 +175,8 @@ message MetricSample {
 // One stored log chunk: a run of bytes captured at one microsecond on one
 // stream. Bytes are returned verbatim; UTF-8 decoding happens at the edge.
 message LogChunk {
+  // Opaque identity stable across direction, pagination, and payload truncation.
+  string id = 5;
   int64 at_us = 1;
   LogStream stream = 2;
   bytes payload = 3;

@@ -921,23 +921,46 @@ export interface CoordinatorStatus {
 // ---------------------------------------------------------------------------
 // Logs
 // ---------------------------------------------------------------------------
-// NOTE: no log storage/streaming exists in the backend yet — this shape is
-// the UI's proposal for that future API (cursor-paged, ADR 0008 style).
-
+/** Inclusive severity thresholds: warn includes error; info adds info; debug adds debug. */
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error'
 
 export interface LogEntry {
+  id?: string
   t: Date
-  level: LogLevel
-  /** Module path / component that emitted the line. */
+  /** Preserve microsecond precision for pagination and ordering. */
+  at?: string
+  level?: LogLevel
   target: string
   message: string
+  attempt?: AttemptId
+  stream?: 'stdout' | 'stderr'
+  truncated?: boolean
+}
+
+export interface LogRequest {
+  order?: 'asc' | 'desc'
+  limit?: number
+  /** Inclusive lower bound; retained across all continuation requests. */
+  from?: string
+}
+
+export interface LogSource {
+  attempt: AttemptId
+  node: NodeId | null
+  availability: 'available' | 'expired' | 'unreachable' | 'not_started'
+  truncated: boolean
+  earliestAvailableAt: Date | null
+  reason: string | null
 }
 
 export interface LogChunk {
+  resumeCursor?: string | null
+  /** Always chronological; cursor direction is selected by the request. */
   entries: LogEntry[]
-  /** Pass back to fetch older entries; null when history is exhausted. */
   nextCursor: string | null
+  sources?: LogSource[]
+  live?: boolean
+  unsupported?: boolean
 }
 
 // ---------------------------------------------------------------------------
