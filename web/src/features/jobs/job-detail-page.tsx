@@ -257,7 +257,7 @@ function JobLogsCard({ jobId }: { jobId: JobId }) {
         <CardTitle className="text-sm">Logs</CardTitle>
       </CardHeader>
       <CardContent className="space-y-2 p-4">
-        <LogViewer entries={logs.data?.entries ?? []} loading={logs.isLoading} />
+        <LogViewer controller={logs} />
       </CardContent>
     </Card>
   )

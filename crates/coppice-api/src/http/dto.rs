@@ -1703,11 +1703,12 @@ pub enum LogAvailability {
     NotStarted,
 }
 
-/// One log line for the client (mirrors the future `web/src/api/types.ts`
-/// `LogChunk`, superseded by this contract). Bytes are decoded UTF-8-lossily
+/// One captured log chunk for the client. Bytes are decoded UTF-8-lossily
 /// into `text`; raw bytes are not recoverable through this API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// Stable identity; distinct repeated writes remain distinct entries.
+    pub id: String,
     pub attempt: AttemptId,
     pub at: Timestamp,
     pub stream: LogStreamName,
@@ -1740,9 +1741,23 @@ pub struct LogSourceRecord {
     pub reason: Option<String>,
 }
 
+// A nullable field must still be present in the response contract.
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 /// `GET /api/v1/jobs/{job}/logs` — the never-bare-array envelope (ADR 0031).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetJobLogsResponse {
+    /// Ascending high-water mark, valid even when this page exhausts current output.
+    #[serde(deserialize_with = "required_option")]
+    pub resume_cursor: Option<String>,
+    /// Whether the job can still produce output (polling is best effort).
+    pub live: bool,
     pub entries: Vec<LogEntry>,
     pub sources: Vec<LogSourceRecord>,
     /// Opaque continuation token ([`LogCursor`]); `null` iff the walk is truly
@@ -3083,5 +3098,26 @@ mod tests {
             json,
             serde_json::json!({ "kind": "node_lost", "class": "platform" })
         );
+    }
+    #[test]
+    fn log_contract_requires_identity_liveness_and_nullable_resume_field() {
+        let entry = serde_json::json!({
+            "id": "segment:1", "attempt": AttemptId::new(),
+            "at": "2026-01-01T00:00:00.000000Z", "stream": "stdout", "text": "line", "truncated": false
+        });
+        assert!(serde_json::from_value::<LogEntry>(entry.clone()).is_ok());
+        let mut missing_id = entry.clone();
+        missing_id.as_object_mut().unwrap().remove("id");
+        assert!(serde_json::from_value::<LogEntry>(missing_id).is_err());
+        let response = serde_json::json!({ "entries": [entry], "sources": [], "next_cursor": null, "resume_cursor": null, "live": false });
+        assert!(serde_json::from_value::<GetJobLogsResponse>(response.clone()).is_ok());
+        for field in ["live", "resume_cursor"] {
+            let mut missing = response.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<GetJobLogsResponse>(missing).is_err(),
+                "{field} must be present"
+            );
+        }
     }
 }

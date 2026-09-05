@@ -1,3 +1,5 @@
+import { useCallback } from 'react'
+import { useLogController, type LogFetcher } from './log-controller'
 import {
   keepPreviousData,
   useInfiniteQuery,
@@ -117,12 +119,28 @@ export function useJobUsage(id: JobId, attempt: AttemptId | null = null) {
   })
 }
 
+function useLogPager(source: 'job' | 'node' | 'coordinator', id: string, fetchPage: LogFetcher) {
+  const client = useQueryClient()
+  const fetch = useCallback<LogFetcher>(
+    (cursor, request) =>
+      client.fetchQuery({
+        queryKey: [...queryKeys[`${source}Logs`](id), cursor, request],
+        queryFn: () => fetchPage(cursor, request),
+        staleTime: 0,
+        gcTime: 0,
+        retry: false,
+      }),
+    [client, source, id, fetchPage],
+  )
+  return useLogController(fetch)
+}
+
 export function useJobLogs(id: JobId) {
-  return useQuery({
-    queryKey: queryKeys.jobLogs(id),
-    queryFn: () => api.getJobLogs(id, null),
-    ...LIVE,
-  })
+  const fetchPage = useCallback<LogFetcher>(
+    (cursor, request) => api.getJobLogs(id, cursor, request),
+    [id],
+  )
+  return useLogPager('job', id, fetchPage)
 }
 
 export function useNodes() {
@@ -150,11 +168,11 @@ export function useNodeUtilization(id: NodeId) {
 }
 
 export function useNodeLogs(id: NodeId) {
-  return useQuery({
-    queryKey: queryKeys.nodeLogs(id),
-    queryFn: () => api.getNodeLogs(id, null),
-    ...LIVE,
-  })
+  const fetchPage = useCallback<LogFetcher>(
+    (cursor, request) => api.getNodeLogs(id, cursor, request),
+    [id],
+  )
+  return useLogPager('node', id, fetchPage)
 }
 
 export function useCoordinatorStatus() {
@@ -166,11 +184,11 @@ export function useCoordinatorStatus() {
 }
 
 export function useCoordinatorLogs(id: CoordinatorId) {
-  return useQuery({
-    queryKey: queryKeys.coordinatorLogs(id),
-    queryFn: () => api.getCoordinatorLogs(id, null),
-    ...LIVE,
-  })
+  const fetchPage = useCallback<LogFetcher>(
+    (cursor, request) => api.getCoordinatorLogs(id, cursor, request),
+    [id],
+  )
+  return useLogPager('coordinator', id, fetchPage)
 }
 
 export function useQuotaEntities() {

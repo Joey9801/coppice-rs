@@ -175,12 +175,14 @@ message MetricSample {
 // One stored log chunk: a run of bytes captured at one microsecond on one
 // stream. Bytes are returned verbatim; UTF-8 decoding happens at the edge.
 message LogChunk {
-  int64 at_us = 1;
-  LogStream stream = 2;
-  bytes payload = 3;
+  // Opaque identity stable across direction, pagination, and payload truncation.
+  string id = 1;
+  int64 at_us = 2;
+  LogStream stream = 3;
+  bytes payload = 4;
   // True when `payload` was cut down to the page's remaining `max_bytes` budget
   // because this chunk alone exceeded it: the store still counts the chunk as
   // fully consumed, so the resume cursor advances past it whole and the dropped
   // bytes are never re-served. Only ever set on a page's first chunk.
-  bool truncated = 4;
+  bool truncated = 5;
 }

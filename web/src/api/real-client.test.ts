@@ -720,3 +720,94 @@ describe('getCoordinatorStatus', () => {
     expect(status.snapshot!.entriesSinceSnapshot).toBe(998)
   })
 })
+
+describe('log contracts', () => {
+  it('requests directional pages and preserves identity, precision, raw streams and source availability', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        entries: [
+          {
+            id: 'second',
+            attempt: 'attempt-a',
+            at: '2026-01-01T00:00:00.000002Z',
+            stream: 'stderr',
+            text: 'raw warning?',
+            truncated: true,
+          },
+          {
+            id: 'first',
+            attempt: 'attempt-a',
+            at: '2026-01-01T00:00:00.000001Z',
+            stream: 'stdout',
+            text: 'raw output',
+            truncated: false,
+          },
+        ],
+        sources: [
+          {
+            attempt: 'attempt-a',
+            node: 'node-a',
+            availability: 'unreachable',
+            reason: 'offline',
+            truncated: true,
+            earliest_available_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+        next_cursor: 'older',
+        resume_cursor: null,
+        live: true,
+      }),
+    )
+    const chunk = await createRealClient().getJobLogs('job-a', 'cursor', {
+      order: 'desc',
+      limit: 50,
+    })
+    if (chunk.unsupported) throw new Error('Job logs must be supported')
+    const url = String(fetchMock.mock.calls[0]![0])
+    expect(url).toContain('cursor=cursor')
+    expect(url).toContain('order=desc')
+    expect(url).toContain('limit=50')
+    expect(chunk.entries.map((e) => e.id)).toEqual(['first', 'second'])
+    expect(chunk.entries[1]).toMatchObject({
+      at: '2026-01-01T00:00:00.000002Z',
+      stream: 'stderr',
+      attempt: 'attempt-a',
+      truncated: true,
+    })
+    expect(chunk.entries[1]!.level).toBeUndefined()
+    expect(chunk.sources?.[0]).toMatchObject({
+      availability: 'unreachable',
+      reason: 'offline',
+      truncated: true,
+    })
+    expect(chunk.sources?.[0]?.earliestAvailableAt).toBeInstanceOf(Date)
+  })
+
+  it('retains forward range and high-water mark, and reports unsupported real sources without mock data', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        entries: [],
+        sources: [],
+        next_cursor: null,
+        resume_cursor: 'watermark',
+        live: false,
+      }),
+    )
+    const api = createRealClient()
+    expect(
+      await api.getJobLogs('job-a', 'watermark', {
+        order: 'asc',
+        limit: 200,
+        from: '2026-01-01T00:00:00.000001Z',
+      }),
+    ).toMatchObject({ resumeCursor: 'watermark', live: false })
+    expect(String(fetchMock.mock.calls[0]![0])).toContain('from=2026-01-01T00%3A00%3A00.000001Z')
+    expect(await api.getNodeLogs('node-a', null, { order: 'desc', limit: 200 })).toMatchObject({
+      unsupported: true,
+    })
+    expect(await api.getCoordinatorLogs('1', null, { order: 'desc', limit: 200 })).toMatchObject({
+      unsupported: true,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})

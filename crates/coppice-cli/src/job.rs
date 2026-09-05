@@ -2194,6 +2194,7 @@ retry_user_errors = true
 
     fn log_entry(attempt: AttemptId, at_us: i64, text: &str) -> dto::LogEntry {
         dto::LogEntry {
+            id: String::new(),
             attempt,
             at: Timestamp::from_micros(at_us).unwrap(),
             stream: dto::LogStreamName::Stdout,
@@ -2235,11 +2236,15 @@ retry_user_errors = true
             .parse()
             .unwrap();
         let page_one = dto::GetJobLogsResponse {
+            resume_cursor: None,
+            live: false,
             entries: vec![log_entry(attempt, 1_000_000, "line one")],
             sources: vec![available_source(attempt)],
             next_cursor: Some("page2".to_string()),
         };
         let page_two = dto::GetJobLogsResponse {
+            resume_cursor: None,
+            live: false,
             entries: vec![log_entry(attempt, 2_000_000, "line two")],
             sources: vec![available_source(attempt)],
             next_cursor: None,
@@ -2311,6 +2316,8 @@ retry_user_errors = true
         // One log page (drained to head immediately), and a job that already
         // reads terminal — so follow does its final drain and exits.
         let page = Arc::new(dto::GetJobLogsResponse {
+            resume_cursor: None,
+            live: false,
             entries: vec![log_entry(attempt, 1_000_000, "only line")],
             sources: vec![available_source(attempt)],
             next_cursor: None,

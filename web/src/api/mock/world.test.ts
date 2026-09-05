@@ -423,7 +423,10 @@ describe('MockWorld filters and lookups', () => {
     let cursor: string | null = null
     let pages = 0
     do {
-      const chunk: { nextCursor: string | null } = world.buildNodeLogs(node.id, cursor)
+      const chunk: { nextCursor: string | null } = world.buildNodeLogs(node.id, cursor, {
+        order: 'desc',
+        limit: 40,
+      })
       cursor = chunk.nextCursor
       pages += 1
     } while (cursor && pages < 20)
@@ -847,5 +850,47 @@ describe('MockWorld listJobs semantics', () => {
     invalid({ cursor: 'v1:job-garbage' }) // prefixed but not uuid-backed
     invalid({ limit: 0 })
     invalid({ limit: 1001 })
+  })
+})
+
+describe('mock directional logs', () => {
+  it('rejects unknown and out-of-range cursors instead of replaying history', () => {
+    const world = new MockWorld(NOW_US)
+    const id = world.buildNodeSummaries()[0]!.id
+    expect(() => world.buildNodeLogs(id, 'unknown', { order: 'desc', limit: 40 })).toThrow(
+      'unknown log cursor',
+    )
+    const head = world.buildNodeLogs(id, null, { order: 'asc', limit: 1 })
+    expect(() =>
+      world.buildNodeLogs(id, head.resumeCursor, {
+        order: 'asc',
+        limit: 40,
+        from: '2099-01-01T00:00:00Z',
+      }),
+    ).toThrow('unknown log cursor')
+  })
+
+  it('returns chronological head/tail windows with stable identities across overlaps', () => {
+    const world = new MockWorld(NOW_US)
+    const id = world.buildNodeSummaries()[0]!.id
+    const head = world.buildNodeLogs(id, null, { order: 'asc', limit: 1000 })
+    const tail = world.buildNodeLogs(id, null, { order: 'desc', limit: 5 })
+    expect(tail.entries.map((e) => e.id)).toEqual(head.entries.slice(-5).map((e) => e.id))
+    const older = world.buildNodeLogs(id, tail.nextCursor, { order: 'desc', limit: 5 })
+    expect(Date.parse(older.entries.at(-1)!.at)).toBeLessThanOrEqual(
+      Date.parse(tail.entries[0]!.at),
+    )
+    const newer = world.buildNodeLogs(id, null, {
+      order: 'asc',
+      limit: 200,
+      from: tail.entries.at(-1)!.at,
+    })
+    expect(newer.entries[0]!.id).toBe(tail.entries.at(-1)!.id)
+    expect(new Set(head.entries.map((e) => e.id)).size).toBe(head.entries.length)
+    world.advanceTo(NOW_US + 30_000_000)
+    const later = world.buildNodeLogs(id, null, { order: 'asc', limit: 1000 })
+    expect(later.entries.slice(0, head.entries.length).map((e) => e.id)).toEqual(
+      head.entries.map((e) => e.id),
+    )
   })
 })

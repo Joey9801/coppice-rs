@@ -6,6 +6,7 @@ import type {
   CoordinatorId,
   JobId,
   ListJobsRequest,
+  LogRequest,
   NodeId,
   QuotaEntityId,
 } from '../types'
@@ -54,17 +55,18 @@ export function createMockClient(): CoppiceApi {
     getJobTimeline: (id: JobId) => settle(() => world.buildJobTimeline(id)),
     getJobUsage: (id: JobId, attempt?: AttemptId | null) =>
       settle(() => world.buildJobUsage(id, attempt ?? null)),
-    getJobLogs: (id: JobId, cursor: string | null) => settle(() => world.buildJobLogs(id, cursor)),
+    getJobLogs: (id: JobId, cursor: string | null, request: LogRequest) =>
+      settle(() => world.buildJobLogs(id, cursor, request)),
 
     listNodes: () => settle(() => world.buildNodeSummaries()),
     getNode: (id: NodeId) => settle(() => world.buildNodeDetail(id)),
     getNodeUtilization: (id: NodeId) => settle(() => world.buildNodeUtilization(id)),
-    getNodeLogs: (id: NodeId, cursor: string | null) =>
-      settle(() => world.buildNodeLogs(id, cursor)),
+    getNodeLogs: (id: NodeId, cursor: string | null, request: LogRequest) =>
+      settle(() => world.buildNodeLogs(id, cursor, request)),
 
     getCoordinatorStatus: () => settle(() => world.buildCoordinatorStatus()),
-    getCoordinatorLogs: (id: CoordinatorId, cursor: string | null) =>
-      settle(() => world.buildCoordinatorLogs(id, cursor)),
+    getCoordinatorLogs: (id: CoordinatorId, cursor: string | null, request: LogRequest) =>
+      settle(() => world.buildCoordinatorLogs(id, cursor, request)),
 
     // The demo session always holds `admin`, so the mock never rejects with
     // PermissionDenied — the real client will (ADR 0023 scoped bindings).

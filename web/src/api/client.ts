@@ -10,6 +10,7 @@ import type {
   JobList,
   ListJobsRequest,
   LogChunk,
+  LogRequest,
   NodeDetail,
   NodeId,
   NodeSummary,
@@ -57,17 +58,21 @@ export interface CoppiceApi {
   getJobTimeline(id: JobId): Promise<TimelineEvent[]>
   /** Usage samples for one attempt; null/omitted = current (else latest). */
   getJobUsage(id: JobId, attempt?: AttemptId | null): Promise<GetJobUsageResponse>
-  getJobLogs(id: JobId, cursor: string | null): Promise<LogChunk>
+  getJobLogs(id: JobId, cursor: string | null, request: LogRequest): Promise<LogChunk>
 
   // Nodes
   listNodes(): Promise<NodeSummary[]>
   getNode(id: NodeId): Promise<NodeDetail>
   getNodeUtilization(id: NodeId): Promise<NodeUtilization>
-  getNodeLogs(id: NodeId, cursor: string | null): Promise<LogChunk>
+  getNodeLogs(id: NodeId, cursor: string | null, request: LogRequest): Promise<LogChunk>
 
   // Coordinators
   getCoordinatorStatus(): Promise<CoordinatorStatus>
-  getCoordinatorLogs(id: CoordinatorId, cursor: string | null): Promise<LogChunk>
+  getCoordinatorLogs(
+    id: CoordinatorId,
+    cursor: string | null,
+    request: LogRequest,
+  ): Promise<LogChunk>
 
   // Quota entities
   listQuotaEntities(): Promise<QuotaEntityNode[]>
