@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="web/public/coppice-dark.svg">
+  <img src="web/public/coppice-light.svg" alt="Coppice" width="96" height="96">
+</picture>
+
 # Coppice
 
 [![CI](https://github.com/Joey9801/coppice-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Joey9801/coppice-rs/actions/workflows/ci.yml)

@@ -21,11 +21,17 @@ const NAV = [
 ] as const
 
 function AppShell() {
+  const { theme } = useTheme()
+
   return (
     <div className="flex min-h-screen">
       <aside className="flex w-52 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
         <div className="flex h-14 items-center gap-2 border-b px-4">
-          <img src="/coppice.svg" alt="" className="size-6" />
+          <img
+            src={theme === 'dark' ? '/coppice-dark.svg' : '/coppice-light.svg'}
+            alt=""
+            className="size-6"
+          />
           <span className="text-base font-semibold tracking-tight">Coppice</span>
         </div>
         <nav className="flex flex-col gap-1 p-2">
