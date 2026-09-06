@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 60">
+  <title>Coppice</title>
+  <path d="M15 32V45Q15 52 22 52H38Q45 52 45 45V43M30 21V52" fill="none" stroke="#8cd9ad" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"/>
+  <path transform="translate(5 0)" d="M4 32Q1 32 2 29L8 16Q10 12 12 16L18 29Q19 32 16 32Z" fill="#8cd9ad"/>
+  <path d="M24 21Q21 21 22 18L28 5Q30 1 32 5L38 18Q39 21 36 21Z" fill="#55b982"/>
+  <path transform="translate(-5 0)" d="M44 43Q41 43 42 40L48 27Q50 23 52 27L58 40Q59 43 56 43Z" fill="#8cd9ad"/>
+</svg>

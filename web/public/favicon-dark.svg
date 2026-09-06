@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <title>Coppice</title>
+  <path transform="translate(1 0)" d="M1.5 9Q.6 9 1 8L2.5 5Q3 4 3.5 5L5 8Q5.4 9 4.5 9Z" fill="#8cd9ad"/>
+  <path d="M6.5 6Q5.6 6 6 5L7.5 2Q8 1 8.5 2L10 5Q10.4 6 9.5 6Z" fill="#8cd9ad"/>
+  <path transform="translate(-1 0)" d="M11.5 12Q10.6 12 11 11L12.5 8Q13 7 13.5 8L15 11Q15.4 12 14.5 12Z" fill="#8cd9ad"/>
+  <path d="M4 9V12Q4 14 6 14H10Q12 14 12 12M8 6V14" fill="none" stroke="#8cd9ad" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
