@@ -120,6 +120,14 @@ agent_addr  = "0.0.0.0:7072"    # agent heartbeats and reports
 # via explicit value ▸ the system hostname ▸ the local address of the default
 # route, so a fleet can ship one byte-identical config artifact.
 advertise_host = "coord-3.batch.example.com"
+# Names this node's leaf must also serve, without advertising them: DNS names
+# or IP literals, no port. SANs only — membership and discovery still carry
+# `advertise_host` alone. For a TCP pass-through load balancer in front of
+# the agent listener, which cannot substitute its own certificate, so the
+# coordinator behind it terminates TLS for the balancer's name. Renewal
+# treats the configured names as a floor, so adding one here and restarting
+# re-issues the leaf to cover it.
+extra_sans = ["agents.batch.example.com"]
 # The local admin socket (ADR 0037 §3): where `coppice coordinator init` and
 # `admin issue-operator-cert` are served. Optional; defaults to
 # `<data_dir>/admin.sock`, whose directory the daemon tightens to owner-only
