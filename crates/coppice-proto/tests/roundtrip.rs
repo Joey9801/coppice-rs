@@ -654,6 +654,37 @@ fn charge_record_absent_refund_fraction_is_full_refund() {
 }
 
 #[test]
+fn settlement_roundtrips_both_true_up_kinds() {
+    use coppice_core::quota::{Settlement, TrueUp};
+    for settlement in [
+        Settlement {
+            actual_cost: CostUnits(900_000_000),
+            true_up: TrueUp::Refund(CostUnits(2_025_000_000)),
+        },
+        Settlement {
+            actual_cost: CostUnits(3_700_000_000),
+            true_up: TrueUp::Surcharge(CostUnits(100_000_000)),
+        },
+    ] {
+        let encoded: pb::core::v1::Settlement = settlement.into();
+        let back: Settlement = encoded.try_into().expect("decodes");
+        assert_eq!(back, settlement, "settlement roundtrip must be lossless");
+    }
+}
+
+#[test]
+fn unset_settlement_true_up_oneof_is_an_error() {
+    let encoded = pb::core::v1::Settlement {
+        actual_cost_ucu: 1,
+        true_up: None,
+    };
+    assert_eq!(
+        coppice_core::quota::Settlement::try_from(encoded),
+        Err(ConvertError::MissingField("Settlement.true_up"))
+    );
+}
+
+#[test]
 fn policy_config_incentive_knobs_roundtrip() {
     let policy = PolicyConfig {
         unbounded_runtime_multiplier: PriorityMultiplier::from_integer(3),

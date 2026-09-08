@@ -61,6 +61,24 @@ message ChargeRecord {
   optional uint32 refund_fraction_milli = 3;
 }
 
+// What an attempt's charge settled to at terminal resolution: the actual
+// cost it was priced at and the true-up that closed the gap. Recorded on the
+// attempt beside its charge so a job's refund is answerable from state after
+// the true-up has been folded into entity usage (ADR 0005/0029).
+message Settlement {
+  // rate × ceil-seconds(actual runtime) × multiplier, µCU; zero for an
+  // attempt that never reached Running.
+  uint64 actual_cost_ucu = 1;
+  // Exactly one is set; an unset oneof is a decode error.
+  oneof true_up {
+    // The unused portion of the charge, already decayed from charge time to
+    // resolution time, µCU.
+    uint64 refund_ucu = 2;
+    // Consumption beyond the charge (post-max_runtime kill grace), µCU.
+    uint64 surcharge_ucu = 3;
+  }
+}
+
 // Maps one user-facing priority to its Q32.32 cost multiplier. Part of the
 // replicated policy; repeated sorted entries, never a proto map. Canonical
 // form: ascending priority, unique priorities.

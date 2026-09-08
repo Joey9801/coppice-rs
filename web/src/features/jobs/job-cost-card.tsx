@@ -20,10 +20,20 @@ import { TrueUpAmount } from './true-up-amount'
  * actually produced: a queued job shows what it *will* be charged, a running
  * job shows the upfront charge with the refund still pending, a finished job
  * shows the refund and the final settled cost.
+ *
+ * `terminal` is the job's own state, not inferred from which cost fields are
+ * populated: the settled figures follow from it, never the other way round.
  */
-export function JobCostCard({ cost, requests }: { cost: CostReport; requests: Resources }) {
+export function JobCostCard({
+  cost,
+  requests,
+  terminal,
+}: {
+  cost: CostReport
+  requests: Resources
+  terminal: boolean
+}) {
   const hasPenalty = cost.priorityMultiplier !== 1 || cost.unboundedMultiplier !== 1
-  const terminal = cost.actualUcu != null
   const charged = cost.chargedUcu > 0
 
   return (
@@ -164,6 +174,19 @@ function ChargeSection({
         {windowLine}
         <p className="pt-1 text-xs text-muted-foreground">
           Charged upfront to your quota when the job is placed on a node.
+        </p>
+      </div>
+    )
+  }
+
+  if (!charged) {
+    // Terminal without ever being placed (aborted while queued): nothing was
+    // charged, so there is nothing to refund or settle.
+    return (
+      <div className="space-y-1">
+        <BuildupRow label="Final cost" value={formatUcu(0)} strong />
+        <p className="pt-1 text-xs text-muted-foreground">
+          Never placed on a node, so nothing was charged.
         </p>
       </div>
     )

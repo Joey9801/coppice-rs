@@ -345,6 +345,18 @@ pub enum TrueUp {
     Surcharge(CostUnits),
 }
 
+/// What an attempt's charge settled to at terminal resolution: the actual
+/// cost it was priced at and the [`TrueUp`] that closed the gap. Recorded on
+/// the attempt beside its charge so the job's cost story (ADR 0005/0029) is
+/// answerable from state after the true-up has been folded into entity usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settlement {
+    /// `rate × ceil-seconds(actual runtime) × multiplier`; zero for an
+    /// attempt that never reached `Running`.
+    pub actual_cost: CostUnits,
+    pub true_up: TrueUp,
+}
+
 /// True up a placement charge against the attempt's actual cost at terminal
 /// resolution (ADR 0013's `Finalizing` funnel).
 ///

@@ -78,6 +78,7 @@ impl From<&AttemptRecord> for pb::AttemptRecord {
             multiplier_q32_32: r.multiplier.0,
             started_at_us: r.started_at.map(|t| t.as_micros()),
             ended_at_us: r.ended_at.map(|t| t.as_micros()),
+            settlement: r.settlement.map(Into::into),
         }
     }
 }
@@ -100,6 +101,7 @@ impl TryFrom<pb::AttemptRecord> for AttemptRecord {
                 .ended_at_us
                 .map(|us| timestamp(us, "AttemptRecord.ended_at_us"))
                 .transpose()?,
+            settlement: r.settlement.map(TryInto::try_into).transpose()?,
         })
     }
 }

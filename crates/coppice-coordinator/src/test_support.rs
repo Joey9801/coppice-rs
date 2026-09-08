@@ -70,6 +70,7 @@ pub fn attempt_record(
         multiplier: PriorityMultiplier(0),
         started_at,
         ended_at: None,
+        settlement: None,
     }
 }
 

@@ -14,7 +14,7 @@ use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass}
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState};
 use coppice_core::node::Node;
-use coppice_core::quota::{self, ChargeRecord, CostUnits, TrueUp, UsageState};
+use coppice_core::quota::{self, ChargeRecord, CostUnits, Settlement, TrueUp, UsageState};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 
@@ -420,6 +420,7 @@ impl StateMachine {
                     multiplier,
                     started_at: None,
                     ended_at: None,
+                    settlement: None,
                 },
             );
             events.push(Event::AttemptStateChanged {
@@ -1559,6 +1560,18 @@ impl StateMachine {
         let retain = started && outcome.class() != OutcomeClass::Platform;
         let decay = self.policy.decay;
         let adjustment = quota::true_up(&charge, actual, at, &decay, retain);
+        // Retain what the charge settled to: entity usage absorbs the true-up
+        // without remembering which job it came from, so this record is the
+        // only per-job answer to "what was refunded?". First write wins, as
+        // with `ended_at`.
+        if let Some(a) = self.attempts.get_mut(&attempt) {
+            if a.settlement.is_none() {
+                a.settlement = Some(Settlement {
+                    actual_cost: actual,
+                    true_up: adjustment,
+                });
+            }
+        }
         if let Some(entity) = self.jobs.get(&job).map(|j| j.spec.quota_entity) {
             self.settle_ancestors(entity, adjustment, at);
         }

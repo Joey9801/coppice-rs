@@ -291,9 +291,8 @@ export interface JobSummary {
   /** Min funded/requested fraction across dims; only while accruing. */
   fundingFraction: number | null
   /**
-   * Gross µCU charged across attempts (upfront placement charges). NOT
-   * trued-up when terminal — replicated state does not retain the per-job
-   * settlement; the net figure is `JobDetail.cost.actualUcu`.
+   * Gross µCU charged across attempts (upfront placement charges), never
+   * the trued-up net — that is `JobDetail.cost.actualUcu`.
    */
   costUcu: number
   /** Outcome of the last attempt, when terminal. */
@@ -385,9 +384,16 @@ export interface CostReport {
    * platform-attributable outcomes.
    */
   refundFraction: number
-  /** Final cost after true-up; only when the job is terminal. */
+  /**
+   * Final settled cost — `chargedUcu` less the net refund (or plus the net
+   * surcharge) across attempts; only when the job is terminal.
+   */
   actualUcu: number | null
-  /** Refund or surcharge applied at finalization. */
+  /**
+   * Net refund or surcharge across the job's attempts, read from each
+   * attempt's retained settlement. Null until the job is terminal, and null
+   * on a terminal job whose charges trued up to exactly nothing.
+   */
   trueUp: { kind: 'Refund' | 'Surcharge'; amountUcu: number } | null
 }
 
