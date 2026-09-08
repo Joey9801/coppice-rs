@@ -112,3 +112,73 @@ only way onto a host.
 The stack's outputs are a contract too; `up.sh`, `formation.sh` and the smoke
 test read them by name.
 
+## Bring-up and teardown
+
+Three scripts drive an environment; all of them work from any cwd and take the
+environment name as their first argument (`^[a-z][a-z0-9-]{0,19}$`).
+
+```
+scripts/aws-demo/up.sh demo --tarball ./coppice-0.1.0-aarch64-unknown-linux-gnu.tar.gz
+scripts/aws-demo/down.sh demo --yes
+```
+
+`up.sh` applies the env stack, then waits — it does not return until the
+cluster is actually usable:
+
+1. preflight: caller identity, an arm64 release tarball, and bootstrap state
+   in the state bucket (otherwise it tells you to run `bootstrap.sh` first);
+2. `terraform apply` for `env/`, with per-environment state at
+   `env/<name>/terraform.tfstate`;
+3. picks the first coordinator the ASG reports `InService` whose SSM agent is
+   `Online`;
+4. runs `scripts/aws-demo/formation.sh` on it via SSM `send-command`. That
+   script forms the cluster (`coppice coordinator init` with the rendered
+   `deploy/examples/policy.toml`) and stores the operator break-glass
+   certificate, key and CA in SSM under `/coppice/<env>/operator/*`. It is
+   idempotent — it reads the daemon's `/readyz` phase and skips `init` on an
+   already-formed cluster — so `up.sh` always runs it;
+5. polls `https://<env>.coppice.jwjr.uk/readyz?require=healthy` for a 200,
+   then the API for three coordinator voters and three schedulable nodes.
+
+**Changing the release means a new environment.** A launch-template change
+only shapes instances launched after it; the six that already exist keep
+running what they booted with, and an instance refresh that is safe for a raft
+voter set needs readiness-aware lifecycle hooks this stack does not have yet.
+`up.sh` therefore refuses a tarball whose SHA-256 differs from the deployed
+one (`artefact_sha256` output) and points at `down.sh`. The hash is also
+stamped into the user-data, so a changed tarball under an unchanged name still
+shows up as a launch-template diff rather than as nothing.
+
+`--on-demand-agents` swaps the agent ASG off spot, `--skip-apply` re-runs
+formation and the waits against an existing stack, `--status-only` runs only
+the waits and the summary, and `--timeout` (default 1200 s) is the budget for
+each wait.
+
+There is no SSH anywhere: reaching an instance is
+`aws ssm start-session --target <instance id>`.
+
+Getting a token for the API or the CLI:
+
+```
+export COPPICE_API=https://demo.coppice.jwjr.uk
+export COPPICE_TOKEN="$(scripts/aws-demo/up.sh --token-only demo)"
+coppice cluster status
+```
+
+`--token-only` reads the demo user's password from SSM and exchanges it for a
+Cognito **ID** token — the coordinator validates the `aud` claim, which
+Cognito puts only in the ID token, never the access token. Neither the
+password nor the token is echoed, and neither is ever passed on a command
+line.
+
+`down.sh` destroys the stack and then proves the environment is gone: it
+deletes any SSM parameters left under `/coppice/<env>`, then asks each
+service directly — EC2 instances, volumes, addresses, NAT gateways, security
+groups, VPCs, launch templates, ASGs, load balancers, target groups, Cognito
+pools, buckets and IAM roles — for anything tagged `coppice:env=<env>` or
+named `coppice-<env>-…`. It exits non-zero and lists what it found if anything
+remains — the demo is billed by the hour. The Resource Groups Tagging API is
+deliberately only advisory here: after the first real teardown it went on
+listing terminated instances, deleted volumes and the rules of deleted
+security groups for over an hour. The environment's Terraform state object is
+left in the bucket; its key is printed at the end.
