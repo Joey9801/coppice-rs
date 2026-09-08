@@ -1,0 +1,47 @@
+#!/bin/bash
+#
+# Ops-host user-data for the AWS demo (docs/roadmap/aws-demo-plan.md).
+# Rendered by Terraform; ${env_name} is this environment.
+#
+# The host exists so there is somewhere inside the VPC to run Prometheus from
+# and somewhere to open an SSM session to when a coordinator is misbehaving.
+# Prometheus itself is not deployed yet, so this does the minimum: patch the
+# base image and leave a marker naming the environment.
+set -euxo pipefail
+
+exec > >(tee -a /var/log/coppice-cloud-init.log) 2>&1
+
+retry() {
+  what="$1"
+  shift
+  attempt=1
+  until "$@"; do
+    if [ "$attempt" -ge 30 ]; then
+      echo "coppice cloud-init: $what failed after $attempt attempts" >&2
+      exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 10
+  done
+}
+
+export DEBIAN_FRONTEND=noninteractive
+
+retry "apt-get update" apt-get update
+# curl and jq so that an SSM session on this host can poke the coordinators'
+# client listener straight away: this host is the inside-the-VPC vantage point
+# when something is wrong. No AWS CLI here yet — Ubuntu 24.04 has no apt
+# package for it and nothing on this host needs it until Prometheus arrives.
+retry "apt-get install" apt-get install -y curl jq
+
+# The marker is what a session lands on: which environment this is, and where
+# the things worth curling live.
+install -d -m 0755 /etc/coppice
+cat >/etc/coppice/ops-env <<EOF
+COPPICE_ENV=${env_name}
+COPPICE_API=https://${fqdn}
+COPPICE_SSM_PREFIX=${ssm_prefix}
+COPPICE_REGION=${region}
+EOF
+
+echo "coppice cloud-init: ops host ready (${fqdn})"

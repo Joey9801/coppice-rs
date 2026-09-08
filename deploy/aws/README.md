@@ -46,3 +46,69 @@ The stack's outputs (`state_bucket`, `zone_id`, `zone_name`, `name_servers`,
 `terraform_remote_state`, so they are a contract: do not rename them.
 
 
+## Environment stack
+
+`env/` is one whole environment per apply, keyed on `env_name` (a DNS label,
+`^[a-z][a-z0-9-]{0,19}$`). Everything it creates is named `coppice-<env>-…`
+and tagged `coppice:env = <env>`, so N environments coexist in the account
+with nothing mutable shared between them. `scripts/aws-demo/up.sh` and
+`down.sh` are what drive it.
+
+What it builds:
+
+- a VPC with one public subnet per availability zone and **no NAT gateway** —
+  a NAT gateway alone costs more than the whole fleet, and the instances need
+  egress only for apt, the artefact download and Docker image pulls;
+- one network load balancer carrying both planes: a `TLS` listener on 443
+  holding the bootstrap stack's wildcard certificate for the client plane
+  (API, web UI, `/enroll`), and a plain `TCP` listener on 7072 that passes the
+  agent plane's mTLS through untouched. `<env>.coppice.jwjr.uk` is an alias to
+  it;
+- a coordinator ASG (fixed size, on-demand) registered with both target
+  groups, an agent ASG (spot by default, `agents_on_demand = true` for a
+  deterministic CI run), and one small ops instance;
+- a Cognito user pool, app client and one seeded demo user — the OIDC issuer
+  the coordinators' `[sso]` block points at;
+- an artefact bucket holding the release tarball named by `release_tarball`,
+  and the environment's SSM parameters under `/coppice/<env>`.
+
+Two things about it are worth knowing before reading the code:
+
+- **Both target groups health-check `HTTP /readyz` on port 7070**, not TCP on
+  the target port. A coordinator that is *parked* — listeners serving, cluster
+  not yet formed — accepts TCP on both ports while being useless to a client
+  and to an enrolling agent. Plain `/readyz` answers 200 only from a formed
+  replica, so the balancer never routes to a parked node. The ASG's own health
+  check is `EC2` for the same reason: an `ELB` health check would terminate
+  the fleet in a loop before formation could ever run.
+- **The coordinator security group admits 7072 from the whole VPC**, not just
+  from the balancer's group: a TCP pass-through listener preserves the source
+  IP, so agent connections arrive carrying the agent's own private address.
+
+### Secrets and cloud-init
+
+Nothing secret is in user-data, which is readable by anything that can reach
+IMDS. Terraform mints the two enrollment secrets and the demo user's password
+as SSM SecureStrings; `cloud-init/{coordinator,agent}.sh.tftpl` fetch the
+one secret their role is entitled to at boot, with a retry loop because a
+fresh instance profile's permissions take up to a minute to propagate, and
+write it to `/etc/coppice/enroll-token` 0600-owned by the role's user.
+
+Those templates render `/etc/coppice/<role>.toml` from the *checked-in*
+`deploy/examples/<role>.toml` with `sed`, so the comments explaining every key
+travel to the host, and then refuse to start the unit if any ALL-CAPS
+placeholder survived the substitution. The operator certificate parameters are
+created here as `"unset"` placeholders with `ignore_changes = [value]`:
+formation overwrites them on a coordinator, and Terraform still owns and
+destroys them.
+
+The three instance roles hold only what a named code path calls — the
+coordinator's `autoscaling:Describe*` is `ec2-asg` discovery, its
+`ssm:PutParameter` is formation storing operator material — and every
+statement in `iam.tf` carries the caller in a comment. There is no SSH: no key
+pair, no port 22, and `AmazonSSMManagedInstanceCore` on all three roles is the
+only way onto a host.
+
+The stack's outputs are a contract too; `up.sh`, `formation.sh` and the smoke
+test read them by name.
+
