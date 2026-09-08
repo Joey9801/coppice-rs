@@ -475,6 +475,21 @@ pub(crate) struct ListenConfig {
     #[serde(default)]
     pub(crate) advertise_host: Option<String>,
 
+    /// Additional names this coordinator's leaf must serve, beyond
+    /// `advertise_host`: DNS names or IP literals, no port. They become SANs
+    /// on every leaf the daemon obtains (formation, enrollment, renewal) and
+    /// nothing else — never the address published into discovery or Raft
+    /// membership, which stays `advertise_host` alone.
+    ///
+    /// The case this exists for is a shared front name agents dial: a TCP
+    /// pass-through load balancer in front of the agent listener cannot
+    /// substitute its own certificate, so the coordinator behind it must
+    /// terminate TLS for the balancer's name itself. Renewal treats the
+    /// configured set as a floor (`tasks::renewal`), so adding a name here
+    /// and restarting renews the leaf to cover it.
+    #[serde(default)]
+    pub(crate) extra_sans: Vec<String>,
+
     /// The local admin socket (ADR 0037 §3): the Unix-domain-socket surface
     /// `coppice coordinator init` and `admin issue-operator-cert` speak to.
     ///
@@ -496,6 +511,23 @@ pub(crate) struct ListenConfig {
 }
 
 impl ListenConfig {
+    /// Every `extra_sans` entry must be a bare DNS name or IP literal — the
+    /// shape a TLS server name (and so a SAN) takes. A `host:port`, an empty
+    /// string, or a URL would otherwise be discovered only when the leaf is
+    /// issued, on the leader, mid-formation or mid-renewal.
+    pub(crate) fn validate_extra_sans(&self) -> anyhow::Result<()> {
+        use tokio_rustls::rustls::pki_types::ServerName;
+        for san in &self.extra_sans {
+            ServerName::try_from(san.as_str()).map_err(|e| {
+                anyhow::anyhow!(
+                    "listen.extra_sans entry {san:?} is not a DNS name or IP address \
+                     (no port, no scheme): {e}"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// The Raft address this replica advertises to peers: the resolved
     /// `advertise_host` combined with the port half of
     /// [`raft_addr`](ListenConfig::raft_addr).
@@ -1371,6 +1403,10 @@ pub fn load(path: &Path) -> Result<ResolvedConfig> {
             .validate()
             .with_context(|| format!("reading coordinator config {}", path.display()))?;
     }
+    config
+        .listen
+        .validate_extra_sans()
+        .with_context(|| format!("reading coordinator config {}", path.display()))?;
     let resolved_host = resolve_advertise_host(config.listen.advertise_host.as_deref())?;
     config.listen.advertise_host = Some(resolved_host);
     Ok(ResolvedConfig { config })
@@ -1501,6 +1537,59 @@ addrs = []
 # Explicitly insecure: every request is an anonymous admin (issue #45).
 insecure_open = true
 "#;
+
+    #[test]
+    fn extra_sans_parse_and_validate() {
+        let (_guard, path) = write_config(
+            r#"
+cluster_id = "cluster-5f0e6e6a-9c2a-4b8e-9a2b-1f4b6c8d9e10"
+data_dir = "/var/lib/coppice"
+
+[listen]
+advertise_host = "10.0.1.5"
+extra_sans = ["coord.demo.example.com", "10.0.9.9", "::1"]
+
+[tls]
+cert_path = "/etc/coppice/pki/node.crt"
+key_path  = "/etc/coppice/pki/node.key"
+ca_path   = "/etc/coppice/pki/ca.crt"
+
+[discovery]
+backend = "static"
+
+[discovery.static]
+addrs = []
+"#,
+        );
+        let config = read_config(&path).expect("parses");
+        assert_eq!(
+            config.listen.extra_sans,
+            ["coord.demo.example.com", "10.0.9.9", "::1"]
+        );
+        config
+            .listen
+            .validate_extra_sans()
+            .expect("all valid server names");
+    }
+
+    #[test]
+    fn extra_sans_rejects_a_host_port() {
+        let listen = ListenConfig {
+            client_addr: default_client_addr(),
+            raft_addr: default_raft_addr(),
+            agent_addr: default_agent_addr(),
+            advertise_host: Some("10.0.1.5".to_string()),
+            extra_sans: vec!["coord.demo.example.com:7072".to_string()],
+            admin_socket: None,
+        };
+        let err = listen
+            .validate_extra_sans()
+            .expect_err("a host:port is not a SAN");
+        assert!(
+            format!("{err:#}").contains("listen.extra_sans"),
+            "error names the key: {err:#}"
+        );
+    }
 
     #[test]
     fn full_documented_example_parses() {

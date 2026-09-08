@@ -1213,6 +1213,15 @@ pub(crate) fn leaf_sans(cfg: &Config) -> Vec<String> {
     if let Some(host) = cfg.listen.advertise_host.as_deref() {
         sans.push(host.to_string());
     }
+    // Names this daemon serves under without advertising them — a
+    // pass-through load balancer's name in front of the agent listener, say
+    // (`[listen] extra_sans`). SANs only: membership still carries
+    // `advertise_host` alone.
+    for extra in &cfg.listen.extra_sans {
+        if !sans.iter().any(|s| s == extra) {
+            sans.push(extra.clone());
+        }
+    }
     // Every deployment reaches its own node locally at some point (the admin
     // client's default target, a health probe); a leaf that cannot serve
     // `localhost` makes those need a second certificate.
@@ -1278,6 +1287,35 @@ mod tests {
         let s = state(marks(None, None));
         assert_eq!(s.readyz().phase, ReadyzPhase::Waiting);
         assert!(s.readyz().reason.unwrap().contains("coordinator init"));
+    }
+
+    #[test]
+    fn leaf_sans_carry_extra_sans_after_the_advertised_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = seed_config(dir.path(), ClusterId::new());
+        config.listen.extra_sans = vec![
+            "coord.demo.example.com".to_string(),
+            // A duplicate of the advertised host is folded, not doubled.
+            "localhost".to_string(),
+        ];
+        let sans = leaf_sans(&config);
+        assert_eq!(
+            sans,
+            ["localhost", "coord.demo.example.com", "127.0.0.1", "::1"]
+        );
+
+        // The same set survives issuance: a formed voter's minted leaf serves
+        // the extra name, which is what a pass-through balancer needs.
+        let ca = pki::mint_root_ca().expect("ca");
+        let signer = pki::CaSigner::load(&ca.cert_pem, &ca.key_pem).expect("signer");
+        let machine = MachineId::new();
+        let (cert_pem, _key_pem) =
+            pki::mint_coordinator_local(&signer, &machine, &sans).expect("mint leaf");
+        let issued = pki::leaf_sans(&cert_pem).expect("parse leaf");
+        assert!(
+            issued.iter().any(|s| s == "coord.demo.example.com"),
+            "{issued:?}"
+        );
     }
 
     #[test]
