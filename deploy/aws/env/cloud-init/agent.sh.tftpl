@@ -1,0 +1,115 @@
+#!/bin/bash
+#
+# Node agent user-data for the AWS demo (docs/roadmap/aws-demo-plan.md).
+# Rendered by Terraform; ${env_name} is this environment.
+#
+# Same shape as the coordinator's, with Docker installed before anything
+# coppice and the private DNS name rather than the private IP as the
+# advertised address.
+set -euxo pipefail
+
+exec > >(tee -a /var/log/coppice-cloud-init.log) 2>&1
+
+# The release this instance was launched to run. Not used by the script: it is
+# here so that a changed tarball changes the user-data, and with it the launch
+# template version.
+echo "coppice cloud-init: release sha256 ${artefact_sha256}"
+
+retry() {
+  what="$1"
+  shift
+  attempt=1
+  until "$@"; do
+    if [ "$attempt" -ge 30 ]; then
+      echo "coppice cloud-init: $what failed after $attempt attempts" >&2
+      exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 10
+  done
+}
+
+export DEBIAN_FRONTEND=noninteractive
+
+retry "apt-get update" apt-get update
+# `docker.io` is installed here and not later because the agent unit's
+# `SupplementaryGroups=docker` is resolved by systemd, not by the daemon: on a
+# host with no `docker` group the unit dies with status=216/GROUP before
+# ExecStart runs. `Restart=always` would eventually recover, but there is no
+# reason to make it.
+retry "apt-get install" apt-get install -y curl jq unzip docker.io
+
+# Ubuntu 24.04 ships no `awscli` apt package (noble dropped it; the snap is
+# the only Canonical route, and snapd seeding on first boot is slow and
+# flaky), so the official v2 installer is used instead. This host is arm64.
+install_aws_cli() {
+  rm -rf /tmp/awscli && mkdir -p /tmp/awscli && cd /tmp/awscli &&
+    curl -fsSL -o awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip &&
+    unzip -q awscliv2.zip && ./aws/install --update >/dev/null && cd / && rm -rf /tmp/awscli
+}
+retry "aws cli install" install_aws_cli
+aws --version
+systemctl enable --now docker
+
+TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+# The agent's `[listen] advertise_host` is the name a coordinator dials for
+# NodeService log and usage reads, and the SAN the cluster puts in this node's
+# leaf. The private DNS name (ip-10-42-1-23.eu-west-2.compute.internal) is
+# stable for the instance's life and resolvable inside the VPC.
+PRIVATE_DNS=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-hostname)
+
+mkdir -p /opt/coppice-release
+retry "release download" aws s3 cp "s3://${artefact_bucket}/${artefact_key}" \
+  /opt/coppice-release.tar.gz --region "${region}"
+tar xzf /opt/coppice-release.tar.gz -C /opt/coppice-release
+/opt/coppice-release/deploy/install.sh --role agent
+
+sed \
+  -e "s|ENV\.coppice\.jwjr\.uk|${fqdn}|g" \
+  -e "s|AGENT_PRIVATE_DNS|$PRIVATE_DNS|" \
+  /opt/coppice-release/deploy/examples/agent.toml >/etc/coppice/agent.toml
+chown root:root /etc/coppice/agent.toml
+chmod 0644 /etc/coppice/agent.toml
+
+# An unsubstituted discovery address would be an agent that never finds a
+# coordinator, and an unsubstituted advertise_host an agent whose job logs are
+# unreachable — both silent-ish failures worth turning into a loud one.
+if grep -Eq 'COORDINATOR_PRIVATE_IP|AGENT_PRIVATE_DNS|POOL_ID|COGNITO_APP_CLIENT_ID|ENV\.' /etc/coppice/agent.toml; then
+  echo "coppice cloud-init: unsubstituted placeholder left in /etc/coppice/agent.toml" >&2
+  grep -nE 'COORDINATOR_PRIVATE_IP|AGENT_PRIVATE_DNS|POOL_ID|COGNITO_APP_CLIENT_ID|ENV\.' /etc/coppice/agent.toml >&2
+  exit 1
+fi
+
+# The agent-role enrollment secret. Its own value, not the coordinator's:
+# verification keeps the last token whose hash matches, so a shared secret
+# would leave one role unable to enroll.
+set +x
+enroll_token=""
+for attempt in $(seq 1 30); do
+  if enroll_token=$(aws ssm get-parameter \
+    --name "${ssm_prefix}/enroll/agent" \
+    --with-decryption \
+    --query Parameter.Value \
+    --output text \
+    --region "${region}" 2>/dev/null); then
+    break
+  fi
+  echo "coppice cloud-init: enrollment secret not readable yet (attempt $attempt)" >&2
+  enroll_token=""
+  sleep 10
+done
+if [ -z "$enroll_token" ]; then
+  echo "coppice cloud-init: could not read the agent enrollment secret from SSM" >&2
+  exit 1
+fi
+
+install -m 0600 -o coppice-agent -g coppice-agent /dev/null /etc/coppice/enroll-token
+printf '%s' "$enroll_token" >/etc/coppice/enroll-token
+unset enroll_token
+set -x
+
+# Expected to fail and be restarted until the cluster exists and can enroll
+# it; that is the whole recovery story for both daemons.
+systemctl enable --now coppice-agent
+
+echo "coppice cloud-init: agent started (${fqdn})"

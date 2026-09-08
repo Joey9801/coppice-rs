@@ -1,0 +1,128 @@
+#!/bin/bash
+#
+# Coordinator user-data for the AWS demo (docs/roadmap/aws-demo-plan.md).
+# Rendered by Terraform; ${env_name} is this environment.
+#
+# Everything here is idempotent, because a re-run must not break a host that
+# is already serving. Nothing secret is in this file: the enrollment token is
+# read from SSM at boot, and anything that can read user-data through IMDS
+# could read it here.
+set -euxo pipefail
+
+exec > >(tee -a /var/log/coppice-cloud-init.log) 2>&1
+
+# The release this instance was launched to run. Not used by the script: it is
+# here so that a changed tarball changes the user-data, and with it the launch
+# template version.
+echo "coppice cloud-init: release sha256 ${artefact_sha256}"
+
+# Retry the calls that legitimately fail for a while after launch: apt mirrors
+# rate-limit, S3 may not see the object yet, and a fresh instance profile's
+# permissions take up to a minute to propagate. 30 attempts, 10s apart.
+retry() {
+  what="$1"
+  shift
+  attempt=1
+  until "$@"; do
+    if [ "$attempt" -ge 30 ]; then
+      echo "coppice cloud-init: $what failed after $attempt attempts" >&2
+      exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 10
+  done
+}
+
+export DEBIAN_FRONTEND=noninteractive
+
+retry "apt-get update" apt-get update
+# jq is what the formation step and the readiness polling parse /readyz with;
+# unzip is for the AWS CLI installer below.
+retry "apt-get install" apt-get install -y curl jq unzip
+
+# Ubuntu 24.04 ships no `awscli` apt package (noble dropped it; the snap is
+# the only Canonical route, and snapd seeding on first boot is slow and
+# flaky), so the official v2 installer is used instead. This host is arm64.
+install_aws_cli() {
+  rm -rf /tmp/awscli && mkdir -p /tmp/awscli && cd /tmp/awscli &&
+    curl -fsSL -o awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip &&
+    unzip -q awscliv2.zip && ./aws/install --update >/dev/null && cd / && rm -rf /tmp/awscli
+}
+retry "aws cli install" install_aws_cli
+aws --version
+
+# IMDSv2 (the instance requires it: no token, no metadata).
+TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+# `ec2-asg` discovery hands peers private IPs and a peer verifies the leaf
+# against the address it dialled, so `advertise_host` must be this instance's
+# private IP and not its hostname.
+PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+
+# The release tarball, and the packaging layer inside it (deploy/README.md).
+mkdir -p /opt/coppice-release
+retry "release download" aws s3 cp "s3://${artefact_bucket}/${artefact_key}" \
+  /opt/coppice-release.tar.gz --region "${region}"
+tar xzf /opt/coppice-release.tar.gz -C /opt/coppice-release
+# Installs the binary, both units and the service users, creates /etc/coppice
+# and /etc/coppice/pki, and starts nothing.
+/opt/coppice-release/deploy/install.sh --role coordinator
+
+# The node config, rendered from the checked-in example so that the comments
+# explaining every key travel to the host with it. Only the ALL-CAPS
+# placeholders and the zero cluster id are substituted.
+sed \
+  -e "s|cluster-00000000-0000-0000-0000-000000000000|cluster-${cluster_id}|" \
+  -e "s|COORDINATOR_PRIVATE_IP|$PRIVATE_IP|" \
+  -e "s|ENV\.coppice\.jwjr\.uk|${fqdn}|g" \
+  -e "s|POOL_ID|${cognito_pool_id}|" \
+  -e "s|COGNITO_APP_CLIENT_ID|${cognito_client_id}|g" \
+  /opt/coppice-release/deploy/examples/coordinator.toml >/etc/coppice/coordinator.toml
+chown root:root /etc/coppice/coordinator.toml
+chmod 0644 /etc/coppice/coordinator.toml
+
+# Fail loudly rather than let the daemon start with a placeholder: an
+# unsubstituted `POOL_ID` would be a coordinator that rejects every login, and
+# an unsubstituted advertise_host would be a node no peer can reach.
+if grep -Eq 'COORDINATOR_PRIVATE_IP|AGENT_PRIVATE_DNS|POOL_ID|COGNITO_APP_CLIENT_ID|ENV\.' /etc/coppice/coordinator.toml; then
+  echo "coppice cloud-init: unsubstituted placeholder left in /etc/coppice/coordinator.toml" >&2
+  grep -nE 'COORDINATOR_PRIVATE_IP|AGENT_PRIVATE_DNS|POOL_ID|COGNITO_APP_CLIENT_ID|ENV\.' /etc/coppice/coordinator.toml >&2
+  exit 1
+fi
+
+# The enrollment secret, which is how this node obtains its `[tls]` leaf. Set
+# +x for the duration: with -x the value would otherwise land in this log and
+# in the console output.
+set +x
+enroll_token=""
+for attempt in $(seq 1 30); do
+  if enroll_token=$(aws ssm get-parameter \
+    --name "${ssm_prefix}/enroll/coordinator" \
+    --with-decryption \
+    --query Parameter.Value \
+    --output text \
+    --region "${region}" 2>/dev/null); then
+    break
+  fi
+  echo "coppice cloud-init: enrollment secret not readable yet (attempt $attempt)" >&2
+  enroll_token=""
+  sleep 10
+done
+if [ -z "$enroll_token" ]; then
+  echo "coppice cloud-init: could not read the coordinator enrollment secret from SSM" >&2
+  exit 1
+fi
+
+# Created empty at the right mode and owner first, so the secret is never
+# world-readable even momentarily. The daemon trims the file, so a trailing
+# newline would be harmless; printf omits it anyway.
+install -m 0600 -o coppice -g coppice /dev/null /etc/coppice/enroll-token
+printf '%s' "$enroll_token" >/etc/coppice/enroll-token
+unset enroll_token
+set -x
+
+# The daemon parks here until formation, and `Restart=always` covers every
+# reason it might not come up yet, so this is the last step: nothing below
+# would be waited for.
+systemctl enable --now coppice-coordinator
+
+echo "coppice cloud-init: coordinator ready to park (cluster-${cluster_id}, ${fqdn})"
