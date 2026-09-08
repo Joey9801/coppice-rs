@@ -33,6 +33,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use coppice_core::attempt;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
+use coppice_core::quota::TrueUp;
 use coppice_core::time::Timestamp;
 
 /// Resource quantities (mirrors `coppice_core::resource::Resources`).
@@ -803,10 +804,9 @@ pub struct JobSummary {
     /// Min funded/requested fraction across dimensions; only while the
     /// current attempt is `accruing`, `null` otherwise.
     pub funding_fraction: Option<f64>,
-    /// µCU charged across the job's attempts so far. See the projection note
-    /// (`project::total_charged`) on why a terminal job reports its gross
-    /// charge, not the trued-up net: the true-up settles only against entity
-    /// usage and is not retained per attempt.
+    /// Gross µCU charged across the job's attempts so far (the upfront
+    /// placement charges), never the trued-up net — that is the detail's
+    /// `CostReport::actual_ucu` (`project::total_charged`).
     pub cost_ucu: u64,
     /// Outcome of the last attempt; only when the job is terminal.
     pub outcome: Option<AttemptOutcome>,
@@ -1288,7 +1288,7 @@ pub struct RateBreakdown {
 
 /// A true-up adjustment applied at finalization (mirrors the `trueUp` field of
 /// `CostReport`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrueUpView {
     pub kind: TrueUpKind,
     pub amount_ucu: u64,
@@ -1299,6 +1299,21 @@ pub struct TrueUpView {
 pub enum TrueUpKind {
     Refund,
     Surcharge,
+}
+
+impl From<TrueUp> for TrueUpView {
+    fn from(t: TrueUp) -> Self {
+        match t {
+            TrueUp::Refund(c) => TrueUpView {
+                kind: TrueUpKind::Refund,
+                amount_ucu: c.0,
+            },
+            TrueUp::Surcharge(c) => TrueUpView {
+                kind: TrueUpKind::Surcharge,
+                amount_ucu: c.0,
+            },
+        }
+    }
 }
 
 /// A job's cost breakdown (mirrors `CostReport` in `types.ts`), computed from
@@ -1328,12 +1343,16 @@ pub struct CostReport {
     pub charged_ucu: u64,
     /// Fraction (0..1) of the unused charge a true-up refunds (ADR 0029).
     pub refund_fraction: f64,
-    /// Final settled cost; always `null` — no measured-usage pipeline exists,
-    /// so actual consumption is not recoverable from replicated state
-    /// (`project::total_charged`).
+    /// Final settled cost: `charged_ucu` less the net refund (or plus the net
+    /// surcharge) across the job's attempts — what its entity was left
+    /// holding. `null` until the job is terminal, and `null` on a terminal
+    /// job when any attempt's settlement was not retained (it finished before
+    /// the field existed): the settled cost is then unknown, not the gross.
     pub actual_ucu: Option<u64>,
-    /// The finalization refund/surcharge; always `null` — the true-up settles
-    /// against entity usage and is not retained per job (`project::total_charged`).
+    /// The net finalization refund/surcharge across the job's attempts, read
+    /// from each attempt's retained settlement. `null` whenever `actual_ucu`
+    /// is, and `null` on a settled job whose adjustments net to nothing (it
+    /// ran to its limit, was never placed, or its retries cancelled exactly).
     pub true_up: Option<TrueUpView>,
 }
 

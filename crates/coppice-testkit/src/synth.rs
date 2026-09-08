@@ -22,12 +22,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::{Allocation, AllocationState};
-use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState};
+use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass};
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
-use coppice_core::quota::{self, ChargeRecord, CostUnits, PriorityMultiplier, UsageState};
+use coppice_core::quota::{
+    self, ChargeRecord, CostUnits, DecayPolicy, PriorityMultiplier, Settlement, UsageState,
+};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::authz::{Binding, Role, Subject};
@@ -131,6 +133,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             rate,
             multiplier,
             charge_amount,
+            decay: policy.decay,
         };
 
         let bucket = rng.below(100);
@@ -456,6 +459,7 @@ struct AttemptCtx {
     rate: u64,
     multiplier: PriorityMultiplier,
     charge_amount: CostUnits,
+    decay: DecayPolicy,
 }
 
 /// What an attempt/allocation pair being built should look like. Mirrors the
@@ -594,21 +598,44 @@ fn build_attempt(
         }
         _ => None,
     };
+    let charge = ChargeRecord {
+        amount: ctx.charge_amount,
+        charged_at,
+        refund_fraction_milli: quota::FULL_REFUND_MILLI,
+    };
+    // A terminal attempt carries what its charge settled to, priced the way
+    // apply prices it: actual cost over the started..ended span (zero if it
+    // never started), trued up against the charge at the end stamp.
+    let settlement = match (&attempt_state, ended_at) {
+        (AttemptState::Terminal(outcome), Some(end)) => {
+            let actual_cost = match started_at {
+                Some(start) => quota::cost_from_rate(
+                    ctx.rate,
+                    quota::runtime_seconds_ceil(end - start),
+                    ctx.multiplier,
+                ),
+                None => CostUnits::ZERO,
+            };
+            let retain = started_at.is_some() && outcome.class() != OutcomeClass::Platform;
+            Some(Settlement {
+                actual_cost,
+                true_up: quota::true_up(&charge, actual_cost, end, &ctx.decay, retain),
+            })
+        }
+        _ => None,
+    };
     bufs.attempts.push((
         attempt_id,
         AttemptRecord {
             attempt,
             // v1 groups are singletons keyed by the job id.
             group: GroupId(ctx.job.0),
-            charge: ChargeRecord {
-                amount: ctx.charge_amount,
-                charged_at,
-                refund_fraction_milli: quota::FULL_REFUND_MILLI,
-            },
+            charge,
             rate_ucu_per_second: ctx.rate,
             multiplier: ctx.multiplier,
             started_at,
             ended_at,
+            settlement,
         },
     ));
     let allocation = Allocation {
@@ -1063,6 +1090,15 @@ pub fn check_consistency(sm: &StateMachine) {
                 alloc.allocation.state,
                 AllocationState::Released,
                 "a terminal attempt's allocation must be released"
+            );
+            assert!(
+                ar.settlement.is_some(),
+                "a terminal attempt must carry what its charge settled to"
+            );
+        } else {
+            assert!(
+                ar.settlement.is_none(),
+                "a live attempt has nothing settled yet"
             );
         }
     }

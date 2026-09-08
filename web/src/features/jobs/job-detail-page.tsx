@@ -3,6 +3,7 @@ import { Link } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, SearchX } from 'lucide-react'
 import {
   derivePhase,
+  isTerminalJobState,
   jobAttemptId,
   jobCurrentAttempt,
   type AttemptView,
@@ -138,7 +139,12 @@ function JobDetailView({ job }: { job: JobDetail }) {
             <JobSpecCard job={job} />
           </div>
           <div className="lg:col-span-2">
-            <JobCostCard cost={job.cost} requests={job.spec.requests} />
+            <JobCostCard
+              cost={job.cost}
+              requests={job.spec.requests}
+              terminal={isTerminalJobState(job.state)}
+              attempts={job.attempts}
+            />
           </div>
         </div>
 

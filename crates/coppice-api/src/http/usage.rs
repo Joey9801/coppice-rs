@@ -780,6 +780,7 @@ mod tests {
             multiplier: PriorityMultiplier::ONE,
             started_at: started.then(|| ts(1000)),
             ended_at: None,
+            settlement: None,
         }
     }
 

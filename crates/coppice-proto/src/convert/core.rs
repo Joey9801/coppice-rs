@@ -9,7 +9,8 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::node::{HostFacts, Node};
 use coppice_core::quota::{
-    ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, UsageState,
+    ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, Settlement, TrueUp,
+    UsageState,
 };
 use coppice_core::resource::Resources;
 
@@ -660,6 +661,33 @@ impl TryFrom<pb::ChargeRecord> for ChargeRecord {
             // Absent (a charge recorded before ADR 0029) trues up at full
             // refund, exactly as it did then.
             refund_fraction_milli: charge.refund_fraction_milli.unwrap_or(1000),
+        })
+    }
+}
+
+impl From<Settlement> for pb::Settlement {
+    fn from(s: Settlement) -> Self {
+        pb::Settlement {
+            actual_cost_ucu: s.actual_cost.0,
+            true_up: Some(match s.true_up {
+                TrueUp::Refund(c) => pb::settlement::TrueUp::RefundUcu(c.0),
+                TrueUp::Surcharge(c) => pb::settlement::TrueUp::SurchargeUcu(c.0),
+            }),
+        }
+    }
+}
+
+impl TryFrom<pb::Settlement> for Settlement {
+    type Error = ConvertError;
+
+    fn try_from(s: pb::Settlement) -> Result<Self, ConvertError> {
+        let true_up = match req(s.true_up, "Settlement.true_up")? {
+            pb::settlement::TrueUp::RefundUcu(c) => TrueUp::Refund(CostUnits(c)),
+            pb::settlement::TrueUp::SurchargeUcu(c) => TrueUp::Surcharge(CostUnits(c)),
+        };
+        Ok(Settlement {
+            actual_cost: CostUnits(s.actual_cost_ucu),
+            true_up,
         })
     }
 }

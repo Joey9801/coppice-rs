@@ -1,5 +1,5 @@
 import { type ReactNode } from 'react'
-import type { CostReport, Resources } from '@/api/types'
+import type { AttemptView, CostReport, Resources } from '@/api/types'
 import {
   formatBytes,
   formatCpu,
@@ -20,11 +20,36 @@ import { TrueUpAmount } from './true-up-amount'
  * actually produced: a queued job shows what it *will* be charged, a running
  * job shows the upfront charge with the refund still pending, a finished job
  * shows the refund and the final settled cost.
+ *
+ * `terminal` is the job's own state, not inferred from which cost fields are
+ * populated: the settled figures follow from it, never the other way round.
+ * `attempts` says whether the settled figures describe one attempt or are
+ * netted across retries, and how that attempt ended — both change what can
+ * honestly be said of them.
  */
-export function JobCostCard({ cost, requests }: { cost: CostReport; requests: Resources }) {
+export function JobCostCard({
+  cost,
+  requests,
+  terminal,
+  attempts,
+}: {
+  cost: CostReport
+  requests: Resources
+  terminal: boolean
+  attempts: AttemptView[]
+}) {
   const hasPenalty = cost.priorityMultiplier !== 1 || cost.unboundedMultiplier !== 1
-  const terminal = cost.actualUcu != null
   const charged = cost.chargedUcu > 0
+  // Mirrors the server's retention rule (ADR 0029): the recorded refund
+  // fraction applied only if the attempt ran and its end was the user's own.
+  // A platform fault (node lost, revoked, …) or an attempt that never
+  // started refunds the unused charge in full, whatever the fraction says.
+  const last = attempts[attempts.length - 1]
+  const fractionApplied =
+    attempts.length === 1 &&
+    last != null &&
+    last.startedAt != null &&
+    last.outcome?.class !== 'Platform'
 
   return (
     <Card>
@@ -45,7 +70,13 @@ export function JobCostCard({ cost, requests }: { cost: CostReport; requests: Re
         </div>
 
         <div className="border-t pt-4">
-          <ChargeSection cost={cost} terminal={terminal} charged={charged} />
+          <ChargeSection
+            cost={cost}
+            terminal={terminal}
+            charged={charged}
+            attemptCount={attempts.length}
+            fractionApplied={fractionApplied}
+          />
         </div>
       </CardContent>
     </Card>
@@ -144,10 +175,15 @@ function ChargeSection({
   cost,
   terminal,
   charged,
+  attemptCount,
+  fractionApplied,
 }: {
   cost: CostReport
   terminal: boolean
   charged: boolean
+  attemptCount: number
+  /** Whether `cost.refundFraction` is what the displayed refund applied. */
+  fractionApplied: boolean
 }) {
   const windowLine = (
     <span className="text-xs text-muted-foreground">
@@ -169,6 +205,19 @@ function ChargeSection({
     )
   }
 
+  if (!charged) {
+    // Terminal without ever being placed (aborted while queued): nothing was
+    // charged, so there is nothing to refund or settle.
+    return (
+      <div className="space-y-1">
+        <BuildupRow label="Final cost" value={formatUcu(0)} strong />
+        <p className="pt-1 text-xs text-muted-foreground">
+          Never placed on a node, so nothing was charged.
+        </p>
+      </div>
+    )
+  }
+
   if (!terminal) {
     return (
       <div className="space-y-1">
@@ -182,32 +231,58 @@ function ChargeSection({
     )
   }
 
+  if (cost.actualUcu == null) {
+    // Terminal, but the server could not settle it: an attempt finished
+    // before its settlement was retained. Say so rather than show the gross
+    // charge as the final cost.
+    return (
+      <div className="space-y-1.5">
+        <BuildupRow label="Charged at placement" value={formatUcu(cost.chargedUcu)} />
+        <BuildupRow label="Refund" value={<span className="text-muted-foreground">unknown</span>} />
+        <BuildupRow
+          label="Final cost"
+          value={<span className="text-muted-foreground">unavailable</span>}
+          divide
+          strong
+        />
+        <p className="text-xs text-muted-foreground">
+          Settlement was not recorded for this job, so the refund and final cost cannot be shown.
+        </p>
+      </div>
+    )
+  }
+
+  const retried = attemptCount > 1
   return (
     <div className="space-y-1.5">
       <BuildupRow label="Charged at placement" value={formatUcu(cost.chargedUcu)} />
       <div>
         <BuildupRow
-          label="Refund"
+          label={cost.trueUp?.kind === 'Surcharge' ? 'Surcharge' : 'Refund'}
           value={
             cost.trueUp ? (
               <TrueUpAmount trueUp={cost.trueUp} />
             ) : (
-              <span className="text-muted-foreground">none — ran to its limit</span>
+              // With one attempt a zero true-up means it used its whole
+              // charge; across retries it may be adjustments that cancelled.
+              <span className="text-muted-foreground">
+                {retried
+                  ? `none — no net adjustment across ${attemptCount} attempts`
+                  : 'none — ran to its limit'}
+              </span>
             )
           }
         />
-        {cost.trueUp?.kind === 'Refund' ? (
+        {cost.trueUp?.kind === 'Refund' && fractionApplied ? (
           <p className="text-xs text-muted-foreground">
             {formatPercent(cost.refundFraction)} of the unused runtime
           </p>
         ) : null}
+        {cost.trueUp && retried ? (
+          <p className="text-xs text-muted-foreground">net across {attemptCount} attempts</p>
+        ) : null}
       </div>
-      <BuildupRow
-        label="Final cost"
-        value={formatUcu(cost.actualUcu ?? cost.chargedUcu)}
-        divide
-        strong
-      />
+      <BuildupRow label="Final cost" value={formatUcu(cost.actualUcu)} divide strong />
     </div>
   )
 }

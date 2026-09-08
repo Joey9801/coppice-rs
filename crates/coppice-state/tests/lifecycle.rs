@@ -11,7 +11,7 @@ use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::{AllocationId, GroupId};
 use coppice_core::job::{JobState, RetryPolicy};
 use coppice_core::node::HostFacts;
-use coppice_core::quota::{CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
+use coppice_core::quota::{CostUnits, PriorityMultiplier, Settlement, TrueUp, FULL_REFUND_MILLI};
 use coppice_core::time::Duration;
 use coppice_state::command::{
     BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs,
@@ -63,6 +63,8 @@ fn happy_path_submit_to_eviction() {
     // The job stays Attempting while the attempt runs — no Running mirror.
     assert_eq!(sm.jobs[&job].state, JobState::Attempting(attempt));
     assert_eq!(sm.attempts[&attempt].attempt.state, AttemptState::Running);
+    // Nothing has settled yet.
+    assert_eq!(sm.attempts[&attempt].settlement, None);
     assert_eq!(
         sm.allocations[&alloc].allocation.state,
         AllocationState::Active
@@ -93,6 +95,13 @@ fn happy_path_submit_to_eviction() {
     );
     // Ran 60 s of the declared 3600: true-up refunds the unused charge.
     assert!(sm.quota_entities[&ROOT].usage.usage < usage_charged);
+    assert!(matches!(
+        sm.attempts[&attempt].settlement,
+        Some(Settlement {
+            true_up: TrueUp::Refund(_),
+            ..
+        })
+    ));
 
     apply_ok(
         &mut sm,
@@ -1600,6 +1609,15 @@ fn bounded_early_exit_retains_the_configured_fraction() {
     assert_eq!(
         sm.quota_entities[&ROOT].usage.usage,
         CostUnits(charge - refunded)
+    );
+    // The attempt retains what it settled to — the only per-job record of
+    // the refund once usage has absorbed it.
+    assert_eq!(
+        sm.attempts[&aid(11)].settlement,
+        Some(Settlement {
+            actual_cost: CostUnits(actual),
+            true_up: TrueUp::Refund(CostUnits(refunded)),
+        })
     );
 }
 

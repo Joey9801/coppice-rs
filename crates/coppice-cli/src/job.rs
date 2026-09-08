@@ -1406,6 +1406,11 @@ fn render_status(detail: &dto::JobDetail) -> String {
         "cost (charged)",
         &format!("{} uCU", detail.cost.charged_ucu),
     );
+    // The settled figure exists once the job is terminal: the charge less
+    // what the true-up refunded (or plus what it surcharged).
+    if let Some(actual) = detail.cost.actual_ucu {
+        kv("cost (settled)", &format!("{actual} uCU"));
+    }
     if let Some(abort) = &detail.abort_requested {
         let reason = abort.reason.as_deref().unwrap_or("(none)");
         kv(
@@ -2181,6 +2186,23 @@ retry_user_errors = true
         );
         assert!(rendered.contains("cost (charged)  1234 uCU"), "{rendered}");
         assert!(rendered.contains("submitted by    -"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn status_renders_the_settled_cost_once_terminal() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let live = sample_job_detail(job, dto::JobStateKind::Attempting);
+        assert!(!render_status(&live).contains("cost (settled)"));
+
+        let mut done = sample_job_detail(job, dto::JobStateKind::Succeeded);
+        done.cost.actual_ucu = Some(1000);
+        done.cost.true_up = Some(dto::TrueUpView {
+            kind: dto::TrueUpKind::Refund,
+            amount_ucu: 234,
+        });
+        let rendered = render_status(&done);
+        assert!(rendered.contains("cost (charged)  1234 uCU"), "{rendered}");
+        assert!(rendered.contains("cost (settled)  1000 uCU"), "{rendered}");
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ use coppice_core::id::{
 use coppice_core::job::{Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::quota::{
-    ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, UsageState,
+    ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, Settlement, UsageState,
     DEFAULT_PENALTY_EXPONENT_MILLI, DEFAULT_REFUND_FRACTION_MILLI,
     DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
 };
@@ -542,6 +542,12 @@ pub struct AttemptRecord {
     /// attempt aborted before it ever started still carries it — that is what
     /// distinguishes "ended without starting" from "never ended".
     pub ended_at: Option<Timestamp>,
+    /// What the charge settled to when the attempt reached `Terminal`: the
+    /// actual cost and the true-up that was folded into entity usage. Kept
+    /// here because usage retains no per-job figure, so this is the only
+    /// place a job's refund is answerable from (ADR 0029's explainability
+    /// contract). Absent while the attempt is live.
+    pub settlement: Option<Settlement>,
 }
 
 /// An allocation's replicated record plus its commit-order sequence.
