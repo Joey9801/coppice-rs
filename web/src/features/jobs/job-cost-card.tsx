@@ -1,5 +1,5 @@
 import { type ReactNode } from 'react'
-import type { CostReport, Resources } from '@/api/types'
+import type { AttemptView, CostReport, Resources } from '@/api/types'
 import {
   formatBytes,
   formatCpu,
@@ -23,22 +23,33 @@ import { TrueUpAmount } from './true-up-amount'
  *
  * `terminal` is the job's own state, not inferred from which cost fields are
  * populated: the settled figures follow from it, never the other way round.
- * `attemptCount` says whether the settled figures describe one attempt or
- * are netted across retries, which changes what can honestly be said of them.
+ * `attempts` says whether the settled figures describe one attempt or are
+ * netted across retries, and how that attempt ended — both change what can
+ * honestly be said of them.
  */
 export function JobCostCard({
   cost,
   requests,
   terminal,
-  attemptCount,
+  attempts,
 }: {
   cost: CostReport
   requests: Resources
   terminal: boolean
-  attemptCount: number
+  attempts: AttemptView[]
 }) {
   const hasPenalty = cost.priorityMultiplier !== 1 || cost.unboundedMultiplier !== 1
   const charged = cost.chargedUcu > 0
+  // Mirrors the server's retention rule (ADR 0029): the recorded refund
+  // fraction applied only if the attempt ran and its end was the user's own.
+  // A platform fault (node lost, revoked, …) or an attempt that never
+  // started refunds the unused charge in full, whatever the fraction says.
+  const last = attempts[attempts.length - 1]
+  const fractionApplied =
+    attempts.length === 1 &&
+    last != null &&
+    last.startedAt != null &&
+    last.outcome?.class !== 'Platform'
 
   return (
     <Card>
@@ -63,7 +74,8 @@ export function JobCostCard({
             cost={cost}
             terminal={terminal}
             charged={charged}
-            attemptCount={attemptCount}
+            attemptCount={attempts.length}
+            fractionApplied={fractionApplied}
           />
         </div>
       </CardContent>
@@ -164,11 +176,14 @@ function ChargeSection({
   terminal,
   charged,
   attemptCount,
+  fractionApplied,
 }: {
   cost: CostReport
   terminal: boolean
   charged: boolean
   attemptCount: number
+  /** Whether `cost.refundFraction` is what the displayed refund applied. */
+  fractionApplied: boolean
 }) {
   const windowLine = (
     <span className="text-xs text-muted-foreground">
@@ -258,7 +273,7 @@ function ChargeSection({
             )
           }
         />
-        {cost.trueUp?.kind === 'Refund' && !retried ? (
+        {cost.trueUp?.kind === 'Refund' && fractionApplied ? (
           <p className="text-xs text-muted-foreground">
             {formatPercent(cost.refundFraction)} of the unused runtime
           </p>

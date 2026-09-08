@@ -1,9 +1,26 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import type { CostReport, Resources } from '@/api/types'
+import type { AttemptView, CostReport, Resources } from '@/api/types'
 import { JobCostCard } from './job-cost-card'
 
 const requests: Resources = { cpuMillis: 1000, memoryBytes: 1 << 30, diskBytes: 1 << 30 }
+
+/** A finished attempt that ran and exited on its own. */
+function attempt(n: number, overrides: Partial<AttemptView> = {}): AttemptView {
+  return {
+    id: `attempt-00000000-0000-0000-0000-00000000000${n}`,
+    job: 'job-00000000-0000-0000-0000-000000000001',
+    node: 'node-00000000-0000-0000-0000-000000000001',
+    allocation: `alloc-00000000-0000-0000-0000-00000000000${n}`,
+    state: 'Terminal',
+    outcome: { kind: 'Exited', exitCode: 0, class: 'Success' },
+    startedAt: new Date('2026-01-01T00:00:00Z'),
+    endedAt: new Date('2026-01-01T00:15:00Z'),
+    rateUcuPerSecond: 1_000_000 / 3600,
+    chargedUcu: 1_000_000,
+    ...overrides,
+  }
+}
 
 /** A bounded 1-hour job at 1 CU/hour, charged 1 CU upfront. */
 function cost(overrides: Partial<CostReport> = {}): CostReport {
@@ -32,7 +49,7 @@ describe('JobCostCard', () => {
         cost={cost({ actualUcu: 400_000, trueUp: { kind: 'Refund', amountUcu: 600_000 } })}
         requests={requests}
         terminal
-        attemptCount={1}
+        attempts={[attempt(1)]}
       />,
     )
     expect(screen.getByText('Charged at placement')).toBeInTheDocument()
@@ -50,7 +67,7 @@ describe('JobCostCard', () => {
         cost={cost({ actualUcu: 1_000_000 })}
         requests={requests}
         terminal
-        attemptCount={1}
+        attempts={[attempt(1)]}
       />,
     )
     expect(screen.getByText('none — ran to its limit')).toBeInTheDocument()
@@ -67,7 +84,7 @@ describe('JobCostCard', () => {
         })}
         requests={requests}
         terminal
-        attemptCount={2}
+        attempts={[attempt(1), attempt(2)]}
       />,
     )
     expect(screen.getByText('Surcharge')).toBeInTheDocument()
@@ -87,12 +104,41 @@ describe('JobCostCard', () => {
         })}
         requests={requests}
         terminal
-        attemptCount={2}
+        attempts={[attempt(1), attempt(2)]}
       />,
     )
     expect(screen.getByText('Refund 0.600 CU')).toBeInTheDocument()
     expect(screen.queryByText(/of the unused runtime/)).not.toBeInTheDocument()
     expect(screen.getByText('net across 2 attempts')).toBeInTheDocument()
+  })
+
+  it('does not explain a platform-fault refund with the retained fraction', () => {
+    // The node was lost: the server refunds the unused charge in full, so
+    // the configured 75% would misdescribe the amount shown.
+    render(
+      <JobCostCard
+        cost={cost({ actualUcu: 250_000, trueUp: { kind: 'Refund', amountUcu: 750_000 } })}
+        requests={requests}
+        terminal
+        attempts={[attempt(1, { outcome: { kind: 'NodeLost', class: 'Platform' } })]}
+      />,
+    )
+    expect(screen.getByText('Refund 0.750 CU')).toBeInTheDocument()
+    expect(screen.queryByText(/of the unused runtime/)).not.toBeInTheDocument()
+  })
+
+  it('does not explain the refund of an attempt that never started', () => {
+    render(
+      <JobCostCard
+        cost={cost({ actualUcu: 0, trueUp: { kind: 'Refund', amountUcu: 1_000_000 } })}
+        requests={requests}
+        terminal
+        attempts={[
+          attempt(1, { startedAt: null, outcome: { kind: 'Aborted', class: 'UserRequest' } }),
+        ]}
+      />,
+    )
+    expect(screen.queryByText(/of the unused runtime/)).not.toBeInTheDocument()
   })
 
   it('does not claim a retried job with no net true-up ran to its limit', () => {
@@ -101,7 +147,7 @@ describe('JobCostCard', () => {
         cost={cost({ chargedUcu: 2_000_000, actualUcu: 2_000_000 })}
         requests={requests}
         terminal
-        attemptCount={2}
+        attempts={[attempt(1), attempt(2)]}
       />,
     )
     expect(screen.getByText('none — no net adjustment across 2 attempts')).toBeInTheDocument()
@@ -109,14 +155,16 @@ describe('JobCostCard', () => {
   })
 
   it('reports the settlement as unknown when the server could not settle it', () => {
-    render(<JobCostCard cost={cost()} requests={requests} terminal attemptCount={1} />)
+    render(<JobCostCard cost={cost()} requests={requests} terminal attempts={[attempt(1)]} />)
     expect(screen.getByText('unknown')).toBeInTheDocument()
     expect(screen.getByText('unavailable')).toBeInTheDocument()
     expect(screen.queryByText(/still running/)).not.toBeInTheDocument()
   })
 
   it('keeps the refund pending while the job is live', () => {
-    render(<JobCostCard cost={cost()} requests={requests} terminal={false} attemptCount={1} />)
+    render(
+      <JobCostCard cost={cost()} requests={requests} terminal={false} attempts={[attempt(1)]} />,
+    )
     expect(screen.getByText('Refund at finish')).toBeInTheDocument()
     expect(screen.getByText('— still running')).toBeInTheDocument()
     expect(screen.queryByText('Final cost')).not.toBeInTheDocument()
@@ -128,7 +176,7 @@ describe('JobCostCard', () => {
         cost={cost({ chargedUcu: 0, actualUcu: 0 })}
         requests={requests}
         terminal
-        attemptCount={0}
+        attempts={[]}
       />,
     )
     expect(screen.getByText('Never placed on a node, so nothing was charged.')).toBeInTheDocument()
@@ -142,7 +190,7 @@ describe('JobCostCard', () => {
         cost={cost({ chargedUcu: 0 })}
         requests={requests}
         terminal={false}
-        attemptCount={0}
+        attempts={[]}
       />,
     )
     expect(screen.getByText('Will be charged')).toBeInTheDocument()
