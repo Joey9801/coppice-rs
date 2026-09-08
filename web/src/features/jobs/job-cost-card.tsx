@@ -23,15 +23,19 @@ import { TrueUpAmount } from './true-up-amount'
  *
  * `terminal` is the job's own state, not inferred from which cost fields are
  * populated: the settled figures follow from it, never the other way round.
+ * `attemptCount` says whether the settled figures describe one attempt or
+ * are netted across retries, which changes what can honestly be said of them.
  */
 export function JobCostCard({
   cost,
   requests,
   terminal,
+  attemptCount,
 }: {
   cost: CostReport
   requests: Resources
   terminal: boolean
+  attemptCount: number
 }) {
   const hasPenalty = cost.priorityMultiplier !== 1 || cost.unboundedMultiplier !== 1
   const charged = cost.chargedUcu > 0
@@ -55,7 +59,12 @@ export function JobCostCard({
         </div>
 
         <div className="border-t pt-4">
-          <ChargeSection cost={cost} terminal={terminal} charged={charged} />
+          <ChargeSection
+            cost={cost}
+            terminal={terminal}
+            charged={charged}
+            attemptCount={attemptCount}
+          />
         </div>
       </CardContent>
     </Card>
@@ -154,10 +163,12 @@ function ChargeSection({
   cost,
   terminal,
   charged,
+  attemptCount,
 }: {
   cost: CostReport
   terminal: boolean
   charged: boolean
+  attemptCount: number
 }) {
   const windowLine = (
     <span className="text-xs text-muted-foreground">
@@ -205,32 +216,58 @@ function ChargeSection({
     )
   }
 
+  if (cost.actualUcu == null) {
+    // Terminal, but the server could not settle it: an attempt finished
+    // before its settlement was retained. Say so rather than show the gross
+    // charge as the final cost.
+    return (
+      <div className="space-y-1.5">
+        <BuildupRow label="Charged at placement" value={formatUcu(cost.chargedUcu)} />
+        <BuildupRow label="Refund" value={<span className="text-muted-foreground">unknown</span>} />
+        <BuildupRow
+          label="Final cost"
+          value={<span className="text-muted-foreground">unavailable</span>}
+          divide
+          strong
+        />
+        <p className="text-xs text-muted-foreground">
+          Settlement was not recorded for this job, so the refund and final cost cannot be shown.
+        </p>
+      </div>
+    )
+  }
+
+  const retried = attemptCount > 1
   return (
     <div className="space-y-1.5">
       <BuildupRow label="Charged at placement" value={formatUcu(cost.chargedUcu)} />
       <div>
         <BuildupRow
-          label="Refund"
+          label={cost.trueUp?.kind === 'Surcharge' ? 'Surcharge' : 'Refund'}
           value={
             cost.trueUp ? (
               <TrueUpAmount trueUp={cost.trueUp} />
             ) : (
-              <span className="text-muted-foreground">none — ran to its limit</span>
+              // With one attempt a zero true-up means it used its whole
+              // charge; across retries it may be adjustments that cancelled.
+              <span className="text-muted-foreground">
+                {retried
+                  ? `none — no net adjustment across ${attemptCount} attempts`
+                  : 'none — ran to its limit'}
+              </span>
             )
           }
         />
-        {cost.trueUp?.kind === 'Refund' ? (
+        {cost.trueUp?.kind === 'Refund' && !retried ? (
           <p className="text-xs text-muted-foreground">
             {formatPercent(cost.refundFraction)} of the unused runtime
           </p>
         ) : null}
+        {cost.trueUp && retried ? (
+          <p className="text-xs text-muted-foreground">net across {attemptCount} attempts</p>
+        ) : null}
       </div>
-      <BuildupRow
-        label="Final cost"
-        value={formatUcu(cost.actualUcu ?? cost.chargedUcu)}
-        divide
-        strong
-      />
+      <BuildupRow label="Final cost" value={formatUcu(cost.actualUcu)} divide strong />
     </div>
   )
 }

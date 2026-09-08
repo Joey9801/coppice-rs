@@ -1166,12 +1166,15 @@ fn cost_report(state: &StateMachine, record: &JobRecord) -> dto::CostReport {
 
     let charged_ucu = total_charged(state, record);
     // The settled figures exist only once the job is terminal: every attempt
-    // has then trued up, and the net of their settlements is the job's.
-    let (actual_ucu, true_up) = if record.state.is_terminal() {
-        let net = net_true_up(state, record);
-        (Some(settled_cost(charged_ucu, net)), net.map(Into::into))
-    } else {
-        (None, None)
+    // has then trued up, and the net of their settlements is the job's. They
+    // stay unknown when any attempt's settlement was not retained (a job
+    // finished before the field existed), rather than passing the gross
+    // charge off as settled.
+    let (actual_ucu, true_up) = match (record.state.is_terminal(), net_true_up(state, record)) {
+        (true, NetTrueUp::Settled(net)) => {
+            (Some(settled_cost(charged_ucu, net)), net.map(Into::into))
+        }
+        _ => (None, None),
     };
 
     dto::CostReport {
@@ -1190,30 +1193,41 @@ fn cost_report(state: &StateMachine, record: &JobRecord) -> dto::CostReport {
     }
 }
 
-/// The net true-up across a job's settled attempts: refunds less surcharges,
-/// as a single refund or surcharge; `None` when nothing was adjusted
-/// (no attempt settled, or the adjustments cancel exactly). Each attempt's
-/// settlement is the replicated record of what its charge trued up to
+/// The net true-up across a job's attempts, or that it cannot be known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetTrueUp {
+    /// Some attempt has no retained settlement: it finished before
+    /// `AttemptRecord::settlement` existed and was restored from an older
+    /// snapshot, or has not finished yet. The net cannot be reported without
+    /// misstating it, so nothing is.
+    Unknown,
+    /// Every attempt has settled: refunds less surcharges, as a single refund
+    /// or surcharge, or `None` when nothing was adjusted (no attempts, or the
+    /// adjustments cancel exactly).
+    Settled(Option<TrueUp>),
+}
+
+/// Net the job's attempts' settlements. Each settlement is the replicated
+/// record of what that attempt's charge trued up to
 /// (`AttemptRecord::settlement`), so this is read, never re-derived.
-fn net_true_up(state: &StateMachine, record: &JobRecord) -> Option<TrueUp> {
-    let (refunds, surcharges) = record
-        .attempts
-        .iter()
-        .filter_map(|id| state.attempts.get(id))
-        .filter_map(|ar| ar.settlement)
-        .fold((0u64, 0u64), |(r, s), settlement| {
-            match settlement.true_up {
-                TrueUp::Refund(c) => (r.saturating_add(c.0), s),
-                TrueUp::Surcharge(c) => (r, s.saturating_add(c.0)),
-            }
-        });
-    if refunds > surcharges {
+fn net_true_up(state: &StateMachine, record: &JobRecord) -> NetTrueUp {
+    let (mut refunds, mut surcharges) = (0u64, 0u64);
+    for id in &record.attempts {
+        let Some(settlement) = state.attempts.get(id).and_then(|ar| ar.settlement) else {
+            return NetTrueUp::Unknown;
+        };
+        match settlement.true_up {
+            TrueUp::Refund(c) => refunds = refunds.saturating_add(c.0),
+            TrueUp::Surcharge(c) => surcharges = surcharges.saturating_add(c.0),
+        }
+    }
+    NetTrueUp::Settled(if refunds > surcharges {
         Some(TrueUp::Refund(CostUnits(refunds - surcharges)))
     } else if surcharges > refunds {
         Some(TrueUp::Surcharge(CostUnits(surcharges - refunds)))
     } else {
         None
-    }
+    })
 }
 
 /// What a job's charges settled to: the gross charged, less the net refund
@@ -3064,6 +3078,97 @@ mod tests {
 
     /// A terminal job that was never placed settled nothing: its final cost
     /// is its (zero) charge and there is no true-up to report.
+    /// `settlement` is an additive snapshot field: a job that finished before
+    /// it existed restores with none. Its settled figures are then unknown,
+    /// never the gross charge dressed up as settled.
+    #[test]
+    fn get_job_cost_report_leaves_an_unsettled_terminal_attempt_unknown() {
+        let now = ts(1_000_000);
+        let mut state = StateMachine::default();
+        let entity = quota_id(1);
+        put_entity(&mut state, entity, None, "e", 1_000_000, 0, now);
+        let node = NodeId::new();
+
+        let id = job_id(1);
+        let mut rec = test_job(id, JobState::Succeeded, ts(0));
+        rec.spec.quota_entity = entity;
+        let first = AttemptId::new();
+        let second = AttemptId::new();
+        rec.attempts = vec![first, second];
+        state.jobs.insert(id, rec);
+
+        // The first attempt settled; the second predates the field.
+        let mut a1 = test_attempt(
+            first,
+            id,
+            node,
+            AttemptState::Terminal(AttemptOutcome::Exited { code: 1 }),
+        );
+        a1.settlement = Some(Settlement {
+            actual_cost: CostUnits(300),
+            true_up: TrueUp::Refund(CostUnits(700)),
+        });
+        let a2 = test_attempt(
+            second,
+            id,
+            node,
+            AttemptState::Terminal(AttemptOutcome::Exited { code: 0 }),
+        );
+        state.attempts.insert(first, a1);
+        state.attempts.insert(second, a2);
+
+        let cost = get_job(&state, &id, now, &no_memos()).unwrap().cost;
+        assert_eq!(cost.charged_ucu, 2000);
+        assert_eq!(cost.actual_ucu, None);
+        assert_eq!(cost.true_up, None);
+    }
+
+    /// Adjustments that cancel exactly across retries settle to the gross
+    /// charge with no net true-up — distinct from the unknown case above.
+    #[test]
+    fn get_job_cost_report_settles_cancelling_true_ups_to_the_gross_charge() {
+        let now = ts(1_000_000);
+        let mut state = StateMachine::default();
+        let entity = quota_id(1);
+        put_entity(&mut state, entity, None, "e", 1_000_000, 0, now);
+        let node = NodeId::new();
+
+        let id = job_id(1);
+        let mut rec = test_job(id, JobState::Succeeded, ts(0));
+        rec.spec.quota_entity = entity;
+        let first = AttemptId::new();
+        let second = AttemptId::new();
+        rec.attempts = vec![first, second];
+        state.jobs.insert(id, rec);
+
+        let mut a1 = test_attempt(
+            first,
+            id,
+            node,
+            AttemptState::Terminal(AttemptOutcome::RuntimeLimitExceeded),
+        );
+        a1.settlement = Some(Settlement {
+            actual_cost: CostUnits(1300),
+            true_up: TrueUp::Surcharge(CostUnits(300)),
+        });
+        let mut a2 = test_attempt(
+            second,
+            id,
+            node,
+            AttemptState::Terminal(AttemptOutcome::Exited { code: 0 }),
+        );
+        a2.settlement = Some(Settlement {
+            actual_cost: CostUnits(700),
+            true_up: TrueUp::Refund(CostUnits(300)),
+        });
+        state.attempts.insert(first, a1);
+        state.attempts.insert(second, a2);
+
+        let cost = get_job(&state, &id, now, &no_memos()).unwrap().cost;
+        assert_eq!(cost.actual_ucu, Some(2000));
+        assert_eq!(cost.true_up, None);
+    }
+
     #[test]
     fn get_job_cost_report_of_a_never_placed_terminal_job_is_zero() {
         let now = ts(1_000_000);

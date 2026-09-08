@@ -1345,12 +1345,14 @@ pub struct CostReport {
     pub refund_fraction: f64,
     /// Final settled cost: `charged_ucu` less the net refund (or plus the net
     /// surcharge) across the job's attempts — what its entity was left
-    /// holding. `null` until the job is terminal.
+    /// holding. `null` until the job is terminal, and `null` on a terminal
+    /// job when any attempt's settlement was not retained (it finished before
+    /// the field existed): the settled cost is then unknown, not the gross.
     pub actual_ucu: Option<u64>,
     /// The net finalization refund/surcharge across the job's attempts, read
-    /// from each attempt's retained settlement. `null` until the job is
-    /// terminal, and `null` on a terminal job whose charges trued up to
-    /// exactly nothing (it ran to its limit, or was never placed).
+    /// from each attempt's retained settlement. `null` whenever `actual_ucu`
+    /// is, and `null` on a settled job whose adjustments net to nothing (it
+    /// ran to its limit, was never placed, or its retries cancelled exactly).
     pub true_up: Option<TrueUpView>,
 }
 

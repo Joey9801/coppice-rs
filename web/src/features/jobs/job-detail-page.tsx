@@ -143,6 +143,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
               cost={job.cost}
               requests={job.spec.requests}
               terminal={isTerminalJobState(job.state)}
+              attemptCount={job.attempts.length}
             />
           </div>
         </div>
