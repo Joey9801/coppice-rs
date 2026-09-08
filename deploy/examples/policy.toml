@@ -1,0 +1,61 @@
+# Formation policy for the AWS demo environment (ADR 0037 §3).
+#
+# Passed once, to one parked coordinator, as
+# `coppice coordinator init --config … --policy policy.toml`. Every entry is an
+# idempotent seed rather than an edit: re-running `init` against a formed
+# cluster changes nothing here, so bringup automation can retry it freely.
+#
+# Parse-tested in CI against the real schema — see `deploy_example_parses` in
+# crates/coppice-coordinator/src/policy.rs.
+
+[cost_weights]
+# What one CU buys, written the way pricing is stated rather than as the
+# replicated Q32.32 µCU-per-unit-second it converts to at this edge (ADR 0019 —
+# no float is ever replicated). Seeded only while the replicated weights are
+# still all-zero (the booted "everything is free" default), so a later
+# operator edit survives a re-init.
+core_hours_per_cu = 1.0        # one CPU core-hour costs 1 CU
+memory_gib_hours_per_cu = 2.0  # 2 GiB-hours of memory cost 1 CU
+disk_gib_hours_per_cu = 15.0   # 15 GiB-hours of disk cost 1 CU
+
+[[priority_multiplier]]
+# The whole table is seeded in one shot, and only while the replicated table is
+# still empty. One entry is enough for the demo: priority 0 at face value.
+index = 0
+multiplier = 1.0
+
+[[quota_entity]]
+# Created only when no entity carries this id — reconfiguration is not an
+# amnesty, so a re-init never resets accumulated usage. Jobs charge against it.
+id = "quota-00000000-0000-0000-0000-0000000000d1"
+name = "demo"
+# The quota stock in µCU (ADR 0019): 1e9 µCU = 1000 CU, which at the prices
+# above is 1000 core-hours — far more than a demo run consumes, so the
+# environment never has to think about quota.
+quota = 1000000000
+
+# Enrollment tokens (ADR 0037 §5). This is the launch-template story: Terraform
+# mints each secret, stores it as an SSM SecureString, bakes the *hash* into
+# this document by rendering the secret here at formation time, and cloud-init
+# drops the secret itself at `[enrollment] token_path` on every instance. Only
+# the salted hash is replicated.
+#
+# `label` is the IDEMPOTENCY KEY: a token is minted only when no live token
+# already carries the label, so re-applying this policy against a formed
+# cluster mints nothing and cannot rotate a secret behind your back. Rotation
+# is the explicit admin verb, not a re-init.
+
+[[enroll_token]]
+# Each role gets its OWN secret. Verification keeps the last token whose hash
+# matches, so two roles seeded from one value would leave one of them unable
+# to enroll.
+secret = "COORDINATOR_ENROLL_SECRET"
+role = "coordinator"
+label = "coordinator-launch"
+# No `ttl`: a launch template's token must still work when the ASG replaces an
+# instance six months from now. The supported long-lived default (§5).
+
+[[enroll_token]]
+secret = "AGENT_ENROLL_SECRET"
+role = "agent"
+label = "agent-launch"

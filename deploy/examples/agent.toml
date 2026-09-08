@@ -1,0 +1,72 @@
+# Coppice node agent — the AWS demo environment's shape.
+#
+# A template like coordinator.toml: ALL-CAPS values are substituted per
+# instance by cloud-init. Sized for the demo's t4g.medium agents (2 vCPU,
+# 4 GiB RAM, 30 GB gp3 root volume). Parse-tested in CI against the real
+# structs — see `deploy_example_parses` in crates/coppice-agent/src/config.rs.
+
+# StateDirectory=coppice-agent in the unit creates and owns this. It holds the
+# durable journal, the LOCK, the self-minted node identity (never configured,
+# deployment-story A1) and the telemetry segments `coppice job logs` reads.
+data_dir = "/var/lib/coppice-agent"
+
+# Prometheus scrape target. The agent has no client listener, so
+# unlike the coordinator it needs an address of its own; unauthenticated by
+# design, closed to everything but the ops instance by security group.
+metrics_addr = "0.0.0.0:9464"
+
+[discovery]
+# Agents reach coordinators through the NLB's TCP pass-through listener, so one
+# stable name outlives any individual coordinator. Consulted on every reconnect
+# rather than once at startup, so an ASG replacement needs no agent restart.
+backend = "static"
+
+[discovery.static]
+addrs = ["ENV.coppice.jwjr.uk:7072"]
+
+[tls]
+# Absent on a fresh instance; written by enrollment below. The unit's
+# ReadWritePaths=/etc/coppice/pki is what lets that write through
+# ProtectSystem=strict.
+#
+# These are configurable paths rather than a fixed layout under data_dir
+# because externally issued material is a supported substitution at the same
+# paths (docs/operations/security.md, ADR 0037 §4): a Vault agent or config
+# management can own these files instead, and the daemon reads and
+# hot-reloads them either way. That the same table means "write here" or
+# "read this" depending on what is on disk is issue #127.
+cert_path = "/etc/coppice/pki/node.crt"
+key_path  = "/etc/coppice/pki/node.key"
+ca_path   = "/etc/coppice/pki/ca.crt"
+
+[enrollment]
+# Same public endpoint and the same system-root verification as the
+# coordinators use; the secret is the `agent-launch` token from policy.toml,
+# dropped by cloud-init from an SSM SecureString before the unit starts.
+endpoint = "https://ENV.coppice.jwjr.uk"
+token_path = "/etc/coppice/enroll-token"
+
+[listen]
+# The agent-hosted NodeService (ADR 0034): how a coordinator fetches this
+# node's job logs and usage detail after a job goes terminal. Without it those
+# reads simply have nowhere to go, which would fail the demo's criterion 3.
+addr = "0.0.0.0:7073"
+# Required whenever `[listen]` is present: a 0.0.0.0 bind is never a dialable
+# address, so the reachable name is stated rather than guessed. It is also the
+# SAN the cluster puts in this agent's leaf at enrollment.
+advertise_host = "AGENT_PRIVATE_DNS"
+
+[reservation]
+# Withheld from scheduling for the agent, the Docker daemon and the kernel.
+# The defaults are sized for a real worker (2 cores, 4 GiB, 20 GiB) and the
+# disk default alone exceeds what a 30 GB root volume can spare once the OS
+# and the image cache are accounted for — the daemon would refuse to start
+# (`reservation.disk must be less than the node's disk capacity`) or leave
+# nothing schedulable. These are the small-instance numbers.
+cpu_millis = 500
+memory = "1GiB"
+disk = "8GiB"
+
+[labels]
+# Advertised at registration and available to job placement constraints.
+role = "demo-worker"

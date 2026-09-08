@@ -987,6 +987,31 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         format!("{MINIMAL_TOP}\n{extra}\n{MINIMAL_TABLES}")
     }
 
+    /// The host-packaging template (`deploy/examples/agent.toml`), the file
+    /// cloud-init renders onto a real worker. Compiled in for the same reason
+    /// the coordinator's is: a key renamed here must fail at review time, not
+    /// as a `deny_unknown_fields` startup error on an instance.
+    const DEPLOY_EXAMPLE: &str = include_str!("../../../deploy/examples/agent.toml");
+
+    #[test]
+    fn deploy_example_parses() {
+        let (_guard, path) = write_config(DEPLOY_EXAMPLE);
+        let config = load(&path).expect("deploy example should parse");
+
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/coppice-agent"));
+        assert!(config.enrollment.is_some());
+        // `[listen]` is what makes job logs fetchable off-node (ADR 0034), and
+        // an advertise host is mandatory once it is present.
+        let listen = config
+            .listen
+            .as_ref()
+            .expect("the example hosts NodeService");
+        assert_eq!(listen.advertised_service_addr(), "AGENT_PRIVATE_DNS:7073");
+        // Sized for a small instance: the default 20 GiB disk reservation
+        // would swallow most of the demo's 30 GB root volume.
+        assert_eq!(config.reservation.disk, ByteSize::from_gib(8));
+    }
+
     #[test]
     fn full_example_parses() {
         let (_guard, path) = write_config(FULL_EXAMPLE);

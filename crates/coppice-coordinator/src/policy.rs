@@ -665,6 +665,39 @@ name = "default"
 quota = 1000000000000
 "#;
 
+    /// The host-packaging template (`deploy/examples/policy.toml`), the
+    /// document the AWS demo's formation step renders and applies. Compiled in
+    /// so a schema change fails here rather than at `coppice coordinator init`
+    /// on an instance mid-bringup, which is the one moment with no fallback.
+    const DEPLOY_EXAMPLE: &str = include_str!("../../../deploy/examples/policy.toml");
+
+    #[test]
+    fn deploy_example_parses() {
+        let policy =
+            FormationPolicy::parse_toml(DEPLOY_EXAMPLE.as_bytes()).expect("deploy example parses");
+        assert_eq!(policy.quota_entities.len(), 1);
+        assert!(policy.cost_weights.is_some());
+        // Both launch roles are seeded, each under the label that makes
+        // re-applying the policy a no-op (ADR 0037 §5).
+        let labels: Vec<&str> = policy
+            .enroll_tokens
+            .iter()
+            .map(|token| token.label.as_str())
+            .collect();
+        assert_eq!(labels, ["coordinator-launch", "agent-launch"]);
+        assert!(policy.enroll_tokens.iter().all(|token| token.ttl.is_none()));
+        // The placeholders must differ: `verify_enroll_token` keeps the last
+        // hash that matches, so two roles seeded from one secret would hand
+        // whichever token sorts last to every enrollee, and one role's
+        // enrollment would fail.
+        let secrets: std::collections::HashSet<&str> = policy
+            .enroll_tokens
+            .iter()
+            .map(|token| token.secret.as_str())
+            .collect();
+        assert_eq!(secrets.len(), policy.enroll_tokens.len());
+    }
+
     #[test]
     fn parses_the_sample_schema() {
         let policy = FormationPolicy::parse_toml(SAMPLE.as_bytes()).expect("sample parses");

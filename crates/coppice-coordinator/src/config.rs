@@ -1538,6 +1538,52 @@ addrs = []
 insecure_open = true
 "#;
 
+    /// The host-packaging template (`deploy/examples/coordinator.toml`), the
+    /// file cloud-init renders onto a real coordinator. Compiled in so a key
+    /// renamed or removed in this module fails here, at review time, rather
+    /// than as a `deny_unknown_fields` startup error on an instance nobody is
+    /// watching.
+    const DEPLOY_EXAMPLE: &str = include_str!("../../../deploy/examples/coordinator.toml");
+
+    #[test]
+    fn deploy_example_parses() {
+        let (_guard, path) = write_config(DEPLOY_EXAMPLE);
+        let config = read_config(&path).expect("deploy example should parse");
+
+        // Everything `load` validates except the advertise-host resolution,
+        // which is host I/O (the example's placeholder is not resolvable).
+        config.discovery.validate().expect("discovery section");
+        config.client_tls_posture().expect("client_tls posture");
+        config.auth_posture().expect("auth posture");
+        config.history_mode().expect("history mode");
+        config
+            .enrollment
+            .as_ref()
+            .expect("the example enrolls for its leaf")
+            .validate()
+            .expect("enrollment section");
+
+        assert_eq!(config.discovery.backend, BackendKind::Ec2Asg);
+        assert_eq!(config.discovery.cluster_size, 3);
+        // `ec2-asg` hands peers private IPs, so the advertised host (and
+        // therefore the leaf's SAN) must be the IP, not a hostname.
+        assert_eq!(
+            config.listen.advertise_host.as_deref(),
+            Some("COORDINATOR_PRIVATE_IP")
+        );
+        // Agents dial the load balancer's name through a TCP pass-through
+        // listener, so the leaf must serve that name too.
+        assert_eq!(config.listen.extra_sans, ["ENV.coppice.jwjr.uk"]);
+        config.listen.validate_extra_sans().expect("extra_sans");
+        // The socket lives in the unit's RuntimeDirectory, not the data
+        // directory — the whole reason `RuntimeDirectoryMode=0700` is
+        // load-bearing in deploy/systemd/coppice-coordinator.service.
+        assert_eq!(
+            config.listen.admin_socket,
+            Some(PathBuf::from("/run/coppice/admin.sock"))
+        );
+    }
+
     #[test]
     fn extra_sans_parse_and_validate() {
         let (_guard, path) = write_config(

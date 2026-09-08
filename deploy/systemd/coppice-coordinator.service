@@ -1,0 +1,87 @@
+# Coppice coordinator.
+#
+# The daemon's whole command line is `--config` (ADR 0020/0037): first node,
+# joining node and restarted node are the same invocation, and the process
+# derives its intent from what the data directory says. That is why
+# `Restart=always` is the entire recovery story here — the convergence loop
+# (ADR 0037 §6) is idempotent and resumes from any interruption, so a crash, a
+# lost leader, a not-yet-formed cluster and a coordinator whose enrollment
+# endpoint is not up yet all reduce to "start again and keep probing".
+#
+# `RequiresMountsFor=/var/lib/coppice` is the blank-disk guard: if the data
+# volume is not mounted, the unit must fail ordering rather than let the daemon
+# see an empty directory and mint itself a fresh installation (ADR 0016 —
+# disks carry an identity stamp, and an empty disk only ever enters an existing
+# cluster as a new learner).
+#
+# `Type=notify` matches what the daemon actually signals: READY=1 once its
+# listeners are serving, which includes a *parked* daemon waiting for
+# formation. Process readiness and cluster readiness are deliberately different
+# questions — the second one is `GET /readyz?require=healthy` on the client
+# listener, never systemd's notion of "started".
+#
+# See docs/operations/cluster-lifecycle.md and docs/operations/configuration.md.
+
+[Unit]
+Description=Coppice coordinator
+Documentation=https://github.com/Joey9801/coppice-rs/blob/main/docs/operations/cluster-lifecycle.md
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/coppice
+
+[Service]
+Type=notify
+User=coppice
+Group=coppice
+ExecStart=/usr/local/bin/coppice coordinator --config /etc/coppice/coordinator.toml
+Restart=always
+RestartSec=2s
+
+# /var/lib/coppice (data directory, 0700: it holds the raft log, the manifest
+# stamp and private key material).
+StateDirectory=coppice
+StateDirectoryMode=0700
+# /run/coppice, the home of the admin socket `coppice coordinator init` speaks
+# to. The daemon *verifies* rather than chmods a socket directory it did not
+# choose itself, so 0700 is mandatory: being able to open that socket IS the
+# authorization for formation (ADR 0037 §3).
+RuntimeDirectory=coppice
+RuntimeDirectoryMode=0700
+# /etc/coppice, where the config, the enrollment token and the PKI live.
+ConfigurationDirectory=coppice
+
+# Shutdown is a plain SIGTERM; the daemon emits STOPPING=1 and drains. 30s is
+# well clear of the drain, and systemd escalates to SIGKILL after it.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+# Sandboxing. Nothing here is exotic: the coordinator opens TCP listeners
+# above 1024, a Unix socket, and files under three directories.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# The listeners are all >1024 and the daemon never changes uid, so it needs no
+# capability at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# ConfigurationDirectory= is read-only under ProtectSystem=strict, but
+# enrollment and leaf renewal write the certificate, key and CA bundle back to
+# the `[tls]` paths (ADR 0037 §4/§8), so that one subtree is writable.
+ReadWritePaths=/etc/coppice/pki
+
+[Install]
+WantedBy=multi-user.target
