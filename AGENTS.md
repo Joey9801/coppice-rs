@@ -86,6 +86,37 @@ out of date.
   pasted log lines, a cause hypothesis, and a fix sketch — don't just
   note it and move on.
 
+### Grooming commits for rebase-merge
+
+This repo merges PRs with GitHub's **rebase merge**, not squash — every
+commit on a PR branch lands on `main`'s history verbatim, in order. A PR's
+commits are only mergeable once they're *groomed* for that:
+
+- Each commit is a coherent, self-contained unit: it builds, passes its
+  own relevant checks, and reads as one logical change — not "WIP", "fix
+  typo", "address review comment", or "fixup" commits layered on top of
+  earlier ones in the same PR. Fold those into the commit they fix via
+  interactive rebase (`git rebase -i`) rather than leaving them as
+  separate history entries.
+- Commit messages match this repo's existing log style (see `git log`
+  for examples: short imperative subject, `type(scope):` prefix where one
+  fits, body explaining *why* when it isn't obvious from the diff).
+- The branch is rebased on current `main`, not merged with `main` — no
+  merge commits inside a PR branch.
+- Ordering matters: if a PR has multiple commits, they should be
+  sequenced so each one leaves the tree in a working state, in an order
+  that reads sensibly on its own — imagine someone reading them one at a
+  time in `main`'s history later.
+
+**You don't need to keep a PR in this state continuously while it's under
+active iteration** — pushing incremental commits during review is normal
+and fine. But aim to arrive at groomed history by the *first* revision you
+present as ready for review, not as an afterthought once review wraps up,
+and re-groom (interactive rebase + force-push to your own PR branch) once
+the PR settles, before handing it back for merge. If the user asks you to
+"groom" a PR, that's a request to rewrite that branch's history into the
+state above — not to add more commits on top.
+
 ## Deeper notes
 
 `docs/agent-notes/` has more detail on recurring operational issues:
