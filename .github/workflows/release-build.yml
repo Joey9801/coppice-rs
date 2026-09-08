@@ -1,0 +1,167 @@
+name: release build
+
+# Builds the shippable artifact CI otherwise never produces: one binary with
+# the web UI compiled into it, plus the host packaging under deploy/.
+#
+# Manual only. A release build of the whole workspace on two architectures is
+# expensive in runner minutes, and nothing downstream needs one per commit:
+# it is dispatched when a tarball is wanted (a demo bring-up, a release), and
+# `workflow_call` lets the AWS demo workflow build the very tarball it
+# deploys. Dispatching on a `v*` tag ref attaches the artifacts to that tag's
+# GitHub release; dispatching on a branch just names them by short sha.
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      version:
+        description: The version string in the artifact and tarball names.
+        value: ${{ jobs.version.outputs.version }}
+      artifact-aarch64:
+        description: upload-artifact name holding the aarch64 tarball.
+        value: ${{ jobs.version.outputs.artifact-aarch64 }}
+      artifact-x86-64:
+        description: upload-artifact name holding the x86_64 tarball.
+        value: ${{ jobs.version.outputs.artifact-x86-64 }}
+
+# One run per ref; a second dispatch on the same ref supersedes the first.
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are errors in CI. Cargo compiles registry dependencies with
+  # `--cap-lints allow`, so this only ever fires on first-party code.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # One place decides what a build is called, so the matrix jobs, the release
+  # upload, and a caller consuming `workflow_call` outputs cannot disagree.
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.name.outputs.version }}
+      artifact-aarch64: coppice-aarch64-unknown-linux-gnu
+      artifact-x86-64: coppice-x86_64-unknown-linux-gnu
+    steps:
+      # A tag build is named by its tag; everything else by the short sha, so
+      # the AWS demo can address "the tarball for this commit" without a
+      # release existing.
+      - id: name
+        run: |
+          if [ "${{ github.ref_type }}" = tag ]; then
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native builds on both architectures — the repository is public, so
+          # the arm64 runners are free and no cross toolchain is needed. arm64
+          # is the demo's own architecture (Graviton); x86_64 rides along so a
+          # workstation or an x86 instance can run the same tarball.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      # crates/coppice-api/build.rs embeds web/dist at compile time and falls
+      # back to a "run npm build" stub when the directory is missing — a
+      # coordinator that serves that stub is a broken release nobody notices
+      # until the demo. Fail here instead.
+      - name: check the web bundle exists to embed
+        run: test -f web/dist/index.html
+
+      # With no toolchain argument this installs the *active* toolchain, which
+      # rust-toolchain.toml pins — the same compiler ci.yml and a developer
+      # machine use.
+      - run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Release profile and per-target, so this shares nothing with
+          # ci.yml's debug caches.
+          shared-key: release-${{ matrix.target }}
+
+      # `--locked` fails on a stale Cargo.lock rather than updating it. Only
+      # the `coppice` binary: the workspace's test-only crates are not shipped.
+      - run: cargo build --release --locked --bin coppice
+
+      # A binary that cannot even print its version is not worth packaging —
+      # this catches a link failure or a missing runtime dependency here rather
+      # than on a host.
+      - run: ./target/release/coppice --version
+
+      - name: package
+        run: |
+          set -euo pipefail
+          version='${{ needs.version.outputs.version }}'
+          stage="$(mktemp -d)"
+          install -m 0755 target/release/coppice "$stage/coppice"
+          mkdir -p "$stage/deploy/systemd" "$stage/deploy/examples"
+          install -m 0644 deploy/systemd/*.service "$stage/deploy/systemd/"
+          install -m 0644 deploy/examples/*.toml "$stage/deploy/examples/"
+          install -m 0644 deploy/README.md "$stage/deploy/"
+          install -m 0755 deploy/install.sh "$stage/deploy/"
+          mkdir -p dist
+          tarball="dist/coppice-$version-${{ matrix.target }}.tar.gz"
+          tar -czf "$tarball" -C "$stage" .
+          ( cd dist && sha256sum "$(basename "$tarball")" > "$(basename "$tarball").sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coppice-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # Publishing needs `contents: write`, so it is its own job rather than a step
+  # inside `build` — the build itself keeps the workflow's read-only default.
+  release:
+    name: attach to the release
+    # A tag alone is not a release: only `v*` tags publish, so a dispatch on
+    # any other tag builds and uploads the artifact without creating one.
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coppice-*
+          merge-multiple: true
+          path: dist
+      # `gh release create` on a tag that already has a release fails, so
+      # create-if-absent and upload with --clobber: a re-run of this workflow
+      # for the same tag replaces its assets rather than erroring.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ github.ref_name }}'
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --draft=false --title "$tag" --generate-notes
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber dist/*
