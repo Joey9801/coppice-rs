@@ -1,0 +1,16 @@
+# Terraform working directories and any state that ends up on disk. The
+# provider lock files (.terraform.lock.hcl) are deliberately NOT ignored:
+# they are committed so every operator and CI run resolves the same providers.
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Local backend used for the first-ever bootstrap apply, before the state
+# bucket it creates exists (see scripts/aws-demo/bootstrap.sh).
+.bootstrap-local/
+*_override.tf
+
+# Variable files can hold environment specifics; only the checked-in examples
+# belong in git.
+*.tfvars
+!*.auto.tfvars.example
