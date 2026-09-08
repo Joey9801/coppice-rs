@@ -1,0 +1,88 @@
+# Coppice node agent.
+#
+# Same shape as the coordinator unit and for the same reasons: one flagless
+# `--config` command line, `Restart=always` as the whole recovery story (an
+# agent that cannot reach a coordinator, or whose enrollment token is not yet
+# on disk, fails and is restarted until the cluster exists), and
+# `RequiresMountsFor=` the data volume so an unmounted disk fails ordering
+# instead of presenting an empty directory — the durable journal and the
+# self-minted node identity both live there (deployment-story A1).
+#
+# `Type=exec`, NOT `Type=notify`: unlike the coordinator, the agent daemon
+# emits no sd_notify READY=1 today (crates/coppice-coordinator/src/systemd.rs
+# has no agent-side caller), so systemd would wait out the notify timeout and
+# then fail the unit. `Type=exec` means "started once the binary is execed",
+# which is the honest claim. The agent also installs no SIGTERM handler, so a
+# stop is the kernel's default termination rather than a drain: running
+# containers are left to the reap janitor and to the coordinator's liveness
+# timeout. Both are noted in deploy/README.md.
+#
+# See docs/operations/configuration.md and docs/architecture/docker-executor.md.
+
+[Unit]
+Description=Coppice node agent
+Documentation=https://github.com/Joey9801/coppice-rs/blob/main/docs/operations/configuration.md
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+RequiresMountsFor=/var/lib/coppice-agent
+
+[Service]
+Type=exec
+User=coppice-agent
+Group=coppice-agent
+# The Docker daemon socket is group-owned by `docker`; the executor dials it
+# over AF_UNIX (auto-discovered, or `[executor] docker_host`).
+SupplementaryGroups=docker
+ExecStart=/usr/local/bin/coppice agent --config /etc/coppice/agent.toml
+Restart=always
+RestartSec=2s
+
+# /var/lib/coppice-agent: the journal, the LOCK, the node identity, and the
+# telemetry segments that back `coppice job logs`.
+StateDirectory=coppice-agent
+StateDirectoryMode=0700
+ConfigurationDirectory=coppice
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+# Sandboxing, matching the coordinator except where talking to Docker requires
+# otherwise.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# PrivateDevices=no, deliberately: the executor's host-facts and capacity
+# detection read the real device topology, and a private /dev would hide it.
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+# Read-only /sys/fs/cgroup is enough: capacity detection only *reads*
+# `cpu.max`/`memory.max` down the cgroup chain (crates/coppice-agent/src/
+# capacity.rs). Container cgroups are the Docker daemon's to write, not ours.
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Enrollment and renewal write the leaf and CA bundle back to the `[tls]`
+# paths, and ConfigurationDirectory= is read-only under ProtectSystem=strict.
+ReadWritePaths=/etc/coppice/pki
+# connect(2) on a Unix socket needs write access to the socket inode. A
+# systemd-in-Docker run of this unit reached /run/docker.sock without these
+# two lines, so ProtectSystem=strict evidently leaves /run writable there;
+# they cost nothing and cover the hosts where it does not. The `-` prefix
+# keeps the unit startable before dockerd has created the socket — the agent
+# fails, Restart=always brings it back, and it picks the socket up.
+ReadWritePaths=-/run/docker.sock
+ReadWritePaths=-/var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,120 @@
+# Coppice coordinator — the AWS demo environment's shape.
+#
+# A template, not a drop-in: every ALL-CAPS value is substituted per
+# environment (cloud-init renders this file from Terraform). Everything else is
+# deliberate and explained where it is not obvious. The authoritative reference
+# for each key is docs/operations/configuration.md; this file is the subset a
+# three-coordinator ASG behind one NLB actually needs.
+#
+# Unknown keys are a startup error (`deny_unknown_fields`), so this file is
+# parse-tested in CI against the real structs — see the
+# `deploy_example_parses` test in crates/coppice-coordinator/src/config.rs.
+
+# The logical cluster name every replica shares (ADR 0020/0037). One value for
+# the whole environment; it survives a wipe-and-re-form, which the per-formation
+# `history_id` deliberately does not.
+cluster_id = "cluster-00000000-0000-0000-0000-000000000000"
+
+# StateDirectory=coppice in the unit creates and owns this.
+data_dir = "/var/lib/coppice"
+
+[discovery]
+# Coordinators find their own auto-scaling group over IMDSv2 +
+# DescribeAutoScalingInstances/DescribeAutoScalingGroups/DescribeInstances
+# (ADR 0037 §2). Seed-only: the addresses that decide consensus live in
+# replicated membership, so a stale or empty answer here is survivable and the
+# convergence loop simply probes again.
+backend = "ec2-asg"
+# The intended voter count: the removal rule, convergence, and the
+# `/readyz?require=healthy` gate all consult it before replicated state is
+# reachable.
+cluster_size = 3
+
+[discovery.ec2_asg]
+# The raft port composed onto every discovered instance's private IP; matches
+# `[listen] raft_addr` below.
+port = 7071
+# `region` is omitted on purpose: it comes from this instance's own IMDS
+# document, which is right for a coordinator inside the group it discovers.
+
+[listen]
+client_addr = "0.0.0.0:7070"   # HTTP API, web UI, /metrics, /readyz, /enroll
+raft_addr   = "0.0.0.0:7071"   # coordinator peer traffic (intra-SG only)
+agent_addr  = "0.0.0.0:7072"   # agent plane, mTLS end to end (NLB TCP pass-through)
+# The address peers and agents dial, and the SAN on this node's leaf. The
+# `ec2-asg` backend hands peers private IPs, and a peer verifies the leaf
+# against the address it dialled, so this must be the instance's private IP —
+# not its hostname, which the unset-fallback would pick on an image whose
+# hostname is a resolvable FQDN. cloud-init renders it from IMDS.
+advertise_host = "COORDINATOR_PRIVATE_IP"
+# Names this leaf must ALSO serve, without advertising them. Agents dial the
+# load balancer's name (`[discovery.static]` in agent.toml), and the NLB
+# passes the agent plane's TLS straight through, so it is this node that
+# terminates TLS for that name. Raft membership still carries only
+# `advertise_host`; renewal re-issues the leaf if this set grows.
+extra_sans = ["ENV.coppice.jwjr.uk"]
+# The unit's RuntimeDirectory=coppice / RuntimeDirectoryMode=0700 creates this
+# directory; the daemon verifies rather than chmods a socket directory it did
+# not choose, so that mode is load-bearing. Being able to open this socket IS
+# the authorization for `coppice coordinator init` (ADR 0037 §3).
+admin_socket = "/run/coppice/admin.sock"
+
+[tls]
+# Machine plane only: the leaf served on the raft and agent listeners. Absent
+# on a fresh instance — the daemon parks, enrolls (below), and writes these
+# three files itself, which is why the unit gives /etc/coppice/pki as a
+# ReadWritePaths= exception to ProtectSystem=strict.
+#
+# Configurable paths rather than a fixed layout under data_dir because
+# externally issued material is a supported substitution at the same paths
+# (docs/operations/security.md, ADR 0037 §4): an external issuer can own the
+# files and the daemon hot-reloads them either way. Making that choice
+# explicit in the schema instead of inferred from disk is issue #127.
+cert_path = "/etc/coppice/pki/node.crt"
+key_path  = "/etc/coppice/pki/node.key"
+ca_path   = "/etc/coppice/pki/ca.crt"
+
+[client_tls]
+# TLS terminates on the load balancer: the NLB holds the ACM certificate for
+# <env>.coppice.jwjr.uk and forwards plain HTTP to :7070 inside the VPC, which
+# docs/operations/configuration.md names as a supported posture for this
+# listener. Enrollment tokens therefore cross only the VPC-internal hop in the
+# clear; the client half of that trip is ordinary system-root verification of
+# the NLB's certificate (see `[enrollment]` below).
+insecure = true
+
+[history]
+# Explicitly lossy, and the only mode implemented (issue #43): terminal jobs
+# are evicted on the replicated `terminal_retention` TTL and nothing writes a
+# durable copy first. The demo runbook states this rather than implying a
+# ClickHouse sink that does not exist yet (issue #42).
+mode = "none"
+
+[enrollment]
+# How a fresh coordinator obtains its `[tls]` leaf (ADR 0037 §§4-5): token +
+# CSR to the cluster's public /enroll endpoint. The endpoint is the public
+# name, so the certificate verified here is the NLB's ACM one under ordinary
+# system roots — no private-CA distribution problem.
+endpoint = "https://ENV.coppice.jwjr.uk"
+# Written by cloud-init from an SSM SecureString before the unit starts. The
+# secret is the one baked into the `[[enroll_token]]` entry labelled
+# `coordinator-launch` in policy.toml.
+token_path = "/etc/coppice/enroll-token"
+
+[sso]
+# Connection identity only — every role binding is replicated policy
+# (ADRs 0022/0023). Validation is offline against the issuer's JWKS; the
+# coordinator is a resource server and never authenticates *to* Cognito, so
+# there is no client secret here.
+issuer = "https://cognito-idp.eu-west-2.amazonaws.com/POOL_ID"
+client_id = "COGNITO_APP_CLIENT_ID"
+# Cognito access tokens carry `client_id` rather than `aud` while ID tokens
+# carry `aud`; stated explicitly so the expected audience is visible in the
+# file rather than inferred from `client_id`.
+audience = "COGNITO_APP_CLIENT_ID"
+
+[observability]
+log_level = "info"
+# The code default is "text"; JSON is set here because these logs are read out
+# of the journal by machine.
+log_format = "json"
