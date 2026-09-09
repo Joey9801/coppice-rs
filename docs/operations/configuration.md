@@ -280,7 +280,9 @@ issuer = "https://sso.example.com/oidc"
 client_id = "coppice"
 # Expected `aud` claim. OPTIONAL — defaults to `client_id`, which is right
 # for most deployments (tokens minted with `aud == client_id`); set this only
-# when the issuer mints a different audience for this resource server.
+# when the issuer mints a different audience for this resource server. When a
+# token carries no `aud` at all, its `client_id` claim is checked against this
+# value instead — Amazon Cognito user-pool access tokens are shaped that way.
 audience = "coppice"
 
 # [auth]

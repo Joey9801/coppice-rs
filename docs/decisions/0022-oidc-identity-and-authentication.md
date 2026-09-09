@@ -63,8 +63,9 @@ never matched by bindings, never stored in replicated state.
 Clients present an OAuth2 **JWT access token** as a bearer credential. Every
 replica validates it locally: signature against the issuer's JWKS (cached,
 refreshed in the background and on unknown key ids), `iss`, `aud` equal to
-the cluster's configured audience, `exp`/`nbf` with a small clock-skew
-allowance. **No token introspection, no IdP call on the request path** —
+the cluster's configured audience (or, when the token carries no `aud`, a
+`client_id` claim equal to it — the shape Amazon Cognito mints access tokens
+in, RFC 9068 §2.2), `exp`/`nbf` with a small clock-skew allowance. **No token introspection, no IdP call on the request path** —
 follower reads authenticate exactly as locally as leader writes.
 
 The consequence is embraced rather than hidden: revocation latency equals

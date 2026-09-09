@@ -114,16 +114,19 @@ impl Validator {
         validation.validate_exp = true;
         validation.validate_nbf = true;
         validation.set_issuer(&[self.config.issuer.as_str()]);
-        validation.set_audience(&[self.config.audience.as_str()]);
-        // Presence is required separately from value checks so a token missing
-        // `aud` or `sub` entirely produces a specific error rather than the
-        // generic mismatch a value check would report.
-        validation.required_spec_claims =
-            HashSet::from(["exp", "iss", "aud", "sub"].map(str::to_string));
+        // The audience is checked by hand below, because the check has a
+        // fallback (`client_id`) that the library's `aud` validation cannot
+        // express. Presence is required separately from value checks so a
+        // token missing `sub` entirely produces a specific error rather than
+        // the generic mismatch a value check would report.
+        validation.validate_aud = false;
+        validation.required_spec_claims = HashSet::from(["exp", "iss", "sub"].map(str::to_string));
 
         let claims = decode::<Map<String, Value>>(token, &key.key, &validation)
             .map_err(|e| ValidateError::from_jwt(e.kind()))?
             .claims;
+
+        check_audience(&claims, &self.config.audience)?;
 
         let sub = claims
             .get("sub")
@@ -142,6 +145,37 @@ impl Validator {
             name,
             email,
         })
+    }
+}
+
+/// Check that the token is addressed to this cluster.
+///
+/// The `aud` claim is authoritative when present, in either RFC 7519 shape: a
+/// string that equals `expected`, or an array containing it. A present `aud`
+/// that does not name `expected` is [`WrongAudience`](ValidateError::WrongAudience)
+/// regardless of anything else the token carries — the fallback below never
+/// rescues a token minted for a different audience.
+///
+/// When `aud` is **absent**, the `client_id` claim stands in for it. Some
+/// issuers — Amazon Cognito user pools are the motivating case, issue #130 —
+/// mint OAuth2 access tokens with no `aud` at all and identify the app client
+/// through `client_id` instead (RFC 9068 §2.2 lists `client_id` as a
+/// registered access-token claim). Coppice's configured audience defaults to
+/// the app client id, so for those issuers `client_id` carries exactly the
+/// "who is this token for" meaning `aud` would. A token with neither claim
+/// is [`MissingAudience`](ValidateError::MissingAudience): it could be an
+/// access token minted for any other service, replayed here, which is the
+/// attack the audience check exists to stop.
+fn check_audience(claims: &Map<String, Value>, expected: &str) -> Result<(), ValidateError> {
+    match claims.get("aud") {
+        Some(Value::String(one)) if one == expected => Ok(()),
+        Some(Value::Array(items)) if items.iter().any(|a| a.as_str() == Some(expected)) => Ok(()),
+        Some(_) => Err(ValidateError::WrongAudience),
+        None => match claims.get("client_id") {
+            Some(Value::String(id)) if id == expected => Ok(()),
+            Some(_) => Err(ValidateError::WrongAudience),
+            None => Err(ValidateError::MissingAudience),
+        },
     }
 }
 
@@ -238,10 +272,11 @@ pub enum ValidateError {
     /// `iss` is not the configured issuer.
     #[error("the token was issued by a different issuer")]
     WrongIssuer,
-    /// `aud` does not contain the configured audience.
+    /// `aud` (or, when `aud` is absent, `client_id`) does not name the
+    /// configured audience.
     #[error("the token is not addressed to this cluster's audience")]
     WrongAudience,
-    /// `aud` is absent entirely.
+    /// Neither `aud` nor `client_id` is present.
     #[error("the token carries no audience claim")]
     MissingAudience,
     /// `sub` is absent or empty.
@@ -268,7 +303,6 @@ impl ValidateError {
             ErrorKind::InvalidSignature => ValidateError::BadSignature,
             ErrorKind::InvalidAlgorithm => ValidateError::AlgorithmMismatch,
             ErrorKind::MissingRequiredClaim(name) => match name.as_str() {
-                "aud" => ValidateError::MissingAudience,
                 "sub" => ValidateError::MissingSubject,
                 "iss" => ValidateError::WrongIssuer,
                 _ => ValidateError::Malformed(format!("the {name} claim is missing")),
@@ -343,11 +377,42 @@ mod tests {
     }
 
     #[test]
-    fn missing_claim_mapping_is_specific() {
+    fn audience_shapes() {
+        let ok = |v: Value| check_audience(&claims(v), "coppice");
+        assert_eq!(ok(json!({ "aud": "coppice" })), Ok(()));
+        assert_eq!(ok(json!({ "aud": ["other", "coppice"] })), Ok(()));
+        assert_eq!(ok(json!({ "client_id": "coppice" })), Ok(()));
+
+        // `aud` is authoritative when present: `client_id` never rescues it.
         assert_eq!(
-            ValidateError::from_jwt(&ErrorKind::MissingRequiredClaim("aud".into())),
-            ValidateError::MissingAudience
+            ok(json!({ "aud": "other", "client_id": "coppice" })),
+            Err(ValidateError::WrongAudience)
         );
+        assert_eq!(
+            ok(json!({ "aud": ["other"] })),
+            Err(ValidateError::WrongAudience)
+        );
+        assert_eq!(ok(json!({ "aud": 42 })), Err(ValidateError::WrongAudience));
+        assert_eq!(
+            ok(json!({ "client_id": "other" })),
+            Err(ValidateError::WrongAudience)
+        );
+        assert_eq!(
+            ok(json!({ "client_id": ["coppice"] })),
+            Err(ValidateError::WrongAudience)
+        );
+        assert_eq!(
+            ok(json!({ "sub": "x" })),
+            Err(ValidateError::MissingAudience)
+        );
+        assert_eq!(
+            ok(json!({ "aud": null })),
+            Err(ValidateError::WrongAudience)
+        );
+    }
+
+    #[test]
+    fn missing_claim_mapping_is_specific() {
         assert_eq!(
             ValidateError::from_jwt(&ErrorKind::MissingRequiredClaim("sub".into())),
             ValidateError::MissingSubject
