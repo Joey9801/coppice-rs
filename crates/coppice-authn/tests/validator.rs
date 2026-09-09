@@ -113,8 +113,8 @@ async fn the_audience_must_name_this_cluster() {
     );
 
     // An access token minted for a different service, replayed here, is the
-    // attack this check exists for — so "no audience at all" is its own
-    // rejection rather than a pass.
+    // attack this check exists for — so "no audience at all" (neither `aud`
+    // nor `client_id`) is its own rejection rather than a pass.
     let missing = idp.sign(TokenClaims::new("user"));
     assert_eq!(
         validator.validate(&missing, DEFAULT_GROUPS_CLAIM).await,
@@ -127,6 +127,52 @@ async fn the_audience_must_name_this_cluster() {
         .validate(&array, DEFAULT_GROUPS_CLAIM)
         .await
         .is_ok());
+
+    idp.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_cognito_shaped_access_token_is_addressed_by_its_client_id() {
+    let idp = FakeIdp::start().await;
+    let (_cache, validator) = ready_validator(&idp).await;
+
+    // Amazon Cognito user-pool access tokens carry no `aud`; the app client
+    // is named by `client_id` instead (issue #130). The configured audience
+    // is that client id, so the token is addressed to this cluster.
+    let cognito = idp.sign(
+        TokenClaims::new("user-42")
+            .claim("client_id", json!(AUDIENCE))
+            .claim("token_use", json!("access")),
+    );
+    let validated = validator
+        .validate(&cognito, DEFAULT_GROUPS_CLAIM)
+        .await
+        .expect("a Cognito-shaped access token validates");
+    assert_eq!(validated.sub, "user-42");
+
+    // The fallback only fills in for an *absent* `aud`. A token that names
+    // another audience is rejected even if its `client_id` matches — an
+    // access token for a different resource server is exactly what this
+    // check exists to keep out.
+    let mismatched = idp.sign(
+        TokenClaims::new("user-42")
+            .audience("some-other-api")
+            .claim("client_id", json!(AUDIENCE)),
+    );
+    assert_eq!(
+        validator.validate(&mismatched, DEFAULT_GROUPS_CLAIM).await,
+        Err(ValidateError::WrongAudience)
+    );
+
+    // And a `client_id` for a different app client is not this cluster's.
+    let other_client =
+        idp.sign(TokenClaims::new("user-42").claim("client_id", json!("someone-else")));
+    assert_eq!(
+        validator
+            .validate(&other_client, DEFAULT_GROUPS_CLAIM)
+            .await,
+        Err(ValidateError::WrongAudience)
+    );
 
     idp.shutdown().await;
 }
