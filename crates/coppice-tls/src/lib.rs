@@ -238,6 +238,19 @@ fn parse_port(addr: &str, port_str: &str) -> Result<u16, HostPortError> {
 // Paths + material
 // ---------------------------------------------------------------------------
 
+/// The directory, under a daemon's `data_dir`, that holds cluster-managed
+/// machine-plane material (`[tls] source = "cluster"`).
+pub const PKI_DIR: &str = "pki";
+
+/// The cluster-managed leaf certificate's file name within [`PKI_DIR`].
+pub const NODE_CERT_FILE: &str = "node.crt";
+
+/// The cluster-managed private key's file name within [`PKI_DIR`].
+pub const NODE_KEY_FILE: &str = "node.key";
+
+/// The cluster-managed trust-anchor bundle's file name within [`PKI_DIR`].
+pub const CA_BUNDLE_FILE: &str = "ca.crt";
+
 /// The three `[tls]` file paths, as loaded from config.
 #[derive(Debug, Clone)]
 pub struct TlsPaths {
@@ -247,6 +260,27 @@ pub struct TlsPaths {
     pub key: PathBuf,
     /// The cluster CA bundle used to verify peers (PEM).
     pub ca: PathBuf,
+}
+
+impl TlsPaths {
+    /// Where cluster-managed material lives for a daemon whose data directory
+    /// is `data_dir` (issue #127): `<data_dir>/pki/{node.crt,node.key,ca.crt}`.
+    ///
+    /// A fixed layout, not a configurable one. Under `[tls] source = "cluster"`
+    /// the daemon *writes* these files — formation mints the first leaf into
+    /// them, enrollment installs one it was handed, renewal replaces it, a
+    /// re-root rewrites the bundle — so their location is the cluster's
+    /// business rather than the operator's, and having exactly one answer is
+    /// what lets every one of those writers agree with the reload store
+    /// without an operator keeping four settings consistent.
+    pub fn cluster_managed(data_dir: &std::path::Path) -> TlsPaths {
+        let pki = data_dir.join(PKI_DIR);
+        TlsPaths {
+            cert: pki.join(NODE_CERT_FILE),
+            key: pki.join(NODE_KEY_FILE),
+            ca: pki.join(CA_BUNDLE_FILE),
+        }
+    }
 }
 
 /// One immutable generation of parsed mTLS material.

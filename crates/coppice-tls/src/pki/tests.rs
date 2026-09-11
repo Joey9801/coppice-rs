@@ -561,3 +561,37 @@ fn staging_does_not_disturb_the_live_signing_key() {
         pending.key_pem
     );
 }
+
+/// Cluster-managed material lives at `<data_dir>/pki`, a directory nothing
+/// else creates: whichever of formation, enrollment or renewal installs first
+/// must make it, owner-only (issue #127).
+#[test]
+fn installing_a_leaf_creates_the_pki_directory_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let paths = crate::TlsPaths::cluster_managed(&data_dir);
+    assert!(!paths.cert.parent().unwrap().exists());
+
+    let ca = mint_root_ca().unwrap();
+    let signer = CaSigner::load(&ca.cert_pem, &ca.key_pem).unwrap();
+    let machine = mint_machine_identity();
+    let (cert, key) =
+        mint_coordinator_local(&signer, &machine, &["localhost".to_string()]).unwrap();
+    install_leaf_material(&paths, &ca.cert_pem, &cert, &key).unwrap();
+
+    assert_eq!(std::fs::read(&paths.ca).unwrap(), ca.cert_pem);
+    assert_eq!(std::fs::read(&paths.cert).unwrap(), cert);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(paths.cert.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "the pki dir must be owner-only");
+    }
+
+    // A second install into the now-existing directory is an ordinary write.
+    install_leaf_material(&paths, &ca.cert_pem, &cert, &key).unwrap();
+}
