@@ -11,15 +11,17 @@
 //! machine-identity, and CA-key-custody primitives the convergence loop needs.
 //! **All production certificate/CA minting in the workspace lives under [`pki`],
 //! and only coordinator code paths call its signing entry points** (signing runs
-//! on the leader, which always holds the CA key). External PKI stays a supported
-//! *substitution* — a deployment may supply its own leaves through the `[tls]`
-//! paths and bypass enrollment — never a requirement.
+//! on the leader, which always holds the CA key). The cluster exclusively owns
+//! this machine-plane material (issue #127): formation, enrollment, renewal and
+//! re-rooting write it, always at the fixed [`TlsPaths::cluster_managed`]
+//! layout under the daemon's data directory, and nothing external ever
+//! substitutes for it. The user-facing HTTP listener's serving certificate is
+//! a separate concern ([`ClientTlsStore`], config `[client_tls]`).
 //!
-//! The reload half below is unchanged: whatever mints the material — cluster
-//! enrollment or an external issuer — the coordinator must pick a rotated
-//! cert/key/CA up *without a restart*, so short-lived rotated certificates
-//! require no process choreography, and in-flight connections finish on the old
-//! leaf.
+//! The reload half below is independent of who minted the material: the
+//! coordinator must pick a rotated cert/key/CA up *without a restart*, so
+//! short-lived rotated certificates require no process choreography, and
+//! in-flight connections finish on the old leaf.
 //!
 //! The crate is a small shared dependency of both `coppice-coordinator` (the
 //! two mTLS listeners) and `coppice-consensus` (the outbound raft peer mesh),
@@ -28,7 +30,7 @@
 //! ## Shape
 //!
 //! - [`TlsStore`] holds the current [`TlsMaterial`] behind an [`arc_swap`]
-//!   cell, loaded from the `[tls]` paths. [`TlsStore::reload`] re-reads the
+//!   cell, loaded from the machine-plane [`TlsPaths`]. [`TlsStore::reload`] re-reads the
 //!   files and swaps in freshly-parsed material *only when it parses cleanly*:
 //!   a broken, half-written file never takes down serving — it is logged and
 //!   the old material keeps serving. [`spawn_reload_task`] drives reloads from
@@ -238,7 +240,20 @@ fn parse_port(addr: &str, port_str: &str) -> Result<u16, HostPortError> {
 // Paths + material
 // ---------------------------------------------------------------------------
 
-/// The three `[tls]` file paths, as loaded from config.
+/// The directory, under a daemon's `data_dir`, that holds the cluster-managed
+/// machine-plane material (issue #127).
+pub const PKI_DIR: &str = "pki";
+
+/// The cluster-managed leaf certificate's file name within [`PKI_DIR`].
+pub const NODE_CERT_FILE: &str = "node.crt";
+
+/// The cluster-managed private key's file name within [`PKI_DIR`].
+pub const NODE_KEY_FILE: &str = "node.key";
+
+/// The cluster-managed trust-anchor bundle's file name within [`PKI_DIR`].
+pub const CA_BUNDLE_FILE: &str = "ca.crt";
+
+/// The three machine-plane material files: leaf, key and trust-anchor bundle.
 #[derive(Debug, Clone)]
 pub struct TlsPaths {
     /// This coordinator's leaf certificate chain (PEM).
@@ -247,6 +262,27 @@ pub struct TlsPaths {
     pub key: PathBuf,
     /// The cluster CA bundle used to verify peers (PEM).
     pub ca: PathBuf,
+}
+
+impl TlsPaths {
+    /// Where cluster-managed material lives for a daemon whose data directory
+    /// is `data_dir` (issue #127): `<data_dir>/pki/{node.crt,node.key,ca.crt}`.
+    ///
+    /// A fixed layout, not a configurable one: the cluster owns this material
+    /// and the daemon *writes* these files — formation mints the first leaf into
+    /// them, enrollment installs one it was handed, renewal replaces it, a
+    /// re-root rewrites the bundle — so their location is the cluster's
+    /// business rather than the operator's, and having exactly one answer is
+    /// what lets every one of those writers agree with the reload store
+    /// without an operator keeping four settings consistent.
+    pub fn cluster_managed(data_dir: &std::path::Path) -> TlsPaths {
+        let pki = data_dir.join(PKI_DIR);
+        TlsPaths {
+            cert: pki.join(NODE_CERT_FILE),
+            key: pki.join(NODE_KEY_FILE),
+            ca: pki.join(CA_BUNDLE_FILE),
+        }
+    }
 }
 
 /// One immutable generation of parsed mTLS material.
