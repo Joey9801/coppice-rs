@@ -104,3 +104,21 @@ resource "aws_cognito_user" "demo" {
   password       = random_password.demo_user.result
   message_action = "SUPPRESS"
 }
+
+# Membership of this group is what the cluster's day-0 authorization binds to
+# (deploy/examples/policy.toml, `[[authorization.binding]] group =
+# "coppice-admins"`): Cognito lists a user's groups under `cognito:groups` in
+# the ID token, and formation seeds a binding for the group rather than for the
+# demo user's `sub`, so adding an operator later is a group membership, not a
+# policy edit.
+resource "aws_cognito_user_group" "admins" {
+  name         = "coppice-admins"
+  user_pool_id = aws_cognito_user_pool.this.id
+  description  = "Unscoped admins of the coppice ${var.env_name} cluster"
+}
+
+resource "aws_cognito_user_in_group" "demo_admin" {
+  user_pool_id = aws_cognito_user_pool.this.id
+  group_name   = aws_cognito_user_group.admins.name
+  username     = aws_cognito_user.demo.username
+}

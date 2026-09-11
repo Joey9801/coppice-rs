@@ -56,6 +56,9 @@ locals {
     cluster_id        = random_uuid.cluster.result
     cognito_pool_id   = aws_cognito_user_pool.this.id
     cognito_client_id = aws_cognito_user_pool_client.web.id
+    # The ops host's Prometheus; unused by the other two templates.
+    prometheus_version = var.prometheus_version
+    prometheus_sha256  = var.prometheus_sha256
   }
 }
 

@@ -62,6 +62,21 @@ observations, such as:
 Prometheus metrics should be emitted by coordinators, agents, scheduler workers,
 API servers, and event delivery components.
 
+What exists today is narrower than the categories below. The coordinator
+serves `/metrics` on the client listener (the same one as the API; there is
+no separate metrics port) and the agent on its optional `metrics_addr`. The
+families actually registered are the `describe_metrics` call sites in the
+code — consensus and snapshot health (`coordinator_view_applied_index`,
+`coordinator_snapshot_*`, `coordinator_state_{jobs,nodes,attempts,
+allocations}`), authentication outcomes and JWKS health (`authn_*`), TLS
+reloads, the node-service log and usage fetch counters on both sides, the
+agent's executor and image-cache gauges (`agent_running_jobs`,
+`agent_cached_images`, …), and the per-node usage gauges
+(`agent_node_used_*` on agents, `coppice_node_used_*` on the leader). Queue
+depth, scheduling latency and quota-usage families are not implemented yet.
+Anything that asserts on metrics — the AWS demo smoke test, for one — must
+check against the code, not this list.
+
 Important metric categories include:
 
 - Queue depth by project, queue, priority, and state.

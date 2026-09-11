@@ -27,7 +27,7 @@ output "agent_asg_name" {
 }
 
 output "ops_instance_id" {
-  description = "Ops host instance id, for `aws ssm start-session`."
+  description = "Ops host instance id: the Prometheus host, reached with `aws ssm start-session` (port-forward 9090) or `aws ssm send-command`; the smoke test's Prometheus check goes through the latter."
   value       = aws_instance.ops.id
 }
 
