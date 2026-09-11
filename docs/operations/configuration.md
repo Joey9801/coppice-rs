@@ -366,3 +366,28 @@ charged. Cost is a scalar with no external unit — only the ratios between
 prices and quota stocks mean anything — so the fix is to price the other
 dimensions up and scale the quota entities, not to price one dimension
 below what a weight can hold.
+
+The document may also carry the cluster's **day-0 role bindings**
+([ADR 0023](../decisions/0023-scoped-role-bindings.md)). A fresh cluster's
+binding list is empty — deny by default, so only operator certificates can
+act — and a deployment that terminates TLS in front of the coordinators
+has no way to present one, which makes formation the only moment the
+first bindings can be installed:
+
+```toml
+[authorization]
+groups_claim = "cognito:groups"   # optional; the claim group names are read from
+
+[[authorization.binding]]
+group = "coppice-admins"          # exactly one of group / principal
+role = "admin"                    # submitter | operator | admin
+# scope = "quota-…"               # optional; absent = the whole entity tree
+```
+
+The list is installed as one full replacement, **only while the replicated
+list is still empty**: once anything is bound, `coppice policy authz set`
+owns it and a re-run of `init` leaves it alone. The same lockout rule as
+the API applies at the edge — a document whose bindings retain no unscoped
+`admin`, including a table that is present but binds nobody, is refused
+before formation starts — and a `scope` must name an entity the document
+seeds or one that already exists.

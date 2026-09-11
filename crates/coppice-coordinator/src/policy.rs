@@ -27,7 +27,15 @@
 //!   entity is left untouched (reconfiguration is not an amnesty, and re-init
 //!   must not reset accumulated usage);
 //! - each `[[enroll_token]]` is minted **only when no live token carries its
-//!   label** (ADR 0037 §5), which is why labels are required and unique here.
+//!   label** (ADR 0037 §5), which is why labels are required and unique here;
+//! - the `[authorization]` role bindings are installed with one
+//!   full-replacement `UpdateAuthorization` **only while the replicated
+//!   binding list is still empty** — the day-0 authority the security doc
+//!   describes: a fresh cluster denies everyone but operator certificates, and
+//!   a deployment that terminates TLS in front of the coordinators has no way
+//!   to present one, so the first bindings must ride formation's local-socket
+//!   authority. Once any binding exists, `coppice policy authz set` owns the
+//!   list and a re-init leaves it alone.
 //!
 //! Human-facing multipliers and prices are floats in the TOML; they are
 //! converted to the replicated Q32.32 fixed-point [`PriorityMultiplier`] and
@@ -43,7 +51,10 @@ use serde::Deserialize;
 use coppice_core::id::{EnrollTokenId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier, MICRO_PER_COST_UNIT};
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::command::{ConfigureQuotaEntity, MintEnrollToken, UpdatePolicy};
+use coppice_state::authz::{Binding, Role, Subject};
+use coppice_state::command::{
+    ConfigureQuotaEntity, MintEnrollToken, UpdateAuthorization, UpdatePolicy,
+};
 use coppice_state::{Command, EnrollRole, StateMachine};
 use coppice_tls::pki;
 
@@ -75,6 +86,101 @@ pub struct FormationPolicy {
     /// user-data, name it here, form, and the fleet enrolls.
     #[serde(default, rename = "enroll_token")]
     pub enroll_tokens: Vec<EnrollTokenSpec>,
+    /// The initial role bindings, as the `[authorization]` table (ADR 0023).
+    /// Absent = leave the replicated bindings untouched.
+    #[serde(default)]
+    pub authorization: Option<AuthorizationSpec>,
+}
+
+/// The `[authorization]` table: the day-0 role bindings and, optionally, the
+/// token claim group names are read from.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationSpec {
+    /// Rename of `PolicyConfig::groups_claim` (default `groups`), installed
+    /// at the same log position as the bindings. Cognito, for one, puts a
+    /// user's groups under `cognito:groups`.
+    #[serde(default)]
+    pub groups_claim: Option<String>,
+    /// One `[[authorization.binding]]` per binding. At least one must be an
+    /// unscoped `admin`, the same lockout rule apply enforces (ADR 0023).
+    #[serde(default, rename = "binding")]
+    pub bindings: Vec<BindingSpec>,
+}
+
+impl AuthorizationSpec {
+    /// Every binding in document order, or the first entry that cannot be one.
+    fn bindings(&self) -> Result<Vec<Binding>> {
+        self.bindings
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b.binding(i))
+            .collect()
+    }
+}
+
+/// One role binding: exactly one of `group`/`principal`, a role, and an
+/// optional quota-entity scope (absent = the whole tree).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingSpec {
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub principal: Option<String>,
+    pub role: RoleSpec,
+    #[serde(default)]
+    pub scope: Option<QuotaEntityId>,
+}
+
+/// The wire spelling of [`coppice_state::authz::Role`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleSpec {
+    Submitter,
+    Operator,
+    Admin,
+}
+
+impl From<RoleSpec> for Role {
+    fn from(r: RoleSpec) -> Self {
+        match r {
+            RoleSpec::Submitter => Role::Submitter,
+            RoleSpec::Operator => Role::Operator,
+            RoleSpec::Admin => Role::Admin,
+        }
+    }
+}
+
+impl BindingSpec {
+    /// The replicated binding, or why this entry cannot be one. Mirrors the
+    /// API's wire → domain conversion and apply's own subject check so the
+    /// document fails here, at the seeding edge, rather than mid-formation.
+    fn binding(&self, index: usize) -> Result<Binding> {
+        let subject = match (&self.group, &self.principal) {
+            (Some(name), None) => Subject::Group(name.clone()),
+            (None, Some(sub)) => Subject::Principal(sub.clone()),
+            (Some(_), Some(_)) => bail!(
+                "[[authorization.binding]] {} names both `group` and `principal`; exactly one",
+                index + 1
+            ),
+            (None, None) => bail!(
+                "[[authorization.binding]] {} names neither `group` nor `principal`; exactly one",
+                index + 1
+            ),
+        };
+        if subject.name().trim().is_empty() {
+            bail!(
+                "[[authorization.binding]] {} has an empty subject",
+                index + 1
+            );
+        }
+        Ok(Binding {
+            subject,
+            role: self.role.into(),
+            scope: self.scope,
+        })
+    }
 }
 
 /// One `[[enroll_token]]` entry: an operator-supplied secret, the role it
@@ -397,6 +503,34 @@ impl FormationPolicy {
                 bail!("enrollment token {:?} has an empty secret", token.label);
             }
         }
+        if let Some(authz) = &self.authorization {
+            if authz
+                .groups_claim
+                .as_deref()
+                .is_some_and(|claim| claim.trim().is_empty())
+            {
+                bail!("[authorization] groups_claim is empty or whitespace-only");
+            }
+            let bindings = authz.bindings()?;
+            // Apply refuses a list with no unscoped admin (AuthorizationLockout);
+            // refusing it here names the document instead of failing formation
+            // halfway through. An empty list is the same lockout: absence of
+            // the table already means "leave authorization untouched", so a
+            // table that is present but binds nobody is a mistake, not a
+            // no-op — it would leave an OIDC-only cluster looking initialised
+            // while nobody can act.
+            if !bindings
+                .iter()
+                .any(|b| b.role == Role::Admin && b.scope.is_none())
+            {
+                bail!(
+                    "[authorization] would install no unscoped admin binding; at least one is \
+                     required so an accidental lockout stays loud (ADR 0023)"
+                );
+            }
+            // Scopes are checked in `commands`, where the existing entities
+            // are known.
+        }
         Ok(())
     }
 
@@ -518,6 +652,38 @@ impl FormationPolicy {
                 expires_at,
                 minted_at: now,
             }));
+        }
+
+        // Role bindings: one full replacement, only while the replicated list
+        // is still empty (the booted deny-everyone default). Once anything is
+        // bound, the list belongs to `coppice policy authz set`, and a re-init
+        // must not revert an operator's edits. A scoped binding may name an
+        // entity seeded above: those commands are ordered first, so the scope
+        // exists by the time this one applies.
+        if let Some(authz) = &self.authorization {
+            let bindings = authz.bindings()?;
+            // `validate` guaranteed at least one unscoped admin, so the list
+            // is never empty here.
+            if state.bindings.is_empty() {
+                let seeded: std::collections::BTreeSet<QuotaEntityId> =
+                    self.quota_entities.iter().map(|qe| qe.id).collect();
+                for binding in &bindings {
+                    if let Some(scope) = binding.scope {
+                        if !seeded.contains(&scope) && !state.quota_entities.contains_key(&scope) {
+                            bail!(
+                                "[[authorization.binding]] scope {scope} is neither seeded by this \
+                                 document nor an existing quota entity"
+                            );
+                        }
+                    }
+                }
+                commands.push(Command::UpdateAuthorization(UpdateAuthorization {
+                    bindings,
+                    actor: None,
+                    updated_at: now,
+                    groups_claim: authz.groups_claim.clone(),
+                }));
+            }
         }
 
         Ok(commands)
@@ -696,6 +862,16 @@ quota = 1000000000000
             .map(|token| token.secret.as_str())
             .collect();
         assert_eq!(secrets.len(), policy.enroll_tokens.len());
+        // Day-0 authorization: the demo's Cognito group is an unscoped admin,
+        // read from the claim Cognito actually uses.
+        let authz = policy.authorization.as_ref().expect("[authorization]");
+        assert_eq!(authz.groups_claim.as_deref(), Some("cognito:groups"));
+        let bindings = authz.bindings().expect("valid bindings");
+        assert!(bindings.iter().any(|b| {
+            b.subject == Subject::Group("coppice-admins".to_string())
+                && b.role == Role::Admin
+                && b.scope.is_none()
+        }));
     }
 
     #[test]
@@ -1289,5 +1465,166 @@ ttl = "15m"
             };
             assert!(actor.is_none(), "seeding is not an API-originated write");
         }
+    }
+
+    const AUTHZ_SAMPLE: &str = r#"
+[[quota_entity]]
+id = "quota-00000000-0000-0000-0000-000000000001"
+name = "default"
+quota = 1000000000000
+
+[authorization]
+groups_claim = "cognito:groups"
+
+[[authorization.binding]]
+group = "coppice-admins"
+role = "admin"
+
+[[authorization.binding]]
+principal = "user-42"
+role = "submitter"
+scope = "quota-00000000-0000-0000-0000-000000000001"
+"#;
+
+    #[test]
+    fn authorization_seeds_the_bindings_after_the_entities_on_a_fresh_state() {
+        let policy = FormationPolicy::parse_toml(AUTHZ_SAMPLE.as_bytes()).unwrap();
+        let commands = policy
+            .commands(&StateMachine::default(), Timestamp::now(), CHEAP_KDF)
+            .expect("valid policy");
+        // The entity first (the scoped binding needs it to exist), then one
+        // full-replacement UpdateAuthorization.
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(commands[0], Command::ConfigureQuotaEntity(_)));
+        let Command::UpdateAuthorization(update) = &commands[1] else {
+            panic!("expected UpdateAuthorization, got {:?}", commands[1]);
+        };
+        assert_eq!(update.groups_claim.as_deref(), Some("cognito:groups"));
+        assert!(update.actor.is_none());
+        assert_eq!(update.bindings.len(), 2);
+        assert_eq!(
+            update.bindings[0].subject,
+            Subject::Group("coppice-admins".to_string())
+        );
+        assert_eq!(update.bindings[0].role, Role::Admin);
+        assert!(update.bindings[0].scope.is_none());
+        assert_eq!(
+            update.bindings[1].subject,
+            Subject::Principal("user-42".to_string())
+        );
+        assert_eq!(update.bindings[1].role, Role::Submitter);
+        assert_eq!(update.bindings[1].scope, Some(policy.quota_entities[0].id));
+    }
+
+    #[test]
+    fn authorization_is_left_alone_once_any_binding_exists() {
+        let policy = FormationPolicy::parse_toml(AUTHZ_SAMPLE.as_bytes()).unwrap();
+        let now = Timestamp::now();
+        let mut state = StateMachine::default();
+        state.quota_entities.insert(
+            policy.quota_entities[0].id,
+            coppice_state::QuotaEntity {
+                parent: None,
+                name: "default".to_string(),
+                quota: CostUnits(1_000_000_000_000),
+                usage: coppice_core::quota::UsageState::new(now),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        // An operator has since replaced the list with something else
+        // entirely; a re-init must not put the document's bindings back.
+        state.bindings = vec![Binding {
+            subject: Subject::Group("ops".to_string()),
+            role: Role::Admin,
+            scope: None,
+        }];
+        assert!(policy
+            .commands(&state, now, CHEAP_KDF)
+            .expect("valid policy")
+            .is_empty());
+    }
+
+    #[test]
+    fn authorization_without_an_unscoped_admin_is_refused_at_the_edge() {
+        let err = FormationPolicy::parse_toml(
+            br#"
+[authorization]
+[[authorization.binding]]
+group = "submitters"
+role = "submitter"
+"# as &[u8],
+        )
+        .expect_err("a lockout document is refused");
+        assert!(
+            format!("{err:#}").contains("no unscoped admin binding"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_present_but_empty_authorization_table_is_refused() {
+        // Absence means "leave authorization alone"; presence must bind an
+        // admin, or the table has silently installed nothing.
+        for doc in [
+            "[authorization]\n",
+            "[authorization]\ngroups_claim = \"cognito:groups\"\n",
+            "[authorization]\nbinding = []\n",
+        ] {
+            let err = FormationPolicy::parse_toml(doc.as_bytes()).expect_err(doc);
+            assert!(
+                format!("{err:#}").contains("no unscoped admin binding"),
+                "{doc}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_binding_needs_exactly_one_subject() {
+        for (doc, needle) in [
+            (
+                "[authorization]\n[[authorization.binding]]\nrole = \"admin\"\n",
+                "neither `group` nor `principal`",
+            ),
+            (
+                "[authorization]\n[[authorization.binding]]\ngroup = \"a\"\nprincipal = \"b\"\nrole = \"admin\"\n",
+                "both `group` and `principal`",
+            ),
+            (
+                "[authorization]\n[[authorization.binding]]\ngroup = \" \"\nrole = \"admin\"\n",
+                "empty subject",
+            ),
+            (
+                "[authorization]\ngroups_claim = \" \"\n[[authorization.binding]]\ngroup = \"a\"\nrole = \"admin\"\n",
+                "groups_claim is empty",
+            ),
+        ] {
+            let err = FormationPolicy::parse_toml(doc.as_bytes()).expect_err(doc);
+            assert!(format!("{err:#}").contains(needle), "{doc}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn authorization_scope_must_be_seeded_or_existing() {
+        let policy = FormationPolicy::parse_toml(
+            br#"
+[authorization]
+[[authorization.binding]]
+group = "admins"
+role = "admin"
+[[authorization.binding]]
+group = "team"
+role = "submitter"
+scope = "quota-00000000-0000-0000-0000-0000000000ee"
+"# as &[u8],
+        )
+        .unwrap();
+        let err = policy
+            .commands(&StateMachine::default(), Timestamp::now(), CHEAP_KDF)
+            .expect_err("unknown scope is refused");
+        assert!(
+            format!("{err:#}").contains("neither seeded by this document nor an existing"),
+            "{err:#}"
+        );
     }
 }
