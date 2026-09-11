@@ -998,8 +998,36 @@ async fn a_flood_is_shed_before_the_issuer_is_ever_invoked() {
     type Answer = tokio::task::JoinHandle<(u16, Vec<u8>, Option<NodeId>)>;
     let mut handles: Vec<Answer> = Vec::new();
 
-    // Oversized bodies: shed at the 413 byte cap, before the token is even
-    // read from the body.
+    // The 413 byte cap, probed on its own before the burst. The cap sits
+    // *behind* the rate limit and the concurrency cap by design (a flood must
+    // cost a clock read and an atomic, never a body read), so an oversized
+    // request that arrives mid-burst is legitimately shed at 429/503 without
+    // the cap ever seeing it — on a loaded host, every one of the sixteen
+    // below can be (issue #136). Only a request the limits admit can prove
+    // the cap, and the one sure way to be admitted is to go first.
+    {
+        let huge = format!(
+            r#"{{"csr_pem":"{}"}}"#,
+            "A".repeat(coppice_api::http::MAX_ENROLL_BODY + 1)
+        );
+        let response = http()
+            .post(&url)
+            .bearer_auth("cpk_oversize-probe")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(huge)
+            .send()
+            .await
+            .expect("POST /enroll (oversize probe)");
+        let (status, _) = checked(response).await;
+        assert_eq!(
+            status, 413,
+            "an oversized body is shed at the byte cap before the token is even \
+             read from the body"
+        );
+    }
+
+    // Oversized bodies in the burst: 413 if the limits admit them, 429/503 if
+    // they do not; never anything else, and never the issuer.
     for i in 0..16u32 {
         let url = url.clone();
         handles.push(tokio::spawn(async move {
@@ -1064,16 +1092,13 @@ async fn a_flood_is_shed_before_the_issuer_is_ever_invoked() {
     }
 
     let mut non_shed = 0usize;
-    let mut saw_413 = false;
     let mut saw_429_or_503 = false;
     let mut valid_success: Option<(Vec<u8>, NodeId)> = None;
 
     for handle in handles {
         let (status, body, node) = handle.await.expect("request task joined");
         match status {
-            413 => {
-                saw_413 = true;
-            }
+            413 => {}
             429 | 503 => {
                 saw_429_or_503 = true;
             }
@@ -1088,10 +1113,6 @@ async fn a_flood_is_shed_before_the_issuer_is_ever_invoked() {
         }
     }
 
-    assert!(
-        saw_413,
-        "an oversized body among the burst must be shed at 413"
-    );
     assert!(
         saw_429_or_503,
         "40 concurrent requests against a burst of 20 must shed some at 429/503"
