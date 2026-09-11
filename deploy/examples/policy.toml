@@ -59,3 +59,20 @@ label = "coordinator-launch"
 secret = "AGENT_ENROLL_SECRET"
 role = "agent"
 label = "agent-launch"
+
+# Day-0 authorization (ADR 0023). A fresh cluster denies everyone but operator
+# certificates, and this deployment terminates TLS on the load balancer, so no
+# client certificate ever reaches a coordinator: the first bindings can only be
+# installed here, under `init`'s local-socket authority. Installed as ONE full
+# replacement and only while the replicated list is still empty, so once an
+# operator has run `coppice policy authz set` a re-init leaves it alone.
+[authorization]
+# Cognito puts a user's groups under this claim in the ID token.
+groups_claim = "cognito:groups"
+
+[[authorization.binding]]
+# Everyone Terraform puts in the pool's `coppice-admins` group — the seeded
+# demo user, for one — is an unscoped admin. The demo has one user who is also
+# its operator; a real deployment would scope submitters to their entities.
+group = "coppice-admins"
+role = "admin"
