@@ -200,51 +200,23 @@ ssm_agent_online() {
   [ "$status" = "Online" ]
 }
 
-# Ship formation.sh to the instance and wait for it. The whole script travels
-# as ONE element of the `commands` array (RunShellScript joins the elements
-# with newlines, which would otherwise split heredocs and multi-line
-# constructs); --rawfile keeps it out of argv and out of any quoting hazard.
+# Ship formation.sh to the instance and wait for it; the exports the script
+# needs are prepended so they survive its re-exec under bash.
 run_formation() {
-  local instance_id="$1" script params command_id status
+  local instance_id="$1" script rc=0
   script="$(printf 'export ENV_NAME=%q SSM_PREFIX=%q REGION=%q\n' \
     "$env_name" "$ssm_prefix" "$REGION")
 $(cat "$REPO_ROOT/scripts/aws-demo/formation.sh")"
 
-  params="$(jq -n --arg s "$script" '{commands: [$s], executionTimeout: ["900"]}')"
-
   say "running formation on $instance_id"
-  command_id="$(aws ssm send-command --region "$REGION" \
-    --document-name AWS-RunShellScript \
-    --instance-ids "$instance_id" \
-    --comment "coppice formation $env_name" \
-    --timeout-seconds 900 \
-    --parameters "$params" \
-    --query 'Command.CommandId' --output text)"
-
-  while :; do
-    status="$(aws ssm get-command-invocation --region "$REGION" \
-      --command-id "$command_id" --instance-id "$instance_id" \
-      --query Status --output text 2>/dev/null || echo Pending)"
-    case "$status" in
-    Pending | InProgress | Delayed) sleep 5 ;;
-    *) break ;;
-    esac
-  done
-
-  local out err
-  out="$(aws ssm get-command-invocation --region "$REGION" \
-    --command-id "$command_id" --instance-id "$instance_id" \
-    --query StandardOutputContent --output text 2>/dev/null || true)"
-  err="$(aws ssm get-command-invocation --region "$REGION" \
-    --command-id "$command_id" --instance-id "$instance_id" \
-    --query StandardErrorContent --output text 2>/dev/null || true)"
+  ssm_run "$instance_id" 900 "$script" || rc=$?
   say "formation output (tail)"
-  printf '%s\n' "$out" | tail -n 40
-  if [ -n "$err" ] && [ "$err" != "None" ]; then
+  printf '%s\n' "$ssm_stdout" | tail -n 40
+  if [ -n "$ssm_stderr" ]; then
     printf '%s\n' "--- stderr ---" >&2
-    printf '%s\n' "$err" >&2
+    printf '%s\n' "$ssm_stderr" >&2
   fi
-  [ "$status" = "Success" ] || die "formation failed on $instance_id (status: $status)"
+  [ "$rc" -eq 0 ] || die "formation failed on $instance_id (status: $ssm_status)"
 }
 
 form_cluster() {
@@ -263,10 +235,6 @@ form_cluster() {
 }
 
 # --- readiness and cluster shape ---------------------------------------------
-
-http_code() {
-  curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || true
-}
 
 wait_for_readyz() {
   local url="https://$fqdn/readyz?require=healthy" code deadline
@@ -288,63 +256,12 @@ wait_for_readyz() {
   done
 }
 
-# A Cognito ID token for the demo user. The coordinator validates `aud`, and
-# Cognito puts an `aud` claim only in the ID token — the access token carries
-# `client_id` instead — so this is deliberately not AccessToken.
-#
-# Neither the password nor the token may appear in any process's argv, where
-# `ps` shows it to every user on the machine. The password reaches jq through
-# its environment (readable only by the same user) and the AWS CLI through a
-# 0600 file; the token reaches curl through a 0600 config file (`-K`).
-# Created once, at top level: a trap set inside a `$(...)` subshell would fire
-# when that subshell exits and remove the directory before it is ever used.
-secrets_dir="$(mktemp -d "${TMPDIR:-/tmp}/coppice-up.XXXXXX")"
-chmod 0700 "$secrets_dir"
-# shellcheck disable=SC2064
-trap "rm -rf '$secrets_dir'" EXIT
-
-secret_file() {
-  local f
-  f="$(mktemp "$secrets_dir/$1.XXXXXX")"
-  chmod 0600 "$f"
-  printf '%s\n' "$f"
-}
-
-mint_id_token() {
-  local input token
-  input="$(secret_file initiate-auth)"
-  PASSWORD="$(aws ssm get-parameter --region "$REGION" \
-    --name "$ssm_prefix/demo-user/password" --with-decryption \
-    --query Parameter.Value --output text)" \
-    jq -n --arg c "$cognito_client_id" --arg u "$demo_user_email" \
-    '{AuthFlow: "USER_PASSWORD_AUTH", ClientId: $c,
-      AuthParameters: {USERNAME: $u, PASSWORD: env.PASSWORD}}' >"$input"
-  token="$(aws cognito-idp initiate-auth --region "$REGION" \
-    --cli-input-json "file://$input" \
-    --query 'AuthenticationResult.IdToken' --output text)"
-  rm -f "$input"
-  [ -n "$token" ] && [ "$token" != "None" ] || return 1
-  printf '%s\n' "$token"
-}
-
-# The bearer token for api_get, written once as a curl config file.
-auth_config=""
-set_api_token() {
-  auth_config="$(secret_file curl-auth)"
-  printf 'header = "Authorization: Bearer %s"\n' "$1" >"$auth_config"
-}
-
-api_get() {
-  local path="$1"
-  curl -s --max-time 15 -K "$auth_config" "https://$fqdn$path" 2>/dev/null || true
-}
-
 wait_for_voters() {
   local body count deadline
   say "waiting for three coordinator voters"
   deadline=$((SECONDS + timeout_secs))
   while :; do
-    body="$(api_get /api/v1/coordinators)"
+    body="$(api_get "$fqdn" /api/v1/coordinators)"
     count="$(jq -r '[.members[]? | select(.voter)] | length' <<<"$body" 2>/dev/null || echo 0)"
     if [ "${count:-0}" -ge 3 ]; then
       say "coordinators: $count voters"
@@ -361,7 +278,7 @@ wait_for_nodes() {
   say "waiting for three schedulable compute nodes"
   deadline=$((SECONDS + timeout_secs))
   while :; do
-    body="$(api_get /api/v1/nodes)"
+    body="$(api_get "$fqdn" /api/v1/nodes)"
     count="$(jq -r '[.nodes[]? | select(.schedulable and .health != "lost")] | length' \
       <<<"$body" 2>/dev/null || echo 0)"
     if [ "${count:-0}" -ge 3 ]; then
@@ -389,6 +306,10 @@ To drive it from the CLI:
   export COPPICE_TOKEN="\$(scripts/aws-demo/up.sh --token-only $env_name)"
   coppice cluster status
 
+To prove it end to end (cluster shape, a real Docker job, Prometheus, OIDC):
+
+  scripts/aws-demo/smoke.sh $env_name
+
 EOF
 }
 
@@ -400,7 +321,9 @@ if [ "$token_only" = true ]; then
   preflight_identity >&2
   tf_init_env "$env_name" >&2
   read_outputs
-  mint_id_token || die "could not obtain an ID token for $demo_user_email"
+  init_secrets_dir
+  mint_id_token "$ssm_prefix" "$cognito_client_id" "$demo_user_email" ||
+    die "could not obtain an ID token for $demo_user_email"
   exit 0
 fi
 
@@ -429,7 +352,9 @@ fi
 
 wait_for_readyz
 say "obtaining a demo-user ID token"
-id_token="$(mint_id_token)" || die "could not obtain an ID token for $demo_user_email"
+init_secrets_dir
+id_token="$(mint_id_token "$ssm_prefix" "$cognito_client_id" "$demo_user_email")" ||
+  die "could not obtain an ID token for $demo_user_email"
 set_api_token "$id_token"
 unset id_token
 wait_for_voters

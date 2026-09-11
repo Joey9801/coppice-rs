@@ -266,10 +266,12 @@ four sessions because chunk 2 needs real-AWS iteration.
    `down.sh` leaves no resources. Product findings from the first real
    multi-host run are spun out as their own PRs against `main`, not folded
    into this one.
-3. **Observability and the happy-path smoke test** (medium). Prometheus on
-   the ops instance with EC2 service discovery, agent `metrics_addr`
-   wired, `smoke.sh` covering criteria 2 through 4, Cognito token
-   acquisition for the CLI.
+3. **Observability and the happy-path smoke test** (medium) — *landed*.
+   Prometheus on the ops instance with EC2 service discovery, agent
+   `metrics_addr` wired, `smoke.sh` covering criteria 2 through 4, Cognito
+   token acquisition for the CLI. The Prometheus check queries the ops host
+   over SSM run-command rather than a port-forward, so a CI runner needs no
+   Session Manager plugin; the port-forward remains the human route.
 4. **Chaos scenarios and the runbook** (medium). Coordinator kill and
    worker replacement in `smoke.sh`, `docs/operations/aws-demo.md` with
    cost, sizing, teardown, the ClickHouse and drain caveats, and the

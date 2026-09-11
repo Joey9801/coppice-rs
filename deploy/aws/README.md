@@ -66,7 +66,8 @@ What it builds:
   it;
 - a coordinator ASG (fixed size, on-demand) registered with both target
   groups, an agent ASG (spot by default, `agents_on_demand = true` for a
-  deterministic CI run), and one small ops instance;
+  deterministic CI run), and one small ops instance running Prometheus
+  (below);
 - a Cognito user pool, app client and one seeded demo user — the OIDC issuer
   the coordinators' `[sso]` block points at;
 - an artefact bucket holding the release tarball named by `release_tarball`,
@@ -109,8 +110,45 @@ statement in `iam.tf` carries the caller in a comment. There is no SSH: no key
 pair, no port 22, and `AmazonSSMManagedInstanceCore` on all three roles is the
 only way onto a host.
 
-The stack's outputs are a contract too; `up.sh`, `formation.sh` and the smoke
-test read them by name.
+The stack's outputs are a contract too; `up.sh`, `formation.sh` and `smoke.sh`
+read them by name.
+
+### Prometheus
+
+The ops instance runs one upstream Prometheus (`prometheus_version`, pinned
+and checksum-verified in `cloud-init/ops.sh.tftpl`) with **EC2 service
+discovery** on the tags the launch templates propagate: `coppice:env` selects
+this environment, `coppice:role` selects coordinators and agents, and there is
+no static target list, so an ASG replacement is scraped as soon as it is
+running. Relabelling picks the port by role:
+
+| role | target | why |
+|---|---|---|
+| coordinator | `<private ip>:7070` `/metrics` | the client listener; the same one as the API, there is no separate coordinator metrics port |
+| agent | `<private ip>:9464` `/metrics` | the agent's dedicated `metrics_addr`, unauthenticated, so the agent security group admits it from the ops instance only |
+
+Every target carries `role`, `instance` (the private DNS name, which is also
+the agent's `advertise_host`) and `instance_id`.
+
+Prometheus listens on loopback only and the ops security group has no
+ingress rule at all. Reaching it is an SSM port-forward (needs the
+[Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)):
+
+```
+aws ssm start-session --region eu-west-2 \
+  --target "$(terraform -chdir=deploy/aws/env output -raw ops_instance_id)" \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["9090"],"localPortNumber":["9090"]}'
+# then http://localhost:9090
+```
+
+`smoke.sh` instead runs its queries on the host with `aws ssm send-command`,
+which needs no plugin and no background process on a CI runner.
+
+Node utilisation is a short in-memory window on the coordinator, so this
+Prometheus is the only longer view of it that exists, and it lives on this one
+instance with two days of retention: the environment is disposable and so is
+its metric history. Grafana is out of scope.
 
 ## Bring-up and teardown
 
@@ -170,6 +208,50 @@ Cognito **ID** token — the coordinator validates the `aud` claim, which
 Cognito puts only in the ID token, never the access token. Neither the
 password nor the token is echoed, and neither is ever passed on a command
 line.
+
+### The smoke test
+
+`scripts/aws-demo/smoke.sh <env>` proves an environment works from the
+outside and is what a CI run executes between `up.sh` and `down.sh`. It
+needs a `coppice` CLI (`cargo build --release --bin coppice`; pass
+`--coppice PATH` or set `COPPICE_BIN`), touches only the public surface plus
+the ops host over SSM for the Prometheus check, prints `PASS`/`FAIL` with
+evidence per check, runs every check even after one fails, and exits
+non-zero if any did.
+
+| check | what it proves |
+|---|---|
+| `authn` | a tokenless `GET /api/v1/overview` is 401, a garbage token is 401, and a Cognito ID token minted with `USER_PASSWORD_AUTH` for the seeded user is 200 |
+| `coordinators` | `GET /api/v1/coordinators` shows exactly three voters |
+| `nodes` | `GET /api/v1/nodes` shows exactly three schedulable agents that are not lost (issue #51's criterion). Health is a leader-only read (#133): a leader-served `healthy` verdict is reported as evidence when one is obtained, not asserted |
+| `prometheus` | on the ops host, `count(up{job="coppice"} == 1)` is 6 with three of each role; every coordinator reports `coordinator_state_nodes` = 3 and all three agents expose `agent_running_jobs` |
+| `job` | `coppice job submit examples/jobs/stress-demo.toml` (with the quota entity swapped for the one formation seeded) reaches `succeeded`; the timeline from `GET /jobs/{id}/timeline` starts at `job_submitted` and ends in a transition to `succeeded`; `coppice job logs` prints real lines and `coppice job usage` real samples, and the API reports both sources as `available` |
+
+The Prometheus families asserted on are ones that exist in the code
+(`describe_metrics` call sites), not the aspirational list in
+[docs/operations/observability.md](../../docs/operations/observability.md).
+
+**The job check is time-bounded, and says so in its output.** Logs and usage
+are served from per-attempt segments on the agent that ran the work, kept
+for about an hour after the attempt ends (`[telemetry]` filesystem sink
+retention) and less under disk pressure; terminal jobs are evicted from
+replicated state on the `terminal_retention` TTL; and `[history] mode =
+"none"` is the only history mode (issue #43), so nothing durable is written
+first. The assertions are made within minutes of the job finishing. They are
+a "query it now" guarantee, not a "query it tomorrow" one, and the test does
+not pretend otherwise.
+
+`--skip-job` runs the four fast checks only; `--job-spec` submits a different
+spec; `--timeout` (default 900 s) bounds each wait.
+
+**Spot agents can fail a run honestly.** The agent ASG is spot by default,
+and a spot reclaim during the run is reported as exactly what it is: the
+Prometheus check sees five healthy targets until the replacement boots,
+and a job on the reclaimed node ends `node_lost` (the example spec has
+`max_retries = 0`, so the job fails rather than retrying). Two reclaims
+hit the first evening's runs in `eu-west-2`. Bring the environment up
+with `--on-demand-agents` when the result has to be deterministic, as a
+CI run does.
 
 `down.sh` destroys the stack and then proves the environment is gone: it
 deletes any SSM parameters left under `/coppice/<env>`, then asks each
