@@ -155,9 +155,22 @@ async fn serve_tls(
     // accepting, rather than being dropped mid-response.
     let (drain, _) = watch::channel(false);
 
+    // Every connection task, so that this future resolves only once they have
+    // all finished — the contract `axum::serve` gives the plain-HTTP posture,
+    // and one a caller relies on: the pre-formation handover publishes the
+    // formed phase the moment the surface's serve future returns, and a
+    // connection still open past that point could answer `/readyz` with the
+    // new phase and then close, which is the keep-alive race of issue #136.
+    // Dropping the set aborts whatever is left, so a caller that gives up on
+    // the drain and aborts this task takes the connections down with it.
+    let mut connections = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
             _ = stopped(&mut shutdown) => break,
+            // Reap finished connections as they go, so the set does not grow
+            // with every connection this listener has ever served.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => match accepted {
                 Ok((tcp, peer)) => {
                     // Connection-time resolution: the current serving material
@@ -178,7 +191,7 @@ async fn serve_tls(
                     };
                     let app = app.clone();
                     let drain = drain.subscribe();
-                    tokio::spawn(serve_connection(tcp, peer, config, app, drain));
+                    connections.spawn(serve_connection(tcp, peer, config, app, drain));
                 }
                 Err(e) => {
                     // A per-accept error (transient fd exhaustion, say) must
@@ -193,6 +206,8 @@ async fn serve_tls(
 
     let _ = drain.send(true);
     tracing::debug!("client listener stopped accepting");
+    while connections.join_next().await.is_some() {}
+    tracing::debug!("client listener drained");
 }
 
 async fn serve_connection(

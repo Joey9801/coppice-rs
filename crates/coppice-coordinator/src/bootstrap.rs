@@ -1348,6 +1348,28 @@ fn dup_listener(listener: &TcpListener) -> Result<TcpListener> {
     }
 }
 
+/// A stint in the parked state that ends with a cluster to serve, captured
+/// before the pre-formation surface is torn down. The formed phase is
+/// published and `init` (if that is what ended the stint) answered only once
+/// that teardown has completed — see the handover ordering in [`park`].
+struct Leaving {
+    started: StartedNode,
+    store: Arc<TlsStore>,
+    /// The waiting `init` caller and its reply, when a local formation ended
+    /// the stint; `None` when the convergence loop joined an existing cluster.
+    reply: Option<(oneshot::Sender<Result<FormationDone>>, FormationDone)>,
+}
+
+/// How the park loop ended, before the pre-formation surface is torn down.
+/// Nothing is awaited inside the loop's `select!` arms on the way out: the
+/// teardown happens once, below the loop, for every exit.
+#[allow(clippy::large_enum_variant)]
+enum Stint {
+    Formed(Leaving),
+    Shutdown,
+    Failed { intent_at_us: i64 },
+}
+
 /// How a stint in the parked state ended.
 ///
 /// The `Started` arm is much larger than the other two, which is the right
@@ -1432,7 +1454,7 @@ async fn park(
     let mut converge =
         crate::convergence::PreStart::new(&resolved.config, &prepared.advertise_addr, tls.clone());
 
-    let outcome = loop {
+    let stint = loop {
         let call = tokio::select! {
             // Biased toward the local socket: an operator who ran `init` on
             // this host is waiting on a reply, and if a cluster genuinely
@@ -1442,17 +1464,20 @@ async fn park(
             call = form_rx.recv() => match call {
                 Some(call) => call,
                 // Nothing else holds the sender while parked.
-                None => break ParkOutcome::Shutdown,
+                None => break Stint::Shutdown,
             },
             (started, store) = converge.run() => {
-                phase.publish_formed(started.handle.clone(), started.views.clone());
                 tracing::info!(
                     node_id = started.handle.node_id(),
                     "leaving park: joined the cluster discovery found (ADR 0037 §1)"
                 );
-                break ParkOutcome::Started(started, store);
+                break Stint::Formed(Leaving {
+                    started,
+                    store,
+                    reply: None,
+                });
             }
-            _ = shutdown_rx.wait_for(|s| *s) => break ParkOutcome::Shutdown,
+            _ = shutdown_rx.wait_for(|s| *s) => break Stint::Shutdown,
         };
 
         let ctx = formation::FormationContext {
@@ -1475,11 +1500,11 @@ async fn park(
                     machine_id: machine.to_string(),
                     operator,
                 };
-                // Publish the phase before replying: the caller's very next
-                // act is often to poll `/readyz` or `ProbeCluster`.
-                phase.publish_formed(started.handle.clone(), started.views.clone());
-                let _ = call.reply.send(Ok(done));
-                break ParkOutcome::Started(started, tls_store);
+                break Stint::Formed(Leaving {
+                    started,
+                    store: tls_store,
+                    reply: Some((call.reply, done)),
+                });
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "formation failed");
@@ -1517,7 +1542,7 @@ async fn park(
                         }
                     }
                     let _ = shutdown_rx.wait_for(|s| *s).await;
-                    break ParkOutcome::Failed { intent_at_us };
+                    break Stint::Failed { intent_at_us };
                 }
                 // Nothing was stamped: still parked, still available for a
                 // corrected `init`.
@@ -1525,8 +1550,39 @@ async fn park(
         }
     };
 
+    // The handover, in this order and no other:
+    //
+    // 1. Tear down the pre-formation surface. Its `/readyz` runs on a
+    //    duplicate of the client listener, and stopping it closes every
+    //    keep-alive connection a client opened to it.
+    // 2. Publish the formed phase. Only now can a `/readyz` answer "voter",
+    //    and it can only do so over a connection the runtime surface will
+    //    keep serving.
+    // 3. Reply to `init`.
+    //
+    // Publishing first (the previous order) let a client read "voter" over a
+    // pre-formation keep-alive connection that step 1 then closed under it;
+    // its next request on that pooled connection failed with hyper's
+    // `IncompleteMessage`, since a client cannot tell a server-side close that
+    // raced its send from a server that died mid-response (issue #136). The
+    // phase is still published before the reply, because the caller's very
+    // next act is often to poll `/readyz` or `ProbeCluster`.
     closed.shutdown().await;
-    Ok(outcome)
+    match stint {
+        Stint::Formed(Leaving {
+            started,
+            store,
+            reply,
+        }) => {
+            phase.publish_formed(started.handle.clone(), started.views.clone());
+            if let Some((reply, done)) = reply {
+                let _ = reply.send(Ok(done));
+            }
+            Ok(ParkOutcome::Started(started, store))
+        }
+        Stint::Shutdown => Ok(ParkOutcome::Shutdown),
+        Stint::Failed { intent_at_us } => Ok(ParkOutcome::Failed { intent_at_us }),
+    }
 }
 
 /// Install the daemon's shutdown signal handler.
