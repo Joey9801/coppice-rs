@@ -64,9 +64,21 @@ variable "agent_instance_types" {
 }
 
 variable "ops_instance_type" {
-  description = "Ops instance type. It runs nothing yet (Prometheus is a later addition), so the smallest Graviton size is right."
+  description = "Ops instance type. It runs one Prometheus scraping six targets, which the smallest Graviton size handles."
   type        = string
   default     = "t4g.nano"
+}
+
+variable "prometheus_version" {
+  description = "Prometheus release installed on the ops instance from GitHub, without the leading v. Bump prometheus_sha256 with it."
+  type        = string
+  default     = "3.14.0"
+}
+
+variable "prometheus_sha256" {
+  description = "SHA-256 of prometheus-<version>.linux-arm64.tar.gz, from the release's sha256sums.txt; cloud-init refuses a download that does not match."
+  type        = string
+  default     = "077f3781ab7245dc04c9a3c9b78ba120fc8e41aa0dc97489b0af67247e50ba83"
 }
 
 variable "coordinator_root_gb" {

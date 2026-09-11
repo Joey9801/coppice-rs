@@ -3,10 +3,14 @@
 # Ops-host user-data for the AWS demo (docs/roadmap/aws-demo-plan.md).
 # Rendered by Terraform; ${env_name} is this environment.
 #
-# The host exists so there is somewhere inside the VPC to run Prometheus from
-# and somewhere to open an SSM session to when a coordinator is misbehaving.
-# Prometheus itself is not deployed yet, so this does the minimum: patch the
-# base image and leave a marker naming the environment.
+# The host runs Prometheus against the fleet and is the inside-the-VPC vantage
+# point for an SSM session when a coordinator is misbehaving. Prometheus finds
+# the six processes by EC2 service discovery on the instance tags the launch
+# templates propagate, so there is no static target list and an ASG
+# replacement is scraped as soon as it is running. It listens on loopback
+# only: the security group has no ingress rule at all, and the way in is an SSM
+# port-forward (deploy/aws/README.md) or `aws ssm send-command`, which is what
+# scripts/aws-demo/smoke.sh uses.
 set -euxo pipefail
 
 exec > >(tee -a /var/log/coppice-cloud-init.log) 2>&1
@@ -29,19 +33,127 @@ export DEBIAN_FRONTEND=noninteractive
 
 retry "apt-get update" apt-get update
 # curl and jq so that an SSM session on this host can poke the coordinators'
-# client listener straight away: this host is the inside-the-VPC vantage point
-# when something is wrong. No AWS CLI here yet — Ubuntu 24.04 has no apt
-# package for it and nothing on this host needs it until Prometheus arrives.
+# client listener and Prometheus straight away.
 retry "apt-get install" apt-get install -y curl jq
 
 # The marker is what a session lands on: which environment this is, and where
 # the things worth curling live.
 install -d -m 0755 /etc/coppice
-cat >/etc/coppice/ops-env <<EOF
+cat >/etc/coppice/ops-env <<EOT
 COPPICE_ENV=${env_name}
 COPPICE_API=https://${fqdn}
 COPPICE_SSM_PREFIX=${ssm_prefix}
 COPPICE_REGION=${region}
-EOF
+PROMETHEUS_URL=http://127.0.0.1:9090
+EOT
 
-echo "coppice cloud-init: ops host ready (${fqdn})"
+# --- Prometheus ---------------------------------------------------------------
+
+# A pinned upstream release, checksum-verified (the digest is from the
+# release's sha256sums.txt and travels here through Terraform, so bumping the
+# version means bumping both). This host is arm64.
+PROM_VERSION="${prometheus_version}"
+PROM_SHA256="${prometheus_sha256}"
+PROM_TARBALL="prometheus-$PROM_VERSION.linux-arm64.tar.gz"
+
+download_prometheus() {
+  rm -rf /tmp/prometheus && mkdir -p /tmp/prometheus && cd /tmp/prometheus &&
+    curl -fsSL -o "$PROM_TARBALL" \
+      "https://github.com/prometheus/prometheus/releases/download/v$PROM_VERSION/$PROM_TARBALL" &&
+    echo "$PROM_SHA256  $PROM_TARBALL" | sha256sum -c - &&
+    tar xzf "$PROM_TARBALL" &&
+    install -m 0755 "prometheus-$PROM_VERSION.linux-arm64/prometheus" /usr/local/bin/prometheus &&
+    install -m 0755 "prometheus-$PROM_VERSION.linux-arm64/promtool" /usr/local/bin/promtool &&
+    cd / && rm -rf /tmp/prometheus
+}
+retry "prometheus download" download_prometheus
+prometheus --version
+
+if ! id prometheus >/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin prometheus
+fi
+install -d -m 0755 /etc/prometheus
+install -d -m 0750 -o prometheus -g prometheus /var/lib/prometheus
+
+# One scrape job for the whole fleet. Discovery is by tag: `coppice:env`
+# selects this environment (N environments share the account), `coppice:role`
+# selects the two roles that expose metrics, and the ops host itself is left
+# out. The port is chosen by role in relabelling: coordinators serve /metrics
+# on the client listener (7070, the same listener as the API — there is no
+# separate coordinator metrics port), agents on their dedicated, unauthenticated
+# `metrics_addr` (9464), which the agent security group opens to this host
+# alone. `role` and `instance` (the private DNS name, which is also the agent's
+# advertise_host) are the labels the smoke test and a human both read.
+#
+# Terraform renders this file, so Prometheus's own `$${1}` is written escaped
+# for Terraform; the heredoc is quoted so bash then leaves it alone too (every
+# other substitution in it is Terraform's, made at render time).
+cat >/etc/prometheus/prometheus.yml <<'EOT'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: coppice
+    ec2_sd_configs:
+      - region: ${region}
+        port: 7070
+        refresh_interval: 30s
+        filters:
+          - name: tag:coppice:env
+            values: ["${env_name}"]
+          - name: tag:coppice:role
+            values: ["coordinator", "agent"]
+          - name: instance-state-name
+            values: ["running"]
+    relabel_configs:
+      - source_labels: [__meta_ec2_tag_coppice_role]
+        target_label: role
+      - source_labels: [__meta_ec2_tag_coppice_role, __meta_ec2_private_ip]
+        regex: "agent;(.+)"
+        replacement: "$${1}:9464"
+        target_label: __address__
+      - source_labels: [__meta_ec2_instance_id]
+        target_label: instance_id
+      - source_labels: [__meta_ec2_private_dns_name]
+        target_label: instance
+EOT
+chown root:prometheus /etc/prometheus/prometheus.yml
+chmod 0640 /etc/prometheus/prometheus.yml
+promtool check config /etc/prometheus/prometheus.yml
+
+# Loopback only, and a short retention: the environment rarely outlives an
+# afternoon, and this is the only place a longer view of node utilisation
+# exists (the coordinator's own window is a short in-memory one), so two days
+# is generous rather than tight. The instance role supplies the
+# ec2:DescribeInstances credential over IMDSv2.
+cat >/etc/systemd/system/prometheus.service <<EOT
+[Unit]
+Description=Prometheus (coppice ${env_name} fleet scrape)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+ExecStart=/usr/local/bin/prometheus \\
+  --config.file=/etc/prometheus/prometheus.yml \\
+  --storage.tsdb.path=/var/lib/prometheus \\
+  --storage.tsdb.retention.time=2d \\
+  --web.listen-address=127.0.0.1:9090
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/prometheus
+
+[Install]
+WantedBy=multi-user.target
+EOT
+
+systemctl daemon-reload
+systemctl enable --now prometheus
+
+echo "coppice cloud-init: ops host ready, prometheus $PROM_VERSION scraping ${env_name} (${fqdn})"

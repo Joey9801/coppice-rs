@@ -150,6 +150,16 @@ resource "aws_autoscaling_group" "coordinator" {
   # deliberately unhealthy to the target group's /readyz check, and an ELB
   # health check would terminate the whole fleet in a loop before formation
   # could ever run.
+  # No instance may boot before the environment's public name resolves. Both
+  # daemons dial <env>.<domain> to enroll from their first seconds, and a
+  # lookup that lands before the alias record exists is answered NXDOMAIN and
+  # cached by the VPC resolver for the zone's 900 s negative TTL — on the first
+  # real bring-up one coordinator sat in its (correct) enrollment retry loop
+  # for a quarter of an hour because of it. The record depends on the load
+  # balancer, so this serialises instance launch behind both; a couple of
+  # minutes, against fifteen.
+  depends_on = [aws_route53_record.this]
+
   health_check_type = "EC2"
 
   # Keep waiting for capacity through failed scaling activities rather than
@@ -196,6 +206,9 @@ resource "aws_autoscaling_group" "agent" {
   min_size         = var.agent_count
   max_size         = var.agent_count
   desired_capacity = var.agent_count
+
+  # See the coordinator group.
+  depends_on = [aws_route53_record.this]
 
   health_check_type = "EC2"
 
@@ -249,15 +262,21 @@ resource "aws_autoscaling_group" "agent" {
   }
 }
 
-# A plain instance, not a group: it is a singleton whose only job is to be
-# somewhere to run Prometheus from later, and it holds nothing worth replacing
-# automatically.
+# A plain instance, not a group: it is a singleton that runs Prometheus and is
+# the inside-the-VPC vantage point for debugging, and it holds nothing worth
+# replacing automatically (a lost Prometheus is a lost demo history, not a
+# lost cluster).
 resource "aws_instance" "ops" {
   ami                    = data.aws_ssm_parameter.ubuntu.value
   instance_type          = var.ops_instance_type
   subnet_id              = values(aws_subnet.public)[0].id
   vpc_security_group_ids = [aws_security_group.ops.id]
   iam_instance_profile   = aws_iam_instance_profile.ops.name
+
+  # Not strictly needed (nothing here dials the public name at boot), but the
+  # ops host is the vantage point for debugging the others, and having it
+  # come up in the same wave keeps the bring-up's shape simple.
+  depends_on = [aws_route53_record.this]
 
   metadata_options {
     http_endpoint               = local.metadata_options.http_endpoint
@@ -280,6 +299,12 @@ resource "aws_instance" "ops" {
   }
 
   user_data_base64 = base64encode(templatefile("${path.module}/cloud-init/ops.sh.tftpl", local.cloud_init_vars))
+  # A changed user-data must be a new host: the provider would otherwise
+  # stop/start the existing instance, whose per-instance cloud-init script
+  # does not run again, leaving Terraform believing a Prometheus change was
+  # applied while the host keeps the old installation. The instance holds
+  # nothing worth preserving (two days of disposable metric history).
+  user_data_replace_on_change = true
 
   tags = {
     Name           = "${local.name_prefix}-ops"
