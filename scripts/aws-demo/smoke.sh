@@ -235,39 +235,48 @@ check_coordinators() {
 
 # --- check: three schedulable agents -----------------------------------------
 
-# The health verdict comes from the leader's in-memory liveness marks, so a
-# read the load balancer routes to a follower answers `unknown` for every node
-# (issue #133). Schedulability is replicated and is what this check asserts;
-# a leader-served read is sought for the evidence but is not required.
+# Every coordinator answers the same health verdict now: a replica that does
+# not lead fetches the leader's liveness marks over the internal admin channel
+# (ADR 0040, issue #133). So whichever of the three the load balancer picks,
+# all three nodes must read `healthy` — this is an assertion, not the
+# leader-luck evidence it used to be.
+#
+# Still retried, for a different reason: the agents' first heartbeats have to
+# land, and a freshly elected leader grants each node a grace window in which
+# health is honestly `unknown`.
+nodes_healthy_count() {
+  jq -r '[.nodes[]? | select(.health == "healthy")] | length' <<<"$1" 2>/dev/null || echo 0
+}
+
 nodes_all_healthy() {
-  local body="$1"
-  [ "$(jq -r '[.nodes[]? | select(.health == "healthy")] | length' <<<"$body" 2>/dev/null || echo 0)" = "3" ]
+  nodes_body="$(api /api/v1/nodes)"
+  [ "$(nodes_healthy_count "$nodes_body")" = "3" ]
 }
 
 check_nodes() {
-  local body total ready healthy attempt
-  body="$(api /api/v1/nodes)"
-  total="$(jq -r '[.nodes[]?] | length' <<<"$body" 2>/dev/null || echo 0)"
+  local total ready
+  nodes_body="$(api /api/v1/nodes)"
+  total="$(jq -r '[.nodes[]?] | length' <<<"$nodes_body" 2>/dev/null || echo 0)"
   ready="$(jq -r '[.nodes[]? | select(.schedulable and .health != "lost")] | length' \
-    <<<"$body" 2>/dev/null || echo 0)"
+    <<<"$nodes_body" 2>/dev/null || echo 0)"
   evidence "GET /api/v1/nodes: $total nodes, $ready schedulable and not lost"
   jq -r '.nodes[]? | "  \(.id) health=\(.health) schedulable=\(.schedulable) cpu=\(.capacity.cpu_millis)m mem=\(.capacity.memory_bytes) role=\(.labels.role // "-")"' \
-    <<<"$body" 2>/dev/null | while IFS= read -r line; do evidence "$line"; done
+    <<<"$nodes_body" 2>/dev/null | while IFS= read -r line; do evidence "$line"; done
   [ "$ready" = "3" ] || fail "expected exactly 3 schedulable nodes, found ${ready:-0}" || return 1
 
-  # Each request is a new connection, so a handful of tries usually reaches
-  # the leader once.
-  for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    nodes_all_healthy "$body" && break
-    body="$(api /api/v1/nodes)"
-  done
-  healthy="$(jq -r '[.nodes[]? | select(.health == "healthy")] | length' <<<"$body" 2>/dev/null || echo 0)"
-  if [ "$healthy" = "3" ]; then
-    evidence "a leader-served read reports all 3 nodes healthy (attempt $attempt)"
-  else
-    evidence "note: no leader-served read in $attempt attempts; health stays 'unknown' from a follower (issue #133), schedulability is the replicated fact"
-  fi
-  return 0
+  retry_until 120 10 nodes_all_healthy ||
+    fail "expected all 3 nodes to report health=healthy from any coordinator (ADR 0040), found $(nodes_healthy_count "$nodes_body")" ||
+    return 1
+  evidence 'all 3 nodes report health=healthy, with last_heartbeat set'
+  jq -r '.nodes[]? | "  \(.id) health=\(.health) last_heartbeat=\(.last_heartbeat // "null")"' \
+    <<<"$nodes_body" 2>/dev/null | while IFS= read -r line; do evidence "$line"; done
+
+  # The overview counts `lost` from the same verdict, so a fleet that reads
+  # healthy per node and lost in aggregate is a real inconsistency.
+  local lost
+  lost="$(jq -r '.capacity.nodes.lost // "?"' <<<"$(api /api/v1/overview)" 2>/dev/null || echo '?')"
+  evidence "GET /api/v1/overview: capacity.nodes.lost = $lost"
+  [ "$lost" = "0" ] || fail "the overview counts $lost nodes lost while every node reads healthy"
 }
 
 # --- check: Prometheus scrapes all six ---------------------------------------
