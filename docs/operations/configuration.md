@@ -20,7 +20,7 @@ node want a different value than its peers?* → config file.
 | --- | --- |
 | Listen/advertise addresses, ports | config file |
 | Data directory | config file (the raft node id is *not* config: minted at init and read from the disk stamp, [ADR 0025](../decisions/0025-self-minted-coordinator-identity.md)) |
-| Machine-plane TLS paths (`[tls]`); client-listener TLS paths (`[client_tls]`); enrollment token path and endpoint | config file |
+| Machine-plane TLS source and paths (`[tls]`); client-listener TLS paths (`[client_tls]`); enrollment token path and endpoint | config file |
 | History sink mode (`[history]`) | config file (declares *how* history is retained; the TTL it retains against is policy — [ADR 0012](../decisions/0012-data-retention.md)) |
 | Discovery backend and `cluster_size` | config file (seed-only; consulted before replicated state is reachable — [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)) |
 | Enrollment tokens (hashes), issued-identity revocations | replicated policy (ADR 0037) |
@@ -205,17 +205,29 @@ p_cost = 1          # parallelism lanes
 
 [tls]
 # MACHINE PLANE ONLY: the leaf served on the raft and agent-gateway
-# listeners, and this node's client identity toward peers. The trust
-# root is the cluster-owned CA minted at formation (ADR 0037); these
-# files are written by formation (the forming node) or enrollment (every
-# other machine), hot-reloaded on change, and externally-issued certs
-# are a supported substitution at the same paths. They may be ABSENT on
-# a fresh installation: a daemon with no material still parks and
-# accepts `coordinator init`, which mints the first certificates. This
-# cert is never served on the user-facing listener below.
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+# listeners, and this node's client identity toward peers. This cert is
+# never served on the user-facing listener below. `source` is explicit
+# (issue #127) rather than inferred from what happens to be on disk:
+#
+#   source = "cluster" — the cluster owns this material end to end. The
+#   trust root is the cluster-owned CA minted at formation (ADR 0037);
+#   `formation` (the forming node) or `enrollment` (every other machine)
+#   writes the leaf, key and CA bundle under the fixed layout
+#   `<data_dir>/pki/{node.crt,node.key,ca.crt}`, renewal and re-rooting
+#   keep it current, and the files hot-reload on change. Paths are not
+#   configurable under this source — `cert_path`/`key_path`/`ca_path` are
+#   a startup error here. An agent must also have `[enrollment]`; a
+#   coordinator's may be absent (the forming node mints its own leaf at
+#   `coordinator init` instead).
+#
+#   source = "external" — an operator- or config-management-owned leaf.
+#   `cert_path`, `key_path` and `ca_path` are all required, each must
+#   exist and parse at config load (a startup error names the offending
+#   file), and the daemon only ever reads and hot-reloads them — it never
+#   writes them: no enrollment (`[enrollment]` present is a startup
+#   error), no renewal, no trust-anchor adoption at re-rooting, no leaf
+#   install at `coordinator init`. Rotation is the external issuer's job.
+source = "cluster"
 
 [client_tls]
 # REQUIRED — there is no default posture. A missing table, a half-filled

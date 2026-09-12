@@ -38,7 +38,8 @@ Restart=always
 RestartSec=2s
 
 # /var/lib/coppice (data directory, 0700: it holds the raft log, the manifest
-# stamp and private key material).
+# stamp, the CA key and — under `[tls] source = "cluster"` — the pki/
+# subdirectory formation, enrollment and renewal write into).
 StateDirectory=coppice
 StateDirectoryMode=0700
 # /run/coppice, the home of the admin socket `coppice coordinator init` speaks
@@ -47,7 +48,10 @@ StateDirectoryMode=0700
 # authorization for formation (ADR 0037 §3).
 RuntimeDirectory=coppice
 RuntimeDirectoryMode=0700
-# /etc/coppice, where the config, the enrollment token and the PKI live.
+# /etc/coppice, where the config and the enrollment token live. Cluster-owned
+# PKI material lives under the state directory instead (`[tls] source =
+# "cluster"` resolves to /var/lib/coppice/pki); an operator running
+# `source = "external"` points `[tls]` at whatever read-only paths they like.
 ConfigurationDirectory=coppice
 
 # Shutdown is a plain SIGTERM; the daemon emits STOPPING=1 and drains. 30s is
@@ -78,10 +82,6 @@ SystemCallFilter=@system-service
 # capability at all.
 CapabilityBoundingSet=
 AmbientCapabilities=
-# ConfigurationDirectory= is read-only under ProtectSystem=strict, but
-# enrollment and leaf renewal write the certificate, key and CA bundle back to
-# the `[tls]` paths (ADR 0037 §4/§8), so that one subtree is writable.
-ReadWritePaths=/etc/coppice/pki
 
 [Install]
 WantedBy=multi-user.target

@@ -123,6 +123,45 @@ overlap enough to earn it; pure value-parsing helpers can live in
 `coppice-core` (which stays I/O-free — file reading belongs to the
 binaries).
 
+### Amendment (2026-09-12): explicit `[tls]` source
+
+**Problem.** `[tls]` originally carried only `cert_path`/`key_path`/
+`ca_path`, and whether the daemon owned that material (writing it at
+enrollment and renewal) or merely read it (an externally provisioned leaf)
+was inferred from what happened to already be on disk — the same table
+meant "write here" on a fresh install and "read this" on a pre-provisioned
+one. A typo in a path, or a config copied from the wrong host, silently
+picked the wrong mode instead of failing at startup (issue #127).
+
+**Decision.** `[tls]` now carries an explicit `source`, `"cluster"` or
+`"external"` (`deny_unknown_fields`, every mismatch names both options and
+the offending key):
+
+- `source = "cluster"` — the cluster owns the material end to end,
+  written under the fixed layout `<data_dir>/pki/{node.crt,node.key,
+  ca.crt}` by formation, enrollment, renewal and re-rooting.
+  `cert_path`/`key_path`/`ca_path` are rejected here — the layout is not
+  configurable. An agent under this source must also configure
+  `[enrollment]`; a coordinator's may be absent (the forming node mints
+  its own leaf at `coordinator init`).
+- `source = "external"` — `cert_path`, `key_path` and `ca_path` are all
+  required, each validated (exists, parses) at config load, and the
+  daemon only ever reads and hot-reloads them. It never writes them: no
+  enrollment (`[enrollment]` present is a startup error under this
+  source), no renewal, no trust-anchor adoption at re-rooting, no leaf
+  install at formation.
+
+**Consequences.** The data directory gains a fixed `pki/` layout for the
+common case, which retires the `/etc/coppice/pki` `ReadWritePaths=`
+exception in the systemd units (`ProtectSystem=strict` now covers
+`/etc/coppice` without a carve-out — see
+[deploy/systemd](../../deploy/systemd)). Externally provisioned material is
+never written by the daemon under any circumstance, which closes the
+previous silent-inference failure mode outright rather than just
+documenting it better. Every operational runbook that named
+`/etc/coppice/pki` now names the cluster-managed data-dir path instead
+(`docs/operations/re-rooting.md`, `security.md`, `configuration.md`).
+
 ## Consequences
 
 - The litmus test gives every future knob a home before it is written, and

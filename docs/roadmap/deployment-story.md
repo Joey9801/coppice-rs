@@ -157,7 +157,7 @@ hashes in replicated
 policy — listable and revocable with a policy write, with the stated
 caveat that token revocation stops future enrollments but does not
 recall already-issued leaves. Vault-style external issuance remains a
-substitution behind the same `[tls]` paths, not a dependency.
+substitution behind `[tls] source = "external"`, not a dependency.
 
 **A3 — capacity autodetect, landed.** cpu/memory/disk are detected at
 startup (`available_parallelism` ∩ the cgroup v2 `cpu.max` quota,

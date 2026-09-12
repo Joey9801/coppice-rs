@@ -63,8 +63,8 @@ mkdir -p /opt/coppice-release
 retry "release download" aws s3 cp "s3://${artefact_bucket}/${artefact_key}" \
   /opt/coppice-release.tar.gz --region "${region}"
 tar xzf /opt/coppice-release.tar.gz -C /opt/coppice-release
-# Installs the binary, both units and the service users, creates /etc/coppice
-# and /etc/coppice/pki, and starts nothing.
+# Installs the binary, both units and the service users, creates /etc/coppice,
+# and starts nothing.
 /opt/coppice-release/deploy/install.sh --role coordinator
 
 # The node config, rendered from the checked-in example so that the comments

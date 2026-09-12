@@ -928,6 +928,36 @@ Log scraping is removed from every workflow:
   `waiting`, HTTP 503 — visible, alive, and deliberately not "ready"; the
   same holds for `formation-failed`.
 
+### Amendment (2026-09-12): explicit `[tls]` source
+
+§4's "External PKI stays a substitution, not a requirement" bullet
+described the substitution as living "behind file paths plus reload" —
+the same `cert_path`/`key_path`/`ca_path` table meant either "the cluster
+writes here" or "an external issuer owns this" depending on what happened
+to already be on disk, inferred rather than stated. A typo or a config
+copied from the wrong host could silently pick the wrong mode instead of
+failing at startup (issue #127).
+
+**Decision.** `[tls]` now carries an explicit `source = "cluster" |
+"external"` ([ADR 0020](0020-node-config-vs-replicated-policy.md)'s
+amendment of the same date has the full schema and validation rules).
+Under `"cluster"`, formation, enrollment, renewal and re-rooting write
+the fixed layout `<data_dir>/pki/{node.crt,node.key,ca.crt}` exactly as
+this section describes, and the paths are no longer configurable. Under
+`"external"`, the three paths are required and validated at config load,
+and the daemon never writes them under any circumstance — no enrollment,
+no renewal, no trust-anchor adoption at re-rooting — which is what §4
+always intended by "substitution, not a requirement" but previously left
+to be inferred.
+
+**Consequences.** The fixed cluster-managed layout retires the
+`/etc/coppice/pki` `ReadWritePaths=` exception from the systemd units
+(`ProtectSystem=strict` needs no carve-out for `/etc/coppice` any more).
+Re-rooting, security and configuration operations docs now name the
+data-dir path (`/var/lib/coppice/pki` on coordinators,
+`/var/lib/coppice-agent/pki` on agents) wherever they previously named
+`/etc/coppice/pki`.
+
 ## Consequences
 
 - **A minimal production deployment needs a DNS name, an OIDC issuer,

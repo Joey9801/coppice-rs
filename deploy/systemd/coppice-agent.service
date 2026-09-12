@@ -37,10 +37,14 @@ ExecStart=/usr/local/bin/coppice agent --config /etc/coppice/agent.toml
 Restart=always
 RestartSec=2s
 
-# /var/lib/coppice-agent: the journal, the LOCK, the node identity, and the
-# telemetry segments that back `coppice job logs`.
+# /var/lib/coppice-agent: the journal, the LOCK, the node identity, the
+# telemetry segments that back `coppice job logs`, and (under `[tls] source =
+# "cluster"`) the pki/ subdirectory enrollment and renewal write into.
 StateDirectory=coppice-agent
 StateDirectoryMode=0700
+# /etc/coppice, where the config and the enrollment token live. An operator
+# running `source = "external"` points `[tls]` at whatever read-only paths
+# they like instead of the state directory.
 ConfigurationDirectory=coppice
 
 KillSignal=SIGTERM
@@ -72,9 +76,6 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 CapabilityBoundingSet=
 AmbientCapabilities=
-# Enrollment and renewal write the leaf and CA bundle back to the `[tls]`
-# paths, and ConfigurationDirectory= is read-only under ProtectSystem=strict.
-ReadWritePaths=/etc/coppice/pki
 # connect(2) on a Unix socket needs write access to the socket inode. A
 # systemd-in-Docker run of this unit reached /run/docker.sock without these
 # two lines, so ProtectSystem=strict evidently leaves /run writable there;
