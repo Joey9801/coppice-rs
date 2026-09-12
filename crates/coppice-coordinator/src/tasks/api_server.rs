@@ -103,6 +103,34 @@ pub trait LeaderWrites: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>>;
 }
 
+/// Where a replica that does not lead reads the leader's node-liveness marks
+/// (ADR 0040) — the one *read* that crosses the admin hop.
+///
+/// A separate trait from [`LeaderWrites`] rather than a fifth method on it,
+/// because the two carry different promises. A forwarded write must never be
+/// reported as having succeeded when this replica cannot vouch for it, so
+/// every failure there is an error the client sees. This read has the opposite
+/// obligation: every failure degrades to an empty map, which renders as health
+/// `unknown` — exactly what the replica served before ADR 0040 — so a fetch
+/// that fails must never turn a node list into a 503. Production plugs the
+/// same [`crate::clientwrite::AdminForwarder`] into both.
+///
+/// It carries no [`Actor`]: there is no client identity in a health read to
+/// hand over, and the hop authenticates as this coordinator's own machine
+/// identity, the same as every other verb on that channel.
+pub trait LeaderReads: Send + Sync + 'static {
+    /// The leader's marks for the term it leads, as it holds them.
+    ///
+    /// `Err` is "no answer" in every shape — unreachable, timed out, not the
+    /// leader after all, undecodable — and the control plane maps all of them
+    /// onto the same empty map. The distinctions matter only to the debug log
+    /// the transport writes.
+    fn node_liveness(
+        &self,
+        leader: CoordinatorId,
+    ) -> BoxFuture<'_, Result<coppice_api::LivenessMarks, ApiError>>;
+}
+
 /// How a write attempted on *this* replica ended.
 ///
 /// [`ApiError`] cannot express the one distinction the forwarding decision
@@ -501,6 +529,11 @@ pub struct CoordinatorControlPlane<C> {
     ///
     /// [`with_forwarder`]: Self::with_forwarder
     forwarder: Option<Arc<dyn LeaderWrites>>,
+    /// Where the liveness read goes when this replica does not lead
+    /// (ADR 0040). `None` — a plane with no seam attached — serves an empty
+    /// map while following, which is exactly the pre-0040 behaviour: health
+    /// `unknown` for every node.
+    leader_reads: Option<Arc<dyn LeaderReads>>,
     /// This daemon's armed `[test_failpoints]` set. Disarmed unless a
     /// debug-build config named a gate, and disarmable at all only in a debug
     /// build — a release binary refuses the section outright, so the check in
@@ -543,6 +576,7 @@ impl<C> CoordinatorControlPlane<C> {
             node_handle: None,
             node_log_client: None,
             forwarder: None,
+            leader_reads: None,
             failpoints: crate::failpoints::Failpoints::default(),
         }
     }
@@ -611,6 +645,16 @@ impl<C> CoordinatorControlPlane<C> {
     /// instead.
     pub fn with_forwarder(mut self, forwarder: Arc<dyn LeaderWrites>) -> Self {
         self.forwarder = Some(forwarder);
+        self
+    }
+
+    /// Attach the leader-read seam backing the node-health read on a replica
+    /// that does not lead (ADR 0040). The runtime attaches the same
+    /// `AdminForwarder` it gives [`with_forwarder`](Self::with_forwarder); a
+    /// plane without it serves health `unknown` while following, as it did
+    /// before ADR 0040.
+    pub fn with_leader_reads(mut self, reads: Arc<dyn LeaderReads>) -> Self {
+        self.leader_reads = Some(reads);
         self
     }
 

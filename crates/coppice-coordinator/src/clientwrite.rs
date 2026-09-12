@@ -8,6 +8,15 @@
 //! calling one of the `Forward*` RPCs under a bounded timeout, and mapping
 //! what comes back onto the ordinary [`ApiError`] vocabulary.
 //!
+//! Since ADR 0040 one **read** crosses the same hop: a replica that does not
+//! lead fetches the leader's node-liveness marks, under a much shorter budget,
+//! and degrades to "nothing to judge by" on any failure rather than to an
+//! error. That asymmetry is the whole difference between [`LeaderWrites`] and
+//! [`LeaderReads`] — and it is why the read keeps *one cached channel* per
+//! leader ([`ChannelCache`]) where the write dials afresh: a forwarded write is
+//! rare, while the read runs once per follower-served node page, at whatever
+//! rate a dashboard polls.
+//!
 //! The *decision* to forward, and every rule about what a forwarded write
 //! means, lives with the write path in
 //! [`crate::tasks::api_server`]; the leader-side handlers live in
@@ -18,7 +27,7 @@
 //! no longer) the leader, that coordinator answers `NotLeader` and this side
 //! surfaces the ordinary redirect — it never chases a second hop.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use coppice_api::http::dto::{
     ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest, SubmitJobResponse,
@@ -33,8 +42,9 @@ use coppice_proto::pb::raft::v1 as pb;
 use coppice_state::Actor;
 use coppice_tls::TlsStore;
 use tonic::transport::Channel;
+use tonic::Code;
 
-use crate::tasks::api_server::{BoxFuture, LeaderWrites};
+use crate::tasks::api_server::{BoxFuture, LeaderReads, LeaderWrites};
 
 /// How long a follower waits for the leader to answer a forwarded write —
 /// **in total**, dial included.
@@ -56,6 +66,24 @@ use crate::tasks::api_server::{BoxFuture, LeaderWrites};
 /// timeouts would have advertised 10s and delivered up to 20.
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a replica that does not lead waits for the leader's liveness
+/// marks — **in total**, dial included (ADR 0040).
+///
+/// Deliberately a fifth of the write path's 10 s, and for a different job. A
+/// forwarded write is a client's mutation: it is worth waiting a long time
+/// for, because the alternative is telling the caller an outcome nobody knows.
+/// This is a dashboard poll behind `GET /api/v1/nodes`, and its fallback
+/// answer — health `unknown`, exactly what the replica served before ADR 0040
+/// — is *fine*. Spending ten seconds of a viewer's page load to avoid a
+/// degraded field would be the wrong trade in both directions: the read is on
+/// a poll loop, so a slow answer is quickly a stale one, and the UI refreshes
+/// anyway.
+///
+/// It bounds the dial as well as the call, for the same reason
+/// [`FORWARD_TIMEOUT`] does: a leader address that blackholes packets leaves a
+/// TCP connect hanging for the OS's retry budget, which is minutes.
+const LIVENESS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The single instant every stage of one forwarded write must finish by.
 ///
 /// Stamped once per [`LeaderWrites`] call and threaded through the dial and
@@ -63,6 +91,86 @@ const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// per stage.
 fn forward_deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + FORWARD_TIMEOUT
+}
+
+/// What a cached read channel is pinned to: the leader it reaches, the address
+/// it was dialed at, and the TLS material generation it presented.
+///
+/// All three, because all three are reasons the cached connection is the wrong
+/// one to speak over. A re-election names a different leader; a membership
+/// change moves the same leader's address; a rotation retires the leaf the
+/// channel froze into its `ClientTlsConfig` when it was built. The generation
+/// term is the same check the raft mesh's peer-channel map makes (ADR 0037 §4),
+/// for exactly that last reason.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ChannelKey {
+    leader: CoordinatorId,
+    addr: String,
+    tls_generation: u64,
+}
+
+/// The one channel the ADR 0040 liveness read keeps, behind the key it was
+/// dialed under.
+///
+/// One slot, not a map: a cluster has one leader at a time, so a second entry
+/// could only ever be a stale one. Generic over the client purely so the reuse
+/// and invalidation rules can be tested without a socket; the daemon
+/// instantiates it at `Client<Channel>`.
+///
+/// The mutex is a `std` one and every method takes it, uses it, and drops it
+/// without awaiting — the dial itself happens outside the lock, so two
+/// concurrent first reads may both dial and the second simply replaces the
+/// first's entry. Racing to dial twice is cheaper than serializing every node
+/// page behind one connect.
+struct ChannelCache<C>(Mutex<Option<(ChannelKey, C)>>);
+
+impl<C> Default for ChannelCache<C> {
+    fn default() -> Self {
+        ChannelCache(Mutex::new(None))
+    }
+}
+
+impl<C: Clone> ChannelCache<C> {
+    /// The cached client, if it was dialed under exactly this key.
+    fn get(&self, key: &ChannelKey) -> Option<C> {
+        let cache = self.0.lock().expect("liveness read channel cache poisoned");
+        cache
+            .as_ref()
+            .filter(|(cached, _)| cached == key)
+            .map(|(_, client)| client.clone())
+    }
+
+    fn put(&self, key: ChannelKey, client: C) {
+        *self.0.lock().expect("liveness read channel cache poisoned") = Some((key, client));
+    }
+
+    /// Drop the cached client, but only if it is still the one this key names.
+    ///
+    /// Keyed rather than unconditional so a read whose connection broke cannot
+    /// throw away a replacement some concurrent read has already dialed — the
+    /// entry it is entitled to retire is its own.
+    fn invalidate(&self, key: &ChannelKey) {
+        let mut cache = self.0.lock().expect("liveness read channel cache poisoned");
+        if cache.as_ref().is_some_and(|(cached, _)| cached == key) {
+            *cache = None;
+        }
+    }
+}
+
+/// Whether a non-OK status means the *connection* failed rather than the leader
+/// having answered over it.
+///
+/// Only these four retire a cached channel. Anything else — a
+/// `FAILED_PRECONDITION` history-id mismatch, a `PERMISSION_DENIED` — is the
+/// leader speaking, which is evidence the connection works and that redialing
+/// would change nothing. tonic's `Channel` reconnects on its own, so the point
+/// of dropping the entry is not to force a reconnect but to re-resolve the
+/// leader and rebuild the TLS config while we are at it.
+fn is_transport_failure(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Unknown | Code::Cancelled | Code::DeadlineExceeded
+    )
 }
 
 /// Forwards client writes to the leader over the mTLS admin channel.
@@ -74,45 +182,99 @@ pub(crate) struct AdminForwarder {
     /// (not frozen) so a rotated leaf is presented on the next hop, exactly
     /// as [`crate::enroll::EnrollService`] does it.
     tls: Arc<TlsStore>,
+    /// The cached channel for the ADR 0040 liveness read, and *only* for it.
+    ///
+    /// The write path keeps dialing per call (ADR 0038): it is rare enough that
+    /// a handshake costs nothing anybody can measure, and a fresh dial is one
+    /// less piece of state to reason about on the path that mutates the cluster.
+    /// The read is the opposite shape — one per follower-served node list,
+    /// detail, or overview request — so a dial per call would put dashboard-rate
+    /// TCP and TLS churn on the leader.
+    read_channel: ChannelCache<Client<Channel>>,
 }
 
 impl AdminForwarder {
     pub(crate) fn new(node: NodeHandle, tls: Arc<TlsStore>) -> Arc<AdminForwarder> {
-        Arc::new(AdminForwarder { node, tls })
+        Arc::new(AdminForwarder {
+            node,
+            tls,
+            read_channel: ChannelCache::default(),
+        })
     }
 
-    /// Dial the leader's admin surface, or say why not.
+    /// The leader's raft address in this replica's membership view.
     ///
-    /// A leader with no address in this replica's membership view is the
-    /// fallback case, not a failure: nothing can be forwarded, so the client
-    /// gets the hintless redirect and retries. A leader that *has* an address
-    /// but will not answer is a genuine unavailability.
-    async fn dial(
-        &self,
-        leader: CoordinatorId,
-        deadline: tokio::time::Instant,
-    ) -> Result<(Client<Channel>, [u8; 16]), ApiError> {
+    /// A leader with no address here is the fallback case, not a failure:
+    /// nothing can be forwarded, so the client gets the hintless redirect and
+    /// retries. A leader that *has* an address but will not answer is a genuine
+    /// unavailability, which is the dial's business rather than this lookup's.
+    fn leader_addr(&self, leader: CoordinatorId) -> Result<String, ApiError> {
         let summary = self.node.cluster_summary();
-        let Some(addr) = summary
+        summary
             .members
             .iter()
             .find(|m| m.id == leader)
             .map(|m| m.addr.clone())
-        else {
-            tracing::debug!(
-                leader,
-                "cannot forward the write: the leader has no address in this replica's \
-                 membership view"
-            );
-            return Err(ApiError::NotLeader { leader_hint: None });
-        };
+            .ok_or_else(|| {
+                tracing::debug!(
+                    leader,
+                    "cannot reach the leader over the admin channel: it has no address in this \
+                     replica's membership view"
+                );
+                ApiError::NotLeader { leader_hint: None }
+            })
+    }
 
+    /// Dial the leader's admin surface, or say why not.
+    ///
+    /// The write path's dial: one handshake per forwarded write, never cached.
+    ///
+    /// `budget` is the caller's whole allowance, named only so the timeout
+    /// message quotes the budget that actually applied.
+    async fn dial(
+        &self,
+        leader: CoordinatorId,
+        deadline: tokio::time::Instant,
+        budget: std::time::Duration,
+    ) -> Result<(Client<Channel>, [u8; 16]), ApiError> {
+        let addr = self.leader_addr(leader)?;
         let client = under_dial_timeout(
             deadline,
+            budget,
             crate::admin::admin_channel_from_store(&addr, &self.tls),
         )
         .await?;
         Ok((client, self.node.history_id()))
+    }
+
+    /// The channel the ADR 0040 liveness read speaks over: the cached one when
+    /// it still matches the leader, the address, and the TLS generation, a fresh
+    /// dial under `deadline` when it does not.
+    ///
+    /// The key comes back with the client so the caller can retire *that* entry
+    /// — and nothing else — if the RPC on it turns out to have failed at the
+    /// transport.
+    async fn read_client(
+        &self,
+        leader: CoordinatorId,
+        deadline: tokio::time::Instant,
+    ) -> Result<(Client<Channel>, ChannelKey, [u8; 16]), ApiError> {
+        let key = ChannelKey {
+            leader,
+            addr: self.leader_addr(leader)?,
+            tls_generation: self.tls.generation(),
+        };
+        if let Some(client) = self.read_channel.get(&key) {
+            return Ok((client, key, self.node.history_id()));
+        }
+        let client = under_dial_timeout(
+            deadline,
+            LIVENESS_FETCH_TIMEOUT,
+            crate::admin::admin_channel_from_store(&key.addr, &self.tls),
+        )
+        .await?;
+        self.read_channel.put(key.clone(), client.clone());
+        Ok((client, key, self.node.history_id()))
     }
 }
 
@@ -141,14 +303,15 @@ fn not_sent(detail: String) -> ApiError {
 /// does not bind refuses.
 async fn under_dial_timeout<T>(
     deadline: tokio::time::Instant,
+    budget: std::time::Duration,
     dial: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> Result<T, ApiError> {
     match tokio::time::timeout_at(deadline, dial).await {
         Ok(Ok(client)) => Ok(client),
         Ok(Err(e)) => Err(not_sent(format!("{e:#}"))),
         Err(_elapsed) => Err(not_sent(format!(
-            "the connection did not establish within the {}s forwarding budget",
-            FORWARD_TIMEOUT.as_secs()
+            "the connection did not establish within the {}s budget",
+            budget.as_secs()
         ))),
     }
 }
@@ -253,7 +416,7 @@ impl LeaderWrites for AdminForwarder {
     ) -> BoxFuture<'a, Result<SubmitJobResponse, ApiError>> {
         Box::pin(async move {
             let deadline = forward_deadline();
-            let (mut client, history_id) = self.dial(leader, deadline).await?;
+            let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
             let wire = submit_to_pb(history_id, req, actor);
             let response = under_timeout(deadline, client.forward_submit_job(wire)).await?;
             let log_index = applied_index(response.outcome)?;
@@ -273,7 +436,7 @@ impl LeaderWrites for AdminForwarder {
     ) -> BoxFuture<'a, Result<(), ApiError>> {
         Box::pin(async move {
             let deadline = forward_deadline();
-            let (mut client, history_id) = self.dial(leader, deadline).await?;
+            let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
             let wire = pb::ForwardAbortJobRequest {
                 history_id: history_id.to_vec(),
                 job: Some(job.into()),
@@ -294,7 +457,7 @@ impl LeaderWrites for AdminForwarder {
     ) -> BoxFuture<'a, Result<ConfigureQuotaEntityResponse, ApiError>> {
         Box::pin(async move {
             let deadline = forward_deadline();
-            let (mut client, history_id) = self.dial(leader, deadline).await?;
+            let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
             let wire = pb::ForwardConfigureQuotaEntityRequest {
                 history_id: history_id.to_vec(),
                 entity: Some(req.entity.into()),
@@ -326,13 +489,175 @@ impl LeaderWrites for AdminForwarder {
     ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>> {
         Box::pin(async move {
             let deadline = forward_deadline();
-            let (mut client, history_id) = self.dial(leader, deadline).await?;
+            let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
             let wire = authorization_to_pb(history_id, req, actor)?;
             let response =
                 under_timeout(deadline, client.forward_update_authorization(wire)).await?;
             let log_index = applied_index(response.outcome)?;
             Ok(UpdateAuthorizationResponse { log_index })
         })
+    }
+}
+
+impl LeaderReads for AdminForwarder {
+    /// One hop to the leader for its liveness marks (ADR 0040), over the one
+    /// cached admin channel [`AdminForwarder::read_client`] keeps and under
+    /// [`LIVENESS_FETCH_TIMEOUT`].
+    ///
+    /// Every failure is an `Err` the control plane turns into an empty map, and
+    /// every one of them is logged at **debug**, never warn: an election, a
+    /// membership view a beat behind, or a leader that has just stepped down
+    /// all reach here, and a dashboard polling every few seconds would turn any
+    /// of them into a torrent of warnings about a field that degraded exactly
+    /// as designed.
+    ///
+    /// The errors [`under_dial_timeout`] builds are phrased for the write
+    /// path — the only caller that ever shows one to anybody. This read
+    /// discards the text and logs its own line, so that wording never reaches
+    /// a human through here.
+    ///
+    /// A failure at the transport also retires the cached channel, so the next
+    /// read redials: not because a `Channel` cannot reconnect by itself (it can,
+    /// lazily), but because a connection that just broke is the moment to
+    /// re-resolve the leader's address and rebuild the mTLS config from current
+    /// material rather than to keep retrying the one that failed.
+    fn node_liveness(
+        &self,
+        leader: CoordinatorId,
+    ) -> BoxFuture<'_, Result<coppice_api::LivenessMarks, ApiError>> {
+        Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + LIVENESS_FETCH_TIMEOUT;
+            let (mut client, key, history_id) =
+                self.read_client(leader, deadline).await.inspect_err(|e| {
+                    tracing::debug!(
+                        leader,
+                        error = %e,
+                        "could not reach the leader for its liveness marks; node health \
+                         degrades to unknown"
+                    );
+                })?;
+
+            let wire = pb::FetchNodeLivenessRequest {
+                history_id: history_id.to_vec(),
+            };
+            let response =
+                match tokio::time::timeout_at(deadline, client.fetch_node_liveness(wire)).await {
+                    Ok(Ok(response)) => response.into_inner(),
+                    Ok(Err(status)) => {
+                        // A broken connection retires the entry; a refusal the
+                        // leader actually spoke leaves it in place, since it is
+                        // evidence the channel works.
+                        if is_transport_failure(&status) {
+                            self.read_channel.invalidate(&key);
+                        }
+                        tracing::debug!(
+                        leader,
+                        status = status.message(),
+                        "the leader refused the liveness fetch; node health degrades to unknown"
+                    );
+                        return Err(ApiError::Unavailable(
+                            "the leader did not serve its liveness marks".to_string(),
+                        ));
+                    }
+                    Err(_elapsed) => {
+                        // Silence is indistinguishable from a wedged
+                        // connection, so the cached one does not get a second
+                        // page's worth of trust.
+                        self.read_channel.invalidate(&key);
+                        tracing::debug!(
+                            leader,
+                            budget_secs = LIVENESS_FETCH_TIMEOUT.as_secs(),
+                            "the leader did not answer the liveness fetch inside the budget; node \
+                         health degrades to unknown"
+                        );
+                        return Err(ApiError::Unavailable(
+                            "the leader did not answer the liveness fetch in time".to_string(),
+                        ));
+                    }
+                };
+
+            marks_from_pb(response.outcome).inspect_err(|e| {
+                tracing::debug!(
+                    leader,
+                    error = %e,
+                    "the leader's liveness answer was not usable; node health degrades to unknown"
+                );
+            })
+        })
+    }
+}
+
+/// The leader's liveness answer, as the marks the read model projects — or the
+/// `Err` that becomes an empty map.
+///
+/// The `NotLeader` arm is where one hop stops: the receiver's answer is not
+/// "nobody knows", it is "not me", and this side serves `unknown` rather than
+/// chasing whoever does. A response with no arm at all is a peer speaking a
+/// schema this build does not understand, which is not an answer either.
+fn marks_from_pb(
+    outcome: Option<pb::fetch_node_liveness_response::Outcome>,
+) -> Result<coppice_api::LivenessMarks, ApiError> {
+    use pb::fetch_node_liveness_response::Outcome;
+
+    let marks = match outcome {
+        Some(Outcome::Marks(marks)) => marks,
+        Some(Outcome::NotLeader(_)) => return Err(ApiError::NotLeader { leader_hint: None }),
+        None => {
+            return Err(ApiError::Unavailable(
+                "the leader answered the liveness fetch with no outcome".to_string(),
+            ))
+        }
+    };
+
+    marks.nodes.into_iter().map(mark_from_pb).collect()
+}
+
+/// One mark off the wire.
+///
+/// Fallible in both fields, and refusing rather than defaulting in both: a node
+/// id that does not parse names no node, and a `last_heartbeat_at_us` outside
+/// the representable range is not a heartbeat — substituting the epoch would
+/// display 1970 as the last time a healthy node was heard from. Neither can
+/// happen between builds of this tree; the point is that a peer which sent one
+/// costs this read its whole answer (health `unknown`) instead of a plausible
+/// wrong one.
+fn mark_from_pb(
+    mark: pb::NodeLivenessMark,
+) -> Result<(coppice_core::id::NodeId, coppice_api::LivenessMark), ApiError> {
+    let node: coppice_core::id::NodeId = required(mark.node, "NodeLivenessMark.node")
+        .and_then(TryInto::try_into)
+        .map_err(|e: ConvertError| ApiError::Invalid(e.to_string()))?;
+    let last_heartbeat = match mark.last_heartbeat_at_us {
+        Some(at_us) => Some(coppice_core::time::Timestamp::from_micros(at_us).ok_or_else(
+            || ApiError::Invalid(format!("NodeLivenessMark.last_heartbeat_at_us {at_us} is not a representable timestamp")),
+        )?),
+        None => None,
+    };
+    Ok((
+        node,
+        coppice_api::LivenessMark {
+            last_heartbeat,
+            silent_for: std::time::Duration::from_micros(mark.silent_for_us),
+        },
+    ))
+}
+
+/// One mark on the wire — the leader's side of [`mark_from_pb`].
+///
+/// The monotonic span is computed by the leader before it encodes, so the
+/// `silent_for` this read model derives health from never depends on two
+/// coordinators' clocks agreeing (ADR 0040).
+pub(crate) fn mark_to_pb(
+    node: coppice_core::id::NodeId,
+    mark: &coppice_api::LivenessMark,
+) -> pb::NodeLivenessMark {
+    pb::NodeLivenessMark {
+        node: Some(node.into()),
+        last_heartbeat_at_us: mark.last_heartbeat.map(|at| at.as_micros()),
+        // Saturating rather than wrapping: a span past u64 µs (≈584 000 years)
+        // is not reachable, and the clamp keeps the cast from being the one
+        // place a nonsense value could become a *small* one.
+        silent_for_us: mark.silent_for.as_micros().min(u128::from(u64::MAX)) as u64,
     }
 }
 
@@ -840,6 +1165,117 @@ mod tests {
         assert!(matches!(applied_index(None), Err(ApiError::Unavailable(_))));
     }
 
+    /// The ADR 0040 mark survives the hop in both directions and in both of
+    /// its shapes: heard-from (a wall stamp to display) and granted-grace-only
+    /// (no stamp at all). Collapsing the second into an epoch stamp would show
+    /// an operator "last heard 1970" for a node the leader has never heard
+    /// from, and collapsing the first would lose the only displayable fact
+    /// behind `last_heartbeat`.
+    #[test]
+    fn a_liveness_mark_survives_the_hop_in_both_shapes() {
+        let node = coppice_core::id::NodeId::new();
+        let at = coppice_core::time::Timestamp::now();
+
+        for last_heartbeat in [Some(at), None] {
+            let sent = coppice_api::LivenessMark {
+                last_heartbeat,
+                silent_for: std::time::Duration::from_millis(1_234),
+            };
+            let (back_node, back) =
+                mark_from_pb(mark_to_pb(node, &sent)).expect("a well-formed mark");
+            assert_eq!(back_node, node);
+            assert_eq!(back.last_heartbeat, last_heartbeat);
+            // The span is what health is derived from, so it must survive to
+            // the microsecond, not to the second.
+            assert_eq!(back.silent_for, sent.silent_for);
+        }
+    }
+
+    /// Present-but-empty and absent are different answers, which is the whole
+    /// reason the response is a oneof: a leader tracking no nodes has told us
+    /// something, and a replica that is not the leader has not.
+    #[test]
+    fn an_empty_mark_list_from_the_leader_is_an_answer_and_not_leader_is_not() {
+        use pb::fetch_node_liveness_response::{Marks, NotLeader, Outcome};
+
+        let empty = marks_from_pb(Some(Outcome::Marks(Marks { nodes: Vec::new() })))
+            .expect("a leader tracking nothing has answered");
+        assert!(empty.is_empty());
+
+        // One hop: the far side is not the leader either, so the read stops
+        // here and the caller serves `unknown`.
+        assert!(matches!(
+            marks_from_pb(Some(Outcome::NotLeader(NotLeader {}))),
+            Err(ApiError::NotLeader { leader_hint: None })
+        ));
+
+        // No arm at all is a peer speaking a schema this build does not know;
+        // it is not an answer, so it must not be reported as an empty one.
+        assert!(matches!(marks_from_pb(None), Err(ApiError::Unavailable(_))));
+    }
+
+    /// A mark this build cannot decode costs the read its whole answer —
+    /// health `unknown` — rather than being dropped or defaulted into
+    /// something plausible. A node id that does not parse names no node, and
+    /// an unrepresentable stamp is not a heartbeat.
+    #[test]
+    fn a_malformed_mark_is_refused_rather_than_defaulted() {
+        use pb::fetch_node_liveness_response::{Marks, Outcome};
+
+        let node = coppice_core::id::NodeId::new();
+        let good = mark_to_pb(
+            node,
+            &coppice_api::LivenessMark {
+                last_heartbeat: None,
+                silent_for: std::time::Duration::ZERO,
+            },
+        );
+
+        let mut no_node = good.clone();
+        no_node.node = None;
+        assert!(marks_from_pb(Some(Outcome::Marks(Marks {
+            nodes: vec![no_node]
+        })))
+        .is_err());
+
+        let mut absurd_stamp = good.clone();
+        absurd_stamp.last_heartbeat_at_us = Some(i64::MAX);
+        assert!(marks_from_pb(Some(Outcome::Marks(Marks {
+            nodes: vec![absurd_stamp]
+        })))
+        .is_err());
+
+        // And one bad entry does not quietly leave the good ones behind: the
+        // answer is all of it or none of it.
+        let mut broken = good.clone();
+        broken.node = None;
+        assert!(marks_from_pb(Some(Outcome::Marks(Marks {
+            nodes: vec![good, broken]
+        })))
+        .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_liveness_dial_that_never_completes_is_bounded_by_its_own_budget() {
+        // The same blackhole as the write path's, against the read's budget:
+        // a node list must not hold a viewer's request for the write path's
+        // ten seconds to decorate a field whose fallback is fine.
+        let started = tokio::time::Instant::now();
+        let never = std::future::pending::<anyhow::Result<()>>();
+        let deadline = tokio::time::Instant::now() + LIVENESS_FETCH_TIMEOUT;
+        assert!(
+            under_dial_timeout(deadline, LIVENESS_FETCH_TIMEOUT, never)
+                .await
+                .is_err(),
+            "bounded"
+        );
+        assert_eq!(started.elapsed(), LIVENESS_FETCH_TIMEOUT);
+        assert!(
+            LIVENESS_FETCH_TIMEOUT < FORWARD_TIMEOUT,
+            "the read's budget is deliberately shorter than the write's"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_dial_that_never_completes_is_bounded_by_the_forward_budget() {
         // The blackholed leader address: connect neither succeeds nor fails.
@@ -849,7 +1285,7 @@ mod tests {
         // flakes.
         let started = tokio::time::Instant::now();
         let never = std::future::pending::<anyhow::Result<()>>();
-        let error = under_dial_timeout(forward_deadline(), never)
+        let error = under_dial_timeout(forward_deadline(), FORWARD_TIMEOUT, never)
             .await
             .expect_err("bounded");
         assert!(started.elapsed() >= FORWARD_TIMEOUT);
@@ -871,7 +1307,7 @@ mod tests {
         // "never left this replica".
         let refused =
             std::future::ready::<anyhow::Result<()>>(Err(anyhow::anyhow!("connection refused")));
-        match under_dial_timeout(forward_deadline(), refused)
+        match under_dial_timeout(forward_deadline(), FORWARD_TIMEOUT, refused)
             .await
             .expect_err("dial failed")
         {
@@ -915,7 +1351,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(9)).await;
             anyhow::Ok(())
         };
-        under_dial_timeout(deadline, slow_dial)
+        under_dial_timeout(deadline, FORWARD_TIMEOUT, slow_dial)
             .await
             .expect("the dial finished inside the budget");
 
@@ -951,5 +1387,94 @@ mod tests {
             Err(ApiError::Unavailable(_))
         ));
         assert_eq!(started.elapsed(), FORWARD_TIMEOUT, "not a second more");
+    }
+
+    fn key(leader: CoordinatorId, addr: &str, tls_generation: u64) -> ChannelKey {
+        ChannelKey {
+            leader,
+            addr: addr.to_string(),
+            tls_generation,
+        }
+    }
+
+    /// The read path's channel is reused for the same leader, address and TLS
+    /// generation, and dropped the moment any of the three moves.
+    ///
+    /// The reuse is the point of the cache — a node page every couple of
+    /// seconds must not be a TLS handshake on the leader — but each of the
+    /// three misses is a correctness rule, not an optimization: a cached
+    /// connection to a deposed leader reads the wrong replica's marks, one to a
+    /// moved address reads nobody's, and one built before a rotation presents a
+    /// retired leaf until the far side drops it.
+    #[test]
+    fn the_read_channel_is_reused_per_leader_address_and_tls_generation() {
+        let cache: ChannelCache<&'static str> = ChannelCache::default();
+        let warm = key(1, "10.0.0.1:7443", 3);
+
+        assert_eq!(cache.get(&warm), None, "nothing is cached before a dial");
+        cache.put(warm.clone(), "the dialed channel");
+        assert_eq!(cache.get(&warm), Some("the dialed channel"));
+
+        // A different leader, the same address: an election moved leadership to
+        // a peer that happens to reuse an address this replica once dialed.
+        assert_eq!(cache.get(&key(2, "10.0.0.1:7443", 3)), None);
+        // The same leader at a new address: a membership change moved it.
+        assert_eq!(cache.get(&key(1, "10.0.0.9:7443", 3)), None);
+        // The same leader at the same address, after a rotation (ADR 0037 §4).
+        assert_eq!(cache.get(&key(1, "10.0.0.1:7443", 4)), None);
+        // And none of those misses disturbed the entry itself — only an
+        // explicit retirement or a replacement does.
+        assert_eq!(cache.get(&warm), Some("the dialed channel"));
+    }
+
+    /// Retirement is keyed: a read whose connection broke drops its own entry
+    /// and never a replacement dialed in the meantime, which is what keeps two
+    /// concurrent node pages from starving each other of a warm channel.
+    #[test]
+    fn invalidating_drops_only_the_entry_the_failing_read_was_using() {
+        let cache: ChannelCache<&'static str> = ChannelCache::default();
+        let first = key(1, "10.0.0.1:7443", 3);
+        let replacement = key(1, "10.0.0.1:7443", 4);
+
+        cache.put(replacement.clone(), "the redialed channel");
+        cache.invalidate(&first);
+        assert_eq!(
+            cache.get(&replacement),
+            Some("the redialed channel"),
+            "a stale failure must not retire a channel it never used"
+        );
+
+        cache.invalidate(&replacement);
+        assert_eq!(cache.get(&replacement), None);
+    }
+
+    /// Only a transport-level status retires the channel. A leader that
+    /// answered — even to refuse — has proved the connection works, and
+    /// redialing on its say-so would turn a persistent refusal into a handshake
+    /// per poll.
+    #[test]
+    fn a_status_the_leader_spoke_keeps_the_channel_and_a_broken_one_does_not() {
+        for code in [
+            Code::Unavailable,
+            Code::Unknown,
+            Code::Cancelled,
+            Code::DeadlineExceeded,
+        ] {
+            assert!(
+                is_transport_failure(&tonic::Status::new(code, "")),
+                "{code:?} means the connection failed"
+            );
+        }
+        for code in [
+            Code::FailedPrecondition,
+            Code::PermissionDenied,
+            Code::Unimplemented,
+            Code::Internal,
+        ] {
+            assert!(
+                !is_transport_failure(&tonic::Status::new(code, "")),
+                "{code:?} is the leader answering over a channel that works"
+            );
+        }
     }
 }

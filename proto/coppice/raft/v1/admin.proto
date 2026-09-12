@@ -276,6 +276,18 @@ service RaftAdminService {
   // than reusing the shared outcome alone.
   rpc ForwardUpdateAuthorization(ForwardUpdateAuthorizationRequest)
       returns (ForwardUpdateAuthorizationResponse);
+
+  // A follower's internal fetch of the leader's node-liveness marks
+  // (ADR 0040) — the read twin of the forwarded writes above, and the only
+  // read that crosses this hop at all. Node health is derived from the
+  // leader's in-memory marks (ADR 0009), so a replica that does not lead has
+  // nothing to derive it from and used to answer `unknown` for the whole
+  // fleet.
+  //
+  // Single hop, same as the writes: a receiver that is not the leader answers
+  // with the NotLeader arm rather than fetching from whoever is, and the
+  // asking replica degrades to `unknown` rather than chasing a second hop.
+  rpc FetchNodeLiveness(FetchNodeLivenessRequest) returns (FetchNodeLivenessResponse);
 }
 
 // ---- Enrollment tokens and identity revocation (ADR 0037 §5) -------------
@@ -551,4 +563,59 @@ message ForwardUpdateAuthorizationResponse {
   // installs together at one log position.
   ForwardWriteOutcome outcome = 1;
   reserved 2; // was policy_log_index, back when the rename was a 2nd command.
+}
+
+// ---- The forwarded liveness read (ADR 0040) ------------------------------
+
+// A follower's fetch of the leader's node-liveness marks (ADR 0040).
+//
+// The read twin of the forwarded writes above, carrying nothing but the
+// cluster stamp: the asker is not naming a node, it wants the whole map, the
+// same way the read handler it serves does.
+//
+// ADR 0039's usage *numbers* are still not forwarded, deliberately. This
+// carries one tiny entry per node and no history, and unlike a `used`
+// reading, the verdict derived from it — healthy / lost / unknown — is what
+// an operator acts on.
+message FetchNodeLivenessRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+}
+
+// The leader's answer to FetchNodeLiveness.
+//
+// A oneof rather than a bare repeated field because empty and absent are
+// different facts here: a leader tracking no nodes is an answer, and "I hold
+// no marks to give you" is not — and a `repeated` field cannot tell the two
+// apart (proto3 presence). The shape follows ForwardWriteOutcome's: a message
+// per arm, empty ones included, per the house style.
+message FetchNodeLivenessResponse {
+  // The marks the responder holds for the term it leads.
+  message Marks {
+    repeated NodeLivenessMark nodes = 1; // ascending by node id.
+  }
+  // The receiver is not the leader (the asker's view was stale, or leadership
+  // moved under it). One hop is the rule, so this is where the read stops:
+  // the asking replica serves `unknown`, exactly as it did before ADR 0040.
+  message NotLeader {}
+
+  oneof outcome {
+    Marks marks = 1;
+    NotLeader not_leader = 2;
+  }
+}
+
+// One node's standing in the leader's liveness map (ADR 0009), as of the
+// instant the leader took the snapshot.
+//
+// Two clocks, two jobs — the same split the in-memory mark carries.
+// `silent_for_us` is the monotonic span the health verdict is derived from:
+// the leader measures it against its own `Instant` clock before encoding, so
+// nothing on this hop depends on two machines' wall clocks agreeing.
+// `last_heartbeat_at_us` is the wall stamp of the node's last actual report,
+// for display only, and absent for a node the leader has merely granted a
+// grace window this term.
+message NodeLivenessMark {
+  coppice.core.v1.NodeId node = 1;
+  optional int64 last_heartbeat_at_us = 2;
+  uint64 silent_for_us = 3;
 }

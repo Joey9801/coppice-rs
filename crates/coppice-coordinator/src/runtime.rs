@@ -249,6 +249,12 @@ pub async fn run<C>(
     // per daemon, not per process, so a fleet in one test process arms one
     // member; it cannot load at all in a release build.
     failpoints: crate::failpoints::Failpoints,
+    // The daemon's node-liveness map (ADR 0009), created by the boot path
+    // because the admin service needs the *same* handle to serve
+    // `FetchNodeLiveness` from (ADR 0040). Ingestion marks it, housekeeping
+    // seeds and reads it, and the API's health derivation reads it while this
+    // replica leads.
+    liveness: NodeLiveness,
     external_shutdown: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<()>
 where
@@ -281,9 +287,6 @@ where
         }
     };
 
-    // Leader-only health-monitor state, shared (not a channel) between
-    // ingestion (marks) and housekeeping (seeds/reads) — see `crate::liveness`.
-    let liveness = NodeLiveness::new();
     // Its ADR 0039 twin: heartbeat `used` readings, peeled off by ingestion
     // and read by the usage-history task, the `/metrics` gather, and the API's
     // usage reads. Same shape, same leader-only lifetime, same reason it is a
@@ -361,6 +364,11 @@ where
     });
     tracing::debug!("runtime: agent session server up");
 
+    // One hop, two directions: the ADR 0038 write forwarder and the ADR 0040
+    // liveness read ride the same channel with the same machine identity, so
+    // they are one object attached twice rather than two.
+    let forwarder =
+        crate::clientwrite::AdminForwarder::new(node_handle.clone(), Arc::clone(&machine_tls));
     let control_plane = Arc::new(
         CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
             .with_derived(queue_window, fanout.clone())
@@ -371,10 +379,14 @@ where
             // leader over the admin channel instead of coming back as a
             // redirect (ADR 0038) — the same hop, and the same machine
             // identity, the `/enroll` proxy below uses.
-            .with_forwarder(crate::clientwrite::AdminForwarder::new(
-                node_handle.clone(),
-                Arc::clone(&machine_tls),
-            ))
+            .with_forwarder(
+                Arc::clone(&forwarder) as Arc<dyn crate::tasks::api_server::LeaderWrites>
+            )
+            // The same hop in the read direction: node health is derived from
+            // the leader's in-memory marks, so a replica that does not lead
+            // fetches them instead of answering `unknown` for every node
+            // (ADR 0040).
+            .with_leader_reads(forwarder as Arc<dyn crate::tasks::api_server::LeaderReads>)
             .with_failpoints(failpoints),
     );
     // `POST /api/v1/enroll` (ADR 0037 §4). Captured by the router directly,

@@ -92,6 +92,12 @@ pub struct BootedCoordinator {
     /// This daemon's published phase (ADR 0037 §1/§9): what `/readyz`,
     /// `ProbeCluster`, and the admin socket answer from.
     phase: Arc<PhaseState>,
+    /// The node-liveness map the mounted admin service will serve
+    /// `FetchNodeLiveness` from (ADR 0040), handed on to the task runtime that
+    /// fills it. Carried rather than constructed there so the two halves cannot
+    /// drift onto separate maps — a runtime with its own would leave every
+    /// follower's node health `unknown`, which is the bug ADR 0040 fixes.
+    pub liveness: crate::NodeLiveness,
 }
 
 impl BootedCoordinator {
@@ -258,6 +264,11 @@ pub async fn run_with(
         resolved.config.data_dir.clone(),
         tls.clone(),
         resolved.config.token_kdf.kdf(),
+        // Created here rather than inside the task runtime: `FetchNodeLiveness`
+        // (ADR 0040) serves this very map to replicas that do not lead, so the
+        // admin service and the runtime must share one handle. It travels on
+        // out of `assemble` for the runtime to fill.
+        crate::NodeLiveness::new(),
     );
 
     let (started, tls_store) = match startup {
@@ -385,6 +396,7 @@ pub async fn run_with(
         raft_server,
         file_registration,
         phase: _,
+        liveness,
     } = assemble(
         &resolved.config,
         tls_store,
@@ -487,6 +499,8 @@ pub async fn run_with(
         // without arming any other's (ADR 0023's revocation race). Always
         // disarmed in a release build — the section cannot load there.
         resolved.config.failpoints(),
+        // The map the admin service mounted above already serves (ADR 0040).
+        liveness,
         Some(shutdown_rx),
     )
     .await?;
@@ -586,6 +600,11 @@ pub async fn serve_runtime(
     readyz: ReadyzEndpoint,
     history: HistorySink,
     auth: coppice_authn::AuthMode,
+    // The node-liveness map from `BootedCoordinator::liveness` — the same one
+    // the mounted admin service serves `FetchNodeLiveness` from (ADR 0040).
+    // There is no default: a freshly constructed map would compile, serve every
+    // follower's node health as `unknown`, and say nothing about why.
+    liveness: crate::NodeLiveness,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     serve_runtime_with_serving_sans(
@@ -612,6 +631,7 @@ pub async fn serve_runtime(
         // what every release build gets, since `[test_failpoints]` cannot load
         // there at all.
         crate::failpoints::Failpoints::default(),
+        liveness,
         shutdown,
     )
     .await
@@ -651,6 +671,7 @@ pub async fn serve_runtime_with_serving_sans(
     housekeeping_interval: std::time::Duration,
     auth: coppice_authn::AuthMode,
     failpoints: crate::failpoints::Failpoints,
+    liveness: crate::NodeLiveness,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     crate::runtime::run(
@@ -671,6 +692,7 @@ pub async fn serve_runtime_with_serving_sans(
         housekeeping_interval,
         auth,
         failpoints,
+        liveness,
         shutdown,
     )
     .await
@@ -1024,6 +1046,9 @@ fn assemble(
         handle.clone(),
         Arc::clone(&tls_store),
     );
+    // Taken before the service is moved onto the tonic router below: the task
+    // runtime fills this map and the mounted service serves it (ADR 0040).
+    let liveness = admin_service.liveness();
 
     // The replica-local log-fetch client (ADR 0034): dials agents' NodeService
     // listeners with this node's leaf as the client identity and the cluster CA
@@ -1061,6 +1086,7 @@ fn assemble(
 
     Ok(BootedCoordinator {
         cluster_id: cfg.cluster_id,
+        liveness,
         consensus,
         views,
         event_tap,
@@ -1163,6 +1189,7 @@ async fn start_directly(
         resolved.config.data_dir.clone(),
         Some(Arc::clone(&tls_store)),
         resolved.config.token_kdf.kdf(),
+        crate::NodeLiveness::new(),
     );
 
     assemble(

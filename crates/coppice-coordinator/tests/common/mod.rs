@@ -752,6 +752,9 @@ log_level = "warn"
             node_log_client,
             raft_server_shutdown,
             raft_server,
+            // The map the mounted admin service serves `FetchNodeLiveness`
+            // from (ADR 0040); the runtime below fills it.
+            liveness,
             ..
         } = booted;
 
@@ -805,6 +808,7 @@ log_level = "warn"
             // section, and this harness hand-assembles its replica rather
             // than going through `run_with`.
             coppice_coordinator::failpoints::Failpoints::default(),
+            liveness,
             Some(shutdown_rx),
         ));
 
