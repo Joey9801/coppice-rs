@@ -110,6 +110,14 @@ pub use tasks::housekeeping::HistorySink;
 // embedder that only wants to shorten it for a test still needs to be able to
 // say what "unshortened" is.
 pub use limits::HOUSEKEEPING_INTERVAL;
+// The node-liveness map (ADR 0009), named in `bootstrap::serve_runtime*` and
+// carried on `bootstrap::BootedCoordinator` for one reason: since ADR 0040 the
+// admin service serves these marks to replicas that do not lead, so the map
+// the boot path hands that service and the map the task runtime fills must be
+// the same one. An embedder assembling the runtime itself therefore has to be
+// able to name it — and gets it from the `BootedCoordinator` rather than
+// constructing one, which is what keeps the two halves paired.
+pub use liveness::NodeLiveness;
 
 #[cfg(test)]
 mod test_support;

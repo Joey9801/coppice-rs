@@ -272,6 +272,16 @@ pub struct LivenessMark {
     pub silent_for: std::time::Duration,
 }
 
+/// Every node the leader of the current term is tracking, ascending by id —
+/// the leader's liveness marks (ADR 0009's health monitor input) as the node
+/// read model derives health from them.
+///
+/// A node absent from the map is a node there is nothing to judge by, which
+/// reads as `unknown` and never as `lost`: an empty map is the honest answer of
+/// a replica that could not reach the leader, and calling a fleet lost on the
+/// strength of a failed fetch would page somebody.
+pub type LivenessMarks = std::collections::BTreeMap<coppice_core::id::NodeId, LivenessMark>;
+
 /// One event with the identity and stamp of ADR 0032's shared timeline
 /// shape: ordered and deduplicated by `(index, ordinal)`, rendered at the
 /// advisory `at`.

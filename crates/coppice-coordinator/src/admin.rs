@@ -351,6 +351,16 @@ struct AdminInner<C: Consensus> {
     /// The argon2id cost minted token secrets are hashed at (`[token_kdf]`,
     /// ADR 0037 §5). Node-local: only the PHC string is replicated.
     token_kdf: pki::TokenKdf,
+    /// This daemon's node-liveness map (ADR 0009) — the same handle ingestion
+    /// marks and housekeeping seeds, shared here so `FetchNodeLiveness` can
+    /// serve it to a replica that does not lead (ADR 0040).
+    ///
+    /// Not behind a lock or an `Option`, unlike `seam` and `tls`: the map is
+    /// created once per daemon and outlives every leadership term, and what it
+    /// holds is already term-scoped (`crate::liveness`). A replica that is not
+    /// the leader of the term it names gets an empty snapshot from the map
+    /// itself, which is why this needs no gating of its own.
+    liveness: crate::liveness::NodeLiveness,
 }
 
 /// The consensus-backed half of [`AdminService`], present only once formed.
@@ -373,6 +383,7 @@ impl<C: Consensus> AdminService<C> {
         data_dir: PathBuf,
         tls: Option<Arc<TlsStore>>,
         token_kdf: pki::TokenKdf,
+        liveness: crate::liveness::NodeLiveness,
     ) -> Self {
         AdminService {
             inner: Arc::new(AdminInner {
@@ -381,8 +392,15 @@ impl<C: Consensus> AdminService<C> {
                 data_dir,
                 tls: RwLock::new(tls),
                 token_kdf,
+                liveness,
             }),
         }
+    }
+
+    /// This daemon's node-liveness handle, so the boot path can hand the very
+    /// same map to the task runtime that fills it (`runtime::run`).
+    pub(crate) fn liveness(&self) -> crate::liveness::NodeLiveness {
+        self.inner.liveness.clone()
     }
 
     /// Attach the consensus seam once the cluster is formed. Called exactly
@@ -1705,6 +1723,56 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         let outcome = api_server::update_authorization_here(consensus.as_ref(), &dto, &actor).await;
         Ok(Response::new(pb::ForwardUpdateAuthorizationResponse {
             outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
+        }))
+    }
+
+    /// The leader-side half of a replica's liveness read (ADR 0040).
+    ///
+    /// The same gates the forwarded writes pass — coordinator machine or
+    /// operator (ADR 0037 §7), a formed cluster, a matching history stamp —
+    /// and then one more that is the whole substance of the verb: this replica
+    /// must actually be the leader of a term, and it answers with the marks of
+    /// *that* term.
+    ///
+    /// Not the leader is an **outcome**, not a status: one hop is the rule, so
+    /// the asking replica serves health `unknown` rather than chasing whoever
+    /// leads now. The term gate lives in the map (`crate::liveness`), so a
+    /// replica re-elected moments ago answers with an empty set of marks
+    /// rather than the previous term's — and empty-but-leading is a real
+    /// answer here, distinct from `NotLeader`, which is why the response is a
+    /// oneof and not a bare list.
+    async fn fetch_node_liveness(
+        &self,
+        request: Request<pb::FetchNodeLivenessRequest>,
+    ) -> Result<Response<pb::FetchNodeLivenessResponse>, Status> {
+        use pb::fetch_node_liveness_response::{Marks, NotLeader, Outcome};
+
+        self.require_operator_or_machine(&request, "FetchNodeLiveness")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        let term = match consensus.status().borrow().role {
+            coppice_consensus::Role::Leader { term } => Some(term),
+            _ => None,
+        };
+        let outcome = match term {
+            // `Instant::now()` is read here, on the leader, and the span is
+            // encoded — so nothing about a health verdict depends on the
+            // asking replica's clock.
+            Some(term) => Outcome::Marks(Marks {
+                nodes: self
+                    .inner
+                    .liveness
+                    .snapshot(term, std::time::Instant::now())
+                    .iter()
+                    .map(|(node, mark)| crate::clientwrite::mark_to_pb(*node, mark))
+                    .collect(),
+            }),
+            None => Outcome::NotLeader(NotLeader {}),
+        };
+        Ok(Response::new(pb::FetchNodeLivenessResponse {
+            outcome: Some(outcome),
         }))
     }
 }
