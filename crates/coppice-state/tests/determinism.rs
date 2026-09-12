@@ -305,6 +305,7 @@ fn pki_facts_survive_snapshot_roundtrip() {
                 coppice_state::CaCertBundle::parse(params.self_signed(&key).unwrap().pem()).unwrap()
             },
             staged_root_serial: None,
+            external_anchor_serials: Vec::new(),
             recorded_at: base_ts(),
         }),
         // Stage a re-root: the recorded bundle now carries a pending root at
@@ -313,6 +314,7 @@ fn pki_facts_survive_snapshot_roundtrip() {
         Command::RecordCaCertificate(RecordCaCertificate {
             bundle: staged_bundle,
             staged_root_serial: Some(staged_serial.clone()),
+            external_anchor_serials: Vec::new(),
             recorded_at: ts(TS_US + 1_500_000),
         }),
         Command::RecordStagedKeyTransferIntent(RecordStagedKeyTransferIntent {

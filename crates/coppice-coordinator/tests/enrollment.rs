@@ -847,6 +847,7 @@ async fn a_revoked_leader_refuses_to_renew_itself_locally() {
             bundle: CaCertBundle::parse(std::str::from_utf8(&ca.cert_pem).unwrap())
                 .expect("the minted CA parses"),
             staged_root_serial: None,
+            external_anchor_serials: Vec::new(),
             recorded_at: Timestamp::now(),
         }))
         .await

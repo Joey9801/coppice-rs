@@ -181,6 +181,18 @@ pub async fn run_with(
     } else {
         None
     };
+    // Under external provenance the machine identity is the leaf's, not a fresh
+    // mint (issue #127). Settle it here, before anything reads or binds it: a
+    // daemon that joins by convergence never reaches formation's copy of this
+    // call, and a daemon whose leaf carries the wrong subject — or an identity
+    // this installation does not already go by — must fail-stop at startup
+    // rather than discover it at the first authenticated RPC.
+    if resolved.config.tls_source() == TlsSource::External {
+        let store = tls
+            .as_ref()
+            .expect("external provenance always loads a store above");
+        formation::adopt_external_machine_identity(&resolved.config.data_dir, store)?;
+    }
     // Reload task (mtime poll; SIGHUP only in the daemon proper): spawned as
     // soon as a store exists — immediately, or after formation mints one.
     let daemon_owned = shutdown.is_none();

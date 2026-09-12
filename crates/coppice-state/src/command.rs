@@ -414,6 +414,15 @@ pub struct RecordCaCertificate {
     /// completed rotation, or the ACTIVATION commit that promotes a previously
     /// staged root to position 0.
     pub staged_root_serial: Option<String>,
+    /// The roots of `bundle` an **operator** provisioned, by lowercase-hex
+    /// serial (issue #127). Each must be a certificate of `bundle` at a
+    /// position other than 0, or apply rejects the command.
+    ///
+    /// There is no carry-forward: every command states its own set, and a
+    /// rotation command states none. That is sound because rotation is refused
+    /// outright while the recorded set is non-empty, so formation under `[tls]
+    /// source = "external"` is the only thing that ever writes a non-empty one.
+    pub external_anchor_serials: Vec<String>,
     pub recorded_at: Timestamp,
 }
 
@@ -658,6 +667,7 @@ mod tests {
         let ca = Command::RecordCaCertificate(RecordCaCertificate {
             bundle: CaCertBundle::parse(ca_pem).unwrap(),
             staged_root_serial: None,
+            external_anchor_serials: Vec::new(),
             recorded_at: ts(21),
         });
         assert_eq!(ca.stamped_at(), ts(21));

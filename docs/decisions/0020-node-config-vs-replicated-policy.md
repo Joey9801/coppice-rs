@@ -151,6 +151,16 @@ the offending key):
   source), no renewal, no trust-anchor adoption at re-rooting, no leaf
   install at formation.
 
+*(Amended 2026-09-12, alongside the formation coherence fix recorded in
+ADR 0037: under `"external"` the leaf's subject also carries the node's
+identity — a coordinator leaf's `CN` must be its `machine-<uuid>` id and
+an agent leaf's `CN` its `node-<uuid>` id, with SANs for the advertised
+host and server-plus-client EKUs — because the daemon has no other way to
+learn an id it did not mint itself: it verifies its own leaf against
+`ca_path` at first start and adopts the id the `CN` names, fail-stopping
+if the leaf's profile is wrong or if it disagrees with an identity
+already persisted to the data directory.)*
+
 **Consequences.** The data directory gains a fixed `pki/` layout for the
 common case, which retires the `/etc/coppice/pki` `ReadWritePaths=`
 exception in the systemd units (`ProtectSystem=strict` now covers

@@ -227,6 +227,24 @@ p_cost = 1          # parallelism lanes
 #   writes them: no enrollment (`[enrollment]` present is a startup
 #   error), no renewal, no trust-anchor adoption at re-rooting, no leaf
 #   install at `coordinator init`. Rotation is the external issuer's job.
+#
+#   The leaf's subject carries this node's identity, because under this
+#   source nothing else can: a coordinator leaf needs `OU=coppice-coordinator`
+#   and a `CN` equal to a `machine-<uuid>` id the operator chooses; an agent
+#   leaf needs no `OU` and a `CN` equal to a `node-<uuid>` id; both need
+#   SANs covering the daemon's advertised host, and both need server and
+#   client EKUs (the mTLS plane uses each leaf in both directions). On
+#   first start the daemon verifies its own leaf against `ca_path`,
+#   classifies it, and adopts the id its `CN` names — persisted to the
+#   data directory (`machine-identity` for a coordinator, `node-identity`
+#   for an agent) — rather than self-minting one, because an operator
+#   cannot provision a matching leaf for an id the daemon has not minted
+#   yet. A leaf that doesn't classify as the right profile, or whose id
+#   disagrees with an identity already on disk, is a startup fail-stop
+#   (the disagreement case prints both ids). See "External PKI" in
+#   docs/operations/security.md for the trust-bundle story: the CA
+#   bundle formation records under this source, and what a fleet mixing
+#   external and cluster-enrolled machines needs to add to it.
 source = "cluster"
 
 [client_tls]

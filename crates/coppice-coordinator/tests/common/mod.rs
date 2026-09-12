@@ -919,6 +919,10 @@ pub struct Daemon {
     /// `[tls]` material with cluster-minted material, so a client that dialed
     /// with this CA before `init` must re-dial with the cluster's afterwards.
     ca_pem: Vec<u8>,
+    /// Where this daemon's `[tls]` material actually lives — under the data
+    /// directory for a cluster-sourced fixture, in a sibling `external/`
+    /// directory for one built by [`Daemon::new_external`] (issue #127).
+    tls_paths: TlsPaths,
     client_port: u16,
     raft_port: u16,
     agent_port: u16,
@@ -993,7 +997,68 @@ impl Daemon {
             let leaf = ca.leaf();
             write_cluster_material(&root.join("data"), &ca.pem, &leaf.cert_pem, &leaf.key_pem);
         }
+        let tls_paths = TlsPaths::cluster_managed(&root.join("data"));
+        Daemon::assemble(
+            cluster_id,
+            ca.pem.clone(),
+            tls_paths,
+            // Cluster-managed (issue #127): material lives under <data_dir>/pki,
+            // which `Daemon::new` seeds and `Daemon::new_certless` deliberately
+            // leaves empty for formation (or enrollment) to fill.
+            "source = \"cluster\"".to_string(),
+            dir,
+        )
+    }
 
+    /// A daemon whose `[tls]` material is **operator-provisioned** (issue #127):
+    /// `source = "external"`, three files in a sibling directory the daemon
+    /// never writes, and a coordinator leaf whose CN is `machine` — which is
+    /// the identity this daemon must then form or join under, because under
+    /// external provenance the leaf is the authority for identity, not a fresh
+    /// mint.
+    ///
+    /// The leaf's SANs are `localhost` / `127.0.0.1`, matching the fixture's
+    /// `advertise_host = "localhost"`. Never call `set_enrollment` on one of
+    /// these: enrollment writes machine material, and config load refuses the
+    /// combination.
+    pub fn new_external(cluster_id: ClusterId, ca: &Ca, machine: &MachineId) -> Daemon {
+        Daemon::external_with_leaf(cluster_id, ca, ca.coordinator_leaf(machine))
+    }
+
+    /// [`Daemon::new_external`] with a caller-chosen leaf, for the cases whose
+    /// whole subject is a leaf the daemon must refuse.
+    pub fn external_with_leaf(cluster_id: ClusterId, ca: &Ca, leaf: Leaf) -> Daemon {
+        let dir = tempfile::tempdir().expect("create daemon tempdir");
+        let external = dir.path().join("external");
+        std::fs::create_dir_all(&external).expect("create external pki dir");
+        let tls_paths = TlsPaths {
+            cert: external.join("node.crt"),
+            key: external.join("node.key"),
+            ca: external.join("ca.crt"),
+        };
+        std::fs::write(&tls_paths.cert, &leaf.cert_pem).expect("write external cert");
+        std::fs::write(&tls_paths.key, &leaf.key_pem).expect("write external key");
+        std::fs::write(&tls_paths.ca, &ca.pem).expect("write external ca");
+        let tls_block = format!(
+            "source = \"external\"\n\
+             cert_path = \"{cert}\"\n\
+             key_path = \"{key}\"\n\
+             ca_path = \"{ca_path}\"",
+            cert = tls_paths.cert.display(),
+            key = tls_paths.key.display(),
+            ca_path = tls_paths.ca.display(),
+        );
+        Daemon::assemble(cluster_id, ca.pem.clone(), tls_paths, tls_block, dir)
+    }
+
+    fn assemble(
+        cluster_id: ClusterId,
+        ca_pem: Vec<u8>,
+        tls_paths: TlsPaths,
+        tls_block: String,
+        dir: TempDir,
+    ) -> Daemon {
+        let root = dir.path();
         let client_port = free_port();
         let raft_port = free_port();
         let agent_port = free_port();
@@ -1057,10 +1122,7 @@ t_cost = 1
 p_cost = 1
 
 [tls]
-# Cluster-managed (issue #127): material lives under <data_dir>/pki, which
-# `Daemon::new` seeds and `Daemon::new_certless` deliberately leaves empty for
-# formation (or enrollment) to fill.
-source = "cluster"
+{tls_block}
 
 [client_tls]
 # Plain HTTP on the client listener (ADR 0037 §4: the posture is always
@@ -1087,7 +1149,8 @@ log_level = "warn"
             cluster_id,
             dir,
             config_path,
-            ca_pem: ca.pem.clone(),
+            ca_pem,
+            tls_paths,
             client_port,
             raft_port,
             agent_port,
@@ -1505,7 +1568,11 @@ log_level = "warn"
     /// For tests whose subject is not enrollment: the daemon's first
     /// convergence round finds a usable leaf and goes straight to probing.
     pub fn install_tls_material(&self, ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) {
-        write_cluster_material(&self.data_dir(), ca_pem, cert_pem, key_pem);
+        let paths = self.tls_paths();
+        std::fs::create_dir_all(paths.cert.parent().expect("tls dir")).expect("create tls dir");
+        std::fs::write(&paths.ca, ca_pem).expect("write ca");
+        std::fs::write(&paths.cert, cert_pem).expect("write cert");
+        std::fs::write(&paths.key, key_pem).expect("write key");
     }
 
     /// The `[tls]` paths this daemon serves from: a certless daemon's
@@ -1513,11 +1580,11 @@ log_level = "warn"
     /// The cluster-managed `[tls]` layout under this daemon's data directory
     /// (issue #127), for tests that watch the files appear or seed them.
     pub fn tls_paths(&self) -> TlsPaths {
-        TlsPaths::cluster_managed(&self.data_dir())
+        self.tls_paths.clone()
     }
 
     pub fn tls_material(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let paths = TlsPaths::cluster_managed(&self.data_dir());
+        let paths = self.tls_paths();
         (
             std::fs::read(&paths.ca).expect("read cluster ca"),
             std::fs::read(&paths.cert).expect("read node cert"),

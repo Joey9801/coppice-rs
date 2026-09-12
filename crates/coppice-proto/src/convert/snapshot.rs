@@ -190,6 +190,7 @@ impl From<&CaCertificate> for pbcore::CaCertificate {
         pbcore::CaCertificate {
             cert_pem: ca.bundle.pem().to_string(),
             recorded_at_us: ca.recorded_at.as_micros(),
+            external_anchor_serials: ca.external_anchor_serials.clone(),
         }
     }
 }
@@ -206,6 +207,7 @@ impl TryFrom<pbcore::CaCertificate> for CaCertificate {
                 reason: "not a sequence of X.509 CA certificate PEM blocks",
             })?,
             recorded_at: timestamp(ca.recorded_at_us, "CaCertificate.recorded_at_us")?,
+            external_anchor_serials: ca.external_anchor_serials,
         })
     }
 }

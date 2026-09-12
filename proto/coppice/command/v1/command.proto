@@ -319,6 +319,12 @@ message RecordCaCertificate {
   // rotation, or the ACTIVATION commit that promotes a previously staged
   // root to position 0.
   optional string staged_root_serial = 3;
+  // The roots of `cert_pem` an operator provisioned, by lowercase-hex serial
+  // (issue #127/#140) — see `coppice.core.v1.CaCertificate`. Apply rejects a
+  // serial that is not a certificate of `cert_pem` at a position other than 0.
+  // Every command states its own set: there is no carry-forward, and formation
+  // under `[tls] source = "external"` is the only writer of a non-empty one.
+  repeated string external_anchor_serials = 4;
 }
 
 // Bind a coordinator machine identity to a raft seat (ADR 0037 §7). One

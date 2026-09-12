@@ -840,6 +840,28 @@ What stays honest about this procedure:
   leaf lifetime is the only bound that is true without observing anything
   — which is why `--force` exists and why using it means verifying
   turnover by hand.
+- **Re-rooting is a cluster-CA operation; it does not carry
+  operator-provisioned roots.** Under `[tls] source = "external"`
+  formation records the operator's `ca_path` roots next to the cluster
+  root, tagged as `external_anchor_serials` on the CA record, so
+  externally issued leaves authenticate ([security.md](security.md)).
+  `begin` composes the staged bundle from the outgoing cluster root alone
+  and `complete` records the single active root, so a re-root would drop
+  those operator roots from the record and every externally issued
+  coordinator, agent and operator leaf would stop authenticating at the
+  application layer from `begin` onward. The refusal keys on that
+  replicated `external_anchor_serials` set, not on any one node's own
+  `[tls] source` — so it fires on **every** coordinator of a cluster
+  whose recorded bundle carries operator-provisioned anchors, including
+  a cluster-managed coordinator (`source = "cluster"`) that has joined
+  and become leader of a cluster an operator founded externally. While
+  that set is non-empty, `rotate-ca begin` and `rotate-ca complete` are
+  **refused** on any coordinator, and `rotate-ca status` reports the
+  operation as unsupported rather than as a rotation in progress and
+  lists the anchors by serial. Rotate an external issuer's root through
+  that issuer. Teaching a re-root to carry the operator's anchors
+  through, rather than refuse, is
+  [issue #140](https://github.com/Joey9801/coppice-rs/issues/140).
 - **A rotation does not shrink the root-equivalent set.** The same disks
   hold the new key. If the compromise was a disk you are keeping,
   re-rooting buys you nothing until that disk is gone; remove the voter

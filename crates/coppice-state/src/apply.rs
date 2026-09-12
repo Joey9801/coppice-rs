@@ -1118,6 +1118,20 @@ impl StateMachine {
         // runbook): the new bundle wholly supersedes the old.
         let serials = c.bundle.serials();
 
+        // Operator-provisioned anchors must actually be roots of this bundle,
+        // and never the active one: position 0 is the cluster's own signing
+        // root, whose key this cluster holds (issue #127). A named serial that
+        // is neither is a proposer bug, and this set gates re-rooting — so it
+        // is checked here, where the answer is deterministic on every replica,
+        // rather than trusted from whoever proposed it.
+        for serial in &c.external_anchor_serials {
+            if !serials.iter().skip(1).any(|s| s == serial) {
+                return Err(RejectionReason::UnknownExternalAnchor {
+                    serial: serial.clone(),
+                });
+            }
+        }
+
         match &c.staged_root_serial {
             Some(serial) => {
                 // The named serial must sit at a position other than 0: a
@@ -1185,9 +1199,13 @@ impl StateMachine {
             }
         }
 
+        // No carry-forward: the recorded set is whatever this command states.
+        // A rotation states none, and rotation is refused while the recorded
+        // set is non-empty, so the only writer of a non-empty set is formation.
         self.ca = Some(CaCertificate {
             bundle: c.bundle.clone(),
             recorded_at: c.recorded_at,
+            external_anchor_serials: c.external_anchor_serials.clone(),
         });
         Ok(Applied::default())
     }

@@ -380,6 +380,18 @@ pub struct CaCertificate {
     /// Validated public certificate material (never a private key).
     pub bundle: CaCertBundle,
     pub recorded_at: Timestamp,
+    /// The roots of [`bundle`](Self::bundle) an **operator** provisioned, by
+    /// lowercase-hex serial — the anchors formation copied out of `[tls]
+    /// ca_path` under `source = "external"` so externally issued leaves
+    /// authenticate against replicated state (issue #127). Never position 0.
+    /// Empty means every root here was minted by this cluster.
+    ///
+    /// Re-rooting rebuilds the bundle from cluster roots alone, so it would
+    /// drop exactly these; keeping the set here — rather than reading each
+    /// coordinator's own `[tls] source` — is what makes the `rotate-ca`
+    /// refusal a cluster fact that every replica reaches the same answer on
+    /// (issue #140).
+    pub external_anchor_serials: Vec<String>,
 }
 
 /// The pending root of a staged re-root, and the disks that durably hold its
@@ -767,6 +779,12 @@ pub enum RejectionReason {
          a staged root is never the active signing root (ADR 0037 §4)"
     )]
     UnknownStagedRoot { serial: String },
+    #[error(
+        "no certificate at a non-active position of the recorded bundle carries serial {serial}, \
+         so it cannot be an operator-provisioned trust anchor; the cluster's own signing root is \
+         always position 0 (issue #127)"
+    )]
+    UnknownExternalAnchor { serial: String },
     #[error(
         "staged-root scope mismatch: this cluster stages {expected:?} but the command names \
          {got} (ADR 0037 §4)"

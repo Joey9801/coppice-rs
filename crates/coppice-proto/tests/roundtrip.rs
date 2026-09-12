@@ -257,6 +257,7 @@ fn every_command() -> Vec<Command> {
                 coppice_state::CaCertBundle::parse(params.self_signed(&key).unwrap().pem()).unwrap()
             },
             staged_root_serial: None,
+            external_anchor_serials: Vec::new(),
             recorded_at: ts(),
         }),
         // A staged re-root: the recorded bundle carries the still-active old
@@ -279,6 +280,28 @@ fn every_command() -> Vec<Command> {
             Command::RecordCaCertificate(RecordCaCertificate {
                 bundle,
                 staged_root_serial: Some(staged_serial),
+                external_anchor_serials: Vec::new(),
+                recorded_at: ts(),
+            })
+        },
+        // An externally founded cluster: the cluster's own root at position 0
+        // and the operator's root behind it, named as a provisioned anchor
+        // (issue #127) — the replicated fact `rotate-ca` refuses on.
+        {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let mut pems = Vec::new();
+            for _ in 0..2 {
+                let key = KeyPair::generate().unwrap();
+                let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+                params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                pems.push(params.self_signed(&key).unwrap().pem());
+            }
+            let bundle = coppice_state::CaCertBundle::parse(pems.concat()).unwrap();
+            let anchor = bundle.serials()[1].clone();
+            Command::RecordCaCertificate(RecordCaCertificate {
+                bundle,
+                staged_root_serial: None,
+                external_anchor_serials: vec![anchor],
                 recorded_at: ts(),
             })
         },
@@ -502,6 +525,7 @@ fn ca_bundle_carrying_key_material_is_rejected_at_the_boundary() {
                 pb::command::v1::RecordCaCertificate {
                     cert_pem: cert_pem.clone(),
                     staged_root_serial: None,
+                    external_anchor_serials: Vec::new(),
                     recorded_at_us: ts().as_micros(),
                 },
             )),
@@ -829,5 +853,46 @@ fn resources_encode_canonically() {
             pb::core::v1::ResourceKind::CpuMillis as i32,
             pb::core::v1::ResourceKind::DiskBytes as i32,
         ]
+    );
+}
+
+/// The snapshot is the other door into replicated state, and the anchor set
+/// gates re-rooting — so a replica rebuilt from a snapshot must reach the same
+/// `rotate-ca` answer as one that replayed the log (issue #127).
+#[test]
+fn external_anchor_serials_survive_the_snapshot_record_roundtrip() {
+    use coppice_proto::convert::{state_from_records, state_to_records};
+
+    let bundle = {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let mut pems = Vec::new();
+        for _ in 0..2 {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            pems.push(params.self_signed(&key).unwrap().pem());
+        }
+        coppice_state::CaCertBundle::parse(pems.concat()).unwrap()
+    };
+    let anchor = bundle.serials()[1].clone();
+
+    let mut state = coppice_state::StateMachine::default();
+    state
+        .apply(&Command::RecordCaCertificate(RecordCaCertificate {
+            bundle,
+            staged_root_serial: None,
+            external_anchor_serials: vec![anchor.clone()],
+            recorded_at: ts(),
+        }))
+        .expect("recording an externally founded bundle is accepted");
+
+    let rebuilt = state_from_records(state_to_records(&state)).expect("records rebuild");
+    assert_eq!(
+        rebuilt
+            .ca
+            .as_ref()
+            .expect("the rebuilt state records a CA")
+            .external_anchor_serials,
+        vec![anchor]
     );
 }

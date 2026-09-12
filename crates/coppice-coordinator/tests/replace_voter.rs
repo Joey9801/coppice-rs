@@ -358,6 +358,7 @@ async fn replace_voter_refuses_a_new_that_is_still_catching_up() {
                 )
                 .expect("the fixture CA parses"),
                 staged_root_serial: None,
+                external_anchor_serials: Vec::new(),
                 recorded_at: Timestamp::now(),
             },
         ))

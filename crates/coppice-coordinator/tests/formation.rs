@@ -20,11 +20,15 @@ use std::time::Duration;
 use coppice_consensus::fs::RealFs;
 use coppice_consensus::storage::{self, StorageOptions};
 use coppice_consensus::{NodeOptions, StartIntent};
+use coppice_coordinator::admin;
 use coppice_coordinator::localadmin::{AdminCall, AdminReply, OperatorPem};
-use coppice_core::id::ClusterId;
+use coppice_coordinator::rotate::RotationPhase;
+use coppice_core::id::{ClusterId, MachineId};
 use coppice_core::time::Timestamp;
+use coppice_proto::pb::core::v1 as pbcore;
+use coppice_proto::pb::raft::v1 as pb;
 
-use common::{Ca, Daemon, Fleet};
+use common::{poll, Ca, Daemon, Fleet};
 
 /// A bootstrap policy that seeds one quota entity — the cheapest thing whose
 /// arrival in replicated state is observable through the client API, so
@@ -1145,4 +1149,469 @@ async fn a_leader_that_loses_quorum_stops_reporting_ready() {
     );
 
     fleet.stop_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// External provenance (issue #127): the operator owns the leaf, so the cluster
+// has to make its own authority of record agree with it.
+// ---------------------------------------------------------------------------
+
+/// How many CA certificates a PEM bundle carries.
+fn cert_blocks(pem: &str) -> usize {
+    pem.matches("-----BEGIN CERTIFICATE-----").count()
+}
+
+/// A daemon whose `[tls]` material is provisioned out of band forms under the
+/// machine identity its own leaf names — not a fresh mint no operator could
+/// have certified in advance — and the bundle the cluster records carries the
+/// operator's root beside its own, so that leaf authenticates against
+/// replicated state and not merely through the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_externally_provisioned_coordinator_forms_under_the_identity_its_leaf_names() {
+    let ca = Ca::new();
+    let machine = MachineId::new();
+    let mut daemon = Daemon::new_external(ClusterId::new(), &ca, &machine);
+    let provisioned = daemon.tls_material();
+    daemon.start();
+    daemon.await_phase("waiting").await;
+
+    let reply = daemon.admin(plain_init()).await;
+    let AdminReply::Formed {
+        machine_id,
+        operator,
+        ..
+    } = reply
+    else {
+        panic!("expected the cluster to form, got {reply:?}");
+    };
+    assert_eq!(
+        machine_id,
+        machine.to_string(),
+        "formation must adopt the identity the provisioned leaf's CN names"
+    );
+    daemon.await_phase("voter").await;
+
+    // The day-0 credential carries the whole trust-anchor set, because the
+    // surface it is about to dial serves an operator-issued leaf.
+    assert_eq!(
+        cert_blocks(&operator.ca_pem),
+        2,
+        "the recorded bundle is the cluster root plus the operator's: {}",
+        operator.ca_pem
+    );
+    let operator_root = String::from_utf8(ca.pem.clone()).expect("fixture CA is UTF-8");
+    assert!(
+        operator.ca_pem.contains(operator_root.trim()),
+        "the operator's own root must be one of the recorded anchors"
+    );
+
+    // Read the binding back off replicated state, dialling with the operator's
+    // OWN material — which is the proof that `AdminService::caller` classifies
+    // a caller against the recorded bundle: this leaf chains to the operator's
+    // root, which is an anchor only because formation recorded it.
+    //
+    // (The day-0 credential above cannot be used for this. It is signed by the
+    // cluster root, and the listener's client-auth anchors are the operator's
+    // `ca_path` — which the daemon never writes into. Distributing the cluster
+    // root into that bundle is the operator obligation the security doc spells
+    // out, and it cannot be discharged before `init` has minted the root.)
+    let (ext_ca, ext_cert, ext_key) = daemon.tls_material();
+    let probe = daemon
+        .probe(&ext_ca, &ext_cert, &ext_key)
+        .await
+        .expect("probe the formed cluster with operator-issued material");
+    let seat = probe.node_id.expect("a formed voter reports its seat");
+    let mut client = admin::admin_channel(&daemon.raft_target(), &ext_ca, &ext_cert, &ext_key)
+        .await
+        .expect("dial the admin surface of an externally leafed daemon");
+    let status = client
+        .cluster_status(pb::ClusterStatusRequest {
+            history_id: probe.history_id.clone(),
+        })
+        .await
+        .expect("read cluster status")
+        .into_inner();
+    let binding = status
+        .bindings
+        .iter()
+        .find(|b| b.node_id == seat)
+        .expect("formation bound the forming voter's machine identity");
+    assert_eq!(binding.machine_id, machine.to_string());
+
+    // And nothing at all was written where the operator's material lives.
+    assert_eq!(
+        daemon.tls_material(),
+        provisioned,
+        "formation must leave operator-provisioned material byte-identical"
+    );
+    assert!(
+        !daemon.data_dir().join(coppice_tls::PKI_DIR).exists(),
+        "a daemon under external provenance never creates <data_dir>/pki"
+    );
+
+    daemon.stop().await.expect("formed daemon stops cleanly");
+}
+
+/// An externally provisioned peer joins an externally formed cluster with no
+/// `[enrollment]` anywhere: its leaf already authenticates against the recorded
+/// bundle, and the identity it is admitted under is the one that leaf names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_externally_provisioned_peer_joins_an_externally_formed_cluster_without_enrolling() {
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let leader_machine = MachineId::new();
+    let member_machine = MachineId::new();
+
+    let mut leader = Daemon::new_external(cluster_id, &ca, &leader_machine);
+    leader.set_cluster_size(2);
+    leader.start();
+    leader.await_phase("waiting").await;
+    let reply = leader.admin(plain_init()).await;
+    assert!(
+        matches!(reply, AdminReply::Formed { .. }),
+        "expected the cluster to form, got {reply:?}"
+    );
+    leader.await_phase("voter").await;
+
+    let mut member = Daemon::new_external(cluster_id, &ca, &member_machine);
+    member.set_cluster_size(2);
+    member.set_static_discovery(&[leader.raft_target()]);
+    member.start();
+    let body = member.await_phase("voter").await;
+    assert_eq!(body["voters"].as_array().expect("voters").len(), 2);
+
+    // The member adopted its leaf's identity on its own first start, before it
+    // ever spoke to the leader.
+    let stored = std::fs::read_to_string(
+        member
+            .data_dir()
+            .join(coppice_tls::pki::MACHINE_IDENTITY_FILE),
+    )
+    .expect("the member persisted a machine identity");
+    assert_eq!(stored.trim(), member_machine.to_string());
+
+    // Both identities are bound, and the leader's dial-back verified the
+    // member's externally issued leaf to get there. The read itself goes over
+    // the member's own operator-issued leaf, which the leader can only classify
+    // because formation recorded the operator's root as a trust anchor.
+    let (ext_ca, ext_cert, ext_key) = member.tls_material();
+    let probe = leader
+        .probe(&ext_ca, &ext_cert, &ext_key)
+        .await
+        .expect("probe the formed cluster");
+    let mut client = admin::admin_channel(&leader.raft_target(), &ext_ca, &ext_cert, &ext_key)
+        .await
+        .expect("dial the leader's admin surface");
+    let status = client
+        .cluster_status(pb::ClusterStatusRequest {
+            history_id: probe.history_id.clone(),
+        })
+        .await
+        .expect("read cluster status")
+        .into_inner();
+    let bound: Vec<&str> = status
+        .bindings
+        .iter()
+        .map(|b| b.machine_id.as_str())
+        .collect();
+    assert!(
+        bound.contains(&leader_machine.to_string().as_str())
+            && bound.contains(&member_machine.to_string().as_str()),
+        "both externally named identities must be bound, got {bound:?}"
+    );
+
+    member.stop().await.expect("member stops cleanly");
+    leader.stop().await.expect("leader stops cleanly");
+}
+
+/// A leaf that does not classify as a coordinator machine identity is a
+/// startup fail-stop: there is no id to adopt, and minting one would produce a
+/// daemon that can handshake and nothing else.
+#[tokio::test]
+async fn external_formation_refuses_a_leaf_without_the_coordinator_profile() {
+    let ca = Ca::new();
+    // `Ca::leaf` mints CN=coppice-test-node with no OU — an agent-shaped
+    // subject whose CN is not even a node id.
+    let mut daemon = Daemon::external_with_leaf(ClusterId::new(), &ca, ca.leaf());
+    daemon.start();
+
+    let err = daemon
+        .await_exit(Duration::from_secs(30))
+        .await
+        .expect_err("a daemon whose leaf names no machine identity must fail-stop");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains(coppice_tls::pki::COORDINATOR_OU),
+        "the error must state the subject an external issuer has to produce: {text}"
+    );
+}
+
+/// A leaf that names a different machine identity than the one this
+/// installation already goes by is a fail-stop naming both — adopting the new
+/// one would hand the installation a second identity while its seat, binding
+/// and key custody still name the first.
+#[tokio::test]
+async fn an_external_leaf_that_disagrees_with_the_stored_machine_identity_is_refused() {
+    let ca = Ca::new();
+    let leaf_machine = MachineId::new();
+    let stored_machine = MachineId::new();
+    let mut daemon = Daemon::new_external(ClusterId::new(), &ca, &leaf_machine);
+
+    let data_dir = daemon.data_dir();
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+    coppice_tls::pki::persist_machine_identity(&data_dir, &stored_machine)
+        .expect("seed a machine identity this installation already goes by");
+
+    daemon.start();
+    let err = daemon
+        .await_exit(Duration::from_secs(30))
+        .await
+        .expect_err("a leaf that contradicts the stored identity must fail-stop");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains(&stored_machine.to_string()) && text.contains(&leaf_machine.to_string()),
+        "the error must print both identities: {text}"
+    );
+}
+
+/// Re-rooting is refused outright on an externally provisioned coordinator
+/// (issue #140). Formation records the operator's roots beside the cluster
+/// root, and the rotation verbs read a multi-root bundle as a rotation in
+/// flight: without this gate `status` would report one in progress the
+/// moment the cluster formed, `begin` would report it already activated, and
+/// `complete --force` would keep position 0 alone — dropping every external
+/// anchor and failing every externally issued certificate at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotate_ca_is_refused_on_an_externally_provisioned_coordinator() {
+    let ca = Ca::new();
+    let machine = MachineId::new();
+    let mut daemon = Daemon::new_external(ClusterId::new(), &ca, &machine);
+    daemon.start();
+    daemon.await_phase("waiting").await;
+    let reply = daemon.admin(plain_init()).await;
+    assert!(matches!(reply, AdminReply::Formed { .. }), "{reply:?}");
+    daemon.await_phase("voter").await;
+
+    // The bundle really is multi-rooted — that is the state the gate exists
+    // for — and status must not read it as a rotation.
+    let reply = daemon.admin(AdminCall::RotateCaStatus).await;
+    let AdminReply::RotationStatus { status } = reply else {
+        panic!("expected a rotation status, got {reply:?}");
+    };
+    assert_eq!(status.roots.len(), 2, "{status:?}");
+    assert_eq!(status.phase, RotationPhase::Unsupported, "{status:?}");
+    assert!(!status.rotation_in_progress, "{status:?}");
+    assert!(status.earliest_complete_us.is_none(), "{status:?}");
+    // The refusal's cause is a replicated fact, and status names it: the one
+    // root of this bundle the operator provisioned, not "this host's config".
+    assert_eq!(
+        status.external_anchor_serials,
+        vec![status.roots[1].serial.clone()],
+        "{status:?}"
+    );
+
+    for (call, verb) in [
+        (AdminCall::RotateCaBegin, "begin"),
+        (AdminCall::RotateCaComplete { force: true }, "complete"),
+    ] {
+        let reply = daemon.admin(call).await;
+        let AdminReply::Error { message } = reply else {
+            panic!("expected rotate-ca {verb} to be refused, got {reply:?}");
+        };
+        assert!(
+            message.contains("operator-provisioned") && message.contains("#140"),
+            "rotate-ca {verb} refusal should name the anchors and the issue: {message}"
+        );
+    }
+
+    // Refusal is a no-op: the recorded bundle still carries both roots.
+    let reply = daemon.admin(AdminCall::RotateCaStatus).await;
+    let AdminReply::RotationStatus { status } = reply else {
+        panic!("expected a rotation status, got {reply:?}");
+    };
+    assert_eq!(status.roots.len(), 2, "{status:?}");
+
+    let _ = daemon.stop().await;
+}
+
+/// The refusal is a property of the **cluster**, not of the host an operator
+/// happens to be standing on.
+///
+/// A mixed fleet is supported: an externally provisioned founder, then
+/// cluster-enrolled coordinators joining it. Leadership moves freely between
+/// them, and a cluster-managed leader reads `[tls] source = "cluster"` on its
+/// own disk — so gating re-rooting on local config would have let exactly this
+/// leader rebuild the bundle from cluster roots alone and drop every anchor
+/// the founder recorded, failing every externally issued certificate at once.
+/// The anchors are replicated, so every coordinator refuses, followers
+/// included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn rotate_ca_is_refused_on_a_cluster_managed_leader_of_an_externally_founded_cluster() {
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let machine = MachineId::new();
+
+    // --- The founder: operator-provisioned material, so formation records the
+    // --- operator's root beside the cluster root it mints.
+    let mut founder = Daemon::new_external(cluster_id, &ca, &machine);
+    founder.set_cluster_size(3);
+    founder.start();
+    founder.await_phase("waiting").await;
+    let AdminReply::Formed { operator, .. } = founder.admin(plain_init()).await else {
+        panic!("expected the externally provisioned founder to form");
+    };
+    founder.await_phase("voter").await;
+
+    // --- The documented operator step for a mixed fleet, performed before
+    // --- anything dials: the founder's `ca_path` bundle must also carry the
+    // --- cluster root, which the daemon never writes into it. The recorded
+    // --- (combined) bundle is exactly that bundle, and `init` just handed it
+    // --- over as the day-0 credential's anchors. Without this the founder's
+    // --- listener would not trust a cluster-issued leaf — neither the
+    // --- operator credential about to mint the token, nor the joiners'.
+    let (_, founder_cert, founder_key) = founder.tls_material();
+    founder.install_tls_material(operator.ca_pem.as_bytes(), &founder_cert, &founder_key);
+    // The store re-reads its files on an mtime poll (2 s), so wait for the
+    // daemon to actually be serving under the combined bundle rather than
+    // racing it.
+    poll(
+        Duration::from_secs(15),
+        "the founder to pick up the recorded bundle as its own anchors",
+        || async {
+            let AdminReply::RotationStatus { status } =
+                founder.admin(AdminCall::RotateCaStatus).await
+            else {
+                return false;
+            };
+            status.installed_matches_replicated
+        },
+    )
+    .await;
+
+    // --- The fleet-wide artifact: one coordinator enrollment token.
+    let token = {
+        let (op_ca, op_cert, op_key) = operator_identity(&operator);
+        let mut client = admin::admin_channel(&founder.raft_target(), &op_ca, &op_cert, &op_key)
+            .await
+            .expect("dial the founder's admin surface with the day-0 credential");
+        let history_id = client
+            .probe_cluster(pb::ProbeClusterRequest {
+                cluster_id: String::new(),
+            })
+            .await
+            .expect("probe")
+            .into_inner()
+            .history_id;
+        client
+            .mint_enroll_token(pb::MintEnrollTokenRequest {
+                history_id,
+                role: pbcore::EnrollRole::Coordinator as i32,
+                label: "coordinators".to_string(),
+                ttl_seconds: None,
+            })
+            .await
+            .expect("mint a coordinator enrollment token")
+            .into_inner()
+            .secret
+    };
+
+    // --- Two cluster-managed joiners. They enroll for cluster-issued leaves
+    // --- and receive the recorded (combined) bundle as their `ca.crt`, so they
+    // --- trust the founder's externally issued leaf; the founder trusts theirs
+    // --- because of the step above.
+    let mut joiners = Vec::new();
+    for _ in 0..2 {
+        let joiner = Daemon::new_certless(cluster_id, &ca);
+        joiner.set_cluster_size(3);
+        joiner.set_static_discovery(&[founder.raft_target()]);
+        joiner.set_enrollment(&founder.api(""), &token);
+        joiners.push(joiner);
+    }
+    for joiner in &mut joiners {
+        joiner.start();
+    }
+    for joiner in &joiners {
+        joiner.await_phase("voter").await;
+    }
+
+    // --- Hand leadership to a cluster-managed coordinator by taking the
+    // --- externally provisioned one away.
+    founder.stop().await.expect("the founder stops cleanly");
+
+    // Which joiner leads is observed, never assumed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let leader_idx = loop {
+        let mut found = None;
+        for (i, joiner) in joiners.iter().enumerate() {
+            if joiner.readyz().await.1["is_leader"] == true {
+                found = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = found {
+            break i;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no cluster-managed joiner took leadership of the externally founded cluster"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let follower_idx = 1 - leader_idx;
+
+    // This leader is a `new_certless` daemon: its `[tls] source` is "cluster"
+    // by construction, and its own material was minted by this cluster. Its
+    // local config knows nothing about the operator's anchors — replicated
+    // state is the only place they exist.
+    let AdminReply::RotationStatus { status } =
+        joiners[leader_idx].admin(AdminCall::RotateCaStatus).await
+    else {
+        panic!("expected a rotation status from the cluster-managed leader");
+    };
+    assert_eq!(status.roots.len(), 2, "{status:?}");
+    assert_eq!(status.phase, RotationPhase::Unsupported, "{status:?}");
+    assert!(!status.rotation_in_progress, "{status:?}");
+    assert_eq!(
+        status.external_anchor_serials,
+        vec![status.roots[1].serial.clone()],
+        "the leader reads the founder's anchors out of replicated state: {status:?}"
+    );
+
+    for (call, verb) in [
+        (AdminCall::RotateCaBegin, "begin"),
+        (AdminCall::RotateCaComplete { force: true }, "complete"),
+    ] {
+        let reply = joiners[leader_idx].admin(call).await;
+        let AdminReply::Error { message } = reply else {
+            panic!("expected rotate-ca {verb} to be refused on the leader, got {reply:?}");
+        };
+        assert!(
+            message.contains("operator-provisioned") && message.contains("#140"),
+            "rotate-ca {verb} refusal should name the anchors and the issue: {message}"
+        );
+    }
+
+    // The refusal is a no-op: the anchors are still recorded.
+    let AdminReply::RotationStatus { status } =
+        joiners[leader_idx].admin(AdminCall::RotateCaStatus).await
+    else {
+        panic!("expected a rotation status from the cluster-managed leader");
+    };
+    assert_eq!(status.roots.len(), 2, "{status:?}");
+
+    // And on a follower it is the *same* refusal, not "you are not the
+    // leader": the gate runs before the leader check, so an operator walking
+    // the fleet gets the real answer wherever they ask.
+    let reply = joiners[follower_idx].admin(AdminCall::RotateCaBegin).await;
+    let AdminReply::Error { message } = reply else {
+        panic!("expected rotate-ca begin to be refused on the follower, got {reply:?}");
+    };
+    assert!(
+        message.contains("operator-provisioned") && message.contains("#140"),
+        "a follower must give the replicated refusal, not the not-leader one: {message}"
+    );
+
+    for joiner in &mut joiners {
+        let _ = joiner.stop().await;
+    }
 }

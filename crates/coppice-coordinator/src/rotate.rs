@@ -246,6 +246,17 @@ pub enum RotationPhase {
     /// The incoming root is active and this daemon signs under it. `complete`
     /// is what remains, once its clock gate allows.
     CompleteEligible,
+    /// The recorded bundle carries operator-provisioned trust anchors
+    /// ([`RotationStatus::external_anchor_serials`]), under which re-rooting
+    /// is not supported (issue #140). They were recorded beside the cluster
+    /// root at formation, by a coordinator running `[tls] source =
+    /// "external"`, so externally issued leaves authenticate — **not** a
+    /// rotation in flight, whatever the root count says. `begin` and
+    /// `complete` refuse rather than rebuild the bundle without them.
+    ///
+    /// A replicated fact, so this is the phase every coordinator of such a
+    /// cluster reports, including cluster-managed ones.
+    Unsupported,
 }
 
 /// One root certificate in the recorded bundle, as an operator sees it.
@@ -288,6 +299,11 @@ pub struct RotationStatus {
     pub recorded_at_us: i64,
     /// True while the recorded bundle holds more than one root.
     pub rotation_in_progress: bool,
+    /// The recorded bundle's **operator-provisioned** roots, by lowercase-hex
+    /// serial (issue #127). Non-empty means re-rooting is refused on every
+    /// coordinator of this cluster: a re-root rebuilds the bundle from cluster
+    /// roots alone, and these are anchors the cluster cannot re-mint.
+    pub external_anchor_serials: Vec<String>,
     /// The pending root's serial, while one is staged.
     pub staged_root_serial: Option<String>,
     /// Whether this daemon's on-disk `[tls] ca_path` bundle is the one the
@@ -472,14 +488,76 @@ impl<C: Consensus> RotationContext<'_, C> {
         }
     }
 
+    /// The operator-provisioned trust anchors the cluster records, by serial
+    /// — empty on a wholly cluster-minted bundle, and empty too on a cluster
+    /// that records no CA at all.
+    fn external_anchors(&self) -> Vec<String> {
+        self.consensus
+            .views()
+            .latest()
+            .state()
+            .ca
+            .as_ref()
+            .map(|ca| ca.external_anchor_serials.clone())
+            .unwrap_or_default()
+    }
+
+    /// The refusal every rotation verb shares once the cluster records
+    /// operator-provisioned anchors (issue #140). The rotation code reads
+    /// "more than one root" as "a rotation is in flight", but those extra
+    /// roots are the operator's anchors that formation recorded so their
+    /// leaves authenticate — `begin` would report a rotation already activated
+    /// and `complete` would keep position 0 alone, dropping every one of them
+    /// and failing every externally issued certificate at once.
+    ///
+    /// Keyed on the **replicated** set, never on this daemon's own `[tls]
+    /// source`. A fleet may legitimately mix provenances — an externally
+    /// provisioned founder with cluster-enrolled coordinators joining it — and
+    /// leadership moves between them. Reading the local config would have made
+    /// the refusal a property of whichever host the operator happened to be
+    /// standing on: a cluster-managed coordinator that had become leader would
+    /// have re-rooted the externally founded cluster and dropped every anchor
+    /// the founder recorded. Whether the anchors exist is a cluster fact, so
+    /// every replica reaches the same answer, followers included.
+    fn refuse_if_external_anchors(&self, verb: &str) -> Result<()> {
+        let anchors = self.external_anchors();
+        if !anchors.is_empty() {
+            bail!(
+                "rotate-ca {verb} is not supported on this cluster: its recorded CA bundle \
+                 carries {n} operator-provisioned trust anchor(s) beside the cluster root \
+                 ({serials}). They are a replicated cluster fact, written at formation by a \
+                 coordinator running [tls] source = \"external\", and a re-root rebuilds the \
+                 bundle from cluster roots alone — so it would drop them and fail every \
+                 externally issued certificate at once (issue #140). This refusal holds on \
+                 every coordinator of this cluster, whatever its own [tls] source says. \
+                 Rotate the external issuer's root through that issuer instead; \
+                 `rotate-ca status` lists the anchors.",
+                n = anchors.len(),
+                serials = anchors.join(", "),
+            );
+        }
+        Ok(())
+    }
+
     /// Assemble the operator-facing status document.
     fn status(&self) -> Result<RotationStatus> {
         let (pem, recorded_at, staged) = self.recorded_ca()?;
         let roots = describe_roots(pem.as_bytes(), staged.as_ref())?;
-        let rotation_in_progress = roots.len() > 1;
         let summary = self.handle.cluster_summary();
         let view = self.consensus.views().latest();
         let state = view.state();
+        // Once the cluster records operator-provisioned anchors the root count
+        // says nothing about a rotation (see `refuse_if_external_anchors`):
+        // report the operation as unsupported rather than as an in-progress
+        // rotation an operator could be tempted to `complete`. A replicated
+        // fact, so a follower and a leader of any provenance agree.
+        let external_anchor_serials = state
+            .ca
+            .as_ref()
+            .map(|ca| ca.external_anchor_serials.clone())
+            .unwrap_or_default();
+        let unsupported = !external_anchor_serials.is_empty();
+        let rotation_in_progress = roots.len() > 1 && !unsupported;
 
         let installed = self.tls.current();
         let installed_matches_replicated =
@@ -506,6 +584,7 @@ impl<C: Consensus> RotationContext<'_, C> {
         };
 
         let phase = match (&staged, roots.len()) {
+            _ if unsupported => RotationPhase::Unsupported,
             (_, 0 | 1) => RotationPhase::None,
             (Some(s), _) if s.holders.len() <= 1 => RotationPhase::Staged,
             (Some(_), _) => RotationPhase::Distributing,
@@ -524,6 +603,7 @@ impl<C: Consensus> RotationContext<'_, C> {
             roots,
             recorded_at_us: recorded_at.as_micros(),
             rotation_in_progress,
+            external_anchor_serials,
             staged_root_serial: staged.as_ref().map(|s| s.serial.clone()),
             installed_matches_replicated,
             leaf_under_active_root,
@@ -595,6 +675,7 @@ pub(crate) fn status<C: Consensus>(ctx: &RotationContext<'_, C>) -> Result<Rotat
 /// operator's mental model is "run `begin` until it says activated", not
 /// "reason about which half happened".
 pub(crate) async fn begin<C: Consensus>(ctx: &RotationContext<'_, C>) -> Result<BeginReport> {
+    ctx.refuse_if_external_anchors("begin")?;
     ctx.require_leader()?;
     let (current_pem, _, staged) = ctx.recorded_ca()?;
     let current_roots = describe_roots(current_pem.as_bytes(), staged.as_ref())?;
@@ -799,6 +880,10 @@ async fn mint_and_stage<C: Consensus>(
             Command::RecordCaCertificate(RecordCaCertificate {
                 bundle,
                 staged_root_serial: Some(serial.clone()),
+                // A rotation never states operator anchors: it is refused
+                // outright while the cluster records any (issue #140), so this
+                // is only ever reached on a wholly cluster-minted bundle.
+                external_anchor_serials: Vec::new(),
                 recorded_at: Timestamp::now(),
             }),
             "recording the staged dual-root CA bundle",
@@ -895,6 +980,7 @@ async fn activate<C: Consensus>(
             Command::RecordCaCertificate(RecordCaCertificate {
                 bundle,
                 staged_root_serial: None,
+                external_anchor_serials: Vec::new(),
                 recorded_at: Timestamp::now(),
             }),
             "recording the activated CA bundle",
@@ -1327,6 +1413,7 @@ pub(crate) async fn complete<C: Consensus>(
     ctx: &RotationContext<'_, C>,
     force: bool,
 ) -> Result<CompleteReport> {
+    ctx.refuse_if_external_anchors("complete")?;
     ctx.require_leader()?;
     let (current_pem, recorded_at, staged) = ctx.recorded_ca()?;
     let roots = describe_roots(current_pem.as_bytes(), staged.as_ref())?;
@@ -1395,6 +1482,7 @@ pub(crate) async fn complete<C: Consensus>(
             Command::RecordCaCertificate(RecordCaCertificate {
                 bundle,
                 staged_root_serial: None,
+                external_anchor_serials: Vec::new(),
                 recorded_at: Timestamp::now(),
             }),
             "recording the completed single-root CA bundle",

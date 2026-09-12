@@ -743,6 +743,7 @@ impl From<&RecordCaCertificate> for pb::RecordCaCertificate {
         pb::RecordCaCertificate {
             cert_pem: c.bundle.pem().to_string(),
             staged_root_serial: c.staged_root_serial.clone(),
+            external_anchor_serials: c.external_anchor_serials.clone(),
             recorded_at_us: c.recorded_at.as_micros(),
         }
     }
@@ -761,6 +762,9 @@ impl TryFrom<pb::RecordCaCertificate> for RecordCaCertificate {
             })?,
             // An empty/absent staged_root_serial decodes as `None`.
             staged_root_serial: c.staged_root_serial.filter(|s| !s.is_empty()),
+            // A bare `repeated`: empty on the wire genuinely means "every root
+            // here is cluster-minted", so absence and emptiness coincide.
+            external_anchor_serials: c.external_anchor_serials,
             recorded_at: timestamp(c.recorded_at_us, "RecordCaCertificate.recorded_at_us")?,
         })
     }

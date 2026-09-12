@@ -893,9 +893,23 @@ fn render_rotation(s: &rotate::RotationStatus) -> String {
                 "ACTIVE, PENDING LOCAL SWAP — the incoming root signs, but not on this host yet",
             rotate::RotationPhase::CompleteEligible =>
                 "ACTIVE (dual trust) — ready for `rotate-ca complete` once its clock allows",
+            rotate::RotationPhase::Unsupported =>
+                "UNSUPPORTED — the recorded bundle carries operator-provisioned anchors; they \
+                 are not a rotation, and re-rooting would drop them (issue #140)",
         }
     );
     let _ = writeln!(out, "recorded at   {} (unix us)", s.recorded_at_us);
+    // A replicated fact about the CLUSTER, not about this host's `[tls]
+    // source`: these are the roots `rotate-ca` refuses to drop, on every
+    // coordinator, so name them where the refusal is explained.
+    if !s.external_anchor_serials.is_empty() {
+        let _ = writeln!(
+            out,
+            "operator anchors  {} (serial {})",
+            s.external_anchor_serials.len(),
+            s.external_anchor_serials.join(", ")
+        );
+    }
     for root in &s.roots {
         let _ = writeln!(
             out,

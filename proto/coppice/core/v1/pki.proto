@@ -17,6 +17,17 @@ import "coppice/core/v1/ids.proto";
 message CaCertificate {
   string cert_pem = 1;
   int64 recorded_at_us = 2;
+  // Lowercase-hex serials of the roots in `cert_pem` that an OPERATOR
+  // provisioned — the trust anchors formation recorded from `[tls] ca_path`
+  // under `source = "external"` (issue #127/#140). Never position 0: the
+  // cluster's own signing root is always the active one. Empty means every
+  // root here was minted by this cluster.
+  //
+  // This is the replicated fact the rotation verbs gate on: a re-root rebuilds
+  // the bundle from cluster roots alone, so it would silently drop these, and
+  // whether it must refuse is a property of the CLUSTER, not of whichever
+  // coordinator the operator happens to be standing on.
+  repeated string external_anchor_serials = 3;
 }
 
 // The role an enrollment token grants (ADR 0037 §5). Closed set with the

@@ -1676,6 +1676,7 @@ mod idempotency_tests {
                 bundle: coppice_state::CaCertBundle::parse(cert.pem())
                     .expect("a real CA cert PEM is a valid bundle"),
                 recorded_at: coppice_core::time::Timestamp::now(),
+                external_anchor_serials: Vec::new(),
             });
             *index += 1;
             publisher.publish_now(state, *index);

@@ -209,18 +209,16 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     let metrics_handle = install_metrics_recorder()?;
 
     // The data directory comes first now: the node identity lives in it, and
-    // everything downstream — enrollment's claim, the journal's fencing
-    // watermark, the session's registration — is issued *for* that identity
-    // (deployment-story A1). Minted on a fresh installation, read back on every
-    // later boot, and a hard error on a directory that holds a journal but no
-    // identity file.
+    // everything downstream — enrollment's claim (under cluster provenance),
+    // the journal's fencing watermark, the session's registration — is issued
+    // *for* that identity (deployment-story A1).
     //
     // The directory's singleton `LOCK` is taken *before* any of that: an
     // accidental overlapping start (a service manager plus a manual
-    // invocation) must lose here, not after both processes have minted
-    // different identities and enrolled a certificate for the wrong one. The
-    // guard's ownership moves into the journal below and lives as long as it
-    // does.
+    // invocation) must lose here, not after both processes have settled on
+    // different identities and enrolled (or adopted) a certificate for the
+    // wrong one. The guard's ownership moves into the journal below and lives
+    // as long as it does.
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
     let fs = RealFs::new(config.data_dir.clone());
@@ -230,19 +228,39 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
             config.data_dir.display()
         )
     })?;
-    let node = identity::load_or_mint_node_identity(&config.data_dir)?;
 
-    // Obtain the machine-plane leaf before anything tries to load it (ADR 0037
-    // §4/§8), for the identity just settled. A no-op when `[enrollment]` is
-    // absent, and a no-op when a usable leaf is already installed — so this is
-    // safe on every restart, not just the first boot.
-    ensure_enrolled(&config, node).await?;
+    // The order the identity and the leaf settle in depends on `[tls]
+    // source` (issue #127): under cluster provenance the identity is minted
+    // (or read back) first and a leaf is issued *for* it by enrollment; under
+    // external provenance there is no issuer to ask, so the leaf comes first
+    // and the identity is adopted from it — the coordinator's agent gateway
+    // requires the leaf's CN to equal the claimed NodeId, so an id minted
+    // ahead of a fixed, operator-provisioned leaf could simply never
+    // authenticate (see `identity::adopt_external_node_identity`).
+    let (node, tls_store) = match config.tls_source() {
+        config::TlsSource::External => {
+            let tls_store = load_tls_store(&config)?;
+            let node = identity::adopt_external_node_identity(&config.data_dir, &tls_store)?;
+            (node, tls_store)
+        }
+        config::TlsSource::Cluster => {
+            let node = identity::load_or_mint_node_identity(&config.data_dir)?;
+            // Obtain the machine-plane leaf before anything tries to load it
+            // (ADR 0037 §4/§8), for the identity just settled. A no-op when
+            // `[enrollment]` is absent, and a no-op when a usable leaf is
+            // already installed — so this is safe on every restart, not just
+            // the first boot.
+            ensure_enrolled(&config, node).await?;
+            // Load the shared hot-reload TLS store (fail-fast on missing or
+            // unparseable material, ADR 0011).
+            let tls_store = load_tls_store(&config)?;
+            (node, tls_store)
+        }
+    };
 
-    // Load the shared hot-reload TLS store up front (fail-fast on missing or
-    // unparseable material, ADR 0011) and drive reloads from an mtime poll plus
-    // SIGHUP. Shared by the NodeService listener and the session client, so one
-    // rotation on disk re-arms both (ADR 0037 §4).
-    let tls_store = load_tls_store(&config)?;
+    // Drive reloads from an mtime poll plus SIGHUP. Shared by the NodeService
+    // listener and the session client, so one rotation on disk re-arms both
+    // (ADR 0037 §4).
     let _tls_reload = coppice_tls::spawn_reload_task(
         Arc::clone(&tls_store),
         coppice_tls::ReloadOptions {

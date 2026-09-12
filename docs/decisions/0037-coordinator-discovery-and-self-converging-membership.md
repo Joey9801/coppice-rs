@@ -950,6 +950,25 @@ no renewal, no trust-anchor adoption at re-rooting — which is what §4
 always intended by "substitution, not a requirement" but previously left
 to be inferred.
 
+*(Amended again 2026-09-12, closing a coherence gap in the above: under
+`"external"`, `coordinator init` mints the cluster root CA as before but
+now records it as the first entry of a replicated CA bundle followed by
+every CA in the operator's `ca_path` — since machine-facing
+authentication classifies peers against that replicated bundle, not
+against anything on disk — and, since an operator cannot provision a
+leaf for an id the daemon has not minted yet, every externally leafed
+coordinator or agent now adopts its `MachineId`/`NodeId` from its own
+leaf's `CN` on first start instead of self-minting one.)*
+
+*(Amended again 2026-09-13: the operator-provisioned entries of that
+bundle are now named explicitly, as an `external_anchor_serials` field
+on the CA record rather than inferred from position, and `rotate-ca
+begin`/`complete` refuse on every coordinator — regardless of that
+node's own `[tls] source` — whenever the field is non-empty, closing the
+gap where a `source = "cluster"` coordinator leading an externally
+founded cluster would otherwise re-root and silently drop the operator's
+anchors.)*
+
 **Consequences.** The fixed cluster-managed layout retires the
 `/etc/coppice/pki` `ReadWritePaths=` exception from the systemd units
 (`ProtectSystem=strict` needs no carve-out for `/etc/coppice` any more).

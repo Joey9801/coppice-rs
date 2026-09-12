@@ -48,6 +48,7 @@ fn record_ca(bundle: &CaCertBundle) -> Command {
     Command::RecordCaCertificate(RecordCaCertificate {
         bundle: bundle.clone(),
         staged_root_serial: None,
+        external_anchor_serials: Vec::new(),
         recorded_at: base_ts(),
     })
 }
@@ -60,6 +61,7 @@ fn record_ca_at(
     Command::RecordCaCertificate(RecordCaCertificate {
         bundle: bundle.clone(),
         staged_root_serial,
+        external_anchor_serials: Vec::new(),
         recorded_at: at,
     })
 }
@@ -772,6 +774,96 @@ fn stage_commit_naming_a_serial_absent_from_the_bundle_is_rejected() {
             serial: "deadbeef".into(),
         }
     );
+}
+
+/// Operator-provisioned anchors are the replicated fact `rotate-ca` refuses
+/// on (issue #127/#140), so apply names them off the bundle it is given.
+fn record_ca_with_anchors(bundle: &CaCertBundle, anchors: Vec<String>) -> Command {
+    Command::RecordCaCertificate(RecordCaCertificate {
+        bundle: bundle.clone(),
+        staged_root_serial: None,
+        external_anchor_serials: anchors,
+        recorded_at: base_ts(),
+    })
+}
+
+#[test]
+fn recording_external_anchors_stores_them_on_the_ca_record() {
+    let mut sm = StateMachine::default();
+    // The shape an external formation records: the cluster's own root at
+    // position 0, the operator's root behind it.
+    let (bundle, operator_serial) = staged_bundle("cluster", "operator");
+    apply_ok(
+        &mut sm,
+        record_ca_with_anchors(&bundle, vec![operator_serial.clone()]),
+    );
+    assert_eq!(
+        sm.ca
+            .as_ref()
+            .expect("a CA was recorded")
+            .external_anchor_serials,
+        vec![operator_serial]
+    );
+}
+
+#[test]
+fn an_external_anchor_at_the_active_position_is_rejected() {
+    let mut sm = StateMachine::default();
+    let (bundle, _operator_serial) = staged_bundle("cluster", "operator");
+    // Position 0 is the cluster's own signing root — whose key this cluster
+    // holds — so it can never be an operator-provisioned anchor.
+    let active_serial = bundle.serials()[0].clone();
+    let err = sm
+        .apply(&record_ca_with_anchors(
+            &bundle,
+            vec![active_serial.clone()],
+        ))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        RejectionReason::UnknownExternalAnchor {
+            serial: active_serial,
+        }
+    );
+    assert!(sm.ca.is_none(), "a rejected command has no effects");
+}
+
+#[test]
+fn an_external_anchor_absent_from_the_bundle_is_rejected() {
+    let mut sm = StateMachine::default();
+    let (bundle, _operator_serial) = staged_bundle("cluster", "operator");
+    let err = sm
+        .apply(&record_ca_with_anchors(&bundle, vec!["deadbeef".into()]))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        RejectionReason::UnknownExternalAnchor {
+            serial: "deadbeef".into(),
+        }
+    );
+}
+
+/// No carry-forward: the recorded set is whatever the latest command states.
+/// Rotation is refused while it is non-empty, so nothing but formation ever
+/// writes a non-empty one — but the rule itself is unconditional, and this is
+/// what makes each command's payload the whole truth about the anchors.
+#[test]
+fn a_later_record_replaces_the_external_anchor_set_rather_than_merging() {
+    let mut sm = StateMachine::default();
+    let (bundle, operator_serial) = staged_bundle("cluster", "operator");
+    apply_ok(
+        &mut sm,
+        record_ca_with_anchors(&bundle, vec![operator_serial]),
+    );
+
+    let single = cert_bundle("cluster-only");
+    apply_ok(&mut sm, record_ca_with_anchors(&single, Vec::new()));
+    assert!(sm
+        .ca
+        .as_ref()
+        .expect("a CA was recorded")
+        .external_anchor_serials
+        .is_empty());
 }
 
 #[test]

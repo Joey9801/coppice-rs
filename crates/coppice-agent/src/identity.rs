@@ -29,6 +29,15 @@
 //! an identity. Sibling artifacts (`LOCK`, `telemetry/`, `image-cache.json`)
 //! are either created for a fresh boot too or absent on a node that never ran a
 //! job, so neither is a sound signal on its own.
+//!
+//! [`load_or_mint_node_identity`] is only the story under `[tls] source =
+//! "cluster"` (issue #127), where the identity is minted first and a leaf is
+//! later issued *for* it. Under `source = "external"` there is no issuer to
+//! ask, so [`adopt_external_node_identity`] runs the binding the other way:
+//! the operator-provisioned leaf already names a node id, the coordinator's
+//! agent gateway already requires the leaf's CN to equal the claimed
+//! [`NodeId`] (ADR 0037 §4), and minting a fresh random id here would simply
+//! never be able to authenticate.
 
 use std::path::Path;
 
@@ -113,6 +122,22 @@ pub fn load_or_mint_node_identity(data_dir: &Path) -> Result<NodeId> {
     }
 
     let id = NodeId::new();
+    persist_node_identity(data_dir, &id)?;
+    tracing::info!(
+        node_id = %id,
+        path = %data_dir.join(NODE_IDENTITY_FILE).display(),
+        "minted a fresh node identity"
+    );
+    Ok(id)
+}
+
+/// Durably write `id` to `<data_dir>/node-identity` (`tmp` + fsync + rename +
+/// directory fsync, ADR 0017). Shared by [`load_or_mint_node_identity`]'s
+/// mint path and [`adopt_external_node_identity`]'s adopt path — both need
+/// exactly the same durable write, just for an id that arrived by a different
+/// route (self-minted vs. read off a verified leaf).
+fn persist_node_identity(data_dir: &Path, id: &NodeId) -> Result<()> {
+    let fs = RealFs::new(data_dir);
     write_atomic(
         &fs,
         Path::new(NODE_IDENTITY_FILE),
@@ -124,13 +149,106 @@ pub fn load_or_mint_node_identity(data_dir: &Path) -> Result<NodeId> {
             "writing node identity {}",
             data_dir.join(NODE_IDENTITY_FILE).display()
         )
-    })?;
-    tracing::info!(
-        node_id = %id,
-        path = %data_dir.join(NODE_IDENTITY_FILE).display(),
-        "minted a fresh node identity"
-    );
-    Ok(id)
+    })
+}
+
+/// The agent's persistent [`NodeId`] under `[tls] source = "external"`
+/// (issue #127, ADR 0037 §4/§7): **adopted from the verified leaf**, never
+/// minted.
+///
+/// [`load_or_mint_node_identity`] mints a random id and only later has a
+/// certificate issued *for* it — that inversion is exactly what enrollment
+/// (deployment-story A2) wants, because the cluster is the one minting the
+/// leaf and can always be told which id to put in it. Under external
+/// provenance there is no such feedback loop: the leaf already exists,
+/// provisioned by whatever issued it out of band, and the coordinator's agent
+/// gateway authenticates a node by requiring the leaf's `CN` to equal its
+/// claimed [`NodeId`] (ADR 0037 §4). A self-minted id that happens to differ
+/// from the leaf's `CN` would simply never be able to log in, so on this path
+/// the leaf is the authority and the on-disk identity file follows it rather
+/// than the other way around.
+///
+/// Verifies the current material's leaf against its own CA bundle
+/// ([`coppice_tls::pki::verify_leaf`]) and requires it to classify as
+/// [`coppice_tls::pki::Profile::Agent`] — a coordinator or operator leaf
+/// pointed at an agent's `[tls]` paths is a misconfiguration, not a node id.
+/// Then reconciles the leaf's node id with `<data_dir>/node-identity`
+/// ([`load_node_identity`], never [`load_or_mint_node_identity`] — minting a
+/// random id on this path is exactly the bug this function exists to close):
+///
+/// * absent → persist the leaf's id durably and return it (first boot);
+/// * present and equal → return it (every later boot: idempotent);
+/// * present and different → a hard error naming both ids and both paths. The
+///   leaf is still authoritative for identity, but the stored id may be load-
+///   bearing for journal fencing or prior enrollment state, so this refuses
+///   rather than silently overwriting it — the operator must either reissue
+///   the leaf for the stored id, or start the node from a fresh data dir if
+///   the leaf's id is the one that should stick.
+///
+/// `data_dir` is created if missing, mirroring
+/// [`load_or_mint_node_identity`], so an agent pointed at a fresh path adopts
+/// without a separate setup step.
+pub fn adopt_external_node_identity(
+    data_dir: &Path,
+    tls: &coppice_tls::TlsStore,
+) -> Result<NodeId> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+
+    let cert_path = tls.paths().cert.display().to_string();
+    let subject_requirements =
+        "an external agent leaf must carry no OU, CN = the node id in `node-<uuid>` form \
+         (ADR 0024), and SANs covering the host this agent advertises under [listen] \
+         (ADR 0037 §4, issue #127)";
+
+    let material = tls.current();
+    let verified = coppice_tls::pki::verify_leaf(material.ca_pem(), material.cert_pem())
+        .with_context(|| {
+            format!(
+                "verifying the externally-provisioned agent leaf {cert_path} against its CA \
+                 bundle; {subject_requirements}"
+            )
+        })?;
+
+    let leaf_node = match verified.profile {
+        coppice_tls::pki::Profile::Agent(node) => node,
+        coppice_tls::pki::Profile::Coordinator(machine) => {
+            bail!(
+                "the externally-provisioned leaf {cert_path} classifies as a coordinator leaf \
+                 (OU=coppice-coordinator, CN={machine}), not an agent leaf; {subject_requirements}"
+            );
+        }
+        coppice_tls::pki::Profile::Operator { cn } => {
+            bail!(
+                "the externally-provisioned leaf {cert_path} classifies as an operator leaf \
+                 (OU=coppice-operators, CN={cn}), not an agent leaf; {subject_requirements}"
+            );
+        }
+    };
+
+    match load_node_identity(data_dir)? {
+        None => {
+            persist_node_identity(data_dir, &leaf_node)?;
+            tracing::info!(
+                node_id = %leaf_node,
+                path = %data_dir.join(NODE_IDENTITY_FILE).display(),
+                cert = %cert_path,
+                "adopted the node identity named by the externally-provisioned leaf"
+            );
+            Ok(leaf_node)
+        }
+        Some(stored) if stored == leaf_node => Ok(stored),
+        Some(stored) => {
+            bail!(
+                "the node identity stored at {identity_path} ({stored}) does not match the \
+                 node id named by the externally-provisioned leaf {cert_path} ({leaf_node}); \
+                 under [tls] source = \"external\" the leaf is authoritative for identity, so \
+                 either reissue the leaf for {stored} or start this node from a fresh data_dir \
+                 to adopt {leaf_node} (issue #127)",
+                identity_path = data_dir.join(NODE_IDENTITY_FILE).display(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +345,169 @@ mod tests {
         assert_eq!(
             load_or_mint_node_identity(dir.path()).expect("loads"),
             existing
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // adopt_external_node_identity
+    // -----------------------------------------------------------------
+
+    /// A throwaway root plus an agent leaf for `node`, written into `dir` as
+    /// `node.crt` / `node.key` / `ca.crt` and loaded into a [`TlsStore`] —
+    /// mirrors `crates/coppice-agent/tests/enrollment_config.rs`'s external
+    /// fixture, so `tls.paths().cert` is a real, meaningful path for the error
+    /// messages under test.
+    fn seed_agent_tls(
+        dir: &std::path::Path,
+        node: &NodeId,
+    ) -> std::sync::Arc<coppice_tls::TlsStore> {
+        let ca = coppice_tls::pki::mint_root_ca().expect("mint a throwaway root");
+        let signer =
+            coppice_tls::pki::CaSigner::load(&ca.cert_pem, &ca.key_pem).expect("load the signer");
+        let (cert, key) =
+            coppice_tls::pki::mint_agent_local(&signer, node, &["node-1.example.com".to_string()])
+                .expect("mint a throwaway leaf");
+        write_and_load_tls(dir, &ca.cert_pem, &cert, &key)
+    }
+
+    fn write_and_load_tls(
+        dir: &std::path::Path,
+        ca_pem: &[u8],
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> std::sync::Arc<coppice_tls::TlsStore> {
+        let paths = coppice_tls::TlsPaths {
+            cert: dir.join("node.crt"),
+            key: dir.join("node.key"),
+            ca: dir.join("ca.crt"),
+        };
+        std::fs::write(&paths.cert, cert_pem).expect("write cert");
+        std::fs::write(&paths.key, key_pem).expect("write key");
+        std::fs::write(&paths.ca, ca_pem).expect("write ca");
+        coppice_tls::TlsStore::load(paths).expect("load tls store")
+    }
+
+    #[test]
+    fn adopt_external_identity_absent_file_adopts_and_persists() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let tls_dir = tempfile::tempdir().expect("temp dir");
+        let node = NodeId::new();
+        let tls = seed_agent_tls(tls_dir.path(), &node);
+
+        let adopted = adopt_external_node_identity(data_dir.path(), &tls).expect("adopts");
+        assert_eq!(adopted, node);
+
+        let raw =
+            std::fs::read_to_string(data_dir.path().join(NODE_IDENTITY_FILE)).expect("persisted");
+        assert_eq!(raw.trim().parse::<NodeId>().expect("typed form"), node);
+    }
+
+    #[test]
+    fn adopt_external_identity_is_idempotent() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let tls_dir = tempfile::tempdir().expect("temp dir");
+        let node = NodeId::new();
+        let tls = seed_agent_tls(tls_dir.path(), &node);
+
+        let first = adopt_external_node_identity(data_dir.path(), &tls).expect("adopts");
+        let second = adopt_external_node_identity(data_dir.path(), &tls).expect("still ok");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn adopt_external_identity_mismatch_names_both_ids() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let tls_dir = tempfile::tempdir().expect("temp dir");
+        let leaf_node = NodeId::new();
+        let tls = seed_agent_tls(tls_dir.path(), &leaf_node);
+
+        let stored = NodeId::new();
+        std::fs::write(
+            data_dir.path().join(NODE_IDENTITY_FILE),
+            format!("{stored}\n"),
+        )
+        .expect("write");
+
+        let err = adopt_external_node_identity(data_dir.path(), &tls)
+            .expect_err("a mismatched stored id is fatal");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&stored.to_string()) && text.contains(&leaf_node.to_string()),
+            "the error names both ids: {text}"
+        );
+    }
+
+    #[test]
+    fn adopt_external_identity_rejects_a_coordinator_leaf() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let tls_dir = tempfile::tempdir().expect("temp dir");
+        let ca = coppice_tls::pki::mint_root_ca().expect("mint a throwaway root");
+        let signer =
+            coppice_tls::pki::CaSigner::load(&ca.cert_pem, &ca.key_pem).expect("load the signer");
+        let (cert, key) = coppice_tls::pki::mint_coordinator_local(
+            &signer,
+            &coppice_core::id::MachineId::new(),
+            &["coord-1.example.com".to_string()],
+        )
+        .expect("mint a throwaway coordinator leaf");
+        let tls = write_and_load_tls(tls_dir.path(), &ca.cert_pem, &cert, &key);
+
+        let err = adopt_external_node_identity(data_dir.path(), &tls)
+            .expect_err("a coordinator leaf is not an agent leaf");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("no OU") && text.contains("node id"),
+            "the error explains the agent subject requirements: {text}"
+        );
+    }
+
+    #[test]
+    fn adopt_external_identity_rejects_an_operator_leaf() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let tls_dir = tempfile::tempdir().expect("temp dir");
+        let ca = coppice_tls::pki::mint_root_ca().expect("mint a throwaway root");
+        let signer =
+            coppice_tls::pki::CaSigner::load(&ca.cert_pem, &ca.key_pem).expect("load the signer");
+        let (cert, key) = coppice_tls::pki::mint_operator_local(&signer, "alice")
+            .expect("mint a throwaway operator leaf");
+        let tls = write_and_load_tls(tls_dir.path(), &ca.cert_pem, &cert, &key);
+
+        let err = adopt_external_node_identity(data_dir.path(), &tls)
+            .expect_err("an operator leaf is not an agent leaf");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("no OU") && text.contains("node id"),
+            "the error explains the agent subject requirements: {text}"
+        );
+    }
+
+    #[test]
+    fn adopt_external_identity_rejects_a_leaf_that_does_not_chain() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let tls_dir = tempfile::tempdir().expect("temp dir");
+
+        // Sign the leaf under a different root than the one the store trusts,
+        // so the chain check fails.
+        let issuing_ca = coppice_tls::pki::mint_root_ca().expect("mint issuing root");
+        let signer = coppice_tls::pki::CaSigner::load(&issuing_ca.cert_pem, &issuing_ca.key_pem)
+            .expect("load the signer");
+        let (cert, key) = coppice_tls::pki::mint_agent_local(
+            &signer,
+            &NodeId::new(),
+            &["node-1.example.com".to_string()],
+        )
+        .expect("mint a throwaway leaf");
+
+        let untrusted_ca = coppice_tls::pki::mint_root_ca().expect("mint unrelated root");
+        let tls = write_and_load_tls(tls_dir.path(), &untrusted_ca.cert_pem, &cert, &key);
+
+        let cert_path = tls.paths().cert.display().to_string();
+        let err = adopt_external_node_identity(data_dir.path(), &tls)
+            .expect_err("a leaf that does not chain to the CA is fatal");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&cert_path),
+            "the error names the leaf path: {text}"
         );
     }
 }

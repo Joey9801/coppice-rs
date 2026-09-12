@@ -868,19 +868,20 @@ pub(crate) async fn form(ctx: FormationContext, req: FormRequest) -> Result<Form
     let signer = pki::CaSigner::load(&ca.cert_pem, &ca.key_pem)
         .context("loading the freshly minted cluster CA for signing")?;
 
-    let machine = pki::mint_machine_identity();
-    pki::persist_machine_identity(&data_dir, &machine)
-        .context("persisting this coordinator's machine identity")?;
-
     let tls_paths = cfg.tls_paths();
-    // Whether this node's *own* leaf is the cluster's business (issue #127).
-    // Under external provenance the operator's issuer owns it: the cluster CA
-    // above is still minted — it is what signs every agent and every future
-    // coordinator leaf, and the re-root machinery needs a key to hold — but
-    // this node keeps serving the leaf it was provisioned with, and formation
-    // writes nothing into the `[tls]` paths.
-    let tls_store = match cfg.tls_source() {
+    // Whether this node's *own* leaf — and with it its own machine identity —
+    // is the cluster's business (issue #127). Under external provenance the
+    // operator's issuer owns both: the cluster CA above is still minted — it is
+    // what signs every agent and every enrolled coordinator leaf, and the
+    // re-root machinery needs a key to hold — but this node keeps serving the
+    // leaf it was provisioned with, formation writes nothing into the `[tls]`
+    // paths, and the identity it forms under is the one that leaf's CN names
+    // rather than a fresh mint no operator could have certified in advance.
+    let (machine, tls_store) = match cfg.tls_source() {
         TlsSource::Cluster => {
+            let machine = pki::mint_machine_identity();
+            pki::persist_machine_identity(&data_dir, &machine)
+                .context("persisting this coordinator's machine identity")?;
             let (leaf_cert, leaf_key) =
                 pki::mint_coordinator_local(&signer, &machine, &leaf_sans(cfg))
                     .context("issuing this coordinator's own leaf certificate")?;
@@ -889,16 +890,17 @@ pub(crate) async fn form(ctx: FormationContext, req: FormRequest) -> Result<Form
             // The daemon may have started with no TLS material at all (the
             // ADR's minimal deployment): the material now exists, so the store
             // does too.
-            match tls {
+            let store = match tls {
                 Some(store) => {
                     store.force_reload().context(
                         "reloading TLS material after installing the cluster-minted leaf",
                     )?;
                     store
                 }
-                None => TlsStore::load(tls_paths)
+                None => TlsStore::load(tls_paths.clone())
                     .context("loading the TLS store from the freshly minted material")?,
-            }
+            };
+            (machine, store)
         }
         TlsSource::External => {
             let store = tls.ok_or_else(|| {
@@ -911,15 +913,33 @@ pub(crate) async fn form(ctx: FormationContext, req: FormRequest) -> Result<Form
                     tls_paths.ca.display(),
                 )
             })?;
+            // Idempotent, and already run once at startup (`bootstrap::run_with`);
+            // repeated here because `form` is also reachable from the in-crate
+            // tests, and because the identity must be settled before it is bound.
+            let machine = adopt_external_machine_identity(&data_dir, &store)?;
             tracing::info!(
+                %machine,
                 cert = %tls_paths.cert.display(),
                 "formation: [tls] source = \"external\", so the operator-provisioned leaf was \
-                 left untouched; only the cluster CA was minted"
+                 left untouched; only the cluster CA was minted, and this node forms under the \
+                 machine identity its leaf names"
             );
-            store
+            (machine, store)
         }
     };
     tracing::info!(%machine, "formation: minted the cluster CA");
+
+    // The trust-anchor set this cluster records is not always just the root it
+    // just minted (issue #127). Machine-facing authentication classifies peers
+    // against the *replicated* bundle, never against anything on disk, so under
+    // external provenance an operator-issued leaf would complete the handshake
+    // and then fail application authentication unless the operator's own roots
+    // are in that bundle too. Record them alongside the cluster root, which
+    // stays at position 0 because that is the root new leaves are issued under
+    // (`load_ca_key` / `CaSigner` pair against position 0; verification is
+    // order-independent — see `pki::verify_leaf`'s docs).
+    let (recorded_bundle, external_anchor_serials) =
+        recorded_ca_bundle(cfg, &ca.cert_pem, tls_store.as_ref())?;
 
     if failpoint == Some(Failpoint::BeforeRaftInitialize) {
         bail!("formation aborted at the BeforeRaftInitialize failpoint (test-only)");
@@ -954,7 +974,8 @@ pub(crate) async fn form(ctx: FormationContext, req: FormRequest) -> Result<Form
         failpoint,
         req: &req,
         started: &started,
-        ca: &ca,
+        bundle: recorded_bundle,
+        external_anchor_serials,
         signer: &signer,
         machine,
         node_id,
@@ -986,7 +1007,13 @@ struct FinishInputs<'a> {
     failpoint: Option<Failpoint>,
     req: &'a FormRequest,
     started: &'a StartedNode,
-    ca: &'a pki::CaMaterial,
+    /// The trust-anchor set this formation records: the freshly minted cluster
+    /// root at position 0, plus the operator's own roots under external
+    /// provenance (see [`recorded_ca_bundle`]).
+    bundle: CaCertBundle,
+    /// Which of `bundle`'s roots the operator provisioned, by serial — empty
+    /// under cluster provenance (see [`recorded_ca_bundle`]).
+    external_anchor_serials: Vec<String>,
     signer: &'a pki::CaSigner,
     machine: MachineId,
     node_id: u64,
@@ -1001,7 +1028,8 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
         failpoint,
         req,
         started,
-        ca,
+        bundle,
+        external_anchor_serials,
         signer,
         machine,
         node_id,
@@ -1015,19 +1043,21 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
     // --- Step 3 (replicated half): the CA certificate is public material
     // -- every node needs, and this node's machine identity binds to its raft
     // -- seat. Both wait for the history to exist, hence their position here.
-    let bundle = CaCertBundle::parse(
-        std::str::from_utf8(&ca.cert_pem).context("cluster CA certificate is not UTF-8")?,
-    )
-    .map_err(|e| anyhow!("the minted cluster CA is not a valid CA bundle: {e}"))?;
+    let ca_pem = bundle.pem().to_string();
     let recorded_at = Timestamp::now();
     let mut last_index = crate::policy::propose_all(
         &started.consensus,
         vec![
-            // Formation records a single root and nothing pending: there is
-            // no rotation to stage on a cluster that does not exist yet.
+            // Nothing pending: there is no rotation to stage on a cluster that
+            // does not exist yet. Under external provenance the bundle is not
+            // single-rooted, and `external_anchor_serials` is what says so —
+            // the extra roots are the operator's anchors, not a rotation, and
+            // naming them here is what makes `rotate-ca`'s refusal a
+            // replicated fact rather than a per-node config reading.
             Command::RecordCaCertificate(RecordCaCertificate {
                 bundle,
                 staged_root_serial: None,
+                external_anchor_serials,
                 recorded_at,
             }),
             Command::BindMachineIdentity(BindMachineIdentity {
@@ -1053,7 +1083,13 @@ async fn finish_formation(inputs: FinishInputs<'_>) -> Result<OperatorCredential
     .context("recording the cluster CA, this node's machine identity, and its key custody")?;
 
     // --- Step 5: the day-0 operator certificate. -------------------------
-    let operator = issue_operator_credential(signer, &ca.cert_pem, req)?;
+    //
+    // The credential carries the *recorded* bundle, not just the root that
+    // signed it: under external provenance the surfaces this operator is about
+    // to dial serve an operator-issued leaf, so a day-0 client trusting only
+    // the cluster root could not complete a handshake (issue #127). Under
+    // cluster provenance the two are the same bytes.
+    let operator = issue_operator_credential(signer, ca_pem.as_bytes(), req)?;
 
     // --- Step 6: the bootstrap policy (idempotent puts). -----------------
     //
@@ -1235,6 +1271,158 @@ async fn refuse_if_cluster_exists(cfg: &Config, advertise_addr: &str) -> Result<
 /// coordinator can come by its first leaf must produce a leaf that serves the
 /// same addresses, or a self-enrolled node would fail the leader's dial-back
 /// verification (ADR 0037 §6) that a formed one passes.
+/// The trust-anchor set a formation records into replicated state (issue #127).
+///
+/// Under cluster provenance it is exactly the root just minted. Under external
+/// provenance it is that root **followed by every CA certificate in the
+/// operator's provisioned `ca_path` bundle**, because the authority of record
+/// for machine-facing authentication is the replicated bundle and nothing else:
+/// `AdminService::caller`, the agent gateway and the client edge all classify a
+/// peer with [`pki::verify_leaf`] against it. Without the operator's roots in
+/// there, an externally issued coordinator, agent or operator leaf completes the
+/// TLS handshake and is then refused at the application layer — a failure mode
+/// with no useful diagnostic anywhere near its cause.
+///
+/// Order is load-bearing in one direction only. Verification is
+/// order-independent across bundle members (see [`pki::verify_leaf`]'s docs),
+/// but *issuance* is not: position 0 is the active signing root, the one
+/// [`pki::load_ca_key`] and [`pki::CaSigner`] pair a key against. So the cluster
+/// root goes first and the operator's roots follow.
+fn recorded_ca_bundle(
+    cfg: &Config,
+    cluster_ca_pem: &[u8],
+    tls: &TlsStore,
+) -> Result<(CaCertBundle, Vec<String>)> {
+    let cluster_pem =
+        std::str::from_utf8(cluster_ca_pem).context("cluster CA certificate is not UTF-8")?;
+    match cfg.tls_source() {
+        TlsSource::Cluster => CaCertBundle::parse(cluster_pem)
+            .map(|bundle| (bundle, Vec::new()))
+            .map_err(|e| anyhow!("the minted cluster CA is not a valid CA bundle: {e}")),
+        TlsSource::External => {
+            let ca_path = cfg.tls_paths().ca;
+            let material = tls.current();
+            let external_pem = std::str::from_utf8(material.ca_pem()).with_context(|| {
+                format!(
+                    "the operator-provisioned CA bundle {} is not UTF-8",
+                    ca_path.display()
+                )
+            })?;
+            let combined = format!("{cluster_pem}{external_pem}");
+            let bundle = CaCertBundle::parse(combined).map_err(|e| {
+                anyhow!(
+                    "refusing to form: the operator-provisioned CA bundle {} cannot be \
+                     recorded as this cluster's trust-anchor set: {e}. Under [tls] source = \
+                     \"external\" every block in ca_path must be a CA certificate — no leaf, \
+                     no private key, and nothing outside the PEM blocks (issue #127).",
+                    ca_path.display()
+                )
+            })?;
+            // Position 0 is the cluster root this formation just minted;
+            // everything after it came out of the operator's `ca_path`. Naming
+            // them in replicated state is what lets every coordinator — not
+            // just one reading its own `[tls] source` — know that a re-root
+            // here would drop anchors it cannot re-mint (issue #140).
+            let anchors: Vec<String> = bundle.serials().into_iter().skip(1).collect();
+            tracing::info!(
+                ca_path = %ca_path.display(),
+                roots = bundle.serials().len(),
+                external_anchors = anchors.len(),
+                "formation: recorded the operator's roots alongside the cluster root, so \
+                 externally issued leaves authenticate against replicated state"
+            );
+            Ok((bundle, anchors))
+        }
+    }
+}
+
+/// This coordinator's [`MachineId`] under `[tls] source = "external"`
+/// (issue #127): **adopted from the verified leaf**, never minted.
+///
+/// A coordinator leaf's common name *is* its machine identity (ADR 0037 §4/§7),
+/// and machine-facing authorization reads that identity straight off the
+/// presented leaf. Under cluster provenance the ordering works out because the
+/// cluster mints both: the id first, the certificate for it second. Under
+/// external provenance it cannot — an operator has no way to certify an id the
+/// daemon has not minted yet — so the direction reverses and the leaf becomes
+/// the authority.
+///
+/// Three outcomes, all of them fail-stop when they are not the happy one:
+///
+/// * the leaf does not verify against its own `ca_path`, or verifies but does
+///   not classify as [`pki::Profile::Coordinator`] ⇒ error naming `cert_path`
+///   and stating the subject an external issuer must produce;
+/// * `<data_dir>/machine-identity` is absent ⇒ the leaf's id is persisted there;
+/// * it is present and disagrees ⇒ error printing both ids. Adopting the leaf's
+///   id over a stored one would hand this installation a second identity while
+///   its raft seat, its binding and its custody record all still name the first.
+///
+/// Idempotent: an equal stored identity is simply accepted, so startup and
+/// formation can both call it.
+pub(crate) fn adopt_external_machine_identity(
+    data_dir: &Path,
+    tls: &TlsStore,
+) -> Result<MachineId> {
+    let paths = tls.paths().clone();
+    let material = tls.current();
+    let requirements = || {
+        format!(
+            "Under [tls] source = \"external\" the leaf at {cert} must be issued with \
+             OU={ou}, CN set to this machine's identity in the `machine-<uuid>` form, and \
+             SANs covering the host this daemon advertises — its common name *is* the \
+             identity the cluster binds to its raft seat (ADR 0037 §4/§7, issue #127).",
+            cert = paths.cert.display(),
+            ou = pki::COORDINATOR_OU,
+        )
+    };
+
+    let verified = pki::verify_leaf(material.ca_pem(), material.cert_pem()).map_err(|e| {
+        anyhow!(
+            "the operator-provisioned leaf does not verify against {ca}: {e}. {req}",
+            ca = paths.ca.display(),
+            req = requirements(),
+        )
+    })?;
+    let machine = match verified.profile {
+        pki::Profile::Coordinator(machine) => machine,
+        other => {
+            return Err(anyhow!(
+                "the operator-provisioned leaf verifies but classifies as {other:?}, not a \
+                 coordinator machine identity. {}",
+                requirements()
+            ))
+        }
+    };
+
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+    match pki::load_machine_identity(data_dir)
+        .context("reading this installation's machine identity")?
+    {
+        Some(stored) if stored == machine => {}
+        Some(stored) => bail!(
+            "the machine identity this installation already goes by ({stored}, recorded in \
+             {file}) is not the one its leaf names ({machine}, the CN of {cert}). Under [tls] \
+             source = \"external\" the leaf is the authority for identity, but adopting a \
+             second one over an installation's existing seat, binding and key custody would \
+             be worse than stopping: reissue the leaf for {stored}, or point this daemon at a \
+             fresh data_dir (issue #127).",
+            file = data_dir.join(pki::MACHINE_IDENTITY_FILE).display(),
+            cert = paths.cert.display(),
+        ),
+        None => {
+            pki::persist_machine_identity(data_dir, &machine)
+                .context("persisting the machine identity this coordinator's leaf names")?;
+            tracing::info!(
+                %machine,
+                cert = %paths.cert.display(),
+                "adopted the machine identity named by the operator-provisioned leaf"
+            );
+        }
+    }
+    Ok(machine)
+}
+
 pub(crate) fn leaf_sans(cfg: &Config) -> Vec<String> {
     let mut sans = Vec::new();
     if let Some(host) = cfg.listen.advertise_host.as_deref() {

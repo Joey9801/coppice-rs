@@ -203,6 +203,70 @@ default, and the coordinator token is classified root-equivalent — the
 long-lived variant is an explicitly accepted risk, short-lived
 per-refresh minting the recommended stronger posture. External PKI
 remains a supported substitution behind `[tls] source = "external"`.
+Under that source, `coordinator init` still mints the cluster root CA —
+it signs every agent leaf, every enrolled coordinator leaf, and the
+day-0 operator certificate, and re-rooting needs a key to hold — but the
+CA bundle it records into replicated state is the cluster root at
+position 0 followed by every CA certificate in the operator's `ca_path`
+bundle, because machine-facing authentication classifies peers against
+that replicated bundle, never against anything on disk: an externally
+issued leaf that completed the TLS handshake but classified against
+nothing would simply fail authentication. Chain verification is
+order-independent across the rest of the bundle; position 0 stays the
+cluster root because that is what new leaves are issued under, and an
+operator `ca_path` that isn't a valid CA bundle (a non-CA certificate, a
+private key, junk outside the PEM blocks) is a formation error naming
+`ca_path`. The day-0 operator credential `init` prints carries this same
+combined bundle, so an operator dialling an externally leafed coordinator
+trusts the leaf it is served.
+
+The reverse direction needs one manual step, and it is the same step the
+mixing case below needs. That credential is signed by the cluster root,
+but a listener's client-auth anchors are whatever `ca_path` holds — and
+the daemon never writes there. So a day-0 operator certificate is only
+accepted once the operator has copied the cluster root (printed by
+`init`, and readable from the recorded bundle) into their own `ca_path`
+bundle and let the daemon reload it. Until then, drive an externally
+provisioned cluster with a credential the external issuer minted.
+
+Machine identity is adopted, not minted, under this source. A
+coordinator's `MachineId` and an agent's `NodeId` are normally self-
+minted on first boot, but a coordinator leaf's `CN` must *be* the
+machine id and the agent gateway requires an agent leaf's `CN` to equal
+the claimed node id — an operator cannot provision a matching leaf for
+an id the daemon hasn't minted yet. So on first start under
+`source = "external"` the daemon verifies its own leaf against its own
+`ca_path`, classifies it, and adopts the id the `CN` names, persisting
+it to the data directory (`machine-identity` for a coordinator,
+`node-identity` for an agent). A leaf that doesn't classify as the right
+profile is a fail-stop at startup; a leaf whose id disagrees with an
+identity already on disk is also a fail-stop, printing both ids, and the
+operator either reissues the leaf for the stored id or starts from a
+fresh data directory. Nothing about this changes under
+`source = "cluster"`.
+
+A fleet that mixes externally provisioned coordinators with
+cluster-enrolled machines (agents that enroll, coordinators that join by
+enrollment) needs that same addition, for the same reason: the cluster
+root belongs in the external `ca_path` bundle, and the daemon never
+writes into external paths, so nothing will put it there for the
+operator. It is available from `init`'s output and from the recorded
+bundle over the admin surface; the operator copies it in out of band.
+
+One limit follows from re-rooting being a cluster-CA operation:
+`rotate-ca` rebuilds the recorded bundle from cluster roots only and
+would drop the operator's roots, which are recorded as a separate
+`external_anchor_serials` set on the CA record rather than inferred from
+any node's own config. So while that set is non-empty the `begin` and
+`complete` verbs are refused, and `status` reports the operation as
+unsupported, on **every** coordinator of the cluster — including a
+cluster-managed coordinator (`source = "cluster"`) that leads a cluster
+an operator founded externally, since the refusal is a fact about the
+cluster's recorded bundle, not about the deciding node's own `[tls]`
+setting ([re-rooting.md](re-rooting.md), Limits). Lifting the limit — a
+re-root that touches only cluster-minted roots and leaves the operator's
+anchors standing — is
+[issue #140](https://github.com/Joey9801/coppice-rs/issues/140).
 
 ### Token custody on the enrolling machine
 
