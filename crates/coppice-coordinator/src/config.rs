@@ -39,6 +39,8 @@ pub(crate) use auth::{AuthConfig, AuthPosture};
 pub(crate) use client_tls::{ClientTlsConfig, ClientTlsPosture};
 pub(crate) use discovery::DiscoveryConfig;
 pub(crate) use history::{HistoryConfig, HistoryMode};
+pub(crate) use tls::TlsConfig;
+pub use tls::TlsSource;
 // The `[enrollment]` table is the SHARED definition in `coppice-enroll` — the
 // same type the agent parses, so the two daemons cannot disagree about what
 // `insecure` means, and its `Secret` token field redacts itself from every
@@ -125,6 +127,157 @@ mod client_tls {
         /// "neither" error, so a missing table and an empty one read alike.
         pub(crate) fn absent() -> anyhow::Error {
             ambiguous("is missing")
+        }
+    }
+}
+
+mod tls {
+    //! The `[tls]` section (issue #127): where this daemon's machine-plane mTLS
+    //! material comes from, stated rather than inferred.
+    //!
+    //! Two provenances, and the difference is *who writes the files*. Under
+    //! `source = "cluster"` the cluster owns the material: formation mints the
+    //! first leaf, enrollment obtains one, renewal replaces it, and a re-root
+    //! rewrites the trust anchors — all into the fixed
+    //! `<data_dir>/pki/{node.crt,node.key,ca.crt}`, which is therefore not
+    //! configurable. Under `source = "external"` an external issuer owns it:
+    //! the three paths are required, and the daemon only ever *reads* and
+    //! hot-reloads them — it never enrolls, never renews, never adopts trust
+    //! anchors onto disk, and formation leaves the operator's leaf alone.
+    //!
+    //! Before this section existed the same three path keys meant both things,
+    //! and which one a deployment got depended on whether the files happened to
+    //! be there at startup — so a mistyped path silently turned an
+    //! externally-provisioned node into one that enrolled for a cluster leaf.
+
+    use std::path::{Path, PathBuf};
+
+    use coppice_tls::TlsPaths;
+    use serde::Deserialize;
+
+    /// Who owns this daemon's machine-plane certificate, key and trust anchors.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum TlsSource {
+        /// The cluster: material lives at `<data_dir>/pki` and is written by
+        /// formation, enrollment, renewal and re-rooting.
+        Cluster,
+        /// An external issuer: material lives at the configured paths and is
+        /// only ever read.
+        External,
+    }
+
+    /// The `[tls]` section as written.
+    ///
+    /// Like `[client_tls]`, the invariant is one serde cannot express — which
+    /// keys are legal depends on `source` — so the paths are individually
+    /// optional and [`TlsConfig::validate`] is what makes a loaded config mean
+    /// exactly one thing. Secrets stay by path reference either way: the file
+    /// never holds key material (ADR 0020).
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct TlsConfig {
+        pub(crate) source: TlsSource,
+        #[serde(default)]
+        cert_path: Option<PathBuf>,
+        #[serde(default)]
+        key_path: Option<PathBuf>,
+        #[serde(default)]
+        ca_path: Option<PathBuf>,
+    }
+
+    /// The one error message, shared by every mismatch, because the fix is
+    /// always the same: say which provenance this deployment has and configure
+    /// only the keys that provenance owns.
+    fn mismatch(detail: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "[tls] {detail}. The material's provenance is explicit, never implied: \
+             `source = \"cluster\"` means the cluster owns it — formation, enrollment and \
+             renewal write `<data_dir>/pki/node.crt`, `node.key` and `ca.crt`, and no path is \
+             configurable — while `source = \"external\"` means an external issuer owns it, \
+             `cert_path`, `key_path` and `ca_path` are all required, and this daemon only ever \
+             reads them (issue #127)"
+        )
+    }
+
+    fn named(keys: [(&'static str, bool); 3]) -> Vec<&'static str> {
+        keys.iter()
+            .filter(|(_, present)| *present)
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    impl TlsConfig {
+        /// Reject every combination of `source` and paths that states two
+        /// things at once, or states one of them incompletely.
+        ///
+        /// `has_enrollment` is the config's `[enrollment]` section: enrollment
+        /// obtains material by *writing* it, which external provenance forbids
+        /// outright, so the two sections are checked against each other here
+        /// rather than each being separately plausible.
+        pub(crate) fn validate(&self, has_enrollment: bool) -> anyhow::Result<()> {
+            let present = named([
+                ("cert_path", self.cert_path.is_some()),
+                ("key_path", self.key_path.is_some()),
+                ("ca_path", self.ca_path.is_some()),
+            ]);
+            match self.source {
+                TlsSource::Cluster => {
+                    if !present.is_empty() {
+                        return Err(mismatch(&format!(
+                            "sets `{}` under `source = \"cluster\"`, where the paths are not \
+                             configurable; cluster-managed material always lives under \
+                             `<data_dir>/pki`",
+                            present.join("`, `")
+                        )));
+                    }
+                }
+                TlsSource::External => {
+                    let missing = named([
+                        ("cert_path", self.cert_path.is_none()),
+                        ("key_path", self.key_path.is_none()),
+                        ("ca_path", self.ca_path.is_none()),
+                    ]);
+                    if !missing.is_empty() {
+                        return Err(mismatch(&format!(
+                            "is `source = \"external\"` but does not set `{}`",
+                            missing.join("`, `")
+                        )));
+                    }
+                    if has_enrollment {
+                        return Err(mismatch(
+                            "is `source = \"external\"` and this config also carries an \
+                             `[enrollment]` section; enrollment obtains a leaf by writing it \
+                             into the `[tls]` paths, and externally-provisioned material is \
+                             never written by this daemon. Delete `[enrollment]`, or say \
+                             `source = \"cluster\"`",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Where the three files live.
+        ///
+        /// Infallible because [`TlsConfig::validate`] has already run — every
+        /// path a `Config` can be read from goes through `load`, which
+        /// validates before returning one.
+        pub(crate) fn paths(&self, data_dir: &Path) -> TlsPaths {
+            match self.source {
+                TlsSource::Cluster => TlsPaths::cluster_managed(data_dir),
+                TlsSource::External => TlsPaths {
+                    cert: self.expect_path(&self.cert_path, "cert_path"),
+                    key: self.expect_path(&self.key_path, "key_path"),
+                    ca: self.expect_path(&self.ca_path, "ca_path"),
+                },
+            }
+        }
+
+        fn expect_path(&self, path: &Option<PathBuf>, key: &str) -> PathBuf {
+            path.clone().unwrap_or_else(|| {
+                panic!("[tls] source = \"external\" without {key}: config::load validates this")
+            })
         }
     }
 }
@@ -1029,19 +1182,6 @@ impl Default for PacingConfig {
     }
 }
 
-/// mTLS material for intra-cluster traffic (ADR 0011).
-///
-/// Secrets by path reference only: the config file itself never holds key
-/// material, so it stays safe to commit, diff, and attach to support
-/// bundles (ADR 0020).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TlsConfig {
-    pub(crate) cert_path: PathBuf,
-    pub(crate) key_path: PathBuf,
-    pub(crate) ca_path: PathBuf,
-}
-
 /// SSO connection parameters.
 ///
 /// This is a **resource-server** validator, not an OAuth client: the
@@ -1309,6 +1449,18 @@ impl Config {
         }
     }
 
+    /// Where this daemon's machine-plane mTLS material comes from
+    /// (issue #127) — the gate on every code path that would *write* it.
+    pub fn tls_source(&self) -> TlsSource {
+        self.tls.source
+    }
+
+    /// The three machine-plane material paths: `<data_dir>/pki/...` under
+    /// cluster provenance, the configured trio under external provenance.
+    pub(crate) fn tls_paths(&self) -> coppice_tls::TlsPaths {
+        self.tls.paths(&self.data_dir)
+    }
+
     pub(crate) fn admin_socket_path(&self) -> PathBuf {
         self.listen
             .admin_socket
@@ -1323,6 +1475,12 @@ impl ResolvedConfig {
     #[cfg(test)]
     pub(crate) fn into_config(self) -> Config {
         self.config
+    }
+
+    /// Where this daemon's machine-plane material comes from (issue #127),
+    /// for the embedder seams that hand it to the runtime themselves.
+    pub fn tls_source(&self) -> TlsSource {
+        self.config.tls_source()
     }
 
     /// Emit the fully-resolved effective configuration.
@@ -1382,6 +1540,25 @@ pub fn load(path: &Path) -> Result<ResolvedConfig> {
         enrollment
             .validate()
             .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    }
+    // Which provenance the machine-plane material has, and — under external
+    // provenance — that it is actually there and parses (issue #127). The
+    // second half is deliberately fail-stop: a daemon told its material is
+    // operator-provisioned must never quietly fall through to enrolling for a
+    // cluster leaf because a path was mistyped, which is exactly what the old
+    // "all three exist?" sniff did.
+    config
+        .tls
+        .validate(config.enrollment.is_some())
+        .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    if config.tls_source() == TlsSource::External {
+        coppice_tls::TlsStore::load(config.tls_paths()).with_context(|| {
+            format!(
+                "loading the externally-provisioned [tls] material named by coordinator config \
+                 {}",
+                path.display()
+            )
+        })?;
     }
     // Both fail at load rather than at first use: a zero pacing interval
     // would busy-spin a background loop from the moment the daemon starts,
@@ -1467,9 +1644,7 @@ snapshot_log_entries = 50_000
 snapshot_keep_log_entries = 2000
 
 [tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+source = "cluster"
 
 [client_tls]
 cert_path = "/etc/coppice/pki/api.example.com.crt"
@@ -1504,9 +1679,7 @@ data_dir = "/var/lib/coppice"
 advertise_host = "coord-1.example.com"
 
 [tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+source = "cluster"
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
@@ -1517,9 +1690,7 @@ data_dir = "/var/lib/coppice"
 advertise_host = "coord-1.example.com"
 
 [tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+source = "cluster"
 
 [client_tls]
 insecure = true
@@ -1562,6 +1733,11 @@ insecure_open = true
             .expect("the example enrolls for its leaf")
             .validate()
             .expect("enrollment section");
+        config
+            .tls
+            .validate(config.enrollment.is_some())
+            .expect("tls section");
+        assert_eq!(config.tls_source(), TlsSource::Cluster);
 
         assert_eq!(config.discovery.backend, BackendKind::Ec2Asg);
         assert_eq!(config.discovery.cluster_size, 3);
@@ -1596,9 +1772,7 @@ advertise_host = "10.0.1.5"
 extra_sans = ["coord.demo.example.com", "10.0.9.9", "::1"]
 
 [tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+source = "cluster"
 
 [discovery]
 backend = "static"
@@ -1679,15 +1853,11 @@ addrs = []
         // File value overrides the built-in 1000 default.
         assert_eq!(config.raft.snapshot_keep_log_entries, 2000);
 
+        assert_eq!(config.tls_source(), TlsSource::Cluster);
         assert_eq!(
-            config.tls.cert_path,
-            PathBuf::from("/etc/coppice/pki/node.crt")
+            config.tls_paths().cert,
+            PathBuf::from("/var/lib/coppice/pki/node.crt")
         );
-        assert_eq!(
-            config.tls.key_path,
-            PathBuf::from("/etc/coppice/pki/node.key")
-        );
-        assert_eq!(config.tls.ca_path, PathBuf::from("/etc/coppice/pki/ca.crt"));
 
         let sso = config.sso.expect("sso section present");
         assert_eq!(sso.issuer, "https://sso.example.com/oidc");
@@ -2273,6 +2443,135 @@ addrs = []
             };
             assert!(format!("{err:#}").contains("[token_kdf]"), "{err:#}");
         }
+    }
+
+    // ---- [tls]: the material's provenance (issue #127) -------------------
+
+    /// Cluster provenance puts the material at a fixed place under the data
+    /// directory, and naming a path there is a config error rather than a
+    /// setting that quietly loses.
+    #[test]
+    fn cluster_source_resolves_under_the_data_dir_and_rejects_every_path_key() {
+        let (_guard, path) = write_config(MINIMAL_EXAMPLE);
+        let config = load(&path).expect("cluster source loads").config;
+        assert_eq!(config.tls_source(), TlsSource::Cluster);
+        let paths = config.tls_paths();
+        assert_eq!(paths.cert, PathBuf::from("/var/lib/coppice/pki/node.crt"));
+        assert_eq!(paths.key, PathBuf::from("/var/lib/coppice/pki/node.key"));
+        assert_eq!(paths.ca, PathBuf::from("/var/lib/coppice/pki/ca.crt"));
+
+        for key in ["cert_path", "key_path", "ca_path"] {
+            let contents = MINIMAL_EXAMPLE.replace(
+                "[tls]\nsource = \"cluster\"",
+                &format!("[tls]\nsource = \"cluster\"\n{key} = \"/etc/coppice/x.pem\""),
+            );
+            let (_guard, path) = write_config(&contents);
+            let err = load(&path).expect_err("a path under cluster provenance must fail");
+            let rendered = format!("{err:#}");
+            assert!(rendered.contains(key), "{rendered}");
+            assert!(rendered.contains("source = \"external\""), "{rendered}");
+        }
+    }
+
+    /// External provenance needs all three paths, and the error names exactly
+    /// the ones that are missing.
+    #[test]
+    fn external_source_requires_all_three_paths() {
+        let (_guard, path) = write_config(&MINIMAL_EXAMPLE.replace(
+            "[tls]\nsource = \"cluster\"",
+            "[tls]\nsource = \"external\"\ncert_path = \"/x.crt\"",
+        ));
+        let err = load(&path).expect_err("two missing paths must fail");
+        // Exactly the missing two, named in the sentence about *this* config —
+        // the guidance that follows names all three, as it must.
+        assert!(
+            format!("{err:#}").contains("does not set `key_path`, `ca_path`"),
+            "{err:#}"
+        );
+    }
+
+    /// Enrollment *writes* machine material, so it cannot coexist with
+    /// material this daemon is told never to write.
+    #[test]
+    fn external_source_refuses_an_enrollment_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = seed_external_material(dir.path());
+        let contents = format!(
+            "{}\n[enrollment]\nendpoint = \"https://coord.example.com\"\n             token_path = \"/etc/coppice/enroll-token\"\n",
+            external_example(&paths)
+        );
+        let (_guard, path) = write_config(&contents);
+        let err = load(&path).expect_err("external + [enrollment] must fail");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("[enrollment]"), "{rendered}");
+        assert!(rendered.contains("source = \"cluster\""), "{rendered}");
+    }
+
+    /// External material is read at load, so a mistyped path fails at startup
+    /// instead of silently leaving the daemon certless.
+    #[test]
+    fn external_source_loads_the_material_and_fails_naming_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = seed_external_material(dir.path());
+        let (_guard, path) = write_config(&external_example(&paths));
+        let config = load(&path).expect("external material loads").config;
+        assert_eq!(config.tls_source(), TlsSource::External);
+        assert_eq!(config.tls_paths().cert, paths.cert);
+
+        std::fs::remove_file(&paths.key).expect("remove the key");
+        let (_guard, path) = write_config(&external_example(&paths));
+        let err = load(&path).expect_err("a missing external file must fail at load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&paths.key.display().to_string()),
+            "{rendered}"
+        );
+    }
+
+    /// `source` has no default: a `[tls]` table that never says where its
+    /// material comes from is serde's own missing-field error.
+    #[test]
+    fn a_tls_table_without_a_source_fails() {
+        let (_guard, path) =
+            write_config(&MINIMAL_EXAMPLE.replace("[tls]\nsource = \"cluster\"", "[tls]"));
+        let err = load(&path).expect_err("a sourceless [tls] must fail");
+        assert!(format!("{err:#}").contains("source"), "{err:#}");
+    }
+
+    /// A throwaway CA and leaf on disk, for the external-provenance fixtures:
+    /// the daemon parses what it is pointed at, so the files must be real.
+    fn seed_external_material(dir: &Path) -> coppice_tls::TlsPaths {
+        let ca = coppice_tls::pki::mint_root_ca().expect("mint a throwaway root");
+        let signer =
+            coppice_tls::pki::CaSigner::load(&ca.cert_pem, &ca.key_pem).expect("load the signer");
+        let machine = coppice_tls::pki::mint_machine_identity();
+        let (cert, key) = coppice_tls::pki::mint_coordinator_local(
+            &signer,
+            &machine,
+            &["coord-1.example.com".to_string()],
+        )
+        .expect("mint a throwaway leaf");
+        let paths = coppice_tls::TlsPaths {
+            cert: dir.join("node.crt"),
+            key: dir.join("node.key"),
+            ca: dir.join("ca.crt"),
+        };
+        std::fs::write(&paths.cert, &cert).expect("write cert");
+        std::fs::write(&paths.key, &key).expect("write key");
+        std::fs::write(&paths.ca, &ca.cert_pem).expect("write ca");
+        paths
+    }
+
+    fn external_example(paths: &coppice_tls::TlsPaths) -> String {
+        MINIMAL_EXAMPLE.replace(
+            "[tls]\nsource = \"cluster\"",
+            &format!(
+                "[tls]\nsource = \"external\"\ncert_path = \"{}\"\nkey_path = \"{}\"\n                 ca_path = \"{}\"",
+                paths.cert.display(),
+                paths.key.display(),
+                paths.ca.display(),
+            ),
+        )
     }
 
     #[test]

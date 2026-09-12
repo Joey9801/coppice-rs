@@ -139,6 +139,7 @@ use coppice_state::command::{
 use coppice_state::{CaCertBundle, Command, StagedRoot};
 use coppice_tls::{pki, TlsStore};
 
+use crate::config::TlsSource;
 use coppice_proto::pb::raft::v1 as pb;
 
 /// How long to keep retrying a per-peer key push while the peer catches up to
@@ -406,6 +407,9 @@ pub(crate) struct RotationContext<'a, C: Consensus> {
     pub(crate) handle: &'a NodeHandle,
     /// This daemon's serving material, used to dial peers for the key push.
     pub(crate) tls: &'a TlsStore,
+    /// Whether this daemon may write that material (issue #127). A re-root
+    /// installs trust anchors on disk; under external provenance it must not.
+    pub(crate) tls_source: TlsSource,
     pub(crate) data_dir: &'a Path,
 }
 
@@ -605,7 +609,7 @@ pub(crate) async fn begin<C: Consensus>(ctx: &RotationContext<'_, C>) -> Result<
     if current_roots.len() > 1 && staged.is_none() {
         let key_backup = promote_staged_if_activated(ctx.data_dir, current_pem.as_bytes(), None)
             .context("promoting this host's staged CA key after an activated rotation")?;
-        adopt_anchors(ctx.tls, current_pem.as_bytes())
+        adopt_anchors(ctx.tls, ctx.tls_source, current_pem.as_bytes())
             .await
             .context("installing the recorded bundle in this host's own trust store")?;
         return Ok(BeginReport {
@@ -680,7 +684,7 @@ pub(crate) async fn begin<C: Consensus>(ctx: &RotationContext<'_, C>) -> Result<
     // --- Phase 3b: the local half of activation ---------------------------
     let key_backup = promote_staged_if_activated(ctx.data_dir, activated_pem.as_bytes(), None)
         .context("promoting this host's staged CA key to the live signing path")?;
-    adopt_anchors(ctx.tls, activated_pem.as_bytes())
+    adopt_anchors(ctx.tls, ctx.tls_source, activated_pem.as_bytes())
         .await
         .context("installing the activated bundle in this host's own trust store")?;
     tracing::info!("rotate-ca: the incoming root is active and this host signs under it");
@@ -716,7 +720,7 @@ async fn stage_or_resume<C: Consensus>(
                 serial = %staged.serial,
                 "rotate-ca: resuming the recorded staging; this leader holds the staged key"
             );
-            adopt_anchors(ctx.tls, current_pem.as_bytes())
+            adopt_anchors(ctx.tls, ctx.tls_source, current_pem.as_bytes())
                 .await
                 .context("installing the recorded bundle in this host's own trust store")?;
             self_confirm_staged(ctx, &staged.serial).await?;
@@ -810,7 +814,7 @@ async fn mint_and_stage<C: Consensus>(
     // Trust the incoming root here before anyone else is asked to. Adopting
     // the bundle is a local write of replicated state — no signature, no dial,
     // no leader.
-    adopt_anchors(ctx.tls, bundle_pem.as_bytes())
+    adopt_anchors(ctx.tls, ctx.tls_source, bundle_pem.as_bytes())
         .await
         .context("installing the staged bundle in this host's own trust store")?;
 
@@ -1248,8 +1252,29 @@ const ADOPT_RETRY: Duration = Duration::from_millis(50);
 /// Returns whether anything changed. Confirmation is the point: the callers in
 /// [`begin`] use the return to sequence a rotation, so "the bytes were written"
 /// is not a strong enough postcondition — the store must be serving them.
-pub(crate) async fn adopt_anchors(tls: &TlsStore, bundle_pem: &[u8]) -> Result<bool> {
+pub(crate) async fn adopt_anchors(
+    tls: &TlsStore,
+    source: TlsSource,
+    bundle_pem: &[u8],
+) -> Result<bool> {
     if same_anchor_set(tls.current().ca_pem(), bundle_pem).unwrap_or(false) {
+        return Ok(false);
+    }
+    // Externally-provisioned material is never written by this daemon
+    // (issue #127), and the trust anchors are part of it: the operator's
+    // issuer owns that file, and a daemon that overwrote it would be changing
+    // who this host trusts behind the operator's back — and would be
+    // overwritten again by the next run of whatever provisions it. So the
+    // cluster's recorded bundle is *reported*, not installed, and distributing
+    // it is the operator's step.
+    if source == TlsSource::External {
+        tracing::warn!(
+            ca_path = %tls.paths().ca.display(),
+            "trust anchors: this cluster records a bundle this node does not trust, but \
+             [tls] source = \"external\" means the daemon never writes that file. Distribute \
+             the recorded bundle to this host (issue #127, ADR 0037 §4); until then this node \
+             cannot verify peers signed under the new root"
+        );
         return Ok(false);
     }
     pki::install_ca_bundle(tls.paths(), bundle_pem)
@@ -1384,7 +1409,7 @@ pub(crate) async fn complete<C: Consensus>(
     // looks: `complete` is the verb an operator runs to end a compromise, and
     // "the outgoing root is no longer trusted" must be a fact about the daemon
     // answering the call, not a promise about its next timer tick.
-    adopt_anchors(ctx.tls, active_pem.as_bytes())
+    adopt_anchors(ctx.tls, ctx.tls_source, active_pem.as_bytes())
         .await
         .context("installing the completed single-root bundle in this host's own trust store")?;
 

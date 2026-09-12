@@ -100,8 +100,8 @@ async fn a_fleet_that_lost_its_volumes_re_forms_once_and_refuses_the_old_history
     // address in as the fleet-wide enrollment endpoint (standing in for a
     // load-balanced name) — re-forming on a node the template cannot enroll
     // against would be a fixture artifact, not a deployment.
-    fleet.members[0].wipe_installation();
-    fleet.members[1].wipe_installation();
+    fleet.members[0].wipe_data_dir();
+    fleet.members[1].wipe_data_dir();
 
     // ---- the wiped nodes park, loudly --------------------------------------
     fleet.members[0].start();

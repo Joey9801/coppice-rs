@@ -45,6 +45,7 @@ use coppice_api::http::ReadyzReport;
 use coppice_consensus::{NodeHandle, OpenraftConsensus};
 use coppice_tls::TlsStore;
 
+use crate::config::TlsSource;
 use crate::formation::{self, FormRequest, OperatorCredential, PhaseState};
 use crate::rotate;
 
@@ -182,6 +183,10 @@ pub(crate) struct FormationDone {
 pub(crate) struct LocalAdmin {
     phase: Arc<PhaseState>,
     data_dir: PathBuf,
+    /// Whether this daemon owns its machine material (issue #127): the
+    /// `rotate-ca` verbs install trust anchors, which external provenance
+    /// forbids.
+    tls_source: TlsSource,
     form_tx: mpsc::Sender<FormationCall>,
     /// Attached once the cluster is formed, so `issue-operator-cert` can read
     /// the CA certificate out of replicated state and the `rotate-ca` verbs
@@ -206,11 +211,13 @@ impl LocalAdmin {
     pub(crate) fn new(
         phase: Arc<PhaseState>,
         data_dir: PathBuf,
+        tls_source: TlsSource,
         form_tx: mpsc::Sender<FormationCall>,
     ) -> Arc<LocalAdmin> {
         Arc::new(LocalAdmin {
             phase,
             data_dir,
+            tls_source,
             form_tx,
             formed: RwLock::new(None),
         })
@@ -265,6 +272,7 @@ impl LocalAdmin {
             consensus,
             handle,
             tls,
+            tls_source: self.tls_source,
             data_dir: &self.data_dir,
         }
     }

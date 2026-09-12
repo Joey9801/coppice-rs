@@ -60,19 +60,15 @@ extra_sans = ["ENV.coppice.jwjr.uk"]
 admin_socket = "/run/coppice/admin.sock"
 
 [tls]
-# Machine plane only: the leaf served on the raft and agent listeners. Absent
-# on a fresh instance — the daemon parks, enrolls (below), and writes these
-# three files itself, which is why the unit gives /etc/coppice/pki as a
-# ReadWritePaths= exception to ProtectSystem=strict.
-#
-# Configurable paths rather than a fixed layout under data_dir because
-# externally issued material is a supported substitution at the same paths
-# (docs/operations/security.md, ADR 0037 §4): an external issuer can own the
-# files and the daemon hot-reloads them either way. Making that choice
-# explicit in the schema instead of inferred from disk is issue #127.
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+# Machine plane only: the leaf served on the raft and agent listeners.
+# "cluster" means the cluster owns this material end to end: formation mints
+# it, enrollment installs it on a fresh instance, and renewal/re-rooting keep
+# it current, all under the fixed layout data_dir/pki/{node.crt,node.key,
+# ca.crt} — no paths are configurable here. The alternative is
+# `source = "external"` with `cert_path`/`key_path`/`ca_path` naming
+# operator-provisioned files that the daemon only ever reads and hot-reloads,
+# never writes (docs/operations/security.md, ADR 0037 §4).
+source = "cluster"
 
 [client_tls]
 # TLS terminates on the load balancer: the NLB holds the ACM certificate for

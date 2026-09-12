@@ -117,11 +117,9 @@ fn agent_config(
         data_dir,
         // One coordinator, this harness's gateway (ADR 0037 §2).
         discovery: SeedConfig::static_seeds(vec![endpoint.to_string()]),
-        tls: TlsConfig {
-            cert_path,
-            key_path,
-            ca_path,
-        },
+        // Provisioned by this harness and never written by the agent
+        // (issue #127): the leaf is handed over directly, with no enrollment.
+        tls: TlsConfig::external(cert_path, key_path, ca_path),
         // The harness provisions the leaf directly; no enrollment.
         enrollment: None,
         // Generous overrides on every dimension (deployment-story A3), so the
@@ -165,7 +163,7 @@ fn spawn_agent(
     )
     .with_service_addr(Some(service_addr));
     tokio::spawn(async move {
-        let tls = coppice_agent::load_tls_store(&config.tls).expect("load agent tls store");
+        let tls = coppice_agent::load_tls_store(&config).expect("load agent tls store");
         let _ = run(session, &config, tls).await;
     })
 }

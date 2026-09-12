@@ -53,6 +53,21 @@ pub fn tls_store_from_pem(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Arc
     .expect("build tls store from pem")
 }
 
+/// Seed cluster-managed material at `<data_dir>/pki` (issue #127), creating
+/// the directory the daemon would otherwise create on its first install.
+pub fn write_cluster_material(
+    data_dir: &std::path::Path,
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) {
+    let paths = TlsPaths::cluster_managed(data_dir);
+    std::fs::create_dir_all(paths.cert.parent().expect("pki dir")).expect("create pki dir");
+    std::fs::write(&paths.ca, ca_pem).expect("write ca");
+    std::fs::write(&paths.cert, cert_pem).expect("write cert");
+    std::fs::write(&paths.key, key_pem).expect("write key");
+}
+
 /// A test CA plus one issued leaf's PEM material.
 pub struct Leaf {
     pub cert_pem: Vec<u8>,
@@ -360,6 +375,9 @@ t_cost = 1
 p_cost = 1
 
 [tls]
+# Pre-provisioned by this fixture and never written by the daemon
+# (issue #127): these nodes are handed a leaf, and none of them enrolls.
+source = "external"
 cert_path = "{cert}"
 key_path = "{key}"
 ca_path = "{ca}"
@@ -699,6 +717,9 @@ t_cost = 1
 p_cost = 1
 
 [tls]
+# Pre-provisioned by this fixture and never written by the daemon
+# (issue #127): these nodes are handed a leaf, and none of them enrolls.
+source = "external"
 cert_path = "{cert}"
 key_path = "{key}"
 ca_path = "{ca}"
@@ -727,6 +748,7 @@ log_level = "warn"
         std::fs::write(&config_path, toml).expect("write config");
 
         let resolved = config::load(&config_path).expect("load coordinator config");
+        let tls_source = resolved.tls_source();
 
         // One shared hot-reload store for the raft/admin server and the agent
         // gateway (both reuse the node's identity, ADR 0011 / ADR 0037 §4).
@@ -795,6 +817,7 @@ log_level = "warn"
             coppice_coordinator::RenewalPacing::default(),
             // Explicitly lossy (ADR 0012), matching the `[history]` section
             // these fixtures write: no history store runs behind the suites.
+            tls_source,
             coppice_coordinator::HistorySink::None,
             housekeeping_interval,
             // The test fleet's config harness runs the open posture (the same
@@ -968,9 +991,7 @@ impl Daemon {
         let root = dir.path();
         if write_material {
             let leaf = ca.leaf();
-            std::fs::write(root.join("node.crt"), &leaf.cert_pem).expect("write cert");
-            std::fs::write(root.join("node.key"), &leaf.key_pem).expect("write key");
-            std::fs::write(root.join("ca.crt"), &ca.pem).expect("write ca");
+            write_cluster_material(&root.join("data"), &ca.pem, &leaf.cert_pem, &leaf.key_pem);
         }
 
         let client_port = free_port();
@@ -1036,9 +1057,10 @@ t_cost = 1
 p_cost = 1
 
 [tls]
-cert_path = "{cert}"
-key_path = "{key}"
-ca_path = "{ca}"
+# Cluster-managed (issue #127): material lives under <data_dir>/pki, which
+# `Daemon::new` seeds and `Daemon::new_certless` deliberately leaves empty for
+# formation (or enrollment) to fill.
+source = "cluster"
 
 [client_tls]
 # Plain HTTP on the client listener (ADR 0037 §4: the posture is always
@@ -1057,9 +1079,6 @@ insecure_open = true
 log_level = "warn"
 "#,
                 data_dir = root.join("data").display(),
-                cert = root.join("node.crt").display(),
-                key = root.join("node.key").display(),
-                ca = root.join("ca.crt").display(),
             ),
         )
         .expect("write config");
@@ -1486,20 +1505,23 @@ log_level = "warn"
     /// For tests whose subject is not enrollment: the daemon's first
     /// convergence round finds a usable leaf and goes straight to probing.
     pub fn install_tls_material(&self, ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) {
-        let root = self.dir.path();
-        std::fs::write(root.join("ca.crt"), ca_pem).expect("write ca");
-        std::fs::write(root.join("node.crt"), cert_pem).expect("write cert");
-        std::fs::write(root.join("node.key"), key_pem).expect("write key");
+        write_cluster_material(&self.data_dir(), ca_pem, cert_pem, key_pem);
     }
 
     /// The `[tls]` paths this daemon serves from: a certless daemon's
     /// formation writes its own minted leaf here (ADR 0037 §3 step 3).
+    /// The cluster-managed `[tls]` layout under this daemon's data directory
+    /// (issue #127), for tests that watch the files appear or seed them.
+    pub fn tls_paths(&self) -> TlsPaths {
+        TlsPaths::cluster_managed(&self.data_dir())
+    }
+
     pub fn tls_material(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let root = self.dir.path();
+        let paths = TlsPaths::cluster_managed(&self.data_dir());
         (
-            std::fs::read(root.join("ca.crt")).expect("read cluster ca"),
-            std::fs::read(root.join("node.crt")).expect("read node cert"),
-            std::fs::read(root.join("node.key")).expect("read node key"),
+            std::fs::read(&paths.ca).expect("read cluster ca"),
+            std::fs::read(&paths.cert).expect("read node cert"),
+            std::fs::read(&paths.key).expect("read node key"),
         )
     }
 
@@ -1549,8 +1571,17 @@ log_level = "warn"
         )
     }
 
-    /// Wipe the data directory, the documented recovery from a failed
-    /// formation (ADR 0037 §3).
+    /// Wipe the data directory: the documented recovery from a failed
+    /// formation (ADR 0037 §3), and equally what losing the volume looks like.
+    ///
+    /// The two used to differ — the `[tls]` material once lived outside the
+    /// data directory, so a failed-formation recovery kept its certificates
+    /// while a lost disk did not. Cluster-managed material now lives at
+    /// `<data_dir>/pki` (issue #127), so both are one act: what comes back is a
+    /// fresh installation with no identity, no certificate and no history,
+    /// which parks, and either re-forms on `init` or re-enrolls. The config,
+    /// the ports and the enrollment block survive, because in a real fleet
+    /// those come from the launch template and not from the volume.
     pub fn wipe_data_dir(&self) {
         let dir = self.data_dir();
         if dir.exists() {
@@ -2077,36 +2108,12 @@ impl Fleet {
 }
 
 // ---------------------------------------------------------------------------
-// Volume loss (ADR 0037 §1/§3)
+// Fail-stop observation (ADR 0037 §3)
 // ---------------------------------------------------------------------------
 
 /// A second `impl` block rather than an edit to the one above, so this file
 /// stays append-only while several suites are being written against it.
 impl Daemon {
-    /// Destroy this installation the way losing its disk would: the data
-    /// directory (manifest, raft log, machine identity, CA key) **and** the
-    /// `[tls]` material go together.
-    ///
-    /// Distinct from [`Daemon::wipe_data_dir`], which models the ADR 0037 §3
-    /// recovery from a failed formation — a deliberate operator act on a node
-    /// whose certificates are still valid. This one models the volume being
-    /// gone: what comes back is a fresh installation with no identity, no
-    /// certificate and no history, which is the only state from which a daemon
-    /// re-enrolls (`enroll_if_needed` returns early whenever a usable leaf is
-    /// on disk, so a half-wipe would quietly keep the old identity's leaf).
-    ///
-    /// The config, the ports and the enrollment block survive, because in a
-    /// real fleet those come from the launch template and not from the volume.
-    pub fn wipe_installation(&self) {
-        self.wipe_data_dir();
-        for file in ["node.crt", "node.key", "ca.crt"] {
-            let path = self.dir.path().join(file);
-            if path.exists() {
-                std::fs::remove_file(&path).expect("wipe tls material");
-            }
-        }
-    }
-
     /// Wait for a daemon to exit **on its own**, and return what `run_with`
     /// returned.
     ///

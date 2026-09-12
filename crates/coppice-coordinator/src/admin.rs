@@ -50,6 +50,7 @@ use coppice_tls::TlsStore;
 
 use crate::cli::{AdminArgs, AdminVerb};
 use crate::config;
+use crate::config::TlsSource;
 use crate::enroll::{self, EnrollContext, EnrollError, EnrollRequest};
 use crate::tasks::api_server;
 
@@ -348,6 +349,10 @@ struct AdminInner<C: Consensus> {
     /// no replicated CA, no caller can be classified and every verb is
     /// refused, which is the fail-closed direction.
     tls: RwLock<Option<Arc<TlsStore>>>,
+    /// Whether this daemon may write that material (issue #127): the key-push
+    /// handler adopts trust anchors onto disk, which external provenance
+    /// forbids.
+    tls_source: TlsSource,
     /// The argon2id cost minted token secrets are hashed at (`[token_kdf]`,
     /// ADR 0037 §5). Node-local: only the PHC string is replicated.
     token_kdf: pki::TokenKdf,
@@ -371,6 +376,7 @@ impl<C: Consensus> AdminService<C> {
     pub(crate) fn unformed(
         phase: Arc<crate::formation::PhaseState>,
         data_dir: PathBuf,
+        tls_source: TlsSource,
         tls: Option<Arc<TlsStore>>,
         token_kdf: pki::TokenKdf,
     ) -> Self {
@@ -380,6 +386,7 @@ impl<C: Consensus> AdminService<C> {
                 phase,
                 data_dir,
                 tls: RwLock::new(tls),
+                tls_source,
                 token_kdf,
             }),
         }
@@ -994,7 +1001,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         // is why it is safe to do here, on a request whose *key* half may yet
         // be refused below.
         let tls = self.tls()?;
-        crate::rotate::adopt_anchors(&tls, &ca_pem)
+        crate::rotate::adopt_anchors(&tls, self.inner.tls_source, &ca_pem)
             .await
             .map_err(|e| {
                 Status::internal(format!(
@@ -3007,9 +3014,10 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
         }
     };
 
-    let ca = read_pem(&cfg.tls.ca_path)?;
-    let cert = read_pem(&cfg.tls.cert_path)?;
-    let key = read_pem(&cfg.tls.key_path)?;
+    let tls_paths = cfg.tls_paths();
+    let ca = read_pem(&tls_paths.ca)?;
+    let cert = read_pem(&tls_paths.cert)?;
+    let key = read_pem(&tls_paths.key)?;
 
     let mut client = admin_channel(&target, &ca, &cert, &key).await?;
 
