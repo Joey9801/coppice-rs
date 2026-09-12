@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use coppice_consensus::{Consensus, OpenraftConsensus, PromotionPlan};
 use coppice_coordinator::admin;
-use coppice_core::id::{ClusterId, JobId, MachineId, QuotaEntityId};
+use coppice_core::id::{ClusterId, JobId, MachineId, NodeId, QuotaEntityId};
 use coppice_core::time::Timestamp;
 use coppice_state::command::BumpClusterVersion;
 use coppice_state::Command;
@@ -784,6 +784,252 @@ async fn a_client_pointed_at_a_follower_submits_observes_and_aborts() {
     )
     .await;
 
+    fleet.stop_all().await;
+}
+
+/// The enrollment token this test seeds for the one agent it runs — a second
+/// role alongside the coordinator token every fleet config already carries.
+const AGENT_TOKEN: &str = "cpk_fleet-agent-launch-template-secret";
+
+/// Issue #133, end to end: a node's health reads `healthy` from a **follower**,
+/// not just from the leader.
+///
+/// Node health is derived from the leader's in-memory liveness marks (ADR 0009),
+/// which no other replica holds. Before ADR 0040 a follower had nothing to
+/// derive it from and answered `health: "unknown"` with a null `last_heartbeat`
+/// for every node — so behind a load balancer the whole fleet read as unknown
+/// roughly two thirds of the time. This asserts the forwarded read: a real
+/// agent, enrolled and heartbeating against a real fleet, observed through a
+/// confirmed follower's own HTTP surface.
+///
+/// Production code only on both sides: `coppice_enroll::ensure_enrolled` against
+/// the public `/api/v1/enroll` route for the leaf, and the real agent session
+/// runner for the registration and the heartbeats. The only stand-in is the
+/// executor, which never runs anything here — no job is submitted.
+///
+/// The three node surfaces are checked together on purpose: `GET /api/v1/nodes`,
+/// `GET /api/v1/nodes/{id}` and the overview's node counts all derive from one
+/// `node_health`, and a regression that split them would be invisible in any
+/// one of them alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
+    init_tracing();
+    let ca = Ca::new();
+    let mut fleet = Fleet::new(3, &ca);
+    fleet.start_all();
+
+    // The fleet's own coordinator token, plus an agent-role token for the node
+    // below: an agent leaf has to chain to the *cluster* CA that formation
+    // mints, so it cannot be provisioned from the test CA by hand.
+    let policy = format!(
+        "{}\n[[enroll_token]]\nsecret = \"{AGENT_TOKEN}\"\nrole = \"agent\"\n\
+         label = \"agents\"\n",
+        Fleet::seeding_policy()
+    );
+    fleet.init_with_policy(policy).await;
+    fleet.await_voters(3).await;
+
+    let leader_idx = fleet_leader_index(&fleet, 3).await;
+    let follower_idx = (leader_idx + 1) % 3;
+    assert_ne!(follower_idx, leader_idx);
+
+    // -- Enroll the agent and run it against the leader's gateway. ----------
+    //
+    // Agent sessions terminate on the leader (ADR 0009): registration is a
+    // write and the heartbeats are what fill the marks this test is about, so
+    // the agent points at the leader. The *reads* below all go to the follower,
+    // which is the whole subject.
+    let node = NodeId::new();
+    let agent_dir = tempfile::tempdir().expect("agent tempdir");
+    let paths = coppice_tls::TlsPaths {
+        cert: agent_dir.path().join("node.crt"),
+        key: agent_dir.path().join("node.key"),
+        ca: agent_dir.path().join("ca.crt"),
+    };
+    let enrollment = coppice_enroll::EnrollmentConfig {
+        endpoint: fleet.members[leader_idx].api(""),
+        token: Some(coppice_enroll::Secret::new(AGENT_TOKEN.to_string())),
+        token_path: None,
+        insecure: true,
+    };
+    let outcome = coppice_enroll::ensure_enrolled(
+        &paths,
+        &enrollment,
+        coppice_enroll::Claim::Node(node),
+        &[],
+    )
+    .await
+    .expect("the agent enrolls over the public route against the formed cluster");
+    assert_eq!(outcome, coppice_enroll::Outcome::Enrolled);
+
+    let data_dir = agent_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the agent data dir");
+    std::fs::write(
+        data_dir.join(coppice_agent::identity::NODE_IDENTITY_FILE),
+        format!("{node}\n"),
+    )
+    .expect("seed the agent node identity");
+
+    let agent_config = coppice_agent::config::Config {
+        data_dir: data_dir.clone(),
+        discovery: coppice_discovery::SeedConfig::static_seeds(vec![
+            fleet.members[leader_idx].agent_target()
+        ]),
+        tls: coppice_agent::config::TlsConfig {
+            cert_path: paths.cert.clone(),
+            key_path: paths.key.clone(),
+            ca_path: paths.ca.clone(),
+        },
+        // The leaf is already on disk; the session runner must not re-enroll.
+        enrollment: None,
+        // Every dimension overridden, so nothing here depends on what the
+        // machine running the test reports.
+        capacity: coppice_agent::config::CapacityConfig {
+            cpu_millis: Some(16_000),
+            memory: Some(coppice_core::bytes::ByteSize::from_gib(16)),
+            disk: Some(coppice_core::bytes::ByteSize::from_tib(1)),
+        },
+        reservation: Default::default(),
+        // Fast enough that the first mark lands well inside the poll below.
+        heartbeat_interval: Duration::from_millis(300),
+        reconnect_backoff_min: Duration::from_millis(100),
+        reconnect_backoff_max: Duration::from_millis(500),
+        labels: Default::default(),
+        executor: Default::default(),
+        pressure: Default::default(),
+        image_cache: Default::default(),
+        telemetry: Default::default(),
+        listen: None,
+        metrics_addr: None,
+    };
+
+    let advertised = agent_config
+        .effective_capacity(&coppice_agent::capacity::detect(&agent_config.data_dir))
+        .expect("every capacity dimension is overridden here")
+        .advertised;
+    let fs = coppice_consensus::fs::RealFs::new(data_dir.clone());
+    let (journal, journal_state) =
+        coppice_agent::journal::Journal::open(fs).expect("open the agent journal");
+    let session = coppice_agent::session::Session::new(
+        node,
+        advertised,
+        Vec::new(),
+        journal,
+        journal_state,
+        coppice_agent::executor::FakeExecutor::new(),
+    );
+    let agent_join = tokio::spawn(async move {
+        let tls = coppice_agent::load_tls_store(&agent_config.tls).expect("load the agent store");
+        let _ = coppice_agent::session::run(session, &agent_config, tls).await;
+    });
+
+    // -- Read health through the follower, and only the follower. -----------
+    let client = reqwest::Client::new();
+    let follower = &fleet.members[follower_idx];
+    assert!(
+        follower.readyz().await.1["is_leader"] == false,
+        "the member every read below targets must actually be a follower"
+    );
+
+    poll(
+        Duration::from_secs(30),
+        "a follower reports the node healthy with a heartbeat stamp",
+        || {
+            let client = &client;
+            let url = follower.api("/api/v1/nodes");
+            async move {
+                let Ok(resp) = client.get(&url).send().await else {
+                    return false;
+                };
+                let (status, body) = split_response(resp).await;
+                if status != 200 {
+                    return false;
+                }
+                body["nodes"].as_array().is_some_and(|nodes| {
+                    nodes.iter().any(|n| {
+                        n["id"] == node.to_string()
+                            && n["health"] == "healthy"
+                            && n["last_heartbeat"].is_string()
+                    })
+                })
+            }
+        },
+    )
+    .await;
+
+    // Still a follower — a mid-test election would have made the assertion
+    // above prove nothing at all, so it is re-checked rather than assumed.
+    let readyz = follower.readyz().await.1;
+    assert_eq!(
+        readyz["is_leader"], false,
+        "leadership moved mid-test, so the healthy read above may have been \
+         served by the leader after all: {readyz}"
+    );
+
+    let (status, list) = split_response(
+        client
+            .get(follower.api("/api/v1/nodes"))
+            .send()
+            .await
+            .expect("the node list reaches the follower"),
+    )
+    .await;
+    assert_eq!(status, 200, "{list}");
+    let summary = list["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|n| n["id"] == node.to_string()).cloned())
+        .unwrap_or_else(|| panic!("the registered node is missing from the list: {list}"));
+
+    // The detail view is a second projection of the same marks, so it must be
+    // telling the same story as the list — but not necessarily to the
+    // microsecond: the agent heartbeats every 300ms and each request fetches the
+    // leader's marks afresh, so the later request may legitimately have seen a
+    // newer beat. What must hold is that both surfaces have a stamp at all and
+    // that time only moves forwards between them; an equality assertion here
+    // would be a coin flip.
+    let (status, detail) = split_response(
+        client
+            .get(follower.api(&format!("/api/v1/nodes/{node}")))
+            .send()
+            .await
+            .expect("the node detail reaches the follower"),
+    )
+    .await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["summary"]["health"], "healthy", "{detail}");
+    let stamp = |view: &serde_json::Value, which: &str| -> Timestamp {
+        serde_json::from_value(view["last_heartbeat"].clone()).unwrap_or_else(|e| {
+            panic!("the {which} view must serve a heartbeat stamp, got {view}: {e}")
+        })
+    };
+    let listed = stamp(&summary, "list");
+    let detailed = stamp(&detail["summary"], "detail");
+    assert!(
+        detailed >= listed,
+        "the detail view was fetched after the list, so its stamp cannot be older: \
+         {detailed} < {listed}"
+    );
+
+    // And the overview's counts come from the same `node_health`, so a healthy
+    // node must not be counted lost — the third surface issue #133 named.
+    let (status, overview) = split_response(
+        client
+            .get(follower.api("/api/v1/overview"))
+            .send()
+            .await
+            .expect("the overview reaches the follower"),
+    )
+    .await;
+    assert_eq!(status, 200, "{overview}");
+    let nodes = &overview["capacity"]["nodes"];
+    assert_eq!(nodes["total"], 1, "{overview}");
+    assert_eq!(nodes["lost"], 0, "{overview}");
+    assert_eq!(
+        nodes["schedulable"], 1,
+        "a healthy node's capacity is the cluster's to schedule against: {overview}"
+    );
+
+    agent_join.abort();
     fleet.stop_all().await;
 }
 

@@ -695,6 +695,11 @@ async fn get_overview<P: ControlPlane>(
         Timestamp::now(),
         &window,
         &plane.usage_window(),
+        // The leader's liveness marks, fetched over the admin channel when
+        // this replica is not the leader (ADR 0040), so the `lost` count here
+        // and the per-node health of `GET /api/v1/nodes` are the same verdict
+        // wherever the read landed.
+        &plane.node_liveness().await,
     );
     Ok((
         ReadIndexes {
@@ -737,7 +742,13 @@ async fn list_nodes<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Bounded))
         .await?;
-    let response = super::project::list_nodes(view.state(), &plane.usage_window());
+    let response = super::project::list_nodes(
+        view.state(),
+        &plane.usage_window(),
+        // Leader-sourced, fetched over the admin channel while this replica
+        // follows (ADR 0040); an empty map reads as `unknown`, never an error.
+        &plane.node_liveness().await,
+    );
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -758,8 +769,14 @@ async fn get_node<P: ControlPlane>(
         .await?;
     // The node's accrual `projected_start` sweep is memoized per published
     // view, so polling node details does not rescan the allocation map.
-    let response = super::project::get_node(view.state(), &id, &plane.usage_window(), view.memos())
-        .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
+    let response = super::project::get_node(
+        view.state(),
+        &id,
+        &plane.usage_window(),
+        &plane.node_liveness().await,
+        view.memos(),
+    )
+    .ok_or_else(|| HttpError::not_found(format!("node {id} not found")))?;
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -1036,6 +1053,9 @@ mod tests {
         /// The ADR 0039 usage snapshot the plane serves; the default is a
         /// replica with nothing measured (every `used` absent).
         usage: UsageSnapshot,
+        /// The leader's liveness marks the plane serves (ADR 0040), as though
+        /// already fetched. Default: none, so every node reads `unknown`.
+        liveness: crate::LivenessMarks,
         /// The ring window `job_timeline` serves, regardless of the job asked
         /// (the tier-1 backstop is exercised for its envelope/paging, not its
         /// filtering — that is unit-tested on the ring itself).
@@ -1091,6 +1111,10 @@ mod tests {
 
         fn usage_window(&self) -> UsageSnapshot {
             self.usage.clone()
+        }
+
+        async fn node_liveness(&self) -> crate::LivenessMarks {
+            self.liveness.clone()
         }
 
         async fn job_timeline(
@@ -1213,6 +1237,7 @@ mod tests {
             fail_with,
             queue_window: QueueWindow::default(),
             usage: UsageSnapshot::default(),
+            liveness: Default::default(),
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -1231,6 +1256,27 @@ mod tests {
             fail_with: None,
             queue_window: QueueWindow::default(),
             usage,
+            liveness: Default::default(),
+            timeline: empty_timeline(),
+            state,
+            read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
+            coordinator: None,
+        }))
+    }
+
+    /// [`app_with_state`] with the leader's liveness marks attached — what
+    /// `node_liveness` hands the node projections on any replica (ADR 0040).
+    fn app_with_liveness(
+        state: coppice_state::StateMachine,
+        liveness: crate::LivenessMarks,
+    ) -> Router {
+        router(Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
+            liveness,
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -1358,6 +1404,7 @@ mod tests {
         let plane = StubPlane {
             fail_with: None,
             usage: UsageSnapshot::default(),
+            liveness: Default::default(),
             queue_window: QueueWindow {
                 buckets: vec![crate::QueueBucket {
                     start: Timestamp::from_micros(60_000_000).expect("in range"),
@@ -1501,7 +1548,6 @@ mod tests {
         // must serialize as `null`, never as a zero vector.
         let usage = crate::UsageSnapshot {
             current: Default::default(),
-            liveness: Default::default(),
             history: std::sync::Arc::new(crate::ClusterUsage {
                 nodes: std::collections::BTreeMap::from([(
                     node,
@@ -1534,10 +1580,9 @@ mod tests {
         assert_eq!(body["samples"][1]["used"], serde_json::Value::Null);
     }
 
-    /// The nodes list serves the leader's liveness marks: a fresh mark
-    /// reads `healthy` with its wall stamp, no mark reads `unknown` with a
-    /// null stamp (the follower answer — and what every node served before
-    /// liveness was wired through).
+    /// The nodes list serves the leader's liveness marks, whichever replica
+    /// the read landed on (ADR 0040): a fresh mark reads `healthy` with its
+    /// wall stamp, a node with no mark reads `unknown` with a null stamp.
     #[tokio::test]
     async fn list_nodes_serves_last_heartbeat_and_derived_health() {
         let (heard, unheard) = (NodeId::new(), NodeId::new());
@@ -1548,18 +1593,15 @@ mod tests {
         // Health reads the mark's monotonic silence, so the wall stamp can
         // be anything the fixture likes; it is served back verbatim.
         let at = Timestamp::UNIX_EPOCH + coppice_core::time::Duration::from_secs(1_700_000_000);
-        let usage = crate::UsageSnapshot {
-            liveness: std::collections::BTreeMap::from([(
-                heard,
-                crate::LivenessMark {
-                    last_heartbeat: Some(at),
-                    silent_for: std::time::Duration::from_secs(5),
-                },
-            )]),
-            ..Default::default()
-        };
+        let marks = crate::LivenessMarks::from([(
+            heard,
+            crate::LivenessMark {
+                last_heartbeat: Some(at),
+                silent_for: std::time::Duration::from_secs(5),
+            },
+        )]);
 
-        let response = app_with_usage(state, usage)
+        let response = app_with_liveness(state, marks)
             .oneshot(Request::get("/api/v1/nodes").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -1952,6 +1994,7 @@ mod tests {
             fail_with: None,
             queue_window: QueueWindow::default(),
             usage: UsageSnapshot::default(),
+            liveness: Default::default(),
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2263,6 +2306,7 @@ mod tests {
             fail_with: None,
             queue_window: QueueWindow::default(),
             usage: UsageSnapshot::default(),
+            liveness: Default::default(),
             timeline,
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2560,6 +2604,7 @@ mod tests {
             fail_with: None,
             queue_window: QueueWindow::default(),
             usage: UsageSnapshot::default(),
+            liveness: Default::default(),
             timeline: empty_timeline(),
             state,
             read_consistency: std::sync::Mutex::default(),
@@ -2790,6 +2835,7 @@ mod tests {
                 fail_with: None,
                 queue_window: QueueWindow::default(),
                 usage: UsageSnapshot::default(),
+                liveness: Default::default(),
                 timeline: empty_timeline(),
                 state: coppice_state::StateMachine::default(),
                 read_consistency: std::sync::Mutex::default(),
@@ -4222,6 +4268,7 @@ mod tests {
             }),
             queue_window: QueueWindow::default(),
             usage: UsageSnapshot::default(),
+            liveness: Default::default(),
             timeline: empty_timeline(),
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),
@@ -4262,6 +4309,7 @@ mod tests {
             }),
             queue_window: QueueWindow::default(),
             usage: UsageSnapshot::default(),
+            liveness: Default::default(),
             timeline: empty_timeline(),
             state: coppice_state::StateMachine::default(),
             read_consistency: std::sync::Mutex::default(),

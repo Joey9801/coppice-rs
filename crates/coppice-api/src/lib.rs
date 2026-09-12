@@ -228,25 +228,20 @@ pub struct ClusterUsage {
 /// reported shows up immediately rather than at the next 30 s bucket close;
 /// `history` is the task's last published window. On a follower — where no
 /// agent sessions terminate — `current` is empty and `history` has no
-/// buckets, and every `used` renders as honestly absent — as does every
-/// `last_heartbeat` and node health derived from `liveness`.
+/// buckets, and every `used` renders as honestly absent.
+///
+/// Liveness marks are deliberately **not** here. They were, while both were
+/// leader-local facts a single snapshot could hand over together; since
+/// ADR 0040 the replica serving a read fetches them from the leader when it is
+/// not the leader itself, which makes them an awaited read with a failure mode
+/// of their own — so [`ControlPlane::node_liveness`] owns them and this stays
+/// the synchronous, leader-local usage view ADR 0039 specified.
 #[derive(Debug, Clone, Default)]
 pub struct UsageSnapshot {
     /// Nodes with a reading fresher than the staleness cutoff. Absent =
     /// not measured.
     pub current: std::collections::BTreeMap<coppice_core::id::NodeId, NodeUsageSample>,
     pub history: std::sync::Arc<ClusterUsage>,
-    /// The leader's liveness marks for the term it currently leads — the
-    /// source of `NodeSummary.last_heartbeat` and the read-time health
-    /// derivation. Leader-local like `current` (agent sessions terminate on
-    /// the leader) and scoped to the current leadership term, so the map is
-    /// empty on a follower, on a replica that has stepped down, and on a
-    /// newly elected leader until its health monitor seeds the term —
-    /// every `last_heartbeat` then renders as null with health `unknown`.
-    /// Unlike `current` there is no staleness cutoff: "last heard at T"
-    /// stays a fact as T ages, and the monotonic age beside it is exactly
-    /// what health is derived from.
-    pub liveness: std::collections::BTreeMap<coppice_core::id::NodeId, LivenessMark>,
     /// Nodes in replicated state right now — the live denominator for
     /// coverage, read at snapshot time rather than from the history task's
     /// tracked set (which is empty until the first bucket closes and can lag
@@ -255,7 +250,8 @@ pub struct UsageSnapshot {
 }
 
 /// One node's standing in the leader's liveness map (ADR 0009's health
-/// monitor input), as of the instant the [`UsageSnapshot`] was taken.
+/// monitor input), as of the instant the leader took the snapshot
+/// ([`ControlPlane::node_liveness`]).
 ///
 /// Two clocks, two jobs. `silent_for` is the *monotonic* span since the
 /// leader last heard from the node — or, for a node it has only granted a
@@ -266,6 +262,12 @@ pub struct UsageSnapshot {
 /// by a wall-clock step. `last_heartbeat` is the wall stamp of the last
 /// actual report, for display only, and absent for a node granted grace but
 /// not yet heard from this term.
+///
+/// Both are measured on the **leader's** clocks, whichever replica serves the
+/// read: the span is computed before it crosses the ADR 0040 hop, so no part
+/// of a health verdict depends on two coordinators' clocks agreeing. What the
+/// hop adds is latency — a span is that much staler than when it was taken —
+/// and at a dashboard's poll rate against a 90 s deadline that is noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LivenessMark {
     pub last_heartbeat: Option<coppice_core::time::Timestamp>,
@@ -772,6 +774,24 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// Cheap: a live read of a small map plus an `Arc` clone of the published
     /// history, no locks held across an await and no consensus involvement.
     fn usage_window(&self) -> UsageSnapshot;
+
+    /// The leader's liveness marks for the term it leads (ADR 0009's health
+    /// monitor input) — the source of `NodeSummary.last_heartbeat` and of
+    /// every read-time node-health verdict.
+    ///
+    /// Read locally while this replica leads; fetched **from the leader** over
+    /// the coordinator admin channel while it follows (ADR 0040), because the
+    /// marks are in-memory on the leader alone and a replica without them can
+    /// only answer `unknown` for the whole fleet (issue #133). Empty when no
+    /// leader is known — an election in progress — or when the fetch fails,
+    /// which renders as `unknown` and never as an error: an unreachable leader
+    /// must not turn a node list into a 503.
+    ///
+    /// Deliberately narrower than [`usage_window`](ControlPlane::usage_window),
+    /// which stays synchronous and leader-local: one entry per node with no
+    /// history, and a verdict operators act on rather than a number they watch
+    /// (ADR 0039's "no read-forwarding" still holds for the numbers).
+    fn node_liveness(&self) -> impl Future<Output = LivenessMarks> + Send;
 
     /// One job's transition timeline (ADR 0032), ascending by `(index,
     /// ordinal)`, resuming strictly after `after` and bounded by `limit`

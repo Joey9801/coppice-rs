@@ -1787,6 +1787,10 @@ impl coppice_api::ControlPlane for NoopPlane {
         ClusterId::new()
     }
 
+    async fn node_liveness(&self) -> coppice_api::LivenessMarks {
+        coppice_api::LivenessMarks::default()
+    }
+
     async fn submit_job(
         &self,
         _req: coppice_api::http::dto::SubmitJobRequest,

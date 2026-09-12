@@ -22,7 +22,9 @@ use coppice_state::{
     QUOTA_TREE_DEPTH_CAP,
 };
 
-use crate::{CoordinatorSummary, JobTimelineWindow, LivenessMark, QueueWindow, UsageSnapshot};
+use crate::{
+    CoordinatorSummary, JobTimelineWindow, LivenessMark, LivenessMarks, QueueWindow, UsageSnapshot,
+};
 
 use super::dto;
 
@@ -32,8 +34,8 @@ use super::dto;
 /// the rate). The full retained hour still ships in `history`.
 const RATE_WINDOW_BUCKETS: usize = 10;
 
-/// How silent a node may be — its monotonic `silent_for` in
-/// `UsageSnapshot::liveness` — before a read reports it `lost`. Matched to
+/// How silent a node may be — the monotonic `silent_for` of its
+/// [`LivenessMark`] — before a read reports it `lost`. Matched to
 /// the coordinator's `AGENT_LIVENESS_DEADLINE`, comparison included (the
 /// monitor declares loss at *exactly* the deadline): the leader's health
 /// monitor proposes `DeclareNodeLost` from the same marks at the same span,
@@ -76,16 +78,17 @@ fn build_node_memos(state: &StateMachine) -> BTreeMap<NodeId, NodeMemo> {
 }
 
 /// A node's health at read time, from the leader's liveness marks for the
-/// term it leads (`UsageSnapshot::liveness`). The verdict reads only the
-/// mark's monotonic `silent_for`, never its wall stamp: silent for the
-/// deadline or longer is `lost` — the verdict the health monitor's
-/// `DeclareNodeLost` reaches from the same span (the read may show it a
-/// housekeeping tick early, or keep showing it after the loss is applied,
-/// since `DeclareNodeLost` leaves no replicated flag to project); heard
-/// from within it is `healthy`. `unknown` is the honest "nothing to judge
-/// by": no mark at all — every node when a follower serves the read — or a
-/// node still inside the grace window a new leader granted it, which is a
-/// courtesy of the monitor's, not a report.
+/// term it leads ([`LivenessMarks`], fetched from the leader when a follower
+/// serves the read — ADR 0040). The verdict reads only the mark's monotonic
+/// `silent_for`, never its wall stamp: silent for the deadline or longer is
+/// `lost` — the verdict the health monitor's `DeclareNodeLost` reaches from
+/// the same span (the read may show it a housekeeping tick early, or keep
+/// showing it after the loss is applied, since `DeclareNodeLost` leaves no
+/// replicated flag to project); heard from within it is `healthy`. `unknown`
+/// is the honest "nothing to judge by": no mark at all — a node the leader
+/// is not tracking, or every node when the marks could not be fetched at all
+/// — or a node still inside the grace window a new leader granted it, which
+/// is a courtesy of the monitor's, not a report.
 ///
 /// One function so the node views and the cluster's `lost` count can never
 /// disagree about what a node's health is.
@@ -106,8 +109,9 @@ fn node_summary(
     record: &coppice_state::NodeRecord,
     memo: &NodeMemo,
     usage: &UsageSnapshot,
+    liveness: &LivenessMarks,
 ) -> dto::NodeSummary {
-    let mark = usage.liveness.get(node_id);
+    let mark = liveness.get(node_id);
     dto::NodeSummary {
         id: *node_id,
         capacity: (&record.node.capacity).into(),
@@ -129,10 +133,14 @@ fn node_summary(
     }
 }
 
-/// `GET /api/v1/nodes`. Pure over the state and the leader's usage
-/// snapshot: node health comes from the snapshot's monotonic marks, so no
-/// reader clock is involved.
-pub fn list_nodes(state: &StateMachine, usage: &UsageSnapshot) -> dto::ListNodesResponse {
+/// `GET /api/v1/nodes`. Pure over the state, the leader's usage snapshot and
+/// its liveness marks: node health comes from the marks' monotonic spans, so
+/// no reader clock is involved.
+pub fn list_nodes(
+    state: &StateMachine,
+    usage: &UsageSnapshot,
+    liveness: &LivenessMarks,
+) -> dto::ListNodesResponse {
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
 
@@ -141,7 +149,7 @@ pub fn list_nodes(state: &StateMachine, usage: &UsageSnapshot) -> dto::ListNodes
         .iter()
         .map(|(id, record)| {
             let memo = memos.get(id).unwrap_or(&empty);
-            node_summary(id, record, memo, usage)
+            node_summary(id, record, memo, usage, liveness)
         })
         .collect();
 
@@ -156,6 +164,7 @@ pub fn get_node(
     state: &StateMachine,
     id: &NodeId,
     usage: &UsageSnapshot,
+    liveness: &LivenessMarks,
     view_memos: &ViewMemos,
 ) -> Option<dto::GetNodeResponse> {
     let record = state.nodes.get(id)?;
@@ -163,7 +172,7 @@ pub fn get_node(
     let empty = NodeMemo::default();
     let memo = memos.get(id).unwrap_or(&empty);
 
-    let summary = node_summary(id, record, memo, usage);
+    let summary = node_summary(id, record, memo, usage, liveness);
 
     let active_attempts = state
         .attempts
@@ -223,11 +232,12 @@ pub fn cluster_overview(
     now: Timestamp,
     window: &QueueWindow,
     usage: &UsageSnapshot,
+    liveness: &LivenessMarks,
 ) -> dto::GetClusterOverviewResponse {
     dto::GetClusterOverviewResponse {
         cluster_id,
         queue: queue_stats(state, now, window),
-        capacity: cluster_capacity(state, usage),
+        capacity: cluster_capacity(state, usage, liveness),
     }
 }
 
@@ -253,7 +263,11 @@ pub fn job_timeline(window: &JobTimelineWindow) -> dto::GetJobTimelineResponse {
     }
 }
 
-fn cluster_capacity(state: &StateMachine, usage: &UsageSnapshot) -> dto::ClusterCapacity {
+fn cluster_capacity(
+    state: &StateMachine,
+    usage: &UsageSnapshot,
+    liveness: &LivenessMarks,
+) -> dto::ClusterCapacity {
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
 
@@ -269,7 +283,7 @@ fn cluster_capacity(state: &StateMachine, usage: &UsageSnapshot) -> dto::Cluster
         nodes.total += 1;
         // A lost node's capacity is not the cluster's to schedule against, so
         // it is excluded from the total rather than counted and discounted.
-        if node_health(usage.liveness.get(id)) == dto::NodeHealth::Lost {
+        if node_health(liveness.get(id)) == dto::NodeHealth::Lost {
             nodes.lost += 1;
         } else {
             capacity = capacity.saturating_add(&record.node.capacity);
@@ -1599,7 +1613,7 @@ mod tests {
     #[test]
     fn list_nodes_returns_empty_for_no_nodes() {
         let state = StateMachine::default();
-        let response = list_nodes(&state, &no_usage());
+        let response = list_nodes(&state, &no_usage(), &no_liveness());
         assert!(response.nodes.is_empty());
     }
 
@@ -1611,7 +1625,7 @@ mod tests {
         state.nodes.insert(n1, test_node(n1));
         state.nodes.insert(n2, test_node(n2));
 
-        let response = list_nodes(&state, &no_usage());
+        let response = list_nodes(&state, &no_usage(), &no_liveness());
         assert_eq!(response.nodes.len(), 2);
     }
 
@@ -1656,7 +1670,7 @@ mod tests {
             ),
         );
 
-        let response = list_nodes(&state, &no_usage());
+        let response = list_nodes(&state, &no_usage(), &no_liveness());
         assert_eq!(response.nodes.len(), 1);
         let summary = &response.nodes[0];
         assert_eq!(summary.running_count, 1);
@@ -1671,30 +1685,34 @@ mod tests {
         let mut state = StateMachine::default();
         state.nodes.insert(node, test_node(node));
 
-        let response = list_nodes(&state, &no_usage());
+        let response = list_nodes(&state, &no_usage(), &no_liveness());
         assert_eq!(response.nodes[0].health, dto::NodeHealth::Unknown);
         assert_eq!(response.nodes[0].last_heartbeat, None);
     }
 
-    /// A snapshot carrying the given liveness marks, for the health
-    /// derivation tests: each is (node, wall stamp of its last report if
-    /// any, monotonic silence since its last report or grace grant).
-    fn liveness_of(marks: &[(NodeId, Option<Timestamp>, std::time::Duration)]) -> UsageSnapshot {
-        UsageSnapshot {
-            liveness: marks
-                .iter()
-                .map(|(node, last_heartbeat, silent_for)| {
-                    (
-                        *node,
-                        LivenessMark {
-                            last_heartbeat: *last_heartbeat,
-                            silent_for: *silent_for,
-                        },
-                    )
-                })
-                .collect(),
-            ..UsageSnapshot::default()
-        }
+    /// The leader's marks for the health-derivation tests: each is (node,
+    /// wall stamp of its last report if any, monotonic silence since its
+    /// last report or grace grant).
+    fn liveness_of(marks: &[(NodeId, Option<Timestamp>, std::time::Duration)]) -> LivenessMarks {
+        marks
+            .iter()
+            .map(|(node, last_heartbeat, silent_for)| {
+                (
+                    *node,
+                    LivenessMark {
+                        last_heartbeat: *last_heartbeat,
+                        silent_for: *silent_for,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// What a replica with no marks to judge by serves — a follower whose
+    /// fetch of the leader's map failed, or a leader that has not seeded the
+    /// term yet. Every node reads `unknown` (ADR 0040).
+    fn no_liveness() -> LivenessMarks {
+        LivenessMarks::default()
     }
 
     #[test]
@@ -1717,7 +1735,7 @@ mod tests {
         // monitor is declaring lost on the same tick; a nanosecond short of
         // it is still healthy.
         let just_inside = HEARTBEAT_LIVENESS_DEADLINE - std::time::Duration::from_nanos(1);
-        let usage = liveness_of(&[
+        let marks = liveness_of(&[
             (fresh, Some(heard_at), just_inside),
             (silent, Some(heard_at), HEARTBEAT_LIVENESS_DEADLINE),
             // Granted grace on leadership gain, no report yet: nothing to
@@ -1726,7 +1744,7 @@ mod tests {
             (seeded_overdue, None, HEARTBEAT_LIVENESS_DEADLINE),
         ]);
 
-        let by_id: BTreeMap<_, _> = list_nodes(&state, &usage)
+        let by_id: BTreeMap<_, _> = list_nodes(&state, &no_usage(), &marks)
             .nodes
             .into_iter()
             .map(|n| (n.id, n))
@@ -1757,7 +1775,7 @@ mod tests {
             .insert(stepped_forward, test_node(stepped_forward));
         state.nodes.insert(stepped_back, test_node(stepped_back));
 
-        let usage = liveness_of(&[
+        let marks = liveness_of(&[
             // Stamped an hour "ago" on the wall clock (the clock jumped
             // forward), but heard from a second ago: healthy.
             (
@@ -1773,7 +1791,7 @@ mod tests {
                 HEARTBEAT_LIVENESS_DEADLINE + std::time::Duration::from_secs(1),
             ),
         ]);
-        let by_id: BTreeMap<_, _> = list_nodes(&state, &usage)
+        let by_id: BTreeMap<_, _> = list_nodes(&state, &no_usage(), &marks)
             .nodes
             .into_iter()
             .map(|n| (n.id, n))
@@ -1801,7 +1819,7 @@ mod tests {
             test_allocation(alloc, job, attempt, lost, AllocationState::Active),
         );
 
-        let usage = liveness_of(&[
+        let marks = liveness_of(&[
             (live, Some(now), std::time::Duration::from_secs(1)),
             (
                 lost,
@@ -1809,8 +1827,15 @@ mod tests {
                 HEARTBEAT_LIVENESS_DEADLINE + std::time::Duration::from_secs(1),
             ),
         ]);
-        let capacity =
-            cluster_overview(&state, cluster(), now, &QueueWindow::default(), &usage).capacity;
+        let capacity = cluster_overview(
+            &state,
+            cluster(),
+            now,
+            &QueueWindow::default(),
+            &no_usage(),
+            &marks,
+        )
+        .capacity;
 
         assert_eq!(capacity.nodes.total, 2);
         assert_eq!(capacity.nodes.lost, 1);
@@ -1824,7 +1849,14 @@ mod tests {
     #[test]
     fn get_node_returns_none_for_missing() {
         let state = StateMachine::default();
-        assert!(get_node(&state, &NodeId::new(), &no_usage(), &no_memos()).is_none());
+        assert!(get_node(
+            &state,
+            &NodeId::new(),
+            &no_usage(),
+            &no_liveness(),
+            &no_memos()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1845,7 +1877,7 @@ mod tests {
             test_allocation(alloc, job, attempt, node, AllocationState::Active),
         );
 
-        let response = get_node(&state, &node, &no_usage(), &no_memos()).unwrap();
+        let response = get_node(&state, &node, &no_usage(), &no_liveness(), &no_memos()).unwrap();
         assert_eq!(response.active_attempts.len(), 1);
         assert_eq!(response.active_attempts[0].rate_ucu_per_second, 100);
         assert_eq!(response.active_attempts[0].outcome, None);
@@ -1881,7 +1913,8 @@ mod tests {
         let mut state = StateMachine::default();
         state.nodes.insert(node, record);
 
-        let response = get_node(&state, &node, &no_usage(), &no_memos()).expect("the node exists");
+        let response = get_node(&state, &node, &no_usage(), &no_liveness(), &no_memos())
+            .expect("the node exists");
         let host = response.host.expect("facts pass through");
         assert_eq!(host.os_version, "macOS 15.5");
         assert_eq!(host.kernel_version, "Darwin 24.5.0");
@@ -1898,7 +1931,8 @@ mod tests {
         // A node whose agent reported nothing reads as unknown, not as zeros.
         let bare = NodeId::new();
         state.nodes.insert(bare, test_node(bare));
-        let response = get_node(&state, &bare, &no_usage(), &no_memos()).expect("the node exists");
+        let response = get_node(&state, &bare, &no_usage(), &no_liveness(), &no_memos())
+            .expect("the node exists");
         assert!(response.host.is_none());
         assert!(response.detected_capacity.is_none());
     }
@@ -1956,7 +1990,14 @@ mod tests {
     /// [`cluster_overview`] with empty derived sources — what a replica with
     /// no bucket coverage serves.
     fn overview(state: &StateMachine, now: Timestamp) -> dto::GetClusterOverviewResponse {
-        cluster_overview(state, cluster(), now, &QueueWindow::default(), &no_usage())
+        cluster_overview(
+            state,
+            cluster(),
+            now,
+            &QueueWindow::default(),
+            &no_usage(),
+            &no_liveness(),
+        )
     }
 
     #[test]
@@ -2149,7 +2190,6 @@ mod tests {
                 },
             )]),
             history: Default::default(),
-            liveness: Default::default(),
             total_nodes: 2,
         };
         let capacity = cluster_overview(
@@ -2158,6 +2198,7 @@ mod tests {
             ts(1_000),
             &QueueWindow::default(),
             &usage,
+            &no_liveness(),
         )
         .capacity;
 
@@ -2385,6 +2426,7 @@ mod tests {
             ts(0),
             &window,
             &no_usage(),
+            &no_liveness(),
         )
         .queue;
         assert_eq!(queue.arrival_rate_per_minute, Some(4.0));
@@ -3356,7 +3398,7 @@ mod tests {
         // pair of polls against the same view would share the sweep.
         let memos = ViewMemos::default();
 
-        let node_view = get_node(&state, &node, &no_usage(), &memos).unwrap();
+        let node_view = get_node(&state, &node, &no_usage(), &no_liveness(), &memos).unwrap();
         assert_eq!(node_view.accrual_queue.len(), 1);
         assert_eq!(node_view.accrual_queue[0].allocation.id, waiter_alloc);
         assert_eq!(node_view.accrual_queue[0].projected_start, expected);
@@ -3378,7 +3420,7 @@ mod tests {
         // observes it, so both views report the honest `None`.
         let (state, node, waiter, _) = state_with_runner_and_accrual(None);
 
-        let node_view = get_node(&state, &node, &no_usage(), &no_memos()).unwrap();
+        let node_view = get_node(&state, &node, &no_usage(), &no_liveness(), &no_memos()).unwrap();
         assert_eq!(node_view.accrual_queue[0].projected_start, None);
 
         let job_view = get_job(&state, &waiter, ts(1_000_000), &no_memos()).unwrap();
