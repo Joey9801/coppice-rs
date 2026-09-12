@@ -43,12 +43,13 @@ use coppice_consensus::{
 use coppice_core::id::ClusterId;
 use coppice_net::admin::Server as AdminServer;
 use coppice_state::Command;
-use coppice_tls::{TlsPaths, TlsStore};
+use coppice_tls::TlsStore;
 
 use coppice_api::http::{MetricsEndpoint, ReadyzEndpoint};
 
 use crate::admin::AdminService;
 use crate::cli::RunArgs;
+use crate::config::TlsSource;
 use crate::formation::{self, Formation, PhaseState, StartupState};
 use crate::localadmin::{AdminSocket, FormationCall, FormationDone, LocalAdmin};
 use crate::tasks::housekeeping::HistorySink;
@@ -164,10 +165,17 @@ pub async fn run_with(
     // The startup states that *serve consensus* still require material, so a
     // formed daemon whose certs went missing fails with the same clarity as
     // before.
-    let tls_paths = tls_paths(&resolved.config);
-    let mut tls: Option<Arc<TlsStore>> = if [&tls_paths.cert, &tls_paths.key, &tls_paths.ca]
-        .iter()
-        .all(|p| p.exists())
+    //
+    // Only *cluster* provenance has that absent-is-legitimate state. Under
+    // `[tls] source = "external"` the material is the operator's and was
+    // already loaded once at config load (issue #127), so a missing file here
+    // is a hard error rather than a daemon that parks waiting for an
+    // enrollment it is forbidden to attempt.
+    let tls_paths = resolved.config.tls_paths();
+    let mut tls: Option<Arc<TlsStore>> = if resolved.config.tls_source() == TlsSource::External
+        || [&tls_paths.cert, &tls_paths.key, &tls_paths.ca]
+            .iter()
+            .all(|p| p.exists())
     {
         Some(load_tls_store(&resolved.config)?)
     } else {
@@ -248,6 +256,7 @@ pub async fn run_with(
     let local_admin = LocalAdmin::new(
         Arc::clone(&phase),
         resolved.config.data_dir.clone(),
+        resolved.config.tls_source(),
         form_tx,
     );
     let admin_socket_join =
@@ -256,6 +265,7 @@ pub async fn run_with(
     let admin_service: AdminService<OpenraftConsensus> = AdminService::unformed(
         Arc::clone(&phase),
         resolved.config.data_dir.clone(),
+        resolved.config.tls_source(),
         tls.clone(),
         resolved.config.token_kdf.kdf(),
     );
@@ -448,6 +458,10 @@ pub async fn run_with(
         // loop above got: same section, same node-local liveness-only
         // character (ADR 0020).
         resolved.config.pacing.renewal(),
+        // Which provenance the machine material has (issue #127): `External`
+        // stands the renewal task down, because the leaf is then the external
+        // issuer's to rotate.
+        resolved.config.tls_source(),
         // The declared `[history]` mode (ADR 0012). `config::load` already
         // rejected a config that never declared one, so this cannot silently
         // become the lossy mode by default — it is what the file says.
@@ -603,6 +617,9 @@ pub async fn serve_runtime(
         None,
         // No config in hand on this seam, so production renewal pacing.
         RenewalPacing::default(),
+        // Likewise no `[tls]` section in hand: the embedder seam behaves like
+        // a cluster-managed daemon, which is what its callers' material is.
+        TlsSource::Cluster,
         history,
         // Likewise the production sweep cadence: an embedder with nothing to
         // say about pacing gets what a deployment gets.
@@ -647,6 +664,8 @@ pub async fn serve_runtime_with_serving_sans(
     readyz: ReadyzEndpoint,
     serving_sans: Option<Vec<String>>,
     renewal_pacing: RenewalPacing,
+    // Whether this daemon owns the machine material it serves (issue #127).
+    tls_source: TlsSource,
     history: HistorySink,
     housekeeping_interval: std::time::Duration,
     auth: coppice_authn::AuthMode,
@@ -667,6 +686,7 @@ pub async fn serve_runtime_with_serving_sans(
         readyz,
         serving_sans,
         renewal_pacing,
+        tls_source,
         history,
         housekeeping_interval,
         auth,
@@ -837,33 +857,25 @@ async fn bind_client_listener(
     }
 }
 
-/// The config's `[tls]` paths as a [`TlsPaths`].
-pub(crate) fn tls_paths(cfg: &config::Config) -> TlsPaths {
-    TlsPaths {
-        cert: cfg.tls.cert_path.clone(),
-        key: cfg.tls.key_path.clone(),
-        ca: cfg.tls.ca_path.clone(),
-    }
-}
-
 /// Load the shared hot-reload TLS store from the config's `[tls]` paths
 /// (ADR 0011/0037 §4). Fails fast, naming the offending path, if any file is
 /// missing or unparseable.
 fn load_tls_store(cfg: &config::Config) -> Result<Arc<TlsStore>> {
-    TlsStore::load(tls_paths(cfg)).context("loading coordinator TLS material (config [tls])")
+    TlsStore::load(cfg.tls_paths()).context("loading coordinator TLS material (config [tls])")
 }
 
 /// The error for a startup state that serves consensus without TLS material
 /// on disk — the pre-ADR-0037 fail-fast, now scoped to the states it
 /// belongs to (a parked daemon legitimately has no material yet).
 fn missing_tls_error(cfg: &config::Config) -> anyhow::Error {
+    let paths = cfg.tls_paths();
     anyhow!(
         "this data directory holds a cluster but the [tls] material is missing \
          (cert {}, key {}, ca {}); a coordinator serving consensus must have valid \
          machine credentials (ADR 0011)",
-        cfg.tls.cert_path.display(),
-        cfg.tls.key_path.display(),
-        cfg.tls.ca_path.display(),
+        paths.cert.display(),
+        paths.key.display(),
+        paths.ca.display(),
     )
 }
 
@@ -1161,6 +1173,7 @@ async fn start_directly(
     let admin_service = AdminService::unformed(
         Arc::clone(&phase),
         resolved.config.data_dir.clone(),
+        resolved.config.tls_source(),
         Some(Arc::clone(&tls_store)),
         resolved.config.token_kdf.kdf(),
     );

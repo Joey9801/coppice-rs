@@ -28,28 +28,28 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use coppice_consensus::fs::RealFs;
 use coppice_proto::pb::core::v1 as pbcore;
-use coppice_tls::{TlsPaths, TlsStore};
+use coppice_tls::TlsStore;
 
 /// Load the agent's shared hot-reload TLS store from its config's `[tls]`
 /// paths (ADR 0011, ADR 0037 §4). Fails fast, naming the offending path, if
 /// any file is missing or unparseable. Shared by the `NodeService` listener
 /// and the session client, so one rotation on disk re-arms both; `coppice
 /// dev` builds its agent half through this too.
-pub fn load_tls_store(tls: &config::TlsConfig) -> Result<Arc<TlsStore>> {
-    let paths = tls_paths(tls);
-    TlsStore::load(paths).with_context(|| {
-        "loading agent TLS material (config [tls]); provision the three files out of band, or \
-         configure [enrollment] to obtain them from the cluster at startup (ADR 0037 §4)"
+pub fn load_tls_store(config: &config::Config) -> Result<Arc<TlsStore>> {
+    let paths = config.tls_paths();
+    TlsStore::load(paths).with_context(|| match config.tls_source() {
+        config::TlsSource::Cluster => format!(
+            "loading agent TLS material from {} ([tls] source = \"cluster\"); enrollment \
+             installs it there at startup, so this means enrollment has not succeeded \
+             (ADR 0037 §4, issue #127)",
+            config.data_dir.join(coppice_tls::PKI_DIR).display()
+        ),
+        config::TlsSource::External => {
+            "loading agent TLS material (config [tls] source = \"external\"); the three files \
+             are provisioned out of band and this agent never writes them (issue #127)"
+                .to_string()
+        }
     })
-}
-
-/// The `[tls]` trio as the store and the enrollment installer both see them.
-fn tls_paths(tls: &config::TlsConfig) -> TlsPaths {
-    TlsPaths {
-        cert: tls.cert_path.clone(),
-        key: tls.key_path.clone(),
-        ca: tls.ca_path.clone(),
-    }
 }
 
 /// Obtain the `[tls]` material from the cluster if `[enrollment]` is configured
@@ -81,7 +81,7 @@ pub async fn ensure_enrolled(
     let Some(enrollment) = &config.enrollment else {
         return Ok(());
     };
-    let paths = tls_paths(&config.tls);
+    let paths = config.tls_paths();
     // An agent's leaf always carries its node id as a SAN — the cluster adds
     // that itself from the claimed identity, because ADR 0034's id-pinned dial
     // depends on it. What the cluster cannot know is the *host* this agent
@@ -231,7 +231,7 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // unparseable material, ADR 0011) and drive reloads from an mtime poll plus
     // SIGHUP. Shared by the NodeService listener and the session client, so one
     // rotation on disk re-arms both (ADR 0037 §4).
-    let tls_store = load_tls_store(&config.tls)?;
+    let tls_store = load_tls_store(&config)?;
     let _tls_reload = coppice_tls::spawn_reload_task(
         Arc::clone(&tls_store),
         coppice_tls::ReloadOptions {

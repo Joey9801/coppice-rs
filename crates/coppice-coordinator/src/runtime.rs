@@ -230,6 +230,10 @@ pub async fn run<C>(
     // How often that task re-examines its conditions, and how hard a failed
     // renewal retries: the `[pacing]` renewal knobs (ADR 0037 §4).
     renewal_pacing: renewal::RenewalPacing,
+    // Whether this daemon owns the machine material it serves (issue #127).
+    // `External` means an operator's issuer does, so the renewal task stands
+    // down and nothing here ever writes the `[tls]` files.
+    tls_source: crate::config::TlsSource,
     // Where terminal-job history goes (ADR 0012): the `[history]` mode the
     // daemon path resolved from config. No default — an embedder driving this
     // seam states it, because "lossy" is a deployment decision and not
@@ -418,6 +422,7 @@ where
     // otherwise. Short leaf lifetimes are only free if this never stops.
     let renewal_join = tokio::spawn(renewal::run(
         machine_tls,
+        tls_source,
         data_dir,
         Arc::clone(&consensus),
         node_handle,
