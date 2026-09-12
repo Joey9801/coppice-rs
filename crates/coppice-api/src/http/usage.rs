@@ -649,6 +649,9 @@ mod tests {
         fn usage_window(&self) -> crate::UsageSnapshot {
             crate::UsageSnapshot::default()
         }
+        async fn node_liveness(&self) -> crate::LivenessMarks {
+            crate::LivenessMarks::default()
+        }
         async fn job_timeline(
             &self,
             _job: JobId,

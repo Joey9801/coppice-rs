@@ -375,7 +375,6 @@ mod tests {
         UsageSnapshot {
             current,
             history: Arc::new(ClusterUsage { nodes, cluster }),
-            liveness: Default::default(),
             total_nodes: tracked.len() as u32,
         }
     }

@@ -207,9 +207,15 @@ async fn show(client: &ApiClient, node: NodeId, json: bool) -> Result<()> {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// Node liveness, in the wire's own vocabulary. `unknown` is the only value a
-/// coordinator produces today (the replicated state records no health input),
-/// so the label is deliberately not softened into "healthy".
+/// Node liveness, in the wire's own vocabulary, printed as the coordinator
+/// spelled it and never softened.
+///
+/// All three values are reachable from any replica now (ADR 0040 fetches the
+/// leader's liveness marks when a follower serves the read). `unknown` is a
+/// third answer and not a synonym for either of the others: it means the
+/// coordinator has nothing to judge the node by — the marks could not be
+/// fetched, or the node is inside the grace window a new leader granted it —
+/// so rendering it as "healthy" would invent a report that never arrived.
 fn health_label(health: dto::NodeHealth) -> &'static str {
     match health {
         dto::NodeHealth::Unknown => "unknown",

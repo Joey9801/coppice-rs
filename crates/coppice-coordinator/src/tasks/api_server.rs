@@ -545,12 +545,12 @@ pub struct CoordinatorControlPlane<C> {
     /// `usage_history` watch — is the "nothing measured" posture every read
     /// serves as `used: null`.
     usage: Option<crate::usage::NodeUsage>,
-    /// The leader's liveness marks, when `with_usage` attached them: the
-    /// wall-clock side feeds `NodeSummary.last_heartbeat`, the monotonic
+    /// This replica's own liveness marks, when `with_usage` attached them:
+    /// the wall-clock side feeds `NodeSummary.last_heartbeat`, the monotonic
     /// side the read-time health derivation. Read only while this replica
-    /// leads, and only for the term it leads. `None` serves an empty map —
-    /// every heartbeat null and every health `unknown`, the same posture a
-    /// follower has.
+    /// leads, and only for the term it leads — a replica that follows fetches
+    /// the leader's instead (`leader_reads`, ADR 0040). `None` on a leader
+    /// serves an empty map: every heartbeat null and every health `unknown`.
     liveness: Option<crate::liveness::NodeLiveness>,
     /// The usage-history task's published rolling window. Seeded with an empty
     /// `ClusterUsage` whose sender is dropped immediately, exactly as
@@ -591,13 +591,13 @@ impl<C> CoordinatorControlPlane<C> {
     }
 
     /// Attach the best-effort node-usage sources (ADR 0039): the leader's
-    /// heartbeat sample sink, its liveness marks (behind `last_heartbeat`
-    /// and node health, served only while — and for the term — this replica
-    /// leads), and the usage-history task's published window. The runtime
+    /// heartbeat sample sink, this replica's liveness marks (behind
+    /// `last_heartbeat` and node health, read locally only while — and for the
+    /// term — this replica leads; ADR 0040 fetches the leader's while it
+    /// follows), and the usage-history task's published window. The runtime
     /// calls this; a control plane without them serves an empty snapshot,
     /// which renders as `used: null`, `last_heartbeat: null`, and health
-    /// `unknown` everywhere rather than as fabricated values — the same
-    /// posture a follower has with them attached.
+    /// `unknown` everywhere rather than as fabricated values.
     pub fn with_usage(
         mut self,
         usage: crate::usage::NodeUsage,
@@ -830,18 +830,6 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 .map(|sink| sink.snapshot(Timestamp::now(), crate::limits::USAGE_SAMPLE_MAX_AGE))
                 .unwrap_or_default(),
             history: self.usage_history.borrow().clone(),
-            // Served for the term this replica leads *right now*, per the
-            // status watch — the map's own term gate then drops anything a
-            // prior term left behind, so a stepped-down or freshly re-elected
-            // replica serves nothing rather than old marks. No cutoff, unlike
-            // `current`: a silent node's mark is still a fact, and its
-            // monotonic age is what the health derivation reads.
-            liveness: match (&self.liveness, &self.consensus.status().borrow().role) {
-                (Some(liveness), Role::Leader { term }) => {
-                    liveness.snapshot(*term, std::time::Instant::now())
-                }
-                _ => Default::default(),
-            },
             total_nodes: self
                 .views
                 .latest()
@@ -850,6 +838,46 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 .len()
                 .try_into()
                 .unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Three cases, one answer shape (ADR 0040).
+    ///
+    /// **Leading**: read the local map for the term this replica leads *right
+    /// now*, per the status watch — the map's own term gate then drops
+    /// anything a prior term left behind, so a stepped-down or freshly
+    /// re-elected replica serves nothing rather than stale marks. No staleness
+    /// cutoff, unlike `usage_window`'s `current`: a silent node's mark is
+    /// still a fact, and its monotonic age is exactly what health is derived
+    /// from.
+    ///
+    /// **Following a known leader**, with a seam attached: fetch that leader's
+    /// marks over the admin channel. The marks are in-memory on the leader
+    /// alone — agent sessions terminate there — so this is the only way a
+    /// follower can answer anything but `unknown` (issue #133).
+    ///
+    /// **Otherwise** — an election in progress, or no seam — the empty map,
+    /// which reads as `unknown`. Never an error: a health read must degrade,
+    /// not fail.
+    async fn node_liveness(&self) -> coppice_api::LivenessMarks {
+        // Copied out of the watch before any `.await`: a borrow guard is not
+        // `Send` and must never be held across the hop below.
+        let role = self.consensus.status().borrow().role.clone();
+        match role {
+            Role::Leader { term } => match &self.liveness {
+                Some(liveness) => liveness.snapshot(term, std::time::Instant::now()),
+                None => Default::default(),
+            },
+            Role::Follower {
+                leader: Some(leader),
+            } => match &self.leader_reads {
+                // Every failure shape collapses here: the transport has
+                // already said which it was, at debug level, and the read has
+                // nothing better to serve than "nothing to judge by".
+                Some(reads) => reads.node_liveness(leader).await.unwrap_or_default(),
+                None => Default::default(),
+            },
+            Role::Follower { leader: None } | Role::Unknown => Default::default(),
         }
     }
 
@@ -1085,13 +1113,18 @@ mod tests {
         control_plane_and_publisher(outcome).0
     }
 
-    /// The liveness marks a read serves follow leadership, not the process:
-    /// a leader serves the marks of the term it leads; a replica that has
-    /// stepped down serves none (never a stale `healthy` decaying into
-    /// `lost`); a re-elected one serves none until its monitor seeds the
-    /// new term, and then only the new term's grace grants and reports.
-    #[test]
-    fn usage_window_serves_liveness_for_the_led_term_only() {
+    /// The marks a **leading** replica serves follow leadership, not the
+    /// process: it serves the marks of the term it leads; one that has stepped
+    /// down serves none (never a stale `healthy` decaying into `lost`); a
+    /// re-elected one serves none until its monitor seeds the new term, and
+    /// then only the new term's grace grants and reports.
+    ///
+    /// The step-down leg here is a plane with *no* leader-read seam — the
+    /// pre-ADR-0040 posture, which is still what a plane without one serves.
+    /// The forwarding leg is
+    /// [`a_follower_serves_the_leaders_marks_over_the_admin_hop`].
+    #[tokio::test]
+    async fn node_liveness_serves_the_led_terms_marks_locally() {
         use coppice_consensus::Role;
         use std::time::Instant;
 
@@ -1104,32 +1137,172 @@ mod tests {
         // Leader of term 1 (the fake's default): the marks are served.
         liveness.seed(1, [node], Instant::now());
         liveness.mark(1, node);
-        let served = plane.usage_window().liveness;
+        let served = plane.node_liveness().await;
         assert!(served[&node].last_heartbeat.is_some());
 
-        // Step-down: same map, same marks, nothing served.
+        // Step-down: same map, same marks, nothing served — and with no seam
+        // attached there is nowhere to fetch the leader's from either.
         consensus.set_role(Role::Follower { leader: Some(2) });
-        assert!(plane.usage_window().liveness.is_empty());
+        assert!(plane.node_liveness().await.is_empty());
 
         // Re-elected for term 3: still nothing until the monitor seeds the
         // term, and then the old term's report is gone — the node is inside
         // its new grace window with no heartbeat, not lost or healthy on
         // term 1's say-so.
         consensus.set_role(Role::Leader { term: 3 });
-        assert!(plane.usage_window().liveness.is_empty());
+        assert!(plane.node_liveness().await.is_empty());
         liveness.seed(3, [node], Instant::now());
-        let served = plane.usage_window().liveness;
+        let served = plane.node_liveness().await;
         assert_eq!(served[&node].last_heartbeat, None);
         assert!(served[&node].silent_for < std::time::Duration::from_secs(1));
 
         // A report from the stale term changes nothing; one from the led
         // term is served.
         liveness.mark(1, node);
-        assert_eq!(plane.usage_window().liveness[&node].last_heartbeat, None);
+        assert_eq!(plane.node_liveness().await[&node].last_heartbeat, None);
         liveness.mark(3, node);
-        assert!(plane.usage_window().liveness[&node]
-            .last_heartbeat
-            .is_some());
+        assert!(plane.node_liveness().await[&node].last_heartbeat.is_some());
+    }
+
+    /// The ADR 0040 read, end to end through the seam: a replica that follows
+    /// a known leader serves the marks that leader answered with, and the
+    /// hop's every failure shape degrades to the empty map — health
+    /// `unknown` — rather than to an error a node list would have to render.
+    ///
+    /// The asymmetry with the write path is the whole point: a forwarded write
+    /// that fails must reach the client as a failure, and this must not.
+    #[tokio::test]
+    async fn a_follower_serves_the_leaders_marks_over_the_admin_hop() {
+        use coppice_consensus::Role;
+
+        let node = NodeId::new();
+        let at = Timestamp::now();
+        let marks = coppice_api::LivenessMarks::from([(
+            node,
+            coppice_api::LivenessMark {
+                last_heartbeat: Some(at),
+                silent_for: std::time::Duration::from_secs(3),
+            },
+        )]);
+
+        let reads = FakeLeaderReads::answering(LivenessAnswer::Marks(marks));
+        let (plane, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        let liveness = crate::liveness::NodeLiveness::new();
+        let (_, history) = watch::channel(Arc::new(ClusterUsage::default()));
+        let plane = plane
+            .with_usage(crate::usage::NodeUsage::new(), liveness.clone(), history)
+            .with_leader_reads(Arc::clone(&reads) as Arc<dyn LeaderReads>);
+
+        // Leading: the local map answers and the seam is never asked. A leader
+        // that dialled itself would be both absurd and a load amplifier.
+        consensus.set_role(Role::Leader { term: 7 });
+        liveness.seed(7, [node], std::time::Instant::now());
+        assert_eq!(plane.node_liveness().await.len(), 1);
+        assert_eq!(reads.calls(), 0);
+
+        // Following a known leader: the seam's answer is served verbatim,
+        // wall stamp and monotonic span alike, addressed to that leader.
+        consensus.set_role(Role::Follower { leader: Some(4) });
+        let served = plane.node_liveness().await;
+        assert_eq!(served[&node].last_heartbeat, Some(at));
+        assert_eq!(served[&node].silent_for, std::time::Duration::from_secs(3));
+        assert_eq!(reads.leaders(), vec![4]);
+
+        // Every failure the transport can report — nothing reached the leader,
+        // the answer never came back, the receiver was not the leader either,
+        // and a mark this build cannot decode — is the same answer here:
+        // nothing to judge by.
+        for failure in [
+            LivenessAnswer::NotSent,
+            LivenessAnswer::LostAnswer,
+            LivenessAnswer::NotLeader,
+            LivenessAnswer::Undecodable,
+        ] {
+            reads.answer(failure);
+            assert!(
+                plane.node_liveness().await.is_empty(),
+                "a failed liveness fetch must read as unknown, never as an error"
+            );
+        }
+
+        // No leader to ask (an election in progress) does not reach the seam
+        // at all, and neither does the pre-leadership Unknown role.
+        let before = reads.calls();
+        consensus.set_role(Role::Follower { leader: None });
+        assert!(plane.node_liveness().await.is_empty());
+        consensus.set_role(Role::Unknown);
+        assert!(plane.node_liveness().await.is_empty());
+        assert_eq!(reads.calls(), before, "there is nobody to dial");
+    }
+
+    /// What a [`FakeLeaderReads`] pretends the hop produced.
+    ///
+    /// One arm per shape the real transport can end in, so the control plane's
+    /// rule — *every* failure reads as `unknown` — is tested against all of
+    /// them rather than against one representative.
+    #[derive(Clone)]
+    enum LivenessAnswer {
+        Marks(coppice_api::LivenessMarks),
+        /// Nothing left this replica: no address, or a dial that failed.
+        NotSent,
+        /// The request went out and no answer came back inside the budget.
+        LostAnswer,
+        /// The receiver is not the leader either; one hop stops here.
+        NotLeader,
+        /// A mark this build cannot decode.
+        Undecodable,
+    }
+
+    /// A [`LeaderReads`] seam that answers from a script and records who it was
+    /// asked to dial.
+    struct FakeLeaderReads {
+        answer: std::sync::Mutex<LivenessAnswer>,
+        seen: std::sync::Mutex<Vec<CoordinatorId>>,
+    }
+
+    impl FakeLeaderReads {
+        fn answering(answer: LivenessAnswer) -> Arc<FakeLeaderReads> {
+            Arc::new(FakeLeaderReads {
+                answer: std::sync::Mutex::new(answer),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn answer(&self, answer: LivenessAnswer) {
+            *self.answer.lock().unwrap() = answer;
+        }
+
+        fn calls(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        fn leaders(&self) -> Vec<CoordinatorId> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl LeaderReads for FakeLeaderReads {
+        fn node_liveness(
+            &self,
+            leader: CoordinatorId,
+        ) -> BoxFuture<'_, Result<coppice_api::LivenessMarks, ApiError>> {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(leader);
+                match self.answer.lock().unwrap().clone() {
+                    LivenessAnswer::Marks(marks) => Ok(marks),
+                    LivenessAnswer::NotSent => Err(ApiError::Unavailable(
+                        "nothing was sent to the leader".to_string(),
+                    )),
+                    LivenessAnswer::LostAnswer => Err(ApiError::Unavailable(
+                        "the leader did not answer the liveness fetch in time".to_string(),
+                    )),
+                    LivenessAnswer::NotLeader => Err(ApiError::NotLeader { leader_hint: None }),
+                    LivenessAnswer::Undecodable => Err(ApiError::Invalid(
+                        "a mark this build cannot decode".to_string(),
+                    )),
+                }
+            })
+        }
     }
 
     /// What a [`FakeForwarder`] pretends the leader said.
