@@ -232,7 +232,7 @@ impl<'a> PreStart<'a> {
         let Some(enrollment) = &self.config.enrollment else {
             return;
         };
-        let paths = crate::bootstrap::tls_paths(self.config);
+        let paths = self.config.tls_paths();
         if coppice_enroll::client::has_usable_leaf(&paths) {
             return;
         }
@@ -299,7 +299,7 @@ impl<'a> PreStart<'a> {
         if let Some(store) = &self.tls {
             return Ok(Arc::clone(store));
         }
-        let store = TlsStore::load(crate::bootstrap::tls_paths(self.config))
+        let store = TlsStore::load(self.config.tls_paths())
             .context("loading the TLS material this daemon enrolled for")?;
         self.tls = Some(Arc::clone(&store));
         Ok(store)
@@ -310,7 +310,8 @@ impl<'a> PreStart<'a> {
 /// the mTLS probe plane, distinct from `has_usable_leaf`'s expiry check
 /// because a probe with an expired leaf still fails informatively.
 fn leaf_present(cfg: &Config) -> bool {
-    [&cfg.tls.cert_path, &cfg.tls.key_path, &cfg.tls.ca_path]
+    let paths = cfg.tls_paths();
+    [&paths.cert, &paths.key, &paths.ca]
         .iter()
         .all(|p| p.exists())
 }

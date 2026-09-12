@@ -433,13 +433,160 @@ impl TelemetryConfig {
     }
 }
 
-/// mTLS material (ADR 0011). Secrets by path reference only.
+/// Who owns this agent's mTLS material (issue #127).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsSource {
+    /// The cluster: material lives at `<data_dir>/pki` and is written by
+    /// enrollment and renewal.
+    Cluster,
+    /// An external issuer: material lives at the configured paths and is only
+    /// ever read.
+    External,
+}
+
+/// The `[tls]` section (ADR 0011, issue #127): where this agent's mTLS
+/// material comes from, stated rather than inferred.
+///
+/// Two provenances, and the difference is *who writes the files*. Under
+/// `source = "cluster"` the cluster owns the material: enrollment installs the
+/// first leaf and renewal replaces it, both into the fixed
+/// `<data_dir>/pki/{node.crt,node.key,ca.crt}` — which is therefore not
+/// configurable, and which is why `[enrollment]` is required. Under
+/// `source = "external"` an external issuer owns it: the three paths are
+/// required and the agent only ever reads and hot-reloads them, so
+/// `[enrollment]` is a config error rather than an unused section.
+///
+/// Secrets stay by path reference either way: the file never holds key
+/// material (ADR 0020).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
-    pub ca_path: PathBuf,
+    pub source: TlsSource,
+    #[serde(default)]
+    cert_path: Option<PathBuf>,
+    #[serde(default)]
+    key_path: Option<PathBuf>,
+    #[serde(default)]
+    ca_path: Option<PathBuf>,
+}
+
+/// The one error message, shared by every mismatch, because the fix is always
+/// the same: say which provenance this deployment has and configure only the
+/// keys that provenance owns.
+fn tls_mismatch(detail: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "[tls] {detail}. The material's provenance is explicit, never implied: \
+         `source = \"cluster\"` means the cluster owns it — enrollment and renewal write \
+         `<data_dir>/pki/node.crt`, `node.key` and `ca.crt`, no path is configurable, and \
+         `[enrollment]` is required because it is the only way an agent obtains one — while \
+         `source = \"external\"` means an external issuer owns it, `cert_path`, `key_path` \
+         and `ca_path` are all required, and this agent only ever reads them (issue #127)"
+    )
+}
+
+fn tls_keys(keys: [(&'static str, bool); 3]) -> Vec<&'static str> {
+    keys.iter()
+        .filter(|(_, present)| *present)
+        .map(|(key, _)| *key)
+        .collect()
+}
+
+impl TlsConfig {
+    /// A cluster-managed section, for callers that build a config in process
+    /// rather than parsing one (`coppice dev`, the test fixtures).
+    pub fn cluster_managed() -> TlsConfig {
+        TlsConfig {
+            source: TlsSource::Cluster,
+            cert_path: None,
+            key_path: None,
+            ca_path: None,
+        }
+    }
+
+    /// An externally-provisioned section naming its three files.
+    pub fn external(cert_path: PathBuf, key_path: PathBuf, ca_path: PathBuf) -> TlsConfig {
+        TlsConfig {
+            source: TlsSource::External,
+            cert_path: Some(cert_path),
+            key_path: Some(key_path),
+            ca_path: Some(ca_path),
+        }
+    }
+
+    /// Reject every combination of `source` and paths that states two things
+    /// at once, or states one of them incompletely.
+    fn validate(&self, has_enrollment: bool) -> Result<()> {
+        let present = tls_keys([
+            ("cert_path", self.cert_path.is_some()),
+            ("key_path", self.key_path.is_some()),
+            ("ca_path", self.ca_path.is_some()),
+        ]);
+        match self.source {
+            TlsSource::Cluster => {
+                if !present.is_empty() {
+                    return Err(tls_mismatch(&format!(
+                        "sets `{}` under `source = \"cluster\"`, where the paths are not \
+                         configurable; cluster-managed material always lives under \
+                         `<data_dir>/pki`",
+                        present.join("`, `")
+                    )));
+                }
+                if !has_enrollment {
+                    return Err(tls_mismatch(
+                        "is `source = \"cluster\"` but this config has no `[enrollment]` \
+                         section; an agent whose material is cluster-managed must be able to \
+                         enroll for it, because nothing else will ever put a leaf on this host",
+                    ));
+                }
+            }
+            TlsSource::External => {
+                let missing = tls_keys([
+                    ("cert_path", self.cert_path.is_none()),
+                    ("key_path", self.key_path.is_none()),
+                    ("ca_path", self.ca_path.is_none()),
+                ]);
+                if !missing.is_empty() {
+                    return Err(tls_mismatch(&format!(
+                        "is `source = \"external\"` but does not set `{}`",
+                        missing.join("`, `")
+                    )));
+                }
+                if has_enrollment {
+                    return Err(tls_mismatch(
+                        "is `source = \"external\"` and this config also carries an \
+                         `[enrollment]` section; enrollment obtains a leaf by writing it into \
+                         the `[tls]` paths, and externally-provisioned material is never \
+                         written by this agent. Delete `[enrollment]`, or say \
+                         `source = \"cluster\"`",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where the three files live.
+    ///
+    /// Infallible because [`TlsConfig::validate`] has already run — every
+    /// `Config` comes either from [`load`], which validates, or from the two
+    /// constructors above, which cannot build an invalid one.
+    fn paths(&self, data_dir: &Path) -> coppice_tls::TlsPaths {
+        match self.source {
+            TlsSource::Cluster => coppice_tls::TlsPaths::cluster_managed(data_dir),
+            TlsSource::External => coppice_tls::TlsPaths {
+                cert: expect_tls_path(&self.cert_path, "cert_path"),
+                key: expect_tls_path(&self.key_path, "key_path"),
+                ca: expect_tls_path(&self.ca_path, "ca_path"),
+            },
+        }
+    }
+}
+
+fn expect_tls_path(path: &Option<PathBuf>, key: &str) -> PathBuf {
+    path.clone().unwrap_or_else(|| {
+        panic!("[tls] source = \"external\" without {key}: config::load validates this")
+    })
 }
 
 /// Capacity overrides (deployment-story A3: detected at startup, configured
@@ -602,6 +749,18 @@ impl Config {
             .map(ListenConfig::advertised_service_addr)
     }
 
+    /// Where this agent's mTLS material comes from (issue #127) — the gate on
+    /// every code path that would *write* it.
+    pub fn tls_source(&self) -> TlsSource {
+        self.tls.source
+    }
+
+    /// The three mTLS material paths: `<data_dir>/pki/...` under cluster
+    /// provenance, the configured trio under external provenance.
+    pub fn tls_paths(&self) -> coppice_tls::TlsPaths {
+        self.tls.paths(&self.data_dir)
+    }
+
     /// Reject semantically invalid values that `serde` alone cannot catch:
     /// bounds and cross-field ordering. `serde`'s `deny_unknown_fields` and
     /// the humane-duration codec handle shape and typos; this handles meaning.
@@ -655,6 +814,12 @@ impl Config {
             );
         }
         self.telemetry.validate()?;
+        // Which provenance the mTLS material has, checked against
+        // `[enrollment]` because the two sections state one thing between them
+        // (issue #127): enrollment obtains a leaf by *writing* it, which is
+        // exactly what external provenance forbids and what cluster
+        // provenance depends on.
+        self.tls.validate(self.enrollment.is_some())?;
         // The enrollment endpoint's transport posture is a startup decision, not
         // a first-enrollment one (ADR 0037 §4): an `http://` endpoint without
         // the opt-in fails here, with no fallback.
@@ -845,6 +1010,19 @@ pub fn load(path: &Path) -> Result<Config> {
     config
         .validate()
         .with_context(|| format!("validating agent config {}", path.display()))?;
+    // Under external provenance the material is the operator's and must be
+    // there *now* (issue #127). Fail-stop rather than fall through: an agent
+    // told its leaf is operator-provisioned must never quietly end up with no
+    // identity because a path was mistyped, and it has no enrollment fallback
+    // to reach for.
+    if config.tls_source() == TlsSource::External {
+        coppice_tls::TlsStore::load(config.tls_paths()).with_context(|| {
+            format!(
+                "loading the externally-provisioned [tls] material named by agent config {}",
+                path.display()
+            )
+        })?;
+    }
     Ok(config)
 }
 
@@ -896,9 +1074,11 @@ backend = "static"
 addrs = ["coord-1.example.com:7072", "coord-2.example.com:7072"]
 
 [tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+source = "cluster"
+
+[enrollment]
+endpoint = "https://coppice.example.com:7070"
+token_path = "/run/secrets/coppice-enroll-token"
 
 [capacity]
 cpu_millis   = 32000
@@ -976,9 +1156,23 @@ backend = "static"
 addrs = ["coord-1.example.com:7072"]
 
 [tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+source = "cluster"
+
+[enrollment]
+endpoint = "https://coppice.example.com:7070"
+token_path = "/run/secrets/coppice-enroll-token"
+"#;
+
+    /// The `[tls]`/`[enrollment]` pair every fixture here carries: cluster
+    /// provenance, whose material needs no paths and whose one requirement is
+    /// that the agent can enroll for it (issue #127).
+    const TLS_AND_ENROLLMENT: &str = r#"
+[tls]
+source = "cluster"
+
+[enrollment]
+endpoint = "https://coppice.example.com:7070"
+token_path = "/run/secrets/coppice-enroll-token"
 "#;
 
     /// A minimal config with `extra` (bare keys, tables, or both) spliced in
@@ -1284,8 +1478,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 
     #[test]
     fn a_missing_discovery_section_is_rejected() {
-        let bad =
-            format!("{MINIMAL_TOP}\n[tls]\ncert_path = \"a\"\nkey_path = \"b\"\nca_path = \"c\"\n");
+        let bad = format!("{MINIMAL_TOP}\n{TLS_AND_ENROLLMENT}");
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("[discovery] is required");
         assert!(format!("{err:#}").contains("discovery"));
@@ -1297,8 +1490,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         // resolved per reconnect is the point (ADR 0037 §2).
         let toml = format!(
             "{MINIMAL_TOP}\n[discovery]\nbackend = \"dns\"\n\n[discovery.dns]\n\
-             name = \"coordinators.example.com\"\nport = 7072\n\n\
-             [tls]\ncert_path = \"a\"\nkey_path = \"b\"\nca_path = \"c\"\n"
+             name = \"coordinators.example.com\"\nport = 7072\n\n{TLS_AND_ENROLLMENT}"
         );
         let (_guard, path) = write_config(&toml);
         let config = load(&path).expect("a dns backend is valid for an agent");

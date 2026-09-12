@@ -445,8 +445,8 @@ on voter disks plus any promotion candidate past the key-transfer gate,
 every recipient root-equivalent; the leader signs). Agents share the coordinators' public token-authenticated
 enrollment endpoint (system-root-verified TLS), role-scoped revocable
 tokens, and renewal-as-revocation-lever over their mTLS sessions;
-Vault-style external issuance remains a substitution behind the same
-`[tls]` paths. Enrollment has landed in the tree (PR #73, part of issue
+Vault-style external issuance remains a substitution behind
+`[tls] source = "external"`. Enrollment has landed in the tree (PR #73, part of issue
 #47's chunk series), with the remaining OD-14/15(a) work limited to the
 chunk 07 test matrix and re-root runbook. **Half (b) — drain and
 decommission — remains open.**

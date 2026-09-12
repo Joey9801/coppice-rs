@@ -202,7 +202,7 @@ revocation), the long-lived agent launch-template token is the supported
 default, and the coordinator token is classified root-equivalent — the
 long-lived variant is an explicitly accepted risk, short-lived
 per-refresh minting the recommended stronger posture. External PKI
-remains a supported substitution behind the same `[tls]` paths.
+remains a supported substitution behind `[tls] source = "external"`.
 
 ### Token custody on the enrolling machine
 
@@ -217,7 +217,7 @@ startup line names the endpoint, the posture, and whether the token is
 inline or a path — never the secret.
 
 Enrollment is idempotent, and that is the strongest custody control
-available: a machine with a usable leaf already in its `[tls]` paths makes
+available: a machine with a usable leaf already under `<data_dir>/pki` makes
 no network call and never reads the token, so the token is needed **only
 on first boot**. A launch template may therefore delete the token file
 after the first successful start, and a restart, an image rebake, or a

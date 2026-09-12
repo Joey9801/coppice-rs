@@ -19,8 +19,8 @@ usage() {
 usage: install.sh --role coordinator|agent
 
   --role   which daemon this host runs. Both units are installed either way;
-           the role decides who owns /etc/coppice/pki, which is the one
-           directory the daemon writes back to (enrollment and leaf renewal).
+           the role only decides which example config to point the operator
+           at and which unit the closing message says to enable.
 EOF
 }
 
@@ -52,8 +52,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$role" in
-coordinator) role_user="coppice" ;;
-agent) role_user="coppice-agent" ;;
+coordinator | agent) ;;
 "")
 	echo "install.sh: --role is required" >&2
 	usage >&2
@@ -101,12 +100,12 @@ install -d -m 0755 /etc/systemd/system
 install -m 0644 "$root/deploy/systemd/coppice-coordinator.service" /etc/systemd/system/
 install -m 0644 "$root/deploy/systemd/coppice-agent.service" /etc/systemd/system/
 
-# /etc/coppice holds the config, the enrollment token and the PKI. The daemon
-# writes its leaf, key and CA bundle into pki/ at enrollment and at every
-# renewal, so that subtree — and only that subtree — is owned by the role's
-# user and kept private to it.
+# /etc/coppice holds the config and the enrollment token, both written by the
+# operator or cloud-init, never by the daemon: it stays root-owned 0755 and
+# the daemon writes nothing under it. Cluster-managed TLS material lives
+# under the role's own state directory instead (/var/lib/coppice/pki or
+# /var/lib/coppice-agent/pki), created by StateDirectory=.
 install -d -m 0755 -o root -g root /etc/coppice
-install -d -m 0700 -o "$role_user" -g "$role_user" /etc/coppice/pki
 
 systemctl daemon-reload
 

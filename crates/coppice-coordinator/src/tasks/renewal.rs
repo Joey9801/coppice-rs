@@ -51,6 +51,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::config::TlsSource;
 use coppice_consensus::{Consensus, NodeHandle};
 use coppice_tls::{pki, TlsPaths, TlsStore};
 use tokio::sync::watch;
@@ -117,8 +118,10 @@ const UNKNOWN_EXPIRY_POLL: Duration = Duration::from_secs(60 * 60);
 /// renewal *point* (`RENEW_AT` of the leaf's lifetime), the alarm threshold,
 /// and the unknown-expiry poll are not configurable — they are properties of
 /// the design, not of a deployment's tempo.
+#[allow(clippy::too_many_arguments)] // wiring seam: each is a distinct task input
 pub async fn run<C: Consensus>(
     store: Arc<TlsStore>,
+    tls_source: TlsSource,
     data_dir: PathBuf,
     consensus: Arc<C>,
     node: NodeHandle,
@@ -126,6 +129,18 @@ pub async fn run<C: Consensus>(
     pacing: RenewalPacing,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Renewal replaces the leaf on disk, so it is cluster-provenance-only
+    // (issue #127). Under `[tls] source = "external"` keeping the certificate
+    // alive is the external issuer's job — this task returns immediately
+    // rather than never being spawned, so the runtime's join/drain order stays
+    // one shape.
+    if tls_source == TlsSource::External {
+        tracing::info!(
+            "renewal: [tls] source = \"external\", so this daemon's leaf is the external \
+             issuer's to rotate; the renewal task will not run (issue #127)"
+        );
+        return;
+    }
     let paths = store.paths().clone();
     let mut backoff: Option<Duration> = None;
 
@@ -256,7 +271,9 @@ pub async fn run<C: Consensus>(
         // learner, a voter that was unreachable during `begin`, a replica that
         // was down for the whole rotation.
         if let Some(recorded) = stale_recorded_ca(&store, consensus.as_ref()) {
-            if let Err(e) = crate::rotate::adopt_anchors(&store, recorded.as_bytes()).await {
+            if let Err(e) =
+                crate::rotate::adopt_anchors(&store, TlsSource::Cluster, recorded.as_bytes()).await
+            {
                 tracing::warn!(
                     error = %format!("{e:#}"),
                     "renewal: could not adopt the trust anchors the cluster records; \

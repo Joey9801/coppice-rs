@@ -195,12 +195,51 @@ pub fn install_leaf_material(
         (&paths.cert, cert_pem),
         (&paths.key, key_pem),
     ] {
+        ensure_private_dir(path)?;
         atomic_write_private(path, bytes).map_err(|source| CustodyError::Write {
             path: path.clone(),
             source,
         })?;
     }
     Ok(())
+}
+
+/// Create `path`'s parent directory, owner-only, if it does not exist yet.
+///
+/// Cluster-managed material lives at `<data_dir>/pki/...` (issue #127), a
+/// directory nothing else creates: the first thing to write into it is
+/// whichever of formation, enrollment or renewal gets there first, and
+/// [`atomic_write_private`] does not create parents — it would fail with a
+/// bare `NotFound` naming a temp file. Doing it here means every producer of
+/// machine material goes through one place that gets the `0700` right, and a
+/// pre-existing directory is left exactly as the operator made it.
+fn ensure_private_dir(path: &Path) -> Result<(), CustodyError> {
+    let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .or_else(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|source| CustodyError::Write {
+            path: dir.to_path_buf(),
+            source,
+        })
 }
 
 /// Install just the **trust anchor bundle** into the `[tls] ca_path` a

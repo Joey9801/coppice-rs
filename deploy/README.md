@@ -39,9 +39,9 @@ sudo /opt/coppice-release/deploy/install.sh --role coordinator   # or --role age
 
 `install.sh` creates the `coppice` and `coppice-agent` system users, installs
 the binary at `/usr/local/bin/coppice`, installs both units, creates
-`/etc/coppice` and `/etc/coppice/pki` (owned by the role's user, 0700), and
-runs `daemon-reload`. It writes no configuration and starts nothing: cloud-init
-or an operator does that. Re-running it is safe.
+`/etc/coppice` (root-owned, 0755), and runs `daemon-reload`. It writes no
+configuration and starts nothing: cloud-init or an operator does that.
+Re-running it is safe.
 
 Configuration then goes at:
 
@@ -50,7 +50,7 @@ Configuration then goes at:
 | `/etc/coppice/coordinator.toml` | coordinator node config (`deploy/examples/coordinator.toml`) |
 | `/etc/coppice/agent.toml` | agent node config (`deploy/examples/agent.toml`) |
 | `/etc/coppice/enroll-token` | the enrollment secret, 0600, owned by the role's user |
-| `/etc/coppice/pki/` | leaf, key and CA bundle — **written by the daemon**, not by you |
+| `/var/lib/coppice/pki/` or `/var/lib/coppice-agent/pki/` | leaf, key and CA bundle under `[tls] source = "cluster"` — **written by the daemon**, not by you (see `docs/operations/configuration.md`) |
 
 Then `systemctl enable --now coppice-coordinator` (or `coppice-agent`).
 

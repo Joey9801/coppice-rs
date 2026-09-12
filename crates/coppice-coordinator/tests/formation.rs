@@ -661,14 +661,7 @@ async fn init_is_refused_when_discovery_names_an_already_initialized_cluster() {
     // other CA fails the handshake, and an unanswerable candidate is skipped,
     // not refused.
     let mut newcomer = Daemon::new(cluster_id, &ca);
-    let root = newcomer
-        .data_dir()
-        .parent()
-        .expect("data dir has a parent")
-        .to_path_buf();
-    std::fs::write(root.join("ca.crt"), &cluster_ca).expect("write cluster ca");
-    std::fs::write(root.join("node.crt"), &cluster_cert).expect("write cluster cert");
-    std::fs::write(root.join("node.key"), &cluster_key).expect("write cluster key");
+    newcomer.install_tls_material(&cluster_ca, &cluster_cert, &cluster_key);
     newcomer.set_static_discovery(&[existing.raft_target()]);
     newcomer.start();
     newcomer.await_phase("waiting").await;
@@ -823,13 +816,7 @@ async fn assert_failed_and_closed(daemon: &mut Daemon, ca: &Ca) {
 /// drop it — the "crashed after `raft.initialize`" state.
 async fn initialize_raft_history(daemon: &Daemon, _ca: &Ca) {
     let root = daemon.data_dir();
-    let certs = root.parent().expect("tempdir root");
-    let tls = coppice_tls::TlsStore::load(coppice_tls::TlsPaths {
-        cert: certs.join("node.crt"),
-        key: certs.join("node.key"),
-        ca: certs.join("ca.crt"),
-    })
-    .expect("load tls store");
+    let tls = coppice_tls::TlsStore::load(daemon.tls_paths()).expect("load tls store");
 
     let started = coppice_consensus::start(
         NodeOptions {

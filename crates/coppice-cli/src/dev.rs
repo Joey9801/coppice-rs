@@ -328,15 +328,12 @@ pub async fn run(args: DevArgs) -> Result<()> {
     // Nothing is provisioned: the `[tls]` trio names paths that do not exist
     // yet, and formation writes into them (ADR 0037 §4's minimal deployment).
     let coord_data = root.join("coordinator");
-    let coord_pki = root.join("coordinator-pki");
-    std::fs::create_dir_all(&coord_pki).context("creating the coordinator PKI dir")?;
     let config_path = root.join("coordinator.toml");
     std::fs::write(
         &config_path,
         coordinator_toml(&CoordinatorLayout {
             cluster_id,
             data_dir: &coord_data,
-            pki_dir: &coord_pki,
             raft_port,
             agent_port,
             client_port,
@@ -379,20 +376,14 @@ pub async fn run(args: DevArgs) -> Result<()> {
     wait_for_client_api(&api, &mut coordinator).await?;
 
     // -- Agent: in-process, enrolling, dialing the gateway over localhost. --
-    let agent_pki = root.join("agent-pki");
-    std::fs::create_dir_all(&agent_pki).context("creating the agent PKI dir")?;
     let mut agent_config = AgentConfig {
         data_dir: agent_data,
         // The dev coordinator is this same process on localhost, so the static
         // backend names it directly (ADR 0037 §2).
         discovery: SeedConfig::static_seeds(vec![format!("localhost:{agent_port}")]),
-        // Certless, exactly like the coordinator: these three paths are where
-        // enrollment installs what it is handed.
-        tls: AgentTls {
-            cert_path: agent_pki.join("agent.crt"),
-            key_path: agent_pki.join("agent.key"),
-            ca_path: agent_pki.join("ca.crt"),
-        },
+        // Certless, exactly like the coordinator: enrollment installs what it
+        // is handed under `<data_dir>/pki` (issue #127).
+        tls: AgentTls::cluster_managed(),
         // The real thing (ADR 0037 §4): a token and an address. `insecure`
         // because the dev client listener is `[client_tls] insecure = true`,
         // and the posture must be declared on both ends or the endpoint is
@@ -753,7 +744,6 @@ pub async fn run(args: DevArgs) -> Result<()> {
 struct CoordinatorLayout<'a> {
     cluster_id: ClusterId,
     data_dir: &'a Path,
-    pki_dir: &'a Path,
     raft_port: u16,
     agent_port: u16,
     client_port: u16,
@@ -795,13 +785,11 @@ election_timeout = "300ms"
 heartbeat_interval = "100ms"
 rpc_timeout = "2s"
 
-# Certless (ADR 0037 §4's minimal deployment): none of these three files
-# exists at startup. Formation mints the cluster CA and this daemon's first
-# leaf and writes them here.
+# Certless (ADR 0037 §4's minimal deployment): nothing exists under
+# <data_dir>/pki at startup. Formation mints the cluster CA and this daemon's
+# first leaf and writes them there (issue #127).
 [tls]
-cert_path = "{cert}"
-key_path = "{key}"
-ca_path = "{ca}"
+source = "cluster"
 
 [client_tls]
 # Plain HTTP on the client listener (ADR 0037 §4: the posture is always
@@ -825,9 +813,6 @@ insecure_open = true
         client_port = layout.client_port,
         raft_port = layout.raft_port,
         agent_port = layout.agent_port,
-        cert = layout.pki_dir.join("coordinator.crt").display(),
-        key = layout.pki_dir.join("coordinator.key").display(),
-        ca = layout.pki_dir.join("ca.crt").display(),
     )
 }
 
@@ -1149,7 +1134,7 @@ fn serve_node_service(
     let Some(listen) = &config.listen else {
         return Ok(());
     };
-    let tls_store = coppice_agent::load_tls_store(&config.tls)?;
+    let tls_store = coppice_agent::load_tls_store(config)?;
     let listener = coppice_agent::node_service::NodeServiceListener::bind(listen.addr, tls_store)
         .context("binding the dev NodeService listener")?;
     tracing::info!(
@@ -1163,7 +1148,7 @@ fn serve_node_service(
 /// The agent session loop as a task body (aborted at shutdown, like a
 /// process kill — the journal is crash-safe by design, ADR 0009).
 async fn run_agent<E: Executor + Clone>(session: Session<RealFs, E>, config: AgentConfig) {
-    let tls_store = match coppice_agent::load_tls_store(&config.tls) {
+    let tls_store = match coppice_agent::load_tls_store(&config) {
         Ok(store) => store,
         Err(e) => {
             tracing::error!("dev agent session loop exited: {e:#}");
@@ -1452,7 +1437,6 @@ mod tests {
                     .parse()
                     .expect("cluster id"),
                 data_dir: &dir.path().join("coordinator"),
-                pki_dir: &dir.path().join("pki"),
                 raft_port: 7071,
                 agent_port: 7072,
                 client_port: 7070,

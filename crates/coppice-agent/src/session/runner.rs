@@ -105,6 +105,18 @@ where
         while inflight.join_next().await.is_some() {}
     });
 
+    // Renewal replaces the leaf on disk, so it is cluster-provenance-only
+    // (issue #127): under `[tls] source = "external"` keeping the certificate
+    // alive is the external issuer's job, and this agent never writes those
+    // files. Said once here rather than on every reconnect.
+    let renews = config.tls_source() == crate::config::TlsSource::Cluster;
+    if !renews {
+        tracing::info!(
+            "[tls] source = \"external\": this agent's leaf is the external issuer's to \
+             rotate, so no renewal will be attempted over the session (issue #127)"
+        );
+    }
+
     // Built once: an unusable `[discovery]` section is a configuration error,
     // not something to retry against (ADR 0037 §2). Consulting it, by contrast,
     // never fails — a backend that cannot reach its source answers with an empty
@@ -132,7 +144,17 @@ where
         let endpoint = candidates[endpoint_idx % candidates.len()].as_str();
         endpoint_idx += 1;
 
-        match serve_once(&mut session, endpoint, &tls, config, &mut exit_rx, &reap_tx).await {
+        match serve_once(
+            &mut session,
+            endpoint,
+            &tls,
+            config,
+            renews,
+            &mut exit_rx,
+            &reap_tx,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!(endpoint, "session closed; reconnecting");
                 backoff = config.reconnect_backoff_min;
@@ -166,11 +188,24 @@ async fn dial(endpoint: &str, store: &TlsStore) -> anyhow::Result<Channel> {
     Ok(channel)
 }
 
+/// The renewal deadline as a future, or one that never fires when this agent
+/// does not own its material (issue #127).
+async fn renew_timer(renews: bool, at: Instant) {
+    if renews {
+        tokio::time::sleep_until(at).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn serve_once<F, E>(
     session: &mut Session<F, E>,
     endpoint: &str,
     tls: &TlsStore,
     config: &Config,
+    // Whether this agent renews its own leaf (issue #127): false under
+    // `[tls] source = "external"`, where the material is the operator's.
+    renews: bool,
     exit_rx: &mut mpsc::Receiver<crate::executor::ExitEvent>,
     reap_tx: &mpsc::Sender<coppice_core::id::AllocationId>,
 ) -> anyhow::Result<()>
@@ -264,7 +299,7 @@ where
                     send_all(&tx, vec![hb]).await?;
                 }
             }
-            _ = tokio::time::sleep_until(renew_at) => {
+            _ = renew_timer(renews, renew_at) => {
                 renew_at = Instant::now() + renewal.attempt(&mut client, tls).await;
             }
             _ = janitor.tick() => {
