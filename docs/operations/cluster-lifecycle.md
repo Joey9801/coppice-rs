@@ -136,8 +136,8 @@ plain-HTTP endpoint requires the conspicuous `insecure = true` opt-in
 unverified endpoint without it is a startup error. Renewal happens
 later over the machine-plane mTLS services, authenticated by the
 current leaf, preserving the subject — short-lived leaves are free.
-Externally-issued certificates remain a supported substitution via the
-same `[tls]` paths. Either way, changed files under `[tls]` reload
+Externally-issued certificates remain a supported substitution via
+`[tls] source = "external"`. Either way, changed files under `[tls]` reload
 without restart (or force with SIGHUP); rotation never requires
 recycling processes. Operators additionally hold an **operator-profile
 certificate** (ADR 0022) for the verbs machines may not call — the
