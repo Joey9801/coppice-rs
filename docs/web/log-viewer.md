@@ -59,6 +59,9 @@ filter stays attached to every forward continuation. On reaching the current end
 page is truncated and immediate history remains. An empty initial tail probes
 from the start, which also handles jobs that have not started their first attempt.
 A new attempt is reachable after the previous attempt's high-water mark.
+`coppice job logs --follow` tails by the same rule: `next_cursor` while history
+remains, then the retained `resume_cursor` on every poll, with the stream and
+attempt filters carried unchanged; it never resumes by `from`.
 
 Log request direction and limit, entry metadata, and supported-page fields are
 required. `at` is the entry's only timestamp; structured infrastructure entries
