@@ -199,6 +199,11 @@ fn every_command() -> Vec<Command> {
             jobs: vec![jid(1), jid(2)],
             evicted_at: ts(),
         }),
+        Command::EvictNodes(EvictNodes {
+            nodes: vec![node, NodeId(Uuid::from_u128(5))],
+            evicted_at: ts(),
+            actor: Some(operator_cert_actor()),
+        }),
         Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
             entity: QuotaEntityId(Uuid::from_u128(0xE1)),
             parent: Some(QuotaEntityId(Uuid::from_u128(0xEE))),
@@ -736,6 +741,33 @@ fn absent_submitted_by_roundtrips_inside_job_specs() {
     });
     let (_, back) = command_from_pb(command_to_pb(&submit, 1)).unwrap();
     assert_eq!(back, submit);
+}
+
+#[test]
+fn policy_config_node_retention_roundtrips() {
+    // The ADR 0041 retention window is a replicated policy field; a
+    // non-default window must survive unchanged.
+    let policy = PolicyConfig {
+        node_retention: Duration::from_hours(1),
+        ..PolicyConfig::default()
+    };
+    let encoded: pb::core::v1::PolicyConfig = (&policy).into();
+    assert_eq!(
+        encoded.node_retention_us,
+        Some(Duration::from_hours(1).as_micros())
+    );
+    let back: PolicyConfig = encoded.try_into().expect("policy must convert");
+    assert_eq!(back, policy, "node_retention roundtrip must be lossless");
+}
+
+#[test]
+fn policy_config_absent_node_retention_is_the_documented_default() {
+    // A policy written before ADR 0041 omits the field; it must decode to
+    // the documented 24 h, not to a zero window that would evict on sight.
+    let mut encoded: pb::core::v1::PolicyConfig = (&PolicyConfig::default()).into();
+    encoded.node_retention_us = None;
+    let back: PolicyConfig = encoded.try_into().expect("policy must convert");
+    assert_eq!(back.node_retention, Duration::from_hours(24));
 }
 
 #[test]

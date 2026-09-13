@@ -14,9 +14,9 @@ use coppice_core::time::{Duration, Timestamp};
 use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::{
     AbortJob, AllocationSpec, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
-    DispatchAttempt, Placement, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RegisterNode, SetNodeDraining, SetNodeSchedulable, SubmitJob, UpdateAuthorization,
-    UpdatePolicy,
+    DispatchAttempt, EvictNodes, Placement, RecordAttemptExited, RecordAttemptOutcome,
+    RecordAttemptStarted, RegisterNode, SetNodeDraining, SetNodeSchedulable, SubmitJob,
+    UpdateAuthorization, UpdatePolicy,
 };
 use coppice_state::{Applied, Command, PolicyConfig, StateMachine};
 use uuid::Uuid;
@@ -319,6 +319,10 @@ pub fn with_actor(command: Command, actor: Actor) -> Command {
             actor: Some(actor),
             ..c
         }),
+        Command::EvictNodes(c) => Command::EvictNodes(EvictNodes {
+            actor: Some(actor),
+            ..c
+        }),
         Command::ConfigureQuotaEntity(c) => Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
             actor: Some(actor),
             ..c
@@ -365,6 +369,16 @@ pub fn set_schedulable_cmd(node: NodeId, schedulable: bool) -> Command {
         schedulable,
         actor: None,
         updated_at: base_ts(),
+    })
+}
+
+/// Remove node records (ADR 0041). Actor-less here: [`with_actor`] attaches
+/// one for the authorization tests.
+pub fn evict_nodes_cmd(nodes: Vec<NodeId>) -> Command {
+    Command::EvictNodes(EvictNodes {
+        nodes,
+        actor: None,
+        evicted_at: base_ts(),
     })
 }
 

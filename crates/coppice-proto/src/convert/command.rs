@@ -14,7 +14,7 @@ use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
     ConfigureQuotaEntity, ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost,
-    DispatchAttempt, EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement,
+    DispatchAttempt, EvictNodes, EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement,
     RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
     RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
     RecordStagedKeyTransferIntent, RegisterNode, RetireMachineBinding, RevokeEnrollToken,
@@ -50,6 +50,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::SetNodeSchedulable(c) => Body::SetNodeSchedulable(c.into()),
         Command::SetNodeDraining(c) => Body::SetNodeDraining(c.into()),
         Command::EvictTerminalJobs(c) => Body::EvictTerminalJobs(c.into()),
+        Command::EvictNodes(c) => Body::EvictNodes(c.into()),
         Command::ConfigureQuotaEntity(c) => Body::ConfigureQuotaEntity(c.into()),
         Command::UpdatePolicy(c) => Body::UpdatePolicy(c.into()),
         Command::UpdateAuthorization(c) => Body::UpdateAuthorization(c.into()),
@@ -94,6 +95,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::SetNodeSchedulable(c) => Command::SetNodeSchedulable(c.try_into()?),
         Body::SetNodeDraining(c) => Command::SetNodeDraining(c.try_into()?),
         Body::EvictTerminalJobs(c) => Command::EvictTerminalJobs(c.try_into()?),
+        Body::EvictNodes(c) => Command::EvictNodes(c.try_into()?),
         Body::ConfigureQuotaEntity(c) => Command::ConfigureQuotaEntity(c.try_into()?),
         Body::UpdatePolicy(c) => Command::UpdatePolicy(c.try_into()?),
         Body::UpdateAuthorization(c) => Command::UpdateAuthorization(c.try_into()?),
@@ -521,6 +523,32 @@ impl TryFrom<pb::EvictTerminalJobs> for EvictTerminalJobs {
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
             evicted_at: timestamp(c.evicted_at_us, "EvictTerminalJobs.evicted_at_us")?,
+        })
+    }
+}
+
+impl From<&EvictNodes> for pb::EvictNodes {
+    fn from(c: &EvictNodes) -> Self {
+        pb::EvictNodes {
+            nodes: c.nodes.iter().map(|id| (*id).into()).collect(),
+            actor: c.actor.as_ref().map(Into::into),
+            evicted_at_us: c.evicted_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::EvictNodes> for EvictNodes {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::EvictNodes) -> Result<Self, ConvertError> {
+        Ok(EvictNodes {
+            nodes: c
+                .nodes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            actor: c.actor.map(Into::into),
+            evicted_at: timestamp(c.evicted_at_us, "EvictNodes.evicted_at_us")?,
         })
     }
 }
@@ -1052,6 +1080,7 @@ impl From<&PolicyConfig> for pbcore::PolicyConfig {
             accrual_limit: policy.accrual_limit,
             default_charge_runtime_s: policy.default_charge_runtime_s,
             terminal_retention_us: policy.terminal_retention.as_micros(),
+            node_retention_us: Some(policy.node_retention.as_micros()),
             abort_grace_us: policy.abort_grace.as_micros(),
             unbounded_runtime_multiplier_q32_32: Some(policy.unbounded_runtime_multiplier.0),
             refund_fraction_milli: Some(policy.refund_fraction_milli),
@@ -1076,6 +1105,11 @@ impl TryFrom<pbcore::PolicyConfig> for PolicyConfig {
             // the codec's.
             terminal_retention: Duration::from_micros(policy.terminal_retention_us),
             abort_grace: Duration::from_micros(policy.abort_grace_us),
+            // Absent decodes to the documented 24 h default, following
+            // fields 9–11 above.
+            node_retention: policy
+                .node_retention_us
+                .map_or(Duration::from_hours(24), Duration::from_micros),
             // Absent (a policy written by a pre-0029 coordinator) decodes to
             // the neutral values, reproducing today's behaviour — not the new
             // PolicyConfig::default() knobs, which only fresh policies get.

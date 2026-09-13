@@ -63,6 +63,7 @@ message Command {
     SetNodeDraining set_node_draining = 53;
 
     EvictTerminalJobs evict_terminal_jobs = 60;
+    EvictNodes evict_nodes = 61;
 
     ConfigureQuotaEntity configure_quota_entity = 70;
     UpdatePolicy update_policy = 71;
@@ -266,6 +267,19 @@ message SetNodeDraining {
 message EvictTerminalJobs {
   repeated coppice.core.v1.JobId jobs = 1;
   int64 evicted_at_us = 2;
+}
+
+// Remove node records from replicated state (ADR 0041). Proposed by the
+// leader's retention GC (nodes silent for longer than
+// PolicyConfig.node_retention) and by the admin API's explicit node remove;
+// both apply identically. Missing ids are skipped so duplicate proposals
+// across leader changes stay idempotent.
+message EvictNodes {
+  repeated coppice.core.v1.NodeId nodes = 1;
+  int64 evicted_at_us = 2;
+  // Who asked (ADR 0023). Absent on the retention GC's own proposals; node
+  // removal is a cluster verb, an unscoped operator or admin binding.
+  coppice.core.v1.Actor actor = 3;
 }
 
 // Create or update one quota entity. Updates preserve accumulated usage —

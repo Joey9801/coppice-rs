@@ -253,6 +253,41 @@ fn drain_takes_an_unscoped_binding() {
     assert!(!sm.nodes[&nid(1)].node.schedulable);
 }
 
+/// Node removal is the same cluster verb as drain (ADR 0041), and — like
+/// drain — a validation failure is reported before authority is consulted.
+#[test]
+fn node_eviction_takes_the_same_cluster_verb_as_drain() {
+    let mut sm = tree_setup();
+    install(
+        &mut sm,
+        vec![
+            principal_binding("root", Role::Admin, None),
+            principal_binding("ops", Role::Operator, None),
+            principal_binding("lead", Role::Admin, Some(ROOT)),
+        ],
+    );
+    // A node that still accepts placements rejects on validation, whoever
+    // asked: the batch check runs before the authorization check, so an
+    // actor-less proposer's rejections are exactly what they always were.
+    let reason = sm
+        .apply(&with_actor(evict_nodes_cmd(vec![nid(1)]), actor("nobody")))
+        .expect_err("nid(1) still accepts placements");
+    assert!(!denied(&reason), "{reason:?}");
+
+    apply_ok(&mut sm, set_schedulable_cmd(nid(1), false));
+    let reason = sm
+        .apply(&with_actor(evict_nodes_cmd(vec![nid(1)]), actor("lead")))
+        .expect_err("a scoped admin holds no cluster verb");
+    assert!(denied(&reason), "{reason:?}");
+    assert!(sm.nodes.contains_key(&nid(1)));
+
+    apply_ok(
+        &mut sm,
+        with_actor(evict_nodes_cmd(vec![nid(1)]), actor("ops")),
+    );
+    assert!(!sm.nodes.contains_key(&nid(1)));
+}
+
 /// An unknown node still rejects `UnknownNode` before the authorization
 /// check, so an actor-carrying command's rejections stay in the catalog's
 /// documented order.

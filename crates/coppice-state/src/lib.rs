@@ -647,6 +647,14 @@ pub struct PolicyConfig {
     ///
     /// Consulted by the proposer, never by apply.
     pub terminal_retention: Duration,
+    /// A node record that no longer accepts placements and holds no live
+    /// allocation is eligible for `EvictNodes` this long after the leader
+    /// last heard from it (ADR 0041).
+    ///
+    /// Consulted by the proposer, never by apply — the silence is measured
+    /// against the leader-local liveness marks of ADR 0040, which are not
+    /// replicated state.
+    pub node_retention: Duration,
     /// Default SIGTERM→SIGKILL grace for aborts.
     pub abort_grace: Duration,
     /// Name of the token claim carrying a principal's groups (ADR 0022/0023),
@@ -671,6 +679,7 @@ impl Default for PolicyConfig {
             unbounded_runtime_multiplier: DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
             refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
             terminal_retention: Duration::from_hours(72),
+            node_retention: Duration::from_hours(24),
             abort_grace: Duration::from_secs(30),
             groups_claim: DEFAULT_GROUPS_CLAIM.to_string(),
         }
@@ -715,6 +724,10 @@ pub enum RejectionReason {
     AllocationNotAccruing(AllocationId),
     #[error("node {0} is not schedulable")]
     NodeNotSchedulable(NodeId),
+    #[error("node {0} still accepts placements")]
+    NodeAcceptsPlacements(NodeId),
+    #[error("node {0} still holds a live allocation")]
+    NodeNotEmpty(NodeId),
     #[error("observed set for node {node} carries epoch {got}, current is {current}")]
     StaleNodeEpoch {
         node: NodeId,

@@ -997,6 +997,94 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
     assert!(!sm.nodes[&nid(1)].accepts_placements());
 }
 
+/// `EvictNodes` removes a node record outright (ADR 0041): the retention GC
+/// and `node remove` share one apply path, and both need the node to have
+/// stopped taking work and to hold nothing live.
+#[test]
+fn evict_nodes_removes_an_empty_drained_node() {
+    let mut sm = setup();
+    apply_ok(&mut sm, set_schedulable_cmd(nid(1), false));
+    let applied = apply_ok(&mut sm, evict_nodes_cmd(vec![nid(1)]));
+    assert!(applied.events.is_empty());
+    assert!(!sm.nodes.contains_key(&nid(1)));
+    assert!(sm.accrual_queue.is_empty());
+
+    // An agent that was not actually gone re-registers as a genuinely new
+    // record: epoch restarts at 1, schedulable, and every command fenced by
+    // the old epoch is already dead.
+    apply_ok(
+        &mut sm,
+        register_node_cmd(nid(1), cpu(10_000), ts(TS_US + 1)),
+    );
+    assert_eq!(sm.nodes[&nid(1)].epoch, 1);
+    assert!(sm.nodes[&nid(1)].accepts_placements());
+}
+
+/// Idempotence across leader changes: a re-proposal listing an id that the
+/// first proposal already removed is an accepted no-op, not a rejection.
+#[test]
+fn evict_nodes_skips_missing_ids() {
+    let mut sm = setup();
+    apply_ok(&mut sm, evict_nodes_cmd(vec![nid(9)]));
+    assert!(sm.nodes.contains_key(&nid(1)));
+}
+
+#[test]
+fn evict_nodes_rejects_a_node_that_still_accepts_placements() {
+    let mut sm = setup();
+    assert_eq!(
+        sm.apply(&evict_nodes_cmd(vec![nid(1)])).unwrap_err(),
+        RejectionReason::InvalidBatch(vec![Rejection {
+            item_index: 0,
+            reason: RejectionReason::NodeAcceptsPlacements(nid(1))
+        }])
+    );
+    assert!(sm.nodes.contains_key(&nid(1)));
+}
+
+/// The whole command rejects, not just the offending item — a listed node
+/// with live work is a proposer bug, and the batch is all-or-nothing.
+#[test]
+fn evict_nodes_rejects_a_drained_node_that_still_holds_live_work() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(4_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(4_000)),
+            base_ts(),
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), base_ts()));
+    apply_ok(&mut sm, set_draining_cmd(nid(1), true));
+
+    assert_eq!(
+        sm.apply(&evict_nodes_cmd(vec![nid(1)])).unwrap_err(),
+        RejectionReason::InvalidBatch(vec![Rejection {
+            item_index: 0,
+            reason: RejectionReason::NodeNotEmpty(nid(1))
+        }])
+    );
+    assert!(sm.nodes.contains_key(&nid(1)));
+
+    // Once the work settles the allocation is released and the same command
+    // applies.
+    apply_ok(
+        &mut sm,
+        outcome_cmd(
+            aid(11),
+            AttemptOutcome::Exited { code: 0 },
+            30,
+            ts(TS_US + 1),
+        ),
+    );
+    apply_ok(&mut sm, evict_nodes_cmd(vec![nid(1)]));
+    assert!(!sm.nodes.contains_key(&nid(1)));
+}
+
 /// `SetNodeDraining` is the heartbeat half of the agent's announcement
 /// (ADR 0041): machine-proposed, no events, and it never writes the cordon.
 #[test]
