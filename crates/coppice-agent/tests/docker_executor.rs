@@ -689,10 +689,31 @@ mod harness {
     /// in `haystack` in order (the store may hold strictly more). The §8.2
     /// "no daemon-returned chunk is discarded" oracle.
     pub fn is_subsequence(needle: &[String], haystack: &[String]) -> bool {
+        first_missing(needle, haystack).is_none()
+    }
+
+    /// The first element of `needle` that the in-order walk of `haystack` cannot
+    /// match, as `(index into needle, line)` — the diagnostic behind
+    /// [`is_subsequence`], so a retention failure names the missing line rather
+    /// than just the fact of one.
+    pub fn first_missing<'a>(
+        needle: &'a [String],
+        haystack: &[String],
+    ) -> Option<(usize, &'a String)> {
         let mut it = haystack.iter();
         needle
             .iter()
-            .all(|want| it.by_ref().any(|have| have == want))
+            .enumerate()
+            .find(|(_, want)| !it.by_ref().any(|have| have == *want))
+    }
+
+    /// The leading token of each line (`tick-N` for the fat printers), so a
+    /// diagnostic over kilobyte lines stays readable.
+    pub fn line_heads(lines: &[String]) -> Vec<&str> {
+        lines
+            .iter()
+            .map(|line| line.split(' ').next().unwrap_or(line.as_str()))
+            .collect()
     }
 
     /// Poll `sink` every 250ms until `(job, attempt)` holds at least `min` stored
@@ -2191,6 +2212,22 @@ const FAT_PRINTER: &[&str] = &[
      i=0; while true; do echo \"tick-$i $p\"; i=$((i+1)); sleep 0.05; done",
 ];
 
+/// [`FAT_PRINTER`] bounded to `n` lines and then parked: the container stays
+/// running (so it is adoptable as a live one) while its log files stop
+/// changing, which lets a test observe the daemon's retained window without a
+/// rotation racing the observer (issue #139).
+fn finite_fat_printer(n: usize) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "p=x; for k in 1 2 3 4 5 6 7 8 9 10; do p=\"$p$p\"; done; \
+             i=0; while [ $i -lt {n} ]; do echo \"tick-$i $p\"; i=$((i+1)); sleep 0.05; done; \
+             exec sleep 3600"
+        ),
+    ]
+}
+
 /// A printer whose every line is the SAME literal `same-line` (~150ms cadence) —
 /// the §8.2 indistinguishable-occurrences case: identical user writes are
 /// semantically distinct, never deduplicated, so completeness is a count invariant
@@ -2596,13 +2633,28 @@ async fn daemon_log_rotation_bounds_catchup() {
     let attempt = AttemptId::new();
     let job = JobId::new();
     let name = format!("coppice-{alloc}");
+    /// Lines the printer emits before parking; see step 1 for the sizing.
+    const PRINTED: usize = 90;
 
     let r: anyhow::Result<()> = async {
         harness::image_size(&docker, harness::BUSYBOX).await?; // ensure image present
 
         // 1. Create out-of-band with the full coppice label set and a small
-        //    rotating json-file log driver (max-size 8k, max-file 2), running a
-        //    fast fat printer so rotation actually cycles.
+        //    rotating json-file log driver (max-size 32k, max-file 2), running a
+        //    fat printer that emits a fixed number of lines and then parks, so
+        //    the files rotate several times and then hold still.
+        //
+        //    Holding still matters (issue #139): the daemon's own follower skips
+        //    a whole file whenever it falls two rotations behind between reads
+        //    (moby logs "file rotations were missed while following logs; some
+        //    log messages have been skipped over"), and nothing on the logs API
+        //    reports it. While the printer ran through adoption and stop, a
+        //    sub-second daemon stall skipped a still-retained file and the
+        //    retention oracle below blamed the executor. Adopting only once the
+        //    files are final means the follower's tail read is the whole
+        //    retained window and no rotation can race it. At ~1.1 KiB per json
+        //    line, 32k holds ~29 lines, so 90 lines rotate three times and
+        //    leave 30–58 retained — comfortably past the 20 chunks awaited.
         let mut labels = HashMap::new();
         labels.insert("coppice.allocation".to_string(), alloc.to_string());
         labels.insert("coppice.attempt".to_string(), attempt.to_string());
@@ -2618,7 +2670,7 @@ async fn daemon_log_rotation_bounds_catchup() {
         labels.insert("coppice.disk-mode".to_string(), "quota".to_string());
 
         let mut log_opts = HashMap::new();
-        log_opts.insert("max-size".to_string(), "8k".to_string());
+        log_opts.insert("max-size".to_string(), "32k".to_string());
         log_opts.insert("max-file".to_string(), "2".to_string());
         let host_config = bollard::models::HostConfig {
             log_config: Some(bollard::models::HostConfigLogConfig {
@@ -2629,12 +2681,7 @@ async fn daemon_log_rotation_bounds_catchup() {
         };
         let body = bollard::models::ContainerCreateBody {
             image: Some(harness::BUSYBOX.to_string()),
-            cmd: Some(
-                FAT_PRINTER
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>(),
-            ),
+            cmd: Some(finite_fat_printer(PRINTED)),
             labels: Some(labels),
             host_config: Some(host_config),
             ..Default::default()
@@ -2658,24 +2705,29 @@ async fn daemon_log_rotation_bounds_catchup() {
             .await
             .map_err(|e| anyhow!("start out-of-band container: {e}"))?;
 
-        // 2. Wait until the first line the container printed has rotated away — the
-        //    "partial history" (in fact a full-rotation gap relative to the very
-        //    start) that catch-up can never recover.
+        // 2. Wait until the printer has parked (its last line is retained) and
+        //    the first line it printed has rotated away — the "partial history"
+        //    (in fact a full-rotation gap relative to the very start) that
+        //    catch-up can never recover. From here the files are final.
+        let last = format!("tick-{} ", PRINTED - 1);
         let deadline = tokio::time::Instant::now() + StdDuration::from_secs(60);
         loop {
             let lines = harness::daemon_log_lines(&docker, &name).await?;
-            if !lines.iter().any(|l| l.starts_with("tick-0 ")) && !lines.is_empty() {
+            if lines.last().is_some_and(|l| l.starts_with(&last))
+                && !lines.iter().any(|l| l.starts_with("tick-0 "))
+            {
                 break;
             }
             ensure!(
                 tokio::time::Instant::now() < deadline,
-                "the daemon never rotated the first line away"
+                "the printer never finished with its first line rotated away"
             );
             tokio::time::sleep(StdDuration::from_millis(250)).await;
         }
 
         // 3. Adopt with a telemetry executor over an EMPTY root: catch-up/follow
-        //    from container start, capturing only what the daemon still retains.
+        //    from container start, capturing only what the daemon still retains
+        //    (the container is still running, parked on its final line).
         let (exec, _tx, _hub, sink) =
             harness::executor_with_telemetry(docker.clone(), root.path()).await;
         exec.observe().await?;
@@ -2704,11 +2756,15 @@ async fn daemon_log_rotation_bounds_catchup() {
             !stored_lines.is_empty(),
             "catch-up collected nothing from a live, rotating container"
         );
-        ensure!(
-            harness::is_subsequence(&daemon, &stored_lines),
-            "a still-retained daemon line is missing from the store (§8.2)\n daemon(last 5)={:?}",
-            &daemon[daemon.len().saturating_sub(5)..]
-        );
+        if let Some((index, line)) = harness::first_missing(&daemon, &stored_lines) {
+            bail!(
+                "a still-retained daemon line is missing from the store (§8.2)\n \
+                 missing daemon[{index}]={:?}\n daemon={:?}\n stored={:?}",
+                line.split(' ').next().unwrap_or(line),
+                harness::line_heads(&daemon),
+                harness::line_heads(&stored_lines),
+            );
+        }
         ensure!(
             harness::attempt_ended(&sink, job, attempt).await,
             "the adopted-then-reaped attempt must be marked ended (§8.4)"
