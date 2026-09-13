@@ -21,7 +21,7 @@ use coppice_core::time::{Duration, Timestamp};
 use crate::authz::{self, Actor, Role, Subject, Verb};
 use crate::command::{
     AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
-    ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost, DispatchAttempt,
+    ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost, DispatchAttempt, EvictNodes,
     EvictTerminalJobs, MintEnrollToken, Placement, RebindMachineAddress, ReconcileNode,
     RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate,
     RecordEnrolledIdentity, RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode,
@@ -58,6 +58,7 @@ impl StateMachine {
             Command::SetNodeSchedulable(c) => self.set_node_schedulable(c),
             Command::SetNodeDraining(c) => self.set_node_draining(c),
             Command::EvictTerminalJobs(c) => self.evict_terminal_jobs(c),
+            Command::EvictNodes(c) => self.evict_nodes(c),
             Command::ConfigureQuotaEntity(c) => self.configure_quota_entity(c),
             Command::UpdatePolicy(c) => self.update_policy(c),
             Command::UpdateAuthorization(c) => self.update_authorization(c),
@@ -949,6 +950,62 @@ impl StateMachine {
             events.push(Event::JobEvicted { job: *job });
         }
         Ok(Applied { events })
+    }
+
+    fn evict_nodes(&mut self, c: &EvictNodes) -> ApplyResult {
+        // Missing ids are skipped, like `EvictTerminalJobs`: a duplicate
+        // proposal across a leader change must be idempotent. A listed node
+        // that could still be given work, or that still holds one live
+        // allocation, is a proposer bug and rejects the whole command.
+        let mut items: Vec<Rejection> = Vec::new();
+        for (i, node) in c.nodes.iter().enumerate() {
+            let Some(rec) = self.nodes.get(node) else {
+                continue;
+            };
+            let reason = if rec.accepts_placements() {
+                Some(RejectionReason::NodeAcceptsPlacements(*node))
+            } else if self.allocations.values().any(|a| {
+                a.allocation.node == *node && a.allocation.state != AllocationState::Released
+            }) {
+                Some(RejectionReason::NodeNotEmpty(*node))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                items.push(Rejection {
+                    item_index: i as u32,
+                    reason,
+                });
+            }
+        }
+        if !items.is_empty() {
+            return Err(RejectionReason::InvalidBatch(items));
+        }
+        // Removal is a cluster verb (ADR 0023), the same one drain takes.
+        // Validation first, so the retention GC's actor-less proposals see
+        // exactly the rejections they saw before authorization existed.
+        self.authorize(c.actor.as_ref(), Verb::Drain)?;
+        for node in &c.nodes {
+            if self.nodes.remove(node).is_none() {
+                continue;
+            }
+            // An evictable node has no live allocation, so it can have no
+            // accrual queue either — the queue only ever holds `Accruing`
+            // entries. Clear the range anyway, for the same reason
+            // `evict_terminal_jobs` unwinds its allocations explicitly: a
+            // dangling key would outlive the record it describes.
+            let stale: Vec<(NodeId, u64)> = self
+                .accrual_queue
+                .range((*node, 0)..=(*node, u64::MAX))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in stale {
+                self.accrual_queue.remove(&key);
+            }
+        }
+        // No events: nothing downstream watches a node record disappear, and
+        // an empty node has no work whose fate an event would describe.
+        Ok(Applied::default())
     }
 
     // ---- Admin / policy ----

@@ -29,8 +29,9 @@ use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{state_from_records, state_to_records, StateRecords};
 use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
-    BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
-    ReconcileNode, RegisterNode, SetNodeDraining, SetNodeSchedulable, UpdateAuthorization,
+    BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictNodes, EvictTerminalJobs,
+    LostAttempt, ReconcileNode, RegisterNode, SetNodeDraining, SetNodeSchedulable,
+    UpdateAuthorization,
 };
 use coppice_state::{Command, StateMachine};
 use proptest::prelude::*;
@@ -151,6 +152,18 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 node: node_of(n),
                 draining,
                 at: ts,
+            })
+        }),
+        (any::<u8>(), any::<bool>(), arb_ts()).prop_map(|(mask, with_who, ts)| {
+            Command::EvictNodes(EvictNodes {
+                nodes: (0..NODES as usize)
+                    .filter(|k| mask & (1 << k) != 0)
+                    .map(node_of)
+                    .collect(),
+                evicted_at: ts,
+                // A cluster verb, like the drain above: acceptance depends on
+                // whatever bindings an earlier command installed.
+                actor: with_who.then(|| actor("root")),
             })
         }),
         (any::<u8>(), arb_ts()).prop_map(|(mask, ts)| {

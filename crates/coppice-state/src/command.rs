@@ -12,9 +12,10 @@
 //!
 //! # Actor-carrying commands
 //!
-//! Seven commands — [`SubmitJob`], [`AbortJob`], [`SetNodeSchedulable`],
-//! [`ConfigureQuotaEntity`], [`UpdatePolicy`], [`UpdateAuthorization`], and
-//! [`BumpClusterVersion`] — carry an `actor: Option<Actor>` (ADR 0023). They
+//! Eight commands — [`SubmitJob`], [`AbortJob`], [`SetNodeSchedulable`],
+//! [`EvictNodes`], [`ConfigureQuotaEntity`], [`UpdatePolicy`],
+//! [`UpdateAuthorization`], and [`BumpClusterVersion`] — carry an
+//! `actor: Option<Actor>` (ADR 0023). They
 //! are exactly the commands reachable through the public API, and the
 //! `Option` is the structural distinction between the two kinds of proposer:
 //!
@@ -66,6 +67,7 @@ pub enum Command {
     SetNodeDraining(SetNodeDraining),
     // Housekeeping.
     EvictTerminalJobs(EvictTerminalJobs),
+    EvictNodes(EvictNodes),
     // Admin / policy.
     ConfigureQuotaEntity(ConfigureQuotaEntity),
     UpdatePolicy(UpdatePolicy),
@@ -110,6 +112,7 @@ impl Command {
             Command::SetNodeSchedulable(c) => c.updated_at,
             Command::SetNodeDraining(c) => c.at,
             Command::EvictTerminalJobs(c) => c.evicted_at,
+            Command::EvictNodes(c) => c.evicted_at,
             Command::ConfigureQuotaEntity(c) => c.updated_at,
             Command::UpdatePolicy(c) => c.updated_at,
             Command::UpdateAuthorization(c) => c.updated_at,
@@ -349,6 +352,23 @@ pub struct SetNodeDraining {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictTerminalJobs {
     pub jobs: Vec<JobId>,
+    pub evicted_at: Timestamp,
+}
+
+/// Remove node records from replicated state (ADR 0041).
+///
+/// Proposed from two places and applied identically: the leader's retention
+/// GC, for nodes silent longer than `PolicyConfig::node_retention`, and the
+/// admin API's explicit `node remove`. Missing ids are skipped (duplicate
+/// proposals across leader changes must be idempotent); a listed node that
+/// still accepts placements or still holds a live allocation is a proposer
+/// bug and rejects the whole command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictNodes {
+    pub nodes: Vec<NodeId>,
+    /// Who asked — see the module note on actor-carrying commands. `None`
+    /// for the retention GC's own proposals.
+    pub actor: Option<Actor>,
     pub evicted_at: Timestamp,
 }
 

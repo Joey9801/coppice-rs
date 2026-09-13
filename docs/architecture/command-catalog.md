@@ -449,6 +449,16 @@ reachable through the API.
 | Apply effects | Remove each listed job, its attempts, and their (already `Released`) allocations from state. Quota usage is untouched — charges and true-ups have long since settled. |
 | Rejections | `InvalidBatch` wrapping `JobNotTerminal` |
 
+#### `EvictNodes`
+
+| | |
+| --- | --- |
+| Proposer | Two, applying identically (ADR 0041). **Leader housekeeping retention GC**: every node that does not accept placements, holds no live allocation, and has been silent for at least `policy.node_retention` (24 h default) according to the leader-local liveness marks of ADR 0040 — proposed with no actor, and the clock is the proposer's, never apply's. **Admin API `node remove`** (`coppice node remove`): one node, with the request's actor. |
+| Payload | `nodes: NodeId[]`, `actor: Actor`, `evicted_at_us` |
+| Validation | Every listed node that exists must **not accept placements** (`schedulable = false` or the agent's `draining`) and must hold **no non-`Released` allocation**. Missing ids are skipped silently — duplicate proposals across leader changes must be idempotent. Either failure is a proposer bug and rejects the whole command, with per-item diagnostics. Actor (when present) holds unscoped `operator` or `admin` — removal is the same cluster verb as drain. Validation precedes the authorization check, as it does for `SetNodeSchedulable`. |
+| Apply effects | Remove each listed node record, and any accrual-queue entries keyed by it (an evictable node has none — the range is cleared so no key can outlive the record it describes). **No events**: nothing downstream watches a node record disappear, and an empty node has no work whose fate an event would describe. A removed node whose agent is still alive re-registers as a genuinely new record — `epoch = 1`, schedulable — which is the honest outcome of removing a node that was not gone; `revoke-identity` is how you stop that. |
+| Rejections | `InvalidBatch` wrapping `NodeAcceptsPlacements` / `NodeNotEmpty`; `PermissionDenied` |
+
 ### Admin / policy
 
 #### `ConfigureQuotaEntity`
@@ -466,7 +476,7 @@ reachable through the API.
 | | |
 | --- | --- |
 | Proposer | Admin API / CLI. The CLI converts human-facing forms (half-life → Q0.64 λ, rates → stocks) so no transcendental math ever runs in a replica (ADR 0019/0020). |
-| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `unbounded_runtime_multiplier: u64` (Q32.32, default 2.0 — ADR 0029), `refund_fraction_milli: u32` (default 750 — ADR 0029), `terminal_retention_us: i64` (72 h default), `abort_grace_us: i64` (30 s default), `groups_claim: string` (`"groups"` default — ADR 0023); plus `actor: Actor`, `updated_at_us` |
+| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `unbounded_runtime_multiplier: u64` (Q32.32, default 2.0 — ADR 0029), `refund_fraction_milli: u32` (default 750 — ADR 0029), `terminal_retention_us: i64` (72 h default), `node_retention_us: i64` (24 h default — ADR 0041), `abort_grace_us: i64` (30 s default), `groups_claim: string` (`"groups"` default — ADR 0023); plus `actor: Actor`, `updated_at_us` |
 | Validation | `decay.validate()` (positive tick, λ within the iteration bound); `unbounded_runtime_multiplier ≥ 2³²` (≥ 1.0); `refund_fraction_milli ≤ 1000`; actor holds unscoped `admin`; a full-replacement payload is otherwise self-consistent by construction |
 | Apply effects | Replace the replicated policy. In-flight charge records keep their recorded rate/multiplier/refund fraction (no retroactive repricing); decay re-times from each entity's next touch; quota-stock rescaling on half-life change is owned by the tooling that authored the command. |
 | Rejections | `InvalidPolicy`, `PermissionDenied` |

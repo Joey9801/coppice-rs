@@ -125,4 +125,9 @@ message PolicyConfig {
   // documented-default convention of fields 9 and 10: absent decodes to
   // "groups".
   optional string groups_claim = 11;
+  // A node record that no longer accepts placements and holds no live
+  // allocation is eligible for eviction this long after the leader last
+  // heard from it (ADR 0041). Consulted by the proposer, never by apply.
+  // Explicit presence, following fields 9–11: absent decodes to 24 h.
+  optional int64 node_retention_us = 12;
 }
