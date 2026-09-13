@@ -93,7 +93,7 @@ launch-template credential:
 
 ```
 coppice node --target coord-1:7071 \
-  --ca /etc/coppice/pki/ca.crt --cert operator.crt --key operator.key \
+  --ca /var/lib/coppice/pki/ca.crt --cert operator.crt --key operator.key \
   enroll-token mint --role coordinator --ttl 15m --label replacement-coordinator
 ```
 
@@ -225,7 +225,7 @@ key holders   [4739272934893806964, 9156952040390162700, 17882036273301565489]  
 ```
 
 ```
-openssl x509 -in /etc/coppice/pki/ca.crt -noout -subject -serial -ext subjectKeyIdentifier
+openssl x509 -in /var/lib/coppice/pki/ca.crt -noout -subject -serial -ext subjectKeyIdentifier
 ```
 
 ```
@@ -408,11 +408,11 @@ Caused by:
     1: invalid peer certificate: BadSignature
 ```
 
-Copy the recorded bundle from any coordinator's `[tls] ca_path` to every
-workstation and automation host that holds one:
+Copy the recorded bundle from any coordinator's cluster-managed PKI
+directory to every workstation and automation host that holds one:
 
 ```
-scp coord-1:/etc/coppice/pki/ca.crt ./ca.crt
+scp coord-1:/var/lib/coppice/pki/ca.crt ./ca.crt
 ```
 
 With the refreshed bundle, the **day-0 operator certificate — issued
@@ -447,12 +447,12 @@ no fast path for a CA change. Two consequences, both verified:
   WARN coppice_agent::session::runner: session error; reconnecting endpoint="localhost:21112" error=transport error
   ```
 
-The remedy is to push the recorded bundle into each agent's
-`[tls] ca_path`. **No restart is needed** — the agent's TLS store
-hot-reloads it on the mtime poll:
+The remedy is to push the recorded bundle into each agent's PKI directory.
+**No restart is needed** — the agent's TLS store hot-reloads it on the
+mtime poll:
 
 ```
-scp coord-1:/etc/coppice/pki/ca.crt agent-7:/etc/coppice/pki/ca.crt
+scp coord-1:/var/lib/coppice/pki/ca.crt agent-7:/var/lib/coppice-agent/pki/ca.crt
 ```
 
 ```
@@ -521,13 +521,15 @@ instead of verifying it. Verifying means: for every node in the fleet,
 its leaf chains to the incoming root. For a node whose leaf you can read:
 
 ```
-openssl x509 -in /etc/coppice/pki/ca.crt -outform pem > new-root.pem   # first block = active root
-openssl verify -CAfile new-root.pem /etc/coppice/pki/node.crt
+openssl x509 -in /var/lib/coppice/pki/ca.crt -outform pem > new-root.pem   # first block = active root
+openssl verify -CAfile new-root.pem /var/lib/coppice/pki/node.crt
 ```
 
 ```
-/etc/coppice/pki/node.crt: OK
+/var/lib/coppice/pki/node.crt: OK
 ```
+
+(An agent's material lives at the same layout under `/var/lib/coppice-agent/pki` instead.)
 
 A node still under the outgoing root fails it plainly:
 
@@ -582,7 +584,7 @@ leaf so startup enrollment re-runs.
 
 ```
 systemctl stop coppice-agent
-rm -f /etc/coppice/pki/node.crt /etc/coppice/pki/node.key /etc/coppice/pki/ca.crt
+rm -f /var/lib/coppice-agent/pki/node.crt /var/lib/coppice-agent/pki/node.key /var/lib/coppice-agent/pki/ca.crt
 systemctl start coppice-agent
 ```
 
@@ -713,10 +715,10 @@ restore-versus-reinit:
    [cluster-lifecycle.md](cluster-lifecycle.md). This mints a brand-new
    CA; there is no continuity with the old root and no dual-trust window,
    because there is nothing to be dual with.
-5. **Re-enroll the fleet.** Every agent needs its `[tls]` material
-   removed so startup enrollment re-runs, and every agent and coordinator
-   needs the new `cluster_id` in its config. Collect a fresh operator
-   credential from the `init` output.
+5. **Re-enroll the fleet.** Every agent needs the material under its PKI
+   directory removed so startup enrollment re-runs, and every agent and
+   coordinator needs the new `cluster_id` in its config. Collect a fresh
+   operator credential from the `init` output.
 
 ## Verification
 
@@ -788,7 +790,7 @@ a host still holding two anchors has not renewed since `complete` and is
 still trusting a root the cluster has retired:
 
 ```
-grep -c 'BEGIN CERTIFICATE' /etc/coppice/pki/ca.crt
+grep -c 'BEGIN CERTIFICATE' /var/lib/coppice/pki/ca.crt   # or /var/lib/coppice-agent/pki/ca.crt on an agent
 ```
 
 ```

@@ -63,8 +63,8 @@ mkdir -p /opt/coppice-release
 retry "release download" aws s3 cp "s3://${artefact_bucket}/${artefact_key}" \
   /opt/coppice-release.tar.gz --region "${region}"
 tar xzf /opt/coppice-release.tar.gz -C /opt/coppice-release
-# Installs the binary, both units and the service users, creates /etc/coppice
-# and /etc/coppice/pki, and starts nothing.
+# Installs the binary, both units and the service users, creates /etc/coppice,
+# and starts nothing.
 /opt/coppice-release/deploy/install.sh --role coordinator
 
 # The node config, rendered from the checked-in example so that the comments
@@ -89,9 +89,9 @@ if grep -Eq 'COORDINATOR_PRIVATE_IP|AGENT_PRIVATE_DNS|POOL_ID|COGNITO_APP_CLIENT
   exit 1
 fi
 
-# The enrollment secret, which is how this node obtains its `[tls]` leaf. Set
-# +x for the duration: with -x the value would otherwise land in this log and
-# in the console output.
+# The enrollment secret, which is how this node obtains its cluster-owned
+# machine-plane leaf. Set +x for the duration: with -x the value would
+# otherwise land in this log and in the console output.
 set +x
 enroll_token=""
 for attempt in $(seq 1 30); do
