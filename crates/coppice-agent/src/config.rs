@@ -99,6 +99,18 @@ pub struct Config {
     #[serde(default = "default_backoff_max", with = "humantime_serde")]
     pub reconnect_backoff_max: Duration,
 
+    /// How long a SIGTERM'd agent waits for its running work to finish before
+    /// exiting anyway (ADR 0041). The clock starts at the signal; the agent
+    /// announces `draining` on its next report and then waits for the work it
+    /// is already accountable for.
+    ///
+    /// Work still running when the window closes is **left running**, not
+    /// stopped (ADR 0041). Size this (and the unit's `TimeoutStopSec`, and any
+    /// ASG lifecycle-hook heartbeat) to the longest job this node should be
+    /// allowed to finish.
+    #[serde(default = "default_shutdown_grace", with = "humantime_serde")]
+    pub shutdown_grace: Duration,
+
     /// Placement labels advertised at registration. `BTreeMap` keeps the
     /// canonical ascending-key ordering the wire form requires.
     #[serde(default)]
@@ -620,6 +632,15 @@ impl Config {
                  select a backend that discovers them (issue #48, ADR 0037 §2)"
             );
         }
+        // Zero is not "stop immediately": a drain that cannot wait at all is a
+        // config mistake, and the honest way to say it is to stop the unit with
+        // SIGKILL (ADR 0041).
+        if self.shutdown_grace.is_zero() {
+            anyhow::bail!(
+                "shutdown_grace must be greater than zero: it is how long a drain waits for \
+                 running work (ADR 0041)"
+            );
+        }
         if self.executor.default_uid == 0 {
             anyhow::bail!("executor.default_uid must not be 0: workloads never run as root (§6)");
         }
@@ -690,6 +711,7 @@ impl Config {
             heartbeat_interval = ?self.heartbeat_interval,
             reconnect_backoff_min = ?self.reconnect_backoff_min,
             reconnect_backoff_max = ?self.reconnect_backoff_max,
+            shutdown_grace = ?self.shutdown_grace,
             capacity_overrides = ?self.capacity,
             reservation = ?self.reservation,
             labels = ?self.labels,
@@ -730,6 +752,10 @@ fn default_backoff_min() -> Duration {
 
 fn default_backoff_max() -> Duration {
     Duration::from_secs(15)
+}
+
+fn default_shutdown_grace() -> Duration {
+    Duration::from_secs(5 * 60)
 }
 
 fn default_reap_janitor_after() -> Duration {
@@ -881,6 +907,7 @@ metrics_addr = "127.0.0.1:9464"
 heartbeat_interval = "5s"
 reconnect_backoff_min = "250ms"
 reconnect_backoff_max = "30s"
+shutdown_grace = "10m"
 
 [discovery]
 backend = "static"
@@ -1014,6 +1041,7 @@ token_path = "/etc/coppice/enroll-token"
         assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(config.reconnect_backoff_min, Duration::from_millis(250));
         assert_eq!(config.reconnect_backoff_max, Duration::from_secs(30));
+        assert_eq!(config.shutdown_grace, Duration::from_secs(600));
         // Every dimension is overridden here, so the settled vector is the
         // file's and the host's reading does not enter into it.
         let effective = config
@@ -1149,6 +1177,9 @@ token_path = "/etc/coppice/enroll-token"
         assert_eq!(config.heartbeat_interval, default_heartbeat_interval());
         assert_eq!(config.reconnect_backoff_min, default_backoff_min());
         assert_eq!(config.reconnect_backoff_max, default_backoff_max());
+        // Five minutes of drain (ADR 0041), with no `shutdown_grace` written.
+        assert_eq!(config.shutdown_grace, default_shutdown_grace());
+        assert_eq!(config.shutdown_grace, Duration::from_secs(5 * 60));
         assert!(config.labels.is_empty());
         assert_eq!(
             config.executor.reap_janitor_after,
@@ -1243,6 +1274,16 @@ token_path = "/etc/coppice/enroll-token"
             message.contains("heatbeat_interval"),
             "error should name the offending key, got: {message}"
         );
+    }
+
+    #[test]
+    fn a_zero_shutdown_grace_is_rejected() {
+        // A drain that may not wait at all is a mistake, not a posture: the
+        // way to say "kill it now" is SIGKILL, not a zero window (ADR 0041).
+        let bad = minimal_with("shutdown_grace = \"0s\"\n");
+        let (_guard, path) = write_config(&bad);
+        let err = load(&path).expect_err("a zero shutdown_grace must fail");
+        assert!(format!("{err:#}").contains("shutdown_grace"), "{err:#}");
     }
 
     #[test]

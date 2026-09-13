@@ -423,6 +423,9 @@ pub async fn run(args: DevArgs) -> Result<()> {
         heartbeat_interval: Duration::from_secs(2),
         reconnect_backoff_min: Duration::from_millis(100),
         reconnect_backoff_max: Duration::from_secs(2),
+        // Never reached: dev drops the agent task rather than draining it
+        // (ADR 0041), so this is the production default, unused.
+        shutdown_grace: Duration::from_secs(5 * 60),
         labels: Default::default(),
         // Docker Desktop on macOS exposes no Linux sysfs topology to this
         // process. Dev remains portable by retaining the S2 NanoCpus-only
@@ -1156,7 +1159,11 @@ async fn run_agent<E: Executor + Clone>(session: Session<RealFs, E>, config: Age
             return;
         }
     };
-    if let Err(e) = session::run(session, &config, tls_store).await {
+    // `coppice dev` stops its agent by dropping this task (the journal is
+    // crash-safe by design), so the ADR 0041 drain seam is wired to a watch
+    // that never flips — the sender is held here for as long as the loop runs.
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    if let Err(e) = session::run(session, &config, tls_store, shutdown_rx).await {
         tracing::error!("dev agent session loop exited: {e:#}");
     }
 }

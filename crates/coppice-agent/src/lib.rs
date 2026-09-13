@@ -146,7 +146,12 @@ const METRICS_UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// `tokio::spawn`s the upkeep task ([`run_daemon`] is `async`). `coppice dev`
 /// does not call this: it installs one shared recorder via the coordinator's
 /// helper and describes the agent tree explicitly.
-fn install_metrics_recorder() -> Result<metrics_exporter_prometheus::PrometheusHandle> {
+fn install_metrics_recorder(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(
+    metrics_exporter_prometheus::PrometheusHandle,
+    tokio::task::JoinHandle<()>,
+)> {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::set_global_recorder(recorder)
@@ -154,25 +159,110 @@ fn install_metrics_recorder() -> Result<metrics_exporter_prometheus::PrometheusH
         .context("a metrics recorder was already installed in this process")?;
     describe_metrics();
     let upkeep_handle = handle.clone();
-    tokio::spawn(async move {
+    let upkeep_join = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(METRICS_UPKEEP_INTERVAL);
         loop {
-            // `interval` ticks immediately on its first `tick`; upkeep on a
-            // fresh recorder is a no-op, so that first tick is harmless.
-            ticker.tick().await;
-            upkeep_handle.run_upkeep();
+            tokio::select! {
+                // `interval` ticks immediately on its first `tick`; upkeep on a
+                // fresh recorder is a no-op, so that first tick is harmless.
+                _ = ticker.tick() => upkeep_handle.run_upkeep(),
+                // Nothing scrapes a stopping process, so upkeep stops with it
+                // (ADR 0041): the daemon joins this task on the way out, and a
+                // task that only ever ticks would have to be aborted instead.
+                _ = shutdown.changed() => break,
+            }
         }
     });
-    Ok(handle)
+    Ok((handle, upkeep_join))
 }
+
+/// Await `join` until `deadline`, then name it in a warning and drop it.
+///
+/// The agent's copy of the coordinator runtime's `drain`, and for the same
+/// reason (issue #111, `docs/agent-notes/architecture-gotchas.md`): every step
+/// of a shutdown waits on a task that may itself be waiting on something
+/// outside this process — a Docker request, a coordinator that stopped
+/// answering — so no step may wait unboundedly.
+pub(crate) async fn drain_task<T>(
+    label: &str,
+    join: tokio::task::JoinHandle<T>,
+    deadline: tokio::time::Instant,
+) {
+    let abort = join.abort_handle();
+    if tokio::time::timeout_at(deadline, join).await.is_err() {
+        tracing::warn!(
+            task = label,
+            "agent: task did not drain within the shutdown budget; dropping it"
+        );
+        abort.abort();
+    }
+}
+
+/// How long the daemon's post-loop shutdown may take in total: every listener
+/// stop and task join below shares this one deadline. Mirrors the
+/// coordinator's `SHUTDOWN_DRAIN` — the drain proper is the session loop's
+/// `shutdown_grace`, and this is only the teardown after it.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run the agent daemon from its config file: recover the journal, build the
 /// session over the production [`executor::DockerExecutor`], and enter the
-/// dial/serve loop until the process is stopped.
+/// dial/serve loop until the process is asked to stop.
 ///
 /// This is the whole daemon minus argument parsing and tracing setup, which
 /// belong to the `coppice` binary (`coppice agent --config <path>`).
+///
+/// Installs the SIGTERM/SIGINT handler that begins the drain (ADR 0041); see
+/// [`run_daemon_with_shutdown`] for the seam that takes the trigger instead.
 pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Both interactive (ctrl-c / SIGINT) and orchestrated (SIGTERM from
+    // `systemctl stop`, a container stop, an ASG lifecycle hook) stops flip the
+    // same watch; whichever fires first wins and the other arm is dropped. The
+    // coordinator's signal task, shape for shape.
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "agent: failed to install SIGTERM handler");
+                    return;
+                }
+            };
+            let reason = tokio::select! {
+                res = tokio::signal::ctrl_c() => res.map(|()| "ctrl-c").ok(),
+                _ = sigterm.recv() => Some("SIGTERM"),
+            };
+            if let Some(reason) = reason {
+                tracing::info!(
+                    signal = reason,
+                    "agent: stop requested; draining (ADR 0041)"
+                );
+                let _ = shutdown_tx.send(true);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("agent: ctrl-c received; draining (ADR 0041)");
+                let _ = shutdown_tx.send(true);
+            }
+        }
+    });
+    run_daemon_with_shutdown(config_path, shutdown_rx).await
+}
+
+/// [`run_daemon`] with the shutdown trigger supplied by the caller rather than
+/// by a signal handler.
+///
+/// The daemon path is [`run_daemon`]; this is the seam an integration test (or
+/// an embedder) drives, so no test ever has to raise a real signal at the
+/// process running it. Flipping the watch runs exactly the same drain.
+pub async fn run_daemon_with_shutdown(
+    config_path: &std::path::Path,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let config = config::load(config_path)?;
     config.log_effective();
 
@@ -183,7 +273,7 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // server below. The server itself is bound later, only when `metrics_addr`
     // is configured, but the recorder is installed unconditionally so metrics
     // accrue (and upkeep drains histograms) from the start regardless.
-    let metrics_handle = install_metrics_recorder()?;
+    let (metrics_handle, upkeep_join) = install_metrics_recorder(shutdown_rx.clone())?;
 
     // The data directory comes first now: the node identity lives in it, and
     // everything downstream — enrollment's claim, the journal's fencing
@@ -220,7 +310,7 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // SIGHUP. Shared by the NodeService listener and the session client, so one
     // rotation on disk re-arms both (ADR 0037 §4).
     let tls_store = load_tls_store(&config)?;
-    let _tls_reload = coppice_tls::spawn_reload_task(
+    let tls_reload_join = coppice_tls::spawn_reload_task(
         Arc::clone(&tls_store),
         coppice_tls::ReloadOptions {
             sighup: true,
@@ -328,6 +418,7 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // advertisement — a legitimate posture (the agent's logs are unreachable
     // off-node). The handler reads the first LOG-consuming store; with telemetry
     // disabled that is `None` and every fetch answers UnknownAttempt.
+    let mut node_service_join = None;
     if let Some(listen) = &config.listen {
         let listener = node_service::NodeServiceListener::bind(listen.addr, Arc::clone(&tls_store))
             .context("binding the NodeService listener")?;
@@ -335,11 +426,12 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
             service_addr = ?config.service_addr(),
             "NodeService listener bound; coordinators can dial for job logs (ADR 0034)"
         );
-        node_service::serve(
+        node_service_join = Some(node_service::serve_until(
             listener,
             telemetry.log_store.clone(),
             telemetry.metric_store.clone(),
-        );
+            shutdown_rx.clone(),
+        ));
     }
 
     // Bind and serve the Prometheus `/metrics` server when configured (issue
@@ -347,17 +439,22 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     // daemon here rather than after registration. Absent `metrics_addr` = no
     // server (the recorder still runs; nothing scrapes it) — a legitimate
     // posture for an agent whose metrics are pulled another way or not at all.
+    let mut metrics_join = None;
     if let Some(metrics_addr) = config.metrics_addr {
         let listener = metrics_server::prepare_listener(metrics_addr)
             .await
             .context("binding the metrics server listener")?;
-        tracing::info!(%metrics_addr, "Prometheus metrics server bound at /metrics (issue #46)");
-        metrics_server::serve(
+        tracing::info!(
+            %metrics_addr,
+            "agent operational listener bound: /metrics, /healthz, /readyz (issue #46, ADR 0041)"
+        );
+        metrics_join = Some(metrics_server::serve_until(
             listener,
             metrics_handle,
             gather_metrics,
             usage::render_exposition,
-        );
+            shutdown_rx.clone(),
+        ));
     }
 
     let session = session::Session::new(
@@ -376,5 +473,33 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     .with_usage_metrics();
 
     tracing::info!("coppice agent started; entering the session loop");
-    session::run(session, &config, tls_store).await
+    session::run(session, &config, tls_store, shutdown_rx).await?;
+
+    // The session loop has drained (ADR 0041 step 3). What is left is step 4:
+    // stop the listeners, join every task this function owns, and drop the
+    // telemetry sinks LAST so their segment janitors finish their own drains
+    // rather than being dropped mid-write.
+    //
+    // Every join below shares one absolute deadline, and a task that misses it
+    // is named and dropped: a shutdown step that waits on a Docker request or a
+    // coordinator that stopped answering must not be able to wait forever
+    // (issue #111, docs/agent-notes/architecture-gotchas.md).
+    tracing::info!("agent: session loop drained; stopping listeners");
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN;
+    if let Some(join) = node_service_join {
+        drain_task("node-service", join, deadline).await;
+    }
+    if let Some(join) = metrics_join {
+        drain_task("metrics-server", join, deadline).await;
+    }
+    drain_task("metrics-upkeep", upkeep_join, deadline).await;
+    // The TLS reload poll has no shutdown watch of its own (it serves every
+    // plane, and a reload is never mid-anything that matters), so it is aborted
+    // rather than waited out.
+    tls_reload_join.abort();
+    let _ = tls_reload_join.await;
+    tracing::info!("agent: listeners down; flushing telemetry");
+    drop(telemetry);
+    tracing::info!("coppice agent stopped");
+    Ok(())
 }

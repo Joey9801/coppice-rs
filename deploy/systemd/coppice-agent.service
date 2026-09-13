@@ -12,10 +12,13 @@
 # emits no sd_notify READY=1 today (crates/coppice-coordinator/src/systemd.rs
 # has no agent-side caller), so systemd would wait out the notify timeout and
 # then fail the unit. `Type=exec` means "started once the binary is execed",
-# which is the honest claim. The agent also installs no SIGTERM handler, so a
-# stop is the kernel's default termination rather than a drain: running
-# containers are left to the reap janitor and to the coordinator's liveness
-# timeout. Both are noted in deploy/README.md.
+# which is the honest claim. On stop, SIGTERM begins a drain (ADR 0041): the
+# agent announces `draining = true` on every Register/Heartbeat so the
+# coordinator stops placing work on it, then waits for its accountable
+# running work to finish, up to the `shutdown_grace` TOML key (default 5m).
+# Anything still running at that deadline is left running for the
+# coordinator's NodeLost backstop to retry elsewhere, and the agent stops
+# its listeners, joins its tasks, and exits 0.
 #
 # See docs/operations/configuration.md and docs/architecture/docker-executor.md.
 
@@ -46,7 +49,12 @@ StateDirectoryMode=0700
 ConfigurationDirectory=coppice
 
 KillSignal=SIGTERM
-TimeoutStopSec=30
+# 5m (the `shutdown_grace` default in agent.toml) plus margin for the
+# post-drain teardown (stopping listeners, joining tasks, flushing
+# telemetry sinks). An operator who raises `shutdown_grace` must raise this
+# too: systemd SIGKILLs the process at this timeout, which is exactly the
+# ungraceful kill the drain exists to avoid.
+TimeoutStopSec=330
 LimitNOFILE=65536
 
 # Sandboxing, matching the coordinator except where talking to Docker requires

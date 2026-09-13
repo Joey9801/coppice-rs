@@ -15,6 +15,13 @@ data_dir = "/var/lib/coppice-agent"
 # design, closed to everything but the ops instance by security group.
 metrics_addr = "0.0.0.0:9464"
 
+# How long a SIGTERM'd agent waits for its accountable running work to
+# finish before it stops anyway, leaving anything still running to the
+# coordinator's NodeLost backstop (ADR 0041). The unit's TimeoutStopSec
+# (deploy/systemd/coppice-agent.service) is sized from this — it is 330s
+# for this 5m default — so raising one means raising the other.
+shutdown_grace = "5m"
+
 [discovery]
 # Agents reach coordinators through the NLB's TCP pass-through listener, so one
 # stable name outlives any individual coordinator. Consulted on every reconnect

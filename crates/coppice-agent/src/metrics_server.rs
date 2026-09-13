@@ -97,9 +97,46 @@ pub fn serve(
     gather: fn(),
     extra: fn() -> String,
 ) -> tokio::task::JoinHandle<()> {
-    let app = router(handle, gather, extra);
+    spawn_serving(listener, router(handle, gather, extra), None)
+}
+
+/// [`serve`], stopping gracefully when `shutdown` flips (ADR 0041): the
+/// listener stops accepting, in-flight scrapes and probes finish, and the
+/// daemon's shutdown tail joins the handle to observe it actually down.
+pub fn serve_until(
+    listener: tokio::net::TcpListener,
+    handle: PrometheusHandle,
+    gather: fn(),
+    extra: fn() -> String,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_serving(listener, router(handle, gather, extra), Some(shutdown))
+}
+
+fn spawn_serving(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        let graceful = async move {
+            match shutdown {
+                Some(mut rx) => {
+                    // A dropped sender means the same thing as a flip: whoever
+                    // owned the trigger is gone.
+                    while !*rx.borrow_and_update() {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(graceful)
+            .await
+        {
             // Like the coordinator's API server: a dead scrape endpoint never
             // takes the agent down (the node keeps executing work); the
             // operator just sees why the port went dark.
