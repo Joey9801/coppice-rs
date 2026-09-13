@@ -44,11 +44,15 @@ failure in CI, that's the likely cause, not a real regression.
 
 ## Other resolved flakes (context if you hit something similar)
 
-- **Docker telemetry segment creation** — a Docker Hub pull abort mid-drain
-  could leave `create_segment` writing a schema-less sqlite segment that
-  poisoned later readers, and the test harness was swallowing the
-  underlying `Err`. Fixed by creating segments under a temp name and
-  renaming into place atomically once the schema is written.
+- **Docker telemetry segment creation** (issue #112) — dropping the
+  telemetry hub aborts its drain tasks, and an abort landing inside
+  `create_segment` between the sqlite file's creation and its schema
+  migration left a schema-less `seg-*.db` that poisoned every later reader
+  with `no such table`; the `docker_executor` harness was folding that
+  `Err` into a misleading "no log rows" failure. Fixed by building segments
+  under a `.tmp` name and renaming into place once the schema and `meta`
+  rows are committed (the sweep reclaims stale temps), and by making the
+  harness surface store errors.
 - **`oom_classification`** — the CI daemon can occasionally lose the OOM
   notification entirely due to a cgroup v2 race; the `Killed` verdict is
   correct by design in that case, so the fix was retrying the test on a
