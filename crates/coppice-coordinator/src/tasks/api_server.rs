@@ -26,8 +26,9 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use coppice_api::http::dto::{
-    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest,
-    SubmitJobResponse, UpdateAuthorizationRequest, UpdateAuthorizationResponse,
+    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
+    SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
+    UpdateAuthorizationResponse,
 };
 use coppice_api::{
     ApiError, ClusterUsage, Consistency, ControlPlane, CoordinatorMemberSummary,
@@ -44,7 +45,9 @@ use crate::tasks::node_client::NodeClient;
 use coppice_core::job::Job;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::command::{AbortJob, ConfigureQuotaEntity, SubmitJob, UpdateAuthorization};
+use coppice_state::command::{
+    AbortJob, ConfigureQuotaEntity, EvictNodes, SetNodeSchedulable, SubmitJob, UpdateAuthorization,
+};
 use coppice_state::{Actor, Command};
 
 use crate::tasks::event_fanout::{EventFilter, FanoutHandle};
@@ -101,6 +104,25 @@ pub trait LeaderWrites: Send + Sync + 'static {
         req: &'a UpdateAuthorizationRequest,
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>>;
+
+    /// The ADR 0041 admin cordon, either direction — `schedulable` is
+    /// assigned, so one method serves drain and undrain.
+    fn set_node_schedulable<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        node: NodeId,
+        schedulable: bool,
+        actor: &'a Actor,
+    ) -> BoxFuture<'a, Result<(), ApiError>>;
+
+    /// The ADR 0041 removal. Plural because the command is; the HTTP route
+    /// sends exactly one node.
+    fn evict_nodes<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        nodes: &'a [NodeId],
+        actor: &'a Actor,
+    ) -> BoxFuture<'a, Result<(), ApiError>>;
 }
 
 /// Where a replica that does not lead reads the leader's node-liveness marks
@@ -488,6 +510,79 @@ pub(crate) async fn update_authorization_here<C: Consensus>(
     Ok(UpdateAuthorizationResponse { log_index })
 }
 
+/// Propose one admin cordon on this replica, with no forwarding (ADR 0041).
+///
+/// `schedulable` is assigned rather than toggled, so drain and undrain share
+/// this one function and re-proposing an already-applied value is a no-op.
+/// A node apply does not find rejects `UnknownNode`, which the HTTP layer
+/// reads as a 404.
+pub(crate) async fn set_node_schedulable_here<C: Consensus>(
+    consensus: &C,
+    node: NodeId,
+    schedulable: bool,
+    actor: &Actor,
+) -> Result<(), LocalWriteError> {
+    let command = Command::SetNodeSchedulable(SetNodeSchedulable {
+        node,
+        schedulable,
+        actor: Some(actor.clone()),
+        updated_at: Timestamp::now(),
+    });
+    match consensus.propose(command).await {
+        Ok(Applied { outcome: Ok(_), .. }) => Ok(()),
+        Ok(Applied {
+            outcome: Err(rejection),
+            ..
+        }) => Err(LocalWriteError::Api(ApiError::Rejected(rejection))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Propose one node eviction on this replica, with no forwarding (ADR 0041).
+///
+/// The same command the leader's retention GC proposes, with an actor
+/// attached. Apply skips ids it cannot find — so a retried removal succeeds
+/// rather than 404ing — and refuses a node that still accepts placements or
+/// still holds a live allocation. Such refusals arrive wrapped in
+/// `InvalidBatch`; [`unwrap_single_item`] reduces that to the one item's own
+/// reason before it reaches the operator.
+pub(crate) async fn evict_nodes_here<C: Consensus>(
+    consensus: &C,
+    nodes: Vec<NodeId>,
+    actor: &Actor,
+) -> Result<(), LocalWriteError> {
+    let command = Command::EvictNodes(EvictNodes {
+        nodes,
+        actor: Some(actor.clone()),
+        evicted_at: Timestamp::now(),
+    });
+    match consensus.propose(command).await {
+        Ok(Applied { outcome: Ok(_), .. }) => Ok(()),
+        Ok(Applied {
+            outcome: Err(rejection),
+            ..
+        }) => Err(LocalWriteError::Api(ApiError::Rejected(
+            unwrap_single_item(rejection),
+        ))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A one-item `InvalidBatch` reduced to the item's own reason; anything else
+/// unchanged.
+///
+/// Only safe for a command this process built with exactly one item: the
+/// item index is then known to be 0 and carries no information, and the
+/// envelope is pure noise in front of the sentence that matters.
+fn unwrap_single_item(rejection: coppice_state::RejectionReason) -> coppice_state::RejectionReason {
+    match rejection {
+        coppice_state::RejectionReason::InvalidBatch(mut items) if items.len() == 1 => {
+            items.remove(0).reason
+        }
+        other => other,
+    }
+}
+
 /// Implements [`ControlPlane`] by proposing through the consensus seam.
 #[allow(dead_code)] // fields are read by submit_job/abort_job, exercised in tests below.
 pub struct CoordinatorControlPlane<C> {
@@ -724,6 +819,38 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                     forwarder
                         .abort_job(leader, job, req.reason.as_deref(), &actor)
                         .await
+                }
+                None => Err(no_leader_here(leader)),
+            },
+        }
+    }
+
+    async fn set_node_schedulable(
+        &self,
+        req: SetNodeSchedulableRequest,
+        actor: Actor,
+    ) -> Result<(), ApiError> {
+        match set_node_schedulable_here(&*self.consensus, req.node, req.schedulable, &actor).await {
+            Ok(()) => Ok(()),
+            Err(LocalWriteError::Api(e)) => Err(e),
+            Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
+                Some((forwarder, leader)) => {
+                    forwarder
+                        .set_node_schedulable(leader, req.node, req.schedulable, &actor)
+                        .await
+                }
+                None => Err(no_leader_here(leader)),
+            },
+        }
+    }
+
+    async fn evict_node(&self, req: EvictNodeRequest, actor: Actor) -> Result<(), ApiError> {
+        match evict_nodes_here(&*self.consensus, vec![req.node], &actor).await {
+            Ok(()) => Ok(()),
+            Err(LocalWriteError::Api(e)) => Err(e),
+            Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
+                Some((forwarder, leader)) => {
+                    forwarder.evict_nodes(leader, &[req.node], &actor).await
                 }
                 None => Err(no_leader_here(leader)),
             },
@@ -1335,6 +1462,10 @@ mod tests {
     struct ForwardedCall {
         leader: CoordinatorId,
         job: Option<JobId>,
+        /// The node an ADR 0041 node write named, for the same reason `job`
+        /// is here: a forward that reached the leader with the wrong target
+        /// is a failure no status assertion catches.
+        node: Option<NodeId>,
         actor: Actor,
     }
 
@@ -1356,9 +1487,30 @@ mod tests {
             job: Option<JobId>,
             actor: &Actor,
         ) -> Result<u64, ApiError> {
+            self.record_call(leader, job, None, actor)
+        }
+
+        /// [`record`](Self::record) for a write that names a node instead.
+        fn record_node(
+            &self,
+            leader: CoordinatorId,
+            node: NodeId,
+            actor: &Actor,
+        ) -> Result<u64, ApiError> {
+            self.record_call(leader, None, Some(node), actor)
+        }
+
+        fn record_call(
+            &self,
+            leader: CoordinatorId,
+            job: Option<JobId>,
+            node: Option<NodeId>,
+            actor: &Actor,
+        ) -> Result<u64, ApiError> {
             self.seen.lock().unwrap().push(ForwardedCall {
                 leader,
                 job,
+                node,
                 actor: actor.clone(),
             });
             match self.answer.lock().unwrap().clone() {
@@ -1391,6 +1543,15 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|c| c.job)
+                .collect()
+        }
+
+        fn nodes(&self) -> Vec<NodeId> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c.node)
                 .collect()
         }
 
@@ -1457,6 +1618,33 @@ mod tests {
             Box::pin(async move {
                 let log_index = self.record(leader, None, actor)?;
                 Ok(UpdateAuthorizationResponse { log_index })
+            })
+        }
+
+        fn set_node_schedulable<'a>(
+            &'a self,
+            leader: CoordinatorId,
+            node: NodeId,
+            _schedulable: bool,
+            actor: &'a Actor,
+        ) -> BoxFuture<'a, Result<(), ApiError>> {
+            Box::pin(async move {
+                self.record_node(leader, node, actor)?;
+                Ok(())
+            })
+        }
+
+        fn evict_nodes<'a>(
+            &'a self,
+            leader: CoordinatorId,
+            nodes: &'a [NodeId],
+            actor: &'a Actor,
+        ) -> BoxFuture<'a, Result<(), ApiError>> {
+            Box::pin(async move {
+                for node in nodes {
+                    self.record_node(leader, *node, actor)?;
+                }
+                Ok(())
             })
         }
     }
@@ -1707,6 +1895,65 @@ mod tests {
         assert_eq!(response.entity, entity);
         assert_eq!(response.log_index, 11);
         assert_eq!(forwarder.calls(), 2);
+    }
+
+    /// The ADR 0041 node writes forward like every other client write.
+    /// Checks the forwarded target and actor specifically: either one being
+    /// wrong still answers 200 to the client, so a status-code check alone
+    /// would not catch it.
+    #[tokio::test]
+    async fn a_follower_forwards_node_drains_and_removals_too() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(11));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let drained = NodeId::new();
+        let removed = NodeId::new();
+        cp.set_node_schedulable(
+            SetNodeSchedulableRequest {
+                node: drained,
+                schedulable: false,
+            },
+            test_actor(),
+        )
+        .await
+        .expect("forwarded drain");
+        cp.evict_node(EvictNodeRequest { node: removed }, test_actor())
+            .await
+            .expect("forwarded removal");
+
+        assert_eq!(forwarder.nodes(), vec![drained, removed]);
+        assert_eq!(forwarder.leaders(), vec![7, 7]);
+        assert_eq!(forwarder.actors(), vec![test_actor(), test_actor()]);
+    }
+
+    /// A rejection the leader classified as `UnknownNode` must survive the
+    /// hop as that, not as an unlabelled generic rejection.
+    #[tokio::test]
+    async fn an_unknown_node_rejection_keeps_its_classification_across_the_hop() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::RejectedAs(
+            coppice_api::RejectionKind::UnknownNode,
+            "node not found".to_string(),
+        ));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let result = cp
+            .set_node_schedulable(
+                SetNodeSchedulableRequest {
+                    node: NodeId::new(),
+                    schedulable: false,
+                },
+                test_actor(),
+            )
+            .await;
+        match result {
+            Err(ApiError::ForwardedRejection { kind, reason }) => {
+                assert_eq!(kind, coppice_api::RejectionKind::UnknownNode);
+                assert_eq!(reason, "node not found");
+            }
+            other => panic!("expected a relayed rejection, got {other:?}"),
+        }
     }
 
     #[tokio::test]

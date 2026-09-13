@@ -18,8 +18,9 @@ use std::sync::Arc;
 use coppice_core::time::Timestamp;
 use coppice_state::ViewMemos;
 use http::dto::{
-    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest,
-    SubmitJobResponse, UpdateAuthorizationRequest, UpdateAuthorizationResponse,
+    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
+    SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
+    UpdateAuthorizationResponse,
 };
 
 /// Consistency class for read operations (ADR 0007).
@@ -453,6 +454,9 @@ pub enum RejectionKind {
     /// A bindings list retaining no unscoped admin (ADR 0023's loud
     /// accident guard).
     AuthorizationLockout,
+    /// The node a drain or undrain named is not in the state (ADR 0041 node-write
+    /// routes only; a 404).
+    UnknownNode,
 }
 
 impl RejectionKind {
@@ -465,6 +469,7 @@ impl RejectionKind {
             R::UnknownQuotaEntity(_) => RejectionKind::UnknownQuotaEntity,
             R::InvalidAuthorization(_) => RejectionKind::InvalidAuthorization,
             R::AuthorizationLockout => RejectionKind::AuthorizationLockout,
+            R::UnknownNode(_) => RejectionKind::UnknownNode,
             _ => RejectionKind::Other,
         }
     }
@@ -711,6 +716,33 @@ pub trait ControlPlane: Send + Sync + 'static {
     fn abort_job(
         &self,
         req: AbortJobRequest,
+        actor: coppice_state::Actor,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Propose the admin cordon (ADR 0041) on behalf of `actor`: `schedulable
+    /// = false` drains the node, `true` undrains it. Same two-check
+    /// arrangement as [`submit_job`](ControlPlane::submit_job), over the
+    /// cluster-scoped `Verb::Drain`.
+    ///
+    /// Assigns the flag rather than toggling it, so it is idempotent and
+    /// safe to retry. Unknown node rejects with
+    /// `RejectionReason::UnknownNode` (404).
+    fn set_node_schedulable(
+        &self,
+        req: SetNodeSchedulableRequest,
+        actor: coppice_state::Actor,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Propose the removal of one node's record (ADR 0041's decommission
+    /// verb) on behalf of `actor` — an `EvictNodes` command naming the single
+    /// node, the same command the leader's retention GC proposes in batches.
+    ///
+    /// Refuses (409) a node that still accepts placements or holds a live
+    /// allocation. A missing node is not a refusal: eviction skips missing
+    /// ids, so a repeated `remove` is idempotent.
+    fn evict_node(
+        &self,
+        req: EvictNodeRequest,
         actor: coppice_state::Actor,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 

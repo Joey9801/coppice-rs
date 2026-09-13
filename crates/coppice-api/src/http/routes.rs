@@ -33,7 +33,7 @@ use crate::{Consistency, ControlPlane};
 use super::authn::{RequestActor, RequestPresentation};
 use super::authorize::{precheck, Intent};
 use super::enroll::EnrollEndpoint;
-use super::error::{authorization_error, HttpError};
+use super::error::{authorization_error, node_write_error, HttpError};
 use super::extract::{IdPath, ReadIndexes, ReadQuery};
 use super::metrics::MetricsEndpoint;
 use super::readyz::ReadyzEndpoint;
@@ -144,13 +144,10 @@ fn operational_routes<S: Clone + Send + Sync + 'static>(
                 async move { readyz.handle(require).await }
             }),
         )
-        // Liveness (ADR 0041): 200 for as long as this process is serving,
-        // and deliberately nothing more. It is the systemd/load-balancer
-        // "restart me if this fails" signal, so it must not consult the
-        // cluster, the replica's phase, or anything else that can fail while
-        // the process is perfectly alive — a liveness probe that goes red
-        // during an election would have the orchestrator kill a healthy
-        // daemon. `/readyz` is where every such condition is reported.
+        // Liveness (ADR 0041): 200 for as long as the process is serving.
+        // Must not consult the cluster or replica phase — that would risk
+        // an orchestrator killing a healthy daemon mid-election. `/readyz`
+        // is where such conditions are reported.
         .route("/healthz", get(healthz))
 }
 
@@ -304,6 +301,11 @@ fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
         .route("/nodes", get(list_nodes::<P>))
         .route("/nodes/:node", get(get_node::<P>))
         .route("/nodes/:node/utilization", get(get_node_utilization::<P>))
+        // The ADR 0041 node writes. All three are bodyless: the path names
+        // the node, and the route names the intent.
+        .route("/nodes/:node/drain", post(drain_node::<P>))
+        .route("/nodes/:node/undrain", post(undrain_node::<P>))
+        .route("/nodes/:node/remove", post(remove_node::<P>))
         .route(
             "/nodes/:node/history",
             get(unimplemented_id_read::<NodeId>("GetNodeHistory")),
@@ -653,6 +655,72 @@ async fn abort_job<P: ControlPlane>(
     precheck(&*plane, &actor, Intent::Abort { job }).await?;
     plane.abort_job(request, actor).await?;
     Ok(Json(AbortJobResponse {}))
+}
+
+/// `POST /api/v1/nodes/{node}/drain` (ADR 0041) — the admin cordon on.
+///
+/// No body either way; the resulting state is read back from
+/// `GET /api/v1/nodes/{node}`, which is also where `--wait` watches the
+/// work drain away.
+///
+/// Gated on `Verb::Drain` — an unscoped `operator` binding or higher
+/// (ADR 0023). Draining is idempotent: a drained node drains again happily.
+async fn drain_node<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
+    IdPath(node): IdPath<NodeId>,
+) -> Result<impl IntoResponse, HttpError> {
+    set_node_schedulable(&*plane, actor, node, false).await
+}
+
+/// `POST /api/v1/nodes/{node}/undrain` — the admin cordon off, and the exact
+/// twin of [`drain_node`] down to the command it proposes.
+async fn undrain_node<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
+    IdPath(node): IdPath<NodeId>,
+) -> Result<impl IntoResponse, HttpError> {
+    set_node_schedulable(&*plane, actor, node, true).await
+}
+
+/// The half [`drain_node`] and [`undrain_node`] share: pre-check the cluster
+/// verb, then propose the assignment.
+///
+/// One function rather than two so the two directions cannot drift into
+/// different authorization or different error mapping — the direction is a
+/// bool, and it is the only thing that differs.
+async fn set_node_schedulable<P: ControlPlane>(
+    plane: &P,
+    actor: coppice_state::Actor,
+    node: NodeId,
+    schedulable: bool,
+) -> Result<impl IntoResponse, HttpError> {
+    precheck(plane, &actor, Intent::Drain).await?;
+    plane
+        .set_node_schedulable(dto::SetNodeSchedulableRequest { node, schedulable }, actor)
+        .await
+        .map_err(node_write_error)?;
+    Ok(Json(dto::DrainNodeResponse {}))
+}
+
+/// `POST /api/v1/nodes/{node}/remove` (ADR 0041) — evict one node's record.
+///
+/// Apply refuses a node that still accepts placements or holds a live
+/// allocation (409 — retry after drain), and skips one already gone (200,
+/// idempotent). Does not require the node to be silent: an agent still
+/// alive re-registers on its next registration; `revoke-identity` is what
+/// stops that.
+async fn remove_node<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
+    IdPath(node): IdPath<NodeId>,
+) -> Result<impl IntoResponse, HttpError> {
+    precheck(&*plane, &actor, Intent::RemoveNode).await?;
+    plane
+        .evict_node(dto::EvictNodeRequest { node }, actor)
+        .await
+        .map_err(node_write_error)?;
+    Ok(Json(dto::RemoveNodeResponse {}))
 }
 
 /// `POST /api/v1/quota-entities` — body `ConfigureQuotaEntityRequest`, the
@@ -1075,7 +1143,11 @@ mod tests {
         /// (the tier-1 backstop is exercised for its envelope/paging, not its
         /// filtering — that is unit-tested on the ring itself).
         timeline: JobTimelineWindow,
-        state: coppice_state::StateMachine,
+        /// The replicated state reads are served from — and, for the ADR 0041
+        /// node writes, the state those writes actually **apply to** via the
+        /// real `StateMachine::apply`, so status mapping is tested against
+        /// its real rejections rather than a fake's idea of them.
+        state: std::sync::Mutex<coppice_state::StateMachine>,
         /// Every consistency class `read_state` was asked for, so a test can
         /// assert a route's default (e.g. the strong quota-entity detail).
         read_consistency: std::sync::Mutex<Vec<Consistency>>,
@@ -1110,6 +1182,25 @@ mod tests {
 
         fn record(&self, actor: coppice_state::Actor) {
             self.actors.lock().unwrap().push(actor);
+        }
+
+        /// Apply one command to the plane's state, mapping the outcome the
+        /// way the real control plane does. The single-item `InvalidBatch`
+        /// unwrap mirrors `api_server::evict_nodes_here`, so a one-node
+        /// removal reads as its own reason rather than "batch rejected".
+        fn apply(&self, command: coppice_state::Command) -> Result<(), ApiError> {
+            if let Some(make) = self.fail_with {
+                return Err(make());
+            }
+            match self.state.lock().unwrap().apply(&command) {
+                Ok(_) => Ok(()),
+                Err(coppice_state::RejectionReason::InvalidBatch(mut items))
+                    if items.len() == 1 =>
+                {
+                    Err(ApiError::Rejected(items.remove(0).reason))
+                }
+                Err(reason) => Err(ApiError::Rejected(reason)),
+            }
         }
     }
 
@@ -1174,6 +1265,40 @@ mod tests {
             }
         }
 
+        /// The one pair of writes this plane really applies (see `state`).
+        /// `fail_with` still wins, so the error-mapping tests keep working the
+        /// way they do for every other write.
+        async fn set_node_schedulable(
+            &self,
+            req: dto::SetNodeSchedulableRequest,
+            actor: coppice_state::Actor,
+        ) -> Result<(), ApiError> {
+            self.record(actor.clone());
+            self.apply(coppice_state::Command::SetNodeSchedulable(
+                coppice_state::command::SetNodeSchedulable {
+                    node: req.node,
+                    schedulable: req.schedulable,
+                    actor: Some(actor),
+                    updated_at: Timestamp::now(),
+                },
+            ))
+        }
+
+        async fn evict_node(
+            &self,
+            req: dto::EvictNodeRequest,
+            actor: coppice_state::Actor,
+        ) -> Result<(), ApiError> {
+            self.record(actor.clone());
+            self.apply(coppice_state::Command::EvictNodes(
+                coppice_state::command::EvictNodes {
+                    nodes: vec![req.node],
+                    actor: Some(actor),
+                    evicted_at: Timestamp::now(),
+                },
+            ))
+        }
+
         async fn configure_quota_entity(
             &self,
             req: dto::ConfigureQuotaEntityRequest,
@@ -1209,7 +1334,7 @@ mod tests {
 
         async fn read_state(&self, opts: ReadOptions) -> Result<ReadView, ApiError> {
             self.read_consistency.lock().unwrap().push(opts.consistency);
-            Ok(ReadView::new(self.state.clone(), 1, 1))
+            Ok(ReadView::new(self.state.lock().unwrap().clone(), 1, 1))
         }
 
         async fn fetch_logs(
@@ -1254,7 +1379,7 @@ mod tests {
             usage: UsageSnapshot::default(),
             liveness: Default::default(),
             timeline: empty_timeline(),
-            state,
+            state: std::sync::Mutex::new(state),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
@@ -1273,7 +1398,7 @@ mod tests {
             usage,
             liveness: Default::default(),
             timeline: empty_timeline(),
-            state,
+            state: std::sync::Mutex::new(state),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
@@ -1293,7 +1418,7 @@ mod tests {
             usage: UsageSnapshot::default(),
             liveness,
             timeline: empty_timeline(),
-            state,
+            state: std::sync::Mutex::new(state),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
@@ -1456,7 +1581,7 @@ mod tests {
                 }],
             },
             timeline: empty_timeline(),
-            state: coppice_state::StateMachine::default(),
+            state: std::sync::Mutex::default(),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
@@ -1847,6 +1972,164 @@ mod tests {
         assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
     }
 
+    // ---- The ADR 0041 node writes ---------------------------------------
+    //
+    // These run against a `StubPlane` whose node writes really apply to a
+    // `StateMachine` (see its `state` field), so each assertion below is a
+    // round trip through the same apply the coordinator proposes into: the
+    // write lands, and the very next read is what an operator would see.
+
+    /// A state machine holding one node, schedulable or cordoned, with no
+    /// work on it — the shape both node writes are about.
+    fn state_with_node(id: NodeId, schedulable: bool) -> coppice_state::StateMachine {
+        let mut state = coppice_state::StateMachine::default();
+        let mut record = utilization_node(id);
+        record.node.schedulable = schedulable;
+        state.nodes.insert(id, record);
+        state
+    }
+
+    /// A bodyless POST — what all three node writes take.
+    fn post_empty(uri: &str) -> Request<Body> {
+        Request::post(uri).body(Body::empty()).unwrap()
+    }
+
+    /// `GET /api/v1/nodes/{node}`, as status and body.
+    async fn get_node_via(app: &Router, node: NodeId) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/nodes/{node}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    #[tokio::test]
+    async fn drain_cordons_the_node_and_undrain_lifts_it() {
+        let node = NodeId::new();
+        let app = app_with_state(None, state_with_node(node, true));
+
+        for (verb, expected) in [("drain", false), ("undrain", true)] {
+            let response = app
+                .clone()
+                .oneshot(post_empty(&format!("/api/v1/nodes/{node}/{verb}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{verb}");
+            // The empty object, like an abort's: the node's state is read
+            // back, never echoed.
+            assert_eq!(body_json(response).await, serde_json::json!({}), "{verb}");
+
+            let (status, body) = get_node_via(&app, node).await;
+            assert_eq!(status, StatusCode::OK, "{verb}");
+            assert_eq!(body["summary"]["schedulable"], expected, "after {verb}");
+        }
+    }
+
+    /// Draining is an assignment, not a toggle — which is what makes the CLI
+    /// safe to retry after an unknown outcome, and `--wait` safe to re-run.
+    #[tokio::test]
+    async fn draining_an_already_drained_node_succeeds() {
+        let node = NodeId::new();
+        let app = app_with_state(None, state_with_node(node, false));
+        let response = app
+            .clone()
+            .oneshot(post_empty(&format!("/api/v1/nodes/{node}/drain")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (_, body) = get_node_via(&app, node).await;
+        assert_eq!(body["summary"]["schedulable"], false);
+    }
+
+    #[tokio::test]
+    async fn removing_a_drained_empty_node_takes_it_out_of_the_read_model() {
+        let node = NodeId::new();
+        let app = app_with_state(None, state_with_node(node, false));
+        let response = app
+            .clone()
+            .oneshot(post_empty(&format!("/api/v1/nodes/{node}/remove")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (status, body) = get_node_via(&app, node).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "NOT_FOUND");
+
+        // And again: eviction skips ids it cannot find, so a retried removal
+        // must succeed rather than 404 — the client cannot tell its first
+        // attempt from a lost answer.
+        let repeat = app
+            .oneshot(post_empty(&format!("/api/v1/nodes/{node}/remove")))
+            .await
+            .unwrap();
+        assert_eq!(repeat.status(), StatusCode::OK);
+    }
+
+    /// Removing a node that is still taking work is a 409, not a 400: the
+    /// operator has something to do about it (drain it first) and then the
+    /// identical request lands.
+    #[tokio::test]
+    async fn removing_a_schedulable_node_is_refused_with_a_conflict() {
+        let node = NodeId::new();
+        let app = app_with_state(None, state_with_node(node, true));
+        let response = app
+            .clone()
+            .oneshot(post_empty(&format!("/api/v1/nodes/{node}/remove")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "REJECTED");
+        // The item's own reason, not the `InvalidBatch` envelope's "batch
+        // rejected; per-item diagnostics attached" — an operator who named
+        // one node is owed the sentence about that node.
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("still accepts placements") && message.contains(&node.to_string()),
+            "{message}"
+        );
+
+        // Refused means refused: the record is still there.
+        let (status, _) = get_node_via(&app, node).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// An id that is well-formed but is not a node reads as a 404 on the
+    /// writes, exactly as it does on `GET /api/v1/nodes/{node}` — the same
+    /// answer to the same question, whichever verb asked it.
+    #[tokio::test]
+    async fn draining_an_unknown_node_is_a_not_found() {
+        let node = NodeId::new();
+        let response = app(None)
+            .oneshot(post_empty(&format!("/api/v1/nodes/{node}/drain")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "NOT_FOUND");
+        assert!(
+            body["message"].as_str().unwrap().contains("not found"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_node_id_in_the_path_is_rejected_before_the_plane() {
+        let response = app(None)
+            .oneshot(post_empty("/api/v1/nodes/not-a-node-id/drain"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
     #[tokio::test]
     async fn abort_takes_the_job_from_the_path() {
         let job = JobId::new();
@@ -2037,7 +2320,7 @@ mod tests {
             usage: UsageSnapshot::default(),
             liveness: Default::default(),
             timeline: empty_timeline(),
-            state,
+            state: std::sync::Mutex::new(state),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
@@ -2349,7 +2632,7 @@ mod tests {
             usage: UsageSnapshot::default(),
             liveness: Default::default(),
             timeline,
-            state,
+            state: std::sync::Mutex::new(state),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
@@ -2647,7 +2930,7 @@ mod tests {
             usage: UsageSnapshot::default(),
             liveness: Default::default(),
             timeline: empty_timeline(),
-            state,
+            state: std::sync::Mutex::new(state),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
@@ -2878,7 +3161,7 @@ mod tests {
                 usage: UsageSnapshot::default(),
                 liveness: Default::default(),
                 timeline: empty_timeline(),
-                state: coppice_state::StateMachine::default(),
+                state: std::sync::Mutex::default(),
                 read_consistency: std::sync::Mutex::default(),
                 actors: std::sync::Mutex::default(),
                 authorization: std::sync::Mutex::default(),
@@ -4111,6 +4394,70 @@ mod tests {
         idp.shutdown().await;
     }
 
+    /// The node writes take a **cluster** verb (ADR 0023's `Verb::Drain`);
+    /// ADR 0041 gives drain, undrain, and remove the same one. So an
+    /// unscoped operator gets all three and a scoped operator gets none —
+    /// scope is what matters here, not role — and every refusal must leave
+    /// the plane untouched.
+    #[tokio::test]
+    async fn the_node_writes_take_an_unscoped_operator_and_nothing_less() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let node = NodeId::new();
+        let (mut state, _tree) = authz_fixture(|t| {
+            vec![
+                group_binding("sre", Role::Operator, None),
+                group_binding("team-sre", Role::Operator, Some(t.team_a)),
+                group_binding("batch-users", Role::Submitter, None),
+            ]
+        });
+        // The fixture is a quota tree; the writes need a node to name. It is
+        // cordoned already so `remove` has something it can legitimately do.
+        let mut record = utilization_node(node);
+        record.node.schedulable = false;
+        state.nodes.insert(node, record);
+
+        for verb in ["drain", "undrain", "remove"] {
+            let uri = format!("/api/v1/nodes/{node}/{verb}");
+
+            let (status, body, plane) = authz_case(
+                &idp,
+                Arc::clone(&chain),
+                state.clone(),
+                "on-call",
+                &["sre"],
+                post_empty(&uri),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{verb}: {body}");
+            accepted_actor(&plane, "on-call", &["sre"]);
+
+            for (principal, groups) in [
+                ("team-lead", &["team-sre"][..]),
+                ("user-42", &["batch-users"][..]),
+            ] {
+                let (status, body, plane) = authz_case(
+                    &idp,
+                    Arc::clone(&chain),
+                    state.clone(),
+                    principal,
+                    groups,
+                    post_empty(&uri),
+                )
+                .await;
+                assert_denied(status, &body, &plane);
+                assert!(
+                    body["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("drain, undrain, or remove nodes"),
+                    "{verb} as {principal}: {body}"
+                );
+            }
+        }
+        idp.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_submitter_aborts_their_own_job_with_no_binding_at_all() {
         // ADR 0023's one implicit grant besides the operator cert: the
@@ -4324,7 +4671,7 @@ mod tests {
             usage: UsageSnapshot::default(),
             liveness: Default::default(),
             timeline: empty_timeline(),
-            state: coppice_state::StateMachine::default(),
+            state: std::sync::Mutex::default(),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
@@ -4365,7 +4712,7 @@ mod tests {
             usage: UsageSnapshot::default(),
             liveness: Default::default(),
             timeline: empty_timeline(),
-            state: coppice_state::StateMachine::default(),
+            state: std::sync::Mutex::default(),
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),

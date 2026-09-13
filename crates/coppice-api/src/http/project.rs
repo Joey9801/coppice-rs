@@ -124,6 +124,7 @@ fn node_summary(
             .map(|sample| (&sample.used).into()),
         labels: record.node.labels.clone(),
         schedulable: record.node.schedulable,
+        draining: record.draining,
         health: node_health(mark),
         epoch: record.epoch,
         // The wall stamp is display-only: health above never reads it.
@@ -287,7 +288,7 @@ fn cluster_capacity(
             nodes.lost += 1;
         } else {
             capacity = capacity.saturating_add(&record.node.capacity);
-            if record.node.schedulable {
+            if record.accepts_placements() {
                 nodes.schedulable += 1;
             }
         }
@@ -2162,6 +2163,26 @@ mod tests {
         assert_eq!(capacity.used, None);
         assert_eq!(capacity.reporting_nodes, 0);
         assert_eq!(capacity.total_nodes, 2);
+    }
+
+    #[test]
+    fn overview_excludes_an_agent_draining_node_from_schedulable_even_though_not_cordoned() {
+        let n1 = NodeId::new();
+        let n2 = NodeId::new();
+
+        let mut state = StateMachine::default();
+        state.nodes.insert(n1, test_node(n1));
+        let mut agent_draining = test_node(n2);
+        // Not cordoned: the admin never asked for this. The agent announced
+        // its own shutdown, which must still exclude it from `schedulable`.
+        assert!(agent_draining.node.schedulable);
+        agent_draining.draining = true;
+        state.nodes.insert(n2, agent_draining);
+
+        let capacity = overview(&state, ts(0)).capacity;
+
+        assert_eq!(capacity.nodes.total, 2);
+        assert_eq!(capacity.nodes.schedulable, 1);
         assert!(capacity.history.is_empty());
     }
 

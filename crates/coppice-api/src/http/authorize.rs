@@ -43,6 +43,17 @@ pub(super) enum Intent<'a> {
     Submit { entity: &'a QuotaEntityId },
     /// `POST /api/v1/jobs/{job}/abort`.
     Abort { job: JobId },
+    /// `POST /api/v1/nodes/{node}/drain` and `.../undrain` (ADR 0041).
+    ///
+    /// No node in the arm, unlike [`Abort`](Intent::Abort): `Verb::Drain` is
+    /// a **cluster** verb, so the decision reads only the actor's unscoped
+    /// bindings.
+    Drain,
+    /// `POST /api/v1/nodes/{node}/remove` (ADR 0041). Kept distinct from
+    /// [`Drain`](Intent::Drain) at the call site, but resolves to the same
+    /// verb (ADR 0041: removal is the end of the drain, not a further
+    /// authority).
+    RemoveNode,
     /// `POST /api/v1/quota-entities`.
     ConfigureQuotaEntity {
         entity: &'a QuotaEntityId,
@@ -99,6 +110,7 @@ pub(super) async fn precheck<P: ControlPlane>(
             // owner.
             None => return Ok(()),
         },
+        Intent::Drain | Intent::RemoveNode => Verb::Drain,
         Intent::ConfigureQuotaEntity { entity, new_parent } => {
             Verb::ConfigureQuotaEntity { entity, new_parent }
         }

@@ -36,16 +36,10 @@ use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaE
 use coppice_core::quota::TrueUp;
 use coppice_core::time::Timestamp;
 
-/// `GET /healthz` (ADR 0041) — the whole body.
-///
-/// Outside `/api/v1` like `/readyz` and `/metrics`, and outside its
-/// versioning too: the one field is a constant, and a probe that matches on
-/// it must never have to be reconfigured across a release. It carries no
-/// readiness, phase, or cluster information on purpose — `/readyz` is the
-/// endpoint with a verdict in it.
-///
-/// Serialize-only, unlike the read models below: the constant is a
-/// `&'static str` because nothing ever parses this body back into Rust.
+/// `GET /healthz` (ADR 0041) — the whole body. Outside `/api/v1` and its
+/// versioning; carries no readiness, phase, or cluster information on
+/// purpose (`/readyz` is where a verdict lives). Serialize-only: nothing
+/// ever parses this body back into Rust.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct HealthzResponse {
     /// Always `"ok"`: the process answered.
@@ -266,8 +260,16 @@ pub struct NodeSummary {
     /// whose last sample aged out. Never a zero standing in for absence.
     pub used: Option<Resources>,
     pub labels: BTreeMap<String, String>,
-    /// False = draining: no new placements, running work continues.
+    /// The admin cordon (`SetNodeSchedulable` / `DeclareNodeLost`): false
+    /// means an operator has cordoned the node, or it has been declared
+    /// lost. Survives agent restarts. A node takes new placements only
+    /// when `schedulable && !draining`.
     pub schedulable: bool,
+    /// The agent's own announcement that it is shutting down (advisory
+    /// `Drain`/heartbeat), cleared on re-registration. Distinct from the
+    /// admin cordon: an operator did not necessarily ask for this. A node
+    /// takes new placements only when `schedulable && !draining`.
+    pub draining: bool,
     pub health: NodeHealth,
     /// Bumps on (re)registration or loss; fences stale agent commands.
     pub epoch: u64,
@@ -485,7 +487,8 @@ pub struct QueueStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCounts {
     pub total: u32,
-    /// Registered, not draining, and not lost.
+    /// Accepts placements: neither cordoned nor agent-draining, and not
+    /// lost.
     pub schedulable: u32,
     /// Nodes reported [`NodeHealth::Lost`]. Leader-local like the health it
     /// counts: a follower — with no heartbeat marks to judge by — reports 0,
@@ -1505,6 +1508,47 @@ pub struct AbortJobRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AbortJobResponse {}
 
+/// `POST /api/v1/nodes/{node}/drain` and `POST /api/v1/nodes/{node}/undrain`
+/// (ADR 0041) — the admin cordon, as the `SetNodeSchedulable` command spells
+/// it.
+///
+/// **Not a request body.** Both routes take no body; this is the argument
+/// type of the [`ControlPlane`](crate::ControlPlane) seam the two handlers
+/// share, serde-derived only so a test can build and compare one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetNodeSchedulableRequest {
+    pub node: NodeId,
+    /// `false` cordons the node — new placements stop, running work
+    /// continues; `true` lifts the cordon.
+    pub schedulable: bool,
+}
+
+/// The answer to a drain or an undrain: empty, like an abort's.
+///
+/// One type for both directions because one command backs both, and the
+/// node's resulting state is read back from `GET /api/v1/nodes/{node}` rather
+/// than echoed here — a write that resolved is a write that applied, and
+/// anything this body claimed about the node would already be a snapshot of
+/// the past.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DrainNodeResponse {}
+
+/// `POST /api/v1/nodes/{node}/remove` (ADR 0041) — the decommission verb,
+/// one node's record evicted from replicated state.
+///
+/// Bodyless like the two above, and the same seam-argument type rather than a
+/// wire body. Singular where the `EvictNodes` command is plural: the
+/// retention GC proposes batches, an operator removes the node they named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvictNodeRequest {
+    pub node: NodeId,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RemoveNodeResponse {}
+
 /// `POST /api/v1/quota-entities` — the create-or-update upsert of the
 /// `ConfigureQuotaEntity` command (no delete in v1).
 ///
@@ -2359,6 +2403,7 @@ mod tests {
             }),
             labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
             schedulable: true,
+            draining: false,
             health: NodeHealth::Unknown,
             epoch: 3,
             last_heartbeat: None,
@@ -2376,6 +2421,7 @@ mod tests {
                 "used": { "cpu_millis": 2500, "memory_bytes": 3_000_000_000u64, "disk_bytes": 0 },
                 "labels": { "zone": "a" },
                 "schedulable": true,
+                "draining": false,
                 "health": "unknown",
                 "epoch": 3,
                 "last_heartbeat": null,

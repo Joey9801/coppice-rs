@@ -641,8 +641,19 @@ export interface NodeSummary {
    */
   used: Resources | null
   labels: Record<string, string>
-  /** False = draining: no new placements, running work continues. */
+  /**
+   * The admin cordon (`SetNodeSchedulable` / `DeclareNodeLost`): false means
+   * an operator has cordoned the node, or it has been declared lost.
+   * Survives agent restarts. A node takes new placements only when
+   * `schedulable && !draining`.
+   */
   schedulable: boolean
+  /**
+   * The agent's own announcement that it is shutting down, cleared on
+   * re-registration. Optional on the wire; absence means false. A node
+   * takes new placements only when `schedulable && !draining`.
+   */
+  draining?: boolean
   health: NodeHealth
   /** Bumps on (re)registration or loss; fences stale agent commands. */
   epoch: number

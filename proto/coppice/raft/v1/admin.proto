@@ -276,6 +276,17 @@ service RaftAdminService {
   // than reusing the shared outcome alone.
   rpc ForwardUpdateAuthorization(ForwardUpdateAuthorizationRequest)
       returns (ForwardUpdateAuthorizationResponse);
+  // The ADR 0041 node writes, forwarded the same way: the admin cordon
+  // (`POST /api/v1/nodes/{node}/drain` and `.../undrain`, one command with
+  // the flag assigned either way) and node removal (`.../remove`).
+  //
+  // Named for the commands they propose, not the routes: SetNodeSchedulable
+  // serves two routes, and EvictNodes is the same command the leader's
+  // retention GC proposes — that one never crosses this hop, since the GC
+  // only ever runs on the leader.
+  rpc ForwardSetNodeSchedulable(ForwardSetNodeSchedulableRequest)
+      returns (ForwardSetNodeSchedulableResponse);
+  rpc ForwardEvictNodes(ForwardEvictNodesRequest) returns (ForwardEvictNodesResponse);
 
   // A follower's internal fetch of the leader's node-liveness marks
   // (ADR 0040) — the read twin of the forwarded writes above, and the only
@@ -445,6 +456,9 @@ message ForwardWriteOutcome {
     REJECTION_KIND_INVALID_AUTHORIZATION = 3;
     // A bindings list retaining no unscoped admin binding.
     REJECTION_KIND_AUTHORIZATION_LOCKOUT = 4;
+    // The node a drain or undrain named does not exist at the command's log
+    // position. A 404 on the ADR 0041 node-write routes only.
+    REJECTION_KIND_UNKNOWN_NODE = 5;
   }
   // The receiver is not the leader (the forwarder's view was stale, or
   // leadership moved under it). It never forwards again — the originating
@@ -563,6 +577,44 @@ message ForwardUpdateAuthorizationResponse {
   // installs together at one log position.
   ForwardWriteOutcome outcome = 1;
   reserved 2; // was policy_log_index, back when the rename was a 2nd command.
+}
+
+// A follower's forwarding of `POST /api/v1/nodes/{node}/drain` or
+// `.../undrain` (ADR 0041). Neither route has a request body — the path
+// names the node and the route names the direction — so what crosses is the
+// command's two fields.
+message ForwardSetNodeSchedulableRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  coppice.core.v1.NodeId node = 8;
+  // Assigned, never toggled: `false` is drain, `true` is undrain, and
+  // proposing the value the record already holds is a successful no-op. That
+  // is what makes a retried forward safe after a lost answer.
+  bool schedulable = 9;
+  // As ForwardSubmitJobRequest.actor. Verb::Drain is a cluster verb, so the
+  // actor is the entire authorization input.
+  coppice.core.v1.Actor actor = 10;
+}
+
+message ForwardSetNodeSchedulableResponse {
+  ForwardWriteOutcome outcome = 1;
+}
+
+// A follower's forwarding of `POST /api/v1/nodes/{node}/remove` (ADR 0041).
+//
+// Plural because the command is: `EvictNodes` takes a list, and encoding one
+// node as a list rather than the list as one node keeps this message the
+// shape of the thing it proposes. The HTTP route sends exactly one.
+message ForwardEvictNodesRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  // Ids the leader must evict. Missing ids are skipped by apply, so a
+  // retried forward after a lost answer succeeds rather than 404ing.
+  repeated coppice.core.v1.NodeId nodes = 8;
+  // As ForwardSubmitJobRequest.actor.
+  coppice.core.v1.Actor actor = 9;
+}
+
+message ForwardEvictNodesResponse {
+  ForwardWriteOutcome outcome = 1;
 }
 
 // ---- The forwarded liveness read (ADR 0040) ------------------------------
