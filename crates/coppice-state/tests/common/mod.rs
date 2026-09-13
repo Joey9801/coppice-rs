@@ -15,7 +15,8 @@ use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::{
     AbortJob, AllocationSpec, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
     DispatchAttempt, Placement, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RegisterNode, SetNodeSchedulable, SubmitJob, UpdateAuthorization, UpdatePolicy,
+    RegisterNode, SetNodeDraining, SetNodeSchedulable, SubmitJob, UpdateAuthorization,
+    UpdatePolicy,
 };
 use coppice_state::{Applied, Command, PolicyConfig, StateMachine};
 use uuid::Uuid;
@@ -364,6 +365,16 @@ pub fn set_schedulable_cmd(node: NodeId, schedulable: bool) -> Command {
         schedulable,
         actor: None,
         updated_at: base_ts(),
+    })
+}
+
+/// The agent's own shutdown announcement (ADR 0041), machine-proposed: no
+/// actor, and it never writes the admin cordon.
+pub fn set_draining_cmd(node: NodeId, draining: bool) -> Command {
+    Command::SetNodeDraining(SetNodeDraining {
+        node,
+        draining,
+        at: base_ts(),
     })
 }
 

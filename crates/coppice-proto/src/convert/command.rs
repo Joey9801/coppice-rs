@@ -18,7 +18,8 @@ use coppice_state::command::{
     RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
     RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
     RecordStagedKeyTransferIntent, RegisterNode, RetireMachineBinding, RevokeEnrollToken,
-    RevokeIdentity, SetNodeSchedulable, SubmitJob, UpdateAuthorization, UpdatePolicy,
+    RevokeIdentity, SetNodeDraining, SetNodeSchedulable, SubmitJob, UpdateAuthorization,
+    UpdatePolicy,
 };
 use coppice_state::{
     CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_GROUPS_CLAIM,
@@ -47,6 +48,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::RegisterNode(c) => Body::RegisterNode(c.into()),
         Command::DeclareNodeLost(c) => Body::DeclareNodeLost(c.into()),
         Command::SetNodeSchedulable(c) => Body::SetNodeSchedulable(c.into()),
+        Command::SetNodeDraining(c) => Body::SetNodeDraining(c.into()),
         Command::EvictTerminalJobs(c) => Body::EvictTerminalJobs(c.into()),
         Command::ConfigureQuotaEntity(c) => Body::ConfigureQuotaEntity(c.into()),
         Command::UpdatePolicy(c) => Body::UpdatePolicy(c.into()),
@@ -90,6 +92,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::RegisterNode(c) => Command::RegisterNode(c.try_into()?),
         Body::DeclareNodeLost(c) => Command::DeclareNodeLost(c.try_into()?),
         Body::SetNodeSchedulable(c) => Command::SetNodeSchedulable(c.try_into()?),
+        Body::SetNodeDraining(c) => Command::SetNodeDraining(c.try_into()?),
         Body::EvictTerminalJobs(c) => Command::EvictTerminalJobs(c.try_into()?),
         Body::ConfigureQuotaEntity(c) => Command::ConfigureQuotaEntity(c.try_into()?),
         Body::UpdatePolicy(c) => Command::UpdatePolicy(c.try_into()?),
@@ -470,6 +473,28 @@ impl TryFrom<pb::SetNodeSchedulable> for SetNodeSchedulable {
             schedulable: c.schedulable,
             actor: c.actor.map(Into::into),
             updated_at: timestamp(c.updated_at_us, "SetNodeSchedulable.updated_at_us")?,
+        })
+    }
+}
+
+impl From<&SetNodeDraining> for pb::SetNodeDraining {
+    fn from(c: &SetNodeDraining) -> Self {
+        pb::SetNodeDraining {
+            node: Some(c.node.into()),
+            draining: c.draining,
+            at_us: c.at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::SetNodeDraining> for SetNodeDraining {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::SetNodeDraining) -> Result<Self, ConvertError> {
+        Ok(SetNodeDraining {
+            node: req(c.node, "SetNodeDraining.node")?.try_into()?,
+            draining: c.draining,
+            at: timestamp(c.at_us, "SetNodeDraining.at_us")?,
         })
     }
 }

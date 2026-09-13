@@ -60,6 +60,7 @@ message Command {
     RegisterNode register_node = 50;
     DeclareNodeLost declare_node_lost = 51;
     SetNodeSchedulable set_node_schedulable = 52;
+    SetNodeDraining set_node_draining = 53;
 
     EvictTerminalJobs evict_terminal_jobs = 60;
 
@@ -246,6 +247,17 @@ message SetNodeSchedulable {
   // Who asked (ADR 0023). Drain is a cluster verb: an unscoped operator or
   // admin binding, never a scoped one.
   coppice.core.v1.Actor actor = 4;
+}
+
+// The agent's own shutdown announcement (ADR 0041), normalized by the
+// leader from a Heartbeat whose `draining` differs from the replicated
+// record. Machine-proposed like DeclareNodeLost: no actor, and it never
+// writes the admin cordon `schedulable`. A Register carries the same fact
+// on RegisterNode instead.
+message SetNodeDraining {
+  coppice.core.v1.NodeId node = 1;
+  bool draining = 2;
+  int64 at_us = 3;
 }
 
 // Remove terminal jobs from replicated state (ADR 0012). Proposed only

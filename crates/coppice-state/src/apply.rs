@@ -25,8 +25,8 @@ use crate::command::{
     EvictTerminalJobs, MintEnrollToken, Placement, RebindMachineAddress, ReconcileNode,
     RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate,
     RecordEnrolledIdentity, RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode,
-    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeSchedulable, SubmitJob,
-    UpdateAuthorization, UpdatePolicy,
+    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable,
+    SubmitJob, UpdateAuthorization, UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -56,6 +56,7 @@ impl StateMachine {
             Command::RegisterNode(c) => self.register_node(c),
             Command::DeclareNodeLost(c) => self.declare_node_lost(c),
             Command::SetNodeSchedulable(c) => self.set_node_schedulable(c),
+            Command::SetNodeDraining(c) => self.set_node_draining(c),
             Command::EvictTerminalJobs(c) => self.evict_terminal_jobs(c),
             Command::ConfigureQuotaEntity(c) => self.configure_quota_entity(c),
             Command::UpdatePolicy(c) => self.update_policy(c),
@@ -897,6 +898,20 @@ impl StateMachine {
         // Drain blocks new placements only: running work continues and
         // existing accruals keep funding.
         rec.node.schedulable = c.schedulable;
+        Ok(Applied::default())
+    }
+
+    fn set_node_draining(&mut self, c: &SetNodeDraining) -> ApplyResult {
+        // Machine-proposed (ADR 0041): the leader's ingestion normalized an
+        // agent report, so there is no actor and nothing to authorize.
+        let Some(rec) = self.nodes.get_mut(&c.node) else {
+            return Err(RejectionReason::UnknownNode(c.node));
+        };
+        // The announcement gates placements and nothing else: running work
+        // continues and existing accruals keep funding, exactly as under an
+        // admin cordon. The cordon itself is untouched — the two flags have
+        // different owners.
+        rec.draining = c.draining;
         Ok(Applied::default())
     }
 
