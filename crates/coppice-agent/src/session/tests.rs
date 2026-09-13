@@ -1025,3 +1025,32 @@ async fn heartbeat_carries_the_measured_usage_fold() {
         coppice_proto::convert::node_usage_from_pb(usage).expect("the report decodes");
     assert_eq!(reported, Resources::ZERO);
 }
+
+/// The shutdown announcement (ADR 0041) rides both report shapes, and is
+/// agent-local intent: a reconnect resets the session but must not retract it,
+/// so the drain lands as soon as the agent registers again.
+#[tokio::test]
+async fn the_draining_announcement_rides_both_reports_and_survives_a_reconnect() {
+    let (_dir, mut session, _exec) = session();
+
+    assert!(!session.is_draining());
+    assert!(!draining_of(&session.register_report()));
+    assert!(!draining_of(&session.heartbeat_report().await));
+
+    session.set_draining(true);
+    assert!(session.is_draining());
+    assert!(draining_of(&session.register_report()));
+    assert!(draining_of(&session.heartbeat_report().await));
+
+    session.reset_session();
+    assert!(draining_of(&session.register_report()));
+}
+
+/// The `draining` flag of whichever report body this is.
+fn draining_of(report: &pb::AgentReport) -> bool {
+    match report.body.as_ref().expect("a report has a body") {
+        pb::agent_report::Body::Register(r) => r.draining,
+        pb::agent_report::Body::Heartbeat(h) => h.draining,
+        other => panic!("not a report that carries draining: {other:?}"),
+    }
+}
