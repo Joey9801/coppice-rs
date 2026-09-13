@@ -791,8 +791,7 @@ async fn run_logs(
     let mut sources: Vec<dto::LogSourceRecord> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page =
-            fetch_logs_page(client, job, stream, attempt, order, cursor.as_deref(), None).await?;
+        let page = fetch_logs_page(client, job, stream, attempt, order, cursor.as_deref()).await?;
         merge_sources(&mut sources, page.sources);
         multi = latch_multi(multi, &sources);
         for entry in &page.entries {
@@ -830,17 +829,16 @@ fn latch_multi(multi: bool, sources: &[dto::LogSourceRecord]) -> bool {
     multi
 }
 
-/// Follow state carried across polls. A null cursor loses the exact resume
-/// position, so we also remember the last printed entry's instant and how many
-/// entries we already printed at that instant — a re-poll passes `from=<last>`
-/// (inclusive) and skips that many leading duplicates.
+/// Follow state carried across polls. `cursor` is the token to send on the
+/// next request: `next_cursor` while a page is truncated and history remains,
+/// else the server's ascending `resume_cursor` — an exclusive high-water mark
+/// that stays valid on an exhausted page, carries the same-microsecond skip
+/// count, and lets a later attempt be reached from the prior attempt's end.
 #[derive(Default)]
 struct FollowState {
     sources: Vec<dto::LogSourceRecord>,
     multi: bool,
     cursor: Option<String>,
-    last_at: Option<String>,
-    last_at_count: usize,
 }
 
 /// The `--follow` loop: drain to the live head, and once caught up either exit
@@ -874,7 +872,9 @@ async fn run_follow(
 }
 
 /// Fetch and print pages until the walk reaches the live head (`next_cursor`
-/// null), resuming by cursor when one is held and by `from`/skip otherwise.
+/// null), then retain the page's `resume_cursor` so the next poll continues
+/// from exactly where this one stopped. The stream and attempt filters ride
+/// on every request, so a re-poll never widens or narrows the walk.
 async fn drain_to_head(
     client: &ApiClient,
     job: JobId,
@@ -883,12 +883,6 @@ async fn drain_to_head(
     state: &mut FollowState,
 ) -> Result<()> {
     loop {
-        // Resume from the held cursor when we have one; otherwise from the last
-        // printed instant (inclusive), skipping already-printed duplicates.
-        let (from, skip) = match &state.cursor {
-            Some(_) => (None, 0),
-            None => (state.last_at.clone(), state.last_at_count),
-        };
         let page = fetch_logs_page(
             client,
             job,
@@ -896,31 +890,21 @@ async fn drain_to_head(
             attempt,
             dto::LogOrder::Asc,
             state.cursor.as_deref(),
-            from.as_deref(),
         )
         .await?;
         merge_sources(&mut state.sources, page.sources);
         state.multi = latch_multi(state.multi, &state.sources);
-
-        let mut skipped = 0usize;
         for entry in &page.entries {
-            let at = entry.at.to_string();
-            // Only the first (from-resumed) page skips leading duplicates.
-            if from.as_deref() == Some(at.as_str()) && skipped < skip {
-                skipped += 1;
-                continue;
-            }
             print_entry(entry, state.multi);
-            if state.last_at.as_deref() == Some(at.as_str()) {
-                state.last_at_count += 1;
-            } else {
-                state.last_at = Some(at);
-                state.last_at_count = 1;
-            }
         }
 
-        state.cursor = page.next_cursor;
-        if state.cursor.is_none() {
+        let more = page.next_cursor.is_some();
+        // Never rewind: a page that carries neither token (a job with no
+        // attempt yet) keeps whatever position we already held.
+        if let Some(next) = page.next_cursor.or(page.resume_cursor) {
+            state.cursor = Some(next);
+        }
+        if !more {
             break;
         }
     }
@@ -928,7 +912,6 @@ async fn drain_to_head(
 }
 
 /// One logs GET, mapping a non-2xx response to a rich error.
-#[allow(clippy::too_many_arguments)]
 async fn fetch_logs_page(
     client: &ApiClient,
     job: JobId,
@@ -936,7 +919,6 @@ async fn fetch_logs_page(
     attempt: Option<AttemptId>,
     order: dto::LogOrder,
     cursor: Option<&str>,
-    from: Option<&str>,
 ) -> Result<dto::GetJobLogsResponse> {
     let mut query: Query = vec![("order", order.as_str().to_string())];
     if let Some(stream) = stream {
@@ -947,9 +929,6 @@ async fn fetch_logs_page(
     }
     if let Some(cursor) = cursor {
         query.push(("cursor", cursor.to_string()));
-    }
-    if let Some(from) = from {
-        query.push(("from", from.to_string()));
     }
     client
         .get_json(
@@ -993,8 +972,8 @@ fn print_entry(entry: &dto::LogEntry, prefix_attempt: bool) {
 /// Merge a page's source records into the running set, keeping insertion order
 /// and letting a later record for the same attempt supersede an earlier one —
 /// except `truncated`, which is sticky: it is evidence of loss, and a later
-/// page over a narrower range (a follow re-poll with `from=`) legitimately
-/// reports false without unsaying it. The set stays deduplicated by attempt,
+/// page resumed past the pruned region (a follow re-poll from the high-water
+/// mark) legitimately reports false without unsaying it. The set stays deduplicated by attempt,
 /// so its length is the number of distinct attempts seen.
 fn merge_sources(into: &mut Vec<dto::LogSourceRecord>, page: Vec<dto::LogSourceRecord>) {
     for record in page {
@@ -2375,6 +2354,392 @@ retry_user_errors = true
         .await
         .expect("follow terminates promptly")
         .expect("follow succeeds");
+    }
+
+    // -- follow with resume cursors ------------------------------------------
+
+    type SeenQueries = Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>;
+
+    /// A scripted logs server for `--follow`: the n-th logs request is answered
+    /// with `pages[n]` (the last page repeats once exhausted), the n-th
+    /// post-drain terminal check with `states[n]` (likewise; the up-front
+    /// multiplicity fetch sees `states[0]` too), and every logs query string is
+    /// recorded so a test can assert the exact cursor sequence the client sent.
+    struct FollowScript {
+        pages: Vec<dto::GetJobLogsResponse>,
+        states: Vec<dto::JobStateKind>,
+        logs_served: Mutex<usize>,
+        details_served: Mutex<usize>,
+        seen: SeenQueries,
+    }
+
+    async fn spawn_follow_script(
+        pages: Vec<dto::GetJobLogsResponse>,
+        states: Vec<dto::JobStateKind>,
+    ) -> (String, SeenQueries) {
+        let seen: SeenQueries = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(FollowScript {
+            pages,
+            states,
+            logs_served: Mutex::new(0),
+            details_served: Mutex::new(0),
+            seen: seen.clone(),
+        });
+        let router =
+            Router::new()
+                .route(
+                    "/api/v1/jobs/:job/logs",
+                    get(
+                        |State(script): State<Arc<FollowScript>>,
+                         AxumQuery(params): AxumQuery<
+                            std::collections::HashMap<String, String>,
+                        >| async move {
+                            script.seen.lock().unwrap().push(params);
+                            let mut served = script.logs_served.lock().unwrap();
+                            let page = &script.pages[(*served).min(script.pages.len() - 1)];
+                            *served += 1;
+                            Json(serde_json::to_value(page).unwrap())
+                        },
+                    ),
+                )
+                .route(
+                    "/api/v1/jobs/:job",
+                    get(
+                        |State(script): State<Arc<FollowScript>>,
+                         AxumPath(job): AxumPath<String>| async move {
+                            let id: JobId = job.parse().unwrap();
+                            let mut served = script.details_served.lock().unwrap();
+                            // The first fetch is the multiplicity probe, not a
+                            // terminal check; it does not advance the script.
+                            let index = served.saturating_sub(1);
+                            let state = script.states[index.min(script.states.len() - 1)];
+                            *served += 1;
+                            // The sample detail lists no attempts, so the
+                            // up-front multiplicity probe always says
+                            // "single"; `latch_multi` is what a retry exercises.
+                            Json(serde_json::to_value(sample_job_detail(id, state)).unwrap())
+                        },
+                    ),
+                )
+                .with_state(script);
+        (spawn(router).await, seen)
+    }
+
+    fn follow_page(
+        entries: Vec<dto::LogEntry>,
+        sources: Vec<dto::LogSourceRecord>,
+        next_cursor: Option<&str>,
+        resume_cursor: Option<&str>,
+    ) -> dto::GetJobLogsResponse {
+        dto::GetJobLogsResponse {
+            resume_cursor: resume_cursor.map(str::to_string),
+            live: true,
+            entries,
+            sources,
+            next_cursor: next_cursor.map(str::to_string),
+        }
+    }
+
+    async fn run_follow_script(
+        base: &str,
+        stream: Option<dto::LogStreamName>,
+        attempt: Option<AttemptId>,
+    ) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_follow(
+                &client(base),
+                JobId::new(),
+                stream,
+                attempt,
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("follow terminates promptly")
+        .expect("follow succeeds");
+    }
+
+    fn cursors(seen: &SeenQueries) -> Vec<Option<String>> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|q| q.get("cursor").cloned())
+            .collect()
+    }
+
+    const ATTEMPT_ONE: &str = "attempt-00000000-0000-0000-0000-000000000001";
+    const ATTEMPT_TWO: &str = "attempt-00000000-0000-0000-0000-000000000002";
+
+    /// An exhausted page (`next_cursor` null) still yields a high-water mark;
+    /// the next poll resumes from it rather than from the walk's start, and the
+    /// final post-terminal drain reuses the latest mark.
+    #[tokio::test]
+    async fn follow_polls_from_the_resume_cursor_once_a_page_is_exhausted() {
+        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let pages = vec![
+            follow_page(
+                vec![log_entry(a1, 1_000_000, "one")],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:1000000:1"),
+            ),
+            follow_page(
+                vec![log_entry(a1, 2_000_000, "two")],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:2000000:1"),
+            ),
+            follow_page(
+                vec![],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:2000000:1"),
+            ),
+        ];
+        let (base, seen) = spawn_follow_script(
+            pages,
+            vec![dto::JobStateKind::Attempting, dto::JobStateKind::Succeeded],
+        )
+        .await;
+
+        run_follow_script(&base, None, None).await;
+
+        // Drain (no cursor) → still attempting → poll from mark one →
+        // succeeded → final drain from mark two.
+        assert_eq!(
+            cursors(&seen),
+            [
+                None,
+                Some("v1:asc:a1:1000000:1".to_string()),
+                Some("v1:asc:a1:2000000:1".to_string()),
+            ]
+        );
+        assert!(
+            seen.lock().unwrap().iter().all(|q| !q.contains_key("from")),
+            "resumption is by cursor alone, never by `from`"
+        );
+    }
+
+    /// A truncated page is continued through `next_cursor` (remaining history);
+    /// only once the walk reaches the head does `resume_cursor` take over.
+    #[tokio::test]
+    async fn follow_keeps_next_cursor_for_remaining_history() {
+        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let pages = vec![
+            follow_page(
+                vec![log_entry(a1, 1_000_000, "one")],
+                vec![available_source(a1)],
+                Some("v1:asc:a1:2000000:0"),
+                Some("v1:asc:a1:1000000:1"),
+            ),
+            follow_page(
+                vec![log_entry(a1, 2_000_000, "two")],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:2000000:1"),
+            ),
+        ];
+        let (base, seen) = spawn_follow_script(pages, vec![dto::JobStateKind::Succeeded]).await;
+
+        run_follow_script(&base, None, None).await;
+
+        assert_eq!(
+            cursors(&seen),
+            [
+                None,
+                Some("v1:asc:a1:2000000:0".to_string()),
+                Some("v1:asc:a1:2000000:1".to_string()),
+            ]
+        );
+    }
+
+    /// Two identical writes at the same microsecond are distinguished by the
+    /// server's skip count inside the token; the client relays the token
+    /// verbatim and does no de-duplication of its own, so both lines print.
+    #[tokio::test]
+    async fn follow_relays_the_same_microsecond_skip_through_the_token() {
+        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let pages = vec![
+            follow_page(
+                vec![log_entry(a1, 1_000_000, "same")],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:1000000:1"),
+            ),
+            follow_page(
+                vec![log_entry(a1, 1_000_000, "same")],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:1000000:2"),
+            ),
+            follow_page(
+                vec![],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:1000000:2"),
+            ),
+        ];
+        let (base, seen) = spawn_follow_script(
+            pages,
+            vec![dto::JobStateKind::Attempting, dto::JobStateKind::Succeeded],
+        )
+        .await;
+
+        run_follow_script(&base, None, None).await;
+
+        assert_eq!(
+            cursors(&seen),
+            [
+                None,
+                Some("v1:asc:a1:1000000:1".to_string()),
+                Some("v1:asc:a1:1000000:2".to_string()),
+            ]
+        );
+    }
+
+    /// A poll that finds nothing new hands back the same mark, and the client
+    /// polls from that same mark again — it neither rewinds nor advances.
+    #[tokio::test]
+    async fn follow_repeats_the_watermark_when_a_poll_finds_no_output() {
+        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let mark = "v1:asc:a1:1000000:1";
+        let pages = vec![
+            follow_page(
+                vec![log_entry(a1, 1_000_000, "one")],
+                vec![available_source(a1)],
+                None,
+                Some(mark),
+            ),
+            follow_page(vec![], vec![available_source(a1)], None, Some(mark)),
+        ];
+        let (base, seen) = spawn_follow_script(
+            pages,
+            vec![
+                dto::JobStateKind::Attempting,
+                dto::JobStateKind::Attempting,
+                dto::JobStateKind::Attempting,
+                dto::JobStateKind::Succeeded,
+            ],
+        )
+        .await;
+
+        run_follow_script(&base, None, None).await;
+
+        let mark = Some(mark.to_string());
+        assert_eq!(
+            cursors(&seen),
+            [None, mark.clone(), mark.clone(), mark.clone(), mark]
+        );
+    }
+
+    /// A job with no attempt yet answers with neither token; the client keeps
+    /// polling from the start until a mark appears, then holds on to it.
+    #[tokio::test]
+    async fn follow_keeps_polling_from_the_start_until_a_mark_appears() {
+        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let pages = vec![
+            follow_page(vec![], vec![], None, None),
+            follow_page(
+                vec![log_entry(a1, 1_000_000, "one")],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:1000000:1"),
+            ),
+        ];
+        let (base, seen) = spawn_follow_script(
+            pages,
+            vec![dto::JobStateKind::Attempting, dto::JobStateKind::Succeeded],
+        )
+        .await;
+
+        run_follow_script(&base, None, None).await;
+
+        assert_eq!(
+            cursors(&seen),
+            [None, None, Some("v1:asc:a1:1000000:1".to_string())]
+        );
+    }
+
+    /// A retry that lands after the first attempt's high-water mark is reached
+    /// from that mark: the server walks on to the new attempt, the client
+    /// latches multi-attempt prefixing, and the next mark is the new attempt's.
+    #[tokio::test]
+    async fn follow_continues_into_a_later_attempt_from_the_prior_mark() {
+        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let a2: AttemptId = ATTEMPT_TWO.parse().unwrap();
+        let pages = vec![
+            follow_page(
+                vec![log_entry(a1, 1_000_000, "first attempt")],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:1000000:1"),
+            ),
+            follow_page(
+                vec![log_entry(a2, 3_000_000, "second attempt")],
+                vec![available_source(a1), available_source(a2)],
+                None,
+                Some("v1:asc:a2:3000000:1"),
+            ),
+            follow_page(
+                vec![],
+                vec![available_source(a2)],
+                None,
+                Some("v1:asc:a2:3000000:1"),
+            ),
+        ];
+        let (base, seen) = spawn_follow_script(
+            pages,
+            vec![dto::JobStateKind::Attempting, dto::JobStateKind::Succeeded],
+        )
+        .await;
+
+        run_follow_script(&base, None, None).await;
+
+        assert_eq!(
+            cursors(&seen),
+            [
+                None,
+                Some("v1:asc:a1:1000000:1".to_string()),
+                Some("v1:asc:a2:3000000:1".to_string()),
+            ]
+        );
+    }
+
+    /// The stream and attempt filters ride on every poll alongside the
+    /// cursor, so resuming never widens the walk beyond what was asked for.
+    #[tokio::test]
+    async fn follow_preserves_the_stream_and_attempt_filters_on_every_poll() {
+        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let pages = vec![
+            follow_page(
+                vec![log_entry(a1, 1_000_000, "one")],
+                vec![available_source(a1)],
+                Some("v1:asc:a1:2000000:0"),
+                Some("v1:asc:a1:1000000:1"),
+            ),
+            follow_page(
+                vec![],
+                vec![available_source(a1)],
+                None,
+                Some("v1:asc:a1:2000000:0"),
+            ),
+        ];
+        let (base, seen) = spawn_follow_script(
+            pages,
+            vec![dto::JobStateKind::Attempting, dto::JobStateKind::Succeeded],
+        )
+        .await;
+
+        run_follow_script(&base, Some(dto::LogStreamName::Stderr), Some(a1)).await;
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() >= 3, "initial drain, poll, final drain");
+        for query in seen.iter() {
+            assert_eq!(query.get("order").map(String::as_str), Some("asc"));
+            assert_eq!(query.get("stream").map(String::as_str), Some("stderr"));
+            assert_eq!(query.get("attempt").map(String::as_str), Some(ATTEMPT_ONE));
+        }
     }
 
     // -- Timeline -----------------------------------------------------------
