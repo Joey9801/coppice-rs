@@ -6,12 +6,18 @@
 //! prove nothing.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use coppice_testkit::tracing_capture::{assert_no_secret, capture};
 
 const TOKEN: &str = "cpk_agent_startup_secret";
 
 /// A minimal but complete agent config, with `[enrollment]` spliced in.
+///
+/// The cluster owns the machine-plane material outright at the fixed
+/// `<data_dir>/pki` layout (#127), so there is no `[tls]` table left to
+/// splice in here: enrollment is the only thing that ever puts a leaf on a
+/// worker.
 fn config_with(enrollment: &str) -> String {
     format!(
         r#"
@@ -22,11 +28,6 @@ backend = "static"
 
 [discovery.static]
 addrs = ["coord-1.example.com:7072"]
-
-[tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
 
 {enrollment}
 "#
@@ -39,13 +40,40 @@ fn load(contents: &str) -> anyhow::Result<coppice_agent::config::Config> {
     coppice_agent::config::load(file.path())
 }
 
+/// Enrollment is the only way a leaf reaches a worker, so an agent config
+/// without the table cannot start (#127).
 #[test]
-fn the_table_is_optional() {
-    let config = load(&config_with("")).expect("a config without [enrollment] is valid");
+fn a_missing_table_fails_to_load() {
+    let error = load(&config_with("")).expect_err("a config without [enrollment] is invalid");
+    let rendered = format!("{error:#}");
     assert!(
-        config.enrollment.is_none(),
-        "an agent whose leaf is provisioned out of band configures no enrollment"
+        rendered.contains("enrollment"),
+        "error names the section: {rendered}"
     );
+}
+
+/// Machine-plane material is named nowhere in the file: it is exactly the
+/// fixed layout under `data_dir` (#127).
+#[test]
+fn tls_paths_are_derived_from_data_dir() {
+    let config = load(&config_with(
+        r#"
+[enrollment]
+endpoint = "https://coppice.example.com:7070"
+token_path = "/run/secrets/coppice-enroll-token"
+"#,
+    ))
+    .expect("valid");
+    let paths = config.tls_paths();
+    assert_eq!(
+        paths.cert,
+        PathBuf::from("/var/lib/coppice-agent/pki/node.crt")
+    );
+    assert_eq!(
+        paths.key,
+        PathBuf::from("/var/lib/coppice-agent/pki/node.key")
+    );
+    assert_eq!(paths.ca, PathBuf::from("/var/lib/coppice-agent/pki/ca.crt"));
 }
 
 #[test]
@@ -58,7 +86,7 @@ token_path = "/run/secrets/coppice-enroll-token"
 "#,
     ))
     .expect("valid");
-    let enrollment = config.enrollment.expect("the table parsed");
+    let enrollment = config.enrollment;
     assert_eq!(enrollment.endpoint, "https://coppice.example.com:7070");
     assert_eq!(enrollment.token_kind(), "path");
     assert!(!enrollment.insecure, "insecure defaults off");
@@ -89,7 +117,7 @@ insecure = true
 "#,
     ))
     .expect("the opt-in is what makes it valid");
-    assert!(config.enrollment.expect("the table parsed").insecure);
+    assert!(config.enrollment.insecure);
 }
 
 #[test]

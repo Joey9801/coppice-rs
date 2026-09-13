@@ -96,7 +96,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 # Test-only self-signed CA + per-node leaf certs for the mTLS Raft/admin mesh
 # the multi-node integration test drives (ADR 0011). Dev-only: production nodes
-# read PEM material from disk (config `[tls]`), never mint it.
+# read PEM material from `<data_dir>/pki`, never mint it.
 rcgen.workspace = true
 # The real node agent (lib): its `Session` runner, `FakeExecutor`, and journal
 # drive the end-to-end agent↔coordinator reconciliation protocol test

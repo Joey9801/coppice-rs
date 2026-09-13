@@ -146,7 +146,7 @@ impl Renewal {
 }
 
 /// One renewal round trip: CSR out over the live session channel, issued leaf
-/// in, installed into the `[tls]` paths and published to the store.
+/// in, installed into the cluster-managed paths and published to the store.
 ///
 /// `force_reload` is what makes the new leaf reach the wire: the next dial (and
 /// the `NodeService` listener's next handshake) reads the store's current

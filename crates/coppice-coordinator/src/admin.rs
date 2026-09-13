@@ -3075,9 +3075,10 @@ pub async fn run_cli(args: AdminArgs) -> Result<()> {
         }
     };
 
-    let ca = read_pem(&cfg.tls.ca_path)?;
-    let cert = read_pem(&cfg.tls.cert_path)?;
-    let key = read_pem(&cfg.tls.key_path)?;
+    let paths = cfg.tls_paths();
+    let ca = read_pem(&paths.ca)?;
+    let cert = read_pem(&paths.cert)?;
+    let key = read_pem(&paths.key)?;
 
     let mut client = admin_channel(&target, &ca, &cert, &key).await?;
 

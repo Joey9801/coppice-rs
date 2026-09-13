@@ -126,7 +126,7 @@ fn cluster_signer(daemon: &Daemon) -> pki::CaSigner {
     pki::CaSigner::load(&ca_pem, &key).expect("load the cluster CA signer")
 }
 
-/// The SANs of the leaf currently installed at `daemon`'s `[tls]` cert path.
+/// The SANs of the leaf currently installed at `<data_dir>/pki/node.crt`.
 fn on_disk_sans(daemon: &Daemon) -> Vec<String> {
     let (_, cert_pem, _) = daemon.tls_material();
     pki::leaf_sans(&cert_pem).expect("the installed leaf parses")

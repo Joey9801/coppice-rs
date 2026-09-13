@@ -59,28 +59,22 @@ extra_sans = ["ENV.coppice.jwjr.uk"]
 # the authorization for `coppice coordinator init` (ADR 0037 §3).
 admin_socket = "/run/coppice/admin.sock"
 
-[tls]
-# Machine plane only: the leaf served on the raft and agent listeners. Absent
-# on a fresh instance — the daemon parks, enrolls (below), and writes these
-# three files itself, which is why the unit gives /etc/coppice/pki as a
-# ReadWritePaths= exception to ProtectSystem=strict.
-#
-# Configurable paths rather than a fixed layout under data_dir because
-# externally issued material is a supported substitution at the same paths
-# (docs/operations/security.md, ADR 0037 §4): an external issuer can own the
-# files and the daemon hot-reloads them either way. Making that choice
-# explicit in the schema instead of inferred from disk is issue #127.
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+# No [tls] table: machine-plane material (the leaf served on the raft and
+# agent listeners) is entirely cluster-owned and lives at the fixed layout
+# `<data_dir>/pki/{node.crt,node.key,ca.crt}` — not configurable (issue #127).
+# Absent on a fresh instance — the daemon parks, enrolls (below), and writes
+# those files itself under its own StateDirectory, so no ReadWritePaths=
+# exception is needed for /etc/coppice.
 
 [client_tls]
-# TLS terminates on the load balancer: the NLB holds the ACM certificate for
-# <env>.coppice.jwjr.uk and forwards plain HTTP to :7070 inside the VPC, which
-# docs/operations/configuration.md names as a supported posture for this
-# listener. Enrollment tokens therefore cross only the VPC-internal hop in the
-# clear; the client half of that trip is ordinary system-root verification of
-# the NLB's certificate (see `[enrollment]` below).
+# The USER-FACING listener only — distinct from the cluster-owned machine
+# plane above. TLS terminates on the load balancer: the NLB holds the ACM
+# certificate for <env>.coppice.jwjr.uk and forwards plain HTTP to :7070
+# inside the VPC, which docs/operations/configuration.md names as a supported
+# posture for this listener. Enrollment tokens therefore cross only the
+# VPC-internal hop in the clear; the client half of that trip is ordinary
+# system-root verification of the NLB's certificate (see `[enrollment]`
+# below).
 insecure = true
 
 [history]
@@ -91,10 +85,10 @@ insecure = true
 mode = "none"
 
 [enrollment]
-# How a fresh coordinator obtains its `[tls]` leaf (ADR 0037 §§4-5): token +
-# CSR to the cluster's public /enroll endpoint. The endpoint is the public
-# name, so the certificate verified here is the NLB's ACM one under ordinary
-# system roots — no private-CA distribution problem.
+# How a fresh coordinator obtains its cluster-owned machine-plane leaf
+# (ADR 0037 §§4-5): token + CSR to the cluster's public /enroll endpoint. The
+# endpoint is the public name, so the certificate verified here is the NLB's
+# ACM one under ordinary system roots — no private-CA distribution problem.
 endpoint = "https://ENV.coppice.jwjr.uk"
 # Written by cloud-init from an SSM SecureString before the unit starts. The
 # secret is the one baked into the `[[enroll_token]]` entry labelled

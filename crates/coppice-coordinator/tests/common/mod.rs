@@ -15,7 +15,7 @@
 
 use std::future::Future;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,62 @@ pub fn tls_store_from_pem(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Arc
         key_pem.to_vec(),
     )
     .expect("build tls store from pem")
+}
+
+/// Lay a leaf into `data_dir`'s cluster-managed layout (issue #127) and return
+/// the paths a daemon or agent rooted there will read.
+///
+/// Through [`pki::install_leaf_material`] rather than three `fs::write` calls,
+/// so the fixture's `pki/` directory is owner-only exactly as a real install's
+/// is — a mode assertion in a test is only worth making if the fixtures reach
+/// the same state the product does.
+pub fn install_material(
+    data_dir: &Path,
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> TlsPaths {
+    let paths = TlsPaths::cluster_managed(data_dir);
+    pki::install_leaf_material(&paths, ca_pem, cert_pem, key_pem).expect("install tls material");
+    paths
+}
+
+/// Provision a harness agent rooted at `data_dir` exactly as its cluster would
+/// have: a leaf whose CN is `node_id` (the gateway binds CN to the claimed id
+/// at session accept, ADR 0011) laid into the cluster-managed layout, plus the
+/// `node-identity` file the agent settles its identity from
+/// (deployment-story A1).
+///
+/// One helper rather than one per harness: three suites want the same
+/// already-enrolled agent, and the layout they install into is the product's,
+/// not theirs to choose (issue #127).
+pub fn agent_material(data_dir: &Path, ca: &Ca, node_id: NodeId) -> TlsPaths {
+    let leaf = ca.leaf_with_cn(&node_id.to_string());
+    let paths = install_material(data_dir, &ca.pem, &leaf.cert_pem, &leaf.key_pem);
+    std::fs::write(
+        data_dir.join(coppice_agent::identity::NODE_IDENTITY_FILE),
+        format!("{node_id}\n"),
+    )
+    .expect("seed the agent node identity");
+    paths
+}
+
+/// The `[enrollment]` table a harness agent carries.
+///
+/// Every agent config declares one (issue #127), but these harnesses hand the
+/// agent its leaf directly through [`agent_material`], so startup enrollment
+/// finds usable material and short-circuits without ever dialing: the endpoint
+/// below is deliberately unroutable, and a harness that ever reached it would
+/// fail loudly rather than quietly enrolling.
+pub fn unused_enrollment() -> coppice_enroll::EnrollmentConfig {
+    coppice_enroll::EnrollmentConfig {
+        endpoint: "https://enrollment.invalid:7070".to_string(),
+        token: Some(coppice_enroll::Secret::new(
+            "unused-by-construction".to_string(),
+        )),
+        token_path: None,
+        insecure: false,
+    }
 }
 
 /// A test CA plus one issued leaf's PEM material.
@@ -309,14 +365,12 @@ impl Node {
         let port = free_port();
         let dir = tempfile::tempdir().expect("create node tempdir");
         let root = dir.path();
-        let cert_path = root.join("node.crt");
-        let key_path = root.join("node.key");
-        let ca_path = root.join("ca.crt");
-        std::fs::write(&cert_path, &leaf.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &leaf.key_pem).expect("write key");
-        std::fs::write(&ca_path, &ca.pem).expect("write ca");
 
         let data_dir = root.join("data");
+        // Handed a leaf rather than enrolling for one, but in the one place a
+        // daemon looks: the cluster-managed layout under its data directory.
+        install_material(&data_dir, &ca.pem, &leaf.cert_pem, &leaf.key_pem);
+
         let config_path = root.join("coordinator.toml");
         let toml = format!(
             r#"cluster_id = "{cluster_id}"
@@ -359,11 +413,6 @@ m_cost_kib = 8
 t_cost = 1
 p_cost = 1
 
-[tls]
-cert_path = "{cert}"
-key_path = "{key}"
-ca_path = "{ca}"
-
 [client_tls]
 # Plain HTTP on the client listener (ADR 0037 §4: the posture is always
 # explicit, never implied).
@@ -381,9 +430,6 @@ insecure_open = true
 log_level = "warn"
 "#,
             data_dir = data_dir.display(),
-            cert = cert_path.display(),
-            key = key_path.display(),
-            ca = ca_path.display(),
         );
         std::fs::write(&config_path, toml).expect("write config");
 
@@ -400,16 +446,11 @@ log_level = "warn"
         }
     }
 
-    /// The node's hot-reload TLS store, loaded from the cert/key/ca files laid
-    /// down in [`Node::new`] — the same disk-based path the daemon takes.
+    /// The node's hot-reload TLS store, loaded from the material laid down in
+    /// [`Node::new`] — the same disk-based path the daemon takes.
     fn tls_store(&self) -> Arc<TlsStore> {
-        let root = self.dir.path();
-        TlsStore::load(TlsPaths {
-            cert: root.join("node.crt"),
-            key: root.join("node.key"),
-            ca: root.join("ca.crt"),
-        })
-        .unwrap_or_else(|e| panic!("load tls store for node {}: {e:#}", self.id))
+        TlsStore::load(TlsPaths::cluster_managed(&self.dir.path().join("data")))
+            .unwrap_or_else(|e| panic!("load tls store for node {}: {e:#}", self.id))
     }
 
     /// Boot (or re-boot) this replica through the real config + bootstrap path.
@@ -648,14 +689,10 @@ impl RunningCoordinator {
         // One leaf serves the Raft/admin transport AND the agent gateway (both
         // reuse the node's identity, ADR 0011).
         let leaf = ca.leaf();
-        let cert_path = root.join("node.crt");
-        let key_path = root.join("node.key");
-        let ca_path = root.join("ca.crt");
-        std::fs::write(&cert_path, &leaf.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &leaf.key_pem).expect("write key");
-        std::fs::write(&ca_path, &ca.pem).expect("write ca");
 
         let data_dir = root.join("data");
+        let tls_paths = install_material(&data_dir, &ca.pem, &leaf.cert_pem, &leaf.key_pem);
+
         let config_path = root.join("coordinator.toml");
         let toml = format!(
             r#"cluster_id = "{cluster_id}"
@@ -698,11 +735,6 @@ m_cost_kib = 8
 t_cost = 1
 p_cost = 1
 
-[tls]
-cert_path = "{cert}"
-key_path = "{key}"
-ca_path = "{ca}"
-
 [client_tls]
 # Plain HTTP on the client listener (ADR 0037 §4: the posture is always
 # explicit, never implied).
@@ -720,9 +752,6 @@ insecure_open = true
 log_level = "warn"
 "#,
             data_dir = data_dir.display(),
-            cert = cert_path.display(),
-            key = key_path.display(),
-            ca = ca_path.display(),
         );
         std::fs::write(&config_path, toml).expect("write config");
 
@@ -730,12 +759,7 @@ log_level = "warn"
 
         // One shared hot-reload store for the raft/admin server and the agent
         // gateway (both reuse the node's identity, ADR 0011 / ADR 0037 §4).
-        let tls_store = TlsStore::load(TlsPaths {
-            cert: cert_path.clone(),
-            key: key_path.clone(),
-            ca: ca_path.clone(),
-        })
-        .expect("load coordinator tls store");
+        let tls_store = TlsStore::load(tls_paths).expect("load coordinator tls store");
 
         let booted = bootstrap::bootstrap(resolved, Arc::clone(&tls_store))
             .await
@@ -897,7 +921,7 @@ pub struct Daemon {
     dir: TempDir,
     config_path: PathBuf,
     /// The CA whose leaf this daemon starts with. Formation replaces the
-    /// `[tls]` material with cluster-minted material, so a client that dialed
+    /// machine-plane material with cluster-minted material, so a client that dialed
     /// with this CA before `init` must re-dial with the cluster's afterwards.
     ca_pem: Vec<u8>,
     client_port: u16,
@@ -961,8 +985,7 @@ impl Daemon {
 
     /// A daemon with **no TLS material on disk** — the ADR 0037 §4 minimal
     /// deployment, where nothing is provisioned and formation mints the first
-    /// certificates. The config still names the `[tls]` paths; formation
-    /// writes into them.
+    /// certificates into `<data_dir>/pki` (issue #127).
     pub fn new_certless(cluster_id: ClusterId, ca: &Ca) -> Daemon {
         Daemon::with_material(cluster_id, ca, false)
     }
@@ -972,9 +995,7 @@ impl Daemon {
         let root = dir.path();
         if write_material {
             let leaf = ca.leaf();
-            std::fs::write(root.join("node.crt"), &leaf.cert_pem).expect("write cert");
-            std::fs::write(root.join("node.key"), &leaf.key_pem).expect("write key");
-            std::fs::write(root.join("ca.crt"), &ca.pem).expect("write ca");
+            install_material(&root.join("data"), &ca.pem, &leaf.cert_pem, &leaf.key_pem);
         }
 
         let client_port = free_port();
@@ -1039,11 +1060,6 @@ m_cost_kib = 8
 t_cost = 1
 p_cost = 1
 
-[tls]
-cert_path = "{cert}"
-key_path = "{key}"
-ca_path = "{ca}"
-
 [client_tls]
 # Plain HTTP on the client listener (ADR 0037 §4: the posture is always
 # explicit, never implied).
@@ -1061,9 +1077,6 @@ insecure_open = true
 log_level = "warn"
 "#,
                 data_dir = root.join("data").display(),
-                cert = root.join("node.crt").display(),
-                key = root.join("node.key").display(),
-                ca = root.join("ca.crt").display(),
             ),
         )
         .expect("write config");
@@ -1485,25 +1498,28 @@ log_level = "warn"
         format!("localhost:{}", self.agent_port)
     }
 
-    /// Write TLS material into this daemon's `[tls]` paths before it starts —
-    /// the state a certless daemon reaches by enrolling, laid down directly.
-    /// For tests whose subject is not enrollment: the daemon's first
+    /// Write TLS material into this daemon's cluster-managed layout before it
+    /// starts — the state a certless daemon reaches by enrolling, laid down
+    /// directly. For tests whose subject is not enrollment: the daemon's first
     /// convergence round finds a usable leaf and goes straight to probing.
     pub fn install_tls_material(&self, ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) {
-        let root = self.dir.path();
-        std::fs::write(root.join("ca.crt"), ca_pem).expect("write ca");
-        std::fs::write(root.join("node.crt"), cert_pem).expect("write cert");
-        std::fs::write(root.join("node.key"), key_pem).expect("write key");
+        install_material(&self.data_dir(), ca_pem, cert_pem, key_pem);
     }
 
-    /// The `[tls]` paths this daemon serves from: a certless daemon's
-    /// formation writes its own minted leaf here (ADR 0037 §3 step 3).
+    /// Where this daemon's machine-plane material lives: `<data_dir>/pki`
+    /// (issue #127), which is where a certless daemon's formation writes its
+    /// own minted leaf (ADR 0037 §3 step 3).
+    pub fn tls_paths(&self) -> TlsPaths {
+        TlsPaths::cluster_managed(&self.data_dir())
+    }
+
+    /// The CA bundle, leaf and key currently installed at [`Daemon::tls_paths`].
     pub fn tls_material(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let root = self.dir.path();
+        let paths = self.tls_paths();
         (
-            std::fs::read(root.join("ca.crt")).expect("read cluster ca"),
-            std::fs::read(root.join("node.crt")).expect("read node cert"),
-            std::fs::read(root.join("node.key")).expect("read node key"),
+            std::fs::read(&paths.ca).expect("read cluster ca"),
+            std::fs::read(&paths.cert).expect("read node cert"),
+            std::fs::read(&paths.key).expect("read node key"),
         )
     }
 
@@ -2091,9 +2107,11 @@ impl Fleet {
 /// A second `impl` block rather than an edit to the one above, so this file
 /// stays append-only while several suites are being written against it.
 impl Daemon {
-    /// Destroy this installation the way losing its disk would: the data
-    /// directory (manifest, raft log, machine identity, CA key) **and** the
-    /// `[tls]` material go together.
+    /// Destroy this installation the way losing its disk would. The cluster
+    /// owns the machine-plane material and keeps it under `<data_dir>/pki`
+    /// (issue #127), so the certificate, the manifest, the raft log, the
+    /// machine identity and the CA key all go with the volume — which is
+    /// exactly what a replaced instance sees.
     ///
     /// Distinct from [`Daemon::wipe_data_dir`], which models the ADR 0037 §3
     /// recovery from a failed formation — a deliberate operator act on a node
@@ -2107,12 +2125,6 @@ impl Daemon {
     /// real fleet those come from the launch template and not from the volume.
     pub fn wipe_installation(&self) {
         self.wipe_data_dir();
-        for file in ["node.crt", "node.key", "ca.crt"] {
-            let path = self.dir.path().join(file);
-            if path.exists() {
-                std::fs::remove_file(&path).expect("wipe tls material");
-            }
-        }
     }
 
     /// Wait for a daemon to exit **on its own**, and return what `run_with`

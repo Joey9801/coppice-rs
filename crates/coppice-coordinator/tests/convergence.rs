@@ -169,6 +169,11 @@ async fn a_converged_replica_restarts_straight_back_into_its_voter_seat() {
     let first = newcomer.await_phase("voter").await;
     let node_id = first["node_id"].clone();
 
+    // The material enrollment installed, read from the one place a daemon
+    // looks (issue #127) — captured before the restart so the assertion below
+    // can say the leaf survived it rather than merely that one exists.
+    let enrolled = newcomer.tls_material();
+
     newcomer.stop().await.expect("converged replica stops");
     newcomer.start();
 
@@ -180,6 +185,16 @@ async fn a_converged_replica_restarts_straight_back_into_its_voter_seat() {
         "a restart must not mint a new id"
     );
     assert_eq!(again["voters"].as_array().expect("voters").len(), 2);
+
+    // And it did not re-enroll to get there: the trio under `<data_dir>/pki`
+    // is byte-identical, which is the whole reason a restart costs nothing —
+    // a daemon that found no usable leaf would have minted a fresh keypair
+    // and gone back to the enrollment endpoint.
+    assert_eq!(
+        newcomer.tls_material(),
+        enrolled,
+        "a restart reuses the material already under <data_dir>/pki"
+    );
 
     newcomer.stop().await.expect("newcomer stops cleanly");
     leader.stop().await.expect("leader stops cleanly");
@@ -377,16 +392,14 @@ async fn interrupted_join_at(point: KillPoint) {
     if let Some(name) = point.failpoint() {
         joiner.arm_failpoints(&[name]);
     }
-    let root = joiner
-        .data_dir()
-        .parent()
-        .expect("data dir has a parent")
-        .to_path_buf();
+    // The one place a daemon's machine-plane material lives (issue #127):
+    // enrollment installs it here and the reload store reads it from here.
+    let paths = joiner.tls_paths();
     let identity_path = machine_identity_path(&joiner);
     joiner.start();
 
     // ---- stage the kill point ----------------------------------------------
-    let staged = stage_kill_point(point, &joiner, &root).await;
+    let staged = stage_kill_point(point, &joiner, &paths).await;
     let phase_at_kill = staged["phase"].as_str().unwrap_or("waiting").to_string();
     // A stamped replica reports its node id; a parked one has none yet, and
     // that absence is itself part of what `AfterEnroll` is staging.
@@ -398,8 +411,8 @@ async fn interrupted_join_at(point: KillPoint) {
     );
     let identity_before = std::fs::read(&identity_path)
         .unwrap_or_else(|e| panic!("{point:?}: read machine identity: {e}"));
-    let leaf_before = std::fs::read(root.join("node.crt"))
-        .unwrap_or_else(|e| panic!("{point:?}: read enrolled leaf: {e}"));
+    let leaf_before =
+        std::fs::read(&paths.cert).unwrap_or_else(|e| panic!("{point:?}: read enrolled leaf: {e}"));
 
     joiner.kill().await;
     joiner.await_released().await;
@@ -443,7 +456,7 @@ async fn interrupted_join_at(point: KillPoint) {
          machine identity, not mint a new one"
     );
     assert_eq!(
-        std::fs::read(root.join("node.crt")).expect("read leaf"),
+        std::fs::read(&paths.cert).expect("read leaf"),
         leaf_before,
         "{point:?} (killed at {phase_at_kill}): the restart already held a usable leaf and \
          must not have re-enrolled"
@@ -501,11 +514,11 @@ async fn interrupted_join_at(point: KillPoint) {
 async fn stage_kill_point(
     point: KillPoint,
     joiner: &Daemon,
-    root: &std::path::Path,
+    paths: &coppice_tls::TlsPaths,
 ) -> serde_json::Value {
     match point {
         KillPoint::AfterEnroll => {
-            let root = root.to_path_buf();
+            let paths = paths.clone();
             let identity_path = joiner
                 .data_dir()
                 .join(coppice_tls::pki::machine::MACHINE_IDENTITY_FILE);
@@ -513,12 +526,12 @@ async fn stage_kill_point(
                 Duration::from_secs(20),
                 "the joiner enrolls: leaf and machine identity on disk",
                 || {
-                    let root = root.clone();
+                    let paths = paths.clone();
                     let identity_path = identity_path.clone();
                     async move {
-                        ["node.crt", "node.key", "ca.crt"]
+                        [&paths.cert, &paths.key, &paths.ca]
                             .iter()
-                            .all(|f| root.join(f).exists())
+                            .all(|f| f.exists())
                             && identity_path.exists()
                     }
                 },
@@ -717,20 +730,18 @@ async fn a_stale_hint_naming_a_dead_leader_does_not_wedge_a_joiner() {
     joiner.set_cluster_size(4);
     joiner.set_enrollment(&first.api(""), &token);
     joiner.start();
-    let root = joiner
-        .data_dir()
-        .parent()
-        .expect("data dir has a parent")
-        .to_path_buf();
+    // The one place a daemon's machine-plane material lives (issue #127):
+    // enrollment installs it here and the reload store reads it from here.
+    let paths = joiner.tls_paths();
     poll(
         Duration::from_secs(20),
         "the joiner enrolls: leaf on disk while still parked",
         || {
-            let root = root.clone();
+            let paths = paths.clone();
             async move {
-                ["node.crt", "node.key", "ca.crt"]
+                [&paths.cert, &paths.key, &paths.ca]
                     .iter()
-                    .all(|f| root.join(f).exists())
+                    .all(|f| f.exists())
             }
         },
     )

@@ -541,11 +541,9 @@ async fn an_agent_enrolls_over_http_registers_and_renews_with_production_code_on
     let minted = mint(&mut admin, &history_id, pbcore::EnrollRole::Agent, "agents").await;
 
     let dir = tempfile::tempdir().expect("temp dir");
-    let paths = coppice_tls::TlsPaths {
-        cert: dir.path().join("node.crt"),
-        key: dir.path().join("node.key"),
-        ca: dir.path().join("ca.crt"),
-    };
+    // The agent's data directory: enrollment is what puts material in its
+    // `pki/` subdirectory, and nothing else ever does (issue #127).
+    let paths = coppice_tls::TlsPaths::cluster_managed(dir.path());
     let config = coppice_enroll::EnrollmentConfig {
         endpoint: format!("http://{}", daemon.client_addr()),
         token: Some(coppice_enroll::Secret::new(minted.secret)),
@@ -561,7 +559,14 @@ async fn an_agent_enrolls_over_http_registers_and_renews_with_production_code_on
             .expect("enroll over the public route");
     assert_eq!(outcome, coppice_enroll::Outcome::Enrolled);
 
-    let leaf = std::fs::read(&paths.cert).expect("the leaf landed in the [tls] paths");
+    assert_eq!(
+        paths.cert,
+        dir.path()
+            .join(coppice_tls::PKI_DIR)
+            .join(coppice_tls::NODE_CERT_FILE),
+        "enrollment installs into the fixed layout, not a configured path"
+    );
+    let leaf = std::fs::read(&paths.cert).expect("the leaf landed under <data_dir>/pki");
     let verified = pki::verify_leaf(&std::fs::read(&paths.ca).unwrap(), &leaf)
         .expect("the installed leaf chains to the cluster CA");
     assert_eq!(verified.profile, pki::Profile::Agent(node));

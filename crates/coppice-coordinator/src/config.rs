@@ -83,7 +83,8 @@ mod client_tls {
     /// The resolved posture of the client listener.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum ClientTlsPosture {
-        /// Serve HTTPS from these paths, hot-reloaded like `[tls]`.
+        /// Serve HTTPS from these paths, hot-reloaded like the machine-plane
+        /// material under `<data_dir>/pki`.
         Tls { cert: PathBuf, key: PathBuf },
         /// Serve plain HTTP, explicitly and conspicuously.
         Insecure,
@@ -400,10 +401,6 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) test_failpoints: Option<TestFailpointConfig>,
 
-    /// mTLS material for intra-cluster traffic (ADR 0011, day one). Required:
-    /// there is no insecure fallback.
-    pub(crate) tls: TlsConfig,
-
     /// The public client listener's own serving posture (ADR 0037 §4).
     /// **Required** — an absent section is the "neither mode configured"
     /// error, not a default. Optional to *serde* only so that error can name
@@ -422,8 +419,8 @@ pub(crate) struct Config {
     history: Option<HistoryConfig>,
 
     /// How this installation enrolls for its own machine leaf when it has none
-    /// (ADR 0037 §4). Optional: a formed voter, or one whose material is
-    /// supplied by an external PKI, never enrolls. Validated here, consumed by
+    /// (ADR 0037 §4). Optional: a coordinator that forms the cluster mints its
+    /// own leaf and never enrolls. Validated here, consumed by
     /// the convergence loop's enroll step ([`crate::convergence`]), which
     /// retries it every tick until a usable leaf exists.
     #[serde(default)]
@@ -1029,19 +1026,6 @@ impl Default for PacingConfig {
     }
 }
 
-/// mTLS material for intra-cluster traffic (ADR 0011).
-///
-/// Secrets by path reference only: the config file itself never holds key
-/// material, so it stays safe to commit, diff, and attach to support
-/// bundles (ADR 0020).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TlsConfig {
-    pub(crate) cert_path: PathBuf,
-    pub(crate) key_path: PathBuf,
-    pub(crate) ca_path: PathBuf,
-}
-
 /// SSO connection parameters.
 ///
 /// This is a **resource-server** validator, not an OAuth client: the
@@ -1309,6 +1293,17 @@ impl Config {
         }
     }
 
+    /// Where this daemon's machine-plane mTLS material lives (issue #127).
+    ///
+    /// Not configurable: the cluster is the sole owner of the coordinator's
+    /// leaf, key, and trust anchor, so formation, enrollment, renewal, and
+    /// re-rooting all write the one fixed `<data_dir>/pki` layout the reload
+    /// store reads. There is nothing for an operator to keep consistent, and
+    /// no path to mistype into a silently-certless daemon.
+    pub(crate) fn tls_paths(&self) -> coppice_tls::TlsPaths {
+        coppice_tls::TlsPaths::cluster_managed(&self.data_dir)
+    }
+
     pub(crate) fn admin_socket_path(&self) -> PathBuf {
         self.listen
             .admin_socket
@@ -1466,14 +1461,9 @@ rpc_timeout        = "1s"
 snapshot_log_entries = 50_000
 snapshot_keep_log_entries = 2000
 
-[tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
-
 [client_tls]
-cert_path = "/etc/coppice/pki/api.example.com.crt"
-key_path  = "/etc/coppice/pki/api.example.com.key"
+cert_path = "/etc/coppice/client-tls/api.example.com.crt"
+key_path  = "/etc/coppice/client-tls/api.example.com.key"
 
 [history]
 # Explicitly lossy: this deployment runs no durable history store (ADR 0012).
@@ -1502,11 +1492,6 @@ data_dir = "/var/lib/coppice"
 
 [listen]
 advertise_host = "coord-1.example.com"
-
-[tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
 "#;
 
     const MINIMAL_EXAMPLE: &str = r#"
@@ -1515,11 +1500,6 @@ data_dir = "/var/lib/coppice"
 
 [listen]
 advertise_host = "coord-1.example.com"
-
-[tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
 
 [client_tls]
 insecure = true
@@ -1594,11 +1574,6 @@ data_dir = "/var/lib/coppice"
 [listen]
 advertise_host = "10.0.1.5"
 extra_sans = ["coord.demo.example.com", "10.0.9.9", "::1"]
-
-[tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
 
 [discovery]
 backend = "static"
@@ -1679,15 +1654,12 @@ addrs = []
         // File value overrides the built-in 1000 default.
         assert_eq!(config.raft.snapshot_keep_log_entries, 2000);
 
-        assert_eq!(
-            config.tls.cert_path,
-            PathBuf::from("/etc/coppice/pki/node.crt")
-        );
-        assert_eq!(
-            config.tls.key_path,
-            PathBuf::from("/etc/coppice/pki/node.key")
-        );
-        assert_eq!(config.tls.ca_path, PathBuf::from("/etc/coppice/pki/ca.crt"));
+        // Machine-plane material is not configured at all: it is derived from
+        // `data_dir` alone (issue #127).
+        let tls = config.tls_paths();
+        assert_eq!(tls.cert, PathBuf::from("/var/lib/coppice/pki/node.crt"));
+        assert_eq!(tls.key, PathBuf::from("/var/lib/coppice/pki/node.key"));
+        assert_eq!(tls.ca, PathBuf::from("/var/lib/coppice/pki/ca.crt"));
 
         let sso = config.sso.expect("sso section present");
         assert_eq!(sso.issuer, "https://sso.example.com/oidc");
@@ -2381,9 +2353,50 @@ addrs = []
                 .client_tls_posture()
                 .expect("cert + key is a posture"),
             ClientTlsPosture::Tls {
-                cert: PathBuf::from("/etc/coppice/pki/api.example.com.crt"),
-                key: PathBuf::from("/etc/coppice/pki/api.example.com.key"),
+                cert: PathBuf::from("/etc/coppice/client-tls/api.example.com.crt"),
+                key: PathBuf::from("/etc/coppice/client-tls/api.example.com.key"),
             }
+        );
+    }
+
+    /// The two planes stay separate: `[client_tls]` keeps naming operator-held
+    /// serving material by path, while the machine plane is derived from
+    /// `data_dir` and named nowhere in the file (issue #127).
+    #[test]
+    fn client_tls_paths_are_independent_of_the_machine_plane_layout() {
+        let (_guard, path) = write_config(FULL_EXAMPLE);
+        let config = read_config(&path).expect("full example parses");
+        assert_eq!(
+            config
+                .client_tls_posture()
+                .expect("cert + key is a posture"),
+            ClientTlsPosture::Tls {
+                cert: PathBuf::from("/etc/coppice/client-tls/api.example.com.crt"),
+                key: PathBuf::from("/etc/coppice/client-tls/api.example.com.key"),
+            }
+        );
+        assert_eq!(
+            config.tls_paths().cert,
+            PathBuf::from("/var/lib/coppice/pki/node.crt")
+        );
+    }
+
+    /// The cluster owns the machine plane outright, so the old `[tls]` trio is
+    /// not merely ignored — a config still carrying it fails to load, naming
+    /// the section (issue #127).
+    #[test]
+    fn an_obsolete_tls_section_is_rejected() {
+        let (_guard, path) = write_config(&format!(
+            "{MINIMAL_EXAMPLE}\n[tls]\n\
+             cert_path = \"/etc/coppice/pki/node.crt\"\n\
+             key_path  = \"/etc/coppice/pki/node.key\"\n\
+             ca_path   = \"/etc/coppice/pki/ca.crt\"\n"
+        ));
+        let err = read_config(&path).expect_err("[tls] is no longer a configurable section");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("tls"),
+            "error names the section: {message}"
         );
     }
 
