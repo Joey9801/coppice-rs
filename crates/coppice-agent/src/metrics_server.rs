@@ -1,11 +1,14 @@
-//! The agent's optional Prometheus `/metrics` server (issue #46).
+//! The agent's optional operational HTTP listener (issue #46, ADR 0041):
+//! `/metrics`, `/healthz`, and `/readyz`.
 //!
-//! A tiny, unauthenticated HTTP endpoint that renders this process's `metrics`
-//! recorder — the scrape target for the agent's `agent_*` counters
-//! (docker-executor.md §8.1, ADR 0034). It mirrors [`node_service`](crate::node_service)'s
+//! One tiny, unauthenticated HTTP listener: the scrape target for the agent's
+//! `agent_*` counters (docker-executor.md §8.1, ADR 0034) and, on the daemon
+//! path, the probes systemd and a load balancer read (ADR 0041). It mirrors
+//! [`node_service`](crate::node_service)'s
 //! bind-then-serve shape: [`prepare_listener`] binds eagerly at startup so a
-//! port conflict fails the daemon fast, and [`serve`] spawns the axum server as
-//! a fire-and-forget background task.
+//! port conflict fails the daemon fast, and [`serve`]/[`serve_until`] spawn the
+//! axum server as a background task. No `metrics_addr` means no probe surface
+//! either — a posture, not an oversight.
 //!
 //! **Why a local handler rather than `coppice_api::http::MetricsEndpoint`.**
 //! The scrape contract here is identical to the coordinator's — sample gauges,
@@ -21,10 +24,13 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
+
+use crate::health::AgentHealth;
 
 /// The `Content-Type` of a Prometheus text-exposition scrape (format version
 /// 0.0.4). Kept identical to `coppice_api::http::metrics`.
@@ -108,9 +114,41 @@ pub fn serve_until(
     handle: PrometheusHandle,
     gather: fn(),
     extra: fn() -> String,
+    health: AgentHealth,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_serving(listener, router(handle, gather, extra), Some(shutdown))
+    let app = router(handle, gather, extra).merge(probe_router(health));
+    spawn_serving(listener, app, Some(shutdown))
+}
+
+/// The two probe routes, over the shared health snapshot. See [`AgentHealth`]
+/// for the phase precedence (ADR 0041).
+///
+/// `GET /healthz` is *liveness*: 200 `{"status":"ok"}` while the process is
+/// serving, nothing else. `GET /readyz` is *readiness*: 200 only for `ready`,
+/// 503 otherwise, with the full snapshot as the body either way so a failed
+/// probe carries `phase` and `reason`.
+fn probe_router(health: AgentHealth) -> Router {
+    Router::new()
+        .route(
+            "/healthz",
+            get(|| async { Json(serde_json::json!({ "status": "ok" })) }),
+        )
+        .route(
+            "/readyz",
+            get(move || {
+                let health = health.clone();
+                async move {
+                    let readiness = health.readiness();
+                    let status = if readiness.is_ready() {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (status, Json(readiness))
+                }
+            }),
+        )
 }
 
 fn spawn_serving(
@@ -168,7 +206,86 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
+    use coppice_core::id::NodeId;
     use tower::ServiceExt;
+
+    /// Drive one probe route over the merged router the daemon serves, and
+    /// answer the status and decoded JSON body.
+    async fn probe(health: &AgentHealth, path: &str) -> (StatusCode, serde_json::Value) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let app = router(recorder.handle(), crate::gather_metrics, String::new)
+            .merge(probe_router(health.clone()));
+        let response = app
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).expect("a JSON body"))
+    }
+
+    #[tokio::test]
+    async fn healthz_is_200_regardless_of_readiness() {
+        // Liveness says "the process is serving", and nothing else: a draining,
+        // unregistered agent with a dead daemon is still alive (ADR 0041), and
+        // a /healthz that failed there would have systemd restart a process
+        // that is doing exactly what it was told to.
+        let health = AgentHealth::new(NodeId::new());
+        let (status, body) = probe(&health, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+
+        health.set_draining(true);
+        health.set_docker_ok(false);
+        let (status, _) = probe(&health, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_answers_200_only_for_the_ready_phase() {
+        let node = NodeId::new();
+        let health = AgentHealth::new(node);
+
+        // Before the first registration.
+        let (status, body) = probe(&health, "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["phase"], "starting");
+        assert_eq!(body["node_id"], node.to_string());
+        assert_eq!(body["registered"], false);
+
+        // Registered on a live session with a reachable daemon: the one 200.
+        health.set_registered(true);
+        let (status, body) = probe(&health, "/readyz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["phase"], "ready");
+        assert_eq!(body["docker_ok"], true);
+        assert_eq!(body["running"], 0);
+
+        // The daemon went away under a registered agent.
+        health.set_docker_ok(false);
+        let (status, body) = probe(&health, "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["phase"], "docker-unavailable");
+
+        // The session broke after having registered once.
+        health.set_docker_ok(true);
+        health.set_registered(false);
+        let (status, body) = probe(&health, "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["phase"], "reconnecting");
+
+        // Draining wins over everything, and carries the work still being
+        // waited for — the number an ASG lifecycle hook polls to zero.
+        health.set_registered(true);
+        health.set_draining(true);
+        health.set_running(3);
+        let (status, body) = probe(&health, "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["phase"], "draining");
+        assert_eq!(body["draining"], true);
+        assert_eq!(body["running"], 3);
+        assert!(body["reason"].is_string());
+    }
 
     #[tokio::test]
     async fn metrics_route_renders_a_described_metric_over_http() {

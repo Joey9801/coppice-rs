@@ -109,6 +109,11 @@ pub struct Session<F: Fs, E: Executor> {
     /// a reader can see why `capacity` above differs from the hardware. `None`
     /// when no dimension could be detected.
     detected_capacity: Option<Resources>,
+    /// The shared snapshot behind the daemon's `/readyz` (ADR 0041), written
+    /// here and read by the operational listener. `None` for a session that was
+    /// never given one — every unit test, and `coppice dev`. Nothing in the
+    /// session's own decisions reads it back: it is a report, not state.
+    health: Option<crate::health::AgentHealth>,
 }
 
 impl<F: Fs, E: Executor> Session<F, E> {
@@ -139,7 +144,18 @@ impl<F: Fs, E: Executor> Session<F, E> {
             service_addr: None,
             host_facts: None,
             detected_capacity: None,
+            health: None,
         }
+    }
+
+    /// Publish this session's state to the daemon's health snapshot (ADR 0041).
+    /// A builder setter like the others: only the daemon serves probes, so only
+    /// the daemon supplies one.
+    pub fn with_health(mut self, health: crate::health::AgentHealth) -> Session<F, E> {
+        health.set_draining(self.draining);
+        health.set_running(self.outstanding_live_work().len());
+        self.health = Some(health);
+        self
     }
 
     /// Set the advertised `NodeService` address (ADR 0034) echoed in every
@@ -201,6 +217,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
     /// immediately rather than waiting for the tick.
     pub fn set_draining(&mut self, draining: bool) {
         self.draining = draining;
+        if let Some(health) = &self.health {
+            health.set_draining(draining);
+        }
     }
     pub fn is_draining(&self) -> bool {
         self.draining
@@ -220,6 +239,21 @@ impl<F: Fs, E: Executor> Session<F, E> {
     pub fn reset_session(&mut self) {
         self.registered = false;
         self.last_seq = None;
+        if let Some(health) = &self.health {
+            // Not registered any more: `/readyz` reports `reconnecting` from
+            // here, since this session registered at least once (ADR 0041).
+            health.set_registered(false);
+        }
+    }
+
+    /// Re-publish the parts of the health snapshot that track the journal
+    /// (ADR 0041). Called by the live loop after every event it handles, which
+    /// is the only place that knows an event finished; a no-op for a session
+    /// with no snapshot.
+    pub fn refresh_health(&self) {
+        if let Some(health) = &self.health {
+            health.set_running(self.outstanding_live_work().len());
+        }
     }
 
     /// Drain the watchdogs armed since the last call — the [`ArmedWatchdog`]s
@@ -320,10 +354,17 @@ impl<F: Fs, E: Executor> Session<F, E> {
     /// + runtime *before* accepting any new work (ADR 0009 restart step 3).
     async fn on_register_accepted(&mut self) -> std::io::Result<Vec<pb::AgentReport>> {
         self.registered = true;
+        if let Some(health) = &self.health {
+            health.set_registered(true);
+        }
         let runtime = match self.executor.observe().await {
-            Ok(runtime) => runtime,
+            Ok(runtime) => {
+                self.note_observation(true);
+                runtime
+            }
             Err(e) => {
                 tracing::warn!(node = %self.node, error = %e, "executor.observe failed; ObservedSet reports journal only");
+                self.note_observation(false);
                 Vec::new()
             }
         };
@@ -716,6 +757,15 @@ impl<F: Fs, E: Executor> Session<F, E> {
         }
     }
 
+    /// Record the outcome of an `observe()` call in the health snapshot: the
+    /// agent's only continuous evidence that its container runtime is still
+    /// there, and what `/readyz` reports as `docker-unavailable` (ADR 0041).
+    fn note_observation(&self, ok: bool) {
+        if let Some(health) = &self.health {
+            health.set_docker_ok(ok);
+        }
+    }
+
     /// A periodic heartbeat: capacity, the currently-running allocation set,
     /// the (v1-empty) image-cache inventory, and this node's best-effort
     /// job-attributable usage.
@@ -741,19 +791,23 @@ impl<F: Fs, E: Executor> Session<F, E> {
     pub async fn heartbeat_report(&self) -> pb::AgentReport {
         use crate::executor::ContainerState;
         let running = match self.executor.observe().await {
-            Ok(containers) => containers
-                .into_iter()
-                .filter(|c| match c.state {
-                    ContainerState::Running { .. } => true,
-                    ContainerState::Exited(_) => {
-                        self.state.intents.contains_key(&c.allocation)
-                            && !self.state.exits.contains_key(&c.allocation)
-                    }
-                })
-                .map(|c| c.allocation.into())
-                .collect(),
+            Ok(containers) => {
+                self.note_observation(true);
+                containers
+                    .into_iter()
+                    .filter(|c| match c.state {
+                        ContainerState::Running { .. } => true,
+                        ContainerState::Exited(_) => {
+                            self.state.intents.contains_key(&c.allocation)
+                                && !self.state.exits.contains_key(&c.allocation)
+                        }
+                    })
+                    .map(|c| c.allocation.into())
+                    .collect()
+            }
             Err(e) => {
                 tracing::warn!(node = %self.node, error = %e, "executor.observe failed for heartbeat; running set empty");
+                self.note_observation(false);
                 Vec::new()
             }
         };

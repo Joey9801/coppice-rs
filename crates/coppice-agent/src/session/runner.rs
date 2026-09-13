@@ -464,6 +464,11 @@ where
             }
         }
 
+        // The journal changed if the last event journaled anything; re-publish
+        // what `/readyz` reports as `running` (ADR 0041). Cheap, and the only
+        // place that knows an event has finished being handled.
+        session.refresh_health();
+
         // The drain's two obligations, evaluated after every event the loop
         // handled (a command, an exit, a heartbeat tick) rather than on a poll
         // of their own (ADR 0041).

@@ -12,6 +12,7 @@
 pub mod capacity;
 pub mod config;
 pub mod executor;
+pub mod health;
 pub mod hostinfo;
 pub mod identity;
 pub mod journal;
@@ -266,6 +267,12 @@ pub async fn run_daemon_with_shutdown(
     let config = config::load(config_path)?;
     config.log_effective();
 
+    // The listeners do **not** share the session's shutdown watch (ADR 0041):
+    // `/readyz` must keep answering `draining` with a falling `running` count
+    // for the whole `shutdown_grace` drain, so the operational surfaces get
+    // their own trigger, flipped only once `session::run` has returned.
+    let (listeners_tx, listeners_rx) = tokio::sync::watch::channel(false);
+
     // Install the process-wide Prometheus recorder before any counter is
     // emitted, so the descriptions (§8.1) and every counter after land in the
     // recorder the `/metrics` server renders (issue #46). This also describes
@@ -273,7 +280,9 @@ pub async fn run_daemon_with_shutdown(
     // server below. The server itself is bound later, only when `metrics_addr`
     // is configured, but the recorder is installed unconditionally so metrics
     // accrue (and upkeep drains histograms) from the start regardless.
-    let (metrics_handle, upkeep_join) = install_metrics_recorder(shutdown_rx.clone())?;
+    // On the listeners' trigger too: it drains the recorder's histograms, so it
+    // must keep running for as long as anything can scrape `/metrics`.
+    let (metrics_handle, upkeep_join) = install_metrics_recorder(listeners_rx.clone())?;
 
     // The data directory comes first now: the node identity lives in it, and
     // everything downstream — enrollment's claim, the journal's fencing
@@ -418,6 +427,11 @@ pub async fn run_daemon_with_shutdown(
     // advertisement — a legitimate posture (the agent's logs are unreachable
     // off-node). The handler reads the first LOG-consuming store; with telemetry
     // disabled that is `None` and every fetch answers UnknownAttempt.
+    // The snapshot behind `/readyz` (ADR 0041). Built before either the
+    // listener or the session, because both hold a handle to it and neither
+    // knows about the other: the session writes, the listener reads.
+    let health = health::AgentHealth::new(node);
+
     let mut node_service_join = None;
     if let Some(listen) = &config.listen {
         let listener = node_service::NodeServiceListener::bind(listen.addr, Arc::clone(&tls_store))
@@ -430,7 +444,7 @@ pub async fn run_daemon_with_shutdown(
             listener,
             telemetry.log_store.clone(),
             telemetry.metric_store.clone(),
-            shutdown_rx.clone(),
+            listeners_rx.clone(),
         ));
     }
 
@@ -453,7 +467,8 @@ pub async fn run_daemon_with_shutdown(
             metrics_handle,
             gather_metrics,
             usage::render_exposition,
-            shutdown_rx.clone(),
+            health.clone(),
+            listeners_rx,
         ));
     }
 
@@ -470,21 +485,29 @@ pub async fn run_daemon_with_shutdown(
     // overrides, so the node detail view can explain the advertised vector.
     .with_host_facts(hostinfo::collect(&detected), detected.as_resources())
     // Publish the executor as the `/metrics` node-usage source (usage.rs).
-    .with_usage_metrics();
+    .with_usage_metrics()
+    // What `/readyz` answers from (ADR 0041).
+    .with_health(health);
 
     tracing::info!("coppice agent started; entering the session loop");
-    session::run(session, &config, tls_store, shutdown_rx).await?;
+    // Not `?`: whichever way the session loop ended, the teardown below still
+    // has to run — the listeners are still up, the telemetry sinks still hold
+    // unflushed segments, and leaking both on the error path would be a worse
+    // exit than the error itself. The outcome is returned after step 4.
+    let outcome = session::run(session, &config, tls_store, shutdown_rx).await;
 
-    // The session loop has drained (ADR 0041 step 3). What is left is step 4:
-    // stop the listeners, join every task this function owns, and drop the
-    // telemetry sinks LAST so their segment janitors finish their own drains
-    // rather than being dropped mid-write.
+    // The session loop has drained (ADR 0041 step 3); step 4 stops the
+    // listeners only now (so `/readyz` can answer `draining` with a falling
+    // `running` count throughout), joins every task this function owns, and
+    // drops the telemetry sinks LAST so their segment janitors finish their
+    // own drains rather than being dropped mid-write.
     //
     // Every join below shares one absolute deadline, and a task that misses it
     // is named and dropped: a shutdown step that waits on a Docker request or a
     // coordinator that stopped answering must not be able to wait forever
     // (issue #111, docs/agent-notes/architecture-gotchas.md).
     tracing::info!("agent: session loop drained; stopping listeners");
+    let _ = listeners_tx.send(true);
     let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN;
     if let Some(join) = node_service_join {
         drain_task("node-service", join, deadline).await;
@@ -501,5 +524,5 @@ pub async fn run_daemon_with_shutdown(
     tracing::info!("agent: listeners down; flushing telemetry");
     drop(telemetry);
     tracing::info!("coppice agent stopped");
-    Ok(())
+    outcome
 }
