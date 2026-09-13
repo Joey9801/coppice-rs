@@ -36,6 +36,22 @@ use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaE
 use coppice_core::quota::TrueUp;
 use coppice_core::time::Timestamp;
 
+/// `GET /healthz` (ADR 0041) — the whole body.
+///
+/// Outside `/api/v1` like `/readyz` and `/metrics`, and outside its
+/// versioning too: the one field is a constant, and a probe that matches on
+/// it must never have to be reconfigured across a release. It carries no
+/// readiness, phase, or cluster information on purpose — `/readyz` is the
+/// endpoint with a verdict in it.
+///
+/// Serialize-only, unlike the read models below: the constant is a
+/// `&'static str` because nothing ever parses this body back into Rust.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct HealthzResponse {
+    /// Always `"ok"`: the process answered.
+    pub status: &'static str,
+}
+
 /// Resource quantities (mirrors `coppice_core::resource::Resources`).
 ///
 /// `deny_unknown_fields` because this nests inside write requests: a typo

@@ -106,18 +106,18 @@ pub fn router<P: ControlPlane>(
 /// served**: that closure is what confines a failed formation to the node
 /// that attempted it. What remains is exactly what an operator and their
 /// automation need to see the daemon and know why it is not ready:
-/// `/readyz` and `/metrics`. Everything else, `/api/v1` included, answers
-/// the JSON 404 through the same fallback the full router uses, so no
-/// client mistakes a parked daemon for a broken one.
+/// `/healthz`, `/readyz` and `/metrics`. Everything else, `/api/v1`
+/// included, answers the JSON 404 through the same fallback the full router
+/// uses, so no client mistakes a parked daemon for a broken one.
 pub fn closed_router(metrics: MetricsEndpoint, readyz: ReadyzEndpoint) -> Router {
     operational_routes(metrics, readyz).fallback(super::ui::fallback)
 }
 
-/// The two operational routes both surfaces carry: the Prometheus scrape
-/// target (issue #46) and the ADR 0037 §9 readiness gate. Neither is under
-/// `/api/v1` — they are not part of the JSON API — and neither touches the
-/// [`ControlPlane`], which is what lets a daemon with no consensus replica
-/// serve them.
+/// The three operational routes both surfaces carry: the Prometheus scrape
+/// target (issue #46), the ADR 0037 §9 readiness gate, and the ADR 0041
+/// liveness probe. None is under `/api/v1` — they are not part of the JSON
+/// API — and none touches the [`ControlPlane`], which is what lets a daemon
+/// with no consensus replica serve them.
 fn operational_routes<S: Clone + Send + Sync + 'static>(
     metrics: MetricsEndpoint,
     readyz: ReadyzEndpoint,
@@ -144,6 +144,21 @@ fn operational_routes<S: Clone + Send + Sync + 'static>(
                 async move { readyz.handle(require).await }
             }),
         )
+        // Liveness (ADR 0041): 200 for as long as this process is serving,
+        // and deliberately nothing more. It is the systemd/load-balancer
+        // "restart me if this fails" signal, so it must not consult the
+        // cluster, the replica's phase, or anything else that can fail while
+        // the process is perfectly alive — a liveness probe that goes red
+        // during an election would have the orchestrator kill a healthy
+        // daemon. `/readyz` is where every such condition is reported.
+        .route("/healthz", get(healthz))
+}
+
+/// `GET /healthz` — the ADR 0041 liveness answer. Reaching this handler at
+/// all *is* the answer; the body exists only so a probe configured to match
+/// on content has something stable to match.
+async fn healthz() -> impl IntoResponse {
+    Json(dto::HealthzResponse { status: "ok" })
 }
 
 /// The `/api/v1` route map (ADR 0031), nested under its prefix by [`router`].
@@ -1345,6 +1360,31 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// The liveness probe (ADR 0041) answers on **both** surfaces and takes
+    /// no credential: a daemon parked before formation is as alive as a
+    /// serving one, and an orchestrator that could not tell them apart from a
+    /// crash would restart the parked one forever.
+    #[tokio::test]
+    async fn healthz_answers_ok_on_the_serving_and_the_pre_formation_surface() {
+        for app in [
+            app(None),
+            super::closed_router(
+                crate::http::MetricsEndpoint::detached_for_tests(),
+                crate::http::ReadyzEndpoint::detached_for_tests(),
+            ),
+        ] {
+            let response = app
+                .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                body_json(response).await,
+                serde_json::json!({"status":"ok"})
+            );
+        }
     }
 
     #[tokio::test]
@@ -3247,6 +3287,19 @@ mod tests {
             .extensions_mut()
             .insert(crate::http::PeerCertificates(Arc::new(vec![leaf_der])));
         request
+    }
+
+    /// `/healthz` is an operational surface, not part of the JSON API, so a
+    /// credentialled posture must not gate it: a load balancer holds no
+    /// token, and a liveness probe that 401s reads as a dead process.
+    #[tokio::test]
+    async fn healthz_needs_no_credential_in_the_oidc_posture() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let response = router_with_authn(stub_plane(Default::default()), oidc_chain(&idp).await)
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
