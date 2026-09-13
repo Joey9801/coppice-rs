@@ -19,8 +19,9 @@
 //! implements them.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 
 use coppice_api::http::dto;
 use coppice_core::bytes::ByteSize;
@@ -80,11 +81,58 @@ pub enum NodeVerb {
         #[arg(long)]
         json: bool,
     },
+    /// Stop scheduling new work onto a node; running work continues.
+    Drain {
+        /// Node id (`node-<uuid>`).
+        node: NodeId,
+        /// Poll the node until nothing is running or accruing on it, or the
+        /// duration elapses. Bare `--wait` means 10 minutes; `--wait 30s`
+        /// names a duration explicitly; omitting the flag entirely means
+        /// return as soon as the drain is requested, without waiting.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "10m",
+            value_parser = parse_wait
+        )]
+        wait: Option<Duration>,
+        /// Print the server's JSON response instead of a confirmation line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make a drained node schedulable again.
+    Undrain {
+        /// Node id (`node-<uuid>`).
+        node: NodeId,
+        /// Print the server's JSON response instead of a confirmation line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a node from the cluster (ADR 0041).
+    Remove {
+        /// Node id (`node-<uuid>`).
+        node: NodeId,
+        /// Print the server's JSON response instead of a confirmation line.
+        #[arg(long)]
+        json: bool,
+    },
     /// The mTLS admin verbs (`enroll-token`, `revoke-identity`), owned by the
     /// coordinator crate and flattened in whole so this CLI never restates
     /// their contract.
     #[command(flatten)]
     Admin(coppice_coordinator::cli::NodeVerb),
+}
+
+/// Parse a humane duration string (`"30s"`, `"10m"`) for `--wait`.
+///
+/// Reuses `humantime`'s parser (the same grammar the config file's durations
+/// use, and the one `coppice-coordinator`'s own `--wait` flags use), so an
+/// unlabelled bare integer is rejected rather than silently meaning some
+/// unit. Kept private to this module — `coppice-coordinator::cli` has its own
+/// copy for its own flags, and neither needs to be a shared dependency of the
+/// other.
+fn parse_wait(raw: &str) -> Result<Duration, String> {
+    humantime_serde::re::humantime::parse_duration(raw).map_err(|e| e.to_string())
 }
 
 /// Run the selected `coppice node` verb, routing to the transport it needs.
@@ -97,6 +145,18 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         NodeVerb::Show { node, json } => {
             let client = args.connection.client()?;
             show(&client, node, json).await
+        }
+        NodeVerb::Drain { node, wait, json } => {
+            let client = args.connection.client()?;
+            drain(&client, node, wait, json).await
+        }
+        NodeVerb::Undrain { node, json } => {
+            let client = args.connection.client()?;
+            undrain(&client, node, json).await
+        }
+        NodeVerb::Remove { node, json } => {
+            let client = args.connection.client()?;
+            remove(&client, node, json).await
         }
         NodeVerb::Admin(verb) => {
             coppice_coordinator::node::run_cli(admin_args(
@@ -203,6 +263,138 @@ async fn show(client: &ApiClient, node: NodeId, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `coppice node drain`: stop scheduling new work onto a node.
+///
+/// With `--wait`, polls `GET /nodes/{node}` once a second until nothing is
+/// running or accruing on it, or the wait duration elapses.
+async fn drain(client: &ApiClient, node: NodeId, wait: Option<Duration>, json: bool) -> Result<()> {
+    post_node_action(client, node, "drain", "requesting drain", json, || {
+        format!("node {node} draining")
+    })
+    .await?;
+    if let Some(deadline) = wait {
+        wait_for_drain(client, node, deadline, Duration::from_secs(1)).await?;
+    }
+    Ok(())
+}
+
+/// `coppice node undrain`: make a drained node schedulable again.
+async fn undrain(client: &ApiClient, node: NodeId, json: bool) -> Result<()> {
+    post_node_action(client, node, "undrain", "requesting undrain", json, || {
+        format!("node {node} schedulable")
+    })
+    .await
+}
+
+/// `coppice node remove`: remove a node from the cluster (ADR 0041).
+async fn remove(client: &ApiClient, node: NodeId, json: bool) -> Result<()> {
+    post_node_action(client, node, "remove", "requesting removal", json, || {
+        format!("node {node} removed")
+    })
+    .await
+}
+
+/// The shared POST half of `drain`/`undrain`/`remove`: all three take no
+/// request body and return an empty `{}` on success; only the path segment
+/// and confirmation words differ.
+///
+/// `--json` prints the server's own response body verbatim, unparsed — the
+/// same convention `list`/`show` use. Without it, prints a one-line
+/// confirmation instead.
+async fn post_node_action(
+    client: &ApiClient,
+    node: NodeId,
+    action: &str,
+    sending: &'static str,
+    json: bool,
+    confirmation: impl FnOnce() -> String,
+) -> Result<()> {
+    let path = format!("/nodes/{node}/{action}");
+    if json {
+        let body: serde_json::Value = client
+            .post_json(
+                &path,
+                &serde_json::json!({}),
+                ctx(sending, "reading response"),
+            )
+            .await?;
+        print_json(&body);
+    } else {
+        client
+            .post_ignoring_body(&path, &serde_json::json!({}), sending)
+            .await?;
+        println!("{}", confirmation());
+    }
+    Ok(())
+}
+
+/// Poll a node's summary once every `interval` until it is [`drained`] or
+/// `deadline` elapses, printing a stderr progress line whenever the
+/// `(running, accruing)` pair changes, and a final line when it is empty.
+///
+/// Progress goes to stderr, not stdout: `--json` writes the server's own
+/// response body to stdout, and a script that pipes that into `jq` must not
+/// have narration interleaved with it.
+async fn wait_for_drain(
+    client: &ApiClient,
+    node: NodeId,
+    deadline: Duration,
+    interval: Duration,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut last: Option<(u32, u32)> = None;
+    loop {
+        let body: serde_json::Value = client
+            .get_json(
+                &format!("/nodes/{node}"),
+                &Vec::new(),
+                ctx("checking drain progress", "reading node detail"),
+            )
+            .await?;
+        let response: dto::GetNodeResponse =
+            serde_json::from_value(body).context("reading node detail")?;
+        let current = counts(&response.summary);
+        // The verdict before the progress line, so a node that is already
+        // empty is answered rather than narrated: "waiting for node X to
+        // drain: running 0, accruing 0" is a sentence that contradicts
+        // itself, and a scale-in script's log is where it would show up.
+        if drained(&response.summary) {
+            eprintln!("node {node} drained");
+            return Ok(());
+        }
+        if last != Some(current) {
+            eprintln!(
+                "waiting for node {node} to drain: running {}, accruing {}",
+                current.0, current.1
+            );
+            last = Some(current);
+        }
+        if start.elapsed() >= deadline {
+            return Err(anyhow!(
+                "node {node} did not drain within {deadline:?}: running {}, accruing {} \
+                 outstanding",
+                current.0,
+                current.1
+            ));
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Both counts at zero: nothing is running and nothing is still funded, so a
+/// drain wait is satisfied.
+fn drained(summary: &dto::NodeSummary) -> bool {
+    let (running, accruing) = counts(summary);
+    running == 0 && accruing == 0
+}
+
+/// The `(running, accruing)` pair a drain wait watches, pulled out so the
+/// "did the progress line need reprinting" decision in [`wait_for_drain`] is
+/// testable without a live poll loop.
+fn counts(summary: &dto::NodeSummary) -> (u32, u32) {
+    (summary.running_count, summary.accruing_count)
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -224,13 +416,20 @@ fn health_label(health: dto::NodeHealth) -> &'static str {
     }
 }
 
-/// The scheduling posture: `schedulable: false` is a drain, not a fault —
-/// running work continues, only new placements stop — so it gets its own word.
-fn schedulable_label(schedulable: bool) -> &'static str {
-    if schedulable {
-        "schedulable"
-    } else {
+/// The scheduling posture, derived from the two independent flags on
+/// [`dto::NodeSummary`]: the admin cordon (`schedulable`) and the agent's
+/// own shutdown announcement (`draining`).
+///
+/// - cordoned (`!schedulable`), regardless of `draining`, reads `"drained"`;
+/// - not cordoned but agent-draining reads `"draining"`;
+/// - neither flag set reads `"schedulable"`.
+fn schedulable_label(schedulable: bool, draining: bool) -> &'static str {
+    if !schedulable {
+        "drained"
+    } else if draining {
         "draining"
+    } else {
+        "schedulable"
     }
 }
 
@@ -270,7 +469,7 @@ fn render_list(response: &dto::ListNodesResponse) -> String {
             vec![
                 node.id.to_string(),
                 health_label(node.health).to_string(),
-                schedulable_label(node.schedulable).to_string(),
+                schedulable_label(node.schedulable, node.draining).to_string(),
                 resources_cell(&node.capacity),
                 resources_cell(&node.allocated),
                 node.running_count.to_string(),
@@ -313,7 +512,7 @@ fn render_detail(response: &dto::GetNodeResponse) -> String {
     kv(
         &mut out,
         "scheduling",
-        schedulable_label(summary.schedulable),
+        schedulable_label(summary.schedulable, summary.draining),
     );
     kv(&mut out, "epoch", &summary.epoch.to_string());
     kv(&mut out, "capacity", &resources(&summary.capacity));
@@ -399,7 +598,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::extract::{Path as AxumPath, State};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
 
     use crate::testsupport::{error_body, spawn};
@@ -430,6 +629,7 @@ mod tests {
             }),
             labels,
             schedulable: true,
+            draining: false,
             health: dto::NodeHealth::Unknown,
             epoch: 3,
             last_heartbeat: None,
@@ -474,6 +674,18 @@ mod tests {
         assert!(rendered.contains("unknown"), "{rendered}");
         assert!(rendered.contains("schedulable"), "{rendered}");
         assert!(rendered.contains("4000m"), "{rendered}");
+    }
+
+    #[test]
+    fn schedulable_label_reads_the_cordon_before_the_agent_drain() {
+        // Neither flag set: schedulable.
+        assert_eq!(schedulable_label(true, false), "schedulable");
+        // Agent draining on its own, not cordoned: draining.
+        assert_eq!(schedulable_label(true, true), "draining");
+        // Cordoned, agent not (yet) draining: drained.
+        assert_eq!(schedulable_label(false, false), "drained");
+        // Cordoned and agent draining: still drained — the cordon wins.
+        assert_eq!(schedulable_label(false, true), "drained");
     }
 
     #[test]
@@ -637,5 +849,191 @@ mod tests {
             }],
         });
         assert!(rendered.contains("projected start unbounded"), "{rendered}");
+    }
+
+    /// A `GetNodeResponse` with the given running/accruing counts, otherwise
+    /// identical to [`sample_summary`] — what the `--wait` poll decodes.
+    fn get_node_response(running: u32, accruing: u32) -> dto::GetNodeResponse {
+        dto::GetNodeResponse {
+            summary: dto::NodeSummary {
+                running_count: running,
+                accruing_count: accruing,
+                ..sample_summary()
+            },
+            host: None,
+            detected_capacity: None,
+            active_attempts: Vec::new(),
+            accrual_queue: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_posts_to_the_drain_path() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route(
+                "/api/v1/nodes/:node/drain",
+                post(
+                    |AxumPath(node): AxumPath<String>,
+                     State(seen): State<Arc<Mutex<Vec<String>>>>| async move {
+                        seen.lock().unwrap().push(node);
+                        Json(serde_json::json!({}))
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let base = spawn(router).await;
+
+        drain(&ApiClient::new(&base).unwrap(), node_id(), None, false)
+            .await
+            .expect("drain succeeds");
+        assert_eq!(*seen.lock().unwrap(), [node_id().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn undrain_posts_to_the_undrain_path() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route(
+                "/api/v1/nodes/:node/undrain",
+                post(
+                    |AxumPath(node): AxumPath<String>,
+                     State(seen): State<Arc<Mutex<Vec<String>>>>| async move {
+                        seen.lock().unwrap().push(node);
+                        Json(serde_json::json!({}))
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let base = spawn(router).await;
+
+        undrain(&ApiClient::new(&base).unwrap(), node_id(), false)
+            .await
+            .expect("undrain succeeds");
+        assert_eq!(*seen.lock().unwrap(), [node_id().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remove_posts_to_the_remove_path() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route(
+                "/api/v1/nodes/:node/remove",
+                post(
+                    |AxumPath(node): AxumPath<String>,
+                     State(seen): State<Arc<Mutex<Vec<String>>>>| async move {
+                        seen.lock().unwrap().push(node);
+                        Json(serde_json::json!({}))
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let base = spawn(router).await;
+
+        remove(&ApiClient::new(&base).unwrap(), node_id(), false)
+            .await
+            .expect("remove succeeds");
+        assert_eq!(*seen.lock().unwrap(), [node_id().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drain_json_prints_the_servers_body_and_still_posts() {
+        let router = Router::new().route(
+            "/api/v1/nodes/:node/drain",
+            post(|| async { Json(serde_json::json!({})) }),
+        );
+        let base = spawn(router).await;
+        drain(&ApiClient::new(&base).unwrap(), node_id(), None, true)
+            .await
+            .expect("drain --json succeeds");
+    }
+
+    #[tokio::test]
+    async fn an_error_body_surfaces_its_code_and_message() {
+        let router = Router::new().route(
+            "/api/v1/nodes/:node/remove",
+            post(|| async {
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(error_body("NODE_BUSY", "node still has running attempts")),
+                )
+            }),
+        );
+        let base = spawn(router).await;
+        let err = remove(&ApiClient::new(&base).unwrap(), node_id(), false)
+            .await
+            .expect_err("remove fails");
+        let message = format!("{err:#}");
+        assert!(message.contains("NODE_BUSY"), "{message}");
+        assert!(message.contains("running attempts"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_drain_returns_once_both_counts_reach_zero() {
+        let calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let router = Router::new()
+            .route(
+                "/api/v1/nodes/:node",
+                get(|State(calls): State<Arc<Mutex<u32>>>| async move {
+                    let mut calls = calls.lock().unwrap();
+                    *calls += 1;
+                    let body = if *calls == 1 {
+                        get_node_response(1, 2)
+                    } else {
+                        get_node_response(0, 0)
+                    };
+                    Json(serde_json::to_value(body).unwrap())
+                }),
+            )
+            .with_state(calls.clone());
+        let base = spawn(router).await;
+
+        // A short interval keeps this fast: at most one sleep of a few
+        // milliseconds between the two polls.
+        wait_for_drain(
+            &ApiClient::new(&base).unwrap(),
+            node_id(),
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("wait succeeds once counts reach zero");
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_drain_errors_naming_outstanding_counts_when_the_deadline_elapses() {
+        let router = Router::new().route(
+            "/api/v1/nodes/:node",
+            get(|| async { Json(serde_json::to_value(get_node_response(1, 2)).unwrap()) }),
+        );
+        let base = spawn(router).await;
+
+        let err = wait_for_drain(
+            &ApiClient::new(&base).unwrap(),
+            node_id(),
+            Duration::ZERO,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("wait fails when the node never drains");
+        let message = format!("{err:#}");
+        assert!(message.contains(&node_id().to_string()), "{message}");
+        assert!(message.contains("running 1"), "{message}");
+        assert!(message.contains("accruing 2"), "{message}");
+    }
+
+    #[test]
+    fn drained_is_true_only_when_both_counts_are_zero() {
+        assert!(drained(&get_node_response(0, 0).summary));
+        assert!(!drained(&get_node_response(1, 0).summary));
+        assert!(!drained(&get_node_response(0, 1).summary));
+        assert!(!drained(&get_node_response(3, 4).summary));
+    }
+
+    #[test]
+    fn counts_reads_the_running_and_accruing_pair() {
+        assert_eq!(counts(&get_node_response(1, 2).summary), (1, 2));
+        assert_eq!(counts(&get_node_response(0, 0).summary), (0, 0));
     }
 }
