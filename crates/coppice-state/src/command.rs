@@ -63,6 +63,7 @@ pub enum Command {
     RegisterNode(RegisterNode),
     DeclareNodeLost(DeclareNodeLost),
     SetNodeSchedulable(SetNodeSchedulable),
+    SetNodeDraining(SetNodeDraining),
     // Housekeeping.
     EvictTerminalJobs(EvictTerminalJobs),
     // Admin / policy.
@@ -107,6 +108,7 @@ impl Command {
             Command::RegisterNode(c) => c.registered_at,
             Command::DeclareNodeLost(c) => c.declared_at,
             Command::SetNodeSchedulable(c) => c.updated_at,
+            Command::SetNodeDraining(c) => c.at,
             Command::EvictTerminalJobs(c) => c.evicted_at,
             Command::ConfigureQuotaEntity(c) => c.updated_at,
             Command::UpdatePolicy(c) => c.updated_at,
@@ -323,6 +325,19 @@ pub struct SetNodeSchedulable {
     /// Who asked — see the module note on actor-carrying commands.
     pub actor: Option<Actor>,
     pub updated_at: Timestamp,
+}
+
+/// The agent's own shutdown announcement, from its reports (ADR 0041).
+///
+/// Machine-proposed like [`DeclareNodeLost`]: the leader's ingestion turns a
+/// `Heartbeat` whose `draining` differs from the replicated record into one
+/// of these. Distinct from [`SetNodeSchedulable`], the admin cordon: this
+/// one never carries an actor and never writes `schedulable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetNodeDraining {
+    pub node: NodeId,
+    pub draining: bool,
+    pub at: Timestamp,
 }
 
 /// Remove terminal jobs from replicated state (ADR 0012).

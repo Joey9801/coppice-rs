@@ -427,6 +427,16 @@ reachable through the API.
 | Apply effects | Set the flag. Drain blocks new placements only: running work continues, and existing accruing allocations keep funding (revoking them is the scheduler's call, via `CommitPlacements`). This is the **admin cordon**, one of the two flags behind `NodeRecord::accepts_placements()` (ADR 0041); the other is the agent's own `draining`, which no actor-carrying command writes. |
 | Rejections | `UnknownNode`, `PermissionDenied` |
 
+#### `SetNodeDraining`
+
+| | |
+| --- | --- |
+| Proposer | Leader ingestion, when an agent's `Heartbeat` report carries a `draining` that differs from the replicated record (ADR 0041). A `Register` carries the same fact on `RegisterNode` instead, so this command never competes with a registration. Machine-proposed: no actor, like `DeclareNodeLost` |
+| Payload | `node: NodeId`, `draining: bool`, `at_us` |
+| Validation | Node exists |
+| Apply effects | Set `NodeRecord.draining`. Gates placements through `accepts_placements()` and nothing else: running work continues and existing accruing allocations keep funding, exactly as under an admin cordon. `schedulable` is **not** touched — the cordon is the admin's flag and this one is the agent's. No events. |
+| Rejections | `UnknownNode` |
+
 ### Housekeeping
 
 #### `EvictTerminalJobs`

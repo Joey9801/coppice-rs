@@ -190,6 +190,11 @@ fn every_command() -> Vec<Command> {
             updated_at: ts(),
             actor: Some(open_posture_actor()),
         }),
+        Command::SetNodeDraining(SetNodeDraining {
+            node,
+            draining: true,
+            at: ts(),
+        }),
         Command::EvictTerminalJobs(EvictTerminalJobs {
             jobs: vec![jid(1), jid(2)],
             evicted_at: ts(),

@@ -30,7 +30,7 @@ use coppice_proto::convert::{state_from_records, state_to_records, StateRecords}
 use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs, LostAttempt,
-    ReconcileNode, RegisterNode, SetNodeSchedulable, UpdateAuthorization,
+    ReconcileNode, RegisterNode, SetNodeDraining, SetNodeSchedulable, UpdateAuthorization,
 };
 use coppice_state::{Command, StateMachine};
 use proptest::prelude::*;
@@ -146,6 +146,13 @@ fn arb_global() -> impl Strategy<Value = Command> {
                     actor: with_who.then(|| actor("root")),
                 })
             }),
+        (0usize..NODES as usize, any::<bool>(), arb_ts()).prop_map(|(n, draining, ts)| {
+            Command::SetNodeDraining(SetNodeDraining {
+                node: node_of(n),
+                draining,
+                at: ts,
+            })
+        }),
         (any::<u8>(), arb_ts()).prop_map(|(mask, ts)| {
             Command::EvictTerminalJobs(EvictTerminalJobs {
                 jobs: (0..MAX_JOBS)

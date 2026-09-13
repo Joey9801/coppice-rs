@@ -997,6 +997,66 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
     assert!(!sm.nodes[&nid(1)].accepts_placements());
 }
 
+/// `SetNodeDraining` is the heartbeat half of the agent's announcement
+/// (ADR 0041): machine-proposed, no events, and it never writes the cordon.
+#[test]
+fn set_node_draining_gates_placements_and_leaves_the_cordon_alone() {
+    let mut sm = setup();
+    let applied = apply_ok(&mut sm, set_draining_cmd(nid(1), true));
+    assert!(applied.events.is_empty());
+    assert!(sm.nodes[&nid(1)].draining);
+    assert!(sm.nodes[&nid(1)].node.schedulable);
+    assert!(!sm.nodes[&nid(1)].accepts_placements());
+
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()),
+    );
+    let rejection = sm
+        .apply(&place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            base_ts(),
+        ))
+        .unwrap_err();
+    assert_eq!(
+        rejection,
+        RejectionReason::InvalidBatch(vec![Rejection {
+            item_index: 0,
+            reason: RejectionReason::NodeNotSchedulable(nid(1))
+        }])
+    );
+
+    // Idempotent, and reversible: an agent that abandons its shutdown says so
+    // on the next heartbeat.
+    apply_ok(&mut sm, set_draining_cmd(nid(1), true));
+    apply_ok(&mut sm, set_draining_cmd(nid(1), false));
+    assert!(sm.nodes[&nid(1)].accepts_placements());
+}
+
+/// An admin cordon and the agent's announcement are independent: clearing
+/// one never clears the other.
+#[test]
+fn set_node_draining_and_the_admin_cordon_are_independent() {
+    let mut sm = setup();
+    apply_ok(&mut sm, set_schedulable_cmd(nid(1), false));
+    apply_ok(&mut sm, set_draining_cmd(nid(1), true));
+    apply_ok(&mut sm, set_draining_cmd(nid(1), false));
+    assert!(
+        !sm.nodes[&nid(1)].node.schedulable,
+        "clearing the agent announcement must not lift the operator's cordon"
+    );
+    assert!(!sm.nodes[&nid(1)].accepts_placements());
+}
+
+#[test]
+fn set_node_draining_rejects_an_unknown_node() {
+    let mut sm = setup();
+    assert_eq!(
+        sm.apply(&set_draining_cmd(nid(9), true)).unwrap_err(),
+        RejectionReason::UnknownNode(nid(9))
+    );
+}
+
 /// The agent's own announcement gates placements on its own, without
 /// touching the admin cordon (ADR 0041): two flags, one gate.
 #[test]
