@@ -28,7 +28,7 @@ use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
     LostAttempt, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RegisterNode,
+    RegisterNode, SetNodeDraining,
 };
 use coppice_state::Command;
 
@@ -321,9 +321,11 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
                 service_addr,
                 host_facts,
                 detected_capacity,
-                // Chunk A: the agent does not report a shutdown announcement
-                // yet (ADR 0041); the wiring lands with the agent's drain.
-                draining: false,
+                // The agent's own shutdown announcement (ADR 0041). Rides
+                // `RegisterNode` itself, so a re-registration that omits it
+                // clears the flag at the same log position that bumps the
+                // epoch.
+                draining: reg.draining,
             }));
         }
 
@@ -497,6 +499,27 @@ fn heartbeat_diff(
     now: Timestamp,
     out: &mut Normalized,
 ) {
+    // The agent's shutdown announcement (ADR 0041), diffed against the
+    // replicated record: only a *change* becomes a command, so a steady
+    // stream of draining heartbeats proposes nothing. The caller already
+    // established that the node is known and the epoch is current, so a
+    // `SetNodeDraining` here can never write a record the agent no longer
+    // owns. The diff reads the latest applied view like every other
+    // ingestion dedupe; apply is idempotent, so losing a proposal race
+    // under latency costs at most one redundant log entry.
+    if view
+        .state()
+        .nodes
+        .get(&node)
+        .is_some_and(|record| record.draining != hb.draining)
+    {
+        out.commands.push(Command::SetNodeDraining(SetNodeDraining {
+            node,
+            draining: hb.draining,
+            at: now,
+        }));
+    }
+
     let running: BTreeSet<AllocationId> = hb
         .running
         .iter()
@@ -737,6 +760,17 @@ mod tests {
         })
     }
 
+    /// A heartbeat carrying the agent's shutdown announcement (ADR 0041).
+    fn draining_heartbeat(draining: bool) -> Body {
+        Body::Heartbeat(Heartbeat {
+            capacity: None,
+            running: Vec::new(),
+            image_cache: None,
+            used: None,
+            draining,
+        })
+    }
+
     /// A heartbeat carrying a `used` reading (ADR 0039).
     fn heartbeat_with_usage(used: &Resources, sampled_at: Timestamp) -> Body {
         Body::Heartbeat(Heartbeat {
@@ -815,6 +849,79 @@ mod tests {
                 assert_eq!(rn.detected_capacity, Some(requested()));
             }
             other => panic!("expected RegisterNode, got {other:?}"),
+        }
+    }
+
+    /// The agent's announcement rides `RegisterNode` itself, so the same log
+    /// position that bumps the epoch settles the flag (ADR 0041).
+    #[test]
+    fn register_carries_the_agents_draining_announcement() {
+        let node = NodeId::new();
+        let view = view_of(StateMachine::default());
+        let reg = |draining| {
+            Body::Register(Register {
+                capacity: Some((&requested()).into()),
+                labels: Vec::new(),
+                service_addr: None,
+                host_facts: None,
+                detected_capacity: None,
+                draining,
+            })
+        };
+
+        for draining in [true, false] {
+            let out = normalize(&view, &report(node, 0, reg(draining)), now());
+            match &out.commands[..] {
+                [Command::RegisterNode(rn)] => assert_eq!(rn.draining, draining),
+                other => panic!("expected one RegisterNode, got {other:?}"),
+            }
+        }
+    }
+
+    /// A heartbeat whose announcement differs from the record proposes the
+    /// change; one that agrees proposes nothing, so a draining agent's steady
+    /// heartbeats do not spam the log (ADR 0041).
+    #[test]
+    fn a_heartbeat_proposes_set_node_draining_only_on_a_change() {
+        let node = NodeId::new();
+        let mut sm = StateMachine::default();
+        sm.nodes.insert(node, node_record(node, 1, true));
+        let view = view_of(sm.clone());
+
+        // false -> true: the flip.
+        let out = normalize(&view, &report(node, 1, draining_heartbeat(true)), now());
+        match &out.commands[..] {
+            [Command::SetNodeDraining(c)] => {
+                assert_eq!(c.node, node);
+                assert!(c.draining);
+                assert_eq!(c.at, now());
+            }
+            other => panic!("expected one SetNodeDraining, got {other:?}"),
+        }
+
+        // Agreeing with the record: nothing.
+        let out = normalize(&view, &report(node, 1, draining_heartbeat(false)), now());
+        assert!(out.commands.is_empty());
+
+        // And symmetrically, once the record carries the announcement, a
+        // heartbeat that still carries it proposes nothing while one that has
+        // dropped it retracts.
+        sm.nodes.get_mut(&node).expect("node").draining = true;
+        let drained_view = view_of(sm);
+        let out = normalize(
+            &drained_view,
+            &report(node, 1, draining_heartbeat(true)),
+            now(),
+        );
+        assert!(out.commands.is_empty());
+        let out = normalize(
+            &drained_view,
+            &report(node, 1, draining_heartbeat(false)),
+            now(),
+        );
+        match &out.commands[..] {
+            [Command::SetNodeDraining(c)] => assert!(!c.draining),
+            other => panic!("expected one SetNodeDraining, got {other:?}"),
         }
     }
 
