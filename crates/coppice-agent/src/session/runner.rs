@@ -47,18 +47,39 @@ const MAX_CONCURRENT_REAPS: usize = 4;
 /// Bound on deferred reaps queued for a worker slot. Overflow is dropped with
 /// a warning — the janitor sweep reclaims anything dropped.
 const REAP_QUEUE_CAPACITY: usize = 256;
+/// How long [`run`] waits for the two tasks it owns (the exit watcher and the
+/// reaper) once the loop has returned. Mirrors the coordinator's
+/// `SHUTDOWN_DRAIN`: every step of a shutdown is bounded, because a step that
+/// waits on an in-flight daemon request can wait forever (issue #111).
+const TASK_DRAIN: Duration = Duration::from_secs(10);
+/// Bound on the drain's closing handshake: the agent half-closes its outbound
+/// stream and waits for the coordinator to end the command stream in reply,
+/// which is this side's only confirmation that the last reports went out.
+const OUTBOUND_FLUSH: Duration = Duration::from_millis(500);
 
-/// Run the agent session forever: connect, serve, reconnect. Returns only on
-/// an unrecoverable configuration error.
+/// Run the agent session until the process is asked to stop: connect, serve,
+/// reconnect. Returns `Ok(())` once `shutdown` has flipped and the drain below
+/// has finished, and an error only on an unrecoverable configuration error.
 ///
 /// `tls` is the process's shared hot-reload store (ADR 0037 §4): each
 /// (re)connect builds its client config from the *current* material, so a
 /// rotation on disk reaches the next dial without a restart while the live
 /// session finishes on the leaf it connected with.
+///
+/// # Shutdown is a drain (ADR 0041)
+///
+/// `shutdown` is the seam the daemon's SIGTERM/SIGINT handler flips, and that
+/// an integration test flips directly, so no test ever raises a real signal.
+/// Flipping it does **not** stop the loop: the session announces itself
+/// `draining` on every subsequent `Register` and `Heartbeat` and keeps serving
+/// until [`Drain`]'s invariant is satisfied. [`GraceDeadline`] is the only
+/// thing that overrides it, and bounds the whole stop at
+/// `config.shutdown_grace`.
 pub async fn run<F, E>(
     mut session: Session<F, E>,
     config: &Config,
     tls: Arc<TlsStore>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()>
 where
     F: Fs,
@@ -68,7 +89,7 @@ where
     // channel the serve loop selects on. Survives reconnects.
     let (exit_tx, mut exit_rx) = mpsc::channel(OUTBOUND_CAPACITY);
     let watcher = session.executor().clone();
-    tokio::spawn(async move {
+    let watcher_join = tokio::spawn(async move {
         loop {
             let exit = watcher.next_exit().await;
             if exit_tx.send(exit).await.is_err() {
@@ -86,7 +107,7 @@ where
     let (reap_tx, mut reap_rx) =
         mpsc::channel::<coppice_core::id::AllocationId>(REAP_QUEUE_CAPACITY);
     let reaper = session.executor().clone();
-    tokio::spawn(async move {
+    let reaper_join = tokio::spawn(async move {
         let mut inflight = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -111,10 +132,27 @@ where
     // list and a warning of its own.
     let discovery = coppice_discovery::build(&config.discovery)?;
 
+    let mut drain = Drain::new(config.shutdown_grace);
+    // The one clock of the shutdown path, raced at every await below. Nothing
+    // on the deadline path flushes: the coordinator's liveness backstop covers
+    // whatever the dropped stream did not carry.
+    let mut grace = GraceDeadline::new(shutdown.clone(), config.shutdown_grace);
+
     let mut backoff = config.reconnect_backoff_min;
     let mut endpoint_idx = 0usize;
-    loop {
-        let candidates = discovery.candidates().await;
+    let outcome = loop {
+        // Consulting discovery is a network step of its own (a DNS lookup, an
+        // HTTP GET), so it is raced too: nothing between the flip and the exit
+        // may be unbounded. With no stream there is nothing to announce on, so
+        // an idle draining agent keeps reconnecting until it can say it is
+        // leaving (ADR 0041) — the deadline is its only other way out.
+        let candidates = tokio::select! {
+            candidates = discovery.candidates() => candidates,
+            _ = grace.elapsed() => {
+                drain.warn_deadline(&session, "consulting discovery");
+                break Ok(());
+            }
+        };
         if candidates.is_empty() {
             // Nothing to dial this round: the source is unreachable or lists
             // nobody. Back off exactly as a failed session does — the next
@@ -125,15 +163,47 @@ where
                 ?backoff,
                 "discovery returned no coordinator candidates; retrying after backoff"
             );
-            tokio::time::sleep(backoff).await;
+            if backoff_sleep(backoff, &mut grace, &mut drain, &mut shutdown, &mut session).await {
+                drain.warn_deadline(&session, "waiting to reconnect");
+                break Ok(());
+            }
             backoff = (backoff * 2).min(config.reconnect_backoff_max);
             continue;
         }
         let endpoint = candidates[endpoint_idx % candidates.len()].as_str();
         endpoint_idx += 1;
 
-        match serve_once(&mut session, endpoint, &tls, config, &mut exit_rx, &reap_tx).await {
-            Ok(()) => {
+        // `serve_once` borrows `session` and `drain` mutably for as long as the
+        // select expression lives, so the deadline is recorded as a flag and
+        // acted on once those borrows have been released with the dropped
+        // future.
+        let mut expired = false;
+        let served = tokio::select! {
+            served = serve_once(
+                &mut session,
+                endpoint,
+                &tls,
+                config,
+                &mut exit_rx,
+                &reap_tx,
+                &mut shutdown,
+                &mut drain,
+            ) => served,
+            // The grace window closed with a session step still in flight —
+            // dropping the future above is what cancels it.
+            _ = grace.elapsed() => {
+                expired = true;
+                Ok(Served::Drained)
+            }
+        };
+        if expired {
+            drain.warn_deadline(&session, "serving the session");
+            break Ok(());
+        }
+
+        match served {
+            Ok(Served::Drained) => break Ok(()),
+            Ok(Served::Closed) => {
                 tracing::info!(endpoint, "session closed; reconnecting");
                 backoff = config.reconnect_backoff_min;
             }
@@ -143,8 +213,175 @@ where
         }
 
         session.reset_session();
-        tokio::time::sleep(backoff).await;
+        // The announcement was session-scoped: whatever the broken stream did
+        // or did not deliver, the next registration carries `draining` again
+        // and re-establishes it at the coordinator (ADR 0041).
+        drain.announced = false;
+        if backoff_sleep(backoff, &mut grace, &mut drain, &mut shutdown, &mut session).await {
+            drain.warn_deadline(&session, "waiting to reconnect");
+            break Ok(());
+        }
         backoff = (backoff * 2).min(config.reconnect_backoff_max);
+    };
+
+    // The loop is done; the two tasks this function owns drain under one
+    // bounded deadline, as every shutdown step must (issue #111).
+    //
+    // The reaper stops on its own once the queue sender drops, finishing the
+    // reaps already in flight — those hold the telemetry drain barrier, so
+    // they are worth waiting for. The exit watcher cannot: it is parked inside
+    // `next_exit()`, which has no cancellation of its own, so it is aborted.
+    // Nothing is lost — an exit that arrives after the run loop has stopped
+    // reporting has nowhere to go, and the journal is the durable record
+    // either way (ADR 0009).
+    drop(reap_tx);
+    let deadline = tokio::time::Instant::now() + TASK_DRAIN;
+    crate::drain_task("reaper", reaper_join, deadline).await;
+    watcher_join.abort();
+    let _ = watcher_join.await;
+    outcome
+}
+
+/// The shutdown grace window, as a single future raced against every await the
+/// session loop makes.
+///
+/// It enforces exactly one invariant: **the process leaves the session loop no
+/// later than `shutdown_grace` after the shutdown flip, whatever it is
+/// mid-await.** Checking a deadline between `select!` iterations would not
+/// bound anything — a branch body parked in `observe()`, which on the real
+/// executor is a Docker list/inspect that can sit for Docker's own 120 s
+/// request timeout, neither observes the flip nor reaches the top of the loop.
+/// When this future wins a race, the in-flight future is dropped, cancelling
+/// the request under it.
+///
+/// It is built from a *cloned* shutdown receiver, so the clock starts at the
+/// flip itself rather than at whenever the loop got round to observing it, and
+/// it spans reconnects. Once it has fired the loop always exits, so it is never
+/// polled to completion twice.
+struct GraceDeadline(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>);
+
+impl GraceDeadline {
+    fn new(mut shutdown: tokio::sync::watch::Receiver<bool>, grace: Duration) -> GraceDeadline {
+        GraceDeadline(Box::pin(async move {
+            flipped(&mut shutdown).await;
+            tokio::time::sleep(grace).await;
+        }))
+    }
+
+    /// Resolve once the window has closed, and never before the flip.
+    async fn elapsed(&mut self) {
+        (&mut self.0).await
+    }
+}
+
+/// Shutdown bookkeeping for one run of the session loop (ADR 0041).
+///
+/// It enforces exactly one invariant: **the loop does not exit early until the
+/// drain has been announced on a live session and the accountable live work is
+/// empty** ([`complete`](Drain::complete)). The only thing that overrides it is
+/// [`GraceDeadline`]. A drain is never retracted: the only thing that flips the
+/// shutdown watch is the process being told to stop.
+struct Drain {
+    /// The configured window, kept for the warning that names it.
+    grace: Duration,
+    /// Whether the shutdown flip has been observed.
+    started: bool,
+    /// Whether a report carrying `draining = true` has been handed to the
+    /// *current* session's outbound stream. Reset on every reconnect, because
+    /// a report the broken stream may have swallowed is not an announcement.
+    announced: bool,
+}
+
+impl Drain {
+    fn new(grace: Duration) -> Drain {
+        Drain {
+            grace,
+            started: false,
+            announced: false,
+        }
+    }
+
+    /// Observe the shutdown flip: mark the session draining, so every later
+    /// report carries it, including a re-registration.
+    fn begin<F: Fs, E: Executor>(&mut self, session: &mut Session<F, E>) {
+        if self.started {
+            return;
+        }
+        session.set_draining(true);
+        self.started = true;
+        tracing::info!(
+            grace = ?self.grace,
+            outstanding = session.outstanding_live_work().len(),
+            "shutdown requested; draining (announcing to the coordinator, then waiting for \
+             running work to finish)"
+        );
+    }
+
+    /// Whether the drain is done: announced on a live session, with nothing
+    /// left that this agent is accountable for.
+    fn complete<F: Fs, E: Executor>(&self, session: &Session<F, E>) -> bool {
+        self.started && self.announced && session.outstanding_live_work().is_empty()
+    }
+
+    /// The one log of the deadline path: which step was in flight, and what
+    /// work is being abandoned. The containers are deliberately left running
+    /// for the coordinator's liveness backstop (ADR 0041).
+    fn warn_deadline<F: Fs, E: Executor>(&self, session: &Session<F, E>, step: &str) {
+        let outstanding = session.outstanding_live_work();
+        let allocations: Vec<String> = outstanding.iter().map(|a| a.to_string()).collect();
+        tracing::warn!(
+            grace = ?self.grace,
+            step,
+            outstanding = allocations.len(),
+            allocations = %allocations.join(","),
+            "shutdown_grace elapsed; dropping the step in flight and exiting, leaving any \
+             running containers to the coordinator's liveness backstop (ADR 0041)"
+        );
+    }
+}
+
+/// How a serve attempt ended: the stream closed (reconnect), or the drain
+/// finished under it (stop the run loop).
+enum Served {
+    Closed,
+    Drained,
+}
+
+/// Resolve once `shutdown` reads `true`, and never otherwise.
+///
+/// Level-triggered rather than edge-triggered, so a flip that happened before
+/// this future was built still fires; a dropped sender parks forever, because
+/// it means the flip can no longer come (that is `coppice dev`, which stops its
+/// agent by dropping the task).
+async fn flipped(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Sleep for the reconnect backoff, waking early on a shutdown flip (which
+/// begins the drain and retries at once — a draining agent wants its
+/// announcement on the wire). Returns `true` if the grace window closed
+/// instead, which ends the run.
+async fn backoff_sleep<F: Fs, E: Executor>(
+    backoff: Duration,
+    grace: &mut GraceDeadline,
+    drain: &mut Drain,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    session: &mut Session<F, E>,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => false,
+        _ = flipped(shutdown), if !drain.started => {
+            drain.begin(session);
+            false
+        }
+        _ = grace.elapsed() => true,
     }
 }
 
@@ -166,6 +403,7 @@ async fn dial(endpoint: &str, store: &TlsStore) -> anyhow::Result<Channel> {
     Ok(channel)
 }
 
+#[allow(clippy::too_many_arguments)] // wiring seam: each is a distinct loop input
 async fn serve_once<F, E>(
     session: &mut Session<F, E>,
     endpoint: &str,
@@ -173,7 +411,9 @@ async fn serve_once<F, E>(
     config: &Config,
     exit_rx: &mut mpsc::Receiver<crate::executor::ExitEvent>,
     reap_tx: &mpsc::Sender<coppice_core::id::AllocationId>,
-) -> anyhow::Result<()>
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    drain: &mut Drain,
+) -> anyhow::Result<Served>
 where
     F: Fs,
     E: Executor + Clone,
@@ -224,6 +464,37 @@ where
             }
         }
 
+        // The drain's two obligations, evaluated after every event the loop
+        // handled (a command, an exit, a heartbeat tick) rather than on a poll
+        // of their own (ADR 0041).
+        //
+        // First: say it. A heartbeat sent the moment the session is registered
+        // and draining is the announcement — the `Register` of a session opened
+        // *while* draining already carries the flag, but this one covers the
+        // flip landing mid-session, and re-sending it costs one small report.
+        if drain.started && !drain.announced && session.is_registered() {
+            let hb = session.heartbeat_report().await;
+            send_all(&tx, vec![hb]).await?;
+            drain.announced = true;
+            tracing::info!("draining announced to the coordinator; no new placements from here");
+        }
+        // Then: stop, if there is nothing left to be accountable for.
+        if drain.complete(session) {
+            tracing::info!("drain complete: no live work left, session closing");
+            // Half-close the outbound stream rather than tearing the
+            // connection down: dropping `tx` makes tonic send everything still
+            // queued — the announcement above, any terminal status — and then
+            // END_STREAM, which the coordinator answers by ending its command
+            // stream. Draining `inbound` to that end is this side's only
+            // confirmation the queue went out; the backstop covers a timeout.
+            drop(tx);
+            let _ = tokio::time::timeout(OUTBOUND_FLUSH, async {
+                while let Ok(Some(_)) = inbound.message().await {}
+            })
+            .await;
+            return Ok(Served::Drained);
+        }
+
         // The next watchdog to fire, if any.
         let next_deadline = deadlines.values().min().copied();
         let watchdog = async {
@@ -249,7 +520,7 @@ where
                             );
                         }
                     }
-                    Ok(None) => return Ok(()),
+                    Ok(None) => return Ok(Served::Closed),
                     Err(status) => {
                         if let Some(hint) = status.metadata().get(LEADER_HINT) {
                             tracing::info!(?hint, "coordinator refused with a leader hint; rotating");
@@ -286,6 +557,11 @@ where
                     let reports = session.trigger_max_runtime(alloc).await?;
                     send_all(&tx, reports).await?;
                 }
+            }
+            // The shutdown flip, once. The loop keeps running; the top of the
+            // next iteration announces the drain and re-evaluates its exit.
+            _ = flipped(shutdown), if !drain.started => {
+                drain.begin(session);
             }
         }
     }

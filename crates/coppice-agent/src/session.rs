@@ -205,6 +205,11 @@ impl<F: Fs, E: Executor> Session<F, E> {
     pub fn is_draining(&self) -> bool {
         self.draining
     }
+    /// This session's accountable live work — see [`outstanding_live_work`],
+    /// which is where the rule is stated. The drain loop's exit condition.
+    pub fn outstanding_live_work(&self) -> Vec<AllocationId> {
+        outstanding_live_work(&self.state)
+    }
     pub fn executor(&self) -> &E {
         &self.executor
     }
@@ -894,6 +899,27 @@ fn start_ids(sj: &pb::StartJob) -> Option<StartIds> {
         attempt,
         job,
     })
+}
+
+/// The agent's **accountable live work** over a recovered journal state
+/// (ADR 0041, "Agent shutdown is a drain, then a bounded wait"): every
+/// allocation with a journaled start intent and no journaled exit.
+///
+/// Deliberately the same accountability rule the heartbeat's `running` set
+/// follows ([`Session::heartbeat_report`]) rather than a runtime query: a
+/// container the daemon already reports `Exited` is still ours until its exit
+/// is journaled and reported, so the two can never disagree about whether this
+/// agent still owes a terminal report. A tombstoned allocation never has an
+/// intent, so tombstones need no arm here.
+///
+/// A list rather than a count: the drain names the allocations it gave up on.
+pub fn outstanding_live_work(state: &JournalState) -> Vec<AllocationId> {
+    state
+        .intents
+        .keys()
+        .filter(|alloc| !state.exits.contains_key(alloc))
+        .copied()
+        .collect()
 }
 
 fn observed_to_pb(o: &ObservedAllocation) -> pb::ObservedAllocation {

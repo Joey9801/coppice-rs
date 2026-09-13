@@ -330,6 +330,24 @@ overrides — capacity is detected from the host at startup, and the node
 identity is self-minted and persisted at `<data_dir>/node-identity`
 rather than configured (deployment-story A1/A3, issue #48).
 
+A top-level `shutdown_grace` key (humantime duration, default `5m`; zero
+is rejected at load) sizes the agent's drain on `SIGTERM`/`SIGINT`
+([ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md)):
+the agent announces `draining = true` on every `Register`/`Heartbeat` so
+the coordinator stops placing new work on it, then keeps serving until
+its accountable running work is empty or `shutdown_grace` elapses,
+whichever comes first. Anything still running at the deadline is
+deliberately left running rather than killed — killing it would report
+the job's own failure, whereas a node that falls silent is classified
+`NodeLost` and retried elsewhere, the correct outcome for work a planned
+termination could not accommodate. Because of this, `shutdown_grace`
+should be sized to the longest job the deployment expects to let finish,
+and the systemd unit's `TimeoutStopSec` in
+`deploy/systemd/coppice-agent.service` — along with any ASG
+lifecycle-hook heartbeat timeout — must be sized with margin over it,
+since systemd SIGKILLs the process outright once `TimeoutStopSec`
+elapses.
+
 ## Replicated policy
 
 Policy is inspected and changed through the CLI, which converts

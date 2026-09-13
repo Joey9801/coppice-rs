@@ -1046,6 +1046,45 @@ async fn the_draining_announcement_rides_both_reports_and_survives_a_reconnect()
     assert!(draining_of(&session.register_report()));
 }
 
+#[tokio::test]
+async fn accountable_live_work_is_intents_without_journaled_exits() {
+    // The drain's exit condition (ADR 0041): what the agent must wait for is
+    // exactly what its heartbeat claims in `running` — a journaled intent with
+    // no journaled exit — so the two can never disagree about whether the
+    // agent still owes the coordinator a terminal report.
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    assert!(
+        crate::session::outstanding_live_work(session.state()).is_empty(),
+        "a freshly registered agent owes nothing"
+    );
+
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .await
+        .unwrap();
+    assert_eq!(session.outstanding_live_work(), vec![alloc]);
+
+    // Exited in the runtime but not yet journaled: still ours. This is the
+    // case a naive "ask the executor" predicate would get wrong — the terminal
+    // report has not been sent, and exiting here would make a clean exit look
+    // like a loss.
+    exec.finish(alloc, natural_exit(0, Duration::from_micros(1), exec.now()));
+    assert_eq!(
+        session.outstanding_live_work(),
+        vec![alloc],
+        "an exit the journal has not recorded is still accountable work"
+    );
+
+    // Journaled exit: nothing left to wait for.
+    session
+        .handle_observed_exit(alloc, natural_exit(0, Duration::from_micros(1), exec.now()))
+        .await
+        .unwrap();
+    assert!(session.outstanding_live_work().is_empty());
+}
+
 /// The `draining` flag of whichever report body this is.
 fn draining_of(report: &pb::AgentReport) -> bool {
     match report.body.as_ref().expect("a report has a body") {

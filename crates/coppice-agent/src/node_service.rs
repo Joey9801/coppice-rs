@@ -182,6 +182,31 @@ pub fn serve(
     log_store: Option<FilesystemSink>,
     metric_store: Option<FilesystemSink>,
 ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
+    spawn_serving(listener, log_store, metric_store, None)
+}
+
+/// [`serve`], stopping gracefully when `shutdown` flips (ADR 0041).
+///
+/// The daemon's entry point: the agent's drain stops accepting and lets
+/// in-flight page reads finish, then the join in `run_daemon`'s shutdown tail
+/// observes the server actually down. `coppice dev` uses [`serve`] instead —
+/// it stops its agent by dropping the whole runtime, and has no drain to
+/// sequence.
+pub fn serve_until(
+    listener: NodeServiceListener,
+    log_store: Option<FilesystemSink>,
+    metric_store: Option<FilesystemSink>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
+    spawn_serving(listener, log_store, metric_store, Some(shutdown))
+}
+
+fn spawn_serving(
+    listener: NodeServiceListener,
+    log_store: Option<FilesystemSink>,
+    metric_store: Option<FilesystemSink>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
     let NodeServiceListener { listener, tls, .. } = listener;
     let incoming = coppice_tls::serve(listener, tls);
     let service =
@@ -189,7 +214,20 @@ pub fn serve(
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, async move {
+                match shutdown {
+                    Some(mut rx) => {
+                        // A dropped sender means the same thing as a flip: the
+                        // owner of the trigger is gone.
+                        while !*rx.borrow_and_update() {
+                            if rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            })
             .await
     })
 }

@@ -105,6 +105,9 @@ fn agent_config(node_id: NodeId, data_dir: PathBuf, endpoint: &str, ca: &Ca) -> 
         heartbeat_interval: Duration::from_millis(300),
         reconnect_backoff_min: Duration::from_millis(100),
         reconnect_backoff_max: Duration::from_millis(500),
+        // Long enough that only the tests that mean to hit the deadline do
+        // (ADR 0041); those override it.
+        shutdown_grace: Duration::from_secs(60),
         labels: BTreeMap::new(),
         executor: Default::default(),
         pressure: Default::default(),
@@ -147,7 +150,10 @@ fn spawn_agent(config: Config, executor: FakeExecutor) -> JoinHandle<()> {
     let session = build_session(&config, executor);
     tokio::spawn(async move {
         let tls = coppice_agent::load_tls_store(&config).expect("load agent tls store");
-        let _ = run(session, &config, tls).await;
+        // The ADR 0041 drain seam: this harness stops its agent by aborting
+        // the task, so the shutdown watch it is given never flips.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _ = run(session, &config, tls, shutdown_rx).await;
     })
 }
 

@@ -315,6 +315,12 @@ struct FakeInner {
     /// honest reading for a runtime that measures nothing; tests that drive the
     /// usage pipeline set it via [`FakeExecutor::set_usage`].
     usage: Option<Resources>,
+    /// How long [`Executor::observe`] parks before answering. Zero by default;
+    /// a test sets it via [`FakeExecutor::set_observe_delay`] to stand in for
+    /// the real executor's Docker list/inspect, which can block for the
+    /// daemon's own request timeout — the case ADR 0041's `shutdown_grace` has
+    /// to be able to preempt.
+    observe_delay: StdDuration,
 }
 
 impl Default for FakeInner {
@@ -327,6 +333,7 @@ impl Default for FakeInner {
             now: Timestamp::now(),
             stop_causes: std::collections::BTreeMap::new(),
             usage: None,
+            observe_delay: StdDuration::ZERO,
         }
     }
 }
@@ -441,6 +448,15 @@ impl FakeExecutor {
     pub fn set_usage(&self, usage: Option<Resources>) {
         self.lock().usage = usage;
     }
+
+    /// Make every subsequent [`Executor::observe`] park for `delay` before
+    /// answering — the fake's stand-in for a Docker list/inspect that has gone
+    /// slow (the daemon's own request timeout is 120 s). The shutdown drain's
+    /// grace window must be able to cut such a call short, and this is how a
+    /// test builds one (ADR 0041).
+    pub fn set_observe_delay(&self, delay: StdDuration) {
+        self.lock().observe_delay = delay;
+    }
 }
 
 impl Executor for FakeExecutor {
@@ -495,6 +511,13 @@ impl Executor for FakeExecutor {
     }
 
     async fn observe(&self) -> Result<Vec<ObservedContainer>, ExecutorError> {
+        // Read and release the lock before parking: the delay models a slow
+        // daemon, not a held mutex, and the test driving it keeps poking the
+        // same fake from the outside.
+        let delay = self.lock().observe_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let inner = self.lock();
         Ok(inner
             .running

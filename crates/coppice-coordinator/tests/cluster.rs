@@ -902,6 +902,7 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
         heartbeat_interval: Duration::from_millis(300),
         reconnect_backoff_min: Duration::from_millis(100),
         reconnect_backoff_max: Duration::from_millis(500),
+        shutdown_grace: Duration::from_secs(60),
         labels: Default::default(),
         executor: Default::default(),
         pressure: Default::default(),
@@ -928,7 +929,10 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
     );
     let agent_join = tokio::spawn(async move {
         let tls = coppice_agent::load_tls_store(&agent_config).expect("load the agent store");
-        let _ = coppice_agent::session::run(session, &agent_config, tls).await;
+        // The ADR 0041 drain seam: this harness stops its agent by aborting
+        // the task, so the shutdown watch it is given never flips.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _ = coppice_agent::session::run(session, &agent_config, tls, shutdown_rx).await;
     });
 
     // -- Read health through the follower, and only the follower. -----------
