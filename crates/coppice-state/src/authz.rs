@@ -150,8 +150,9 @@ pub enum Verb<'a> {
         entity: &'a QuotaEntityId,
         submitted_by: Option<&'a str>,
     },
-    /// Drain or undrain a node. A cluster verb: unscoped `operator` or
-    /// higher.
+    /// Drain a node, undrain it, or remove its record (ADR 0041). A cluster
+    /// verb: unscoped `operator` or higher. One verb for all three because
+    /// removal is the *end* of a drain, not a further authority.
     Drain,
     /// Create or reconfigure a quota entity: `admin` covering the entity's
     /// position, and — when the command actually reparents it — `admin`
@@ -175,7 +176,7 @@ impl fmt::Display for Verb<'_> {
         match self {
             Verb::Submit { entity } => write!(f, "submit a job charging quota entity {entity}"),
             Verb::Abort { entity, .. } => write!(f, "abort a job charging quota entity {entity}"),
-            Verb::Drain => f.write_str("change a node's schedulability"),
+            Verb::Drain => f.write_str("drain, undrain, or remove nodes"),
             Verb::ConfigureQuotaEntity { entity, new_parent } => match new_parent {
                 Some(p) => write!(f, "configure quota entity {entity} under parent {p}"),
                 None => write!(f, "configure quota entity {entity} at the tree root"),

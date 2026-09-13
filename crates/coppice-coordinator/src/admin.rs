@@ -1726,6 +1726,66 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         }))
     }
 
+    /// The leader-side half of a forwarded admin cordon (ADR 0041). As the
+    /// four above, through the same
+    /// [`api_server::set_node_schedulable_here`] the direct path runs.
+    async fn forward_set_node_schedulable(
+        &self,
+        request: Request<pb::ForwardSetNodeSchedulableRequest>,
+    ) -> Result<Response<pb::ForwardSetNodeSchedulableResponse>, Status> {
+        self.require_operator_or_machine(&request, "ForwardSetNodeSchedulable")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        let node: coppice_core::id::NodeId = req
+            .node
+            .ok_or_else(|| {
+                Status::invalid_argument("missing ForwardSetNodeSchedulableRequest.node")
+            })?
+            .try_into()
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let actor = crate::clientwrite::set_node_schedulable_actor_from_pb(req.actor)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let outcome = api_server::set_node_schedulable_here(
+            consensus.as_ref(),
+            node,
+            req.schedulable,
+            &actor,
+        )
+        .await;
+        Ok(Response::new(pb::ForwardSetNodeSchedulableResponse {
+            // As the abort's: the DTO response is empty, so the applied index
+            // has no client-visible use, but the outcome message is shared.
+            outcome: Some(forwarded_outcome(outcome.map(|()| 0))?),
+        }))
+    }
+
+    /// The leader-side half of a forwarded node removal (ADR 0041).
+    async fn forward_evict_nodes(
+        &self,
+        request: Request<pb::ForwardEvictNodesRequest>,
+    ) -> Result<Response<pb::ForwardEvictNodesResponse>, Status> {
+        self.require_operator_or_machine(&request, "ForwardEvictNodes")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        let mut nodes = Vec::with_capacity(req.nodes.len());
+        for node in req.nodes {
+            nodes.push(
+                coppice_core::id::NodeId::try_from(node)
+                    .map_err(|e| Status::invalid_argument(format!("{e}")))?,
+            );
+        }
+        let actor = crate::clientwrite::evict_nodes_actor_from_pb(req.actor)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let outcome = api_server::evict_nodes_here(consensus.as_ref(), nodes, &actor).await;
+        Ok(Response::new(pb::ForwardEvictNodesResponse {
+            outcome: Some(forwarded_outcome(outcome.map(|()| 0))?),
+        }))
+    }
+
     /// The leader-side half of a replica's liveness read (ADR 0040).
     ///
     /// The same gates the forwarded writes pass — coordinator machine or

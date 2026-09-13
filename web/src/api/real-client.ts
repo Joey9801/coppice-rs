@@ -1076,6 +1076,7 @@ interface WireNodeSummary {
   used: WireResources | null
   labels: Record<string, string>
   schedulable: boolean
+  draining?: boolean
   health: WireNodeHealth
   epoch: number
   last_heartbeat: string | null
@@ -1091,6 +1092,7 @@ function mapNodeSummary(n: WireNodeSummary): NodeSummary {
     used: mapResourcesOrNull(n.used),
     labels: n.labels,
     schedulable: n.schedulable,
+    draining: n.draining ?? false,
     health: snakeToPascal(n.health) as NodeHealth,
     epoch: n.epoch,
     lastHeartbeat: toDateOrNull(n.last_heartbeat),

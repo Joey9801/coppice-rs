@@ -708,6 +708,20 @@ mod tests {
         ) -> Result<(), ApiError> {
             unimplemented!("logs tests never abort")
         }
+        async fn set_node_schedulable(
+            &self,
+            _req: crate::http::dto::SetNodeSchedulableRequest,
+            _actor: coppice_state::Actor,
+        ) -> Result<(), ApiError> {
+            unimplemented!("logs tests never drain a node")
+        }
+        async fn evict_node(
+            &self,
+            _req: crate::http::dto::EvictNodeRequest,
+            _actor: coppice_state::Actor,
+        ) -> Result<(), ApiError> {
+            unimplemented!("logs tests never remove a node")
+        }
         async fn configure_quota_entity(
             &self,
             _req: ConfigureQuotaEntityRequest,

@@ -35,7 +35,7 @@ use coppice_api::http::dto::{
 };
 use coppice_api::{ApiError, RejectionKind};
 use coppice_consensus::{CoordinatorId, NodeHandle};
-use coppice_core::id::JobId;
+use coppice_core::id::{JobId, NodeId};
 use coppice_net::admin::Client;
 use coppice_proto::convert::ConvertError;
 use coppice_proto::pb::raft::v1 as pb;
@@ -388,6 +388,7 @@ pub(crate) fn rejection_kind_from_pb(raw: i32) -> RejectionKind {
         Ok(Pb::UnknownQuotaEntity) => RejectionKind::UnknownQuotaEntity,
         Ok(Pb::InvalidAuthorization) => RejectionKind::InvalidAuthorization,
         Ok(Pb::AuthorizationLockout) => RejectionKind::AuthorizationLockout,
+        Ok(Pb::UnknownNode) => RejectionKind::UnknownNode,
         Ok(Pb::Unspecified) | Err(_) => RejectionKind::Other,
     }
 }
@@ -404,6 +405,7 @@ pub(crate) fn rejection_kind_to_pb(
         RejectionKind::UnknownQuotaEntity => Pb::UnknownQuotaEntity,
         RejectionKind::InvalidAuthorization => Pb::InvalidAuthorization,
         RejectionKind::AuthorizationLockout => Pb::AuthorizationLockout,
+        RejectionKind::UnknownNode => Pb::UnknownNode,
     }
 }
 
@@ -495,6 +497,49 @@ impl LeaderWrites for AdminForwarder {
                 under_timeout(deadline, client.forward_update_authorization(wire)).await?;
             let log_index = applied_index(response.outcome)?;
             Ok(UpdateAuthorizationResponse { log_index })
+        })
+    }
+
+    fn set_node_schedulable<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        node: NodeId,
+        schedulable: bool,
+        actor: &'a Actor,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        Box::pin(async move {
+            let deadline = forward_deadline();
+            let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
+            let wire = pb::ForwardSetNodeSchedulableRequest {
+                history_id: history_id.to_vec(),
+                node: Some(node.into()),
+                schedulable,
+                actor: Some(actor.into()),
+            };
+            let response =
+                under_timeout(deadline, client.forward_set_node_schedulable(wire)).await?;
+            applied_index(response.outcome)?;
+            Ok(())
+        })
+    }
+
+    fn evict_nodes<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        nodes: &'a [NodeId],
+        actor: &'a Actor,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        Box::pin(async move {
+            let deadline = forward_deadline();
+            let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
+            let wire = pb::ForwardEvictNodesRequest {
+                history_id: history_id.to_vec(),
+                nodes: nodes.iter().map(|node| (*node).into()).collect(),
+                actor: Some(actor.into()),
+            };
+            let response = under_timeout(deadline, client.forward_evict_nodes(wire)).await?;
+            applied_index(response.outcome)?;
+            Ok(())
         })
     }
 }
@@ -792,6 +837,22 @@ pub(crate) fn abort_actor_from_pb(
     actor: Option<coppice_proto::pb::core::v1::Actor>,
 ) -> Result<Actor, ConvertError> {
     actor_from_pb(actor, "ForwardAbortJobRequest.actor")
+}
+
+/// A forwarded cordon's actor. Like the abort's: the node and the flag are
+/// read straight off the message by the handler, so only the actor needs a
+/// conversion boundary of its own.
+pub(crate) fn set_node_schedulable_actor_from_pb(
+    actor: Option<coppice_proto::pb::core::v1::Actor>,
+) -> Result<Actor, ConvertError> {
+    actor_from_pb(actor, "ForwardSetNodeSchedulableRequest.actor")
+}
+
+/// A forwarded eviction's actor.
+pub(crate) fn evict_nodes_actor_from_pb(
+    actor: Option<coppice_proto::pb::core::v1::Actor>,
+) -> Result<Actor, ConvertError> {
+    actor_from_pb(actor, "ForwardEvictNodesRequest.actor")
 }
 
 /// The authorization replacement, on the wire.

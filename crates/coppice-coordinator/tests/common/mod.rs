@@ -1853,6 +1853,22 @@ impl coppice_api::ControlPlane for NoopPlane {
         Err(unattached())
     }
 
+    async fn set_node_schedulable(
+        &self,
+        _req: coppice_api::http::dto::SetNodeSchedulableRequest,
+        _actor: coppice_state::Actor,
+    ) -> Result<(), coppice_api::ApiError> {
+        Err(unattached())
+    }
+
+    async fn evict_node(
+        &self,
+        _req: coppice_api::http::dto::EvictNodeRequest,
+        _actor: coppice_state::Actor,
+    ) -> Result<(), coppice_api::ApiError> {
+        Err(unattached())
+    }
+
     async fn configure_quota_entity(
         &self,
         _req: coppice_api::http::dto::ConfigureQuotaEntityRequest,
