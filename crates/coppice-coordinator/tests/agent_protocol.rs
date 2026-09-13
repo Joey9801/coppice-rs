@@ -15,7 +15,7 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Certificate, Identity, Server as TonicServer, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
-use coppice_agent::config::{CapacityConfig, Config, TlsConfig};
+use coppice_agent::config::{CapacityConfig, Config};
 use coppice_agent::executor::{ExitCause, ExitInfo, FakeExecutor};
 use coppice_agent::journal::Journal;
 use coppice_agent::session::{run, Session};
@@ -76,48 +76,22 @@ fn requested() -> Resources {
 
 // ---- agent harness -------------------------------------------------------
 
-/// Build an agent config pointing at `endpoint`, writing its mTLS PKI into
-/// `pki_dir`. The client leaf's subject CN is the node id's typed string form
-/// (`node-<uuid>`), which the gateway binds to the claimed NodeId at session
-/// accept (ADR 0011).
-fn agent_config(
-    node_id: NodeId,
-    data_dir: PathBuf,
-    endpoint: &str,
-    ca: &Ca,
-    pki_dir: &Path,
-) -> Config {
-    let leaf = ca.leaf_with_cn(&node_id.to_string());
-    let cert_path = pki_dir.join("agent.crt");
-    let key_path = pki_dir.join("agent.key");
-    let ca_path = pki_dir.join("agent-ca.crt");
-    std::fs::write(&cert_path, &leaf.cert_pem).expect("write agent cert");
-    std::fs::write(&key_path, &leaf.key_pem).expect("write agent key");
-    std::fs::write(&ca_path, &ca.pem).expect("write agent ca");
-
-    // An agent settles its identity from `<data_dir>/node-identity`
-    // (deployment-story A1). The harness seeds that file with the id the leaf
-    // above was minted for, which is exactly the documented shape of a node
-    // whose identity predates the file — and keeps the CN↔NodeId binding the
-    // gateway checks intact.
-    std::fs::create_dir_all(&data_dir).expect("create agent data dir");
-    std::fs::write(
-        data_dir.join(coppice_agent::identity::NODE_IDENTITY_FILE),
-        format!("{node_id}\n"),
-    )
-    .expect("seed the agent node identity");
+/// Build an agent config pointing at `endpoint`, with its cluster-managed mTLS
+/// material under `<data_dir>/pki`. The client leaf's subject CN is the node
+/// id's typed string form (`node-<uuid>`), which the gateway binds to the
+/// claimed NodeId at session accept (ADR 0011).
+fn agent_config(node_id: NodeId, data_dir: PathBuf, endpoint: &str, ca: &Ca) -> Config {
+    // The leaf and the identity land in the one layout an agent reads, the
+    // same one enrollment would have written them to (issue #127).
+    common::agent_material(&data_dir, ca, node_id);
 
     Config {
         data_dir,
         // One coordinator, this harness's gateway (ADR 0037 §2).
         discovery: SeedConfig::static_seeds(vec![endpoint.to_string()]),
-        tls: TlsConfig {
-            cert_path,
-            key_path,
-            ca_path,
-        },
-        // The harness provisions the leaf directly; no enrollment.
-        enrollment: None,
+        // Declared because every agent declares one, and never contacted:
+        // the leaf above is already installed (issue #127).
+        enrollment: common::unused_enrollment(),
         // Generous, so a job's request always fits.
         // Generous overrides on every dimension (deployment-story A3), so the
         // harness never depends on what the machine running the test reports.
@@ -172,7 +146,7 @@ fn build_session(config: &Config, executor: FakeExecutor) -> Session<RealFs, Fak
 fn spawn_agent(config: Config, executor: FakeExecutor) -> JoinHandle<()> {
     let session = build_session(&config, executor);
     tokio::spawn(async move {
-        let tls = coppice_agent::load_tls_store(&config.tls).expect("load agent tls store");
+        let tls = coppice_agent::load_tls_store(&config).expect("load agent tls store");
         let _ = run(session, &config, tls).await;
     })
 }
@@ -309,7 +283,6 @@ async fn run_to_running() -> RunningJob {
         agent_dir.path().join("data"),
         &coord.agent_endpoint,
         &ca,
-        agent_dir.path(),
     );
     let agent = spawn_agent(config, executor.clone());
 
@@ -444,7 +417,6 @@ async fn agent_restart_mid_run_converges_without_duplicate_execution() {
         world.agent_dir.path().join("data"),
         &world.coord.agent_endpoint,
         &world.ca,
-        world.agent_dir.path(),
     );
     let agent2 = spawn_agent(config2, executor2.clone());
 
@@ -662,7 +634,6 @@ async fn host_facts_survive_registration_to_the_node_detail() {
         agent_dir.path().join("data"),
         &coord.agent_endpoint,
         &ca,
-        agent_dir.path(),
     );
     let agent = spawn_agent(config, FakeExecutor::new());
 
@@ -755,13 +726,7 @@ async fn stale_fenced_command_is_rejected_by_the_agent() {
     // Run the real agent against the scripted coordinator.
     let executor = FakeExecutor::new();
     let agent_dir = tempfile::tempdir().expect("agent tempdir");
-    let config = agent_config(
-        node_id,
-        agent_dir.path().join("data"),
-        &endpoint,
-        &ca,
-        agent_dir.path(),
-    );
+    let config = agent_config(node_id, agent_dir.path().join("data"), &endpoint, &ca);
     let agent = spawn_agent(config, executor.clone());
 
     // 1. Registration: on the agent's Register, accept with token (term 5,
@@ -881,7 +846,6 @@ async fn node_lost_then_reappearing_container_is_stopped() {
         agent_dir.path().join("data"),
         &coord.agent_endpoint,
         &ca,
-        agent_dir.path(),
     );
     let agent = spawn_agent(config, executor.clone());
     let views = coord.views();
@@ -966,7 +930,6 @@ async fn node_lost_then_reappearing_container_is_stopped() {
         agent_dir.path().join("data"),
         &coord.agent_endpoint,
         &ca,
-        agent_dir.path(),
     );
     let agent2 = spawn_agent(config2, executor2.clone());
 

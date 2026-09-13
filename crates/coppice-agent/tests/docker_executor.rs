@@ -3613,11 +3613,10 @@ async fn node_service_serves_live_container_logs_over_mtls() {
         let listener = NodeServiceListener::bind(
             "127.0.0.1:0".parse().expect("addr"),
             coppice_tls::TlsStore::from_pem(
-                coppice_tls::TlsPaths {
-                    cert: "unused-cert".into(),
-                    key: "unused-key".into(),
-                    ca: "unused-ca".into(),
-                },
+                // `root` is this node's real data dir (the telemetry sink lives
+                // under it too), so the store's paths are the fixed layout the
+                // cluster would install into rather than placeholders (#127).
+                coppice_tls::TlsPaths::cluster_managed(root.path()),
                 pki.ca_pem.clone(),
                 pki.server_cert.clone(),
                 pki.server_key.clone(),

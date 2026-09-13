@@ -5,7 +5,7 @@
 //! operator-profile certificate. What differs is where the material comes from
 //! — these verbs are run from a laptop or a CI job that has an operator
 //! certificate but no coordinator config file, so `--ca` / `--cert` / `--key`
-//! are explicit rather than read out of `[tls]`.
+//! are explicit rather than read out of a coordinator's data directory.
 //!
 //! One rule shapes the output. `mint` prints the secret to **stdout, once**,
 //! with everything else on stderr, so `coppice node enroll-token mint … >

@@ -28,40 +28,30 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use coppice_consensus::fs::RealFs;
 use coppice_proto::pb::core::v1 as pbcore;
-use coppice_tls::{TlsPaths, TlsStore};
+use coppice_tls::TlsStore;
 
-/// Load the agent's shared hot-reload TLS store from its config's `[tls]`
-/// paths (ADR 0011, ADR 0037 §4). Fails fast, naming the offending path, if
-/// any file is missing or unparseable. Shared by the `NodeService` listener
-/// and the session client, so one rotation on disk re-arms both; `coppice
-/// dev` builds its agent half through this too.
-pub fn load_tls_store(tls: &config::TlsConfig) -> Result<Arc<TlsStore>> {
-    let paths = tls_paths(tls);
+/// Load the agent's shared hot-reload TLS store from the cluster-managed
+/// layout under its data directory (ADR 0011, ADR 0037 §4, issue #127). Fails
+/// fast, naming the offending path, if any file is missing or unparseable.
+/// Shared by the `NodeService` listener and the session client, so one rotation
+/// on disk re-arms both; `coppice dev` builds its agent half through this too.
+pub fn load_tls_store(config: &config::Config) -> Result<Arc<TlsStore>> {
+    let paths = config.tls_paths();
     TlsStore::load(paths).with_context(|| {
-        "loading agent TLS material (config [tls]); provision the three files out of band, or \
-         configure [enrollment] to obtain them from the cluster at startup (ADR 0037 §4)"
+        "loading agent TLS material from <data_dir>/pki; the cluster owns it, so it is \
+         [enrollment] that puts it there at startup (ADR 0037 §4)"
     })
 }
 
-/// The `[tls]` trio as the store and the enrollment installer both see them.
-fn tls_paths(tls: &config::TlsConfig) -> TlsPaths {
-    TlsPaths {
-        cert: tls.cert_path.clone(),
-        key: tls.key_path.clone(),
-        ca: tls.ca_path.clone(),
-    }
-}
-
-/// Obtain the `[tls]` material from the cluster if `[enrollment]` is configured
-/// and there is not already a usable leaf on disk (ADR 0037 §4/§8).
+/// Obtain the machine-plane material from the cluster unless there is already a
+/// usable leaf on disk (ADR 0037 §4/§8, issue #127).
 ///
 /// Runs before [`load_tls_store`], which is what makes an agent's minimal
 /// deployment a token and an address: boot with neither certificate nor key,
-/// enroll for a leaf whose CN is `node` (ADR 0011), and register exactly as an
-/// out-of-band-provisioned agent does. With a usable leaf already installed
-/// this makes no network call at all and never reads the token — restarts are
-/// free, and a compromised endpoint sees nothing from an already-enrolled
-/// fleet.
+/// enroll for a leaf whose CN is `node` (ADR 0011), and register. With a usable
+/// leaf already installed this makes no network call at all and never reads the
+/// token — restarts are free, and a compromised endpoint sees nothing from an
+/// already-enrolled fleet.
 ///
 /// `node` is a parameter rather than a config field because the CN↔NodeId
 /// binding now runs the other way (deployment-story A1): the identity is minted
@@ -78,10 +68,8 @@ pub async fn ensure_enrolled(
     config: &config::Config,
     node: coppice_core::id::NodeId,
 ) -> Result<()> {
-    let Some(enrollment) = &config.enrollment else {
-        return Ok(());
-    };
-    let paths = tls_paths(&config.tls);
+    let enrollment = &config.enrollment;
+    let paths = config.tls_paths();
     // An agent's leaf always carries its node id as a SAN — the cluster adds
     // that itself from the claimed identity, because ADR 0034's id-pinned dial
     // depends on it. What the cluster cannot know is the *host* this agent
@@ -222,16 +210,16 @@ pub async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     let node = identity::load_or_mint_node_identity(&config.data_dir)?;
 
     // Obtain the machine-plane leaf before anything tries to load it (ADR 0037
-    // §4/§8), for the identity just settled. A no-op when `[enrollment]` is
-    // absent, and a no-op when a usable leaf is already installed — so this is
-    // safe on every restart, not just the first boot.
+    // §4/§8), for the identity just settled. A no-op when a usable leaf is
+    // already installed — so this is safe on every restart, not just the
+    // first boot.
     ensure_enrolled(&config, node).await?;
 
     // Load the shared hot-reload TLS store up front (fail-fast on missing or
     // unparseable material, ADR 0011) and drive reloads from an mtime poll plus
     // SIGHUP. Shared by the NodeService listener and the session client, so one
     // rotation on disk re-arms both (ADR 0037 §4).
-    let tls_store = load_tls_store(&config.tls)?;
+    let tls_store = load_tls_store(&config)?;
     let _tls_reload = coppice_tls::spawn_reload_task(
         Arc::clone(&tls_store),
         coppice_tls::ReloadOptions {

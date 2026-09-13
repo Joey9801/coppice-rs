@@ -301,7 +301,8 @@ async fn every_coordinator_renews_onto_the_new_root() {
     // proxy for it.
     //
     // `installed_matches_replicated` is computed from the live `TlsStore`,
-    // whereas `tls_material()` reads the three `[tls]` files off disk — and
+    // whereas `tls_material()` reads the three files under `<data_dir>/pki` off
+    // disk — and
     // `pki::install_leaf_material` writes all three *before* calling
     // `force_reload()`. So there is a real window in which the files already
     // show the new bundle while the store still serves the old one. Polling
@@ -382,6 +383,16 @@ async fn every_coordinator_renews_onto_the_new_root() {
     };
     for member in &fleet.members {
         let (ca_pem, cert_pem, _) = member.tls_material();
+        // Adoption writes the bundle where every reader looks and nowhere
+        // else: one fixed path, not a configured one (issue #127).
+        assert_eq!(
+            member.tls_paths().ca,
+            member
+                .data_dir()
+                .join(coppice_tls::PKI_DIR)
+                .join(coppice_tls::CA_BUNDLE_FILE),
+            "the adopted anchors land at <data_dir>/pki/ca.crt"
+        );
         assert_eq!(
             cert_block_count(&ca_pem),
             2,

@@ -3,7 +3,7 @@
 //! A machine that holds a role-scoped token and the cluster's address, and
 //! nothing else, becomes a machine that speaks cluster-CA mTLS. That is the
 //! whole of this module: [`ensure_enrolled`] generates a keypair and CSR, posts
-//! them with the token, and installs the returned leaf into the `[tls]` paths a
+//! them with the token, and installs the returned leaf into the cluster-managed paths a
 //! [`TlsStore`](coppice_tls::TlsStore) watches.
 //!
 //! Three rules shape it, all from §4.
@@ -334,7 +334,7 @@ pub enum EnrollClientError {
     #[error("the enrollment endpoint returned an unreadable body: {0}")]
     BadResponse(String),
 
-    /// The issued material could not be written to the `[tls]` paths.
+    /// The issued material could not be written to the cluster-managed paths.
     #[error(transparent)]
     Install(#[from] pki::CustodyError),
 }

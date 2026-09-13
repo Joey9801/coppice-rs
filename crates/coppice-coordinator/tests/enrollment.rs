@@ -696,8 +696,8 @@ async fn an_agent_enrolls_then_renews_over_the_session_plane_until_revoked() {
 ///
 /// This is the half the coordinator-side renewal test above cannot reach — the
 /// leaf on *disk*. A renewal that returns a valid certificate but does not land
-/// in the `[tls]` paths, or lands there without re-arming the store, leaves the
-/// agent presenting its old leaf until it expires.
+/// under `<data_dir>/pki`, or lands there without re-arming the store, leaves
+/// the agent presenting its old leaf until it expires.
 ///
 /// [`renew_once`]: coppice_agent::session::renewal::renew_once
 #[tokio::test]
@@ -725,11 +725,7 @@ async fn the_agent_runner_rewrites_its_leaf_files_and_rearms_the_store() {
     // Install the enrolled material exactly as agent startup does, and load the
     // store the daemon would run on.
     let dir = tempfile::tempdir().expect("temp dir");
-    let paths = coppice_tls::TlsPaths {
-        cert: dir.path().join("node.crt"),
-        key: dir.path().join("node.key"),
-        ca: dir.path().join("ca.crt"),
-    };
+    let paths = coppice_tls::TlsPaths::cluster_managed(dir.path());
     pki::install_leaf_material(
         &paths,
         issued.ca_pem.as_bytes(),
@@ -855,18 +851,14 @@ async fn a_revoked_leader_refuses_to_renew_itself_locally() {
     rc.views().at_least(applied.log_index).await.expect("view");
 
     // The machine-plane material renewal watches: a coordinator leaf under
-    // that CA, in its own [tls] paths.
+    // that CA, in this installation's own `<data_dir>/pki` layout.
     let signer =
         coppice_tls::pki::CaSigner::load(&ca.cert_pem, &ca.key_pem).expect("load the signer");
     let (key_pem, csr_pem) = pki::generate_key_and_csr().unwrap();
     let leaf = coppice_tls::pki::issue_coordinator(&signer, &csr_pem, &machine, &[])
         .expect("issue the current leaf");
     let dir = tempfile::tempdir().expect("temp dir");
-    let paths = coppice_tls::TlsPaths {
-        cert: dir.path().join("node.crt"),
-        key: dir.path().join("node.key"),
-        ca: dir.path().join("ca.crt"),
-    };
+    let paths = coppice_tls::TlsPaths::cluster_managed(dir.path());
     coppice_tls::pki::install_leaf_material(&paths, &ca.cert_pem, &leaf, &key_pem)
         .expect("install the current material");
     let store = coppice_tls::TlsStore::load(paths.clone()).expect("load the store");

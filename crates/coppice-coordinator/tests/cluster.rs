@@ -841,11 +841,11 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
     // which is the whole subject.
     let node = NodeId::new();
     let agent_dir = tempfile::tempdir().expect("agent tempdir");
-    let paths = coppice_tls::TlsPaths {
-        cert: agent_dir.path().join("node.crt"),
-        key: agent_dir.path().join("node.key"),
-        ca: agent_dir.path().join("ca.crt"),
-    };
+    let data_dir = agent_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create the agent data dir");
+    // Where an agent's material lives, full stop: enrollment writes it here
+    // and the session runner reads it from here (issue #127).
+    let paths = coppice_tls::TlsPaths::cluster_managed(&data_dir);
     let enrollment = coppice_enroll::EnrollmentConfig {
         endpoint: fleet.members[leader_idx].api(""),
         token: Some(coppice_enroll::Secret::new(AGENT_TOKEN.to_string())),
@@ -861,9 +861,21 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
     .await
     .expect("the agent enrolls over the public route against the formed cluster");
     assert_eq!(outcome, coppice_enroll::Outcome::Enrolled);
+    // Enrollment landed the trio in the fixed layout, which is what makes the
+    // config below able to name no paths at all.
+    for file in [
+        coppice_tls::NODE_CERT_FILE,
+        coppice_tls::NODE_KEY_FILE,
+        coppice_tls::CA_BUNDLE_FILE,
+    ] {
+        let expected = data_dir.join(coppice_tls::PKI_DIR).join(file);
+        assert!(
+            expected.exists(),
+            "enrollment installs {}",
+            expected.display()
+        );
+    }
 
-    let data_dir = agent_dir.path().join("data");
-    std::fs::create_dir_all(&data_dir).expect("create the agent data dir");
     std::fs::write(
         data_dir.join(coppice_agent::identity::NODE_IDENTITY_FILE),
         format!("{node}\n"),
@@ -875,13 +887,9 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
         discovery: coppice_discovery::SeedConfig::static_seeds(vec![
             fleet.members[leader_idx].agent_target()
         ]),
-        tls: coppice_agent::config::TlsConfig {
-            cert_path: paths.cert.clone(),
-            key_path: paths.key.clone(),
-            ca_path: paths.ca.clone(),
-        },
-        // The leaf is already on disk; the session runner must not re-enroll.
-        enrollment: None,
+        // The leaf is already on disk, so this is never contacted; it is
+        // declared because every agent declares one (issue #127).
+        enrollment,
         // Every dimension overridden, so nothing here depends on what the
         // machine running the test reports.
         capacity: coppice_agent::config::CapacityConfig {
@@ -919,7 +927,7 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
         coppice_agent::executor::FakeExecutor::new(),
     );
     let agent_join = tokio::spawn(async move {
-        let tls = coppice_agent::load_tls_store(&agent_config.tls).expect("load the agent store");
+        let tls = coppice_agent::load_tls_store(&agent_config).expect("load the agent store");
         let _ = coppice_agent::session::run(session, &agent_config, tls).await;
     });
 

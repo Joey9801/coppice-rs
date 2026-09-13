@@ -43,7 +43,7 @@ use coppice_core::time::Timestamp;
 use coppice_state::command::{BindMachineIdentity, ConfirmKeyPossession, RecordCaCertificate};
 use coppice_state::{CaCertBundle, Command};
 use coppice_tls::pki;
-use coppice_tls::{TlsPaths, TlsStore};
+use coppice_tls::TlsStore;
 
 use crate::config::Config;
 use crate::policy::FormationPolicy;
@@ -861,8 +861,9 @@ pub(crate) async fn form(ctx: FormationContext, req: FormRequest) -> Result<Form
 
     // --- Step 3: the cluster root CA and this node's own coordinator leaf.
     // The key file lands in the data directory (owner-only) and never enters
-    // replicated state; the leaf lands in the `[tls]` paths, so the hot-reload
-    // store picks it up without a restart (ADR 0037 §4).
+    // replicated state; the leaf lands in the cluster-managed `<data_dir>/pki`
+    // layout, so the hot-reload store picks it up without a restart
+    // (ADR 0037 §4, issue #127).
     let ca = pki::mint_root_ca().context("minting the cluster root CA")?;
     pki::write_ca_key(&data_dir, &ca.key_pem).context("writing the cluster CA key")?;
     let signer = pki::CaSigner::load(&ca.cert_pem, &ca.key_pem)
@@ -874,13 +875,9 @@ pub(crate) async fn form(ctx: FormationContext, req: FormRequest) -> Result<Form
 
     let (leaf_cert, leaf_key) = pki::mint_coordinator_local(&signer, &machine, &leaf_sans(cfg))
         .context("issuing this coordinator's own leaf certificate")?;
-    let tls_paths = TlsPaths {
-        cert: cfg.tls.cert_path.clone(),
-        key: cfg.tls.key_path.clone(),
-        ca: cfg.tls.ca_path.clone(),
-    };
+    let tls_paths = cfg.tls_paths();
     pki::install_leaf_material(&tls_paths, &ca.cert_pem, &leaf_cert, &leaf_key)
-        .context("installing the cluster-minted leaf into the configured [tls] paths")?;
+        .context("installing the cluster-minted leaf under <data_dir>/pki")?;
     // The daemon may have started with no TLS material at all (the ADR's
     // minimal deployment): the material now exists, so the store does too.
     let tls_store = match tls {
@@ -1169,7 +1166,8 @@ async fn refuse_if_cluster_exists(cfg: &Config, advertise_addr: &str) -> Result<
         return Ok(());
     }
 
-    let have_creds = [&cfg.tls.ca_path, &cfg.tls.cert_path, &cfg.tls.key_path]
+    let paths = cfg.tls_paths();
+    let have_creds = [&paths.ca, &paths.cert, &paths.key]
         .iter()
         .all(|p| p.exists());
     if !have_creds {
@@ -1247,6 +1245,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use coppice_consensus::storage::FormationMarks;
+    use coppice_tls::TlsPaths;
 
     fn marks(intent: Option<i64>, complete: Option<i64>) -> FormationMarks {
         FormationMarks {
@@ -1350,8 +1349,9 @@ mod tests {
     // `tests/formation.rs` can only observe through a surface.
 
     /// A throwaway CA plus a leaf, the material a daemon starts with before
-    /// the cluster mints its own.
-    fn seed_tls(dir: &Path) -> TlsPaths {
+    /// the cluster mints its own — laid into `data_dir`'s cluster-managed
+    /// layout, the only place a daemon ever looks (issue #127).
+    fn seed_tls(data_dir: &Path) -> TlsPaths {
         use rcgen::{CertificateParams, DnType, KeyPair};
         let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1376,23 +1376,23 @@ mod tests {
             .signed_by(&leaf_key, &ca_cert, &ca_key)
             .expect("sign leaf");
 
-        let paths = TlsPaths {
-            cert: dir.join("node.crt"),
-            key: dir.join("node.key"),
-            ca: dir.join("ca.crt"),
-        };
-        std::fs::write(&paths.cert, leaf.pem()).expect("write cert");
-        std::fs::write(&paths.key, leaf_key.serialize_pem()).expect("write key");
-        std::fs::write(&paths.ca, ca_cert.pem()).expect("write ca");
+        let paths = TlsPaths::cluster_managed(data_dir);
+        pki::install_leaf_material(
+            &paths,
+            ca_cert.pem().as_bytes(),
+            leaf.pem().as_bytes(),
+            leaf_key.serialize_pem().as_bytes(),
+        )
+        .expect("install seed material");
         paths
     }
 
     /// A config file for a node that will never bind anything: `form` opens
     /// storage and raft, but the listeners belong to the daemon.
     fn seed_config(root: &Path, cluster_id: ClusterId) -> Config {
-        let paths = seed_tls(root);
         let data_dir = root.join("data");
         std::fs::create_dir_all(&data_dir).expect("create data dir");
+        seed_tls(&data_dir);
         let config_path = root.join("coordinator.toml");
         std::fs::write(
             &config_path,
@@ -1415,11 +1415,6 @@ advertise_host = "localhost"
 election_timeout = "300ms"
 heartbeat_interval = "100ms"
 
-[tls]
-cert_path = "{cert}"
-key_path = "{key}"
-ca_path = "{ca}"
-
 [client_tls]
 # Plain HTTP on the client listener (ADR 0037 §4: the posture is always
 # explicit, never implied).
@@ -1438,9 +1433,6 @@ insecure_open = true
 log_level = "warn"
 "#,
                 data_dir = data_dir.display(),
-                cert = paths.cert.display(),
-                key = paths.key.display(),
-                ca = paths.ca.display(),
             ),
         )
         .expect("write config");
@@ -1451,12 +1443,7 @@ log_level = "warn"
     }
 
     fn context(config: Config, failpoint: Option<Failpoint>) -> FormationContext {
-        let tls_store = TlsStore::load(TlsPaths {
-            cert: config.tls.cert_path.clone(),
-            key: config.tls.key_path.clone(),
-            ca: config.tls.ca_path.clone(),
-        })
-        .expect("load tls store");
+        let tls_store = TlsStore::load(config.tls_paths()).expect("load tls store");
         FormationContext {
             config,
             advertise_addr: "localhost:17071".to_string(),

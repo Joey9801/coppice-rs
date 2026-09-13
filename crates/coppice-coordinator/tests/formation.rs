@@ -295,6 +295,61 @@ async fn init_forms_a_single_voter_cluster_opens_the_api_and_stamps_the_marker()
     daemon.stop().await.expect("formed daemon stops cleanly");
 }
 
+/// The ADR 0037 §4 minimal deployment, followed to where the certificates
+/// actually land: nothing is provisioned, and formation puts the cluster's own
+/// trio at exactly `<data_dir>/pki/{node.crt,node.key,ca.crt}` with the
+/// directory owner-only (issue #127).
+///
+/// Worth asserting on disk rather than only through the store, because the
+/// layout is the whole contract between formation, enrollment, renewal and the
+/// reload poll: nothing configures it, so nothing would catch a producer that
+/// quietly wrote somewhere else.
+#[tokio::test]
+async fn formation_installs_the_cluster_trio_in_the_fixed_layout() {
+    let ca = Ca::new();
+    let mut daemon = Daemon::new_certless(ClusterId::new(), &ca);
+    let paths = daemon.tls_paths();
+    let pki_dir = daemon.data_dir().join(coppice_tls::PKI_DIR);
+    assert_eq!(paths.cert, pki_dir.join(coppice_tls::NODE_CERT_FILE));
+    assert_eq!(paths.key, pki_dir.join(coppice_tls::NODE_KEY_FILE));
+    assert_eq!(paths.ca, pki_dir.join(coppice_tls::CA_BUNDLE_FILE));
+    assert!(
+        !pki_dir.exists(),
+        "a certless daemon has nothing provisioned"
+    );
+
+    daemon.start();
+    daemon.await_phase("waiting").await;
+    let reply = daemon.admin(plain_init()).await;
+    assert!(
+        matches!(reply, AdminReply::Formed { .. }),
+        "expected the cluster to form, got {reply:?}"
+    );
+    daemon.await_phase("voter").await;
+
+    for path in [&paths.ca, &paths.cert, &paths.key] {
+        assert!(path.exists(), "formation installs {}", path.display());
+    }
+    // The leaf the daemon serves chains to the CA it just minted, so the trio
+    // is one coherent install rather than three files that happen to exist.
+    let (ca_pem, cert_pem, _) = daemon.tls_material();
+    coppice_tls::pki::verify_leaf(&ca_pem, &cert_pem)
+        .expect("the installed leaf chains to the cluster CA");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&pki_dir)
+            .expect("the pki dir exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "private keys live here: got {mode:04o}");
+    }
+
+    daemon.stop().await.expect("formed daemon stops cleanly");
+}
+
 #[tokio::test]
 async fn re_running_init_reports_already_initialized() {
     let ca = Ca::new();
@@ -661,14 +716,7 @@ async fn init_is_refused_when_discovery_names_an_already_initialized_cluster() {
     // other CA fails the handshake, and an unanswerable candidate is skipped,
     // not refused.
     let mut newcomer = Daemon::new(cluster_id, &ca);
-    let root = newcomer
-        .data_dir()
-        .parent()
-        .expect("data dir has a parent")
-        .to_path_buf();
-    std::fs::write(root.join("ca.crt"), &cluster_ca).expect("write cluster ca");
-    std::fs::write(root.join("node.crt"), &cluster_cert).expect("write cluster cert");
-    std::fs::write(root.join("node.key"), &cluster_key).expect("write cluster key");
+    newcomer.install_tls_material(&cluster_ca, &cluster_cert, &cluster_key);
     newcomer.set_static_discovery(&[existing.raft_target()]);
     newcomer.start();
     newcomer.await_phase("waiting").await;
@@ -823,13 +871,7 @@ async fn assert_failed_and_closed(daemon: &mut Daemon, ca: &Ca) {
 /// drop it — the "crashed after `raft.initialize`" state.
 async fn initialize_raft_history(daemon: &Daemon, _ca: &Ca) {
     let root = daemon.data_dir();
-    let certs = root.parent().expect("tempdir root");
-    let tls = coppice_tls::TlsStore::load(coppice_tls::TlsPaths {
-        cert: certs.join("node.crt"),
-        key: certs.join("node.key"),
-        ca: certs.join("ca.crt"),
-    })
-    .expect("load tls store");
+    let tls = coppice_tls::TlsStore::load(daemon.tls_paths()).expect("load tls store");
 
     let started = coppice_consensus::start(
         NodeOptions {

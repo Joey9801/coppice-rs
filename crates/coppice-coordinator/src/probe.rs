@@ -55,10 +55,11 @@ fn creds(cfg: &Config) -> Result<Arc<ProbeCreds>> {
     let read = |path: &std::path::Path| {
         std::fs::read(path).with_context(|| format!("reading TLS material {}", path.display()))
     };
+    let paths = cfg.tls_paths();
     Ok(Arc::new(ProbeCreds {
-        ca: read(&cfg.tls.ca_path)?,
-        cert: read(&cfg.tls.cert_path)?,
-        key: read(&cfg.tls.key_path)?,
+        ca: read(&paths.ca)?,
+        cert: read(&paths.cert)?,
+        key: read(&paths.key)?,
         cluster_id: cfg.cluster_id.to_string(),
     }))
 }

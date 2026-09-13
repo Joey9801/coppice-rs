@@ -1,7 +1,7 @@
 //! Coordinator leaf renewal (ADR 0037 §4).
 //!
 //! Short leaf lifetimes are only free if renewal is automatic, so every replica
-//! runs this: watch the leaf currently in `[tls]`, re-issue it at about two
+//! runs this: watch the leaf currently under `<data_dir>/pki`, re-issue it at about two
 //! thirds of its lifetime, install the result, and let the hot-reload store
 //! swap it in without a restart or a dropped connection.
 //!
@@ -681,11 +681,7 @@ mod tests {
 
     #[test]
     fn the_generated_jitter_stays_in_range() {
-        let paths = TlsPaths {
-            cert: "/etc/coppice/pki/node.crt".into(),
-            key: "/etc/coppice/pki/node.key".into(),
-            ca: "/etc/coppice/pki/ca.crt".into(),
-        };
+        let paths = TlsPaths::cluster_managed(std::path::Path::new("/var/lib/coppice"));
         for _ in 0..64 {
             let jitter = jitter_fraction(&paths);
             assert!((-JITTER..=JITTER).contains(&jitter), "{jitter}");

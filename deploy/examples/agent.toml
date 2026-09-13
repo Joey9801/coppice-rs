@@ -24,25 +24,17 @@ backend = "static"
 [discovery.static]
 addrs = ["ENV.coppice.jwjr.uk:7072"]
 
-[tls]
-# Absent on a fresh instance; written by enrollment below. The unit's
-# ReadWritePaths=/etc/coppice/pki is what lets that write through
-# ProtectSystem=strict.
-#
-# These are configurable paths rather than a fixed layout under data_dir
-# because externally issued material is a supported substitution at the same
-# paths (docs/operations/security.md, ADR 0037 §4): a Vault agent or config
-# management can own these files instead, and the daemon reads and
-# hot-reloads them either way. That the same table means "write here" or
-# "read this" depending on what is on disk is issue #127.
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+# No [tls] table: machine-plane material is entirely cluster-owned and lives
+# at the fixed layout `<data_dir>/pki/{node.crt,node.key,ca.crt}` under this
+# agent's own StateDirectory — not configurable (issue #127). Absent on a
+# fresh instance; written by enrollment below.
 
 [enrollment]
-# Same public endpoint and the same system-root verification as the
-# coordinators use; the secret is the `agent-launch` token from policy.toml,
-# dropped by cloud-init from an SSM SecureString before the unit starts.
+# REQUIRED for an agent — there is no other way to obtain machine-plane
+# material. Same public endpoint and the same system-root verification as
+# the coordinators use; the secret is the `agent-launch` token from
+# policy.toml, dropped by cloud-init from an SSM SecureString before the unit
+# starts.
 endpoint = "https://ENV.coppice.jwjr.uk"
 token_path = "/etc/coppice/enroll-token"
 

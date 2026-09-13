@@ -94,7 +94,7 @@
 //! # Trust before signature
 //!
 //! Every replica verifies its peers against the bundle in its own
-//! `[tls] ca_path`, and a replica that cannot verify the leader cannot dial
+//! `<data_dir>/pki/ca.crt` bundle, and a replica that cannot verify the leader cannot dial
 //! it — so it cannot renew, and renewal is the only thing that would otherwise
 //! hand it the new anchors. A rotation that switched signing before the fleet
 //! trusted the incoming root would therefore not merely be *slow* to converge;
@@ -289,7 +289,7 @@ pub struct RotationStatus {
     pub rotation_in_progress: bool,
     /// The pending root's serial, while one is staged.
     pub staged_root_serial: Option<String>,
-    /// Whether this daemon's on-disk `[tls] ca_path` bundle is the one the
+    /// Whether this daemon's on-disk `<data_dir>/pki/ca.crt` bundle is the one the
     /// cluster replicates — i.e. whether it *trusts* what the cluster records.
     ///
     /// Anchors and leaves move independently: a rotation records the incoming

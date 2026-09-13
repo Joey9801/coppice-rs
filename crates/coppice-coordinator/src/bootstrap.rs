@@ -43,7 +43,7 @@ use coppice_consensus::{
 use coppice_core::id::ClusterId;
 use coppice_net::admin::Server as AdminServer;
 use coppice_state::Command;
-use coppice_tls::{TlsPaths, TlsStore};
+use coppice_tls::TlsStore;
 
 use coppice_api::http::{MetricsEndpoint, ReadyzEndpoint};
 
@@ -170,7 +170,7 @@ pub async fn run_with(
     // The startup states that *serve consensus* still require material, so a
     // formed daemon whose certs went missing fails with the same clarity as
     // before.
-    let tls_paths = tls_paths(&resolved.config);
+    let tls_paths = resolved.config.tls_paths();
     let mut tls: Option<Arc<TlsStore>> = if [&tls_paths.cert, &tls_paths.key, &tls_paths.ca]
         .iter()
         .all(|p| p.exists())
@@ -859,20 +859,11 @@ async fn bind_client_listener(
     }
 }
 
-/// The config's `[tls]` paths as a [`TlsPaths`].
-pub(crate) fn tls_paths(cfg: &config::Config) -> TlsPaths {
-    TlsPaths {
-        cert: cfg.tls.cert_path.clone(),
-        key: cfg.tls.key_path.clone(),
-        ca: cfg.tls.ca_path.clone(),
-    }
-}
-
-/// Load the shared hot-reload TLS store from the config's `[tls]` paths
-/// (ADR 0011/0037 §4). Fails fast, naming the offending path, if any file is
-/// missing or unparseable.
+/// Load the shared hot-reload TLS store from the cluster-managed layout under
+/// the data directory (ADR 0011/0037 §4, issue #127). Fails fast, naming the
+/// offending path, if any file is missing or unparseable.
 fn load_tls_store(cfg: &config::Config) -> Result<Arc<TlsStore>> {
-    TlsStore::load(tls_paths(cfg)).context("loading coordinator TLS material (config [tls])")
+    TlsStore::load(cfg.tls_paths()).context("loading coordinator TLS material from <data_dir>/pki")
 }
 
 /// The error for a startup state that serves consensus without TLS material
@@ -880,12 +871,15 @@ fn load_tls_store(cfg: &config::Config) -> Result<Arc<TlsStore>> {
 /// belongs to (a parked daemon legitimately has no material yet).
 fn missing_tls_error(cfg: &config::Config) -> anyhow::Error {
     anyhow!(
-        "this data directory holds a cluster but the [tls] material is missing \
-         (cert {}, key {}, ca {}); a coordinator serving consensus must have valid \
-         machine credentials (ADR 0011)",
-        cfg.tls.cert_path.display(),
-        cfg.tls.key_path.display(),
-        cfg.tls.ca_path.display(),
+        "this data directory holds a cluster but its cluster-managed TLS material is \
+         missing from {} (expected {}, {}, {}); a coordinator serving consensus must \
+         have valid machine credentials (ADR 0011). The cluster owns this material \
+         (issue #127) — restore the data directory's contents rather than \
+         provisioning it by hand",
+        cfg.data_dir.join(coppice_tls::PKI_DIR).display(),
+        coppice_tls::NODE_CERT_FILE,
+        coppice_tls::NODE_KEY_FILE,
+        coppice_tls::CA_BUNDLE_FILE,
     )
 }
 

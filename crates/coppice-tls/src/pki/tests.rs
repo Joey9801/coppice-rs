@@ -595,3 +595,24 @@ fn installing_a_leaf_creates_the_pki_directory_owner_only() {
     // A second install into the now-existing directory is an ordinary write.
     install_leaf_material(&paths, &ca.cert_pem, &cert, &key).unwrap();
 }
+
+/// The layout itself, spelled out. Every producer and every reader of
+/// machine-plane material agrees on it by construction (issue #127), so the
+/// one thing left to hold is that the construction is what it claims: three
+/// fixed names under one fixed directory, and nothing derived from config.
+#[test]
+fn the_cluster_managed_layout_is_three_fixed_names_under_the_data_dir() {
+    let paths = crate::TlsPaths::cluster_managed(std::path::Path::new("/var/lib/coppice"));
+    assert_eq!(
+        paths.cert,
+        std::path::Path::new("/var/lib/coppice/pki/node.crt")
+    );
+    assert_eq!(
+        paths.key,
+        std::path::Path::new("/var/lib/coppice/pki/node.key")
+    );
+    assert_eq!(
+        paths.ca,
+        std::path::Path::new("/var/lib/coppice/pki/ca.crt")
+    );
+}

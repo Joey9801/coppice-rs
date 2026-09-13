@@ -57,22 +57,19 @@ pub struct Config {
     /// restart ([`crate::session::run`]).
     pub discovery: coppice_discovery::SeedConfig,
 
-    /// mTLS material for the session transport (ADR 0011). Required: there is
-    /// no insecure fallback.
-    pub tls: TlsConfig,
-
-    /// How this agent obtains the `[tls]` material when it has none
-    /// (ADR 0037 §4/§8). Optional and absent by default: an agent whose leaf
-    /// is provisioned out of band — `coppice dev`, an external PKI, a
-    /// configuration-management drop — needs no `[enrollment]` table and never
-    /// contacts the enrollment endpoint. When present, the daemon enrolls at
-    /// startup if and only if the `[tls]` files are not already usable.
+    /// How this agent obtains its machine-plane mTLS material (ADR 0037 §4/§8,
+    /// issue #127). **Required**: the cluster owns that material outright and
+    /// enrollment is the only thing that ever puts a leaf on a worker, so an
+    /// agent without this table could never register at all.
+    ///
+    /// Enrolling is not a per-boot cost: with a usable leaf already installed
+    /// at [`Config::tls_paths`] the startup step makes no network call and
+    /// never reads the token, so restarts are free.
     ///
     /// The table's shape and its posture rules live in `coppice-enroll` rather
     /// than here: the coordinator parses the identical table, and `insecure`
     /// must mean exactly one thing on both sides.
-    #[serde(default)]
-    pub enrollment: Option<coppice_enroll::EnrollmentConfig>,
+    pub enrollment: coppice_enroll::EnrollmentConfig,
 
     /// Per-dimension **overrides** over what the host reports
     /// (deployment-story A3). Optional whole, and optional per field: capacity
@@ -433,15 +430,6 @@ impl TelemetryConfig {
     }
 }
 
-/// mTLS material (ADR 0011). Secrets by path reference only.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TlsConfig {
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
-    pub ca_path: PathBuf,
-}
-
 /// Capacity overrides (deployment-story A3: detected at startup, configured
 /// only to override).
 ///
@@ -501,6 +489,15 @@ impl Default for ReservationConfig {
 }
 
 impl Config {
+    /// Where this agent's machine-plane mTLS material lives (issue #127).
+    ///
+    /// Not configurable: the cluster is the sole owner of the agent's leaf,
+    /// key, and trust anchor, so enrollment and renewal write the one fixed
+    /// `<data_dir>/pki` layout the reload store reads.
+    pub fn tls_paths(&self) -> coppice_tls::TlsPaths {
+        coppice_tls::TlsPaths::cluster_managed(&self.data_dir)
+    }
+
     /// Settle this host's capacity: detection, then overrides, then the
     /// reservation (deployment-story A3, §6.4).
     ///
@@ -658,11 +655,9 @@ impl Config {
         // The enrollment endpoint's transport posture is a startup decision, not
         // a first-enrollment one (ADR 0037 §4): an `http://` endpoint without
         // the opt-in fails here, with no fallback.
-        if let Some(enrollment) = &self.enrollment {
-            enrollment
-                .validate()
-                .map_err(|e| anyhow::anyhow!("[enrollment]: {e}"))?;
-        }
+        self.enrollment
+            .validate()
+            .map_err(|e| anyhow::anyhow!("[enrollment]: {e}"))?;
         if let Some(listen) = &self.listen {
             if listen.advertise_host.trim().is_empty() {
                 anyhow::bail!(
@@ -682,14 +677,12 @@ impl Config {
     /// declared posture, and *which kind* of token source is configured are
     /// logged — never the secret, from either source (ADR 0037 §4).
     pub fn log_effective(&self) {
-        if let Some(enrollment) = &self.enrollment {
-            tracing::info!(
-                endpoint = %enrollment.endpoint,
-                insecure = enrollment.insecure,
-                token_source = enrollment.token_kind(),
-                "enrollment configured; a missing [tls] leaf will be obtained at startup"
-            );
-        }
+        tracing::info!(
+            endpoint = %self.enrollment.endpoint,
+            insecure = self.enrollment.insecure,
+            token_source = self.enrollment.token_kind(),
+            "enrollment configured; a missing cluster leaf will be obtained at startup"
+        );
         tracing::info!(
             data_dir = %self.data_dir.display(),
             discovery_backend = self.discovery.backend.as_str(),
@@ -895,10 +888,9 @@ backend = "static"
 [discovery.static]
 addrs = ["coord-1.example.com:7072", "coord-2.example.com:7072"]
 
-[tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+[enrollment]
+endpoint = "https://coord-1.example.com:7070"
+token_path = "/etc/coppice/enroll-token"
 
 [capacity]
 cpu_millis   = 32000
@@ -960,13 +952,14 @@ advertise_host = "node-3.batch.example.com"
     /// below so [`minimal_with`] can splice a fragment between them: TOML puts
     /// every bare key after a table header *inside* that table, so a test
     /// appending `heartbeat_interval = …` to a whole document would silently be
-    /// testing a key of `[tls]`.
+    /// testing a key of `[discovery]`.
     const MINIMAL_TOP: &str = r#"
 data_dir = "/var/lib/coppice-agent"
 "#;
 
     /// The required tables of a minimal config: a `[discovery]` section with
-    /// one seed, and the mTLS trio. No `[capacity]` — it is detected
+    /// one seed, and the `[enrollment]` table that is the only way an agent
+    /// obtains its leaf (issue #127). No `[capacity]` — it is detected
     /// (deployment-story A3), and an absent section is the ordinary shape.
     const MINIMAL_TABLES: &str = r#"
 [discovery]
@@ -975,10 +968,9 @@ backend = "static"
 [discovery.static]
 addrs = ["coord-1.example.com:7072"]
 
-[tls]
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+[enrollment]
+endpoint = "https://coord-1.example.com:7070"
+token_path = "/etc/coppice/enroll-token"
 "#;
 
     /// A minimal config with `extra` (bare keys, tables, or both) spliced in
@@ -999,7 +991,7 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         let config = load(&path).expect("deploy example should parse");
 
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/coppice-agent"));
-        assert!(config.enrollment.is_some());
+        config.enrollment.validate().expect("enrollment section");
         // `[listen]` is what makes job logs fetchable off-node (ADR 0034), and
         // an advertise host is mandatory once it is present.
         let listen = config
@@ -1282,10 +1274,62 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         assert!(message.contains("addrs"), "{message}");
     }
 
+    /// The machine plane is derived from `data_dir` alone, so the old `[tls]`
+    /// trio is not ignored — it fails the load, naming the section (#127).
+    #[test]
+    fn an_obsolete_tls_section_is_rejected() {
+        let (_guard, path) = write_config(&minimal_with(
+            "[tls]\ncert_path = \"a\"\nkey_path = \"b\"\nca_path = \"c\"",
+        ));
+        let err = load(&path).expect_err("[tls] is no longer a configurable section");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("tls"),
+            "error names the section: {message}"
+        );
+    }
+
+    /// Enrollment is the only way a leaf reaches a worker, so an agent config
+    /// without the table cannot start (#127).
+    #[test]
+    fn a_missing_enrollment_section_is_rejected() {
+        let without = MINIMAL_TABLES
+            .split("[enrollment]")
+            .next()
+            .expect("the fixture has an [enrollment] table");
+        let (_guard, path) = write_config(&format!("{MINIMAL_TOP}\n{without}"));
+        let err = load(&path).expect_err("[enrollment] is required");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("enrollment"),
+            "error names the section: {message}"
+        );
+    }
+
+    /// Machine-plane material is named nowhere in the file: it is exactly the
+    /// fixed layout under `data_dir` (#127).
+    #[test]
+    fn tls_paths_are_the_fixed_layout_under_the_data_dir() {
+        let (_guard, path) = write_config(&minimal_with(""));
+        let config = load(&path).expect("minimal config parses");
+        let paths = config.tls_paths();
+        assert_eq!(
+            paths.cert,
+            PathBuf::from("/var/lib/coppice-agent/pki/node.crt")
+        );
+        assert_eq!(
+            paths.key,
+            PathBuf::from("/var/lib/coppice-agent/pki/node.key")
+        );
+        assert_eq!(paths.ca, PathBuf::from("/var/lib/coppice-agent/pki/ca.crt"));
+    }
+
     #[test]
     fn a_missing_discovery_section_is_rejected() {
-        let bad =
-            format!("{MINIMAL_TOP}\n[tls]\ncert_path = \"a\"\nkey_path = \"b\"\nca_path = \"c\"\n");
+        let bad = format!(
+            "{MINIMAL_TOP}\n[enrollment]\nendpoint = \"https://coord-1.example.com:7070\"\n\
+             token_path = \"/etc/coppice/enroll-token\"\n"
+        );
         let (_guard, path) = write_config(&bad);
         let err = load(&path).expect_err("[discovery] is required");
         assert!(format!("{err:#}").contains("discovery"));
@@ -1298,7 +1342,8 @@ ca_path   = "/etc/coppice/pki/ca.crt"
         let toml = format!(
             "{MINIMAL_TOP}\n[discovery]\nbackend = \"dns\"\n\n[discovery.dns]\n\
              name = \"coordinators.example.com\"\nport = 7072\n\n\
-             [tls]\ncert_path = \"a\"\nkey_path = \"b\"\nca_path = \"c\"\n"
+             [enrollment]\nendpoint = \"https://coord-1.example.com:7070\"\n\
+             token_path = \"/etc/coppice/enroll-token\"\n"
         );
         let (_guard, path) = write_config(&toml);
         let config = load(&path).expect("a dns backend is valid for an agent");
