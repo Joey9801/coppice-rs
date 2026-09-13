@@ -276,8 +276,9 @@ pub struct LostAttempt {
 /// Node (re)registration.
 ///
 /// Re-registration bumps the node epoch, fencing all commands issued under
-/// earlier epochs; the drain flag survives (an agent restart must not undo
-/// an admin's drain).
+/// earlier epochs; the admin cordon survives (an agent restart must not undo
+/// an admin's drain), while the agent's own `draining` announcement is
+/// rewritten from this report (ADR 0041).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterNode {
     pub node: NodeId,
@@ -295,6 +296,11 @@ pub struct RegisterNode {
     /// `[capacity]` overrides, so a reader can explain an advertised capacity
     /// that differs from the hardware.
     pub detected_capacity: Option<Resources>,
+    /// Whether the registering agent is shutting down (ADR 0041), from its
+    /// `Register` report. Written to [`crate::NodeRecord::draining`] on every
+    /// registration, so an agent that comes back clears the announcement at
+    /// the same log position that bumps the epoch.
+    pub draining: bool,
 }
 
 /// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,

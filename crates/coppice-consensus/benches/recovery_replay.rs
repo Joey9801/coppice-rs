@@ -75,6 +75,7 @@ fn register_node_command() -> Command {
         service_addr: None,
         host_facts: None,
         detected_capacity: None,
+        draining: false,
     })
 }
 

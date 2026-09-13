@@ -141,6 +141,7 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Co
         service_addr: None,
         host_facts: None,
         detected_capacity: None,
+        draining: false,
     })
 }
 

@@ -864,6 +864,7 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
                     detected_capacity: None,
                 },
                 epoch,
+                draining: false,
             },
         ));
     }

@@ -567,6 +567,24 @@ pub struct NodeRecord {
     /// Bumped on (re)registration and on loss declaration; invalidates all
     /// coordinator→agent commands issued under earlier epochs (ADR 0009).
     pub epoch: u64,
+    /// The agent's own announcement that it is shutting down (ADR 0041).
+    ///
+    /// Distinct from the admin cordon [`Node::schedulable`]. Set from the
+    /// agent's reports and **cleared by a re-registration whose report does
+    /// not carry it**, so an agent restart never leaves a node permanently
+    /// drained, while an operator's drain survives it.
+    pub draining: bool,
+}
+
+impl NodeRecord {
+    /// The single placement gate (ADR 0041): the admin has not cordoned the
+    /// node *and* the agent has not announced that it is leaving. Everything
+    /// that decides "may this node take new work" asks this, so the two
+    /// flags can never disagree. Display surfaces that report the cordon
+    /// itself still read [`Node::schedulable`] directly.
+    pub fn accepts_placements(&self) -> bool {
+        self.node.schedulable && !self.draining
+    }
 }
 
 /// One node of the quota-entity tree.

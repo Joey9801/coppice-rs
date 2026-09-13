@@ -158,6 +158,10 @@ struct SimAccrual {
 /// packing loops read capacity and labels without a map lookup.
 struct NodeModel<'a> {
     node: &'a Node,
+    /// Whether this node may take new work: the record's
+    /// `NodeRecord::accepts_placements` gate (ADR 0041), captured once per
+    /// pass so every candidate filter asks the same question apply will.
+    accepts_placements: bool,
     /// Free capacity mirroring `free_capacity`, decremented as the batch seats
     /// work and incremented (then re-pledged) as it revokes accruals.
     sim_free: Resources,
@@ -226,9 +230,9 @@ impl<'a> Pass<'a> {
         let mut node_index: BTreeMap<NodeId, usize> = BTreeMap::new();
         for (id, rec) in &snapshot.nodes {
             let hosts_accrual = accrual_nodes.contains(id);
-            // Unschedulable nodes matter only as accrual sources to re-plan
-            // off of; a drained node with no accruals is dead weight.
-            if !rec.node.schedulable && !hosts_accrual {
+            // Nodes that refuse placements matter only as accrual sources to
+            // re-plan off of; a drained node with no accruals is dead weight.
+            if !rec.accepts_placements() && !hosts_accrual {
                 continue;
             }
             let mut accruals: Vec<SimAccrual> = Vec::new();
@@ -260,6 +264,7 @@ impl<'a> Pass<'a> {
             node_index.insert(*id, idx);
             nodes.push(NodeModel {
                 node: &rec.node,
+                accepts_placements: rec.accepts_placements(),
                 sim_free: base_free.get(id).copied().unwrap_or(Resources::ZERO),
                 accruals,
                 events: evs,
@@ -339,7 +344,7 @@ impl<'a> Pass<'a> {
     }
 
     /// Re-plan existing accruals (scheduling-model.md): if a distinct
-    /// accruing job's full request now fits on another schedulable node,
+    /// accruing job's full request now fits on another placement-accepting node,
     /// revoke its accrual and reseat it there, funded. Failing that, move it
     /// to a node that meaningfully improves its `projected_ready` bound
     /// (ADR 0027): always when the move turns an indefinite bound finite,
@@ -507,7 +512,7 @@ impl<'a> Pass<'a> {
         Some(sweep_projected_ready(&nm.events, &needs)[pos])
     }
 
-    /// Best node — schedulable, not the source, not already a revocation
+    /// Best node — accepting placements, not the source, not already a revocation
     /// source — that gives the moved accrual a finite `projected_ready`
     /// meaningfully better than `current` (ADR 0027): any finite bound when
     /// `current` is indefinite, otherwise earlier by at least the configured
@@ -522,7 +527,7 @@ impl<'a> Pass<'a> {
     ) -> Option<usize> {
         let mut best: Option<(Timestamp, f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if nm.node.id == source || !nm.node.schedulable {
+            if nm.node.id == source || !nm.accepts_placements {
                 continue;
             }
             if self.revoked_nodes.contains(&nm.node.id) {
@@ -576,7 +581,7 @@ impl<'a> Pass<'a> {
         best.map(|(_, _, i)| i)
     }
 
-    /// Best schedulable node — other than `source`, accrual-free, and not
+    /// Best placement-accepting node — other than `source`, accrual-free, and not
     /// already a revocation source — whose free capacity holds the whole
     /// request. Accrual-free keeps the target off any future revocation, so the
     /// batch never places-then-revokes on one node.
@@ -589,7 +594,7 @@ impl<'a> Pass<'a> {
     ) -> Option<usize> {
         let mut best: Option<(f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if nm.node.id == source || !nm.node.schedulable || !nm.accruals.is_empty() {
+            if nm.node.id == source || !nm.accepts_placements || !nm.accruals.is_empty() {
                 continue;
             }
             if self.revoked_nodes.contains(&nm.node.id) {
@@ -687,7 +692,7 @@ impl<'a> Pass<'a> {
     ) -> bool {
         let mut best: Option<(f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if !nm.node.schedulable
+            if !nm.accepts_placements
                 || !requested.fits_within(&nm.node.capacity)
                 || !node_satisfies_labels(required, &nm.node.labels)
                 || !requested.fits_within(&nm.sim_free)
@@ -744,7 +749,7 @@ impl<'a> Pass<'a> {
         let deadline = self.now + runtime;
         let mut best: Option<(f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if !nm.node.schedulable || nm.accruals.is_empty() {
+            if !nm.accepts_placements || nm.accruals.is_empty() {
                 continue;
             }
             // A lend reseats every survivor on the same node, so the node ends
@@ -875,7 +880,7 @@ impl<'a> Pass<'a> {
         }
         let mut best: Option<(Option<Timestamp>, f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if !nm.node.schedulable
+            if !nm.accepts_placements
                 || !requested.fits_within(&nm.node.capacity)
                 || !node_satisfies_labels(required, &nm.node.labels)
             {
@@ -1226,6 +1231,7 @@ mod tests {
                     detected_capacity: None,
                 },
                 epoch: 1,
+                draining: false,
             },
         );
         sm

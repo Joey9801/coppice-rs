@@ -40,6 +40,7 @@ pub fn node_record(id: NodeId, epoch: u64, schedulable: bool) -> NodeRecord {
             detected_capacity: None,
         },
         epoch,
+        draining: false,
     }
 }
 

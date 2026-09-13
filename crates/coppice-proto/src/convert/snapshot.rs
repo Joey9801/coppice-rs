@@ -131,6 +131,7 @@ impl From<&NodeRecord> for pb::NodeRecord {
         pb::NodeRecord {
             node: Some((&r.node).into()),
             epoch: r.epoch,
+            draining: r.draining,
         }
     }
 }
@@ -142,6 +143,7 @@ impl TryFrom<pb::NodeRecord> for NodeRecord {
         Ok(NodeRecord {
             node: req(r.node, "NodeRecord.node")?.try_into()?,
             epoch: r.epoch,
+            draining: r.draining,
         })
     }
 }

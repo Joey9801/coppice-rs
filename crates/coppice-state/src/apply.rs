@@ -491,7 +491,9 @@ impl StateMachine {
         let Some(node) = self.nodes.get(&spec.node) else {
             return Some(RejectionReason::UnknownNode(spec.node));
         };
-        if !node.node.schedulable {
+        // One gate for both reasons a node refuses work (ADR 0041): the
+        // admin cordon and the agent's own shutdown announcement.
+        if !node.accepts_placements() {
             return Some(RejectionReason::NodeNotSchedulable(spec.node));
         }
         if !spec.requested.fits_within(&node.node.capacity) {
@@ -784,9 +786,14 @@ impl StateMachine {
         match self.nodes.get_mut(&c.node) {
             Some(rec) => {
                 // Re-registration: the epoch bump fences every command issued
-                // under earlier epochs (ADR 0009). Drain survives — desired
-                // state owned by the admin, not the agent's restart.
+                // under earlier epochs (ADR 0009). The admin cordon survives —
+                // desired state owned by the admin, not the agent's restart.
                 rec.epoch += 1;
+                // The agent's own announcement is rewritten from this report
+                // (ADR 0041): an agent that registers again has, by
+                // definition, not gone away, so a report without the flag
+                // voids the earlier "I am leaving".
+                rec.draining = c.draining;
                 rec.node.capacity = c.capacity;
                 rec.node.labels = c.labels.clone();
                 // Overwrite the advertised address like capacity/labels: an
@@ -818,6 +825,7 @@ impl StateMachine {
                             detected_capacity: c.detected_capacity,
                         },
                         epoch: 1,
+                        draining: c.draining,
                     },
                 );
                 events.push(Event::NodeEpochBumped {

@@ -784,6 +784,7 @@ mod tests {
                     detected_capacity: None,
                 },
                 epoch: 1,
+                draining: false,
             },
         )
     }

@@ -172,12 +172,15 @@ async fn declare_lost_nodes<C: Consensus>(
 }
 
 /// The nodes whose last report is older than [`AGENT_LIVENESS_DEADLINE`] and
-/// that are still schedulable or hold a non-`Released` allocation.
+/// that still accept placements or hold a non-`Released` allocation.
 ///
-/// The schedulable-or-live-allocations guard is what stops us re-declaring an
-/// already-lost silent node every tick: `DeclareNodeLost` leaves the node
-/// unschedulable with all its allocations `Released`, so a second declaration
-/// is neither needed nor emitted. A node not yet tracked in the liveness map
+/// The accepts-placements-or-live-allocations guard is what stops us
+/// re-declaring an already-lost silent node every tick: `DeclareNodeLost`
+/// leaves the node unschedulable with all its allocations `Released`, so a
+/// second declaration is neither needed nor emitted. An agent that announced
+/// its own shutdown (ADR 0041) and then went quiet with nothing left running
+/// is the same case: it has already stopped taking work, and its record is
+/// the retention GC's to collect. A node not yet tracked in the liveness map
 /// (no report and no seed) is left alone — real nodes are always seeded on
 /// leadership gain and marked on every report.
 fn stale_nodes(view: &StateView, liveness: &NodeLiveness, now: Instant) -> Vec<NodeId> {
@@ -193,7 +196,7 @@ fn stale_nodes(view: &StateView, liveness: &NodeLiveness, now: Instant) -> Vec<N
         let has_live_allocation = view.state().allocations.values().any(|a| {
             a.allocation.node == *node_id && a.allocation.state != AllocationState::Released
         });
-        if node_record.node.schedulable || has_live_allocation {
+        if node_record.accepts_placements() || has_live_allocation {
             out.push(*node_id);
         }
     }

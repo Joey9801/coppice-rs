@@ -407,6 +407,7 @@ impl From<&RegisterNode> for pb::RegisterNode {
             service_addr: c.service_addr.clone(),
             host_facts: c.host_facts.as_ref().map(Into::into),
             detected_capacity: c.detected_capacity.as_ref().map(Into::into),
+            draining: c.draining,
         }
     }
 }
@@ -424,6 +425,7 @@ impl TryFrom<pb::RegisterNode> for RegisterNode {
             service_addr: c.service_addr.filter(|s| !s.is_empty()),
             host_facts: c.host_facts.map(Into::into),
             detected_capacity: c.detected_capacity.map(Resources::try_from).transpose()?,
+            draining: c.draining,
         })
     }
 }
