@@ -74,9 +74,10 @@ the operational workflow is described in
   system roots — never TOFU, no CA-pin distribution, single-phase
   bringup; renewal rides the internal mTLS services). Subjects are
   cluster-minted, so stability and uniqueness hold by construction. The
-  coordinator gains cert reload without restart; external PKI
-  (Vault-style leaves, config-managed certs) remains a supported
-  substitution, never a requirement.
+  coordinator gains cert reload without restart. The cluster exclusively
+  owns this material — there is no externally provisioned substitution
+  for the machine plane (issue #127); it always lives at the fixed
+  `<data_dir>/pki` layout.
 - **C4, rolling upgrade** → replacement is "start the new machine".
   A dead predecessor's removal rides the newcomer's promotion joint
   change on the leader's own replication evidence
@@ -156,8 +157,9 @@ accounted root-equivalent — and the leader signs. Tokens are salted
 hashes in replicated
 policy — listable and revocable with a policy write, with the stated
 caveat that token revocation stops future enrollments but does not
-recall already-issued leaves. Vault-style external issuance remains a
-substitution behind the same `[tls]` paths, not a dependency.
+recall already-issued leaves. There is no externally provisioned mode
+for the machine plane (issue #127) — the cluster owns this material end
+to end at the fixed `<data_dir>/pki` layout.
 
 **A3 — capacity autodetect, landed.** cpu/memory/disk are detected at
 startup (`available_parallelism` ∩ the cgroup v2 `cpu.max` quota,

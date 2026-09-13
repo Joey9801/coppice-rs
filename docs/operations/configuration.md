@@ -20,7 +20,7 @@ node want a different value than its peers?* → config file.
 | --- | --- |
 | Listen/advertise addresses, ports | config file |
 | Data directory | config file (the raft node id is *not* config: minted at init and read from the disk stamp, [ADR 0025](../decisions/0025-self-minted-coordinator-identity.md)) |
-| Machine-plane TLS paths (`[tls]`); client-listener TLS paths (`[client_tls]`); enrollment token path and endpoint | config file |
+| Client-listener TLS paths (`[client_tls]`); enrollment token path and endpoint | config file (machine-plane TLS material is cluster-owned at a fixed path — not configurable) |
 | History sink mode (`[history]`) | config file (declares *how* history is retained; the TTL it retains against is policy — [ADR 0012](../decisions/0012-data-retention.md)) |
 | Discovery backend and `cluster_size` | config file (seed-only; consulted before replicated state is reachable — [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md)) |
 | Enrollment tokens (hashes), issued-identity revocations | replicated policy (ADR 0037) |
@@ -69,11 +69,23 @@ Conventions (all from ADR 0020):
   There is no environment-variable layer.
 - **No hot reload of the config file.** Changes take effect on restart;
   coordinator restarts are designed to be cheap (rolling restart with
-  learner catch-up). The one deliberate exception is the key material the
-  file *points to*: files under `[tls]` paths reload without restart
-  (mtime watch, or SIGHUP to force — ADR 0037), so certificate rotation
-  never recycles processes.
+  learner catch-up). The one deliberate exception is key material: the
+  cluster-owned machine-plane files at `<data_dir>/pki` and the
+  `[client_tls]` paths both reload without restart (mtime watch, or SIGHUP
+  to force — ADR 0037), so certificate rotation never recycles processes.
 - The effective configuration is logged in full at startup.
+
+**Machine-plane material is not configured.** The leaf served on the raft
+and agent-gateway listeners, and each node's client identity toward peers,
+is entirely cluster-owned and always lives at the fixed layout
+`<data_dir>/pki/{node.crt,node.key,ca.crt}`, written by formation,
+enrollment, renewal and re-rooting (issue #127). There is no `[tls]` table
+and no externally provisioned mode for it — see the amendments to
+[ADR 0020](../decisions/0020-node-config-vs-replicated-policy.md) and
+[ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md).
+This is separate from `[client_tls]` below, the user-facing HTTP
+listener's serving certificate, which does support an externally issued
+cert, a TLS-terminating load balancer, or explicit `insecure = true`.
 
 ### Annotated coordinator example
 
@@ -203,25 +215,23 @@ m_cost_kib = 19456  # memory cost in KiB
 t_cost = 2          # iteration count
 p_cost = 1          # parallelism lanes
 
-[tls]
-# MACHINE PLANE ONLY: the leaf served on the raft and agent-gateway
-# listeners, and this node's client identity toward peers. The trust
-# root is the cluster-owned CA minted at formation (ADR 0037); these
-# files are written by formation (the forming node) or enrollment (every
-# other machine), hot-reloaded on change, and externally-issued certs
-# are a supported substitution at the same paths. They may be ABSENT on
-# a fresh installation: a daemon with no material still parks and
+# No [tls] table. MACHINE-PLANE material — the leaf served on the raft and
+# agent-gateway listeners, and this node's client identity toward peers — is
+# entirely cluster-owned and lives at the fixed layout
+# `<data_dir>/pki/{node.crt,node.key,ca.crt}`; there is no config key for it
+# (issue #127). The trust root is the cluster-owned CA minted at formation
+# (ADR 0037); those files are written by formation (the forming node) or
+# enrollment (every other machine), and hot-reloaded on change. They may be
+# ABSENT on a fresh installation: a daemon with no material still parks and
 # accepts `coordinator init`, which mints the first certificates. This
-# cert is never served on the user-facing listener below.
-cert_path = "/etc/coppice/pki/node.crt"
-key_path  = "/etc/coppice/pki/node.key"
-ca_path   = "/etc/coppice/pki/ca.crt"
+# material is never served on the user-facing listener below.
 
 [client_tls]
 # REQUIRED — there is no default posture. A missing table, a half-filled
 # one (cert without key), or one claiming both modes is a startup error
 # naming both options.
-# USER-FACING HTTP API listener (ADR 0037 §4): an externally signed
+# USER-FACING HTTP API listener (ADR 0037 §4), distinct from the
+# cluster-owned machine-plane material above: an externally signed
 # serving certificate (browsers won't trust the cluster's private root),
 # or sit behind a TLS-terminating LB, or `insecure = true` (conspicuous
 # dev-only opt-in; mutually exclusive with the paths; the SERVING-side
@@ -230,10 +240,10 @@ ca_path   = "/etc/coppice/pki/ca.crt"
 # endpoint — enrollment clients verify it with ordinary system-root
 # hostname verification, which is why no cluster-CA pin distribution
 # exists. Independent of the serving cert, operator-profile *client*
-# certificates presented here are verified against the cluster CA from
-# [tls] (ADR 0022 break-glass).
-cert_path = "/etc/coppice/pki/api.example.com.crt"
-key_path  = "/etc/coppice/pki/api.example.com.key"
+# certificates presented here are verified against the cluster CA at
+# `<data_dir>/pki/ca.crt` (ADR 0022 break-glass).
+cert_path = "/etc/coppice/client-tls/api.example.com.crt"
+key_path  = "/etc/coppice/client-tls/api.example.com.key"
 
 [history]
 # REQUIRED — there is no default and the mode is never inferred from a

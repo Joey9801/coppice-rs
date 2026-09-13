@@ -393,8 +393,9 @@ under an explicit custody invariant — and coordinators and agents
 obtain leaves via one token-authenticated
 public enrollment endpoint on the client listener, verified with
 ordinary system-root TLS (never TOFU, no CA-pin distribution,
-single-phase bringup; renewal on the internal mTLS services); external
-PKI is a substitution, not a requirement. Cluster-minted subjects anchor the machine self-service
+single-phase bringup; renewal on the internal mTLS services); there is
+no externally provisioned substitution for the machine plane (issue
+#127) — the cluster owns this material end to end. Cluster-minted subjects anchor the machine self-service
 membership grant amending ADRs 0022/0023 (one seat per installation
 identity); replacing a live voter is the explicit operator verb
 `ReplaceVoter{old,new}`, dead voters are removed on the leader's own
@@ -444,10 +445,11 @@ CA certificate replicated; the key never in replicated state, residing
 on voter disks plus any promotion candidate past the key-transfer gate,
 every recipient root-equivalent; the leader signs). Agents share the coordinators' public token-authenticated
 enrollment endpoint (system-root-verified TLS), role-scoped revocable
-tokens, and renewal-as-revocation-lever over their mTLS sessions;
-Vault-style external issuance remains a substitution behind the same
-`[tls]` paths. Enrollment has landed in the tree (PR #73, part of issue
-#47's chunk series), with the remaining OD-14/15(a) work limited to the
+tokens, and renewal-as-revocation-lever over their mTLS sessions; there
+is no externally provisioned substitution for the machine plane (issue
+#127) — the cluster owns this material end to end at the fixed
+`<data_dir>/pki` layout. Enrollment has landed in the tree (PR #73, part
+of issue #47's chunk series), with the remaining OD-14/15(a) work limited to the
 chunk 07 test matrix and re-root runbook. **Half (b) — drain and
 decommission — remains open.**
 

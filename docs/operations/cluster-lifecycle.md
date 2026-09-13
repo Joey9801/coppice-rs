@@ -135,13 +135,13 @@ plain-HTTP endpoint requires the conspicuous `insecure = true` opt-in
 (dev/test only — it exposes the token); a token configured against an
 unverified endpoint without it is a startup error. Renewal happens
 later over the machine-plane mTLS services, authenticated by the
-current leaf, preserving the subject — short-lived leaves are free.
-Externally-issued certificates remain a supported substitution via the
-same `[tls]` paths. Either way, changed files under `[tls]` reload
-without restart (or force with SIGHUP); rotation never requires
-recycling processes. Operators additionally hold an **operator-profile
-certificate** (ADR 0022) for the verbs machines may not call — the
-first one is minted by `init` at formation.
+current leaf, preserving the subject — short-lived leaves are free. This
+material always lives at the fixed layout `<data_dir>/pki` and is never
+externally provisioned; changed files there reload without restart (or
+force with SIGHUP); rotation never requires recycling processes. Operators
+additionally hold an **operator-profile certificate** (ADR 0022) for the
+verbs machines may not call — the first one is minted by `init` at
+formation.
 
 Config is byte-identical across replicas — addresses come from
 `advertise_host` defaulting per machine, seeds come from the `[discovery]`

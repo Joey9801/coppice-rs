@@ -260,9 +260,11 @@ insecure_open`), where every request resolves to a static anonymous actor
 that is likewise an implicit unscoped admin.
 
 TLS on the client listener follows the deployment posture (terminate here via
-the node-config `[tls]` server cert, or in front of it); it is config, not
-contract — except that operator-cert authentication requires terminating
-here, since a proxy in front leaves no peer certificate to verify.
+the node-config `[client_tls]` server cert, or in front of it); it is config,
+not contract — except that operator-cert authentication requires
+terminating here, since a proxy in front leaves no peer certificate to
+verify. That serving cert is distinct from the cluster-owned machine-plane
+material at `<data_dir>/pki`, which this listener never serves.
 
 ### Serving the UI
 

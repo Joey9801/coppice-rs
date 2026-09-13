@@ -123,6 +123,44 @@ overlap enough to earn it; pure value-parsing helpers can live in
 `coppice-core` (which stays I/O-free — file reading belongs to the
 binaries).
 
+### Amendment (2026-09-13, issue #127): machine-plane TLS is cluster-owned, not configured
+
+**Problem.** `[tls]` carried `cert_path`/`key_path`/`ca_path`, and the same
+three paths meant two different things depending on filesystem state: absent
+files plus `[enrollment]` meant the daemon obtained and wrote cluster-issued
+material, while existing files were treated as externally provisioned
+material to read and hot-reload. Inferring ownership from file existence is
+unsafe — a typo or a stale file silently selects the wrong behaviour. Making
+the external mode explicit instead (PR #138) exposed its real cost:
+certificate-derived node identity, replicated external trust anchors,
+mixed-provenance fleets and an unresolved interaction with CA rotation, none
+of it justified by a concrete deployment need.
+
+**Decision.** The `[tls]` table is removed from both coordinator and agent
+configs. Machine-plane material — the leaf served on the raft and
+agent-gateway listeners, and each node's client identity toward peers —
+always lives at the fixed layout `<data_dir>/pki/{node.crt,node.key,ca.crt}`,
+created by the daemon itself (owner-only, 0700). Formation mints and
+installs the founding coordinator's leaf and the cluster CA there; every
+other coordinator and every agent obtains its leaf through enrollment,
+which is now **required** in agent config (`[enrollment]` was previously
+optional). Renewal, trust-anchor adoption and re-rooting rewrite files at
+that same fixed location. There is no externally provisioned mode for the
+machine plane.
+
+This does not change `[client_tls]`, the separate posture for the
+user-facing HTTP listener: it keeps supporting an externally issued
+serving certificate, TLS termination in front of Coppice, or `insecure =
+true` for dev.
+
+**Consequences.** The data directory gains a fixed `pki/` layout, which
+retires the `/etc/coppice/pki` `ReadWritePaths=` exception in the systemd
+units (`ProtectSystem=strict` now covers `/etc/coppice` without a
+carve-out — see [deploy/systemd](../../deploy/systemd)). Every operational
+runbook that named `/etc/coppice/pki` now names the cluster-managed
+data-dir path instead (`docs/operations/re-rooting.md`, `security.md`,
+`configuration.md`).
+
 ## Consequences
 
 - The litmus test gives every future knob a home before it is written, and

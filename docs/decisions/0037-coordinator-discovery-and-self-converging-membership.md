@@ -928,6 +928,35 @@ Log scraping is removed from every workflow:
   `waiting`, HTTP 503 — visible, alive, and deliberately not "ready"; the
   same holds for `formation-failed`.
 
+### Amendment (2026-09-13, issue #127): machine-plane TLS is cluster-owned, not configured
+
+§4's "External PKI stays a substitution, not a requirement" bullet no
+longer holds. The substitution worked by inference — existing files at the
+`[tls]` paths were read, absent ones were enrolled for — so a typo or a stale
+file silently chose the wrong behaviour, and making the choice explicit
+(PR #138) showed that a genuine external machine-identity mode needs
+certificate-derived identity, replicated external anchors and a story for
+both CA rotations, which no deployment currently needs.
+
+**Decision.** The `[tls]` table is removed entirely. Machine-plane
+material — the leaf served on the raft and agent-gateway listeners, and
+each node's client identity toward peers — always lives at the fixed
+layout `<data_dir>/pki/{node.crt,node.key,ca.crt}`, written by formation
+(the founding coordinator), enrollment (every other machine), renewal and
+re-rooting exactly as this section describes, and the paths are no longer
+configurable. Agent config must now carry `[enrollment]` — it was
+previously optional. The client (HTTP API) listener's own TLS posture
+(`[client_tls]`) is unchanged: it still supports an externally issued
+certificate, a TLS-terminating load balancer, or explicit `insecure`.
+
+**Consequences.** The fixed cluster-managed layout retires the
+`/etc/coppice/pki` `ReadWritePaths=` exception from the systemd units
+(`ProtectSystem=strict` needs no carve-out for `/etc/coppice` any more).
+Re-rooting, security and configuration operations docs now name the
+data-dir path (`/var/lib/coppice/pki` on coordinators,
+`/var/lib/coppice-agent/pki` on agents) wherever they previously named
+`/etc/coppice/pki`.
+
 ## Consequences
 
 - **A minimal production deployment needs a DNS name, an OIDC issuer,
