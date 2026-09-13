@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -143,31 +143,136 @@ fn build_session(config: &Config, executor: FakeExecutor) -> Session<RealFs, Fak
     )
 }
 
-/// Spawn the real agent session runner; returns its task handle. The runner
-/// loops forever (connect, serve, reconnect), so a test stops it with
-/// [`stop_agent`].
-fn spawn_agent(config: Config, executor: FakeExecutor) -> JoinHandle<()> {
+/// A spawned agent: its task handle, the ADR 0041 shutdown watch that stands in
+/// for the SIGTERM a test must never raise at the process running it, and the
+/// operational listener serving `/healthz` and `/readyz` beside it.
+struct RunningAgent {
+    join: JoinHandle<anyhow::Result<()>>,
+    shutdown: watch::Sender<bool>,
+    /// `http://127.0.0.1:<port>` of this agent's operational listener.
+    probe_base: String,
+    /// The listener's own trigger — deliberately *not* `shutdown` (ADR 0041).
+    /// The daemon flips this only after the session loop returns, so the probes
+    /// keep answering for the whole drain; the harness mirrors that ordering
+    /// because it is the property under test.
+    listeners: watch::Sender<bool>,
+    listener_join: JoinHandle<()>,
+}
+
+impl RunningAgent {
+    /// `GET <probe_base><path>`, answering the status and decoded JSON body.
+    async fn probe(&self, path: &str) -> (reqwest::StatusCode, serde_json::Value) {
+        let response = reqwest::get(format!("{}{path}", self.probe_base))
+            .await
+            .expect("the agent's operational listener must answer");
+        let status = response.status();
+        let body = response.json().await.expect("a JSON probe body");
+        (status, body)
+    }
+
+    /// Ask the agent to drain, exactly as the daemon's signal handler would.
+    fn signal_shutdown(&self) {
+        self.shutdown.send(true).expect("the agent loop is running");
+    }
+
+    /// Whether the run loop has already returned.
+    fn has_exited(&self) -> bool {
+        self.join.is_finished()
+    }
+
+    /// Wait for the run loop to return, asserting it returned `Ok` — the drain
+    /// finished, rather than the loop falling out on an error.
+    async fn expect_clean_exit(self, deadline: Duration, label: &str) {
+        let outcome = tokio::time::timeout(deadline, self.join)
+            .await
+            .unwrap_or_else(|_| panic!("timed out after {deadline:?} waiting for: {label}"))
+            .expect("the agent task must not panic");
+        outcome.unwrap_or_else(|e| panic!("the agent must exit Ok ({label}): {e:#}"));
+        // The daemon's step 4, in the same order: the session loop has returned,
+        // so now — and only now — the operational listener is told to stop, and
+        // joined to observe it actually down.
+        let _ = self.listeners.send(true);
+        tokio::time::timeout(DEADLINE, self.listener_join)
+            .await
+            .expect("the operational listener must stop once the drain has finished")
+            .expect("the listener task must not panic");
+    }
+}
+
+/// Spawn the real agent session runner; returns its handle and its shutdown
+/// watch. The runner serves until it is drained
+/// ([`RunningAgent::signal_shutdown`]) or aborted ([`stop_agent`]).
+async fn spawn_agent(config: Config, executor: FakeExecutor) -> RunningAgent {
+    // The shared `/readyz` snapshot, wired exactly as `run_daemon_with_shutdown`
+    // wires it: the session writes it, the operational listener reads it, and
+    // the two know nothing of each other (ADR 0041).
     let session = build_session(&config, executor);
-    tokio::spawn(async move {
+    let health = coppice_agent::health::AgentHealth::new(node_identity(&config));
+    let session = session.with_health(health.clone());
+
+    // Two triggers, not one — the point of the fix this exercises. `shutdown`
+    // is the SIGTERM seam and starts a drain that can run for `shutdown_grace`;
+    // `listeners` is flipped only once the session loop has returned, so
+    // `/readyz` is still answering `draining` with a live `running` count for
+    // the whole of that window, which is what an ASG lifecycle hook polls.
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (listeners, listeners_rx) = watch::channel(false);
+
+    let listener = coppice_agent::metrics_server::prepare_listener(
+        format!("127.0.0.1:{}", free_port()).parse().unwrap(),
+    )
+    .await
+    .expect("bind the agent operational listener");
+    let probe_base = format!(
+        "http://{}",
+        listener.local_addr().expect("listener local addr")
+    );
+    // A process-local recorder (never installed globally — the test process
+    // hosts several agents), which is all `/metrics` needs; the probes below
+    // read `health`.
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let listener_join = coppice_agent::metrics_server::serve_until(
+        listener,
+        recorder.handle(),
+        coppice_agent::gather_metrics,
+        coppice_agent::usage::render_exposition,
+        health,
+        listeners_rx,
+    );
+
+    let join = tokio::spawn(async move {
         let tls = coppice_agent::load_tls_store(&config).expect("load agent tls store");
-        // The ADR 0041 drain seam: this harness stops its agent by aborting
-        // the task, so the shutdown watch it is given never flips.
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let _ = run(session, &config, tls, shutdown_rx).await;
-    })
+        run(session, &config, tls, shutdown_rx).await
+    });
+    RunningAgent {
+        join,
+        shutdown,
+        probe_base,
+        listeners,
+        listener_join,
+    }
 }
 
 /// Abort the agent and await its full drop, which releases the journal `LOCK`
-/// so a fresh instance can reopen the same data dir (ADR 0009 restart).
-async fn stop_agent(handle: JoinHandle<()>) {
-    handle.abort();
-    let _ = handle.await;
+/// so a fresh instance can reopen the same data dir (ADR 0009 restart). The
+/// ungraceful stop — a test that wants the drain uses
+/// [`RunningAgent::signal_shutdown`] instead.
+async fn stop_agent(agent: RunningAgent) {
+    agent.join.abort();
+    let _ = agent.join.await;
+    let _ = agent.listeners.send(true);
+    let _ = agent.listener_join.await;
 }
 
 // ---- state readers (all over the coordinator's published views) ----------
 
 fn node_epoch(views: &StateViews, node: NodeId) -> Option<u64> {
     views.latest().state().nodes.get(&node).map(|n| n.epoch)
+}
+
+/// The node record's agent-announced drain flag (ADR 0041), as replicated.
+fn node_draining(views: &StateViews, node: NodeId) -> Option<bool> {
+    views.latest().state().nodes.get(&node).map(|n| n.draining)
 }
 
 fn job_state(views: &StateViews, job: JobId) -> Option<JobState> {
@@ -266,13 +371,19 @@ struct RunningJob {
     attempt: AttemptId,
     alloc: AllocationId,
     executor: FakeExecutor,
-    agent: JoinHandle<()>,
+    agent: RunningAgent,
     agent_dir: tempfile::TempDir,
 }
 
 /// The shared prefix of tests 1, 2, and 4: boot + register + submit + reach
 /// attempt `Running` with the container started exactly once.
 async fn run_to_running() -> RunningJob {
+    run_to_running_with(|_| {}).await
+}
+
+/// [`run_to_running`] with a last look at the agent's config before it starts —
+/// the drain tests turn `shutdown_grace` down to something a test can wait out.
+async fn run_to_running_with(tweak: impl FnOnce(&mut Config)) -> RunningJob {
     let ca = Ca::new();
     let coord = RunningCoordinator::start(ClusterId::new(), &ca).await;
     poll(DEADLINE, "coordinator leadership", || {
@@ -284,13 +395,14 @@ async fn run_to_running() -> RunningJob {
     let node = NodeId::new();
     let agent_dir = tempfile::tempdir().expect("agent tempdir");
     let executor = FakeExecutor::new();
-    let config = agent_config(
+    let mut config = agent_config(
         node,
         agent_dir.path().join("data"),
         &coord.agent_endpoint,
         &ca,
     );
-    let agent = spawn_agent(config, executor.clone());
+    tweak(&mut config);
+    let agent = spawn_agent(config, executor.clone()).await;
 
     let views = coord.views();
 
@@ -424,7 +536,7 @@ async fn agent_restart_mid_run_converges_without_duplicate_execution() {
         &world.coord.agent_endpoint,
         &world.ca,
     );
-    let agent2 = spawn_agent(config2, executor2.clone());
+    let agent2 = spawn_agent(config2, executor2.clone()).await;
 
     // Re-registration bumps the node epoch (session re-established).
     poll(DEADLINE, "node epoch bumped on re-registration", || {
@@ -641,7 +753,7 @@ async fn host_facts_survive_registration_to_the_node_detail() {
         &coord.agent_endpoint,
         &ca,
     );
-    let agent = spawn_agent(config, FakeExecutor::new());
+    let agent = spawn_agent(config, FakeExecutor::new()).await;
 
     let views = coord.views();
     poll(DEADLINE, "node registered (epoch >= 1)", || {
@@ -733,7 +845,7 @@ async fn stale_fenced_command_is_rejected_by_the_agent() {
     let executor = FakeExecutor::new();
     let agent_dir = tempfile::tempdir().expect("agent tempdir");
     let config = agent_config(node_id, agent_dir.path().join("data"), &endpoint, &ca);
-    let agent = spawn_agent(config, executor.clone());
+    let agent = spawn_agent(config, executor.clone()).await;
 
     // 1. Registration: on the agent's Register, accept with token (term 5,
     //    epoch 3, seq 1).
@@ -853,7 +965,7 @@ async fn node_lost_then_reappearing_container_is_stopped() {
         &coord.agent_endpoint,
         &ca,
     );
-    let agent = spawn_agent(config, executor.clone());
+    let agent = spawn_agent(config, executor.clone()).await;
     let views = coord.views();
 
     poll(DEADLINE, "node registered", || {
@@ -937,7 +1049,7 @@ async fn node_lost_then_reappearing_container_is_stopped() {
         &coord.agent_endpoint,
         &ca,
     );
-    let agent2 = spawn_agent(config2, executor2.clone());
+    let agent2 = spawn_agent(config2, executor2.clone()).await;
 
     // The agent re-registers and reports the running container; the coordinator
     // finds no live intent for it and sends StopJob directly (never a log
@@ -1096,4 +1208,437 @@ fn advertised(config: &Config) -> coppice_core::resource::Resources {
         .effective_capacity(&coppice_agent::capacity::detect(&config.data_dir))
         .expect("every capacity dimension is overridden by the harness")
         .advertised
+}
+
+// ---- Test 6: the ADR 0041 shutdown drain ---------------------------------
+
+/// Assert `cond` holds continuously for `window` — the bounded *negative*
+/// check: "the agent does not exit", "the job is not placed". A `poll` proves
+/// something eventually happens; this proves something does not.
+async fn holds_for<F, Fut>(window: Duration, label: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = Instant::now();
+    while start.elapsed() < window {
+        assert!(cond().await, "expected to hold for {window:?}: {label}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// An idle agent stopped with SIGTERM announces its drain and exits promptly,
+/// and the node it left behind takes no more work.
+///
+/// ADR 0041 "Agent shutdown is a drain, then a bounded wait": with nothing to
+/// wait for, the whole drain is the announcement — and the announcement is the
+/// point, since it is what stops the node receiving placements from that log
+/// position rather than 90 s later down the liveness path.
+#[tokio::test]
+async fn shutdown_while_idle_announces_the_drain_and_exits() {
+    init_tracing();
+    let ca = Ca::new();
+    let coord = RunningCoordinator::start(ClusterId::new(), &ca).await;
+    poll(DEADLINE, "coordinator leadership", || {
+        let coord = &coord;
+        async move { coord.is_leader() }
+    })
+    .await;
+
+    let node = NodeId::new();
+    let agent_dir = tempfile::tempdir().expect("agent tempdir");
+    let executor = FakeExecutor::new();
+    let config = agent_config(
+        node,
+        agent_dir.path().join("data"),
+        &coord.agent_endpoint,
+        &ca,
+    );
+    let agent = spawn_agent(config, executor.clone()).await;
+    let views = coord.views();
+
+    poll(DEADLINE, "node registered", || {
+        let views = views.clone();
+        async move { node_epoch(&views, node).is_some_and(|e| e >= 1) }
+    })
+    .await;
+    assert_eq!(
+        node_draining(&views, node),
+        Some(false),
+        "a running agent announces nothing"
+    );
+
+    // SIGTERM, as the daemon's handler would deliver it.
+    agent.signal_shutdown();
+
+    // The announcement rides the immediate heartbeat and the leader turns it
+    // into SetNodeDraining.
+    poll(DEADLINE, "node record draining", || {
+        let views = views.clone();
+        async move { node_draining(&views, node) == Some(true) }
+    })
+    .await;
+
+    // Nothing to wait for, so the loop returns almost at once.
+    agent
+        .expect_clean_exit(Duration::from_secs(5), "an idle agent's drain")
+        .await;
+
+    // And the node takes no more work: `accepts_placements()` is false while
+    // draining, so a fresh job has nowhere to go and stays queued.
+    let entity = QuotaEntityId::new();
+    seed_quota(&coord, entity).await;
+    let job = JobId::new();
+    submit_job(&coord, job, entity, 0).await;
+    poll(DEADLINE, "the submitted job is applied", || {
+        let views = views.clone();
+        async move { job_state(&views, job).is_some() }
+    })
+    .await;
+    holds_for(Duration::from_secs(2), "the job stays queued", || {
+        let views = views.clone();
+        async move { job_state(&views, job) == Some(JobState::Queued) }
+    })
+    .await;
+
+    coord.shutdown().await;
+    drop(agent_dir);
+}
+
+/// An agent stopped mid-job waits for the container, and the attempt it was
+/// running ends as the clean outcome it earned — not the `NodeLost` a killed
+/// agent would have produced.
+#[tokio::test]
+async fn shutdown_waits_for_running_work_then_exits() {
+    init_tracing();
+    let world = run_to_running().await;
+    let views = world.coord.views();
+    let node = world.node;
+
+    world.agent.signal_shutdown();
+
+    // The drain is announced while the work continues.
+    poll(DEADLINE, "node record draining", || {
+        let views = views.clone();
+        async move { node_draining(&views, node) == Some(true) }
+    })
+    .await;
+    holds_for(
+        Duration::from_secs(2),
+        "the agent keeps serving while its container runs",
+        || {
+            let agent = &world.agent;
+            let executor = &world.executor;
+            let alloc = world.alloc;
+            async move { !agent.has_exited() && executor.is_running(alloc) }
+        },
+    )
+    .await;
+
+    // The job finishes inside the window: the drain got what it was waiting
+    // for, and the coordinator sees the real outcome.
+    world.executor.finish(
+        world.alloc,
+        ExitInfo {
+            code: 0,
+            cause: ExitCause::Natural,
+            runtime: coppice_core::time::Duration::from_micros(1_000),
+            finished_at: coppice_core::time::Timestamp::now(),
+        },
+    );
+    poll(DEADLINE, "job Succeeded", || {
+        let views = views.clone();
+        let job = world.job;
+        async move { job_state(&views, job) == Some(JobState::Succeeded) }
+    })
+    .await;
+    assert_eq!(
+        attempt_state(&views, world.attempt),
+        Some(AttemptState::Terminal(AttemptOutcome::Exited { code: 0 })),
+        "a drained agent's finished work is its own outcome, never NodeLost",
+    );
+
+    world
+        .agent
+        .expect_clean_exit(DEADLINE, "the drain after the container finished")
+        .await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+/// The probes keep answering for the whole drain, and answer `draining` with a
+/// live `running` count while they do (ADR 0041).
+///
+/// This is the contract an ASG lifecycle hook (or a `systemd` unit's stop
+/// handler) is written against: it polls `/readyz` and waits for `running` to
+/// reach zero or for the process to go. A listener that shared the session's
+/// shutdown watch would close on the signal — in the first milliseconds of a
+/// window that can legitimately run for minutes — and every one of those polls
+/// would be a connection refused instead of an answer. So the operational
+/// listener has a trigger of its own, flipped only once the session loop has
+/// returned; the harness wires the two in that same order.
+#[tokio::test]
+async fn readyz_reports_the_drain_while_it_is_still_draining() {
+    init_tracing();
+    let world = run_to_running().await;
+    let node = world.node;
+
+    // Before the signal: registered, serving, and ready.
+    let (status, body) = world.agent.probe("/readyz").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["phase"], "ready");
+    assert_eq!(body["node_id"], node.to_string());
+    assert_eq!(body["draining"], false);
+
+    world.agent.signal_shutdown();
+
+    // Mid-drain — the container is still running, so the agent is still here.
+    // `draining` wins the phase precedence over a session that is otherwise
+    // perfectly healthy, and `running` is the work being waited for.
+    poll(DEADLINE, "/readyz reports the drain", || {
+        let agent = &world.agent;
+        async move {
+            let (status, body) = agent.probe("/readyz").await;
+            status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && body["phase"] == "draining"
+                && body["draining"] == true
+                && body["running"] == 1
+        }
+    })
+    .await;
+
+    // Liveness is unconditional throughout: a draining agent is doing exactly
+    // what it was told to, and a `/healthz` that failed here would have systemd
+    // restart it mid-drain.
+    let (status, body) = world.agent.probe("/healthz").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+
+    // The listener outlives the drain, not the signal: it is still answering
+    // some seconds in, with the session loop still running.
+    holds_for(
+        Duration::from_secs(2),
+        "the probes stay up for the whole drain",
+        || {
+            let agent = &world.agent;
+            async move {
+                if agent.has_exited() {
+                    return false;
+                }
+                let (status, body) = agent.probe("/readyz").await;
+                status == reqwest::StatusCode::SERVICE_UNAVAILABLE && body["phase"] == "draining"
+            }
+        },
+    )
+    .await;
+
+    // Let the work finish; `running` falls to zero and the drain completes.
+    world.executor.finish(
+        world.alloc,
+        ExitInfo {
+            code: 0,
+            cause: ExitCause::Natural,
+            runtime: coppice_core::time::Duration::from_micros(1_000),
+            finished_at: coppice_core::time::Timestamp::now(),
+        },
+    );
+    // `expect_clean_exit` asserts the other half of the ordering: the listener
+    // does come down, once the session loop has returned.
+    world
+        .agent
+        .expect_clean_exit(DEADLINE, "the drain after the container finished")
+        .await;
+
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+/// `shutdown_grace` bounds the process, not the gaps between events: a branch
+/// body parked in a slow executor call is cut short at the deadline.
+///
+/// The real `heartbeat_report()` awaits `observe()`, which on the Docker
+/// executor is a list/inspect that can sit there for the daemon's own 120 s
+/// request timeout. Checking the deadline only between `select!` iterations
+/// would let a 2 s grace window become a two-minute stop — and a flip that
+/// arrived during such a call would not even be *observed* until it returned.
+/// The runner races one grace deadline, built from a cloned shutdown receiver,
+/// against every await it makes: the clock starts at the flip, and the
+/// in-flight future is dropped when the window closes.
+#[tokio::test]
+async fn shutdown_grace_preempts_an_executor_call_in_flight() {
+    init_tracing();
+    let world = run_to_running_with(|config| {
+        config.shutdown_grace = Duration::from_secs(2);
+    })
+    .await;
+
+    // Far longer than the grace window, and longer than `DEADLINE`: if the
+    // deadline did not preempt, the agent would still be inside `observe()`
+    // when the test gave up.
+    world.executor.set_observe_delay(Duration::from_secs(120));
+
+    // Wait until a heartbeat has actually entered the slow `observe()` — the
+    // next tick is at most one `heartbeat_interval` away, and the call parks
+    // for two minutes once it starts, so the flip below lands mid-await.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let flipped_at = Instant::now();
+    world.agent.signal_shutdown();
+
+    world
+        .agent
+        .expect_clean_exit(DEADLINE, "the drain preempting an in-flight executor call")
+        .await;
+    let waited = flipped_at.elapsed();
+    assert!(
+        waited < Duration::from_secs(2) + Duration::from_secs(8),
+        "shutdown_grace must bound the whole stop, not just the gaps between \
+         events; waited {waited:?} on a 2s window with a 120s executor call in flight"
+    );
+
+    // Abandoned, never killed — the same rule as the ordinary deadline path.
+    assert!(
+        world.executor.is_running(world.alloc),
+        "an abandoned container is left running, never stopped"
+    );
+
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+/// Work that outlives `shutdown_grace` is abandoned, not killed: the agent
+/// exits at the deadline with the container still running.
+///
+/// ADR 0041: killing it locally would report an exit code the coordinator
+/// classifies as the job's own failure, where a node that falls silent has its
+/// work classified `NodeLost` and retried elsewhere. The backstop that follows
+/// is the coordinator's business and is tested there.
+#[tokio::test]
+async fn shutdown_past_the_grace_window_leaves_the_container_running() {
+    init_tracing();
+    let world = run_to_running_with(|config| {
+        config.shutdown_grace = Duration::from_secs(2);
+    })
+    .await;
+    let views = world.coord.views();
+
+    let flipped_at = Instant::now();
+    world.agent.signal_shutdown();
+
+    // Never finished: the only thing that ends this drain is the deadline.
+    world
+        .agent
+        .expect_clean_exit(DEADLINE, "the drain hitting shutdown_grace")
+        .await;
+    let waited = flipped_at.elapsed();
+    assert!(
+        waited >= Duration::from_secs(2),
+        "the drain must wait out the whole window, waited {waited:?}"
+    );
+
+    // The container was left alone, and the attempt is still Running as far as
+    // the cluster knows — nothing reported a fabricated failure for it.
+    assert!(
+        world.executor.is_running(world.alloc),
+        "an abandoned container is left running, never stopped"
+    );
+    assert_eq!(
+        attempt_state(&views, world.attempt),
+        Some(AttemptState::Running),
+        "the attempt is still Running at exit; the backstop is the coordinator's",
+    );
+    assert_eq!(
+        node_draining(&views, world.node),
+        Some(true),
+        "the drain was still announced",
+    );
+
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+/// A drain that begins while the agent is reconnecting survives the gap and
+/// lands on the next registration.
+///
+/// ADR 0041: the intent is agent-local state, not stream state. The agent has
+/// nothing to announce on while the coordinator is down, so it keeps
+/// reconnecting rather than slipping away silently, and its re-registration
+/// carries `draining` — which `RegisterNode` writes at the same log position
+/// that bumps the epoch.
+#[tokio::test]
+async fn shutdown_while_reconnecting_lands_on_re_registration() {
+    init_tracing();
+    let ca = Ca::new();
+    // Both coordinators serve the agent gateway on this one port, so the
+    // agent's reconnect loop finds the second one at the address it already
+    // has (its discovery list is static, as a real agent's would be).
+    let agent_port = free_port();
+    let coord = RunningCoordinator::start_on_agent_port(ClusterId::new(), &ca, agent_port).await;
+    poll(DEADLINE, "coordinator leadership", || {
+        let coord = &coord;
+        async move { coord.is_leader() }
+    })
+    .await;
+
+    let node = NodeId::new();
+    let agent_dir = tempfile::tempdir().expect("agent tempdir");
+    let executor = FakeExecutor::new();
+    let config = agent_config(
+        node,
+        agent_dir.path().join("data"),
+        &coord.agent_endpoint,
+        &ca,
+    );
+    let agent = spawn_agent(config, executor.clone()).await;
+
+    poll(DEADLINE, "node registered", || {
+        let views = coord.views();
+        async move { node_epoch(&views, node).is_some_and(|e| e >= 1) }
+    })
+    .await;
+
+    // Sever the session by taking the whole coordinator away; the agent falls
+    // into its reconnect loop against an address nothing answers on.
+    coord.shutdown().await;
+
+    // SIGTERM with nowhere to say it. An idle agent that exited here would
+    // leave the cluster to discover its absence by timeout — the exact path
+    // the drain exists to replace — so it must still be running when the
+    // coordinator comes back.
+    agent.signal_shutdown();
+    holds_for(
+        Duration::from_secs(2),
+        "the agent keeps reconnecting until it can announce",
+        || {
+            let agent = &agent;
+            async move { !agent.has_exited() }
+        },
+    )
+    .await;
+
+    // A coordinator at the same address again. The agent re-registers, and the
+    // registration itself carries the drain.
+    let coord2 = RunningCoordinator::start_on_agent_port(ClusterId::new(), &ca, agent_port).await;
+    poll(DEADLINE, "second coordinator leadership", || {
+        let coord2 = &coord2;
+        async move { coord2.is_leader() }
+    })
+    .await;
+    let views = coord2.views();
+    poll(DEADLINE, "re-registered, announcing the drain", || {
+        let views = views.clone();
+        async move {
+            node_epoch(&views, node).is_some_and(|e| e >= 1)
+                && node_draining(&views, node) == Some(true)
+        }
+    })
+    .await;
+
+    // Announced at last, and with nothing running, the drain is done.
+    agent
+        .expect_clean_exit(DEADLINE, "the drain after re-registration")
+        .await;
+
+    coord2.shutdown().await;
+    drop(agent_dir);
 }
