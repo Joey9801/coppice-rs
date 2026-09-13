@@ -18,7 +18,7 @@ documents so that each concern can grow independently.
 | [lifecycle/](lifecycle/) | The job lifecycle state machine. |
 | [scheduling/](scheduling/) | Scheduling model, the v1 scheduler algorithm, quotas and priorities, image-cache policy. |
 | [protocols/](protocols/) | The agent–coordinator protocol. |
-| [operations/](operations/) | Configuration, observability, failure handling, and security. |
+| [operations/](operations/) | Configuration, observability, failure handling, scale-in and health probes, and security. |
 | [testing/](testing/) | The [end-to-end test register](testing/end-to-end.md): behaviours only ever checked by driving a real cluster, pending an automated suite. |
 | [roadmap/](roadmap/) | Initial scope, the design-decision register, the [known open-issues register](roadmap/known-open-issues.md), and the [future-features wishlist](roadmap/future-features.md). |
 | [decisions/](decisions/) | Architecture Decision Records (ADRs). |
