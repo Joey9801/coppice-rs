@@ -445,8 +445,18 @@ impl FilesystemSink {
 
     /// Create a fresh segment for `(job, attempt)` (§8.4): make the attempt
     /// directory, pick a start strictly after any existing segment's (so starts
-    /// stay strictly increasing across rolls *and* restarts), open a WAL pool,
-    /// run the schema migration, and write the `meta` rows.
+    /// stay strictly increasing across rolls *and* restarts), build the file,
+    /// and open its WAL pool.
+    ///
+    /// The build is atomic from every reader's point of view (issue #112): the
+    /// schema migration and `meta` rows are committed into a **temporary**
+    /// `seg-<start>.db.tmp` in rollback-journal mode (one self-contained file,
+    /// nothing in a WAL), which is closed and only then renamed to its
+    /// `seg-<start>.db` name. Readers list segments by the final name, so a
+    /// drain aborted mid-build — `HubInner::drop` aborts the drain tasks, and
+    /// an agent crash can land anywhere — leaves at most a temp file that
+    /// nothing opens and the sweep reclaims, never a listed segment with no
+    /// tables that fails every reader of the attempt with `no such table`.
     async fn create_segment(
         &self,
         job: JobId,
@@ -461,27 +471,33 @@ impl FilesystemSink {
         std::fs::create_dir_all(&dir)?;
         let start = next_segment_start(&dir, now);
         let path = dir.join(segment_filename(start));
-        let options = SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(BUSY_TIMEOUT);
+        let tmp = temp_segment_path(&path);
+        // A stale temp at this exact name (an earlier process aborted mid-build
+        // with the same start) must not be adopted half-built.
+        delete_temp_segment_files(&tmp);
+        {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(segment_connect_options(&tmp, SqliteJournalMode::Delete))
+                .await?;
+            MIGRATOR.run(&pool).await?;
+            for (key, value) in [
+                ("format_version", "1".to_string()),
+                ("job_id", job.to_string()),
+                ("attempt_id", attempt.to_string()),
+                ("start_us", start.as_micros().to_string()),
+            ] {
+                sqlx::query!("INSERT INTO meta (key, value) VALUES (?, ?)", key, value)
+                    .execute(&pool)
+                    .await?;
+            }
+            pool.close().await;
+        }
+        std::fs::rename(&tmp, &path)?;
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_with(options)
+            .connect_with(segment_connect_options(&path, SqliteJournalMode::Wal))
             .await?;
-        MIGRATOR.run(&pool).await?;
-        for (key, value) in [
-            ("format_version", "1".to_string()),
-            ("job_id", job.to_string()),
-            ("attempt_id", attempt.to_string()),
-            ("start_us", start.as_micros().to_string()),
-        ] {
-            sqlx::query!("INSERT INTO meta (key, value) VALUES (?, ?)", key, value)
-                .execute(&pool)
-                .await?;
-        }
         let size = segment_size_on_disk(&path);
         Ok(OpenSegment {
             pool,
@@ -618,6 +634,7 @@ impl FilesystemSink {
                 }
             }
         }
+        self.reclaim_stale_temp_segments().await;
         cleanup_empty_dirs(&self.inner.root);
         if deleted > 0 {
             // Coarse invalidation on any deletion: both bounds caches are
@@ -638,6 +655,26 @@ impl FilesystemSink {
                 .clear();
         }
         deleted
+    }
+
+    /// Unlink temp segment files left by a build that never reached its
+    /// rename ([`create_segment`](Self::create_segment)): a drain aborted at
+    /// hub drop, or an earlier agent process that crashed mid-roll. Candidates
+    /// are collected without the writer lock, then unlinked **while holding**
+    /// it: segments are only ever built under [`Inner::open`], so at that
+    /// moment no build is in flight and every temp file still on disk is
+    /// stale — no clock heuristic, no risk of pulling a live build out from
+    /// under the writer. A temp created after the walk waits for the next sweep.
+    async fn reclaim_stale_temp_segments(&self) {
+        let candidates = list_temp_segments(&self.inner.root);
+        if candidates.is_empty() {
+            return;
+        }
+        let _writer = self.inner.open.lock().await;
+        for tmp in &candidates {
+            tracing::debug!(path = %tmp.display(), "reclaiming a stale temp telemetry segment (§8.4)");
+            delete_temp_segment_files(tmp);
+        }
     }
 
     /// The pressure sweep's byte target: the max over [`pressure_paths`] of the
@@ -2707,8 +2744,71 @@ fn segment_filename(start: Timestamp) -> String {
     format!("seg-{:020}.db", start.as_micros())
 }
 
+/// The suffix a segment carries while it is being built: `seg-<start>.db.tmp`
+/// (docker-executor.md §8.4). Not a `.db` name, so [`parse_segment_start`]
+/// and every reader ignore it until the rename.
+const TEMP_SEGMENT_SUFFIX: &str = ".tmp";
+
+/// The temp path a segment is built at before its rename into `path`.
+fn temp_segment_path(path: &Path) -> PathBuf {
+    sibling(path, TEMP_SEGMENT_SUFFIX)
+}
+
+/// The connect options every segment uses, differing only in journal mode:
+/// rollback (`Delete`) while a segment is built under its temp name, so the
+/// finished file is self-contained, and WAL once it is in place (§8.4).
+fn segment_connect_options(path: &Path, journal_mode: SqliteJournalMode) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(journal_mode)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(BUSY_TIMEOUT)
+}
+
+/// Delete a temp segment's files — the `.db.tmp` and any `-journal`/`-wal`/
+/// `-shm` sibling SQLite may have left beside it. Every error is tolerated.
+fn delete_temp_segment_files(tmp: &Path) {
+    let _ = std::fs::remove_file(tmp);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(sibling(tmp, suffix));
+    }
+}
+
+/// Every `seg-<µs>.db.tmp` under `root`'s attempt directories.
+fn list_temp_segments(root: &Path) -> Vec<PathBuf> {
+    let mut temps = Vec::new();
+    let Ok(jobs) = std::fs::read_dir(root) else {
+        return temps;
+    };
+    for job_entry in jobs.flatten() {
+        let Ok(attempts) = std::fs::read_dir(job_entry.path()) else {
+            continue;
+        };
+        for attempt_entry in attempts.flatten() {
+            let Ok(entries) = std::fs::read_dir(attempt_entry.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name
+                    .strip_suffix(TEMP_SEGMENT_SUFFIX)
+                    .is_some_and(|db| parse_segment_start(db).is_some())
+                {
+                    temps.push(path);
+                }
+            }
+        }
+    }
+    temps
+}
+
 /// Parse a segment start out of a `seg-<µs>.db` filename, or `None` for anything
-/// else (a `-wal`/`-shm` sibling, the `ended` marker, junk).
+/// else (a `-wal`/`-shm` sibling, a `.tmp` under construction, the `ended`
+/// marker, junk).
 fn parse_segment_start(name: &str) -> Option<Timestamp> {
     let digits = name.strip_prefix("seg-")?.strip_suffix(".db")?;
     Timestamp::from_micros(digits.parse::<i64>().ok()?)
@@ -2805,7 +2905,10 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 
 /// Remove attempt directories left with no segment files after a sweep — drop
 /// the `ended` marker and any orphaned `-wal`/`-shm` journal files, then the
-/// now-empty attempt and job directories (docker-executor.md §8.4).
+/// now-empty attempt and job directories (docker-executor.md §8.4). Stale temp
+/// segments were reclaimed just before by [`reclaim_stale_temp_segments`].
+///
+/// [`reclaim_stale_temp_segments`]: FilesystemSink::reclaim_stale_temp_segments
 /// Whole-file/dir unlinks only; every error is tolerated (a non-empty dir
 /// simply stays).
 fn cleanup_empty_dirs(root: &Path) {
@@ -4031,6 +4134,97 @@ mod tests {
         assert!(
             !dir.exists(),
             "orphaned journals must not strand the attempt dir"
+        );
+    }
+
+    /// Drive an append one poll at a time until its segment file first lands
+    /// on disk, then drop the future — the shape of `HubInner::drop` aborting a
+    /// drain task mid-roll (issue #112). Returns the attempt dir.
+    async fn abort_first_segment_creation(
+        sink: &FilesystemSink,
+        job: JobId,
+        attempt: AttemptId,
+        alloc: AllocationId,
+    ) -> PathBuf {
+        let dir = attempt_dir(sink, job, attempt);
+        let batch = [log(job, attempt, alloc, at(1), LogStream::Stdout, b"x")];
+        let mut append = std::pin::pin!(sink.append_logs_at(&batch, at(1)));
+        for _ in 0..10_000 {
+            let done = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(append.as_mut(), cx).is_ready())
+            })
+            .await;
+            assert!(
+                !done,
+                "append completed before its segment file was observed"
+            );
+            let files = std::fs::read_dir(&dir)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            if files > 0 {
+                return dir;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("no segment file ever appeared");
+    }
+
+    // Issue #112: a drain aborted between creating a segment's sqlite file and
+    // running its schema migration must not leave a listed, schema-less
+    // `seg-*.db` behind — every reader would fail with `no such table` on it.
+    #[tokio::test]
+    async fn aborted_segment_creation_never_leaves_a_listed_segment() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let dir = abort_first_segment_creation(&sink, job, attempt, alloc).await;
+
+        assert!(
+            list_segments(&dir).is_empty(),
+            "a half-built segment must never be listed: {:?}",
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(sink.max_log_timestamp(&job, &attempt).await.unwrap(), None);
+        let page = sink
+            .log_page(&job, &attempt, &page_query(LogOrder::Ascending))
+            .await
+            .unwrap();
+        assert!(page.chunks.is_empty());
+
+        // The writer recovers on its next flush with a properly built segment.
+        sink.append_logs_at(
+            &[log(job, attempt, alloc, at(2), LogStream::Stdout, b"y")],
+            at(2),
+        )
+        .await;
+        assert_eq!(list_segments(&dir).len(), 1);
+        assert_eq!(
+            sink.max_log_timestamp(&job, &attempt).await.unwrap(),
+            Some(at(2))
+        );
+    }
+
+    // The temp file an aborted build leaves behind is reclaimed by the sweep,
+    // so it neither accumulates nor strands the attempt dir.
+    #[tokio::test]
+    async fn sweep_reclaims_stale_temp_segments() {
+        let root = TempDir::new().unwrap();
+        let sink = sink_with(root.path().join("tel"), |_| {}).await;
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        let dir = abort_first_segment_creation(&sink, job, attempt, alloc).await;
+        let temps = list_temp_segments(&sink.inner.root);
+        assert_eq!(temps.len(), 1, "the aborted build left its temp file");
+        assert!(temps[0].starts_with(&dir));
+
+        let deleted = sink.sweep(at(1000), DiskPressure::Ok).await;
+        assert_eq!(deleted, 0, "temp reclaim is not a segment deletion");
+        assert!(list_temp_segments(&sink.inner.root).is_empty());
+        assert!(
+            !dir.exists(),
+            "a stale temp must not strand the attempt dir"
         );
     }
 

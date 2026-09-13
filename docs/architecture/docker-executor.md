@@ -820,8 +820,16 @@ schema fails the build rather than the agent.
 
 ```
 <data_dir>/telemetry/<job-id>/<attempt-id>/
-  seg-<start-timestamp>.db    # tables: meta, metrics, log_chunks (time-indexed)
+  seg-<start-timestamp>.db      # tables: meta, metrics, log_chunks (time-indexed)
+  seg-<start-timestamp>.db.tmp  # a segment still being built (schema + meta not yet committed)
 ```
+
+A segment is built under the `.tmp` name and renamed into place only
+once its schema and `meta` rows are committed, so a writer aborted
+mid-build (hub teardown, agent crash) can never leave a listed segment
+without its tables — one such file would fail every reader of the
+attempt. Readers list `seg-*.db` only; the retention sweep reclaims
+stale `.tmp` files.
 
 A segment rolls at a size bound (default 256 MiB) or age bound (default
 6h), whichever first. Segments are non-overlapping and time-ordered, so
