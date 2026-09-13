@@ -1,5 +1,17 @@
 //! Housekeeping (leader-only; a 60 s tick in every deployment).
 //!
+//! Each tick runs three passes over the latest applied view, in order:
+//!
+//! 1. **Liveness** — nodes past [`AGENT_LIVENESS_DEADLINE`] are declared lost
+//!    (ADR 0009's health monitor).
+//! 2. **Node retention** — node records that stopped accepting placements,
+//!    hold no live allocation, and have been silent for
+//!    `policy.node_retention` are evicted (ADR 0041).
+//! 3. **Terminal-job retention** — the pass described below.
+//!
+//! All three measure their own clock proposer-side and propose; apply stays
+//! deterministic and idempotent under a leader change.
+//!
 //! Scans the view for terminal jobs past retention and removes them from
 //! replicated state with an `EvictTerminalJobs` proposal. What gates that
 //! proposal is the configured `[history]` mode (ADR 0012), which the daemon
@@ -35,7 +47,7 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::id::{JobId, NodeId};
 use coppice_core::job::JobState;
 use coppice_core::time::Timestamp;
-use coppice_state::command::{DeclareNodeLost, EvictTerminalJobs};
+use coppice_state::command::{DeclareNodeLost, EvictNodes, EvictTerminalJobs};
 use coppice_state::Command;
 
 use crate::leadership;
@@ -125,6 +137,7 @@ pub async fn run<C>(
                 _ = leadership::until_leadership_lost(&mut status, term, &mut shutdown) => break,
                 _ = ticker.tick() => {
                     declare_lost_nodes(&consensus, &views, &liveness).await;
+                    evict_silent_nodes(&consensus, &views, &liveness).await;
                     run_pass(&consensus, &views, history).await;
                 }
             }
@@ -174,15 +187,12 @@ async fn declare_lost_nodes<C: Consensus>(
 /// The nodes whose last report is older than [`AGENT_LIVENESS_DEADLINE`] and
 /// that still accept placements or hold a non-`Released` allocation.
 ///
-/// The accepts-placements-or-live-allocations guard is what stops us
-/// re-declaring an already-lost silent node every tick: `DeclareNodeLost`
-/// leaves the node unschedulable with all its allocations `Released`, so a
-/// second declaration is neither needed nor emitted. An agent that announced
-/// its own shutdown (ADR 0041) and then went quiet with nothing left running
-/// is the same case: it has already stopped taking work, and its record is
-/// the retention GC's to collect. A node not yet tracked in the liveness map
-/// (no report and no seed) is left alone — real nodes are always seeded on
-/// leadership gain and marked on every report.
+/// This guard stops us re-declaring an already-lost node every tick:
+/// `DeclareNodeLost` leaves it unschedulable with everything `Released`, and
+/// a drained agent (ADR 0041) that went quiet is the same case — its record
+/// is the retention GC's to collect. A node with no liveness mark at all is
+/// left alone; real nodes are always seeded on leadership gain and marked on
+/// every report.
 fn stale_nodes(view: &StateView, liveness: &NodeLiveness, now: Instant) -> Vec<NodeId> {
     let mut out = Vec::new();
     for (node_id, node_record) in view.state().nodes.iter() {
@@ -193,14 +203,96 @@ fn stale_nodes(view: &StateView, liveness: &NodeLiveness, now: Instant) -> Vec<N
         if !overdue {
             continue;
         }
-        let has_live_allocation = view.state().allocations.values().any(|a| {
-            a.allocation.node == *node_id && a.allocation.state != AllocationState::Released
-        });
-        if node_record.accepts_placements() || has_live_allocation {
+        if node_record.accepts_placements() || has_live_allocation(view, *node_id) {
             out.push(*node_id);
         }
     }
     out
+}
+
+/// Whether `node` still holds an allocation that is not `Released` — the
+/// "still has work on it" predicate shared by the liveness monitor, the
+/// retention GC, and `EvictNodes`' own apply-side validation (ADR 0041).
+fn has_live_allocation(view: &StateView, node: NodeId) -> bool {
+    view.state()
+        .allocations
+        .values()
+        .any(|a| a.allocation.node == node && a.allocation.state != AllocationState::Released)
+}
+
+/// Evict the node records whose full `node_retention` window of silence has
+/// elapsed (ADR 0041).
+///
+/// One batch per tick: apply skips ids that are already gone, so a
+/// re-issued proposal is idempotent across a leader change. This pass
+/// applies exactly the conditions apply re-checks.
+async fn evict_silent_nodes<C: Consensus>(
+    consensus: &Arc<C>,
+    views: &StateViews,
+    liveness: &NodeLiveness,
+) {
+    let view = views.latest();
+    let due = due_for_node_eviction(&view, liveness, Instant::now());
+    if due.is_empty() {
+        return;
+    }
+    // Proposer-side wall clock: housekeeping runs outside apply.
+    let command = Command::EvictNodes(EvictNodes {
+        nodes: due.clone(),
+        // The retention GC is machine-proposed; only the admin API's explicit
+        // `node remove` carries an actor.
+        actor: None,
+        evicted_at: Timestamp::now(),
+    });
+    match consensus.propose(command).await {
+        Ok(Applied { outcome: Ok(_), .. }) => {
+            tracing::info!(
+                count = due.len(),
+                "housekeeping: evicted node records silent past the retention window"
+            );
+        }
+        Ok(Applied {
+            outcome: Err(reason),
+            ..
+        }) => {
+            tracing::warn!(?reason, "housekeeping: EvictNodes rejected");
+        }
+        Err(e) if e.is_retryable() => {
+            tracing::info!(error = %e, "housekeeping: retryable EvictNodes error");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "housekeeping: fatal EvictNodes error");
+        }
+    }
+}
+
+/// The nodes eligible for `EvictNodes`: they have stopped accepting
+/// placements (an admin cordon, an agent's own drain announcement, or
+/// `DeclareNodeLost`), hold no live allocation, and have been silent for at
+/// least `policy.node_retention`.
+///
+/// Silence is measured exactly as [`stale_nodes`] measures it, against the
+/// leader-local liveness marks of ADR 0040: a node with no mark at all is
+/// not considered silent. A leader change therefore only ever delays an
+/// eviction, never hastens one.
+fn due_for_node_eviction(view: &StateView, liveness: &NodeLiveness, now: Instant) -> Vec<NodeId> {
+    let Some(retention) = view.state().policy.node_retention.to_std() else {
+        // A negative window is not expressible as a monotonic span; treat it
+        // as "never due" rather than evicting everything.
+        tracing::warn!("housekeeping: node_retention is negative, skipping the node retention GC");
+        return Vec::new();
+    };
+    view.state()
+        .nodes
+        .iter()
+        .filter(|(_, record)| !record.accepts_placements())
+        .map(|(node_id, _)| *node_id)
+        .filter(|node_id| match liveness.last_seen(*node_id) {
+            Some(seen) => now.saturating_duration_since(seen) >= retention,
+            None => false,
+        })
+        .filter(|node_id| !has_live_allocation(view, *node_id))
+        .collect()
 }
 
 async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history: HistorySink) {
@@ -381,6 +473,133 @@ mod tests {
         assert!(!stale.contains(&drained_lost));
         // Within its liveness grace window.
         assert!(!stale.contains(&fresh));
+    }
+
+    /// The retention GC's conditions, one node each (ADR 0041): silent past
+    /// the window and holding nothing is due; anything still schedulable,
+    /// still holding work, or still being heard from is not.
+    #[test]
+    fn nodes_are_evicted_only_once_drained_empty_and_silent() {
+        let retention = PolicyConfig::default()
+            .node_retention
+            .to_std()
+            .expect("the default window is positive");
+        // Anchor on `base` and add, never subtract: the monotonic clock can be
+        // younger than the retention window on a freshly started process.
+        let base = Instant::now();
+        let now = base + retention + StdDuration::from_secs(1);
+
+        let drained_silent = NodeId::new();
+        let schedulable_silent = NodeId::new();
+        let drained_busy = NodeId::new();
+        let drained_recent = NodeId::new();
+        let lost_silent = NodeId::new();
+        let untracked = NodeId::new();
+
+        let mut sm = StateMachine::default();
+        for (id, schedulable) in [
+            (drained_silent, false),
+            (schedulable_silent, true),
+            (drained_busy, false),
+            (drained_recent, false),
+            (untracked, false),
+        ] {
+            sm.nodes.insert(id, node_record(id, 1, schedulable));
+        }
+        // A node the health monitor already declared lost: unschedulable with
+        // every allocation released. Its record is precisely what this GC is
+        // for — a churning ASG would otherwise accumulate them forever.
+        sm.nodes
+            .insert(lost_silent, node_record(lost_silent, 1, false));
+        // `drained_busy` still holds a non-`Released` allocation.
+        let alloc = AllocationId::new();
+        sm.allocations.insert(
+            alloc,
+            allocation_record(
+                alloc,
+                JobId::new(),
+                AttemptId::new(),
+                drained_busy,
+                Resources::ZERO,
+                AllocationState::Active,
+            ),
+        );
+        // A released allocation is not live and must not hold a record back.
+        let released = AllocationId::new();
+        sm.allocations.insert(
+            released,
+            allocation_record(
+                released,
+                JobId::new(),
+                AttemptId::new(),
+                drained_silent,
+                Resources::ZERO,
+                AllocationState::Released,
+            ),
+        );
+        let view = view_of(sm);
+
+        let liveness = NodeLiveness::new();
+        liveness.seed(
+            1,
+            [
+                drained_silent,
+                schedulable_silent,
+                drained_busy,
+                lost_silent,
+            ],
+            base,
+        );
+        liveness.seed(1, [drained_recent], now);
+        // `untracked` is deliberately left out of the map entirely.
+
+        let due: BTreeSet<NodeId> = due_for_node_eviction(&view, &liveness, now)
+            .into_iter()
+            .collect();
+        assert!(due.contains(&drained_silent));
+        assert!(due.contains(&lost_silent));
+        // Still taking work: an operator undrained it, or it never drained.
+        assert!(!due.contains(&schedulable_silent));
+        // Still holding a live allocation: apply would reject the batch.
+        assert!(!due.contains(&drained_busy));
+        // Heard from inside the window: a node drained for maintenance whose
+        // agent is still up keeps its record (and its cordon).
+        assert!(!due.contains(&drained_recent));
+        // No mark at all — the same rule `stale_nodes` follows.
+        assert!(!due.contains(&untracked));
+
+        // Nothing is due before the full window has elapsed.
+        assert!(due_for_node_eviction(
+            &view,
+            &liveness,
+            base + retention - StdDuration::from_secs(1)
+        )
+        .is_empty());
+    }
+
+    /// An agent that announced its own shutdown (ADR 0041) and then went away
+    /// travels the same path: `draining` alone stops placements, so the record
+    /// becomes due without any admin cordon or `DeclareNodeLost`.
+    #[test]
+    fn an_agent_announced_drain_is_enough_to_make_a_record_due() {
+        let retention = PolicyConfig::default()
+            .node_retention
+            .to_std()
+            .expect("the default window is positive");
+        let base = Instant::now();
+        let now = base + retention + StdDuration::from_secs(1);
+
+        let node = NodeId::new();
+        let mut sm = StateMachine::default();
+        let mut record = node_record(node, 1, true);
+        record.draining = true;
+        sm.nodes.insert(node, record);
+        let view = view_of(sm);
+
+        let liveness = NodeLiveness::new();
+        liveness.seed(1, [node], base);
+
+        assert_eq!(due_for_node_eviction(&view, &liveness, now), vec![node]);
     }
 
     /// A terminal job record with the given submission and terminal times.
