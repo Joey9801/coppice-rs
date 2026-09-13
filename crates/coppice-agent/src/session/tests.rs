@@ -1046,6 +1046,40 @@ async fn the_draining_announcement_rides_both_reports_and_survives_a_reconnect()
     assert!(draining_of(&session.register_report()));
 }
 
+/// A registration whose `observe()` failed leaves `/readyz` reporting
+/// `docker-unavailable`: the failure is the last thing the snapshot heard, and
+/// nothing after the call may overwrite it with a success it never had.
+#[tokio::test]
+async fn a_failed_registration_observation_sticks_in_the_readiness_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (journal, state) = Journal::open(RealFs::new(dir.path())).unwrap();
+    let exec = FakeExecutor::new();
+    let health = crate::health::AgentHealth::new(NodeId::new());
+    let mut session = Session::new(
+        NodeId::new(),
+        Resources::ZERO,
+        Vec::new(),
+        journal,
+        state,
+        exec.clone(),
+    )
+    .with_health(health.clone());
+
+    exec.fail_next_observe("docker daemon is gone");
+    register(&mut session, 1, 1, 1).await;
+
+    let readiness = health.readiness();
+    assert!(
+        !readiness.docker_ok,
+        "the failed observation is what the snapshot must hold"
+    );
+    assert_eq!(readiness.phase, crate::health::Phase::DockerUnavailable);
+
+    // And it clears on the next observation that succeeds.
+    let _ = session.heartbeat_report().await;
+    assert_eq!(health.readiness().phase, crate::health::Phase::Ready);
+}
+
 #[tokio::test]
 async fn accountable_live_work_is_intents_without_journaled_exits() {
     // The drain's exit condition (ADR 0041): what the agent must wait for is

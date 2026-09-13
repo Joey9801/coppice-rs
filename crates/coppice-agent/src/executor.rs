@@ -321,6 +321,10 @@ struct FakeInner {
     /// daemon's own request timeout — the case ADR 0041's `shutdown_grace` has
     /// to be able to preempt.
     observe_delay: StdDuration,
+    /// When set, the next [`Executor::observe`] fails with this message and
+    /// clears the flag. Lets a test drive the "the daemon went away" readiness
+    /// path without a daemon.
+    fail_next_observe: Option<String>,
 }
 
 impl Default for FakeInner {
@@ -334,6 +338,7 @@ impl Default for FakeInner {
             stop_causes: std::collections::BTreeMap::new(),
             usage: None,
             observe_delay: StdDuration::ZERO,
+            fail_next_observe: None,
         }
     }
 }
@@ -457,6 +462,11 @@ impl FakeExecutor {
     pub fn set_observe_delay(&self, delay: StdDuration) {
         self.lock().observe_delay = delay;
     }
+
+    /// Make the next [`Executor::observe`] fail, once.
+    pub fn fail_next_observe(&self, message: &str) {
+        self.lock().fail_next_observe = Some(message.to_string());
+    }
 }
 
 impl Executor for FakeExecutor {
@@ -518,7 +528,10 @@ impl Executor for FakeExecutor {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let inner = self.lock();
+        let mut inner = self.lock();
+        if let Some(message) = inner.fail_next_observe.take() {
+            return Err(ExecutorError::Other(message));
+        }
         Ok(inner
             .running
             .values()
