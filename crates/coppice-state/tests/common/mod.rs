@@ -115,7 +115,23 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Co
         service_addr: None,
         host_facts: None,
         detected_capacity: None,
+        draining: false,
     })
+}
+
+/// [`register_node_cmd`] whose report carries the agent's own shutdown
+/// announcement (ADR 0041): `draining = true` blocks placements without
+/// touching the admin cordon, and `false` clears a previous announcement.
+pub fn register_node_cmd_draining(
+    node: NodeId,
+    capacity: Resources,
+    at: Timestamp,
+    draining: bool,
+) -> Command {
+    match register_node_cmd(node, capacity, at) {
+        Command::RegisterNode(c) => Command::RegisterNode(RegisterNode { draining, ..c }),
+        other => other,
+    }
 }
 
 /// [`register_node_cmd`] plus the display-only host description, for the tests
@@ -136,6 +152,7 @@ pub fn register_node_cmd_with_host(
         service_addr: None,
         detected_capacity: host_facts.as_ref().map(|_| capacity),
         host_facts,
+        draining: false,
     })
 }
 

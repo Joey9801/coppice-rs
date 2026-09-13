@@ -202,7 +202,7 @@ message LostAttempt {
 }
 
 // Node (re)registration. Re-registration bumps the node epoch, fencing all
-// commands issued under earlier epochs; the drain flag survives. The
+// commands issued under earlier epochs; the admin cordon survives. The
 // catalog's `node: Node` payload is realized as the id/capacity/labels
 // triple — `schedulable` is admin-owned desired state, not registration
 // input.
@@ -223,6 +223,12 @@ message RegisterNode {
   // so a reader can show advertised-vs-detected. Absent when the agent
   // detected nothing.
   optional coppice.core.v1.Resources detected_capacity = 7;
+  // Whether the registering agent is shutting down (ADR 0041), from its
+  // Register report. Unlike `schedulable` this IS registration input: it is
+  // the agent's own announcement about itself, and a registration that does
+  // not carry it clears any earlier one at the same log position that bumps
+  // the epoch.
+  bool draining = 8;
 }
 
 // Node missed the replicated heartbeat deadline: epoch bump, unschedulable,

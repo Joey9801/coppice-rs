@@ -981,15 +981,68 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
         }),
     );
     let epoch_before = sm.nodes[&nid(1)].epoch;
+    // The re-registration reports no shutdown announcement of its own, which
+    // clears `draining` (ADR 0041) — and must still leave the admin cordon
+    // exactly where the operator put it.
     apply_ok(
         &mut sm,
-        register_node_cmd(nid(1), cpu(20_000), ts(TS_US + 1)),
+        register_node_cmd_draining(nid(1), cpu(20_000), ts(TS_US + 1), false),
     );
     assert_eq!(sm.nodes[&nid(1)].epoch, epoch_before + 1);
     assert_eq!(sm.nodes[&nid(1)].node.capacity, cpu(20_000));
     assert!(
         !sm.nodes[&nid(1)].node.schedulable,
         "an agent restart must not undo a drain"
+    );
+    assert!(!sm.nodes[&nid(1)].accepts_placements());
+}
+
+/// The agent's own announcement gates placements on its own, without
+/// touching the admin cordon (ADR 0041): two flags, one gate.
+#[test]
+fn agent_announced_drain_blocks_placements_without_touching_the_cordon() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        register_node_cmd_draining(nid(1), cpu(10_000), ts(TS_US + 1), true),
+    );
+    assert!(
+        sm.nodes[&nid(1)].node.schedulable,
+        "an agent report never writes the admin cordon"
+    );
+    assert!(!sm.nodes[&nid(1)].accepts_placements());
+
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()),
+    );
+    let rejection = sm
+        .apply(&place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            base_ts(),
+        ))
+        .unwrap_err();
+    assert_eq!(
+        rejection,
+        RejectionReason::InvalidBatch(vec![Rejection {
+            item_index: 0,
+            reason: RejectionReason::NodeNotSchedulable(nid(1))
+        }])
+    );
+
+    // The agent came back: its earlier "I am leaving" is void, and the node
+    // takes work again at the same log position that bumps the epoch.
+    apply_ok(
+        &mut sm,
+        register_node_cmd_draining(nid(1), cpu(10_000), ts(TS_US + 2), false),
+    );
+    assert!(sm.nodes[&nid(1)].accepts_placements());
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            base_ts(),
+        ),
     );
 }
 

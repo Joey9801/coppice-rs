@@ -603,6 +603,7 @@ mod tests {
                     detected_capacity: None,
                 },
                 epoch,
+                draining: false,
             },
         );
         // The publisher may drop: `views.latest()` borrows the last-published

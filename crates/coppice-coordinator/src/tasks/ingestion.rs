@@ -321,6 +321,9 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
                 service_addr,
                 host_facts,
                 detected_capacity,
+                // Chunk A: the agent does not report a shutdown announcement
+                // yet (ADR 0041); the wiring lands with the agent's drain.
+                draining: false,
             }));
         }
 

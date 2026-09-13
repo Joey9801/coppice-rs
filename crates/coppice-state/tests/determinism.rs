@@ -106,17 +106,24 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
 /// and some reject — both must be deterministic.
 fn arb_global() -> impl Strategy<Value = Command> {
     prop_oneof![
-        (0usize..NODES as usize, 4_000u64..32_000, arb_ts()).prop_map(|(n, cpu_millis, ts)| {
-            Command::RegisterNode(RegisterNode {
-                node: node_of(n),
-                capacity: cpu(cpu_millis),
-                labels: BTreeMap::new(),
-                registered_at: ts,
-                service_addr: None,
-                host_facts: None,
-                detected_capacity: None,
-            })
-        }),
+        (
+            0usize..NODES as usize,
+            4_000u64..32_000,
+            any::<bool>(),
+            arb_ts()
+        )
+            .prop_map(|(n, cpu_millis, draining, ts)| {
+                Command::RegisterNode(RegisterNode {
+                    node: node_of(n),
+                    capacity: cpu(cpu_millis),
+                    labels: BTreeMap::new(),
+                    registered_at: ts,
+                    service_addr: None,
+                    host_facts: None,
+                    detected_capacity: None,
+                    draining,
+                })
+            }),
         (0usize..NODES as usize, arb_ts()).prop_map(|(n, ts)| {
             Command::DeclareNodeLost(DeclareNodeLost {
                 node: node_of(n),

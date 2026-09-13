@@ -83,7 +83,7 @@ state version" rule in
 
 - **Semantic validation is authoritative, not version equality.** Every item
   in the batch is re-validated against *current* state (job still `Queued`,
-  node schedulable, allocation still `Accruing`, ids fresh, capacity sane,
+  node accepting placements, allocation still `Accruing`, ids fresh, capacity sane,
   accrual cap respected). If every item passes, the batch commits even if
   `version` has advanced past `expected_version`. Rationale: `version`
   bumps on *every* command, including `SubmitJob`s that cannot invalidate a
@@ -339,7 +339,7 @@ reachable through the API.
 | --- | --- |
 | Proposer | Scheduler engine via the leader — one batch per scheduling pass |
 | Payload | `expected_version: u64` (audit record of the snapshot version; see contract), `proposed_at_us` (the charge timestamp), `revocations: AllocationId[]`, `placements: Placement[]` where `Placement = { job: JobId, attempt: AttemptId, group: GroupId, allocations: AllocationSpec[] }`, `AllocationSpec = { id: AllocationId, node: NodeId, requested: Resources }`. The proto field is repeated; **v1 writers emit exactly one allocation per placement and set `group` = the job's id** (singleton groups); apply rejects other shapes until the gang-scheduling ADR. |
-| Validation (all-or-nothing, per-item diagnostics) | Revocations: allocation exists and is `Accruing` (funded allocations are stable — revoking one is always a rejection). Placements: job exists and is `Queued`; attempt and allocation ids are fresh; node exists and is schedulable; `requested` fits within the node's total advertised capacity; exactly one allocation, `group` = job id. Batch-level: after simulating the batch (revocation frees → pledge pass → new placements in order), the number of distinct jobs holding accruing allocations must not exceed the replicated accrual cap K, and no node the batch touches may be left accruing for more than one job (ADR 0027 — hardcoded at one, so a same-batch swap on an occupied node passes and a second accrual on it does not). |
+| Validation (all-or-nothing, per-item diagnostics) | Revocations: allocation exists and is `Accruing` (funded allocations are stable — revoking one is always a rejection). Placements: job exists and is `Queued`; attempt and allocation ids are fresh; node exists and accepts placements (`schedulable` and not `draining` — ADR 0041); `requested` fits within the node's total advertised capacity; exactly one allocation, `group` = job id. Batch-level: after simulating the batch (revocation frees → pledge pass → new placements in order), the number of distinct jobs holding accruing allocations must not exceed the replicated accrual cap K, and no node the batch touches may be left accruing for more than one job (ADR 0027 — hardcoded at one, so a same-batch swap on an occupied node passes and a second accrual on it does not). |
 | Apply effects | In order: **(1) Revocations** — each attempt `Terminal(Revoked)`, allocations `Released`, true-up (full decayed refund; the attempt never ran), job → `Queued` free of retry budget (or `Aborted` if an abort is pending), freed capacity pledged onward in commit order. **(2) Placements**, in payload order: assign the allocation the next `seq`; insert attempt + allocation; run the pledge from the node's current free capacity — fully covered → allocation `Funded`, attempt starts `Ready` (accrual skipped, the common case); partially or not covered → allocation `Accruing` in the accrual queue, attempt starts `Accruing`. Job → `Attempting(attempt)`. **(3) Quota charge**: a job with no *enforced* `max_runtime` first has its multiplier inflated, `m' = ⌊multiplier × unbounded_runtime_multiplier / 2³²⌋` (else `m' = multiplier`); the job's full cost `C = rate(requests, current weights) × ceil(max_runtime_s) × m'` (jobs with no `max_runtime` are charged the replicated `default_charge_runtime` at `m'`) is charged to every ancestor of its entity at `proposed_at_us`; the attempt records `(C, rate, m', proposed_at_us, refund_fraction_milli)` for true-up, where the recorded fraction is the replicated `refund_fraction_milli` for a bounded job or 1000 for an unbounded one (ADR 0029). |
 | Rejections | `InvalidBatch[(index, reason)]` wrapping `UnknownAllocation`, `AllocationNotAccruing`, `UnknownJob`, `JobNotQueued`, `DuplicateAttempt`, `DuplicateAllocation`, `UnknownNode`, `NodeNotSchedulable`, `RequestExceedsNodeCapacity`, `UnsupportedPlacementShape`, `UnknownQuotaEntity`; batch-level `AccrualLimitExceeded`, `PerNodeAccrualExceeded` |
 
@@ -402,9 +402,9 @@ reachable through the API.
 | | |
 | --- | --- |
 | Proposer | Leader, on agent (re)registration |
-| Payload | `node: Node` (id, `capacity: Resources`, labels), `registered_at_us`, `service_addr`, `host_facts`, `detected_capacity` |
+| Payload | `node: Node` (id, `capacity: Resources`, labels), `registered_at_us`, `service_addr`, `host_facts`, `detected_capacity`, `draining: bool` (the agent's own shutdown announcement, from its `Register` report — ADR 0041) |
 | Validation | None beyond shape — registration is always legal |
-| Apply effects | New node: insert with `epoch = 1`, `schedulable = true`. Existing node: **bump `node_epoch`** (invalidating all commands issued under earlier epochs, per ADR 0009), update capacity, labels, `service_addr`, and the display-only `host_facts` / `detected_capacity` (overwritten wholesale — a re-imaged host must not leave half the previous machine's story behind); the drain flag is **not** cleared — drain is desired state owned by the admin, and an agent restart must not undo it. Live allocations are untouched (the ObservedSet reconciliation that follows registration settles them). If capacity grew, run a pledge pass. |
+| Apply effects | New node: insert with `epoch = 1`, `schedulable = true`, `draining` from the command. Existing node: **bump `node_epoch`** (invalidating all commands issued under earlier epochs, per ADR 0009), update capacity, labels, `service_addr`, and the display-only `host_facts` / `detected_capacity` (overwritten wholesale — a re-imaged host must not leave half the previous machine's story behind); the admin cordon `schedulable` is **not** touched — it is desired state owned by the admin, and an agent restart must not undo it, while `draining` **is** rewritten from the report, so an agent that comes back voids its earlier "I am leaving" at the same log position that bumps the epoch. Live allocations are untouched (the ObservedSet reconciliation that follows registration settles them). If capacity grew, run a pledge pass. |
 | Rejections | — (structurally infallible) |
 
 #### `DeclareNodeLost`
@@ -424,7 +424,7 @@ reachable through the API.
 | Proposer | Admin API (drain / undrain) |
 | Payload | `node: NodeId`, `schedulable: bool`, `actor: Actor`, `updated_at_us` |
 | Validation | Node exists; actor holds unscoped `operator` or `admin` (node operations are cluster verbs — ADR 0023) |
-| Apply effects | Set the flag. Drain blocks new placements only: running work continues, and existing accruing allocations keep funding (revoking them is the scheduler's call, via `CommitPlacements`). |
+| Apply effects | Set the flag. Drain blocks new placements only: running work continues, and existing accruing allocations keep funding (revoking them is the scheduler's call, via `CommitPlacements`). This is the **admin cordon**, one of the two flags behind `NodeRecord::accepts_placements()` (ADR 0041); the other is the agent's own `draining`, which no actor-carrying command writes. |
 | Rejections | `UnknownNode`, `PermissionDenied` |
 
 ### Housekeeping

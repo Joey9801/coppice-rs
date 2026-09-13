@@ -163,6 +163,11 @@ message NodeRecord {
   coppice.core.v1.Node node = 1;
   // Bumped on (re)registration and on loss declaration (ADR 0009).
   uint64 epoch = 2;
+  // The agent's own shutdown announcement (ADR 0041), distinct from the
+  // admin cordon `node.schedulable`: set from the agent's reports and
+  // cleared by a re-registration that does not carry it. Placements are
+  // gated on both.
+  bool draining = 3;
 }
 
 // One node of the quota-entity tree, keyed by `entity` (the map key made
