@@ -761,14 +761,14 @@ mod harness {
         sink: &FilesystemSink,
         job: JobId,
         attempt: AttemptId,
-    ) -> Option<i64> {
-        let max = sink
-            .max_log_timestamp(&job, &attempt)
-            .await
-            .ok()
-            .flatten()?;
+    ) -> anyhow::Result<Option<i64>> {
+        // A store error is surfaced, never folded into `None`: issue #112 hid a
+        // poisoned segment behind a misleading "no log rows" failure this way.
+        let Some(max) = sink.max_log_timestamp(&job, &attempt).await? else {
+            return Ok(None);
+        };
         let micros = max.as_micros();
-        Some(micros - micros.rem_euclid(1_000_000))
+        Ok(Some(micros - micros.rem_euclid(1_000_000)))
     }
 
     /// Assert the §8.2 bounded-duplication contract over stored chunks: with
@@ -2321,7 +2321,7 @@ async fn log_replay_after_restart_is_at_least_once() {
         // The boundary B will derive == store MAX(at) floored; A is gone, so nothing
         // writes between this read and the follower's own read during observe.
         let boundary = harness::boundary_floor_micros(&sink, job, attempt)
-            .await
+            .await?
             .ok_or_else(|| anyhow!("pre-crash store had no log rows to derive a boundary from"))?;
         exec_b.observe().await?; // adopt → resume the follower from `boundary`
         harness::wait_for_chunks(&sink, job, attempt, pre + 10, 60).await?;
@@ -2392,7 +2392,7 @@ async fn boundary_second_split_across_a_segment_roll() {
         let (exec_b, _txb, _hub_b, _sink_b) =
             harness::executor_with_telemetry_opts(docker.clone(), root.path(), tiny).await;
         let boundary = harness::boundary_floor_micros(&sink, job, attempt)
-            .await
+            .await?
             .ok_or_else(|| anyhow!("pre-crash store had no log rows to derive a boundary from"))?;
         exec_b.observe().await?;
         harness::wait_for_chunks(&sink, job, attempt, pre + 60, 60).await?;
@@ -2526,7 +2526,7 @@ async fn repeated_crashes_during_replay_keep_every_daemon_chunk() {
         for _ in 0..RECOVERIES {
             let (exec, _tx, hub, _s) =
                 harness::executor_with_telemetry(docker.clone(), root.path()).await;
-            if let Some(b) = harness::boundary_floor_micros(&sink, job, attempt).await {
+            if let Some(b) = harness::boundary_floor_micros(&sink, job, attempt).await? {
                 boundaries.push(b);
             }
             exec.observe().await?;
@@ -2539,7 +2539,7 @@ async fn repeated_crashes_during_replay_keep_every_daemon_chunk() {
         // Final executor adopts, grows, then stops + drains + reaps.
         let (exec_f, _txf, _hub_f, _sink_f) =
             harness::executor_with_telemetry(docker.clone(), root.path()).await;
-        if let Some(b) = harness::boundary_floor_micros(&sink, job, attempt).await {
+        if let Some(b) = harness::boundary_floor_micros(&sink, job, attempt).await? {
             boundaries.push(b);
         }
         exec_f.observe().await?;
@@ -2892,7 +2892,7 @@ async fn production_build_wires_collection_end_to_end() {
         )
         .await;
         let boundary = harness::boundary_floor_micros(&store_b, job, attempt)
-            .await
+            .await?
             .ok_or_else(|| anyhow!("sink B had no log rows to derive a boundary from"))?;
         exec_b.observe().await?; // adopt → resume the follower from `boundary`
         harness::wait_for_chunks(&store_b, job, attempt, pre + 10, 60).await?;
@@ -3289,7 +3289,7 @@ async fn identical_payloads_survive_restart_within_bounds() {
         let pre_chunks = harness::stored_chunks(&sink, job, attempt).await;
         let stored_count_pre = pre_chunks.len();
         let boundary = harness::boundary_floor_micros(&sink, job, attempt)
-            .await
+            .await?
             .ok_or_else(|| anyhow!("pre-crash store had no log rows"))?;
         let n_boundary = harness::chunks_in_boundary_second(&pre_chunks, boundary);
         exec_b.observe().await?;
