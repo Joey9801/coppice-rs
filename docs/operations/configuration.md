@@ -320,7 +320,9 @@ otlp_endpoint = "https://otel-collector.example.com:4317"
 The coordinator's Prometheus `/metrics` endpoint has no address of its own:
 it is served on the client API listener at `/metrics` (issue #46), alongside
 `/api/v1`, so there is no coordinator `metrics_addr` knob. (The agent daemon,
-which has no such listener, keeps its own optional `metrics_addr`.)
+which has no such listener, keeps its own optional `metrics_addr`; when set,
+that listener also serves the agent's `/healthz` and `/readyz` probes —
+[operations/scale-in.md](scale-in.md).)
 
 The agent's file follows the same conventions with its own schema: the
 same `[discovery]` section (minus the coordinator-only knobs, consulted

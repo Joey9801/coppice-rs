@@ -66,9 +66,13 @@ Gaps, each of which shapes the acceptance criteria below:
 - **No ClickHouse sink** (issue #42) and no durable history store (issue
   #43, `[history] mode = "none"` is the only mode). The demo cannot include
   ClickHouse; it must say so.
-- **No drain verb** (OD-15b, issue #49). Worker replacement today is the
-  90 s liveness timeout, `DeclareNodeLost`, and attempt retry. The demo
-  documents that as current behaviour, which #51 allows.
+- ~~**No drain verb** (OD-15b, issue #49).~~ Landed as
+  [ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md): `coppice node drain`, an agent SIGTERM drain, and node-record
+  eviction. Terminating an instance without stopping the unit first is
+  still the 90 s timeout path, which is what smoke step 6 exercises; a
+  lifecycle-hook drain is documented in
+  [operations/scale-in.md](../operations/scale-in.md) and not wired into
+  the demo's Terraform.
 - **The in-repo fleet tests are in-process.** The `Fleet` harness in
   `crates/coppice-coordinator/tests/common` runs every member as a tokio
   task with real mTLS. This deployment is the first time the daemons run as
@@ -201,7 +205,7 @@ Maps onto #51's acceptance criteria:
 | 4 | Prometheus scrapes all six | Prometheus API `count(up==1)` is 6, via SSM port-forward |
 | 4 | OAuth protects the client API | tokenless `GET /api/v1/overview` is 401; Cognito token succeeds |
 | 5 | leader kill, no duplicate submission | find leader, terminate its instance through the ASG, submit the same job id in a retry loop during election, assert one job; assert a new leader and, after the replacement joins, three voters again |
-| 6 | worker replacement | terminate an agent mid-job, assert the attempt ends `NodeLost`, the retry lands on another node, and the ASG replacement enrols; runbook states this is the timeout path, not drain |
+| 6 | worker replacement | terminate an agent mid-job, assert the attempt ends `NodeLost`, the retry lands on another node, and the ASG replacement enrols; runbook states this is the timeout path, not the ADR 0041 drain, because the instance is terminated without stopping the unit |
 | 7 | CI exercises it | the workflow below |
 
 ClickHouse is recorded as not demonstrable until issue #42 lands.

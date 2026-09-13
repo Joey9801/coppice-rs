@@ -112,7 +112,7 @@ issue #47.
 | A1 | ~~Node identity + config are hand-authored~~ — landed | the agent mints `NodeId::new()` on first boot and persists it at `<data_dir>/node-identity`; `node_id` is gone from `agent.toml`, so a fleet ships one byte-identical file |
 | A2 | ~~Cert issuance is out-of-band~~ — landed | ADR 0011's enrollment-token → CSR → per-node-cert flow is built (`POST /api/v1/enroll`, `[enrollment]` in `configuration.md`, agent-side renewal), resolving OD-15a; see the plan below for the shape as shipped |
 | A3 | ~~Capacity is static config~~ — landed | cpu/memory/disk are detected at startup (`available_parallelism` ∩ cgroup `cpu.max`, `MemTotal` ∩ `memory.max`, `statvfs` on `data_dir`); `[capacity]` survives only as a per-dimension override |
-| A4 | No graceful scale-in | `SetNodeSchedulable` exists in the state machine but **nothing calls it** (no API, no CLI); there is no compute-node removal/GC command at all; scale-in today = instance dies → 90 s liveness timeout → `DeclareNodeLost` → running attempts killed as `NodeLost` |
+| A4 | ~~No graceful scale-in~~ — landed | `coppice node drain/undrain/remove` over the HTTP API, agent SIGTERM drain with a bounded wait, `EvictNodes` by explicit removal or `node_retention` GC, `/healthz` on both daemons and an agent `/readyz` ([ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md)); `DeclareNodeLost` remains the crash backstop |
 | A5 | The Docker executor is a stub | every `start` fails; the agent cannot run real workloads (tracked as the top critical-path item) |
 
 ### Plan, in shipping order
@@ -174,25 +174,33 @@ consulted on every reconnect, so a DNS/ASG change reaches a running agent
 without a restart — and an empty static seed list is now a config-load
 error rather than a runtime panic.
 
-**A4 — graceful drain and decommission.** Three pieces:
+**A4 — graceful drain and decommission, landed** as [ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md). The three pieces as planned, with the details the ADR fixed noted inline:
 
-1. **A drain verb**: `coppice node drain <node-id> [--wait]` (admin CLI
-   now, API later) proposing `SetNodeSchedulable{false}` — the apply and
-   scheduler sides already honor it; `--wait` polls until the node's live
-   allocations reach zero.
-2. **Agent-initiated drain on shutdown**: SIGTERM → agent reports
-   draining, waits for running work up to a deadline, then exits. Cloud
-   wiring: an ASG lifecycle hook (or spot-interruption watcher) runs the
-   drain before the instance is reaped, holding scale-in protection until
-   the wait completes.
-3. **Node record GC**: a `RemoveNode`-for-compute-nodes command (records
-   are currently immortal — `DeclareNodeLost` only marks unschedulable),
-   proposed by housekeeping for nodes unschedulable and empty past a
-   retention window (ADR 0012 style), so an ASG that churns instances
-   daily does not grow state forever.
+1. **A drain verb**: `coppice node drain <node-id> [--wait]` over
+   `POST /api/v1/nodes/{id}/drain` (plus `undrain` and `remove`),
+   proposing `SetNodeSchedulable{false}` with the caller's actor; `--wait`
+   polls `GET /nodes/{id}` until running and accruing counts reach zero.
+2. **Agent-initiated drain on shutdown**: SIGTERM → the agent's reports
+   carry `draining`, which the leader replicates as a second flag on the
+   node record (distinct from the admin cordon, and cleared by
+   re-registration so a restart never leaves a node drained); the agent
+   waits for its accountable work up to `shutdown_grace` (5 m), then
+   exits, leaving overrun work to the `NodeLost` backstop. Cloud wiring —
+   an ASG lifecycle hook or spot-interruption watcher stopping the unit —
+   is documented in [operations/scale-in.md](../operations/scale-in.md),
+   not built into the Terraform.
+3. **Node record GC**: `EvictNodes`, proposed by `coppice node remove`
+   for a drained, empty node, and by housekeeping for nodes that no
+   longer accept placements, hold no live allocation, and have been
+   silent past the replicated `node_retention` window (24 h, settable at
+   formation under `[retention]`), so an ASG that churns instances daily
+   does not grow state forever.
 
 `DeclareNodeLost` stays as the backstop for ungraceful death; the point of
 A4 is that *planned* scale-in never rides the 90 s timeout or kills work.
+Both daemons also serve `/healthz`, and the agent's metrics listener
+gained a `/readyz` that distinguishes starting, ready, reconnecting,
+Docker-unavailable, and draining.
 
 **A5 — Docker executor** is unchanged in scope and remains the top
 critical-path item ahead of everything here except possibly A1 (trivial).
@@ -240,6 +248,5 @@ The MVP critical path landed 2026-07-20 (Docker executor → API server →
 CLI), so nothing here competes with it any more. Remaining sequencing:
 the Part 1 implementation (issue #47) landed in full, and the agent side
 followed: A1, A2, and A3 are all built (issue #48), so the zero-touch ASG
-launch script above is real. Only A4 still waits on the OD-15
-decommission/scale-in decision — ADRs 0022/0023 are written, so
-authorization is no longer the blocker there.
+launch script above is real, and A4 landed with ADR 0041 (issue #49),
+which closes OD-15. Part 2 is complete.

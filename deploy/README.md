@@ -103,11 +103,13 @@ automation, and it requires a full, caught-up voter set held continuously for
 - **The agent unit is `Type=exec`, not `Type=notify`.** The agent daemon has no
   `sd_notify` caller today (only the coordinator does, in
   `crates/coppice-coordinator/src/systemd.rs`), so `Type=notify` would sit out
-  the notify timeout and then fail the unit. It also installs no SIGTERM
-  handler, so `systemctl stop` is the kernel's default termination: running
-  containers are cleaned up by the reap janitor on the next start and by the
-  coordinator's liveness timeout, not by a drain. There is no drain verb yet
-  (issue #49).
+  the notify timeout and then fail the unit. `systemctl stop` is a drain
+  ([ADR 0041](../docs/decisions/0041-graceful-scale-in-drain-and-node-eviction.md)):
+  the agent announces it is draining, waits for its running work up to
+  `shutdown_grace` (5 m), and exits; the unit's `TimeoutStopSec` is sized
+  over that window. Work still running at the deadline is left for the
+  coordinator's liveness timeout to retry elsewhere — see
+  [operations/scale-in.md](../docs/operations/scale-in.md).
 - **`Restart=always` is the whole recovery story.** Both daemons' startup paths
   are idempotent and resume from any interruption, so "not formed yet", "the
   enrollment token has not landed yet", "no coordinator is up yet" and "the

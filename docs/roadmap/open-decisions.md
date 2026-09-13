@@ -36,7 +36,7 @@ re-deriving it from the whole design.
 | [OD-12](#od-12-abort-semantics-partial-scheduling-and-job-groups) | Abort semantics, partial scheduling & job groups | High | Resolved — [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md), [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) |
 | [OD-13](#od-13-base-score-and-the-exact-job-costing-formula) | Base score and the exact job-costing formula | High | Resolved — [ADR 0021](../decisions/0021-effective-score-ranking.md) |
 | [OD-14](#od-14-coordinator-discovery-and-control-plane-pki) | Coordinator discovery & control-plane PKI | Medium | Resolved — [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md) |
-| [OD-15](#od-15-agent-enrollment-signer-and-decommission-protocol) | Agent enrollment signer & decommission protocol | High — gates zero-touch autoscaling | Half resolved — OD-15(a) via [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md); (b) drain/decommission open, plan in [deployment-story.md](deployment-story.md) |
+| [OD-15](#od-15-agent-enrollment-signer-and-decommission-protocol) | Agent enrollment signer & decommission protocol | High — gates zero-touch autoscaling | Resolved — (a) via [ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md); (b) via [ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md) |
 | [OD-16](#od-16-user-authentication-and-principal-model) | User authentication & principal model | High | Resolved — [ADR 0022](../decisions/0022-oidc-identity-and-authentication.md) |
 | [OD-17](#od-17-authorization-model-and-enforcement) | Authorization model & enforcement | High | Resolved — [ADR 0023](../decisions/0023-scoped-role-bindings.md) |
 
@@ -450,8 +450,20 @@ is no externally provisioned substitution for the machine plane (issue
 #127) — the cluster owns this material end to end at the fixed
 `<data_dir>/pki` layout. Enrollment has landed in the tree (PR #73, part
 of issue #47's chunk series), with the remaining OD-14/15(a) work limited to the
-chunk 07 test matrix and re-root runbook. **Half (b) — drain and
-decommission — remains open.**
+chunk 07 test matrix and re-root runbook.
+
+**Half (b) resolved** (2026-09-13, issue #49) — [ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md):
+the node record carries two flags — the admin cordon (`schedulable`,
+sticky across restarts) and the agent's own `draining` announcement
+(cleared by re-registration) — behind one placement gate; drain, undrain,
+and remove are ordinary HTTP writes (`coppice node drain --wait`); SIGTERM
+makes the agent announce `draining`, wait for its accountable work up to
+`shutdown_grace`, and leave overrun work to the `NodeLost` backstop; node
+records are evicted by an explicit `remove` or by housekeeping once
+drained, empty, and silent past the replicated `node_retention` (24 h);
+both daemons serve `/healthz`, and the agent gains a `/readyz`. ASG
+lifecycle-hook and spot-interruption wiring is documented in
+[operations/scale-in.md](../operations/scale-in.md), not built.
 
 **Question.** (a) Who signs agent leaves in the ADR 0011 enrollment flow —
 a coordinator-held CA (key on the leader, cert in replicated policy) or an
