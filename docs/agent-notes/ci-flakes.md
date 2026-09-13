@@ -57,6 +57,19 @@ failure in CI, that's the likely cause, not a real regression.
   notification entirely due to a cgroup v2 race; the `Killed` verdict is
   correct by design in that case, so the fix was retrying the test on a
   `Killed` result rather than treating it as a hard failure.
+- **`daemon_log_rotation_bounds_catchup`** (issue #139) — the daemon's own
+  `docker logs --follow` skips a whole file when its follower falls two
+  rotations behind between reads (moby logs "file rotations were missed
+  while following logs; some log messages have been skipped over"; nothing
+  on the API reports it). The test rotated 8k files of ~1 KiB lines, so a
+  sub-second daemon stall inside the stop grace skipped a still-retained
+  file and the retention oracle blamed the executor. Fixed by having the
+  printer emit a fixed number of lines and park, and adopting only once the
+  daemon's files are final, so no rotation can race the follower's tail
+  read; the failure now names the first missing line and prints the daemon
+  and stored line heads. Reproduce a daemon-side skip locally by
+  `kill -STOP`-ing dockerd inside the Colima VM for ~0.5 s on the `kill`
+  event of a fast-rotating container, then `kill -CONT`.
 
 ## Filing a new flake
 
