@@ -733,6 +733,7 @@ mod tests {
             running: running.iter().map(|a| (*a).into()).collect(),
             image_cache: None,
             used: None,
+            draining: false,
         })
     }
 
@@ -743,6 +744,7 @@ mod tests {
             running: Vec::new(),
             image_cache: None,
             used: Some(coppice_proto::convert::node_usage_to_pb(used, sampled_at)),
+            draining: false,
         })
     }
 
@@ -791,6 +793,7 @@ mod tests {
                 ..Default::default()
             }),
             detected_capacity: Some((&requested()).into()),
+            draining: false,
         });
 
         let out = normalize(&view, &report(node, 0, reg), now());
@@ -1289,6 +1292,7 @@ mod tests {
             service_addr: None,
             host_facts: None,
             detected_capacity: None,
+            draining: false,
         });
         let inbound = report(node, 0, reg);
 

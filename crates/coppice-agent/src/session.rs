@@ -80,6 +80,13 @@ pub struct Session<F: Fs, E: Executor> {
     /// so a StartJob that arrives drained is still executed (committed intent
     /// predating the drain) — this only records the request.
     drained: bool,
+    /// Our own shutdown announcement (ADR 0041), carried on every `Register`
+    /// and `Heartbeat` from the moment shutdown begins. Distinct from
+    /// [`Session::drained`], which records the coordinator's advisory `Drain`
+    /// command: this one is agent-local intent, so it is **not** cleared by
+    /// [`Session::reset_session`] — a drain that begins while the stream is
+    /// down lands as soon as the agent registers again.
+    draining: bool,
     /// Watchdogs armed by successful starts with a `max_runtime`, drained
     /// by the live loop which owns the timers.
     armed_watchdogs: Vec<ArmedWatchdog>,
@@ -126,6 +133,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             last_seq: None,
             registered: false,
             drained: false,
+            draining: false,
             armed_watchdogs: Vec::new(),
             pending_reaps: Vec::new(),
             service_addr: None,
@@ -187,6 +195,15 @@ impl<F: Fs, E: Executor> Session<F, E> {
     }
     pub fn is_drained(&self) -> bool {
         self.drained
+    }
+    /// Announce (or retract) this agent's own shutdown on every subsequent
+    /// report (ADR 0041). The shutdown path sets it and then heartbeats
+    /// immediately rather than waiting for the tick.
+    pub fn set_draining(&mut self, draining: bool) {
+        self.draining = draining;
+    }
+    pub fn is_draining(&self) -> bool {
+        self.draining
     }
     pub fn executor(&self) -> &E {
         &self.executor
@@ -687,6 +704,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 // registration so re-registration heals a re-imaged machine.
                 host_facts: self.host_facts.as_ref().map(Into::into),
                 detected_capacity: self.detected_capacity.as_ref().map(Into::into),
+                // Registration rewrites the replicated flag, so a session that
+                // is not draining clears a stale announcement here (ADR 0041).
+                draining: self.draining,
             })),
         }
     }
@@ -744,6 +764,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             running,
             image_cache: Some(self.executor.cache_inventory()),
             used,
+            draining: self.draining,
         }))
     }
 

@@ -148,6 +148,15 @@ message Register {
   // advertises something other than what its hardware suggests. Absent when
   // no dimension could be detected.
   optional coppice.core.v1.Resources detected_capacity = 5;
+  // The agent's own shutdown announcement (ADR 0041): true once the process
+  // has begun draining and is waiting out its remaining work. Distinct from
+  // the admin cordon, which is replicated state the agent never reports.
+  //
+  // Registration rewrites the replicated flag unconditionally, so a `Register`
+  // that does not carry it **clears** it: an agent that comes back has, by
+  // definition, not gone away, and `systemctl restart coppice-agent` therefore
+  // never leaves a node permanently drained.
+  bool draining = 6;
 }
 
 // Periodic liveness, inventory, and running-set signal. The coordinator
@@ -163,6 +172,11 @@ message Heartbeat {
   // whose runtime measures nothing, or whose samples are all stale, reports
   // no `used` at all rather than a misleading floor.
   optional NodeUsage used = 4;
+  // The agent's own shutdown announcement (ADR 0041), same fact as
+  // `Register.draining`: an agent that begins draining mid-session announces
+  // it on every subsequent heartbeat, and the leader turns a value that
+  // differs from the replicated record into a `SetNodeDraining`.
+  bool draining = 5;
 }
 
 // Job-attributable resource usage observed on a node, folded by the agent from
