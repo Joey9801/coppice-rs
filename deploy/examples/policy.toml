@@ -18,6 +18,13 @@ core_hours_per_cu = 1.0        # one CPU core-hour costs 1 CU
 memory_gib_hours_per_cu = 2.0  # 2 GiB-hours of memory cost 1 CU
 disk_gib_hours_per_cu = 15.0   # 15 GiB-hours of disk cost 1 CU
 
+[retention]
+# How long replicated records outlive what they describe. Both are seeded only
+# while the replicated field still holds its booted default, so a re-init never
+# overwrites an operator's later edit.
+node = "24h"      # a drained, empty, silent node record before the GC evicts it (ADR 0041)
+terminal = "72h"  # a terminal job before it leaves replicated state (ADR 0012)
+
 [[priority_multiplier]]
 # The whole table is seeded in one shot, and only while the replicated table is
 # still empty. One entry is enough for the demo: priority 0 at face value.

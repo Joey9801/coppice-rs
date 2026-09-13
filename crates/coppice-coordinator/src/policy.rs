@@ -22,7 +22,8 @@
 //!   a no-op and an operator's later edits survive; the `[cost_weights]`
 //!   prices ride the same command under the same rule, seeded only while the
 //!   replicated weights are still all-zero (the booted "everything is free"
-//!   default);
+//!   default); the `[retention]` windows ride it too, each seeded only while
+//!   the replicated field still holds its booted default;
 //! - each quota entity is created **only when absent** by id — an existing
 //!   entity is left untouched (reconfiguration is not an amnesty, and re-init
 //!   must not reset accumulated usage);
@@ -55,7 +56,7 @@ use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
     ConfigureQuotaEntity, MintEnrollToken, UpdateAuthorization, UpdatePolicy,
 };
-use coppice_state::{Command, EnrollRole, StateMachine};
+use coppice_state::{Command, EnrollRole, PolicyConfig, StateMachine};
 use coppice_tls::pki;
 
 /// `2^32`, the scale of the Q32.32 fixed-point [`PriorityMultiplier`].
@@ -90,6 +91,50 @@ pub struct FormationPolicy {
     /// Absent = leave the replicated bindings untouched.
     #[serde(default)]
     pub authorization: Option<AuthorizationSpec>,
+    /// How long replicated records outlive what they describe, as the
+    /// `[retention]` table. Absent = leave both windows at their booted
+    /// defaults.
+    #[serde(default)]
+    pub retention: Option<RetentionSpec>,
+}
+
+/// The `[retention]` table: how long replicated records outlive what they
+/// describe.
+///
+/// ```toml
+/// [retention]
+/// node = "24h"      # PolicyConfig::node_retention (ADR 0041)
+/// terminal = "72h"  # PolicyConfig::terminal_retention (ADR 0012)
+/// ```
+///
+/// Both are humantime spans and both are optional; an omitted field leaves
+/// that window at its booted default. Like the prices, each is seeded **only
+/// while the replicated field still holds that default**, so a re-run of
+/// `init` never overwrites an operator's later edit.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionSpec {
+    /// How long a drained, empty, silent node record is kept before the
+    /// leader's housekeeping GC evicts it (ADR 0041). Default 24 h.
+    #[serde(default, with = "humantime_serde::option")]
+    pub node: Option<std::time::Duration>,
+    /// How long a terminal job is kept in replicated state after it finished
+    /// (ADR 0012). Default 72 h.
+    #[serde(default, with = "humantime_serde::option")]
+    pub terminal: Option<std::time::Duration>,
+}
+
+impl RetentionSpec {
+    /// Reject a zero window: it would evict a record the instant it
+    /// qualifies, which is a footgun rather than a shorter retention.
+    fn validate(&self) -> Result<()> {
+        for (field, value) in [("node", self.node), ("terminal", self.terminal)] {
+            if value.is_some_and(|v| v.is_zero()) {
+                bail!("[retention] {field} must be a non-zero duration (for example \"24h\")");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The `[authorization]` table: the day-0 role bindings and, optionally, the
@@ -480,6 +525,9 @@ impl FormationPolicy {
         if let Some(weights) = &self.cost_weights {
             weights.validate()?;
         }
+        if let Some(retention) = &self.retention {
+            retention.validate()?;
+        }
         let mut seen_id = std::collections::BTreeSet::new();
         for qe in &self.quota_entities {
             if !seen_id.insert(qe.id) {
@@ -590,13 +638,33 @@ impl FormationPolicy {
         let seeds_weights = weights.is_some_and(|weights| {
             weights != CostWeights::default() && state.policy.cost_weights == CostWeights::default()
         });
-        if seeds_multipliers || seeds_weights {
+        // Retention windows, under the same seed-only-from-default rule.
+        let booted = PolicyConfig::default();
+        let retention = self.retention.unwrap_or_default();
+        let seeds_node_retention = retention.node.map(Duration::from).is_some_and(|window| {
+            window != booted.node_retention && state.policy.node_retention == booted.node_retention
+        });
+        let seeds_terminal_retention =
+            retention
+                .terminal
+                .map(Duration::from)
+                .is_some_and(|window| {
+                    window != booted.terminal_retention
+                        && state.policy.terminal_retention == booted.terminal_retention
+                });
+        if seeds_multipliers || seeds_weights || seeds_node_retention || seeds_terminal_retention {
             let mut policy = state.policy.clone();
             if seeds_multipliers {
                 policy.priority_multipliers = self.multiplier_table();
             }
             if let (true, Some(weights)) = (seeds_weights, weights) {
                 policy.cost_weights = weights;
+            }
+            if let (true, Some(window)) = (seeds_node_retention, retention.node) {
+                policy.node_retention = Duration::from(window);
+            }
+            if let (true, Some(window)) = (seeds_terminal_retention, retention.terminal) {
+                policy.terminal_retention = Duration::from(window);
             }
             commands.push(Command::UpdatePolicy(UpdatePolicy {
                 policy,
@@ -843,6 +911,9 @@ quota = 1000000000000
             FormationPolicy::parse_toml(DEPLOY_EXAMPLE.as_bytes()).expect("deploy example parses");
         assert_eq!(policy.quota_entities.len(), 1);
         assert!(policy.cost_weights.is_some());
+        // The retention windows the demo states explicitly (ADR 0012, 0041).
+        let retention = policy.retention.expect("[retention]");
+        assert!(retention.node.is_some() && retention.terminal.is_some());
         // Both launch roles are seeded, each under the label that makes
         // re-applying the policy a no-op (ADR 0037 §5).
         let labels: Vec<&str> = policy
@@ -882,6 +953,87 @@ quota = 1000000000000
         assert_eq!(policy.quota_entities[0].name, "default");
         assert_eq!(policy.quota_entities[0].quota, 1_000_000_000_000);
         assert!(policy.quota_entities[0].parent.is_none());
+    }
+
+    /// The `[retention]` table parses as humantime spans and rejects a zero
+    /// window.
+    #[test]
+    fn retention_windows_parse_and_reject_zero() {
+        let policy =
+            FormationPolicy::parse_toml(b"[retention]\nnode = \"6h\"\nterminal = \"7d\"\n")
+                .expect("retention parses");
+        let retention = policy.retention.expect("[retention]");
+        assert_eq!(
+            retention.node,
+            Some(std::time::Duration::from_secs(6 * 3600))
+        );
+        assert_eq!(
+            retention.terminal,
+            Some(std::time::Duration::from_secs(7 * 24 * 3600))
+        );
+
+        // Either field alone is fine; the other keeps its booted default.
+        let partial = FormationPolicy::parse_toml(b"[retention]\nnode = \"30m\"\n")
+            .expect("a partial table parses");
+        assert_eq!(partial.retention.expect("[retention]").terminal, None);
+
+        let err = FormationPolicy::parse_toml(b"[retention]\nnode = \"0s\"\n")
+            .expect_err("zero is rejected");
+        assert!(format!("{err:#}").contains("non-zero"), "{err:#}");
+    }
+
+    /// Retention rides the same full-replacement `UpdatePolicy` as the prices
+    /// and the priority table, under the same rule: seeded only while the
+    /// replicated field still holds its booted default, so a re-apply is a
+    /// no-op and an operator's edit survives.
+    #[test]
+    fn retention_seeds_the_policy_command_only_from_the_booted_default() {
+        let policy =
+            FormationPolicy::parse_toml(b"[retention]\nnode = \"6h\"\nterminal = \"7d\"\n")
+                .unwrap();
+        let now = Timestamp::now();
+
+        let fresh = StateMachine::default();
+        let commands = policy.commands(&fresh, now, CHEAP_KDF).expect("valid");
+        match &commands[..] {
+            [Command::UpdatePolicy(up)] => {
+                assert_eq!(up.policy.node_retention, Duration::from_hours(6));
+                assert_eq!(up.policy.terminal_retention, Duration::from_days(7));
+                // A full replacement that changes nothing else.
+                assert_eq!(up.policy.cost_weights, fresh.policy.cost_weights);
+            }
+            other => panic!("expected one UpdatePolicy, got {other:?}"),
+        }
+
+        // Already applied: nothing to propose.
+        let mut applied = StateMachine::default();
+        applied.policy.node_retention = Duration::from_hours(6);
+        applied.policy.terminal_retention = Duration::from_days(7);
+        assert!(policy
+            .commands(&applied, now, CHEAP_KDF)
+            .expect("valid")
+            .is_empty());
+
+        // An operator moved one window off the default: that one is left
+        // alone, and only the other is seeded.
+        let mut edited = StateMachine::default();
+        edited.policy.node_retention = Duration::from_hours(48);
+        match &policy.commands(&edited, now, CHEAP_KDF).expect("valid")[..] {
+            [Command::UpdatePolicy(up)] => {
+                assert_eq!(up.policy.node_retention, Duration::from_hours(48));
+                assert_eq!(up.policy.terminal_retention, Duration::from_days(7));
+            }
+            other => panic!("expected one UpdatePolicy, got {other:?}"),
+        }
+
+        // A document that restates the booted defaults proposes nothing.
+        let restated =
+            FormationPolicy::parse_toml(b"[retention]\nnode = \"24h\"\nterminal = \"72h\"\n")
+                .unwrap();
+        assert!(restated
+            .commands(&StateMachine::default(), now, CHEAP_KDF)
+            .expect("valid")
+            .is_empty());
     }
 
     #[test]
