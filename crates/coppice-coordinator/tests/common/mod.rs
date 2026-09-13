@@ -681,8 +681,38 @@ impl RunningCoordinator {
         ca: &Ca,
         housekeeping_interval: Duration,
     ) -> RunningCoordinator {
+        Self::start_inner(cluster_id, ca, housekeeping_interval, free_port()).await
+    }
+
+    /// [`start`](Self::start) with the agent gateway bound to a port the caller
+    /// chose, rather than one picked here.
+    ///
+    /// For the one thing a test cannot otherwise do: stop a coordinator and
+    /// bring another up at the same address, so a running agent's reconnect
+    /// loop finds it again (the drain-while-reconnecting test, ADR 0041). The
+    /// caller allocates the port with [`free_port`] before the first
+    /// coordinator starts and reuses it for the second.
+    pub async fn start_on_agent_port(
+        cluster_id: ClusterId,
+        ca: &Ca,
+        agent_port: u16,
+    ) -> RunningCoordinator {
+        Self::start_inner(
+            cluster_id,
+            ca,
+            coppice_coordinator::HOUSEKEEPING_INTERVAL,
+            agent_port,
+        )
+        .await
+    }
+
+    async fn start_inner(
+        cluster_id: ClusterId,
+        ca: &Ca,
+        housekeeping_interval: Duration,
+        agent_port: u16,
+    ) -> RunningCoordinator {
         let raft_port = free_port();
-        let agent_port = free_port();
         let dir = tempfile::tempdir().expect("create coordinator tempdir");
         let root = dir.path();
 
