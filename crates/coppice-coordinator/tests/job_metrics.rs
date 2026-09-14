@@ -235,6 +235,7 @@ async fn submit_retrying_job(coord: &RunningCoordinator, job: JobId, entity: Quo
                 },
                 abort_requested: None,
                 submitted_by: None,
+                metadata: Default::default(),
             },
             multiplier: PriorityMultiplier::ONE,
             submitted_at: Timestamp::now(),

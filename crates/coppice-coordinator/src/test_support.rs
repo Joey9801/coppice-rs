@@ -126,6 +126,7 @@ pub fn job_record(
             retry: RetryPolicy::default(),
             abort_requested: None,
             submitted_by: None,
+            metadata: Default::default(),
         },
         state: JobState::Queued,
         multiplier: PriorityMultiplier(0),

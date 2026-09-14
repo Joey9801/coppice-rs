@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 
 use serde::Deserialize;
@@ -23,12 +23,15 @@ use serde::Deserialize;
 // the authentication edge's view of it arrives as an extension trait.
 use coppice_authn::ActorExt;
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
+use coppice_core::metadata;
 use coppice_core::time::Timestamp;
 
 use super::dto::{
-    self, AbortJobRequest, AbortJobResponse, ConfigureQuotaEntityRequest, SubmitJobRequest,
+    self, AbortJobRequest, AbortJobResponse, ConfigureQuotaEntityRequest,
+    ReplaceJobMetadataRequest, ReplaceJobMetadataResponse, SubmitJobRequest,
+    UpdateJobMetadataRequest, UpdateJobMetadataResponse,
 };
-use crate::{Consistency, ControlPlane};
+use crate::{Consistency, ControlPlane, UpdateJobMetadataCall};
 
 use super::authn::{RequestActor, RequestPresentation};
 use super::authorize::{precheck, Intent};
@@ -293,6 +296,14 @@ fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
         .route("/jobs", get(list_jobs::<P>).post(submit_job::<P>))
         .route("/jobs/:job", get(get_job::<P>))
         .route("/jobs/:job/abort", post(abort_job::<P>))
+        // The ADR 0042 metadata writes, one path and two verbs: PUT is the
+        // full replacement, POST the patch. Two methods rather than two
+        // paths because they address the same resource — the job's metadata
+        // map — and differ only in how much of it the caller claims to own.
+        .route(
+            "/jobs/:job/metadata",
+            put(replace_job_metadata::<P>).post(update_job_metadata::<P>),
+        )
         .route("/jobs/:job/timeline", get(get_job_timeline::<P>))
         .route("/jobs/:job/usage", get(super::usage::get_job_usage::<P>))
         .route("/jobs/:job/logs", get(super::logs::get_job_logs::<P>))
@@ -655,6 +666,81 @@ async fn abort_job<P: ControlPlane>(
     precheck(&*plane, &actor, Intent::Abort { job }).await?;
     plane.abort_job(request, actor).await?;
     Ok(Json(AbortJobResponse {}))
+}
+
+/// `PUT /api/v1/jobs/{job}/metadata` (ADR 0042) — body
+/// `ReplaceJobMetadataRequest`, the whole map replacing whatever is stored.
+///
+/// Validated here, at the edge: the replacement *is* the resulting map, so
+/// every ADR 0042 limit is checkable without reading any state, and a breach
+/// is an `INVALID_ARGUMENT` carrying the domain validator's own text rather
+/// than a consensus round trip ending in a 409.
+///
+/// Gated exactly like an abort (ADR 0042: one verb, one rule): `operator` or
+/// higher over the job's quota entity, or having submitted the job.
+async fn replace_job_metadata<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
+    IdPath(job): IdPath<JobId>,
+    body: Result<Json<ReplaceJobMetadataRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let Json(request) = body.map_err(bad_body)?;
+    let metadata = request.metadata;
+    metadata::validate(&metadata).map_err(|e| HttpError::invalid(e.to_string()))?;
+    precheck(&*plane, &actor, Intent::UpdateJobMetadata { job }).await?;
+    let response = plane
+        .update_job_metadata(
+            UpdateJobMetadataCall {
+                job,
+                update: coppice_state::command::JobMetadataUpdate::Replace(metadata),
+            },
+            actor,
+        )
+        .await?;
+    Ok(Json(ReplaceJobMetadataResponse {
+        job: response.job,
+        log_index: response.log_index,
+    }))
+}
+
+/// `POST /api/v1/jobs/{job}/metadata` (ADR 0042) — body
+/// `UpdateJobMetadataRequest`, the `set`/`unset` patch.
+///
+/// The edge checks everything that is a property of the request alone: the
+/// set/unset overlap, duplicate `unset` keys, and the `set` entries' own keys
+/// and values. It cannot check the *result* — the merge happens against state
+/// at the command's log position, which this replica may not hold — so the
+/// key count and whole-map size of the merged map are apply's to enforce, and
+/// a breach there comes back as `REJECTED` (409) rather than a 400.
+///
+/// Same authorization as [`replace_job_metadata`].
+async fn update_job_metadata<P: ControlPlane>(
+    State(plane): State<Arc<P>>,
+    RequestActor(actor): RequestActor,
+    IdPath(job): IdPath<JobId>,
+    body: Result<Json<UpdateJobMetadataRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let Json(request) = body.map_err(bad_body)?;
+    request.validate().map_err(HttpError::invalid)?;
+    metadata::validate(&request.set).map_err(|e| HttpError::invalid(e.to_string()))?;
+    let set = request.set;
+    precheck(&*plane, &actor, Intent::UpdateJobMetadata { job }).await?;
+    let response = plane
+        .update_job_metadata(
+            UpdateJobMetadataCall {
+                job,
+                update: coppice_state::command::JobMetadataUpdate::Patch {
+                    set,
+                    unset: request.unset.iter().cloned().collect(),
+                },
+            },
+            actor,
+        )
+        .await?;
+    Ok(Json(UpdateJobMetadataResponse {
+        job: response.job,
+        log_index: response.log_index,
+    }))
 }
 
 /// `POST /api/v1/nodes/{node}/drain` (ADR 0041) — the admin cordon on.
@@ -1164,6 +1250,15 @@ mod tests {
         actors: std::sync::Mutex<Vec<coppice_state::Actor>>,
         /// The last `PUT /api/v1/authorization` body the plane was handed.
         authorization: std::sync::Mutex<Option<dto::UpdateAuthorizationRequest>>,
+        /// The last `POST /api/v1/jobs` body the plane was handed. Recorded
+        /// for the same reason `actors` is: a field the handler silently
+        /// drops still answers 200, so the only way to prove `metadata`
+        /// survives the edge is to look at what actually arrived.
+        submitted: std::sync::Mutex<Option<SubmitJobRequest>>,
+        /// Every ADR 0042 metadata edit the plane was handed, in call order
+        /// — the *domain* edit, so a test asserts which arm the handler
+        /// built as well as the routing.
+        metadata_calls: std::sync::Mutex<Vec<crate::UpdateJobMetadataCall>>,
     }
 
     impl StubPlane {
@@ -1182,6 +1277,23 @@ mod tests {
 
         fn record(&self, actor: coppice_state::Actor) {
             self.actors.lock().unwrap().push(actor);
+        }
+
+        /// The single `SubmitJobRequest` a one-submit test drove.
+        fn only_submitted(&self) -> SubmitJobRequest {
+            self.submitted
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("a submission reached the plane")
+        }
+
+        /// The single ADR 0042 edit a one-write test drove; an unexpected
+        /// second call fails the assertion too.
+        fn only_metadata_call(&self) -> crate::UpdateJobMetadataCall {
+            let calls = self.metadata_calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "expected exactly one metadata write");
+            calls[0].clone()
         }
 
         /// Apply one command to the plane's state, mapping the outcome the
@@ -1244,13 +1356,37 @@ mod tests {
             actor: coppice_state::Actor,
         ) -> Result<SubmitJobResponse, ApiError> {
             self.record(actor);
+            let job = req.job;
+            *self.submitted.lock().unwrap() = Some(req);
             match self.fail_with {
                 Some(make) => Err(make()),
-                None => Ok(SubmitJobResponse {
-                    job: req.job,
-                    log_index: 7,
-                }),
+                None => Ok(SubmitJobResponse { job, log_index: 7 }),
             }
+        }
+
+        /// The ADR 0042 metadata write. Like the node writes, this one
+        /// really applies: the command goes through the plane's own
+        /// `StateMachine`, so the edge's error mapping is tested against
+        /// apply's real rejections — `InvalidJobMetadata` for a merged map
+        /// that breaks a limit, `UnknownJob` for an id that is not there —
+        /// rather than a fake's idea of them.
+        async fn update_job_metadata(
+            &self,
+            req: crate::UpdateJobMetadataCall,
+            actor: coppice_state::Actor,
+        ) -> Result<dto::UpdateJobMetadataResponse, ApiError> {
+            self.record(actor.clone());
+            let job = req.job;
+            self.metadata_calls.lock().unwrap().push(req.clone());
+            self.apply(coppice_state::Command::UpdateJobMetadata(
+                coppice_state::command::UpdateJobMetadata {
+                    job,
+                    update: req.update,
+                    actor: Some(actor),
+                    updated_at: Timestamp::now(),
+                },
+            ))?;
+            Ok(dto::UpdateJobMetadataResponse { job, log_index: 7 })
         }
 
         async fn abort_job(
@@ -1383,6 +1519,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             // No handle by default: coordinator-status tests build their own
             // plane with a seeded summary.
             coordinator: None,
@@ -1402,6 +1540,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             coordinator: None,
         }))
     }
@@ -1422,6 +1562,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             coordinator: None,
         }))
     }
@@ -1585,6 +1727,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             coordinator: None,
         };
         let response = router(Arc::new(plane))
@@ -2178,6 +2322,7 @@ mod tests {
                 retry: Default::default(),
                 abort_requested: None,
                 submitted_by: None,
+                metadata: Default::default(),
             },
             state: coppice_core::job::JobState::Queued,
             multiplier: coppice_core::quota::PriorityMultiplier::ONE,
@@ -2214,6 +2359,428 @@ mod tests {
         assert_eq!(body["jobs"][1]["id"], lo.to_string());
         // Scan reached the low end: cursor is explicit null, never omitted.
         assert_eq!(body["next_cursor"], serde_json::Value::Null);
+    }
+
+    // ---- job metadata (ADR 0042) ------------------------------------------
+
+    /// A state machine holding one queued job carrying `metadata`.
+    fn state_with_metadata(job: JobId, metadata: &[(&str, &str)]) -> coppice_state::StateMachine {
+        let mut state = state_with_jobs(&[job]);
+        state.jobs.get_mut(&job).expect("seeded").spec.metadata = metadata
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        state
+    }
+
+    /// `PUT`/`POST /api/v1/jobs/{job}/metadata` against a plane holding
+    /// `state`, returning the status, the body, and the plane so a test can
+    /// look at what reached it.
+    async fn metadata_write(
+        state: coppice_state::StateMachine,
+        request: Request<Body>,
+    ) -> (StatusCode, serde_json::Value, Arc<StubPlane>) {
+        let plane = stub_plane(state);
+        let response = router(Arc::clone(&plane)).oneshot(request).await.unwrap();
+        let status = response.status();
+        (status, body_json(response).await, plane)
+    }
+
+    /// `GET /api/v1/jobs/{job}`'s `metadata` object.
+    async fn metadata_of(app: &Router, job: JobId) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/jobs/{job}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await["metadata"].clone()
+    }
+
+    #[tokio::test]
+    async fn submit_carries_metadata_through_to_the_control_plane() {
+        // The field has to survive the edge as the *domain* map: a handler
+        // that deserialized it and then dropped it would answer 200 all the
+        // same, and the job would simply have no annotations.
+        let job = JobId::new();
+        let plane = stub_plane(coppice_state::StateMachine::default());
+        let body = serde_json::json!({
+            "job": job,
+            "image": "busybox:1",
+            "command": ["sh"],
+            "requests": { "cpu_millis": 1, "memory_bytes": 1, "disk_bytes": 1 },
+            "quota_entity": QuotaEntityId::new(),
+            "metadata": { "name": "nightly", "attempt/count": "3", "flaky:seen": "" },
+        })
+        .to_string();
+        let response = router(Arc::clone(&plane))
+            .oneshot(post_json("/api/v1/jobs", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let submitted = plane.only_submitted();
+        assert_eq!(
+            submitted.metadata,
+            coppice_core::metadata::JobMetadata::from([
+                ("attempt/count".to_string(), "3".to_string()),
+                ("flaky:seen".to_string(), String::new()),
+                ("name".to_string(), "nightly".to_string()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_omitting_metadata_is_the_empty_map() {
+        let job = JobId::new();
+        let plane = stub_plane(coppice_state::StateMachine::default());
+        let body = serde_json::json!({
+            "job": job,
+            "image": "busybox:1",
+            "command": ["sh"],
+            "requests": { "cpu_millis": 1, "memory_bytes": 1, "disk_bytes": 1 },
+            "quota_entity": QuotaEntityId::new(),
+        })
+        .to_string();
+        let response = router(Arc::clone(&plane))
+            .oneshot(post_json("/api/v1/jobs", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(plane.only_submitted().metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn job_reads_carry_metadata_as_an_always_present_object() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let app = app_with_state(
+            None,
+            state_with_metadata(job, &[("name", "nightly"), ("n", "2")]),
+        );
+        // Detail and summary carry the same map, so a list row can be titled
+        // without a per-row fetch.
+        assert_eq!(
+            metadata_of(&app, job).await,
+            serde_json::json!({ "n": "2", "name": "nightly" })
+        );
+        let response = app
+            .clone()
+            .oneshot(Request::get("/api/v1/jobs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(
+            body["jobs"][0]["metadata"],
+            serde_json::json!({ "n": "2", "name": "nightly" })
+        );
+
+        // Empty is `{}`, present — never omitted and never null.
+        let app = app_with_state(None, state_with_jobs(&[job]));
+        assert_eq!(metadata_of(&app, job).await, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn replacing_metadata_installs_the_whole_map() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let plane = stub_plane(state_with_metadata(job, &[("old", "1"), ("kept", "no")]));
+        let app = router(Arc::clone(&plane));
+        let response = app
+            .clone()
+            .oneshot(put_json(
+                &format!("/api/v1/jobs/{job}/metadata"),
+                r#"{"metadata":{"new":"yes"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["job"], job.to_string());
+        assert_eq!(body["log_index"], 7);
+
+        // Replacement, not a merge: the previous keys are gone.
+        assert_eq!(
+            metadata_of(&app, job).await,
+            serde_json::json!({ "new": "yes" })
+        );
+        // And an empty object really does clear the map — that is the verb.
+        let response = app
+            .clone()
+            .oneshot(put_json(
+                &format!("/api/v1/jobs/{job}/metadata"),
+                r#"{"metadata":{}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(metadata_of(&app, job).await, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn patching_metadata_merges_set_over_the_map_and_drops_unset() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let plane = stub_plane(state_with_metadata(
+            job,
+            &[("keep", "1"), ("change", "before"), ("drop", "yes")],
+        ));
+        let app = router(Arc::clone(&plane));
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/api/v1/jobs/{job}/metadata"),
+                r#"{"set":{"change":"after","add":"new"},"unset":["drop"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["job"], job.to_string());
+        assert_eq!(
+            metadata_of(&app, job).await,
+            serde_json::json!({ "add": "new", "change": "after", "keep": "1" })
+        );
+
+        // The domain edit the plane was handed is the patch, not a
+        // pre-merged replacement: the merge is apply's, at its own position.
+        let call = plane.only_metadata_call();
+        assert_eq!(call.job, job);
+        assert!(matches!(
+            call.update,
+            coppice_state::command::JobMetadataUpdate::Patch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_empty_metadata_patch_is_an_accepted_no_op() {
+        // ADR 0042: an update computing to the stored map is accepted, so a
+        // retried forward is safe. `{}` is the degenerate case of that.
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let plane = stub_plane(state_with_metadata(job, &[("k", "1")]));
+        let app = router(Arc::clone(&plane));
+        let response = app
+            .clone()
+            .oneshot(post_json(&format!("/api/v1/jobs/{job}/metadata"), "{}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            metadata_of(&app, job).await,
+            serde_json::json!({ "k": "1" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_patch_is_refused_when_the_request_contradicts_itself() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        // (body, the phrase the message must name) — each is a property of
+        // the request alone, so each is a 400 with nothing proposed.
+        let cases = [
+            // A key set and unset at once: ambiguous, and an order would be
+            // a rule nobody wrote down.
+            (
+                r#"{"set":{"k":"v"},"unset":["k"]}"#,
+                "both `set` and `unset`",
+            ),
+            // The same key removed twice.
+            (r#"{"unset":["k","k"]}"#, "more than once"),
+            // An empty key can never be stored, so it can never be removed.
+            (r#"{"unset":[""]}"#, "empty key"),
+            // An unknown field: the body is `deny_unknown_fields`.
+            (r#"{"sett":{"k":"v"}}"#, "unknown field"),
+        ];
+        for (body, phrase) in cases {
+            let (status, body_json, plane) = metadata_write(
+                state_with_jobs(&[job]),
+                post_json(&format!("/api/v1/jobs/{job}/metadata"), body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {body_json}");
+            assert_eq!(body_json["code"], "INVALID_ARGUMENT", "{body}");
+            assert!(
+                body_json["message"].as_str().unwrap().contains(phrase),
+                "{body}: {body_json}"
+            );
+            assert!(
+                plane.metadata_calls.lock().unwrap().is_empty(),
+                "{body}: a refused request must not reach the control plane"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_breaching_a_limit_is_invalid_at_the_edge() {
+        // The edge check exists so a client learns *which* limit it broke
+        // without paying a consensus round trip for a 409 — and the text is
+        // the domain validator's own, so the two checks cannot describe the
+        // same breach differently.
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let oversize = "x".repeat(1_025);
+        let long_key = "k".repeat(65);
+        let cases = [
+            // A key outside the charset, on both verbs.
+            (
+                "PUT",
+                r#"{"metadata":{"has space":"v"}}"#.to_string(),
+                "outside the allowed set",
+            ),
+            (
+                "POST",
+                r#"{"set":{"has space":"v"}}"#.to_string(),
+                "outside the allowed set",
+            ),
+            // A key too long.
+            (
+                "PUT",
+                serde_json::json!({ "metadata": { long_key.clone(): "v" } }).to_string(),
+                "keys are 1 to 64 bytes",
+            ),
+            // A value past the per-value size limit.
+            (
+                "PUT",
+                serde_json::json!({ "metadata": { "k": oversize } }).to_string(),
+                "more than the limit of 1024",
+            ),
+        ];
+        for (verb, body, phrase) in cases {
+            let uri = format!("/api/v1/jobs/{job}/metadata");
+            let request = match verb {
+                "PUT" => put_json(&uri, &body),
+                _ => post_json(&uri, &body),
+            };
+            let (status, response, plane) = metadata_write(state_with_jobs(&[job]), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{verb} {body}: {response}");
+            assert_eq!(response["code"], "INVALID_ARGUMENT", "{verb} {body}");
+            assert!(
+                response["message"].as_str().unwrap().contains(phrase),
+                "{verb} {body}: {response}"
+            );
+            assert!(
+                plane.metadata_calls.lock().unwrap().is_empty(),
+                "{verb} {body}: nothing may be proposed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replacement_without_a_metadata_field_is_invalid() {
+        // Required, unlike the patch's two halves: a body that forgot the
+        // field would otherwise clear the map by accident. `{"metadata":{}}`
+        // still clears it, deliberately.
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let (status, body, _) = metadata_write(
+            state_with_jobs(&[job]),
+            put_json(&format!("/api/v1/jobs/{job}/metadata"), "{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn a_metadata_write_on_an_unknown_job_is_the_aborts_rejection() {
+        // Not a 404: the pre-check declines to guess about a job this view
+        // has not seen, and apply's `UnknownJob` is the same 409 an abort of
+        // an unknown job already gives. One mapping, two verbs.
+        let job = JobId::new();
+        let (status, body, _) = metadata_write(
+            coppice_state::StateMachine::default(),
+            put_json(
+                &format!("/api/v1/jobs/{job}/metadata"),
+                r#"{"metadata":{"k":"v"}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "REJECTED");
+    }
+
+    #[tokio::test]
+    async fn a_metadata_write_rejects_a_malformed_path_id() {
+        for request in [
+            put_json("/api/v1/jobs/not-a-job-id/metadata", r#"{"metadata":{}}"#),
+            post_json("/api/v1/jobs/not-a-job-id/metadata", "{}"),
+        ] {
+            let response = app(None).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_a_malformed_metadata_filter() {
+        // Each of the leaf's own rules, as the client sees them.
+        let cases = [
+            // A key that could never be stored.
+            (r#"{"metadata":{"key":"has space"}}"#, "outside the allowed"),
+            (r#"{"metadata":{"key":""}}"#, "keys are 1 to 64 bytes"),
+            // A non-string operand.
+            (
+                r#"{"metadata":{"key":"k","equals":1}}"#,
+                "invalid type: integer",
+            ),
+            // No other operator exists.
+            (r#"{"metadata":{"key":"k","matches":"v"}}"#, "unknown field"),
+            // An unknown field on the leaf.
+            (r#"{"metadata":{"key":"k","like":"v"}}"#, "unknown field"),
+        ];
+        for (filter, phrase) in cases {
+            let uri = format!("/api/v1/jobs?filter={}", urlencoding_encode(filter));
+            let response = app(None)
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{filter}");
+            let body = body_json(response).await;
+            assert_eq!(body["code"], "INVALID_ARGUMENT", "{filter}");
+            assert!(
+                body["message"].as_str().unwrap().contains(phrase),
+                "{filter}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_metadata_filter_is_presence_or_exact_equality() {
+        let matching: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let other: JobId = "job-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let mut state = state_with_metadata(matching, &[("k", "v")]);
+        let with_other = state_with_metadata(other, &[("k", "w")]);
+        state
+            .jobs
+            .insert(other, with_other.jobs.get(&other).unwrap().clone());
+
+        let matched = |filter: &str| {
+            let uri = format!("/api/v1/jobs?filter={}", urlencoding_encode(filter));
+            let app = app_with_state(None, state.clone());
+            async move {
+                let response = app
+                    .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = body_json(response).await;
+                body["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|j| j["id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // Presence matches both; equality matches one, byte for byte.
+        assert_eq!(matched(r#"{"metadata":{"key":"k"}}"#).await.len(), 2);
+        assert_eq!(
+            matched(r#"{"metadata":{"key":"k","equals":"v"}}"#).await,
+            vec![matching.to_string()]
+        );
+        // Case-sensitive, and a key nobody carries matches nothing.
+        assert!(matched(r#"{"metadata":{"key":"k","equals":"V"}}"#)
+            .await
+            .is_empty());
+        assert!(matched(r#"{"metadata":{"key":"absent"}}"#).await.is_empty());
     }
 
     #[tokio::test]
@@ -2324,6 +2891,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             coordinator: None,
         })
     }
@@ -2636,6 +3205,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             coordinator: None,
         })
     }
@@ -2934,6 +3505,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             coordinator: Some(coordinator),
         }))
     }
@@ -3165,6 +3738,8 @@ mod tests {
                 read_consistency: std::sync::Mutex::default(),
                 actors: std::sync::Mutex::default(),
                 authorization: std::sync::Mutex::default(),
+                submitted: std::sync::Mutex::default(),
+                metadata_calls: std::sync::Mutex::default(),
                 coordinator: None,
             }),
             crate::http::MetricsEndpoint::detached_for_tests(),
@@ -4496,6 +5071,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_metadata_writes_take_exactly_the_aborts_authority() {
+        // ADR 0042 makes annotating a job the *same* authority as stopping
+        // it, deliberately, so the two cannot drift into two rules. This
+        // asserts that equivalence at the edge: for each of the three
+        // callers, both metadata verbs must land on the same verdict the
+        // abort does — and the refusal text must name the metadata verb, so
+        // a caller learns which authority they lack.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, tree) = authz_fixture(|t| {
+            vec![
+                group_binding("ops", Role::Operator, Some(t.team_a)),
+                group_binding("batch-users", Role::Submitter, Some(t.team_a)),
+            ]
+        });
+        let uri = format!("/api/v1/jobs/{}/metadata", tree.job);
+        let requests = || {
+            vec![
+                put_json(&uri, r#"{"metadata":{"k":"v"}}"#),
+                post_json(&uri, r#"{"set":{"k":"v"}}"#),
+            ]
+        };
+
+        // The operator over the job's entity, and the job's own submitter
+        // with no binding at all (ADR 0023's ownership grant): both allowed.
+        for (principal, groups) in [("on-call", &["ops"][..]), ("owner", &[][..])] {
+            for request in requests() {
+                let (status, body, plane) = authz_case(
+                    &idp,
+                    Arc::clone(&chain),
+                    state.clone(),
+                    principal,
+                    groups,
+                    request,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{principal}: {body}");
+                accepted_actor(&plane, principal, groups);
+            }
+        }
+
+        // A submitter over the same entity who did not submit *this* job is
+        // refused — submitter is strictly below operator, and ownership is
+        // not transitive.
+        for request in requests() {
+            let (status, body, plane) = authz_case(
+                &idp,
+                Arc::clone(&chain),
+                state.clone(),
+                "user-42",
+                &["batch-users"],
+                request,
+            )
+            .await;
+            assert_denied(status, &body, &plane);
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("update the metadata of a job"),
+                "the refusal must name the metadata verb: {body}"
+            );
+        }
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_metadata_write_on_a_job_the_view_has_never_seen_is_left_to_apply() {
+        // The twin of the abort case below, for the same reason: this
+        // replica's view may simply be behind, a 403 would refuse a possible
+        // owner, and a 404 would be an existence oracle for job ids. The
+        // request goes through carrying its actor, and apply decides.
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let chain = oidc_chain(&idp).await;
+        let (state, _tree) = authz_fixture(|_| Vec::new());
+
+        let (status, body, plane) = authz_case(
+            &idp,
+            chain,
+            state,
+            "nobody",
+            &[],
+            put_json(
+                &format!("/api/v1/jobs/{}/metadata", JobId::new()),
+                r#"{"metadata":{}}"#,
+            ),
+        )
+        .await;
+        // Past the pre-check and into apply, which answers `UnknownJob` —
+        // the 409 an abort of an unknown job gives, never a 403.
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "REJECTED");
+        accepted_actor(&plane, "nobody", &[]);
+        idp.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn aborting_a_job_the_view_has_never_seen_is_left_to_apply() {
         // The pre-check declines to guess. This replica's view may simply be
         // behind, and both guesses are wrong in a visible way: a 403 would
@@ -4675,6 +5347,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             coordinator: None,
         });
         let response = router(plane)
@@ -4716,6 +5390,8 @@ mod tests {
             read_consistency: std::sync::Mutex::default(),
             actors: std::sync::Mutex::default(),
             authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
             coordinator: None,
         });
         let response = router(plane)

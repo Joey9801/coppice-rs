@@ -12,9 +12,10 @@
 //!
 //! # Actor-carrying commands
 //!
-//! Eight commands — [`SubmitJob`], [`AbortJob`], [`SetNodeSchedulable`],
-//! [`EvictNodes`], [`ConfigureQuotaEntity`], [`UpdatePolicy`],
-//! [`UpdateAuthorization`], and [`BumpClusterVersion`] — carry an
+//! Nine commands — [`SubmitJob`], [`AbortJob`], [`UpdateJobMetadata`],
+//! [`SetNodeSchedulable`], [`EvictNodes`], [`ConfigureQuotaEntity`],
+//! [`UpdatePolicy`], [`UpdateAuthorization`], and
+//! [`BumpClusterVersion`] — carry an
 //! `actor: Option<Actor>` (ADR 0023). They
 //! are exactly the commands reachable through the public API, and the
 //! `Option` is the structural distinction between the two kinds of proposer:
@@ -30,13 +31,14 @@
 //!   check entirely, so these commands behave exactly as they did before
 //!   authorization existed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
 };
 use coppice_core::job::Job;
+use coppice_core::metadata::JobMetadata;
 use coppice_core::node::HostFacts;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
@@ -52,6 +54,7 @@ pub enum Command {
     // API-proposed.
     SubmitJob(SubmitJob),
     AbortJob(AbortJob),
+    UpdateJobMetadata(UpdateJobMetadata),
     // Scheduler-proposed.
     CommitPlacements(CommitPlacements),
     DispatchAttempt(DispatchAttempt),
@@ -101,6 +104,7 @@ impl Command {
         match self {
             Command::SubmitJob(c) => c.submitted_at,
             Command::AbortJob(c) => c.requested_at,
+            Command::UpdateJobMetadata(c) => c.updated_at,
             Command::CommitPlacements(c) => c.proposed_at,
             Command::DispatchAttempt(c) => c.dispatched_at,
             Command::RecordAttemptStarted(c) => c.observed_at,
@@ -161,6 +165,38 @@ pub struct AbortJob {
     /// Who asked — see the module note on actor-carrying commands.
     pub actor: Option<Actor>,
     pub requested_at: Timestamp,
+}
+
+/// Replace or patch a job's metadata map (ADR 0042).
+///
+/// Legal in every state, terminal included: annotating a finished job
+/// ("root cause: OOM", a link to the incident) is a primary use, and the
+/// record stays until retention evicts it. An update that leaves the map
+/// unchanged is an accepted no-op, so a retried forward is safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateJobMetadata {
+    pub job: JobId,
+    pub update: JobMetadataUpdate,
+    /// Who asked — see the module note on actor-carrying commands.
+    pub actor: Option<Actor>,
+    pub updated_at: Timestamp,
+}
+
+/// The edit an [`UpdateJobMetadata`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobMetadataUpdate {
+    /// The whole map, replacing whatever is stored — the shape for a caller
+    /// that owns the map.
+    Replace(JobMetadata),
+    /// A partial edit for a caller that owns only some keys: `set` merged
+    /// over the stored map, then `unset` keys removed. A key in both is
+    /// refused at the API, before the command is proposed; apply applies
+    /// them in that order regardless, so the outcome is deterministic even
+    /// for a command that slipped past the edge.
+    Patch {
+        set: JobMetadata,
+        unset: BTreeSet<String>,
+    },
 }
 
 /// One scheduler pass's atomic batch of placements and revocations.

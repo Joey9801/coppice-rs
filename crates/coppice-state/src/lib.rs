@@ -710,6 +710,8 @@ pub enum RejectionReason {
     DuplicateAttempt(AttemptId),
     #[error("allocation {0} already exists")]
     DuplicateAllocation(AllocationId),
+    #[error("invalid job metadata: {0}")]
+    InvalidJobMetadata(String),
     #[error("job {0} is terminal")]
     JobTerminal(JobId),
     #[error("job {0} is not queued")]
@@ -860,6 +862,12 @@ pub enum Event {
         epoch: u64,
     },
     JobEvicted {
+        job: JobId,
+    },
+    /// A job's metadata map changed (ADR 0042). Emitted only when the stored
+    /// map actually differs; an update that computes to the same map is an
+    /// accepted no-op with no event.
+    JobMetadataUpdated {
         job: JobId,
     },
     QuotaEntityConfigured {

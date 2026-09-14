@@ -17,6 +17,7 @@
 //! transition table lives in `docs/lifecycle/job-lifecycle.md`.
 
 use crate::id::{AttemptId, JobId, QuotaEntityId};
+use crate::metadata::JobMetadata;
 use crate::resource::Resources;
 use crate::time::{Duration, Timestamp};
 
@@ -67,6 +68,15 @@ pub struct Job {
     /// Ownership reads this: a principal may always abort and retry a job it
     /// submitted, with no role binding at all.
     pub submitted_by: Option<String>,
+    /// User-owned annotations: a small map of string keys to JSON values,
+    /// replicated with the rest of the spec and mutable after submission
+    /// through `UpdateJobMetadata`
+    /// (`docs/decisions/0042-job-metadata.md`). Descriptive only — the
+    /// scheduler, admission, quota arithmetic and the executor never read
+    /// it. Validated against the ADR's limits by
+    /// [`crate::metadata::validate`] at the API edge *and* at apply, so the
+    /// replicated state never holds an oversized map.
+    pub metadata: JobMetadata,
 }
 
 /// Per-job retry policy.

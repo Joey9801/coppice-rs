@@ -7,10 +7,13 @@
 //! single-allocation placements) pass through untouched so apply can reject
 //! them itself.
 
+use std::collections::BTreeSet;
+
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::Duration;
 use coppice_state::authz::{Actor, Binding, Role, Subject};
+use coppice_state::command::JobMetadataUpdate;
 use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
     ConfigureQuotaEntity, ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost,
@@ -19,13 +22,16 @@ use coppice_state::command::{
     RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
     RecordStagedKeyTransferIntent, RegisterNode, RetireMachineBinding, RevokeEnrollToken,
     RevokeIdentity, SetNodeDraining, SetNodeSchedulable, SubmitJob, UpdateAuthorization,
-    UpdatePolicy,
+    UpdateJobMetadata, UpdatePolicy,
 };
 use coppice_state::{
     CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_GROUPS_CLAIM,
 };
 
-use super::core::{labels_from_pb, labels_to_pb, multipliers_from_pb, multipliers_to_pb};
+use super::core::{
+    labels_from_pb, labels_to_pb, metadata_from_pb, metadata_map_to_pb, metadata_to_pb,
+    multipliers_from_pb, multipliers_to_pb,
+};
 use super::{nonnegative_duration, req, timestamp, ConvertError};
 use crate::pb::command::v1 as pb;
 use crate::pb::command::v1::command::Body;
@@ -39,6 +45,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
     let body = match command {
         Command::SubmitJob(c) => Body::SubmitJob(c.into()),
         Command::AbortJob(c) => Body::AbortJob(c.into()),
+        Command::UpdateJobMetadata(c) => Body::UpdateJobMetadata(c.into()),
         Command::CommitPlacements(c) => Body::CommitPlacements(c.into()),
         Command::DispatchAttempt(c) => Body::DispatchAttempt(c.into()),
         Command::RecordAttemptStarted(c) => Body::RecordAttemptStarted(c.into()),
@@ -84,6 +91,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
     let body = match req(command.body, "Command.body")? {
         Body::SubmitJob(c) => Command::SubmitJob(c.try_into()?),
         Body::AbortJob(c) => Command::AbortJob(c.try_into()?),
+        Body::UpdateJobMetadata(c) => Command::UpdateJobMetadata(c.try_into()?),
         Body::CommitPlacements(c) => Command::CommitPlacements(c.try_into()?),
         Body::DispatchAttempt(c) => Command::DispatchAttempt(c.try_into()?),
         Body::RecordAttemptStarted(c) => Command::RecordAttemptStarted(c.try_into()?),
@@ -164,6 +172,65 @@ impl TryFrom<pb::AbortJob> for AbortJob {
             reason: c.reason,
             actor: c.actor.map(Into::into),
             requested_at: timestamp(c.requested_at_us, "AbortJob.requested_at_us")?,
+        })
+    }
+}
+
+impl From<&UpdateJobMetadata> for pb::UpdateJobMetadata {
+    fn from(c: &UpdateJobMetadata) -> Self {
+        use pb::update_job_metadata::Update;
+        let update = match &c.update {
+            JobMetadataUpdate::Replace(metadata) => Update::Replace(metadata_map_to_pb(metadata)),
+            JobMetadataUpdate::Patch { set, unset } => Update::Patch(pb::MetadataPatch {
+                set: metadata_to_pb(set),
+                // Canonical by construction: `BTreeSet` iteration is
+                // ascending and deduplicated.
+                unset: unset.iter().cloned().collect(),
+            }),
+        };
+        pb::UpdateJobMetadata {
+            job: Some(c.job.into()),
+            update: Some(update),
+            actor: c.actor.as_ref().map(Into::into),
+            updated_at_us: c.updated_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::UpdateJobMetadata> for UpdateJobMetadata {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::UpdateJobMetadata) -> Result<Self, ConvertError> {
+        use pb::update_job_metadata::Update;
+        let update = match req(c.update, "UpdateJobMetadata.update")? {
+            Update::Replace(map) => JobMetadataUpdate::Replace(metadata_from_pb(
+                map.entries,
+                "UpdateJobMetadata.replace",
+            )?),
+            Update::Patch(patch) => {
+                let set = metadata_from_pb(patch.set, "MetadataPatch.set")?;
+                // Same reader rule as an entry list: any order accepted,
+                // duplicates refused.
+                let mut unset = BTreeSet::new();
+                for key in patch.unset {
+                    if key.is_empty() {
+                        return Err(ConvertError::Invalid {
+                            field: "MetadataPatch.unset",
+                            reason: "metadata key must not be empty",
+                        });
+                    }
+                    if !unset.insert(key) {
+                        return Err(ConvertError::DuplicateEntry("MetadataPatch.unset"));
+                    }
+                }
+                JobMetadataUpdate::Patch { set, unset }
+            }
+        };
+        Ok(UpdateJobMetadata {
+            job: req(c.job, "UpdateJobMetadata.job")?.try_into()?,
+            update,
+            actor: c.actor.map(Into::into),
+            updated_at: timestamp(c.updated_at_us, "UpdateJobMetadata.updated_at_us")?,
         })
     }
 }

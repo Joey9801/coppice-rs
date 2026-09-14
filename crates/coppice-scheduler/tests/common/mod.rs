@@ -165,6 +165,7 @@ pub fn submit_cmd(
             retry: RetryPolicy::default(),
             abort_requested: None,
             submitted_by: None,
+            metadata: Default::default(),
         },
         multiplier,
         submitted_at: at,

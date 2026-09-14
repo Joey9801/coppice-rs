@@ -13,12 +13,14 @@ use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass};
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState};
+use coppice_core::metadata::{self, JobMetadata};
 use coppice_core::node::Node;
 use coppice_core::quota::{self, ChargeRecord, CostUnits, Settlement, TrueUp, UsageState};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 
 use crate::authz::{self, Actor, Role, Subject, Verb};
+use crate::command::JobMetadataUpdate;
 use crate::command::{
     AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
     ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost, DispatchAttempt, EvictNodes,
@@ -26,7 +28,7 @@ use crate::command::{
     RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate,
     RecordEnrolledIdentity, RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode,
     RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable,
-    SubmitJob, UpdateAuthorization, UpdatePolicy,
+    SubmitJob, UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -47,6 +49,7 @@ impl StateMachine {
         let result = match command {
             Command::SubmitJob(c) => self.submit_job(c),
             Command::AbortJob(c) => self.abort_job(c),
+            Command::UpdateJobMetadata(c) => self.update_job_metadata(c),
             Command::CommitPlacements(c) => self.commit_placements(c),
             Command::DispatchAttempt(c) => self.dispatch_attempt(c),
             Command::RecordAttemptStarted(c) => self.record_attempt_started(c),
@@ -102,6 +105,11 @@ impl StateMachine {
                 "submitted job carries a pre-set abort flag".into(),
             ));
         }
+        // The same re-check `update_job_metadata` makes (ADR 0042): the API
+        // validated this at admission, but replicated state must not depend
+        // on the proposer having done so.
+        metadata::validate(&c.job.metadata)
+            .map_err(|e| RejectionReason::InvalidJobMetadata(e.to_string()))?;
         if let Some(existing) = self.jobs.get(&c.job.id) {
             // The job id is the submission's idempotency identity (ADR 0026):
             // a client retry after an unknown outcome, or a re-proposal across
@@ -239,6 +247,64 @@ impl StateMachine {
             _ => {}
         }
         Ok(Applied { events })
+    }
+
+    /// Replace or patch a job's metadata (ADR 0042).
+    ///
+    /// Fixed order, because each step depends on the one before: the job
+    /// must exist for ownership to be re-derived, ownership must be checked
+    /// before the command's payload has any effect, and the *resulting* map
+    /// — not the patch — is what the limits apply to.
+    ///
+    /// Terminal jobs are accepted on purpose: annotating a finished job is
+    /// a primary use. An update computing to the map already stored is an
+    /// accepted no-op that emits **no** event — it still authorizes first,
+    /// so a retried forward racing a revocation rejects rather than
+    /// silently succeeding, exactly as an idempotent resubmission does.
+    fn update_job_metadata(&mut self, c: &UpdateJobMetadata) -> ApplyResult {
+        let (entity, submitted_by, current) = match self.jobs.get(&c.job) {
+            None => return Err(RejectionReason::UnknownJob(c.job)),
+            Some(r) => (
+                r.spec.quota_entity,
+                r.spec.submitted_by.clone(),
+                r.spec.metadata.clone(),
+            ),
+        };
+        // Ownership comes from state, so it is re-derived here rather than
+        // trusted from the proposer.
+        self.authorize(
+            c.actor.as_ref(),
+            Verb::UpdateJobMetadata {
+                entity: &entity,
+                submitted_by: submitted_by.as_deref(),
+            },
+        )?;
+        let next = match &c.update {
+            JobMetadataUpdate::Replace(metadata) => metadata.clone(),
+            JobMetadataUpdate::Patch { set, unset } => {
+                let mut next: JobMetadata = current.clone();
+                for (key, value) in set {
+                    next.insert(key.clone(), value.clone());
+                }
+                for key in unset {
+                    next.remove(key);
+                }
+                next
+            }
+        };
+        // The re-check that makes the limits real: whatever the proposer
+        // sent, replicated state never holds an oversized map.
+        metadata::validate(&next)
+            .map_err(|e| RejectionReason::InvalidJobMetadata(e.to_string()))?;
+        if next == current {
+            return Ok(Applied::default());
+        }
+        if let Some(r) = self.jobs.get_mut(&c.job) {
+            r.spec.metadata = next;
+        }
+        Ok(Applied {
+            events: vec![Event::JobMetadataUpdated { job: c.job }],
+        })
     }
 
     // ---- Scheduler-proposed ----
@@ -1990,4 +2056,5 @@ fn same_submission(existing: &Job, retried: &Job) -> bool {
         && existing.max_runtime == retried.max_runtime
         && existing.quota_entity == retried.quota_entity
         && existing.retry == retried.retry
+        && existing.metadata == retried.metadata
 }

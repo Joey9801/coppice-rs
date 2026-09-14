@@ -33,6 +33,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use coppice_core::attempt;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
+use coppice_core::metadata::{self, JobMetadata};
 use coppice_core::quota::TrueUp;
 use coppice_core::time::Timestamp;
 
@@ -652,6 +653,9 @@ pub enum TimelineEventBody {
     JobEvicted {
         job: JobId,
     },
+    JobMetadataUpdated {
+        job: JobId,
+    },
     QuotaEntityConfigured {
         entity: QuotaEntityId,
     },
@@ -706,6 +710,7 @@ impl From<&coppice_state::Event> for TimelineEventBody {
                 epoch: *epoch,
             },
             E::JobEvicted { job } => TimelineEventBody::JobEvicted { job: *job },
+            E::JobMetadataUpdated { job } => TimelineEventBody::JobMetadataUpdated { job: *job },
             E::QuotaEntityConfigured { entity } => {
                 TimelineEventBody::QuotaEntityConfigured { entity: *entity }
             }
@@ -829,6 +834,10 @@ pub struct JobSummary {
     pub cost_ucu: u64,
     /// Outcome of the last attempt; only when the job is terminal.
     pub outcome: Option<AttemptOutcome>,
+    /// User-owned annotations (ADR 0042) — always present, `{}` when empty.
+    /// Carried on the summary so a list row can be titled by `metadata.name`
+    /// without a second fetch per row.
+    pub metadata: JobMetadata,
 }
 
 /// `GET /api/v1/jobs` — an envelope with the keyset-pagination cursor
@@ -877,11 +886,12 @@ pub const MAX_FILTER_NODES: usize = 64;
 /// The job-list filter AST (mirrors `JobFilter` in `types.ts`).
 ///
 /// Externally tagged: every node is a JSON object with exactly one key, so
-/// an unknown key (`label` — reserved, not implemented) or a two-key object
-/// is a deserialization error, surfaced as `INVALID_ARGUMENT`. The
-/// remaining shape rules that serde cannot express
-/// — non-empty combinator/`in` lists, depth and node caps, at-least-one
-/// bound, ordered bounds — are checked in [`JobFilter::validate`].
+/// an unknown key or a two-key object is a deserialization error, surfaced
+/// as `INVALID_ARGUMENT`. The remaining shape rules that serde cannot
+/// express — non-empty combinator/`in` lists, depth and node caps,
+/// at-least-one bound, ordered bounds, the metadata leaf's operand rules —
+/// are checked in [`JobFilter::validate`].
+///
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobFilter {
@@ -904,6 +914,27 @@ pub enum JobFilter {
     /// nothing.
     SubmittedBy(String),
     Requests(RequestsFilter),
+    /// The ADR 0042 metadata leaf, which replaces the `label` leaf ADR 0031
+    /// reserved and never implemented.
+    Metadata(MetadataFilter),
+}
+
+/// `{"metadata": {"key": "…"}}` — presence; plus `"equals"` for exact
+/// string equality (ADR 0042). Nothing else: a pattern match is a further
+/// leaf for a future ADR, not a shape this one carries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataFilter {
+    /// The metadata key, under the same charset and length rules as a stored
+    /// key (ADR 0042): a key that could never be stored can never match, and
+    /// refusing it names the typo.
+    pub key: String,
+    /// The exact value to compare against, byte for byte and
+    /// case-sensitive. Absent is presence: the job has the key, whatever the
+    /// value. `""` is an operand like any other — the empty string is a
+    /// legal stored value.
+    #[serde(default)]
+    pub equals: Option<String>,
 }
 
 /// `{"phase": {"in": [...]}}` — matches the derived [`JobPhase`].
@@ -1055,12 +1086,28 @@ impl JobFilter {
                     }
                 }
             }
+            // One node against the caps above, like every other leaf.
+            JobFilter::Metadata(m) => m.check()?,
             JobFilter::Entity(_)
             | JobFilter::Node(_)
             | JobFilter::Image(_)
             | JobFilter::Search(_)
             | JobFilter::SubmittedBy(_) => {}
         }
+        Ok(())
+    }
+}
+
+impl MetadataFilter {
+    /// The leaf's own rule (ADR 0042): a storable key.
+    ///
+    /// Read off the domain validator rather than restated here — one
+    /// charset, one length bound, one error text, however the two surfaces
+    /// grow. The `equals` operand needs no check: any UTF-8 string is a
+    /// legal thing to compare against, and one too long to be stored simply
+    /// matches nothing.
+    fn check(&self) -> Result<(), String> {
+        metadata::validate_key(&self.key).map_err(|e| format!("`metadata.key` is invalid: {e}"))?;
         Ok(())
     }
 }
@@ -1400,6 +1447,10 @@ pub struct JobDetail {
     /// Present iff the current attempt is accruing.
     pub accrual: Option<AccrualView>,
     pub cost: CostReport,
+    /// User-owned annotations (ADR 0042) — always present, `{}` when empty.
+    /// A sibling of `spec` rather than a field of it: the map is mutable
+    /// after submission, and `JobSpecView` is the immutable submission.
+    pub metadata: JobMetadata,
 }
 
 // ---------------------------------------------------------------------------
@@ -1478,6 +1529,10 @@ pub struct SubmitJobRequest {
     /// Absent = the platform default policy.
     #[serde(default)]
     pub retry: Option<RetryPolicy>,
+    /// User-owned annotations (ADR 0042); absent is the empty map. Checked
+    /// against the ADR's limits at admission, and again at apply.
+    #[serde(default)]
+    pub metadata: JobMetadata,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1507,6 +1562,85 @@ pub struct AbortJobRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AbortJobResponse {}
+
+/// `PUT /api/v1/jobs/{job}/metadata` (ADR 0042) — the whole map, replacing
+/// whatever is stored.
+///
+/// `metadata` is **required**, unlike the patch's two halves: the same
+/// full-replacement shape as `PUT /api/v1/authorization`, and a body that
+/// forgot the field would otherwise clear the map silently. Sending `{}`
+/// explicitly still clears it, which is the point of the verb.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceJobMetadataRequest {
+    pub metadata: JobMetadata,
+}
+
+/// `POST /api/v1/jobs/{job}/metadata` (ADR 0042) — the small patch for a
+/// caller that owns only some keys: `set` merged over the stored map, then
+/// `unset` keys removed.
+///
+/// Both halves default to empty, so `{}` is a legal no-op. A key in both, or
+/// a duplicate in `unset`, is `INVALID_ARGUMENT` ([`Self::validate`]) — the
+/// request is ambiguous about intent, and guessing an order would make the
+/// answer depend on a rule nobody wrote down.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateJobMetadataRequest {
+    #[serde(default)]
+    pub set: JobMetadata,
+    #[serde(default)]
+    pub unset: Vec<String>,
+}
+
+impl UpdateJobMetadataRequest {
+    /// The shape rules serde cannot express, plus the per-entry limits on
+    /// `set`.
+    ///
+    /// What is deliberately **not** checked here is the *resulting* map: a
+    /// patch is merged over state this replica may not have the latest copy
+    /// of, so the key count and whole-map size of the result are apply's to
+    /// judge — and apply does, rejecting `InvalidJobMetadata`. Every rule
+    /// that is a property of the request alone is enforced here, where it
+    /// costs no consensus round trip.
+    pub fn validate(&self) -> Result<(), String> {
+        for key in &self.unset {
+            if key.is_empty() {
+                return Err("`unset` must not contain an empty key".to_string());
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for key in &self.unset {
+            if !seen.insert(key.as_str()) {
+                return Err(format!("`unset` names {key:?} more than once"));
+            }
+            if self.set.contains_key(key) {
+                return Err(format!(
+                    "metadata key {key:?} appears in both `set` and `unset`"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The answer to either metadata write: the job, and the index its command
+/// applied at, for a read-your-writes `?min_index=` (ADR 0007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceJobMetadataResponse {
+    pub job: JobId,
+    pub log_index: u64,
+}
+
+/// The patch's answer. Identical in shape to
+/// [`ReplaceJobMetadataResponse`] and deliberately a separate type: the two
+/// routes are two message pairs in ADR 0031's table, and a client generating
+/// from that table gets the name it expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateJobMetadataResponse {
+    pub job: JobId,
+    pub log_index: u64,
+}
 
 /// `POST /api/v1/nodes/{node}/drain` and `POST /api/v1/nodes/{node}/undrain`
 /// (ADR 0041) — the admin cordon, as the `SetNodeSchedulable` command spells
@@ -2705,8 +2839,92 @@ mod tests {
     }
 
     #[test]
+    fn a_metadata_leaf_is_presence_or_exact_equality() {
+        let presence = parse_filter(serde_json::json!({"metadata": {"key": "k"}})).unwrap();
+        let JobFilter::Metadata(presence) = presence else {
+            panic!("expected a metadata leaf");
+        };
+        assert_eq!(presence.equals, None);
+
+        let equality =
+            parse_filter(serde_json::json!({"metadata": {"key": "k", "equals": ""}})).unwrap();
+        let JobFilter::Metadata(equality) = equality else {
+            panic!("expected a metadata leaf");
+        };
+        // The empty string is an operand, not an absent one: `""` is a legal
+        // stored value, so asking for it must stay distinct from presence.
+        assert_eq!(equality.equals, Some(String::new()));
+
+        assert_eq!(JobFilter::Metadata(presence).validate(), Ok(()));
+        assert_eq!(JobFilter::Metadata(equality).validate(), Ok(()));
+
+        // Nothing but a string is an operand.
+        assert!(parse_filter(serde_json::json!({"metadata": {"key": "k", "equals": 1}})).is_err());
+        // A literal `null` is the absent operand, i.e. presence — there is
+        // no null value to ask for any more.
+        let null_operand =
+            parse_filter(serde_json::json!({"metadata": {"key": "k", "equals": null}})).unwrap();
+        let JobFilter::Metadata(null_operand) = null_operand else {
+            panic!("expected a metadata leaf");
+        };
+        assert_eq!(null_operand.equals, None);
+        // And no other operator exists.
+        assert!(
+            parse_filter(serde_json::json!({"metadata": {"key": "k", "matches": "^x"}})).is_err()
+        );
+    }
+
+    #[test]
+    fn a_metadata_leaf_key_is_checked_against_the_stored_key_rules() {
+        let bad = parse_filter(serde_json::json!({"metadata": {"key": "has space"}})).unwrap();
+        let err = bad.validate().unwrap_err();
+        assert!(err.contains("`metadata.key` is invalid"), "{err}");
+        assert!(err.contains("outside the allowed set"), "{err}");
+    }
+
+    #[test]
+    fn a_metadata_leaf_counts_as_one_node_against_the_cap() {
+        // Whatever it carries, the leaf is one node — the operand is
+        // bounded, so nothing about it scales with the tree.
+        let leaves: Vec<serde_json::Value> = (0..MAX_FILTER_NODES - 1)
+            .map(|_| serde_json::json!({"metadata": {"key": "k", "equals": "x"}}))
+            .collect();
+        let at_cap = parse_filter(serde_json::json!({ "all": leaves.clone() })).unwrap();
+        assert_eq!(at_cap.validate(), Ok(()));
+
+        let mut over = leaves;
+        over.push(serde_json::json!({"metadata": {"key": "k"}}));
+        let over = parse_filter(serde_json::json!({ "all": over })).unwrap();
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn a_metadata_patch_body_defaults_both_halves_and_catches_contradictions() {
+        let empty: UpdateJobMetadataRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, UpdateJobMetadataRequest::default());
+        assert_eq!(empty.validate(), Ok(()));
+
+        let contradictory: UpdateJobMetadataRequest =
+            serde_json::from_str(r#"{"set":{"k":"v"},"unset":["k"]}"#).unwrap();
+        assert!(contradictory
+            .validate()
+            .unwrap_err()
+            .contains("both `set` and `unset`"));
+
+        let repeated: UpdateJobMetadataRequest =
+            serde_json::from_str(r#"{"unset":["k","k"]}"#).unwrap();
+        assert!(repeated.validate().unwrap_err().contains("more than once"));
+
+        // `deny_unknown_fields`, like every other write body here.
+        assert!(serde_json::from_str::<UpdateJobMetadataRequest>(r#"{"sett":{}}"#).is_err());
+        // The replacement's `metadata` is required, so an empty body fails.
+        assert!(serde_json::from_str::<ReplaceJobMetadataRequest>("{}").is_err());
+    }
+
+    #[test]
     fn unknown_keys_and_variants_are_rejected() {
-        // An unknown top-level variant (reserved `label`, or a typo).
+        // An unknown top-level variant (the `label` ADR 0031 reserved and
+        // ADR 0042 replaced with `metadata`, or a typo).
         assert!(parse_filter(serde_json::json!({"label": "x"})).is_err());
         // A two-key object is not a single externally-tagged variant.
         assert!(parse_filter(serde_json::json!({"any": [], "all": []})).is_err());
@@ -2860,6 +3078,10 @@ mod tests {
             funding_fraction: Some(0.5),
             cost_ucu: 42,
             outcome: None,
+            metadata: JobMetadata::from([
+                ("name".to_string(), "nightly-train".to_string()),
+                ("attempt.count".to_string(), "3".to_string()),
+            ]),
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(
@@ -2881,6 +3103,8 @@ mod tests {
                 "funding_fraction": 0.5,
                 "cost_ucu": 42,
                 "outcome": null,
+                // ADR 0042: always present, an object, key-ordered.
+                "metadata": { "attempt.count": "3", "name": "nightly-train" },
             })
         );
     }

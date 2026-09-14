@@ -347,6 +347,7 @@ async fn submit_job(
                 },
                 abort_requested: None,
                 submitted_by: None,
+                metadata: Default::default(),
             },
             multiplier: PriorityMultiplier::ONE,
             submitted_at: Timestamp::now(),

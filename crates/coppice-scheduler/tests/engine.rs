@@ -50,6 +50,7 @@ fn submit_exact_runtime(
         retry: coppice_core::job::RetryPolicy::default(),
         abort_requested: None,
         submitted_by: None,
+        metadata: Default::default(),
     };
     apply_ok(
         sm,

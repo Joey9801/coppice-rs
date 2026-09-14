@@ -1892,6 +1892,14 @@ impl coppice_api::ControlPlane for NoopPlane {
         Err(unattached())
     }
 
+    async fn update_job_metadata(
+        &self,
+        _req: coppice_api::UpdateJobMetadataCall,
+        _actor: coppice_state::Actor,
+    ) -> Result<coppice_api::http::dto::UpdateJobMetadataResponse, coppice_api::ApiError> {
+        Err(unattached())
+    }
+
     async fn read_state(
         &self,
         _opts: coppice_api::ReadOptions,

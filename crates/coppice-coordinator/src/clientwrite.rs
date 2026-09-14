@@ -37,8 +37,9 @@ use coppice_api::{ApiError, RejectionKind};
 use coppice_consensus::{CoordinatorId, NodeHandle};
 use coppice_core::id::{JobId, NodeId};
 use coppice_net::admin::Client;
-use coppice_proto::convert::ConvertError;
+use coppice_proto::convert::{metadata_from_pb, metadata_map_to_pb, metadata_to_pb, ConvertError};
 use coppice_proto::pb::raft::v1 as pb;
+use coppice_state::command::JobMetadataUpdate;
 use coppice_state::Actor;
 use coppice_tls::TlsStore;
 use tonic::transport::Channel;
@@ -542,6 +543,45 @@ impl LeaderWrites for AdminForwarder {
             Ok(())
         })
     }
+
+    /// The ADR 0042 metadata write. `update` crosses as the domain
+    /// [`JobMetadataUpdate`] enum's own oneof shape — `Replace` becomes the
+    /// wire's `replace` arm, `Patch` becomes `patch` — the same conversion
+    /// the command log itself uses (`coppice_proto::convert::command_to_pb`),
+    /// so a forwarded write and a directly-proposed one encode identically.
+    fn update_job_metadata<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        job: JobId,
+        update: &'a JobMetadataUpdate,
+        actor: &'a Actor,
+    ) -> BoxFuture<'a, Result<u64, ApiError>> {
+        Box::pin(async move {
+            let deadline = forward_deadline();
+            let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
+            use pb::forward_update_job_metadata_request::Update;
+            let update = match update {
+                JobMetadataUpdate::Replace(metadata) => {
+                    Update::Replace(metadata_map_to_pb(metadata))
+                }
+                JobMetadataUpdate::Patch { set, unset } => {
+                    Update::Patch(coppice_proto::pb::command::v1::MetadataPatch {
+                        set: metadata_to_pb(set),
+                        unset: unset.iter().cloned().collect(),
+                    })
+                }
+            };
+            let wire = pb::ForwardUpdateJobMetadataRequest {
+                history_id: history_id.to_vec(),
+                job: Some(job.into()),
+                update: Some(update),
+                actor: Some(actor.into()),
+            };
+            let response =
+                under_timeout(deadline, client.forward_update_job_metadata(wire)).await?;
+            applied_index(response.outcome)
+        })
+    }
 }
 
 impl LeaderReads for AdminForwarder {
@@ -742,6 +782,12 @@ fn actor_from_pb(
 }
 
 /// The client's submission, on the wire.
+///
+/// `metadata` crosses unvalidated: this replica's own
+/// [`api_server::submit_job_here`] already ran `metadata::validate` before
+/// landing in the `NotLeader` arm that leads here, and the leader re-runs
+/// the whole write path regardless of what this replica verified
+/// (ADR 0042's two-place enforcement).
 pub(crate) fn submit_to_pb(
     history_id: [u8; 16],
     req: &SubmitJobRequest,
@@ -765,6 +811,7 @@ pub(crate) fn submit_to_pb(
         retry: req
             .retry
             .map(|r| coppice_core::job::RetryPolicy::from(r).into()),
+        metadata: Some(metadata_map_to_pb(&req.metadata)),
     }
 }
 
@@ -789,6 +836,14 @@ pub(crate) fn submit_from_pb(
         Some(e) => Some(e.argv),
         None => None,
     };
+    // Absent is the empty map, the same reading `SubmitJobRequest`'s own
+    // `#[serde(default)]` gives it — not a missing-field error, since an
+    // empty metadata object is indistinguishable from one that was never
+    // set once it has crossed the JSON boundary once already.
+    let metadata = match req.metadata {
+        Some(map) => metadata_from_pb(map.entries, "ForwardSubmitJobRequest.metadata")?,
+        None => coppice_core::metadata::JobMetadata::new(),
+    };
     Ok((
         SubmitJobRequest {
             job: required(req.job, "ForwardSubmitJobRequest.job")?.try_into()?,
@@ -800,6 +855,7 @@ pub(crate) fn submit_from_pb(
             max_runtime_seconds: req.max_runtime_seconds,
             quota_entity: required(req.quota_entity, "ForwardSubmitJobRequest.quota_entity")?
                 .try_into()?,
+            metadata,
             retry: req.retry.map(|r| {
                 let core: coppice_core::job::RetryPolicy = r.into();
                 coppice_api::http::dto::RetryPolicy {
@@ -853,6 +909,49 @@ pub(crate) fn evict_nodes_actor_from_pb(
     actor: Option<coppice_proto::pb::core::v1::Actor>,
 ) -> Result<Actor, ConvertError> {
     actor_from_pb(actor, "ForwardEvictNodesRequest.actor")
+}
+
+/// A forwarded metadata write, back as the job it names, the domain
+/// [`JobMetadataUpdate`] it carries, and the actor that made the request.
+///
+/// Unlike the abort/cordon/eviction actor-only helpers above, this one has a
+/// body to rebuild: `job` and the `update` oneof, decoded with the same
+/// `coppice_proto::convert` helpers the command log itself uses — a
+/// forwarded write is refused by exactly the same rule a direct one would
+/// be.
+pub(crate) fn update_job_metadata_from_pb(
+    req: pb::ForwardUpdateJobMetadataRequest,
+) -> Result<(JobId, JobMetadataUpdate, Actor), ConvertError> {
+    use pb::forward_update_job_metadata_request::Update;
+    let actor = actor_from_pb(req.actor, "ForwardUpdateJobMetadataRequest.actor")?;
+    let job: JobId = required(req.job, "ForwardUpdateJobMetadataRequest.job")?.try_into()?;
+    let update = match required(req.update, "ForwardUpdateJobMetadataRequest.update")? {
+        Update::Replace(map) => JobMetadataUpdate::Replace(metadata_from_pb(
+            map.entries,
+            "ForwardUpdateJobMetadataRequest.replace",
+        )?),
+        Update::Patch(patch) => {
+            let set = metadata_from_pb(patch.set, "ForwardUpdateJobMetadataRequest.patch.set")?;
+            // Any order, no duplicates, no empty key — the same reader rule
+            // the command conversion applies.
+            let mut unset = std::collections::BTreeSet::new();
+            for key in patch.unset {
+                if key.is_empty() {
+                    return Err(ConvertError::Invalid {
+                        field: "ForwardUpdateJobMetadataRequest.patch.unset",
+                        reason: "metadata key must not be empty",
+                    });
+                }
+                if !unset.insert(key) {
+                    return Err(ConvertError::DuplicateEntry(
+                        "ForwardUpdateJobMetadataRequest.patch.unset",
+                    ));
+                }
+            }
+            JobMetadataUpdate::Patch { set, unset }
+        }
+    };
+    Ok((job, update, actor))
 }
 
 /// The authorization replacement, on the wire.
@@ -940,6 +1039,9 @@ mod tests {
                 max_retries: 2,
                 retry_user_errors: true,
             }),
+            metadata: [("name".to_string(), "nightly-build".to_string())]
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -970,6 +1072,7 @@ mod tests {
             original.max_runtime_seconds
         );
         assert_eq!(round_tripped.quota_entity, original.quota_entity);
+        assert_eq!(round_tripped.metadata, original.metadata);
         let retry = round_tripped.retry.expect("retry policy survives");
         assert_eq!(retry.max_retries, 2);
         assert!(retry.retry_user_errors);

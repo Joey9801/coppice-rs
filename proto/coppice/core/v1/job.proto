@@ -49,6 +49,30 @@ message Job {
   // proposer or through an unauthenticated path. A principal may always
   // abort and retry a job it submitted — the ownership grant reads this.
   optional string submitted_by = 11;
+  // User-owned annotations (ADR 0042): small, mutable, descriptive key/value
+  // pairs of strings the platform itself never reads. `repeated
+  // MetadataEntry`, never a proto `map` — map encoding order is unspecified,
+  // and this rides a replicated, snapshotted payload (schema-style.md). Same
+  // repeated-entry rule as `Label`: writers emit ascending key order, readers
+  // accept any order and reject duplicate keys.
+  repeated MetadataEntry metadata = 12;
+}
+
+// One key/value pair of a metadata map. A message rather than a `map` entry
+// so the ordering above is ours to fix.
+message MetadataEntry {
+  // 1-64 bytes, ASCII letters, digits, `.` `_` `-` `/` `:` (ADR 0042).
+  // Enforced at the API and re-checked at apply; conversion rejects empty.
+  string key = 1;
+  // At most 1024 bytes of UTF-8; empty is a legal value.
+  string value = 2;
+}
+
+// A whole metadata map, wrapped so it can be a oneof arm and so "no map"
+// stays distinguishable from "the empty map" (clearing the map is a
+// meaningful request). Entries follow MetadataEntry's rule above.
+message MetadataMap {
+  repeated MetadataEntry entries = 1;
 }
 
 // An entrypoint override for a job's container. A message rather than a
