@@ -15,6 +15,7 @@ pub mod attempt;
 pub mod bytes;
 pub mod id;
 pub mod job;
+pub mod metadata;
 pub mod node;
 pub mod quota;
 pub mod resource;

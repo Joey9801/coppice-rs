@@ -176,6 +176,7 @@ pub fn submit_cmd(
             retry,
             abort_requested: None,
             submitted_by: None,
+            metadata: Default::default(),
         },
         multiplier: PriorityMultiplier::ONE,
         submitted_at: base_ts(),

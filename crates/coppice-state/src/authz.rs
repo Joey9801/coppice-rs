@@ -150,6 +150,15 @@ pub enum Verb<'a> {
         entity: &'a QuotaEntityId,
         submitted_by: Option<&'a str>,
     },
+    /// Replace or patch the metadata of a job charging `entity`
+    /// (ADR 0042): evaluated *exactly* like [`Verb::Abort`] — the job's
+    /// submitter, or `operator` or higher over the entity. Annotating a job
+    /// is no more privileged than stopping it, so the two share one code
+    /// path below rather than two rules that could drift.
+    UpdateJobMetadata {
+        entity: &'a QuotaEntityId,
+        submitted_by: Option<&'a str>,
+    },
     /// Drain a node, undrain it, or remove its record (ADR 0041). A cluster
     /// verb: unscoped `operator` or higher. One verb for all three because
     /// removal is the *end* of a drain, not a further authority.
@@ -176,6 +185,10 @@ impl fmt::Display for Verb<'_> {
         match self {
             Verb::Submit { entity } => write!(f, "submit a job charging quota entity {entity}"),
             Verb::Abort { entity, .. } => write!(f, "abort a job charging quota entity {entity}"),
+            Verb::UpdateJobMetadata { entity, .. } => write!(
+                f,
+                "update the metadata of a job charging quota entity {entity}"
+            ),
             Verb::Drain => f.write_str("drain, undrain, or remove nodes"),
             Verb::ConfigureQuotaEntity { entity, new_parent } => match new_parent {
                 Some(p) => write!(f, "configure quota entity {entity} under parent {p}"),
@@ -268,11 +281,18 @@ pub fn evaluate(
                 "submitter or higher over that quota entity",
             ))
         }
+        // One arm, deliberately: aborting a job and annotating it are the
+        // same authority (ADR 0042), so they cannot drift apart.
         Verb::Abort {
             entity,
             submitted_by,
+        }
+        | Verb::UpdateJobMetadata {
+            entity,
+            submitted_by,
         } => {
-            // Ownership: a principal may always abort a job it submitted,
+            // Ownership: a principal may always abort or annotate a job it
+            // submitted,
             // with no binding at all (ADR 0023's only implicit grant besides
             // the flags above). An empty principal never owns anything —
             // `submitted_by` is only ever stamped from a present actor.

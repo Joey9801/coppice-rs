@@ -10,6 +10,7 @@ use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
 };
 use coppice_core::job::{Job, JobState, RetryPolicy};
+use coppice_core::metadata::JobMetadata;
 use coppice_core::node::HostFacts;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
@@ -50,7 +51,19 @@ fn job(n: u128) -> Job {
         retry: RetryPolicy::default(),
         abort_requested: None,
         submitted_by: Some("user-42".into()),
+        metadata: metadata_fixture(),
     }
+}
+
+/// A representative metadata map (ADR 0042): a few string keys across the
+/// charset, including the empty value that is a legal one.
+fn metadata_fixture() -> JobMetadata {
+    JobMetadata::from([
+        ("name".to_string(), "nightly".to_string()),
+        ("ticket".to_string(), "INC-1234".to_string()),
+        ("attempt/count".to_string(), "3".to_string()),
+        ("flaky:seen".to_string(), String::new()),
+    ])
 }
 
 /// A token-derived actor: a plain principal carrying group membership, no
@@ -102,6 +115,21 @@ fn every_command() -> Vec<Command> {
             reason: Some("wrong dataset".into()),
             requested_at: ts(),
             actor: Some(operator_cert_actor()),
+        }),
+        Command::UpdateJobMetadata(UpdateJobMetadata {
+            job: jid(1),
+            update: JobMetadataUpdate::Replace(metadata_fixture()),
+            updated_at: ts(),
+            actor: Some(grouped_actor()),
+        }),
+        Command::UpdateJobMetadata(UpdateJobMetadata {
+            job: jid(1),
+            update: JobMetadataUpdate::Patch {
+                set: metadata_fixture(),
+                unset: ["a".to_string(), "b".to_string()].into(),
+            },
+            updated_at: ts(),
+            actor: None,
         }),
         Command::CommitPlacements(CommitPlacements {
             expected_version: 41,
@@ -867,5 +895,145 @@ fn resources_encode_canonically() {
             pb::core::v1::ResourceKind::CpuMillis as i32,
             pb::core::v1::ResourceKind::DiskBytes as i32,
         ]
+    );
+}
+
+#[test]
+fn job_metadata_encodes_canonically() {
+    // Ascending key order by construction: two equal maps built in different
+    // insertion orders must encode byte-identically.
+    let forwards = JobMetadata::from([
+        ("a".to_string(), "1".to_string()),
+        ("b".to_string(), String::new()),
+        ("c".to_string(), "3".to_string()),
+    ]);
+    let mut backwards = JobMetadata::new();
+    for (key, value) in forwards.iter().rev() {
+        backwards.insert(key.clone(), value.clone());
+    }
+    let mut spec = job(1);
+    spec.metadata = forwards;
+    let mut other = job(1);
+    other.metadata = backwards;
+    assert_eq!(
+        pb::core::v1::Job::from(&spec).encode_to_vec(),
+        pb::core::v1::Job::from(&other).encode_to_vec()
+    );
+    let encoded = pb::core::v1::Job::from(&spec);
+    let keys: Vec<&str> = encoded.metadata.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(keys, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn empty_job_metadata_roundtrips() {
+    // Empty and absent are the same bytes for a repeated field, and that is
+    // correct here: an empty map is the default, not a missing one.
+    let mut spec = job(1);
+    spec.metadata = JobMetadata::new();
+    let pb_job = pb::core::v1::Job::from(&spec);
+    assert!(pb_job.metadata.is_empty());
+    assert_eq!(Job::try_from(pb_job).expect("must convert"), spec);
+}
+
+#[test]
+fn metadata_entries_are_accepted_in_any_order() {
+    // The corpus rule for repeated entry lists: writers sort, readers do
+    // not police order — the `BTreeMap` re-sorts.
+    let entry = |key: &str, value: &str| pb::core::v1::MetadataEntry {
+        key: key.to_string(),
+        value: value.to_string(),
+    };
+    let mut pb_job = pb::core::v1::Job::from(&job(1));
+    pb_job.metadata = vec![entry("b", "2"), entry("a", "1")];
+    let decoded = Job::try_from(pb_job).expect("any order decodes");
+    assert_eq!(
+        decoded.metadata,
+        JobMetadata::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn duplicate_or_empty_metadata_keys_are_rejected_at_the_boundary() {
+    let entry = |key: &str| pb::core::v1::MetadataEntry {
+        key: key.to_string(),
+        value: String::new(),
+    };
+    let mut pb_job = pb::core::v1::Job::from(&job(1));
+    pb_job.metadata = vec![entry("a"), entry("a")];
+    assert_eq!(
+        Job::try_from(pb_job.clone()),
+        Err(ConvertError::DuplicateEntry("Job.metadata"))
+    );
+    pb_job.metadata = vec![entry("")];
+    assert_eq!(
+        Job::try_from(pb_job),
+        Err(ConvertError::Invalid {
+            field: "Job.metadata",
+            reason: "metadata key must not be empty",
+        })
+    );
+}
+
+#[test]
+fn unset_job_metadata_update_oneof_is_rejected_at_the_boundary() {
+    let envelope = pb::command::v1::Command {
+        version: 1,
+        body: Some(pb::command::v1::command::Body::UpdateJobMetadata(
+            pb::command::v1::UpdateJobMetadata {
+                job: Some(jid(1).into()),
+                update: None,
+                actor: None,
+                updated_at_us: ts().as_micros(),
+            },
+        )),
+    };
+    assert_eq!(
+        command_from_pb(envelope),
+        Err(ConvertError::MissingField("UpdateJobMetadata.update"))
+    );
+}
+
+#[test]
+fn unset_keys_are_order_free_but_unique_and_non_empty() {
+    let patch = |unset: Vec<&str>| pb::command::v1::Command {
+        version: 1,
+        body: Some(pb::command::v1::command::Body::UpdateJobMetadata(
+            pb::command::v1::UpdateJobMetadata {
+                job: Some(jid(1).into()),
+                update: Some(pb::command::v1::update_job_metadata::Update::Patch(
+                    pb::command::v1::MetadataPatch {
+                        set: vec![],
+                        unset: unset.into_iter().map(str::to_string).collect(),
+                    },
+                )),
+                actor: None,
+                updated_at_us: ts().as_micros(),
+            },
+        )),
+    };
+    let (_, decoded) = command_from_pb(patch(vec!["b", "a"])).expect("any order decodes");
+    let Command::UpdateJobMetadata(c) = decoded else {
+        panic!("wrong arm");
+    };
+    let JobMetadataUpdate::Patch { unset, .. } = c.update else {
+        panic!("wrong update arm");
+    };
+    assert_eq!(
+        unset.into_iter().collect::<Vec<_>>(),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert_eq!(
+        command_from_pb(patch(vec!["a", "a"])),
+        Err(ConvertError::DuplicateEntry("MetadataPatch.unset"))
+    );
+    assert_eq!(
+        command_from_pb(patch(vec![""])),
+        Err(ConvertError::Invalid {
+            field: "MetadataPatch.unset",
+            reason: "metadata key must not be empty",
+        })
     );
 }

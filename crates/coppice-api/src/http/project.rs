@@ -723,7 +723,7 @@ fn list_jobs_scan(
 
 /// Per-request evaluation memo for a [`dto::JobFilter`].
 ///
-/// Holds the precomputed descendant id set of each entity-subtree leaf so
+/// Holds the precomputed descendant id set of each entity-subtree leaf, so
 /// filter evaluation is O(1) per job after this bounded setup. An unknown
 /// entity id resolves to an empty set (matches nothing), never an error.
 struct FilterContext {
@@ -788,6 +788,23 @@ impl FilterContext {
                 };
                 r.min.map_or(true, |m| value >= m) && r.max.map_or(true, |m| value <= m)
             }
+            F::Metadata(m) => self.matches_metadata(m, record),
+        }
+    }
+
+    /// The ADR 0042 metadata leaf: presence, or exact string equality.
+    ///
+    /// Both short-circuit on the key being absent — a job without the key
+    /// never matches either.
+    fn matches_metadata(&self, filter: &dto::MetadataFilter, record: &JobRecord) -> bool {
+        let Some(stored) = record.spec.metadata.get(&filter.key) else {
+            return false;
+        };
+        match &filter.equals {
+            // Byte for byte, case-sensitive.
+            Some(operand) => stored == operand,
+            // Presence: the key exists, whatever the value.
+            None => true,
         }
     }
 }
@@ -914,6 +931,7 @@ fn job_summary(state: &StateMachine, record: &JobRecord) -> dto::JobSummary {
         } else {
             None
         },
+        metadata: record.spec.metadata.clone(),
     }
 }
 
@@ -1309,6 +1327,7 @@ pub fn get_job(
         queue: queue_explainer(state, record, now),
         accrual: job_accrual(state, record, view_memos),
         cost: cost_report(state, record),
+        metadata: spec.metadata.clone(),
     })
 }
 
@@ -1953,6 +1972,7 @@ mod tests {
                 retry: Default::default(),
                 abort_requested: None,
                 submitted_by: None,
+                metadata: Default::default(),
             },
             state,
             multiplier: PriorityMultiplier::ONE,
@@ -2514,6 +2534,78 @@ mod tests {
 
     fn ids(response: &dto::ListJobsResponse) -> Vec<JobId> {
         response.jobs.iter().map(|j| j.id).collect()
+    }
+
+    // ---- metadata leaf (ADR 0042) -----------------------------------------
+
+    /// A queued job carrying exactly the metadata given.
+    fn metadata_job(id: JobId, metadata: &[(&str, &str)]) -> JobRecord {
+        let mut record = queued(id, 0);
+        record.spec.metadata = metadata
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        record
+    }
+
+    /// The single leaf, built for brevity at the call sites below.
+    fn metadata_leaf(key: &str, equals: Option<&str>) -> dto::JobFilter {
+        dto::JobFilter::Metadata(dto::MetadataFilter {
+            key: key.to_string(),
+            equals: equals.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn metadata_key_alone_is_presence_whatever_the_value() {
+        let with_empty = job_id(1);
+        let with_value = job_id(2);
+        let without = job_id(3);
+        let mut state = StateMachine::default();
+        // An empty value is a stored value, so it is present.
+        state
+            .jobs
+            .insert(with_empty, metadata_job(with_empty, &[("k", "")]));
+        state
+            .jobs
+            .insert(with_value, metadata_job(with_value, &[("k", "v")]));
+        // A job with *some* metadata but not this key must not match, which
+        // is a different miss from a job with no metadata at all.
+        state
+            .jobs
+            .insert(without, metadata_job(without, &[("other", "1")]));
+
+        let filter = metadata_leaf("k", None);
+        assert_eq!(
+            ids(&list_jobs(&state, Some(&filter), None, 100)),
+            vec![with_value, with_empty]
+        );
+    }
+
+    #[test]
+    fn metadata_equals_is_exact_case_sensitive_string_equality() {
+        let text = job_id(1);
+        let cased = job_id(2);
+        let empty = job_id(3);
+        let mut state = StateMachine::default();
+        for (id, value) in [(text, "INC-1234"), (cased, "inc-1234"), (empty, "")] {
+            state.jobs.insert(id, metadata_job(id, &[("k", value)]));
+        }
+        let matching = |operand: &str| {
+            let filter = metadata_leaf("k", Some(operand));
+            ids(&list_jobs(&state, Some(&filter), None, 100))
+        };
+
+        assert_eq!(matching("INC-1234"), vec![text]);
+        // Exact, not substring, and case-sensitive — unlike the image leaf.
+        assert!(matching("INC").is_empty());
+        assert_eq!(matching("inc-1234"), vec![cased]);
+        // `""` is equality with the empty value, not presence: it matches
+        // only the job storing the empty string.
+        assert_eq!(matching(""), vec![empty]);
+        // A key nobody carries matches nothing, operand or not.
+        let filter = metadata_leaf("absent", Some("v"));
+        assert!(list_jobs(&state, Some(&filter), None, 100).jobs.is_empty());
     }
 
     #[test]

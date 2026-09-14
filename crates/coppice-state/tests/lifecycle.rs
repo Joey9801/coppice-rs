@@ -5,19 +5,23 @@
 
 mod common;
 
+use std::collections::BTreeSet;
+
 use common::*;
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
-use coppice_core::id::{AllocationId, GroupId};
+use coppice_core::id::{AllocationId, GroupId, JobId};
 use coppice_core::job::{JobState, RetryPolicy};
+use coppice_core::metadata::{JobMetadata, MAX_VALUE_BYTES};
 use coppice_core::node::HostFacts;
 use coppice_core::quota::{CostUnits, PriorityMultiplier, Settlement, TrueUp, FULL_REFUND_MILLI};
 use coppice_core::time::Duration;
+use coppice_state::authz::{Actor, Role};
 use coppice_state::command::{
     BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs,
-    LostAttempt, ReconcileNode, SetNodeSchedulable,
+    JobMetadataUpdate, LostAttempt, ReconcileNode, SetNodeSchedulable, UpdateJobMetadata,
 };
-use coppice_state::{Command, Event, Rejection, RejectionReason};
+use coppice_state::{Applied, Command, Event, Rejection, RejectionReason, StateMachine};
 
 #[test]
 fn happy_path_submit_to_eviction() {
@@ -1981,4 +1985,262 @@ fn v1_placement_shape_is_enforced() {
             reason: RejectionReason::UnsupportedPlacementShape
         }])
     );
+}
+
+// ---- UpdateJobMetadata (ADR 0042) ----
+
+fn update_metadata_cmd(job: JobId, update: JobMetadataUpdate, actor: Option<Actor>) -> Command {
+    Command::UpdateJobMetadata(UpdateJobMetadata {
+        job,
+        update,
+        actor,
+        updated_at: base_ts(),
+    })
+}
+
+fn replace_cmd(job: JobId, map: JobMetadata) -> Command {
+    update_metadata_cmd(job, JobMetadataUpdate::Replace(map), None)
+}
+
+fn str_val(s: &str) -> String {
+    s.to_string()
+}
+
+#[test]
+fn update_job_metadata_replace_sets_whole_map_and_emits_event() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+
+    let mut map = JobMetadata::new();
+    map.insert("name".into(), str_val("nightly-build"));
+    map.insert("ticket".into(), str_val("INC-1234"));
+
+    let applied = apply_ok(&mut sm, replace_cmd(jid(1), map.clone()));
+    assert_eq!(
+        applied.events,
+        vec![Event::JobMetadataUpdated { job: jid(1) }]
+    );
+    assert_eq!(sm.jobs[&jid(1)].spec.metadata, map);
+}
+
+#[test]
+fn update_job_metadata_patch_applies_set_then_unset_leaving_other_keys_alone() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+
+    let mut initial = JobMetadata::new();
+    initial.insert("name".into(), str_val("nightly-build"));
+    initial.insert("ticket".into(), str_val("INC-1234"));
+    initial.insert("stale".into(), str_val("drop-me"));
+    apply_ok(&mut sm, replace_cmd(jid(1), initial));
+
+    let mut set = JobMetadata::new();
+    set.insert("ticket".into(), str_val("INC-5678"));
+    set.insert("new_key".into(), "true".to_string());
+    let mut unset = BTreeSet::new();
+    unset.insert("stale".to_string());
+
+    let applied = apply_ok(
+        &mut sm,
+        update_metadata_cmd(jid(1), JobMetadataUpdate::Patch { set, unset }, None),
+    );
+    assert_eq!(
+        applied.events,
+        vec![Event::JobMetadataUpdated { job: jid(1) }]
+    );
+
+    let mut expected = JobMetadata::new();
+    expected.insert("name".into(), str_val("nightly-build"));
+    expected.insert("ticket".into(), str_val("INC-5678"));
+    expected.insert("new_key".into(), "true".to_string());
+    assert_eq!(sm.jobs[&jid(1)].spec.metadata, expected);
+}
+
+#[test]
+fn update_job_metadata_rejects_unknown_job() {
+    let mut sm = setup();
+    let reason = sm
+        .apply(&replace_cmd(jid(404), JobMetadata::new()))
+        .expect_err("no such job");
+    assert_eq!(reason, RejectionReason::UnknownJob(jid(404)));
+}
+
+/// Ownership is re-derived from replicated state, exactly like `AbortJob`:
+/// the job's own submitter can edit it with only a submitter binding, an
+/// unrelated submitter is refused, and an operator over the quota entity
+/// can edit anyone's.
+#[test]
+fn update_job_metadata_honors_ownership_then_falls_back_to_operator() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        update_authorization_cmd(vec![
+            principal_binding("root", Role::Admin, None),
+            principal_binding("ana", Role::Submitter, Some(ROOT)),
+            principal_binding("bo", Role::Operator, Some(ROOT)),
+        ]),
+    );
+    let ana = actor("ana");
+    apply_ok(
+        &mut sm,
+        with_actor(
+            submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+            ana.clone(),
+        ),
+    );
+    apply_ok(
+        &mut sm,
+        with_actor(
+            submit_cmd(jid(2), cpu(1_000), None, RetryPolicy::default()),
+            ana.clone(),
+        ),
+    );
+
+    let mut map = JobMetadata::new();
+    map.insert("name".into(), str_val("whatever"));
+
+    // A submitter with no ownership over job 1 is refused.
+    let reason = sm
+        .apply(&update_metadata_cmd(
+            jid(1),
+            JobMetadataUpdate::Replace(map.clone()),
+            Some(actor("carol")),
+        ))
+        .expect_err("carol holds nothing");
+    assert!(matches!(reason, RejectionReason::PermissionDenied(_)));
+
+    // The owner can, with only a submitter binding.
+    apply_ok(
+        &mut sm,
+        update_metadata_cmd(jid(1), JobMetadataUpdate::Replace(map.clone()), Some(ana)),
+    );
+    assert_eq!(sm.jobs[&jid(1)].spec.metadata, map);
+
+    // An operator over the entity can edit anyone's.
+    apply_ok(
+        &mut sm,
+        update_metadata_cmd(
+            jid(2),
+            JobMetadataUpdate::Replace(map.clone()),
+            Some(actor("bo")),
+        ),
+    );
+    assert_eq!(sm.jobs[&jid(2)].spec.metadata, map);
+}
+
+#[test]
+fn update_job_metadata_rejects_oversized_value() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+
+    let mut map = JobMetadata::new();
+    map.insert("huge".into(), str_val(&"x".repeat(MAX_VALUE_BYTES + 1)));
+    let reason = sm
+        .apply(&replace_cmd(jid(1), map))
+        .expect_err("value breaks the per-value size limit");
+    assert!(
+        matches!(reason, RejectionReason::InvalidJobMetadata(_)),
+        "{reason:?}"
+    );
+    assert!(sm.jobs[&jid(1)].spec.metadata.is_empty());
+}
+
+#[test]
+fn submit_job_rechecks_metadata_limits_and_counts_metadata_in_its_identity() {
+    let mut sm = setup();
+    let with_metadata = |map: JobMetadata| {
+        let mut cmd = submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default());
+        if let Command::SubmitJob(c) = &mut cmd {
+            c.job.metadata = map;
+        }
+        cmd
+    };
+
+    // The apply-side re-check applies to a submission too (ADR 0042): a
+    // proposer that skipped the API's admission check still cannot land an
+    // oversized map.
+    let mut huge = JobMetadata::new();
+    huge.insert("huge".into(), str_val(&"x".repeat(MAX_VALUE_BYTES + 1)));
+    let reason = sm
+        .apply(&with_metadata(huge))
+        .expect_err("submission breaks the per-value size limit");
+    assert!(
+        matches!(reason, RejectionReason::InvalidJobMetadata(_)),
+        "{reason:?}"
+    );
+    assert!(!sm.jobs.contains_key(&jid(1)));
+
+    // Metadata is part of the submission's identity (ADR 0026): the same id
+    // with the same map is the idempotent retry, a different map is a
+    // different intent and rejects rather than silently keeping the original.
+    let mut named = JobMetadata::new();
+    named.insert("name".into(), str_val("nightly"));
+    apply_ok(&mut sm, with_metadata(named.clone()));
+    apply_ok(&mut sm, with_metadata(named.clone()));
+    let mut renamed = JobMetadata::new();
+    renamed.insert("name".into(), str_val("adhoc"));
+    assert_eq!(
+        sm.apply(&with_metadata(renamed))
+            .expect_err("a different map"),
+        RejectionReason::SubmitSpecMismatch(jid(1))
+    );
+    assert_eq!(sm.jobs[&jid(1)].spec.metadata, named);
+}
+
+#[test]
+fn update_job_metadata_accepted_on_terminal_job() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+    apply_ok(&mut sm, abort_cmd(jid(1), base_ts()));
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Aborted);
+
+    let mut map = JobMetadata::new();
+    map.insert("root_cause".into(), str_val("OOM"));
+    let applied = apply_ok(&mut sm, replace_cmd(jid(1), map.clone()));
+    assert_eq!(
+        applied.events,
+        vec![Event::JobMetadataUpdated { job: jid(1) }]
+    );
+    assert_eq!(sm.jobs[&jid(1)].spec.metadata, map);
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Aborted);
+}
+
+#[test]
+fn update_job_metadata_noop_replace_emits_no_event_and_leaves_state_unchanged() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+
+    let mut map = JobMetadata::new();
+    map.insert("name".into(), str_val("nightly-build"));
+    apply_ok(&mut sm, replace_cmd(jid(1), map.clone()));
+
+    let before = sm.clone();
+    let applied = apply_ok(&mut sm, replace_cmd(jid(1), map.clone()));
+    assert_eq!(applied, Applied::default());
+    assert_eq!(
+        StateMachine {
+            version: before.version,
+            ..sm.clone()
+        },
+        StateMachine {
+            version: before.version,
+            ..before.clone()
+        }
+    );
+    assert_eq!(sm.jobs[&jid(1)].spec.metadata, map);
 }

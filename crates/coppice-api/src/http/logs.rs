@@ -708,6 +708,13 @@ mod tests {
         ) -> Result<(), ApiError> {
             unimplemented!("logs tests never abort")
         }
+        async fn update_job_metadata(
+            &self,
+            _req: crate::UpdateJobMetadataCall,
+            _actor: coppice_state::Actor,
+        ) -> Result<crate::http::dto::UpdateJobMetadataResponse, ApiError> {
+            unimplemented!("logs tests never write metadata")
+        }
         async fn set_node_schedulable(
             &self,
             _req: crate::http::dto::SetNodeSchedulableRequest,
@@ -844,6 +851,7 @@ mod tests {
                 retry: Default::default(),
                 abort_requested: None,
                 submitted_by: None,
+                metadata: Default::default(),
             },
             state: JobState::Queued,
             multiplier: PriorityMultiplier::ONE,

@@ -217,6 +217,7 @@ async fn submit_job(coord: &RunningCoordinator, job: JobId, entity: QuotaEntityI
                 },
                 abort_requested: None,
                 submitted_by: None,
+                metadata: Default::default(),
             },
             multiplier: PriorityMultiplier::ONE,
             submitted_at: Timestamp::now(),

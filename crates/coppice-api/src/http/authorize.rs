@@ -43,6 +43,11 @@ pub(super) enum Intent<'a> {
     Submit { entity: &'a QuotaEntityId },
     /// `POST /api/v1/jobs/{job}/abort`.
     Abort { job: JobId },
+    /// `PUT` and `POST /api/v1/jobs/{job}/metadata` (ADR 0042). Resolved
+    /// from the job exactly like [`Abort`](Intent::Abort), because the two
+    /// are the same authority: annotating a job is no more privileged than
+    /// stopping it.
+    UpdateJobMetadata { job: JobId },
     /// `POST /api/v1/nodes/{node}/drain` and `.../undrain` (ADR 0041).
     ///
     /// No node in the arm, unlike [`Abort`](Intent::Abort): `Verb::Drain` is
@@ -90,11 +95,24 @@ pub(super) async fn precheck<P: ControlPlane>(
 
     let verb = match intent {
         Intent::Submit { entity } => Verb::Submit { entity },
-        Intent::Abort { job } => match state.jobs.get(&job) {
-            Some(record) => Verb::Abort {
-                entity: &record.spec.quota_entity,
-                submitted_by: record.spec.submitted_by.as_deref(),
-            },
+        // One arm for the two job verbs: the lookup, the ownership
+        // derivation and the skip-on-unknown reasoning below are identical,
+        // and only the verb constructed from them differs.
+        Intent::Abort { job } | Intent::UpdateJobMetadata { job } => match state.jobs.get(&job) {
+            Some(record) => {
+                let entity = &record.spec.quota_entity;
+                let submitted_by = record.spec.submitted_by.as_deref();
+                match intent {
+                    Intent::Abort { .. } => Verb::Abort {
+                        entity,
+                        submitted_by,
+                    },
+                    _ => Verb::UpdateJobMetadata {
+                        entity,
+                        submitted_by,
+                    },
+                }
+            }
             // A job this view has never heard of. It may not exist, or it may
             // simply not have applied here yet — and this check cannot tell
             // the two apart, so it declines to guess.

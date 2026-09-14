@@ -97,6 +97,8 @@ mutations are `POST` with a request-message body. One route per
 | `POST /api/v1/jobs` | `SubmitJob*` (exists) | write |
 | `GET  /api/v1/jobs/{job}` | `GetJob*` | bounded |
 | `POST /api/v1/jobs/{job}/abort` | `AbortJob*` (exists) | write |
+| `PUT  /api/v1/jobs/{job}/metadata` | `ReplaceJobMetadata*` (ADR 0042) | write |
+| `POST /api/v1/jobs/{job}/metadata` | `UpdateJobMetadata*` (patch, ADR 0042) | write |
 | `GET  /api/v1/jobs/{job}/timeline` | `GetJobTimeline*` | bounded |
 | `GET  /api/v1/jobs/{job}/usage?attempt=` | `GetJobUsage*` | eventual (shipped, ADR 0036) |
 | `GET  /api/v1/jobs/{job}/logs?cursor=&limit=` | `GetJobLogs*` | eventual (shipped, ADR 0034) |
@@ -137,10 +139,24 @@ batches with ADR 0008 cursors — never a raw firehose.
 *(ListJobs signature amended 2026-07-16, when it shipped: the sketched flat
 `?phase=&entity=&node=&search=` params are replaced by a single URL-encoded
 JSON `filter` AST (`coppice-api::http::dto::JobFilter` — an `all`/`any`/`not`
-tree over phase/entity/node/image/id/search/submitted/requests leaves), and
+tree over phase/entity/node/image/id/search/submitted/requests leaves, plus
+the `metadata` leaf added by the 2026-09-14 amendment below), and
 paging is keyset — `?cursor=` a `v1:<job-id>` token walking JobId descending
 — rather than an offset, with no `total` on the response since an exact count
 would force a full filtered scan.)*
+
+*(Job metadata added 2026-09-14 per [ADR 0042](0042-job-metadata.md): the
+two `/jobs/{job}/metadata` rows above, one path and two verbs — `PUT` is the
+full replacement `{ "metadata": { … } }` for a caller that owns the map,
+`POST` the `{ "set": { … }, "unset": [ … ] }` patch for one that owns some
+keys — both answering `{ "job": id, "log_index": n }`, both gated by the
+abort rule through `precheck`, and both forwarded to the leader over the
+admin plane (ADR 0038). `SubmitJobRequest` gains `metadata`, and
+`JobSummary`/`JobDetail` gain it as an always-present object. The `ListJobs`
+filter grammar's reserved `label` leaf is **replaced** — not joined — by a
+`metadata` leaf with `key` alone (presence) or `key` plus `equals` (exact,
+case-sensitive string equality). Metadata values are plain strings: there is
+no value type and no pattern operator. See ADR 0042 for the limits.)*
 
 The table's "message pair" naming survives the wire-format amendment
 unchanged: the pairs are the same-named DTOs in

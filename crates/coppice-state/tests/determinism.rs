@@ -23,6 +23,7 @@ use common::*;
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::bytes::ByteSize;
 use coppice_core::job::RetryPolicy;
+use coppice_core::metadata::JobMetadata;
 use coppice_core::quota::CostUnits;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -30,8 +31,8 @@ use coppice_proto::convert::{state_from_records, state_to_records, StateRecords}
 use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictNodes, EvictTerminalJobs,
-    LostAttempt, ReconcileNode, RegisterNode, SetNodeDraining, SetNodeSchedulable,
-    UpdateAuthorization,
+    JobMetadataUpdate, LostAttempt, ReconcileNode, RegisterNode, SetNodeDraining,
+    SetNodeSchedulable, UpdateAuthorization, UpdateJobMetadata,
 };
 use coppice_state::{Command, StateMachine};
 use proptest::prelude::*;
@@ -64,6 +65,38 @@ fn arb_outcome() -> impl Strategy<Value = AttemptOutcome> {
     ]
 }
 
+/// An arbitrary metadata map: a few short string keys and values, all
+/// inside the ADR 0042 limits so the command is accepted rather than always
+/// rejected. The empty value is in range, since it is a legal one.
+fn arb_metadata() -> impl Strategy<Value = JobMetadata> {
+    proptest::collection::btree_map("[a-z._:/-]{1,6}", "[a-z ]{0,8}", 0..4)
+}
+
+/// An arbitrary metadata edit: replacement and patch, both shapes, against
+/// a job that may or may not exist by the time it applies.
+fn arb_metadata_update(job: coppice_core::id::JobId) -> impl Strategy<Value = Command> {
+    (
+        arb_metadata(),
+        arb_metadata(),
+        proptest::collection::btree_set("[a-z._:/-]{1,6}", 0..3),
+        any::<bool>(),
+        arb_ts(),
+    )
+        .prop_map(move |(replace, set, unset, use_patch, ts)| {
+            let update = if use_patch {
+                JobMetadataUpdate::Patch { set, unset }
+            } else {
+                JobMetadataUpdate::Replace(replace)
+            };
+            Command::UpdateJobMetadata(UpdateJobMetadata {
+                job,
+                update,
+                actor: None,
+                updated_at: ts,
+            })
+        })
+}
+
 /// One job's lifecycle chain, truncated at `progress` and with an optional
 /// abort spliced in — so sequences cover early endings, races, and
 /// stale-report rejections, not just happy paths.
@@ -76,9 +109,10 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
         500u64..12_000,
         proptest::option::of(60i64..7_200),
         arb_ts(),
+        proptest::option::of((0usize..=6, arb_metadata_update(jid(1_000 + i as u128)))),
     )
         .prop_map(
-            move |(progress, abort_at, outcome, node_ix, cpu_millis, max_rt, ts)| {
+            move |(progress, abort_at, outcome, node_ix, cpu_millis, max_rt, ts, metadata_at)| {
                 let job = jid(1_000 + i as u128);
                 let attempt = aid(2_000 + i as u128);
                 let alloc = alid(3_000 + i as u128);
@@ -97,6 +131,14 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
                 if let Some(at) = abort_at {
                     let at = at.min(chain.len());
                     chain.insert(at, abort_cmd(job, ts));
+                }
+                // Metadata updates are legal in every state, terminal
+                // included (ADR 0042), so one can land anywhere in the
+                // chain — including before the job exists, which must
+                // reject deterministically.
+                if let Some((at, update)) = metadata_at {
+                    let at = at.min(chain.len());
+                    chain.insert(at, update);
                 }
                 chain
             },

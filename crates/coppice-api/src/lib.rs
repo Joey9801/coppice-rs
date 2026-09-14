@@ -20,8 +20,23 @@ use coppice_state::ViewMemos;
 use http::dto::{
     AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
     SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
-    UpdateAuthorizationResponse,
+    UpdateAuthorizationResponse, UpdateJobMetadataResponse,
 };
+
+/// The argument of [`ControlPlane::update_job_metadata`] (ADR 0042).
+///
+/// **Not a wire body**, like [`SetNodeSchedulableRequest`]: the two HTTP
+/// routes have their own DTOs, and both map onto this. It carries the
+/// *domain* edit rather than the JSON one, so the conversion and the limit
+/// check happen once, at the edge, and everything below the seam — the
+/// direct propose and the forwarded hop alike — works in the same terms
+/// apply does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateJobMetadataCall {
+    /// Resolved from the path segment, which is authoritative.
+    pub job: coppice_core::id::JobId,
+    pub update: coppice_state::command::JobMetadataUpdate,
+}
 
 /// Consistency class for read operations (ADR 0007).
 ///
@@ -718,6 +733,26 @@ pub trait ControlPlane: Send + Sync + 'static {
         req: AbortJobRequest,
         actor: coppice_state::Actor,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Propose the ADR 0042 metadata write on behalf of `actor` — one method
+    /// for both routes, because they are one command: `PUT` carries a
+    /// `JobMetadataUpdate::Replace` and `POST` a
+    /// `JobMetadataUpdate::Patch`, and nothing downstream of the HTTP
+    /// layer distinguishes them. Same two-check arrangement as
+    /// [`submit_job`](ControlPlane::submit_job), over
+    /// `Verb::UpdateJobMetadata`, which evaluates exactly like an abort's.
+    ///
+    /// A limit breach that survived the edge check (a patch whose *result*
+    /// only apply can measure) comes back as
+    /// `RejectionReason::InvalidJobMetadata` through
+    /// [`ApiError::Rejected`]; an unknown job as `RejectionReason::UnknownJob`
+    /// through the same arm, which is the 409 an abort of an unknown job
+    /// already gives.
+    fn update_job_metadata(
+        &self,
+        req: UpdateJobMetadataCall,
+        actor: coppice_state::Actor,
+    ) -> impl Future<Output = Result<UpdateJobMetadataResponse, ApiError>> + Send;
 
     /// Propose the admin cordon (ADR 0041) on behalf of `actor`: `schedulable
     /// = false` drains the node, `true` undrains it. Same two-check

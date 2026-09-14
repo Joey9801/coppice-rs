@@ -1786,6 +1786,32 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         }))
     }
 
+    /// The leader-side half of a forwarded metadata write (ADR 0042), either
+    /// verb — `update` already carries which shape (`replace` or `patch`),
+    /// so one handler serves both routes. As the writes above, through the
+    /// same [`api_server::update_job_metadata_here`] the direct path runs.
+    ///
+    /// Unlike the abort/cordon/eviction outcomes, the log index here is real
+    /// client-visible data — the HTTP response is `{ job, log_index }`, not
+    /// an empty body — so it is threaded through rather than zeroed.
+    async fn forward_update_job_metadata(
+        &self,
+        request: Request<pb::ForwardUpdateJobMetadataRequest>,
+    ) -> Result<Response<pb::ForwardUpdateJobMetadataResponse>, Status> {
+        self.require_operator_or_machine(&request, "ForwardUpdateJobMetadata")?;
+        let req = request.into_inner();
+        let (consensus, handle) = self.formed()?;
+        Self::check_cluster(&req.history_id, &handle)?;
+
+        let (job, update, actor) = crate::clientwrite::update_job_metadata_from_pb(req)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let outcome =
+            api_server::update_job_metadata_here(consensus.as_ref(), job, update, &actor).await;
+        Ok(Response::new(pb::ForwardUpdateJobMetadataResponse {
+            outcome: Some(forwarded_outcome(outcome)?),
+        }))
+    }
+
     /// The leader-side half of a replica's liveness read (ADR 0040).
     ///
     /// The same gates the forwarded writes pass — coordinator machine or

@@ -784,6 +784,45 @@ async fn a_client_pointed_at_a_follower_submits_observes_and_aborts() {
     )
     .await;
 
+    // (g) ADR 0042's fourth forwarded write: annotate the (now-terminal)
+    // job over the same follower. Terminal jobs still accept metadata edits
+    // (ADR 0042's "annotate a finished job" case), so this exercises the
+    // forwarding hop on exactly the state the abort above just produced,
+    // not a freshly-queued job.
+    let resp = client
+        .put(follower.api(&format!("/api/v1/jobs/{job}/metadata")))
+        .json(&serde_json::json!({ "metadata": { "name": "adr-0038-acceptance" } }))
+        .send()
+        .await
+        .expect("metadata replace request reaches the follower");
+    let (status, body) = split_response(resp).await;
+    assert_eq!(
+        status, 200,
+        "a follower must forward a metadata write to the leader and \
+         answer 200, not 421: {body}"
+    );
+    assert_eq!(body["job"], job.to_string(), "{body}");
+    let metadata_log_index = body["log_index"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("metadata response carries no log_index: {body}"));
+
+    // (h) Observe the annotation, again from the follower's own bounded read
+    // — `?min_index=` pinned to the metadata write's own log index, the same
+    // read-your-writes shape as (d).
+    let resp = client
+        .get(follower.api(&format!(
+            "/api/v1/jobs/{job}?min_index={metadata_log_index}"
+        )))
+        .send()
+        .await
+        .expect("job read request reaches the follower");
+    let (status, body) = split_response(resp).await;
+    assert_eq!(
+        status, 200,
+        "the follower must be able to read its own metadata write back: {body}"
+    );
+    assert_eq!(body["metadata"]["name"], "adr-0038-acceptance", "{body}");
+
     fleet.stop_all().await;
 }
 

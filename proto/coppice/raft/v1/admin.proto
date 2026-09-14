@@ -13,6 +13,7 @@ syntax = "proto3";
 
 package coppice.raft.v1;
 
+import "coppice/command/v1/command.proto";
 import "coppice/core/v1/authz.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
@@ -287,6 +288,12 @@ service RaftAdminService {
   rpc ForwardSetNodeSchedulable(ForwardSetNodeSchedulableRequest)
       returns (ForwardSetNodeSchedulableResponse);
   rpc ForwardEvictNodes(ForwardEvictNodesRequest) returns (ForwardEvictNodesResponse);
+  // `PUT /api/v1/jobs/{job}/metadata` (full replacement) and `POST
+  // .../metadata` (patch), ADR 0042. One RPC for both, since the leader-side
+  // write is the same UpdateJobMetadata command either way — only the oneof
+  // arm the follower fills in differs.
+  rpc ForwardUpdateJobMetadata(ForwardUpdateJobMetadataRequest)
+      returns (ForwardUpdateJobMetadataResponse);
 
   // A follower's internal fetch of the leader's node-liveness marks
   // (ADR 0040) — the read twin of the forwarded writes above, and the only
@@ -514,6 +521,11 @@ message ForwardSubmitJobRequest {
   // actor here could already propose the command itself. Absent means an
   // actorless proposal, which no client write ever is.
   coppice.core.v1.Actor actor = 17;
+  // User-owned annotations (ADR 0042); absent/empty is the empty map. The
+  // leader re-checks the same limits this replica already applied at
+  // admission, so a forwarded submission is bound by exactly the rules a
+  // direct one is.
+  coppice.core.v1.MetadataMap metadata = 18;
 }
 
 message ForwardSubmitJobResponse {
@@ -614,6 +626,34 @@ message ForwardEvictNodesRequest {
 }
 
 message ForwardEvictNodesResponse {
+  ForwardWriteOutcome outcome = 1;
+}
+
+// A follower's forwarding of `PUT /api/v1/jobs/{job}/metadata` (replace) or
+// `POST /api/v1/jobs/{job}/metadata` (patch), ADR 0042. The two HTTP verbs
+// share this one message: which the caller sent is exactly which arm of
+// `update` is set, mirroring the domain's JobMetadataUpdate enum rather than
+// carrying a separate bool.
+message ForwardUpdateJobMetadataRequest {
+  bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
+  coppice.core.v1.JobId job = 8;
+  oneof update {
+    // The whole map, replacing whatever is there. An empty map is a
+    // meaningful request (clear the map), not confused with "no update".
+    coppice.core.v1.MetadataMap replace = 9;
+    // `set` merged over the current map, then `unset` keys removed; the API
+    // has already rejected a key appearing in both before this crosses the
+    // wire.
+    coppice.command.v1.MetadataPatch patch = 10;
+  }
+  // As ForwardSubmitJobRequest.actor. Load-bearing beyond the role check
+  // here: ADR 0023's ownership grant compares this principal to the job's
+  // submitted_by (the same rule as abort), so a lost actor would turn an
+  // owner's metadata edit into a 403.
+  coppice.core.v1.Actor actor = 11;
+}
+
+message ForwardUpdateJobMetadataResponse {
   ForwardWriteOutcome outcome = 1;
 }
 

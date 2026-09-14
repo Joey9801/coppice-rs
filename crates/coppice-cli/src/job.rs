@@ -32,8 +32,14 @@
 //! [retry]                  # optional
 //! max_retries = 3          # default 3
 //! retry_user_errors = false # default false
+//!
+//! [metadata]                # optional, ADR 0042 user-owned annotations
+//! name = "nightly-build"    # the well-known key; titles the job in the UI
+//! ticket = "INC-1234"
+//! attempt = "3"             # values are strings; a bare 3 is a spec error
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -43,6 +49,7 @@ use serde::Deserialize;
 use coppice_api::http::dto;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AttemptId, JobId, NodeId, QuotaEntityId};
+use coppice_core::metadata::JobMetadata;
 use coppice_core::time::Timestamp;
 
 use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection, Query};
@@ -84,6 +91,14 @@ pub struct JobSpec {
     /// Retry policy. Absent = the platform default policy.
     #[serde(default)]
     pub retry: Option<RetrySpec>,
+    /// User-owned annotations (ADR 0042), as a `[metadata]` TOML table of
+    /// **strings**. Absent is the empty map, matching the wire default. A
+    /// non-string value (a bare integer, an array, a sub-table) is a spec
+    /// error, not a coerced string: metadata has no value type, so a
+    /// caller who wants `3` writes `"3"`. The server re-checks the map
+    /// against ADR 0042's limits regardless.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Requested resources. All three dimensions are required — a defaulted request
@@ -179,6 +194,7 @@ impl JobSpec {
                 max_retries: r.max_retries,
                 retry_user_errors: r.retry_user_errors,
             }),
+            metadata: self.metadata.clone(),
         }
     }
 }
@@ -277,6 +293,23 @@ pub enum JobCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Replace or patch a job's metadata (ADR 0042).
+    Metadata {
+        /// Job id (`job-<uuid>`).
+        job: JobId,
+        /// `key=value`, repeatable. The value is parsed as JSON and falls
+        /// back to a plain string when it is not valid JSON.
+        #[arg(long = "set")]
+        set: Vec<String>,
+        /// Key to remove, repeatable.
+        #[arg(long = "unset")]
+        unset: Vec<String>,
+        /// Send the `--set` pairs as the WHOLE map, replacing what is
+        /// stored (`PUT`) instead of patching (`POST`). Has nothing to
+        /// unset — combining it with `--unset` is an error.
+        #[arg(long)]
+        replace: bool,
+    },
 }
 
 /// The ergonomic flags that build `job list`'s JSON filter AST.
@@ -285,9 +318,9 @@ pub enum JobCommand {
 /// ANDed together into an `all` node (a lone leaf is sent bare). The full AST —
 /// `any`, `not`, nested combinators — is deliberately not expressible from the
 /// command line: it is a JSON tree, and a flag grammar for it would be worse
-/// than the JSON. Only leaves the server actually implements appear: the
-/// contract reserves `label` without backing it, so no flag pretends to
-/// offer it.
+/// than the JSON. Only leaves the server actually implements appear: ADR 0042
+/// replaced the `label` leaf the contract once reserved (and never backed)
+/// with `metadata`, covered by `--metadata-key`/`--metadata-equals` below.
 #[derive(Debug, Default, clap::Args)]
 pub struct JobFilterArgs {
     /// Match jobs in these display phases (repeatable).
@@ -332,6 +365,16 @@ pub struct JobFilterArgs {
     /// Inclusive upper bound for `--requests`.
     #[arg(long, requires = "requests")]
     pub requests_max: Option<u64>,
+    /// Match jobs that carry this metadata key at all (ADR 0042), whatever
+    /// its value.
+    #[arg(long)]
+    pub metadata_key: Option<String>,
+    /// Match jobs whose metadata `key` equals `value` exactly (`key=value`,
+    /// split on the first `=` so a value may contain one). The comparison is
+    /// byte for byte and case-sensitive; there is no value type and no
+    /// pattern operator (ADR 0042).
+    #[arg(long)]
+    pub metadata_equals: Option<String>,
 }
 
 /// Parse an RFC 3339 instant with the *contract's* parser — the same
@@ -474,12 +517,37 @@ fn build_filter(args: &JobFilterArgs) -> Result<Option<serde_json::Value>> {
         }
         leaves.push(json!({ "requests": leaf }));
     }
+    if let Some(key) = &args.metadata_key {
+        leaves.push(json!({ "metadata": { "key": key } }));
+    }
+    if let Some(raw) = &args.metadata_equals {
+        let (key, value) = split_key_value(raw, "--metadata-equals")?;
+        leaves.push(json!({ "metadata": { "key": key, "equals": value } }));
+    }
 
     Ok(match leaves.len() {
         0 => None,
         1 => leaves.pop(),
         _ => Some(json!({ "all": leaves })),
     })
+}
+
+/// Split a `key=rest` flag operand on its **first** `=`, so the value half
+/// may itself contain `=` without being mistaken for a second separator.
+/// `flag` names the offending flag in the error when no `=` is present at
+/// all.
+fn split_key_value<'a>(raw: &'a str, flag: &str) -> Result<(&'a str, &'a str)> {
+    raw.split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("{flag} expects key=value, got {raw:?}"))
+}
+
+/// Parse one `coppice job metadata --set key=value` operand: split on the
+/// first `=` (an argument with none is an error naming it); everything after
+/// it is the value, verbatim. Metadata values are plain strings (ADR 0042),
+/// so there is nothing to interpret — `attempt=3` stores `"3"`.
+fn parse_set_pair(raw: &str) -> Result<(String, String)> {
+    let (key, value) = split_key_value(raw, "--set")?;
+    Ok((key.to_string(), value.to_string()))
 }
 
 /// One of an attempt's two output streams (the `--stream` value).
@@ -544,6 +612,12 @@ pub async fn run(args: JobArgs) -> Result<()> {
             run_usage(&client, job, attempt, order).await
         }
         JobCommand::Abort { job, reason } => abort(&client, job, reason).await,
+        JobCommand::Metadata {
+            job,
+            set,
+            unset,
+            replace,
+        } => metadata(&client, job, set, unset, replace).await,
     }
 }
 
@@ -639,6 +713,7 @@ fn render_job_list(page: &dto::ListJobsResponse) -> String {
                 };
                 vec![
                     job.id.to_string(),
+                    metadata_name(&job.metadata),
                     state,
                     job.image.clone(),
                     job.quota_entity.to_string(),
@@ -653,6 +728,7 @@ fn render_job_list(page: &dto::ListJobsResponse) -> String {
         out.push_str(&render_table(
             &[
                 "id",
+                "name",
                 "state",
                 "image",
                 "entity",
@@ -667,6 +743,17 @@ fn render_job_list(page: &dto::ListJobsResponse) -> String {
         let _ = writeln!(out, "\nmore may exist; continue with --cursor {cursor}");
     }
     out
+}
+
+/// The well-known `name` metadata key (ADR 0042), as it should appear in a
+/// list row: its value when present and non-empty, else `-` — an empty
+/// `name` "is ignored" per the ADR, and renders the same as an absent one
+/// rather than as a blank table cell.
+fn metadata_name(metadata: &JobMetadata) -> String {
+    match metadata.get("name") {
+        Some(name) if !name.is_empty() => name.clone(),
+        _ => "-".to_string(),
+    }
 }
 
 async fn submit(client: &ApiClient, spec_path: &Path, job: Option<JobId>) -> Result<()> {
@@ -727,6 +814,57 @@ async fn abort(client: &ApiClient, job: JobId, reason: Option<String>) -> Result
         .post_ignoring_body(&format!("/jobs/{job}/abort"), &request, "requesting abort")
         .await?;
     println!("abort requested for {job}");
+    Ok(())
+}
+
+/// `coppice job metadata`: propose either a full replacement (`--replace`,
+/// `PUT`) or a patch (`POST`) of a job's metadata (ADR 0042).
+///
+/// `--set` operands are parsed once here — via [`parse_set_pair`] — and
+/// reused for both request shapes, so `--replace`'s map and the patch's
+/// `set` half read `key=value` identically.
+async fn metadata(
+    client: &ApiClient,
+    job: JobId,
+    set: Vec<String>,
+    unset: Vec<String>,
+    replace: bool,
+) -> Result<()> {
+    let set: JobMetadata = set
+        .iter()
+        .map(|raw| parse_set_pair(raw))
+        .collect::<Result<_>>()?;
+
+    if replace {
+        if !unset.is_empty() {
+            bail!("--replace sends --set as the whole map; it has nothing to --unset");
+        }
+        // An empty --set under --replace is not a mistake to guard against:
+        // it is how a caller clears the map, mirroring `PUT /authorization`.
+        let request = dto::ReplaceJobMetadataRequest { metadata: set };
+        let resp: dto::ReplaceJobMetadataResponse = client
+            .put_json(
+                &format!("/jobs/{job}/metadata"),
+                &request,
+                ctx("replacing job metadata", "reading metadata response"),
+            )
+            .await?;
+        println!("metadata updated for {job} (log index {})", resp.log_index);
+        return Ok(());
+    }
+
+    if set.is_empty() && unset.is_empty() {
+        bail!("nothing to do: give at least one --set or --unset (or pass --replace with --set)");
+    }
+    let request = dto::UpdateJobMetadataRequest { set, unset };
+    let resp: dto::UpdateJobMetadataResponse = client
+        .post_json(
+            &format!("/jobs/{job}/metadata"),
+            &request,
+            ctx("updating job metadata", "reading metadata response"),
+        )
+        .await?;
+    println!("metadata updated for {job} (log index {})", resp.log_index);
     Ok(())
 }
 
@@ -1398,6 +1536,18 @@ fn render_status(detail: &dto::JobDetail) -> String {
         );
     }
 
+    // User-owned annotations (ADR 0042): one `key = value` line per entry,
+    // in the map's own (key-sorted) order. Values are plain strings, so
+    // they print as themselves — unquoted, unescaped.
+    if detail.metadata.is_empty() {
+        let _ = writeln!(out, "metadata        (none)");
+    } else {
+        let _ = writeln!(out, "metadata:");
+        for (key, value) in &detail.metadata {
+            let _ = writeln!(out, "  {key} = {value}");
+        }
+    }
+
     if detail.attempts.is_empty() {
         let _ = writeln!(out, "attempts        (none)");
     } else {
@@ -1486,6 +1636,7 @@ fn timeline_description(body: &dto::TimelineEventBody) -> String {
             allocation, node, ..
         } => format!("stop requested for allocation {allocation} on node {node}"),
         B::JobEvicted { .. } => "evicted".to_string(),
+        B::JobMetadataUpdated { .. } => "metadata updated".to_string(),
         // The five cluster-scoped events never fall inside a job-filtered
         // window, but the match stays exhaustive — this repo forbids wildcard
         // arms on wire enums — with a plain generic description each.
@@ -1506,7 +1657,7 @@ mod tests {
 
     use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
     use axum::http::StatusCode as AxumStatus;
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     use axum::{Json, Router};
 
     use crate::testsupport::{error_body, leader_hint, spawn};
@@ -1636,6 +1787,59 @@ retry_user_errors = true
         let retry = spec.retry.expect("retry present");
         assert_eq!(retry.max_retries, 3);
         assert!(!retry.retry_user_errors);
+    }
+
+    const METADATA_SPEC: &str = r#"
+image = "busybox:1.36"
+command = ["sh", "-c", "echo hi"]
+quota_entity = "quota-00000000-0000-0000-0000-000000000001"
+
+[resources]
+cpu_millis = 500
+memory = "256MiB"
+disk = "1GiB"
+
+[metadata]
+name = "nightly-build"
+attempt = "3"
+ticket = "INC-1234"
+empty = ""
+"#;
+
+    /// A `[metadata]` table of strings crosses into the request unchanged,
+    /// the empty value included.
+    #[test]
+    fn metadata_table_crosses_into_the_request() {
+        let spec = parse(METADATA_SPEC).expect("metadata spec parses");
+        let request = spec.request(JobId::new());
+        assert_eq!(
+            request.metadata,
+            JobMetadata::from([
+                ("name".to_string(), "nightly-build".to_string()),
+                ("attempt".to_string(), "3".to_string()),
+                ("ticket".to_string(), "INC-1234".to_string()),
+                ("empty".to_string(), String::new()),
+            ])
+        );
+    }
+
+    /// Metadata has no value type, so a non-string TOML value is a spec
+    /// error rather than a coerced string (ADR 0042).
+    #[test]
+    fn a_non_string_metadata_value_is_a_spec_error() {
+        let spec = METADATA_SPEC.replace(r#"attempt = "3""#, "attempt = 3");
+        let err = parse(&spec).expect_err("a bare integer is refused");
+        assert!(format!("{err:#}").contains("attempt"), "{err:#}");
+    }
+
+    /// A spec with no `[metadata]` table converts to the empty map, matching
+    /// the wire default (`SubmitJobRequest::metadata`'s `#[serde(default)]`).
+    #[test]
+    fn absent_metadata_table_is_the_empty_map() {
+        let spec = parse(MINIMAL_SPEC).expect("minimal spec parses");
+        assert!(spec.metadata.is_empty());
+        let request = spec.request(JobId::new());
+        assert!(request.metadata.is_empty());
     }
 
     #[test]
@@ -1827,6 +2031,110 @@ retry_user_errors = true
         assert!(format!("{backwards:#}").contains("--submitted-after"));
     }
 
+    // -- metadata leaves and --set parsing -----------------------------------
+
+    #[test]
+    fn metadata_key_leaf_round_trips() {
+        let filter = round_trip(&JobFilterArgs {
+            metadata_key: Some("name".to_string()),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Metadata(dto::MetadataFilter {
+                key: "name".to_string(),
+                equals: None,
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_equals_leaf_round_trips() {
+        let filter = round_trip(&JobFilterArgs {
+            metadata_equals: Some("ticket=INC-1234".to_string()),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Metadata(dto::MetadataFilter {
+                key: "ticket".to_string(),
+                equals: Some("INC-1234".to_string()),
+            })
+        );
+    }
+
+    /// The operand is a plain string, whatever it looks like: `3` is the
+    /// two-character value `"3"`, not a number, and the value half may
+    /// itself contain `=`.
+    #[test]
+    fn metadata_equals_operands_are_plain_strings() {
+        let filter = round_trip(&JobFilterArgs {
+            metadata_equals: Some("attempt=3".to_string()),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Metadata(dto::MetadataFilter {
+                key: "attempt".to_string(),
+                equals: Some("3".to_string()),
+            })
+        );
+
+        let filter = round_trip(&JobFilterArgs {
+            metadata_equals: Some("query=a=b=c".to_string()),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Metadata(dto::MetadataFilter {
+                key: "query".to_string(),
+                equals: Some("a=b=c".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_equals_without_an_equals_sign_is_an_error() {
+        let err = build_filter(&JobFilterArgs {
+            metadata_equals: Some("ticket".to_string()),
+            ..JobFilterArgs::default()
+        })
+        .expect_err("a missing `=` is refused");
+        assert!(format!("{err:#}").contains("--metadata-equals"));
+    }
+
+    #[test]
+    fn parse_set_pair_reads_the_value_verbatim() {
+        let (key, value) = parse_set_pair("name=nightly").expect("parses");
+        assert_eq!(key, "name");
+        assert_eq!(value, "nightly");
+
+        // Nothing is interpreted: JSON-looking text is just that text.
+        let (key, value) = parse_set_pair(r#"tags=["a","b"]"#).expect("parses");
+        assert_eq!(key, "tags");
+        assert_eq!(value, r#"["a","b"]"#);
+
+        // The value half may itself contain `=`; only the first `=` splits.
+        let (key, value) = parse_set_pair("query=a=b=c").expect("parses");
+        assert_eq!(key, "query");
+        assert_eq!(value, "a=b=c");
+
+        // An empty value is legal.
+        let (key, value) = parse_set_pair("empty=").expect("parses");
+        assert_eq!(key, "empty");
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn parse_set_pair_with_no_equals_sign_is_an_error() {
+        let err = parse_set_pair("name").expect_err("a missing `=` is refused");
+        assert!(format!("{err:#}").contains("name"));
+    }
+
     fn sample_job_summary(id: JobId) -> dto::JobSummary {
         dto::JobSummary {
             id,
@@ -1846,6 +2154,7 @@ retry_user_errors = true
             funding_fraction: None,
             cost_ucu: 1234,
             outcome: None,
+            metadata: JobMetadata::new(),
         }
     }
 
@@ -2093,6 +2402,122 @@ retry_user_errors = true
         assert!(message.contains("10.0.0.3:7070"), "{message}");
     }
 
+    #[tokio::test]
+    async fn metadata_patch_posts_set_and_unset() {
+        let captured: Arc<Mutex<Vec<dto::UpdateJobMetadataRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route(
+                "/api/v1/jobs/:job/metadata",
+                post(
+                    |State(captured): State<Arc<Mutex<Vec<dto::UpdateJobMetadataRequest>>>>,
+                     Json(req): Json<dto::UpdateJobMetadataRequest>| async move {
+                        captured.lock().unwrap().push(req);
+                        Json(
+                            serde_json::to_value(dto::UpdateJobMetadataResponse {
+                                job: JobId::new(),
+                                log_index: 7,
+                            })
+                            .unwrap(),
+                        )
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let base = spawn(router).await;
+
+        let job = JobId::new();
+        metadata(
+            &client(&base),
+            job,
+            vec!["name=nightly".to_string(), "attempt=3".to_string()],
+            vec!["stale".to_string()],
+            false,
+        )
+        .await
+        .expect("metadata patch succeeds");
+
+        let received = captured.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].set.get("name"), Some(&"nightly".to_string()));
+        assert_eq!(received[0].set.get("attempt"), Some(&"3".to_string()));
+        assert_eq!(received[0].unset, vec!["stale".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn metadata_replace_puts_the_whole_map() {
+        let captured: Arc<Mutex<Vec<dto::ReplaceJobMetadataRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .route(
+                "/api/v1/jobs/:job/metadata",
+                put(
+                    |State(captured): State<Arc<Mutex<Vec<dto::ReplaceJobMetadataRequest>>>>,
+                     Json(req): Json<dto::ReplaceJobMetadataRequest>| async move {
+                        captured.lock().unwrap().push(req);
+                        Json(
+                            serde_json::to_value(dto::ReplaceJobMetadataResponse {
+                                job: JobId::new(),
+                                log_index: 9,
+                            })
+                            .unwrap(),
+                        )
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let base = spawn(router).await;
+
+        let job = JobId::new();
+        metadata(
+            &client(&base),
+            job,
+            vec!["name=nightly".to_string()],
+            Vec::new(),
+            true,
+        )
+        .await
+        .expect("metadata replace succeeds");
+
+        let received = captured.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].metadata.get("name"),
+            Some(&"nightly".to_string())
+        );
+    }
+
+    /// `--replace` has nothing to unset — combining it with `--unset` is
+    /// refused before any request is sent.
+    #[tokio::test]
+    async fn metadata_replace_with_unset_is_refused() {
+        let err = metadata(
+            &client("http://127.0.0.1:1"),
+            JobId::new(),
+            Vec::new(),
+            vec!["stale".to_string()],
+            true,
+        )
+        .await
+        .expect_err("--replace with --unset is refused");
+        assert!(format!("{err:#}").contains("--replace"));
+    }
+
+    /// With neither `--set` nor `--unset`, a plain patch has nothing to do.
+    #[tokio::test]
+    async fn metadata_patch_with_nothing_to_do_is_refused() {
+        let err = metadata(
+            &client("http://127.0.0.1:1"),
+            JobId::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .await
+        .expect_err("an empty patch is refused");
+        assert!(format!("{err:#}").contains("nothing to do"));
+    }
+
     /// A minimal but complete `JobDetail`, built from the real DTO types.
     fn sample_job_detail(job: JobId, state: dto::JobStateKind) -> dto::JobDetail {
         let ts = Timestamp::from_micros(1_000_000).unwrap();
@@ -2147,6 +2572,7 @@ retry_user_errors = true
                 actual_ucu: None,
                 true_up: None,
             },
+            metadata: JobMetadata::new(),
         }
     }
 
@@ -2182,6 +2608,28 @@ retry_user_errors = true
         let rendered = render_status(&done);
         assert!(rendered.contains("cost (charged)  1234 uCU"), "{rendered}");
         assert!(rendered.contains("cost (settled)  1000 uCU"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn status_renders_metadata_as_none_when_empty() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let rendered = render_status(&detail);
+        assert!(rendered.contains("metadata        (none)"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn status_renders_the_metadata_block() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let mut detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        detail.metadata = JobMetadata::from([
+            ("attempt".to_string(), "3".to_string()),
+            ("name".to_string(), "nightly-build".to_string()),
+        ]);
+        let rendered = render_status(&detail);
+        assert!(rendered.contains("metadata:"), "{rendered}");
+        assert!(rendered.contains("  attempt = 3"), "{rendered}");
+        assert!(rendered.contains("  name = nightly-build"), "{rendered}");
     }
 
     #[tokio::test]

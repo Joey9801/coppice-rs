@@ -28,13 +28,13 @@ use tokio::sync::watch;
 use coppice_api::http::dto::{
     AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
     SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
-    UpdateAuthorizationResponse,
+    UpdateAuthorizationResponse, UpdateJobMetadataResponse,
 };
 use coppice_api::{
     ApiError, ClusterUsage, Consistency, ControlPlane, CoordinatorMemberSummary,
     CoordinatorSummary, JobTimelineWindow, LogFetchError, LogFetchOutcome, LogFetchRequest,
     MetricsFetchError, MetricsFetchOutcome, MetricsFetchRequest, QueueWindow, ReadOptions,
-    ReadView, StampedEvent, UsageSnapshot,
+    ReadView, StampedEvent, UpdateJobMetadataCall, UsageSnapshot,
 };
 use coppice_consensus::{
     Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, Role, StateView, StateViews,
@@ -46,7 +46,8 @@ use coppice_core::job::Job;
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
-    AbortJob, ConfigureQuotaEntity, EvictNodes, SetNodeSchedulable, SubmitJob, UpdateAuthorization,
+    AbortJob, ConfigureQuotaEntity, EvictNodes, JobMetadataUpdate, SetNodeSchedulable, SubmitJob,
+    UpdateAuthorization, UpdateJobMetadata,
 };
 use coppice_state::{Actor, Command};
 
@@ -123,6 +124,20 @@ pub trait LeaderWrites: Send + Sync + 'static {
         nodes: &'a [NodeId],
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<(), ApiError>>;
+
+    /// The ADR 0042 metadata write, either shape (`replace` or `patch`) —
+    /// which one the caller sent is carried in `update`, not a second
+    /// method. Unlike abort, the response carries a log index (the HTTP
+    /// handler's `{ job, log_index }` body, so a caller can `?min_index=`
+    /// its way to a read-your-write), so this returns `u64` rather than
+    /// `()`.
+    fn update_job_metadata<'a>(
+        &'a self,
+        leader: CoordinatorId,
+        job: JobId,
+        update: &'a JobMetadataUpdate,
+        actor: &'a Actor,
+    ) -> BoxFuture<'a, Result<u64, ApiError>>;
 }
 
 /// Where a replica that does not lead reads the leader's node-liveness marks
@@ -268,6 +283,14 @@ pub(crate) async fn submit_job_here<C: Consensus>(
             }
         },
     };
+    // ADR 0042's admission-side check: turns an oversized or malformed
+    // metadata object into `Invalid` here rather than letting it reach
+    // consensus and come back as the apply-side rejection. Apply re-checks
+    // the same limits regardless (see the comment on the `metadata` field
+    // below), so replicated state can never hold an oversized map whatever
+    // the proposer did — this is purely for the client's sake.
+    coppice_core::metadata::validate(&req.metadata).map_err(|e| invalid(e.to_string()))?;
+    let metadata = req.metadata.clone();
 
     // Everything above this line is shape validation: it reads only the
     // request, so its verdict is the same on every replica and a follower is
@@ -289,10 +312,11 @@ pub(crate) async fn submit_job_here<C: Consensus>(
     // publishes a fact that was true when it was sampled, and leadership may
     // already have moved. That is why the barrier below exists.
     //
-    // Only this write path needs the gate. `abort_job_here` and
-    // `configure_quota_entity_here` validate nothing against the view — they
-    // build a command from the request and propose it — so their `NotLeader`
-    // already comes from the propose, which cannot be stale.
+    // Only this write path needs the gate. `abort_job_here`,
+    // `configure_quota_entity_here`, and `update_job_metadata_here` validate
+    // nothing against the view — they build a command from the request and
+    // propose it — so their `NotLeader` already comes from the propose,
+    // which cannot be stale.
     match consensus.status().borrow().role {
         Role::Leader { .. } => {}
         Role::Follower { leader } => return Err(LocalWriteError::NotLeader { leader }),
@@ -368,6 +392,11 @@ pub(crate) async fn submit_job_here<C: Consensus>(
             // command's actor (ADR 0023), so a client cannot submit a job as
             // somebody else and inherit their ownership grant.
             submitted_by: None,
+            // Re-checked at apply against the same limits (ADR 0042), so a
+            // proposer that skipped this admission check — or whose limits
+            // drifted from a lagging binary — still cannot land an oversized
+            // map in replicated state.
+            metadata,
         },
         multiplier,
         submitted_at: Timestamp::now(),
@@ -408,6 +437,48 @@ pub(crate) async fn abort_job_here<C: Consensus>(
 
     match consensus.propose(command).await {
         Ok(Applied { outcome: Ok(_), .. }) => Ok(()),
+        Ok(Applied {
+            outcome: Err(rejection),
+            ..
+        }) => Err(LocalWriteError::Api(ApiError::Rejected(rejection))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Propose one metadata update on this replica, with no forwarding
+/// (ADR 0042). The twin of [`abort_job_here`], for either HTTP verb — the
+/// caller passes the [`JobMetadataUpdate`] it built (`Replace` for `PUT`,
+/// `Patch` for `POST`), so this one function serves both routes.
+///
+/// Validates nothing against the view: ownership (the job's submitter, or
+/// operator-or-higher over its quota entity) and the ADR 0042 limits are
+/// both apply-time checks against the authoritative, just-applied record,
+/// never this replica's possibly-stale copy — same reasoning as
+/// `configure_quota_entity_here`. A limit breach or an authorization
+/// refusal both come back through the rejection arm below, the former as a
+/// 409 and the latter as a 403.
+///
+/// Returns the applied log index rather than `()`, unlike
+/// [`abort_job_here`]: the HTTP response is `{ job, log_index }` so a caller
+/// can pair the write with a `?min_index=` read (ADR 0007).
+pub(crate) async fn update_job_metadata_here<C: Consensus>(
+    consensus: &C,
+    job: JobId,
+    update: JobMetadataUpdate,
+    actor: &Actor,
+) -> Result<u64, LocalWriteError> {
+    let command = Command::UpdateJobMetadata(UpdateJobMetadata {
+        job,
+        update,
+        actor: Some(actor.clone()),
+        updated_at: Timestamp::now(),
+    });
+
+    match consensus.propose(command).await {
+        Ok(Applied {
+            outcome: Ok(_),
+            log_index,
+        }) => Ok(log_index),
         Ok(Applied {
             outcome: Err(rejection),
             ..
@@ -869,6 +940,31 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
                 Some((forwarder, leader)) => {
                     forwarder.configure_quota_entity(leader, &req, &actor).await
                 }
+                None => Err(no_leader_here(leader)),
+            },
+        }
+    }
+
+    async fn update_job_metadata(
+        &self,
+        req: UpdateJobMetadataCall,
+        actor: Actor,
+    ) -> Result<UpdateJobMetadataResponse, ApiError> {
+        match update_job_metadata_here(&*self.consensus, req.job, req.update.clone(), &actor).await
+        {
+            Ok(log_index) => Ok(UpdateJobMetadataResponse {
+                job: req.job,
+                log_index,
+            }),
+            Err(LocalWriteError::Api(e)) => Err(e),
+            Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
+                Some((forwarder, leader)) => forwarder
+                    .update_job_metadata(leader, req.job, &req.update, &actor)
+                    .await
+                    .map(|log_index| UpdateJobMetadataResponse {
+                        job: req.job,
+                        log_index,
+                    }),
                 None => Err(no_leader_here(leader)),
             },
         }
@@ -1647,6 +1743,16 @@ mod tests {
                 Ok(())
             })
         }
+
+        fn update_job_metadata<'a>(
+            &'a self,
+            leader: CoordinatorId,
+            job: JobId,
+            _update: &'a JobMetadataUpdate,
+            actor: &'a Actor,
+        ) -> BoxFuture<'a, Result<u64, ApiError>> {
+            Box::pin(async move { self.record(leader, Some(job), actor) })
+        }
     }
 
     /// The actor every write test proposes as: a bearer-authenticated
@@ -1680,6 +1786,7 @@ mod tests {
             job,
             command: vec!["run".to_string()],
             entrypoint: None,
+            metadata: Default::default(),
         }
     }
 
@@ -2215,6 +2322,143 @@ mod tests {
         ));
     }
 
+    // ---- UpdateJobMetadata (ADR 0042) -------------------------------------
+
+    /// A here-path metadata write: the propose lands, the response echoes
+    /// the job and carries a real log index, and the command that reached
+    /// consensus carries both the actor and the exact update the caller
+    /// asked for — a lost actor here would make the write apply with the
+    /// system's own authority instead of the caller's.
+    #[tokio::test]
+    async fn accepted_metadata_update_proposes_the_actor_and_the_update() {
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        let job = JobId::new();
+        let mut metadata = coppice_core::metadata::JobMetadata::new();
+        metadata.insert("name".to_string(), "nightly-build".to_string());
+        let update = coppice_state::command::JobMetadataUpdate::Replace(metadata.clone());
+
+        let response = cp
+            .update_job_metadata(
+                UpdateJobMetadataCall {
+                    job,
+                    update: update.clone(),
+                },
+                test_actor(),
+            )
+            .await
+            .expect("accepted");
+        assert_eq!(response.job, job);
+        assert!(response.log_index > 0);
+
+        match &consensus.proposed()[0] {
+            Command::UpdateJobMetadata(c) => {
+                assert_eq!(c.job, job);
+                assert_eq!(c.update, update);
+                assert_eq!(c.actor, Some(test_actor()));
+            }
+            other => panic!("expected an UpdateJobMetadata command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_metadata_update_maps_to_rejected() {
+        let reason =
+            coppice_state::RejectionReason::InvalidJobMetadata("too many keys".to_string());
+        let cp = control_plane(ProposeOutcome::Rejected(reason));
+        let result = cp
+            .update_job_metadata(
+                UpdateJobMetadataCall {
+                    job: JobId::new(),
+                    update: coppice_state::command::JobMetadataUpdate::Replace(
+                        coppice_core::metadata::JobMetadata::new(),
+                    ),
+                },
+                test_actor(),
+            )
+            .await;
+        assert!(matches!(result, Err(ApiError::Rejected(_))));
+    }
+
+    #[tokio::test]
+    async fn not_leader_metadata_update_without_a_forwarder_still_redirects_without_a_fake_hint() {
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)));
+        let result = cp
+            .update_job_metadata(
+                UpdateJobMetadataCall {
+                    job: JobId::new(),
+                    update: coppice_state::command::JobMetadataUpdate::Replace(
+                        coppice_core::metadata::JobMetadata::new(),
+                    ),
+                },
+                test_actor(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApiError::NotLeader { leader_hint: None })
+        ));
+    }
+
+    /// A follower forwards a metadata write to the leader the failed propose
+    /// named, carrying the caller's own actor and job — the same
+    /// forward-and-serve shape every other write has.
+    #[tokio::test]
+    async fn a_follower_forwards_the_metadata_update_and_serves_the_leaders_answer() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let job = JobId::new();
+        let response = cp
+            .update_job_metadata(
+                UpdateJobMetadataCall {
+                    job,
+                    update: coppice_state::command::JobMetadataUpdate::Replace(
+                        coppice_core::metadata::JobMetadata::new(),
+                    ),
+                },
+                test_actor(),
+            )
+            .await
+            .expect("forwarded");
+        assert_eq!(response.job, job);
+        assert_eq!(response.log_index, 42);
+        assert_eq!(forwarder.leaders(), vec![7]);
+        assert_eq!(forwarder.jobs(), vec![job]);
+        assert_eq!(forwarder.actors(), vec![test_actor()]);
+    }
+
+    /// A rejection the leader classified survives the metadata hop the same
+    /// way it does every other forwarded write (ADR 0038).
+    #[tokio::test]
+    async fn a_classified_rejection_survives_the_metadata_hop() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::RejectedAs(
+            coppice_api::RejectionKind::PermissionDenied,
+            "not the job's owner".to_string(),
+        ));
+        let cp = control_plane(ProposeOutcome::NotLeader(Some(7)))
+            .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let result = cp
+            .update_job_metadata(
+                UpdateJobMetadataCall {
+                    job: JobId::new(),
+                    update: coppice_state::command::JobMetadataUpdate::Replace(
+                        coppice_core::metadata::JobMetadata::new(),
+                    ),
+                },
+                test_actor(),
+            )
+            .await;
+        match result {
+            Err(ApiError::ForwardedRejection { kind, reason }) => {
+                assert_eq!(kind, coppice_api::RejectionKind::PermissionDenied);
+                assert_eq!(reason, "not the job's owner");
+            }
+            other => panic!("expected a relayed rejection, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn job_timeline_without_a_fanout_is_honestly_empty() {
         // No ring attached (the plane is built without `with_derived`): the
@@ -2314,6 +2558,17 @@ mod tests {
         )
         .await
         .expect("accepted");
+        cp.update_job_metadata(
+            UpdateJobMetadataCall {
+                job: JobId::new(),
+                update: coppice_state::command::JobMetadataUpdate::Replace(
+                    coppice_core::metadata::JobMetadata::new(),
+                ),
+            },
+            test_actor(),
+        )
+        .await
+        .expect("accepted");
 
         let actors: Vec<Option<Actor>> = consensus
             .proposed()
@@ -2323,10 +2578,11 @@ mod tests {
                 Command::AbortJob(c) => c.actor.clone(),
                 Command::ConfigureQuotaEntity(c) => c.actor.clone(),
                 Command::UpdateAuthorization(c) => c.actor.clone(),
+                Command::UpdateJobMetadata(c) => c.actor.clone(),
                 other => panic!("unexpected command {other:?}"),
             })
             .collect();
-        assert_eq!(actors.len(), 4);
+        assert_eq!(actors.len(), 5);
         for actor in actors {
             assert_eq!(actor, Some(test_actor()));
         }

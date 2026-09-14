@@ -303,10 +303,10 @@ carries the system's own authority and skips the check entirely. Apply
 re-checks the actor's authority against the replicated bindings and job
 ownership in its read-only validation phase — a pure lookup, rejecting
 `PermissionDenied` — so authorization races resolve in log order. The
-actor-carrying commands are `SubmitJob`, `AbortJob`, `SetNodeSchedulable`,
-`ConfigureQuotaEntity`, `UpdatePolicy`, `UpdateAuthorization`, and
-`BumpClusterVersion`; internal proposers (scheduler, ingestion, node
-lifecycle, housekeeping) carry no actor and their command types are not
+actor-carrying commands are `SubmitJob`, `AbortJob`, `UpdateJobMetadata`,
+`SetNodeSchedulable`, `EvictNodes`, `ConfigureQuotaEntity`, `UpdatePolicy`,
+`UpdateAuthorization`, and `BumpClusterVersion`; internal proposers
+(scheduler, ingestion, node lifecycle, housekeeping) carry no actor and their command types are not
 reachable through the API.
 
 ### API-proposed
@@ -330,6 +330,16 @@ reachable through the API.
 | Validation | Job exists and is non-terminal; actor is the job's `submitted_by` or holds `operator`/`admin` over the job's quota entity (ADR 0023) |
 | Apply effects | Set `abort_requested` (first request wins; a second `AbortJob` is an accepted no-op preserving the original). Then by current state: **no live attempt** (`Submitted`/`Accepted`/`Queued`) → job `Aborted` immediately, `terminal_at_us` stamped from `requested_at_us`. **Attempt `Accruing`/`Ready`** → attempt `Terminal(Aborted)` with the full terminal path (allocations released + pledge pass, true-up with actual cost 0, job `Aborted`) — no agent interaction. **Attempt `Dispatching`/`Running`** → flag only, emit `StopRequested { node, allocation }`; the runtime sends `StopJob` (tombstone rule / SIGTERM–grace–SIGKILL per ADR 0013) and the outcome arrives later via `RecordAttemptOutcome`. **Attempt `Finalizing`** → flag only; resolution honors abort-wins-over-retry. |
 | Rejections | `UnknownJob`, `JobTerminal`, `PermissionDenied` |
+
+#### `UpdateJobMetadata`
+
+| | |
+| --- | --- |
+| Proposer | API layer (`PUT`/`POST /api/v1/jobs/{job}/metadata`, and `SubmitJobRequest` metadata rides `SubmitJob` instead) |
+| Payload | `job: JobId`, `update: oneof { replace: MetadataMap, patch: MetadataPatch { set: MetadataEntry[], unset: string[] } }` — metadata is `repeated MetadataEntry { key, value }` of strings, written in ascending key order and never a proto `map` ([ADR 0042](../decisions/0042-job-metadata.md)); plus `actor: Actor`, `updated_at_us` |
+| Validation | Job exists (terminal included — annotating a finished job is a primary use); actor is the job's `submitted_by` or holds `operator`/`admin` over the job's quota entity, evaluated by the same `Verb` rule as `AbortJob` with ownership re-derived from the stored record; the **resulting** map satisfies every ADR 0042 limit (key 1–64 bytes from `[A-Za-z0-9._\-/:]`, one value ≤ 1024 bytes of UTF-8 with empty allowed, ≤ 64 keys) |
+| Apply effects | Compute the result — `replace` is the whole map, `patch` merges `set` over the stored map and then removes `unset` (a key in both is refused at the API, and apply's fixed order keeps even a command that slipped past deterministic) — then store it and emit `JobMetadataUpdated { job }`. A result equal to the stored map is an **accepted no-op**: no event, no state change, so a retried forward is safe; the authorization check still runs at its own log position, exactly as an idempotent resubmission does. Metadata is descriptive only — the scheduler, admission, quota arithmetic and the executor never read it. |
+| Rejections | `UnknownJob`, `InvalidJobMetadata`, `PermissionDenied` |
 
 ### Scheduler-proposed
 

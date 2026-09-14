@@ -7,6 +7,7 @@ use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState};
 use coppice_core::bytes::ByteSize;
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
+use coppice_core::metadata::JobMetadata;
 use coppice_core::node::{HostFacts, Node};
 use coppice_core::quota::{
     ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, Settlement, TrueUp,
@@ -138,6 +139,49 @@ pub(crate) fn labels_from_pb(
     Ok(out)
 }
 
+// ---- Job metadata (ADR 0042) ----
+
+/// Canonical form by construction: `BTreeMap` iteration is ascending by key.
+pub fn metadata_to_pb(metadata: &JobMetadata) -> Vec<pb::MetadataEntry> {
+    metadata
+        .iter()
+        .map(|(key, value)| pb::MetadataEntry {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// Decode a metadata entry list under the corpus rule for repeated entry
+/// lists: any order is accepted (the `BTreeMap` re-sorts), duplicate keys
+/// are refused, and an empty key — which no validated map can hold — is
+/// refused as invalid.
+pub fn metadata_from_pb(
+    entries: Vec<pb::MetadataEntry>,
+    field: &'static str,
+) -> Result<JobMetadata, ConvertError> {
+    let mut out = JobMetadata::new();
+    for entry in entries {
+        if entry.key.is_empty() {
+            return Err(ConvertError::Invalid {
+                field,
+                reason: "metadata key must not be empty",
+            });
+        }
+        if out.insert(entry.key, entry.value).is_some() {
+            return Err(ConvertError::DuplicateEntry(field));
+        }
+    }
+    Ok(out)
+}
+
+/// A whole metadata map as the `MetadataMap` the command messages carry.
+pub fn metadata_map_to_pb(metadata: &JobMetadata) -> pb::MetadataMap {
+    pb::MetadataMap {
+        entries: metadata_to_pb(metadata),
+    }
+}
+
 // ---- Job ----
 
 impl From<&Job> for pb::Job {
@@ -157,6 +201,7 @@ impl From<&Job> for pb::Job {
             retry: Some(job.retry.into()),
             abort_requested: job.abort_requested.as_ref().map(Into::into),
             submitted_by: job.submitted_by.clone(),
+            metadata: metadata_to_pb(&job.metadata),
         }
     }
 }
@@ -198,6 +243,7 @@ impl TryFrom<pb::Job> for Job {
             // Apply-stamped, never client-supplied; an absent value is a job
             // submitted with no actor (ADR 0023).
             submitted_by: job.submitted_by,
+            metadata: metadata_from_pb(job.metadata, "Job.metadata")?,
         })
     }
 }
