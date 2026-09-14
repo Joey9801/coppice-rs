@@ -20,7 +20,15 @@ import {
   formatTimeAgo,
   formatTimestamp,
 } from '@/lib/format'
-import { EmptyState, LogViewer, PageHeader, StatePill, StatTile, TimeAgo } from '@/components'
+import {
+  CopyButton,
+  EmptyState,
+  LogViewer,
+  PageHeader,
+  StatePill,
+  StatTile,
+  TimeAgo,
+} from '@/components'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -28,10 +36,17 @@ import { JobAccrualPanel } from './job-accrual-panel'
 import { attemptRuntimeSeconds } from './attempt-runtime'
 import { JobAttemptsCard } from './job-attempts-card'
 import { JobCostCard } from './job-cost-card'
+import { JobMetadataCard } from './job-metadata-card'
 import { JobQueuePanel } from './job-queue-panel'
 import { JobSpecCard } from './job-spec-card'
 import { JobTimeline } from './job-timeline'
 import { JobUsageSection } from './job-usage-section'
+
+/** `metadata.name` when it is a non-empty, usable job title (ADR 0042). */
+function jobDisplayName(job: JobDetail): string | null {
+  const name = job.metadata.name
+  return name && name.trim() !== '' ? name : null
+}
 
 export function JobDetailPage({ jobId }: { jobId: JobId }) {
   const job = useJob(jobId)
@@ -87,6 +102,7 @@ export function JobDetailPage({ jobId }: { jobId: JobId }) {
 function JobDetailView({ job }: { job: JobDetail }) {
   const attempt = jobCurrentAttempt(job)
   const phase = derivePhase(job.state, attempt?.state ?? null)
+  const displayName = jobDisplayName(job)
 
   return (
     <div>
@@ -95,12 +111,20 @@ function JobDetailView({ job }: { job: JobDetail }) {
       <PageHeader
         title={
           <span className="flex flex-wrap items-center gap-2.5">
-            <span className="font-mono text-lg break-all">{job.id}</span>
+            <span className={displayName ? 'text-lg break-all' : 'font-mono text-lg break-all'}>
+              {displayName ?? job.id}
+            </span>
             <StatePill state={phase} />
           </span>
         }
         description={
           <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+            {displayName ? (
+              <span className="inline-flex items-center gap-1 whitespace-nowrap">
+                <span className="font-mono text-xs">{job.id}</span>
+                <CopyButton value={job.id} />
+              </span>
+            ) : null}
             <EntityChain chain={job.entityChain} />
             <span className="text-muted-foreground">· submitted</span>
             <TimeAgo t={job.submittedAt} />
@@ -139,14 +163,16 @@ function JobDetailView({ job }: { job: JobDetail }) {
             <JobSpecCard job={job} />
           </div>
           <div className="lg:col-span-2">
-            <JobCostCard
-              cost={job.cost}
-              requests={job.spec.requests}
-              terminal={isTerminalJobState(job.state)}
-              attempts={job.attempts}
-            />
+            <JobMetadataCard job={job} />
           </div>
         </div>
+
+        <JobCostCard
+          cost={job.cost}
+          requests={job.spec.requests}
+          terminal={isTerminalJobState(job.state)}
+          attempts={job.attempts}
+        />
 
         <JobAttemptsCard attempts={job.attempts} currentAttempt={jobAttemptId(job.state)} />
 

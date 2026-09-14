@@ -13,6 +13,7 @@ import type {
   ConfigureQuotaEntityInput,
   CoordinatorId,
   JobId,
+  JobMetadata,
   ListJobsRequest,
   NodeId,
   QuotaEntityId,
@@ -141,6 +142,37 @@ export function useJobLogs(id: JobId) {
     [id],
   )
   return useLogPager('job', id, fetchPage)
+}
+
+/**
+ * Proposes `UpdateJobMetadata` with a full replacement map (ADR 0042). On
+ * success the job's detail entry and every jobs listing are invalidated —
+ * metadata rides `JobSummary`, so list rows (and their metadata filters)
+ * are stale the moment a map changes.
+ */
+export function useReplaceJobMetadata() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, metadata }: { id: JobId; metadata: JobMetadata }) =>
+      api.replaceJobMetadata(id, metadata),
+    onSuccess: (_data, { id }) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.job(id) })
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] })
+    },
+  })
+}
+
+/** Proposes `UpdateJobMetadata` as a `set`/`unset` patch (ADR 0042). */
+export function useUpdateJobMetadata() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...patch }: { id: JobId; set?: JobMetadata; unset?: string[] }) =>
+      api.updateJobMetadata(id, patch),
+    onSuccess: (_data, { id }) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.job(id) })
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] })
+    },
+  })
 }
 
 export function useNodes() {

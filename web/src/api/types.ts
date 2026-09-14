@@ -42,6 +42,25 @@ export type QuotaEntityId = string
 export type CoordinatorId = string
 
 // ---------------------------------------------------------------------------
+// Job metadata (ADR 0042)
+// ---------------------------------------------------------------------------
+
+/**
+ * A job's user-owned annotations, mirroring `coppice_core::job::Job`'s
+ * `BTreeMap<String, String>`: string keys → UTF-8 string values, always
+ * present (`{}` when empty). There is no value type — any structure a
+ * caller wants is theirs to encode in the string. Descriptive only — the
+ * scheduler, admission, quota arithmetic and the executor never read it.
+ * Limits (key charset/length, value size, key count) live in
+ * `src/lib/job-metadata.ts`.
+ *
+ * Well-known keys: `name` titles the job wherever a title is shown (an
+ * empty `name` is ignored); every other value is rendered by shape (URL
+ * → link, typed Coppice id → `IdLink`, else text).
+ */
+export type JobMetadata = Record<string, string>
+
+// ---------------------------------------------------------------------------
 // Resources
 // ---------------------------------------------------------------------------
 
@@ -297,6 +316,8 @@ export interface JobSummary {
   costUcu: number
   /** Outcome of the last attempt, when terminal. */
   outcome: AttemptOutcome | null
+  /** User-owned annotations (ADR 0042); `{}` when the job carries none. */
+  metadata: JobMetadata
 }
 
 /**
@@ -421,6 +442,8 @@ export interface JobDetail {
   /** Present iff the current attempt is accruing. */
   accrual: AccrualView | null
   cost: CostReport
+  /** User-owned annotations (ADR 0042); `{}` when the job carries none. */
+  metadata: JobMetadata
 }
 
 /** The `AttemptView` `job.state` currently points at, if any (derived, ADR 0030). */
@@ -450,6 +473,11 @@ export function jobCurrentAttempt(job: Pick<JobDetail, 'state' | 'attempts'>): A
  *   exclusive (<); `after > before` is invalid.
  * - `requests`: a resource dimension with at least one of `min`/`max`, both
  *   inclusive; `min > max` is invalid.
+ * - `metadata` (ADR 0042): `key` alone is **presence** — the job has that
+ *   key, whatever the value. `equals` is **exact string equality**, byte for
+ *   byte and case-sensitive. The key is validated under the stored-key
+ *   rules, so a key that could never be stored is invalid rather than
+ *   silently matching nothing.
  *
  * Caps (violation is invalid): max nesting depth 8, max 64 total nodes
  * (combinators + leaves). Empty `all`/`any`/`in` arrays are invalid.
@@ -468,6 +496,7 @@ export type JobFilter =
   | {
       requests: { resource: 'cpuMillis' | 'memoryBytes' | 'diskBytes'; min?: number; max?: number }
     }
+  | { metadata: { key: string; equals?: string } }
 
 /**
  * A single `listJobs` page request. `cursor` is the opaque token from a prior
@@ -516,6 +545,7 @@ export type TimelineEventBody =
   | { kind: 'StopRequested'; node: NodeId; allocation: AllocationId; job: JobId }
   | { kind: 'NodeEpochBumped'; node: NodeId; epoch: number }
   | { kind: 'JobEvicted'; job: JobId }
+  | { kind: 'JobMetadataUpdated'; job: JobId }
   | { kind: 'QuotaEntityConfigured'; entity: QuotaEntityId }
   | { kind: 'PolicyUpdated' }
   | { kind: 'AuthorizationUpdated' }

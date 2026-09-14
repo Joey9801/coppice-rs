@@ -1,13 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getRouteApi } from '@tanstack/react-router'
 import { ListTodo, Search, X } from 'lucide-react'
-import {
-  derivePhase,
-  JOB_PHASES,
-  type JobFilter,
-  type JobPhase,
-  type JobSummary,
-} from '@/api/types'
+import { derivePhase, JOB_PHASES, type JobPhase, type JobSummary } from '@/api/types'
 import { useJobs } from '@/api/queries'
 import { formatPercent, formatUcu, shortId } from '@/lib/format'
 import { EmptyState, IdLink, outcomePill, PageHeader, StatePill, TimeAgo } from '@/components'
@@ -24,26 +18,18 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { buildFilter } from './jobs-filter'
 import { useDebouncedValue } from './use-debounced-value'
 
 const route = getRouteApi('/jobs/')
 
-type JobsSearch = ReturnType<typeof route.useSearch>
-
-/**
- * Build the `JobFilter` AST from the URL search params: each present param is
- * a leaf, ANDed together with `all`; a single leaf is used bare, and no params
- * means no filter (match everything).
- */
-function buildFilter(search: JobsSearch): JobFilter | undefined {
-  const leaves: JobFilter[] = []
-  if (search.state) leaves.push({ phase: { in: [search.state] } })
-  if (search.entity) leaves.push({ entity: { id: search.entity } })
-  if (search.node) leaves.push({ node: search.node })
-  if (search.q) leaves.push({ search: search.q })
-  if (leaves.length === 0) return undefined
-  if (leaves.length === 1) return leaves[0]
-  return { all: leaves }
+/** `error.message` off a failed query without importing the ApiError class. */
+function queryErrorMessage(error: unknown): string {
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === 'string' && message) return message
+  }
+  return 'The cluster API refused the request.'
 }
 
 export function JobsPage() {
@@ -71,6 +57,15 @@ export function JobsPage() {
       <div className="mt-4 rounded-xl border bg-card">
         {jobs.isLoading ? (
           <TableSkeleton />
+        ) : jobs.isError ? (
+          // A refused filter (a metadata key that could never be stored, say)
+          // must not read as "no jobs match" — nor, under keepPreviousData, as
+          // the previous filter's still-displayed rows.
+          <EmptyState
+            icon={ListTodo}
+            title="Couldn't load jobs"
+            description={queryErrorMessage(jobs.error)}
+          />
         ) : rows.length > 0 ? (
           <>
             <JobsTable jobs={rows} />
@@ -117,6 +112,23 @@ function FilterBar() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedQ])
 
+  // Metadata key and value are typed, so they debounce like the search box.
+  const [mkeyInput, setMkeyInput] = useState(search.mkey ?? '')
+  const debouncedMkey = useDebouncedValue(mkeyInput, 250)
+  const [mvalInput, setMvalInput] = useState(search.mval ?? '')
+  const debouncedMval = useDebouncedValue(mvalInput, 250)
+
+  useEffect(() => {
+    const nextKey = debouncedMkey || undefined
+    const nextVal = debouncedMval || undefined
+    if (nextKey === (search.mkey ?? undefined) && nextVal === (search.mval ?? undefined)) return
+    void navigate({
+      search: (prev) => ({ ...prev, mkey: nextKey, mval: nextVal }),
+      replace: true,
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedMkey, debouncedMval])
+
   return (
     <div className="flex flex-wrap items-center gap-2">
       <Select
@@ -146,6 +158,23 @@ function FilterBar() {
           placeholder="Search id or image…"
           value={qInput}
           onChange={(e) => setQInput(e.target.value)}
+        />
+      </div>
+
+      <div className="flex items-center gap-2">
+        <Input
+          className="w-40"
+          aria-label="Metadata key"
+          placeholder="metadata key…"
+          value={mkeyInput}
+          onChange={(e) => setMkeyInput(e.target.value)}
+        />
+        <Input
+          className="w-48"
+          aria-label="Metadata value"
+          placeholder="any value…"
+          value={mvalInput}
+          onChange={(e) => setMvalInput(e.target.value)}
         />
       </div>
 
@@ -221,6 +250,7 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
             >
               <TableCell onClick={(e) => e.stopPropagation()} className="w-px">
                 <IdLink id={job.id} />
+                <JobNameLine metadata={job.metadata} />
               </TableCell>
               <TableCell>
                 <StatePill state={phase} />
@@ -254,6 +284,23 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
         })}
       </TableBody>
     </Table>
+  )
+}
+
+/**
+ * The well-known `name` key (ADR 0042) under the id. An empty `name` is
+ * ignored, exactly as the ADR prescribes for the title.
+ */
+function JobNameLine({ metadata }: { metadata: JobSummary['metadata'] }) {
+  const name = metadata.name
+  if (!name) return null
+  return (
+    <span
+      className="mt-0.5 block max-w-[18rem] truncate text-xs text-muted-foreground"
+      title={name}
+    >
+      {name}
+    </span>
   )
 }
 

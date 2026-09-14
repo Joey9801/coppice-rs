@@ -37,6 +37,16 @@ export function IdLink({ id, full = false, className }: IdLinkProps) {
         {label}
       </Link>
     )
+  } else if (id.startsWith('quota-')) {
+    inner = (
+      <Link
+        to="/entities/$entityId"
+        params={{ entityId: id }}
+        className="font-mono text-sm text-primary hover:underline"
+      >
+        {label}
+      </Link>
+    )
   } else {
     inner = <span className="font-mono text-sm text-foreground">{label}</span>
   }

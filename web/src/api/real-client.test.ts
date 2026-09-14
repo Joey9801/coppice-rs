@@ -811,3 +811,127 @@ describe('log contracts', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('job metadata (ADR 0042)', () => {
+  const JOB = 'job-00000000-0000-0000-0000-000000000001'
+
+  /** The minimal `GetJobResponse` the write path reads back. */
+  function jobDetailBody(metadata: Record<string, string>) {
+    return {
+      id: JOB,
+      state: 'queued',
+      spec: {
+        image: 'busybox',
+        command: [],
+        entrypoint: null,
+        requests: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
+        priority: 0,
+        max_runtime_seconds: null,
+        quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
+        retry: { max_retries: 0, retry_user_errors: false },
+      },
+      submitted_at: '2026-01-01T00:00:00.000000Z',
+      state_since: '2026-01-01T00:00:00.000000Z',
+      terminal_at: null,
+      retries_used: 0,
+      abort_requested: null,
+      entity_chain: [],
+      attempts: [],
+      queue: null,
+      accrual: null,
+      cost: {
+        rate_ucu_per_second: 1,
+        rate_breakdown: { cpu: 1, memory: 0, disk: 0 },
+        priority_multiplier: 1,
+        unbounded_multiplier: 1,
+        effective_rate_ucu_per_second: 1,
+        charge_window_seconds: 3600,
+        charge_window_is_default: false,
+        estimated_ucu: 3600,
+        charged_ucu: 0,
+        refund_fraction: 0.75,
+        actual_ucu: null,
+        true_up: null,
+      },
+      metadata,
+    }
+  }
+
+  it('PUTs a full replacement then re-reads the job at the write index', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ job: JOB, log_index: 77 }))
+    fetchMock.mockResolvedValueOnce(jsonResponse(jobDetailBody({ name: 'nightly-train-42' })))
+    const client = createRealClient()
+    const detail = await client.replaceJobMetadata(JOB, { name: 'nightly-train-42' })
+
+    const [writeUrl, writeInit] = fetchMock.mock.calls[0]! as [string, RequestInit]
+    expect(writeUrl).toBe(`/api/v1/jobs/${JOB}/metadata`)
+    expect(writeInit.method).toBe('PUT')
+    expect(JSON.parse(writeInit.body as string)).toEqual({
+      metadata: { name: 'nightly-train-42' },
+    })
+    expect(fetchMock.mock.calls[1]![0]).toBe(`/api/v1/jobs/${JOB}?min_index=77&consistency=strong`)
+    expect(detail.metadata).toEqual({ name: 'nightly-train-42' })
+  })
+
+  it('POSTs a patch with both halves defaulted to empty', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ job: JOB, log_index: 78 }))
+    fetchMock.mockResolvedValueOnce(jsonResponse(jobDetailBody({})))
+    const client = createRealClient()
+    await client.updateJobMetadata(JOB, { unset: ['ticket'] })
+
+    const [writeUrl, writeInit] = fetchMock.mock.calls[0]! as [string, RequestInit]
+    expect(writeUrl).toBe(`/api/v1/jobs/${JOB}/metadata`)
+    expect(writeInit.method).toBe('POST')
+    expect(JSON.parse(writeInit.body as string)).toEqual({ set: {}, unset: ['ticket'] })
+  })
+
+  it('passes the metadata filter leaf through unchanged', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ jobs: [], next_cursor: null }))
+    const client = createRealClient()
+    await client.listJobs({ filter: { metadata: { key: 'name', equals: 'nightly-train-42' } } })
+
+    const params = new URLSearchParams((fetchMock.mock.calls[0]![0] as string).split('?')[1])
+    expect(JSON.parse(params.get('filter')!)).toEqual({
+      metadata: { key: 'name', equals: 'nightly-train-42' },
+    })
+  })
+
+  it('passes a bare presence leaf through with no operand', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ jobs: [], next_cursor: null }))
+    const client = createRealClient()
+    await client.listJobs({ filter: { metadata: { key: 'ticket' } } })
+
+    const params = new URLSearchParams((fetchMock.mock.calls[0]![0] as string).split('?')[1])
+    expect(JSON.parse(params.get('filter')!)).toEqual({ metadata: { key: 'ticket' } })
+  })
+
+  it('carries the metadata map onto job summaries', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        jobs: [
+          {
+            id: JOB,
+            state: 'queued',
+            attempt: null,
+            image: 'busybox',
+            quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
+            quota_entity_name: 'root',
+            priority: 0,
+            submitted_at: '2026-01-01T00:00:00.000000Z',
+            terminal_at: null,
+            node: null,
+            attempt_state: null,
+            funding_fraction: null,
+            cost_ucu: 0,
+            outcome: null,
+            metadata: { name: 'nightly-train-42', ticket: 'INC-1234' },
+          },
+        ],
+        next_cursor: null,
+      }),
+    )
+    const client = createRealClient()
+    const result = await client.listJobs({})
+    expect(result.jobs[0]!.metadata).toEqual({ name: 'nightly-train-42', ticket: 'INC-1234' })
+  })
+})

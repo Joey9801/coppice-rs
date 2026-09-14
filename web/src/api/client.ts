@@ -8,6 +8,7 @@ import type {
   JobDetail,
   JobId,
   JobList,
+  JobMetadata,
   ListJobsRequest,
   LogChunk,
   LogRequest,
@@ -59,6 +60,21 @@ export interface CoppiceApi {
   /** Usage samples for one attempt; null/omitted = current (else latest). */
   getJobUsage(id: JobId, attempt?: AttemptId | null): Promise<GetJobUsageResponse>
   getJobLogs(id: JobId, cursor: string | null, request: LogRequest): Promise<LogChunk>
+  /**
+   * Proposes `UpdateJobMetadata` with a full replacement map (ADR 0042),
+   * returning the job read back at the write's log index. Authorized like
+   * abort — the job's submitter, or `operator` or higher over the job's
+   * quota entity — so rejections surface as `PermissionDenied`; a map that
+   * breaks a limit is `InvalidArgument`.
+   */
+  replaceJobMetadata(id: JobId, metadata: JobMetadata): Promise<JobDetail>
+  /**
+   * Proposes `UpdateJobMetadata` as a patch (ADR 0042): `set` is merged over
+   * the current map, then `unset` keys are removed. Both default to empty;
+   * a key in both is `InvalidArgument`, as is a result that breaks a limit.
+   * Returns the job read back at the write's log index.
+   */
+  updateJobMetadata(id: JobId, patch: { set?: JobMetadata; unset?: string[] }): Promise<JobDetail>
 
   // Nodes
   listNodes(): Promise<NodeSummary[]>

@@ -37,6 +37,8 @@ export const api: CoppiceApi = import.meta.env.VITE_COPPICE_MOCK
         getJobTimeline: real.getJobTimeline,
         getJobUsage: real.getJobUsage,
         getJobLogs: real.getJobLogs,
+        replaceJobMetadata: real.replaceJobMetadata,
+        updateJobMetadata: real.updateJobMetadata,
 
         listNodes: real.listNodes,
         getNode: real.getNode,

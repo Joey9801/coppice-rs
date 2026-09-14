@@ -5,6 +5,7 @@ import type {
   ConfigureQuotaEntityInput,
   CoordinatorId,
   JobId,
+  JobMetadata,
   ListJobsRequest,
   LogRequest,
   NodeId,
@@ -57,6 +58,10 @@ export function createMockClient(): CoppiceApi {
       settle(() => world.buildJobUsage(id, attempt ?? null)),
     getJobLogs: (id: JobId, cursor: string | null, request: LogRequest) =>
       settle(() => world.buildJobLogs(id, cursor, request)),
+    replaceJobMetadata: (id: JobId, metadata: JobMetadata) =>
+      settle(() => world.replaceJobMetadata(id, metadata)),
+    updateJobMetadata: (id: JobId, patch: { set?: JobMetadata; unset?: string[] }) =>
+      settle(() => world.updateJobMetadata(id, patch)),
 
     listNodes: () => settle(() => world.buildNodeSummaries()),
     getNode: (id: NodeId) => settle(() => world.buildNodeDetail(id)),
