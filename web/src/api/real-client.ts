@@ -24,6 +24,7 @@ import {
   type JobFilter,
   type JobId,
   type JobList,
+  type JobMetadata,
   type JobPhase,
   type JobSpec,
   type JobState,
@@ -94,6 +95,9 @@ export function createRealClient(): CoppiceApi {
       ),
     getJobUsage: (id, attempt) => getJobUsage(id, attempt ?? null),
     getJobLogs: (id, cursor, request) => getJobLogs(id, cursor, request),
+    replaceJobMetadata: (id, metadata) => writeJobMetadata(id, 'PUT', { metadata }),
+    updateJobMetadata: (id, patch) =>
+      writeJobMetadata(id, 'POST', { set: patch.set ?? {}, unset: patch.unset ?? [] }),
 
     listNodes: () =>
       getJson('/nodes', (body: WireListNodesResponse) => body.nodes.map(mapNodeSummary)),
@@ -201,8 +205,21 @@ async function getJson<Wire, T>(path: string, map: (body: Wire) => T): Promise<T
 }
 
 async function postJson<Wire, T>(path: string, body: unknown, map: (body: Wire) => T): Promise<T> {
+  return sendJson('POST', path, body, map)
+}
+
+async function putJson<Wire, T>(path: string, body: unknown, map: (body: Wire) => T): Promise<T> {
+  return sendJson('PUT', path, body, map)
+}
+
+async function sendJson<Wire, T>(
+  method: 'POST' | 'PUT',
+  path: string,
+  body: unknown,
+  map: (body: Wire) => T,
+): Promise<T> {
   const response = await request(path, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
@@ -490,6 +507,7 @@ type WireTimelineEventBody =
   | { kind: 'stop_requested'; node: NodeId; allocation: string; job: JobId }
   | { kind: 'node_epoch_bumped'; node: NodeId; epoch: number }
   | { kind: 'job_evicted'; job: JobId }
+  | { kind: 'job_metadata_updated'; job: JobId }
   | { kind: 'quota_entity_configured'; entity: QuotaEntityId }
   | { kind: 'policy_updated' }
   | { kind: 'authorization_updated' }
@@ -540,6 +558,8 @@ function mapTimelineEventBody(e: WireTimelineEvent): TimelineEventBody {
       return { kind: 'NodeEpochBumped', node: e.node as NodeId, epoch: e.epoch as number }
     case 'job_evicted':
       return { kind: 'JobEvicted', job: e.job as JobId }
+    case 'job_metadata_updated':
+      return { kind: 'JobMetadataUpdated', job: e.job as JobId }
     case 'quota_entity_configured':
       return { kind: 'QuotaEntityConfigured', entity: e.entity as QuotaEntityId }
     case 'policy_updated':
@@ -643,6 +663,7 @@ interface WireJobSummary {
   funding_fraction: number | null
   cost_ucu: number
   outcome: WireAttemptOutcome | null
+  metadata: JobMetadata
 }
 
 function mapJobSummary(j: WireJobSummary): JobSummary {
@@ -660,6 +681,10 @@ function mapJobSummary(j: WireJobSummary): JobSummary {
     fundingFraction: j.funding_fraction,
     costUcu: j.cost_ucu,
     outcome: j.outcome ? mapAttemptOutcome(j.outcome) : null,
+    // Metadata is a flat object of strings on both sides (ADR 0042) — no
+    // key or value rewriting at this boundary, only the copy that keeps the
+    // wire body from aliasing the domain object.
+    metadata: { ...j.metadata },
   }
 }
 
@@ -710,6 +735,10 @@ function filterToWire(f: JobFilter): unknown {
         ...(f.submitted.before ? { before: f.submitted.before.toISOString() } : {}),
       },
     }
+  }
+  if ('metadata' in f) {
+    // Already the wire shape: a bare `key`, optionally with `equals`.
+    return { metadata: f.metadata }
   }
   return {
     requests: {
@@ -883,6 +912,7 @@ interface WireJobDetail {
   queue: WireQueuePositionExplainer | null
   accrual: WireAccrualView | null
   cost: WireCostReport
+  metadata: JobMetadata
 }
 
 /**
@@ -918,7 +948,36 @@ function mapJobDetail(j: WireJobDetail): JobDetail {
     queue: j.queue ? mapQueuePositionExplainer(j.queue) : null,
     accrual: j.accrual ? mapAccrualView(j.accrual) : null,
     cost: mapCostReport(j.cost),
+    metadata: { ...j.metadata },
   }
+}
+
+interface WireUpdateJobMetadataResponse {
+  job: JobId
+  log_index: number
+}
+
+/**
+ * Both metadata writes answer only `{ job, log_index }`, while
+ * `CoppiceApi` promises the updated `JobDetail` — so each write is followed
+ * by a strong, read-your-writes `GET` pinned to the write's `log_index`
+ * (ADR 0007), exactly as `configureQuotaEntity` does.
+ */
+async function writeJobMetadata(
+  id: JobId,
+  method: 'PUT' | 'POST',
+  body: unknown,
+): Promise<JobDetail> {
+  const send = method === 'PUT' ? putJson : postJson
+  const { logIndex } = await send(
+    `/jobs/${encodeURIComponent(id)}/metadata`,
+    body,
+    (wire: WireUpdateJobMetadataResponse) => ({ logIndex: wire.log_index }),
+  )
+  return getJson(
+    `/jobs/${encodeURIComponent(id)}?min_index=${logIndex}&consistency=strong`,
+    mapJobDetail,
+  )
 }
 
 // ---------------------------------------------------------------------------

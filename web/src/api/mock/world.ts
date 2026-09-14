@@ -34,6 +34,7 @@ import type {
   JobDetail,
   JobFilter,
   JobList,
+  JobMetadata,
   JobPhase,
   JobState,
   JobStateKind,
@@ -66,6 +67,7 @@ import type {
   UtilizationSample,
 } from '../types'
 import { derivePhase, isTerminalJobState, jobAttemptId, JOB_PHASES } from '../types'
+import { validateMetadataKey, validateMetadataMap } from '../../lib/job-metadata'
 import {
   GIB,
   hashSeed,
@@ -403,6 +405,8 @@ interface MJob {
   projectedStartUs: number | null
   /** Simulation clock at last state promotion (drives Submitted→Queued flow). */
   lastTransitionUs: number
+  /** User-owned annotations (ADR 0042); mutable, so it lives on the job record, not the spec. */
+  metadata: JobMetadata
 }
 
 interface MCoordinator {
@@ -939,8 +943,9 @@ export class MockWorld {
   }
 
   private newJob(state: JobState, submittedAtUs: number): MJob {
+    const id = this.rng.mintId('job')
     const job: MJob = {
-      id: this.rng.mintId('job'),
+      id,
       spec: this.makeSpec(),
       state,
       submittedAtUs,
@@ -952,9 +957,51 @@ export class MockWorld {
       trueUp: null,
       projectedStartUs: null,
       lastTransitionUs: submittedAtUs,
+      metadata: this.makeMetadata(id),
     }
     this.jobs.set(job.id, job)
     return job
+  }
+
+  /**
+   * Draw a plausible metadata map (ADR 0042) for a newly minted job. Uses a
+   * child `Rng` seeded from the job's own (already-deterministic) id rather
+   * than drawing further from `this.rng` directly, so adding metadata never
+   * perturbs the shared draw sequence every other generator depends on —
+   * the whole world still stays byte-for-byte reproducible from a seed, and
+   * unrelated generators are untouched by this addition. Roughly 40% of
+   * jobs carry none at all; the rest mix a `name`, a `ticket` URL, a
+   * `retry_of`/`pinned_node` reference to an already-minted job/node, and a
+   * plain-text `owner` — enough shapes to exercise every rendering rule
+   * (URL link, `IdLink`, plain text) in the UI.
+   */
+  private makeMetadata(jobId: string): JobMetadata {
+    const rng = new Rng(hashSeed(jobId + 'metadata'))
+    if (!rng.bool(0.6)) return {}
+    const metadata: JobMetadata = {}
+    if (rng.bool(0.7)) {
+      const prefix = rng.pick([
+        'nightly-train',
+        'etl-backfill',
+        'eval-sweep',
+        'batch-ingest',
+        'sweep-agent',
+      ])
+      metadata.name = `${prefix}-${rng.int(1, 99)}`
+    }
+    if (rng.bool(0.35)) {
+      metadata.ticket = `https://tickets.example.com/INC-${rng.int(1000, 9999)}`
+    }
+    if (rng.bool(0.2) && this.jobs.size > 0) {
+      metadata.retry_of = rng.pick([...this.jobs.keys()])
+    }
+    if (rng.bool(0.2) && this.nodes.size > 0) {
+      metadata.pinned_node = rng.pick([...this.nodes.keys()])
+    }
+    if (rng.bool(0.3)) {
+      metadata.owner = rng.pick(['data-platform', 'ml-infra', 'search-relevance', 'billing'])
+    }
+    return metadata
   }
 
   private newAttempt(job: MJob, node: string, state: AttemptState): MAttempt {
@@ -2240,6 +2287,16 @@ export class MockWorld {
         }
         break
       }
+      case 'metadata': {
+        const m = (filter as { metadata: { key: string; equals?: string } }).metadata
+        if (typeof m.key !== 'string' || validateMetadataKey(m.key) !== null) {
+          throw new MockInvalid(`"metadata.key" is invalid: ${m.key}`)
+        }
+        if (m.equals !== undefined && typeof m.equals !== 'string') {
+          throw new MockInvalid('"metadata.equals" must be a string')
+        }
+        break
+      }
       default:
         throw new MockInvalid(`unknown filter node: ${key}`)
     }
@@ -2303,14 +2360,21 @@ export class MockWorld {
         return true
       }
     }
-    // requests
-    const { resource, min, max } = filter.requests
-    return (job) => {
-      const value = job.spec.requests[resource]
-      if (min !== undefined && value < min) return false
-      if (max !== undefined && value > max) return false
-      return true
+    if ('requests' in filter) {
+      const { resource, min, max } = filter.requests
+      return (job) => {
+        const value = job.spec.requests[resource]
+        if (min !== undefined && value < min) return false
+        if (max !== undefined && value > max) return false
+        return true
+      }
     }
+    // metadata: `key` alone is presence, `equals` is exact string equality.
+    const { key, equals } = filter.metadata
+    if (equals !== undefined) {
+      return (job) => job.metadata[key] === equals
+    }
+    return (job) => key in job.metadata
   }
 
   private isTerminal(job: MJob): boolean {
@@ -2340,6 +2404,7 @@ export class MockWorld {
       // matches. Net/settled cost lives on JobDetail's CostReport.
       costUcu: this.totalCharged(job),
       outcome: this.isTerminal(job) ? this.lastOutcome(job) : null,
+      metadata: { ...job.metadata },
     }
   }
 
@@ -2384,7 +2449,48 @@ export class MockWorld {
       queue: job.state.kind === 'Queued' ? this.queueExplainer(job) : null,
       accrual: attempt && attempt.state === 'Accruing' ? this.accrualView(attempt) : null,
       cost: this.costReport(job),
+      metadata: { ...job.metadata },
     }
+  }
+
+  // ---- job metadata (ADR 0042) ---------------------------------------------
+
+  /**
+   * Proposes a full-replacement `UpdateJobMetadata`: the whole map is
+   * replaced, validated against the limits in `src/lib/job-metadata.ts`.
+   * Unknown job -> `NotFound`; a map breaking a limit -> `MockInvalid`.
+   * Terminal jobs accept updates like any other (ADR 0042).
+   */
+  replaceJobMetadata(id: string, metadata: JobMetadata): JobDetail {
+    const job = this.jobOrThrow(id)
+    const invalidReason = validateMetadataMap(metadata)
+    if (invalidReason) throw new MockInvalid(invalidReason)
+    job.metadata = { ...metadata }
+    return this.buildJobDetail(id)
+  }
+
+  /**
+   * Proposes a patch `UpdateJobMetadata`: `set` merges over the current map,
+   * then `unset` keys are removed. A key in both `set` and `unset` is
+   * `MockInvalid`; unsetting an absent key is a no-op, not an error. The
+   * resulting map is re-validated against the limits before it is stored.
+   */
+  updateJobMetadata(id: string, patch: { set?: JobMetadata; unset?: string[] }): JobDetail {
+    const job = this.jobOrThrow(id)
+    const set = patch.set ?? {}
+    const unset = patch.unset ?? []
+    const unsetKeys = new Set(unset)
+    for (const key of Object.keys(set)) {
+      if (unsetKeys.has(key)) {
+        throw new MockInvalid(`metadata key "${key}" is both set and unset`)
+      }
+    }
+    const merged: JobMetadata = { ...job.metadata, ...set }
+    for (const key of unsetKeys) delete merged[key]
+    const invalidReason = validateMetadataMap(merged)
+    if (invalidReason) throw new MockInvalid(invalidReason)
+    job.metadata = merged
+    return this.buildJobDetail(id)
   }
 
   /** Project one entity to the read-only view (usage rounded at the edge). */

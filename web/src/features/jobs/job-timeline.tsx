@@ -9,6 +9,7 @@ import {
   RefreshCw,
   Send,
   Shuffle,
+  Tags,
 } from 'lucide-react'
 import type { JobId, TimelineEvent } from '@/api/types'
 import { useJobTimeline } from '@/api/queries'
@@ -81,6 +82,8 @@ function eventIcon(event: TimelineEvent): LucideIcon {
       return RefreshCw
     case 'JobEvicted':
       return LogOut
+    case 'JobMetadataUpdated':
+      return Tags
     default:
       return CircleDot
   }
@@ -124,6 +127,8 @@ function eventSentence(event: TimelineEvent): ReactNode {
       )
     case 'JobEvicted':
       return 'Job history removed after retention expired'
+    case 'JobMetadataUpdated':
+      return 'Metadata updated'
     default:
       return 'Unknown event'
   }

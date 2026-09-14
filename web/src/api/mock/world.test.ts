@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { JobFilter, ListJobsRequest, Resources } from '../types'
 import { isTerminalJobState, jobAttemptId, jobCurrentAttempt } from '../types'
+import { validateMetadataMap } from '../../lib/job-metadata'
 import { ORG_NAME } from './generate'
 import { isMockInvalid, isMockNotFound, MockWorld } from './world'
 
@@ -850,6 +851,150 @@ describe('MockWorld listJobs semantics', () => {
     invalid({ cursor: 'v1:job-garbage' }) // prefixed but not uuid-backed
     invalid({ limit: 0 })
     invalid({ limit: 1001 })
+  })
+})
+
+describe('MockWorld job metadata (ADR 0042)', () => {
+  const allJobs = (w: MockWorld) => w.listJobs({ limit: 1000 }).jobs
+
+  it('generates every job map within the ADR limits, with some jobs carrying metadata', () => {
+    const world = new MockWorld(NOW_US)
+    const jobs = allJobs(world)
+    let withMetadata = 0
+    for (const j of jobs) {
+      expect(validateMetadataMap(j.metadata)).toBeNull()
+      for (const v of Object.values(j.metadata)) expect(typeof v).toBe('string')
+      if (Object.keys(j.metadata).length > 0) withMetadata += 1
+      // JobDetail's projection must agree with the summary's.
+      expect(world.buildJobDetail(j.id).metadata).toEqual(j.metadata)
+    }
+    expect(withMetadata).toBeGreaterThan(0)
+    expect(withMetadata).toBeLessThan(jobs.length)
+  })
+
+  it('matches metadata presence', () => {
+    const world = new MockWorld(NOW_US)
+    const named = allJobs(world).filter((j) => 'name' in j.metadata)
+    expect(named.length).toBeGreaterThan(0)
+    const rows = world.listJobs({ filter: { metadata: { key: 'name' } }, limit: 1000 }).jobs
+    expect(rows.map((j) => j.id).sort()).toEqual(named.map((j) => j.id).sort())
+  })
+
+  it('matches equals byte for byte, case-sensitively', () => {
+    const world = new MockWorld(NOW_US)
+    const named = allJobs(world).find((j) => j.metadata.name !== undefined)!
+    const name = named.metadata.name!
+    const rows = world.listJobs({
+      filter: { metadata: { key: 'name', equals: name } },
+      limit: 1000,
+    }).jobs
+    expect(rows.some((j) => j.id === named.id)).toBe(true)
+    for (const j of rows) expect(j.metadata.name).toBe(name)
+
+    // Case-sensitive: the upper-cased spelling is a different value.
+    const upper = world.listJobs({
+      filter: { metadata: { key: 'name', equals: name.toUpperCase() } },
+      limit: 1000,
+    }).jobs
+    expect(upper).toEqual([])
+  })
+
+  it('rejects invalid metadata filter leaves with InvalidArgument', () => {
+    const world = new MockWorld(NOW_US)
+    const invalid = (leaf: unknown) => {
+      try {
+        world.listJobs({ filter: { metadata: leaf } as never, limit: 10 })
+        expect.unreachable('expected an InvalidArgument')
+      } catch (e) {
+        expect(isMockInvalid(e)).toBe(true)
+      }
+    }
+    invalid({ key: '' }) // empty key
+    invalid({ key: 'has spaces' }) // bad charset
+    invalid({ key: 'name', equals: 3 }) // non-string operand
+  })
+
+  it('replaces the whole map, and a no-op update succeeds', () => {
+    const world = new MockWorld(NOW_US)
+    const job = allJobs(world)[0]!
+    const detail = world.replaceJobMetadata(job.id, { a: 'one', b: 'two' })
+    expect(detail.metadata).toEqual({ a: 'one', b: 'two' })
+
+    const replaced = world.replaceJobMetadata(job.id, { c: 'three' })
+    expect(replaced.metadata).toEqual({ c: 'three' }) // whole map swapped, not merged
+
+    const unchanged = world.updateJobMetadata(job.id, {})
+    expect(unchanged.metadata).toEqual({ c: 'three' })
+  })
+
+  it('patches: set adds/overwrites, unset removes, absent unset is a no-op', () => {
+    const world = new MockWorld(NOW_US)
+    const job = allJobs(world)[0]!
+    world.replaceJobMetadata(job.id, { keep: 'one', drop: 'two' })
+
+    const patched = world.updateJobMetadata(job.id, {
+      set: { keep: 'ninety-nine', added: 'x' },
+      unset: ['drop', 'never-existed'],
+    })
+    expect(patched.metadata).toEqual({ keep: 'ninety-nine', added: 'x' })
+  })
+
+  it('accepts an empty value', () => {
+    const world = new MockWorld(NOW_US)
+    const job = allJobs(world)[0]!
+    expect(world.replaceJobMetadata(job.id, { flag: '' }).metadata).toEqual({ flag: '' })
+  })
+
+  it('rejects a key present in both set and unset', () => {
+    const world = new MockWorld(NOW_US)
+    const job = allJobs(world)[0]!
+    try {
+      world.updateJobMetadata(job.id, { set: { dup: 'x' }, unset: ['dup'] })
+      expect.unreachable('expected an InvalidArgument')
+    } catch (e) {
+      expect(isMockInvalid(e)).toBe(true)
+    }
+  })
+
+  it('rejects an oversized/invalid key or value on set or replace', () => {
+    const world = new MockWorld(NOW_US)
+    const job = allJobs(world)[0]!
+    const invalid = (fn: () => void) => {
+      try {
+        fn()
+        expect.unreachable('expected an InvalidArgument')
+      } catch (e) {
+        expect(isMockInvalid(e)).toBe(true)
+      }
+    }
+    invalid(() => world.updateJobMetadata(job.id, { set: { 'bad key!': 'x' } }))
+    invalid(() => world.replaceJobMetadata(job.id, { [`k${'x'.repeat(64)}`]: 'x' }))
+    invalid(() => world.replaceJobMetadata(job.id, { note: 'x'.repeat(1025) }))
+  })
+
+  it('surfaces an unknown job as not-found for both mutations', () => {
+    const world = new MockWorld(NOW_US)
+    try {
+      world.replaceJobMetadata('job-does-not-exist', {})
+      expect.unreachable('unknown job should throw')
+    } catch (e) {
+      expect(isMockNotFound(e)).toBe(true)
+    }
+    try {
+      world.updateJobMetadata('job-does-not-exist', { set: { a: 'x' } })
+      expect.unreachable('unknown job should throw')
+    } catch (e) {
+      expect(isMockNotFound(e)).toBe(true)
+    }
+  })
+
+  it('accepts metadata updates on a terminal job', () => {
+    const world = new MockWorld(NOW_US)
+    const terminal = allJobs(world).find((j) =>
+      ['Succeeded', 'Failed', 'Aborted'].includes(j.state.kind),
+    )!
+    const detail = world.replaceJobMetadata(terminal.id, { note: 'root cause: OOM' })
+    expect(detail.metadata).toEqual({ note: 'root cause: OOM' })
   })
 })
 
