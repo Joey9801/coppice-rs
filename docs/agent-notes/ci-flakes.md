@@ -53,6 +53,21 @@ failure in CI, that's the likely cause, not a real regression.
   under a `.tmp` name and renaming into place once the schema and `meta`
   rows are committed (the sweep reclaims stale temps), and by making the
   harness surface store errors.
+- **`a_join_interrupted_at_every_step_resumes_the_same_identity_and_converges`**
+  (issue #148) — the `PromoteVoterIssued` halt once landed in phase
+  `joining` on a loaded runner. The convergence loop heard `AddLearner`
+  succeed on the admin channel and went straight on to `ClusterStatus` and
+  `PromoteVoter`, while the leader's first append — the only way the joiner
+  learns of its own seat, and of who leads — had not arrived; the leader's
+  key transfer then dialled back to a joiner that knew no leader, was
+  refused, and came back as an endpoint-verification failure. Fixed by
+  making the loop wait, at the probe cadence, until its *own* membership
+  holds its seat before it asks the leader anything further
+  (`convergence.rs`, step 4's local half). Reproduce deterministically with
+  the `raft-append-entries-received` gate on the joiner — see
+  `a_joiner_waits_to_see_its_own_seat_before_asking_for_promotion` — which
+  holds the joiner's inbound replication still while its loop keeps
+  ticking; a plain CPU-hog loop never hit it locally in 55 iterations.
 - **`oom_classification`** — the CI daemon can occasionally lose the OOM
   notification entirely due to a cgroup v2 race; the `Killed` verdict is
   correct by design in that case, so the fix was retrying the test on a
