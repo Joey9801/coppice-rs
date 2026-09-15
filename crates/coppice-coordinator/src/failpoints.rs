@@ -63,7 +63,7 @@
 //! rather than a graceful drain.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Halt with the identity stamped and consensus running under `Join`, before
 /// the joiner has issued `AddLearner` at all: the cluster has never heard of
@@ -111,9 +111,29 @@ pub const ALL: [&str; 3] = [
 /// revocation's.
 pub const API_SUBMIT_BEFORE_PROPOSE: &str = "api-submit-before-propose";
 
+/// Hold every inbound Raft `AppendEntries` this daemon receives, so the
+/// replica's own log — and with it its membership and its knowledge of who
+/// leads — stands still while everything else it runs carries on.
+///
+/// Exists for issue #148. A joiner learns of its own admission the same way
+/// it learns everything else: through the leader's replication stream. Its
+/// convergence loop, meanwhile, hears `AddLearner` succeed on the admin
+/// channel and moves on at once, so "admitted on the leader" and "admitted in
+/// this replica's own membership" are two moments with a network round trip
+/// between them. Holding the appends stretches that gap from microseconds to
+/// as long as the test likes, which is what makes the loop's behaviour inside
+/// it assertable rather than a matter of which RPC won the race.
+///
+/// A gate on a *stream*: unlike [`API_SUBMIT_BEFORE_PROPOSE`], many calls
+/// arrive while it is held (the leader retries an unanswered append on its
+/// RPC timeout and keeps sending heartbeats), so it is fired through
+/// [`Failpoints::gate_all_if_armed`], whose release lets every parked call
+/// and every later one through.
+pub const RAFT_APPEND_ENTRIES_RECEIVED: &str = "raft-append-entries-received";
+
 /// Every name `[test_failpoints] gate_at` accepts, on the same terms as
 /// [`ALL`]: an unknown name is a config error, never a silently inert setting.
-pub const ALL_GATES: [&str; 1] = [API_SUBMIT_BEFORE_PROPOSE];
+pub const ALL_GATES: [&str; 2] = [API_SUBMIT_BEFORE_PROPOSE, RAFT_APPEND_ENTRIES_RECEIVED];
 
 /// Where a halted daemon records that it reached `name`, inside its own data
 /// directory. Public so the integration harness computes the same path from
@@ -166,6 +186,9 @@ struct Armed {
     halt_at: Vec<String>,
     /// `[test_failpoints] gate_at` — park until released.
     gate_at: Vec<String>,
+    /// The stream gates whose reached marker this process has already
+    /// written — see [`Failpoints::gate_all_if_armed`].
+    streams_opened: Mutex<Vec<&'static str>>,
     data_dir: PathBuf,
 }
 
@@ -179,6 +202,7 @@ impl Failpoints {
         Failpoints(Some(Arc::new(Armed {
             halt_at: halt_at.to_vec(),
             gate_at: gate_at.to_vec(),
+            streams_opened: Mutex::new(Vec::new()),
             data_dir: data_dir.to_path_buf(),
         })))
     }
@@ -257,6 +281,60 @@ impl Failpoints {
             tokio::time::sleep(GATE_POLL_INTERVAL).await;
         }
         let _ = std::fs::remove_file(&reached);
+    }
+
+    /// Park here until the test releases this gate, if `name` is armed — the
+    /// many-callers sibling of [`gate_if_armed`](Self::gate_if_armed), for a
+    /// gate on a path the peer drives with a *stream* of requests.
+    ///
+    /// The first caller to arrive writes the reached marker (after clearing
+    /// any stale release, for the reason `gate_if_armed` does); every caller,
+    /// first or later, then parks until the release marker exists. Nothing is
+    /// removed on the way out: the release stays, so a call arriving after
+    /// the test has released the gate passes straight through rather than
+    /// re-parking a stream the test has already let go of. The one-time step
+    /// is taken under a lock, so two callers arriving together cannot both
+    /// clear the release and neither can see the other's clearing in flight.
+    pub(crate) async fn gate_all_if_armed(&self, name: &'static str) {
+        let Some(armed) = self.gate_armed(name) else {
+            return;
+        };
+        let reached = gate_reached_marker(&armed.data_dir, name);
+        let release = gate_release_marker(&armed.data_dir, name);
+
+        {
+            let mut opened = armed.streams_opened.lock().expect("stream gate lock");
+            if !opened.contains(&name) {
+                let _ = std::fs::remove_file(&release);
+                if let Err(e) = std::fs::write(&reached, name) {
+                    tracing::error!(
+                        failpoint = name,
+                        marker = %reached.display(),
+                        error = %e,
+                        "test failpoint: could not write the gate's reached marker"
+                    );
+                }
+                tracing::warn!(
+                    failpoint = name,
+                    "test failpoint: parking every call at a stream gate until released \
+                     (test-only; [test_failpoints] cannot load in a release build)"
+                );
+                opened.push(name);
+            }
+        }
+
+        let deadline = std::time::Instant::now() + GATE_MAX_WAIT;
+        while !release.exists() {
+            if std::time::Instant::now() >= deadline {
+                tracing::error!(
+                    failpoint = name,
+                    "test failpoint: stream gate never released; carrying on so the \
+                     test fails on its own assertion rather than hanging"
+                );
+                break;
+            }
+            tokio::time::sleep(GATE_POLL_INTERVAL).await;
+        }
     }
 
     /// Stop this daemon's convergence permanently if `name` is armed;
