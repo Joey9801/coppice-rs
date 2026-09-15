@@ -49,6 +49,9 @@ pub use node::{
 };
 pub use view::{StateView, StateViews, ViewPublisher, ViewPublisherConfig};
 
+/// The service trait that server mounts, for the coordinator to wrap the
+/// handler below behind its own inbound test gates.
+pub use coppice_net::transport::RaftTransportService;
 /// The Raft transport service type the coordinator mounts on its mTLS server.
 ///
 /// Re-exported so the coordinator names the concrete tonic service without

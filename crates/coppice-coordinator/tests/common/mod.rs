@@ -1251,13 +1251,27 @@ log_level = "warn"
     /// until [`Daemon::release_gate`] lets it go, rather than parking it
     /// forever.
     pub fn arm_gates(&self, names: &[&str]) {
-        let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+        self.arm_halts_and_gates(&[], names);
+    }
+
+    /// Arm halts and gates together, in one `[test_failpoints]` section: the
+    /// shape a test needs when the line it wants to *stop* at is only
+    /// reachable while another line is *held* (issue #148).
+    pub fn arm_halts_and_gates(&self, halt_at: &[&str], gate_at: &[&str]) {
+        let quote = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let toml = self.config_without_failpoints();
         std::fs::write(
             &self.config_path,
             format!(
-                "{toml}\n[test_failpoints]\ngate_at = [{}]\n",
-                quoted.join(", ")
+                "{toml}\n[test_failpoints]\nhalt_at = [{}]\ngate_at = [{}]\n",
+                quote(halt_at),
+                quote(gate_at)
             ),
         )
         .expect("write config");
@@ -1296,16 +1310,7 @@ log_level = "warn"
     /// file. Every other `set_*` here rewrites a line or appends its own
     /// section, so nothing else is disturbed — but call this *after* them.
     pub fn arm_failpoints(&self, names: &[&str]) {
-        let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
-        let toml = self.config_without_failpoints();
-        std::fs::write(
-            &self.config_path,
-            format!(
-                "{toml}\n[test_failpoints]\nhalt_at = [{}]\n",
-                quoted.join(", ")
-            ),
-        )
-        .expect("write config");
+        self.arm_halts_and_gates(names, &[]);
     }
 
     /// Disarm every failpoint: the config a restarted daemon gets, so a

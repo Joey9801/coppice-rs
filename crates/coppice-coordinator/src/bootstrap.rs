@@ -37,8 +37,8 @@ use tonic::transport::Server;
 
 use coppice_consensus::{
     Applied, Consensus, ConsensusError, ConsensusStatus, CoordinatorId, EventTapReceiver,
-    NodeHandle, NodeOptions, OpenraftConsensus, StartIntent, StartedNode, StateViews,
-    PROMOTION_LAG_MAX,
+    NodeHandle, NodeOptions, OpenraftConsensus, RaftTransportServer, StartIntent, StartedNode,
+    StateViews, PROMOTION_LAG_MAX,
 };
 use coppice_core::id::ClusterId;
 use coppice_net::admin::Server as AdminServer;
@@ -51,6 +51,7 @@ use crate::admin::AdminService;
 use crate::cli::RunArgs;
 use crate::formation::{self, Formation, PhaseState, StartupState};
 use crate::localadmin::{AdminSocket, FormationCall, FormationDone, LocalAdmin};
+use crate::raft_transport::GatedRaftTransport;
 use crate::tasks::housekeeping::HistorySink;
 use crate::tasks::node_client::NodeClient;
 use crate::tasks::renewal::RenewalPacing;
@@ -1064,8 +1065,15 @@ fn assemble(
         file_registration,
     } = prepared;
     let incoming = coppice_tls::serve(listener, Arc::clone(&tls_store));
+    // The Raft transport is mounted behind this daemon's inbound test gates
+    // ([`crate::raft_transport::GatedRaftTransport`]): a plain pass-through
+    // for every real deployment, and the seam that lets a debug-build test
+    // hold this replica's replication stream still (issue #148).
     let router = Server::builder()
-        .add_service(transport)
+        .add_service(RaftTransportServer::new(GatedRaftTransport::new(
+            transport,
+            cfg.failpoints(),
+        )))
         .add_service(AdminServer::new(admin_service));
 
     let (raft_server_shutdown, shutdown_rx) = oneshot::channel::<()>();

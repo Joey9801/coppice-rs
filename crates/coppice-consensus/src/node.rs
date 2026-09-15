@@ -20,8 +20,6 @@ use tokio::sync::{mpsc, watch};
 use openraft::error::{InitializeError, RaftError};
 use openraft::{BasicNode, Config, Raft, SnapshotPolicy};
 
-use coppice_net::transport::Server;
-
 use crate::adapter::{OpenraftConsensus, TypeConfig, APPLY_CHANNEL_CAPACITY};
 use crate::contact::ContactTracker;
 use crate::events::{EventTap, EventTapReceiver};
@@ -104,9 +102,12 @@ pub struct StartedNode {
     pub event_tap: EventTapReceiver,
     /// Admin/shutdown handle.
     pub handle: NodeHandle,
-    /// The Raft transport service, ready to mount on the coordinator's mTLS
-    /// server.
-    pub transport: Server<RaftTransportHandler>,
+    /// The Raft transport handler, for the coordinator to mount on its mTLS
+    /// server as `RaftTransportServer::new(transport)`. The bare handler
+    /// rather than the mounted service, so the coordinator can wrap it — its
+    /// debug-build test gates sit in front of the inbound RPCs, and a mounted
+    /// tonic service cannot be unwrapped.
+    pub transport: RaftTransportHandler,
     /// Stamps the ADR 0037 §3 `formation_complete` marker through this
     /// replica's open storage engine. Only the `init` path uses it.
     pub formation: Arc<dyn storage::FormationStamp>,
@@ -540,7 +541,7 @@ pub async fn start(
         evidence,
         dial_overrides,
     );
-    let transport = Server::new(RaftTransportHandler::new(raft.clone(), history_id));
+    let transport = RaftTransportHandler::new(raft.clone(), history_id);
     let handle = NodeHandle {
         raft,
         node_id,

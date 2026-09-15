@@ -67,6 +67,7 @@ pub mod localadmin;
 // seeding, so the two never drift. No CLI surface yet — `cluster init` wires
 // it up in a later chunk.
 pub mod policy;
+mod raft_transport;
 // The client half of `ProbeCluster` (ADR 0037 §3): formation's double-init
 // guard today, the convergence loop's search for the cluster later.
 /// `coppice node` — the operator-facing enrollment-token and identity verbs

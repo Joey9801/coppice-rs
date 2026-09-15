@@ -884,7 +884,8 @@ impl Default for TokenKdfConfig {
 
 /// `[test_failpoints]`: where this daemon stops dead (`halt_at`, the join
 /// pipeline, ADR 0037 §6) or parks until a test releases it (`gate_at`, the
-/// API write path, ADR 0023). See [`crate::failpoints`] for what a failpoint
+/// API write path, ADR 0023, and the inbound Raft replication stream, issue
+/// #148). See [`crate::failpoints`] for what a failpoint
 /// is and why it is carried per daemon instead of in an environment variable.
 ///
 /// **Not production-legal, and not merely discouraged.** `[pacing]` and
@@ -1278,8 +1279,9 @@ impl Config {
         }
     }
 
-    /// This daemon's armed failpoints — join-pipeline halts (ADR 0037 §6) and
-    /// write-path gates (ADR 0023) alike — scoped to it alone. Disarmed for
+    /// This daemon's armed failpoints — join-pipeline halts (ADR 0037 §6),
+    /// write-path gates (ADR 0023) and the inbound replication gate (issue
+    /// #148) alike — scoped to it alone. Disarmed for
     /// every config without the section, which, in a release build, is every
     /// config that loads at all.
     pub(crate) fn failpoints(&self) -> crate::failpoints::Failpoints {
