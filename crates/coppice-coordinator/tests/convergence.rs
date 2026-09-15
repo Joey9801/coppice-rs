@@ -314,6 +314,15 @@ impl KillPoint {
     /// acknowledgement, which the joiner's catch-up check against the leader's
     /// replication view does not wait for), so `learner` there is not a slow
     /// `voter` — it is the other half of the point.
+    ///
+    /// What the promotion set deliberately excludes is `joining`: the loop
+    /// asks to be promoted only once its *own* membership holds its seat, so
+    /// the near side of that boundary is a learner by construction and not by
+    /// timing. It was timing once — issue #148 caught this halt in `joining`
+    /// on a loaded runner, with the leader's key transfer refused by a joiner
+    /// that had not yet heard from any leader — and
+    /// [`a_joiner_waits_to_see_its_own_seat_before_asking_for_promotion`]
+    /// holds that window open on purpose to keep it closed.
     fn phases_at_halt(self) -> &'static [&'static str] {
         match self {
             KillPoint::BeforeAddLearner => &["joining"],
@@ -598,6 +607,85 @@ async fn stage_kill_point(
         }
         KillPoint::JustPromoted => joiner.await_phase("voter").await,
     }
+}
+
+/// Issue #148, held open: a joiner whose replication stream is stalled has
+/// been admitted on the leader but not in its own log, and must not ask to
+/// be promoted from there.
+///
+/// The gap is real in production — the leader answers `AddLearner` the moment
+/// the membership entry commits *on the leader*, and this replica learns of
+/// its seat only when the first append lands — but it is microseconds wide,
+/// which is why the parameterized kill-point test above could only ever
+/// catch it by accident (once, in CI, with the halt landing in `joining` and
+/// the leader's key transfer bounced by a joiner that knew no leader). Here
+/// the joiner's inbound `AppendEntries` are parked at a gate, so the gap is
+/// as wide as the test wants and what the loop does inside it is a fact.
+///
+/// The loop's contract inside the gap: it keeps ticking (the gate is on the
+/// replication stream, not the loop), it is *not* seated (`/readyz` reads
+/// `joining` off the local membership), and it does not issue `PromoteVoter`
+/// — the halt armed on that line stays unreached. Once the stream is
+/// released the admission lands, the loop asks, and the very same halt
+/// catches it in `learner` or `voter`, never `joining`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_waits_to_see_its_own_seat_before_asking_for_promotion() {
+    init_tracing();
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+
+    let mut leader = Daemon::new_certless(cluster_id, &ca);
+    leader.set_cluster_size(2);
+    let operator = form(&mut leader).await;
+    let token = coordinator_token(&leader, &operator).await;
+
+    let mut joiner = newcomer(cluster_id, &ca, &leader, &token, 2);
+    joiner.arm_halts_and_gates(
+        &[failpoints::JOIN_PROMOTE_VOTER_ISSUED],
+        &[failpoints::RAFT_APPEND_ENTRIES_RECEIVED],
+    );
+    joiner.start();
+
+    // The leader's first append is parked: it has admitted this joiner and
+    // is replicating to it, and the joiner's own log has seen none of it.
+    joiner
+        .await_gate(failpoints::RAFT_APPEND_ENTRIES_RECEIVED)
+        .await;
+    // Twenty probe-interval ticks of the joiner's loop (50ms under the
+    // fixture's `[pacing]`), each of which re-runs the idempotent `AddLearner`
+    // and gets told yes — ample opportunity to ask for the promotion it must
+    // not ask for.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let halt = joiner.halt_marker(failpoints::JOIN_PROMOTE_VOTER_ISSUED);
+    let body = joiner.readyz().await.1;
+    assert_eq!(
+        body["phase"], "joining",
+        "with its replication stream held, the joiner cannot have seen its seat: {body}"
+    );
+    assert!(
+        !halt.exists(),
+        "the joiner issued PromoteVoter before its own membership held its seat \
+         (issue #148): {body}"
+    );
+
+    joiner.release_gate(failpoints::RAFT_APPEND_ENTRIES_RECEIVED);
+    joiner
+        .await_halted_at(failpoints::JOIN_PROMOTE_VOTER_ISSUED)
+        .await;
+    let body = joiner.readyz().await.1;
+    let phase = body["phase"].as_str().unwrap_or_default();
+    assert!(
+        KillPoint::PromoteVoterIssued
+            .phases_at_halt()
+            .contains(&phase),
+        "released, the joiner asked from a seat it could see: {body}"
+    );
+
+    // Parked for good at the halt, so it goes down the way the kill-point
+    // test takes a halted daemon down.
+    joiner.kill().await;
+    joiner.await_released().await;
+    leader.stop().await.expect("leader stops cleanly");
 }
 
 /// Two newcomers race to join the same cluster and both must converge with

@@ -1116,10 +1116,44 @@ impl Convergence {
             return classify(&status);
         }
 
-        // Step 4: catch-up. The leader's own replication view is the authority
-        // on how far behind this learner is — the local `known_committed` is
-        // not, because a learner that has not yet received a single append
-        // reads zero lag against its own frozen frontier.
+        // Step 4, local half: has this replica *seen* its own admission? The
+        // leader's `Ok` above says the membership entry committed on the
+        // leader; it reaches this replica only through the replication
+        // stream, and until it has, nothing the rest of the pipeline needs is
+        // true here — this replica knows no leader, holds no seat, and its
+        // own `/readyz` still reads `joining` (issue #148). Asking to be
+        // promoted from that state is not merely premature: the leader's key
+        // transfer (ADR 0037 §4) dials back to *this* daemon, which refuses
+        // it for not knowing a leader, and the refusal comes back dressed as
+        // an endpoint-verification failure — a transient of the loop's own
+        // making, surfaced in `/readyz` as if the advertised address were
+        // wrong. So the loop waits for its own log to say it is a learner,
+        // at the probe cadence: at most one append's latency, paid once.
+        //
+        // A fresh read, not the tick's `summary` — that was taken before
+        // `AddLearner` was issued, and for a first-time joiner it predates
+        // the seat by construction.
+        let seated = self
+            .handle
+            .cluster_summary()
+            .members
+            .iter()
+            .any(|m| m.id == node_id);
+        if !seated {
+            tracing::debug!(
+                leader = %leader_addr,
+                node_id,
+                "convergence: admitted by the leader, but the admission has not reached \
+                 this replica's own membership yet; waiting before asking to catch up"
+            );
+            return JoinStep::Learner;
+        }
+
+        // Step 4, leader half: catch-up. The leader's own replication view is
+        // the authority on how far behind this learner is — the local
+        // `known_committed` is not, because a learner that has not yet
+        // received a single append reads zero lag against its own frozen
+        // frontier.
         // Bounded like the other two join RPCs (see [`JOIN_RPC_TIMEOUT`]):
         // this one commits nothing, but it is served by the same leader, and a
         // leader that has stopped answering stops answering everything.
