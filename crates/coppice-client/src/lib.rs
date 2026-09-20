@@ -177,16 +177,21 @@
 //! The wire types here are hand-written copies of the coordinator's own DTOs,
 //! which is what lets this crate publish with no `coppice-*` dependency. A
 //! contract test that lives inside the server — the one place that can see
-//! both crates at once — holds the two to byte-identical JSON, variant for
-//! variant and limit for limit.
+//! both crates at once — round-trips every server value through the copy here
+//! and compares the JSON on both sides as `serde_json::Value`s: every key,
+//! every value, every enum spelling, and every shared limit must match, while
+//! key order and whitespace are not compared.
 //!
 //! That copy is why tolerance runs one way: responses ignore fields this
-//! client is too old to know and keep unknown enum values verbatim ([`types`]
-//! explains the mechanism), so an older client degrades against a newer
-//! coordinator rather than failing outright. Requests are the opposite — the
-//! server rejects an unknown field in a write body, so a typo is an error and
-//! not a silent default. When a typed method cannot express something a newer
-//! server grew, the escape hatch above reaches it anyway.
+//! client is too old to know, and a string-valued enum keeps an unrecognized
+//! value verbatim ([`types`] explains the mechanism, and names the one
+//! tagged-union enum whose unknown payload is discarded instead), so an older
+//! client degrades against a newer coordinator rather than failing outright.
+//! Requests are the opposite — the server rejects an unknown field in a write
+//! body, so a typo is an error and not a silent default, and this crate
+//! refuses an enum's `Unknown` value in a request before sending it. When a
+//! typed method cannot express something a newer server grew, the escape
+//! hatch above reaches it anyway.
 
 mod client;
 mod credential;

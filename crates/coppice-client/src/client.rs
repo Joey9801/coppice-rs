@@ -385,9 +385,24 @@ impl ClientBuilder {
     /// Use a caller-supplied `reqwest::Client` instead of building one.
     ///
     /// The timeout, the TLS posture and the connection pool are then entirely
-    /// that client's; nothing here overrides them. Reach for this to share one
-    /// pool across several Coppice clients, or to install a proxy, a custom
-    /// root store, or a middleware stack.
+    /// that client's; nothing here overrides them. Reach for it to share one
+    /// connection pool across several Coppice clients, or to set anything a
+    /// `reqwest::ClientBuilder` configures and this builder does not — a
+    /// proxy, a custom root store, default headers, the redirect policy,
+    /// per-request and connect timeouts.
+    ///
+    /// It is not an interception point: a `reqwest::Client` has no injectable
+    /// middleware, so nothing supplied here sees or rewrites the requests this
+    /// crate makes.
+    ///
+    /// One default header is this crate's business: `Authorization`. A
+    /// supplied client's default headers ride on every request it sends and
+    /// cannot be removed per request, so a default `Authorization` there
+    /// defeats the promise that a client with no token — or a
+    /// [`TokenProvider`] answering `None` — sends no such header, and hands
+    /// that credential to `/healthz` as well. Leave it out of a client
+    /// supplied here; credentials belong to [`token`](Self::token) or
+    /// [`token_provider`](Self::token_provider).
     pub fn http_client(mut self, http: reqwest::Client) -> ClientBuilder {
         self.http = Some(http);
         self

@@ -10,8 +10,10 @@ that API in Rust — typed ids, typed request and response bodies, a typed error
 vocabulary, pagination, and a log follower.
 
 It is a standalone crate: it depends on no other `coppice-*` crate, and carries
-its own copy of every wire type. A contract test inside the server holds the
-two to byte-identical JSON.
+its own copy of every wire type. A contract test inside the server round-trips
+every server value through this crate's copy and holds the JSON on both sides
+to structural equality — every key, value and enum spelling, compared as
+parsed JSON rather than as text.
 
 ## Install
 
@@ -98,8 +100,12 @@ Either way the token is held as a `BearerToken`, which redacts itself in
 
 Coppice is early-stage and this crate is `0.0.x`: anything here may change in
 any release, and there are no compatibility shims. Responses are built to
-tolerate a newer server — unknown fields are ignored and unknown enum values
-are kept verbatim — so an older client degrades rather than failing.
+tolerate a newer server — unknown fields are ignored, and a string-valued enum
+keeps an unrecognized value verbatim — so an older client degrades rather than
+failing. The one thing genuinely lost is the payload of a timeline event whose
+kind this client does not know: `TimelineEventBody` is a tagged union, so an
+unknown event decodes to a bare `Unknown`. Read those through
+`Client::get_value`, which returns the server's own body.
 
 ## License
 

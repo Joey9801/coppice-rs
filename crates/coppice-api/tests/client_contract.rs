@@ -159,9 +159,9 @@ where
 // ---------------------------------------------------------------------------
 
 /// Every job read model — the list row, the timeline, and the detail view
-/// with its cost report — must decode into the client's copies with byte
-/// identical JSON, including every `AttemptOutcomeKind`/`OutcomeClass`
-/// combination and the true-up variants.
+/// with its cost report — must decode into the client's copies and serialize
+/// back to the identical JSON document, including every
+/// `AttemptOutcomeKind`/`OutcomeClass` combination and the true-up variants.
 #[test]
 fn job_read_models_round_trip_through_the_client() {
     round_trip::<dto::Resources, client::Resources>(&resources(1000, 2_000_000, 3_000_000));
