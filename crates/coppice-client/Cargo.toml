@@ -1,0 +1,77 @@
+[package]
+name = "coppice-client"
+description = "Async, strongly-typed Rust client for the Coppice batch scheduler's HTTP API."
+readme = "README.md"
+keywords = ["coppice", "scheduler", "batch", "client", "api"]
+categories = ["api-bindings", "asynchronous"]
+documentation = "https://docs.rs/coppice-client"
+version.workspace = true
+edition.workspace = true
+# Not inherited: this is the one crate whose `rust-version` strangers rely on,
+# so it states what CI actually proves (the `client-msrv` job) rather than the
+# workspace's untested aspiration. 1.86 is the floor the dependency graph sets
+# today — `reqwest` → `url` → `idna_adapter` needs it.
+rust-version = "1.86"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# The TLS backend, on by default and matching what the rest of this workspace
+# resolves: the Mozilla bundle *and* the platform trust store, because a
+# cluster fronted by a corporate or private-PKI certificate keeps its roots in
+# the OS store, not in the bundle. A caller who wants neither (a plain-HTTP
+# coordinator, or their own pre-built `reqwest::Client`) turns default
+# features off and pays for no TLS stack at all.
+default = ["rustls-tls-native-roots"]
+rustls-tls-native-roots = ["reqwest/rustls-tls", "reqwest/rustls-tls-native-roots"]
+
+[dependencies]
+# This crate publishes to crates.io on its own, so it deliberately depends on
+# **no** `coppice-*` crate: the wire types are duplicated here and held to the
+# server's JSON by a contract test that lives in `coppice-api` (which can see
+# both sides). Feature selections below are therefore local rather than
+# inherited wherever the workspace entry carries features a client does not
+# need.
+# Declared locally for its floor: the wire enums' verbatim `Unknown(String)`
+# catch-all is a variant-level `#[serde(untagged)]`, which needs 1.0.181. The
+# workspace's bare "1" would let a consumer's resolver pick an older serde.
+serde = { version = "1.0.181", features = ["derive"] }
+serde_json = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+
+# Declared locally, not `workspace = true`: the workspace entry turns on
+# `json`, `rustls-tls` and `rustls-tls-native-roots` unconditionally, and a
+# published client must let its TLS backend be a cargo feature (see
+# `[features]` above). `json` is the only feature always wanted.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# Declared locally: the workspace entry is `features = ["full"]`, which pulls
+# in the whole runtime. Nothing here needs more than `tokio::time` — the log
+# follower and the poll helpers sleep between polls, and every other await
+# belongs to `reqwest`.
+tokio = { version = "1", default-features = false, features = ["time"] }
+
+# Declared locally: the workspace entry enables chrono's `serde`, which this
+# crate does not use (`Timestamp` has its own RFC 3339 µs impls), and chrono's
+# default features drag in the local-timezone machinery. `now` gives
+# `Utc::now()` without a timezone database.
+chrono = { version = "0.4.35", default-features = false, features = ["std", "now"] }
+
+# Declared locally: the workspace entry adds `v4`, which no id here mints.
+# Typed ids are UUIDv7 (ADR 0024).
+uuid = { version = "1", default-features = false, features = ["std", "v7"] }
+
+[dev-dependencies]
+# Round-trip tests stand a canned `/api/v1` router up in-process and drive the
+# real client against it, so the tests exercise the wire path (paths, query
+# encoding, headers, error bodies) rather than a mock of it.
+axum = { workspace = true }
+tokio = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
