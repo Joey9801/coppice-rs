@@ -32,6 +32,12 @@
 //! needing a credential; [`Client::session`] reports who a credential proved
 //! you are and what that identity may do.
 //!
+//! The token is held as a [`BearerToken`], whose `Debug` prints
+//! `BearerToken(<redacted>)` and which has neither `Display` nor `Serialize` —
+//! so a `{:?}` of a `Client` or a `ClientBuilder` cannot leak a credential into
+//! a log line. The `Authorization` header is marked sensitive as well, which is
+//! what keeps it out of `reqwest`'s own renderings of a request.
+//!
 //! The base's scheme also decides how the default `reqwest::Client` is built:
 //! a base that is not `https://` skips loading the platform's native root
 //! store even with the `rustls-tls-native-roots` feature on, because
@@ -170,6 +176,7 @@
 //! server grew, the escape hatch above reaches it anyway.
 
 mod client;
+mod credential;
 mod env;
 mod error;
 pub mod follow;
@@ -185,6 +192,7 @@ pub use client::{
     APPLIED_INDEX_HEADER, COMMITTED_INDEX_HEADER, DEFAULT_BASE_URL, DEFAULT_PORT, DEFAULT_TIMEOUT,
     LEADER_HEADER,
 };
+pub use credential::BearerToken;
 pub use env::{
     EnvError, JobEnv, MAX_ENV_NAME_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, MAX_ENV_VARS,
 };

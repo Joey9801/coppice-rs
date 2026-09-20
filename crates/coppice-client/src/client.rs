@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::credential::BearerToken;
 use crate::error::{Error, Result};
 use crate::follow::{FollowOptions, LogFollower};
 use crate::id::{JobId, NodeId, QuotaEntityId};
@@ -288,7 +289,7 @@ pub fn plain_http_builder(base: &str) -> reqwest::ClientBuilder {
 struct Inner {
     base: String,
     http: reqwest::Client,
-    token: Option<String>,
+    token: Option<BearerToken>,
 }
 
 /// Builds a [`Client`].
@@ -305,7 +306,7 @@ struct Inner {
 #[derive(Debug, Clone)]
 pub struct ClientBuilder {
     base: String,
-    token: Option<String>,
+    token: Option<BearerToken>,
     timeout: Duration,
     http: Option<reqwest::Client>,
 }
@@ -328,9 +329,11 @@ impl ClientBuilder {
     /// environment variable that is set but empty must behave exactly like one
     /// that is unset, and in the open (auth-disabled) posture the header's
     /// mere presence is what must never appear.
+    ///
+    /// The token is kept as a [`BearerToken`], so neither this builder's
+    /// `Debug` nor the built client's can print it.
     pub fn token(mut self, token: impl Into<String>) -> ClientBuilder {
-        let token = token.into();
-        self.token = Some(token.trim().to_string()).filter(|t| !t.is_empty());
+        self.token = BearerToken::new(token);
         self
     }
 
@@ -500,7 +503,7 @@ impl Client {
     /// Outside `/api/v1` and outside authentication: reaching it at all is the
     /// answer. It says nothing about readiness, phase, or cluster health.
     pub async fn healthz(&self) -> Result<HealthzResponse> {
-        let request = self.authed(self.inner.http.get(self.root_url(paths::HEALTHZ)));
+        let request = self.authed(self.inner.http.get(self.root_url(paths::HEALTHZ)))?;
         let response = request.send().await.map_err(Error::Transport)?;
         Ok(decode(response).await?.0)
     }
@@ -762,11 +765,27 @@ impl Client {
     /// Attach the bearer token, when there is one. When there is not, no
     /// `Authorization` header is sent at all — the header's mere presence is
     /// what an open-mode cluster must never see.
-    fn authed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.inner.token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
-        }
+    ///
+    /// The header value is built here rather than through
+    /// `RequestBuilder::bearer_auth` for one reason: so it can be marked
+    /// sensitive, which is what makes `reqwest`/`hyper` redact it in their own
+    /// `Debug` renderings of the request. The same construction is why this is
+    /// fallible — a token carrying a byte no header value may hold is a
+    /// refusal naming the problem, not a panic inside the HTTP stack.
+    fn authed(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        let Some(token) = &self.inner.token else {
+            return Ok(request);
+        };
+        let mut value = reqwest::header::HeaderValue::from_str(&format!(
+            "Bearer {}",
+            token.expose()
+        ))
+        .map_err(|_| {
+            // The token itself never reaches the message.
+            Error::InvalidRequest("the bearer token is not a valid HTTP header value".to_string())
+        })?;
+        value.set_sensitive(true);
+        Ok(request.header(reqwest::header::AUTHORIZATION, value))
     }
 
     /// The shared GET half: endpoint query pairs first, then this client's
@@ -783,7 +802,7 @@ impl Client {
             .query(query)
             .query(&self.read.query_pairs());
         let response = self
-            .authed(request)
+            .authed(request)?
             .send()
             .await
             .map_err(Error::Transport)?;
@@ -806,7 +825,7 @@ impl Client {
             None => request,
         };
         let response = self
-            .authed(request)
+            .authed(request)?
             .send()
             .await
             .map_err(Error::Transport)?;
@@ -826,7 +845,7 @@ impl Client {
     async fn put<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
         let request = self.inner.http.put(self.url(path)).json(body);
         let response = self
-            .authed(request)
+            .authed(request)?
             .send()
             .await
             .map_err(Error::Transport)?;
@@ -1003,6 +1022,37 @@ mod tests {
             .build()
             .unwrap()
             .has_token());
+    }
+
+    /// `Client` and `ClientBuilder` are both `Debug`, and both get printed —
+    /// into `tracing`, into a test failure, into an enclosing struct's own
+    /// derive. Neither may carry the credential out with it.
+    #[test]
+    fn debug_of_a_client_or_its_builder_never_prints_the_token() {
+        let builder = Client::builder("http://h:7070").token("s3cr3t");
+        let rendered = format!("{builder:?}");
+        assert!(!rendered.contains("s3cr3t"), "{rendered}");
+
+        let client = builder.build().unwrap();
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("s3cr3t"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// A token carrying a byte no header value may hold is a typed refusal
+    /// naming the problem — not a panic inside the HTTP stack — and the
+    /// message does not quote the token back.
+    #[test]
+    fn a_token_that_cannot_be_a_header_value_is_refused() {
+        let client = Client::builder("http://h:7070")
+            .token("a\nb")
+            .build()
+            .unwrap();
+        let err = client
+            .authed(client.inner.http.get(client.url("/session")))
+            .expect_err("a control character cannot ride in a header");
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+        assert!(!err.to_string().contains("a\nb"));
     }
 
     #[test]
