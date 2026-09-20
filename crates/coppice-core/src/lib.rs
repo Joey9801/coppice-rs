@@ -13,6 +13,7 @@
 pub mod allocation;
 pub mod attempt;
 pub mod bytes;
+pub mod env;
 pub mod id;
 pub mod job;
 pub mod metadata;

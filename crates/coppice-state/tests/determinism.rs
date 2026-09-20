@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use common::*;
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::bytes::ByteSize;
+use coppice_core::env::JobEnv;
 use coppice_core::job::RetryPolicy;
 use coppice_core::metadata::JobMetadata;
 use coppice_core::quota::CostUnits;
@@ -72,6 +73,15 @@ fn arb_metadata() -> impl Strategy<Value = JobMetadata> {
     proptest::collection::btree_map("[a-z._:/-]{1,6}", "[a-z ]{0,8}", 0..4)
 }
 
+/// An arbitrary environment overlay, inside the limits so the submission is
+/// accepted rather than always rejected. Env is fixed at submission, so it
+/// varies the *submitted spec* rather than splicing a command into the
+/// chain — what it proves is that the apply-time re-check and the ADR 0026
+/// identity comparison are themselves deterministic.
+fn arb_env() -> impl Strategy<Value = JobEnv> {
+    proptest::collection::btree_map("[A-Z_][A-Z0-9_]{0,5}", "[a-z ]{0,8}", 0..4)
+}
+
 /// An arbitrary metadata edit: replacement and patch, both shapes, against
 /// a job that may or may not exist by the time it applies.
 fn arb_metadata_update(job: coppice_core::id::JobId) -> impl Strategy<Value = Command> {
@@ -110,14 +120,25 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
         proptest::option::of(60i64..7_200),
         arb_ts(),
         proptest::option::of((0usize..=6, arb_metadata_update(jid(1_000 + i as u128)))),
+        arb_env(),
     )
         .prop_map(
-            move |(progress, abort_at, outcome, node_ix, cpu_millis, max_rt, ts, metadata_at)| {
+            move |(
+                progress,
+                abort_at,
+                outcome,
+                node_ix,
+                cpu_millis,
+                max_rt,
+                ts,
+                metadata_at,
+                env,
+            )| {
                 let job = jid(1_000 + i as u128);
                 let attempt = aid(2_000 + i as u128);
                 let alloc = alid(3_000 + i as u128);
                 let mut chain = vec![
-                    submit_cmd(job, cpu(cpu_millis), max_rt, RetryPolicy::default()),
+                    submit_cmd_with_env(job, cpu(cpu_millis), max_rt, RetryPolicy::default(), env),
                     place_cmd(
                         placement(job, attempt, alloc, node_of(node_ix), cpu(cpu_millis)),
                         ts,

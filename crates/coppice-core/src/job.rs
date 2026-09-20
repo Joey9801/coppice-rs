@@ -16,6 +16,7 @@
 //! `docs/decisions/0013-job-attempt-allocation-state-machines.md`; the
 //! transition table lives in `docs/lifecycle/job-lifecycle.md`.
 
+use crate::env::JobEnv;
 use crate::id::{AttemptId, JobId, QuotaEntityId};
 use crate::metadata::JobMetadata;
 use crate::resource::Resources;
@@ -35,6 +36,17 @@ pub struct Job {
     /// `Some`, the argv is non-empty (also enforced at conversion) so "no
     /// override" has exactly one representation.
     pub entrypoint: Option<Vec<String>>,
+    /// Environment variables for the container, an overlay on the image's own
+    /// environment: a name set here wins over an image `ENV` of the same
+    /// name, and a name it does not mention keeps the image's value.
+    ///
+    /// Part of the immutable submitted spec — there is no update command, so
+    /// what ran is always what was submitted. **Not a secret channel**: the
+    /// map is replicated, rides every snapshot, and is served through the API
+    /// and the UI (`docs/decisions/0011-container-security-posture.md`).
+    /// Validated by [`crate::env::validate`] at the API edge *and* at apply,
+    /// so the replicated state never holds an oversized or malformed map.
+    pub env: JobEnv,
     /// Resources requested for scheduling and isolation.
     pub requests: Resources,
     /// User-chosen priority. A multiplier on the job's cost, not a free lane:

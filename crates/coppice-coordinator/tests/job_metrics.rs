@@ -225,6 +225,7 @@ async fn submit_retrying_job(coord: &RunningCoordinator, job: JobId, entity: Quo
                 image: "registry/img:latest".into(),
                 command: vec!["run".into()],
                 entrypoint: None,
+                env: Default::default(),
                 requests: requested(),
                 priority: 0,
                 max_runtime: None,

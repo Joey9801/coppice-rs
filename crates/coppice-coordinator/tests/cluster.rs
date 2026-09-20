@@ -685,6 +685,10 @@ async fn a_client_pointed_at_a_follower_submits_observes_and_aborts() {
         "requests": { "cpu_millis": 100, "memory_bytes": 1_048_576u64, "disk_bytes": 0 },
         "priority": 0,
         "quota_entity": entity.to_string(),
+        // Carried across the same ADR 0038 hop as everything else in this
+        // request: the leader re-runs the whole write path, so `env` must
+        // arrive exactly as sent, not dropped on the way.
+        "env": { "RUST_LOG": "info" },
     });
     let resp = client
         .post(follower.api("/api/v1/jobs"))
@@ -747,6 +751,11 @@ async fn a_client_pointed_at_a_follower_submits_observes_and_aborts() {
         body["state"], "queued",
         "with no agents in this fleet the job has nowhere to run and must \
          still be sitting queued, not terminal: {body}"
+    );
+    assert_eq!(
+        body["spec"]["env"],
+        serde_json::json!({ "RUST_LOG": "info" }),
+        "the env overlay must survive the forwarding hop: {body}"
     );
 
     // (e) Abort the job, again over the follower.

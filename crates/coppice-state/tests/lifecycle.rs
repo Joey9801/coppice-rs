@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use common::*;
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::env::{JobEnv, MAX_VALUE_BYTES as ENV_MAX_VALUE_BYTES, MAX_VARS};
 use coppice_core::id::{AllocationId, GroupId, JobId};
 use coppice_core::job::{JobState, RetryPolicy};
 use coppice_core::metadata::{JobMetadata, MAX_VALUE_BYTES};
@@ -2194,6 +2195,69 @@ fn submit_job_rechecks_metadata_limits_and_counts_metadata_in_its_identity() {
         RejectionReason::SubmitSpecMismatch(jid(1))
     );
     assert_eq!(sm.jobs[&jid(1)].spec.metadata, named);
+}
+
+#[test]
+fn submit_job_rechecks_env_limits_and_counts_env_in_its_identity() {
+    let mut sm = setup();
+    let with_env =
+        |env: JobEnv| submit_cmd_with_env(jid(1), cpu(1_000), None, RetryPolicy::default(), env);
+
+    // The apply-side re-check is what makes the limits real: env is only
+    // ever set at submission, so this single check is the whole guard on
+    // what replicated state can hold, whatever the proposer sent.
+    let mut huge = JobEnv::new();
+    huge.insert("HUGE".into(), "x".repeat(ENV_MAX_VALUE_BYTES + 1));
+    let reason = sm
+        .apply(&with_env(huge))
+        .expect_err("value breaks the per-value size limit");
+    assert!(
+        matches!(reason, RejectionReason::InvalidJobEnv(_)),
+        "{reason:?}"
+    );
+    assert!(!sm.jobs.contains_key(&jid(1)));
+
+    // A malformed name is refused on the same path.
+    let mut bad_name = JobEnv::new();
+    bad_name.insert("1BAD".into(), "x".into());
+    assert!(
+        matches!(
+            sm.apply(&with_env(bad_name))
+                .expect_err("a non-portable name"),
+            RejectionReason::InvalidJobEnv(_)
+        ),
+        "a name that is not a portable name must be refused"
+    );
+
+    // As is a map with too many variables.
+    let too_many: JobEnv = (0..MAX_VARS + 1)
+        .map(|i| (format!("V{i}"), String::new()))
+        .collect();
+    assert!(
+        matches!(
+            sm.apply(&with_env(too_many))
+                .expect_err("over the variable count"),
+            RejectionReason::InvalidJobEnv(_)
+        ),
+        "a map over the variable-count limit must be refused"
+    );
+
+    // Env is part of the submission's identity (ADR 0026): the same id with
+    // the same overlay is the idempotent retry, a different overlay is a
+    // different intent and rejects rather than silently running the
+    // original's environment.
+    let mut original = JobEnv::new();
+    original.insert("RUST_LOG".into(), "info".into());
+    apply_ok(&mut sm, with_env(original.clone()));
+    apply_ok(&mut sm, with_env(original.clone()));
+    let mut changed = JobEnv::new();
+    changed.insert("RUST_LOG".into(), "debug".into());
+    assert_eq!(
+        sm.apply(&with_env(changed))
+            .expect_err("a different overlay"),
+        RejectionReason::SubmitSpecMismatch(jid(1))
+    );
+    assert_eq!(sm.jobs[&jid(1)].spec.env, original);
 }
 
 #[test]

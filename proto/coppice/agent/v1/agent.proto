@@ -83,6 +83,11 @@ message StartJob {
   repeated string command = 7;
   // Entrypoint override; absent runs the image's own entrypoint.
   coppice.core.v1.Entrypoint entrypoint = 8;
+  // The job's environment overlay, copied verbatim from the spec. The agent
+  // encodes it as the container's `NAME=value` env list, layered over the
+  // image's own `ENV`. Writers emit ascending name order; readers accept any
+  // order and reject duplicate or empty names.
+  repeated coppice.core.v1.EnvVar env = 9;
 }
 
 // Stop the work under an allocation (SIGTERM, grace, SIGKILL). Idempotent,

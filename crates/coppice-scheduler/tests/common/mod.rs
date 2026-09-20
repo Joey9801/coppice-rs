@@ -166,6 +166,7 @@ pub fn submit_cmd(
             abort_requested: None,
             submitted_by: None,
             metadata: Default::default(),
+            env: Default::default(),
         },
         multiplier,
         submitted_at: at,

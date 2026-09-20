@@ -291,6 +291,12 @@ pub(crate) async fn submit_job_here<C: Consensus>(
     // the proposer did — this is purely for the client's sake.
     coppice_core::metadata::validate(&req.metadata).map_err(|e| invalid(e.to_string()))?;
     let metadata = req.metadata.clone();
+    // Same admission-side shape check for the environment overlay
+    // (`coppice_core::env`): re-checked at apply regardless, so replicated
+    // state can never hold an oversized or malformed map whatever the
+    // proposer did.
+    coppice_core::env::validate(&req.env).map_err(|e| invalid(e.to_string()))?;
+    let env = req.env.clone();
 
     // Everything above this line is shape validation: it reads only the
     // request, so its verdict is the same on every replica and a follower is
@@ -382,6 +388,10 @@ pub(crate) async fn submit_job_here<C: Consensus>(
             image: req.image.clone(),
             command: req.command.clone(),
             entrypoint,
+            // Re-checked at apply against the same limits, so a proposer
+            // that skipped this admission check still cannot land an
+            // oversized or malformed map in replicated state.
+            env,
             requests: req.requests.into(),
             priority: req.priority,
             max_runtime,
@@ -1787,6 +1797,7 @@ mod tests {
             command: vec!["run".to_string()],
             entrypoint: None,
             metadata: Default::default(),
+            env: Default::default(),
         }
     }
 
@@ -1809,6 +1820,29 @@ mod tests {
         req.command.clear();
         let result = cp.submit_job(req, test_actor()).await;
         assert!(matches!(result, Err(ApiError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn submit_with_a_malformed_env_is_invalid() {
+        // Shape validation, like the empty command above: the request *is*
+        // the map that would be stored, so the verdict needs no view and a
+        // client learns which limit it broke without a consensus round trip.
+        // Apply re-checks it regardless.
+        let cp = control_plane(ProposeOutcome::Accepted);
+        let mut req = submit_request(JobId::new());
+        req.env.insert("1BAD".to_string(), "v".to_string());
+        assert!(matches!(
+            cp.submit_job(req, test_actor()).await,
+            Err(ApiError::Invalid(_))
+        ));
+
+        let cp = control_plane(ProposeOutcome::Accepted);
+        let mut req = submit_request(JobId::new());
+        req.env.insert("BIG".to_string(), "x".repeat(4097));
+        assert!(matches!(
+            cp.submit_job(req, test_actor()).await,
+            Err(ApiError::Invalid(_))
+        ));
     }
 
     #[tokio::test]

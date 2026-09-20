@@ -163,6 +163,18 @@ pub fn submit_cmd(
     max_runtime_s: Option<i64>,
     retry: RetryPolicy,
 ) -> Command {
+    submit_cmd_with_env(job, requests, max_runtime_s, retry, Default::default())
+}
+
+/// `submit_cmd` with an explicit environment overlay, for the cases that
+/// exercise the submit-time `env` check and the ADR 0026 identity.
+pub fn submit_cmd_with_env(
+    job: JobId,
+    requests: Resources,
+    max_runtime_s: Option<i64>,
+    retry: RetryPolicy,
+    env: coppice_core::env::JobEnv,
+) -> Command {
     Command::SubmitJob(SubmitJob {
         job: Job {
             id: job,
@@ -177,6 +189,7 @@ pub fn submit_cmd(
             abort_requested: None,
             submitted_by: None,
             metadata: Default::default(),
+            env,
         },
         multiplier: PriorityMultiplier::ONE,
         submitted_at: base_ts(),

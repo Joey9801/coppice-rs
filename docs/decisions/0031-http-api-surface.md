@@ -158,6 +158,17 @@ filter grammar's reserved `label` leaf is **replaced** — not joined — by a
 case-sensitive string equality). Metadata values are plain strings: there is
 no value type and no pattern operator. See ADR 0042 for the limits.)*
 
+A job's environment rides the same surface, but as part of the
+**immutable** spec rather than beside it: `SubmitJobRequest` carries an
+optional `env` object of variable names to string values, and
+`JobDetail`'s `spec` returns it as an always-present object.
+`JobSummary` does not carry it — a list row has no use for it, and it is
+the one submitted field that can reach kilobytes. Because it is fixed at
+submission there is nothing to add to the route map and nothing to match
+on in the filter grammar: no verb edits it, and no leaf reads it. The
+limits, and the reason it is not a secret channel, are
+`coppice_core::env` and [ADR 0011](0011-container-security-posture.md).
+
 The table's "message pair" naming survives the wire-format amendment
 unchanged: the pairs are the same-named DTOs in
 `coppice-api::http::dto`, which are the sole definition of each pair

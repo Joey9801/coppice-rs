@@ -2315,6 +2315,7 @@ mod tests {
                 image: "busybox".to_string(),
                 command: vec!["run".to_string()],
                 entrypoint: None,
+                env: Default::default(),
                 requests: coppice_core::resource::Resources::ZERO,
                 priority: 0,
                 max_runtime: None,
@@ -2452,6 +2453,58 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(plane.only_submitted().metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_carries_env_through_to_the_control_plane() {
+        // Same reasoning as the metadata analog: a handler that decoded the
+        // field and then dropped it would still answer 200, so the only way
+        // to prove `env` survives the edge is to look at what arrived.
+        let job = JobId::new();
+        let plane = stub_plane(coppice_state::StateMachine::default());
+        let body = serde_json::json!({
+            "job": job,
+            "image": "busybox:1",
+            "command": ["sh"],
+            "requests": { "cpu_millis": 1, "memory_bytes": 1, "disk_bytes": 1 },
+            "quota_entity": QuotaEntityId::new(),
+            "env": { "RUST_LOG": "info", "EMPTY": "" },
+        })
+        .to_string();
+        let response = router(Arc::clone(&plane))
+            .oneshot(post_json("/api/v1/jobs", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let submitted = plane.only_submitted();
+        assert_eq!(
+            submitted.env,
+            coppice_core::env::JobEnv::from([
+                ("EMPTY".to_string(), String::new()),
+                ("RUST_LOG".to_string(), "info".to_string()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_omitting_env_is_the_empty_map() {
+        let job = JobId::new();
+        let plane = stub_plane(coppice_state::StateMachine::default());
+        let body = serde_json::json!({
+            "job": job,
+            "image": "busybox:1",
+            "command": ["sh"],
+            "requests": { "cpu_millis": 1, "memory_bytes": 1, "disk_bytes": 1 },
+            "quota_entity": QuotaEntityId::new(),
+        })
+        .to_string();
+        let response = router(Arc::clone(&plane))
+            .oneshot(post_json("/api/v1/jobs", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(plane.only_submitted().env.is_empty());
     }
 
     #[tokio::test]

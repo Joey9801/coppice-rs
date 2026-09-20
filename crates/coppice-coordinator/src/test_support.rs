@@ -119,6 +119,7 @@ pub fn job_record(
             image: image.to_string(),
             command: vec!["run".into()],
             entrypoint: None,
+            env: Default::default(),
             requests,
             priority: 0,
             max_runtime,

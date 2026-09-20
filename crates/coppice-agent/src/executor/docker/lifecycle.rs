@@ -8,7 +8,7 @@
 //! only produce evidence (`StopOutcome`, `ObservedContainer`) and start-error
 //! shapes. They never touch the journal or session state.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bollard::models::{ContainerCreateBody, ContainerStateStatusEnum, ContainerUpdateBody};
 use bollard::query_parameters::{
@@ -340,11 +340,34 @@ fn build_create_body(
         cmd: Some(spec.command.clone()),
         // `None` runs the image's own entrypoint (StartSpec contract).
         entrypoint: spec.entrypoint.clone(),
+        env: env_list(&spec.env),
         user: Some(user.to_string()),
         labels: Some(labels),
         host_config: Some(host_config),
         ..Default::default()
     }
+}
+
+/// The create body's `Env`, encoded from the job's overlay (§10).
+///
+/// Ascending name order comes free from the `BTreeMap`, so two agents
+/// building the same spec send byte-identical bodies. `None` for an empty
+/// overlay rather than an empty list: there is nothing to layer, and the
+/// image's own `ENV` is what the container should run with. Docker merges
+/// this list over the image's `ENV` either way, so a name the job sets wins
+/// and a name it omits keeps the image's value — which is exactly the
+/// overlay contract `StartSpec::env` promises. The name charset
+/// (`coppice_core::env`) admits neither `=` nor NUL, so the first `=` here
+/// is always the separator.
+fn env_list(env: &BTreeMap<String, String>) -> Option<Vec<String>> {
+    if env.is_empty() {
+        return None;
+    }
+    Some(
+        env.iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect(),
+    )
 }
 
 async fn prepare_cpu(
@@ -1255,6 +1278,36 @@ mod tests {
     #[test]
     fn grace_clamps_enormous_spans_to_i32_max() {
         assert_eq!(grace_to_secs_ceil(Duration::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn empty_env_leaves_the_create_body_field_unset() {
+        // Nothing to overlay: the image's own `ENV` is what should run, and
+        // an empty list would say the same thing more noisily.
+        assert_eq!(env_list(&BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn env_encodes_as_name_value_in_ascending_name_order() {
+        let mut env = BTreeMap::new();
+        // Inserted out of order on purpose: the encoding is the map's order,
+        // not the caller's.
+        env.insert("C".to_string(), "3".to_string());
+        env.insert("A".to_string(), "1".to_string());
+        env.insert("B".to_string(), String::new());
+        assert_eq!(
+            env_list(&env),
+            Some(vec!["A=1".to_string(), "B=".to_string(), "C=3".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_env_value_may_carry_its_own_equals_sign() {
+        // Only the *name* is charset-restricted; a value holding `=` encodes
+        // verbatim, because the first `=` is the separator.
+        let mut env = BTreeMap::new();
+        env.insert("OPTS".to_string(), "a=b".to_string());
+        assert_eq!(env_list(&env), Some(vec!["OPTS=a=b".to_string()]));
     }
 
     #[test]

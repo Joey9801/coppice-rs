@@ -337,6 +337,7 @@ async fn submit_job(
                 image: "registry/img:latest".into(),
                 command: vec!["run".into()],
                 entrypoint: None,
+                env: Default::default(),
                 requests: requested(),
                 priority: 0,
                 max_runtime: None,
@@ -662,6 +663,7 @@ fn start_job_body(alloc: AllocationId, attempt: AttemptId, job: JobId) -> pb::ag
         image: "registry/img:latest".into(),
         command: vec!["run".into()],
         entrypoint: None,
+        env: Vec::new(),
         limits: None,
         max_runtime_us: None,
     })

@@ -303,6 +303,9 @@ pub(crate) fn start_job_command(
                 .map(|argv| coppice_proto::pb::core::v1::Entrypoint { argv: argv.clone() }),
             limits: Some((&allocation.allocation.requested).into()),
             max_runtime_us: job.spec.max_runtime.map(|d| d.as_micros() as u64),
+            // Ascending name order for free (`JobEnv` is a `BTreeMap`); the
+            // agent applies these over the image's own `ENV` on create.
+            env: coppice_proto::convert::env_to_pb(&job.spec.env),
         })),
     }
 }
@@ -358,12 +361,18 @@ mod tests {
         let alloc_id = AllocationId::new();
         let node = NodeId::new();
 
-        let job = job_record(
+        let mut job = job_record(
             job_id,
             "registry/img:1",
             requested(),
             Some(Duration::from_micros(1_234)),
         );
+        job.spec.env = [
+            ("RUST_LOG".to_string(), "info".to_string()),
+            ("A_FIRST".to_string(), "1".to_string()),
+        ]
+        .into_iter()
+        .collect();
         let attempt = attempt_record(
             attempt_id,
             job_id,
@@ -402,6 +411,21 @@ mod tests {
             requested()
         );
         assert_eq!(sj.max_runtime_us, Some(1_234));
+        // Ascending name order (`JobEnv` is a `BTreeMap`), whatever order the
+        // spec's own map happened to be built in.
+        assert_eq!(
+            sj.env,
+            vec![
+                coppice_proto::pb::core::v1::EnvVar {
+                    name: "A_FIRST".to_string(),
+                    value: "1".to_string(),
+                },
+                coppice_proto::pb::core::v1::EnvVar {
+                    name: "RUST_LOG".to_string(),
+                    value: "info".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

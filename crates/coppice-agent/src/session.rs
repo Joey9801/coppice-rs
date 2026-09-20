@@ -481,6 +481,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
             return Ok(self.report_current_status(alloc, attempt, job));
         }
 
+        // Parsed and validated BEFORE the journal write: a malformed env
+        // (duplicate or empty name) must never leave a journaled intent
+        // behind for a container that will never start.
+        let Some(env) = start_env(&sj) else {
+            tracing::warn!(node = %self.node, %alloc, "dropping malformed StartJob (duplicate or empty env name)");
+            return Ok(Vec::new());
+        };
+
         if self.drained {
             tracing::info!(node = %self.node, %alloc, "starting committed StartJob while drained (intent predates the drain)");
         }
@@ -504,6 +512,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             image: sj.image,
             command: sj.command,
             entrypoint: sj.entrypoint.map(|e| e.argv),
+            env,
             limits: sj
                 .limits
                 .and_then(|r| r.try_into().ok())
@@ -953,6 +962,20 @@ fn start_ids(sj: &pb::StartJob) -> Option<StartIds> {
         attempt,
         job,
     })
+}
+
+/// A `StartJob`'s `env` overlay as a map, or `None` if it is malformed. The
+/// wire form is already validated at the API edge and re-checked at apply
+/// (`coppice_core::env`), so a duplicate or empty name here means a StartJob
+/// we must drop rather than a case worth repairing.
+fn start_env(sj: &pb::StartJob) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut env = std::collections::BTreeMap::new();
+    for var in &sj.env {
+        if var.name.is_empty() || env.insert(var.name.clone(), var.value.clone()).is_some() {
+            return None;
+        }
+    }
+    Some(env)
 }
 
 /// The agent's **accountable live work** over a recovered journal state

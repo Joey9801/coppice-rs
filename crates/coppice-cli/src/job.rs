@@ -37,6 +37,9 @@
 //! name = "nightly-build"    # the well-known key; titles the job in the UI
 //! ticket = "INC-1234"
 //! attempt = "3"             # values are strings; a bare 3 is a spec error
+//!
+//! [env]                     # optional, immutable environment overlay
+//! LOG_LEVEL = "debug"       # values are strings; overlays the image's own ENV
 //! ```
 
 use std::collections::BTreeMap;
@@ -99,6 +102,17 @@ pub struct JobSpec {
     /// against ADR 0042's limits regardless.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    /// Environment overlay, as an `[env]` TOML table of **strings**. Layered
+    /// over the image's own `ENV` — a name set here wins over the image's —
+    /// and fixed at submission: there is no update command and no way to
+    /// change it once the job exists. Absent is the empty map, matching the
+    /// wire default. Like `[metadata]`, values are strings only; a bare
+    /// integer or other non-string value is a spec error, not a coerced
+    /// string. It is **not** a secret channel: the map is replicated,
+    /// snapshotted, and readable through the API and UI, so it must not
+    /// carry secrets.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// Requested resources. All three dimensions are required — a defaulted request
@@ -195,6 +209,7 @@ impl JobSpec {
                 retry_user_errors: r.retry_user_errors,
             }),
             metadata: self.metadata.clone(),
+            env: self.env.clone(),
         }
     }
 }
@@ -1536,6 +1551,23 @@ fn render_status(detail: &dto::JobDetail) -> String {
         );
     }
 
+    // The submitted environment overlay: one `NAME = value` line per entry,
+    // in the map's own (name-sorted) order. Printed here, beside metadata,
+    // because both are maps that need a block rather than a single aligned
+    // line — but unlike metadata this one is fixed at submission, so it is
+    // the whole story. Values print as quoted, escaped strings: a value may
+    // hold any character but NUL, and a raw newline or terminal control
+    // sequence must not be able to forge status lines or drive the viewer's
+    // terminal.
+    if spec.env.is_empty() {
+        let _ = writeln!(out, "env             (none)");
+    } else {
+        let _ = writeln!(out, "env:");
+        for (name, value) in &spec.env {
+            let _ = writeln!(out, "  {name} = {value:?}");
+        }
+    }
+
     // User-owned annotations (ADR 0042): one `key = value` line per entry,
     // in the map's own (key-sorted) order. Values are plain strings, so
     // they print as themselves — unquoted, unescaped.
@@ -1840,6 +1872,60 @@ empty = ""
         assert!(spec.metadata.is_empty());
         let request = spec.request(JobId::new());
         assert!(request.metadata.is_empty());
+    }
+
+    const ENV_SPEC: &str = r#"
+image = "busybox:1.36"
+command = ["sh", "-c", "echo hi"]
+quota_entity = "quota-00000000-0000-0000-0000-000000000001"
+
+[resources]
+cpu_millis = 500
+memory = "256MiB"
+disk = "1GiB"
+
+[env]
+PATH = "/usr/local/bin:/usr/bin:/bin"
+LOG_LEVEL = "debug"
+EMPTY = ""
+"#;
+
+    /// An `[env]` table of strings crosses into the request unchanged, the
+    /// empty value included.
+    #[test]
+    fn env_table_crosses_into_the_request() {
+        let spec = parse(ENV_SPEC).expect("env spec parses");
+        let request = spec.request(JobId::new());
+        assert_eq!(
+            request.env,
+            coppice_core::env::JobEnv::from([
+                (
+                    "PATH".to_string(),
+                    "/usr/local/bin:/usr/bin:/bin".to_string()
+                ),
+                ("LOG_LEVEL".to_string(), "debug".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ])
+        );
+    }
+
+    /// The environment has no value type, so a non-string TOML value is a
+    /// spec error rather than a coerced string, exactly like `[metadata]`.
+    #[test]
+    fn a_non_string_env_value_is_a_spec_error() {
+        let spec = ENV_SPEC.replace(r#"LOG_LEVEL = "debug""#, "LOG_LEVEL = 1");
+        let err = parse(&spec).expect_err("a bare integer is refused");
+        assert!(format!("{err:#}").contains("LOG_LEVEL"), "{err:#}");
+    }
+
+    /// A spec with no `[env]` table converts to the empty map, matching the
+    /// wire default (`SubmitJobRequest::env`'s `#[serde(default)]`).
+    #[test]
+    fn absent_env_table_is_the_empty_map() {
+        let spec = parse(MINIMAL_SPEC).expect("minimal spec parses");
+        assert!(spec.env.is_empty());
+        let request = spec.request(JobId::new());
+        assert!(request.env.is_empty());
     }
 
     #[test]
@@ -2533,6 +2619,7 @@ empty = ""
                 image: "busybox:1.36".to_string(),
                 command: vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
                 entrypoint: None,
+                env: coppice_core::env::JobEnv::new(),
                 requests,
                 priority: 0,
                 max_runtime_seconds: Some(3600),
@@ -2630,6 +2717,38 @@ empty = ""
         assert!(rendered.contains("metadata:"), "{rendered}");
         assert!(rendered.contains("  attempt = 3"), "{rendered}");
         assert!(rendered.contains("  name = nightly-build"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn status_renders_env_as_none_when_empty() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let rendered = render_status(&detail);
+        assert!(rendered.contains("env             (none)"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn status_renders_the_env_block() {
+        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let mut detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        detail.spec.env = coppice_core::env::JobEnv::from([
+            ("LOG_LEVEL".to_string(), "debug".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            // A value that tries to forge a status line and drive the terminal.
+            (
+                "SNEAKY".to_string(),
+                "x\nstate  Succeeded\u{1b}[2J".to_string(),
+            ),
+        ]);
+        let rendered = render_status(&detail);
+        assert!(rendered.contains("env:"), "{rendered}");
+        assert!(rendered.contains("  LOG_LEVEL = \"debug\""), "{rendered}");
+        assert!(rendered.contains("  PATH = \"/usr/bin\""), "{rendered}");
+        assert!(
+            rendered.contains(r#"  SNEAKY = "x\nstate  Succeeded\u{1b}[2J""#),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "{rendered}");
     }
 
     #[tokio::test]

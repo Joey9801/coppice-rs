@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass};
+use coppice_core::env;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState};
 use coppice_core::metadata::{self, JobMetadata};
@@ -110,6 +111,11 @@ impl StateMachine {
         // on the proposer having done so.
         metadata::validate(&c.job.metadata)
             .map_err(|e| RejectionReason::InvalidJobMetadata(e.to_string()))?;
+        // The same re-check for the environment overlay: it is fixed at
+        // submission and never edited afterwards, so this one place is
+        // enough to keep replicated state inside the limits whatever the
+        // proposer did.
+        env::validate(&c.job.env).map_err(|e| RejectionReason::InvalidJobEnv(e.to_string()))?;
         if let Some(existing) = self.jobs.get(&c.job.id) {
             // The job id is the submission's idempotency identity (ADR 0026):
             // a client retry after an unknown outcome, or a re-proposal across
@@ -2057,4 +2063,5 @@ fn same_submission(existing: &Job, retried: &Job) -> bool {
         && existing.quota_entity == retried.quota_entity
         && existing.retry == retried.retry
         && existing.metadata == retried.metadata
+        && existing.env == retried.env
 }
