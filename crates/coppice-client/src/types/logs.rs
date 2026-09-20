@@ -78,6 +78,12 @@ pub enum LogStreamName {
     /// A value this client does not know — a newer server's vocabulary, kept
     /// verbatim rather than rejected. See [`super`] for why this carries the
     /// spelling rather than being a bare unit variant.
+    ///
+    /// Decoding only. `LogStreamName` also travels *out*, as the `stream=`
+    /// filter, and [`LogsParams::validate`] refuses this before the request
+    /// is sent; a caller who genuinely means a stream a newer server grew
+    /// asks for it through
+    /// [`Client::get_value`](crate::Client::get_value).
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -306,6 +312,27 @@ impl LogsParams {
         self
     }
 
+    /// Refuse a `stream=` this client only knows how to *decode*.
+    ///
+    /// [`LogStreamName::Unknown`] is the response-side catch-all; the
+    /// server's own stream vocabulary is closed, so asking it to filter on a
+    /// spelling it does not know is a `400` with nothing useful in it.
+    /// [`Client::job_logs`](crate::Client::job_logs) calls this before
+    /// sending, which covers the pager and the log follower too — both make
+    /// their requests through it.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(stream) = &self.stream {
+            if stream.is_unknown() {
+                return Err(format!(
+                    "`stream` names the unrecognized stream `{stream}`, which no request \
+                     may carry: `LogStreamName::Unknown` exists only to decode a newer \
+                     server's response"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The `?…` query pairs for this request, in wire order, omitting every
     /// field left at its default.
     pub fn query_pairs(&self) -> Vec<(&'static str, String)> {
@@ -377,6 +404,23 @@ mod tests {
                 "{field} must be present"
             );
         }
+    }
+
+    /// `Unknown` decodes a newer server's entries; it is not something to
+    /// filter *on*, and the refusal names the value.
+    #[test]
+    fn validate_rejects_an_unknown_stream_filter() {
+        let params = LogsParams::new().with_stream(LogStreamName::Unknown("audit".to_string()));
+        let err = params.validate().expect_err("an unknown stream");
+        assert!(
+            err.starts_with("`stream` names the unrecognized stream `audit`"),
+            "{err}"
+        );
+        assert!(LogsParams::new()
+            .with_stream(LogStreamName::Stderr)
+            .validate()
+            .is_ok());
+        assert!(LogsParams::new().validate().is_ok());
     }
 
     #[test]

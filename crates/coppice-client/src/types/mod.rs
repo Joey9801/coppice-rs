@@ -17,7 +17,10 @@
 //! - **Requests are exact.** Every write body is checked field-for-field by
 //!   the server — a misspelled key is an error there rather than a silently
 //!   defaulted field — so request types are constructed through a
-//!   constructor or builder rather than a struct literal.
+//!   constructor or builder rather than a struct literal. The tolerance
+//!   above does not cross over: an enum's `Unknown` value is a
+//!   *response-side* catch-all, and a request carrying one is refused by
+//!   this crate's own validation before it is sent (see below).
 //! - **Absent is `null`, not missing.** A read field with no value is an
 //!   explicit `null`; an empty list is `[]`. The one documented exception is
 //!   [`GetAuthConfigResponse`]'s OIDC fields, which are omitted in open mode
@@ -33,6 +36,19 @@
 //! keeps the unrecognized value verbatim — through `Deserialize`, `Serialize`,
 //! `FromStr` and `Display` alike — so nothing is lost, nothing fails, and a
 //! caller that cares can see exactly what it did not recognize.
+//!
+//! Three of those enums are reused in requests — [`JobPhase`] in a
+//! [`PhaseFilter`], [`BindingRole`] on a [`Binding`], [`LogStreamName`] as
+//! the `stream=` log filter — and in that direction `Unknown` is refused:
+//! [`JobFilter::validate`], [`Binding::validate`] and
+//! [`LogsParams::validate`] each reject it by name before anything is sent.
+//! The server's vocabularies are closed *for it*, so such a request could
+//! only ever come back as an opaque `400`. A caller who genuinely needs to
+//! send a value a newer server grew reaches it untyped, through
+//! [`Client::get_value`](crate::Client::get_value),
+//! [`Client::post_value`](crate::Client::post_value) or
+//! [`Client::put_value`](crate::Client::put_value) — the same escape hatch
+//! that covers any other shape these types cannot express.
 //!
 //! `Unknown` holds the string rather than being a bare unit variant for one
 //! concrete reason: [`JobPhase`] is a **map key** in `by_state`, and a unit

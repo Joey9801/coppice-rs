@@ -196,6 +196,11 @@ pub enum BindingRole {
     /// A value this client does not know — a newer server's vocabulary, kept
     /// verbatim rather than rejected. See [`super`] for why this carries the
     /// spelling rather than being a bare unit variant.
+    ///
+    /// Decoding only. A [`Binding`] granting this is refused by
+    /// [`Binding::validate`] before the PUT is sent; a caller who genuinely
+    /// means a role a newer server grew sends the document through
+    /// [`Client::put_value`](crate::Client::put_value).
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -261,15 +266,31 @@ impl Binding {
     }
 
     /// Enforce the exactly-one-subject rule serde cannot express, with the
-    /// server's own error texts.
+    /// server's own error texts — plus one refusal that is this crate's
+    /// alone: a binding may not grant an `Unknown` role.
     pub fn validate(&self) -> Result<(), String> {
         match (&self.group, &self.principal) {
             (Some(_), Some(_)) => {
-                Err("a binding names exactly one of `group`/`principal`, not both".to_string())
+                return Err(
+                    "a binding names exactly one of `group`/`principal`, not both".to_string(),
+                )
             }
-            (None, None) => Err("a binding names exactly one of `group`/`principal`".to_string()),
-            _ => Ok(()),
+            (None, None) => {
+                return Err("a binding names exactly one of `group`/`principal`".to_string())
+            }
+            _ => {}
         }
+        // The server's role set is closed, so a PUT naming a role it does not
+        // know is refused at decode there. Refusing it here names the value.
+        if self.role.is_unknown() {
+            return Err(format!(
+                "a binding cannot grant the unrecognized role `{}`, which no request \
+                 may carry: `BindingRole::Unknown` exists only to decode a newer \
+                 server's response",
+                self.role
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -339,6 +360,29 @@ pub struct UpdateAuthorizationResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Unknown` is the response-side catch-all: the server's role set is
+    /// closed, so a PUT granting one is refused here rather than spending a
+    /// round trip on an opaque 400 — and the refusal names the role.
+    #[test]
+    fn a_binding_cannot_grant_an_unknown_role() {
+        let binding = Binding::for_group("sre", BindingRole::Unknown("auditor".to_string()));
+        let err = binding.validate().expect_err("an unknown role");
+        assert!(
+            err.starts_with("a binding cannot grant the unrecognized role `auditor`"),
+            "{err}"
+        );
+        // The whole-request check prefixes it the way the server's does.
+        let request = UpdateAuthorizationRequest::new([binding]);
+        assert_eq!(
+            request.validate().expect_err("an unknown role"),
+            format!("binding 0: {err}")
+        );
+        // A known role still passes.
+        assert!(Binding::for_group("sre", BindingRole::Operator)
+            .validate()
+            .is_ok());
+    }
 
     #[test]
     fn open_mode_omits_the_oidc_fields_rather_than_nulling_them() {

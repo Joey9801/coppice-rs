@@ -393,6 +393,18 @@ impl JobFilter {
                 if p.r#in.is_empty() {
                     return Err("`phase.in` must be non-empty".to_string());
                 }
+                // Client-only, unlike every other rule here: `Unknown` is a
+                // decoding catch-all, and the server's own phase vocabulary
+                // is closed, so a filter naming one would be refused there
+                // at decode with nothing useful to say. Naming the value
+                // before the round trip is the whole improvement.
+                if let Some(phase) = p.r#in.iter().find(|phase| phase.is_unknown()) {
+                    return Err(format!(
+                        "`phase.in` names the unrecognized phase `{phase}`, which no \
+                         request may carry: `JobPhase::Unknown` exists only to decode \
+                         a newer server's response"
+                    ));
+                }
             }
             JobFilter::Id(i) => {
                 if i.r#in.is_empty() {
@@ -612,6 +624,22 @@ mod tests {
             JobFilter::Id(IdFilter { r#in: vec![] }).validate(),
             Err("`id.in` must be non-empty".to_string())
         );
+    }
+
+    /// `Unknown` is the response-side catch-all; a filter asking for one
+    /// could only ever come back as an opaque 400, so it is refused here,
+    /// naming the value.
+    #[test]
+    fn validate_rejects_an_unknown_phase() {
+        let filter =
+            JobFilter::phase_in([JobPhase::Queued, JobPhase::Unknown("quantum".to_string())]);
+        let err = filter.validate().expect_err("an unknown phase");
+        assert!(
+            err.starts_with("`phase.in` names the unrecognized phase `quantum`"),
+            "{err}"
+        );
+        // A tree of known phases is untouched.
+        assert!(JobFilter::phase_in([JobPhase::Queued]).validate().is_ok());
     }
 
     #[test]

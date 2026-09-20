@@ -699,11 +699,19 @@ impl Client {
     }
 
     /// `GET /api/v1/jobs/{job}/logs` — one page of a job's captured output.
+    ///
+    /// The parameters are checked with
+    /// [`LogsParams::validate`](crate::LogsParams::validate) before anything
+    /// is sent — which is also what covers
+    /// [`job_logs_paged`](Self::job_logs_paged) and
+    /// [`follow_job_logs`](Self::follow_job_logs), since both reach the wire
+    /// through here.
     pub async fn job_logs(
         &self,
         job: JobId,
         params: &LogsParams,
     ) -> Result<Versioned<GetJobLogsResponse>> {
+        params.validate().map_err(Error::InvalidRequest)?;
         self.get(&paths::job_logs(job), &params.query_pairs()).await
     }
 
@@ -987,6 +995,40 @@ mod tests {
             .next_page()
             .await
             .expect_err("empty `all`");
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+    }
+
+    /// The `stream=` filter is refused the same way, and the pager and the
+    /// follower inherit it by going through `job_logs`. The base here is
+    /// unroutable, so reaching the network would be a transport error
+    /// instead.
+    #[tokio::test]
+    async fn job_logs_refuses_an_unknown_stream_locally() {
+        let client = Client::new("http://127.0.0.1:1").unwrap();
+        let job = JobId::new();
+        let params =
+            LogsParams::new().with_stream(crate::LogStreamName::Unknown("audit".to_string()));
+
+        let err = client
+            .job_logs(job, &params)
+            .await
+            .expect_err("an unknown stream");
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+
+        let err = client
+            .job_logs_paged(job, params.clone())
+            .next_page()
+            .await
+            .expect_err("an unknown stream");
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+
+        let options =
+            FollowOptions::new().with_stream(crate::LogStreamName::Unknown("audit".to_string()));
+        let err = client
+            .follow_job_logs(job, options)
+            .next_page()
+            .await
+            .expect_err("an unknown stream");
         assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
     }
 
