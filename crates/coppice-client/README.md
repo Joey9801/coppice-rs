@@ -65,10 +65,23 @@ async fn main() -> coppice_client::Result<()> {
 ## Authentication
 
 There is no login flow: a cluster that requires authentication expects an
-out-of-band bearer token, passed to `ClientBuilder::token`. With no token, no
-`Authorization` header is sent at all, which is what a cluster running in open
-mode (a local dev cluster, say) needs. `Client::auth_config` reports which
-posture a deployment is in without needing a credential.
+out-of-band bearer token. With no credential at all, no `Authorization` header
+is sent, which is what a cluster running in open mode (a local dev cluster,
+say) needs. `Client::auth_config` reports which posture a deployment is in
+without needing a credential.
+
+There are two ways to supply one:
+
+- **`ClientBuilder::token`** — one fixed token. The convenience for a CLI or
+  any other short-lived tool, whose process does not outlive its credential.
+- **`ClientBuilder::token_provider`** — a `TokenProvider` the client asks
+  once per request, immediately before sending. This is what a long-running
+  process needs, because its credential expires under it. The client caches
+  nothing, so refresh, caching and single-flight locking belong to the
+  provider.
+
+Either way the token is held as a `BearerToken`, which redacts itself in
+`Debug` output, and the header it builds is marked sensitive.
 
 ## Feature flags
 

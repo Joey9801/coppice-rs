@@ -105,6 +105,16 @@ pub enum Error {
     /// checks before it was sent.
     #[error("{0}")]
     InvalidRequest(String),
+
+    /// A [`TokenProvider`](crate::TokenProvider) could not supply a token, so
+    /// the request was never sent. The provider's own error is the source.
+    ///
+    /// Not retryable by [`is_retryable`](Self::is_retryable): whether asking
+    /// again could work is a fact about the provider, which only the caller
+    /// knows. It carries no status and no wire code — nothing reached a
+    /// server.
+    #[error("obtaining a credential")]
+    Credential(#[source] crate::credential::BoxError),
 }
 
 /// `; retry against the leader at …`, the suffix the CLI has always printed.
