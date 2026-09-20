@@ -177,9 +177,13 @@ impl ReadOptions {
 /// A read's answer, together with where in the log the replica that served it
 /// had got to.
 ///
-/// Every read carries the two indexes, so every read returns one of these
-/// rather than a bare value; `Deref` and [`into_inner`](Self::into_inner) mean
-/// you can mostly ignore that. The indexes are what make staleness legible:
+/// Every `/api/v1` read carries the two indexes, so every typed read returns
+/// one of these rather than a bare value — including each page a
+/// [`pagination`](crate::pagination) pager or the [`LogFollower`] hands back.
+/// (`/healthz` is the exception, and the only one: it is outside `/api/v1` and
+/// outside consensus, so there is no index to report.) `Deref` and
+/// [`into_inner`](Self::into_inner) mean you can mostly ignore the wrapper.
+/// The indexes are what make staleness legible:
 /// `applied_index` is how far the serving replica has applied, and
 /// `committed_index` how far the cluster has committed, so the difference is
 /// how far behind this answer is.
@@ -552,9 +556,8 @@ impl Client {
     /// `GET /api/v1/auth/config` — the deployment's public authentication
     /// posture. The one endpoint reachable without a credential, because a
     /// client cannot obtain one without knowing this.
-    pub async fn auth_config(&self) -> Result<GetAuthConfigResponse> {
-        let config: Versioned<GetAuthConfigResponse> = self.get(paths::AUTH_CONFIG, &[]).await?;
-        Ok(config.into_inner())
+    pub async fn auth_config(&self) -> Result<Versioned<GetAuthConfigResponse>> {
+        self.get(paths::AUTH_CONFIG, &[]).await
     }
 
     /// `GET /api/v1/authorization` — the replicated role bindings and the

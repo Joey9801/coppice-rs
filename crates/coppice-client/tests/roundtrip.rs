@@ -1282,6 +1282,40 @@ async fn a_short_page_with_a_non_null_cursor_still_continues() {
     assert_eq!(captured.len(), 2);
 }
 
+/// Paging is exactly when staleness matters — a long walk can straddle a
+/// replica falling behind — so each page keeps the read indexes its own
+/// response carried. If this fails, the pager is stripping them again and a
+/// caller walking a list has no way to notice.
+#[tokio::test]
+async fn a_pager_page_keeps_the_read_indexes_of_the_response_that_served_it() {
+    let router = Router::new().route(
+        "/api/v1/jobs",
+        get(|| async {
+            json_with_headers(
+                list_jobs_response_json(vec![], None),
+                &[
+                    (coppice_client::APPLIED_INDEX_HEADER, "41"),
+                    (coppice_client::COMMITTED_INDEX_HEADER, "44"),
+                ],
+            )
+        }),
+    );
+    let base = spawn(router).await;
+    let client = Client::new(&base).unwrap();
+
+    let page = client
+        .list_jobs_paged(ListJobsParams::new())
+        .next_page()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.applied_index, Some(41));
+    assert_eq!(page.committed_index, Some(44));
+    assert_eq!(page.lag(), Some(3));
+    // …and the body is still reached straight through the `Deref`.
+    assert!(page.jobs.is_empty());
+}
+
 /// If this fails, a pager sends a second request even when the first page
 /// already said the scan was complete.
 #[tokio::test]

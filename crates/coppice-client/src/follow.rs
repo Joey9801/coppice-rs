@@ -11,6 +11,11 @@
 //! `resume_cursor` and polls from there. A page with neither token (a job with
 //! no attempt yet) leaves the position alone; the follower never rewinds.
 //!
+//! Each page arrives as the [`Versioned`](crate::Versioned) its underlying
+//! read returned, so a follow that runs for hours can still see which replica
+//! served it and how far behind that replica was. `Versioned` derefs to the
+//! body, so the loop below reads as it always did.
+//!
 //! **The job's state, not the page, says when to stop.** A page's `live` flag
 //! is best-effort, so the follower asks the job whether it is finished, and
 //! when it is, drains once more before stopping — that last drain is what
@@ -38,7 +43,7 @@
 
 use std::time::Duration;
 
-use crate::client::Client;
+use crate::client::{Client, Versioned};
 use crate::error::Result;
 use crate::id::{AttemptId, JobId};
 use crate::pagination::LogCursor;
@@ -161,7 +166,7 @@ impl LogFollower {
 
     /// The next page, or `None` once the job is finished and its output fully
     /// drained.
-    pub async fn next_page(&mut self) -> Result<Option<GetJobLogsResponse>> {
+    pub async fn next_page(&mut self) -> Result<Option<Versioned<GetJobLogsResponse>>> {
         if self.finished {
             return Ok(None);
         }
@@ -170,11 +175,7 @@ impl LogFollower {
             self.waiting = false;
         }
 
-        let page = self
-            .client
-            .job_logs(self.job, &self.params())
-            .await?
-            .into_inner();
+        let page = self.client.job_logs(self.job, &self.params()).await?;
         merge_sources(&mut self.sources, &page.sources);
 
         // Never rewind: a page carrying neither token keeps the position we
