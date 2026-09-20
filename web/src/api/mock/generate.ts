@@ -229,12 +229,32 @@ const ENV_VARS: ReadonlyArray<readonly [string, (rng: Rng) => string]> = [
   ['TOKENIZERS_PARALLELISM', (rng) => rng.pick(['true', 'false'])],
   ['DATA_ROOT', (rng) => `s3://acme-data/v${rng.int(1, 12)}`],
   ['RUN_GROUP', (rng) => `sweep-${rng.int(1, 60)}`],
+  // Rendering edge cases: a long unbroken value, an empty one, and one whose
+  // spaces and newlines must survive display.
+  [
+    'LD_LIBRARY_PATH',
+    () =>
+      '/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/opt/hpcx/ompi/lib:/opt/hpcx/ucx/lib:/opt/amazon/efa/lib',
+  ],
+  ['NCCL_DEBUG_SUBSYS', () => ''],
+  [
+    'TRAIN_OVERRIDES',
+    (rng) =>
+      `optimizer:\n  name: adamw\n  lr: ${rng.pick(['1e-4', '3e-4', '6e-5'])}\nseed: ${rng.int(1, 9999)}`,
+  ],
 ]
 
-/** Environment overlay: a handful of vars, occasionally a large block. */
-export function mintEnv(rng: Rng): Record<string, string> {
+/**
+ * Environment overlay: often none (the spec card's empty state), usually a
+ * handful of vars, occasionally the whole block.
+ */
+export function mintEnv(parent: Rng): Record<string, string> {
+  // Its own stream, seeded by one draw: editing the pool or the weights
+  // below never shifts the rest of the seeded world.
+  const rng = new Rng(parent.int(0, 0x7fffffff))
   const count = rng.weighted([
-    [rng.int(0, 3), 3],
+    [0, 2],
+    [rng.int(1, 3), 3],
     [rng.int(4, 8), 2],
     [ENV_VARS.length, 1],
   ] as const)
