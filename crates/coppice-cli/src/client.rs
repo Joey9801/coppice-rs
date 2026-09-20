@@ -304,13 +304,13 @@ mod tests {
         };
         let client = connection.client().unwrap();
         assert_eq!(client.base_url(), "http://h:7070");
-        assert!(client.has_token());
+        assert!(client.has_credential());
 
         let empty = ApiConnection {
             api: DEFAULT_API_BASE.to_string(),
             token: Some(String::new()),
         };
-        assert!(!empty.client().unwrap().has_token());
+        assert!(!empty.client().unwrap().has_credential());
     }
 
     /// The default base and the default port are two literals that must name

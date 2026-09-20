@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::credential::BearerToken;
+use crate::credential::{BearerToken, Credential, TokenProvider};
 use crate::error::{Error, Result};
 use crate::follow::{FollowOptions, LogFollower};
 use crate::id::{JobId, NodeId, QuotaEntityId};
@@ -289,7 +289,7 @@ pub fn plain_http_builder(base: &str) -> reqwest::ClientBuilder {
 struct Inner {
     base: String,
     http: reqwest::Client,
-    token: Option<BearerToken>,
+    credential: Credential,
 }
 
 /// Builds a [`Client`].
@@ -306,7 +306,7 @@ struct Inner {
 #[derive(Debug, Clone)]
 pub struct ClientBuilder {
     base: String,
-    token: Option<BearerToken>,
+    credential: Credential,
     timeout: Duration,
     http: Option<reqwest::Client>,
 }
@@ -317,7 +317,7 @@ impl ClientBuilder {
     pub fn new(base: impl AsRef<str>) -> ClientBuilder {
         ClientBuilder {
             base: normalize_base_url(base.as_ref()),
-            token: None,
+            credential: Credential::None,
             timeout: DEFAULT_TIMEOUT,
             http: None,
         }
@@ -332,8 +332,17 @@ impl ClientBuilder {
     ///
     /// The token is kept as a [`BearerToken`], so neither this builder's
     /// `Debug` nor the built client's can print it.
+    ///
+    /// This is the convenience for a CLI or any other short-lived tool, whose
+    /// process does not outlive its credential. One that does — a service,
+    /// a controller, anything long-running — wants
+    /// [`token_provider`](Self::token_provider) instead. The two are one
+    /// setting: the last call of either wins.
     pub fn token(mut self, token: impl Into<String>) -> ClientBuilder {
-        self.token = BearerToken::new(token);
+        self.credential = match BearerToken::new(token) {
+            Some(token) => Credential::Static(token),
+            None => Credential::None,
+        };
         self
     }
 
@@ -344,6 +353,23 @@ impl ClientBuilder {
             Some(token) => self.token(token),
             None => self,
         }
+    }
+
+    /// Ask `provider` for a token immediately before every request, instead
+    /// of sending one fixed token.
+    ///
+    /// This is what a process that outlives its credential needs: the client
+    /// calls the provider once per request and caches nothing, so refresh and
+    /// rotation happen wherever the provider decides they should. See
+    /// [`TokenProvider`] for what that obliges an implementation to do — in
+    /// particular, caching and single-flight locking are its business, not
+    /// this client's.
+    ///
+    /// A provider and a static [`token`](Self::token) are one setting, so the
+    /// last call of either wins.
+    pub fn token_provider(mut self, provider: impl TokenProvider) -> ClientBuilder {
+        self.credential = Credential::Provider(Arc::new(provider));
+        self
     }
 
     /// Override the [`DEFAULT_TIMEOUT`] for one request.
@@ -394,7 +420,7 @@ impl ClientBuilder {
             inner: Arc::new(Inner {
                 base: self.base,
                 http,
-                token: self.token,
+                credential: self.credential,
             }),
             read: ReadOptions::new(),
         })
@@ -432,9 +458,14 @@ impl Client {
         &self.inner.base
     }
 
-    /// Whether a bearer token is attached.
-    pub fn has_token(&self) -> bool {
-        self.inner.token.is_some()
+    /// Whether this client sends a credential at all.
+    ///
+    /// True for a static token and true for a [`TokenProvider`], even before
+    /// the provider has ever been asked: whether *that* answers with a token
+    /// is a per-request question, and asking it here would mean a network
+    /// round trip behind a predicate that reads free.
+    pub fn has_credential(&self) -> bool {
+        self.inner.credential.is_some()
     }
 
     /// The absolute URL for an `/api/v1`-relative path (see [`paths`]).
@@ -502,8 +533,12 @@ impl Client {
     ///
     /// Outside `/api/v1` and outside authentication: reaching it at all is the
     /// answer. It says nothing about readiness, phase, or cluster health.
+    ///
+    /// No credential is sent, and a [`TokenProvider`] is not consulted: a
+    /// liveness probe that failed because an identity provider was down would
+    /// be reporting on the wrong process.
     pub async fn healthz(&self) -> Result<HealthzResponse> {
-        let request = self.authed(self.inner.http.get(self.root_url(paths::HEALTHZ)))?;
+        let request = self.inner.http.get(self.root_url(paths::HEALTHZ));
         let response = request.send().await.map_err(Error::Transport)?;
         Ok(decode(response).await?.0)
     }
@@ -766,14 +801,19 @@ impl Client {
     /// `Authorization` header is sent at all — the header's mere presence is
     /// what an open-mode cluster must never see.
     ///
+    /// Async because the token may come from a [`TokenProvider`], which is
+    /// asked here — once per request, immediately before it is sent, on every
+    /// `/api/v1` path. (`/healthz` is outside authentication and never comes
+    /// through here.)
+    ///
     /// The header value is built here rather than through
     /// `RequestBuilder::bearer_auth` for one reason: so it can be marked
     /// sensitive, which is what makes `reqwest`/`hyper` redact it in their own
     /// `Debug` renderings of the request. The same construction is why this is
     /// fallible — a token carrying a byte no header value may hold is a
     /// refusal naming the problem, not a panic inside the HTTP stack.
-    fn authed(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-        let Some(token) = &self.inner.token else {
+    async fn authed(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        let Some(token) = self.inner.credential.resolve().await? else {
             return Ok(request);
         };
         let mut value = reqwest::header::HeaderValue::from_str(&format!(
@@ -802,7 +842,8 @@ impl Client {
             .query(query)
             .query(&self.read.query_pairs());
         let response = self
-            .authed(request)?
+            .authed(request)
+            .await?
             .send()
             .await
             .map_err(Error::Transport)?;
@@ -825,7 +866,8 @@ impl Client {
             None => request,
         };
         let response = self
-            .authed(request)?
+            .authed(request)
+            .await?
             .send()
             .await
             .map_err(Error::Transport)?;
@@ -845,7 +887,8 @@ impl Client {
     async fn put<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
         let request = self.inner.http.put(self.url(path)).json(body);
         let response = self
-            .authed(request)?
+            .authed(request)
+            .await?
             .send()
             .await
             .map_err(Error::Transport)?;
@@ -1011,17 +1054,63 @@ mod tests {
             .token("   ")
             .build()
             .unwrap()
-            .has_token());
+            .has_credential());
         assert!(!Client::builder("http://h:7070")
             .token_opt(None::<String>)
             .build()
             .unwrap()
-            .has_token());
+            .has_credential());
         assert!(Client::builder("http://h:7070")
             .token("t")
             .build()
             .unwrap()
-            .has_token());
+            .has_credential());
+    }
+
+    /// A provider and a static token are one setting, so whichever was set
+    /// last is the posture the client ends up with.
+    #[test]
+    fn a_provider_and_a_static_token_replace_one_another() {
+        struct Never;
+        impl crate::TokenProvider for Never {
+            fn token(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = std::result::Result<Option<BearerToken>, crate::BoxError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(None) })
+            }
+        }
+
+        let provider_last = Client::builder("http://h:7070")
+            .token("t")
+            .token_provider(Never)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            provider_last.inner.credential,
+            Credential::Provider(_)
+        ));
+
+        let token_last = Client::builder("http://h:7070")
+            .token_provider(Never)
+            .token("t")
+            .build()
+            .unwrap();
+        assert!(matches!(token_last.inner.credential, Credential::Static(_)));
+
+        // An empty token clears a provider too: it is the same setting.
+        let cleared = Client::builder("http://h:7070")
+            .token_provider(Never)
+            .token("  ")
+            .build()
+            .unwrap();
+        assert!(!cleared.has_credential());
     }
 
     /// `Client` and `ClientBuilder` are both `Debug`, and both get printed —
@@ -1042,14 +1131,15 @@ mod tests {
     /// A token carrying a byte no header value may hold is a typed refusal
     /// naming the problem — not a panic inside the HTTP stack — and the
     /// message does not quote the token back.
-    #[test]
-    fn a_token_that_cannot_be_a_header_value_is_refused() {
+    #[tokio::test]
+    async fn a_token_that_cannot_be_a_header_value_is_refused() {
         let client = Client::builder("http://h:7070")
             .token("a\nb")
             .build()
             .unwrap();
         let err = client
             .authed(client.inner.http.get(client.url("/session")))
+            .await
             .expect_err("a control character cannot ride in a header");
         assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
         assert!(!err.to_string().contains("a\nb"));

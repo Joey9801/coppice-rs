@@ -10,6 +10,8 @@
 //! surface it.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,10 +23,11 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 
 use coppice_client::{
-    paths, AbortJobRequest, AttemptId, Client, Consistency, Error, ErrorCode, FollowOptions,
-    JobFilter, JobId, JobMetadata, JobPhase, JobStateKind, ListJobsParams, LogOrder, LogStreamName,
-    LogsParams, NodeId, QuotaEntityId, ReadOptions, ReplaceJobMetadataRequest, Resources,
-    SubmitJobRequest, Timestamp, UpdateJobMetadataRequest, UsageParams,
+    paths, AbortJobRequest, AttemptId, BearerToken, BoxError, Client, Consistency, Error,
+    ErrorCode, FollowOptions, JobFilter, JobId, JobMetadata, JobPhase, JobStateKind,
+    ListJobsParams, LogOrder, LogStreamName, LogsParams, NodeId, QuotaEntityId, ReadOptions,
+    ReplaceJobMetadataRequest, Resources, SubmitJobRequest, Timestamp, TokenProvider,
+    UpdateJobMetadataRequest, UsageParams,
 };
 
 // ---------------------------------------------------------------------------
@@ -339,6 +342,37 @@ fn job_usage_response_json(next_cursor: Option<&str>) -> serde_json::Value {
 // Auth header
 // ---------------------------------------------------------------------------
 
+/// `/healthz` is outside authentication: it carries no credential, and a
+/// provider that cannot supply one must not turn a live coordinator into a
+/// failed probe.
+#[tokio::test]
+async fn healthz_sends_no_credential_and_never_asks_the_provider() {
+    let store = capture_store();
+    let router = with_capture(
+        Router::new().route("/healthz", get(|| async { Json(healthz_json()) })),
+        store.clone(),
+    );
+    let base = spawn(router).await;
+
+    let with_token = Client::builder(&base).token("s3cr3t").build().unwrap();
+    with_token.healthz().await.unwrap();
+
+    let canned = Canned(Arc::new(Mutex::new(Err(
+        "the token endpoint is down".to_string()
+    ))));
+    let failing = Client::builder(&base)
+        .token_provider(canned)
+        .build()
+        .unwrap();
+    failing.healthz().await.unwrap();
+
+    let captured = store.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for request in captured.iter() {
+        assert!(request.headers.get("authorization").is_none());
+    }
+}
+
 /// If this fails, a token stopped riding on every request — every call to a
 /// secured cluster would 401.
 #[tokio::test]
@@ -390,6 +424,98 @@ async fn an_empty_or_whitespace_token_behaves_like_no_token() {
 
     let captured = store.lock().unwrap();
     assert!(captured[0].headers.get("authorization").is_none());
+}
+
+/// A provider answering with whatever its slot currently holds — the test
+/// stand-in for a credential that rotates under a long-running process.
+struct Canned(Arc<Mutex<Result<Option<BearerToken>, String>>>);
+
+impl TokenProvider for Canned {
+    fn token(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<BearerToken>, BoxError>> + Send + '_>> {
+        Box::pin(async move {
+            self.0
+                .lock()
+                .unwrap()
+                .clone()
+                .map_err(|e| -> BoxError { e.into() })
+        })
+    }
+}
+
+/// The whole point of a provider: the client asks it again for every request,
+/// so a credential that rotates mid-process reaches the wire without the
+/// client being rebuilt. If this fails, the client is caching something it
+/// promised not to.
+#[tokio::test]
+async fn a_provider_is_asked_again_for_every_request() {
+    let store = capture_store();
+    let router = with_capture(
+        Router::new().route("/api/v1/session", get(|| async { Json(session_json()) })),
+        store.clone(),
+    );
+    let base = spawn(router).await;
+
+    let slot = Arc::new(Mutex::new(Ok(BearerToken::new("first"))));
+    let client = Client::builder(&base)
+        .token_provider(Canned(Arc::clone(&slot)))
+        .build()
+        .unwrap();
+    assert!(client.has_credential());
+
+    client.session().await.unwrap();
+    *slot.lock().unwrap() = Ok(BearerToken::new("second"));
+    client.session().await.unwrap();
+    // `Ok(None)` is the no-credential posture, decided per request.
+    *slot.lock().unwrap() = Ok(None);
+    client.session().await.unwrap();
+
+    let captured = store.lock().unwrap();
+    let auth = |i: usize| {
+        captured[i]
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    assert_eq!(auth(0).as_deref(), Some("Bearer first"));
+    assert_eq!(auth(1).as_deref(), Some("Bearer second"));
+    assert_eq!(auth(2), None);
+}
+
+/// A provider that cannot supply a token fails the call before a request
+/// exists — a coordinator must never see an unauthenticated attempt the
+/// caller believed was authenticated.
+#[tokio::test]
+async fn a_provider_failure_is_a_credential_error_and_sends_nothing() {
+    let store = capture_store();
+    let router = with_capture(
+        Router::new().route("/api/v1/session", get(|| async { Json(session_json()) })),
+        store.clone(),
+    );
+    let base = spawn(router).await;
+
+    let canned = Canned(Arc::new(Mutex::new(Err(
+        "the token endpoint is down".to_string()
+    ))));
+    let client = Client::builder(&base)
+        .token_provider(canned)
+        .build()
+        .unwrap();
+
+    let err = client.session().await.expect_err("the provider failed");
+    assert!(matches!(err, Error::Credential(_)), "{err:?}");
+    assert!(!err.is_retryable());
+    assert_eq!(err.status(), None);
+    assert!(err.code().is_none());
+    assert_eq!(
+        std::error::Error::source(&err)
+            .expect("the provider's own error is the source")
+            .to_string(),
+        "the token endpoint is down"
+    );
+
+    assert!(store.lock().unwrap().is_empty(), "nothing was sent");
 }
 
 // ---------------------------------------------------------------------------

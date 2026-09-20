@@ -38,6 +38,16 @@
 //! a log line. The `Authorization` header is marked sensitive as well, which is
 //! what keeps it out of `reqwest`'s own renderings of a request.
 //!
+//! A fixed token is the convenience for a CLI or any other short-lived tool,
+//! whose process does not outlive its credential. A long-running one does, so
+//! it hands [`ClientBuilder::token_provider`] a [`TokenProvider`] instead: the
+//! client asks it for a token once per request, immediately before sending,
+//! and caches nothing — refresh, caching and single-flight locking are the
+//! provider's business, because only it knows what a token costs and how long
+//! it lasts. A provider answering `Ok(None)` sends no header at all; one
+//! answering `Err` fails the call with [`Error::Credential`] before anything
+//! reaches the wire.
+//!
 //! The base's scheme also decides how the default `reqwest::Client` is built:
 //! a base that is not `https://` skips loading the platform's native root
 //! store even with the `rustls-tls-native-roots` feature on, because
@@ -192,7 +202,7 @@ pub use client::{
     APPLIED_INDEX_HEADER, COMMITTED_INDEX_HEADER, DEFAULT_BASE_URL, DEFAULT_PORT, DEFAULT_TIMEOUT,
     LEADER_HEADER,
 };
-pub use credential::BearerToken;
+pub use credential::{BearerToken, BoxError, TokenProvider};
 pub use env::{
     EnvError, JobEnv, MAX_ENV_NAME_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, MAX_ENV_VARS,
 };
