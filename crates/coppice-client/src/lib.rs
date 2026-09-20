@@ -24,6 +24,14 @@
 //! [`Client::builder`] is where the token, the timeout and a caller-supplied
 //! `reqwest::Client` go.
 //!
+//! Requests are rate-limited by default — [`DEFAULT_RATE_LIMIT_RPS`] a
+//! second, shared across every clone of a client so concurrent pagers and
+//! followers draw on one allowance — because a client that polls as fast as
+//! its pagers resume is the one caller a coordinator cannot argue with.
+//! [`ClientBuilder::rate_limit`] replaces the quota, and
+//! [`ClientBuilder::no_rate_limit`] turns the limiter off for a caller that
+//! already paces itself.
+//!
 //! Two details of the bearer token the README's sketch leaves out. An empty or
 //! whitespace-only token — an environment variable that is set but empty —
 //! counts as no token at all, and with no token **no `Authorization` header is
@@ -207,8 +215,8 @@ pub mod types;
 
 pub use client::{
     plain_http_builder, Client, ClientBuilder, Consistency, ReadOptions, Versioned,
-    APPLIED_INDEX_HEADER, COMMITTED_INDEX_HEADER, DEFAULT_BASE_URL, DEFAULT_PORT, DEFAULT_TIMEOUT,
-    LEADER_HEADER,
+    APPLIED_INDEX_HEADER, COMMITTED_INDEX_HEADER, DEFAULT_BASE_URL, DEFAULT_PORT,
+    DEFAULT_RATE_LIMIT_RPS, DEFAULT_TIMEOUT, LEADER_HEADER,
 };
 pub use credential::{BearerToken, BoxError, TokenProvider};
 pub use env::{
@@ -216,6 +224,7 @@ pub use env::{
 };
 pub use error::{Error, ErrorCode, Result};
 pub use follow::{FollowOptions, LogFollower, DEFAULT_POLL_INTERVAL};
+pub use governor::Quota;
 pub use id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, ParseIdError, QuotaEntityId};
 pub use metadata::{
     validate_key, JobMetadata, MetadataError, MAX_KEYS, MAX_KEY_BYTES, MAX_VALUE_BYTES,
