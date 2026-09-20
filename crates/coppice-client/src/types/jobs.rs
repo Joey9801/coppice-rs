@@ -182,8 +182,11 @@ pub struct QueuePositionExplainer {
     /// link's penalty is `>= 1`, so one infinite ancestor carries through.
     #[serde(deserialize_with = "null_as_infinity")]
     pub penalty_product: f64,
-    /// How long the job has been queued, in whole seconds.
-    pub age_seconds: i64,
+    /// How long the job has been queued. The server measures it against the
+    /// wall clock at read time and clamps at zero, so there is no
+    /// ran-backwards case for a caller to answer for.
+    #[serde(rename = "age_seconds", with = "crate::time::seconds")]
+    pub age: Duration,
 }
 
 /// Per-dimension split of the base cost rate (µCU/second), summing to
@@ -912,6 +915,23 @@ mod tests {
         format!("quota-00000000-0000-0000-0000-{n:012}")
             .parse()
             .unwrap()
+    }
+
+    /// The queue age is a `Duration` here and an `age_seconds` number on the
+    /// wire, like every other `_seconds` key in this crate.
+    #[test]
+    fn a_queued_explainers_age_is_whole_seconds_on_the_wire() {
+        let explainer = QueuePositionExplainer {
+            multiplier: 1.0,
+            penalty_chain: Vec::new(),
+            penalty_product: 1.0,
+            age: Duration::from_secs(30),
+        };
+        let json = serde_json::to_value(&explainer).unwrap();
+        assert_eq!(json["age_seconds"], serde_json::json!(30));
+        assert!(json.get("age").is_none());
+        let back: QueuePositionExplainer = serde_json::from_value(json).unwrap();
+        assert_eq!(back.age, Duration::from_secs(30));
     }
 
     #[test]
