@@ -184,6 +184,13 @@ pub enum JobPhase {
     /// `by_state`: carrying the spelling here (rather than a bare unit
     /// variant) is what keeps two future phases from folding into one entry
     /// and losing a count. See [`super`] for the general rationale.
+    ///
+    /// Decoding only. `JobPhase` also travels *out*, in a
+    /// [`PhaseFilter`](super::PhaseFilter), and a filter naming this is
+    /// refused by [`JobFilter::validate`](super::JobFilter::validate) before
+    /// it is sent. A caller who genuinely means a phase a newer server grew
+    /// builds the filter JSON by hand and sends it through
+    /// [`Client::get_value`](crate::Client::get_value).
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
