@@ -10,6 +10,7 @@ use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::Duration;
 use coppice_proto::pb::agent::v1 as pb;
+use coppice_proto::pb::core::v1 as pbcore;
 
 use coppice_core::time::Timestamp;
 
@@ -80,6 +81,16 @@ fn start_job(
     job: JobId,
     max_runtime_us: Option<u64>,
 ) -> pb::agent_command::Body {
+    start_job_with_env(alloc, attempt, job, max_runtime_us, Vec::new())
+}
+
+fn start_job_with_env(
+    alloc: AllocationId,
+    attempt: AttemptId,
+    job: JobId,
+    max_runtime_us: Option<u64>,
+    env: Vec<pbcore::EnvVar>,
+) -> pb::agent_command::Body {
     pb::agent_command::Body::StartJob(pb::StartJob {
         allocation: Some(alloc.into()),
         attempt: Some(attempt.into()),
@@ -89,6 +100,7 @@ fn start_job(
         entrypoint: None,
         limits: None,
         max_runtime_us,
+        env,
     })
 }
 
@@ -268,6 +280,79 @@ async fn start_job_is_idempotent_and_dedups() {
         1,
         "the allocation was journaled exactly once"
     );
+}
+
+fn env_var(name: &str, value: &str) -> pbcore::EnvVar {
+    pbcore::EnvVar {
+        name: name.into(),
+        value: value.into(),
+    }
+}
+
+#[test]
+fn start_env_decodes_regardless_of_wire_order() {
+    let sj = pb::StartJob {
+        env: vec![env_var("B", "2"), env_var("A", "1")],
+        ..Default::default()
+    };
+    let env = super::start_env(&sj).expect("well-formed env");
+    assert_eq!(
+        env,
+        std::collections::BTreeMap::from([
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn start_env_drops_a_duplicate_name() {
+    let sj = pb::StartJob {
+        env: vec![env_var("A", "1"), env_var("A", "2")],
+        ..Default::default()
+    };
+    assert!(super::start_env(&sj).is_none());
+}
+
+#[test]
+fn start_env_drops_an_empty_name() {
+    let sj = pb::StartJob {
+        env: vec![env_var("", "1")],
+        ..Default::default()
+    };
+    assert!(super::start_env(&sj).is_none());
+}
+
+#[tokio::test]
+async fn start_job_with_malformed_env_is_dropped_without_journaling() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+
+    let reports = session
+        .handle_command(command(
+            1,
+            1,
+            2,
+            start_job_with_env(
+                alloc,
+                attempt,
+                job,
+                None,
+                vec![env_var("A", "1"), env_var("A", "2")],
+            ),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        reports.is_empty(),
+        "a malformed StartJob is dropped, not reported"
+    );
+    assert!(
+        !session.state().intents.contains_key(&alloc),
+        "a malformed env must never leave a journaled intent behind"
+    );
+    assert!(!exec.is_running(alloc));
 }
 
 #[tokio::test]

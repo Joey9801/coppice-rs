@@ -712,6 +712,8 @@ pub enum RejectionReason {
     DuplicateAllocation(AllocationId),
     #[error("invalid job metadata: {0}")]
     InvalidJobMetadata(String),
+    #[error("invalid job environment: {0}")]
+    InvalidJobEnv(String),
     #[error("job {0} is terminal")]
     JobTerminal(JobId),
     #[error("job {0} is not queued")]

@@ -255,8 +255,9 @@ an incident belongs to).
 ## Secrets
 
 Secrets should not be stored casually in job definitions. **v1 stores no
-secrets**: job environment comes only from the job spec, which is treated as
-non-secret, and the platform says so. Secret-manager integration
+secrets**: job environment comes only from the job spec's `env` map, which is
+stored in replicated state and readable through the API and UI, so the
+platform treats it as non-secret and says so. Secret-manager integration
 (reference-only injection at container start) is future work; nothing in v1
 may create a place where secret values land in logs, events, snapshots, or UI.
 The only credentials Coppice itself issues are X.509 certificates

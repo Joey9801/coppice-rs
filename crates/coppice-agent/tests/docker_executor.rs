@@ -326,6 +326,7 @@ mod harness {
             image: image.to_string(),
             command: cmd.iter().map(|s| s.to_string()).collect(),
             entrypoint: None,
+            env: Default::default(),
             limits,
             max_runtime: None,
         }
@@ -1077,6 +1078,61 @@ async fn exit_zero() {
 
         // Reap again: no-op on an already-gone allocation.
         exec.reap(alloc).await?;
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[alloc]).await;
+    r.unwrap();
+}
+
+/// The job's `env` overlay reaches the container's process environment.
+///
+/// Only a real daemon can prove this: the create body's `Env` list is
+/// encoded here (unit-tested in `lifecycle.rs`), but whether Docker merges
+/// it over the image's own `ENV` and hands it to PID 1 is the daemon's
+/// behaviour, not ours. The container is its own assertion — `test "$FOO" =
+/// bar` exits 0 only if the variable arrived with the right value — so a
+/// dropped or mangled overlay shows up as exit 1, and an empty one as the
+/// shell's unset-variable comparison failing.
+#[tokio::test]
+async fn env_overlay_reaches_the_container() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    let (exec, _tx) = harness::executor(docker).await;
+    let mut sp = harness::spec(
+        harness::BUSYBOX,
+        &["sh", "-c", "test \"$FOO\" = bar && test \"$EMPTY\" = \"\""],
+        Resources::ZERO,
+    );
+    sp.env = [
+        ("FOO".to_string(), "bar".to_string()),
+        // An empty value is legal and must arrive as an empty string, not
+        // as an unset variable.
+        ("EMPTY".to_string(), String::new()),
+    ]
+    .into_iter()
+    .collect();
+    let alloc = sp.allocation;
+
+    let r: anyhow::Result<()> = async {
+        exec.start(sp).await?;
+        let info = harness::wait_exit(&exec, alloc, 30).await?;
+        ensure!(
+            info.code == 0,
+            "the container did not see its env overlay (exit {})",
+            info.code
+        );
+        ensure!(
+            info.cause == ExitCause::Natural,
+            "expected Natural, got {:?}",
+            info.cause
+        );
+        ensure!(
+            classify_exit(&info, false) == AttemptOutcome::Exited { code: 0 },
+            "a clean exit under an env overlay must classify as Exited {{ code: 0 }}"
+        );
         Ok(())
     }
     .await;

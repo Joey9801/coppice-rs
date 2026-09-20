@@ -816,6 +816,7 @@ mod tests {
                 image: "busybox".to_string(),
                 command: vec!["run".to_string()],
                 entrypoint: None,
+                env: Default::default(),
                 requests: Resources::ZERO,
                 priority: 0,
                 max_runtime: None,

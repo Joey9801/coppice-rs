@@ -32,6 +32,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use coppice_core::attempt;
 use coppice_core::bytes::ByteSize;
+use coppice_core::env::JobEnv;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::metadata::{self, JobMetadata};
 use coppice_core::quota::TrueUp;
@@ -1271,17 +1272,15 @@ pub struct GetQuotaEntityResponse {
 // ---------------------------------------------------------------------------
 
 /// The immutable submitted spec (mirrors `JobSpec` in `types.ts`).
-///
-/// Deviation from the TS shape: no `env` field. The web `JobSpec` carries an
-/// `env` overlay, but `coppice_core::job::Job` has none yet (it lands with the
-/// Docker executor, per the TS comment), so serializing one here would be a
-/// fabricated always-empty map. It is omitted until the domain type grows it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpecView {
     pub image: String,
     pub command: Vec<String>,
     /// Entrypoint override; `null` runs the image's own entrypoint.
     pub entrypoint: Option<Vec<String>>,
+    /// The environment overlay, always present — `{}` when the job set none.
+    /// Fixed at submission; there is no update route (`coppice_core::env`).
+    pub env: JobEnv,
     pub requests: Resources,
     pub priority: i32,
     /// Enforced runtime bound in whole seconds; `null` when unbounded.
@@ -1514,6 +1513,13 @@ pub struct SubmitJobRequest {
     /// present, must be non-empty.
     #[serde(default)]
     pub entrypoint: Option<Vec<String>>,
+    /// Environment overlay for the container (`coppice_core::env`); absent is
+    /// the empty map. Checked against the limits at admission, and again at
+    /// apply; immutable after submission and part of the ADR 0026 submission
+    /// identity. Not a secret channel — replicated and served through the
+    /// API like the rest of the spec.
+    #[serde(default)]
+    pub env: JobEnv,
     /// Resources requested for scheduling and isolation.
     pub requests: Resources,
     /// Resolved through the replicated multiplier table; a priority with no
@@ -2741,6 +2747,28 @@ mod tests {
         assert_eq!(req.max_runtime_seconds, None);
         assert!(req.entrypoint.is_none());
         assert!(req.retry.is_none());
+        assert!(req.env.is_empty());
+    }
+
+    #[test]
+    fn submit_request_carries_an_explicit_env_map() {
+        let req: SubmitJobRequest = serde_json::from_value(serde_json::json!({
+            "job": JobId::new().to_string(),
+            "image": "busybox",
+            "command": ["run"],
+            "requests": { "cpu_millis": 1000, "memory_bytes": 0, "disk_bytes": 0 },
+            "quota_entity": QuotaEntityId::new().to_string(),
+            "env": { "RUST_LOG": "info", "EMPTY": "" },
+        }))
+        .expect("request with env");
+
+        assert_eq!(
+            req.env,
+            JobEnv::from([
+                ("EMPTY".to_string(), String::new()),
+                ("RUST_LOG".to_string(), "info".to_string()),
+            ])
+        );
     }
 
     #[test]

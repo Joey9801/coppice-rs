@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::bytes::ByteSize;
+use coppice_core::env::JobEnv;
 use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
 };
@@ -52,7 +53,19 @@ fn job(n: u128) -> Job {
         abort_requested: None,
         submitted_by: Some("user-42".into()),
         metadata: metadata_fixture(),
+        env: env_fixture(),
     }
+}
+
+/// A representative environment overlay: portable names across the charset,
+/// including the empty value that is a legal one.
+fn env_fixture() -> JobEnv {
+    JobEnv::from([
+        ("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string()),
+        ("RUST_LOG".to_string(), "info".to_string()),
+        ("_PRIVATE".to_string(), "1".to_string()),
+        ("SHARD9".to_string(), String::new()),
+    ])
 }
 
 /// A representative metadata map (ADR 0042): a few string keys across the
@@ -973,6 +986,83 @@ fn duplicate_or_empty_metadata_keys_are_rejected_at_the_boundary() {
         Err(ConvertError::Invalid {
             field: "Job.metadata",
             reason: "metadata key must not be empty",
+        })
+    );
+}
+
+#[test]
+fn job_env_encodes_canonically() {
+    // Ascending name order by construction: two equal maps built in
+    // different insertion orders must encode byte-identically.
+    let forwards = JobEnv::from([
+        ("A".to_string(), "1".to_string()),
+        ("B".to_string(), String::new()),
+        ("C".to_string(), "3".to_string()),
+    ]);
+    let mut backwards = JobEnv::new();
+    for (name, value) in forwards.iter().rev() {
+        backwards.insert(name.clone(), value.clone());
+    }
+    let mut spec = job(1);
+    spec.env = forwards;
+    let mut other = job(1);
+    other.env = backwards;
+    assert_eq!(
+        pb::core::v1::Job::from(&spec).encode_to_vec(),
+        pb::core::v1::Job::from(&other).encode_to_vec()
+    );
+    let encoded = pb::core::v1::Job::from(&spec);
+    let names: Vec<&str> = encoded.env.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["A", "B", "C"]);
+}
+
+#[test]
+fn empty_job_env_roundtrips() {
+    // Empty and absent are the same bytes for a repeated field, and that is
+    // correct here: an empty overlay is the default, not a missing one.
+    let mut spec = job(1);
+    spec.env = JobEnv::new();
+    let pb_job = pb::core::v1::Job::from(&spec);
+    assert!(pb_job.env.is_empty());
+    assert_eq!(Job::try_from(pb_job).expect("must convert"), spec);
+}
+
+#[test]
+fn env_vars_are_accepted_in_any_order() {
+    let var = |name: &str, value: &str| pb::core::v1::EnvVar {
+        name: name.to_string(),
+        value: value.to_string(),
+    };
+    let mut pb_job = pb::core::v1::Job::from(&job(1));
+    pb_job.env = vec![var("B", "2"), var("A", "1")];
+    let decoded = Job::try_from(pb_job).expect("any order decodes");
+    assert_eq!(
+        decoded.env,
+        JobEnv::from([
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn duplicate_or_empty_env_names_are_rejected_at_the_boundary() {
+    let var = |name: &str| pb::core::v1::EnvVar {
+        name: name.to_string(),
+        value: String::new(),
+    };
+    let mut pb_job = pb::core::v1::Job::from(&job(1));
+    pb_job.env = vec![var("A"), var("A")];
+    assert_eq!(
+        Job::try_from(pb_job.clone()),
+        Err(ConvertError::DuplicateEntry("Job.env"))
+    );
+    pb_job.env = vec![var("")];
+    assert_eq!(
+        Job::try_from(pb_job),
+        Err(ConvertError::Invalid {
+            field: "Job.env",
+            reason: "environment variable name must not be empty",
         })
     );
 }

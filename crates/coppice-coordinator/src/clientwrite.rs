@@ -37,7 +37,9 @@ use coppice_api::{ApiError, RejectionKind};
 use coppice_consensus::{CoordinatorId, NodeHandle};
 use coppice_core::id::{JobId, NodeId};
 use coppice_net::admin::Client;
-use coppice_proto::convert::{metadata_from_pb, metadata_map_to_pb, metadata_to_pb, ConvertError};
+use coppice_proto::convert::{
+    env_from_pb, env_to_pb, metadata_from_pb, metadata_map_to_pb, metadata_to_pb, ConvertError,
+};
 use coppice_proto::pb::raft::v1 as pb;
 use coppice_state::command::JobMetadataUpdate;
 use coppice_state::Actor;
@@ -812,6 +814,7 @@ pub(crate) fn submit_to_pb(
             .retry
             .map(|r| coppice_core::job::RetryPolicy::from(r).into()),
         metadata: Some(metadata_map_to_pb(&req.metadata)),
+        env: env_to_pb(&req.env),
     }
 }
 
@@ -844,12 +847,17 @@ pub(crate) fn submit_from_pb(
         Some(map) => metadata_from_pb(map.entries, "ForwardSubmitJobRequest.metadata")?,
         None => coppice_core::metadata::JobMetadata::new(),
     };
+    // A plain `repeated`, not a wrapper message like `metadata` above — an
+    // empty list is the empty map, with no absent/empty distinction to
+    // preserve.
+    let env = env_from_pb(req.env, "ForwardSubmitJobRequest.env")?;
     Ok((
         SubmitJobRequest {
             job: required(req.job, "ForwardSubmitJobRequest.job")?.try_into()?,
             image: req.image,
             command: req.command,
             entrypoint,
+            env,
             requests: (&requests).into(),
             priority: req.priority,
             max_runtime_seconds: req.max_runtime_seconds,
@@ -1042,6 +1050,9 @@ mod tests {
             metadata: [("name".to_string(), "nightly-build".to_string())]
                 .into_iter()
                 .collect(),
+            env: [("RUST_LOG".to_string(), "info".to_string())]
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -1073,6 +1084,7 @@ mod tests {
         );
         assert_eq!(round_tripped.quota_entity, original.quota_entity);
         assert_eq!(round_tripped.metadata, original.metadata);
+        assert_eq!(round_tripped.env, original.env);
         let retry = round_tripped.retry.expect("retry policy survives");
         assert_eq!(retry.max_retries, 2);
         assert!(retry.retry_user_errors);

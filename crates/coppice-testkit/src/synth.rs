@@ -339,9 +339,11 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             } else {
                 None
             },
-            // Metadata is user-supplied annotation (ADR 0042); the
-            // synthesizer leaves it empty so snapshot fixtures stay stable.
+            // Metadata (ADR 0042) and the environment overlay are both
+            // user-supplied; the synthesizer leaves them empty so snapshot
+            // fixtures stay stable.
             metadata: Default::default(),
+            env: Default::default(),
         };
         // Stamped like the real terminal path: a job aborted before any
         // attempt existed terminates in the abort apply itself, so its

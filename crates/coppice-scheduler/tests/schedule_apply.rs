@@ -274,6 +274,7 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
         abort_requested: None,
         submitted_by: None,
         metadata: Default::default(),
+        env: Default::default(),
     };
     apply_ok(
         &mut sm,

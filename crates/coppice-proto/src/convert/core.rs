@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState};
 use coppice_core::bytes::ByteSize;
+use coppice_core::env::JobEnv;
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::metadata::JobMetadata;
 use coppice_core::node::{HostFacts, Node};
@@ -182,6 +183,38 @@ pub fn metadata_map_to_pb(metadata: &JobMetadata) -> pb::MetadataMap {
     }
 }
 
+// ---- Job environment ----
+
+/// Canonical form by construction: `BTreeMap` iteration is ascending by name.
+pub fn env_to_pb(env: &JobEnv) -> Vec<pb::EnvVar> {
+    env.iter()
+        .map(|(name, value)| pb::EnvVar {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// Decode an environment list under the corpus rule for repeated entry
+/// lists: any order is accepted (the `BTreeMap` re-sorts), duplicate names
+/// are refused, and an empty name — which no validated map can hold — is
+/// refused as invalid.
+pub fn env_from_pb(vars: Vec<pb::EnvVar>, field: &'static str) -> Result<JobEnv, ConvertError> {
+    let mut out = JobEnv::new();
+    for var in vars {
+        if var.name.is_empty() {
+            return Err(ConvertError::Invalid {
+                field,
+                reason: "environment variable name must not be empty",
+            });
+        }
+        if out.insert(var.name, var.value).is_some() {
+            return Err(ConvertError::DuplicateEntry(field));
+        }
+    }
+    Ok(out)
+}
+
 // ---- Job ----
 
 impl From<&Job> for pb::Job {
@@ -202,6 +235,7 @@ impl From<&Job> for pb::Job {
             abort_requested: job.abort_requested.as_ref().map(Into::into),
             submitted_by: job.submitted_by.clone(),
             metadata: metadata_to_pb(&job.metadata),
+            env: env_to_pb(&job.env),
         }
     }
 }
@@ -244,6 +278,7 @@ impl TryFrom<pb::Job> for Job {
             // submitted with no actor (ADR 0023).
             submitted_by: job.submitted_by,
             metadata: metadata_from_pb(job.metadata, "Job.metadata")?,
+            env: env_from_pb(job.env, "Job.env")?,
         })
     }
 }

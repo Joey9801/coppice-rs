@@ -77,6 +77,7 @@ fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequ
         command: vec!["run".to_string()],
         entrypoint: None,
         metadata: Default::default(),
+        env: Default::default(),
     }
 }
 

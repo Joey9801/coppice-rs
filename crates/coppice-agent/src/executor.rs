@@ -34,6 +34,12 @@ pub struct StartSpec {
     pub command: Vec<String>,
     /// Entrypoint override; `None` runs the image's own entrypoint.
     pub entrypoint: Option<Vec<String>>,
+    /// The job's environment overlay, copied verbatim from `StartJob`;
+    /// layered over the image's own `ENV` — a name set here wins, a name it
+    /// does not mention keeps the image's value. Names are POSIX portable
+    /// (`coppice_core::env`), so the `NAME=value` encoding is unambiguous.
+    /// Empty means "no overlay".
+    pub env: std::collections::BTreeMap<String, String>,
     pub limits: Resources,
     /// Enforced runtime bound; the agent's watchdog kills the container past
     /// it (outcome `RuntimeLimitExceeded`). `None` = unbounded.
@@ -656,6 +662,7 @@ mod tests {
             image: "img".into(),
             command: vec!["run".into()],
             entrypoint: None,
+            env: Default::default(),
             limits: Resources::ZERO,
             max_runtime: None,
         })
@@ -690,6 +697,7 @@ mod tests {
             image: "img".into(),
             command: vec!["run".into()],
             entrypoint: None,
+            env: Default::default(),
             limits: Resources::ZERO,
             max_runtime: None,
         })

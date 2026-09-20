@@ -910,7 +910,13 @@ The complete list of changes outside the new modules:
 5. `Config::capacity_resources()` is replaced by
    `advertised_resources()` (= capacity − reservation, §6.4) at its two
    call sites (`Register`, `Heartbeat`).
-6. `Config` additions (all defaulted; a bare v1 config stays valid):
+6. `StartSpec` gains `env: BTreeMap<String, String>`, copied verbatim from
+   `StartJob`. The create body's `Env` is rendered from it as `NAME=value`
+   strings in ascending name order, left unset when the map is empty; a
+   job value overlays the image's own `ENV` of the same name, and any
+   image env the job does not name passes through untouched.
+   `FakeExecutor` gains the same field for parity.
+7. `Config` additions (all defaulted; a bare v1 config stays valid):
 
    ```toml
    [executor]

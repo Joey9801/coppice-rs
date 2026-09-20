@@ -35,10 +35,11 @@ certificate identity. User-facing API access authenticates via SSO as already
 specified in [security](../operations/security.md).
 
 **Secrets are deferred.** v1 stores no secrets: job environment comes only
-from the job spec, which is treated as non-secret. Secret-manager integration
-(reference-only injection at container start) is future work; nothing in v1
-may create a place where secret values land in logs, events, snapshots, or
-the UI.
+from the job spec's `env` map, which is replicated state — snapshotted and
+readable through the API and UI — and is treated as non-secret. Secret-manager
+integration (reference-only injection at container start) is future work;
+nothing in v1 may create a place where secret values land in logs, events,
+snapshots, or the UI.
 
 Stronger runtime isolation (gVisor/Kata) is explicitly out of scope for v1 but
 nothing in the agent design may preclude swapping the container runtime later.

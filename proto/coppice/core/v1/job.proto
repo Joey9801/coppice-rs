@@ -56,6 +56,28 @@ message Job {
   // repeated-entry rule as `Label`: writers emit ascending key order, readers
   // accept any order and reject duplicate keys.
   repeated MetadataEntry metadata = 12;
+  // Environment variables for the container, an overlay on the image's own
+  // environment: a name set here wins over an image `ENV` of the same name.
+  // Part of the immutable submitted spec — there is no update command — and
+  // not a secret channel (ADR 0011): it is replicated, snapshotted, and
+  // served through the API. `repeated EnvVar`, never a proto `map`, for the
+  // same reason as `metadata`; same repeated-entry rule as `Label`: writers
+  // emit ascending name order, readers accept any order and reject
+  // duplicate names.
+  repeated EnvVar env = 13;
+}
+
+// One environment variable of a job's `env` overlay. A message rather than a
+// `map` entry so the ordering above is ours to fix.
+message EnvVar {
+  // A POSIX portable name: 1-128 bytes matching `[A-Za-z_][A-Za-z0-9_]*`.
+  // That charset is load-bearing downstream — it can hold neither `=` nor
+  // NUL, so the agent's `NAME=value` encoding for Docker is unambiguous.
+  // Enforced at the API and re-checked at apply; conversion rejects empty.
+  string name = 1;
+  // At most 4096 bytes of UTF-8 with no NUL; empty is a legal value. The
+  // whole map is additionally capped at 32 KiB of names plus values.
+  string value = 2;
 }
 
 // One key/value pair of a metadata map. A message rather than a `map` entry
