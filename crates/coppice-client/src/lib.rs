@@ -57,9 +57,12 @@
 //!
 //! ## Reads, writes and read-your-writes
 //!
-//! Every read returns a [`Versioned<T>`](Versioned): the body, plus how far
-//! the replica that served it had applied and how far the cluster had
-//! committed. `Versioned` derefs to the body, so most code ignores it.
+//! Every `/api/v1` read returns a [`Versioned<T>`](Versioned): the body, plus
+//! how far the replica that served it had applied and how far the cluster had
+//! committed. That includes every page a pager or the log follower hands back.
+//! `Versioned` derefs to the body, so most code ignores it. [`Client::healthz`]
+//! is the one read that does not: it is outside `/api/v1` and outside
+//! consensus, so there is no index for it to report.
 //!
 //! Reads have per-endpoint consistency defaults — a list is bounded, a
 //! configuration read is strong, a derived series is eventual. Override them

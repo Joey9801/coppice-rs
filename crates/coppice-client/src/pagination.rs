@@ -18,7 +18,12 @@
 //!
 //! The pagers below are the "just give me everything" path. Each owns a
 //! [`Client`] clone and its request parameters, and each `next_page` call
-//! sends one request:
+//! sends one request. A page arrives as the [`Versioned<T>`](Versioned) the
+//! underlying read returned, indexes intact — paging through a list is
+//! exactly when staleness matters, and a pager that stripped them would leave
+//! a caller no way to notice a page served by a replica that had fallen
+//! behind. `Versioned` derefs to the body, so a walk reads the same as it
+//! always did:
 //!
 //! ```no_run
 //! # async fn walk(client: &coppice_client::Client, job: coppice_client::JobId)
@@ -34,7 +39,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::client::Client;
+use crate::client::{Client, Versioned};
 use crate::error::Result;
 use crate::id::JobId;
 use crate::types::{
@@ -132,11 +137,11 @@ impl JobPager {
     }
 
     /// The next page, or `None` once the scan is complete.
-    pub async fn next_page(&mut self) -> Result<Option<ListJobsResponse>> {
+    pub async fn next_page(&mut self) -> Result<Option<Versioned<ListJobsResponse>>> {
         if self.done {
             return Ok(None);
         }
-        let page = self.client.list_jobs(&self.params).await?.into_inner();
+        let page = self.client.list_jobs(&self.params).await?;
         match &page.next_cursor {
             Some(cursor) => self.params.cursor = Some(cursor.clone()),
             None => self.done = true,
@@ -165,15 +170,11 @@ impl TimelinePager {
     }
 
     /// The next page, or `None` once the scan is complete.
-    pub async fn next_page(&mut self) -> Result<Option<GetJobTimelineResponse>> {
+    pub async fn next_page(&mut self) -> Result<Option<Versioned<GetJobTimelineResponse>>> {
         if self.done {
             return Ok(None);
         }
-        let page = self
-            .client
-            .job_timeline(self.job, &self.params)
-            .await?
-            .into_inner();
+        let page = self.client.job_timeline(self.job, &self.params).await?;
         match &page.next_cursor {
             Some(cursor) => self.params.cursor = Some(cursor.clone()),
             None => self.done = true,
@@ -205,15 +206,11 @@ impl LogPager {
     }
 
     /// The next page, or `None` once the walk has reached the head.
-    pub async fn next_page(&mut self) -> Result<Option<GetJobLogsResponse>> {
+    pub async fn next_page(&mut self) -> Result<Option<Versioned<GetJobLogsResponse>>> {
         if self.done {
             return Ok(None);
         }
-        let page = self
-            .client
-            .job_logs(self.job, &self.params)
-            .await?
-            .into_inner();
+        let page = self.client.job_logs(self.job, &self.params).await?;
         match &page.next_cursor {
             Some(cursor) => self.params.cursor = Some(cursor.clone()),
             None => self.done = true,
@@ -242,15 +239,11 @@ impl UsagePager {
     }
 
     /// The next page, or `None` once the walk is complete.
-    pub async fn next_page(&mut self) -> Result<Option<GetJobUsageResponse>> {
+    pub async fn next_page(&mut self) -> Result<Option<Versioned<GetJobUsageResponse>>> {
         if self.done {
             return Ok(None);
         }
-        let page = self
-            .client
-            .job_usage(self.job, &self.params)
-            .await?
-            .into_inner();
+        let page = self.client.job_usage(self.job, &self.params).await?;
         match &page.next_cursor {
             Some(cursor) => self.params.cursor = Some(cursor.clone()),
             None => self.done = true,

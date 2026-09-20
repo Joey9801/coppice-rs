@@ -903,7 +903,7 @@ async fn fetch_timeline(client: &Client, job: JobId) -> Result<Vec<TimelineEvent
         .await
         .api_ctx(ctx("fetching job timeline", "reading job timeline"))?
     {
-        events.extend(page.events);
+        events.extend(page.into_inner().events);
     }
     Ok(events)
 }
@@ -940,6 +940,7 @@ async fn run_logs(
         .await
         .api_ctx(ctx("fetching job logs", "reading job logs"))?
     {
+        let page = page.into_inner();
         merge_sources(&mut sources, page.sources);
         multi = latch_multi(multi, &sources);
         for entry in &page.entries {
@@ -1112,6 +1113,7 @@ async fn run_usage(
         .await
         .api_ctx(ctx("fetching job usage", "reading job usage"))?
     {
+        let page = page.into_inner();
         merge_usage_sources(&mut sources, page.sources);
         samples.extend(page.samples);
     }
