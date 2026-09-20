@@ -46,6 +46,17 @@ tracing.workspace = true
 # and an operator leaf with.
 coppice-testkit.workspace = true
 coppice-tls.workspace = true
+# The published client library carries its own hand-written copy of every
+# `/api/v1` DTO, because it must not depend on this crate's server tree. The
+# copies are held to these types by `tests/client_contract.rs` — the only
+# place that can see both sides — so the dependency lives here, and
+# `coppice-client`'s own manifest stays free of `coppice-*` crates.
+#
+# Declared by path rather than `workspace = true` for one reason: the contract
+# test needs only the wire types, so `default-features = false` keeps the
+# client's TLS backend out of this crate's test build — and a `default-features`
+# override is ignored on a workspace dependency that did not set one.
+coppice-client = { path = "../coppice-client", default-features = false }
 rustls-pemfile.workspace = true
 tokio.workspace = true
 tower.workspace = true
