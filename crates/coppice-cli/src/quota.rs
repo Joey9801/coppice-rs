@@ -7,7 +7,7 @@
 //! create-or-update upsert (no delete in v1, matching the wire contract).
 //!
 //! As with `coppice job` and `coppice cluster`, every wire shape is a
-//! [`coppice_api::http::dto`] type — nothing here redefines the `/api/v1`
+//! [`coppice_client`] type — nothing here redefines the `/api/v1`
 //! contract the web UI is built on. The one thing this module owns is the
 //! *entity file*: a single-entity TOML description accepted by
 //! `quota configure --file`, deliberately spelled the same as one
@@ -20,10 +20,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use coppice_api::http::dto;
-use coppice_core::id::QuotaEntityId;
+use coppice_client::{
+    paths, Client, ConfigureQuotaEntityRequest, GetQuotaEntityResponse, QuotaEntityId,
+    QuotaEntityNode,
+};
 
-use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection};
+use crate::client::{ctx, print_json, render_table, ApiConnection, ApiResultExt};
 use crate::cluster::{indent, phase_label};
 
 // ---------------------------------------------------------------------------
@@ -125,20 +127,22 @@ pub async fn run(args: QuotaArgs) -> Result<()> {
 
 /// `coppice quota list`: every quota entity, root and descendants together,
 /// as one flat table (the tree shape is `show`'s job, not `list`'s).
-async fn list(client: &ApiClient, json: bool) -> Result<()> {
-    let body: serde_json::Value = client
-        .get_json(
-            "/quota-entities",
-            &Vec::new(),
-            ctx("listing quota entities", "reading the quota entity list"),
-        )
-        .await?;
+async fn list(client: &Client, json: bool) -> Result<()> {
     if json {
-        print_json(&body);
+        let body = client
+            .get_value(paths::QUOTA_ENTITIES, &[])
+            .await
+            .api_ctx(ctx(
+                "listing quota entities",
+                "reading the quota entity list",
+            ))?;
+        print_json(&body.value);
         return Ok(());
     }
-    let page: dto::ListQuotaEntitiesResponse =
-        serde_json::from_value(body).context("reading the quota entity list")?;
+    let page = client.list_quota_entities().await.api_ctx(ctx(
+        "listing quota entities",
+        "reading the quota entity list",
+    ))?;
     print!("{}", render_quota_list(&page.entities));
     Ok(())
 }
@@ -159,7 +163,7 @@ const QUOTA_LIST_HEADERS: [&str; 9] = [
 
 /// Render a flat list of quota-entity nodes as an aligned table, or the
 /// "empty" sentinel when there are none.
-fn render_quota_list(entities: &[dto::QuotaEntityNode]) -> String {
+fn render_quota_list(entities: &[QuotaEntityNode]) -> String {
     if entities.is_empty() {
         return "(no quota entities)\n".to_string();
     }
@@ -167,9 +171,9 @@ fn render_quota_list(entities: &[dto::QuotaEntityNode]) -> String {
     render_table(&QUOTA_LIST_HEADERS, &rows)
 }
 
-/// The row cells for one [`dto::QuotaEntityNode`], in [`QUOTA_LIST_HEADERS`]
+/// The row cells for one [`QuotaEntityNode`], in [`QUOTA_LIST_HEADERS`]
 /// order.
-fn quota_node_row(node: &dto::QuotaEntityNode) -> Vec<String> {
+fn quota_node_row(node: &QuotaEntityNode) -> Vec<String> {
     vec![
         node.id.to_string(),
         node.name.clone(),
@@ -204,20 +208,20 @@ fn format_ratio(value: f64) -> String {
 
 /// `coppice quota show`: one entity's own figures, its ancestry, its direct
 /// children, and its subtree stats.
-async fn show(client: &ApiClient, entity: QuotaEntityId, json: bool) -> Result<()> {
-    let body: serde_json::Value = client
-        .get_json(
-            &format!("/quota-entities/{entity}"),
-            &Vec::new(),
-            ctx("fetching quota entity", "reading quota entity detail"),
-        )
-        .await?;
+async fn show(client: &Client, entity: QuotaEntityId, json: bool) -> Result<()> {
+    let path = paths::quota_entity(entity);
     if json {
-        print_json(&body);
+        let body = client
+            .get_value(&path, &[])
+            .await
+            .api_ctx(ctx("fetching quota entity", "reading quota entity detail"))?;
+        print_json(&body.value);
         return Ok(());
     }
-    let detail: dto::GetQuotaEntityResponse =
-        serde_json::from_value(body).context("reading quota entity detail")?;
+    let detail = client
+        .quota_entity(entity)
+        .await
+        .api_ctx(ctx("fetching quota entity", "reading quota entity detail"))?;
     print!("{}", render_quota_detail(&detail));
     Ok(())
 }
@@ -226,9 +230,9 @@ async fn show(client: &ApiClient, entity: QuotaEntityId, json: bool) -> Result<(
 /// itself, then a `chain:` section (ancestry, root first), then a
 /// `children:` section (the same table `quota list` uses, indented), then a
 /// `stats:` block. `usage_history` is never rendered — the field is always
-/// empty (no usage-series sampler exists yet, see [`dto::QuotaEntityStats`])
+/// empty (no usage-series sampler exists yet, see [`GetQuotaEntityResponse`])
 /// — so a section for it would only ever show as absent noise.
-fn render_quota_detail(detail: &dto::GetQuotaEntityResponse) -> String {
+fn render_quota_detail(detail: &GetQuotaEntityResponse) -> String {
     use std::fmt::Write;
 
     let mut out = String::new();
@@ -285,15 +289,15 @@ fn render_quota_detail(detail: &dto::GetQuotaEntityResponse) -> String {
     let by_state: Vec<String> = stats
         .by_state
         .iter()
-        .map(|(phase, count)| format!("{} {count}", phase_label(*phase)))
+        .map(|(phase, count)| format!("{} {count}", phase_label(phase.clone())))
         .collect();
     let _ = writeln!(out, "  by phase       {}", by_state.join(", "));
     let _ = writeln!(
         out,
         "  oldest queued  {}",
         stats
-            .oldest_queued_age_seconds
-            .map(|s| format!("{s}s"))
+            .oldest_queued_age
+            .map(|d| format!("{}s", d.as_secs()))
             .unwrap_or_else(|| "(nothing queued)".to_string())
     );
     let _ = writeln!(
@@ -361,7 +365,7 @@ impl QuotaEntityFile {
 /// `coppice quota configure`: build the upsert request from either input
 /// mode, POST it, and render the result.
 async fn configure(
-    client: &ApiClient,
+    client: &Client,
     file: Option<&Path>,
     entity: Option<QuotaEntityId>,
     name: Option<String>,
@@ -381,19 +385,21 @@ async fn configure(
             request.entity, request.entity
         );
     }
-    let body: serde_json::Value = client
-        .post_json(
-            "/quota-entities",
-            &request,
-            ctx("configuring quota entity", "reading configure response"),
-        )
-        .await?;
     if json {
+        let body = client
+            .post_value(paths::QUOTA_ENTITIES, &request)
+            .await
+            .api_ctx(ctx(
+                "configuring quota entity",
+                "reading configure response",
+            ))?;
         print_json(&body);
         return Ok(());
     }
-    let response: dto::ConfigureQuotaEntityResponse =
-        serde_json::from_value(body).context("reading configure response")?;
+    let response = client.configure_quota_entity(&request).await.api_ctx(ctx(
+        "configuring quota entity",
+        "reading configure response",
+    ))?;
     println!(
         "configured {} (log index {})",
         response.entity, response.log_index
@@ -416,18 +422,14 @@ fn build_configure_request(
     name: Option<String>,
     quota_ucu: Option<u64>,
     parent: Option<QuotaEntityId>,
-) -> Result<(dto::ConfigureQuotaEntityRequest, bool)> {
+) -> Result<(ConfigureQuotaEntityRequest, bool)> {
     if let Some(path) = file {
         let spec = QuotaEntityFile::load(path)?;
-        return Ok((
-            dto::ConfigureQuotaEntityRequest {
-                entity: spec.id,
-                parent: spec.parent,
-                name: spec.name,
-                quota_ucu: spec.quota,
-            },
-            false,
-        ));
+        let mut request = ConfigureQuotaEntityRequest::new(spec.id, spec.name, spec.quota);
+        if let Some(parent) = spec.parent {
+            request = request.with_parent(parent);
+        }
+        return Ok((request, false));
     }
     let name = name.context("--name is required unless --file is given")?;
     let quota_ucu = quota_ucu.context("--quota-ucu is required unless --file is given")?;
@@ -435,15 +437,11 @@ fn build_configure_request(
         Some(entity) => (entity, false),
         None => (QuotaEntityId::new(), true),
     };
-    Ok((
-        dto::ConfigureQuotaEntityRequest {
-            entity,
-            parent,
-            name,
-            quota_ucu,
-        },
-        minted,
-    ))
+    let mut request = ConfigureQuotaEntityRequest::new(entity, name, quota_ucu);
+    if let Some(parent) = parent {
+        request = request.with_parent(parent);
+    }
+    Ok((request, minted))
 }
 
 // ---------------------------------------------------------------------------
@@ -464,13 +462,34 @@ mod tests {
     use axum::{Json, Router};
     use tempfile::NamedTempFile;
 
+    use coppice_api::http::dto;
+    use coppice_client::ListQuotaEntitiesResponse;
+    use coppice_core::id::QuotaEntityId as CoreQuotaEntityId;
     use coppice_core::time::Timestamp;
 
     use crate::testsupport::{error_body, leader_hint, spawn};
 
-    /// A fixed quota-entity id from a small integer, so test bodies can name
-    /// distinct entities tersely.
+    /// Round-trip a server-typed (`coppice_api::http::dto`) fixture through
+    /// JSON into the `coppice_client` type the CLI actually renders. The
+    /// server type is the fixture that pins the wire contract; the client
+    /// type is what `render_quota_list`/`render_quota_detail` take — so this
+    /// conversion, not a hand-written assertion, *is* the cross-check that
+    /// the two crates still agree on the shape.
+    fn to_client<S: serde::Serialize, C: serde::de::DeserializeOwned>(value: S) -> C {
+        serde_json::from_value(serde_json::to_value(value).unwrap())
+            .expect("the client type decodes the server type's own output")
+    }
+
+    /// The client-typed entity id, from a small integer, for calling the verb
+    /// functions and for assertions.
     fn quota_id(n: u8) -> QuotaEntityId {
+        format!("quota-00000000-0000-0000-0000-{n:012}")
+            .parse()
+            .unwrap()
+    }
+
+    /// The same id, server-typed, for `dto::` fixtures.
+    fn dto_quota_id(n: u8) -> CoreQuotaEntityId {
         format!("quota-00000000-0000-0000-0000-{n:012}")
             .parse()
             .unwrap()
@@ -480,7 +499,10 @@ mod tests {
         Timestamp::from_micros(micros).unwrap()
     }
 
-    fn sample_node(id: QuotaEntityId, parent: Option<QuotaEntityId>) -> dto::QuotaEntityNode {
+    fn sample_node(
+        id: CoreQuotaEntityId,
+        parent: Option<CoreQuotaEntityId>,
+    ) -> dto::QuotaEntityNode {
         dto::QuotaEntityNode {
             id,
             name: "team-a".to_string(),
@@ -498,7 +520,10 @@ mod tests {
         }
     }
 
-    fn sample_view(id: QuotaEntityId, parent: Option<QuotaEntityId>) -> dto::QuotaEntityView {
+    fn sample_view(
+        id: CoreQuotaEntityId,
+        parent: Option<CoreQuotaEntityId>,
+    ) -> dto::QuotaEntityView {
         dto::QuotaEntityView {
             id,
             name: "root".to_string(),
@@ -559,8 +584,8 @@ mod tests {
         })
     }
 
-    fn client(base: &str) -> ApiClient {
-        ApiClient::new(base).unwrap()
+    fn client(base: &str) -> Client {
+        Client::new(base).unwrap()
     }
 
     // -----------------------------------------------------------------
@@ -569,7 +594,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_decodes_the_real_response() {
-        let entities = vec![sample_node(quota_id(1), None)];
+        let entities = vec![sample_node(dto_quota_id(1), None)];
         let body = serde_json::to_value(dto::ListQuotaEntitiesResponse { entities }).unwrap();
         let router = Router::new().route(
             "/api/v1/quota-entities",
@@ -605,7 +630,7 @@ mod tests {
             .expect("list decodes null over_quota_ratio");
 
         // The same body, through the same decode the renderer sees.
-        let page: dto::ListQuotaEntitiesResponse = serde_json::from_value(body).unwrap();
+        let page: ListQuotaEntitiesResponse = serde_json::from_value(body).unwrap();
         assert_eq!(page.entities[0].over_quota_ratio, f64::INFINITY);
         assert_eq!(page.entities[0].penalty, f64::INFINITY);
         let rendered = render_quota_list(&page.entities);
@@ -637,7 +662,7 @@ mod tests {
             .await
             .expect("show decodes null over_quota_ratio");
 
-        let detail: dto::GetQuotaEntityResponse = serde_json::from_value(body).unwrap();
+        let detail: GetQuotaEntityResponse = serde_json::from_value(body).unwrap();
         assert_eq!(detail.entity.over_quota_ratio, f64::INFINITY);
         assert_eq!(detail.chain[0].penalty, f64::INFINITY);
         let rendered = render_quota_detail(&detail);
@@ -648,8 +673,9 @@ mod tests {
 
     #[test]
     fn render_quota_list_shows_id_name_and_quota() {
-        let node = sample_node(quota_id(1), None);
-        let rendered = render_quota_list(std::slice::from_ref(&node));
+        let node = sample_node(dto_quota_id(1), None);
+        let client_node: QuotaEntityNode = to_client(node.clone());
+        let rendered = render_quota_list(std::slice::from_ref(&client_node));
         assert!(rendered.contains(&node.id.to_string()), "{rendered}");
         assert!(rendered.contains("team-a"), "{rendered}");
         assert!(rendered.contains("1000"), "{rendered}");
@@ -686,9 +712,9 @@ mod tests {
     async fn show_fetches_the_requested_entity() {
         let id = quota_id(2);
         let response = dto::GetQuotaEntityResponse {
-            entity: sample_node(id, None),
-            chain: vec![sample_view(quota_id(9), None)],
-            children: vec![sample_node(quota_id(3), Some(id))],
+            entity: sample_node(dto_quota_id(2), None),
+            chain: vec![sample_view(dto_quota_id(9), None)],
+            children: vec![sample_node(dto_quota_id(3), Some(dto_quota_id(2)))],
             stats: sample_stats(),
         };
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -721,12 +747,12 @@ mod tests {
     #[test]
     fn render_quota_detail_reports_charged_ucu_as_not_measured() {
         let detail = dto::GetQuotaEntityResponse {
-            entity: sample_node(quota_id(1), None),
+            entity: sample_node(dto_quota_id(1), None),
             chain: Vec::new(),
             children: Vec::new(),
             stats: sample_stats(),
         };
-        let rendered = render_quota_detail(&detail);
+        let rendered = render_quota_detail(&to_client(detail));
         assert!(rendered.contains("(not measured)"), "{rendered}");
         assert!(!rendered.contains("charged (24h)  0"), "{rendered}");
     }
@@ -792,10 +818,13 @@ mod tests {
 
         let received = captured.lock().unwrap();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].entity, entity);
+        assert_eq!(received[0].entity.to_string(), entity.to_string());
         assert_eq!(received[0].name, "team-b");
         assert_eq!(received[0].quota_ucu, 500);
-        assert_eq!(received[0].parent, Some(parent));
+        assert_eq!(
+            received[0].parent.map(|p| p.to_string()),
+            Some(parent.to_string())
+        );
     }
 
     #[tokio::test]
@@ -841,10 +870,13 @@ mod tests {
 
         let received = captured.lock().unwrap();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].entity, id);
+        assert_eq!(received[0].entity.to_string(), id.to_string());
         assert_eq!(received[0].name, "team-c");
         assert_eq!(received[0].quota_ucu, 750);
-        assert_eq!(received[0].parent, Some(parent));
+        assert_eq!(
+            received[0].parent.map(|p| p.to_string()),
+            Some(parent.to_string())
+        );
     }
 
     #[tokio::test]
@@ -903,9 +935,12 @@ mod tests {
             coppice_coordinator::policy::FormationPolicy::parse_toml(policy_body.as_bytes())
                 .expect("parses as a formation-policy quota_entity entry");
         let spec = &policy.quota_entities[0];
-        assert_eq!(spec.id, file.id);
+        assert_eq!(spec.id.to_string(), file.id.to_string());
         assert_eq!(spec.name, file.name);
         assert_eq!(spec.quota, file.quota);
-        assert_eq!(spec.parent, file.parent);
+        assert_eq!(
+            spec.parent.map(|p| p.to_string()),
+            file.parent.map(|p| p.to_string())
+        );
     }
 }

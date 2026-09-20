@@ -1004,13 +1004,22 @@ fn write_operator_material(root: &Path, operator: &OperatorPem) -> Result<()> {
 // Readiness polling over the client API
 // ---------------------------------------------------------------------------
 
-/// A `reqwest::Client` for polling `coppice dev`'s own in-process coordinator
-/// at `http://127.0.0.1:<port>` — never anything else, so it always takes the
-/// plain-HTTP fast path in [`crate::client::plain_http_builder`].
-fn local_readiness_client() -> Result<reqwest::Client> {
-    crate::client::plain_http_builder("http://127.0.0.1")
-        .build()
-        .context("building the dev readiness HTTP client")
+/// A [`coppice_client::Client`] for polling `coppice dev`'s own in-process
+/// coordinator at `http://127.0.0.1:<port>` — never anything else, so it
+/// always takes the library's plain-HTTP fast path (no native root store is
+/// enumerated) and never needs a token: a dev cluster runs in open mode.
+fn local_readiness_client(api: &str) -> Result<coppice_client::Client> {
+    coppice_client::Client::new(api).context("building the dev readiness HTTP client")
+}
+
+/// Whether a readiness poll's failure still proves the listener is up.
+///
+/// The question a readiness probe asks is "did anything answer?", not "did it
+/// answer well": a coordinator that replies 401, 503, or with a body this
+/// build cannot decode is nevertheless serving. Only a transport failure — no
+/// connection, no response, or the request timing out — means "not yet".
+fn answered(err: &coppice_client::Error) -> bool {
+    !matches!(err, coppice_client::Error::Transport(_))
 }
 
 /// Wait until the client listener answers, i.e. the task runtime is serving.
@@ -1021,11 +1030,7 @@ async fn wait_for_client_api(
     api: &str,
     coordinator: &mut tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
-    // Always a plain `http://127.0.0.1` base (see `local_readiness_client`'s
-    // doc) — skip the native-root-store enumeration `reqwest::Client::new()`
-    // would otherwise pay on every `coppice dev` launch.
-    let client = local_readiness_client()?;
-    let url = format!("{api}/api/v1/nodes");
+    let client = local_readiness_client(api)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         if coordinator.is_finished() {
@@ -1033,8 +1038,10 @@ async fn wait_for_client_api(
                 .await
                 .unwrap_or_else(|| anyhow::anyhow!("the dev coordinator exited during startup")));
         }
-        if client.get(&url).send().await.is_ok() {
-            return Ok(());
+        match client.list_nodes().await {
+            Ok(_) => return Ok(()),
+            Err(e) if answered(&e) => return Ok(()),
+            Err(_) => {}
         }
         if tokio::time::Instant::now() >= deadline {
             bail!("the dev coordinator's client API did not come up within 60 seconds");
@@ -1046,19 +1053,18 @@ async fn wait_for_client_api(
 /// Wait for the in-process agent's registration to land in applied state,
 /// returning its epoch (ADR 0009).
 async fn wait_for_agent(api: &str, agent_node: NodeId) -> Result<u64> {
-    let client = local_readiness_client()?;
-    let url = format!("{api}/api/v1/nodes/{agent_node}");
+    let client = local_readiness_client(api)?;
+    // `coppice-client` carries its own typed ids so it can publish with no
+    // `coppice-*` dependency; the two spell a node id identically
+    // (`node-<uuid>`), so the string is the conversion.
+    let agent_node: coppice_client::NodeId = agent_node
+        .to_string()
+        .parse()
+        .context("the dev agent's node id")?;
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Ok(response) = client.get(&url).send().await {
-                if response.status().is_success() {
-                    if let Ok(node) = response
-                        .json::<coppice_api::http::dto::GetNodeResponse>()
-                        .await
-                    {
-                        return node.summary.epoch;
-                    }
-                }
+            if let Ok(node) = client.node(agent_node).await {
+                return node.summary.epoch;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

@@ -7,12 +7,13 @@
 //! state transitions belong to the coordinator; nothing here decides anything.
 //!
 //! The wire shapes are **not** redefined here — every request and response body
-//! is a [`coppice_api::http::dto`] type, so the CLI can never drift from the
-//! contract the web UI is built on. The one thing this module owns is the
-//! *spec file*: a TOML description of a single job, which mirrors the daemon
-//! config files' conventions (ADR 0020) — `deny_unknown_fields` so a typo
-//! fail-stops, humane duration strings, and byte-size units — and which
-//! converts into a [`dto::SubmitJobRequest`].
+//! is a [`coppice_client`] type, so the CLI can never drift from the contract
+//! the web UI and every other Coppice client are built on. The one thing this
+//! module owns is the *spec file*: a TOML description of a single job, which
+//! mirrors the daemon config files' conventions (ADR 0020) —
+//! `deny_unknown_fields` so a typo fail-stops, humane duration strings, and
+//! byte-size units — and which converts into a
+//! [`coppice_client::SubmitJobRequest`].
 //!
 //! A spec file looks like:
 //!
@@ -49,13 +50,17 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use coppice_api::http::dto;
+use coppice_client::{
+    paths, AbortJobRequest, AttemptId, Client, FollowOptions, JobCursor, JobDetail, JobEnv,
+    JobFilter, JobId, JobMetadata, JobPhase, ListJobsParams, ListJobsResponse, LogAvailability,
+    LogEntry, LogOrder, LogSourceRecord, LogStreamName, LogsParams, NodeId, QuotaEntityId,
+    ReplaceJobMetadataRequest, RequestsResource, Resources, RetryPolicy, SubmitJobRequest,
+    TimelineEvent, TimelineEventBody, TimelineParams, Timestamp, UpdateJobMetadataRequest,
+    UsageAvailability, UsageParams, UsagePoint, UsageSourceRecord,
+};
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::{AttemptId, JobId, NodeId, QuotaEntityId};
-use coppice_core::metadata::JobMetadata;
-use coppice_core::time::Timestamp;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection, Query};
+use crate::client::{ctx, print_json, render_table, ApiConnection, ApiResultExt};
 
 // ---------------------------------------------------------------------------
 // Spec file
@@ -65,7 +70,7 @@ use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection, Que
 ///
 /// `deny_unknown_fields` so a typo (`comand`, `max_runtme`) fail-stops naming
 /// the offending key rather than silently defaulting — the same posture the
-/// wire [`dto::SubmitJobRequest`] takes on the server side.
+/// wire [`SubmitJobRequest`] takes on the server side.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobSpec {
@@ -189,28 +194,39 @@ impl JobSpec {
 
     /// Convert the (validated) spec into the wire request, threading in the
     /// client-minted job id (the idempotency key, ADR 0026).
-    pub fn request(&self, job: JobId) -> dto::SubmitJobRequest {
-        dto::SubmitJobRequest {
+    ///
+    /// `SubmitJobRequest` is `#[non_exhaustive]`, so it is built through its
+    /// constructor and `with_*` builders rather than a struct literal.
+    pub fn request(&self, job: JobId) -> SubmitJobRequest {
+        let mut request = SubmitJobRequest::new(
             job,
-            image: self.image.clone(),
-            command: self.command.clone(),
-            entrypoint: self.entrypoint.clone(),
-            requests: dto::Resources {
-                cpu_millis: self.resources.cpu_millis,
-                memory_bytes: self.resources.memory.as_u64(),
-                disk_bytes: self.resources.disk.as_u64(),
-            },
-            priority: self.priority,
-            // Validated to fit i64 seconds with no sub-second remainder.
-            max_runtime_seconds: self.max_runtime.map(|d| d.as_secs() as i64),
-            quota_entity: self.quota_entity,
-            retry: self.retry.map(|r| dto::RetryPolicy {
-                max_retries: r.max_retries,
-                retry_user_errors: r.retry_user_errors,
-            }),
-            metadata: self.metadata.clone(),
-            env: self.env.clone(),
+            self.image.clone(),
+            self.command.clone(),
+            Resources::new(
+                self.resources.cpu_millis,
+                self.resources.memory.as_u64(),
+                self.resources.disk.as_u64(),
+            ),
+            self.quota_entity,
+        )
+        .with_priority(self.priority)
+        .with_metadata(JobMetadata::from(self.metadata.clone()))
+        .with_env(JobEnv::from(self.env.clone()));
+        if let Some(entrypoint) = &self.entrypoint {
+            request = request.with_entrypoint(entrypoint.clone());
         }
+        // Validated to fit i64 seconds with no sub-second remainder; the
+        // library's own whole-seconds wire encoding does the rest.
+        if let Some(max_runtime) = self.max_runtime {
+            request = request.with_max_runtime(max_runtime);
+        }
+        if let Some(retry) = self.retry {
+            request = request.with_retry(RetryPolicy {
+                max_retries: retry.max_retries,
+                retry_user_errors: retry.retry_user_errors,
+            });
+        }
+        request
     }
 }
 
@@ -245,7 +261,7 @@ pub enum JobCommand {
         /// absent). A short page with a next cursor means "continue", never
         /// "done".
         #[arg(long)]
-        limit: Option<u64>,
+        limit: Option<u32>,
         /// Continue from a prior page's `next cursor`.
         #[arg(long)]
         cursor: Option<String>,
@@ -329,7 +345,7 @@ pub enum JobCommand {
 
 /// The ergonomic flags that build `job list`'s JSON filter AST.
 ///
-/// Every flag here is one **leaf** of [`dto::JobFilter`]; the flags given are
+/// Every flag here is one **leaf** of [`JobFilter`]; the flags given are
 /// ANDed together into an `all` node (a lone leaf is sent bare). The full AST —
 /// `any`, `not`, nested combinators — is deliberately not expressible from the
 /// command line: it is a JSON tree, and a flag grammar for it would be worse
@@ -400,7 +416,7 @@ fn parse_timestamp(raw: &str) -> Result<Timestamp, String> {
         .map_err(|e| e.to_string())
 }
 
-/// A `--phase` value; the wire spelling is [`dto::JobPhase`]'s snake_case.
+/// A `--phase` value; the wire spelling is [`JobPhase`]'s snake_case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PhaseArg {
     Submitted,
@@ -415,32 +431,31 @@ pub enum PhaseArg {
     Aborted,
 }
 
-impl PhaseArg {
-    /// The wire value, matching `dto::JobPhase`'s serde spelling.
-    fn wire(self) -> &'static str {
-        match self {
-            PhaseArg::Submitted => "submitted",
-            PhaseArg::Accepted => "accepted",
-            PhaseArg::Queued => "queued",
-            PhaseArg::Accruing => "accruing",
-            PhaseArg::Preparing => "preparing",
-            PhaseArg::Running => "running",
-            PhaseArg::Finalizing => "finalizing",
-            PhaseArg::Succeeded => "succeeded",
-            PhaseArg::Failed => "failed",
-            PhaseArg::Aborted => "aborted",
+impl From<PhaseArg> for JobPhase {
+    fn from(phase: PhaseArg) -> JobPhase {
+        match phase {
+            PhaseArg::Submitted => JobPhase::Submitted,
+            PhaseArg::Accepted => JobPhase::Accepted,
+            PhaseArg::Queued => JobPhase::Queued,
+            PhaseArg::Accruing => JobPhase::Accruing,
+            PhaseArg::Preparing => JobPhase::Preparing,
+            PhaseArg::Running => JobPhase::Running,
+            PhaseArg::Finalizing => JobPhase::Finalizing,
+            PhaseArg::Succeeded => JobPhase::Succeeded,
+            PhaseArg::Failed => JobPhase::Failed,
+            PhaseArg::Aborted => JobPhase::Aborted,
         }
     }
 }
 
-/// An `--entity-scope` value ([`dto::EntityScope`]).
+/// An `--entity-scope` value ([`coppice_client::EntityScope`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ScopeArg {
     Exact,
     Subtree,
 }
 
-/// A `--requests` dimension ([`dto::RequestsResource`]).
+/// A `--requests` dimension ([`RequestsResource`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ResourceArg {
     CpuMillis,
@@ -448,12 +463,12 @@ pub enum ResourceArg {
     DiskBytes,
 }
 
-impl ResourceArg {
-    fn wire(self) -> &'static str {
-        match self {
-            ResourceArg::CpuMillis => "cpu_millis",
-            ResourceArg::MemoryBytes => "memory_bytes",
-            ResourceArg::DiskBytes => "disk_bytes",
+impl From<ResourceArg> for RequestsResource {
+    fn from(resource: ResourceArg) -> RequestsResource {
+        match resource {
+            ResourceArg::CpuMillis => RequestsResource::CpuMillis,
+            ResourceArg::MemoryBytes => RequestsResource::MemoryBytes,
+            ResourceArg::DiskBytes => RequestsResource::DiskBytes,
         }
     }
 }
@@ -461,42 +476,33 @@ impl ResourceArg {
 /// Build the `?filter=` AST from the flags: one leaf per flag given, ANDed
 /// under `all` when there is more than one, sent bare when there is exactly
 /// one, and omitted entirely when there are none (which matches every job).
-///
-/// The tree is built as JSON rather than as a [`dto::JobFilter`] because that
-/// type is deserialize-only — it exists to *parse* what a client sends. The
-/// tests close the loop by deserializing what this builds back into it.
-fn build_filter(args: &JobFilterArgs) -> Result<Option<serde_json::Value>> {
-    use serde_json::json;
-
-    let mut leaves: Vec<serde_json::Value> = Vec::new();
+fn build_filter(args: &JobFilterArgs) -> Result<Option<JobFilter>> {
+    let mut leaves: Vec<JobFilter> = Vec::new();
     if !args.phases.is_empty() {
-        let phases: Vec<&str> = args.phases.iter().map(|p| p.wire()).collect();
-        leaves.push(json!({ "phase": { "in": phases } }));
+        leaves.push(JobFilter::phase_in(
+            args.phases.iter().map(|p| JobPhase::from(*p)),
+        ));
     }
     if let Some(entity) = args.entity {
-        let mut leaf = json!({ "id": entity.to_string() });
-        if let Some(scope) = args.entity_scope {
-            leaf["scope"] = json!(match scope {
-                ScopeArg::Exact => "exact",
-                ScopeArg::Subtree => "subtree",
-            });
-        }
-        leaves.push(json!({ "entity": leaf }));
+        leaves.push(match args.entity_scope {
+            Some(ScopeArg::Exact) => JobFilter::entity_exact(entity),
+            Some(ScopeArg::Subtree) | None => JobFilter::entity(entity),
+        });
     }
     if let Some(node) = args.node {
-        leaves.push(json!({ "node": node.to_string() }));
+        leaves.push(JobFilter::node(node));
     }
     if let Some(image) = &args.image {
-        leaves.push(json!({ "image": { "contains": image } }));
+        leaves.push(JobFilter::image_contains(image.clone()));
     }
     if let Some(image) = &args.image_equals {
-        leaves.push(json!({ "image": { "equals": image } }));
+        leaves.push(JobFilter::image_equals(image.clone()));
     }
     if let Some(search) = &args.search {
-        leaves.push(json!({ "search": search }));
+        leaves.push(JobFilter::search(search.clone()));
     }
     if let Some(submitted_by) = &args.submitted_by {
-        leaves.push(json!({ "submitted_by": submitted_by }));
+        leaves.push(JobFilter::submitted_by(submitted_by.clone()));
     }
     if args.submitted_after.is_some() || args.submitted_before.is_some() {
         if let (Some(after), Some(before)) = (args.submitted_after, args.submitted_before) {
@@ -504,14 +510,12 @@ fn build_filter(args: &JobFilterArgs) -> Result<Option<serde_json::Value>> {
                 bail!("--submitted-after must not be later than --submitted-before");
             }
         }
-        let mut leaf = serde_json::Map::new();
-        if let Some(after) = args.submitted_after {
-            leaf.insert("after".to_string(), json!(after));
-        }
-        if let Some(before) = args.submitted_before {
-            leaf.insert("before".to_string(), json!(before));
-        }
-        leaves.push(json!({ "submitted": leaf }));
+        leaves.push(match (args.submitted_after, args.submitted_before) {
+            (Some(after), Some(before)) => JobFilter::submitted_between(after, before),
+            (Some(after), None) => JobFilter::submitted_after(after),
+            (None, Some(before)) => JobFilter::submitted_before(before),
+            (None, None) => unreachable!("guarded by the `is_some() || is_some()` check above"),
+        });
     }
     if let Some(resource) = args.requests {
         if args.requests_min.is_none() && args.requests_max.is_none() {
@@ -522,28 +526,26 @@ fn build_filter(args: &JobFilterArgs) -> Result<Option<serde_json::Value>> {
                 bail!("--requests-min must not exceed --requests-max");
             }
         }
-        let mut leaf = serde_json::Map::new();
-        leaf.insert("resource".to_string(), json!(resource.wire()));
-        if let Some(min) = args.requests_min {
-            leaf.insert("min".to_string(), json!(min));
-        }
-        if let Some(max) = args.requests_max {
-            leaf.insert("max".to_string(), json!(max));
-        }
-        leaves.push(json!({ "requests": leaf }));
+        let resource = RequestsResource::from(resource);
+        leaves.push(match (args.requests_min, args.requests_max) {
+            (Some(min), Some(max)) => JobFilter::requests_between(resource, min, max),
+            (Some(min), None) => JobFilter::requests_min(resource, min),
+            (None, Some(max)) => JobFilter::requests_max(resource, max),
+            (None, None) => unreachable!("guarded by the min/max presence check above"),
+        });
     }
     if let Some(key) = &args.metadata_key {
-        leaves.push(json!({ "metadata": { "key": key } }));
+        leaves.push(JobFilter::metadata_present(key.clone()));
     }
     if let Some(raw) = &args.metadata_equals {
         let (key, value) = split_key_value(raw, "--metadata-equals")?;
-        leaves.push(json!({ "metadata": { "key": key, "equals": value } }));
+        leaves.push(JobFilter::metadata_equals(key, value));
     }
 
     Ok(match leaves.len() {
         0 => None,
         1 => leaves.pop(),
-        _ => Some(json!({ "all": leaves })),
+        _ => Some(JobFilter::all(leaves)),
     })
 }
 
@@ -572,11 +574,11 @@ pub enum StreamArg {
     Stderr,
 }
 
-impl From<StreamArg> for dto::LogStreamName {
-    fn from(s: StreamArg) -> dto::LogStreamName {
+impl From<StreamArg> for LogStreamName {
+    fn from(s: StreamArg) -> LogStreamName {
         match s {
-            StreamArg::Stdout => dto::LogStreamName::Stdout,
-            StreamArg::Stderr => dto::LogStreamName::Stderr,
+            StreamArg::Stdout => LogStreamName::Stdout,
+            StreamArg::Stderr => LogStreamName::Stderr,
         }
     }
 }
@@ -611,7 +613,7 @@ pub async fn run(args: JobArgs) -> Result<()> {
             follow,
         } => {
             let order = resolve_order(order, follow)?;
-            let stream = stream.map(dto::LogStreamName::from);
+            let stream = stream.map(LogStreamName::from);
             if follow {
                 run_follow(&client, job, stream, attempt, FOLLOW_POLL_INTERVAL).await
             } else {
@@ -638,28 +640,28 @@ pub async fn run(args: JobArgs) -> Result<()> {
 
 /// Resolve the effective log order. `--follow` streams chronologically, so it
 /// forces `asc` and refuses an explicit `--order desc`.
-fn resolve_order(order: Option<OrderArg>, follow: bool) -> Result<dto::LogOrder> {
+fn resolve_order(order: Option<OrderArg>, follow: bool) -> Result<LogOrder> {
     if follow {
         if order == Some(OrderArg::Desc) {
             bail!("--follow streams chronologically and cannot be combined with --order desc");
         }
-        return Ok(dto::LogOrder::Asc);
+        return Ok(LogOrder::Asc);
     }
     Ok(match order {
-        Some(OrderArg::Desc) => dto::LogOrder::Desc,
+        Some(OrderArg::Desc) => LogOrder::Desc,
         // The CLI default is chronological — what a terminal reader expects —
         // even though the server default is `desc`.
-        Some(OrderArg::Asc) | None => dto::LogOrder::Asc,
+        Some(OrderArg::Asc) | None => LogOrder::Asc,
     })
 }
 
 /// Resolve the effective usage order. Both the CLI and the usage endpoint
 /// default to `asc` (a chart-ordered time series), so this is a plain mapping
 /// with no `--follow` interaction to reconcile.
-fn usage_order(order: Option<OrderArg>) -> dto::LogOrder {
+fn usage_order(order: Option<OrderArg>) -> LogOrder {
     match order {
-        Some(OrderArg::Desc) => dto::LogOrder::Desc,
-        Some(OrderArg::Asc) | None => dto::LogOrder::Asc,
+        Some(OrderArg::Desc) => LogOrder::Desc,
+        Some(OrderArg::Asc) | None => LogOrder::Asc,
     }
 }
 
@@ -674,31 +676,34 @@ fn usage_order(order: Option<OrderArg>) -> dto::LogOrder {
 /// filter into an open-ended scan of the whole cluster. The page's continuation
 /// token is printed instead, to be passed back as `--cursor`.
 async fn list(
-    client: &ApiClient,
+    client: &Client,
     filter: &JobFilterArgs,
-    limit: Option<u64>,
+    limit: Option<u32>,
     cursor: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let mut query: Query = Vec::new();
+    let mut params = ListJobsParams::new();
     if let Some(filter) = build_filter(filter)? {
-        query.push(("filter", filter.to_string()));
+        params = params.with_filter(filter);
     }
     if let Some(limit) = limit {
-        query.push(("limit", limit.to_string()));
+        params = params.with_limit(limit);
     }
     if let Some(cursor) = cursor {
-        query.push(("cursor", cursor.to_string()));
+        params = params.with_cursor(JobCursor::from(cursor.to_string()));
     }
-    let body: serde_json::Value = client
-        .get_json("/jobs", &query, ctx("listing jobs", "reading the job list"))
-        .await?;
     if json {
-        print_json(&body);
+        let body = client
+            .get_value(paths::JOBS, &params.query_pairs())
+            .await
+            .api_ctx(ctx("listing jobs", "reading the job list"))?;
+        print_json(&body.value);
         return Ok(());
     }
-    let page: dto::ListJobsResponse =
-        serde_json::from_value(body).context("reading the job list")?;
+    let page = client
+        .list_jobs(&params)
+        .await
+        .api_ctx(ctx("listing jobs", "reading the job list"))?;
     print!("{}", render_job_list(&page));
     Ok(())
 }
@@ -707,7 +712,7 @@ async fn list(
 /// the continuation token to pass back as `--cursor`. A non-null cursor is
 /// printed even for a short (or empty) page: it means "more may exist", and
 /// silently omitting it would present a budget-cut page as a complete answer.
-fn render_job_list(page: &dto::ListJobsResponse) -> String {
+fn render_job_list(page: &ListJobsResponse) -> String {
     use std::fmt::Write;
 
     let mut out = String::new();
@@ -718,13 +723,9 @@ fn render_job_list(page: &dto::ListJobsResponse) -> String {
             .jobs
             .iter()
             .map(|job| {
-                let state = match job.attempt_state {
-                    Some(attempt) => format!(
-                        "{} ({})",
-                        job_state_label(job.state),
-                        attempt_state_label(attempt)
-                    ),
-                    None => job_state_label(job.state).to_string(),
+                let state = match &job.attempt_state {
+                    Some(attempt) => format!("{} ({attempt})", job.state),
+                    None => job.state.to_string(),
                 };
                 vec![
                     job.id.to_string(),
@@ -766,22 +767,19 @@ fn render_job_list(page: &dto::ListJobsResponse) -> String {
 /// rather than as a blank table cell.
 fn metadata_name(metadata: &JobMetadata) -> String {
     match metadata.get("name") {
-        Some(name) if !name.is_empty() => name.clone(),
+        Some(name) if !name.is_empty() => name.to_string(),
         _ => "-".to_string(),
     }
 }
 
-async fn submit(client: &ApiClient, spec_path: &Path, job: Option<JobId>) -> Result<()> {
+async fn submit(client: &Client, spec_path: &Path, job: Option<JobId>) -> Result<()> {
     let spec = JobSpec::load(spec_path)?;
     let job = job.unwrap_or_else(JobId::new);
     let request = spec.request(job);
-    let submitted: dto::SubmitJobResponse = client
-        .post_json(
-            "/jobs",
-            &request,
-            ctx("submitting job", "reading submit response"),
-        )
-        .await?;
+    let submitted = client
+        .submit_job(&request)
+        .await
+        .api_ctx(ctx("submitting job", "reading submit response"))?;
     println!(
         "submitted {} (log index {})",
         submitted.job, submitted.log_index
@@ -789,7 +787,7 @@ async fn submit(client: &ApiClient, spec_path: &Path, job: Option<JobId>) -> Res
     Ok(())
 }
 
-async fn status(client: &ApiClient, job: JobId) -> Result<()> {
+async fn status(client: &Client, job: JobId) -> Result<()> {
     let detail = get_job(client, job).await?;
     // The event timeline (ADR 0032) is enrichment, not core status: a
     // coordinator too old to serve the route answers 501, and `get_job` already
@@ -809,8 +807,8 @@ async fn status(client: &ApiClient, job: JobId) -> Result<()> {
 /// [`status`] so the degradation contract — the status body renders even when
 /// the timeline errs — is unit-testable without capturing stdout.
 fn compose_status(
-    detail: &dto::JobDetail,
-    timeline: Result<Vec<dto::TimelineEvent>>,
+    detail: &JobDetail,
+    timeline: Result<Vec<TimelineEvent>>,
 ) -> (String, Option<String>) {
     let mut out = render_status(detail);
     match timeline {
@@ -822,12 +820,16 @@ fn compose_status(
     }
 }
 
-async fn abort(client: &ApiClient, job: JobId, reason: Option<String>) -> Result<()> {
+async fn abort(client: &Client, job: JobId, reason: Option<String>) -> Result<()> {
     // The path segment is authoritative for the job id; the body omits it.
-    let request = dto::AbortJobRequest { job: None, reason };
+    let mut request = AbortJobRequest::new();
+    if let Some(reason) = reason {
+        request = request.with_reason(reason);
+    }
     client
-        .post_ignoring_body(&format!("/jobs/{job}/abort"), &request, "requesting abort")
-        .await?;
+        .abort_job(job, &request)
+        .await
+        .api_ctx(ctx("requesting abort", "reading abort response"))?;
     println!("abort requested for {job}");
     Ok(())
 }
@@ -839,7 +841,7 @@ async fn abort(client: &ApiClient, job: JobId, reason: Option<String>) -> Result
 /// reused for both request shapes, so `--replace`'s map and the patch's
 /// `set` half read `key=value` identically.
 async fn metadata(
-    client: &ApiClient,
+    client: &Client,
     job: JobId,
     set: Vec<String>,
     unset: Vec<String>,
@@ -856,14 +858,11 @@ async fn metadata(
         }
         // An empty --set under --replace is not a mistake to guard against:
         // it is how a caller clears the map, mirroring `PUT /authorization`.
-        let request = dto::ReplaceJobMetadataRequest { metadata: set };
-        let resp: dto::ReplaceJobMetadataResponse = client
-            .put_json(
-                &format!("/jobs/{job}/metadata"),
-                &request,
-                ctx("replacing job metadata", "reading metadata response"),
-            )
-            .await?;
+        let request = ReplaceJobMetadataRequest::new(set);
+        let resp = client
+            .replace_job_metadata(job, &request)
+            .await
+            .api_ctx(ctx("replacing job metadata", "reading metadata response"))?;
         println!("metadata updated for {job} (log index {})", resp.log_index);
         return Ok(());
     }
@@ -871,27 +870,24 @@ async fn metadata(
     if set.is_empty() && unset.is_empty() {
         bail!("nothing to do: give at least one --set or --unset (or pass --replace with --set)");
     }
-    let request = dto::UpdateJobMetadataRequest { set, unset };
-    let resp: dto::UpdateJobMetadataResponse = client
-        .post_json(
-            &format!("/jobs/{job}/metadata"),
-            &request,
-            ctx("updating job metadata", "reading metadata response"),
-        )
-        .await?;
+    let mut request = UpdateJobMetadataRequest::new();
+    request.set = set;
+    request.unset = unset;
+    let resp = client
+        .update_job_metadata(job, &request)
+        .await
+        .api_ctx(ctx("updating job metadata", "reading metadata response"))?;
     println!("metadata updated for {job} (log index {})", resp.log_index);
     Ok(())
 }
 
 /// GET a job's detail, mapping a non-2xx response to a rich error.
-async fn get_job(client: &ApiClient, job: JobId) -> Result<dto::JobDetail> {
-    client
-        .get_json(
-            &format!("/jobs/{job}"),
-            &Vec::new(),
-            ctx("fetching job status", "reading job detail"),
-        )
+async fn get_job(client: &Client, job: JobId) -> Result<JobDetail> {
+    let detail = client
+        .job(job)
         .await
+        .api_ctx(ctx("fetching job status", "reading job detail"))?;
+    Ok(detail.into_inner())
 }
 
 /// Walk a job's event timeline (ADR 0032), paging through `next_cursor` until
@@ -899,26 +895,15 @@ async fn get_job(client: &ApiClient, job: JobId) -> Result<dto::JobDetail> {
 /// is sent — the server's default page size governs — and `cursor` is passed
 /// only when continuing from a prior page. A non-2xx response (including the
 /// 501 an older coordinator gives) maps to a rich error.
-async fn fetch_timeline(client: &ApiClient, job: JobId) -> Result<Vec<dto::TimelineEvent>> {
-    let mut events: Vec<dto::TimelineEvent> = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let mut query: Query = Vec::new();
-        if let Some(cursor) = &cursor {
-            query.push(("cursor", cursor.clone()));
-        }
-        let page: dto::GetJobTimelineResponse = client
-            .get_json(
-                &format!("/jobs/{job}/timeline"),
-                &query,
-                ctx("fetching job timeline", "reading job timeline"),
-            )
-            .await?;
+async fn fetch_timeline(client: &Client, job: JobId) -> Result<Vec<TimelineEvent>> {
+    let mut events: Vec<TimelineEvent> = Vec::new();
+    let mut pages = client.job_timeline_paged(job, TimelineParams::new());
+    while let Some(page) = pages
+        .next_page()
+        .await
+        .api_ctx(ctx("fetching job timeline", "reading job timeline"))?
+    {
         events.extend(page.events);
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
     }
     Ok(events)
 }
@@ -930,29 +915,35 @@ async fn fetch_timeline(client: &ApiClient, job: JobId) -> Result<Vec<dto::Timel
 /// The non-follow log walk: page through `next_cursor` until it is null, then
 /// report any source that was not fully available.
 async fn run_logs(
-    client: &ApiClient,
+    client: &Client,
     job: JobId,
-    stream: Option<dto::LogStreamName>,
+    stream: Option<LogStreamName>,
     attempt: Option<AttemptId>,
-    order: dto::LogOrder,
+    order: LogOrder,
 ) -> Result<()> {
     // Attempt multiplicity decides prefixing, and it must be known up front: a
     // page can cover a single attempt even when the job has several (the server
     // ends a page wherever the budget lands), so the walk itself is a late
     // signal. The extra GET also surfaces NOT_FOUND before the first page.
     let mut multi = initial_multi(&get_job(client, job).await?, attempt);
-    let mut sources: Vec<dto::LogSourceRecord> = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let page = fetch_logs_page(client, job, stream, attempt, order, cursor.as_deref()).await?;
+    let mut sources: Vec<LogSourceRecord> = Vec::new();
+    let mut params = LogsParams::new().with_order(order);
+    if let Some(stream) = stream {
+        params = params.with_stream(stream);
+    }
+    if let Some(attempt) = attempt {
+        params = params.with_attempt(attempt);
+    }
+    let mut pages = client.job_logs_paged(job, params);
+    while let Some(page) = pages
+        .next_page()
+        .await
+        .api_ctx(ctx("fetching job logs", "reading job logs"))?
+    {
         merge_sources(&mut sources, page.sources);
         multi = latch_multi(multi, &sources);
         for entry in &page.entries {
             print_entry(entry, multi);
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
         }
     }
     print_source_notes(&sources);
@@ -962,14 +953,14 @@ async fn run_logs(
 /// Whether lines need an attempt prefix, decided from the job's attempt list:
 /// more than one attempt, unless `--attempt` scopes the walk to a single one
 /// (scoped output is single-attempt by construction, so a prefix is noise).
-fn initial_multi(detail: &dto::JobDetail, attempt: Option<AttemptId>) -> bool {
+fn initial_multi(detail: &JobDetail, attempt: Option<AttemptId>) -> bool {
     attempt.is_none() && detail.attempts.len() > 1
 }
 
 /// Safety net behind [`initial_multi`]: if a second attempt appears mid-walk
 /// anyway (a retry landing during `--follow`), start prefixing and attribute
 /// the lines already printed — they all belong to the previously-sole attempt.
-fn latch_multi(multi: bool, sources: &[dto::LogSourceRecord]) -> bool {
+fn latch_multi(multi: bool, sources: &[LogSourceRecord]) -> bool {
     if !multi && sources.len() > 1 {
         if let Some(first) = sources.first() {
             eprintln!(
@@ -982,122 +973,44 @@ fn latch_multi(multi: bool, sources: &[dto::LogSourceRecord]) -> bool {
     multi
 }
 
-/// Follow state carried across polls. `cursor` is the token to send on the
-/// next request: `next_cursor` while a page is truncated and history remains,
-/// else the server's ascending `resume_cursor` — an exclusive high-water mark
-/// that stays valid on an exhausted page, carries the same-microsecond skip
-/// count, and lets a later attempt be reached from the prior attempt's end.
-#[derive(Default)]
-struct FollowState {
-    sources: Vec<dto::LogSourceRecord>,
-    multi: bool,
-    cursor: Option<String>,
-}
-
-/// The `--follow` loop: drain to the live head, and once caught up either exit
-/// (job terminal, after one final drain for stragglers) or sleep and re-poll.
+/// The `--follow` loop: [`coppice_client::LogFollower`] owns draining to the
+/// live head, polling from the `resume_cursor`, and stopping one drain after
+/// the job goes terminal. This function keeps only what is CLI-specific: the
+/// up-front multiplicity probe (a page is a late signal for it) and the
+/// prefixing/printing/notes rendering.
 async fn run_follow(
-    client: &ApiClient,
+    client: &Client,
     job: JobId,
-    stream: Option<dto::LogStreamName>,
+    stream: Option<LogStreamName>,
     attempt: Option<AttemptId>,
     interval: Duration,
 ) -> Result<()> {
-    let mut state = FollowState {
-        // Same up-front multiplicity decision as the non-follow walk (a page is
-        // a late signal); `latch_multi` covers retries that appear mid-follow.
-        multi: initial_multi(&get_job(client, job).await?, attempt),
-        ..FollowState::default()
-    };
-    loop {
-        drain_to_head(client, job, stream, attempt, &mut state).await?;
-        let detail = get_job(client, job).await?;
-        if is_terminal(detail.state) {
-            // A last drain catches anything written between our final page and
-            // the job reaching a terminal state.
-            drain_to_head(client, job, stream, attempt, &mut state).await?;
-            break;
-        }
-        tokio::time::sleep(interval).await;
-    }
-    print_source_notes(&state.sources);
-    Ok(())
-}
+    let detail = client
+        .job(job)
+        .await
+        .api_ctx(ctx("fetching job status", "reading job detail"))?;
+    let mut multi = initial_multi(&detail, attempt);
 
-/// Fetch and print pages until the walk reaches the live head (`next_cursor`
-/// null), then retain the page's `resume_cursor` so the next poll continues
-/// from exactly where this one stopped. The stream and attempt filters ride
-/// on every request, so a re-poll never widens or narrows the walk.
-async fn drain_to_head(
-    client: &ApiClient,
-    job: JobId,
-    stream: Option<dto::LogStreamName>,
-    attempt: Option<AttemptId>,
-    state: &mut FollowState,
-) -> Result<()> {
-    loop {
-        let page = fetch_logs_page(
-            client,
-            job,
-            stream,
-            attempt,
-            dto::LogOrder::Asc,
-            state.cursor.as_deref(),
-        )
-        .await?;
-        merge_sources(&mut state.sources, page.sources);
-        state.multi = latch_multi(state.multi, &state.sources);
-        for entry in &page.entries {
-            print_entry(entry, state.multi);
-        }
-
-        let more = page.next_cursor.is_some();
-        // Never rewind: a page that carries neither token (a job with no
-        // attempt yet) keeps whatever position we already held.
-        if let Some(next) = page.next_cursor.or(page.resume_cursor) {
-            state.cursor = Some(next);
-        }
-        if !more {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// One logs GET, mapping a non-2xx response to a rich error.
-async fn fetch_logs_page(
-    client: &ApiClient,
-    job: JobId,
-    stream: Option<dto::LogStreamName>,
-    attempt: Option<AttemptId>,
-    order: dto::LogOrder,
-    cursor: Option<&str>,
-) -> Result<dto::GetJobLogsResponse> {
-    let mut query: Query = vec![("order", order.as_str().to_string())];
+    let mut options = FollowOptions::new().with_poll_interval(interval);
     if let Some(stream) = stream {
-        query.push(("stream", stream_query(stream).to_string()));
+        options = options.with_stream(stream);
     }
     if let Some(attempt) = attempt {
-        query.push(("attempt", attempt.to_string()));
+        options = options.with_attempt(attempt);
     }
-    if let Some(cursor) = cursor {
-        query.push(("cursor", cursor.to_string()));
-    }
-    client
-        .get_json(
-            &format!("/jobs/{job}/logs"),
-            &query,
-            ctx("fetching job logs", "reading job logs"),
-        )
+    let mut follower = client.follow_job_logs(job, options);
+    while let Some(page) = follower
+        .next_page()
         .await
-}
-
-/// The `stream=` query spelling.
-fn stream_query(stream: dto::LogStreamName) -> &'static str {
-    match stream {
-        dto::LogStreamName::Stdout => "stdout",
-        dto::LogStreamName::Stderr => "stderr",
+        .api_ctx(ctx("fetching job logs", "reading job logs"))?
+    {
+        multi = latch_multi(multi, follower.sources());
+        for entry in &page.entries {
+            print_entry(entry, multi);
+        }
     }
+    print_source_notes(follower.sources());
+    Ok(())
 }
 
 /// Print one log line to stdout, prefixing the attempt id only when the walk
@@ -1105,9 +1018,9 @@ fn stream_query(stream: dto::LogStreamName) -> &'static str {
 /// An entry whose own text was cut to fit the page byte budget gets a stderr
 /// warning — the dropped tail is not retrievable, so silence would present
 /// corrupted output as complete.
-fn print_entry(entry: &dto::LogEntry, prefix_attempt: bool) {
+fn print_entry(entry: &LogEntry, prefix_attempt: bool) {
     let text = entry.text.strip_suffix('\n').unwrap_or(&entry.text);
-    let stream = stream_query(entry.stream);
+    let stream = &entry.stream;
     if prefix_attempt {
         println!("{} {} {} {}", entry.attempt, entry.at, stream, text);
     } else {
@@ -1128,7 +1041,7 @@ fn print_entry(entry: &dto::LogEntry, prefix_attempt: bool) {
 /// page resumed past the pruned region (a follow re-poll from the high-water
 /// mark) legitimately reports false without unsaying it. The set stays deduplicated by attempt,
 /// so its length is the number of distinct attempts seen.
-fn merge_sources(into: &mut Vec<dto::LogSourceRecord>, page: Vec<dto::LogSourceRecord>) {
+fn merge_sources(into: &mut Vec<LogSourceRecord>, page: Vec<LogSourceRecord>) {
     for record in page {
         match into.iter_mut().find(|s| s.attempt == record.attempt) {
             Some(existing) => {
@@ -1143,9 +1056,9 @@ fn merge_sources(into: &mut Vec<dto::LogSourceRecord>, page: Vec<dto::LogSourceR
 
 /// After the walk, report to stderr any source that was not fully available,
 /// or whose older lines were pruned — the honesty accounting ADR 0034 requires.
-fn print_source_notes(sources: &[dto::LogSourceRecord]) {
+fn print_source_notes(sources: &[LogSourceRecord]) {
     for source in sources {
-        if let Some(verdict) = availability_label(source.availability) {
+        if let Some(verdict) = availability_label(&source.availability) {
             let reason = source
                 .reason
                 .as_deref()
@@ -1163,12 +1076,11 @@ fn print_source_notes(sources: &[dto::LogSourceRecord]) {
 }
 
 /// The stderr note word for a non-available verdict, or `None` when available.
-fn availability_label(availability: dto::LogAvailability) -> Option<&'static str> {
-    match availability {
-        dto::LogAvailability::Available => None,
-        dto::LogAvailability::Expired => Some("expired"),
-        dto::LogAvailability::Unreachable => Some("unreachable"),
-        dto::LogAvailability::NotStarted => Some("not_started"),
+fn availability_label(availability: &LogAvailability) -> Option<String> {
+    if matches!(availability, LogAvailability::Available) {
+        None
+    } else {
+        Some(availability.to_string())
     }
 }
 
@@ -1183,57 +1095,35 @@ fn availability_label(availability: dto::LogAvailability) -> Option<&'static str
 /// bounded, so buffering the whole series lets rate derivation see each
 /// sample's chronological neighbour across page boundaries.
 async fn run_usage(
-    client: &ApiClient,
+    client: &Client,
     job: JobId,
     attempt: Option<AttemptId>,
-    order: dto::LogOrder,
+    order: LogOrder,
 ) -> Result<()> {
-    let mut samples: Vec<dto::UsagePoint> = Vec::new();
-    let mut sources: Vec<dto::UsageSourceRecord> = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let page = fetch_usage_page(client, job, attempt, order, cursor.as_deref()).await?;
+    let mut samples: Vec<UsagePoint> = Vec::new();
+    let mut sources: Vec<UsageSourceRecord> = Vec::new();
+    let mut params = UsageParams::new().with_order(order);
+    if let Some(attempt) = attempt {
+        params = params.with_attempt(attempt);
+    }
+    let mut pages = client.job_usage_paged(job, params);
+    while let Some(page) = pages
+        .next_page()
+        .await
+        .api_ctx(ctx("fetching job usage", "reading job usage"))?
+    {
         merge_usage_sources(&mut sources, page.sources);
         samples.extend(page.samples);
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
     }
     print!("{}", render_usage(&samples, order));
     print_usage_source_notes(&sources);
     Ok(())
 }
 
-/// One usage GET, mapping a non-2xx response to a rich error. `limit` is left
-/// to the server default; `cursor` is passed only when continuing a walk.
-async fn fetch_usage_page(
-    client: &ApiClient,
-    job: JobId,
-    attempt: Option<AttemptId>,
-    order: dto::LogOrder,
-    cursor: Option<&str>,
-) -> Result<dto::GetJobUsageResponse> {
-    let mut query: Query = vec![("order", order.as_str().to_string())];
-    if let Some(attempt) = attempt {
-        query.push(("attempt", attempt.to_string()));
-    }
-    if let Some(cursor) = cursor {
-        query.push(("cursor", cursor.to_string()));
-    }
-    client
-        .get_json(
-            &format!("/jobs/{job}/usage"),
-            &query,
-            ctx("fetching job usage", "reading job usage"),
-        )
-        .await
-}
-
 /// Merge a page's source records into the running set — the usage twin of
 /// [`merge_sources`], with the same by-attempt dedup and sticky-`truncated`
 /// rule (evidence of pruning must survive a later, narrower record).
-fn merge_usage_sources(into: &mut Vec<dto::UsageSourceRecord>, page: Vec<dto::UsageSourceRecord>) {
+fn merge_usage_sources(into: &mut Vec<UsageSourceRecord>, page: Vec<UsageSourceRecord>) {
     for record in page {
         match into.iter_mut().find(|s| s.attempt == record.attempt) {
             Some(existing) => {
@@ -1249,9 +1139,9 @@ fn merge_usage_sources(into: &mut Vec<dto::UsageSourceRecord>, page: Vec<dto::Us
 /// After the walk, report to stderr any source that was not fully available,
 /// or whose older samples were pruned — the usage twin of
 /// [`print_source_notes`].
-fn print_usage_source_notes(sources: &[dto::UsageSourceRecord]) {
+fn print_usage_source_notes(sources: &[UsageSourceRecord]) {
     for source in sources {
-        if let Some(verdict) = usage_availability_label(source.availability) {
+        if let Some(verdict) = usage_availability_label(&source.availability) {
             let reason = source
                 .reason
                 .as_deref()
@@ -1269,12 +1159,11 @@ fn print_usage_source_notes(sources: &[dto::UsageSourceRecord]) {
 }
 
 /// The stderr note word for a non-available verdict, or `None` when available.
-fn usage_availability_label(availability: dto::UsageAvailability) -> Option<&'static str> {
-    match availability {
-        dto::UsageAvailability::Available => None,
-        dto::UsageAvailability::Expired => Some("expired"),
-        dto::UsageAvailability::Unreachable => Some("unreachable"),
-        dto::UsageAvailability::NotStarted => Some("not_started"),
+fn usage_availability_label(availability: &UsageAvailability) -> Option<String> {
+    if matches!(availability, UsageAvailability::Available) {
+        None
+    } else {
+        Some(availability.to_string())
     }
 }
 
@@ -1289,9 +1178,9 @@ type RatePair = (Option<f64>, Option<f64>);
 /// happen within one cumulative-per-attempt series, so a negative delta is
 /// nonsense we decline to render).
 fn rate_percent(
-    prev: &dto::UsagePoint,
-    cur: &dto::UsagePoint,
-    counter: impl Fn(&dto::UsagePoint) -> u64,
+    prev: &UsagePoint,
+    cur: &UsagePoint,
+    counter: impl Fn(&UsagePoint) -> u64,
 ) -> Option<f64> {
     let dt = cur.at.as_micros().checked_sub(prev.at.as_micros())?;
     if dt <= 0 {
@@ -1308,11 +1197,15 @@ fn rate_percent(
 /// for `desc` it is reversed to a chronological view first, then the results
 /// are mapped back to display order. The chronologically first sample has no
 /// predecessor, so its rate is `None` (rendered `-`).
-fn attempt_rates(samples: &[dto::UsagePoint], order: dto::LogOrder) -> Vec<RatePair> {
+fn attempt_rates(samples: &[UsagePoint], order: LogOrder) -> Vec<RatePair> {
     let n = samples.len();
-    let chrono: Vec<&dto::UsagePoint> = match order {
-        dto::LogOrder::Asc => samples.iter().collect(),
-        dto::LogOrder::Desc => samples.iter().rev().collect(),
+    // `LogOrder` is `#[non_exhaustive]`; this CLI only ever constructs `Asc`
+    // or `Desc` (see `resolve_order`/`usage_order`), so the wildcard arms
+    // below — required by the compiler, not by any real third case — take
+    // the chronological (`Asc`) reading.
+    let chrono: Vec<&UsagePoint> = match order {
+        LogOrder::Desc => samples.iter().rev().collect(),
+        LogOrder::Asc | _ => samples.iter().collect(),
     };
     let mut rates: Vec<RatePair> = vec![(None, None); n];
     for i in 1..n {
@@ -1322,8 +1215,8 @@ fn attempt_rates(samples: &[dto::UsagePoint], order: dto::LogOrder) -> Vec<RateP
         );
     }
     match order {
-        dto::LogOrder::Asc => rates,
-        dto::LogOrder::Desc => rates.into_iter().rev().collect(),
+        LogOrder::Desc => rates.into_iter().rev().collect(),
+        LogOrder::Asc | _ => rates,
     }
 }
 
@@ -1347,7 +1240,7 @@ fn humanize_bytes(bytes: u64) -> String {
 }
 
 /// The ten cells for one sample row, in [`USAGE_HEADERS`] order.
-fn usage_row(sample: &dto::UsagePoint, rate: RatePair) -> [String; 10] {
+fn usage_row(sample: &UsagePoint, rate: RatePair) -> [String; 10] {
     [
         sample.at.to_string(),
         format_percent(rate.0),
@@ -1370,7 +1263,7 @@ fn usage_row(sample: &dto::UsagePoint, rate: RatePair) -> [String; 10] {
 /// `attempt: <id>` header. Rate columns (`cpu%`, `thr%`) are derived per
 /// attempt so a rate never spans an attempt boundary. An empty series says so
 /// rather than printing a bare header.
-fn render_usage(samples: &[dto::UsagePoint], order: dto::LogOrder) -> String {
+fn render_usage(samples: &[UsagePoint], order: LogOrder) -> String {
     use std::fmt::Write;
 
     if samples.is_empty() {
@@ -1378,7 +1271,7 @@ fn render_usage(samples: &[dto::UsagePoint], order: dto::LogOrder) -> String {
     }
 
     // Contiguous attempt blocks in encounter order.
-    let mut blocks: Vec<(AttemptId, Vec<&dto::UsagePoint>)> = Vec::new();
+    let mut blocks: Vec<(AttemptId, Vec<&UsagePoint>)> = Vec::new();
     for sample in samples {
         match blocks.last_mut() {
             Some((attempt, group)) if *attempt == sample.attempt => group.push(sample),
@@ -1397,7 +1290,7 @@ fn render_usage(samples: &[dto::UsagePoint], order: dto::LogOrder) -> String {
         }
 
         // Rate derivation needs an owned slice; clone the (Copy) points back out.
-        let points: Vec<dto::UsagePoint> = group.iter().map(|p| **p).collect();
+        let points: Vec<UsagePoint> = group.iter().map(|p| **p).collect();
         let rates = attempt_rates(&points, order);
 
         // Header first, then one row per sample; column widths span all rows.
@@ -1443,58 +1336,10 @@ fn column_widths(rows: &[[String; 10]]) -> [usize; 10] {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn is_terminal(state: dto::JobStateKind) -> bool {
-    matches!(
-        state,
-        dto::JobStateKind::Succeeded | dto::JobStateKind::Failed | dto::JobStateKind::Aborted
-    )
-}
-
-fn job_state_label(state: dto::JobStateKind) -> &'static str {
-    use dto::JobStateKind as S;
-    match state {
-        S::Submitted => "submitted",
-        S::Accepted => "accepted",
-        S::Queued => "queued",
-        S::Attempting => "attempting",
-        S::Succeeded => "succeeded",
-        S::Failed => "failed",
-        S::Aborted => "aborted",
-    }
-}
-
-fn attempt_state_label(state: dto::AttemptState) -> &'static str {
-    use dto::AttemptState as S;
-    match state {
-        S::Accruing => "accruing",
-        S::Ready => "ready",
-        S::Dispatching => "dispatching",
-        S::Running => "running",
-        S::Finalizing => "finalizing",
-        S::Terminal => "terminal",
-    }
-}
-
-fn outcome_kind_label(kind: dto::AttemptOutcomeKind) -> &'static str {
-    use dto::AttemptOutcomeKind as K;
-    match kind {
-        K::Exited => "exited",
-        K::MemoryLimitExceeded => "memory_limit_exceeded",
-        K::RuntimeLimitExceeded => "runtime_limit_exceeded",
-        K::DiskLimitExceeded => "disk_limit_exceeded",
-        K::Aborted => "aborted",
-        K::Revoked => "revoked",
-        K::PullFailed => "pull_failed",
-        K::StartFailed => "start_failed",
-        K::NodeLost => "node_lost",
-        K::AgentError => "agent_error",
-    }
-}
-
 /// Render a `JobDetail` as aligned plain-text key/value lines plus an attempts
 /// section — deliberately modest, skipping the queue/accrual/cost-breakdown
 /// depth the web UI shows.
-fn render_status(detail: &dto::JobDetail) -> String {
+fn render_status(detail: &JobDetail) -> String {
     use std::fmt::Write;
 
     let spec = &detail.spec;
@@ -1504,7 +1349,7 @@ fn render_status(detail: &dto::JobDetail) -> String {
     };
 
     kv("id", &detail.id.to_string());
-    kv("state", job_state_label(detail.state));
+    kv("state", &detail.state.to_string());
     kv("image", &spec.image);
     kv("command", &spec.command.join(" "));
     if let Some(entrypoint) = &spec.entrypoint {
@@ -1522,8 +1367,8 @@ fn render_status(detail: &dto::JobDetail) -> String {
             ByteSize::from_bytes(spec.requests.disk_bytes),
         ),
     );
-    match spec.max_runtime_seconds {
-        Some(seconds) => kv("max runtime", &format!("{seconds}s")),
+    match spec.max_runtime {
+        Some(duration) => kv("max runtime", &format!("{}s", duration.as_secs())),
         None => kv("max runtime", "unbounded"),
     }
     kv("submitted at", &detail.submitted_at.to_string());
@@ -1585,12 +1430,7 @@ fn render_status(detail: &dto::JobDetail) -> String {
     } else {
         let _ = writeln!(out, "attempts:");
         for attempt in &detail.attempts {
-            let mut line = format!(
-                "  {} {} node {}",
-                attempt.id,
-                attempt_state_label(attempt.state),
-                attempt.node
-            );
+            let mut line = format!("  {} {} node {}", attempt.id, attempt.state, attempt.node);
             if let Some(started) = attempt.started_at {
                 let _ = write!(line, " started {started}");
             }
@@ -1598,7 +1438,7 @@ fn render_status(detail: &dto::JobDetail) -> String {
                 let _ = write!(line, " ended {ended}");
             }
             if let Some(outcome) = &attempt.outcome {
-                let _ = write!(line, " outcome {}", outcome_kind_label(outcome.kind));
+                let _ = write!(line, " outcome {}", outcome.kind);
                 if let Some(code) = outcome.exit_code {
                     let _ = write!(line, " (exit {code})");
                 }
@@ -1614,13 +1454,12 @@ fn render_status(detail: &dto::JobDetail) -> String {
 /// line per event, in the `(index, ordinal)` order the server returns them.
 ///
 /// The block states its own completeness, honouring ADR 0032's honest-absence
-/// vocabulary carried on the wire by [`dto::GetJobTimelineResponse`]: the ring
-/// retains a bounded window, so a job's earliest events may have aged out. The
-/// timeline is complete-from-submission exactly when a `JobSubmitted` event is
-/// present, so a non-empty window lacking one leads with an explicit
-/// truncation note, and an empty window says so outright rather than implying
-/// the job had no history.
-fn render_timeline(events: &[dto::TimelineEvent]) -> String {
+/// vocabulary: the ring retains a bounded window, so a job's earliest events
+/// may have aged out. The timeline is complete-from-submission exactly when a
+/// `JobSubmitted` event is present, so a non-empty window lacking one leads
+/// with an explicit truncation note, and an empty window says so outright
+/// rather than implying the job had no history.
+fn render_timeline(events: &[TimelineEvent]) -> String {
     use std::fmt::Write;
 
     let mut out = String::new();
@@ -1631,7 +1470,7 @@ fn render_timeline(events: &[dto::TimelineEvent]) -> String {
     }
     let complete_from_submission = events
         .iter()
-        .any(|e| matches!(e.body, dto::TimelineEventBody::JobSubmitted { .. }));
+        .any(|e| matches!(e.body, TimelineEventBody::JobSubmitted { .. }));
     if !complete_from_submission {
         let _ = writeln!(out, "  (earlier events not retained on this replica)");
     }
@@ -1643,24 +1482,24 @@ fn render_timeline(events: &[dto::TimelineEvent]) -> String {
 
 /// One event's human description, reusing the shared state labels so the
 /// timeline speaks the same vocabulary as the status lines above it.
-fn timeline_description(body: &dto::TimelineEventBody) -> String {
-    use dto::TimelineEventBody as B;
+///
+/// The trailing wildcard arm is required — `TimelineEventBody` is
+/// `#[non_exhaustive]` — and doubles as the description for `Unknown`, the
+/// client library's own forward-compatibility catch-all for an event kind
+/// this build predates.
+fn timeline_description(body: &TimelineEventBody) -> String {
+    use TimelineEventBody as B;
     match body {
         B::JobSubmitted { .. } => "submitted".to_string(),
         B::JobStateChanged { from, to, .. } => {
-            format!("job {} -> {}", job_state_label(*from), job_state_label(*to))
+            format!("job {from} -> {to}")
         }
         B::AttemptStateChanged {
             attempt,
             node,
             state,
             ..
-        } => format!(
-            "attempt {} {} on node {}",
-            attempt,
-            attempt_state_label(*state),
-            node
-        ),
+        } => format!("attempt {attempt} {state} on node {node}"),
         B::AllocationFunded {
             allocation, node, ..
         } => format!("allocation {allocation} funded on node {node}"),
@@ -1670,13 +1509,16 @@ fn timeline_description(body: &dto::TimelineEventBody) -> String {
         B::JobEvicted { .. } => "evicted".to_string(),
         B::JobMetadataUpdated { .. } => "metadata updated".to_string(),
         // The five cluster-scoped events never fall inside a job-filtered
-        // window, but the match stays exhaustive — this repo forbids wildcard
-        // arms on wire enums — with a plain generic description each.
+        // window, but the match stays exhaustive over what this client
+        // knows — this repo forbids wildcard arms on wire enums except the
+        // one forced by `#[non_exhaustive]` below — with a plain generic
+        // description each.
         B::NodeEpochBumped { .. } => "node epoch bumped".to_string(),
         B::QuotaEntityConfigured { .. } => "quota entity configured".to_string(),
         B::PolicyUpdated => "policy updated".to_string(),
         B::AuthorizationUpdated => "authorization updated".to_string(),
         B::ClusterVersionBumped { .. } => "cluster version bumped".to_string(),
+        _ => "unrecognized event".to_string(),
     }
 }
 
@@ -1691,8 +1533,44 @@ mod tests {
     use axum::http::StatusCode as AxumStatus;
     use axum::routing::{get, post, put};
     use axum::{Json, Router};
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
+    use coppice_api::http::dto;
+    use coppice_core::id::{AttemptId as CoreAttemptId, JobId as CoreJobId};
+    use coppice_core::metadata::JobMetadata as CoreMetadata;
+    use coppice_core::time::Timestamp as CoreTimestamp;
 
     use crate::testsupport::{error_body, leader_hint, spawn};
+
+    /// Convert a server-typed (`dto::`) fixture into the client type the CLI
+    /// actually renders. The server type is the fixture a real coordinator
+    /// would send; the client type is what `render_*`/`compose_status`
+    /// consume; and this conversion IS the contract check — it fails the
+    /// moment the two shapes disagree.
+    fn as_client<S: Serialize, D: DeserializeOwned>(value: S) -> D {
+        serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
+    }
+
+    /// Round-trip a typed id (or any `Display` value) from this crate's own
+    /// id type into the server's type of the same name, via the shared
+    /// `<prefix>-<uuid>` spelling both sides use. The two are never the same
+    /// Rust type after the client-library split, which is exactly why a test
+    /// building a `dto::` expectation from a client-side id needs this.
+    fn dto_id<T>(id: impl std::fmt::Display) -> T
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Debug,
+    {
+        id.to_string()
+            .parse()
+            .expect("id round-trips through its own spelling")
+    }
+
+    /// The server-typed twin of a client [`Timestamp`], to the same instant.
+    fn core_ts(t: Timestamp) -> CoreTimestamp {
+        CoreTimestamp::from_micros(t.as_micros()).expect("in range")
+    }
 
     // -- Spec parsing -------------------------------------------------------
 
@@ -1844,15 +1722,15 @@ empty = ""
     fn metadata_table_crosses_into_the_request() {
         let spec = parse(METADATA_SPEC).expect("metadata spec parses");
         let request = spec.request(JobId::new());
-        assert_eq!(
-            request.metadata,
-            JobMetadata::from([
-                ("name".to_string(), "nightly-build".to_string()),
-                ("attempt".to_string(), "3".to_string()),
-                ("ticket".to_string(), "INC-1234".to_string()),
-                ("empty".to_string(), String::new()),
-            ])
-        );
+        let expected: JobMetadata = [
+            ("name", "nightly-build"),
+            ("attempt", "3"),
+            ("ticket", "INC-1234"),
+            ("empty", ""),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(request.metadata, expected);
     }
 
     /// Metadata has no value type, so a non-string TOML value is a spec
@@ -1865,7 +1743,7 @@ empty = ""
     }
 
     /// A spec with no `[metadata]` table converts to the empty map, matching
-    /// the wire default (`SubmitJobRequest::metadata`'s `#[serde(default)]`).
+    /// the wire default (`SubmitJobRequest::metadata`'s default).
     #[test]
     fn absent_metadata_table_is_the_empty_map() {
         let spec = parse(MINIMAL_SPEC).expect("minimal spec parses");
@@ -1898,13 +1776,10 @@ EMPTY = ""
         let request = spec.request(JobId::new());
         assert_eq!(
             request.env,
-            coppice_core::env::JobEnv::from([
-                (
-                    "PATH".to_string(),
-                    "/usr/local/bin:/usr/bin:/bin".to_string()
-                ),
-                ("LOG_LEVEL".to_string(), "debug".to_string()),
-                ("EMPTY".to_string(), String::new()),
+            JobEnv::from_iter([
+                ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                ("LOG_LEVEL", "debug"),
+                ("EMPTY", ""),
             ])
         );
     }
@@ -1935,7 +1810,7 @@ EMPTY = ""
         let request = spec.request(job);
         assert_eq!(request.job, job);
         assert_eq!(request.image, "busybox:1.36");
-        assert_eq!(request.max_runtime_seconds, Some(3600));
+        assert_eq!(request.max_runtime, Some(Duration::from_secs(3600)));
         assert_eq!(request.requests.cpu_millis, 500);
         assert_eq!(request.requests.memory_bytes, 256 * 1024 * 1024);
         assert_eq!(request.requests.disk_bytes, 1024 * 1024 * 1024);
@@ -1948,8 +1823,8 @@ EMPTY = ""
     // -- HTTP round-trips ---------------------------------------------------
 
     /// A client bound to a spawned fake server's base URL.
-    fn client(base: &str) -> ApiClient {
-        ApiClient::new(base).expect("client builds")
+    fn client(base: &str) -> Client {
+        Client::new(base).expect("client builds")
     }
 
     fn write_spec(contents: &str) -> tempfile::NamedTempFile {
@@ -1960,13 +1835,14 @@ EMPTY = ""
 
     // -- job list -----------------------------------------------------------
 
-    /// The AST this CLI builds is JSON, because `dto::JobFilter` is
-    /// deserialize-only. That makes the contract check a *round trip*: what
-    /// `build_filter` emits must deserialize into the very type the server
-    /// parses it with, and equal the tree we meant.
+    /// The AST this CLI builds is a [`JobFilter`]; the contract check is a
+    /// *round trip* through the server's own type: what `build_filter` emits
+    /// must serialize, deserialize as the server's `dto::JobFilter`, and
+    /// validate — and equal the tree we meant.
     fn round_trip(args: &JobFilterArgs) -> Option<dto::JobFilter> {
         let built = build_filter(args).expect("filter builds");
-        built.map(|value| {
+        built.map(|filter| {
+            let value = serde_json::to_value(&filter).unwrap();
             let parsed: dto::JobFilter = serde_json::from_value(value)
                 .expect("the built filter deserializes as the server's own JobFilter");
             parsed.validate().expect("the built filter validates");
@@ -2016,10 +1892,10 @@ EMPTY = ""
             leaves,
             [
                 dto::JobFilter::Entity(dto::EntityFilter {
-                    id: entity,
+                    id: dto_id(entity),
                     scope: dto::EntityScope::Exact,
                 }),
-                dto::JobFilter::Node(node),
+                dto::JobFilter::Node(dto_id(node)),
                 dto::JobFilter::Image(dto::ImageFilter::Contains("busybox".to_string())),
                 dto::JobFilter::Search("hello".to_string()),
             ]
@@ -2060,7 +1936,7 @@ EMPTY = ""
         assert_eq!(
             filter,
             dto::JobFilter::Submitted(dto::SubmittedFilter {
-                after: Some(after),
+                after: Some(core_ts(after)),
                 before: None,
             })
         );
@@ -2221,7 +2097,7 @@ EMPTY = ""
         assert!(format!("{err:#}").contains("name"));
     }
 
-    fn sample_job_summary(id: JobId) -> dto::JobSummary {
+    fn sample_job_summary(id: CoreJobId) -> dto::JobSummary {
         dto::JobSummary {
             id,
             state: dto::JobStateKind::Queued,
@@ -2232,7 +2108,7 @@ EMPTY = ""
                 .unwrap(),
             quota_entity_name: "default".to_string(),
             priority: 0,
-            submitted_at: Timestamp::from_micros(1_000_000).unwrap(),
+            submitted_at: CoreTimestamp::from_micros(1_000_000).unwrap(),
             submitted_by: None,
             terminal_at: None,
             node: None,
@@ -2240,7 +2116,7 @@ EMPTY = ""
             funding_fraction: None,
             cost_ucu: 1234,
             outcome: None,
-            metadata: JobMetadata::new(),
+            metadata: CoreMetadata::new(),
         }
     }
 
@@ -2251,7 +2127,7 @@ EMPTY = ""
     async fn list_sends_the_filter_ast_limit_and_cursor() {
         type Seen = Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>;
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-        let job = JobId::new();
+        let job = CoreJobId::new();
         let body = serde_json::to_value(dto::ListJobsResponse {
             jobs: vec![sample_job_summary(job)],
             next_cursor: Some("v1:job-00000000-0000-0000-0000-000000000009".to_string()),
@@ -2353,11 +2229,12 @@ EMPTY = ""
 
     #[test]
     fn list_render_shows_the_rows_and_the_continuation() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let rendered = render_job_list(&dto::ListJobsResponse {
+        let job: CoreJobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let page: ListJobsResponse = as_client(dto::ListJobsResponse {
             jobs: vec![sample_job_summary(job)],
             next_cursor: Some("v1:job-00000000-0000-0000-0000-000000000009".to_string()),
         });
+        let rendered = render_job_list(&page);
         assert!(rendered.contains(&job.to_string()), "{rendered}");
         assert!(rendered.contains("busybox:1.36"), "{rendered}");
         assert!(rendered.contains("1234"), "{rendered}");
@@ -2368,10 +2245,11 @@ EMPTY = ""
     /// render must not swallow the continuation token.
     #[test]
     fn list_render_keeps_the_cursor_on_an_empty_page() {
-        let rendered = render_job_list(&dto::ListJobsResponse {
+        let page: ListJobsResponse = as_client(dto::ListJobsResponse {
             jobs: Vec::new(),
             next_cursor: Some("v1:job-00000000-0000-0000-0000-000000000009".to_string()),
         });
+        let rendered = render_job_list(&page);
         assert!(rendered.contains("(no jobs)"), "{rendered}");
         assert!(rendered.contains("more may exist"), "{rendered}");
     }
@@ -2406,7 +2284,7 @@ EMPTY = ""
         // The server received the real DTO, converted from the spec.
         let received = captured.lock().unwrap();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].job, job);
+        assert_eq!(received[0].job, dto_id(job));
         assert_eq!(received[0].image, "busybox:1.36");
         assert_eq!(received[0].max_runtime_seconds, Some(3600));
         assert_eq!(received[0].requests.memory_bytes, 256 * 1024 * 1024);
@@ -2501,7 +2379,7 @@ EMPTY = ""
                         captured.lock().unwrap().push(req);
                         Json(
                             serde_json::to_value(dto::UpdateJobMetadataResponse {
-                                job: JobId::new(),
+                                job: CoreJobId::new(),
                                 log_index: 7,
                             })
                             .unwrap(),
@@ -2543,7 +2421,7 @@ EMPTY = ""
                         captured.lock().unwrap().push(req);
                         Json(
                             serde_json::to_value(dto::ReplaceJobMetadataResponse {
-                                job: JobId::new(),
+                                job: CoreJobId::new(),
                                 log_index: 9,
                             })
                             .unwrap(),
@@ -2605,8 +2483,8 @@ EMPTY = ""
     }
 
     /// A minimal but complete `JobDetail`, built from the real DTO types.
-    fn sample_job_detail(job: JobId, state: dto::JobStateKind) -> dto::JobDetail {
-        let ts = Timestamp::from_micros(1_000_000).unwrap();
+    fn sample_job_detail(job: CoreJobId, state: dto::JobStateKind) -> dto::JobDetail {
+        let ts = CoreTimestamp::from_micros(1_000_000).unwrap();
         let requests = dto::Resources {
             cpu_millis: 500,
             memory_bytes: 256 * 1024 * 1024,
@@ -2634,7 +2512,13 @@ EMPTY = ""
             },
             submitted_at: ts,
             state_since: ts,
-            terminal_at: is_terminal(state).then_some(ts),
+            terminal_at: matches!(
+                state,
+                dto::JobStateKind::Succeeded
+                    | dto::JobStateKind::Failed
+                    | dto::JobStateKind::Aborted
+            )
+            .then_some(ts),
             retries_used: 0,
             abort_requested: None,
             entity_chain: Vec::new(),
@@ -2659,14 +2543,14 @@ EMPTY = ""
                 actual_ucu: None,
                 true_up: None,
             },
-            metadata: JobMetadata::new(),
+            metadata: CoreMetadata::new(),
         }
     }
 
     #[tokio::test]
     async fn status_renders_the_job_detail() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let job = CoreJobId::new();
+        let detail: JobDetail = as_client(sample_job_detail(job, dto::JobStateKind::Attempting));
         let rendered = render_status(&detail);
         assert!(
             rendered.contains(&format!("id              {job}")),
@@ -2682,8 +2566,8 @@ EMPTY = ""
 
     #[tokio::test]
     async fn status_renders_the_settled_cost_once_terminal() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let live = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let job = CoreJobId::new();
+        let live: JobDetail = as_client(sample_job_detail(job, dto::JobStateKind::Attempting));
         assert!(!render_status(&live).contains("cost (settled)"));
 
         let mut done = sample_job_detail(job, dto::JobStateKind::Succeeded);
@@ -2692,6 +2576,7 @@ EMPTY = ""
             kind: dto::TrueUpKind::Refund,
             amount_ucu: 234,
         });
+        let done: JobDetail = as_client(done);
         let rendered = render_status(&done);
         assert!(rendered.contains("cost (charged)  1234 uCU"), "{rendered}");
         assert!(rendered.contains("cost (settled)  1000 uCU"), "{rendered}");
@@ -2699,20 +2584,21 @@ EMPTY = ""
 
     #[tokio::test]
     async fn status_renders_metadata_as_none_when_empty() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let job = CoreJobId::new();
+        let detail: JobDetail = as_client(sample_job_detail(job, dto::JobStateKind::Attempting));
         let rendered = render_status(&detail);
         assert!(rendered.contains("metadata        (none)"), "{rendered}");
     }
 
     #[tokio::test]
     async fn status_renders_the_metadata_block() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let job = CoreJobId::new();
         let mut detail = sample_job_detail(job, dto::JobStateKind::Attempting);
-        detail.metadata = JobMetadata::from([
+        detail.metadata = CoreMetadata::from([
             ("attempt".to_string(), "3".to_string()),
             ("name".to_string(), "nightly-build".to_string()),
         ]);
+        let detail: JobDetail = as_client(detail);
         let rendered = render_status(&detail);
         assert!(rendered.contains("metadata:"), "{rendered}");
         assert!(rendered.contains("  attempt = 3"), "{rendered}");
@@ -2721,15 +2607,15 @@ EMPTY = ""
 
     #[tokio::test]
     async fn status_renders_env_as_none_when_empty() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let job: CoreJobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let detail: JobDetail = as_client(sample_job_detail(job, dto::JobStateKind::Attempting));
         let rendered = render_status(&detail);
         assert!(rendered.contains("env             (none)"), "{rendered}");
     }
 
     #[tokio::test]
     async fn status_renders_the_env_block() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let job: CoreJobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
         let mut detail = sample_job_detail(job, dto::JobStateKind::Attempting);
         detail.spec.env = coppice_core::env::JobEnv::from([
             ("LOG_LEVEL".to_string(), "debug".to_string()),
@@ -2740,6 +2626,7 @@ EMPTY = ""
                 "x\nstate  Succeeded\u{1b}[2J".to_string(),
             ),
         ]);
+        let detail: JobDetail = as_client(detail);
         let rendered = render_status(&detail);
         assert!(rendered.contains("env:"), "{rendered}");
         assert!(rendered.contains("  LOG_LEVEL = \"debug\""), "{rendered}");
@@ -2753,25 +2640,26 @@ EMPTY = ""
 
     #[tokio::test]
     async fn status_renders_the_submitting_principal_when_present() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let job = CoreJobId::new();
         let mut detail = sample_job_detail(job, dto::JobStateKind::Attempting);
         detail.spec.submitted_by = Some("user-42".to_string());
+        let detail: JobDetail = as_client(detail);
         let rendered = render_status(&detail);
         assert!(rendered.contains("submitted by    user-42"), "{rendered}");
     }
 
-    fn log_entry(attempt: AttemptId, at_us: i64, text: &str) -> dto::LogEntry {
+    fn log_entry(attempt: CoreAttemptId, at_us: i64, text: &str) -> dto::LogEntry {
         dto::LogEntry {
             id: String::new(),
             attempt,
-            at: Timestamp::from_micros(at_us).unwrap(),
+            at: CoreTimestamp::from_micros(at_us).unwrap(),
             stream: dto::LogStreamName::Stdout,
             text: text.to_string(),
             truncated: false,
         }
     }
 
-    fn available_source(attempt: AttemptId) -> dto::LogSourceRecord {
+    fn available_source(attempt: CoreAttemptId) -> dto::LogSourceRecord {
         dto::LogSourceRecord {
             attempt,
             node: Some("node-00000000-0000-0000-0000-000000000001".parse().unwrap()),
@@ -2784,25 +2672,21 @@ EMPTY = ""
 
     #[test]
     fn merged_source_truncation_is_sticky() {
-        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
-            .parse()
-            .unwrap();
+        let attempt = CoreAttemptId::new();
         let mut truncated = available_source(attempt);
         truncated.truncated = true;
-        let mut sources = Vec::new();
-        merge_sources(&mut sources, vec![truncated]);
+        let mut sources: Vec<LogSourceRecord> = Vec::new();
+        merge_sources(&mut sources, vec![as_client(truncated)]);
         // A later record for the same attempt reports no truncation (e.g. a
         // narrower follow re-poll) — the evidence of loss must survive it.
-        merge_sources(&mut sources, vec![available_source(attempt)]);
+        merge_sources(&mut sources, vec![as_client(available_source(attempt))]);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].truncated);
     }
 
     #[tokio::test]
     async fn logs_paginate_across_two_pages() {
-        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
-            .parse()
-            .unwrap();
+        let attempt = CoreAttemptId::new();
         let page_one = dto::GetJobLogsResponse {
             resume_cursor: None,
             live: false,
@@ -2852,7 +2736,7 @@ EMPTY = ""
                 .route(
                     "/api/v1/jobs/:job",
                     get(|AxumPath(job): AxumPath<String>| async move {
-                        let id: JobId = job.parse().unwrap();
+                        let id: CoreJobId = job.parse().unwrap();
                         Json(
                             serde_json::to_value(sample_job_detail(
                                 id,
@@ -2865,7 +2749,7 @@ EMPTY = ""
                 .with_state(pages);
         let base = spawn(router).await;
 
-        run_logs(&client(&base), JobId::new(), None, None, dto::LogOrder::Asc)
+        run_logs(&client(&base), JobId::new(), None, None, LogOrder::Asc)
             .await
             .expect("logs walk completes");
 
@@ -2877,9 +2761,7 @@ EMPTY = ""
 
     #[tokio::test]
     async fn follow_terminates_when_the_job_is_terminal() {
-        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
-            .parse()
-            .unwrap();
+        let attempt = CoreAttemptId::new();
         let job = JobId::new();
         // One log page (drained to head immediately), and a job that already
         // reads terminal — so follow does its final drain and exits.
@@ -2902,7 +2784,7 @@ EMPTY = ""
             .route(
                 "/api/v1/jobs/:job",
                 get(move |AxumPath(job): AxumPath<String>| async move {
-                    let id: JobId = job.parse().unwrap();
+                    let id: CoreJobId = job.parse().unwrap();
                     Json(
                         serde_json::to_value(sample_job_detail(id, dto::JobStateKind::Succeeded))
                             .unwrap(),
@@ -2974,7 +2856,7 @@ EMPTY = ""
                     get(
                         |State(script): State<Arc<FollowScript>>,
                          AxumPath(job): AxumPath<String>| async move {
-                            let id: JobId = job.parse().unwrap();
+                            let id: CoreJobId = job.parse().unwrap();
                             let mut served = script.details_served.lock().unwrap();
                             // The first fetch is the multiplicity probe, not a
                             // terminal check; it does not advance the script.
@@ -3009,7 +2891,7 @@ EMPTY = ""
 
     async fn run_follow_script(
         base: &str,
-        stream: Option<dto::LogStreamName>,
+        stream: Option<LogStreamName>,
         attempt: Option<AttemptId>,
     ) {
         tokio::time::timeout(
@@ -3043,7 +2925,7 @@ EMPTY = ""
     /// final post-terminal drain reuses the latest mark.
     #[tokio::test]
     async fn follow_polls_from_the_resume_cursor_once_a_page_is_exhausted() {
-        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let a1: CoreAttemptId = ATTEMPT_ONE.parse().unwrap();
         let pages = vec![
             follow_page(
                 vec![log_entry(a1, 1_000_000, "one")],
@@ -3092,7 +2974,7 @@ EMPTY = ""
     /// only once the walk reaches the head does `resume_cursor` take over.
     #[tokio::test]
     async fn follow_keeps_next_cursor_for_remaining_history() {
-        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let a1: CoreAttemptId = ATTEMPT_ONE.parse().unwrap();
         let pages = vec![
             follow_page(
                 vec![log_entry(a1, 1_000_000, "one")],
@@ -3126,7 +3008,7 @@ EMPTY = ""
     /// verbatim and does no de-duplication of its own, so both lines print.
     #[tokio::test]
     async fn follow_relays_the_same_microsecond_skip_through_the_token() {
-        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let a1: CoreAttemptId = ATTEMPT_ONE.parse().unwrap();
         let pages = vec![
             follow_page(
                 vec![log_entry(a1, 1_000_000, "same")],
@@ -3169,7 +3051,7 @@ EMPTY = ""
     /// polls from that same mark again — it neither rewinds nor advances.
     #[tokio::test]
     async fn follow_repeats_the_watermark_when_a_poll_finds_no_output() {
-        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let a1: CoreAttemptId = ATTEMPT_ONE.parse().unwrap();
         let mark = "v1:asc:a1:1000000:1";
         let pages = vec![
             follow_page(
@@ -3204,7 +3086,7 @@ EMPTY = ""
     /// polling from the start until a mark appears, then holds on to it.
     #[tokio::test]
     async fn follow_keeps_polling_from_the_start_until_a_mark_appears() {
-        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let a1: CoreAttemptId = ATTEMPT_ONE.parse().unwrap();
         let pages = vec![
             follow_page(vec![], vec![], None, None),
             follow_page(
@@ -3233,8 +3115,8 @@ EMPTY = ""
     /// latches multi-attempt prefixing, and the next mark is the new attempt's.
     #[tokio::test]
     async fn follow_continues_into_a_later_attempt_from_the_prior_mark() {
-        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
-        let a2: AttemptId = ATTEMPT_TWO.parse().unwrap();
+        let a1: CoreAttemptId = ATTEMPT_ONE.parse().unwrap();
+        let a2: CoreAttemptId = ATTEMPT_TWO.parse().unwrap();
         let pages = vec![
             follow_page(
                 vec![log_entry(a1, 1_000_000, "first attempt")],
@@ -3277,7 +3159,7 @@ EMPTY = ""
     /// cursor, so resuming never widens the walk beyond what was asked for.
     #[tokio::test]
     async fn follow_preserves_the_stream_and_attempt_filters_on_every_poll() {
-        let a1: AttemptId = ATTEMPT_ONE.parse().unwrap();
+        let a1: CoreAttemptId = ATTEMPT_ONE.parse().unwrap();
         let pages = vec![
             follow_page(
                 vec![log_entry(a1, 1_000_000, "one")],
@@ -3298,7 +3180,12 @@ EMPTY = ""
         )
         .await;
 
-        run_follow_script(&base, Some(dto::LogStreamName::Stderr), Some(a1)).await;
+        run_follow_script(
+            &base,
+            Some(LogStreamName::Stderr),
+            Some(ATTEMPT_ONE.parse().unwrap()),
+        )
+        .await;
 
         let seen = seen.lock().unwrap();
         assert!(seen.len() >= 3, "initial drain, poll, final drain");
@@ -3314,21 +3201,21 @@ EMPTY = ""
     /// A three-event window built from the real DTO types: a submission, a
     /// job-state change, and an attempt-state change — enough to exercise the
     /// three main descriptions and `(index, ordinal)` order.
-    fn sample_timeline_events(job: JobId) -> Vec<dto::TimelineEvent> {
-        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+    fn sample_timeline_events(job: CoreJobId) -> Vec<dto::TimelineEvent> {
+        let attempt: CoreAttemptId = "attempt-00000000-0000-0000-0000-000000000001"
             .parse()
             .unwrap();
         vec![
             dto::TimelineEvent {
                 index: 7,
                 ordinal: 0,
-                at: Timestamp::from_micros(1_000_000).unwrap(),
+                at: CoreTimestamp::from_micros(1_000_000).unwrap(),
                 body: dto::TimelineEventBody::JobSubmitted { job },
             },
             dto::TimelineEvent {
                 index: 8,
                 ordinal: 0,
-                at: Timestamp::from_micros(2_000_000).unwrap(),
+                at: CoreTimestamp::from_micros(2_000_000).unwrap(),
                 body: dto::TimelineEventBody::JobStateChanged {
                     job,
                     from: dto::JobStateKind::Submitted,
@@ -3338,7 +3225,7 @@ EMPTY = ""
             dto::TimelineEvent {
                 index: 9,
                 ordinal: 0,
-                at: Timestamp::from_micros(3_000_000).unwrap(),
+                at: CoreTimestamp::from_micros(3_000_000).unwrap(),
                 body: dto::TimelineEventBody::AttemptStateChanged {
                     attempt,
                     job,
@@ -3351,8 +3238,9 @@ EMPTY = ""
 
     #[test]
     fn timeline_renders_events_in_order() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let rendered = render_timeline(&sample_timeline_events(job));
+        let job = CoreJobId::new();
+        let events: Vec<TimelineEvent> = as_client(sample_timeline_events(job));
+        let rendered = render_timeline(&events);
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(lines[0], "timeline:", "{rendered}");
         // Reuses the shared labels, in the order the events arrive.
@@ -3377,10 +3265,10 @@ EMPTY = ""
 
     #[test]
     fn timeline_without_submission_leads_with_truncation_note() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let job = CoreJobId::new();
         // Drop the JobSubmitted event: the window is honestly partial, so the
         // truncation note must come first, before any event line.
-        let events = sample_timeline_events(job)[1..].to_vec();
+        let events: Vec<TimelineEvent> = as_client(sample_timeline_events(job)[1..].to_vec());
         let rendered = render_timeline(&events);
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(lines[0], "timeline:", "{rendered}");
@@ -3407,9 +3295,10 @@ EMPTY = ""
 
     #[test]
     fn compose_status_appends_timeline_after_the_attempts_block() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let detail = sample_job_detail(job, dto::JobStateKind::Attempting);
-        let (out, warning) = compose_status(&detail, Ok(sample_timeline_events(job)));
+        let job = CoreJobId::new();
+        let detail: JobDetail = as_client(sample_job_detail(job, dto::JobStateKind::Attempting));
+        let events: Vec<TimelineEvent> = as_client(sample_timeline_events(job));
+        let (out, warning) = compose_status(&detail, Ok(events));
         assert!(warning.is_none(), "{out}");
         // The whole status body is preserved, and the timeline block follows it.
         let attempts_at = out.find("attempts").expect("attempts block present");
@@ -3420,7 +3309,7 @@ EMPTY = ""
 
     #[tokio::test]
     async fn timeline_paginates_across_two_pages() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let job = CoreJobId::new();
         let all = sample_timeline_events(job);
         let page_one = dto::GetJobTimelineResponse {
             events: all[..2].to_vec(),
@@ -3465,7 +3354,7 @@ EMPTY = ""
                 .with_state(pages);
         let base = spawn(router).await;
 
-        let events = fetch_timeline(&client(&base), job)
+        let events = fetch_timeline(&client(&base), JobId::new())
             .await
             .expect("timeline walk completes");
 
@@ -3477,11 +3366,11 @@ EMPTY = ""
         assert_eq!(events.len(), 3);
         assert!(matches!(
             events[0].body,
-            dto::TimelineEventBody::JobSubmitted { .. }
+            TimelineEventBody::JobSubmitted { .. }
         ));
         assert!(matches!(
             events[2].body,
-            dto::TimelineEventBody::AttemptStateChanged { .. }
+            TimelineEventBody::AttemptStateChanged { .. }
         ));
     }
 
@@ -3491,10 +3380,10 @@ EMPTY = ""
     /// both order and derived rates. `cpu_usage_total_us` equals `at_us` (so a
     /// one-second wall step over a one-second CPU step is 100%); memory and disk
     /// carry distinguishable byte values.
-    fn usage_point(attempt: AttemptId, at_us: i64) -> dto::UsagePoint {
+    fn usage_point(attempt: CoreAttemptId, at_us: i64) -> dto::UsagePoint {
         dto::UsagePoint {
             attempt,
-            at: Timestamp::from_micros(at_us).unwrap(),
+            at: CoreTimestamp::from_micros(at_us).unwrap(),
             cpu_usage_total_us: at_us as u64,
             cpu_throttled_total_us: 0,
             memory_used_bytes: 256 * 1024 * 1024,
@@ -3508,7 +3397,7 @@ EMPTY = ""
         }
     }
 
-    fn usage_source(attempt: AttemptId) -> dto::UsageSourceRecord {
+    fn usage_source(attempt: CoreAttemptId) -> dto::UsageSourceRecord {
         dto::UsageSourceRecord {
             attempt,
             node: Some("node-00000000-0000-0000-0000-000000000001".parse().unwrap()),
@@ -3521,30 +3410,26 @@ EMPTY = ""
 
     #[test]
     fn usage_merge_truncation_is_sticky() {
-        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
-            .parse()
-            .unwrap();
+        let attempt = CoreAttemptId::new();
         let mut truncated = usage_source(attempt);
         truncated.truncated = true;
-        let mut sources = Vec::new();
-        merge_usage_sources(&mut sources, vec![truncated]);
-        merge_usage_sources(&mut sources, vec![usage_source(attempt)]);
+        let mut sources: Vec<UsageSourceRecord> = Vec::new();
+        merge_usage_sources(&mut sources, vec![as_client(truncated)]);
+        merge_usage_sources(&mut sources, vec![as_client(usage_source(attempt))]);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].truncated);
     }
 
     #[test]
     fn usage_rates_derive_from_the_chronological_predecessor_in_asc() {
-        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
-            .parse()
-            .unwrap();
+        let attempt = CoreAttemptId::new();
         // Three one-second-apart samples; cpu counter steps 1s each => 100%.
-        let samples = vec![
+        let samples: Vec<UsagePoint> = as_client(vec![
             usage_point(attempt, 1_000_000),
             usage_point(attempt, 2_000_000),
             usage_point(attempt, 3_000_000),
-        ];
-        let rendered = render_usage(&samples, dto::LogOrder::Asc);
+        ]);
+        let rendered = render_usage(&samples, LogOrder::Asc);
         let lines: Vec<&str> = rendered.lines().collect();
         // Header, then oldest-first rows. First data row's cpu% is `-`.
         assert!(lines[0].starts_with("time"), "{rendered}");
@@ -3563,22 +3448,20 @@ EMPTY = ""
 
     #[test]
     fn usage_rates_match_across_both_orders() {
-        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
-            .parse()
-            .unwrap();
-        let asc = vec![
+        let attempt = CoreAttemptId::new();
+        let asc: Vec<UsagePoint> = as_client(vec![
             usage_point(attempt, 1_000_000),
             usage_point(attempt, 2_000_000),
             usage_point(attempt, 3_000_000),
-        ];
+        ]);
         let mut desc = asc.clone();
         desc.reverse();
 
-        let asc_lines: Vec<String> = render_usage(&asc, dto::LogOrder::Asc)
+        let asc_lines: Vec<String> = render_usage(&asc, LogOrder::Asc)
             .lines()
             .map(str::to_string)
             .collect();
-        let desc_lines: Vec<String> = render_usage(&desc, dto::LogOrder::Desc)
+        let desc_lines: Vec<String> = render_usage(&desc, LogOrder::Desc)
             .lines()
             .map(str::to_string)
             .collect();
@@ -3602,25 +3485,26 @@ EMPTY = ""
     #[test]
     fn usage_negative_wall_delta_prints_dash() {
         // A non-positive wall-time delta cannot yield a rate.
-        let a = usage_point(AttemptId::new(), 2_000_000);
-        let b = usage_point(a.attempt, 2_000_000); // same instant
+        let attempt = CoreAttemptId::new();
+        let a: UsagePoint = as_client(usage_point(attempt, 2_000_000));
+        let b: UsagePoint = as_client(usage_point(attempt, 2_000_000)); // same instant
         assert!(rate_percent(&a, &b, |p| p.cpu_usage_total_us).is_none());
     }
 
     #[test]
     fn usage_multi_attempt_blocks_get_headers() {
-        let a0: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
+        let a0: CoreAttemptId = "attempt-00000000-0000-0000-0000-000000000001"
             .parse()
             .unwrap();
-        let a1: AttemptId = "attempt-00000000-0000-0000-0000-000000000002"
+        let a1: CoreAttemptId = "attempt-00000000-0000-0000-0000-000000000002"
             .parse()
             .unwrap();
-        let samples = vec![
+        let samples: Vec<UsagePoint> = as_client(vec![
             usage_point(a0, 1_000_000),
             usage_point(a0, 2_000_000),
             usage_point(a1, 3_000_000),
-        ];
-        let rendered = render_usage(&samples, dto::LogOrder::Asc);
+        ]);
+        let rendered = render_usage(&samples, LogOrder::Asc);
         assert!(rendered.contains(&format!("attempt: {a0}")), "{rendered}");
         assert!(rendered.contains(&format!("attempt: {a1}")), "{rendered}");
         // The second block is blank-line separated from the first.
@@ -3632,23 +3516,21 @@ EMPTY = ""
 
     #[test]
     fn usage_single_attempt_has_no_attempt_header() {
-        let attempt = AttemptId::new();
-        let samples = vec![usage_point(attempt, 1_000_000)];
-        let rendered = render_usage(&samples, dto::LogOrder::Asc);
+        let attempt = CoreAttemptId::new();
+        let samples: Vec<UsagePoint> = as_client(vec![usage_point(attempt, 1_000_000)]);
+        let rendered = render_usage(&samples, LogOrder::Asc);
         assert!(!rendered.contains("attempt:"), "{rendered}");
     }
 
     #[test]
     fn usage_empty_series_says_so() {
-        let rendered = render_usage(&[], dto::LogOrder::Asc);
+        let rendered = render_usage(&[], LogOrder::Asc);
         assert_eq!(rendered, "(no samples)\n");
     }
 
     #[tokio::test]
     async fn usage_encodes_attempt_and_order_and_paginates() {
-        let attempt: AttemptId = "attempt-00000000-0000-0000-0000-000000000001"
-            .parse()
-            .unwrap();
+        let attempt: CoreAttemptId = ATTEMPT_ONE.parse().unwrap();
         let page_one = dto::GetJobUsageResponse {
             samples: vec![usage_point(attempt, 1_000_000)],
             sources: vec![usage_source(attempt)],
@@ -3696,8 +3578,8 @@ EMPTY = ""
         run_usage(
             &client(&base),
             JobId::new(),
-            Some(attempt),
-            dto::LogOrder::Desc,
+            Some(ATTEMPT_ONE.parse().unwrap()),
+            LogOrder::Desc,
         )
         .await
         .expect("usage walk completes");
@@ -3710,7 +3592,7 @@ EMPTY = ""
         assert_eq!(seen[1].0, Some("v1:desc:page2".to_string()));
         for (_, order, attempt_param) in seen.iter() {
             assert_eq!(order.as_deref(), Some("desc"));
-            assert_eq!(attempt_param.as_deref(), Some(&attempt.to_string()[..]));
+            assert_eq!(attempt_param.as_deref(), Some(ATTEMPT_ONE));
         }
     }
 
@@ -3727,7 +3609,7 @@ EMPTY = ""
         );
         let base = spawn(router).await;
 
-        let err = run_usage(&client(&base), JobId::new(), None, dto::LogOrder::Asc)
+        let err = run_usage(&client(&base), JobId::new(), None, LogOrder::Asc)
             .await
             .expect_err("usage fails");
         let message = format!("{err:#}");
@@ -3737,7 +3619,6 @@ EMPTY = ""
 
     #[tokio::test]
     async fn timeline_501_degrades_to_a_warning() {
-        let job: JobId = "job-00000000-0000-0000-0000-000000000001".parse().unwrap();
         // The shape an older coordinator gives for the route it cannot serve.
         let router = Router::new().route(
             "/api/v1/jobs/:job/timeline",
@@ -3751,14 +3632,15 @@ EMPTY = ""
         let base = spawn(router).await;
 
         // fetch_timeline surfaces the error code from the wire body.
-        let err = fetch_timeline(&client(&base), job)
+        let err = fetch_timeline(&client(&base), JobId::new())
             .await
             .expect_err("501 errors");
         assert!(format!("{err:#}").contains("UNIMPLEMENTED"), "{err:#}");
 
         // compose_status keeps the full status body and routes the failure to a
         // warning — the degradation contract that keeps `job status` working.
-        let detail = sample_job_detail(job, dto::JobStateKind::Succeeded);
+        let job = CoreJobId::new();
+        let detail: JobDetail = as_client(sample_job_detail(job, dto::JobStateKind::Succeeded));
         let (out, warning) = compose_status(&detail, Err(anyhow::anyhow!("boom")));
         assert!(out.contains("state           succeeded"), "{out}");
         assert!(!out.contains("timeline:"), "{out}");
