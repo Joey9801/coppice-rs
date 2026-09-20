@@ -4,8 +4,11 @@
 //! These are hand-written copies of the coordinator's own DTOs. This crate
 //! deliberately depends on no `coppice-*` crate, so that it can be published
 //! on its own; a contract test inside the server's `coppice-api` builds every
-//! server value, hands the JSON to the type here, and asserts the round trip
-//! is byte-identical, which is what keeps the copies honest.
+//! server value, serializes it, decodes that into the type here, serializes
+//! it again, and asserts the two JSON documents are equal — every key, every
+//! value, every enum spelling, compared as `serde_json::Value`s rather than
+//! as text, so key order and whitespace are the only things it lets differ.
+//! That is what keeps the copies honest.
 //!
 //! Three conventions run through everything here, and knowing them explains
 //! most of the shapes:
@@ -34,8 +37,19 @@
 //! error would fail to read an otherwise perfectly good response. So every
 //! enum that arrives in a response ends in an `Unknown(String)` variant that
 //! keeps the unrecognized value verbatim — through `Deserialize`, `Serialize`,
-//! `FromStr` and `Display` alike — so nothing is lost, nothing fails, and a
-//! caller that cares can see exactly what it did not recognize.
+//! `FromStr` and `Display` alike — so a string-valued vocabulary loses
+//! nothing, nothing fails, and a caller that cares can see exactly what it
+//! did not recognize.
+//!
+//! One enum is deliberately not like that, and it is the exception to state
+//! plainly: [`TimelineEventBody`] is a *tagged union*, whose variants carry
+//! structured payloads rather than being spellings of a string, and its
+//! catch-all is a bare `#[serde(other)]` unit variant. An event kind this
+//! client does not know therefore arrives as `Unknown` **with its payload
+//! discarded** — the kind is not even kept. Reading such an event in full
+//! means reaching for the untyped
+//! [`Client::get_value`](crate::Client::get_value), which returns the
+//! server's own body.
 //!
 //! Three of those enums are reused in requests — [`JobPhase`] in a
 //! [`PhaseFilter`], [`BindingRole`] on a [`Binding`], [`LogStreamName`] as

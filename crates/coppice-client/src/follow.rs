@@ -11,7 +11,7 @@
 //! `resume_cursor` and polls from there. A page with neither token (a job with
 //! no attempt yet) leaves the position alone; the follower never rewinds.
 //!
-//! Each page arrives as the [`Versioned`](crate::Versioned) its underlying
+//! Each page arrives as the [`Versioned`] its underlying
 //! read returned, so a follow that runs for hours can still see which replica
 //! served it and how far behind that replica was. `Versioned` derefs to the
 //! body, so the loop below reads as it always did.
