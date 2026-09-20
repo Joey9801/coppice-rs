@@ -390,6 +390,56 @@ describe('getJob queue explainer', () => {
   })
 })
 
+describe('getJob spec env', () => {
+  it('maps env straight through from the wire (no fabricated default)', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: 'job-00000000-0000-0000-0000-000000000001',
+        state: 'queued',
+        spec: {
+          image: 'busybox',
+          command: [],
+          entrypoint: null,
+          env: { FOO: 'bar', PATH: '/usr/bin' },
+          requests: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
+          priority: 0,
+          max_runtime_seconds: null,
+          quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
+          retry: { max_retries: 0, retry_user_errors: false },
+        },
+        submitted_at: '2026-01-01T00:00:00.000000Z',
+        state_since: '2026-01-01T00:00:00.000000Z',
+        terminal_at: null,
+        retries_used: 0,
+        abort_requested: null,
+        entity_chain: [],
+        attempts: [],
+        queue: null,
+        accrual: null,
+        cost: {
+          rate_ucu_per_second: 0,
+          rate_breakdown: { cpu: 0, memory: 0, disk: 0 },
+          priority_multiplier: 1,
+          unbounded_multiplier: 1,
+          effective_rate_ucu_per_second: 0,
+          charge_window_seconds: 0,
+          charge_window_is_default: true,
+          estimated_ucu: 0,
+          charged_ucu: 0,
+          refund_fraction: 0,
+          actual_ucu: null,
+          true_up: null,
+        },
+        metadata: {},
+      }),
+    )
+    const client = createRealClient()
+    const job = await client.getJob('job-00000000-0000-0000-0000-000000000001')
+
+    expect(job.spec.env).toEqual({ FOO: 'bar', PATH: '/usr/bin' })
+  })
+})
+
 describe('getJob attempts', () => {
   it('maps attempt started_at/ended_at to Dates, honestly absent when null', async () => {
     const attempt = (overrides: Record<string, unknown>) => ({

@@ -264,10 +264,6 @@ export interface AttemptView {
 
 /**
  * Mirrors `coppice_core::Job` (the immutable submitted spec).
- *
- * NOTE: `env` is not yet on the Rust `Job` — it is the UI's proposal for
- * the environment overlay that lands with the Docker executor; reconcile
- * when `coppice_core::job` grows it.
  */
 export interface JobSpec {
   image: string
@@ -278,7 +274,14 @@ export interface JobSpec {
   command: string[]
   /** Entrypoint override; null runs the image's own entrypoint. */
   entrypoint: string[] | null
-  /** Environment overlay. May be large — render lazily. */
+  /**
+   * Mirrors `coppice_core::Job.env`: an immutable environment-variable map
+   * set at submission, never editable afterward. Not secret — visible to
+   * anyone who can read the job. Always present (`{}` when the job declared
+   * none). Limits: at most 64 variables; names 1–128 bytes matching
+   * `[A-Za-z_][A-Za-z0-9_]*`; values at most 4096 bytes; 32 KiB total. May
+   * be large — render lazily.
+   */
   env: Record<string, string>
   requests: Resources
   /** Small integer priority class, mapped to a multiplier by policy. */

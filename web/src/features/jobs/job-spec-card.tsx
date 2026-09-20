@@ -116,7 +116,7 @@ function CommandLine({ spec }: { spec: JobSpec }) {
 /** Env overlay, collapsed to a count — values can be numerous and noisy. */
 function EnvVars({ env }: { env: Record<string, string> }) {
   const [open, setOpen] = useState(false)
-  const entries = Object.entries(env)
+  const entries = Object.entries(env).sort(([a], [b]) => a.localeCompare(b))
 
   if (entries.length === 0) {
     return <span className="text-muted-foreground">none</span>
@@ -135,7 +135,7 @@ function EnvVars({ env }: { env: Record<string, string> }) {
           {entries.map(([name, value]) => (
             <div key={name} className="break-all">
               <dt className="inline text-muted-foreground after:content-['=']">{name}</dt>
-              <dd className="inline">{value}</dd>
+              <dd className="inline whitespace-pre-wrap">{value}</dd>
             </div>
           ))}
         </dl>

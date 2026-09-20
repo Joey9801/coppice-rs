@@ -764,6 +764,7 @@ interface WireJobSpecView {
   image: string
   command: string[]
   entrypoint: string[] | null
+  env: Record<string, string>
   requests: WireResources
   priority: number
   max_runtime_seconds: number | null
@@ -776,10 +777,7 @@ function mapJobSpec(s: WireJobSpecView): JobSpec {
     image: s.image,
     command: s.command,
     entrypoint: s.entrypoint,
-    // No source on the wire yet (`coppice_core::job::Job` carries no env
-    // overlay — see the dto.rs `JobSpecView` deviation note); an empty
-    // overlay is the honest default until the domain type grows one.
-    env: {},
+    env: { ...s.env },
     requests: mapResources(s.requests),
     priority: s.priority,
     maxRuntimeSeconds: s.max_runtime_seconds,
