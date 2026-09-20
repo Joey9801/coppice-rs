@@ -1,12 +1,18 @@
 //! The client itself: how a base URL, a token and a timeout become a thing
 //! you can call endpoints on.
 
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use governor::clock::DefaultClock;
+use governor::state::direct::NotKeyed;
+use governor::state::InMemoryState;
+use governor::{middleware::NoOpMiddleware, Quota, RateLimiter};
 
 use crate::credential::{BearerToken, Credential, TokenProvider};
 use crate::error::{Error, Result};
@@ -45,6 +51,17 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7070";
 /// seconds is comfortably above any bounded read or a write's consensus round
 /// trip, and well below anyone's patience for a dead endpoint.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many requests per second a client sends before it waits, by default.
+///
+/// A client that pumps pagers or followers as fast as they resume can turn a
+/// coordinator into its own worst enemy; ten requests a second is comfortably
+/// above anything an interactive session does and well below anything a
+/// server should be asked to shrug off. See [`ClientBuilder::rate_limit`].
+pub const DEFAULT_RATE_LIMIT_RPS: NonZeroU32 = NonZeroU32::new(10).unwrap();
+
+/// The limiter one client shares between its clones: a single rate, no keys.
+type ClientRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
 
 /// The response header carrying the serving replica's applied log index.
 pub const APPLIED_INDEX_HEADER: &str = "coppice-applied-index";
@@ -294,6 +311,7 @@ struct Inner {
     base: String,
     http: reqwest::Client,
     credential: Credential,
+    rate_limiter: Option<Arc<ClientRateLimiter>>,
 }
 
 /// Builds a [`Client`].
@@ -313,6 +331,7 @@ pub struct ClientBuilder {
     credential: Credential,
     timeout: Duration,
     http: Option<reqwest::Client>,
+    rate_limit: Option<Quota>,
 }
 
 impl ClientBuilder {
@@ -324,6 +343,7 @@ impl ClientBuilder {
             credential: Credential::None,
             timeout: DEFAULT_TIMEOUT,
             http: None,
+            rate_limit: Some(Quota::per_second(DEFAULT_RATE_LIMIT_RPS)),
         }
     }
 
@@ -379,6 +399,36 @@ impl ClientBuilder {
     /// Override the [`DEFAULT_TIMEOUT`] for one request.
     pub fn timeout(mut self, timeout: Duration) -> ClientBuilder {
         self.timeout = timeout;
+        self
+    }
+
+    /// Override the default request rate limit with `quota`.
+    ///
+    /// A client sends at most what `quota` allows, measured just before each
+    /// request is sent — including [`healthz`](Client::healthz) and
+    /// [`auth_config`](Client::auth_config) — and waits for a cell rather
+    /// than failing. `Quota::per_second(n)` allows a burst of `n` before
+    /// settling to `n` a second; `Quota::with_burst` shapes that. The budget
+    /// is shared by every clone of the built client, so pagers and followers
+    /// running concurrently draw on one allowance, which is the point. A
+    /// [`TokenProvider`] is consulted only after the slot is taken, so its
+    /// answer never ages in the limiter's queue.
+    ///
+    /// The default is [`DEFAULT_RATE_LIMIT_RPS`]; see also
+    /// [`no_rate_limit`](Self::no_rate_limit).
+    pub fn rate_limit(mut self, quota: Quota) -> ClientBuilder {
+        self.rate_limit = Some(quota);
+        self
+    }
+
+    /// Send requests unthrottled.
+    ///
+    /// The default limit exists to protect the coordinator from a client
+    /// whose polling loops outrun their welcome; turn it off only when a
+    /// caller already paces itself. One call of either this or
+    /// [`rate_limit`](Self::rate_limit) wins, whichever was last.
+    pub fn no_rate_limit(mut self) -> ClientBuilder {
+        self.rate_limit = None;
         self
     }
 
@@ -440,6 +490,9 @@ impl ClientBuilder {
                 base: self.base,
                 http,
                 credential: self.credential,
+                rate_limiter: self
+                    .rate_limit
+                    .map(|quota| Arc::new(RateLimiter::direct(quota))),
             }),
             read: ReadOptions::new(),
         })
@@ -558,7 +611,7 @@ impl Client {
     /// be reporting on the wrong process.
     pub async fn healthz(&self) -> Result<HealthzResponse> {
         let request = self.inner.http.get(self.root_url(paths::HEALTHZ));
-        let response = request.send().await.map_err(Error::Transport)?;
+        let response = self.send(request).await?;
         Ok(decode(response).await?.0)
     }
 
@@ -579,7 +632,7 @@ impl Client {
     /// behind the very auth this call is probing) must not fail it.
     pub async fn auth_config(&self) -> Result<Versioned<GetAuthConfigResponse>> {
         let request = self.inner.http.get(self.url(paths::AUTH_CONFIG));
-        let response = request.send().await.map_err(Error::Transport)?;
+        let response = self.send(request).await?;
         let (value, indexes) = decode(response).await?;
         Ok(Versioned {
             value,
@@ -836,6 +889,36 @@ impl Client {
 
     // -- plumbing -----------------------------------------------------------
 
+    /// Take the rate-limit slot, waiting for a cell when the budget is
+    /// spent.
+    async fn throttle(&self) {
+        if let Some(limiter) = &self.inner.rate_limiter {
+            limiter.until_ready().await;
+        }
+    }
+
+    /// Send a request, waiting for the rate-limit slot first. The path for
+    /// everything with no credential — [`healthz`](Self::healthz) and
+    /// [`auth_config`](Self::auth_config).
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        self.throttle().await;
+        request.send().await.map_err(Error::Transport)
+    }
+
+    /// The authed counterpart to [`send`](Self::send), and the path every
+    /// authenticated `/api/v1` request takes.
+    ///
+    /// The order is deliberate: the rate-limit slot is taken *before* the
+    /// credential is resolved, so a [`TokenProvider`]'s freshly minted token
+    /// never sits in the limiter's queue — potentially long under contention
+    /// or a low quota — long enough to expire. The provider's answer is
+    /// attached and the request hits the wire immediately after.
+    async fn send_authed(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        self.throttle().await;
+        let request = self.authed(request).await?;
+        request.send().await.map_err(Error::Transport)
+    }
+
     /// Attach the bearer token, when there is one. When there is not, no
     /// `Authorization` header is sent at all — the header's mere presence is
     /// what an open-mode cluster must never see.
@@ -882,12 +965,7 @@ impl Client {
             .get(self.url(path))
             .query(query)
             .query(&self.read.query_pairs());
-        let response = self
-            .authed(request)
-            .await?
-            .send()
-            .await
-            .map_err(Error::Transport)?;
+        let response = self.send_authed(request).await?;
         let (value, indexes) = decode(response).await?;
         Ok(Versioned {
             value,
@@ -906,12 +984,7 @@ impl Client {
             Some(body) => request.json(body),
             None => request,
         };
-        let response = self
-            .authed(request)
-            .await?
-            .send()
-            .await
-            .map_err(Error::Transport)?;
+        let response = self.send_authed(request).await?;
         Ok(decode(response).await?.0)
     }
 
@@ -927,12 +1000,7 @@ impl Client {
 
     async fn put<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
         let request = self.inner.http.put(self.url(path)).json(body);
-        let response = self
-            .authed(request)
-            .await?
-            .send()
-            .await
-            .map_err(Error::Transport)?;
+        let response = self.send_authed(request).await?;
         Ok(decode(response).await?.0)
     }
 
@@ -1244,6 +1312,81 @@ mod tests {
         assert_eq!(strong.read_options().consistency, Some(Consistency::Strong));
         assert_eq!(client.read_options().consistency, None);
         assert_eq!(strong.base_url(), client.base_url());
+    }
+
+    /// The default limit is on, [`rate_limit`](ClientBuilder::rate_limit)
+    /// replaces it, and [`no_rate_limit`](ClientBuilder::no_rate_limit)
+    /// removes it — whichever call came last wins.
+    #[test]
+    fn the_rate_limit_setting_keeps_its_last_call() {
+        let default = Client::new("http://h:7070").unwrap();
+        assert!(default.inner.rate_limiter.is_some());
+
+        let raised = Client::builder("http://h:7070")
+            .rate_limit(Quota::per_second(NonZeroU32::new(100).unwrap()))
+            .build()
+            .unwrap();
+        assert!(raised.inner.rate_limiter.is_some());
+
+        let off = Client::builder("http://h:7070")
+            .no_rate_limit()
+            .build()
+            .unwrap();
+        assert!(off.inner.rate_limiter.is_none());
+
+        // And the last call wins, in either order.
+        assert!(Client::builder("http://h:7070")
+            .no_rate_limit()
+            .rate_limit(Quota::per_second(DEFAULT_RATE_LIMIT_RPS))
+            .build()
+            .unwrap()
+            .inner
+            .rate_limiter
+            .is_some());
+        assert!(Client::builder("http://h:7070")
+            .rate_limit(Quota::per_second(DEFAULT_RATE_LIMIT_RPS))
+            .no_rate_limit()
+            .build()
+            .unwrap()
+            .inner
+            .rate_limiter
+            .is_none());
+    }
+
+    /// The limiter actually throttles: with a burst of one and a rate of one
+    /// a second, a second request waits for its cell. The bounds are loose —
+    /// this asserts pacing, not a millisecond-accurate clock.
+    #[tokio::test]
+    async fn the_limiter_spaces_requests_out() {
+        use std::time::Instant;
+
+        use crate::HealthStatus;
+
+        let app = axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(|| async {
+                axum::Json(HealthzResponse {
+                    status: HealthStatus::Ok,
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = Client::builder(format!("http://{addr}"))
+            .rate_limit(Quota::per_second(NonZeroU32::new(1).unwrap()))
+            .build()
+            .unwrap();
+
+        let start = Instant::now();
+        client.healthz().await.expect("first is free");
+        client.healthz().await.expect("second waits a second");
+        let elapsed = start.elapsed();
+        // The first request is free and the second pays a full interval.
+        assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
+        // …but nowhere near the thirty-second default timeout.
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     }
 
     #[test]

@@ -53,6 +53,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # belongs to `reqwest`.
 tokio = { version = "1", default-features = false, features = ["time"] }
 
+# Declared locally: the workspace has no `governor` entry, and the client
+# publishes on its own. `default-features = false` skips the `quanta` and
+# `dashmap` machinery — a client is not keyed, and an std clock is plenty.
+governor = { version = "0.10", default-features = false, features = ["std"] }
+
 # Declared locally: the workspace entry enables chrono's `serde`, which this
 # crate does not use (`Timestamp` has its own RFC 3339 µs impls), and chrono's
 # default features drag in the local-timezone machinery. `now` gives
