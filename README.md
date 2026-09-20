@@ -33,9 +33,10 @@ Coppice is a Cargo workspace of focused crates:
 | [`coppice-consensus`](crates/coppice-consensus) | lib | Raft integration: replication, elections, snapshots. |
 | [`coppice-scheduler`](crates/coppice-scheduler) | lib | Asynchronous scheduler engine and placement proposals. |
 | [`coppice-api`](crates/coppice-api) | lib | External API surface used by the UI and CLI. |
+| [`coppice-client`](crates/coppice-client) | lib | Standalone, publishable Rust client for the `/api/v1` HTTP surface. |
 | [`coppice-coordinator`](crates/coppice-coordinator) | bin | Control-plane daemon binding consensus, scheduling, and API. |
 | [`coppice-agent`](crates/coppice-agent) | bin | Node agent: container execution and reconciliation. |
-| [`coppice-cli`](crates/coppice-cli) | bin (`coppice`) | Command-line client over the public API. |
+| [`coppice-cli`](crates/coppice-cli) | bin (`coppice`) | Command-line client, built on `coppice-client`. |
 
 ## Building
 

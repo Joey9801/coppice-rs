@@ -12,6 +12,7 @@ members = [
     "crates/coppice-scheduler",
     "crates/coppice-discovery",
     "crates/coppice-api",
+    "crates/coppice-client",
     "crates/coppice-coordinator",
     "crates/coppice-agent",
     "crates/coppice-cli",
@@ -40,6 +41,10 @@ coppice-consensus = { path = "crates/coppice-consensus" }
 coppice-scheduler = { path = "crates/coppice-scheduler" }
 coppice-discovery = { path = "crates/coppice-discovery" }
 coppice-api = { path = "crates/coppice-api" }
+# The published client library. `version` alongside `path` because this is the
+# one crate in the workspace meant to be released to crates.io: a dependent
+# resolves it by path here and by version anywhere else.
+coppice-client = { path = "crates/coppice-client", version = "0.0.1" }
 coppice-coordinator = { path = "crates/coppice-coordinator" }
 # Test and bench infrastructure only — always a dev-dependency, never shipped.
 coppice-testkit = { path = "crates/coppice-testkit" }
@@ -153,6 +158,10 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `Display`/`EnumString` derives for the closed and forward-compatible wire
+# vocabularies in `coppice-client` (ADR-free: a localized library choice, not
+# a wire-format change) — replaces a hand-rolled macro with ordinary derives.
+strum = { version = "0.27", features = ["derive"] }
 # The telemetry segment store (docker-executor.md §8.4), and the convention for
 # all SQL in the repo: queries are compile-time-checked against the schema in
 # `migrations/`, verified offline through the checked-in `.sqlx/` prepare cache

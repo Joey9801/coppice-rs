@@ -45,6 +45,21 @@ jobs:
       # libs. `--locked` fails if Cargo.lock is stale rather than updating it.
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  # `coppice-client` is published, so two promises it makes to strangers are
+  # checked here rather than assumed: its declared `rust-version` builds, and
+  # so does the documented no-TLS configuration. Neither is covered by the
+  # jobs above, which run the pinned toolchain with `--all-features`.
+  client-msrv:
+    name: coppice-client MSRV & no-default-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Keep in step with `rust-version` in crates/coppice-client/Cargo.toml.
+      - run: rustup toolchain install 1.86.0 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.86.0 check -p coppice-client --locked
+      - run: cargo +1.86.0 check -p coppice-client --locked --no-default-features
+
   test:
     name: unit & integration tests (non-fleet)
     runs-on: ubuntu-latest
