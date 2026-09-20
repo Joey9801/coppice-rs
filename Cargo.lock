@@ -1227,6 +1227,7 @@ dependencies = [
  "clap",
  "coppice-agent",
  "coppice-api",
+ "coppice-client",
  "coppice-consensus",
  "coppice-coordinator",
  "coppice-core",

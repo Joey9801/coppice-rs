@@ -1,9 +1,12 @@
 //! Test-only scaffolding shared by the client verbs' contract tests.
 //!
 //! Every verb module tests itself the same way: stand up an in-process axum
-//! server serving real DTO JSON on the real route paths, point an
-//! [`ApiClient`](crate::client::ApiClient) at it, run the verb, and assert on
-//! both what the verb sent and what it did with the answer. The two pieces of
+//! server serving real [`coppice_api::http::dto`] JSON on the real route
+//! paths, point a [`coppice_client::Client`] at it, run the verb, and assert
+//! on both what the verb sent and what it did with the answer. Keeping the
+//! *server's* types as the fixtures while the CLI decodes them with the
+//! *client's* copies is the point: the round trip is a second check that the
+//! two agree, alongside the contract test in `coppice-api`. The two pieces of
 //! that setup with no per-module content — spawning the server and building a
 //! wire error body — live here so the modules do not each grow their own.
 

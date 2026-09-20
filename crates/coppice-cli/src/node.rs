@@ -21,13 +21,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{anyhow, bail, Result};
 
-use coppice_api::http::dto;
+use coppice_client::{
+    paths, Client, GetNodeResponse, ListNodesResponse, NodeHealth, NodeId, NodeSummary, Resources,
+};
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::NodeId;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection, Query};
+use crate::client::{ctx, print_json, render_table, ApiConnection, ApiResultExt};
 
 /// `coppice node` argument group.
 ///
@@ -224,41 +225,39 @@ fn admin_args(
 // ---------------------------------------------------------------------------
 
 /// `coppice node list`: every registered node, one row each.
-async fn list(client: &ApiClient, json: bool) -> Result<()> {
-    let body: serde_json::Value = client
-        .get_json(
-            "/nodes",
-            &Vec::new(),
-            ctx("listing nodes", "reading the node list"),
-        )
-        .await?;
+async fn list(client: &Client, json: bool) -> Result<()> {
     if json {
-        print_json(&body);
+        let body = client
+            .get_value(paths::NODES, &[])
+            .await
+            .api_ctx(ctx("listing nodes", "reading the node list"))?;
+        print_json(&body.value);
         return Ok(());
     }
-    let response: dto::ListNodesResponse =
-        serde_json::from_value(body).context("reading the node list")?;
+    let response = client
+        .list_nodes()
+        .await
+        .api_ctx(ctx("listing nodes", "reading the node list"))?;
     print!("{}", render_list(&response));
     Ok(())
 }
 
 /// `coppice node show`: one node's summary, its live attempts, and the
 /// allocations still accruing against it.
-async fn show(client: &ApiClient, node: NodeId, json: bool) -> Result<()> {
-    let query: Query = Vec::new();
-    let body: serde_json::Value = client
-        .get_json(
-            &format!("/nodes/{node}"),
-            &query,
-            ctx("fetching node status", "reading node detail"),
-        )
-        .await?;
+async fn show(client: &Client, node: NodeId, json: bool) -> Result<()> {
+    let path = paths::node(node);
     if json {
-        print_json(&body);
+        let body = client
+            .get_value(&path, &[])
+            .await
+            .api_ctx(ctx("fetching node status", "reading node detail"))?;
+        print_json(&body.value);
         return Ok(());
     }
-    let response: dto::GetNodeResponse =
-        serde_json::from_value(body).context("reading node detail")?;
+    let response = client
+        .node(node)
+        .await
+        .api_ctx(ctx("fetching node status", "reading node detail"))?;
     print!("{}", render_detail(&response));
     Ok(())
 }
@@ -267,10 +266,16 @@ async fn show(client: &ApiClient, node: NodeId, json: bool) -> Result<()> {
 ///
 /// With `--wait`, polls `GET /nodes/{node}` once a second until nothing is
 /// running or accruing on it, or the wait duration elapses.
-async fn drain(client: &ApiClient, node: NodeId, wait: Option<Duration>, json: bool) -> Result<()> {
-    post_node_action(client, node, "drain", "requesting drain", json, || {
-        format!("node {node} draining")
-    })
+async fn drain(client: &Client, node: NodeId, wait: Option<Duration>, json: bool) -> Result<()> {
+    let path = paths::node_drain(node);
+    post_node_action(
+        client,
+        &path,
+        "requesting drain",
+        json,
+        || client.drain_node(node),
+        || format!("node {node} draining"),
+    )
     .await?;
     if let Some(deadline) = wait {
         wait_for_drain(client, node, deadline, Duration::from_secs(1)).await?;
@@ -279,50 +284,63 @@ async fn drain(client: &ApiClient, node: NodeId, wait: Option<Duration>, json: b
 }
 
 /// `coppice node undrain`: make a drained node schedulable again.
-async fn undrain(client: &ApiClient, node: NodeId, json: bool) -> Result<()> {
-    post_node_action(client, node, "undrain", "requesting undrain", json, || {
-        format!("node {node} schedulable")
-    })
+async fn undrain(client: &Client, node: NodeId, json: bool) -> Result<()> {
+    let path = paths::node_undrain(node);
+    post_node_action(
+        client,
+        &path,
+        "requesting undrain",
+        json,
+        || client.undrain_node(node),
+        || format!("node {node} schedulable"),
+    )
     .await
 }
 
 /// `coppice node remove`: remove a node from the cluster (ADR 0041).
-async fn remove(client: &ApiClient, node: NodeId, json: bool) -> Result<()> {
-    post_node_action(client, node, "remove", "requesting removal", json, || {
-        format!("node {node} removed")
-    })
+async fn remove(client: &Client, node: NodeId, json: bool) -> Result<()> {
+    let path = paths::node_remove(node);
+    post_node_action(
+        client,
+        &path,
+        "requesting removal",
+        json,
+        || client.remove_node(node),
+        || format!("node {node} removed"),
+    )
     .await
 }
 
 /// The shared POST half of `drain`/`undrain`/`remove`: all three take no
-/// request body and return an empty `{}` on success; only the path segment
-/// and confirmation words differ.
+/// request body and return an empty `{}` on success; only the path, the typed
+/// call, and the confirmation words differ.
 ///
 /// `--json` prints the server's own response body verbatim, unparsed — the
-/// same convention `list`/`show` use. Without it, prints a one-line
-/// confirmation instead.
-async fn post_node_action(
-    client: &ApiClient,
-    node: NodeId,
-    action: &str,
+/// same convention `list`/`show` use, via [`Client::post_value`] against the
+/// same `path` the typed call resolves to. Without `--json`, the typed call
+/// (`drain_node`/`undrain_node`/`remove_node`) runs instead and a one-line
+/// confirmation is printed.
+async fn post_node_action<T, F>(
+    client: &Client,
+    path: &str,
     sending: &'static str,
     json: bool,
+    typed_call: impl FnOnce() -> F,
     confirmation: impl FnOnce() -> String,
-) -> Result<()> {
-    let path = format!("/nodes/{node}/{action}");
+) -> Result<()>
+where
+    F: std::future::Future<Output = coppice_client::Result<T>>,
+{
     if json {
-        let body: serde_json::Value = client
-            .post_json(
-                &path,
-                &serde_json::json!({}),
-                ctx(sending, "reading response"),
-            )
-            .await?;
+        let body = client
+            .post_value(path, &serde_json::json!({}))
+            .await
+            .api_ctx(ctx(sending, "reading response"))?;
         print_json(&body);
     } else {
-        client
-            .post_ignoring_body(&path, &serde_json::json!({}), sending)
-            .await?;
+        typed_call()
+            .await
+            .api_ctx(ctx(sending, "reading response"))?;
         println!("{}", confirmation());
     }
     Ok(())
@@ -336,7 +354,7 @@ async fn post_node_action(
 /// response body to stdout, and a script that pipes that into `jq` must not
 /// have narration interleaved with it.
 async fn wait_for_drain(
-    client: &ApiClient,
+    client: &Client,
     node: NodeId,
     deadline: Duration,
     interval: Duration,
@@ -344,15 +362,10 @@ async fn wait_for_drain(
     let start = std::time::Instant::now();
     let mut last: Option<(u32, u32)> = None;
     loop {
-        let body: serde_json::Value = client
-            .get_json(
-                &format!("/nodes/{node}"),
-                &Vec::new(),
-                ctx("checking drain progress", "reading node detail"),
-            )
-            .await?;
-        let response: dto::GetNodeResponse =
-            serde_json::from_value(body).context("reading node detail")?;
+        let response = client
+            .node(node)
+            .await
+            .api_ctx(ctx("checking drain progress", "reading node detail"))?;
         let current = counts(&response.summary);
         // The verdict before the progress line, so a node that is already
         // empty is answered rather than narrated: "waiting for node X to
@@ -383,7 +396,7 @@ async fn wait_for_drain(
 
 /// Both counts at zero: nothing is running and nothing is still funded, so a
 /// drain wait is satisfied.
-fn drained(summary: &dto::NodeSummary) -> bool {
+fn drained(summary: &NodeSummary) -> bool {
     let (running, accruing) = counts(summary);
     running == 0 && accruing == 0
 }
@@ -391,7 +404,7 @@ fn drained(summary: &dto::NodeSummary) -> bool {
 /// The `(running, accruing)` pair a drain wait watches, pulled out so the
 /// "did the progress line need reprinting" decision in [`wait_for_drain`] is
 /// testable without a live poll loop.
-fn counts(summary: &dto::NodeSummary) -> (u32, u32) {
+fn counts(summary: &NodeSummary) -> (u32, u32) {
     (summary.running_count, summary.accruing_count)
 }
 
@@ -408,16 +421,12 @@ fn counts(summary: &dto::NodeSummary) -> (u32, u32) {
 /// coordinator has nothing to judge the node by — the marks could not be
 /// fetched, or the node is inside the grace window a new leader granted it —
 /// so rendering it as "healthy" would invent a report that never arrived.
-fn health_label(health: dto::NodeHealth) -> &'static str {
-    match health {
-        dto::NodeHealth::Unknown => "unknown",
-        dto::NodeHealth::Healthy => "healthy",
-        dto::NodeHealth::Lost => "lost",
-    }
+fn health_label(health: &NodeHealth) -> String {
+    health.to_string()
 }
 
 /// The scheduling posture, derived from the two independent flags on
-/// [`dto::NodeSummary`]: the admin cordon (`schedulable`) and the agent's
+/// [`NodeSummary`]: the admin cordon (`schedulable`) and the agent's
 /// own shutdown announcement (`draining`).
 ///
 /// - cordoned (`!schedulable`), regardless of `draining`, reads `"drained"`;
@@ -434,7 +443,7 @@ fn schedulable_label(schedulable: bool, draining: bool) -> &'static str {
 }
 
 /// One resource triple on a single line, byte dimensions humanized.
-fn resources(r: &dto::Resources) -> String {
+fn resources(r: &Resources) -> String {
     format!(
         "cpu {} mCPU, memory {}, disk {}",
         r.cpu_millis,
@@ -445,7 +454,7 @@ fn resources(r: &dto::Resources) -> String {
 
 /// A compact `cpu/mem/disk` cell for the list table, where a full sentence per
 /// dimension would not fit.
-fn resources_cell(r: &dto::Resources) -> String {
+fn resources_cell(r: &Resources) -> String {
     format!(
         "{}m/{}/{}",
         r.cpu_millis,
@@ -458,7 +467,7 @@ fn resources_cell(r: &dto::Resources) -> String {
 /// non-Released allocations; `used` is measured consumption, which is zero
 /// everywhere until agent telemetry lands — the header says `used` rather than
 /// implying it is a live figure.
-fn render_list(response: &dto::ListNodesResponse) -> String {
+fn render_list(response: &ListNodesResponse) -> String {
     if response.nodes.is_empty() {
         return "(no nodes registered)\n".to_string();
     }
@@ -468,7 +477,7 @@ fn render_list(response: &dto::ListNodesResponse) -> String {
         .map(|node| {
             vec![
                 node.id.to_string(),
-                health_label(node.health).to_string(),
+                health_label(&node.health),
                 schedulable_label(node.schedulable, node.draining).to_string(),
                 resources_cell(&node.capacity),
                 resources_cell(&node.allocated),
@@ -498,7 +507,7 @@ fn render_list(response: &dto::ListNodesResponse) -> String {
 /// Render one node's detail: a key/value block for the summary, then the
 /// attempts currently on the node and the allocations still accruing against
 /// it, each as its own section.
-fn render_detail(response: &dto::GetNodeResponse) -> String {
+fn render_detail(response: &GetNodeResponse) -> String {
     use std::fmt::Write;
 
     let summary = &response.summary;
@@ -508,7 +517,7 @@ fn render_detail(response: &dto::GetNodeResponse) -> String {
     };
 
     kv(&mut out, "id", &summary.id.to_string());
-    kv(&mut out, "health", health_label(summary.health));
+    kv(&mut out, "health", &health_label(&summary.health));
     kv(
         &mut out,
         "scheduling",
@@ -601,9 +610,30 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
 
+    use coppice_api::http::dto;
+    use coppice_core::id::NodeId as CoreNodeId;
+
     use crate::testsupport::{error_body, spawn};
 
+    /// Round-trip a server-typed (`coppice_api::http::dto`) fixture through
+    /// JSON into the `coppice_client` type the CLI actually renders. The
+    /// server type is the fixture that pins the wire contract; the client
+    /// type is what `render_list`/`render_detail`/`drained`/`counts` take —
+    /// so this conversion, not a hand-written assertion, *is* the
+    /// cross-check that the two crates still agree on the shape.
+    fn to_client<S: serde::Serialize, C: serde::de::DeserializeOwned>(value: S) -> C {
+        serde_json::from_value(serde_json::to_value(value).unwrap())
+            .expect("the client type decodes the server type's own output")
+    }
+
+    /// The client-typed node id, for calling the verb functions and for
+    /// assertions.
     fn node_id() -> NodeId {
+        "node-00000000-0000-0000-0000-000000000001".parse().unwrap()
+    }
+
+    /// The same id, server-typed, for `dto::` fixtures.
+    fn dto_node_id() -> CoreNodeId {
         "node-00000000-0000-0000-0000-000000000001".parse().unwrap()
     }
 
@@ -611,7 +641,7 @@ mod tests {
         let mut labels = BTreeMap::new();
         labels.insert("zone".to_string(), "a".to_string());
         dto::NodeSummary {
-            id: node_id(),
+            id: dto_node_id(),
             capacity: dto::Resources {
                 cpu_millis: 4000,
                 memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -658,7 +688,7 @@ mod tests {
             .with_state((seen.clone(), body));
         let base = spawn(router).await;
 
-        list(&ApiClient::new(&base).unwrap(), false)
+        list(&Client::new(&base).unwrap(), false)
             .await
             .expect("list succeeds");
         assert_eq!(*seen.lock().unwrap(), 1);
@@ -666,9 +696,9 @@ mod tests {
 
     #[test]
     fn list_renders_the_node_row() {
-        let rendered = render_list(&dto::ListNodesResponse {
+        let rendered = render_list(&to_client(dto::ListNodesResponse {
             nodes: vec![sample_summary()],
-        });
+        }));
         assert!(rendered.contains(&node_id().to_string()), "{rendered}");
         // Health is `unknown` today and must not be dressed up as healthy.
         assert!(rendered.contains("unknown"), "{rendered}");
@@ -690,7 +720,7 @@ mod tests {
 
     #[test]
     fn list_says_so_when_no_nodes_are_registered() {
-        let rendered = render_list(&dto::ListNodesResponse { nodes: Vec::new() });
+        let rendered = render_list(&to_client(dto::ListNodesResponse { nodes: Vec::new() }));
         assert_eq!(rendered, "(no nodes registered)\n");
     }
 
@@ -723,7 +753,7 @@ mod tests {
                 .with_state((seen.clone(), body));
         let base = spawn(router).await;
 
-        show(&ApiClient::new(&base).unwrap(), node_id(), false)
+        show(&Client::new(&base).unwrap(), node_id(), false)
             .await
             .expect("show succeeds");
         assert_eq!(*seen.lock().unwrap(), [node_id().to_string()]);
@@ -741,7 +771,7 @@ mod tests {
             }),
         );
         let base = spawn(router).await;
-        let err = show(&ApiClient::new(&base).unwrap(), node_id(), false)
+        let err = show(&Client::new(&base).unwrap(), node_id(), false)
             .await
             .expect_err("show fails");
         let message = format!("{err:#}");
@@ -751,13 +781,13 @@ mod tests {
 
     #[test]
     fn detail_reports_empty_sections_and_the_heartbeat_gap() {
-        let rendered = render_detail(&dto::GetNodeResponse {
+        let rendered = render_detail(&to_client(dto::GetNodeResponse {
             summary: sample_summary(),
             host: None,
             detected_capacity: None,
             active_attempts: Vec::new(),
             accrual_queue: Vec::new(),
-        });
+        }));
         assert!(rendered.contains("epoch           3"), "{rendered}");
         // A missing heartbeat is a missing input, not a dead node.
         assert!(
@@ -812,7 +842,7 @@ mod tests {
     /// is unbounded; `projected_start: None` is a real, different claim.
     #[test]
     fn unbounded_projected_start_is_spelled_out() {
-        let rendered = render_detail(&dto::GetNodeResponse {
+        let rendered = render_detail(&to_client(dto::GetNodeResponse {
             summary: sample_summary(),
             host: None,
             detected_capacity: None,
@@ -826,7 +856,7 @@ mod tests {
                     attempt: "attempt-00000000-0000-0000-0000-000000000001"
                         .parse()
                         .unwrap(),
-                    node: node_id(),
+                    node: dto_node_id(),
                     state: dto::AllocationState::Accruing,
                     requested: dto::Resources {
                         cpu_millis: 500,
@@ -847,7 +877,7 @@ mod tests {
                 },
                 projected_start: None,
             }],
-        });
+        }));
         assert!(rendered.contains("projected start unbounded"), "{rendered}");
     }
 
@@ -884,7 +914,7 @@ mod tests {
             .with_state(seen.clone());
         let base = spawn(router).await;
 
-        drain(&ApiClient::new(&base).unwrap(), node_id(), None, false)
+        drain(&Client::new(&base).unwrap(), node_id(), None, false)
             .await
             .expect("drain succeeds");
         assert_eq!(*seen.lock().unwrap(), [node_id().to_string()]);
@@ -907,7 +937,7 @@ mod tests {
             .with_state(seen.clone());
         let base = spawn(router).await;
 
-        undrain(&ApiClient::new(&base).unwrap(), node_id(), false)
+        undrain(&Client::new(&base).unwrap(), node_id(), false)
             .await
             .expect("undrain succeeds");
         assert_eq!(*seen.lock().unwrap(), [node_id().to_string()]);
@@ -930,7 +960,7 @@ mod tests {
             .with_state(seen.clone());
         let base = spawn(router).await;
 
-        remove(&ApiClient::new(&base).unwrap(), node_id(), false)
+        remove(&Client::new(&base).unwrap(), node_id(), false)
             .await
             .expect("remove succeeds");
         assert_eq!(*seen.lock().unwrap(), [node_id().to_string()]);
@@ -943,7 +973,7 @@ mod tests {
             post(|| async { Json(serde_json::json!({})) }),
         );
         let base = spawn(router).await;
-        drain(&ApiClient::new(&base).unwrap(), node_id(), None, true)
+        drain(&Client::new(&base).unwrap(), node_id(), None, true)
             .await
             .expect("drain --json succeeds");
     }
@@ -960,7 +990,7 @@ mod tests {
             }),
         );
         let base = spawn(router).await;
-        let err = remove(&ApiClient::new(&base).unwrap(), node_id(), false)
+        let err = remove(&Client::new(&base).unwrap(), node_id(), false)
             .await
             .expect_err("remove fails");
         let message = format!("{err:#}");
@@ -991,7 +1021,7 @@ mod tests {
         // A short interval keeps this fast: at most one sleep of a few
         // milliseconds between the two polls.
         wait_for_drain(
-            &ApiClient::new(&base).unwrap(),
+            &Client::new(&base).unwrap(),
             node_id(),
             Duration::from_secs(60),
             Duration::from_millis(1),
@@ -1010,7 +1040,7 @@ mod tests {
         let base = spawn(router).await;
 
         let err = wait_for_drain(
-            &ApiClient::new(&base).unwrap(),
+            &Client::new(&base).unwrap(),
             node_id(),
             Duration::ZERO,
             Duration::from_millis(1),
@@ -1023,17 +1053,23 @@ mod tests {
         assert!(message.contains("accruing 2"), "{message}");
     }
 
+    /// The `--wait` poll's `GetNodeResponse`, client-typed — what `drained`
+    /// and `counts` actually take.
+    fn client_get_node_response(running: u32, accruing: u32) -> GetNodeResponse {
+        to_client(get_node_response(running, accruing))
+    }
+
     #[test]
     fn drained_is_true_only_when_both_counts_are_zero() {
-        assert!(drained(&get_node_response(0, 0).summary));
-        assert!(!drained(&get_node_response(1, 0).summary));
-        assert!(!drained(&get_node_response(0, 1).summary));
-        assert!(!drained(&get_node_response(3, 4).summary));
+        assert!(drained(&client_get_node_response(0, 0).summary));
+        assert!(!drained(&client_get_node_response(1, 0).summary));
+        assert!(!drained(&client_get_node_response(0, 1).summary));
+        assert!(!drained(&client_get_node_response(3, 4).summary));
     }
 
     #[test]
     fn counts_reads_the_running_and_accruing_pair() {
-        assert_eq!(counts(&get_node_response(1, 2).summary), (1, 2));
-        assert_eq!(counts(&get_node_response(0, 0).summary), (0, 0));
+        assert_eq!(counts(&client_get_node_response(1, 2).summary), (1, 2));
+        assert_eq!(counts(&client_get_node_response(0, 0).summary), (0, 0));
     }
 }

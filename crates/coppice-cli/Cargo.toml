@@ -21,6 +21,10 @@ coppice-enroll.workspace = true
 # `coppice job` reuses this crate's wire DTOs (request/response shapes) rather
 # than redefining the `/api/v1` contract.
 coppice-api.workspace = true
+# The client verbs (`job`, `node`, `quota`, `cluster`, `policy`, and `dev`'s
+# readiness polling) are a thin shell over this crate: it owns the `/api/v1`
+# transport, the wire types, pagination and the log follower.
+coppice-client.workspace = true
 coppice-agent.workspace = true
 coppice-core.workspace = true
 # `coppice dev` names its own in-process coordinator as the agent's one seed

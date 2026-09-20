@@ -2,14 +2,14 @@
 //! `authz`, over `GET`/`PUT /api/v1/authorization` (ADR 0023): the full
 //! bindings list plus the `groups_claim` token-claim name.
 //!
-//! The wire shapes are [`coppice_api::http::dto`] types, unchanged from every
-//! other verb's convention, and this module reuses them directly as the
-//! bindings TOML's file shape (`dto::BindingDto` already round-trips through
-//! TOML with the right keys). The one thing this module owns is the
-//! *bindings file* wrapper — [`AuthzFile`], the TOML document from
-//! `notes/oidc_impl/SHARED.md` §6 that `policy authz get` prints and
-//! `policy authz set --file` reads — plus the exactly-one-subject validation
-//! serde cannot express.
+//! The wire shapes are the published [`coppice_client`] crate's own types
+//! (`Binding`, `GetAuthorizationResponse`, `UpdateAuthorizationRequest`,
+//! `UpdateAuthorizationResponse`), as in every other verb. What this module
+//! owns outright is the *bindings file* — [`AuthzFile`] and its
+//! [`FileBinding`] tables, the TOML document from
+//! `notes/oidc_impl/SHARED.md` §6 that `policy authz get` prints and `policy
+//! authz set --file` reads — plus the exactly-one-subject validation serde
+//! cannot express, applied where a file binding becomes a wire one.
 //!
 //! ```toml
 //! groups_claim = "groups"
@@ -36,9 +36,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use coppice_api::http::dto;
+use coppice_client::{
+    paths, Binding, BindingRole, Client, GetAuthorizationResponse, QuotaEntityId,
+    UpdateAuthorizationRequest, UpdateAuthorizationResponse,
+};
 
-use crate::client::{ctx, print_json, ApiClient, ApiConnection};
+use crate::client::{ctx, print_json, ApiConnection, ApiResultExt};
 
 // ---------------------------------------------------------------------------
 // CLI surface
@@ -113,14 +116,50 @@ pub struct AuthzFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups_claim: Option<String>,
     #[serde(default)]
-    pub bindings: Vec<dto::BindingDto>,
+    pub bindings: Vec<FileBinding>,
 }
 
-/// Validate the exactly-one-subject rule serde cannot express, naming the
-/// binding's index (1-based, matching how an operator counts `[[bindings]]`
-/// tables in the file) in any failure.
-fn check_exactly_one_subject(index: usize, binding: &dto::BindingDto) -> Result<()> {
-    match (&binding.group, &binding.principal) {
+/// One `[[bindings]]` table: the file's own strict shape, converted to the
+/// wire [`Binding`] by [`AuthzFile::to_request`].
+///
+/// Not [`Binding`] itself, for two reasons. [`Binding`] carries no
+/// `#[serde(deny_unknown_fields)]` — it also shapes `GET /authorization`'s
+/// response, and the client library's responses tolerate a future server
+/// field — whereas this file is a write path that has always rejected a
+/// typo'd key (`rejects_unknown_keys`). And a file can spell the states the
+/// wire type's constructors rule out (both subjects, or neither), which is
+/// exactly what [`check_exactly_one_subject`] exists to name for the operator.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    pub role: BindingRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<QuotaEntityId>,
+}
+
+impl From<&Binding> for FileBinding {
+    fn from(binding: &Binding) -> FileBinding {
+        FileBinding {
+            group: binding.group.clone(),
+            principal: binding.principal.clone(),
+            role: binding.role.clone(),
+            scope: binding.scope,
+        }
+    }
+}
+
+/// Convert one file binding to the wire [`Binding`], enforcing the
+/// exactly-one-subject rule serde cannot express and naming the binding's
+/// index in any failure — 1-based, matching how an operator counts
+/// `[[bindings]]` tables in the file. (The library's own
+/// [`UpdateAuthorizationRequest::validate`] words the same rule 0-based, for
+/// a caller indexing a `Vec`; a bad file never reaches it.)
+fn check_exactly_one_subject(index: usize, binding: &FileBinding) -> Result<Binding> {
+    let wire = match (&binding.group, &binding.principal) {
         (Some(_), Some(_)) => anyhow::bail!(
             "binding {} must give exactly one of group/principal, not both",
             index + 1
@@ -129,8 +168,13 @@ fn check_exactly_one_subject(index: usize, binding: &dto::BindingDto) -> Result<
             "binding {} must give exactly one of group/principal",
             index + 1
         ),
-        _ => Ok(()),
-    }
+        (Some(group), None) => Binding::for_group(group, binding.role.clone()),
+        (None, Some(principal)) => Binding::for_principal(principal, binding.role.clone()),
+    };
+    Ok(match binding.scope {
+        Some(scope) => wire.with_scope(scope),
+        None => wire,
+    })
 }
 
 impl AuthzFile {
@@ -142,26 +186,30 @@ impl AuthzFile {
             .with_context(|| format!("reading authorization policy file {}", path.display()))
     }
 
-    /// Convert to the wire [`dto::UpdateAuthorizationRequest`], validating
-    /// every binding's exactly-one-subject rule up front so a bad file fails
-    /// before any request is sent.
-    fn to_request(&self) -> Result<dto::UpdateAuthorizationRequest> {
-        for (index, binding) in self.bindings.iter().enumerate() {
-            check_exactly_one_subject(index, binding)?;
+    /// Convert to the wire [`UpdateAuthorizationRequest`], validating every
+    /// binding's exactly-one-subject rule up front so a bad file fails before
+    /// any request is sent.
+    fn to_request(&self) -> Result<UpdateAuthorizationRequest> {
+        let bindings = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| check_exactly_one_subject(index, binding))
+            .collect::<Result<Vec<Binding>>>()?;
+        let mut request = UpdateAuthorizationRequest::new(bindings);
+        if let Some(groups_claim) = self.groups_claim.clone() {
+            request = request.with_groups_claim(groups_claim);
         }
-        Ok(dto::UpdateAuthorizationRequest {
-            groups_claim: self.groups_claim.clone(),
-            bindings: self.bindings.clone(),
-        })
+        Ok(request)
     }
 
     /// Wire → file, the inverse `to_request` takes on `groups_claim` and
     /// `bindings` together, for rendering `get`. `get` always reports the
     /// live `groups_claim`, so it is never `None` here.
-    fn from_response(response: &dto::GetAuthorizationResponse) -> AuthzFile {
+    fn from_response(response: &GetAuthorizationResponse) -> AuthzFile {
         AuthzFile {
             groups_claim: Some(response.groups_claim.clone()),
-            bindings: response.bindings.clone(),
+            bindings: response.bindings.iter().map(FileBinding::from).collect(),
         }
     }
 }
@@ -172,23 +220,20 @@ impl AuthzFile {
 
 /// `coppice policy authz get`: fetch the current policy and print it as the
 /// bindings TOML (or the raw JSON with `--json`).
-async fn get(client: &ApiClient, json: bool) -> Result<()> {
-    let body: serde_json::Value = client
-        .get_json(
-            "/authorization",
-            &Vec::new(),
-            ctx(
-                "fetching authorization policy",
-                "reading authorization policy",
-            ),
-        )
-        .await?;
+async fn get(client: &Client, json: bool) -> Result<()> {
+    let read_ctx = ctx(
+        "fetching authorization policy",
+        "reading authorization policy",
+    );
     if json {
-        print_json(&body);
+        let body = client
+            .get_value(paths::AUTHORIZATION, &[])
+            .await
+            .api_ctx(read_ctx)?;
+        print_json(&body.value);
         return Ok(());
     }
-    let response: dto::GetAuthorizationResponse =
-        serde_json::from_value(body).context("reading authorization policy")?;
+    let response = client.authorization().await.api_ctx(read_ctx)?;
     let file = AuthzFile::from_response(&response);
     print!(
         "{}",
@@ -199,22 +244,22 @@ async fn get(client: &ApiClient, json: bool) -> Result<()> {
 
 /// `coppice policy authz set`: parse the bindings TOML at `--file`, convert
 /// to the wire request, `PUT` it, and print a one-line success.
-async fn set(client: &ApiClient, file: &Path, json: bool) -> Result<()> {
+async fn set(client: &Client, file: &Path, json: bool) -> Result<()> {
     let parsed = AuthzFile::load(file)?;
     let request = parsed.to_request()?;
-    let body: serde_json::Value = client
-        .put_json(
-            "/authorization",
-            &request,
-            ctx("updating authorization policy", "reading update response"),
-        )
-        .await?;
+    let write_ctx = ctx("updating authorization policy", "reading update response");
     if json {
+        let body = client
+            .put_value(paths::AUTHORIZATION, &request)
+            .await
+            .api_ctx(write_ctx)?;
         print_json(&body);
         return Ok(());
     }
-    let response: dto::UpdateAuthorizationResponse =
-        serde_json::from_value(body).context("reading update response")?;
+    let response: UpdateAuthorizationResponse = client
+        .update_authorization(&request)
+        .await
+        .api_ctx(write_ctx)?;
     println!(
         "updated authorization policy (log index {})",
         response.log_index
@@ -238,18 +283,40 @@ mod tests {
     use axum::{Json, Router};
     use tempfile::NamedTempFile;
 
+    use coppice_api::http::dto;
     use coppice_core::id::QuotaEntityId;
 
     use crate::testsupport::{error_body, spawn};
 
-    fn client(base: &str) -> ApiClient {
-        ApiClient::new(base).unwrap()
+    /// Round-trip a server-typed (`coppice_api::http::dto`) fixture through
+    /// JSON into the `coppice_client` type the CLI actually reads/writes. The
+    /// server type is the fixture that pins the wire contract; the client
+    /// type is what `get`/`set` take — so this conversion, not a hand-written
+    /// assertion, *is* the cross-check that the two crates still agree on the
+    /// shape.
+    fn to_client<S: serde::Serialize, C: serde::de::DeserializeOwned>(value: S) -> C {
+        serde_json::from_value(serde_json::to_value(value).unwrap())
+            .expect("the client type decodes the server type's own output")
     }
 
-    fn quota_id(n: u8) -> QuotaEntityId {
+    fn client(base: &str) -> Client {
+        Client::new(base).unwrap()
+    }
+
+    /// The same id, spelled once, parsed into whichever crate's typed id a
+    /// given fixture needs: `coppice_client::QuotaEntityId` for a `Binding`
+    /// this module builds directly, `coppice_core::id::QuotaEntityId` for a
+    /// `dto::BindingDto` fixture standing in for the server.
+    fn quota_id_str(n: u8) -> String {
         format!("quota-00000000-0000-0000-0000-{n:012}")
-            .parse()
-            .unwrap()
+    }
+
+    fn quota_id(n: u8) -> coppice_client::QuotaEntityId {
+        quota_id_str(n).parse().unwrap()
+    }
+
+    fn dto_quota_id(n: u8) -> QuotaEntityId {
+        quota_id_str(n).parse().unwrap()
     }
 
     fn write_toml(body: &str) -> NamedTempFile {
@@ -274,19 +341,17 @@ mod tests {
         let binding = &file.bindings[0];
         assert_eq!(binding.group.as_deref(), Some("batch-users"));
         assert!(binding.principal.is_none());
-        assert_eq!(binding.role, dto::BindingRole::Submitter);
+        assert_eq!(binding.role, coppice_client::BindingRole::Submitter);
         assert_eq!(binding.scope, Some(scope));
 
         let request = file.to_request().expect("converts to a request");
         assert_eq!(request.groups_claim.as_deref(), Some("groups"));
         assert_eq!(
             request.bindings,
-            vec![dto::BindingDto {
-                group: Some("batch-users".to_string()),
-                principal: None,
-                role: dto::BindingRole::Submitter,
-                scope: Some(scope),
-            }]
+            vec![
+                Binding::for_group("batch-users", coppice_client::BindingRole::Submitter)
+                    .with_scope(scope)
+            ]
         );
     }
 
@@ -299,12 +364,10 @@ mod tests {
         assert!(request.groups_claim.is_none());
         assert_eq!(
             request.bindings,
-            vec![dto::BindingDto {
-                group: None,
-                principal: Some("svc-ci".to_string()),
-                role: dto::BindingRole::Admin,
-                scope: None,
-            }]
+            vec![Binding::for_principal(
+                "svc-ci",
+                coppice_client::BindingRole::Admin
+            )]
         );
     }
 
@@ -333,8 +396,12 @@ mod tests {
 
     #[test]
     fn get_rendering_round_trips_through_set_parsing() {
-        let scope = quota_id(2);
-        let response = dto::GetAuthorizationResponse {
+        let scope = dto_quota_id(2);
+        // `GetAuthorizationResponse` is `#[non_exhaustive]`, so — as with
+        // every other cross-check test here — the fixture is a server dto,
+        // converted into the client type via the same JSON path a real
+        // response takes.
+        let response: GetAuthorizationResponse = to_client(dto::GetAuthorizationResponse {
             groups_claim: "groups".to_string(),
             bindings: vec![
                 dto::BindingDto {
@@ -350,7 +417,7 @@ mod tests {
                     scope: None,
                 },
             ],
-        };
+        });
         let file = AuthzFile::from_response(&response);
         let rendered = toml::to_string_pretty(&file).expect("renders");
 
@@ -368,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_prints_the_bindings_toml() {
-        let scope = quota_id(3);
+        let scope = dto_quota_id(3);
         let response = dto::GetAuthorizationResponse {
             groups_claim: "groups".to_string(),
             bindings: vec![dto::BindingDto {
@@ -390,6 +457,10 @@ mod tests {
         );
         let base = spawn(router).await;
         get(&client(&base), false).await.expect("get succeeds");
+
+        // The client decodes exactly what the server sent.
+        let decoded: GetAuthorizationResponse = to_client(response);
+        assert_eq!(decoded.bindings.len(), 1);
     }
 
     #[tokio::test]
@@ -415,7 +486,7 @@ mod tests {
             .with_state(captured.clone());
         let base = spawn(router).await;
 
-        let scope = quota_id(4);
+        let scope = dto_quota_id(4);
         let toml_body = format!(
             "groups_claim = \"groups\"\n\n[[bindings]]\nprincipal = \"svc-ci\"\nrole = \"admin\"\n\n[[bindings]]\ngroup = \"batch-users\"\nrole = \"submitter\"\nscope = \"{scope}\"\n"
         );

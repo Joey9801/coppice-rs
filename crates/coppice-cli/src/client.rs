@@ -1,28 +1,27 @@
-//! The shared HTTP plumbing every `coppice` client verb sits on.
+//! What the `coppice` client verbs need on top of [`coppice_client`].
 //!
-//! One place owns the things that must not drift between `job`, `cluster`,
-//! `node`, and `quota`: how an `--api` value becomes a base URL, how a request
-//! is built (including the request timeout `reqwest` does not set for us), and
-//! how a non-2xx response becomes an `anyhow` error carrying the ADR 0031
-//! `{code, message}` body and the `Coppice-Leader` retry hint.
+//! The transport itself — base-URL normalization, the bearer token, the
+//! request timeout, paths, query parameters, wire types, pagination, the log
+//! follower, and turning a non-2xx response into the ADR 0031 `{code,
+//! message}` error with its `Coppice-Leader` hint — belongs to the published
+//! [`coppice_client`] crate, which is also where it is tested. Every verb
+//! module builds a [`coppice_client::Client`] from the flags below and calls
+//! it directly.
 //!
-//! Nothing here knows about any endpoint: paths, query parameters, and the
-//! response DTOs stay in the verb modules, which reuse
-//! [`coppice_api::http::dto`] rather than redefining the contract.
+//! Four things are left here, because they are about *this CLI* rather than
+//! about the API:
+//!
+//! - [`ApiConnection`], the `--api`/`--token` flag pair every HTTP verb group
+//!   flattens in;
+//! - [`Ctx`] and [`ApiResultExt`], which attach the human "what was I doing"
+//!   context to a failure and append the 401 hint that tells an operator to
+//!   set `COPPICE_TOKEN`;
+//! - [`print_json`], the shared `--json` rendering;
+//! - [`render_table`], the shared list-verb table.
 
-use anyhow::{Context as _, Result};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
 
-use coppice_api::http::COPPICE_LEADER;
-
-/// How long a single client request may take before it is abandoned.
-///
-/// `reqwest` imposes no timeout of its own, which turns an unreachable or
-/// wedged coordinator into a CLI that hangs forever with no output. Thirty
-/// seconds is comfortably above any bounded read or a write's consensus
-/// round-trip, and well below a human's patience for a dead endpoint.
-pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use coppice_client::{Client, Error, DEFAULT_BASE_URL, DEFAULT_PORT};
 
 /// The port a coordinator's client API listens on unless configured otherwise.
 ///
@@ -32,22 +31,33 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// `coppice dev` asks for, and the base every client verb dials when neither
 /// `--api` nor `COPPICE_API` says otherwise. The production ports table in
 /// `docs/operations/configuration.md` documents the same convention
-/// (client 7070, raft 7071, agent gateway 7072).
-pub const DEFAULT_API_PORT: u16 = 7070;
+/// (client 7070, raft 7071, agent gateway 7072). The number itself is the
+/// client library's [`DEFAULT_PORT`], so the CLI and anything else built on
+/// that crate cannot disagree about it.
+pub const DEFAULT_API_PORT: u16 = DEFAULT_PORT;
 
 /// The base URL every verb's `--api` falls back to: [`DEFAULT_API_PORT`] on
-/// loopback.
+/// loopback, as [`coppice_client::DEFAULT_BASE_URL`] spells it.
 ///
 /// Loopback rather than `0.0.0.0`: this is the address a client *dials*, and
 /// the only coordinator a bare `coppice job …` can reasonably mean is one on
 /// this machine — a local `coppice dev`. Reaching any other cluster is an
 /// explicit act (`--api`, or `COPPICE_API` in the environment).
-pub const DEFAULT_API_BASE: &str = "http://127.0.0.1:7070";
+pub const DEFAULT_API_BASE: &str = DEFAULT_BASE_URL;
+
+/// The hint a 401 carries, on top of whatever the server said: the two facts
+/// an operator needs to unblock themselves. It is a CLI concern — it names an
+/// environment variable and a subcommand — so it lives here rather than in the
+/// library's error text.
+const UNAUTHORIZED_HINT: &str =
+    "; this cluster requires authentication — set COPPICE_TOKEN to a bearer token, \
+     or use a dev cluster (`coppice dev`), which runs in open mode and needs none";
 
 /// The two human contexts one request attaches to its failures: the send and
 /// the body decode. They are separate because they fail for different reasons
 /// — "fetching job status" is a transport problem, "reading job detail" is a
 /// contract problem — and the distinction is what the operator reads first.
+/// They map onto [`Error::Transport`] and [`Error::Decode`] respectively.
 #[derive(Debug, Clone, Copy)]
 pub struct Ctx {
     /// Wraps the transport failure (`"fetching job status"`).
@@ -60,9 +70,6 @@ pub struct Ctx {
 pub const fn ctx(sending: &'static str, reading: &'static str) -> Ctx {
     Ctx { sending, reading }
 }
-
-/// A query string as the verbs build it: borrowed keys, owned values.
-pub type Query = Vec<(&'static str, String)>;
 
 /// The shared `--api`/`--token` connection flags, flattened
 /// (`#[command(flatten)]`) into every HTTP verb group's argument struct so
@@ -90,243 +97,66 @@ pub struct ApiConnection {
 }
 
 impl ApiConnection {
-    /// The [`ApiClient`] these flags describe.
-    pub fn client(&self) -> Result<ApiClient> {
-        ApiClient::with_token(&self.api, self.token.as_deref())
-    }
-}
-
-/// A client bound to one coordinator's `/api/v1` surface.
-///
-/// Holds the normalized base URL and a single `reqwest::Client`, so a verb
-/// that makes several requests (a paging walk, `job logs --follow`) reuses one
-/// connection pool instead of dialing afresh each time.
-#[derive(Debug, Clone)]
-pub struct ApiClient {
-    base: String,
-    http: reqwest::Client,
-    /// The bearer token from `--token`/`COPPICE_TOKEN`, when set and
-    /// non-empty. Attached as `Authorization: Bearer <token>` on every
-    /// request; `None` sends no `Authorization` header at all (the open-mode
-    /// posture `coppice dev` runs in needs none).
-    token: Option<String>,
-}
-
-impl ApiClient {
-    /// Build a client for an `--api` value, normalizing the base URL, with no
-    /// bearer token attached. Every verb's `run()` goes through
-    /// [`Self::with_token`] instead (there is always a `--token` flag to
-    /// thread through, even when unset); this convenience constructor is for
-    /// tests that do not exercise the token path.
-    #[cfg(test)]
-    pub fn new(api: &str) -> Result<ApiClient> {
-        ApiClient::with_token(api, None)
-    }
-
-    /// Build a client for an `--api` value and an optional bearer token
-    /// (`--token`/`COPPICE_TOKEN`). An empty token string is treated the same
-    /// as `None` — no `Authorization` header — since clap surfaces `env =
-    /// "COPPICE_TOKEN"` as `Some("")` when the variable is set but empty.
-    pub fn with_token(api: &str, token: Option<&str>) -> Result<ApiClient> {
-        let base = normalize_base(api);
-        let http = plain_http_builder(&base)
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("building the HTTP client")?;
-        Ok(ApiClient {
-            base,
-            http,
-            token: token
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_string),
-        })
-    }
-
-    /// The absolute URL for an `/api/v1`-relative path (`"/jobs"`).
-    pub fn url(&self, path: &str) -> String {
-        format!("{}/api/v1{path}", self.base)
-    }
-
-    /// Attach `Authorization: Bearer <token>` to a request builder when a
-    /// token is configured, otherwise pass it through unchanged.
-    fn authed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
-        }
-    }
-
-    /// GET a path and decode its JSON body.
+    /// The [`Client`] these flags describe.
     ///
-    /// `T` may be a DTO or `serde_json::Value` — the `--json` verbs decode to a
-    /// `Value` and print the server's own bytes back, so a pass-through render
-    /// can never disagree with the wire.
-    pub async fn get_json<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        query: &Query,
-        ctx: Ctx,
-    ) -> Result<T> {
-        let request = self.authed(self.http.get(self.url(path)).query(query));
-        let response = request.send().await.context(ctx.sending)?;
-        if !response.status().is_success() {
-            return Err(api_error(response).await);
-        }
-        response.json().await.context(ctx.reading)
-    }
-
-    /// POST a JSON body and decode the JSON response.
-    pub async fn post_json<B: Serialize, T: DeserializeOwned>(
-        &self,
-        path: &str,
-        body: &B,
-        ctx: Ctx,
-    ) -> Result<T> {
-        let response = self.send_post(path, body, ctx.sending).await?;
-        response.json().await.context(ctx.reading)
-    }
-
-    /// POST a JSON body for its status alone, discarding the response body —
-    /// for a write whose success carries no information the caller needs.
-    pub async fn post_ignoring_body<B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-        sending: &'static str,
-    ) -> Result<()> {
-        self.send_post(path, body, sending).await?;
-        Ok(())
-    }
-
-    /// PUT a JSON body and decode the JSON response — the full-replacement
-    /// counterpart to [`Self::post_json`], used by `policy authz set`.
-    pub async fn put_json<B: Serialize, T: DeserializeOwned>(
-        &self,
-        path: &str,
-        body: &B,
-        ctx: Ctx,
-    ) -> Result<T> {
-        let request = self.authed(self.http.put(self.url(path)).json(body));
-        let response = request.send().await.context(ctx.sending)?;
-        if !response.status().is_success() {
-            return Err(api_error(response).await);
-        }
-        response.json().await.context(ctx.reading)
-    }
-
-    /// The shared POST half: send, and map a non-2xx to a rich error.
-    async fn send_post<B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-        sending: &'static str,
-    ) -> Result<reqwest::Response> {
-        let request = self.authed(self.http.post(self.url(path)).json(body));
-        let response = request.send().await.context(sending)?;
-        if !response.status().is_success() {
-            return Err(api_error(response).await);
-        }
-        Ok(response)
+    /// An empty `--token` is treated as no token at all — clap surfaces `env =
+    /// "COPPICE_TOKEN"` as `Some("")` when the variable is set but empty, and
+    /// the library's builder applies that rule.
+    pub fn client(&self) -> Result<Client> {
+        Ok(Client::builder(&self.api)
+            .token_opt(self.token.as_deref())
+            .build()?)
     }
 }
 
-/// Reduce an `--api` value to a bare base URL. Trims a trailing slash, then a
-/// trailing `/api/v1` (the form the dev banner prints and users paste), then
-/// any slash that exposes — so every accepted form maps to the same base.
-/// The scheme is canonicalized to lowercase (RFC 3986 §3.1: schemes are
-/// case-insensitive), so downstream scheme checks can compare literally.
-pub fn normalize_base(raw: &str) -> String {
-    let trimmed = raw.trim_end_matches('/');
-    let canonical = match trimmed.find("://") {
-        Some(scheme_end) => {
-            let (scheme, rest) = trimmed.split_at(scheme_end);
-            format!("{}{rest}", scheme.to_ascii_lowercase())
-        }
-        None => trimmed.to_string(),
-    };
-
-    canonical
-        .strip_suffix("/api/v1")
-        .unwrap_or(&canonical)
-        .trim_end_matches('/')
-        .to_string()
-}
-
-/// A `reqwest::ClientBuilder` for a *normalized* base ([`normalize_base`]),
-/// skipping the platform's native root certificate store when the base is
-/// not `https://`.
+/// Turn a [`coppice_client::Error`] into the `anyhow` error this CLI prints.
 ///
-/// `rustls-tls-native-roots` (this workspace's TLS backend) enumerates the
-/// macOS keychain eagerly inside `ClientBuilder::build`, before any request —
-/// ~3.3s cold — even for a plain `http://127.0.0.1` base that will never
-/// touch TLS. Every base this CLI dials today (`DEFAULT_API_BASE`, `--api`
-/// for an intranet coordinator, `coppice dev`'s own readiness polling) is
-/// plain HTTP, so that cost buys nothing. A future `https://` `--api` (or the
-/// `coppice token` IdP flow) keeps native roots automatically under this same
-/// scheme check.
-pub fn plain_http_builder(base: &str) -> reqwest::ClientBuilder {
-    let builder = reqwest::Client::builder();
-    // Case-insensitive as a belt against un-normalized callers; a normalized
-    // base already carries a lowercase scheme.
-    let is_https = base
-        .as_bytes()
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"));
-    if is_https {
-        builder
-    } else {
-        builder.tls_built_in_native_certs(false)
+/// The three cases that reach an operator differently:
+///
+/// - a transport failure carries `ctx.sending` ("listing jobs"), with the
+///   underlying `reqwest` error as its source;
+/// - a body that did not decode carries `ctx.reading` ("reading the job
+///   list"), with the `serde_json` error as its source;
+/// - everything the server answered keeps the library's own `Display`, which
+///   is the `api error (CODE): message` wording the CLI has always printed —
+///   plus, on a 401, [`UNAUTHORIZED_HINT`].
+pub fn api_error(err: Error, ctx: Ctx) -> anyhow::Error {
+    match err {
+        Error::Transport(e) => anyhow::Error::new(e).context(ctx.sending),
+        Error::Decode(e) => anyhow::Error::new(e).context(ctx.reading),
+        Error::Build(e) => anyhow::Error::new(e).context("building the HTTP client"),
+        other => {
+            let mut message = other.to_string();
+            if other.status() == Some(401) {
+                message.push_str(UNAUTHORIZED_HINT);
+            }
+            anyhow::anyhow!(message)
+        }
     }
 }
 
-/// The wire error body (ADR 0031). The API's own `ErrorBody` is private and
-/// serialize-only, so the client mirrors just the two fields it reads.
-#[derive(Debug, Deserialize)]
-struct ApiErrorBody {
-    code: String,
-    message: String,
+/// Attach a [`Ctx`] to a [`coppice_client`] call, the way a verb wants it.
+///
+/// Spelled `api_ctx` rather than `context`: `anyhow::Context` is already
+/// implemented for this very `Result`, and a same-named method would be
+/// ambiguous at every call site.
+pub trait ApiResultExt<T> {
+    /// Map the library error into an `anyhow` one carrying `ctx`.
+    fn api_ctx(self, ctx: Ctx) -> Result<T>;
 }
 
-/// Turn a non-2xx response into an `anyhow` error, reading the `{code,
-/// message}` body (falling back to raw text) and, on a 421/NOT_LEADER with a
-/// `Coppice-Leader` hint, appending where to retry.
-pub async fn api_error(response: reqwest::Response) -> anyhow::Error {
-    let status = response.status();
-    let leader = response
-        .headers()
-        .get(COPPICE_LEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let body = response.text().await.unwrap_or_default();
-
-    let mut message = match serde_json::from_str::<ApiErrorBody>(&body) {
-        Ok(parsed) => format!("api error ({}): {}", parsed.code, parsed.message),
-        Err(_) if !body.trim().is_empty() => {
-            format!("api error (HTTP {}): {}", status.as_u16(), body.trim())
-        }
-        Err(_) => format!("api error (HTTP {})", status.as_u16()),
-    };
-    if status == reqwest::StatusCode::MISDIRECTED_REQUEST {
-        if let Some(leader) = leader {
-            message.push_str(&format!("; retry against the leader at {leader}"));
-        }
+impl<T> ApiResultExt<T> for coppice_client::Result<T> {
+    fn api_ctx(self, ctx: Ctx) -> Result<T> {
+        self.map_err(|e| api_error(e, ctx))
     }
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        message.push_str(
-            "; this cluster requires authentication — set COPPICE_TOKEN to a bearer token, \
-             or use a dev cluster (`coppice dev`), which runs in open mode and needs none",
-        );
-    }
-    anyhow::anyhow!(message)
 }
 
 /// Print a JSON value as the `--json` rendering: pretty, one trailing newline.
 ///
-/// Every `--json` verb prints the body the server sent (decoded to a
-/// [`serde_json::Value`] and re-emitted), never a re-serialization of a parsed
-/// DTO — so the machine-readable output is the contract itself, including any
-/// field this CLI is too old to know about.
+/// Every `--json` verb prints the body the server sent — fetched through
+/// [`Client::get_value`] and friends, never re-serialized from a parsed type —
+/// so the machine-readable output is the contract itself, including any field
+/// this CLI is too old to know about.
 pub fn print_json(value: &serde_json::Value) {
     println!(
         "{}",
@@ -381,91 +211,9 @@ mod tests {
 
     use crate::testsupport::{error_body, spawn};
 
-    /// `--token`/`COPPICE_TOKEN`, when set and non-empty, attaches
-    /// `Authorization: Bearer <token>` to every request.
-    #[tokio::test]
-    async fn token_attaches_the_authorization_header() {
-        let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let router = {
-            let captured = captured.clone();
-            Router::new().route(
-                "/api/v1/session",
-                get(move |headers: axum::http::HeaderMap| {
-                    let captured = captured.clone();
-                    async move {
-                        let auth = headers
-                            .get(axum::http::header::AUTHORIZATION)
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_string);
-                        captured.lock().unwrap().replace(auth.unwrap_or_default());
-                        axum::Json(serde_json::json!({}))
-                    }
-                }),
-            )
-        };
-        let base = spawn(router).await;
-        let client = ApiClient::with_token(&base, Some("secret-token")).unwrap();
-        let _: serde_json::Value = client
-            .get_json("/session", &Vec::new(), ctx("fetching", "reading"))
-            .await
-            .unwrap();
-        assert_eq!(
-            captured.lock().unwrap().as_deref(),
-            Some("Bearer secret-token")
-        );
-    }
-
-    /// No `--token` means no `Authorization` header at all — the header's
-    /// mere presence is what the open-mode posture must never see.
-    #[tokio::test]
-    async fn no_token_sends_no_authorization_header() {
-        let captured: std::sync::Arc<std::sync::Mutex<Option<bool>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let router = {
-            let captured = captured.clone();
-            Router::new().route(
-                "/api/v1/session",
-                get(move |headers: axum::http::HeaderMap| {
-                    let captured = captured.clone();
-                    async move {
-                        let present = headers.contains_key(axum::http::header::AUTHORIZATION);
-                        captured.lock().unwrap().replace(present);
-                        axum::Json(serde_json::json!({}))
-                    }
-                }),
-            )
-        };
-        let base = spawn(router).await;
-        let client = ApiClient::new(&base).unwrap();
-        let _: serde_json::Value = client
-            .get_json("/session", &Vec::new(), ctx("fetching", "reading"))
-            .await
-            .unwrap();
-        assert_eq!(*captured.lock().unwrap(), Some(false));
-    }
-
-    /// An empty `COPPICE_TOKEN` (clap surfaces the env var set-but-empty as
-    /// `Some("")`) must behave exactly like no token at all.
-    #[tokio::test]
-    async fn empty_token_sends_no_authorization_header() {
-        let router = Router::new().route(
-            "/api/v1/session",
-            get(|headers: axum::http::HeaderMap| async move {
-                assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
-                axum::Json(serde_json::json!({}))
-            }),
-        );
-        let base = spawn(router).await;
-        let client = ApiClient::with_token(&base, Some("")).unwrap();
-        let _: serde_json::Value = client
-            .get_json("/session", &Vec::new(), ctx("fetching", "reading"))
-            .await
-            .unwrap();
-    }
-
     /// A 401 error message mentions `COPPICE_TOKEN` and that dev clusters run
     /// in open mode — the two facts an operator needs to unblock themselves.
+    /// The library answers the 401; the hint is this CLI's addition.
     #[tokio::test]
     async fn unauthorized_error_mentions_coppice_token_and_open_mode() {
         let router = Router::new().route(
@@ -478,84 +226,103 @@ mod tests {
             }),
         );
         let base = spawn(router).await;
-        let client = ApiClient::new(&base).unwrap();
+        let client = Client::new(&base).unwrap();
         let err = client
-            .get_json::<serde_json::Value>("/session", &Vec::new(), ctx("fetching", "reading"))
+            .session()
             .await
+            .api_ctx(ctx("fetching", "reading"))
             .expect_err("401 fails");
         let message = format!("{err:#}");
+        assert!(message.contains("UNAUTHENTICATED"), "{message}");
+        assert!(message.contains("no credentials"), "{message}");
         assert!(message.contains("COPPICE_TOKEN"), "{message}");
         assert!(message.contains("open mode"), "{message}");
     }
 
-    #[test]
-    fn api_base_normalizes_to_one_form() {
-        let want = "http://h:7070";
-        for raw in [
-            "http://h:7070",
-            "http://h:7070/",
-            "http://h:7070/api/v1",
-            "http://h:7070/api/v1/",
-        ] {
-            assert_eq!(normalize_base(raw), want, "{raw}");
-        }
+    /// A server error that is not a 401 keeps the library's wording and gains
+    /// nothing — the hint is specific to a missing credential.
+    #[tokio::test]
+    async fn a_non_401_error_carries_no_token_hint() {
+        let router = Router::new().route(
+            "/api/v1/session",
+            get(|| async {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    axum::Json(error_body("NOT_FOUND", "no such thing")),
+                )
+            }),
+        );
+        let base = spawn(router).await;
+        let err = Client::new(&base)
+            .unwrap()
+            .session()
+            .await
+            .api_ctx(ctx("fetching", "reading"))
+            .expect_err("404 fails");
+        let message = format!("{err:#}");
+        assert_eq!(message, "api error (NOT_FOUND): no such thing");
     }
 
-    #[test]
-    fn url_joins_the_api_prefix() {
-        let client = ApiClient::new("http://h:7070/api/v1/").unwrap();
-        assert_eq!(client.url("/jobs"), "http://h:7070/api/v1/jobs");
+    /// A transport failure reads as the `sending` half of its [`Ctx`]; a body
+    /// that is not the promised shape reads as the `reading` half.
+    #[tokio::test]
+    async fn the_two_context_halves_name_the_two_failures() {
+        // Nothing listens on port 1, so the send itself fails.
+        let err = Client::new("http://127.0.0.1:1")
+            .unwrap()
+            .session()
+            .await
+            .api_ctx(ctx("fetching the session", "reading the session"))
+            .expect_err("an unreachable coordinator fails");
+        assert!(
+            format!("{err:#}").starts_with("fetching the session"),
+            "{err:#}"
+        );
+
+        let router = Router::new().route("/api/v1/session", get(|| async { "not json at all" }));
+        let base = spawn(router).await;
+        let err = Client::new(&base)
+            .unwrap()
+            .session()
+            .await
+            .api_ctx(ctx("fetching the session", "reading the session"))
+            .expect_err("a non-JSON 200 fails");
+        assert!(
+            format!("{err:#}").starts_with("reading the session"),
+            "{err:#}"
+        );
     }
 
-    /// `plain_http_builder` skips native root loading for a bare host and an
-    /// `http://` base, and keeps it for `https://` — the scheme rule that
-    /// avoids paying the macOS keychain cost on every plain-HTTP launch.
+    /// `--token`/`COPPICE_TOKEN`, when set and non-empty, reaches the client;
+    /// an empty one does not. (The header itself is the library's contract and
+    /// is tested there; this pins the flag-to-client wiring.)
     #[test]
-    fn plain_http_builder_skips_native_roots_for_non_https_bases() {
-        for base in ["h:7070", "http://h:7070", "http://127.0.0.1:7070"] {
-            assert!(
-                plain_http_builder(base).build().is_ok(),
-                "builder failed for {base}"
-            );
-        }
-        assert!(plain_http_builder("https://h:7070").build().is_ok());
-    }
+    fn the_connection_flags_build_a_client() {
+        let connection = ApiConnection {
+            api: "http://h:7070/api/v1".to_string(),
+            token: Some("secret-token".to_string()),
+        };
+        let client = connection.client().unwrap();
+        assert_eq!(client.base_url(), "http://h:7070");
+        assert!(client.has_token());
 
-    /// A base whose first eight BYTES straddle a multi-byte character must
-    /// not panic the scheme check — the prefix is compared as bytes, never
-    /// sliced as `str`. `a\u{e9}\u{e9}\u{e9}\u{e9}://host` is 8 bytes into the
-    /// middle of an `\u{e9}` at index 8.
-    #[test]
-    fn a_non_ascii_scheme_does_not_panic_the_builder() {
-        for base in ["a\u{e9}\u{e9}\u{e9}\u{e9}://host", "\u{e9}", "short"] {
-            let _ = plain_http_builder(base);
-            let _ = ApiClient::new(base);
-        }
-    }
-
-    /// A client builds successfully for both an http and an https base — the
-    /// scheme-dependent native-root toggle in `plain_http_builder` must not
-    /// break construction either way.
-    #[test]
-    fn client_constructs_for_http_and_https_bases() {
-        assert!(ApiClient::new("http://h:7070").is_ok());
-        assert!(ApiClient::new("https://h:7070").is_ok());
+        let empty = ApiConnection {
+            api: DEFAULT_API_BASE.to_string(),
+            token: Some(String::new()),
+        };
+        assert!(!empty.client().unwrap().has_token());
     }
 
     /// The default base and the default port are two literals that must name
     /// the same endpoint — `clap`'s `default_value` needs a `&'static str`, so
-    /// the base cannot be built from the port at compile time. This closes the
-    /// gap the other way: if either moves without the other, the CLI's default
-    /// stops pointing at the port `coppice dev` binds.
+    /// the base cannot be built from the port at compile time. Both now come
+    /// from the client library; this pins that they still agree.
     #[test]
     fn the_default_api_base_names_the_default_api_port() {
         assert_eq!(
             DEFAULT_API_BASE,
             format!("http://127.0.0.1:{DEFAULT_API_PORT}")
         );
-        // And it must survive normalization unchanged, since every verb feeds
-        // it straight into `ApiClient::new`.
-        assert_eq!(normalize_base(DEFAULT_API_BASE), DEFAULT_API_BASE);
     }
 
     #[test]
@@ -571,37 +338,5 @@ mod tests {
         assert_eq!(lines[0], "id         state");
         assert_eq!(lines[1], "a          queued");
         assert_eq!(lines[2], "longer-id  running");
-    }
-
-    /// Schemes are case-insensitive per RFC 3986. `normalize_base` must
-    /// canonicalize them to lowercase so all forms normalize to the same base.
-    #[test]
-    fn scheme_normalization_is_case_insensitive() {
-        let base_https_lower = normalize_base("https://h:7070");
-        let base_https_upper = normalize_base("HTTPS://h:7070");
-        let base_https_mixed = normalize_base("HtTpS://h:7070");
-
-        assert_eq!(base_https_lower, base_https_upper);
-        assert_eq!(base_https_lower, base_https_mixed);
-        assert_eq!(base_https_lower, "https://h:7070");
-
-        // HTTP variants should also normalize consistently
-        let base_http_lower = normalize_base("http://h:7070");
-        let base_http_upper = normalize_base("HTTP://h:7070");
-        let base_http_mixed = normalize_base("HtTp://h:7070");
-
-        assert_eq!(base_http_lower, base_http_upper);
-        assert_eq!(base_http_lower, base_http_mixed);
-        assert_eq!(base_http_lower, "http://h:7070");
-    }
-
-    /// A client must construct successfully for uppercase and mixed-case HTTPS
-    /// schemes, preserving the TLS native roots behavior (which requires the
-    /// scheme to be recognized as https regardless of case).
-    #[test]
-    fn client_constructs_for_case_insensitive_https_schemes() {
-        assert!(ApiClient::new("HTTPS://h:7070").is_ok());
-        assert!(ApiClient::new("HtTpS://h:7070").is_ok());
-        assert!(ApiClient::new("https://h:7070").is_ok());
     }
 }

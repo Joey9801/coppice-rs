@@ -11,13 +11,26 @@
 //! eventual for the derived queue window and the local raft metrics), so the
 //! three sections are not a single atomic snapshot and the render never claims
 //! they are.
+//!
+//! The transport and the wire types both come from the published
+//! [`coppice_client`] crate: this module builds a [`coppice_client::Client`]
+//! from the `--api`/`--token` flags and calls it directly, and every response
+//! shape below (`GetClusterOverviewResponse`, `QueueStats`,
+//! `GetCoordinatorStatusResponse`, ...) is that crate's own type, not a
+//! `coppice-api` DTO. `coppice_core::bytes::ByteSize` is kept for the
+//! humanized byte rendering — the client crate's `Resources` carries plain
+//! `u64` byte counts, on purpose, since presenting them for a human is a
+//! caller concern, not a wire one.
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 
-use coppice_api::http::dto;
+use coppice_client::{
+    paths, Client, CoordinatorRole, GetClusterOverviewResponse, GetCoordinatorStatusResponse,
+    JobPhase, QueueStats, Resources,
+};
 use coppice_core::bytes::ByteSize;
 
-use crate::client::{ctx, print_json, render_table, ApiClient, ApiConnection, Query};
+use crate::client::{ctx, print_json, render_table, ApiConnection, ApiResultExt};
 
 /// `coppice cluster` argument group. `--api` is global, matching `coppice job`.
 #[derive(Debug, clap::Args)]
@@ -50,47 +63,40 @@ pub async fn run(args: ClusterArgs) -> Result<()> {
 
 /// `coppice cluster status`: fetch the three reads and render them as one
 /// summary (or, with `--json`, as one combined object).
-async fn status(client: &ApiClient, json: bool) -> Result<()> {
-    let empty: Query = Vec::new();
-    let overview: serde_json::Value = client
-        .get_json(
-            "/overview",
-            &empty,
-            ctx(
-                "fetching the cluster overview",
-                "reading the cluster overview",
-            ),
-        )
-        .await?;
-    let queue: serde_json::Value = client
-        .get_json(
-            "/queue/stats",
-            &empty,
-            ctx("fetching queue stats", "reading queue stats"),
-        )
-        .await?;
-    let coordinators: serde_json::Value = client
-        .get_json(
-            "/coordinators",
-            &empty,
-            ctx("fetching coordinator status", "reading coordinator status"),
-        )
-        .await?;
+async fn status(client: &Client, json: bool) -> Result<()> {
+    // Built once and shared by both branches below, so the human and the
+    // `--json` rendering can never name the reads differently.
+    let overview_ctx = ctx(
+        "fetching the cluster overview",
+        "reading the cluster overview",
+    );
+    let queue_ctx = ctx("fetching queue stats", "reading queue stats");
+    let coordinators_ctx = ctx("fetching coordinator status", "reading coordinator status");
 
     if json {
+        let overview = client
+            .get_value(paths::OVERVIEW, &[])
+            .await
+            .api_ctx(overview_ctx)?;
+        let queue = client
+            .get_value(paths::QUEUE_STATS, &[])
+            .await
+            .api_ctx(queue_ctx)?;
+        let coordinators = client
+            .get_value(paths::COORDINATORS, &[])
+            .await
+            .api_ctx(coordinators_ctx)?;
         print_json(&serde_json::json!({
-            "overview": overview,
-            "queue": queue,
-            "coordinators": coordinators,
+            "overview": overview.value,
+            "queue": queue.value,
+            "coordinators": coordinators.value,
         }));
         return Ok(());
     }
 
-    let overview: dto::GetClusterOverviewResponse =
-        serde_json::from_value(overview).context("reading the cluster overview")?;
-    let queue: dto::QueueStats = serde_json::from_value(queue).context("reading queue stats")?;
-    let coordinators: dto::GetCoordinatorStatusResponse =
-        serde_json::from_value(coordinators).context("reading coordinator status")?;
+    let overview = client.overview().await.api_ctx(overview_ctx)?;
+    let queue = client.queue_stats().await.api_ctx(queue_ctx)?;
+    let coordinators = client.coordinators().await.api_ctx(coordinators_ctx)?;
     print!("{}", render_status(&overview, &queue, &coordinators));
     Ok(())
 }
@@ -99,9 +105,9 @@ async fn status(client: &ApiClient, json: bool) -> Result<()> {
 /// cluster and its raft position, one for capacity, one for the queue, then the
 /// member roster as a table.
 fn render_status(
-    overview: &dto::GetClusterOverviewResponse,
-    queue: &dto::QueueStats,
-    coordinators: &dto::GetCoordinatorStatusResponse,
+    overview: &GetClusterOverviewResponse,
+    queue: &QueueStats,
+    coordinators: &GetCoordinatorStatusResponse,
 ) -> String {
     use std::fmt::Write;
 
@@ -127,7 +133,7 @@ fn render_status(
         "leader",
         &coordinators
             .leader
-            .clone()
+            .map(|id| id.to_string())
             .unwrap_or_else(|| "(none known)".to_string()),
     );
     kv(&mut out, "term", &coordinators.term.to_string());
@@ -204,14 +210,14 @@ fn render_status(
         &mut out,
         "oldest queued",
         &queue
-            .oldest_queued_age_seconds
-            .map(|s| format!("{s}s"))
+            .oldest_queued_age
+            .map(|age| format!("{}s", age.as_secs()))
             .unwrap_or_else(|| "(nothing queued)".to_string()),
     );
     let by_state: Vec<String> = queue
         .by_state
         .iter()
-        .map(|(phase, count)| format!("{} {count}", phase_label(*phase)))
+        .map(|(phase, count)| format!("{} {count}", phase_label(phase.clone())))
         .collect();
     kv(&mut out, "jobs by phase", &by_state.join(", "));
 
@@ -226,8 +232,8 @@ fn render_status(
         .iter()
         .map(|m| {
             vec![
-                m.id.clone(),
-                role_label(m.role).to_string(),
+                m.id.to_string(),
+                role_label(&m.role),
                 m.addr.clone(),
                 if m.voter { "voter" } else { "learner" }.to_string(),
                 m.last_applied
@@ -247,12 +253,13 @@ fn render_status(
 }
 
 /// The wire spelling of a coordinator role, so the CLI and the JSON agree.
-fn role_label(role: dto::CoordinatorRole) -> &'static str {
-    match role {
-        dto::CoordinatorRole::Leader => "leader",
-        dto::CoordinatorRole::Follower => "follower",
-        dto::CoordinatorRole::Learner => "learner",
-    }
+///
+/// `CoordinatorRole` is `#[non_exhaustive]` with an `Unknown(String)`
+/// catch-all for a spelling this client predates; `Display` (which this
+/// delegates to) already renders that verbatim, so a role this CLI does not
+/// recognize prints exactly as the server spelled it rather than panicking.
+fn role_label(role: &CoordinatorRole) -> String {
+    role.to_string()
 }
 
 /// A rate per minute, or the honest "unknown" a null carries.
@@ -265,7 +272,7 @@ fn rate(per_minute: Option<f64>) -> String {
 
 /// A measured `used` triple, or the honest absence of one (ADR 0039): no node
 /// is reporting usage, which is not the same as a cluster consuming nothing.
-fn measured(r: Option<&dto::Resources>) -> String {
+fn measured(r: Option<&Resources>) -> String {
     match r {
         Some(r) => resources(r),
         None => "(not reported)".to_string(),
@@ -273,7 +280,7 @@ fn measured(r: Option<&dto::Resources>) -> String {
 }
 
 /// One resource triple on a single line, byte dimensions humanized.
-fn resources(r: &dto::Resources) -> String {
+fn resources(r: &Resources) -> String {
     format!(
         "cpu {} mCPU, memory {}, disk {}",
         r.cpu_millis,
@@ -283,20 +290,15 @@ fn resources(r: &dto::Resources) -> String {
 }
 
 /// The wire spelling of a display phase, so the CLI and the JSON agree.
-pub fn phase_label(phase: dto::JobPhase) -> &'static str {
-    use dto::JobPhase as P;
-    match phase {
-        P::Submitted => "submitted",
-        P::Accepted => "accepted",
-        P::Queued => "queued",
-        P::Accruing => "accruing",
-        P::Preparing => "preparing",
-        P::Running => "running",
-        P::Finalizing => "finalizing",
-        P::Succeeded => "succeeded",
-        P::Failed => "failed",
-        P::Aborted => "aborted",
-    }
+///
+/// `JobPhase` is `#[non_exhaustive]` with an `Unknown(String)` catch-all for a
+/// phase a newer coordinator grew that this client predates; its `Display`
+/// (which this delegates to) already renders that verbatim — every known
+/// phase's label is exactly its wire spelling, so this is not a lossy
+/// simplification, just naming that fact once instead of repeating it in a
+/// ten-arm match.
+pub fn phase_label(phase: JobPhase) -> String {
+    phase.to_string()
 }
 
 /// Indent every line of a block by two spaces (for a table nested under a
@@ -318,9 +320,22 @@ mod tests {
     use axum::routing::get;
     use axum::{Json, Router};
 
+    use coppice_api::http::dto;
+    use coppice_client::RaftId;
     use coppice_core::id::ClusterId;
 
     use crate::testsupport::{error_body, spawn};
+
+    /// Round-trip a server-typed (`coppice_api::http::dto`) fixture through
+    /// JSON into the `coppice_client` type the CLI actually renders. The
+    /// server type is the fixture that pins the wire contract; the client
+    /// type is what `render_status` and friends take — so this conversion,
+    /// not a hand-written assertion, *is* the cross-check that the two crates
+    /// still agree on the shape.
+    fn to_client<S: serde::Serialize, C: serde::de::DeserializeOwned>(value: S) -> C {
+        serde_json::from_value(serde_json::to_value(value).unwrap())
+            .expect("the client type decodes the server type's own output")
+    }
 
     /// One fixed cluster id, so the render assertions can name it.
     fn cluster_id() -> ClusterId {
@@ -412,18 +427,16 @@ mod tests {
         }
     }
 
-    /// The DTO must survive its own serialize→deserialize round trip — this is
-    /// what lets the CLI decode the contract type directly instead of keeping
-    /// a local mirror.
+    /// The DTO must survive its own serialize→deserialize round trip into the
+    /// client's own type — this is what lets the CLI decode the contract
+    /// type directly instead of keeping a local mirror.
     #[test]
     fn coordinator_dto_round_trips() {
-        let value = serde_json::to_value(sample_coordinators()).unwrap();
-        let decoded: dto::GetCoordinatorStatusResponse =
-            serde_json::from_value(value).expect("the DTO decodes its own output");
-        assert_eq!(decoded.cluster_id, cluster_id());
-        assert_eq!(decoded.leader, Some(1.to_string()));
+        let decoded: GetCoordinatorStatusResponse = to_client(sample_coordinators());
+        assert_eq!(decoded.cluster_id.to_string(), cluster_id().to_string());
+        assert_eq!(decoded.leader, Some(RaftId(1)));
         assert_eq!(decoded.members.len(), 1);
-        assert_eq!(decoded.members[0].role, dto::CoordinatorRole::Leader);
+        assert_eq!(decoded.members[0].role, CoordinatorRole::Leader);
     }
 
     /// Raft ids are random u64s that routinely exceed 2^53; they must cross
@@ -438,10 +451,10 @@ mod tests {
         let value = serde_json::to_value(&sample).unwrap();
         assert_eq!(value["leader"], "7234980239847293847");
         assert_eq!(value["members"][0]["id"], "7234980239847293847");
-        let decoded: dto::GetCoordinatorStatusResponse =
-            serde_json::from_value(value).expect("the DTO decodes its own output");
-        assert_eq!(decoded.leader.as_deref(), Some("7234980239847293847"));
-        assert_eq!(decoded.members[0].id, "7234980239847293847");
+        let decoded: GetCoordinatorStatusResponse =
+            serde_json::from_value(value).expect("the client type decodes the server's output");
+        assert_eq!(decoded.leader, Some(RaftId(huge)));
+        assert_eq!(decoded.members[0].id, RaftId(huge));
     }
 
     /// The paths a spawned fake server was asked for, in order.
@@ -485,7 +498,7 @@ mod tests {
     async fn status_reads_all_three_endpoints() {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let base = spawn(status_router(&seen)).await;
-        status(&ApiClient::new(&base).unwrap(), false)
+        status(&Client::new(&base).unwrap(), false)
             .await
             .expect("status succeeds");
         let mut seen = seen.lock().unwrap().clone();
@@ -499,7 +512,7 @@ mod tests {
     async fn status_json_reads_the_same_three_endpoints() {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let base = spawn(status_router(&seen)).await;
-        status(&ApiClient::new(&base).unwrap(), true)
+        status(&Client::new(&base).unwrap(), true)
             .await
             .expect("status --json succeeds");
         assert_eq!(seen.lock().unwrap().len(), 3);
@@ -507,7 +520,11 @@ mod tests {
 
     #[test]
     fn render_names_the_cluster_queue_and_members() {
-        let rendered = render_status(&sample_overview(), &sample_queue(), &sample_coordinators());
+        let rendered = render_status(
+            &to_client(sample_overview()),
+            &to_client(sample_queue()),
+            &to_client(sample_coordinators()),
+        );
         assert!(
             rendered.contains(&format!("cluster         {}", cluster_id())),
             "{rendered}"
@@ -540,7 +557,7 @@ mod tests {
             }),
         ))
         .await;
-        let err = status(&ApiClient::new(&base).unwrap(), false)
+        let err = status(&Client::new(&base).unwrap(), false)
             .await
             .expect_err("status fails");
         let message = format!("{err:#}");
