@@ -373,6 +373,41 @@ async fn healthz_sends_no_credential_and_never_asks_the_provider() {
     }
 }
 
+/// `/auth/config` is the credential-free discovery endpoint: a client asks it
+/// to learn *how* to authenticate, so it must work with no credential at all
+/// and must never depend on a provider that could itself be behind the auth
+/// being probed.
+#[tokio::test]
+async fn auth_config_sends_no_credential_and_never_asks_the_provider() {
+    let store = capture_store();
+    let router = with_capture(
+        Router::new().route(
+            "/api/v1/auth/config",
+            get(|| async { Json(auth_config_json()) }),
+        ),
+        store.clone(),
+    );
+    let base = spawn(router).await;
+
+    let with_token = Client::builder(&base).token("s3cr3t").build().unwrap();
+    with_token.auth_config().await.unwrap();
+
+    let canned = Canned(Arc::new(Mutex::new(Err(
+        "the token endpoint is down".to_string()
+    ))));
+    let failing = Client::builder(&base)
+        .token_provider(canned)
+        .build()
+        .unwrap();
+    failing.auth_config().await.unwrap();
+
+    let captured = store.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for request in captured.iter() {
+        assert!(request.headers.get("authorization").is_none());
+    }
+}
+
 /// If this fails, a token stopped riding on every request — every call to a
 /// secured cluster would 401.
 #[tokio::test]

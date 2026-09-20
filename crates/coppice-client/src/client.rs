@@ -569,10 +569,23 @@ impl Client {
     }
 
     /// `GET /api/v1/auth/config` — the deployment's public authentication
-    /// posture. The one endpoint reachable without a credential, because a
-    /// client cannot obtain one without knowing this.
+    /// posture. Reachable without a credential, because a client cannot
+    /// obtain one without knowing this.
+    ///
+    /// Like [`healthz`](Self::healthz), no credential is sent and a
+    /// [`TokenProvider`] is not consulted: the point of the call is to learn
+    /// how to authenticate, so it must work on a client that has no credential
+    /// set up yet — and a provider that cannot answer (its endpoint may be
+    /// behind the very auth this call is probing) must not fail it.
     pub async fn auth_config(&self) -> Result<Versioned<GetAuthConfigResponse>> {
-        self.get(paths::AUTH_CONFIG, &[]).await
+        let request = self.inner.http.get(self.url(paths::AUTH_CONFIG));
+        let response = request.send().await.map_err(Error::Transport)?;
+        let (value, indexes) = decode(response).await?;
+        Ok(Versioned {
+            value,
+            applied_index: indexes.applied,
+            committed_index: indexes.committed,
+        })
     }
 
     /// `GET /api/v1/authorization` — the replicated role bindings and the
@@ -829,8 +842,10 @@ impl Client {
     ///
     /// Async because the token may come from a [`TokenProvider`], which is
     /// asked here — once per request, immediately before it is sent, on every
-    /// `/api/v1` path. (`/healthz` is outside authentication and never comes
-    /// through here.)
+    /// authenticated `/api/v1` path. (`/healthz` is outside authentication
+    /// and never comes through here, and `/auth/config` builds its own
+    /// request for the same reason: both must work with no credential at
+    /// all.)
     ///
     /// The header value is built here rather than through
     /// `RequestBuilder::bearer_auth` for one reason: so it can be marked
