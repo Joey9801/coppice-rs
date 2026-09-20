@@ -1179,6 +1179,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "coppice-authn",
+ "coppice-client",
  "coppice-core",
  "coppice-enroll",
  "coppice-scheduler",
