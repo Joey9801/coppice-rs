@@ -21,7 +21,7 @@ waive them.
 | [KOI-3](#koi-3-event-cursors-depend-on-local-apply-batching) | High | Events / replication | Resolved (2026-07-10; drop-and-gap completeness 2026-07-12) | — |
 | [KOI-4](#koi-4-unbounded-projected-ready-does-not-protect-accrual-progress) | High | Scheduling | Resolved (2026-07-10, ADR 0027) | — |
 | [KOI-5](#koi-5-view-and-snapshot-publication-do-not-fit-the-1m-job-target) | High | Scalability | Open (clone cost, copies, instrumentation, and apply latency resolved) | Do not advertise the 1M-job target as supported until the release-mode performance gate runs in CI |
-| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open (design settled 2026-07-15, ADR 0032; stamps + tiers 1/3 + the overview's windowed fields landed the same day; `GetJobTimeline` ring-backed tier-1 half landed; `GetJobUsage` landed 2026-07-21, ADR 0036) | `GetJobTimeline` serves its ring-backed (tier 1), honestly floor-truncated half; `GetJobUsage` now serves best-effort agent-proxied samples (ADR 0036, same `NodeService`/honesty pattern as `GetJobLogs`); still unserved: the durable tier-2 store + writer (and node history), `GetNodeUtilization`'s `used` half, and `SubscribeEvents`' transport |
+| [KOI-6](#koi-6-nothing-records-when-anything-happened-so-no-windowed-read-can-be-served) | High | Observability / API | Open (design settled 2026-07-15, ADR 0032; stamps + tiers 1/3 + the overview's windowed fields landed the same day; `GetJobTimeline` ring-backed tier-1 half landed; `GetJobUsage` landed 2026-07-21, ADR 0036) | `GetJobTimeline` serves its ring-backed (tier 1), honestly floor-truncated half; `GetJobUsage` now serves best-effort agent-proxied samples (ADR 0036, same `NodeService`/honesty pattern as `GetJobLogs`); still unserved: the durable tier-2 store + writer (and node history), and `GetNodeUtilization`'s `used` half (`SubscribeEvents` is served from the ring over SSE, ADR 0043) |
 
 ## KOI-1: Terminal-job eviction can destroy the only history
 
@@ -475,8 +475,7 @@ and those bounds are enforced in CI or a required performance gate.
   closing the job half of ADR 0032 item 7's scope cut. The durable half — the
   tier-2 history event table and writer, the node-history endpoint they also
   serve (`GetNodeHistory`), the durable prefix that would extend the timeline
-  below the ring's tail, `GetNodeUtilization`'s `used` half, and
-  `SubscribeEvents`' SSE transport — is not
+  below the ring's tail, and `GetNodeUtilization`'s `used` half — is not
 - **Affected capability:** every time-ranged read on the public API — the
   overview's queue rates and history and its recent-events window, the job
   timeline, job usage and node utilization series, and the ADR 0008 event
@@ -557,11 +556,14 @@ of 2026-07-21 ([ADR 0036](../decisions/0036-best-effort-job-usage-retrieval.md))
 `GET /api/v1/jobs/{job}/usage` extends ADR 0034's `NodeService` pattern with a
 `FetchMetrics` RPC over the same agent telemetry segment store — best-effort,
 honest per-attempt availability, ascending by default (a time series, unlike
-logs' newest-first). `GetNodeUtilization` and `GetNodeHistory` and
-`SubscribeEvents` remain `501 UNIMPLEMENTED`: node history waits on the
-tier-2 store and writer, the subscription on its SSE transport, and node
-utilization's `used` half on node-level aggregation across attempts (item 7
-of the ADR, now narrowed to just this).
+logs' newest-first). `SubscribeEvents` is served: `GET /api/v1/events` is a
+filtered SSE stream over the tier-1 ring
+([ADR 0043](../decisions/0043-filtered-job-event-subscriptions.md)), which needs no
+durable store because a gap resyncs from state, not from history.
+`GetNodeUtilization` and `GetNodeHistory` remain `501 UNIMPLEMENTED`: node
+history waits on the tier-2 store and writer, and node utilization's `used`
+half on node-level aggregation across attempts (item 7 of the ADR, now
+narrowed to just this).
 
 ### Impact
 
