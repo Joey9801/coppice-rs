@@ -47,6 +47,11 @@ pub const QUEUE_STATS: &str = "/queue/stats";
 /// `GET /jobs` (list) and `POST /jobs` (submit).
 pub const JOBS: &str = "/jobs";
 
+/// `GET /events` — the filtered job-event subscription (ADR 0043). The one
+/// long-lived response on this surface: it answers `text/event-stream` and
+/// stays open.
+pub const EVENTS: &str = "/events";
+
 /// `GET /nodes` — the node list.
 pub const NODES: &str = "/nodes";
 
