@@ -2,6 +2,7 @@
 name = "coppice-enroll"
 version = "0.0.1"
 edition = "2021"
+license.workspace = true
 publish = false
 
 # The enrollment wire contract and client (ADR 0037 §4).

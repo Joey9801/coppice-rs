@@ -2,6 +2,7 @@
 name = "coppice-authn"
 version = "0.0.1"
 edition = "2021"
+license.workspace = true
 publish = false
 
 # The authentication edge (ADR 0022): OIDC discovery, the JWKS cache, offline
