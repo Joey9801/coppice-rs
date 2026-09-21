@@ -1767,17 +1767,13 @@ fn raft_id_round_trips_and_rejects_a_non_decimal_string() {
 /// The two `Timestamp` types must serialize identically and cross-decode.
 #[test]
 fn timestamp_serializes_identically_and_cross_decodes() {
-    // `ServerTimestamp::max_value()`/`min_value()` are deliberately excluded
-    // from this corpus: they render a five-digit, `+`/`-`-prefixed extended
-    // year (`"+262142-12-31T23:59:59.999999Z"`), which chrono's own
-    // `DateTime::parse_from_rfc3339` refuses to parse back — a pre-existing
-    // bug in `coppice_core::time::Timestamp` itself (it cannot round-trip
-    // its own extreme values through its own `Serialize`/`Deserialize`,
-    // confirmed independently of this client), not a client/server copy
-    // drift. See this test's final report for the repro. `9999-12-31` below
-    // is the largest instant whose year still renders without the
-    // extended-year prefix, so it stays inside the format both parsers
-    // accept.
+    // `ServerTimestamp` and `client::Timestamp` both bound their
+    // representable range to a four-digit RFC 3339 year (issue #152), so
+    // `max_value()`/`min_value()` are legal fixtures now: every instant
+    // either type can hold has a rendering the other's parser accepts.
+    // `9999-12-31T23:59:59.999999Z` / `0001-01-01T00:00:00.000000Z` are
+    // those bounds, spelled as literals so a change to either type's range
+    // constant shows up here as a mismatch rather than silently tracking it.
     let micros = [
         0i64,
         1,
@@ -1800,6 +1796,45 @@ fn timestamp_serializes_identically_and_cross_decodes() {
         let server_from_client: ServerTimestamp = serde_json::from_value(client_json).unwrap();
         assert_eq!(server_from_client.as_micros(), us);
     }
+
+    // The bounds are the two extreme literals above, and both sides agree on
+    // that.
+    assert_eq!(
+        ServerTimestamp::max_value().as_micros(),
+        253_402_300_799_999_999
+    );
+    assert_eq!(
+        client::Timestamp::max_value().as_micros(),
+        253_402_300_799_999_999
+    );
+    assert_eq!(
+        ServerTimestamp::min_value().as_micros(),
+        -62_135_596_800_000_000
+    );
+    assert_eq!(
+        client::Timestamp::min_value().as_micros(),
+        -62_135_596_800_000_000
+    );
+    assert_eq!(
+        ServerTimestamp::max_value().as_micros(),
+        client::Timestamp::max_value().as_micros()
+    );
+    assert_eq!(
+        ServerTimestamp::min_value().as_micros(),
+        client::Timestamp::min_value().as_micros()
+    );
+
+    // One microsecond beyond either bound is rejected by both sides.
+    assert!(ServerTimestamp::from_micros(253_402_300_799_999_999 + 1).is_none());
+    assert!(client::Timestamp::from_micros(253_402_300_799_999_999 + 1).is_none());
+    assert!(ServerTimestamp::from_micros(-62_135_596_800_000_000 - 1).is_none());
+    assert!(client::Timestamp::from_micros(-62_135_596_800_000_000 - 1).is_none());
+
+    // The extended-year rendering that motivated bounding the range in the
+    // first place is rejected by both parsers.
+    let extended_year = "\"+262142-12-31T23:59:59.999999Z\"";
+    assert!(serde_json::from_str::<ServerTimestamp>(extended_year).is_err());
+    assert!(serde_json::from_str::<client::Timestamp>(extended_year).is_err());
 }
 
 /// For every id type present in both crates, the wire prefix must match and
