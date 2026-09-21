@@ -178,6 +178,30 @@ pub const USAGE_SAMPLE_MAX_AGE: Duration = Duration::from_secs(90);
 /// shorter tick notices a due job sooner and never makes one due.
 pub const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Most ids one `EvictTerminalJobs` / `EvictNodes` command may name
+/// (issue #155).
+///
+/// Matches the scheduler's `max_placements_per_cycle` default (512) so
+/// eviction is no longer the outlier among the commands housekeeping and the
+/// scheduler propose: it bounds the raft entry, the serial apply that deletes
+/// every listed record, and the `EventBatch` derived from that apply — which
+/// ADR 0043 delivers to SSE subscribers as one unsplittable frame per raft
+/// index and the fanout ring holds as a single item. An unbounded batch is
+/// only ever noticed at design scale, where a burst of jobs aging out together
+/// would produce one multi-megabyte entry and one multi-megabyte frame.
+pub const MAX_EVICTIONS_PER_COMMAND: usize = 512;
+
+/// Capped eviction commands one housekeeping pass proposes sequentially before
+/// leaving the rest of the backlog to the next tick (issue #155).
+///
+/// 16 × [`MAX_EVICTIONS_PER_COMMAND`] = 8192 evictions per 60 s tick ≈ 11.8 M
+/// a day, an order of magnitude over the ~1 M jobs/day design rate, so a
+/// steady state never falls behind and a 100 k burst drains in ~13 ticks —
+/// while no single tick can monopolise the log. Pure liveness, exactly like
+/// the tick itself ([`HOUSEKEEPING_INTERVAL`]): it only ever delays an
+/// eviction, never makes one due.
+pub const MAX_EVICTION_BATCHES_PER_PASS: usize = 16;
+
 /// Agent-liveness deadline before the leader proposes `DeclareNodeLost`
 /// (ADR 0009 health monitor).
 ///
