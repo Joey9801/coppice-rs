@@ -81,6 +81,15 @@ pub struct Authenticated {
     /// Presentation-only claims from the credential, if any. `Default` (both
     /// fields `None`) for every mechanism but the bearer path.
     pub presentation: Presentation,
+    /// When this request's credential stops being valid, for the surfaces
+    /// that outlive a single request: an event subscription ends here
+    /// (ADR 0043) rather than running indefinitely on an expired token.
+    ///
+    /// `None` for the mechanisms that have no deadline to offer — an operator
+    /// certificate (its expiry is the TLS layer's business and is measured in
+    /// months) and open mode (no credential at all). A stream with no
+    /// deadline is ended by the drain or by the client, as before.
+    pub expires_at: Option<coppice_core::time::Timestamp>,
 }
 
 /// The result of offering one request's credentials to one mechanism.
@@ -229,6 +238,7 @@ impl Authenticator {
             Authenticator::Open => Step::Authenticated(Box::new(Authenticated {
                 actor: actor::anonymous(),
                 presentation: Presentation::default(),
+                expires_at: None,
             })),
         }
     }
@@ -251,6 +261,7 @@ fn operator_cert(ca: &CaProvider, strict: bool, creds: Credentials<'_>) -> Step 
             Profile::Operator { cn } => Step::Authenticated(Box::new(Authenticated {
                 actor: actor::operator(&cn),
                 presentation: Presentation::default(),
+                expires_at: None,
             })),
             // A coordinator or agent leaf is a real cluster identity, but not
             // an *operator* one: those certificates authenticate machines on
@@ -309,6 +320,7 @@ async fn bearer(
                 name: validated.name,
                 email: validated.email,
             },
+            expires_at: validated.expires_at,
         })),
         Err(e) => Step::Rejected(Unauthenticated::InvalidBearer(e)),
     }

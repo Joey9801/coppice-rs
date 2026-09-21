@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use coppice_core::time::Timestamp;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, decode_header, Validation};
 use serde_json::{Map, Value};
@@ -37,6 +38,19 @@ pub struct ValidatedToken {
     /// Same presentation-only rule as [`name`](Self::name): display only,
     /// never stored, never replicated.
     pub email: Option<String>,
+    /// The `exp` claim as an instant — when this token stops being valid.
+    ///
+    /// Validation already enforced it (with [`CLOCK_SKEW_LEEWAY_SECS`]), so
+    /// this is not a second check; it is surfaced because a *long-lived*
+    /// request has to respect it too. A subscription opened at 09:00 with a
+    /// token expiring at 09:05 must end at 09:05 (ADR 0043), not run for
+    /// hours on a credential that stopped being valid — the per-request check
+    /// the rest of the API relies on never comes around again for a stream.
+    ///
+    /// `None` only when `exp` is outside [`Timestamp`]'s range, which is a
+    /// clock nobody can act on either way; a stream then simply has no
+    /// deadline of its own.
+    pub expires_at: Option<Timestamp>,
 }
 
 /// Validates bearer tokens against a [`JwksCache`] and an [`OidcConfig`].
@@ -138,12 +152,21 @@ impl Validator {
         let groups = extract_groups(&claims, groups_claim)?;
         let name = extract_string_claim(&claims, "name");
         let email = extract_string_claim(&claims, "email");
+        // `exp` is a required claim and `decode` above already rejected a
+        // token without one or past it, so this is a pure read. Seconds to
+        // microseconds, saturating out of range into `None`.
+        let expires_at = claims
+            .get("exp")
+            .and_then(Value::as_i64)
+            .and_then(|secs| secs.checked_mul(1_000_000))
+            .and_then(Timestamp::from_micros);
 
         Ok(ValidatedToken {
             sub,
             groups,
             name,
             email,
+            expires_at,
         })
     }
 }
