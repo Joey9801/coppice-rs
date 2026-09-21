@@ -243,6 +243,27 @@ followers, which is what lets followers serve reads and event streams.
    evict proposals across a leader change are harmless — apply absorbs them
    (missing ids are skipped) — and in a future durable mode, duplicate history
    writes would be too (idempotent by job id).
+   Eviction proposes in **capped batches**: each `EvictTerminalJobs` names at
+   most `MAX_EVICTIONS_PER_COMMAND` (512) jobs, longest-overdue `terminal_at`
+   first (ties by job id, so two leaders scanning the same state propose the
+   same batch), and one pass proposes at most
+   `MAX_EVICTION_BATCHES_PER_PASS` (16) such commands *sequentially*, leaving
+   any remainder to the next tick — the backlog drains oldest first across
+   ticks, and a rejection or error ends the pass rather than retrying the
+   rest. Unbounded, a burst of jobs aging out together would be one
+   multi-megabyte raft entry, one long serial apply, and one enormous
+   `EventBatch` — which
+   [ADR 0043](../decisions/0043-filtered-job-event-subscriptions.md) delivers
+   as a single unsplittable SSE frame per raft index and the fanout ring holds
+   as one item. 512 matches the scheduler's `max_placements_per_cycle`, so
+   eviction is no longer the outlier; 16 batches a tick is ~11.8 M evictions a
+   day against a ~1 M jobs/day design rate, so the cap is pure liveness — it
+   delays an eviction, never makes one due. The same tick's **node-retention
+   GC** (`EvictNodes`,
+   [ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md))
+   follows exactly the same rule, longest-silent first, which additionally
+   narrows a rejection's blast radius: apply rejects a whole `EvictNodes`
+   batch if any one listed node turns out ineligible.
    The same tick is the **leader health monitor** of
    [command-catalog.md](command-catalog.md#declarenodelost): it seeds the
    liveness map on gaining leadership (grace) and proposes `DeclareNodeLost`

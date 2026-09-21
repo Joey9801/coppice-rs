@@ -12,6 +12,11 @@
 //! All three measure their own clock proposer-side and propose; apply stays
 //! deterministic and idempotent under a leader change.
 //!
+//! Both eviction passes propose in **capped batches**: at most
+//! [`MAX_EVICTIONS_PER_COMMAND`] ids per command and at most
+//! [`MAX_EVICTION_BATCHES_PER_PASS`] commands per tick, oldest first, with
+//! whatever is left over waiting for the next sweep (issue #155).
+//!
 //! Scans the view for terminal jobs past retention and removes them from
 //! replicated state with an `EvictTerminalJobs` proposal. What gates that
 //! proposal is the configured `[history]` mode (ADR 0012), which the daemon
@@ -51,7 +56,9 @@ use coppice_state::command::{DeclareNodeLost, EvictNodes, EvictTerminalJobs};
 use coppice_state::Command;
 
 use crate::leadership;
-use crate::limits::AGENT_LIVENESS_DEADLINE;
+use crate::limits::{
+    AGENT_LIVENESS_DEADLINE, MAX_EVICTIONS_PER_COMMAND, MAX_EVICTION_BATCHES_PER_PASS,
+};
 use crate::liveness::NodeLiveness;
 
 /// Where this daemon's terminal-job history goes (ADR 0012) — the witness
@@ -223,46 +230,102 @@ fn has_live_allocation(view: &StateView, node: NodeId) -> bool {
 /// Evict the node records whose full `node_retention` window of silence has
 /// elapsed (ADR 0041).
 ///
-/// One batch per tick: apply skips ids that are already gone, so a
-/// re-issued proposal is idempotent across a leader change. This pass
-/// applies exactly the conditions apply re-checks.
+/// Capped batches per tick, longest-silent first: apply skips ids that are
+/// already gone, so a re-issued proposal is idempotent across a leader change,
+/// and a backlog that does not fit this tick's budget simply waits for the
+/// next one. This pass applies exactly the conditions apply re-checks.
 async fn evict_silent_nodes<C: Consensus>(
     consensus: &Arc<C>,
     views: &StateViews,
     liveness: &NodeLiveness,
 ) {
     let view = views.latest();
-    let due = due_for_node_eviction(&view, liveness, Instant::now());
-    if due.is_empty() {
-        return;
+    let due = due_for_node_eviction(
+        &view,
+        liveness,
+        Instant::now(),
+        MAX_EVICTIONS_PER_COMMAND * MAX_EVICTION_BATCHES_PER_PASS,
+    );
+    // An empty `due` is the only outcome of an inexpressible window, so the
+    // fallback is never consulted.
+    let retention = view
+        .state()
+        .policy
+        .node_retention
+        .to_std()
+        .unwrap_or(Duration::MAX);
+    let still_silent = |node: NodeId| match liveness.last_seen(node) {
+        Some(seen) => Instant::now().saturating_duration_since(seen) >= retention,
+        None => false,
+    };
+    propose_node_evictions(consensus, &due, MAX_EVICTIONS_PER_COMMAND, still_silent).await;
+}
+
+/// Propose `due` as `EvictNodes` commands of at most `per_command` ids each,
+/// one at a time, stopping at the first rejection or error.
+///
+/// Sequential on purpose: the batches are disjoint, so nothing is lost by
+/// leaving the tail to the next tick, and a single in-flight proposal keeps
+/// this pass from monopolising the log. Chunking also narrows a rejection's
+/// blast radius — apply rejects a whole `EvictNodes` batch if any one listed
+/// node turns out ineligible, so a capped batch loses at most `per_command`
+/// evictions to one bad id instead of the entire backlog.
+///
+/// `still_silent` is asked about every node immediately before its batch is
+/// proposed. `due` was fixed before the first proposal, and the liveness map
+/// keeps moving while earlier batches replicate: a node that resumed
+/// reporting in that time must keep its record (and its cordon), so it is
+/// dropped from its batch here rather than evicted on a stale verdict. The
+/// race between this check and apply remains, as it always did for a single
+/// batch — apply cannot see leader-local liveness — but it no longer grows
+/// with the length of the pass.
+async fn propose_node_evictions<C: Consensus>(
+    consensus: &Arc<C>,
+    due: &[NodeId],
+    per_command: usize,
+    still_silent: impl Fn(NodeId) -> bool,
+) {
+    let mut evicted = 0usize;
+    for batch in due.chunks(per_command.max(1)) {
+        let batch: Vec<NodeId> = batch.iter().copied().filter(|n| still_silent(*n)).collect();
+        if batch.is_empty() {
+            continue;
+        }
+        // Proposer-side wall clock: housekeeping runs outside apply.
+        let command = Command::EvictNodes(EvictNodes {
+            nodes: batch.clone(),
+            // The retention GC is machine-proposed; only the admin API's
+            // explicit `node remove` carries an actor.
+            actor: None,
+            evicted_at: Timestamp::now(),
+        });
+        match consensus.propose(command).await {
+            // `EvictNodes` emits no events, so the applied batch's own length
+            // is the best count available — an over-count only where apply
+            // skipped an id that was already gone.
+            Ok(Applied { outcome: Ok(_), .. }) => evicted += batch.len(),
+            Ok(Applied {
+                outcome: Err(reason),
+                ..
+            }) => {
+                tracing::warn!(?reason, "housekeeping: EvictNodes rejected");
+                break;
+            }
+            Err(e) if e.is_retryable() => {
+                tracing::info!(error = %e, "housekeeping: retryable EvictNodes error");
+                break;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "housekeeping: fatal EvictNodes error");
+                break;
+            }
+        }
     }
-    // Proposer-side wall clock: housekeeping runs outside apply.
-    let command = Command::EvictNodes(EvictNodes {
-        nodes: due.clone(),
-        // The retention GC is machine-proposed; only the admin API's explicit
-        // `node remove` carries an actor.
-        actor: None,
-        evicted_at: Timestamp::now(),
-    });
-    match consensus.propose(command).await {
-        Ok(Applied { outcome: Ok(_), .. }) => {
-            tracing::info!(
-                count = due.len(),
-                "housekeeping: evicted node records silent past the retention window"
-            );
-        }
-        Ok(Applied {
-            outcome: Err(reason),
-            ..
-        }) => {
-            tracing::warn!(?reason, "housekeeping: EvictNodes rejected");
-        }
-        Err(e) if e.is_retryable() => {
-            tracing::info!(error = %e, "housekeeping: retryable EvictNodes error");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "housekeeping: fatal EvictNodes error");
-        }
+    if evicted > 0 {
+        tracing::info!(
+            count = evicted,
+            "housekeeping: evicted node records silent past the retention window"
+        );
     }
 }
 
@@ -275,24 +338,53 @@ async fn evict_silent_nodes<C: Consensus>(
 /// leader-local liveness marks of ADR 0040: a node with no mark at all is
 /// not considered silent. A leader change therefore only ever delays an
 /// eviction, never hastens one.
-fn due_for_node_eviction(view: &StateView, liveness: &NodeLiveness, now: Instant) -> Vec<NodeId> {
+///
+/// At most `limit` records come back, longest-silent first (oldest
+/// `last_seen`, ties broken by [`NodeId`] so the order is deterministic): the
+/// records that have been dead longest leave first, and the remainder waits
+/// for the next sweep (issue #155).
+fn due_for_node_eviction(
+    view: &StateView,
+    liveness: &NodeLiveness,
+    now: Instant,
+    limit: usize,
+) -> Vec<NodeId> {
     let Some(retention) = view.state().policy.node_retention.to_std() else {
         // A negative window is not expressible as a monotonic span; treat it
         // as "never due" rather than evicting everything.
         tracing::warn!("housekeeping: node_retention is negative, skipping the node retention GC");
         return Vec::new();
     };
-    view.state()
+    let due: Vec<(Instant, NodeId)> = view
+        .state()
         .nodes
         .iter()
         .filter(|(_, record)| !record.accepts_placements())
-        .map(|(node_id, _)| *node_id)
-        .filter(|node_id| match liveness.last_seen(*node_id) {
-            Some(seen) => now.saturating_duration_since(seen) >= retention,
-            None => false,
+        .filter_map(|(node_id, _)| {
+            let seen = liveness.last_seen(*node_id)?;
+            (now.saturating_duration_since(seen) >= retention).then_some((seen, *node_id))
         })
-        .filter(|node_id| !has_live_allocation(view, *node_id))
+        .filter(|(_, node_id)| !has_live_allocation(view, *node_id))
+        .collect();
+    oldest_first(due, limit, |(seen, node_id)| (*seen, *node_id))
+        .into_iter()
+        .map(|(_, node_id)| node_id)
         .collect()
+}
+
+/// The `limit` smallest items by `key`, sorted.
+///
+/// The partial selection matters at design scale: a backlog of a million due
+/// records must not be fully sorted to find the few thousand that fit this
+/// pass's budget, so anything over the limit is partitioned in linear time and
+/// only the survivors are ordered.
+fn oldest_first<T, K: Ord, F: Fn(&T) -> K>(mut items: Vec<T>, limit: usize, key: F) -> Vec<T> {
+    if items.len() > limit {
+        items.select_nth_unstable_by_key(limit, &key);
+        items.truncate(limit);
+    }
+    items.sort_unstable_by_key(&key);
+    items
 }
 
 async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history: HistorySink) {
@@ -301,12 +393,39 @@ async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history:
     // apply (`docs/architecture/coordinator-runtime.md`, "Housekeeping").
     let now = Timestamp::now();
 
-    let due = due_for_eviction(&view, now);
+    let budget = MAX_EVICTIONS_PER_COMMAND * MAX_EVICTION_BATCHES_PER_PASS;
+    let due = due_for_eviction(&view, now, budget);
 
     if due.is_empty() {
         return;
     }
+    if due.len() == budget {
+        tracing::debug!(
+            budget,
+            "housekeeping: the eviction backlog filled this pass's budget, \
+             the remainder waits for the next tick"
+        );
+    }
 
+    propose_evictions(consensus, history, &due, now, MAX_EVICTIONS_PER_COMMAND).await;
+}
+
+/// Propose `due` as `EvictTerminalJobs` commands of at most `per_command` jobs
+/// each, one at a time, stopping at the first rejection or error.
+///
+/// Sequential and capped for the reasons in [`MAX_EVICTIONS_PER_COMMAND`]: one
+/// raft entry, one serial apply and one SSE frame per batch, with `due` fixed
+/// from the single view snapshot the caller took. Nothing re-scans between
+/// batches — the published view lags the applies, and the list is already
+/// disjoint, so the next tick is the right place for whatever is left.
+async fn propose_evictions<C: Consensus>(
+    consensus: &Arc<C>,
+    history: HistorySink,
+    due: &[TerminalJobRecord],
+    now: Timestamp,
+    per_command: usize,
+) {
+    let batches = due.len().div_ceil(per_command.max(1));
     // The configured mode is the gate on what has to happen before the
     // proposal: a durable store is written here first, and `none` has nothing
     // to write to, so the TTL that made these jobs due is the whole of it
@@ -317,53 +436,67 @@ async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history:
     match history {
         HistorySink::None => tracing::debug!(
             count = due.len(),
+            batches,
             "housekeeping: terminal jobs past the TTL, proposing eviction (history = \"none\")"
         ),
     }
 
-    let command = Command::EvictTerminalJobs(EvictTerminalJobs {
-        jobs: due.iter().map(|r| r.job).collect(),
-        evicted_at: now,
-    });
-    match consensus.propose(command).await {
-        // Applied: this is the first point at which anything may be said about
-        // what happened to the jobs' history — and under `none` what happened
-        // is that it went away. The count comes from the apply outcome's
-        // `JobEvicted` events, not from `due`: apply skips ids that are
-        // already gone (that skip is what makes duplicate proposals across a
-        // leadership change idempotent), so `due.len()` can overstate what
-        // this proposal actually removed — down to nothing at all, in which
-        // case no history was discarded here and nothing says it was.
-        Ok(Applied {
-            outcome: Ok(applied),
-            ..
-        }) => {
-            let evicted = applied
-                .events
-                .iter()
-                .filter(|e| matches!(e, coppice_state::Event::JobEvicted { .. }))
-                .count();
-            if evicted > 0 {
-                match history {
-                    HistorySink::None => tracing::info!(
-                        count = evicted,
-                        "housekeeping: history = \"none\": evicted terminal jobs past the TTL; \
-                         their history is discarded (ADR 0012 lossy mode)"
-                    ),
-                }
+    let mut evicted = 0usize;
+    for batch in due.chunks(per_command.max(1)) {
+        let command = Command::EvictTerminalJobs(EvictTerminalJobs {
+            jobs: batch.iter().map(|r| r.job).collect(),
+            evicted_at: now,
+        });
+        match consensus.propose(command).await {
+            // Applied: this is the first point at which anything may be said
+            // about what happened to these jobs' history — and under `none`
+            // what happened is that it went away. The count comes from the
+            // apply outcome's `JobEvicted` events, not from `due` or the batch
+            // length: apply skips ids that are already gone (that skip is what
+            // makes duplicate proposals across a leadership change idempotent),
+            // so the proposed count can overstate what was actually removed —
+            // down to nothing at all, in which case no history was discarded
+            // here and nothing says it was.
+            Ok(Applied {
+                outcome: Ok(applied),
+                ..
+            }) => {
+                evicted += applied
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, coppice_state::Event::JobEvicted { .. }))
+                    .count();
+            }
+            // A rejection or an error ends the pass: the remaining batches are
+            // still due next tick, and retrying them now would most likely hit
+            // whatever stopped this one.
+            Ok(Applied {
+                outcome: Err(reason),
+                ..
+            }) => {
+                tracing::debug!(?reason, "housekeeping: EvictTerminalJobs rejected");
+                break;
+            }
+            Err(e) if e.is_retryable() => {
+                tracing::info!(error = %e, "housekeeping: retryable propose error");
+                break;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "housekeeping: fatal propose error");
+                break;
             }
         }
-        Ok(Applied {
-            outcome: Err(reason),
-            ..
-        }) => {
-            tracing::debug!(?reason, "housekeeping: EvictTerminalJobs rejected");
-        }
-        Err(e) if e.is_retryable() => {
-            tracing::info!(error = %e, "housekeeping: retryable propose error");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "housekeeping: fatal propose error");
+    }
+
+    // One summary per pass, covering every batch that applied — including when
+    // a later batch stopped the pass.
+    if evicted > 0 {
+        match history {
+            HistorySink::None => tracing::info!(
+                count = evicted,
+                "housekeeping: history = \"none\": evicted terminal jobs past the TTL; \
+                 their history is discarded (ADR 0012 lossy mode)"
+            ),
         }
     }
 }
@@ -377,7 +510,14 @@ async fn run_pass<C: Consensus>(consensus: &Arc<C>, views: &StateViews, history:
 /// it finishes (KOI-1). A terminal job with no `terminal_at` — a record
 /// that reached terminal state before the field existed — is never
 /// considered due; retention leaks are recoverable, evictions are not.
-fn due_for_eviction(view: &StateView, now: Timestamp) -> Vec<TerminalJobRecord> {
+///
+/// The whole view is scanned, but at most `limit` records come back, oldest
+/// `terminal_at` first with ties broken by [`JobId`] so the order is
+/// deterministic. That is fair progress under a backlog: the longest-overdue
+/// jobs leave first and the remainder waits for the next sweep, instead of an
+/// arbitrary slice of the map being evicted forever ahead of older jobs
+/// (issue #155).
+fn due_for_eviction(view: &StateView, now: Timestamp, limit: usize) -> Vec<TerminalJobRecord> {
     let retention = view.state().policy.terminal_retention;
     let mut unstamped: u64 = 0;
     let due: Vec<TerminalJobRecord> = view
@@ -404,7 +544,7 @@ fn due_for_eviction(view: &StateView, now: Timestamp) -> Vec<TerminalJobRecord> 
             "housekeeping: terminal jobs without a terminal timestamp are exempt from eviction"
         );
     }
-    due
+    oldest_first(due, limit, |r| (r.terminal_at, r.job))
 }
 
 #[cfg(test)]
@@ -553,7 +693,7 @@ mod tests {
         liveness.seed(1, [drained_recent], now);
         // `untracked` is deliberately left out of the map entirely.
 
-        let due: BTreeSet<NodeId> = due_for_node_eviction(&view, &liveness, now)
+        let due: BTreeSet<NodeId> = due_for_node_eviction(&view, &liveness, now, usize::MAX)
             .into_iter()
             .collect();
         assert!(due.contains(&drained_silent));
@@ -572,7 +712,8 @@ mod tests {
         assert!(due_for_node_eviction(
             &view,
             &liveness,
-            base + retention - StdDuration::from_secs(1)
+            base + retention - StdDuration::from_secs(1),
+            usize::MAX
         )
         .is_empty());
     }
@@ -599,7 +740,10 @@ mod tests {
         let liveness = NodeLiveness::new();
         liveness.seed(1, [node], base);
 
-        assert_eq!(due_for_node_eviction(&view, &liveness, now), vec![node]);
+        assert_eq!(
+            due_for_node_eviction(&view, &liveness, now, usize::MAX),
+            vec![node]
+        );
     }
 
     /// A terminal job record with the given submission and terminal times.
@@ -660,7 +804,7 @@ mod tests {
         );
 
         let view = view_of(sm);
-        let due = due_for_eviction(&view, now);
+        let due = due_for_eviction(&view, now, usize::MAX);
         assert_eq!(
             due.iter().map(|r| r.job).collect::<Vec<_>>(),
             vec![done_long_ago]
@@ -670,7 +814,7 @@ mod tests {
         // The moment the post-terminal interval elapses, the long-queued job
         // becomes due too.
         let later = now + retention;
-        let due_later: BTreeSet<JobId> = due_for_eviction(&view, later)
+        let due_later: BTreeSet<JobId> = due_for_eviction(&view, later, usize::MAX)
             .into_iter()
             .map(|r| r.job)
             .collect();
@@ -680,10 +824,207 @@ mod tests {
         assert!(!due_later.contains(&terminal_unstamped));
     }
 
+    /// A state machine holding one due terminal job per entry of `ages`, each
+    /// terminal `age * retention` before `now`. Returns the ids paired with
+    /// their ages so a test can state the expected oldest-first order without
+    /// depending on the (random) id order the map iterates in.
+    fn due_jobs(now: Timestamp, ages: &[i64]) -> (StateMachine, Vec<(i64, JobId)>) {
+        let retention = PolicyConfig::default().terminal_retention;
+        let mut sm = StateMachine::default();
+        let mut ids = Vec::new();
+        for age in ages {
+            let id = JobId::new();
+            let terminal_at = now - retention.saturating_mul(*age);
+            sm.jobs.insert(
+                id,
+                terminal_job(id, Timestamp::UNIX_EPOCH, Some(terminal_at)),
+            );
+            ids.push((*age, id));
+        }
+        (sm, ids)
+    }
+
+    /// Every id of the `EvictTerminalJobs` commands proposed, in order.
+    fn proposed_evictions(consensus: &FakeConsensus) -> Vec<EvictTerminalJobs> {
+        consensus
+            .proposed()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::EvictTerminalJobs(evict) => Some(evict),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The scan hands back the *longest-overdue* jobs, in order, and no more
+    /// than the budget allows (issue #155): a backlog drains oldest first
+    /// rather than by whatever slice of the map the iterator reached.
+    #[test]
+    fn the_due_list_is_oldest_first_and_bounded() {
+        let retention = PolicyConfig::default().terminal_retention;
+        let now = Timestamp::UNIX_EPOCH + retention.saturating_mul(100);
+        // Ages in scrambled insertion order; a larger age is older.
+        let (sm, mut ids) = due_jobs(now, &[3, 1, 5, 2, 4]);
+        let view = view_of(sm);
+
+        ids.sort_by_key(|(age, _)| std::cmp::Reverse(*age));
+        let oldest_three: Vec<JobId> = ids.iter().take(3).map(|(_, id)| *id).collect();
+
+        let due = due_for_eviction(&view, now, 3);
+        assert_eq!(due.iter().map(|r| r.job).collect::<Vec<_>>(), oldest_three);
+    }
+
+    /// Jobs that went terminal in the same microsecond are ordered by id, so
+    /// two leaders scanning the same state propose the same batch.
+    #[test]
+    fn jobs_terminal_at_the_same_instant_are_ordered_by_id() {
+        let retention = PolicyConfig::default().terminal_retention;
+        let now = Timestamp::UNIX_EPOCH + retention.saturating_mul(100);
+        let (sm, ids) = due_jobs(now, &[2, 2, 2]);
+        let view = view_of(sm);
+
+        let mut by_id: Vec<JobId> = ids.iter().map(|(_, id)| *id).collect();
+        by_id.sort();
+        let due = due_for_eviction(&view, now, 2);
+        assert_eq!(due.iter().map(|r| r.job).collect::<Vec<_>>(), by_id[..2]);
+    }
+
+    /// A backlog over the per-command cap becomes several commands, proposed
+    /// one after another, that between them name exactly the due list in
+    /// order — and all carry the one clock reading the pass took.
+    #[tokio::test]
+    async fn a_backlog_is_proposed_in_capped_batches() {
+        let retention = PolicyConfig::default().terminal_retention;
+        let now = Timestamp::UNIX_EPOCH + retention.saturating_mul(100);
+        let (sm, _) = due_jobs(now, &[1, 2, 3, 4, 5]);
+        let view = view_of(sm);
+        let due = due_for_eviction(&view, now, usize::MAX);
+        assert_eq!(due.len(), 5);
+
+        let (consensus, _publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
+        let consensus = Arc::new(consensus);
+        propose_evictions(&consensus, HistorySink::None, &due, now, 2).await;
+
+        let evictions = proposed_evictions(&consensus);
+        assert_eq!(
+            evictions.iter().map(|e| e.jobs.len()).collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+        let proposed: Vec<JobId> = evictions.iter().flat_map(|e| e.jobs.clone()).collect();
+        assert_eq!(proposed, due.iter().map(|r| r.job).collect::<Vec<_>>());
+        assert!(evictions.iter().all(|e| e.evicted_at == now));
+    }
+
+    /// A rejected batch ends the pass: the rest of the backlog is still due
+    /// next tick, and hammering the log with batches that are likely to fail
+    /// the same way buys nothing.
+    #[tokio::test]
+    async fn a_rejected_batch_stops_the_pass() {
+        let retention = PolicyConfig::default().terminal_retention;
+        let now = Timestamp::UNIX_EPOCH + retention.saturating_mul(100);
+        let (sm, _) = due_jobs(now, &[1, 2, 3, 4, 5]);
+        let view = view_of(sm);
+        let due = due_for_eviction(&view, now, usize::MAX);
+
+        let (consensus, _publisher) = FakeConsensus::new(ProposeOutcome::Rejected(
+            coppice_state::RejectionReason::JobNotTerminal(JobId::new()),
+        ));
+        let consensus = Arc::new(consensus);
+        propose_evictions(&consensus, HistorySink::None, &due, now, 2).await;
+
+        assert_eq!(proposed_evictions(&consensus).len(), 1);
+    }
+
+    /// The backlog the budget left behind is picked up by the next sweep,
+    /// oldest first again — nothing is stranded by the bound.
+    #[test]
+    fn the_backlog_drains_across_passes() {
+        let retention = PolicyConfig::default().terminal_retention;
+        let now = Timestamp::UNIX_EPOCH + retention.saturating_mul(100);
+        let (mut sm, mut ids) = due_jobs(now, &[1, 2, 3, 4, 5]);
+        ids.sort_by_key(|(age, _)| std::cmp::Reverse(*age));
+        let oldest_first: Vec<JobId> = ids.iter().map(|(_, id)| *id).collect();
+
+        let first = due_for_eviction(&view_of(sm.clone()), now, 2);
+        assert_eq!(
+            first.iter().map(|r| r.job).collect::<Vec<_>>(),
+            oldest_first[..2]
+        );
+
+        // Apply the first pass's evictions and sweep again.
+        for record in &first {
+            sm.jobs.remove(&record.job);
+        }
+        let second = due_for_eviction(&view_of(sm), now, 2);
+        assert_eq!(
+            second.iter().map(|r| r.job).collect::<Vec<_>>(),
+            oldest_first[2..4]
+        );
+    }
+
+    /// Node records follow the same rule: the longest-silent leave first, and
+    /// no more than the budget allows.
+    #[test]
+    fn due_node_records_are_longest_silent_first_and_bounded() {
+        let retention = PolicyConfig::default()
+            .node_retention
+            .to_std()
+            .expect("the default window is positive");
+        let base = Instant::now();
+        let now = base + retention.saturating_mul(10) + StdDuration::from_secs(1);
+
+        let liveness = NodeLiveness::new();
+        let mut sm = StateMachine::default();
+        let mut ids = Vec::new();
+        // Scrambled insertion order; a larger age is quieter for longer.
+        for age in [3u32, 1, 5, 2, 4] {
+            let id = NodeId::new();
+            sm.nodes.insert(id, node_record(id, 1, false));
+            liveness.seed(1, [id], now - retention.saturating_mul(age));
+            ids.push((age, id));
+        }
+        let view = view_of(sm);
+
+        ids.sort_by_key(|(age, _)| std::cmp::Reverse(*age));
+        let quietest_two: Vec<NodeId> = ids.iter().take(2).map(|(_, id)| *id).collect();
+        assert_eq!(
+            due_for_node_eviction(&view, &liveness, now, 2),
+            quietest_two
+        );
+    }
+
+    /// A node that resumes reporting while earlier batches replicate keeps
+    /// its record: each batch is re-checked against the liveness map just
+    /// before it is proposed, not against the verdict the scan reached.
+    #[tokio::test]
+    async fn a_node_heard_from_mid_pass_is_dropped_from_its_batch() {
+        let due: Vec<NodeId> = (0..4).map(|_| NodeId::new()).collect();
+        let resumed = due[2];
+
+        let (consensus, _publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
+        let consensus = Arc::new(consensus);
+        // The fake records a proposal before answering it, so "one batch has
+        // been proposed" is exactly "the first batch is behind us".
+        let seen = Arc::clone(&consensus);
+        let still_silent = move |node: NodeId| !(node == resumed && !seen.proposed().is_empty());
+        propose_node_evictions(&consensus, &due, 2, still_silent).await;
+
+        let batches: Vec<Vec<NodeId>> = consensus
+            .proposed()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::EvictNodes(evict) => Some(evict.nodes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batches, vec![vec![due[0], due[1]], vec![due[3]]]);
+    }
+
     /// The loop end to end under `[history] mode = "none"`: with no store to
     /// write to, the replicated retention TTL is the whole gate, and what
     /// comes out of a tick is exactly one `EvictTerminalJobs` naming exactly
-    /// the jobs past it (ADR 0012's lossy mode).
+    /// the jobs past it (ADR 0012's lossy mode). A backlog under the cap is
+    /// one proposal; only a bigger one is split (issue #155).
     #[tokio::test(start_paused = true)]
     async fn the_none_mode_evicts_on_the_ttl_alone() {
         let (consensus, mut publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
@@ -747,7 +1088,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(evictions.len(), 1, "one sweep, one proposal");
+        assert_eq!(
+            evictions.len(),
+            1,
+            "one sweep, and a backlog under the cap is one proposal"
+        );
         assert_eq!(evictions[0].jobs, vec![evictable]);
     }
 }
