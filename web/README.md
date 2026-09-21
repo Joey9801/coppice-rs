@@ -19,7 +19,7 @@ CLAUDE.md for the exact procedure and the architecture rules).
 
 ```sh
 cd web
-npm install
+npm ci            # npm only: installs exactly what package-lock.json pins
 npm run dev       # http://localhost:5173, proxies /api/v1 to a coordinator
 npm run build     # typecheck + static bundle in dist/
 npm test          # mock-world invariants + component smoke tests
@@ -27,7 +27,10 @@ npm run lint      # oxlint
 npm run format    # prettier
 ```
 
-Requires Node ≥ 20.
+Requires Node ≥ 20 and npm. Other package managers ignore
+`package-lock.json`, resolve a newer route generator, and rewrite the
+committed `src/routeTree.gen.ts`; `package.json` declares npm so that pnpm
+and npm itself refuse a mismatched install.
 
 ### Dev workflow: pointing at a live coordinator
 

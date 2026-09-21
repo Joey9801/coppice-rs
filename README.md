@@ -120,7 +120,7 @@ You need a Rust toolchain and a running Docker daemon, plus Node if you want
 the web UI (it is embedded from `web/dist` at compile time).
 
 ```sh
-(cd web && npm install && npm run build)     # optional: build the UI first
+(cd web && npm ci && npm run build)     # optional: build the UI first
 cargo run -p coppice-cli -- dev
 ```
 
