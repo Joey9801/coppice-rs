@@ -35,6 +35,34 @@ async fn a_well_formed_token_yields_its_subject_and_groups() {
     idp.shutdown().await;
 }
 
+/// ADR 0043: a stream outlives the single request the rest of the API
+/// validates per call, so the token's own deadline has to travel with the
+/// identity. Surfaced from the already-validated `exp`, not re-derived.
+#[tokio::test]
+async fn a_validated_token_carries_its_expiry() {
+    let idp = FakeIdp::start().await;
+    let (_cache, validator) = ready_validator(&idp).await;
+
+    let before = coppice_core::time::Timestamp::now();
+    let token = idp.sign(TokenClaims::new("user").audience(AUDIENCE).expires_in(300));
+    let validated = validator
+        .validate(&token, DEFAULT_GROUPS_CLAIM)
+        .await
+        .expect("a freshly issued token validates");
+
+    let expires_at = validated.expires_at.expect("`exp` is a required claim");
+    // Within a second of five minutes out, whole-second `exp` granularity
+    // and test scheduling allowed for.
+    let out = expires_at - before;
+    assert!(
+        out >= coppice_core::time::Duration::from_secs(298)
+            && out <= coppice_core::time::Duration::from_secs(301),
+        "expected ~300s of validity, got {out:?}"
+    );
+
+    idp.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_expired_token_is_rejected() {
     let idp = FakeIdp::start().await;

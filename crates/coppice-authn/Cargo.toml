@@ -18,6 +18,10 @@ publish = false
 # (ADR 0023): the same value the API layer attaches to a proposed command, so
 # apply re-checks exactly what the edge authenticated. `groups_claim`'s default
 # name lives there too.
+# `Timestamp`, for the token deadline surfaced on `Authenticated`: the one
+# value here that a long-lived request (an event subscription) has to compare
+# against a clock.
+coppice-core = { workspace = true }
 coppice-state = { workspace = true }
 coppice-tls = { workspace = true }
 jsonwebtoken = { workspace = true }
