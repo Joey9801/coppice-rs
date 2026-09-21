@@ -1358,6 +1358,42 @@ fn eviction_rejects_live_jobs_and_skips_missing() {
     assert!(sm.jobs.is_empty());
 }
 
+/// ADR 0043 before-keys: an eviction removes the job outright, so the event
+/// has to carry the scope keys a subscription filter judges it by — by the
+/// time the fanout sees it there is nothing left in state to look up.
+#[test]
+fn eviction_carries_the_evicted_jobs_scope_keys() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+    let mut map = JobMetadata::new();
+    map.insert("team".into(), "platform".to_string());
+    apply_ok(&mut sm, replace_cmd(jid(1), map.clone()));
+    apply_ok(&mut sm, abort_cmd(jid(1), base_ts()));
+
+    let applied = apply_ok(
+        &mut sm,
+        Command::EvictTerminalJobs(EvictTerminalJobs {
+            jobs: vec![jid(1)],
+            evicted_at: base_ts(),
+        }),
+    );
+    let [Event::JobEvicted { job, scope }] = applied.events.as_slice() else {
+        panic!(
+            "expected exactly one eviction event, got {:?}",
+            applied.events
+        );
+    };
+    assert_eq!(*job, jid(1));
+    // The job's own entity heads the chain, so an `exact` filter matches it
+    // and a `subtree` one finds it anywhere along the chain.
+    assert_eq!(scope.entity_chain.first(), Some(&ROOT));
+    assert_eq!(scope.metadata, map);
+    assert!(sm.jobs.is_empty());
+}
+
 #[test]
 fn terminal_timestamp_is_stamped_by_the_resolving_command() {
     let mut sm = setup();
@@ -1564,6 +1600,49 @@ fn quota_entity_timestamps_stamp_on_create_and_advance_only_updated() {
     assert_eq!(updated.name, "renamed");
     assert_eq!(updated.created_at, create_at);
     assert_eq!(updated.updated_at, update_at);
+}
+
+/// ADR 0043: only a command that moves an **existing** entity flags its event
+/// as a reparent. That flag is the whole of what the fanout has to go on —
+/// every job below the moved entity changes subtree membership without any
+/// event naming it — so a false positive costs subtree subscribers a resync
+/// and a false negative leaves them silently wrong.
+#[test]
+fn quota_entity_events_flag_only_a_reparent_of_an_existing_entity() {
+    let mut sm = setup();
+    let reparented = |applied: Applied| match applied.events.as_slice() {
+        [Event::QuotaEntityConfigured { reparented, .. }] => *reparented,
+        other => panic!("expected one QuotaEntityConfigured, got {other:?}"),
+    };
+
+    // Creation: nothing can be under it yet.
+    assert!(!reparented(apply_ok(
+        &mut sm,
+        configure_entity_cmd(qid(2), Some(ROOT))
+    )));
+    assert!(!reparented(apply_ok(
+        &mut sm,
+        configure_entity_cmd(qid(3), Some(ROOT))
+    )));
+    // Reconfiguration leaving the parent where it was.
+    assert!(!reparented(apply_ok(
+        &mut sm,
+        configure_entity_cmd(qid(3), Some(ROOT))
+    )));
+    // The move itself, in both directions: onto another parent, and up to
+    // the root's own parentless position.
+    assert!(reparented(apply_ok(
+        &mut sm,
+        configure_entity_cmd(qid(3), Some(qid(2)))
+    )));
+    assert!(reparented(apply_ok(
+        &mut sm,
+        configure_entity_cmd(qid(3), None)
+    )));
+    assert!(!reparented(apply_ok(
+        &mut sm,
+        configure_entity_cmd(qid(3), None)
+    )));
 }
 
 #[test]
@@ -2020,9 +2099,15 @@ fn update_job_metadata_replace_sets_whole_map_and_emits_event() {
     map.insert("ticket".into(), str_val("INC-1234"));
 
     let applied = apply_ok(&mut sm, replace_cmd(jid(1), map.clone()));
+    // ADR 0043 before-keys: the event carries the map the job had *before*
+    // this command, so a subscription filtered on a key this replace removed
+    // still sees the update.
     assert_eq!(
         applied.events,
-        vec![Event::JobMetadataUpdated { job: jid(1) }]
+        vec![Event::JobMetadataUpdated {
+            job: jid(1),
+            previous: JobMetadata::new(),
+        }]
     );
     assert_eq!(sm.jobs[&jid(1)].spec.metadata, map);
 }
@@ -2039,7 +2124,7 @@ fn update_job_metadata_patch_applies_set_then_unset_leaving_other_keys_alone() {
     initial.insert("name".into(), str_val("nightly-build"));
     initial.insert("ticket".into(), str_val("INC-1234"));
     initial.insert("stale".into(), str_val("drop-me"));
-    apply_ok(&mut sm, replace_cmd(jid(1), initial));
+    apply_ok(&mut sm, replace_cmd(jid(1), initial.clone()));
 
     let mut set = JobMetadata::new();
     set.insert("ticket".into(), str_val("INC-5678"));
@@ -2053,7 +2138,10 @@ fn update_job_metadata_patch_applies_set_then_unset_leaving_other_keys_alone() {
     );
     assert_eq!(
         applied.events,
-        vec![Event::JobMetadataUpdated { job: jid(1) }]
+        vec![Event::JobMetadataUpdated {
+            job: jid(1),
+            previous: initial,
+        }]
     );
 
     let mut expected = JobMetadata::new();
@@ -2275,7 +2363,10 @@ fn update_job_metadata_accepted_on_terminal_job() {
     let applied = apply_ok(&mut sm, replace_cmd(jid(1), map.clone()));
     assert_eq!(
         applied.events,
-        vec![Event::JobMetadataUpdated { job: jid(1) }]
+        vec![Event::JobMetadataUpdated {
+            job: jid(1),
+            previous: JobMetadata::new(),
+        }]
     );
     assert_eq!(sm.jobs[&jid(1)].spec.metadata, map);
     assert_eq!(sm.jobs[&jid(1)].state, JobState::Aborted);

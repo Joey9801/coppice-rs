@@ -710,11 +710,18 @@ impl From<&coppice_state::Event> for TimelineEventBody {
                 node: *node,
                 epoch: *epoch,
             },
-            E::JobEvicted { job } => TimelineEventBody::JobEvicted { job: *job },
-            E::JobMetadataUpdated { job } => TimelineEventBody::JobMetadataUpdated { job: *job },
-            E::QuotaEntityConfigured { entity } => {
-                TimelineEventBody::QuotaEntityConfigured { entity: *entity }
+            // The apply-stamped before-keys (ADR 0043) both variants carry
+            // stay off the wire: the payload is thin by ADR 0032's one
+            // timeline shape, and a client re-queries state for anything the
+            // keys would have told it.
+            E::JobEvicted { job, scope: _ } => TimelineEventBody::JobEvicted { job: *job },
+            E::JobMetadataUpdated { job, previous: _ } => {
+                TimelineEventBody::JobMetadataUpdated { job: *job }
             }
+            E::QuotaEntityConfigured {
+                entity,
+                reparented: _,
+            } => TimelineEventBody::QuotaEntityConfigured { entity: *entity },
             E::PolicyUpdated => TimelineEventBody::PolicyUpdated,
             E::AuthorizationUpdated => TimelineEventBody::AuthorizationUpdated,
             E::ClusterVersionBumped { to } => TimelineEventBody::ClusterVersionBumped { to: *to },

@@ -2525,11 +2525,13 @@ mod tests {
                 Event::JobSubmitted { job: other },
                 Event::JobSubmitted { job },
             ],
+            scopes: Vec::new(),
         });
         tap.emit(EventBatch {
             applied_index: 9,
             at: Timestamp::UNIX_EPOCH,
             events: vec![Event::JobSubmitted { job }],
+            scopes: Vec::new(),
         });
         // Let the current-thread fanout drain the tap into its ring.
         for _ in 0..10 {
