@@ -127,12 +127,18 @@ followers, which is what lets followers serve reads and event streams.
 
 4. **Event fanout** (every replica). Consumes the `EventTapReceiver`, owns
    the [ADR 0008](../decisions/0008-event-delivery-guarantees.md)
-   reconnection ring (bounded: 1 h / 1M events), and manages subscriptions.
+   reconnection ring (bounded: 1 h / 1M events / 256 MiB), and manages
+   subscriptions (capped; a subscriber whose receiver is gone is removed).
    Subscribers receive `(ordinal, event)` pairs — ordinals assigned per full
    batch before any filtering, so an event's `(index, ordinal)` identity is
    scope-invariant ([ADR 0032](../decisions/0032-advisory-event-timestamps.md))
-   — and the ring backs `SubscribeEvents` replay on reconnect plus the
-   tier-1 window behind `GetJobTimeline` (a query on the fanout inbox).
+   — and the ring backs `SubscribeEvents` catch-up on reconnect plus the
+   tier-1 window behind `GetJobTimeline` (both queries on the fanout inbox).
+   The fanout replays nothing itself: each `GET /api/v1/events` connection
+   has its own task that pages the ring up to the head it subscribed at and
+   then relays its live queue, ending on the shutdown watch
+   ([ADR 0043](../decisions/0043-filtered-job-event-subscriptions.md)).
+   Subscribers that ask for them also get a periodic progress bookmark.
    Exports the `proposer_skew` histogram.
 
 5. **Derived stats** (every replica). Subscribes to the fanout (`All` scope)
@@ -420,8 +426,9 @@ full" is the crux: it is what makes the blocking graph acyclic.
 | apply requests | openraft sm-adapter → apply task | mpsc | 64 | **await** (backpressure into openraft replication) |
 | proposal admission | proposers → openraft | semaphore | 4096 in-flight | **await permit** (backpressure to proposers) |
 | event tap | apply task → fanout | mpsc | 4096 batches | **`try_send`; on full DROP the batch** — the receiver synthesizes a gap from the dense tap sequence ([ADR 0008](../decisions/0008-event-delivery-guarantees.md) drop+gap). Apply NEVER awaits fanout. |
-| fanout ring | fanout-internal | ring | 1 h / 1M events | **evict oldest** — it is a reconnection buffer, not history; backs `SubscribeEvents` replay and the `GetJobTimeline` tier-1 window ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 1) |
-| per-subscriber queue | fanout → client conn | mpsc | 1024 | **`try_send`; on full mark the subscriber gapped**, drop its backlog, deliver `Gap{earliest_available}`; client resyncs via query ([ADR 0008](../decisions/0008-event-delivery-guarantees.md)) |
+| fanout ring | fanout-internal | ring | 1 h / 1M events / 256 MiB (approximate) | **evict oldest** — it is a reconnection buffer, not history; backs `SubscribeEvents` catch-up and the `GetJobTimeline` tier-1 window ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 1) |
+| per-subscriber queue | fanout → subscriber (internal task, or an event connection task) | mpsc | 1024 | **`try_send`; on full mark the subscriber gapped**, drop its backlog, deliver `Gap{earliest_available}`; a progress bookmark that does not fit is skipped, never a reason to gap; a closed receiver removes the subscriber; client resyncs via query ([ADR 0008](../decisions/0008-event-delivery-guarantees.md)) |
+| event stream queue | event connection task → SSE handler | mpsc | 64 | **`send().await`, raced against the shutdown watch and the client hanging up** — a slow client parks its own connection task, which backs up its per-subscriber queue and gaps *that* subscriber only ([ADR 0043](../decisions/0043-filtered-job-event-subscriptions.md)) |
 | queue-window watch | derived stats → API server | watch | latest-value | **overwrite** — the overview projects rates/history from whatever window is current ([ADR 0032](../decisions/0032-advisory-event-timestamps.md) tier 3) |
 | agent inbound | session tasks → ingestion | mpsc (shared) | 8192 | **await** ⇒ the session stops reading its socket ⇒ TCP backpressure to the agent. Never touches apply. |
 | agent outbound | router → per-session | mpsc | 256 | **`try_send`; on full DISCONNECT the session** — commands are idempotent and reconciliation ([ADR 0009](../decisions/0009-fencing-and-reconciliation.md) ObservedSet) heals on reconnect |

@@ -52,7 +52,7 @@ concrete habits that keep the door open).
 | [FF-22](#ff-22-spot-capacity-and-autoscaling) | Spot capacity & autoscaling | OD-15(b), [deployment-story.md](deployment-story.md) |
 | [FF-23](#ff-23-scheduling-simulator-and-capacity-planning) | Scheduling simulator & capacity planning | Pure deterministic scheduler passes |
 | [FF-24](#ff-24-federation) | Federation / multi-cluster | — |
-| [FF-25](#ff-25-external-integration-surface) | Webhooks, event subscriptions, SDKs | KOI-6 (`SubscribeEvents`), [ADR 0008](../decisions/0008-event-delivery-guarantees.md) |
+| [FF-25](#ff-25-external-integration-surface) | Webhooks, wider subscription selectors, SDKs | [ADR 0008](../decisions/0008-event-delivery-guarantees.md), [ADR 0043](../decisions/0043-filtered-job-event-subscriptions.md) |
 | [FF-26](#ff-26-interactive-debugging-of-running-attempts) | Interactive debugging of running attempts | Log-retrieval path as precedent |
 | [FF-27](#ff-27-job-templates-and-defaults) | Job templates & defaults | — |
 
@@ -408,9 +408,10 @@ portability for a router to make placement choices.
 
 #### FF-25: External integration surface
 
-Webhooks on job state transitions, a robust streaming event subscription
-(KOI-6's unserved `SubscribeEvents`, semantics per
-[ADR 0008](../decisions/0008-event-delivery-guarantees.md)), and typed client
+Webhooks on job state transitions (built on the
+[ADR 0043](../decisions/0043-filtered-job-event-subscriptions.md) event
+subscription, which is served), node- and entity-scoped subscription
+selectors beside the job one, and typed client
 SDKs generated from the API. This is what CI systems, workflow engines, and
 notification bots build on — and a good external trigger surface lowers the
 pressure to pull FF-14-style features into the core.
