@@ -12,6 +12,20 @@
       ],
       "port": 5173,
       "autoPort": true
+    },
+    {
+      "name": "web-mock",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "VITE_COPPICE_MOCK=1",
+        "npm",
+        "--prefix",
+        "web",
+        "run",
+        "dev"
+      ],
+      "port": 5173,
+      "autoPort": true
     }
   ]
 }
