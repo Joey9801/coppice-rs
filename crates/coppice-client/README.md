@@ -1,20 +1,62 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Joey9801/coppice-rs/main/docs/images/banner-dark.svg">
+    <img src="https://raw.githubusercontent.com/Joey9801/coppice-rs/main/docs/images/banner-light.svg" alt="Coppice: batch job scheduling for container fleets" width="840">
+  </picture>
+</p>
+
 # coppice-client
 
-An async, strongly-typed Rust client for [Coppice](https://github.com/Joey9801/coppice-rs),
-a distributed batch job scheduler for containerized workloads.
+<p align="center">
+  <a href="https://crates.io/crates/coppice-client"><img src="https://img.shields.io/crates/v/coppice-client" alt="crates.io"></a>
+  <a href="https://docs.rs/coppice-client"><img src="https://img.shields.io/docsrs/coppice-client" alt="docs.rs"></a>
+  <img src="https://img.shields.io/badge/MSRV-1.86-blue" alt="MSRV 1.86">
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="MIT OR Apache-2.0">
+</p>
 
-Coppice runs jobs as Docker images across a fleet of compute nodes, with
-resource requests, priorities and quotas, behind a Raft-replicated control
-plane. Its coordinator serves a JSON HTTP API under `/api/v1`; this crate is
-that API in Rust — typed ids, typed request and response bodies, a typed error
-vocabulary, pagination, a log follower, and a subscription to a set of jobs
-that keeps itself connected.
+<p align="center">
+  <a href="https://docs.rs/coppice-client">API docs</a> ·
+  <a href="https://github.com/Joey9801/coppice-rs">Coppice</a> ·
+  <a href="https://github.com/Joey9801/coppice-rs#quick-start">Run a local cluster</a>
+</p>
 
-It is a standalone crate: it depends on no other `coppice-*` crate, and carries
-its own copy of every wire type. A contract test inside the server round-trips
-every server value through this crate's copy and holds the JSON on both sides
-to structural equality — every key, value and enum spelling, compared as
-parsed JSON rather than as text.
+An async, strongly-typed Rust client for
+[Coppice](https://github.com/Joey9801/coppice-rs), a distributed batch job
+scheduler. Coppice runs jobs as Docker images across a fleet of nodes, with
+resource requests, priorities, and soft quotas, behind a Raft-replicated
+control plane. Its coordinators serve a JSON HTTP API under `/api/v1`, and
+this crate is that API in Rust.
+
+## What it covers
+
+| Area | Methods |
+| --- | --- |
+| Jobs | `submit_job`, `job`, `list_jobs`, `abort_job`, `job_timeline`, `replace_job_metadata`, `update_job_metadata` |
+| Output and usage | `job_logs`, `follow_job_logs`, `job_usage` |
+| Events | `watch_jobs`, `watch_job_events`, `subscribe_job_events` |
+| Nodes | `list_nodes`, `node`, `node_utilization`, `drain_node`, `undrain_node`, `remove_node` |
+| Quotas | `list_quota_entities`, `quota_entity`, `configure_quota_entity` |
+| Cluster | `overview`, `queue_stats`, `coordinators`, `healthz` |
+| Access | `auth_config`, `session`, `authorization`, `update_authorization` |
+
+Around those:
+
+- Typed ids, request and response bodies, and a typed error vocabulary.
+- Pagers for the cursor-based listings (`list_jobs_paged`,
+  `job_timeline_paged`, `job_logs_paged`, `job_usage_paged`), so you never
+  handle cursors by hand.
+- `ReadOptions` to choose consistency per call, including reading your own
+  write with `ReadOptions::at_least(log_index)`.
+- A log follower, and a job subscription that reconnects itself.
+- Client-side rate limiting, shared across clones of a client and on by
+  default.
+- `get_value`, `post_value`, and `put_value` as an escape hatch to the raw
+  JSON when the server is newer than the client.
+
+The crate is standalone. It depends on no other `coppice-*` crate and carries
+its own copy of every wire type. A contract test on the server side
+round-trips every server value through this crate's copy and compares the
+parsed JSON on both sides, so the two cannot drift silently.
 
 ## Install
 
@@ -25,6 +67,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ## Quick start
+
+You need a cluster to talk to. The quickest is `coppice dev` from the
+[main repository](https://github.com/Joey9801/coppice-rs#quick-start), which
+runs a single-node cluster on `http://127.0.0.1:7070` with authentication off.
 
 ```rust,no_run
 use coppice_client::{Client, FollowOptions, JobId, ReadOptions, Resources, SubmitJobRequest};
@@ -144,6 +190,20 @@ What it promises, and what it does not:
 - The filter is **restricted** to the leaves that say which job this is
   (`metadata`, `entity`, `id`, `submitted_by`, under `all`/`any`/`not`); the
   rest are refused by name before a request is sent.
+
+## Errors
+
+Every call returns `coppice_client::Result`. An `Error` carries the server's
+`ErrorCode` when there is one, and answers the questions a caller usually has:
+
+- `is_retryable()` is true for transport failures, `UNAVAILABLE`, `NOT_LEADER`,
+  and a 5xx with no error body. It is false for `REJECTED`, which is a
+  deterministic refusal: the identical request will be refused again.
+- `leader_hint()` gives the address to retry against after `NOT_LEADER`.
+- `is_not_found()` and `is_auth()` cover the other two common branches.
+
+Submission is idempotent on the `JobId` you mint, so retrying a `submit_job`
+that failed with a retryable error is safe as long as you resend the same id.
 
 ## Authentication
 
