@@ -21,6 +21,13 @@ yet on `CoppiceApi` at all.
 
 All run from `web/`:
 
+- `npm ci` — install. npm only, and `ci` rather than `install`: the
+  committed `src/routeTree.gen.ts` matches the route generator pinned in
+  `package-lock.json`, and any other resolution rewrites it. If the file
+  shows up dirty after a build, reinstall (`rm -rf node_modules && npm ci`)
+  rather than committing the churn. `@tanstack/router-plugin` is pinned
+  exactly; when bumping it, commit the regenerated file in the same change
+  (CI checks).
 - `npm run dev` — dev server; proxies `/api/v1` to a coordinator at
   `COPPICE_API_ADDR` (default `http://127.0.0.1:7070`). Set
   `VITE_COPPICE_MOCK=1` to force the mock client instead (no coordinator

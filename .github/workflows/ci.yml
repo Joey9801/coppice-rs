@@ -157,3 +157,7 @@ jobs:
       - run: npm test
       # `build` runs `tsc -b` first, so this is also the typecheck gate.
       - run: npm run build
+      # The build regenerates the committed route tree. A dependency bump
+      # that changes the generator's output has to commit the result too.
+      - name: routeTree.gen.ts is fresh
+        run: git diff --exit-code -- src/routeTree.gen.ts
