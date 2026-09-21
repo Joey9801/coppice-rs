@@ -16,6 +16,7 @@ use governor::{middleware::NoOpMiddleware, Quota, RateLimiter};
 
 use crate::credential::{BearerToken, Credential, TokenProvider};
 use crate::error::{Error, Result};
+use crate::events::{JobEventStream, JobEventWatcher, JobWatcher, WatchOptions};
 use crate::follow::{FollowOptions, LogFollower};
 use crate::id::{JobId, NodeId, QuotaEntityId};
 use crate::pagination::{JobPager, LogPager, TimelinePager, UsagePager};
@@ -25,7 +26,7 @@ use crate::types::{
     DrainNodeResponse, GetAuthConfigResponse, GetAuthorizationResponse, GetClusterOverviewResponse,
     GetCoordinatorStatusResponse, GetJobLogsResponse, GetJobTimelineResponse, GetJobUsageResponse,
     GetNodeResponse, GetNodeUtilizationResponse, GetQuotaEntityResponse, GetSessionResponse,
-    HealthzResponse, JobDetail, ListJobsParams, ListJobsResponse, ListNodesResponse,
+    HealthzResponse, JobDetail, JobFilter, ListJobsParams, ListJobsResponse, ListNodesResponse,
     ListQuotaEntitiesResponse, LogsParams, QueueStats, RemoveNodeResponse,
     ReplaceJobMetadataRequest, ReplaceJobMetadataResponse, SubmitJobRequest, SubmitJobResponse,
     TimelineParams, UpdateAuthorizationRequest, UpdateAuthorizationResponse,
@@ -69,6 +70,26 @@ pub const APPLIED_INDEX_HEADER: &str = "coppice-applied-index";
 pub const COMMITTED_INDEX_HEADER: &str = "coppice-committed-index";
 /// The response header a follower sets to say where the leader is.
 pub const LEADER_HEADER: &str = "coppice-leader";
+
+/// The request header carrying a subscription's resume cursor (ADR 0043).
+///
+/// The server honours it ahead of `?cursor=`, because it is what the client
+/// actually last processed rather than whatever was baked into the URL when
+/// the connection first opened.
+pub const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+
+/// The request timeout a job-event subscription carries instead of this
+/// client's.
+///
+/// A `reqwest` timeout covers reading the response body, so the timeout that
+/// keeps a wedged endpoint from hanging a program would also cut a
+/// subscription off mid-stream — after thirty seconds by default, and rather
+/// sooner than any ADR 0043 consumer expects. There is no per-request way to
+/// say "no timeout" (a request-level `None` falls back to the client's), so
+/// the exemption is a year: longer than any stream, and still not forever.
+///
+/// The connect timeout is untouched and still bounds reaching the host.
+pub const STREAM_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// How fresh a read has to be (ADR 0007).
 ///
@@ -481,6 +502,14 @@ impl ClientBuilder {
             Some(http) => http,
             None => plain_http_builder(&self.base)
                 .timeout(self.timeout)
+                // The same duration again, as the *connect* bound. Ordinary
+                // requests are already covered by the total timeout above, so
+                // this changes nothing for them; it exists for the one request
+                // that opts out of the total timeout — a job-event
+                // subscription, whose response is meant to stay open for hours
+                // (see [`Client::subscribe_job_events`]). Without it, that
+                // request would have no bound on reaching a host at all.
+                .connect_timeout(self.timeout)
                 .build()
                 .map_err(Error::Build)?,
         };
@@ -820,6 +849,102 @@ impl Client {
     /// A pager over `GET /api/v1/jobs/{job}/usage`.
     pub fn job_usage_paged(&self, job: JobId, params: UsageParams) -> UsagePager {
         UsagePager::new(self.clone(), job, params)
+    }
+
+    // -- job events ---------------------------------------------------------
+
+    /// `GET /api/v1/events` — one subscription to the filtered job-event
+    /// stream (ADR 0043).
+    ///
+    /// `filter` selects an **open set**: every job matching it, including jobs
+    /// submitted after the subscription opened. It is checked with
+    /// [`JobFilter::validate_subscribable`](crate::JobFilter::validate_subscribable)
+    /// before anything is sent, so a leaf a subscription cannot answer —
+    /// `phase`, `node`, `image`, `search`, `submitted`, `requests` — is an
+    /// [`Error::InvalidRequest`] naming it rather than a round trip to be
+    /// refused.
+    ///
+    /// `cursor` resumes from just after that applied index; `None` starts from
+    /// wherever the replica is now. It is sent as `Last-Event-ID`, which is
+    /// what the server honours first.
+    ///
+    /// The returned stream is **one connection**, and the server ends it when
+    /// the credential expires or the replica drains. For a subscription that
+    /// outlives its connections, use [`watch_job_events`](Self::watch_job_events);
+    /// for the full list-then-subscribe loop, [`watch_jobs`](Self::watch_jobs).
+    ///
+    /// Opening the stream is an ordinary request: it waits for the rate-limit
+    /// slot and carries the credential like any other. What it does not carry
+    /// is this client's request timeout — a response meant to stay open for
+    /// hours cannot be abandoned after thirty seconds — so only the connect
+    /// timeout bounds it. See [`STREAM_TIMEOUT`].
+    ///
+    /// Quiet is fine: the server bookmarks progress at least every 15 s (ADR
+    /// 0043), and that bookmark doubles as the stream's keepalive. Silence
+    /// beyond [`crate::DEFAULT_STREAM_IDLE_TIMEOUT`] is treated as a dead
+    /// connection instead — [`JobEventStream::next_item`] fails with
+    /// [`Error::StreamIdle`], and [`JobEventWatcher`] reconnects from the
+    /// cursor exactly as it would after any other retryable failure.
+    pub async fn subscribe_job_events(
+        &self,
+        filter: &JobFilter,
+        cursor: Option<u64>,
+    ) -> Result<JobEventStream> {
+        filter
+            .validate_subscribable()
+            .map_err(Error::InvalidRequest)?;
+        let jobs = serde_json::to_string(filter).expect("a JobFilter always serializes");
+        let mut request = self
+            .inner
+            .http
+            .get(self.url(paths::EVENTS))
+            .query(&[("jobs", jobs)])
+            // `reqwest` has no per-request "no timeout": a request-level `None`
+            // falls back to the client's. So the exemption is spelled as a
+            // deadline no subscription will reach.
+            .timeout(STREAM_TIMEOUT);
+        if let Some(cursor) = cursor {
+            request = request.header(LAST_EVENT_ID_HEADER, cursor.to_string());
+        }
+
+        let response = self.send_authed(request).await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let leader = response
+                .headers()
+                .get(LEADER_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = response.text().await.map_err(Error::Transport)?;
+            return Err(api_error(status, &body, leader));
+        }
+        Ok(JobEventStream::new(response, cursor))
+    }
+
+    /// A subscription that reopens itself: the same stream, carried across the
+    /// connection endings that are routine. See [`JobEventWatcher`].
+    pub fn watch_job_events(&self, filter: JobFilter, options: WatchOptions) -> JobEventWatcher {
+        JobEventWatcher::new(self.clone(), filter, options)
+    }
+
+    /// The ADR 0043 loop: list with `filter`, subscribe from that read's
+    /// applied index, and on a `gap` do both again. See [`JobWatcher`], which
+    /// documents the guarantee in full.
+    ///
+    /// The snapshot arrives one page per
+    /// [`next_item`](crate::JobWatcher::next_item) — a
+    /// [`JobWatchItem::SnapshotPage`](crate::JobWatchItem::SnapshotPage) with
+    /// its own applied index, `first` on the first and `last` on the last —
+    /// and by default lists only the jobs that are **not yet terminal**
+    /// ([`SnapshotScope::Live`](crate::SnapshotScope::Live)); the
+    /// subscription's filter is `filter` unchanged. A job you track that is
+    /// absent from the snapshot has left the live set, and reading it is the
+    /// caller's move.
+    ///
+    /// `options.cursor` is ignored — the first cursor comes from the first
+    /// page, which is the only index the snapshot and the stream can agree on.
+    pub fn watch_jobs(&self, filter: JobFilter, options: WatchOptions) -> JobWatcher {
+        JobWatcher::new(self.clone(), filter, options)
     }
 
     // -- nodes --------------------------------------------------------------

@@ -452,6 +452,35 @@ pub enum TimelineEventBody {
     Unknown,
 }
 
+impl TimelineEventBody {
+    /// The job this event is about, for the kinds that are about a job.
+    ///
+    /// `None` for the cluster-scoped kinds — a node's epoch, a quota entity,
+    /// the policy, the authorization config — and for [`Unknown`], whose
+    /// payload (and therefore whose scope ids) this client discarded. A
+    /// consumer keying events by job must treat `None` as "not attributable",
+    /// never as "some job I know nothing about".
+    ///
+    /// [`Unknown`]: TimelineEventBody::Unknown
+    pub fn job(&self) -> Option<JobId> {
+        match self {
+            TimelineEventBody::JobSubmitted { job }
+            | TimelineEventBody::JobStateChanged { job, .. }
+            | TimelineEventBody::AttemptStateChanged { job, .. }
+            | TimelineEventBody::AllocationFunded { job, .. }
+            | TimelineEventBody::StopRequested { job, .. }
+            | TimelineEventBody::JobEvicted { job }
+            | TimelineEventBody::JobMetadataUpdated { job } => Some(*job),
+            TimelineEventBody::NodeEpochBumped { .. }
+            | TimelineEventBody::QuotaEntityConfigured { .. }
+            | TimelineEventBody::PolicyUpdated
+            | TimelineEventBody::AuthorizationUpdated
+            | TimelineEventBody::ClusterVersionBumped { .. }
+            | TimelineEventBody::Unknown => None,
+        }
+    }
+}
+
 /// `GET /api/v1/jobs/{job}/timeline` — one job's transition timeline,
 /// honestly partial.
 ///
@@ -796,11 +825,20 @@ pub struct UpdateJobMetadataResponse {
 // Query parameters
 // ---------------------------------------------------------------------------
 
+/// The largest page size `GET /api/v1/jobs` accepts — the top of the
+/// server's `1..=1000` range, which it rejects outside of rather than
+/// clamping.
+///
+/// Worth naming because a walk that intends to read a whole set wants the
+/// fewest requests it can get away with: [`JobWatcher`](crate::JobWatcher)
+/// asks for exactly this.
+pub const MAX_LIST_JOBS_LIMIT: u32 = 1000;
+
 /// Query parameters for `GET /api/v1/jobs`.
 ///
 /// The server defaults `limit` to 100 when absent, and rejects anything
-/// outside `1..=1000` with `INVALID_ARGUMENT` — it is never silently
-/// clamped.
+/// outside `1..=`[`MAX_LIST_JOBS_LIMIT`] with `INVALID_ARGUMENT` — it is
+/// never silently clamped.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ListJobsParams {
@@ -1152,6 +1190,58 @@ mod tests {
                 "to": "attempting",
             })
         );
+    }
+
+    /// Every job-scoped kind reports its job, and every kind that is not
+    /// about a job reports nothing — including `Unknown`, whose scope ids
+    /// were discarded at decode.
+    #[test]
+    fn an_events_job_is_reported_for_the_kinds_that_have_one() {
+        let node: NodeId = "node-00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let attempt = AttemptId::new();
+        let allocation = AllocationId::new();
+        let scoped = [
+            TimelineEventBody::JobSubmitted { job: job(1) },
+            TimelineEventBody::JobStateChanged {
+                job: job(1),
+                from: JobStateKind::Queued,
+                to: JobStateKind::Attempting,
+            },
+            TimelineEventBody::AttemptStateChanged {
+                attempt,
+                job: job(1),
+                node,
+                state: AttemptState::Running,
+            },
+            TimelineEventBody::AllocationFunded {
+                allocation,
+                job: job(1),
+                node,
+            },
+            TimelineEventBody::StopRequested {
+                node,
+                allocation,
+                job: job(1),
+            },
+            TimelineEventBody::JobEvicted { job: job(1) },
+            TimelineEventBody::JobMetadataUpdated { job: job(1) },
+        ];
+        for body in scoped {
+            assert_eq!(body.job(), Some(job(1)), "{body:?}");
+        }
+        let unscoped = [
+            TimelineEventBody::NodeEpochBumped { node, epoch: 3 },
+            TimelineEventBody::QuotaEntityConfigured {
+                entity: QuotaEntityId::new(),
+            },
+            TimelineEventBody::PolicyUpdated,
+            TimelineEventBody::AuthorizationUpdated,
+            TimelineEventBody::ClusterVersionBumped { to: 2 },
+            TimelineEventBody::Unknown,
+        ];
+        for body in unscoped {
+            assert_eq!(body.job(), None, "{body:?}");
+        }
     }
 
     #[test]

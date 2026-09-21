@@ -134,6 +134,62 @@
 //! the job's own state says it is finished — after one last drain, which is
 //! what catches the final lines. See the [`follow`] module.
 //!
+//! ## Watching a set of jobs
+//!
+//! Polling every job a service owns is almost entirely redundant requests. The
+//! alternative is one connection: `GET /api/v1/events` (ADR 0043) subscribes
+//! to an **open set** — every job matching a filter, including jobs submitted
+//! after the subscription opened — and this crate provides the loop ADR 0008
+//! says a client library should.
+//!
+//! [`Client::watch_jobs`] is that loop, and the one to reach for first. It
+//! lists with the filter — one [`JobWatchItem::SnapshotPage`] per page —
+//! subscribes from the first page's applied index, and answers a `gap` —
+//! delivery having been discontinuous — with a fresh snapshot rather than a
+//! silence:
+//!
+//! ```no_run
+//! # async fn go(client: &coppice_client::Client) -> coppice_client::Result<()> {
+//! use coppice_client::{JobFilter, JobWatchItem, WatchOptions};
+//!
+//! let filter = JobFilter::metadata_equals("owner", "batch-service");
+//! let mut watch = client.watch_jobs(filter, WatchOptions::new());
+//!
+//! while let Some(item) = watch.next_item().await? {
+//!     match item {
+//!         JobWatchItem::SnapshotPage { jobs, index, first, last } => {
+//!             println!("{} jobs at {index:?} (first={first} last={last})", jobs.len());
+//!         }
+//!         JobWatchItem::Batch(batch) => println!("{} events", batch.events.len()),
+//!         // The enum is `#[non_exhaustive]`: a later release may add an item.
+//!         _ => {}
+//!     }
+//! }
+//! # Ok(()) }
+//! ```
+//!
+//! Four things are worth knowing before you build on it. **The snapshot is the
+//! live set**: the list is the caller's filter AND a non-terminal phase, so
+//! its size follows the cluster's working set rather than its retention —
+//! [`SnapshotScope::All`] opts out. A job you track that is *absent* from a
+//! snapshot has left the live set; read it individually if you need its
+//! outcome. **The filter is restricted**: a subscription matches on the keys
+//! that say *which job this is* — `metadata`, `entity`, `id`, `submitted_by`,
+//! under `all`/`any`/`not` — and [`JobFilter::validate_subscribable`] refuses
+//! the rest by name before a request is sent, because the others read state
+//! that changes underneath a live stream. **Payloads are thin**: an event
+//! carries identity, stamp, kind and scope ids, so a consumer that wants the
+//! job reads it with [`ReadOptions::at_least`] set to the event's index. And
+//! **delivery is per-job clean but not a consistent cut**: each snapshot page
+//! reflects its own index, events a page already reflected are dropped from
+//! the stream, and everything after the first page's index arrives as an
+//! event. [`JobWatcher`] spells the guarantee out.
+//!
+//! [`Client::watch_job_events`] is the same subscription without the
+//! list — a [`JobEventWatcher`] that reconnects and hands gaps to you — and
+//! [`Client::subscribe_job_events`] is one bare connection. The [`events`]
+//! module has the detail.
+//!
 //! ## Error handling
 //!
 //! Everything fails with [`Error`]. The three cases worth distinguishing are a
@@ -205,24 +261,31 @@ mod client;
 mod credential;
 mod env;
 mod error;
+pub mod events;
 pub mod follow;
 mod id;
 mod metadata;
 pub mod pagination;
 pub mod paths;
+mod sse;
 mod time;
 pub mod types;
 
 pub use client::{
     plain_http_builder, Client, ClientBuilder, Consistency, ReadOptions, Versioned,
     APPLIED_INDEX_HEADER, COMMITTED_INDEX_HEADER, DEFAULT_BASE_URL, DEFAULT_PORT,
-    DEFAULT_RATE_LIMIT_RPS, DEFAULT_TIMEOUT, LEADER_HEADER,
+    DEFAULT_RATE_LIMIT_RPS, DEFAULT_TIMEOUT, LAST_EVENT_ID_HEADER, LEADER_HEADER, STREAM_TIMEOUT,
 };
 pub use credential::{BearerToken, BoxError, TokenProvider};
 pub use env::{
     EnvError, JobEnv, MAX_ENV_NAME_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, MAX_ENV_VARS,
 };
 pub use error::{Error, ErrorCode, Result};
+pub use events::{
+    JobEventItem, JobEventStream, JobEventWatcher, JobWatchItem, JobWatcher, SnapshotScope,
+    WatchOptions, DEFAULT_MAX_RECONNECT_BACKOFF, DEFAULT_MIN_RECONNECT_BACKOFF,
+    DEFAULT_STREAM_IDLE_TIMEOUT,
+};
 pub use follow::{FollowOptions, LogFollower, DEFAULT_POLL_INTERVAL};
 pub use governor::Quota;
 pub use id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, ParseIdError, QuotaEntityId};
