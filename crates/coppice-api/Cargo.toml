@@ -38,6 +38,10 @@ thiserror.workspace = true
 # `/enroll`'s concurrency cap is a `tokio::sync::Semaphore` (ADR 0037 §4
 # ingress hardening); the rest of the crate stays runtime-agnostic.
 tokio.workspace = true
+# Adapts the subscription's bounded mpsc receiver into the `Stream` axum's
+# `Sse` responder takes, and supplies the `take_until` that ends it at the
+# token's expiry (ADR 0043).
+tokio-stream.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

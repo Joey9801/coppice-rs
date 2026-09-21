@@ -339,8 +339,9 @@ fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
             get(list_quota_entities::<P>).post(configure_quota_entity::<P>),
         )
         .route("/quota-entities/:entity", get(get_quota_entity::<P>))
-        // Reserved: ADR 0008 event subscription (SSE, cursor-resumed).
-        .route("/events", get(unimplemented_read("SubscribeEvents")))
+        // The ADR 0008 event subscription, filtered and cursor-resumed per
+        // ADR 0043. Eventual by nature: a derived, replica-local stream.
+        .route("/events", get(super::events::subscribe_events::<P>))
 }
 
 /// `GET /api/v1/auth/config` — project the resolved posture (ADR 0022) into
@@ -507,19 +508,12 @@ async fn update_authorization<P: ControlPlane>(
     Ok(Json(response))
 }
 
-/// Stub for an unimplemented read route. Extracting [`ReadQuery`] makes the
-/// ADR 0007 parameter contract mechanical even before the endpoint exists:
-/// `?consistency=bogus` is `INVALID_ARGUMENT` on every read, and the
-/// eventual real handler inherits the extractor instead of re-adding it.
-fn unimplemented_read(
-    endpoint: &'static str,
-) -> impl Fn(ReadQuery) -> std::future::Ready<HttpError> + Clone + Send + 'static {
-    move |ReadQuery(_)| ready(HttpError::unimplemented(endpoint))
-}
-
-/// [`unimplemented_read`] for routes with a typed id path segment: the id
-/// is validated ([`IdPath`]) before the 501, so malformed ids are
-/// `INVALID_ARGUMENT` per the contract rather than leaking the stub.
+/// Stub for an unimplemented read route with a typed id path segment. The
+/// id is validated ([`IdPath`]) and the ADR 0007 read parameters extracted
+/// ([`ReadQuery`]) *before* the 501, so the parameter contract is mechanical
+/// even where the endpoint does not exist yet — `?consistency=bogus` is
+/// `INVALID_ARGUMENT` on every read — and the eventual real handler inherits
+/// both extractors instead of re-adding them.
 fn unimplemented_id_read<T>(
     endpoint: &'static str,
 ) -> impl Fn(IdPath<T>, ReadQuery) -> std::future::Ready<HttpError> + Clone + Send + 'static
@@ -1259,6 +1253,25 @@ mod tests {
         /// — the *domain* edit, so a test asserts which arm the handler
         /// built as well as the routing.
         metadata_calls: std::sync::Mutex<Vec<crate::UpdateJobMetadataCall>>,
+        /// What `subscribe_events` serves (ADR 0043). `None` — the default —
+        /// models a replica with no fanout attached, which is the 503 the
+        /// trait documents; `Some(items)` opens a stream that yields them
+        /// and then ends, which is all the frame-rendering tests need.
+        events: Option<Vec<crate::events::EventStreamItem>>,
+        /// Whether to keep the subscription's sender alive (see
+        /// `held_senders`). `false` — the default — ends the stream once the
+        /// seeded items have been read.
+        hold_open: bool,
+        /// Every resume cursor `subscribe_events` was called with, in call
+        /// order — the only way to prove which of `Last-Event-ID` and
+        /// `?cursor=` the handler actually honoured.
+        cursors: std::sync::Mutex<Vec<Option<u64>>>,
+        /// Senders parked here rather than dropped, so a subscription stays
+        /// **open** with nothing to deliver — the only way to observe what
+        /// ends a stream that no producer is ending for it (the token
+        /// deadline, ADR 0043).
+        held_senders:
+            std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::events::EventStreamItem>>>,
     }
 
     impl StubPlane {
@@ -1342,6 +1355,28 @@ mod tests {
             _limit: usize,
         ) -> JobTimelineWindow {
             self.timeline.clone()
+        }
+
+        async fn subscribe_events(
+            &self,
+            _selector: Arc<crate::events::JobSelector>,
+            cursor: Option<u64>,
+        ) -> Result<crate::events::EventSubscription, ApiError> {
+            self.cursors.lock().unwrap().push(cursor);
+            let Some(items) = self.events.clone() else {
+                return Err(ApiError::Unavailable("no event fanout".into()));
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(items.len().max(1));
+            for item in items {
+                tx.try_send(item).expect("the channel was sized for these");
+            }
+            // Dropping the sender here is what normally ends the stream after
+            // the seeded items; a test that wants an *open* stream parks it
+            // on the plane instead.
+            if self.hold_open {
+                self.held_senders.lock().unwrap().push(tx);
+            }
+            Ok(crate::events::EventSubscription { items: rx })
         }
 
         fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
@@ -1521,6 +1556,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             // No handle by default: coordinator-status tests build their own
             // plane with a seeded summary.
             coordinator: None,
@@ -1542,6 +1581,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             coordinator: None,
         }))
     }
@@ -1564,6 +1607,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             coordinator: None,
         }))
     }
@@ -1656,20 +1703,295 @@ mod tests {
 
     #[tokio::test]
     async fn stub_routes_answer_501_with_the_endpoint_name() {
-        // `/events` rather than `/session`: the latter is a real handler now
-        // (ADR 0022), and the reserved subscription route is the remaining
-        // parameterless stub.
+        // A remaining reserved read with a typed id segment (ADR 0031's
+        // table); the id parses, so the 501 is the route's own answer and
+        // not an id rejection.
+        let node = NodeId::new();
         let response = app(None)
-            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get(format!("/api/v1/nodes/{node}/history"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = body_json(response).await;
         assert_eq!(body["code"], "UNIMPLEMENTED");
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("SubscribeEvents"));
+        assert!(body["message"].as_str().unwrap().contains("GetNodeHistory"));
+    }
+
+    // ---- GET /api/v1/events (ADR 0043) ---------------------------------
+
+    /// A plane whose subscription yields `items` and then ends, so a test can
+    /// read the whole SSE body to completion.
+    fn events_app(items: Vec<crate::events::EventStreamItem>) -> Arc<StubPlane> {
+        Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
+            liveness: Default::default(),
+            timeline: empty_timeline(),
+            state: std::sync::Mutex::default(),
+            read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
+            events: Some(items),
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
+            coordinator: None,
+        })
+    }
+
+    /// A `jobs=` query string for one metadata-presence leaf — the smallest
+    /// filter the endpoint accepts.
+    fn jobs_query(key: &str) -> String {
+        let filter = serde_json::json!({"metadata": {"key": key}});
+        format!("jobs={}", urlencode(&filter.to_string()))
+    }
+
+    /// Percent-encode the few characters a JSON filter puts in a query
+    /// string. Hand-rolled rather than a dependency: this is test code and
+    /// the alphabet is tiny.
+    fn urlencode(raw: &str) -> String {
+        raw.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                other => format!("%{other:02X}"),
+            })
+            .collect()
+    }
+
+    async fn sse_body(response: axum::response::Response) -> String {
+        String::from_utf8(
+            to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body")
+                .to_vec(),
+        )
+        .expect("SSE frames are utf-8")
+    }
+
+    /// `jobs` is required in v1: a subscription has to say which jobs it
+    /// wants, and defaulting to "all of them" would make the firehose the
+    /// easiest thing to ask for.
+    #[tokio::test]
+    async fn events_without_a_jobs_filter_is_invalid() {
+        let response = router(events_app(vec![]))
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+        assert!(body["message"].as_str().unwrap().contains("jobs"));
+    }
+
+    /// A leaf outside the restricted set is refused **by name**, because the
+    /// fix is to move that leaf into the `ListJobs` resync query.
+    #[tokio::test]
+    async fn events_names_the_filter_leaf_it_cannot_serve() {
+        let filter = serde_json::json!({
+            "all": [{"metadata": {"key": "team"}}, {"phase": {"in": ["running"]}}]
+        });
+        let uri = format!("/api/v1/events?jobs={}", urlencode(&filter.to_string()));
+        let response = router(events_app(vec![]))
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+        assert!(
+            body["message"].as_str().unwrap().contains("phase"),
+            "the refusal must name the offending leaf, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_refuses_a_non_numeric_cursor() {
+        let uri = format!("/api/v1/events?{}&cursor=abc", jobs_query("team"));
+        let response = router(events_app(vec![]))
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    /// `Last-Event-ID` beats `?cursor=`: the header is what the client last
+    /// actually processed, while the query string is whatever was baked into
+    /// the URL when the connection was first opened.
+    #[tokio::test]
+    async fn events_prefers_the_last_event_id_header_over_the_query_cursor() {
+        let plane = events_app(vec![]);
+        let uri = format!("/api/v1/events?{}&cursor=11", jobs_query("team"));
+        let response = router(Arc::clone(&plane))
+            .oneshot(
+                Request::get(uri)
+                    .header("last-event-id", "42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(plane.cursors.lock().unwrap().as_slice(), &[Some(42)]);
+
+        // Without the header, the query parameter is honoured.
+        let uri = format!("/api/v1/events?{}&cursor=11", jobs_query("team"));
+        let _ = router(Arc::clone(&plane))
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            plane.cursors.lock().unwrap().as_slice(),
+            &[Some(42), Some(11)]
+        );
+    }
+
+    /// The wire contract: `batch` and `progress` carry the applied index as
+    /// the SSE event id — that is the resume cursor — and `gap` carries
+    /// **none**, because a gap is not a position anything can resume from.
+    #[tokio::test]
+    async fn events_renders_the_three_frames_with_ids_only_where_they_resume() {
+        let job = JobId::new();
+        let plane = events_app(vec![
+            crate::events::EventStreamItem::Progress { index: 4 },
+            crate::events::EventStreamItem::Batch(crate::events::EventBatchItem {
+                index: 7,
+                at: Timestamp::from_micros(1_000_000).expect("in range"),
+                events: vec![crate::events::OrdinalEvent {
+                    // A non-zero ordinal: the batch-assigned position rides
+                    // through the filter unchanged (ADR 0032).
+                    ordinal: 3,
+                    event: coppice_state::Event::JobSubmitted { job },
+                }],
+            }),
+            crate::events::EventStreamItem::Gap {
+                earliest_available: 5,
+            },
+        ]);
+        let uri = format!("/api/v1/events?{}", jobs_query("team"));
+        let response = router(plane)
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.starts_with("text/event-stream")),
+            Some(true)
+        );
+
+        let body = sse_body(response).await;
+        assert!(
+            body.contains("event: progress\ndata: {\"index\":4}") && body.contains("id: 4"),
+            "progress frame missing or unlabelled: {body}"
+        );
+        assert!(
+            body.contains("event: batch\n"),
+            "batch frame missing: {body}"
+        );
+        assert!(
+            body.contains("id: 7"),
+            "the batch's id is its index: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"job\":\"{job}\"")) && body.contains("\"ordinal\":3"),
+            "the batch payload is the ADR 0032 timeline shape: {body}"
+        );
+        assert!(
+            body.contains("event: gap\ndata: {\"earliest_available\":5}"),
+            "gap frame missing: {body}"
+        );
+        // Exactly two ids in the whole body, both from the resumable frames.
+        assert_eq!(
+            body.matches("id: ").count(),
+            2,
+            "a gap must not set Last-Event-ID: {body}"
+        );
+    }
+
+    /// A subscription outlives the per-request credential check that guards
+    /// every other route, so the token's own `exp` is what replaces it: the
+    /// stream ends cleanly at the deadline rather than running for hours on a
+    /// credential that stopped being valid (ADR 0043).
+    ///
+    /// The plane here keeps the subscription open with nothing to deliver, so
+    /// the *only* thing that can end this body is the deadline.
+    #[tokio::test]
+    async fn events_ends_the_stream_when_the_bearer_token_expires() {
+        let idp = coppice_testkit::oidc::FakeIdp::start().await;
+        let plane = Arc::new(StubPlane {
+            fail_with: None,
+            queue_window: QueueWindow::default(),
+            usage: UsageSnapshot::default(),
+            liveness: Default::default(),
+            timeline: empty_timeline(),
+            state: std::sync::Mutex::default(),
+            read_consistency: std::sync::Mutex::default(),
+            actors: std::sync::Mutex::default(),
+            authorization: std::sync::Mutex::default(),
+            submitted: std::sync::Mutex::default(),
+            metadata_calls: std::sync::Mutex::default(),
+            events: Some(vec![crate::events::EventStreamItem::Progress { index: 1 }]),
+            hold_open: true,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
+            coordinator: None,
+        });
+
+        // Inside the 60 s skew allowance, so the token still authenticates,
+        // but with a deadline the stream must honour almost immediately.
+        let token = idp.sign(
+            coppice_testkit::oidc::TokenClaims::new("alice")
+                .audience(TEST_CLIENT_ID)
+                .expires_in(-30),
+        );
+        let uri = format!("/api/v1/events?{}", jobs_query("team"));
+        let response = router_with_authn(Arc::clone(&plane), oidc_chain(&idp).await)
+            .oneshot(bearer_request(&uri, &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The body completes rather than hanging: the deadline closed it even
+        // though the producer is still very much alive.
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), sse_body(response))
+            .await
+            .expect("an expired token must end the stream, not hold the connection");
+        assert!(
+            !plane.held_senders.lock().unwrap().is_empty(),
+            "the producer was still open; the deadline is what ended this"
+        );
+        // Ending is clean, not an error frame: the client reconnects with a
+        // fresh token and its last event id, losing nothing.
+        assert!(!body.contains("event: error"), "unexpected frame: {body}");
+
+        idp.shutdown().await;
+    }
+
+    /// No fanout attached — and, by the same path, a replica already at its
+    /// subscription cap — is an honest 503, not a stream that opens and then
+    /// delivers nothing forever.
+    #[tokio::test]
+    async fn events_without_a_fanout_is_unavailable() {
+        let uri = format!("/api/v1/events?{}", jobs_query("team"));
+        let response = app(None)
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(response).await["code"], "UNAVAILABLE");
     }
 
     #[tokio::test]
@@ -1729,6 +2051,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             coordinator: None,
         };
         let response = router(Arc::new(plane))
@@ -2946,6 +3272,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             coordinator: None,
         })
     }
@@ -3260,6 +3590,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             coordinator: None,
         })
     }
@@ -3560,6 +3894,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             coordinator: Some(coordinator),
         }))
     }
@@ -3793,6 +4131,10 @@ mod tests {
                 authorization: std::sync::Mutex::default(),
                 submitted: std::sync::Mutex::default(),
                 metadata_calls: std::sync::Mutex::default(),
+                events: None,
+                hold_open: false,
+                cursors: std::sync::Mutex::default(),
+                held_senders: std::sync::Mutex::default(),
                 coordinator: None,
             }),
             crate::http::MetricsEndpoint::detached_for_tests(),
@@ -5402,6 +5744,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             coordinator: None,
         });
         let response = router(plane)
@@ -5445,6 +5791,10 @@ mod tests {
             authorization: std::sync::Mutex::default(),
             submitted: std::sync::Mutex::default(),
             metadata_calls: std::sync::Mutex::default(),
+            events: None,
+            hold_open: false,
+            cursors: std::sync::Mutex::default(),
+            held_senders: std::sync::Mutex::default(),
             coordinator: None,
         });
         let response = router(plane)

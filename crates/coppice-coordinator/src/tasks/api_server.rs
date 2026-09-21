@@ -732,6 +732,13 @@ pub struct CoordinatorControlPlane<C> {
     /// `ClusterUsage` whose sender is dropped immediately, exactly as
     /// `queue_window` is.
     usage_history: watch::Receiver<Arc<ClusterUsage>>,
+    /// The runtime's shutdown watch, so an open event subscription
+    /// (ADR 0043) ends the moment the drain starts rather than holding the
+    /// API listener open to its deadline (issue #111's shape). `None` — a
+    /// plane assembled without one, which is every test that does not care —
+    /// means only the fanout's own shutdown ends a stream, which is the same
+    /// instant in the daemon because it is the same watch.
+    shutdown: Option<watch::Receiver<bool>>,
 }
 
 impl<C> CoordinatorControlPlane<C> {
@@ -753,8 +760,17 @@ impl<C> CoordinatorControlPlane<C> {
             node_log_client: None,
             forwarder: None,
             leader_reads: None,
+            shutdown: None,
             failpoints: crate::failpoints::Failpoints::default(),
         }
+    }
+
+    /// Attach the runtime's shutdown watch, which event subscriptions end on
+    /// (ADR 0043). The runtime calls this; see the field's doc for what a
+    /// plane without one does.
+    pub fn with_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
     /// Arm this plane's write-path gates from the daemon's own config
@@ -1149,6 +1165,23 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
             },
             Err(_closed) => uncovered(),
         }
+    }
+
+    async fn subscribe_events(
+        &self,
+        selector: Arc<coppice_api::events::JobSelector>,
+        cursor: Option<u64>,
+    ) -> Result<coppice_api::events::EventSubscription, ApiError> {
+        // No fanout is no coverage, and here that has to be an error rather
+        // than the honestly-empty window `job_timeline` serves: a stream that
+        // opened and then delivered nothing forever would be indistinguishable
+        // from a quiet cluster.
+        let Some(fanout) = &self.fanout else {
+            return Err(ApiError::Unavailable(
+                "event subscriptions unavailable: no event fanout attached".into(),
+            ));
+        };
+        crate::tasks::event_stream::open(fanout, selector, cursor, self.shutdown.clone()).await
     }
 
     fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {

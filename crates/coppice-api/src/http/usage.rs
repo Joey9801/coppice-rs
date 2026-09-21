@@ -667,6 +667,15 @@ mod tests {
         fn coordinator_status(&self) -> Result<CoordinatorSummary, ApiError> {
             Err(ApiError::Unavailable("no consensus handle".into()))
         }
+        async fn subscribe_events(
+            &self,
+            _selector: std::sync::Arc<crate::events::JobSelector>,
+            _cursor: Option<u64>,
+        ) -> Result<crate::events::EventSubscription, ApiError> {
+            // Exercised against the router's own stub in `super::routes`;
+            // this plane exists for the fetch walk and never reaches here.
+            Err(ApiError::Unavailable("no event fanout".into()))
+        }
         async fn submit_job(
             &self,
             _req: SubmitJobRequest,

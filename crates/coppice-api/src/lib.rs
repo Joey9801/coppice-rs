@@ -10,6 +10,11 @@
 //! durable state transitions, not imperative worker control. See
 //! `docs/architecture/components.md` and `docs/operations/security.md`.
 
+// The ADR 0043 event-subscription seam: the validated `jobs` selector and
+// the items a subscription delivers. A top-level module rather than one
+// under `http`, because it is the vocabulary `ControlPlane` speaks — the SSE
+// rendering of it lives in `http::events`.
+pub mod events;
 pub mod http;
 
 use std::future::Future;
@@ -882,6 +887,35 @@ pub trait ControlPlane: Send + Sync + 'static {
         after: Option<(u64, u32)>,
         limit: usize,
     ) -> impl Future<Output = JobTimelineWindow> + Send;
+
+    /// Open a filtered event subscription (ADR 0043) — the stream behind
+    /// `GET /api/v1/events`.
+    ///
+    /// `selector` has already been compiled and validated at the edge; this
+    /// side only matches it against the scope keys apply stamped onto the
+    /// derived stream, so the verdict is a pure function of the committed log
+    /// and identical on every replica (KOI-3). `cursor` is the ADR 0008
+    /// applied-index resume point: `None` opens from now, a cursor the
+    /// replica can still cover is caught up before the live stream takes
+    /// over, and one it cannot produces a `Gap` and then runs live.
+    ///
+    /// Replica-local and leaderless, like every other derived read: any
+    /// replica serves it, and a client that reconnects elsewhere resumes from
+    /// the same cursor.
+    ///
+    /// `Err(ApiError::Unavailable)` when this replica cannot take the
+    /// subscription — its cap is reached, or it has no fanout (the same "no
+    /// coverage" posture as `coordinator_status`, but an honest error rather
+    /// than a stream that opens and delivers nothing).
+    ///
+    /// The returned stream ends cleanly when the server drains or the fanout
+    /// shuts down; the caller ends it at the credential's own deadline. A
+    /// dropped receiver is how a disconnected client unsubscribes.
+    fn subscribe_events(
+        &self,
+        selector: Arc<events::JobSelector>,
+        cursor: Option<u64>,
+    ) -> impl Future<Output = Result<events::EventSubscription, ApiError>> + Send;
 
     /// This replica's view of the raft cluster for `GET /api/v1/coordinators`
     /// (ADR 0031, local read): leader/term/indexes and per-member membership,

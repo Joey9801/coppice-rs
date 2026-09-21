@@ -1842,6 +1842,14 @@ impl coppice_api::ControlPlane for NoopPlane {
         coppice_api::LivenessMarks::default()
     }
 
+    async fn subscribe_events(
+        &self,
+        _selector: std::sync::Arc<coppice_api::events::JobSelector>,
+        _cursor: Option<u64>,
+    ) -> Result<coppice_api::events::EventSubscription, coppice_api::ApiError> {
+        Err(unattached())
+    }
+
     async fn submit_job(
         &self,
         _req: coppice_api::http::dto::SubmitJobRequest,

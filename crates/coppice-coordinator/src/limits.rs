@@ -78,6 +78,65 @@ pub const FANOUT_RING_MAX_EVENTS: usize = 1_000_000;
 /// Evict-oldest when full.
 pub const FANOUT_RING_MAX_AGE: Duration = Duration::from_secs(3600);
 
+/// Fanout reconnection ring: approximate max bytes retained (ADR 0043).
+///
+/// The third bound alongside count and age, and the one that binds first now
+/// that a batch carries scope keys: an entity chain, a submitter and a
+/// metadata map per job named, plus a second map on every eviction and
+/// metadata update. A million *tiny* events fit in the count bound and a
+/// million events carrying 4 KiB metadata maps do not, so the count bound
+/// alone no longer describes a memory ceiling. Approximate because
+/// [`approx_bytes`](crate::tasks::event_fanout) cannot see a `BTreeMap`
+/// node's true overhead; it is a safety bound, not an accounting figure.
+pub const FANOUT_RING_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Events examined per batch-aligned catch-up page before the scan returns
+/// short with a resume index (ADR 0043).
+///
+/// Smaller than [`EVENT_WINDOW_SCAN_BUDGET`] on purpose: a timeline read is
+/// one request and done, whereas a catch-up is a *loop* whose client is
+/// already receiving live items into a bounded queue. Shorter pages keep the
+/// fanout's own loop responsive and get the subscriber onto the live stream
+/// sooner, at the cost of more round trips — which are cheap, since both ends
+/// are in this process.
+pub const EVENT_CATCH_UP_SCAN_BUDGET: usize = 20_000;
+
+/// How often the fanout sends each subscriber the ADR 0043 progress bookmark
+/// ("everything matching at or below N has been sent").
+///
+/// Also the stream's keepalive, which is why it is a timer and not purely
+/// event-driven: an idle cluster must still produce bytes often enough that a
+/// proxy or a load balancer does not reap an open SSE connection as dead.
+/// Fifteen seconds sits comfortably inside the 30–60 s idle timeouts those
+/// default to.
+///
+/// Part of the wire contract (ADR 0043): a healthy stream carries a frame at
+/// least this often, and clients treat several missed intervals as a dead
+/// connection rather than a quiet one — `coppice-client`'s
+/// `DEFAULT_STREAM_IDLE_TIMEOUT` defaults to 60 s, four times this interval.
+/// Raising this value narrows that margin for every client already deployed,
+/// so it must not be done casually.
+pub const EVENT_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// One connection task -> its HTTP handler (ADR 0043), the second hop of an
+/// event subscription.
+///
+/// `send().await`; a full queue is the *client's* backpressure reaching the
+/// connection task, which is exactly where it should stop — the task then
+/// stops draining its fanout queue, and that one overflows into a gap by the
+/// ordinary rule. Small, because it buys nothing: the fanout queue behind it
+/// is the real buffer.
+pub const EVENT_STREAM_QUEUE_CAPACITY: usize = 64;
+
+/// Concurrent event subscriptions one replica will serve (ADR 0043).
+///
+/// Each one costs a [`SUBSCRIBER_QUEUE_CAPACITY`] queue plus a connection
+/// task, so this is what bounds the memory a client population can make a
+/// replica hold. Over it, subscribe is refused with `UNAVAILABLE` rather than
+/// queued: a client told "not now" retries against another replica, which is
+/// a better answer than a stream that exists but cannot keep up.
+pub const MAX_EVENT_SUBSCRIPTIONS: usize = 1024;
+
 /// Width of one derived queue-stats bucket (ADR 0032, tier 3).
 ///
 /// The derived-stats task closes a bucket of queue arrival/drain counts at

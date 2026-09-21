@@ -35,7 +35,7 @@ use coppice_state::{AllocationRecord, AttemptRecord, Command, Event, JobRecord};
 
 use crate::leadership;
 use crate::tasks::agent_gateway::{RouteCommand, RouterHandle};
-use crate::tasks::event_fanout::{EventFilter, FanoutHandle, SubscriptionItem};
+use crate::tasks::event_fanout::{EventFilter, FanoutHandle, ProgressItems, SubscriptionItem};
 
 /// Run the dispatch loop until shutdown.
 pub async fn run<C: Consensus>(
@@ -56,7 +56,14 @@ pub async fn run<C: Consensus>(
         // covers everything applied after it registers, the strong resync
         // covers everything committed before its barrier, and this order is
         // what makes those two ranges overlap instead of leaving a gap.
-        let Ok(mut subscription) = fanout.subscribe(EventFilter::All, None).await else {
+        //
+        // No progress bookmarks: they exist so a client can render a resume
+        // cursor (ADR 0043), and dispatch resyncs from a strong view rather
+        // than from a cursor.
+        let Ok(mut subscription) = fanout
+            .subscribe(EventFilter::All, ProgressItems::Omit)
+            .await
+        else {
             // Fanout is gone; nothing to dispatch from until this replica
             // re-gates (which will hit the same wall, so this is really a
             // shutdown in disguise).
@@ -79,6 +86,9 @@ pub async fn run<C: Consensus>(
                                 handle_event(&consensus, &views, &router, &ordinal_event.event).await;
                             }
                         }
+                        // Not subscribed with progress bookmarks, so this
+                        // arm exists only because the item type carries them.
+                        SubscriptionItem::Progress { .. } => {}
                         SubscriptionItem::Gap { earliest_available } => {
                             tracing::info!(
                                 earliest_available,

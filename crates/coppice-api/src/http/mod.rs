@@ -18,7 +18,9 @@ mod authn;
 mod authorize;
 pub mod dto;
 mod enroll;
+// `GET /api/v1/events` (ADR 0043): the SSE rendering of a subscription.
 mod error;
+mod events;
 mod extract;
 mod logs;
 mod metrics;
