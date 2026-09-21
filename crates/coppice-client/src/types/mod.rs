@@ -88,6 +88,7 @@
 mod auth;
 mod cluster;
 mod common;
+mod events;
 mod filter;
 mod jobs;
 mod logs;
@@ -98,6 +99,7 @@ mod usage;
 pub use auth::*;
 pub use cluster::*;
 pub use common::*;
+pub use events::*;
 pub use filter::*;
 pub use jobs::*;
 pub use logs::*;

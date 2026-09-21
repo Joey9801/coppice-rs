@@ -424,6 +424,99 @@ fn job_read_models_round_trip_through_the_client() {
     );
 }
 
+/// The three frames of the ADR 0043 job-event subscription. They never
+/// arrive as a response body — each is one SSE frame's `data:` payload — so
+/// this is the only place their JSON is held to the client's copies.
+#[test]
+fn event_stream_frames_round_trip_through_the_client() {
+    round_trip::<dto::EventBatchFrame, client::EventBatchFrame>(&dto::EventBatchFrame {
+        index: 91,
+        at: ts(1_700_000_000_000_000),
+        events: vec![
+            dto::TimelineEvent {
+                index: 91,
+                ordinal: 0,
+                at: ts(1_700_000_000_000_000),
+                body: dto::TimelineEventBody::JobSubmitted { job: jid(1) },
+            },
+            // A gap in the ordinals is legitimate: they are positions in the
+            // command's *full* batch, and the filter admitted only some.
+            dto::TimelineEvent {
+                index: 91,
+                ordinal: 4,
+                at: ts(1_700_000_000_000_000),
+                body: dto::TimelineEventBody::JobStateChanged {
+                    job: jid(1),
+                    from: dto::JobStateKind::Submitted,
+                    to: dto::JobStateKind::Queued,
+                },
+            },
+        ],
+    });
+    // An admitted command whose every event the filter dropped is still a
+    // frame: the index is the point of it.
+    round_trip::<dto::EventBatchFrame, client::EventBatchFrame>(&dto::EventBatchFrame {
+        index: 92,
+        at: ts(1_700_000_000_000_001),
+        events: vec![],
+    });
+    round_trip::<dto::EventProgressFrame, client::EventProgressFrame>(&dto::EventProgressFrame {
+        index: 93,
+    });
+    round_trip::<dto::EventGapFrame, client::EventGapFrame>(&dto::EventGapFrame {
+        earliest_available: 40,
+    });
+}
+
+/// A subscription accepts a strictly smaller set of filter leaves than a list
+/// does (ADR 0043), and the client refuses the rest before spending a round
+/// trip on them. Both sides must draw that line in the same place and say the
+/// same thing about it — otherwise the client either refuses a filter the
+/// server would have taken, or sends one it will not.
+#[test]
+fn the_subscribable_filter_leaves_agree_between_the_two_crates() {
+    use coppice_api::events::JobSelector;
+
+    let cases: Vec<client::JobFilter> = vec![
+        client::JobFilter::metadata_present("team"),
+        client::JobFilter::metadata_equals("team", "platform"),
+        client::JobFilter::entity(client::QuotaEntityId::new()),
+        client::JobFilter::entity_exact(client::QuotaEntityId::new()),
+        client::JobFilter::id_in([client::JobId::new()]),
+        client::JobFilter::submitted_by("alice@example.com"),
+        client::JobFilter::not(client::JobFilter::metadata_present("archived")),
+        client::JobFilter::all([
+            client::JobFilter::metadata_present("team"),
+            client::JobFilter::any([client::JobFilter::submitted_by("alice")]),
+        ]),
+        client::JobFilter::phase_in([client::JobPhase::Running]),
+        client::JobFilter::node(client::NodeId::new()),
+        client::JobFilter::image_equals("alpine:3"),
+        client::JobFilter::search("needle"),
+        client::JobFilter::submitted_after(client::Timestamp::from_micros(1).unwrap()),
+        client::JobFilter::requests_min(client::RequestsResource::CpuMillis, 1),
+        // The forbidden leaf is nested, so the whole tree is walked on both
+        // sides rather than just its root.
+        client::JobFilter::all([
+            client::JobFilter::metadata_present("team"),
+            client::JobFilter::not(client::JobFilter::phase_in([client::JobPhase::Queued])),
+        ]),
+    ];
+
+    for filter in cases {
+        let json = serde_json::to_value(&filter).unwrap();
+        let server = parse_server_filter(json.clone()).unwrap();
+        let server_verdict = JobSelector::compile(&server)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert_eq!(
+            filter.validate_subscribable(),
+            server_verdict,
+            "the two crates disagree about {json}"
+        );
+    }
+}
+
 /// The node list/detail views, including the every-field-`Some` host facts
 /// and the utilization history, and the drain/undrain/remove empty bodies.
 #[test]

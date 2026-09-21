@@ -359,6 +359,55 @@ impl JobFilter {
         self.check(1, &mut nodes)
     }
 
+    /// [`validate`](Self::validate), plus the one extra rule an **event
+    /// subscription** adds (ADR 0043): only the leaves that say *which job
+    /// this is* may be used.
+    ///
+    /// A subscription matches against the identity keys the apply loop stamped
+    /// onto the event — the job's metadata, its submitter, its quota entity
+    /// chain, its id — and nothing else, because anything else would be read
+    /// from state that has moved on by delivery time and differs between
+    /// replicas. So `phase`, `node`, `image`, `search`, `submitted` and
+    /// `requests` are refused, by name, with the server's own wording: the fix
+    /// is to move that leaf into the `ListJobs` resync query instead.
+    ///
+    /// Every accepted subscription filter is therefore also a valid
+    /// [`Client::list_jobs`](crate::Client::list_jobs) filter, which is what
+    /// makes the list-then-subscribe loop select the same set on both halves.
+    pub fn validate_subscribable(&self) -> Result<(), String> {
+        self.validate()?;
+        self.check_subscribable()
+    }
+
+    fn check_subscribable(&self) -> Result<(), String> {
+        let forbidden = |leaf: &str| {
+            Err(format!(
+                "the `{leaf}` filter leaf is not available on an event subscription: a \
+                 subscription matches on the identity keys stamped at apply time (metadata, \
+                 entity, id, submitted_by), not on state that changes underneath it"
+            ))
+        };
+        match self {
+            JobFilter::All(fs) | JobFilter::Any(fs) => {
+                for f in fs {
+                    f.check_subscribable()?;
+                }
+                Ok(())
+            }
+            JobFilter::Not(f) => f.check_subscribable(),
+            JobFilter::Metadata(_)
+            | JobFilter::Entity(_)
+            | JobFilter::Id(_)
+            | JobFilter::SubmittedBy(_) => Ok(()),
+            JobFilter::Phase(_) => forbidden("phase"),
+            JobFilter::Node(_) => forbidden("node"),
+            JobFilter::Image(_) => forbidden("image"),
+            JobFilter::Search(_) => forbidden("search"),
+            JobFilter::Submitted(_) => forbidden("submitted"),
+            JobFilter::Requests(_) => forbidden("requests"),
+        }
+    }
+
     fn check(&self, depth: usize, nodes: &mut usize) -> Result<(), String> {
         if depth > MAX_FILTER_DEPTH {
             return Err(format!(
@@ -712,6 +761,77 @@ mod tests {
             Err(format!(
                 "filter exceeds the maximum of {MAX_FILTER_NODES} nodes"
             ))
+        );
+    }
+
+    /// A subscription may only name the identity leaves (ADR 0043), and the
+    /// refusal names the one that was the problem — the first thing a caller
+    /// needs, since the fix is to move it into the resync query.
+    #[test]
+    fn validate_subscribable_refuses_every_non_identity_leaf_by_name() {
+        let cases = [
+            (JobFilter::phase_in([JobPhase::Running]), "phase"),
+            (
+                JobFilter::node("node-00000000-0000-0000-0000-000000000002".parse().unwrap()),
+                "node",
+            ),
+            (JobFilter::image_equals("registry/img"), "image"),
+            (JobFilter::search("abc"), "search"),
+            (
+                JobFilter::submitted_after(Timestamp::UNIX_EPOCH),
+                "submitted",
+            ),
+            (
+                JobFilter::requests_min(RequestsResource::CpuMillis, 1),
+                "requests",
+            ),
+        ];
+        for (filter, leaf) in cases {
+            let err = filter
+                .validate_subscribable()
+                .expect_err("a non-identity leaf");
+            assert!(
+                err.starts_with(&format!("the `{leaf}` filter leaf is not")),
+                "{err}"
+            );
+            // …and the same filter is perfectly fine on a list.
+            assert!(filter.validate().is_ok(), "{filter:?}");
+        }
+    }
+
+    #[test]
+    fn validate_subscribable_accepts_the_identity_leaves_under_combinators() {
+        let entity: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000001"
+            .parse()
+            .unwrap();
+        let job: JobId = "job-00000000-0000-0000-0000-000000000003".parse().unwrap();
+        let filter = JobFilter::all([
+            JobFilter::metadata_equals("team", "platform"),
+            JobFilter::not(JobFilter::metadata_present("archived")),
+            JobFilter::any([
+                JobFilter::entity(entity),
+                JobFilter::entity_exact(entity),
+                JobFilter::id_in([job]),
+                JobFilter::submitted_by("alice"),
+            ]),
+        ]);
+        assert_eq!(filter.validate_subscribable(), Ok(()));
+    }
+
+    /// A forbidden leaf buried under combinators is still found, and the
+    /// shared shape rules still run first.
+    #[test]
+    fn validate_subscribable_walks_the_whole_tree_and_runs_validate_first() {
+        let nested = JobFilter::all([
+            JobFilter::metadata_present("team"),
+            JobFilter::any([JobFilter::phase_in([JobPhase::Queued])]),
+        ]);
+        let err = nested.validate_subscribable().expect_err("a nested phase");
+        assert!(err.starts_with("the `phase` filter leaf is not"), "{err}");
+
+        assert_eq!(
+            JobFilter::All(vec![]).validate_subscribable(),
+            Err("`all` filter list must be non-empty".to_string())
         );
     }
 
