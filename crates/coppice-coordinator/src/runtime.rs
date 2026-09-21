@@ -372,6 +372,9 @@ where
     let control_plane = Arc::new(
         CoordinatorControlPlane::new(Arc::clone(&consensus), views.clone(), cluster_id)
             .with_derived(queue_window, fanout.clone())
+            // Event subscriptions (ADR 0043) end on this watch, so an open
+            // SSE stream never holds the listener's drain.
+            .with_shutdown(shutdown_rx.clone())
             .with_usage(usage.clone(), liveness.clone(), cluster_usage)
             .with_node_handle(node_handle.clone())
             .with_log_client(node_log_client)

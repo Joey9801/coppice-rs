@@ -29,7 +29,7 @@ use coppice_core::time::Timestamp;
 use coppice_state::Event;
 
 use crate::limits::{QUEUE_BUCKET_INTERVAL, QUEUE_WINDOW_MAX_BUCKETS};
-use crate::tasks::event_fanout::{EventFilter, FanoutHandle, SubscriptionItem};
+use crate::tasks::event_fanout::{EventFilter, FanoutHandle, ProgressItems, SubscriptionItem};
 
 /// The rolling window plus the bucket currently being filled.
 ///
@@ -146,10 +146,15 @@ async fn run(
     tx: watch::Sender<QueueWindow>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // No cursor: counting starts from "now". The window's coverage is
-    // whatever this subscription actually delivers, which is exactly what
-    // the bucket presence/absence vocabulary reports.
-    let Ok(mut subscription) = fanout.subscribe(EventFilter::All, None).await else {
+    // Counting starts from "now": this task never resumes from a cursor, so
+    // it never catches up either. The window's coverage is whatever this
+    // subscription actually delivers, which is exactly what the bucket
+    // presence/absence vocabulary reports — and why it takes no ADR 0043
+    // progress bookmarks, which only a cursor-rendering client needs.
+    let Ok(mut subscription) = fanout
+        .subscribe(EventFilter::All, ProgressItems::Omit)
+        .await
+    else {
         // Fanout is gone — shutdown in disguise; the watch stays empty.
         return;
     };
@@ -177,6 +182,9 @@ async fn run(
                             state.observe(&ordinal_event.event);
                         }
                     }
+                    // Not subscribed with progress bookmarks; this arm
+                    // exists only because the item type carries them.
+                    Some(SubscriptionItem::Progress { .. }) => {}
                     Some(SubscriptionItem::Gap { earliest_available }) => {
                         // An unknown span of transitions was never counted;
                         // every bucket's completeness claim is void.

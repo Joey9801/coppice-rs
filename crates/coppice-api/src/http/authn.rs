@@ -100,6 +100,29 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestPresentation {
     }
 }
 
+/// When this request's credential stops being valid, as handlers see it.
+///
+/// Only the surfaces that outlive one request have any use for it — today
+/// that is the ADR 0043 event stream, which ends here rather than running on
+/// an expired token. `None` is "no deadline this layer can enforce": open
+/// mode, an operator certificate, or a request that never went through the
+/// layer at all.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RequestDeadline(pub Option<coppice_core::time::Timestamp>);
+
+#[axum::async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for RequestDeadline {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<RequestDeadline>()
+            .copied()
+            .unwrap_or(RequestDeadline(None)))
+    }
+}
+
 /// The `/api/v1` requests that are served **without** authentication: exact
 /// `(method, path)` pairs, and the only ones in the system.
 ///
@@ -181,6 +204,11 @@ pub async fn authenticate(
             // (bearer fills it, the others insert `Presentation::default()`),
             // so `RequestPresentation`'s own fallback is belt-and-braces.
             request.extensions_mut().insert(authenticated.presentation);
+            // Inserted alongside both, and read by the one surface that
+            // outlives a single request's credential check (ADR 0043).
+            request
+                .extensions_mut()
+                .insert(RequestDeadline(authenticated.expires_at));
             next.run(request).await
         }
         // The `Unauthenticated` display text names the mechanism that failed

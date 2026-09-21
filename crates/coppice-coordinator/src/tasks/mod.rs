@@ -10,6 +10,10 @@ pub mod api_server;
 pub mod derived_stats;
 pub mod dispatch;
 pub mod event_fanout;
+// One client's `GET /api/v1/events` subscription (ADR 0043): the connection
+// task that pulls its catch-up and relays the live queue. Private — the
+// control plane opens one per request and nothing else has a reason to.
+pub(crate) mod event_stream;
 pub mod housekeeping;
 pub mod ingestion;
 // Stale-learner garbage collection (ADR 0037 §7): leader-only, evidence is

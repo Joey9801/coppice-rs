@@ -729,6 +729,58 @@ impl From<&coppice_state::Event> for TimelineEventBody {
     }
 }
 
+/// The `event: batch` frame of `GET /api/v1/events` (ADR 0043): everything
+/// one applied command produced that the subscription's filter admitted.
+///
+/// One frame per Raft index, **never split** — a command's events are one
+/// unit on this stream (ADR 0008), and the frame's SSE event id is `index`,
+/// which is exactly what a client hands back as `Last-Event-ID` to resume.
+/// The events are the same ADR 0032 wire shape `GetJobTimeline` serves: thin,
+/// identified by `(index, ordinal)`, with no job snapshot attached. A client
+/// that needs the job's current state re-reads it with `?min_index=<index>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventBatchFrame {
+    pub index: u64,
+    /// The producing command's advisory proposer stamp (ADR 0032). It may run
+    /// backwards as `index` advances; never reorder by it.
+    pub at: Timestamp,
+    /// Ascending by `ordinal`, with gaps wherever the filter excluded an
+    /// event — ordinals are batch positions, never renumbered per
+    /// subscription.
+    pub events: Vec<TimelineEvent>,
+}
+
+/// The `event: progress` frame (ADR 0043): a bookmark saying everything
+/// matching this subscription at or below `index` has been sent.
+///
+/// Sent when the subscription opens (or its catch-up completes) and then
+/// periodically, which is also what keeps an idle connection alive. Carries
+/// the same SSE event id as a batch would, so a client can reconnect from a
+/// bookmark on a stream where nothing it cares about has happened — the whole
+/// reason it exists, since without one such a client would resume from an
+/// ever-staler cursor and re-read history it has already seen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventProgressFrame {
+    pub index: u64,
+}
+
+/// The `event: gap` frame (ADR 0043): delivery was discontinuous.
+///
+/// Deliberately carries **no** SSE event id. A gap is not a position anything
+/// can resume from — that is what makes it a gap — so letting it set
+/// `Last-Event-ID` would hand a reconnecting client a cursor whose coverage
+/// claim is false. The client must instead re-query state with the same
+/// filter (`ListJobs`, which is why the subscription filter is restricted to
+/// leaves that query also accepts), take the `Coppice-Applied-Index` of that
+/// read, and resubscribe from it. The stream stays open and continues live
+/// meanwhile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventGapFrame {
+    /// The oldest index this replica could still have served — everything
+    /// below it is gone from the reconnection ring (ADR 0008).
+    pub earliest_available: u64,
+}
+
 /// `GET /api/v1/jobs/{job}/timeline` — one job's transition timeline
 /// (ADR 0032), served from this replica's fanout ring (tier 1) and honestly
 /// partial.
