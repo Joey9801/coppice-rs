@@ -581,7 +581,7 @@ fn event_matches(filter: &EventFilter, event: &Event) -> bool {
         (EventFilter::All, _) => true,
         (EventFilter::Job(job), Event::JobSubmitted { job: j }) => j == job,
         (EventFilter::Job(job), Event::JobStateChanged { job: j, .. }) => j == job,
-        (EventFilter::Job(job), Event::JobEvicted { job: j }) => j == job,
+        (EventFilter::Job(job), Event::JobEvicted { job: j, .. }) => j == job,
         (EventFilter::Job(job), Event::AttemptStateChanged { job: j, .. }) => j == job,
         (EventFilter::Job(job), Event::AllocationFunded { job: j, .. }) => j == job,
         (EventFilter::Job(job), Event::StopRequested { job: j, .. }) => j == job,
@@ -714,6 +714,7 @@ mod tests {
             applied_index,
             at: Timestamp::UNIX_EPOCH,
             events,
+            scopes: Vec::new(),
         }
     }
 

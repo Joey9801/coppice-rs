@@ -307,6 +307,7 @@ mod tests {
             applied_index: 2,
             at: ts(1_000),
             events: vec![queued_transition(true), queued_transition(false)],
+            scopes: Vec::new(),
         });
 
         // Virtual time: the first interval elapses, the bucket closes, and

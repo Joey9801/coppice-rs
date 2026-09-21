@@ -50,6 +50,35 @@ pub(crate) fn gather_metrics() {
     // Both histograms are pushed as the loop runs; nothing needs sampling.
 }
 
+/// The after-keys for every distinct job named by one command's events
+/// (ADR 0043), looked up in the state that command just produced.
+///
+/// Called on the sole apply task, so it is deliberately cheap: distinct ids
+/// only, one `jobs` lookup plus a bounded entity-parent walk each, and no
+/// clone of any map. Cloning the jobs map to defer this would be the
+/// expensive mistake — holding a clone forces `imbl` path-copies of inline
+/// `JobRecord`s on the very path that must not stall (KOI-5).
+///
+/// A job absent post-apply (an eviction) simply has no entry: its before-keys
+/// ride on the `JobEvicted` event itself.
+fn resolve_scopes(
+    state: &StateMachine,
+    events: &[coppice_state::Event],
+) -> Vec<(coppice_core::id::JobId, coppice_state::JobScope)> {
+    let mut seen: Vec<coppice_core::id::JobId> = Vec::new();
+    let mut scopes = Vec::new();
+    for job in events.iter().filter_map(coppice_state::Event::job) {
+        if seen.contains(&job) {
+            continue;
+        }
+        seen.push(job);
+        if let Some(scope) = state.job_scope(job) {
+            scopes.push((job, scope));
+        }
+    }
+    scopes
+}
+
 /// Run the apply loop until the request channel closes.
 ///
 /// `initial_applied_index` is the log index the recovered `state` reflects —
@@ -101,6 +130,7 @@ pub(crate) async fn run(
                                 tap.emit(EventBatch {
                                     applied_index: *index,
                                     at: command.stamped_at(),
+                                    scopes: resolve_scopes(&state, &applied.events),
                                     events: applied.events.clone(),
                                 });
                             }
@@ -313,6 +343,133 @@ mod tests {
         assert_eq!(one_request, expected);
         assert_eq!(singletons, expected);
         assert_eq!(pairs, expected);
+    }
+
+    /// ADR 0043 scope keys. Two halves, asserted on one real log:
+    ///
+    /// - **after-keys** are resolved from the state the command produced, one
+    ///   entry per distinct job, including the job's entity ancestry — so a
+    ///   `subtree` filter can be answered without the fanout ever touching a
+    ///   later view (KOI-3);
+    /// - an **evicted** job has no after-keys at all (it is gone from state),
+    ///   and its `JobEvicted` event carries the before-keys instead.
+    #[tokio::test]
+    async fn scopes_are_resolved_after_apply_and_eviction_carries_before_keys() {
+        use coppice_core::id::{JobId, QuotaEntityId};
+        use coppice_state::command::{
+            AbortJob, ConfigureQuotaEntity, EvictTerminalJobs, SubmitJob,
+        };
+
+        let root = QuotaEntityId(uuid::Uuid::from_u128(0xE0));
+        let team = QuotaEntityId(uuid::Uuid::from_u128(0xE1));
+        let job = JobId(uuid::Uuid::from_u128(1));
+        let entity = |id, parent| {
+            coppice_state::Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+                entity: id,
+                parent,
+                name: "e".into(),
+                quota: coppice_core::quota::CostUnits(1_000_000_000_000),
+                actor: None,
+                updated_at: ts(1),
+            })
+        };
+        let mut metadata = coppice_core::metadata::JobMetadata::new();
+        metadata.insert("team".into(), "platform".into());
+        let submit = coppice_state::Command::SubmitJob(SubmitJob {
+            job: coppice_core::job::Job {
+                id: job,
+                image: "registry/img:latest".into(),
+                command: vec!["run".into()],
+                entrypoint: None,
+                requests: coppice_core::resource::Resources {
+                    cpu_millis: 1_000,
+                    ..Default::default()
+                },
+                priority: 0,
+                max_runtime: None,
+                quota_entity: team,
+                retry: Default::default(),
+                abort_requested: None,
+                submitted_by: Some("alice".into()),
+                metadata: metadata.clone(),
+                env: Default::default(),
+            },
+            multiplier: coppice_core::quota::PriorityMultiplier::ONE,
+            actor: None,
+            submitted_at: ts(2),
+        });
+        let abort = coppice_state::Command::AbortJob(AbortJob {
+            job,
+            reason: None,
+            requested_at: ts(3),
+            actor: None,
+        });
+        let evict = coppice_state::Command::EvictTerminalJobs(EvictTerminalJobs {
+            jobs: vec![job],
+            evicted_at: ts(4),
+        });
+
+        let (publisher, views) =
+            ViewPublisher::new(StateMachine::default(), 0, ViewPublisherConfig::default());
+        let (tap, mut tap_rx) = EventTap::channel(64);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run(StateMachine::default(), 0, rx, publisher, tap));
+
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(ApplyRequest::Apply {
+            entries: vec![
+                (1, entity(root, None)),
+                (2, entity(team, Some(root))),
+                (3, submit),
+                (4, abort),
+                (5, evict),
+            ],
+            reply,
+        })
+        .await
+        .unwrap();
+        for outcome in reply_rx.await.unwrap() {
+            outcome.expect("every command in this log applies");
+        }
+        drop(tx);
+        handle.await.unwrap();
+        drop(views);
+
+        let mut batches = Vec::new();
+        while let Some(item) = tap_rx.recv().await {
+            match item {
+                TapItem::Batch(batch) => batches.push(batch),
+                TapItem::Gap { .. } => panic!("nothing was dropped"),
+            }
+        }
+
+        // The submission's own batch: after-keys for exactly the one job it
+        // named, entity-first ancestry and all.
+        let submitted = batches
+            .iter()
+            .find(|b| b.applied_index == 3)
+            .expect("the submission emitted a batch");
+        assert_eq!(submitted.scopes.len(), 1);
+        let scope = submitted.scope(job).expect("the job exists post-apply");
+        assert_eq!(scope.entity_chain, vec![team, root]);
+        assert_eq!(scope.submitted_by.as_deref(), Some("alice"));
+        assert_eq!(scope.metadata, metadata);
+
+        // The eviction's batch: nothing to resolve after apply, and the event
+        // carries the keys instead.
+        let evicted = batches
+            .iter()
+            .find(|b| b.applied_index == 5)
+            .expect("the eviction emitted a batch");
+        assert!(
+            evicted.scopes.is_empty(),
+            "an evicted job has no after-keys: it is gone from state"
+        );
+        let [coppice_state::Event::JobEvicted { scope, .. }] = evicted.events.as_slice() else {
+            panic!("expected one eviction event, got {:?}", evicted.events);
+        };
+        assert_eq!(scope.entity_chain, vec![team, root]);
+        assert_eq!(scope.metadata, metadata);
     }
 
     #[tokio::test]

@@ -220,6 +220,91 @@ impl StateMachine {
         gap.dedup();
         gap
     }
+
+    /// The quota entity itself, then each ancestor up to the root — the
+    /// `entity_chain` of a [`JobScope`].
+    ///
+    /// Bounded by [`QUOTA_TREE_DEPTH_CAP`], and defensively so: apply already
+    /// refuses a `ConfigureQuotaEntity` that would cycle or exceed the cap, but
+    /// this walk is on the event path and must terminate whatever the tree
+    /// says. An entity absent from the tree contributes itself and stops — a
+    /// job whose entity has been reconfigured away still has an identity, and
+    /// an empty chain would silently match nothing.
+    pub fn entity_chain(&self, entity: QuotaEntityId) -> Vec<QuotaEntityId> {
+        let mut chain = Vec::new();
+        let mut current = Some(entity);
+        while let Some(id) = current {
+            if chain.len() as u32 >= QUOTA_TREE_DEPTH_CAP {
+                break;
+            }
+            chain.push(id);
+            current = self.quota_entities.get(&id).and_then(|e| e.parent);
+        }
+        chain
+    }
+
+    /// The scope keys a job carries **right now** — the "after" half of the
+    /// ADR 0043 before-OR-after subscription match.
+    ///
+    /// Resolved by direct lookup, never by scanning: the apply loop calls this
+    /// once per distinct job id named by a command's events, immediately after
+    /// the command applied, and hands the results to the fanout on the
+    /// `EventBatch`. `None` for a job the command removed (eviction), which is
+    /// exactly the case the event's own before-keys cover.
+    pub fn job_scope(&self, job: JobId) -> Option<JobScope> {
+        let record = self.jobs.get(&job)?;
+        Some(JobScope {
+            entity_chain: self.entity_chain(record.spec.quota_entity),
+            submitted_by: record.spec.submitted_by.clone(),
+            metadata: record.spec.metadata.clone(),
+        })
+    }
+}
+
+/// The identity-like keys a job-filtered subscription evaluates against
+/// (ADR 0043).
+///
+/// Stamped at apply time and carried on the derived event stream, never looked
+/// up in a later view: a subscription's verdict must be a pure function of the
+/// committed log, so every replica delivers the same events for the same
+/// filter and a cursor resume is portable between them (KOI-3). That is why
+/// these are keys and not a job snapshot — they are the only fields the
+/// restricted subscription filter can name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobScope {
+    /// The job's own quota entity first, then its ancestors up to the root
+    /// (see [`StateMachine::entity_chain`]). An `exact` entity match tests
+    /// the head; a `subtree` match tests membership.
+    pub entity_chain: Vec<QuotaEntityId>,
+    /// `Job.submitted_by` (ADR 0023); `None` for an internal or pre-authz
+    /// submission, which no `submitted_by` filter matches.
+    pub submitted_by: Option<String>,
+    /// The job's metadata map (ADR 0042).
+    pub metadata: coppice_core::metadata::JobMetadata,
+}
+
+impl JobScope {
+    /// Borrow these keys for one match.
+    pub fn view(&self) -> ScopeView<'_> {
+        ScopeView {
+            entity_chain: &self.entity_chain,
+            submitted_by: self.submitted_by.as_deref(),
+            metadata: &self.metadata,
+        }
+    }
+}
+
+/// A borrowed [`JobScope`], so the "before" half of a match can be assembled
+/// from pieces that live in different places without cloning either.
+///
+/// A metadata update changes only the map, so its before-view is the event's
+/// `previous` map over the after-scope's entity chain and submitter — the
+/// borrow is what keeps that free.
+#[derive(Debug, Clone, Copy)]
+pub struct ScopeView<'a> {
+    pub entity_chain: &'a [QuotaEntityId],
+    pub submitted_by: Option<&'a str>,
+    pub metadata: &'a coppice_core::metadata::JobMetadata,
 }
 
 /// A validated PEM bundle of X.509 **CA certificates** — public material only
@@ -865,21 +950,76 @@ pub enum Event {
     },
     JobEvicted {
         job: JobId,
+        /// The evicted job's scope keys as of immediately **before** the
+        /// removal — the ADR 0043 "before" half of a subscription match, and
+        /// the only half there is: the job is gone from state by the time the
+        /// fanout sees this, so nothing could look them up afterwards. Moved
+        /// out of the removed record, never cloned.
+        ///
+        /// Events are derived output, never replicated and never persisted,
+        /// so carrying them here costs nothing on the log or in a snapshot.
+        /// They are also not on the wire: `TimelineEventBody` stays thin.
+        scope: JobScope,
     },
     /// A job's metadata map changed (ADR 0042). Emitted only when the stored
     /// map actually differs; an update that computes to the same map is an
     /// accepted no-op with no event.
     JobMetadataUpdated {
         job: JobId,
+        /// The map the job carried immediately **before** this update, moved
+        /// out as the new one was installed. The rest of the job's scope keys
+        /// are unchanged by this command, so the fanout composes the "before"
+        /// view from this map and the batch's after-scope (ADR 0043). Derived
+        /// output only — never replicated, never on the wire.
+        previous: coppice_core::metadata::JobMetadata,
     },
     QuotaEntityConfigured {
         entity: QuotaEntityId,
+        /// Whether this command moved an **existing** entity under a different
+        /// parent (ADR 0043).
+        ///
+        /// A reparent silently moves every job below `entity` into or out of
+        /// any subscription whose filter reads an entity *subtree*: the jobs
+        /// themselves are untouched, so nothing names them, yet their stamped
+        /// `entity_chain` changes from the next command on. The fanout turns
+        /// this flag into a gap for exactly those subscribers, which is the
+        /// ADR 0008 answer to a discontinuity nothing else can express.
+        ///
+        /// False for a newly created entity (nothing can be under it yet) and
+        /// for a reconfiguration that leaves the parent as it was. Derived
+        /// output only — never replicated, never on the wire.
+        reparented: bool,
     },
     PolicyUpdated,
     AuthorizationUpdated,
     ClusterVersionBumped {
         to: u32,
     },
+}
+
+impl Event {
+    /// The job this event is scoped to, or `None` for a cluster- or
+    /// node-scoped one.
+    ///
+    /// The single place that knows which variants are job-scoped, so the apply
+    /// loop's after-key resolution and the fanout's subscription matching
+    /// cannot disagree about the set (ADR 0043).
+    pub fn job(&self) -> Option<JobId> {
+        match self {
+            Event::JobSubmitted { job }
+            | Event::JobStateChanged { job, .. }
+            | Event::AttemptStateChanged { job, .. }
+            | Event::AllocationFunded { job, .. }
+            | Event::StopRequested { job, .. }
+            | Event::JobEvicted { job, .. }
+            | Event::JobMetadataUpdated { job, .. } => Some(*job),
+            Event::NodeEpochBumped { .. }
+            | Event::QuotaEntityConfigured { .. }
+            | Event::PolicyUpdated
+            | Event::AuthorizationUpdated
+            | Event::ClusterVersionBumped { .. } => None,
+        }
+    }
 }
 
 /// The successful result of applying one command.

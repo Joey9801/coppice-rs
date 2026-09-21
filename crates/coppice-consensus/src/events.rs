@@ -29,8 +29,9 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::Notify;
 
+use coppice_core::id::JobId;
 use coppice_core::time::Timestamp;
-use coppice_state::Event;
+use coppice_state::{Event, JobScope};
 
 /// The events emitted by applying **one** committed command, in emission
 /// order.
@@ -53,6 +54,29 @@ pub struct EventBatch {
     /// clocks, so `at` regressing as the index advances is normal.
     pub at: Timestamp,
     pub events: Vec<Event>,
+    /// The scope keys each job named by `events` carries **after** this
+    /// command applied (ADR 0043), one entry per distinct job id, ascending.
+    ///
+    /// Resolved by the apply loop from the post-apply state — never by the
+    /// fanout from a later view, which is the KOI-3 rule that makes a
+    /// subscription's verdict a pure function of the committed log. A job the
+    /// command removed has no entry here; its "before" keys ride on the
+    /// `JobEvicted` event instead.
+    ///
+    /// A `Vec` and not a map: a command names one or two jobs in the
+    /// overwhelming majority of cases, and a linear scan over that beats a
+    /// map allocation on the serial apply path.
+    pub scopes: Vec<(JobId, JobScope)>,
+}
+
+impl EventBatch {
+    /// This batch's after-keys for `job`, if it still exists post-apply.
+    pub fn scope(&self, job: JobId) -> Option<&JobScope> {
+        self.scopes
+            .iter()
+            .find(|(id, _)| *id == job)
+            .map(|(_, scope)| scope)
+    }
 }
 
 /// Internal channel message: a batch tagged with a dense per-tap sequence so
@@ -295,6 +319,7 @@ mod tests {
             applied_index,
             at: Timestamp::UNIX_EPOCH,
             events: vec![Event::PolicyUpdated],
+            scopes: Vec::new(),
         }
     }
 
@@ -391,6 +416,7 @@ mod tests {
             applied_index: 1,
             at: Timestamp::UNIX_EPOCH,
             events: vec![],
+            scopes: Vec::new(),
         });
         tap.emit(batch(2));
 

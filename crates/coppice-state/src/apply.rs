@@ -273,7 +273,10 @@ impl StateMachine {
             Some(r) => (
                 r.spec.quota_entity,
                 r.spec.submitted_by.clone(),
-                r.spec.metadata.clone(),
+                // Borrowed for the patch fold and the no-op comparison below;
+                // the stored map itself is *moved* out at the write, which is
+                // what gives the event its before-keys for free.
+                &r.spec.metadata,
             ),
         };
         // Ownership comes from state, so it is re-derived here rather than
@@ -302,14 +305,23 @@ impl StateMachine {
         // sent, replicated state never holds an oversized map.
         metadata::validate(&next)
             .map_err(|e| RejectionReason::InvalidJobMetadata(e.to_string()))?;
-        if next == current {
+        if next == *current {
             return Ok(Applied::default());
         }
-        if let Some(r) = self.jobs.get_mut(&c.job) {
-            r.spec.metadata = next;
-        }
+        // The job was present above and nothing since could have removed it.
+        let Some(record) = self.jobs.get_mut(&c.job) else {
+            return Err(RejectionReason::UnknownJob(c.job));
+        };
+        // Swap rather than assign: the displaced map is the event's before-key
+        // (ADR 0043), so the subscription filter can see a job that matched on
+        // a key this very update removed. No extra clone — the old map is
+        // moved straight onto the event.
+        let previous = std::mem::replace(&mut record.spec.metadata, next);
         Ok(Applied {
-            events: vec![Event::JobMetadataUpdated { job: c.job }],
+            events: vec![Event::JobMetadataUpdated {
+                job: c.job,
+                previous,
+            }],
         })
     }
 
@@ -1019,7 +1031,20 @@ impl StateMachine {
                     }
                 }
             }
-            events.push(Event::JobEvicted { job: *job });
+            // The job is gone from state as of this instant, so a subscription
+            // that matched it can only be told so from keys captured here
+            // (ADR 0043 before-keys). The chain walk reads the entity tree,
+            // which the removals above never touch. Moved out of the removed
+            // record — this record is dropped on the next line either way.
+            let entity_chain = self.entity_chain(rec.spec.quota_entity);
+            events.push(Event::JobEvicted {
+                job: *job,
+                scope: crate::JobScope {
+                    entity_chain,
+                    submitted_by: rec.spec.submitted_by,
+                    metadata: rec.spec.metadata,
+                },
+            });
         }
         Ok(Applied { events })
     }
@@ -1115,15 +1140,23 @@ impl StateMachine {
                 new_parent: c.parent.as_ref(),
             },
         )?;
+        // Whether this command moves an existing entity under a different
+        // parent. Decided here, with the old and the new parent both in hand,
+        // because no later reader can tell the two apart — and a subtree
+        // subscription's membership just changed for every job below
+        // `c.entity` without any of them being named (ADR 0043).
+        let mut reparented = false;
         match self.quota_entities.get_mut(&c.entity) {
             // Usage and `created_at` are preserved on update: reconfiguration
             // is not an amnesty, and the creation instant never moves.
             Some(e) => {
+                reparented = e.parent != c.parent;
                 e.parent = c.parent;
                 e.name = c.name.clone();
                 e.quota = c.quota;
                 e.updated_at = c.updated_at;
             }
+            // A fresh entity is not a reparent: nothing can be under it yet.
             None => {
                 self.quota_entities.insert(
                     c.entity,
@@ -1139,7 +1172,10 @@ impl StateMachine {
             }
         }
         Ok(Applied {
-            events: vec![Event::QuotaEntityConfigured { entity: c.entity }],
+            events: vec![Event::QuotaEntityConfigured {
+                entity: c.entity,
+                reparented,
+            }],
         })
     }
 
