@@ -123,6 +123,7 @@ jobs:
           install -m 0644 deploy/systemd/*.service "$stage/deploy/systemd/"
           install -m 0644 deploy/examples/*.toml "$stage/deploy/examples/"
           install -m 0644 deploy/README.md "$stage/deploy/"
+          install -m 0644 LICENSE-APACHE LICENSE-MIT "$stage/"
           install -m 0755 deploy/install.sh "$stage/deploy/"
           mkdir -p dist
           tarball="dist/coppice-$version-${{ matrix.target }}.tar.gz"
