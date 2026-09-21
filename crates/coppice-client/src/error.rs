@@ -115,6 +115,20 @@ pub enum Error {
     /// server.
     #[error("obtaining a credential")]
     Credential(#[source] crate::credential::BoxError),
+
+    /// A [`JobEventStream`](crate::JobEventStream) produced no frame at all —
+    /// not even the `progress` bookmark that doubles as the server's keepalive
+    /// (ADR 0043) — for longer than its idle timeout allows.
+    ///
+    /// Retryable: nothing here says the request was wrong, only that this
+    /// connection is dead. [`JobEventWatcher`](crate::JobEventWatcher)
+    /// reconnects from the cursor exactly as it would after any other
+    /// retryable failure.
+    #[error("the event stream was silent for {idle:?}, longer than the server's keepalive allows")]
+    StreamIdle {
+        /// How long the stream had gone without a frame.
+        idle: std::time::Duration,
+    },
 }
 
 /// `; retry against the leader at …`, the suffix the CLI has always printed.
@@ -184,6 +198,7 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Transport(_) => true,
+            Error::StreamIdle { .. } => true,
             Error::Api { code, .. } => {
                 matches!(code, ErrorCode::Unavailable | ErrorCode::NotLeader)
             }
