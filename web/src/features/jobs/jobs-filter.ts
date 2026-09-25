@@ -13,7 +13,9 @@ import type { JobsSearch } from '@/routes/jobs.index'
 export function buildFilter(search: JobsSearch): JobFilter | undefined {
   const leaves: JobFilter[] = []
   if (search.state) leaves.push({ phase: { in: [search.state] } })
-  if (search.entity) leaves.push({ entity: { id: search.entity } })
+  // `entity` is a ref (ADR 0045): an id from an entity page's link, or a path
+  // picked or typed in the filter bar. The server resolves either.
+  if (search.entity) leaves.push({ entity: { ref: search.entity } })
   if (search.node) leaves.push({ node: search.node })
   if (search.q) leaves.push({ search: search.q })
   if (search.mkey) {

@@ -1,7 +1,27 @@
+import type { ReactNode } from 'react'
 import { fireEvent, render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { JobDetail, JobSpec } from '@/api/types'
 import { JobSpecCard } from './job-spec-card'
+
+// TanStack Router `Link` needs a router context we don't set up in unit
+// tests; render it as a plain anchor encoding `to`/`params` in the href.
+vi.mock('@tanstack/react-router', () => ({
+  Link: ({
+    to,
+    params,
+    children,
+    ...rest
+  }: {
+    to: string
+    params?: Record<string, string>
+    children?: ReactNode
+  }) => (
+    <a href={`${to}?${new URLSearchParams(params).toString()}`} {...rest}>
+      {children}
+    </a>
+  ),
+}))
 
 function spec(overrides: Partial<JobSpec> = {}): JobSpec {
   return {
@@ -13,6 +33,7 @@ function spec(overrides: Partial<JobSpec> = {}): JobSpec {
     priority: 0,
     maxRuntimeSeconds: null,
     quotaEntity: 'quota-00000000-0000-0000-0000-000000000001',
+    quotaEntityPath: 'acme/team-a',
     retry: { maxRetries: 0, retryUserErrors: false },
     ...overrides,
   }

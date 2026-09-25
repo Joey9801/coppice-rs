@@ -32,6 +32,13 @@ export type NodeId = string
 export type AttemptId = string
 export type AllocationId = string
 export type QuotaEntityId = string
+
+/**
+ * Anywhere a client *names* a quota entity (ADR 0045): either a
+ * `quota-<uuid>` id or a slash path (`acme/eng/platform`). A string that
+ * parses as an id is an id; anything else is a path.
+ */
+export type QuotaEntityRef = string
 /**
  * Raft identity of a coordinator replica (`CoordinatorId = u64` in Rust).
  * Carried as a decimal string across the JSON boundary: these ids are random
@@ -288,6 +295,11 @@ export interface JobSpec {
   priority: number
   maxRuntimeSeconds: number | null
   quotaEntity: QuotaEntityId
+  /**
+   * The owning entity's path (`acme/eng/platform`, ADR 0045), resolved at
+   * read time — a rename changes it, the id above never does.
+   */
+  quotaEntityPath: string
   retry: {
     maxRetries: number
     retryUserErrors: boolean
@@ -299,7 +311,8 @@ export interface JobSummary {
   state: JobState
   image: string
   quotaEntity: QuotaEntityId
-  quotaEntityName: string
+  /** The owning entity's path (ADR 0045), resolved at read time. */
+  quotaEntityPath: string
   priority: number
   submittedAt: Date
   terminalAt: Date | null
@@ -344,7 +357,10 @@ export interface QueuePositionExplainer {
   /** One entry per quota entity from leaf to root. */
   penaltyChain: Array<{
     entity: QuotaEntityId
+    /** This entity's own segment. */
     name: string
+    /** Full path, root first (ADR 0045). */
+    path: string
     usageUcu: number
     quotaUcu: number
     /** usage/quota above 1.0 counts against you. */
@@ -464,9 +480,12 @@ export function jobCurrentAttempt(job: Pick<JobDetail, 'state' | 'attempts'>): A
  * Leaves:
  * - `phase`: matches the displayed phase (`derivePhase`), not the raw
  *   `JobState`; `in` is non-empty (empty is invalid).
- * - `entity`: matches jobs owned by a quota entity. `scope` defaults to
- *   `'subtree'` (the entity plus all descendants); `'exact'` matches only the
- *   named entity. An unknown entity id matches nothing (not an error).
+ * - `entity`: matches jobs owned by a quota entity, named by `ref` — a
+ *   `QuotaEntityRef` (ADR 0045): a `quota-<uuid>` id or a slash path.
+ *   `scope` defaults to `'subtree'` (the entity plus all descendants);
+ *   `'exact'` matches only the named entity. An unknown *id* matches nothing
+ *   (not an error); an unresolvable *path* is invalid (a typo must not
+ *   quietly return an empty list).
  * - `node`: the current attempt's node. Unknown ⇒ matches nothing.
  * - `image`: exactly one of `contains` / `equals` (both or neither invalid).
  * - `id`: `in` is a non-empty set of job ids (empty is invalid).
@@ -490,7 +509,7 @@ export type JobFilter =
   | { any: JobFilter[] }
   | { not: JobFilter }
   | { phase: { in: JobPhase[] } }
-  | { entity: { id: QuotaEntityId; scope?: 'subtree' | 'exact' } }
+  | { entity: { ref: QuotaEntityRef; scope?: 'subtree' | 'exact' } }
   | { node: NodeId }
   | { image: { contains: string } | { equals: string } }
   | { id: { in: JobId[] } }
@@ -755,7 +774,10 @@ export interface HostFacts {
 
 export interface QuotaEntityView {
   id: QuotaEntityId
+  /** This entity's own segment (see `QuotaEntityNode.name`). */
   name: string
+  /** Full path, root first (see `QuotaEntityNode.path`). */
+  path: string
   parent: QuotaEntityId | null
   quotaUcu: number
   /** Decayed usage as of "now" (24h half-life by default). */
@@ -777,8 +799,18 @@ export type QuotaEntityOrigin = 'configured' | 'sso'
 /** One node of the quota-entity tree, as listed by the explorer. */
 export interface QuotaEntityNode {
   id: QuotaEntityId
-  /** Full display path, slash-separated ("Acme/Eng/Platform"). */
+  /**
+   * This entity's own path segment (ADR 0045): 1–63 chars of
+   * `[A-Za-z0-9._-]`, first alphanumeric, never itself a `quota-<uuid>`,
+   * unique (case-sensitively) among its siblings. See `isValidEntitySegment`.
+   */
   name: string
+  /**
+   * Ancestors' names root first, joined by `/` (`acme/eng/platform`) — no
+   * leading or trailing slash. Derived at read time from the parent chain,
+   * never stored; a rename or reparent changes it, the id never does.
+   */
+  path: string
   parent: QuotaEntityId | null
   origin: QuotaEntityOrigin
   /** OIDC `sub` the entity was auto-minted for; only on `sso` entities. */
@@ -822,9 +854,11 @@ export interface QuotaEntityDetail {
  * preserve accumulated usage — reconfiguration is not an amnesty.
  */
 export interface ConfigureQuotaEntityInput {
-  /** Null proposes a create; the server mints the id. */
+  /** Null proposes a create; the client mints the id. */
   entity: QuotaEntityId | null
+  /** The parent, by id. The wire also accepts a path here (ADR 0045). */
   parent: QuotaEntityId | null
+  /** One path segment — see `QuotaEntityNode.name`. */
   name: string
   quotaUcu: number
 }

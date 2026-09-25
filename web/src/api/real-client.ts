@@ -115,8 +115,10 @@ export function createRealClient(): CoppiceApi {
       getJson('/quota-entities', (body: WireListQuotaEntitiesResponse) =>
         body.entities.map(mapQuotaEntityNode),
       ),
-    getQuotaEntity: (id) =>
-      getJson(`/quota-entities/${encodeURIComponent(id)}`, mapQuotaEntityDetail),
+    // A ref is an id or a path; a path's `/` must be percent-encoded so it
+    // stays one route segment (`acme%2Feng`, ADR 0045).
+    getQuotaEntity: (ref) =>
+      getJson(`/quota-entities/${encodeURIComponent(ref)}`, mapQuotaEntityDetail),
     configureQuotaEntity: (input) => configureQuotaEntity(input),
   }
 }
@@ -272,6 +274,8 @@ interface WireSessionBinding {
   role: WireBindingRole
   /** Subtree root the role is scoped to; `null` = cluster-wide. */
   scope: QuotaEntityId | null
+  /** That root's path (ADR 0045); `null` exactly when `scope` is. */
+  scope_path: string | null
 }
 
 interface WireGetSessionResponse {
@@ -654,7 +658,7 @@ interface WireJobSummary {
   attempt: AttemptId | null
   image: string
   quota_entity: QuotaEntityId
-  quota_entity_name: string
+  quota_entity_path: string
   priority: number
   submitted_at: string
   terminal_at: string | null
@@ -672,7 +676,7 @@ function mapJobSummary(j: WireJobSummary): JobSummary {
     state: mapJobState(j.state, j.attempt),
     image: j.image,
     quotaEntity: j.quota_entity,
-    quotaEntityName: j.quota_entity_name,
+    quotaEntityPath: j.quota_entity_path,
     priority: j.priority,
     submittedAt: toDate(j.submitted_at),
     terminalAt: toDateOrNull(j.terminal_at),
@@ -769,6 +773,7 @@ interface WireJobSpecView {
   priority: number
   max_runtime_seconds: number | null
   quota_entity: QuotaEntityId
+  quota_entity_path: string
   retry: { max_retries: number; retry_user_errors: boolean }
 }
 
@@ -782,6 +787,7 @@ function mapJobSpec(s: WireJobSpecView): JobSpec {
     priority: s.priority,
     maxRuntimeSeconds: s.max_runtime_seconds,
     quotaEntity: s.quota_entity,
+    quotaEntityPath: s.quota_entity_path,
     retry: { maxRetries: s.retry.max_retries, retryUserErrors: s.retry.retry_user_errors },
   }
 }
@@ -796,6 +802,7 @@ function mapJobSpec(s: WireJobSpecView): JobSpec {
 interface WirePenaltyLink {
   entity: QuotaEntityId
   name: string
+  path: string
   usage_ucu: number
   quota_ucu: number
   over_quota_ratio: number | null
@@ -829,6 +836,7 @@ function mapQueuePositionExplainer(q: WireQueuePositionExplainer): QueuePosition
     penaltyChain: q.penalty_chain.map((p) => ({
       entity: p.entity,
       name: p.name,
+      path: p.path,
       usageUcu: p.usage_ucu,
       quotaUcu: p.quota_ucu,
       overQuotaRatio: orInfinity(p.over_quota_ratio),
@@ -877,6 +885,7 @@ function mapCostReport(c: WireCostReport): CostReport {
 interface WireQuotaEntityView {
   id: QuotaEntityId
   name: string
+  path: string
   parent: QuotaEntityId | null
   quota_ucu: number
   usage_ucu: number
@@ -888,6 +897,7 @@ function mapQuotaEntityView(v: WireQuotaEntityView): QuotaEntityView {
   return {
     id: v.id,
     name: v.name,
+    path: v.path,
     parent: v.parent,
     quotaUcu: v.quota_ucu,
     usageUcu: v.usage_ucu,
@@ -1238,6 +1248,7 @@ function mapNodeUtilization(n: WireGetNodeUtilizationResponse): NodeUtilization 
 interface WireQuotaEntityNode {
   id: QuotaEntityId
   name: string
+  path: string
   parent: QuotaEntityId | null
   quota_ucu: number
   usage_ucu: number
@@ -1259,6 +1270,7 @@ function mapQuotaEntityNode(n: WireQuotaEntityNode): QuotaEntityNode {
   return {
     id: n.id,
     name: n.name,
+    path: n.path,
     parent: n.parent,
     origin: 'configured',
     principal: null,
@@ -1315,6 +1327,8 @@ function mapQuotaEntityDetail(d: WireGetQuotaEntityResponse): QuotaEntityDetail 
 
 interface WireConfigureQuotaEntityResponse {
   entity: QuotaEntityId
+  /** The entity's path as of the write (ADR 0045); the follow-up read re-derives it. */
+  path: string
   log_index: number
 }
 
