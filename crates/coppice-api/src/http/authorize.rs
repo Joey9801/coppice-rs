@@ -23,6 +23,7 @@
 //! evaluates anything itself: one place, so a verb cannot be added with its
 //! check quietly omitted.
 
+use coppice_core::entity_ref::QuotaEntityRef;
 use coppice_core::id::{JobId, QuotaEntityId};
 use coppice_state::authz::{self, Verb};
 use coppice_state::Actor;
@@ -39,8 +40,9 @@ use crate::{Consistency, ControlPlane, ReadOptions};
 /// that arm, so it names the job and [`precheck`] resolves it.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Intent<'a> {
-    /// `POST /api/v1/jobs`.
-    Submit { entity: &'a QuotaEntityId },
+    /// `POST /api/v1/jobs`. The entity as the client named it (ADR 0045):
+    /// [`precheck`] resolves a path against its own eventual view.
+    Submit { entity: &'a QuotaEntityRef },
     /// `POST /api/v1/jobs/{job}/abort`.
     Abort { job: JobId },
     /// `PUT` and `POST /api/v1/jobs/{job}/metadata` (ADR 0042). Resolved
@@ -59,10 +61,11 @@ pub(super) enum Intent<'a> {
     /// verb (ADR 0041: removal is the end of the drain, not a further
     /// authority).
     RemoveNode,
-    /// `POST /api/v1/quota-entities`.
+    /// `POST /api/v1/quota-entities`. `parent` as the client named it, like
+    /// [`Submit`](Intent::Submit)'s entity.
     ConfigureQuotaEntity {
         entity: &'a QuotaEntityId,
-        new_parent: Option<&'a QuotaEntityId>,
+        parent: Option<&'a QuotaEntityRef>,
     },
     /// `PUT /api/v1/authorization`.
     UpdateAuthorization,
@@ -93,8 +96,25 @@ pub(super) async fn precheck<P: ControlPlane>(
         .await?;
     let state = view.state();
 
+    // Resolve a quota-entity reference (ADR 0045) against this same eventual
+    // view. A path the view does not hold may simply not have applied here
+    // yet — this replica may be a follower, or behind — so a miss is the
+    // unknown-job case below over again: decline to judge and leave the
+    // decision to the leader, which resolves the path authoritatively, and to
+    // apply. Never a 421 and never a 404 from here: this read is eventual
+    // precisely so that any replica can run it.
+    let resolved_entity;
+    let resolved_parent;
     let verb = match intent {
-        Intent::Submit { entity } => Verb::Submit { entity },
+        Intent::Submit { entity } => {
+            let Some(id) = state.resolve_quota_entity_ref(entity) else {
+                return Ok(());
+            };
+            resolved_entity = id;
+            Verb::Submit {
+                entity: &resolved_entity,
+            }
+        }
         // One arm for the two job verbs: the lookup, the ownership
         // derivation and the skip-on-unknown reasoning below are identical,
         // and only the verb constructed from them differs.
@@ -129,8 +149,18 @@ pub(super) async fn precheck<P: ControlPlane>(
             None => return Ok(()),
         },
         Intent::Drain | Intent::RemoveNode => Verb::Drain,
-        Intent::ConfigureQuotaEntity { entity, new_parent } => {
-            Verb::ConfigureQuotaEntity { entity, new_parent }
+        Intent::ConfigureQuotaEntity { entity, parent } => {
+            resolved_parent = match parent {
+                None => None,
+                Some(parent) => match state.resolve_quota_entity_ref(parent) {
+                    Some(id) => Some(id),
+                    None => return Ok(()),
+                },
+            };
+            Verb::ConfigureQuotaEntity {
+                entity,
+                parent: resolved_parent.as_ref(),
+            }
         }
         Intent::UpdateAuthorization => Verb::UpdateAuthorization,
     };

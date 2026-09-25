@@ -1697,10 +1697,19 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
 
         let (dto, actor) = crate::clientwrite::configure_from_pb(req)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let views = consensus.views();
         let outcome =
-            api_server::configure_quota_entity_here(consensus.as_ref(), &dto, &actor).await;
+            api_server::configure_quota_entity_here(consensus.as_ref(), &views, &dto, &actor).await;
+        // The path is the leader's to compute (ADR 0045) — it is where the
+        // parent was resolved — so it rides back with an applied outcome for
+        // the follower to relay.
+        let (outcome, path) = match outcome {
+            Ok(response) => (Ok(response.log_index), response.path),
+            Err(e) => (Err(e), String::new()),
+        };
         Ok(Response::new(pb::ForwardConfigureQuotaEntityResponse {
-            outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
+            outcome: Some(forwarded_outcome(outcome)?),
+            path,
         }))
     }
 
@@ -1720,7 +1729,9 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
 
         let (dto, actor) = crate::clientwrite::authorization_from_pb(req)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
-        let outcome = api_server::update_authorization_here(consensus.as_ref(), &dto, &actor).await;
+        let views = consensus.views();
+        let outcome =
+            api_server::update_authorization_here(consensus.as_ref(), &views, &dto, &actor).await;
         Ok(Response::new(pb::ForwardUpdateAuthorizationResponse {
             outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
         }))
@@ -1916,6 +1927,18 @@ fn forwarded_outcome(
         }
         Err(LocalWriteError::Api(ApiError::NotLeader { .. })) => {
             Outcome::NotLeader(pb::forward_write_outcome::NotLeader {})
+        }
+        // A quota-entity path this leader could not resolve, even at a read
+        // barrier (ADR 0045). Nothing was proposed, but the client is owed
+        // the answer an unknown id earns from apply, so it crosses as that
+        // classified rejection and the follower maps it to the same status.
+        Err(LocalWriteError::Api(ApiError::UnresolvedQuotaEntity(reason))) => {
+            Outcome::Rejected(pb::forward_write_outcome::Rejected {
+                kind: crate::clientwrite::rejection_kind_to_pb(
+                    coppice_api::RejectionKind::UnknownQuotaEntity,
+                ) as i32,
+                reason,
+            })
         }
         Err(LocalWriteError::Api(ApiError::Unavailable(message))) => {
             return Err(Status::unavailable(message))
@@ -3536,6 +3559,18 @@ mod tests {
         assert!(matches!(
             outcome(Err(LocalWriteError::NotLeader { leader: Some(9) })),
             Outcome::NotLeader(_)
+        ));
+        // A path this leader could not resolve (ADR 0045): nothing proposed,
+        // but it crosses as the classified unknown-entity rejection, so the
+        // follower answers exactly as an unknown id at apply would have —
+        // naming the path.
+        let path: coppice_core::entity_ref::QuotaEntityRef = "acme/eng".parse().unwrap();
+        assert!(matches!(
+            outcome(Err(LocalWriteError::Api(ApiError::unknown_quota_entity(&path)))),
+            Outcome::Rejected(r)
+                if r.reason.contains("acme/eng")
+                    && r.kind
+                        == pb::forward_write_outcome::RejectionKind::UnknownQuotaEntity as i32
         ));
     }
 

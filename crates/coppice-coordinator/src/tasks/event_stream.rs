@@ -198,8 +198,7 @@ enum CatchUp {
     /// The whole `(cursor, head]` range was served.
     Done,
     /// The range could not be served whole — retention overtook the resume
-    /// point mid-way, or it crossed a quota-entity reparent this selector
-    /// reads (ADR 0043). A gap was sent and the stream continues live.
+    /// point mid-way. A gap was sent and the stream continues live.
     Gapped,
     /// The client is gone, the fanout is gone, or shutdown fired.
     Ended,
@@ -243,24 +242,6 @@ async fn catch_up(
             if !forward(tx, EventStreamItem::Batch(convert(batch)), shutdown).await {
                 return CatchUp::Ended;
             }
-        }
-        // The page stopped at a quota-entity reparent, which changes which
-        // jobs this selector admits without any event naming them (ADR 0043).
-        // Everything below it has just gone out; the rest of the range is a
-        // gap, and the stream continues live from head — the same shape as a
-        // resume point retention overtook.
-        if let Some(reparent_at) = page.reparent_at {
-            // The resync has to reflect the move, so the move's own index is
-            // the earliest position a complete resume can start from — not
-            // the ring's, which may sit far below it.
-            let gap = EventStreamItem::Gap {
-                earliest_available: reparent_at.max(page.earliest_available),
-            };
-            return if forward(tx, gap, shutdown).await {
-                CatchUp::Gapped
-            } else {
-                CatchUp::Ended
-            };
         }
         match page.next {
             Some(next) => after = next,
@@ -366,15 +347,14 @@ mod tests {
         }
     }
 
-    /// The batch a `ConfigureQuotaEntity` that moved an existing entity
-    /// produces: one entity-scoped event naming no job at all.
-    fn reparent_batch(index: u64) -> EventBatch {
+    /// The batch a `ConfigureQuotaEntity` produces: one entity-scoped event
+    /// naming no job at all.
+    fn quota_entity_batch(index: u64) -> EventBatch {
         EventBatch {
             applied_index: index,
             at: Timestamp::UNIX_EPOCH,
             events: vec![Event::QuotaEntityConfigured {
                 entity: coppice_core::id::QuotaEntityId::new(),
-                reparented: true,
             }],
             scopes: Vec::new(),
         }
@@ -383,7 +363,7 @@ mod tests {
     fn subtree_selector(entity: coppice_core::id::QuotaEntityId) -> Arc<JobSelector> {
         Arc::new(
             JobSelector::compile(&dto::JobFilter::Entity(dto::EntityFilter {
-                id: entity,
+                entity: entity.into(),
                 scope: dto::EntityScope::Subtree,
             }))
             .expect("allowed leaf"),
@@ -523,11 +503,13 @@ mod tests {
         let _ = join.await;
     }
 
-    /// A resume whose range crosses a quota-entity reparent gets the batches
-    /// below it, then a gap, then the live stream — and no opening bookmark,
-    /// which would claim the coverage the gap just denied (ADR 0043).
+    /// A resume whose range crosses a quota-entity reconfiguration pages
+    /// straight through, even for a subtree selector: an entity's parent is
+    /// fixed at creation (ADR 0045), so no reconfiguration can move a job
+    /// into or out of a subtree, and the entity event itself is never on a
+    /// `jobs=` stream.
     #[tokio::test]
-    async fn a_catch_up_across_a_reparent_gaps_and_goes_live() {
+    async fn a_catch_up_across_a_quota_entity_reconfiguration_has_no_gap() {
         let entity = coppice_core::id::QuotaEntityId::new();
         let (mut tap, tap_rx) = EventTap::channel(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -535,7 +517,7 @@ mod tests {
 
         tap.emit(batch_under(1, entity));
         tap.emit(batch_under(2, entity));
-        tap.emit(reparent_batch(3));
+        tap.emit(quota_entity_batch(3));
         tap.emit(batch_under(4, entity));
         settle().await;
 
@@ -548,64 +530,13 @@ mod tests {
         .await
         .expect("subscribe");
 
-        // Below the reparent, delivered; then the discontinuity itself.
-        let (indexes, items) = collect(&mut sub, 2).await;
-        assert_eq!(indexes, vec![1, 2]);
-        match tokio::time::timeout(Duration::from_secs(5), sub.items.recv())
-            .await
-            .expect("a gap at the reparent")
-        {
-            Some(EventStreamItem::Gap { .. }) => {}
-            other => panic!("expected a gap, got {other:?}"),
-        }
-        assert!(
-            !items
-                .iter()
-                .any(|i| matches!(i, EventStreamItem::Progress { .. })),
-            "a stream that gapped must not bookmark its way past the hole"
-        );
-
-        // The stream stays open and live: batch 4 was above the reparent and
-        // below head, so it is part of what the resync covers; 5 is new.
-        tap.emit(batch_under(5, entity));
-        let (indexes, items) = collect(&mut sub, 1).await;
-        assert_eq!(indexes, vec![5]);
-        assert!(!items
-            .iter()
-            .any(|i| matches!(i, EventStreamItem::Gap { .. })));
-
-        let _ = shutdown_tx.send(true);
-        drop(tap);
-        let _ = join.await;
-    }
-
-    /// The same history, read by a selector that names no subtree: a reparent
-    /// cannot move a job into or out of its set, so the catch-up runs straight
-    /// through with no gap at all.
-    #[tokio::test]
-    async fn a_selector_that_reads_no_subtree_pages_across_a_reparent() {
-        let entity = coppice_core::id::QuotaEntityId::new();
-        let (mut tap, tap_rx) = EventTap::channel(64);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (fanout, join) = crate::tasks::event_fanout::spawn(tap_rx, 0, shutdown_rx.clone());
-
-        tap.emit(batch_under(1, entity));
-        tap.emit(batch_under(2, entity));
-        tap.emit(reparent_batch(3));
-        tap.emit(batch_under(4, entity));
-        settle().await;
-
-        let mut sub = open(&fanout, any_job_selector(), Some(0), Some(shutdown_rx))
-            .await
-            .expect("subscribe");
-
         let (indexes, items) = collect(&mut sub, 3).await;
         assert_eq!(indexes, vec![1, 2, 4], "the whole range, in order");
         assert!(
             !items
                 .iter()
                 .any(|i| matches!(i, EventStreamItem::Gap { .. })),
-            "no discontinuity for a selector that reads no ancestry"
+            "no discontinuity to report"
         );
 
         let _ = shutdown_tx.send(true);

@@ -39,7 +39,8 @@ use coppice_api::{
 use coppice_consensus::{
     Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, Role, StateView, StateViews,
 };
-use coppice_core::id::{ClusterId, JobId, NodeId};
+use coppice_core::entity_ref::QuotaEntityRef;
+use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
 
 use crate::tasks::node_client::NodeClient;
 use coppice_core::job::Job;
@@ -76,6 +77,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// coordinator-to-coordinator over mTLS and no client can reach it, so taking
 /// the actor as given is not a weakening: a peer able to forge one could
 /// propose the command directly.
+///
+/// Quota-entity references cross as the client wrote them (ADR 0045): a path
+/// is resolved by the leader against its own view, never by the replica that
+/// forwards — resolution reads replicated state, which ADR 0038 defers to the
+/// leader outright.
 pub trait LeaderWrites: Send + Sync + 'static {
     fn submit_job<'a>(
         &'a self,
@@ -193,9 +199,9 @@ impl From<ConsensusError> for LocalWriteError {
     }
 }
 
-/// How long [`submit_job_here`] waits for this replica's published view to
+/// How long [`lookup_linearized`] waits for this replica's published view to
 /// reach the [`Consensus::read_index`] barrier before giving up on judging a
-/// submission whose priority class it cannot find.
+/// write whose priority class or quota-entity path it cannot find.
 ///
 /// [`StateViews::at_least`] has no bound of its own — it waits until the
 /// apply loop publishes or goes away — and this wait sits inside a client's
@@ -203,6 +209,82 @@ impl From<ConsensusError> for LocalWriteError {
 /// and the honest answer for it is the retriable "cannot judge this right
 /// now", not a held-open connection and not a verdict.
 const BARRIER_CATCHUP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The ADR 0038 leadership screen, run before a write path reads replicated
+/// state: a replica the status watch reports as not leading stops here and
+/// hands the request over, so its own lagging view never renders a verdict.
+///
+/// "Follower"/"Unknown" is conclusive enough to act on — this replica is not
+/// going to be able to propose, so there is no point doing the work. "Leader"
+/// is not conclusive at all: a watch publishes a fact that was true when it
+/// was sampled, and leadership may already have moved. That is why every
+/// verdict a *miss* would render goes through [`lookup_linearized`]'s barrier.
+fn screen_leadership<C: Consensus>(consensus: &C) -> Result<(), LocalWriteError> {
+    match consensus.status().borrow().role {
+        Role::Leader { .. } => Ok(()),
+        Role::Follower { leader } => Err(LocalWriteError::NotLeader { leader }),
+        // Mid-election, with no leader to name. Forwarding has no target, so
+        // this is the redirect either way; what it must not be is a verdict
+        // minted from a view nobody is currently authoritative for.
+        Role::Unknown => Err(LocalWriteError::NotLeader { leader: None }),
+    }
+}
+
+/// Run `lookup` against replicated state the way ADR 0038 requires of a
+/// lookup whose *miss* is a terminal verdict: on the latest published view
+/// first, and only on a miss again on a view known to have caught up to a
+/// [`Consensus::read_index`] barrier.
+///
+/// `Ok(Ok(found))` is a hit — on the latest view, at no extra cost, which is
+/// sound for the lookups this serves because a hit can never be stale: a
+/// priority class is added, not silently redefined, and a quota-entity path
+/// names the same entity for good (ADR 0045: name and parent are fixed at
+/// creation, and there is no delete). `Ok(Err(view))` is a miss at a
+/// linearized point on the confirmed leader, handed back so the caller can
+/// say *what* was missing.
+///
+/// The barrier is leader-only, so a replica whose cached leadership has gone
+/// stale learns it there and forwards (`NotLeader`) instead of refusing; any
+/// other barrier failure is the retriable `UNAVAILABLE`, never a verdict. The
+/// catch-up wait is bounded by [`BARRIER_CATCHUP`], because `at_least` waits
+/// as long as it takes and a wedged apply loop must not pin a client's
+/// connection open — a replica that leads but cannot apply answers
+/// `UNAVAILABLE`.
+async fn lookup_linearized<C: Consensus, T>(
+    consensus: &C,
+    views: &StateViews,
+    lookup: impl Fn(&StateView) -> Option<T>,
+) -> Result<Result<T, StateView>, LocalWriteError> {
+    if let Some(found) = lookup(&views.latest()) {
+        return Ok(Ok(found));
+    }
+    let barrier = consensus.read_index().await?;
+    // Leadership is confirmed, but the barrier is a *future* index on a
+    // replica that has yet to apply it. Reading before the view catches up
+    // would re-run the same stale lookup that motivated the barrier.
+    let view = tokio::time::timeout(BARRIER_CATCHUP, views.at_least(barrier))
+        .await
+        .map_err(|_elapsed| {
+            LocalWriteError::Api(ApiError::Unavailable(format!(
+                "this replica did not catch up to the read barrier at index {barrier} \
+                 within {}s, so it cannot judge the request; retry it",
+                BARRIER_CATCHUP.as_secs()
+            )))
+        })??;
+    Ok(match lookup(&view) {
+        Some(found) => Ok(found),
+        None => Err(view),
+    })
+}
+
+/// The id a quota-entity reference names in one published view (ADR 0045).
+///
+/// An id is itself, unchecked — whether it exists is apply's call, at the
+/// command's log position — and a path is walked down the tree. Only a path
+/// can miss.
+fn resolve_ref(view: &StateView, reference: &QuotaEntityRef) -> Option<QuotaEntityId> {
+    view.state().resolve_quota_entity_ref(reference)
+}
 
 /// The replicated priority-multiplier for `priority` in one published view.
 ///
@@ -318,67 +400,48 @@ pub(crate) async fn submit_job_here<C: Consensus>(
     // publishes a fact that was true when it was sampled, and leadership may
     // already have moved. That is why the barrier below exists.
     //
-    // Only this write path needs the gate. `abort_job_here`,
-    // `configure_quota_entity_here`, and `update_job_metadata_here` validate
-    // nothing against the view — they build a command from the request and
-    // propose it — so their `NotLeader` already comes from the propose,
-    // which cannot be stale.
-    match consensus.status().borrow().role {
-        Role::Leader { .. } => {}
-        Role::Follower { leader } => return Err(LocalWriteError::NotLeader { leader }),
-        // Mid-election, with no leader to name. Forwarding has no target, so
-        // this is the redirect either way; what it must not be is an
-        // `Invalid` minted from a view nobody is currently authoritative for.
-        Role::Unknown => return Err(LocalWriteError::NotLeader { leader: None }),
-    }
+    // The quota-entity path (ADR 0045) is the same kind of read: a follower
+    // that has not applied the create of `acme/eng` yet would refuse a
+    // submission naming it, so it forwards the path unresolved rather than
+    // resolving it here.
+    //
+    // `abort_job_here`, `update_job_metadata_here`, and a root
+    // `configure_quota_entity_here` validate nothing against the view — they
+    // build a command from the request and propose it — so their `NotLeader`
+    // already comes from the propose, which cannot be stale.
+    screen_leadership(consensus)?;
 
-    // Multiplier resolution reads the replicated table off the latest
-    // view (ADR 0019: apply never sees the raw `priority: i32` in
-    // arithmetic) — this is the "synchronous validation" that needs
-    // `views` rather than being purely shape-level.
-    let multiplier = match multiplier_for(&views.latest(), req.priority) {
-        // The happy path is unchanged and stays free of extra round trips: a
-        // multiplier that resolves is a multiplier every replica agrees on
-        // (classes are added, not silently redefined), and the propose below
-        // is itself the leadership check — a replica that has lost leadership
-        // fails there with `NotLeader` and the caller forwards.
-        Some(multiplier) => multiplier,
-        // A *missing* multiplier is the one verdict that cannot be taken from
-        // a possibly-stale view, because `Invalid` is terminal: it tells the
-        // client to change a request the leader would have accepted, and no
-        // retry recovers from it. So before refusing, establish leadership
-        // authoritatively — `read_index` is the linearizable read barrier and
-        // is leader-only, so a replica whose watch was stale learns it here
-        // and forwards instead of vetoing.
-        None => {
-            // `NotLeader` becomes the forwarding path (the barrier just told
-            // us this replica is not authoritative); everything else is a
-            // "cannot serve this right now", never a verdict on the request.
-            let barrier = consensus.read_index().await?;
-            // Leadership is confirmed, but the barrier is a *future* index on
-            // a replica that has yet to apply it. Reading before the view
-            // catches up would re-run the same stale lookup that motivated
-            // the barrier, so wait for it — bounded, because `at_least` waits
-            // as long as it takes and a wedged apply loop must not pin a
-            // client's connection open indefinitely.
-            let view = tokio::time::timeout(BARRIER_CATCHUP, views.at_least(barrier))
-                .await
-                .map_err(|_elapsed| {
-                    LocalWriteError::Api(ApiError::Unavailable(format!(
-                        "this replica did not catch up to the read barrier at index {barrier} \
-                         within {}s, so it cannot judge the request; retry it",
-                        BARRIER_CATCHUP.as_secs()
-                    )))
-                })??;
-            // Now authoritative: at the linearized point `barrier`, this
-            // replica led and the table held no such class. That is a
-            // genuinely malformed request, and gets the 400 it deserves.
-            multiplier_for(&view, req.priority).ok_or_else(|| {
-                invalid(format!(
+    // The entity reference and the priority multiplier, both off the latest
+    // view (ADR 0019: apply never sees the raw `priority: i32` in arithmetic,
+    // and ADR 0045: the command carries the id a path names). A hit is final
+    // and costs no round trip — the propose below is itself the leadership
+    // check, so a replica that has lost leadership fails there with
+    // `NotLeader` and the caller forwards. A *miss* is the one verdict that
+    // cannot be taken from a possibly-stale view, because both of its answers
+    // are terminal ("change your request"), so it is only rendered behind a
+    // read barrier: a path created, or a class added, just before this
+    // request is found there rather than refused.
+    let found = lookup_linearized(consensus, views, |view| {
+        Some((
+            resolve_ref(view, &req.quota_entity)?,
+            multiplier_for(view, req.priority)?,
+        ))
+    })
+    .await?;
+    let (quota_entity, multiplier) = match found {
+        Ok(found) => found,
+        // Authoritative now: at the linearized barrier this replica led, and
+        // the state held no such entity, or no such class. Either is a
+        // genuinely bad request — the entity first, as the 409 an unknown id
+        // earns at apply, then the class, as the 400 it always was.
+        Err(view) => {
+            return Err(match resolve_ref(&view, &req.quota_entity) {
+                None => LocalWriteError::Api(ApiError::unknown_quota_entity(&req.quota_entity)),
+                Some(_) => invalid(format!(
                     "no multiplier configured for priority {}",
                     req.priority
-                ))
-            })?
+                )),
+            });
         }
     };
 
@@ -395,7 +458,7 @@ pub(crate) async fn submit_job_here<C: Consensus>(
             requests: req.requests.into(),
             priority: req.priority,
             max_runtime,
-            quota_entity: req.quota_entity,
+            quota_entity,
             retry: req.retry.map(Into::into).unwrap_or_default(),
             abort_requested: None,
             // Never taken from the request: apply stamps it from the
@@ -500,21 +563,49 @@ pub(crate) async fn update_job_metadata_here<C: Consensus>(
 /// Propose one quota-entity upsert on this replica, with no forwarding.
 ///
 /// The client-minted entity id is the upsert's idempotency identity
-/// (ADR 0026), echoed back on success. Direct copy of [`abort_job_here`]'s
-/// propose-and-map shape; the id and quota ride the command as-is, with
-/// `updated_at` stamped by this proposer (apply never reads a clock). Cycle /
-/// unknown-parent refusals come back through the rejection arm as a normal
-/// 409, and an ADR 0023 refusal through the same arm as
+/// (ADR 0026); the answer is the apply's log index and the entity's path.
+/// The id and quota ride the command as-is, with `updated_at` stamped by this
+/// proposer (apply never reads a clock). Unknown-parent, name-clash, too-deep
+/// and immutable-field refusals come back through the rejection arm as a
+/// normal 409, and an ADR 0023 refusal through the same arm as
 /// `PermissionDenied` — which the HTTP layer renders as a 403.
+///
+/// A `parent` — by path or by id — is resolved here, on the leader, and so is
+/// its path, from which the response's `path` is built (ADR 0045): that reads
+/// replicated state, so a replica that is not the leader forwards instead
+/// (ADR 0038), and a parent missing from the latest view is looked for again
+/// behind a read barrier before it is refused, so a client that creates
+/// `acme` and immediately creates a child under it is never refused by view
+/// publication lag. A hit needs no barrier: name and parent are fixed at
+/// creation and nothing is deleted, so a parent's path, once seen, is its
+/// path for good. A parentless upsert reads nothing and its path is its name.
 pub(crate) async fn configure_quota_entity_here<C: Consensus>(
     consensus: &C,
+    views: &StateViews,
     req: &ConfigureQuotaEntityRequest,
     actor: &Actor,
 ) -> Result<ConfigureQuotaEntityResponse, LocalWriteError> {
-    let entity = req.entity;
+    let (parent, path) = match &req.parent {
+        None => (None, req.name.clone()),
+        Some(parent) => {
+            screen_leadership(consensus)?;
+            let found = lookup_linearized(consensus, views, |view| {
+                let id = resolve_ref(view, parent)?;
+                Some((id, view.state().quota_entity_path(id)?))
+            })
+            .await?;
+            match found {
+                Ok((id, parent_path)) => (Some(id), format!("{parent_path}/{}", req.name)),
+                // No such parent at a linearized point on the leader — by
+                // path, or by an id apply would refuse as unknown anyway.
+                // Either way it is the 409 an unknown parent earns.
+                Err(_) => return Err(LocalWriteError::Api(ApiError::unknown_quota_entity(parent))),
+            }
+        }
+    };
     let command = Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
-        entity,
-        parent: req.parent,
+        entity: req.entity,
+        parent,
         name: req.name.clone(),
         quota: CostUnits(req.quota_ucu),
         updated_at: Timestamp::now(),
@@ -525,7 +616,11 @@ pub(crate) async fn configure_quota_entity_here<C: Consensus>(
         Ok(Applied {
             outcome: Ok(_),
             log_index,
-        }) => Ok(ConfigureQuotaEntityResponse { entity, log_index }),
+        }) => Ok(ConfigureQuotaEntityResponse {
+            entity: req.entity,
+            path,
+            log_index,
+        }),
         Ok(Applied {
             outcome: Err(rejection),
             ..
@@ -548,21 +643,77 @@ pub(crate) async fn configure_quota_entity_here<C: Consensus>(
 /// order, like every other policy edit in the system; `UpdatePolicy` remains
 /// the other writer of `groups_claim` (as a full replacement) and races this
 /// one the same way.
+///
+/// Binding scopes arrive as the client named them (ADR 0045). A list with no
+/// path scope reads no state at all — every id rides the command as-is, for
+/// apply to check at its log position — and its `NotLeader` comes from the
+/// propose. A list with one is resolved here, on the leader, by the same
+/// latest-view-then-barrier rule as a submission's entity, a follower
+/// forwarding it untouched (ADR 0038).
 pub(crate) async fn update_authorization_here<C: Consensus>(
     consensus: &C,
+    views: &StateViews,
     req: &UpdateAuthorizationRequest,
     actor: &Actor,
 ) -> Result<UpdateAuthorizationResponse, LocalWriteError> {
     // The exactly-one-subject rule the DTO cannot express. The HTTP handler
     // checks it too, so a direct client never reaches this — but a *forwarded*
     // request arrives as pb and this is the leader's own boundary, which must
-    // not trust that the follower checked.
-    let mut bindings = Vec::with_capacity(req.bindings.len());
+    // not trust that the follower checked. It is a shape check, so it runs
+    // before anything is resolved; the scope is set aside for it.
     for (i, dto) in req.bindings.iter().enumerate() {
+        coppice_state::authz::Binding::try_from(&dto.clone().with_scope(None))
+            .map_err(|e| LocalWriteError::Api(ApiError::Invalid(format!("binding {i}: {e}"))))?;
+    }
+
+    let resolve_all = |view: &StateView| -> Option<Vec<Option<QuotaEntityId>>> {
+        req.bindings
+            .iter()
+            .map(|b| match &b.scope {
+                None => Some(None),
+                Some(scope) => resolve_ref(view, scope).map(Some),
+            })
+            .collect()
+    };
+    let scopes: Vec<Option<QuotaEntityId>> = if req
+        .bindings
+        .iter()
+        .any(|b| matches!(b.scope, Some(QuotaEntityRef::Path(_))))
+    {
+        screen_leadership(consensus)?;
+        match lookup_linearized(consensus, views, resolve_all).await? {
+            Ok(scopes) => scopes,
+            // The first scope the caught-up view cannot place is the one the
+            // refusal names — the 400 an unknown scope id earns on this
+            // endpoint.
+            Err(view) => {
+                let (i, scope) = req
+                    .bindings
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, b)| {
+                        let scope = b.scope.as_ref()?;
+                        resolve_ref(&view, scope).is_none().then_some((i, scope))
+                    })
+                    .expect("a miss names an unresolvable scope");
+                return Err(LocalWriteError::Api(ApiError::unknown_binding_scope(
+                    i, scope,
+                )));
+            }
+        }
+    } else {
+        req.bindings
+            .iter()
+            .map(|b| b.scope.as_ref().and_then(QuotaEntityRef::as_id))
+            .collect()
+    };
+
+    let mut bindings = Vec::with_capacity(req.bindings.len());
+    for (i, (dto, scope)) in req.bindings.iter().zip(scopes).enumerate() {
         bindings.push(
-            coppice_state::authz::Binding::try_from(dto).map_err(|e| {
-                LocalWriteError::Api(ApiError::Invalid(format!("binding {i}: {e}")))
-            })?,
+            coppice_state::authz::Binding::try_from(&dto.clone().with_scope(scope)).map_err(
+                |e| LocalWriteError::Api(ApiError::Invalid(format!("binding {i}: {e}"))),
+            )?,
         );
     }
 
@@ -959,7 +1110,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         req: ConfigureQuotaEntityRequest,
         actor: Actor,
     ) -> Result<ConfigureQuotaEntityResponse, ApiError> {
-        match configure_quota_entity_here(&*self.consensus, &req, &actor).await {
+        match configure_quota_entity_here(&*self.consensus, &self.views, &req, &actor).await {
             Ok(response) => Ok(response),
             Err(LocalWriteError::Api(e)) => Err(e),
             Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
@@ -1001,7 +1152,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         req: UpdateAuthorizationRequest,
         actor: Actor,
     ) -> Result<UpdateAuthorizationResponse, ApiError> {
-        match update_authorization_here(&*self.consensus, &req, &actor).await {
+        match update_authorization_here(&*self.consensus, &self.views, &req, &actor).await {
             Ok(response) => Ok(response),
             Err(LocalWriteError::Api(e)) => Err(e),
             Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
@@ -1593,7 +1744,17 @@ mod tests {
     struct FakeForwarder {
         answer: std::sync::Mutex<ForwardAnswer>,
         seen: std::sync::Mutex<Vec<ForwardedCall>>,
+        /// The quota-entity references each forwarded write carried, in call
+        /// order (ADR 0045): a submission's entity, an upsert's parent, or a
+        /// replacement's binding scopes. Recorded because a follower that
+        /// resolved a path before forwarding would still answer 200 — the
+        /// only evidence it did not is that the path crossed as a path.
+        refs: std::sync::Mutex<Vec<Vec<Option<QuotaEntityRef>>>>,
     }
+
+    /// The path a forwarded upsert's answer carries — the leader's, which the
+    /// follower must relay rather than compute.
+    const LEADER_COMPUTED_PATH: &str = "computed/by-the-leader";
 
     /// One hop the fake saw. The actor is recorded because losing it is the
     /// failure this seam can have silently: a forwarded write that arrives
@@ -1613,7 +1774,17 @@ mod tests {
             Arc::new(FakeForwarder {
                 answer: std::sync::Mutex::new(answer),
                 seen: std::sync::Mutex::new(Vec::new()),
+                refs: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        fn record_refs(&self, refs: Vec<Option<QuotaEntityRef>>) {
+            self.refs.lock().unwrap().push(refs);
+        }
+
+        /// The references every forwarded write carried, in call order.
+        fn refs(&self) -> Vec<Vec<Option<QuotaEntityRef>>> {
+            self.refs.lock().unwrap().clone()
         }
 
         fn answer(&self, answer: ForwardAnswer) {
@@ -1712,6 +1883,7 @@ mod tests {
             actor: &'a Actor,
         ) -> BoxFuture<'a, Result<SubmitJobResponse, ApiError>> {
             Box::pin(async move {
+                self.record_refs(vec![Some(req.quota_entity.clone())]);
                 let log_index = self.record(leader, Some(req.job), actor)?;
                 Ok(SubmitJobResponse {
                     job: req.job,
@@ -1740,9 +1912,11 @@ mod tests {
             actor: &'a Actor,
         ) -> BoxFuture<'a, Result<ConfigureQuotaEntityResponse, ApiError>> {
             Box::pin(async move {
+                self.record_refs(vec![req.parent.clone()]);
                 let log_index = self.record(leader, None, actor)?;
                 Ok(ConfigureQuotaEntityResponse {
                     entity: req.entity,
+                    path: LEADER_COMPUTED_PATH.to_string(),
                     log_index,
                 })
             })
@@ -1751,10 +1925,11 @@ mod tests {
         fn update_authorization<'a>(
             &'a self,
             leader: CoordinatorId,
-            _req: &'a UpdateAuthorizationRequest,
+            req: &'a UpdateAuthorizationRequest,
             actor: &'a Actor,
         ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>> {
             Box::pin(async move {
+                self.record_refs(req.bindings.iter().map(|b| b.scope.clone()).collect());
                 let log_index = self.record(leader, None, actor)?;
                 Ok(UpdateAuthorizationResponse { log_index })
             })
@@ -1824,7 +1999,7 @@ mod tests {
             },
             priority: 0,
             max_runtime_seconds: None,
-            quota_entity: coppice_core::id::QuotaEntityId::new(),
+            quota_entity: QuotaEntityRef::Id(coppice_core::id::QuotaEntityId::new()),
             retry: None,
             job,
             command: vec!["run".to_string()],
@@ -2061,13 +2236,15 @@ mod tests {
         .await
         .expect("forwarded abort");
 
-        let entity = coppice_core::id::QuotaEntityId::new();
         let response = cp
-            .configure_quota_entity(configure_request(entity), test_actor())
+            .configure_quota_entity(
+                configure_request(coppice_core::id::QuotaEntityId::new()),
+                test_actor(),
+            )
             .await
             .expect("forwarded upsert");
-        assert_eq!(response.entity, entity);
         assert_eq!(response.log_index, 11);
+        assert_eq!(response.path, LEADER_COMPUTED_PATH, "relayed, not computed");
         assert_eq!(forwarder.calls(), 2);
     }
 
@@ -2346,22 +2523,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_configure_echoes_the_entity_and_log_index() {
+    async fn accepted_configure_answers_with_the_log_index() {
         let cp = control_plane(ProposeOutcome::Accepted);
-        let entity = coppice_core::id::QuotaEntityId::new();
         let response = cp
-            .configure_quota_entity(configure_request(entity), test_actor())
+            .configure_quota_entity(
+                configure_request(coppice_core::id::QuotaEntityId::new()),
+                test_actor(),
+            )
             .await
             .expect("accepted");
-        assert_eq!(response.entity, entity);
         assert!(response.log_index > 0);
+        assert_eq!(response.path, "team", "a root's path is its name");
     }
 
     #[tokio::test]
     async fn rejected_configure_maps_to_rejected() {
-        // A cycle / unknown-parent refusal is a committed-and-refused apply,
-        // surfaced as a normal 409, not a server fault.
-        let reason = coppice_state::RejectionReason::QuotaEntityCycle(
+        // An immutable-field / unknown-parent refusal is a committed-and-
+        // refused apply, surfaced as a normal 409, not a server fault.
+        let reason = coppice_state::RejectionReason::QuotaEntityImmutable(
             coppice_core::id::QuotaEntityId::new(),
         );
         let cp = control_plane(ProposeOutcome::Rejected(reason));
@@ -2864,5 +3043,451 @@ mod tests {
             }
             other => panic!("expected a classified relayed rejection, got {other:?}"),
         }
+    }
+
+    // ---- Quota entity paths on the write path (ADR 0045 + ADR 0038) ---------
+    //
+    // A path is resolved by the leader, inside the write path it runs for a
+    // direct request and a forwarded one alike; a follower forwards the path
+    // untouched and reads nothing to do it. The leader resolves against its
+    // latest view (a hit is final: names and parents never change and nothing
+    // is deleted), and only a miss pays for a read barrier before the path is
+    // declared unknown.
+
+    fn configure_command(
+        entity: QuotaEntityId,
+        parent: Option<QuotaEntityId>,
+        name: &str,
+    ) -> Command {
+        Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+            entity,
+            parent,
+            name: name.to_string(),
+            quota: CostUnits(1_000_000),
+            updated_at: Timestamp::from_micros(1).expect("in range"),
+            actor: None,
+        })
+    }
+
+    /// Priority 0 configured, plus the root `acme` (and `acme/eng` when
+    /// `eng` is given) — the state a leader's view holds once the client's
+    /// creates have applied.
+    fn state_with_tree(
+        acme: QuotaEntityId,
+        eng: Option<QuotaEntityId>,
+    ) -> coppice_state::StateMachine {
+        let mut state = state_with_priorities(&[0]);
+        state
+            .apply(&configure_command(acme, None, "acme"))
+            .expect("root applies");
+        if let Some(eng) = eng {
+            state
+                .apply(&configure_command(eng, Some(acme), "eng"))
+                .expect("child applies");
+        }
+        state
+    }
+
+    fn path_ref(path: &str) -> QuotaEntityRef {
+        QuotaEntityRef::Path(path.parse().expect("fixture path"))
+    }
+
+    fn submit_by_path(path: &str) -> SubmitJobRequest {
+        let mut req = submit_request(JobId::new());
+        req.quota_entity = path_ref(path);
+        req
+    }
+
+    /// The quota entity the single proposed submission charged.
+    fn proposed_entity(consensus: &FakeConsensus) -> QuotaEntityId {
+        match consensus.proposed().as_slice() {
+            [Command::SubmitJob(submit)] => submit.job.quota_entity,
+            other => panic!("expected exactly one submission, got {other:?}"),
+        }
+    }
+
+    /// The parent the single proposed upsert carried.
+    fn proposed_parent(consensus: &FakeConsensus) -> Option<QuotaEntityId> {
+        match consensus.proposed().as_slice() {
+            [Command::ConfigureQuotaEntity(c)] => c.parent,
+            other => panic!("expected exactly one upsert, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_path_the_latest_view_holds_resolves_without_a_barrier() {
+        // The hit is final, so it must cost nothing extra: a barrier that
+        // could not be established is never consulted.
+        let acme = QuotaEntityId::new();
+        let (cp, consensus, mut publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        publisher.publish_now(&state_with_tree(acme, None), 2);
+        consensus.set_read_index_outcome(ReadIndexOutcome::Timeout);
+
+        cp.submit_job(submit_by_path("acme"), test_actor())
+            .await
+            .expect("resolved on the latest view");
+        assert_eq!(proposed_entity(&consensus), acme);
+    }
+
+    #[tokio::test]
+    async fn a_path_missing_from_the_latest_view_is_found_behind_the_barrier() {
+        // Read-your-writes across view publication: the client's create of
+        // `acme` has committed (the barrier is past it) but this leader has
+        // not yet published the view holding it. Refusing on `latest()` would
+        // turn "create a parent, then name it" into a race; the barrier finds
+        // it and the submission proposes the id it names.
+        let acme = QuotaEntityId::new();
+        let (cp, consensus, mut publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index(5);
+
+        let (result, ()) = tokio::join!(cp.submit_job(submit_by_path("acme"), test_actor()), {
+            // `join!` polls the submission first, so it is parked in
+            // `at_least(5)` by the time the apply catches up under it.
+            let publisher = &mut publisher;
+            async move { publisher.publish_now(&state_with_tree(acme, None), 5) }
+        });
+
+        result.expect("accepted once the view caught up");
+        assert_eq!(proposed_entity(&consensus), acme);
+    }
+
+    #[tokio::test]
+    async fn a_path_still_missing_at_the_barrier_is_the_unknown_entity_refusal() {
+        // Authoritative: this replica leads, the barrier resolved, the view
+        // reached it, and no such path exists. That is the terminal
+        // unknown-entity answer — the 409 an unknown id earns at apply —
+        // naming the path, with nothing proposed.
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index(1); // the index the publisher seeded
+
+        match cp
+            .submit_job(submit_by_path("acme/eng"), test_actor())
+            .await
+        {
+            Err(e @ ApiError::UnresolvedQuotaEntity(_)) => {
+                assert!(e.to_string().contains("acme/eng"), "{e}");
+                assert_eq!(
+                    e.rejection_kind(),
+                    Some(coppice_api::RejectionKind::UnknownQuotaEntity)
+                );
+            }
+            other => panic!("expected the unknown-entity refusal, got {other:?}"),
+        }
+        assert!(consensus.proposed().is_empty(), "nothing proposed");
+    }
+
+    #[tokio::test]
+    async fn a_stale_leader_status_forwards_an_unresolved_path_rather_than_refusing_it() {
+        // The watch still says leader, but leadership has moved to 7: the
+        // barrier is where that surfaces, and the write forwards — with the
+        // path as the client sent it — instead of refusing a path this
+        // replica's view merely has not seen.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index_outcome(ReadIndexOutcome::NotLeader(Some(7)));
+        let cp = cp.with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
+
+        let response = cp
+            .submit_job(submit_by_path("acme/eng"), test_actor())
+            .await
+            .expect("forwarded, not refused");
+        assert_eq!(response.log_index, 42);
+        assert_eq!(forwarder.leaders(), vec![7]);
+        assert_eq!(forwarder.refs(), vec![vec![Some(path_ref("acme/eng"))]]);
+        assert!(consensus.proposed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_child_by_parent_path_resolves_behind_the_barrier_and_answers_its_path() {
+        // The submit_retry shape at unit scale: `acme` has just committed
+        // but is not yet in this leader's published view, and a child is
+        // created under it by path the instant the create returned.
+        let acme = QuotaEntityId::new();
+        let eng = QuotaEntityId::new();
+        let (cp, consensus, mut publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index(5);
+
+        let request = ConfigureQuotaEntityRequest {
+            entity: eng,
+            parent: Some(path_ref("acme")),
+            name: "eng".to_string(),
+            quota_ucu: 1_000_000,
+        };
+        let (result, ()) = tokio::join!(cp.configure_quota_entity(request, test_actor()), {
+            let publisher = &mut publisher;
+            async move { publisher.publish_now(&state_with_tree(acme, None), 5) }
+        });
+
+        let response = result.expect("accepted once the view caught up");
+        assert_eq!(response.entity, eng);
+        assert_eq!(response.path, "acme/eng");
+        assert_eq!(proposed_parent(&consensus), Some(acme));
+    }
+
+    #[tokio::test]
+    async fn a_parent_by_id_carries_the_id_and_answers_the_leaders_path() {
+        let acme = QuotaEntityId::new();
+        let eng = QuotaEntityId::new();
+        let (cp, consensus, mut publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        publisher.publish_now(&state_with_tree(acme, Some(eng)), 2);
+
+        let response = cp
+            .configure_quota_entity(
+                ConfigureQuotaEntityRequest {
+                    entity: eng,
+                    parent: Some(QuotaEntityRef::Id(acme)),
+                    name: "eng".to_string(),
+                    quota_ucu: 2_000_000,
+                },
+                test_actor(),
+            )
+            .await
+            .expect("a quota-only update");
+        assert_eq!(response.path, "acme/eng");
+        assert_eq!(proposed_parent(&consensus), Some(acme));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_parent_at_the_barrier_is_refused_by_path_or_by_id() {
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index(1);
+        let unseen = QuotaEntityId::new();
+
+        for parent in [path_ref("acme/nope"), QuotaEntityRef::Id(unseen)] {
+            let named = parent.to_string();
+            let result = cp
+                .configure_quota_entity(
+                    ConfigureQuotaEntityRequest {
+                        entity: QuotaEntityId::new(),
+                        parent: Some(parent),
+                        name: "x".to_string(),
+                        quota_ucu: 1,
+                    },
+                    test_actor(),
+                )
+                .await;
+            match result {
+                Err(e @ ApiError::UnresolvedQuotaEntity(_)) => {
+                    assert!(e.to_string().contains(&named), "{e}");
+                }
+                other => panic!("expected the unknown-parent refusal, got {other:?}"),
+            }
+        }
+        assert!(consensus.proposed().is_empty(), "nothing proposed");
+    }
+
+    #[tokio::test]
+    async fn unscoped_bindings_are_proposed_without_reading_state() {
+        // A list with no path scope has nothing to resolve, so it must not
+        // touch the barrier or the leadership screen: one that could not be
+        // established is never consulted, and the propose decides.
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index_outcome(ReadIndexOutcome::Timeout);
+        consensus.set_role(Role::Follower { leader: Some(7) });
+
+        cp.update_authorization(authorization_request(None), test_actor())
+            .await
+            .expect("proposed without a read");
+        assert_eq!(consensus.proposed().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_path_scope_is_resolved_on_the_leader_and_a_miss_names_the_binding() {
+        let acme = QuotaEntityId::new();
+        let eng = QuotaEntityId::new();
+        let (cp, consensus, mut publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        publisher.publish_now(&state_with_tree(acme, Some(eng)), 2);
+        consensus.set_read_index(2);
+
+        let scoped = |scope: QuotaEntityRef| {
+            let mut req = authorization_request(None);
+            req.bindings.push(dto::BindingDto {
+                group: Some("eng".to_string()),
+                principal: None,
+                role: dto::BindingRole::Operator,
+                scope: Some(scope),
+            });
+            req
+        };
+
+        cp.update_authorization(scoped(path_ref("acme/eng")), test_actor())
+            .await
+            .expect("resolved");
+        match consensus.proposed().as_slice() {
+            [Command::UpdateAuthorization(update)] => {
+                assert_eq!(update.bindings[0].scope, None);
+                assert_eq!(update.bindings[1].scope, Some(eng));
+            }
+            other => panic!("expected one replacement, got {other:?}"),
+        }
+
+        match cp
+            .update_authorization(scoped(path_ref("acme/ops")), test_actor())
+            .await
+        {
+            Err(e @ ApiError::UnresolvedQuotaEntity(_)) => {
+                let message = e.to_string();
+                assert!(message.contains("binding 1"), "{message}");
+                assert!(message.contains("acme/ops"), "{message}");
+            }
+            other => panic!("expected the unknown-scope refusal, got {other:?}"),
+        }
+        assert_eq!(consensus.proposed().len(), 1, "the miss proposed nothing");
+    }
+
+    // ---- The follower's HTTP edge (ADR 0038, reproduced as 421s in review) --
+    //
+    // Every write naming a quota entity, through the real router on a healthy
+    // follower: each must reach the forwarder with its references exactly as
+    // the client wrote them and answer 200. The follower's barrier is wired
+    // to refuse, so a resolution read sneaking back in front of the forward
+    // turns straight into the 421 the review reproduced; and its view holds
+    // none of the entities, so a resolution against it would refuse too.
+
+    /// The router, plus the publisher half the test keeps alive for as long
+    /// as it uses the router (see `control_plane_and_publisher`).
+    fn follower_router(
+        forwarder: &Arc<FakeForwarder>,
+    ) -> (axum::Router, coppice_consensus::ViewPublisher) {
+        let (plane, consensus, publisher) =
+            control_plane_and_publisher(ProposeOutcome::NotLeader(Some(7)));
+        consensus.set_read_index_outcome(ReadIndexOutcome::NotLeader(Some(7)));
+        let plane = plane.with_forwarder(Arc::clone(forwarder) as Arc<dyn LeaderWrites>);
+        let router = coppice_api::http::router(
+            Arc::new(plane),
+            coppice_api::http::MetricsEndpoint::detached_for_tests(),
+            coppice_api::http::ReadyzEndpoint::detached_for_tests(),
+            coppice_api::http::EnrollEndpoint::detached_for_tests(),
+            // Open mode: what is under test is the forward, not authn.
+            Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
+        );
+        (router, publisher)
+    }
+
+    async fn send(
+        router: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: String,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        let response = router.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn configure_body(parent: &str) -> String {
+        format!(
+            r#"{{ "entity": "{}", "parent": {parent}, "name": "eng", "quota_ucu": 1000 }}"#,
+            QuotaEntityId::new()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_follower_forwards_a_submission_by_path_untouched() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let (router, _publisher) = follower_router(&forwarder);
+        let body = format!(
+            r#"{{ "job": "{}", "image": "busybox", "command": ["run"],
+                 "requests": {{ "cpu_millis": 100, "memory_bytes": 0, "disk_bytes": 0 }},
+                 "quota_entity": "acme/eng" }}"#,
+            JobId::new()
+        );
+        let (status, body) = send(&router, "POST", "/api/v1/jobs", body).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["log_index"], 42);
+        assert_eq!(forwarder.leaders(), vec![7]);
+        assert_eq!(forwarder.refs(), vec![vec![Some(path_ref("acme/eng"))]]);
+    }
+
+    #[tokio::test]
+    async fn a_follower_forwards_a_child_create_with_its_parent_by_id_or_by_path() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let (router, _publisher) = follower_router(&forwarder);
+        let acme = QuotaEntityId::new();
+        for parent in [QuotaEntityRef::Id(acme), path_ref("acme")] {
+            let (status, body) = send(
+                &router,
+                "POST",
+                "/api/v1/quota-entities",
+                configure_body(&format!(r#""{parent}""#)),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{parent}: {body}");
+            // The path is the leader's, relayed — the follower holds no view
+            // of the parent to compute it from.
+            assert_eq!(body["path"], LEADER_COMPUTED_PATH);
+            assert_eq!(body["log_index"], 42);
+        }
+        assert_eq!(
+            forwarder.refs(),
+            vec![
+                vec![Some(QuotaEntityRef::Id(acme))],
+                vec![Some(path_ref("acme"))]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follower_forwards_authorization_updates_scoped_or_not() {
+        let forwarder = FakeForwarder::answering(ForwardAnswer::Applied(42));
+        let (router, _publisher) = follower_router(&forwarder);
+
+        let unscoped = r#"{ "bindings": [ { "group": "admins", "role": "admin" } ] }"#;
+        let (status, body) = send(&router, "PUT", "/api/v1/authorization", unscoped.into()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+        let scoped = r#"{ "bindings": [
+            { "group": "admins", "role": "admin" },
+            { "group": "eng", "role": "operator", "scope": "acme/eng" }
+        ] }"#;
+        let (status, body) = send(&router, "PUT", "/api/v1/authorization", scoped.into()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+        assert_eq!(
+            forwarder.refs(),
+            vec![vec![None], vec![None, Some(path_ref("acme/eng"))]]
+        );
+        assert_eq!(forwarder.leaders(), vec![7, 7]);
+    }
+
+    #[tokio::test]
+    async fn a_follower_relays_the_leaders_unknown_path_answer_with_the_routes_status() {
+        // The leader's terminal answer crosses as the classified rejection;
+        // each route maps it as it maps an unknown id — 409 on submit, 400 on
+        // a binding scope.
+        let forwarder = FakeForwarder::answering(ForwardAnswer::RejectedAs(
+            coppice_api::RejectionKind::UnknownQuotaEntity,
+            "quota entity acme/nope not found".to_string(),
+        ));
+        let (router, _publisher) = follower_router(&forwarder);
+        let submit = format!(
+            r#"{{ "job": "{}", "image": "busybox", "command": ["run"],
+                 "requests": {{ "cpu_millis": 100, "memory_bytes": 0, "disk_bytes": 0 }},
+                 "quota_entity": "acme/nope" }}"#,
+            JobId::new()
+        );
+        let (status, body) = send(&router, "POST", "/api/v1/jobs", submit).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+        assert!(body["message"].as_str().unwrap().contains("acme/nope"));
+
+        let scoped = r#"{ "bindings": [
+            { "group": "admins", "role": "admin" },
+            { "group": "eng", "role": "operator", "scope": "acme/nope" }
+        ] }"#;
+        let (status, body) = send(&router, "PUT", "/api/v1/authorization", scoped.into()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
     }
 }

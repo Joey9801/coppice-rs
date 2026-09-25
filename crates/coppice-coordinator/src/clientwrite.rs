@@ -35,6 +35,7 @@ use coppice_api::http::dto::{
 };
 use coppice_api::{ApiError, RejectionKind};
 use coppice_consensus::{CoordinatorId, NodeHandle};
+use coppice_core::entity_ref::QuotaEntityRef;
 use coppice_core::id::{JobId, NodeId};
 use coppice_net::admin::Client;
 use coppice_proto::convert::{
@@ -392,6 +393,7 @@ pub(crate) fn rejection_kind_from_pb(raw: i32) -> RejectionKind {
         Ok(Pb::InvalidAuthorization) => RejectionKind::InvalidAuthorization,
         Ok(Pb::AuthorizationLockout) => RejectionKind::AuthorizationLockout,
         Ok(Pb::UnknownNode) => RejectionKind::UnknownNode,
+        Ok(Pb::InvalidQuotaEntityName) => RejectionKind::InvalidQuotaEntityName,
         Ok(Pb::Unspecified) | Err(_) => RejectionKind::Other,
     }
 }
@@ -409,6 +411,7 @@ pub(crate) fn rejection_kind_to_pb(
         RejectionKind::InvalidAuthorization => Pb::InvalidAuthorization,
         RejectionKind::AuthorizationLockout => Pb::AuthorizationLockout,
         RejectionKind::UnknownNode => Pb::UnknownNode,
+        RejectionKind::InvalidQuotaEntityName => Pb::InvalidQuotaEntityName,
     }
 }
 
@@ -463,29 +466,24 @@ impl LeaderWrites for AdminForwarder {
         Box::pin(async move {
             let deadline = forward_deadline();
             let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
-            let wire = pb::ForwardConfigureQuotaEntityRequest {
-                history_id: history_id.to_vec(),
-                entity: Some(req.entity.into()),
-                parent: req.parent.map(Into::into),
-                name: req.name.clone(),
-                quota_ucu: req.quota_ucu,
-                actor: Some(actor.into()),
-            };
+            let wire = configure_to_pb(history_id, req, actor);
             let response =
                 under_timeout(deadline, client.forward_configure_quota_entity(wire)).await?;
             let log_index = applied_index(response.outcome)?;
+            // The leader resolved the parent, so the leader computed the path
+            // (ADR 0045); this replica relays it and reads nothing itself.
             Ok(ConfigureQuotaEntityResponse {
                 entity: req.entity,
+                path: response.path,
                 log_index,
             })
         })
     }
 
-    /// The bindings themselves cross as
-    /// [`coppice.core.v1.Binding`](coppice_proto::pb::core::v1::Binding) — the
-    /// same message the command log carries — rather than a second encoding of
-    /// the same idea. A malformed one is refused by the *leader's* conversion,
-    /// not filtered out here: what crosses the hop is the client's request.
+    /// The bindings cross as [`pb::ForwardBinding`] — the command log's
+    /// `coppice.core.v1.Binding` subject and role, with the scope as the
+    /// client's unresolved reference (ADR 0045) rather than an id this
+    /// replica would have had to read state to produce.
     fn update_authorization<'a>(
         &'a self,
         leader: CoordinatorId,
@@ -809,7 +807,7 @@ pub(crate) fn submit_to_pb(
         requests: Some((&requests).into()),
         priority: req.priority,
         max_runtime_seconds: req.max_runtime_seconds,
-        quota_entity: Some(req.quota_entity.into()),
+        quota_entity_ref: req.quota_entity.to_string(),
         retry: req
             .retry
             .map(|r| coppice_core::job::RetryPolicy::from(r).into()),
@@ -861,8 +859,10 @@ pub(crate) fn submit_from_pb(
             requests: (&requests).into(),
             priority: req.priority,
             max_runtime_seconds: req.max_runtime_seconds,
-            quota_entity: required(req.quota_entity, "ForwardSubmitJobRequest.quota_entity")?
-                .try_into()?,
+            quota_entity: entity_ref_from_pb(
+                &req.quota_entity_ref,
+                "ForwardSubmitJobRequest.quota_entity_ref",
+            )?,
             metadata,
             retry: req.retry.map(|r| {
                 let core: coppice_core::job::RetryPolicy = r.into();
@@ -876,6 +876,33 @@ pub(crate) fn submit_from_pb(
     ))
 }
 
+/// A quota-entity reference off the wire (ADR 0045): the client's string,
+/// parsed exactly as the JSON body's is, so a forwarded reference and a
+/// direct one name the same entity. A string that is neither an id nor a
+/// well-formed path is a malformed request, never a guess.
+fn entity_ref_from_pb(raw: &str, field: &'static str) -> Result<QuotaEntityRef, ConvertError> {
+    raw.parse().map_err(|_| ConvertError::Invalid {
+        field,
+        reason: "not a quota entity id or path",
+    })
+}
+
+/// The quota upsert, on the wire, with the parent as the client named it.
+pub(crate) fn configure_to_pb(
+    history_id: [u8; 16],
+    req: &ConfigureQuotaEntityRequest,
+    actor: &Actor,
+) -> pb::ForwardConfigureQuotaEntityRequest {
+    pb::ForwardConfigureQuotaEntityRequest {
+        history_id: history_id.to_vec(),
+        entity: Some(req.entity.into()),
+        parent_ref: req.parent.as_ref().map(ToString::to_string),
+        name: req.name.clone(),
+        quota_ucu: req.quota_ucu,
+        actor: Some(actor.into()),
+    }
+}
+
 /// The quota upsert, back as the DTO the leader's write path takes, with the
 /// actor the originating replica resolved.
 pub(crate) fn configure_from_pb(
@@ -886,7 +913,11 @@ pub(crate) fn configure_from_pb(
         ConfigureQuotaEntityRequest {
             entity: required(req.entity, "ForwardConfigureQuotaEntityRequest.entity")?
                 .try_into()?,
-            parent: req.parent.map(TryInto::try_into).transpose()?,
+            parent: req
+                .parent_ref
+                .as_deref()
+                .map(|raw| entity_ref_from_pb(raw, "ForwardConfigureQuotaEntityRequest.parent_ref"))
+                .transpose()?,
             name: req.name,
             quota_ucu: req.quota_ucu,
         },
@@ -965,27 +996,48 @@ pub(crate) fn update_job_metadata_from_pb(
 /// The authorization replacement, on the wire.
 ///
 /// Fallible where the direct path is: a binding naming both or neither of
-/// `group`/`principal` has no `coppice.core.v1.Binding` to become, and that is
-/// an `Invalid` request rather than something to encode as a guess. The HTTP
-/// handler on this replica has already refused it, so reaching the error here
-/// would take a caller that bypassed the router.
+/// `group`/`principal` has no subject to encode, and that is an `Invalid`
+/// request rather than something to encode as a guess. The HTTP handler on
+/// this replica has already refused it, so reaching the error here would take
+/// a caller that bypassed the router. Scopes cross as the client wrote them
+/// (ADR 0045): resolving a path is the leader's job.
 fn authorization_to_pb(
     history_id: [u8; 16],
     req: &UpdateAuthorizationRequest,
     actor: &Actor,
 ) -> Result<pb::ForwardUpdateAuthorizationRequest, ApiError> {
-    let mut bindings = Vec::with_capacity(req.bindings.len());
+    let mut requested_bindings = Vec::with_capacity(req.bindings.len());
     for (i, dto) in req.bindings.iter().enumerate() {
-        let binding = coppice_state::authz::Binding::try_from(dto)
+        // Subject and role through the domain type and the command log's own
+        // encoding of them, so the two cannot drift; the scope set aside.
+        let unscoped = coppice_state::authz::Binding::try_from(&dto.clone().with_scope(None))
             .map_err(|e| ApiError::Invalid(format!("binding {i}: {e}")))?;
-        bindings.push((&binding).into());
+        let core = coppice_proto::pb::core::v1::Binding::from(&unscoped);
+        requested_bindings.push(pb::ForwardBinding {
+            subject: core.subject.map(binding_subject_to_forward),
+            role: core.role,
+            scope: dto.scope.as_ref().map(ToString::to_string),
+        });
     }
     Ok(pb::ForwardUpdateAuthorizationRequest {
         history_id: history_id.to_vec(),
-        bindings,
+        requested_bindings,
         groups_claim: req.groups_claim.clone(),
         actor: Some(actor.into()),
     })
+}
+
+/// `coppice.core.v1.Binding`'s subject oneof as [`pb::ForwardBinding`]'s —
+/// the same two arms over the same messages.
+fn binding_subject_to_forward(
+    subject: coppice_proto::pb::core::v1::binding::Subject,
+) -> pb::forward_binding::Subject {
+    use coppice_proto::pb::core::v1::binding::Subject as Core;
+    use pb::forward_binding::Subject as Forward;
+    match subject {
+        Core::Group(group) => Forward::Group(group),
+        Core::Principal(principal) => Forward::Principal(principal),
+    }
 }
 
 /// The authorization replacement, back as the DTO the leader's write path
@@ -993,17 +1045,40 @@ fn authorization_to_pb(
 ///
 /// Round-tripping through the DTO rather than handing the leader the domain
 /// `Binding`s directly keeps one rule intact: the leader re-runs the *whole*
-/// write path on the client's request, conversions included, so a forwarded
-/// write and a direct one cannot be validated differently.
+/// write path on the client's request, conversions and scope resolution
+/// included, so a forwarded write and a direct one cannot be validated
+/// differently. Subject and role decode through the command log's own
+/// `coppice.core.v1.Binding` conversion — an unset subject or an unknown role
+/// is refused, never defaulted into authority.
 pub(crate) fn authorization_from_pb(
     req: pb::ForwardUpdateAuthorizationRequest,
 ) -> Result<(UpdateAuthorizationRequest, Actor), ConvertError> {
+    use coppice_proto::pb::core::v1::binding::Subject as Core;
+    use pb::forward_binding::Subject as Forward;
+
     let actor = actor_from_pb(req.actor, "ForwardUpdateAuthorizationRequest.actor")?;
-    let bindings = coppice_proto::convert::bindings_from_pb(req.bindings)?;
+    let mut bindings = Vec::with_capacity(req.requested_bindings.len());
+    for binding in req.requested_bindings {
+        let core = coppice_proto::pb::core::v1::Binding {
+            subject: binding.subject.map(|subject| match subject {
+                Forward::Group(group) => Core::Group(group),
+                Forward::Principal(principal) => Core::Principal(principal),
+            }),
+            role: binding.role,
+            scope: None,
+        };
+        let domain = coppice_state::authz::Binding::try_from(core)?;
+        let scope = binding
+            .scope
+            .as_deref()
+            .map(|raw| entity_ref_from_pb(raw, "ForwardBinding.scope"))
+            .transpose()?;
+        bindings.push(coppice_api::http::dto::BindingDto::from(&domain).with_scope(scope));
+    }
     Ok((
         UpdateAuthorizationRequest {
             groups_claim: req.groups_claim,
-            bindings: bindings.iter().map(Into::into).collect(),
+            bindings,
         },
         actor,
     ))
@@ -1042,7 +1117,7 @@ mod tests {
             },
             priority: -3,
             max_runtime_seconds: Some(3600),
-            quota_entity: QuotaEntityId::new(),
+            quota_entity: QuotaEntityRef::Path("acme/eng".parse().unwrap()),
             retry: Some(dto::RetryPolicy {
                 max_retries: 2,
                 retry_user_errors: true,
@@ -1146,7 +1221,7 @@ mod tests {
         let mut wire = pb::ForwardConfigureQuotaEntityRequest {
             history_id: HISTORY.to_vec(),
             entity: Some(QuotaEntityId::new().into()),
-            parent: None,
+            parent_ref: None,
             name: "platform".to_string(),
             quota_ucu: 1,
             actor: Some((&actor()).into()),
@@ -1157,13 +1232,15 @@ mod tests {
         assert!(abort_actor_from_pb(None).is_err());
     }
 
-    /// The authorization replacement round-trips through the *shared*
-    /// `coppice.core.v1.Binding` — the message the command log already
-    /// carries — so both subject kinds and both scope states arrive as
+    /// The authorization replacement round-trips through
+    /// `ForwardBinding` — the command log's subject and role encoding, with
+    /// the scope as the client's unresolved reference (ADR 0045) — so both
+    /// subject kinds and every scope state (none, an id, a path) arrive as
     /// themselves.
     #[test]
     fn an_authorization_replacement_survives_the_hop() {
-        let scope = QuotaEntityId::new();
+        let scope = QuotaEntityRef::Id(QuotaEntityId::new());
+        let path: QuotaEntityRef = "acme/eng".parse().unwrap();
         let original = UpdateAuthorizationRequest {
             groups_claim: Some("entitlements".to_string()),
             bindings: vec![
@@ -1178,6 +1255,12 @@ mod tests {
                     principal: Some("svc-ci".to_string()),
                     role: dto::BindingRole::Submitter,
                     scope: Some(scope),
+                },
+                dto::BindingDto {
+                    group: Some("eng".to_string()),
+                    principal: None,
+                    role: dto::BindingRole::Operator,
+                    scope: Some(path),
                 },
             ],
         };
@@ -1206,8 +1289,8 @@ mod tests {
         assert!(back.bindings.is_empty());
     }
 
-    /// A binding naming both subject kinds has no `coppice.core.v1.Binding`
-    /// to become, and the encoder says so rather than silently picking one.
+    /// A binding naming both subject kinds has no subject to encode, and the
+    /// encoder says so rather than silently picking one.
     #[test]
     fn a_binding_with_two_subjects_is_invalid_before_it_reaches_the_wire() {
         let req = UpdateAuthorizationRequest {
@@ -1236,6 +1319,8 @@ mod tests {
             RejectionKind::UnknownQuotaEntity,
             RejectionKind::InvalidAuthorization,
             RejectionKind::AuthorizationLockout,
+            RejectionKind::UnknownNode,
+            RejectionKind::InvalidQuotaEntityName,
         ] {
             assert_eq!(
                 rejection_kind_from_pb(rejection_kind_to_pb(kind) as i32),
@@ -1245,25 +1330,21 @@ mod tests {
         assert_eq!(rejection_kind_from_pb(9999), RejectionKind::Other);
     }
 
+    /// The parent crosses as the client named it (ADR 0045) — absent, an
+    /// id, or a path — and is never resolved on the forwarding side.
     #[test]
     fn an_upsert_survives_the_hop_including_a_null_parent() {
         let entity = QuotaEntityId::new();
-        let parent = QuotaEntityId::new();
-        for expected_parent in [None, Some(parent)] {
+        let parent = QuotaEntityRef::Id(QuotaEntityId::new());
+        let path: QuotaEntityRef = "acme/eng".parse().unwrap();
+        for expected_parent in [None, Some(parent), Some(path)] {
             let req = ConfigureQuotaEntityRequest {
                 entity,
-                parent: expected_parent,
+                parent: expected_parent.clone(),
                 name: "platform".to_string(),
                 quota_ucu: 12_345,
             };
-            let wire = pb::ForwardConfigureQuotaEntityRequest {
-                history_id: HISTORY.to_vec(),
-                entity: Some(req.entity.into()),
-                parent: req.parent.map(Into::into),
-                name: req.name.clone(),
-                quota_ucu: req.quota_ucu,
-                actor: Some((&actor()).into()),
-            };
+            let wire = configure_to_pb(HISTORY, &req, &actor());
             let (back, back_actor) = configure_from_pb(wire).expect("a well-formed upsert");
             assert_eq!(back_actor, actor());
             assert_eq!(back.entity, entity);
@@ -1276,8 +1357,17 @@ mod tests {
     #[test]
     fn a_missing_required_field_is_a_malformed_request_not_a_default() {
         let mut wire = submit_to_pb(HISTORY, &submit_request(), &actor());
-        wire.quota_entity = None;
+        wire.requests = None;
         assert!(submit_from_pb(wire).is_err());
+
+        // An entity reference that is neither an id nor a well-formed path —
+        // including the empty string an older peer's absent field decodes as —
+        // is refused, never read as some entity.
+        for raw in ["", "acme//eng", "/acme"] {
+            let mut wire = submit_to_pb(HISTORY, &submit_request(), &actor());
+            wire.quota_entity_ref = raw.to_string();
+            assert!(submit_from_pb(wire).is_err(), "{raw:?}");
+        }
     }
 
     #[test]

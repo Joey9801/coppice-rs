@@ -46,8 +46,7 @@ const PROPOSER_SKEW_SECONDS: &str = "coordinator_event_proposer_skew_seconds";
 const SUBSCRIPTIONS: &str = "coordinator_event_subscriptions";
 /// Gap markers raised, labelled by what made delivery discontinuous:
 /// `overflow` (a subscriber's own queue), `tap` (apply outran the fanout),
-/// `catch_up` (a resume cursor below the ring's floor), `reparent` (a quota
-/// entity moved, changing which jobs a subtree selector admits).
+/// `catch_up` (a resume cursor below the ring's floor).
 const GAPS_TOTAL: &str = "coordinator_event_gaps_total";
 /// Catch-up pages served from the ring (ADR 0043's pull-based resume).
 const CATCH_UP_PAGES_TOTAL: &str = "coordinator_event_catch_up_pages_total";
@@ -73,7 +72,7 @@ pub(crate) fn describe_metrics() {
     );
     metrics::describe_counter!(
         GAPS_TOTAL,
-        "Gap markers raised to subscribers, by cause (overflow, tap, catch_up, reparent)."
+        "Gap markers raised to subscribers, by cause (overflow, tap, catch_up)."
     );
     metrics::describe_counter!(
         CATCH_UP_PAGES_TOTAL,
@@ -200,17 +199,6 @@ pub struct CatchUpPage {
     pub floor: u64,
     /// The oldest index the ring can still serve — what a gap would report.
     pub earliest_available: u64,
-    /// Set when the page stopped *at* a batch that reparented a quota entity
-    /// while the subscriber's selector reads an entity subtree (ADR 0043):
-    /// the index of that batch, whose events this page does not carry.
-    ///
-    /// The range this resume asked for crosses a discontinuity the stream
-    /// cannot express as events, so the caller owes its client a `gap` and
-    /// must not go on paging. `batches` still holds everything below it,
-    /// which is honest to deliver first. `next` is the resume point below the
-    /// discontinuity — meaningful only to a caller that is not resuming a
-    /// subscription.
-    pub reparent_at: Option<u64>,
 }
 
 /// One item delivered to a subscriber.
@@ -549,11 +537,6 @@ impl Ring {
     /// batches, so a page never splits a command's events. `after` below the
     /// floor is the caller's problem to detect (it owes its client a gap
     /// first); this simply starts at the oldest retained entry.
-    ///
-    /// A page also stops *at* a batch that reparents a quota entity when the
-    /// filter reads an entity subtree, reporting it as
-    /// [`reparent_at`](CatchUpPage::reparent_at): that is a discontinuity for
-    /// this subscriber and the caller owes it a gap (ADR 0043).
     fn catch_up(&self, filter: &EventFilter, after: u64, up_to: u64, budget: usize) -> CatchUpPage {
         let start = self
             .entries
@@ -562,7 +545,6 @@ impl Ring {
         let mut examined = 0usize;
         let mut last: Option<u64> = None;
         let mut next: Option<u64> = None;
-        let mut reparent_at: Option<u64> = None;
 
         for entry in self.entries.iter().skip(start) {
             let batch = entry.batch.as_ref();
@@ -572,16 +554,6 @@ impl Ring {
             if examined >= budget {
                 // Stopped short of `up_to`: the caller resumes strictly after
                 // the last whole batch this page examined.
-                next = last;
-                break;
-            }
-            if reparent_gap(filter, batch) {
-                // A resume whose range crosses a reparent gets the same gap a
-                // live subscriber would have got at that instant (ADR 0043):
-                // the filter's verdict on jobs below the moved entity differs
-                // either side of this batch, so no continuation of this page
-                // is honest.
-                reparent_at = Some(batch.applied_index);
                 next = last;
                 break;
             }
@@ -597,7 +569,6 @@ impl Ring {
             next,
             floor: self.floor(),
             earliest_available: self.earliest_available(),
-            reparent_at,
         }
     }
 
@@ -694,11 +665,6 @@ struct SubscriberState {
     /// point normal delivery resumes. See `docs/architecture/coordinator-runtime.md`
     /// ("per-subscriber queue").
     gapped: bool,
-    /// A floor the pending gap must report at least: the index of a quota
-    /// entity move (ADR 0043), so that a marker which had to wait for queue
-    /// space still tells the client how fresh its resync read must be. Zero
-    /// when the pending gap has no such floor.
-    gap_floor: u64,
 }
 
 /// Spawn the fanout task.
@@ -883,11 +849,10 @@ fn flush_gaps(subscribers: &mut BTreeMap<u64, SubscriberState>, ring: &Ring) {
         }
         if sub.gapped {
             let gap = SubscriptionItem::Gap {
-                earliest_available: earliest.max(sub.gap_floor),
+                earliest_available: earliest,
             };
             if sub.tx.try_send(gap).is_ok() {
                 sub.gapped = false;
-                sub.gap_floor = 0;
             }
         }
         true
@@ -992,35 +957,6 @@ fn job_admitted(selector: &JobSelector, batch: &EventBatch, job: JobId) -> bool 
 /// Whether this batch is a discontinuity for `filter` rather than something it
 /// can express as events (ADR 0043).
 ///
-/// `ConfigureQuotaEntity` may move an existing entity under a different
-/// parent. That changes the `entity_chain` stamped on every job below it from
-/// the next command on — moving those jobs into or out of a subtree selector's
-/// set — while emitting one entity-scoped event that names no job and so is
-/// never delivered on a `jobs=` stream. A consumer tracking such a set would
-/// otherwise keep jobs that no longer match and never learn of ones that now
-/// do, with nothing on the stream to tell it. A gap does tell it, and the
-/// resync read is the same filter against current state.
-///
-/// Only subtree selectors are affected: an exact-entity leaf reads the chain's
-/// head, which a reparent above the job never moves, and `All`/`Job`/`Node`
-/// filters do not read the chain at all. The filter test comes first because
-/// it is a stored bool, while this scan is per batch.
-fn reparent_gap(filter: &EventFilter, batch: &EventBatch) -> bool {
-    let EventFilter::Jobs(selector) = filter else {
-        return false;
-    };
-    selector.reads_entity_subtree()
-        && batch.events.iter().any(|event| {
-            matches!(
-                event,
-                Event::QuotaEntityConfigured {
-                    reparented: true,
-                    ..
-                }
-            )
-        })
-}
-
 /// Filter one batch's events down to what `filter` admits, preserving each
 /// event's batch-assigned ordinal (ADR 0032: ordinals are assigned before
 /// any filtering, so an event's `(index, ordinal)` identity is the same
@@ -1090,57 +1026,16 @@ fn event_matches(
 /// queue" channel row. A closed receiver means the client is gone: the
 /// subscription is dropped rather than retried on every batch forever.
 fn deliver(sub: &mut SubscriberState, batch: &EventBatch, ring_earliest: u64) -> bool {
-    // A quota-entity reparent is a discontinuity for a subtree subscriber
-    // (see [`reparent_gap`]): it gets a gap in place of this batch, never the
-    // batch filtered under a membership that changed underneath it.
-    let reparent = reparent_gap(&sub.filter, batch);
-
     if sub.gapped {
-        if reparent {
-            // The pending marker absorbs this move; it must report it too.
-            sub.gap_floor = sub.gap_floor.max(batch.applied_index);
-        }
         let gap = SubscriptionItem::Gap {
-            earliest_available: ring_earliest.max(sub.gap_floor),
+            earliest_available: ring_earliest,
         };
         match sub.tx.try_send(gap) {
-            Ok(()) => {
-                sub.gapped = false;
-                sub.gap_floor = 0;
-            }
+            Ok(()) => sub.gapped = false,
             Err(mpsc::error::TrySendError::Closed(_)) => return false,
-            // Still backed up; try again on the next batch. A reparent in this
-            // batch needs no separate marker: the pending gap covers it.
+            // Still backed up; try again on the next batch.
             Err(mpsc::error::TrySendError::Full(_)) => return true,
         }
-        if reparent {
-            // The gap just flushed already told this subscriber to resync, and
-            // carried this move's index as its floor.
-            sub.last_delivered = sub.last_delivered.max(batch.applied_index);
-            return true;
-        }
-    }
-    if reparent {
-        metrics::counter!(GAPS_TOTAL, "cause" => "reparent").increment(1);
-        // The resync has to reflect the move, so the move's own index is the
-        // earliest position a complete resume can start from — not the
-        // ring's, which may sit far below it.
-        let gap = SubscriptionItem::Gap {
-            earliest_available: batch.applied_index.max(ring_earliest),
-        };
-        match sub.tx.try_send(gap) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Closed(_)) => return false,
-            // A full queue must not lose the marker: the same pending-gap
-            // mechanics an overflow uses retry it on the next batch, and the
-            // sweep clears it on an idle stream.
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                sub.gapped = true;
-                sub.gap_floor = sub.gap_floor.max(batch.applied_index);
-            }
-        }
-        sub.last_delivered = sub.last_delivered.max(batch.applied_index);
-        return true;
     }
     let Some(filtered) = filter_events(&sub.filter, batch) else {
         // Nothing matched, but the subscriber is nonetheless current up to
@@ -1192,7 +1087,6 @@ fn handle_subscribe(
             progress: req.progress,
             last_delivered: head,
             gapped: false,
-            gap_floor: 0,
         },
     );
     metrics::gauge!(SUBSCRIPTIONS).set(subscribers.len() as f64);
@@ -1392,7 +1286,6 @@ mod tests {
                 },
                 Event::QuotaEntityConfigured {
                     entity: QuotaEntityId::new(),
-                    reparented: false,
                 },
             ],
         );
@@ -1481,7 +1374,12 @@ mod tests {
             scopes: vec![(job, scope(&[team, root], None, &[]))],
             ..batch_of(3, vec![job_event(job)])
         };
-        let entity = |id, s| selector(dto::JobFilter::Entity(dto::EntityFilter { id, scope: s }));
+        let entity = |id, s| {
+            selector(dto::JobFilter::Entity(dto::EntityFilter {
+                entity: coppice_core::id::QuotaEntityId::into(id),
+                scope: s,
+            }))
+        };
 
         assert!(filter_events(&entity(team, dto::EntityScope::Exact), &batch).is_some());
         assert!(filter_events(&entity(root, dto::EntityScope::Exact), &batch).is_none());
@@ -1503,7 +1401,6 @@ mod tests {
                 progress,
                 last_delivered: 0,
                 gapped: false,
-                gap_floor: 0,
             },
             rx,
         )
@@ -1545,162 +1442,6 @@ mod tests {
             Some(SubscriptionItem::Events(b)) => assert_eq!(b.applied_index, 4),
             other => panic!("expected the fourth batch, got {other:?}"),
         }
-    }
-
-    // ---- quota-entity reparents (ADR 0043) ------------------------------
-
-    fn reparent_batch(index: u64, reparented: bool) -> EventBatch {
-        batch_of(
-            index,
-            vec![Event::QuotaEntityConfigured {
-                entity: QuotaEntityId::new(),
-                reparented,
-            }],
-        )
-    }
-
-    fn subtree_selector(entity: QuotaEntityId) -> EventFilter {
-        selector(dto::JobFilter::Entity(dto::EntityFilter {
-            id: entity,
-            scope: dto::EntityScope::Subtree,
-        }))
-    }
-
-    fn exact_selector(entity: QuotaEntityId) -> EventFilter {
-        selector(dto::JobFilter::Entity(dto::EntityFilter {
-            id: entity,
-            scope: dto::EntityScope::Exact,
-        }))
-    }
-
-    /// The finding this exists for: a reparent moves every job under the moved
-    /// entity into or out of a subtree subscriber's set while naming none of
-    /// them. The subscriber is told to resync instead of being left with a
-    /// silently wrong set.
-    #[tokio::test]
-    async fn a_reparent_gaps_a_subtree_subscriber() {
-        let (mut sub, mut rx) = subscriber(
-            subtree_selector(QuotaEntityId::new()),
-            ProgressItems::Send,
-            4,
-        );
-
-        assert!(deliver(&mut sub, &reparent_batch(7, true), 3));
-        match rx.try_recv() {
-            Ok(SubscriptionItem::Gap { earliest_available }) => {
-                assert_eq!(earliest_available, 7, "the move's own index")
-            }
-            other => panic!("expected a gap, got {other:?}"),
-        }
-        assert!(!sub.gapped, "the marker was accepted; delivery continues");
-    }
-
-    /// A reconfiguration that did not move the entity is an ordinary
-    /// entity-scoped event: nothing a `jobs=` stream carries, and nothing to
-    /// resync for.
-    #[tokio::test]
-    async fn a_reconfiguration_that_did_not_reparent_gaps_nobody() {
-        let (mut sub, mut rx) = subscriber(
-            subtree_selector(QuotaEntityId::new()),
-            ProgressItems::Send,
-            4,
-        );
-        assert!(deliver(&mut sub, &reparent_batch(7, false), 3));
-        assert!(rx.try_recv().is_err(), "no gap, no events");
-    }
-
-    /// Only ancestry-reading selectors are affected. A metadata selector and
-    /// an exact-entity one both read keys a reparent cannot move — the
-    /// chain's head is the job's own entity — and `All` reads none at all.
-    #[tokio::test]
-    async fn a_reparent_does_not_gap_selectors_that_read_no_subtree() {
-        let unaffected = [
-            metadata_selector("team", Some("platform")),
-            exact_selector(QuotaEntityId::new()),
-            EventFilter::All,
-            EventFilter::Job(JobId::new()),
-        ];
-        for filter in unaffected {
-            let (mut sub, mut rx) = subscriber(filter, ProgressItems::Send, 4);
-            assert!(deliver(&mut sub, &reparent_batch(7, true), 3));
-            assert!(
-                !matches!(rx.try_recv(), Ok(SubscriptionItem::Gap { .. })),
-                "a reparent is not a discontinuity for this selector"
-            );
-        }
-    }
-
-    /// A full queue must not swallow the marker: it takes the overflow path's
-    /// pending-gap state, so the retry sweep still delivers it once the client
-    /// drains — the one thing a lost reparent gap would cost is a set that is
-    /// wrong forever.
-    #[tokio::test]
-    async fn a_reparent_gap_survives_a_full_queue() {
-        let entity = QuotaEntityId::new();
-        let job = JobId::new();
-        let (mut sub, mut rx) = subscriber(subtree_selector(entity), ProgressItems::Send, 1);
-
-        // Fill the queue with a matching batch the subscriber has not drained.
-        let matching = EventBatch {
-            scopes: vec![(job, scope(&[QuotaEntityId::new(), entity], None, &[]))],
-            ..batch_of(6, vec![job_event(job)])
-        };
-        assert!(deliver(&mut sub, &matching, 1));
-
-        assert!(deliver(&mut sub, &reparent_batch(7, true), 1));
-        assert!(sub.gapped, "the marker is pending, not dropped");
-
-        // Drain, then let the sweep flush it.
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(SubscriptionItem::Events(b)) if b.applied_index == 6
-        ));
-        let mut ring = Ring::new(0);
-        ring.push(one_event_batch(4));
-        let mut subs = BTreeMap::new();
-        subs.insert(1, sub);
-        flush_gaps(&mut subs, &ring);
-        assert!(!subs[&1].gapped);
-        match rx.try_recv() {
-            // The marker waited for queue space, but still reports the move's
-            // index rather than the ring's older floor: the resync read has to
-            // be at least that fresh.
-            Ok(SubscriptionItem::Gap { earliest_available }) => assert_eq!(earliest_available, 7),
-            other => panic!("expected the retried gap, got {other:?}"),
-        }
-    }
-
-    /// A resume whose range crosses a reparent cannot be served whole either:
-    /// the page stops at that batch, carrying what is below it and the marker
-    /// that says the rest is a gap.
-    #[test]
-    fn catch_up_stops_at_a_reparent_for_a_subtree_selector() {
-        let entity = QuotaEntityId::new();
-        let job = JobId::new();
-        let matching = |index: u64| EventBatch {
-            scopes: vec![(job, scope(&[QuotaEntityId::new(), entity], None, &[]))],
-            ..batch_of(index, vec![job_event(job)])
-        };
-        let mut ring = Ring::new(0);
-        ring.push(matching(4));
-        ring.push(reparent_batch(5, true));
-        ring.push(matching(6));
-
-        let page = ring.catch_up(&subtree_selector(entity), 0, 6, 1_000);
-        assert_eq!(
-            page.batches
-                .iter()
-                .map(|b| b.applied_index)
-                .collect::<Vec<_>>(),
-            vec![4],
-            "everything below the reparent is still owed and still honest"
-        );
-        assert_eq!(page.reparent_at, Some(5));
-
-        // A selector that reads no subtree pages straight across it.
-        let page = ring.catch_up(&metadata_selector("team", None), 0, 6, 1_000);
-        assert_eq!(page.reparent_at, None);
-        assert_eq!(page.next, None, "the whole range was served");
     }
 
     /// A dropped receiver used to be retried on every batch and every tick,

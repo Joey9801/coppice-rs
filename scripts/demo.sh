@@ -111,9 +111,10 @@ grep -q "Coppice dev is ready" "$DEV_LOG" || { echo "timed out waiting for dev";
 sed -n '/Coppice dev is ready/,/Press Ctrl-C/p' "$DEV_LOG"
 
 API="$(sed -n 's#.* API  *\(http://[^ ]*\)/api/v1.*#\1#p' "$DEV_LOG" | head -1)"
-QUOTA_ENTITY="$(sed -n 's#.* Quota entity  *\(quota-[0-9a-f-]*\).*#\1#p' "$DEV_LOG" | head -1)"
-[[ -n "$API" && -n "$QUOTA_ENTITY" ]] || { echo "could not parse the dev banner"; exit 1; }
+[[ -n "$API" ]] || { echo "could not parse the dev banner"; exit 1; }
 export COPPICE_API="$API"
+# `coppice dev` always seeds a quota entity at the fixed path "dev" (ADR 0045).
+QUOTA_ENTITY="dev"
 
 # --- 2. Submit a dummy job --------------------------------------------------
 

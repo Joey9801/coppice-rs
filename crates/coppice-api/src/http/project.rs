@@ -754,11 +754,13 @@ impl FilterContext {
             F::Not(f) => !self.matches(state, f, record),
             F::Phase(p) => p.r#in.contains(&job_phase(state, record)),
             F::Entity(e) => match e.scope {
-                dto::EntityScope::Subtree => self
-                    .subtrees
-                    .get(&e.id)
+                // `id()` is `None` only for a path the handler never
+                // resolved, which matches nothing.
+                dto::EntityScope::Subtree => e
+                    .id()
+                    .and_then(|id| self.subtrees.get(&id))
                     .is_some_and(|set| set.contains(&record.spec.quota_entity)),
-                dto::EntityScope::Exact => record.spec.quota_entity == e.id,
+                dto::EntityScope::Exact => Some(record.spec.quota_entity) == e.id(),
             },
             F::Node(n) => current_attempt_node(state, record) == Some(*n),
             F::Image(dto::ImageFilter::Contains(s)) => record.spec.image.contains(s),
@@ -817,7 +819,7 @@ fn collect_subtree_ids(filter: &dto::JobFilter, out: &mut BTreeSet<QuotaEntityId
         F::All(fs) | F::Any(fs) => fs.iter().for_each(|f| collect_subtree_ids(f, out)),
         F::Not(f) => collect_subtree_ids(f, out),
         F::Entity(e) if e.scope == dto::EntityScope::Subtree => {
-            out.insert(e.id);
+            out.extend(e.id());
         }
         _ => {}
     }
@@ -913,10 +915,8 @@ fn job_summary(state: &StateMachine, record: &JobRecord) -> dto::JobSummary {
         attempt: current,
         image: record.spec.image.clone(),
         quota_entity: record.spec.quota_entity,
-        quota_entity_name: state
-            .quota_entities
-            .get(&record.spec.quota_entity)
-            .map(|e| e.name.clone())
+        quota_entity_path: state
+            .quota_entity_path(record.spec.quota_entity)
             .unwrap_or_default(),
         priority: record.spec.priority,
         submitted_at: record.submitted_at,
@@ -948,6 +948,7 @@ const Q32_SCALE: f64 = 4_294_967_296.0;
 struct EntityMetrics {
     id: QuotaEntityId,
     name: String,
+    path: String,
     parent: Option<QuotaEntityId>,
     quota_ucu: u64,
     usage_ucu: u64,
@@ -969,6 +970,7 @@ fn entity_metrics(
     Some(EntityMetrics {
         id,
         name: e.name.clone(),
+        path: state.quota_entity_path(id).unwrap_or_default(),
         parent: e.parent,
         quota_ucu: e.quota.0,
         usage_ucu: decayed.0,
@@ -1006,6 +1008,7 @@ fn entity_chain(
         .map(|m| dto::QuotaEntityView {
             id: m.id,
             name: m.name,
+            path: m.path,
             parent: m.parent,
             quota_ucu: m.quota_ucu,
             usage_ucu: m.usage_ucu,
@@ -1029,6 +1032,7 @@ fn penalty_chain(
         .map(|m| dto::PenaltyLink {
             entity: m.id,
             name: m.name,
+            path: m.path,
             usage_ucu: m.usage_ucu,
             quota_ucu: m.quota_ucu,
             over_quota_ratio: m.over_quota_ratio,
@@ -1301,6 +1305,9 @@ pub fn get_job(
             priority: spec.priority,
             max_runtime_seconds: spec.max_runtime.map(Duration::as_secs),
             quota_entity: spec.quota_entity,
+            quota_entity_path: state
+                .quota_entity_path(spec.quota_entity)
+                .unwrap_or_default(),
             retry: dto::RetryPolicy {
                 max_retries: spec.retry.max_retries,
                 retry_user_errors: spec.retry.retry_user_errors,
@@ -1388,14 +1395,15 @@ fn quota_entity_node(
     id: &QuotaEntityId,
     e: &QuotaEntity,
     now: Timestamp,
-    policy: &PolicyConfig,
+    state: &StateMachine,
     counts: &BTreeMap<QuotaEntityId, QuotaCounts>,
 ) -> dto::QuotaEntityNode {
-    let (usage_ucu, over_quota_ratio, penalty) = decayed_quota_figures(e, now, policy);
+    let (usage_ucu, over_quota_ratio, penalty) = decayed_quota_figures(e, now, &state.policy);
     let count = counts.get(id).copied().unwrap_or_default();
     dto::QuotaEntityNode {
         id: *id,
         name: e.name.clone(),
+        path: state.quota_entity_path(*id).unwrap_or_default(),
         parent: e.parent,
         // No auto-minted (SSO) entity path exists yet, so provenance is
         // uniformly "configured" — see the `QuotaEntityOrigin` DTO doc.
@@ -1416,12 +1424,13 @@ fn quota_entity_view(
     id: &QuotaEntityId,
     e: &QuotaEntity,
     now: Timestamp,
-    policy: &PolicyConfig,
+    state: &StateMachine,
 ) -> dto::QuotaEntityView {
-    let (usage_ucu, over_quota_ratio, penalty) = decayed_quota_figures(e, now, policy);
+    let (usage_ucu, over_quota_ratio, penalty) = decayed_quota_figures(e, now, &state.policy);
     dto::QuotaEntityView {
         id: *id,
         name: e.name.clone(),
+        path: state.quota_entity_path(*id).unwrap_or_default(),
         parent: e.parent,
         quota_ucu: e.quota.0,
         usage_ucu,
@@ -1440,7 +1449,7 @@ pub fn list_quota_entities(state: &StateMachine, now: Timestamp) -> dto::ListQuo
     let entities = state
         .quota_entities
         .iter()
-        .map(|(id, e)| quota_entity_node(id, e, now, &state.policy, &counts))
+        .map(|(id, e)| quota_entity_node(id, e, now, state, &counts))
         .collect();
     dto::ListQuotaEntitiesResponse { entities }
 }
@@ -1454,7 +1463,7 @@ pub fn get_quota_entity(
 ) -> Option<dto::GetQuotaEntityResponse> {
     let entity = state.quota_entities.get(id)?;
     let counts = subtree_job_counts(state);
-    let node = quota_entity_node(id, entity, now, &state.policy, &counts);
+    let node = quota_entity_node(id, entity, now, state, &counts);
 
     // Ancestry, this entity first then up to the root, bounded by the depth
     // cap; reversed to root-first for the response.
@@ -1472,7 +1481,7 @@ pub fn get_quota_entity(
             state
                 .quota_entities
                 .get(cid)
-                .map(|e| quota_entity_view(cid, e, now, &state.policy))
+                .map(|e| quota_entity_view(cid, e, now, state))
         })
         .collect();
 
@@ -1481,7 +1490,7 @@ pub fn get_quota_entity(
         .quota_entities
         .iter()
         .filter(|(_, e)| e.parent == Some(*id))
-        .map(|(cid, e)| quota_entity_node(cid, e, now, &state.policy, &counts))
+        .map(|(cid, e)| quota_entity_node(cid, e, now, state, &counts))
         .collect();
 
     let stats = quota_entity_stats(state, *id, now);
@@ -2732,7 +2741,7 @@ mod tests {
         );
 
         let subtree = dto::JobFilter::Entity(dto::EntityFilter {
-            id: root,
+            entity: root.into(),
             scope: dto::EntityScope::Subtree,
         });
         assert_eq!(
@@ -2741,7 +2750,7 @@ mod tests {
         );
 
         let exact = dto::JobFilter::Entity(dto::EntityFilter {
-            id: root,
+            entity: root.into(),
             scope: dto::EntityScope::Exact,
         });
         assert_eq!(
@@ -2751,7 +2760,7 @@ mod tests {
 
         // An unknown entity matches nothing, even under subtree scope.
         let unknown = dto::JobFilter::Entity(dto::EntityFilter {
-            id: quota_id(99),
+            entity: quota_id(99).into(),
             scope: dto::EntityScope::Subtree,
         });
         assert!(list_jobs(&state, Some(&unknown), None, 100).jobs.is_empty());

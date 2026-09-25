@@ -15,10 +15,11 @@ use governor::state::InMemoryState;
 use governor::{middleware::NoOpMiddleware, Quota, RateLimiter};
 
 use crate::credential::{BearerToken, Credential, TokenProvider};
+use crate::entity_ref::QuotaEntityRef;
 use crate::error::{Error, Result};
 use crate::events::{JobEventStream, JobEventWatcher, JobWatcher, WatchOptions};
 use crate::follow::{FollowOptions, LogFollower};
-use crate::id::{JobId, NodeId, QuotaEntityId};
+use crate::id::{JobId, NodeId};
 use crate::pagination::{JobPager, LogPager, TimelinePager, UsagePager};
 use crate::paths;
 use crate::types::{
@@ -994,11 +995,14 @@ impl Client {
 
     /// `GET /api/v1/quota-entities/{entity}` — one entity, its ancestry, its
     /// children and its subtree stats. A **strong** read by default.
+    ///
+    /// `entity` is a ref (ADR 0045): an id or a path. A path is percent-encoded
+    /// as a single path segment (`/` becomes `%2F`) — see [`paths::quota_entity`].
     pub async fn quota_entity(
         &self,
-        entity: QuotaEntityId,
+        entity: impl Into<QuotaEntityRef>,
     ) -> Result<Versioned<GetQuotaEntityResponse>> {
-        self.get(&paths::quota_entity(entity), &[]).await
+        self.get(&paths::quota_entity(entity.into()), &[]).await
     }
 
     /// `POST /api/v1/quota-entities` — create or update an entity.

@@ -118,8 +118,9 @@ impl HttpError {
 /// mapping, the half that is a property of the rejection itself rather than of
 /// the endpoint that provoked it.
 ///
-/// Exactly one distinction lives here: apply's ADR 0023 re-check is a 403, not
-/// a 409. It has to be global, because the re-check can refuse *any* mutating
+/// Two distinctions live here. An ADR 0045 name-grammar refusal is a 400: a
+/// malformed name is never a race. And apply's ADR 0023 re-check is a 403, not
+/// a 409. That one has to be global, because the re-check can refuse *any* mutating
 /// verb — a revocation landing between the API's pre-check and the command's
 /// log position is the whole reason the re-check exists, and answering it with
 /// a 409 (or worse, letting it fall through to a 500) would tell the client
@@ -133,6 +134,9 @@ impl HttpError {
 fn rejection_code(kind: RejectionKind) -> ErrorCode {
     match kind {
         RejectionKind::PermissionDenied => ErrorCode::PermissionDenied,
+        // A name outside the ADR 0045 grammar is a malformed request on every
+        // endpoint that can carry one, never a race.
+        RejectionKind::InvalidQuotaEntityName => ErrorCode::InvalidArgument,
         RejectionKind::Other
         | RejectionKind::UnknownQuotaEntity
         | RejectionKind::InvalidAuthorization
@@ -171,10 +175,8 @@ pub fn node_write_error(e: ApiError) -> HttpError {
 /// (400), each with its own detail text, and each keeps the leading phrase of
 /// the rejection it came from so the three stay distinguishable.
 pub fn authorization_error(e: ApiError) -> HttpError {
-    let kind = match &e {
-        ApiError::Rejected(r) => RejectionKind::of(r),
-        ApiError::ForwardedRejection { kind, .. } => *kind,
-        _ => return e.into(),
+    let Some(kind) = e.rejection_kind() else {
+        return e.into();
     };
     match kind {
         RejectionKind::UnknownQuotaEntity => HttpError::invalid(format!(
@@ -186,9 +188,10 @@ pub fn authorization_error(e: ApiError) -> HttpError {
         RejectionKind::AuthorizationLockout => HttpError::invalid(format!(
             "the bindings list would lock the cluster out of its own authorization: {e}"
         )),
-        RejectionKind::PermissionDenied | RejectionKind::Other | RejectionKind::UnknownNode => {
-            e.into()
-        }
+        RejectionKind::PermissionDenied
+        | RejectionKind::Other
+        | RejectionKind::UnknownNode
+        | RejectionKind::InvalidQuotaEntityName => e.into(),
     }
 }
 
@@ -212,6 +215,11 @@ impl From<ApiError> for HttpError {
                 leader_hint,
             },
             ApiError::Unavailable(m) => HttpError::new(ErrorCode::Unavailable, m),
+            // Answered as the rejection an unknown id earns at apply (see the
+            // variant), so the same classification picks the status.
+            ApiError::UnresolvedQuotaEntity(m) => {
+                HttpError::new(rejection_code(RejectionKind::UnknownQuotaEntity), m)
+            }
         }
     }
 }
