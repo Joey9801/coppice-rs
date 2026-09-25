@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import type { JobDetail, JobSpec } from '@/api/types'
-import { formatDuration, formatResources, shortId } from '@/lib/format'
-import { KeyValueGrid } from '@/components'
+import { formatDuration, formatResources } from '@/lib/format'
+import { EntityLabel, KeyValueGrid } from '@/components'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 
 /** How much command line to show before hiding the rest behind a toggle. */
@@ -10,7 +10,6 @@ const COMMAND_PREVIEW_CHARS = 120
 
 export function JobSpecCard({ job }: { job: JobDetail }) {
   const { spec } = job
-  const entity = job.entityChain[job.entityChain.length - 1]
 
   const items = [
     { label: 'Image', value: <span className="font-mono text-xs break-all">{spec.image}</span> },
@@ -35,14 +34,7 @@ export function JobSpecCard({ job }: { job: JobDetail }) {
     },
     {
       label: 'Quota entity',
-      value: (
-        <span>
-          {entity ? entity.name : '—'}{' '}
-          <span className="ml-1 font-mono text-xs text-muted-foreground">
-            {shortId(spec.quotaEntity)}
-          </span>
-        </span>
-      ),
+      value: <EntityLabel id={spec.quotaEntity} path={spec.quotaEntityPath} variant="stacked" />,
     },
   ]
 

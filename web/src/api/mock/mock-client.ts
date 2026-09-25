@@ -9,9 +9,9 @@ import type {
   ListJobsRequest,
   LogRequest,
   NodeId,
-  QuotaEntityId,
+  QuotaEntityRef,
 } from '../types'
-import { isMockInvalid, isMockNotFound, MockWorld } from './world'
+import { isMockInvalid, isMockNotFound, isMockRejected, MockWorld } from './world'
 
 /**
  * The mock `CoppiceApi`, backed by a singleton `MockWorld`.
@@ -22,7 +22,9 @@ import { isMockInvalid, isMockNotFound, MockWorld } from './world'
  *  2. awaits a small artificial latency, and
  *  3. returns freshly built view objects (never internal mutable state).
  *
- * Unknown ids surface as `ApiError('NotFound', …)`.
+ * Unknown ids surface as `ApiError('NotFound', …)`; malformed input as
+ * `InvalidArgument`; a well-formed write the state refuses (a sibling name
+ * clash, an unknown parent) as `Rejected`, like the server's 409.
  */
 export function createMockClient(): CoppiceApi {
   const world = new MockWorld(Date.now() * 1000)
@@ -35,6 +37,7 @@ export function createMockClient(): CoppiceApi {
     } catch (err) {
       if (isMockNotFound(err)) throw new ApiError('NotFound', (err as Error).message)
       if (isMockInvalid(err)) throw new ApiError('InvalidArgument', (err as Error).message)
+      if (isMockRejected(err)) throw new ApiError('Rejected', (err as Error).message)
       throw err
     }
   }
@@ -76,7 +79,7 @@ export function createMockClient(): CoppiceApi {
     // The demo session always holds `admin`, so the mock never rejects with
     // PermissionDenied — the real client will (ADR 0023 scoped bindings).
     listQuotaEntities: () => settle(() => world.listQuotaEntities()),
-    getQuotaEntity: (id: QuotaEntityId) => settle(() => world.buildQuotaEntityDetail(id)),
+    getQuotaEntity: (ref: QuotaEntityRef) => settle(() => world.buildQuotaEntityDetail(ref)),
     configureQuotaEntity: (input: ConfigureQuotaEntityInput) =>
       settle(() => world.configureQuotaEntity(input)),
   }

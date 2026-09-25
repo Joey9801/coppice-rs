@@ -1,20 +1,17 @@
-import { Fragment, useState } from 'react'
+import { useState } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { ArrowLeft, ArrowRight, Network, Plus } from 'lucide-react'
-import type {
-  JobFilter,
-  JobPhase,
-  QuotaEntityDetail,
-  QuotaEntityNode,
-  QuotaEntityView,
-} from '@/api/types'
+import type { JobFilter, JobPhase, QuotaEntityDetail, QuotaEntityNode } from '@/api/types'
 import { derivePhase, JOB_PHASES } from '@/api/types'
 import { useJobs, useQuotaEntities, useQuotaEntity } from '@/api/queries'
 import { canConfigureEntities, useSession } from '@/auth/session'
 import { formatDuration, formatMultiplier, formatPercent, formatUcu } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
+  CopyButton,
   EmptyState,
+  EntityBreadcrumb,
+  EntitySegment,
   IdLink,
   PageHeader,
   SparkLine,
@@ -37,7 +34,7 @@ import {
 } from '@/components/ui/table'
 import { EntityForm } from './entity-form'
 import { UsageBar } from './entities-page'
-import { isNotFound, lastSegment } from './lib'
+import { isNotFound } from './lib'
 
 export function EntityDetailPage({ entityId }: { entityId: string }) {
   const { data: detail, isPending, isError, error } = useQuotaEntity(entityId)
@@ -97,19 +94,20 @@ function EntityDetailBody({
       <PageHeader
         title={
           <span className="flex flex-wrap items-center gap-2.5">
-            <span>{lastSegment(entity.name)}</span>
+            {/* The path is the title: ancestors link up the tree. */}
+            <EntityBreadcrumb chain={chain} className="gap-x-1.5" />
             {entity.origin === 'sso' ? <Badge variant="secondary">SSO</Badge> : null}
           </span>
         }
         description={
           <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
-            <Breadcrumb chain={chain} />
+            <span className="inline-flex items-center gap-1">
+              <span className="break-all font-mono text-xs">{entity.id}</span>
+              <CopyButton value={entity.id} ariaLabel="Copy entity id" />
+            </span>
             {entity.principal ? (
               <span className="text-muted-foreground">· {entity.principal}</span>
             ) : null}
-            <span className="ml-1">
-              <IdLink id={entity.id} />
-            </span>
           </span>
         }
         actions={
@@ -184,6 +182,7 @@ function EntityDetailBody({
       {canEdit ? (
         <Card className="p-6">
           <EntityForm
+            key={entity.id}
             mode="edit"
             title="Configure"
             entity={entity}
@@ -193,33 +192,6 @@ function EntityDetailBody({
         </Card>
       ) : null}
     </div>
-  )
-}
-
-function Breadcrumb({ chain }: { chain: QuotaEntityView[] }) {
-  if (chain.length === 0) return null
-  return (
-    <span className="flex flex-wrap items-center gap-x-1 gap-y-1">
-      {chain.map((node, i) => {
-        const leaf = i === chain.length - 1
-        return (
-          <Fragment key={node.id}>
-            {i > 0 ? <span className="text-muted-foreground">/</span> : null}
-            {leaf ? (
-              <span className="font-medium text-foreground">{lastSegment(node.name)}</span>
-            ) : (
-              <Link
-                to="/entities/$entityId"
-                params={{ entityId: node.id }}
-                className="text-muted-foreground hover:text-foreground hover:underline"
-              >
-                {lastSegment(node.name)}
-              </Link>
-            )}
-          </Fragment>
-        )
-      })}
-    </span>
   )
 }
 
@@ -292,9 +264,7 @@ function ChildrenCard({
                   >
                     <TableCell>
                       <span className="flex items-center gap-1.5">
-                        <span className="font-medium text-foreground">
-                          {lastSegment(child.name)}
-                        </span>
+                        <EntitySegment id={child.id} name={child.name} path={child.path} />
                         {child.origin === 'sso' ? (
                           <Badge variant="secondary" className="text-[10px]">
                             SSO
@@ -328,8 +298,8 @@ function JobsCard({ entityId }: { entityId: string }) {
   const [state, setState] = useState<JobPhase | ''>('')
   // Entity subtree, optionally ANDed with a phase leaf. First page only here.
   const filter: JobFilter = state
-    ? { all: [{ entity: { id: entityId } }, { phase: { in: [state] } }] }
-    : { entity: { id: entityId } }
+    ? { all: [{ entity: { ref: entityId } }, { phase: { in: [state] } }] }
+    : { entity: { ref: entityId } }
   const { data, isPending } = useJobs({ filter, limit: 25 })
   const jobs = data?.pages[0]?.jobs ?? []
   const hasMore = (data?.pages[0]?.nextCursor ?? null) !== null
