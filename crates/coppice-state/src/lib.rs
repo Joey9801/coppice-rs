@@ -22,6 +22,7 @@ use imbl::OrdMap;
 
 use coppice_core::allocation::Allocation;
 use coppice_core::attempt::{Attempt, AttemptState};
+use coppice_core::entity_ref::{QuotaEntityPath, QuotaEntityRef};
 use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
 };
@@ -241,6 +242,66 @@ impl StateMachine {
             current = self.quota_entities.get(&id).and_then(|e| e.parent);
         }
         chain
+    }
+
+    /// An entity's path (ADR 0045): its ancestors' names, root first, joined
+    /// by `/`, then its own — `acme/eng/platform`. Derived at read time from
+    /// the parent chain, never stored.
+    ///
+    /// `None` for an entity absent from the tree. Bounded by
+    /// [`QUOTA_TREE_DEPTH_CAP`] like [`entity_chain`](Self::entity_chain), and
+    /// for the same defensive reason.
+    pub fn quota_entity_path(&self, entity: QuotaEntityId) -> Option<String> {
+        self.quota_entities.get(&entity)?;
+        let mut names: Vec<&str> = Vec::new();
+        let mut current = Some(entity);
+        while let Some(id) = current {
+            if names.len() as u32 >= QUOTA_TREE_DEPTH_CAP {
+                break;
+            }
+            let Some(e) = self.quota_entities.get(&id) else {
+                break;
+            };
+            names.push(&e.name);
+            current = e.parent;
+        }
+        names.reverse();
+        Some(names.join("/"))
+    }
+
+    /// The entity a path names in this state, if any (ADR 0045): walk down
+    /// from the roots one segment at a time, taking the child with that name.
+    ///
+    /// A scan per segment over the (bounded, ~1k) entity map — no index is
+    /// kept on the state machine. Sibling uniqueness, enforced at apply, is
+    /// what makes the answer unique.
+    pub fn resolve_quota_entity_path(&self, path: &QuotaEntityPath) -> Option<QuotaEntityId> {
+        let mut parent: Option<QuotaEntityId> = None;
+        for (depth, segment) in path.segments().enumerate() {
+            if depth as u32 >= QUOTA_TREE_DEPTH_CAP {
+                return None;
+            }
+            let (id, _) = self
+                .quota_entities
+                .iter()
+                .find(|(_, e)| e.parent == parent && e.name == segment)?;
+            parent = Some(*id);
+        }
+        parent
+    }
+
+    /// Resolve a client's [`QuotaEntityRef`] to an id against this state.
+    ///
+    /// An id resolves to itself **without** an existence check — whether an
+    /// unknown id is an error is the caller's call (a filter matches nothing,
+    /// a write is refused at apply) — and a path resolves through
+    /// [`resolve_quota_entity_path`](Self::resolve_quota_entity_path), `None`
+    /// when nothing lives there.
+    pub fn resolve_quota_entity_ref(&self, entity: &QuotaEntityRef) -> Option<QuotaEntityId> {
+        match entity {
+            QuotaEntityRef::Id(id) => Some(*id),
+            QuotaEntityRef::Path(path) => self.resolve_quota_entity_path(path),
+        }
     }
 
     /// The scope keys a job carries **right now** — the "after" half of the
@@ -676,6 +737,9 @@ impl NodeRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaEntity {
     pub parent: Option<QuotaEntityId>,
+    /// One path segment (ADR 0045's grammar), unique among the entity's
+    /// siblings — both enforced at apply. The entity's path is derived from
+    /// these at read time ([`StateMachine::quota_entity_path`]).
     pub name: String,
     /// The soft quota as a *stock* in µCU (ADR 0019); config tooling converts
     /// human rates.
@@ -833,6 +897,14 @@ pub enum RejectionReason {
     UnsupportedPlacementShape,
     #[error("quota entity {0} parent chain would cycle or exceed the depth cap")]
     QuotaEntityCycle(QuotaEntityId),
+    /// The name broke the ADR 0045 segment grammar; the text names the input
+    /// and the rule.
+    #[error("{0}")]
+    InvalidQuotaEntityName(String),
+    /// Another entity under the same parent (or another root) already holds
+    /// the name (ADR 0045).
+    #[error("quota entity name {name:?} is already taken under the same parent by {holder}")]
+    QuotaEntityNameTaken { name: String, holder: QuotaEntityId },
     #[error("invalid policy: {0}")]
     InvalidPolicy(String),
     #[error("permission denied: {0}")]

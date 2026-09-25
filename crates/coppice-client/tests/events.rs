@@ -265,7 +265,7 @@ fn row(job: &str) -> String {
     format!(
         r#"{{"id":"{job}","state":"queued","attempt":null,"image":"alpine:3",
            "quota_entity":"quota-00000000-0000-0000-0000-000000000001",
-           "quota_entity_name":"team","priority":0,
+           "quota_entity_path":"team","priority":0,
            "submitted_at":"1970-01-01T00:00:01.000000Z","submitted_by":null,
            "terminal_at":null,"node":null,"attempt_state":null,
            "funding_fraction":null,"cost_ucu":0,"outcome":null,"metadata":{{}}}}"#

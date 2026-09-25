@@ -81,15 +81,16 @@ async fn main() -> coppice_client::Result<()> {
         .token_opt(std::env::var("COPPICE_TOKEN").ok())
         .build()?;
 
-    // Pick the quota entity to charge, then submit. The id is minted here and
-    // is the submission's idempotency identity: resend it verbatim on a retry.
-    let entity = client.list_quota_entities().await?.entities[0].id;
+    // Name the quota entity to charge by its path (ADR 0045) — an id works
+    // too, but a path is what a person actually thinks in. The job id is
+    // minted here and is the submission's idempotency identity: resend it
+    // verbatim on a retry.
     let request = SubmitJobRequest::new(
         JobId::new(),
         "alpine:3",
         ["sh", "-c", "echo hello && sleep 5"],
         Resources::new(1_000, 512 * 1024 * 1024, 0),
-        entity,
+        "acme/eng".parse::<coppice_client::QuotaEntityRef>().expect("a valid path"),
     );
     let submitted = client.submit_job(&request).await?;
 

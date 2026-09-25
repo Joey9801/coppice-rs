@@ -15,7 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::{JobId, NodeId, QuotaEntityId};
+use crate::entity_ref::QuotaEntityRef;
+use crate::id::{JobId, NodeId};
 use crate::metadata::validate_key;
 use crate::time::Timestamp;
 
@@ -76,11 +77,12 @@ pub struct PhaseFilter {
     pub r#in: Vec<JobPhase>,
 }
 
-/// `{"entity": {"id": "quota-…", "scope": "subtree"}}`.
+/// `{"entity": {"ref": "acme/eng", "scope": "subtree"}}` — the entity to
+/// match, by id or path (ADR 0045).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityFilter {
     /// The entity to match.
-    pub id: QuotaEntityId,
+    pub r#ref: QuotaEntityRef,
     /// How far the match reaches.
     #[serde(default)]
     pub scope: EntityScope,
@@ -236,17 +238,17 @@ impl JobFilter {
     }
 
     /// Matches an entity and its whole subtree.
-    pub fn entity(id: QuotaEntityId) -> JobFilter {
+    pub fn entity(entity: impl Into<QuotaEntityRef>) -> JobFilter {
         JobFilter::Entity(EntityFilter {
-            id,
+            r#ref: entity.into(),
             scope: EntityScope::Subtree,
         })
     }
 
     /// Matches an entity exactly, not its descendants.
-    pub fn entity_exact(id: QuotaEntityId) -> JobFilter {
+    pub fn entity_exact(entity: impl Into<QuotaEntityRef>) -> JobFilter {
         JobFilter::Entity(EntityFilter {
-            id,
+            r#ref: entity.into(),
             scope: EntityScope::Exact,
         })
     }
@@ -509,6 +511,8 @@ fn check_metadata(filter: &MetadataFilter) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity_ref::QuotaEntityPath;
+    use crate::id::QuotaEntityId;
 
     #[test]
     fn a_phase_leaf_is_a_single_key_object() {
@@ -527,12 +531,23 @@ mod tests {
         let filter = JobFilter::entity(id);
         assert_eq!(
             serde_json::to_value(&filter).unwrap(),
-            serde_json::json!({ "entity": { "id": id.to_string(), "scope": "subtree" } })
+            serde_json::json!({ "entity": { "ref": id.to_string(), "scope": "subtree" } })
         );
         let exact = JobFilter::entity_exact(id);
         assert_eq!(
             serde_json::to_value(&exact).unwrap(),
-            serde_json::json!({ "entity": { "id": id.to_string(), "scope": "exact" } })
+            serde_json::json!({ "entity": { "ref": id.to_string(), "scope": "exact" } })
+        );
+    }
+
+    /// A path is as valid an entity ref in a filter as an id.
+    #[test]
+    fn an_entity_leaf_accepts_a_path_ref() {
+        let path: QuotaEntityPath = "acme/eng".parse().unwrap();
+        let filter = JobFilter::entity(path.clone());
+        assert_eq!(
+            serde_json::to_value(&filter).unwrap(),
+            serde_json::json!({ "entity": { "ref": "acme/eng", "scope": "subtree" } })
         );
     }
 

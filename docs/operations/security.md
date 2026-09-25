@@ -107,8 +107,10 @@ default, no negative grants.
   authorization, cluster version, coordinator membership, enrollment
   administration).
 - **Bindings** are replicated policy:
-  `(Group(name) | Principal(sub)) → role [@ quota-entity subtree]`.
-  Unscoped bindings are cluster-wide; cluster verbs (node operations,
+  `(Group(name) | Principal(sub)) → role [@ quota-entity subtree]`. A
+  binding's `scope` is set by id or by path — either resolves to the same
+  replicated id (ADR 0045). Unscoped bindings are cluster-wide; cluster verbs
+  (node operations,
   policy, authorization, cluster version, coordinator membership RPCs,
   minting enrollment tokens) require an unscoped binding.
   Changed via `coppice-cli policy` as a full-replacement

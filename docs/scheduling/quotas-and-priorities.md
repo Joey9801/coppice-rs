@@ -18,6 +18,13 @@ user. Each entity has a parent, a soft quota, and its configuration is
 replicated policy state. Every job is submitted under exactly one leaf entity
 and charges every ancestor on its path.
 
+An entity's **name** is one path segment, unique among its siblings; its
+**path** — the ancestors' names, root first, joined by `/`
+(`acme/eng/platform`) — is derived from the parent chain, never stored, and
+is how a person names an entity everywhere a client can (ADR 0045). The id
+(`quota-<uuid>`) remains accepted everywhere a path is, and is the only
+durable reference: a path survives until the entity is renamed or moved.
+
 A **soft quota** is replicated as a stock in µCU: the decayed-usage level
 that counts as "at quota". Humans configure a rate ("100 core-hours per
 day"); tooling converts it via `quota_stock = rate × half_life / ln 2`, the

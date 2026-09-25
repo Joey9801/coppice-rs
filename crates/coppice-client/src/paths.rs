@@ -22,7 +22,8 @@
 //! [`HEALTHZ`] is the exception: liveness lives outside `/api/v1` and outside
 //! its versioning, so it is an absolute path.
 
-use crate::id::{JobId, NodeId, QuotaEntityId};
+use crate::entity_ref::QuotaEntityRef;
+use crate::id::{JobId, NodeId};
 
 /// `GET /healthz` — the liveness probe. Absolute, **not** `/api/v1`-relative:
 /// it is outside the JSON API and its versioning.
@@ -117,8 +118,17 @@ pub fn node_remove(node: NodeId) -> String {
 }
 
 /// `GET /quota-entities/{entity}` — one entity's detail.
-pub fn quota_entity(entity: QuotaEntityId) -> String {
-    format!("/quota-entities/{entity}")
+///
+/// `entity` is a ref (ADR 0045): an id or a path. Both are single URL path
+/// segments once encoded: an id's alphabet (`quota-<uuid>`) is all
+/// unreserved characters, and a path's grammar allows only
+/// `[A-Za-z0-9._-]` and `/` — so the only character that needs escaping is
+/// `/`, replaced here with its percent-encoding `%2F`. This is exact, not
+/// an approximation: no other byte in either alphabet is reserved in a URL
+/// path segment.
+pub fn quota_entity(entity: impl Into<QuotaEntityRef>) -> String {
+    let encoded = entity.into().to_string().replace('/', "%2F");
+    format!("/quota-entities/{encoded}")
 }
 
 #[cfg(test)]
@@ -141,5 +151,21 @@ mod tests {
             node_drain(node),
             "/nodes/node-00000000-0000-0000-0000-000000000002/drain"
         );
+    }
+
+    /// An id ref needs no escaping; a path ref's `/` separators are
+    /// percent-encoded so the whole ref stays one path segment (ADR 0045).
+    #[test]
+    fn quota_entity_percent_encodes_a_path_ref_but_not_an_id_ref() {
+        let id: crate::id::QuotaEntityId = "quota-00000000-0000-0000-0000-000000000003"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            quota_entity(id),
+            "/quota-entities/quota-00000000-0000-0000-0000-000000000003"
+        );
+
+        let path: QuotaEntityRef = "acme/eng".parse().unwrap();
+        assert_eq!(quota_entity(path), "/quota-entities/acme%2Feng");
     }
 }

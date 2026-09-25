@@ -61,8 +61,8 @@ async fn wait_for_leader(nodes: &[Node], candidates: &[usize], deadline: Duratio
 }
 
 /// The one logical submission, byte-identical on every send.
-fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequest {
-    dto::SubmitJobRequest {
+fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::ResolvedSubmitJobRequest {
+    dto::ResolvedSubmitJobRequest {
         image: "registry/img:latest".to_string(),
         requests: dto::Resources {
             cpu_millis: 1000,

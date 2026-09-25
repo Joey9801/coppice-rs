@@ -32,9 +32,10 @@ Run the end-to-end checks against an environment brought up by up.sh.
   --job-spec PATH       job spec to submit; default examples/jobs/stress-demo.toml
                         (about five minutes of work, shaped so the usage
                         samples are worth reading).
-  --quota-entity ID     the quota entity the job charges, substituted into a
-                        copy of the spec; default is the `demo` entity that
-                        deploy/examples/policy.toml seeds at formation.
+  --quota-entity REF    the quota entity (an id or a path, ADR 0045) the job
+                        charges, substituted into a copy of the spec; default
+                        is the "demo" path that deploy/examples/policy.toml
+                        seeds at formation.
   --coppice PATH        the `coppice` CLI to drive (default: $COPPICE_BIN, else
                         `coppice` on PATH). Build one with
                         `cargo build --release --bin coppice`.
@@ -47,7 +48,7 @@ EOT
 
 env_name=""
 job_spec="$REPO_ROOT/examples/jobs/stress-demo.toml"
-quota_entity="quota-00000000-0000-0000-0000-0000000000d1"
+quota_entity="demo"
 coppice_bin="${COPPICE_BIN:-coppice}"
 skip_job=false
 timeout_secs=900

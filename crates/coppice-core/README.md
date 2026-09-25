@@ -12,6 +12,12 @@ anywhere in the workspace.
   `NodeId`, `AllocationId`, `AttemptId`, `GroupId`, `QuotaEntityId`) so one
   entity's id can never be passed where another's is expected. No `Default`: a
   defaulted id is always a bug.
+- **Quota entity references** (`entity_ref`) — the ADR 0045 name grammar
+  (`validate_segment`: 1–63 of `[A-Za-z0-9._-]`, first alphanumeric, never an
+  id), the validated slash-joined `QuotaEntityPath` (`acme/eng/platform`), and
+  `QuotaEntityRef`, the one-string id-or-path reference clients name an entity
+  by. Resolving a path to an id needs a state view, so it lives in
+  `coppice-state`.
 - **Resources** (`resource`) — the multi-dimensional `Resources` vector
   (milli-CPU, memory bytes, disk bytes) with the saturating and component-wise
   operations the state machine relies on (`fits_within`, `saturating_add/sub`,

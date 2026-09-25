@@ -22,6 +22,7 @@ use serde::Deserialize;
 // `method()` on the resolved actor: the actor is `coppice_state::Actor`, so
 // the authentication edge's view of it arrives as an extension trait.
 use coppice_authn::ActorExt;
+use coppice_core::entity_ref::{self, QuotaEntityRef};
 use coppice_core::id::{JobId, NodeId, QuotaEntityId};
 use coppice_core::metadata;
 use coppice_core::time::Timestamp;
@@ -31,12 +32,12 @@ use super::dto::{
     ReplaceJobMetadataRequest, ReplaceJobMetadataResponse, SubmitJobRequest,
     UpdateJobMetadataRequest, UpdateJobMetadataResponse,
 };
-use crate::{Consistency, ControlPlane, UpdateJobMetadataCall};
+use crate::{Consistency, ControlPlane, ReadOptions, UpdateJobMetadataCall};
 
 use super::authn::{RequestActor, RequestPresentation};
 use super::authorize::{precheck, Intent};
 use super::enroll::EnrollEndpoint;
-use super::error::{authorization_error, node_write_error, HttpError};
+use super::error::{authorization_error, node_write_error, ErrorCode, HttpError};
 use super::extract::{IdPath, ReadIndexes, ReadQuery};
 use super::metrics::MetricsEndpoint;
 use super::readyz::ReadyzEndpoint;
@@ -401,10 +402,12 @@ async fn get_session<P: ControlPlane>(
     let view = plane
         .read_state(params.into_options(Consistency::Eventual))
         .await?;
-    let bindings = coppice_state::authz::matching_bindings(&view.state().bindings, &actor)
+    let state = view.state();
+    let bindings = coppice_state::authz::matching_bindings(&state.bindings, &actor)
         .map(|b| dto::SessionBinding {
             role: (&b.role).into(),
             scope: b.scope,
+            scope_path: b.scope.and_then(|id| state.quota_entity_path(id)),
         })
         .collect();
     Ok((
@@ -455,7 +458,11 @@ async fn get_authorization<P: ControlPlane>(
     let state = view.state();
     let response = dto::GetAuthorizationResponse {
         groups_claim: state.policy.groups_claim.clone(),
-        bindings: state.bindings.iter().map(Into::into).collect(),
+        bindings: state
+            .bindings
+            .iter()
+            .map(|b| dto::BindingView::of(b, state))
+            .collect(),
     };
     Ok((
         ReadIndexes {
@@ -490,6 +497,29 @@ async fn update_authorization<P: ControlPlane>(
     body: Result<Json<dto::UpdateAuthorizationRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
     let Json(request) = body.map_err(bad_body)?;
+
+    // Scopes named by path resolve against an eventual view (ADR 0045). A
+    // path naming nothing is the same malformed document an unknown scope id
+    // is on this endpoint — a 400 — just caught before the proposal.
+    let view = plane.read_state(eventual()).await?;
+    let state = view.state();
+    let mut bindings = Vec::with_capacity(request.bindings.len());
+    for (i, binding) in request.bindings.into_iter().enumerate() {
+        let scope = match &binding.scope {
+            None => None,
+            Some(scope) => Some(state.resolve_quota_entity_ref(scope).ok_or_else(|| {
+                HttpError::invalid(format!(
+                    "binding {i}: the bindings list scopes a role to a quota entity that does \
+                     not exist: no quota entity at path \"{scope}\""
+                ))
+            })?),
+        };
+        bindings.push(binding.with_scope(scope));
+    }
+    let request = dto::UpdateAuthorizationRequest {
+        groups_claim: request.groups_claim,
+        bindings,
+    };
 
     // The exactly-one-subject rule, checked here and discarded: the plane
     // takes the DTO (like every other write) and converts it itself, but a
@@ -579,7 +609,7 @@ async fn list_jobs<P: ControlPlane>(
         }
     };
 
-    let filter = match &params.filter {
+    let mut filter = match &params.filter {
         None => None,
         Some(raw) => {
             let parsed: dto::JobFilter = serde_json::from_str(raw)
@@ -597,6 +627,13 @@ async fn list_jobs<P: ControlPlane>(
     let view = plane
         .read_state(read.into_options(Consistency::Bounded))
         .await?;
+    // Entity paths resolve against the very view the scan reads (ADR 0045);
+    // an unresolvable path is a typo, and a 400 rather than an empty page.
+    if let Some(filter) = &mut filter {
+        filter
+            .resolve_entity_refs(view.state())
+            .map_err(|e| HttpError::invalid(format!("invalid filter: {e}")))?;
+    }
     let response = super::project::list_jobs(view.state(), filter.as_ref(), cursor, limit as usize);
     Ok((
         ReadIndexes {
@@ -611,6 +648,10 @@ async fn list_jobs<P: ControlPlane>(
 /// `SubmitJobResponse` (echoed client-minted id + `log_index` for a
 /// read-your-writes `min_index`, ADR 0026/0007).
 ///
+/// `quota_entity` is a [`QuotaEntityRef`]; a path is resolved against the
+/// latest view before anything else, and one naming nothing is the 409 an
+/// unknown id earns at apply (ADR 0045).
+///
 /// Gated on `submitter` or higher over the charged quota entity (ADR 0023):
 /// [`precheck`] answers 403 before anything is proposed, and the actor rides
 /// the command for apply's authoritative re-check.
@@ -620,6 +661,8 @@ async fn submit_job<P: ControlPlane>(
     body: Result<Json<SubmitJobRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
     let Json(request) = body.map_err(bad_body)?;
+    let entity = resolve_write_ref(&*plane, &request.quota_entity).await?;
+    let request = request.with_entity(entity);
     precheck(
         &*plane,
         &actor,
@@ -807,7 +850,11 @@ async fn remove_node<P: ControlPlane>(
 /// create-or-update upsert (ADR 0031's write class). Response echoes the
 /// client-minted entity id + `log_index` for read-your-writes, exactly like
 /// `SubmitJob`. A cycle / unknown-parent refusal maps to `REJECTED` (409),
-/// the normal committed-and-refused outcome — and stays a 409 here even
+/// the normal committed-and-refused outcome, as does a sibling name clash
+/// (ADR 0045); a `parent` path naming nothing is the same 409, and a `name`
+/// outside the segment grammar is a 400 before anything is proposed. The
+/// response adds the entity's `path`, read back at the write's index. The
+/// unknown-parent refusal stays a 409 here even
 /// though `PUT /api/v1/authorization` reads the same `UnknownQuotaEntity` as a
 /// 400: on this endpoint an unknown parent really is a race with whoever
 /// deleted it, which is what 409 means.
@@ -824,6 +871,14 @@ async fn configure_quota_entity<P: ControlPlane>(
     body: Result<Json<ConfigureQuotaEntityRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
     let Json(request) = body.map_err(bad_body)?;
+    // The segment grammar is a property of the request alone (ADR 0045), so
+    // it is a 400 here rather than a round trip to apply's backstop.
+    entity_ref::validate_segment(&request.name).map_err(|e| HttpError::invalid(e.to_string()))?;
+    let parent = match &request.parent {
+        None => None,
+        Some(parent) => Some(resolve_write_ref(&*plane, parent).await?),
+    };
+    let request = request.with_parent(parent);
     precheck(
         &*plane,
         &actor,
@@ -833,8 +888,24 @@ async fn configure_quota_entity<P: ControlPlane>(
         },
     )
     .await?;
-    let response = plane.configure_quota_entity(request, actor).await?;
-    Ok(Json(response))
+    let configured = plane.configure_quota_entity(request, actor).await?;
+    // The path as of the write: read back from this replica's view once it
+    // has applied the write's index, so a follower answers with the same path
+    // the leader applied — never one derived from a stale pre-write view.
+    let view = plane
+        .read_state(ReadOptions {
+            consistency: Consistency::Eventual,
+            min_index: Some(configured.log_index),
+        })
+        .await?;
+    Ok(Json(dto::ConfigureQuotaEntityResponse {
+        entity: configured.entity,
+        path: view
+            .state()
+            .quota_entity_path(configured.entity)
+            .unwrap_or_default(),
+        log_index: configured.log_index,
+    }))
 }
 
 /// `GET /api/v1/overview` — bounded by default (ADR 0031) for the
@@ -1108,17 +1179,24 @@ async fn list_quota_entities<P: ControlPlane>(
 
 /// `GET /api/v1/quota-entities/{entity}` — **strong** by default (ADR 0031
 /// puts it in the ADR 0007 configuration-read class, unlike the bounded list
-/// and node reads). 404 when the id is not in the tree, like [`get_node`].
+/// and node reads). The segment is a [`QuotaEntityRef`] (ADR 0045): an id, or
+/// a path percent-encoded into the one segment (`acme%2Feng`). 404 when the
+/// id is not in the tree or the path names nothing, like [`get_node`].
 async fn get_quota_entity<P: ControlPlane>(
     State(plane): State<Arc<P>>,
-    IdPath(id): IdPath<QuotaEntityId>,
+    IdPath(entity): IdPath<QuotaEntityRef>,
     ReadQuery(params): ReadQuery,
 ) -> Result<impl IntoResponse, HttpError> {
     let view = plane
         .read_state(params.into_options(Consistency::Strong))
         .await?;
+    let not_found = || HttpError::not_found(format!("quota entity {entity} not found"));
+    let id = view
+        .state()
+        .resolve_quota_entity_ref(&entity)
+        .ok_or_else(not_found)?;
     let response = super::project::get_quota_entity(view.state(), &id, Timestamp::now())
-        .ok_or_else(|| HttpError::not_found(format!("quota entity {id} not found")))?;
+        .ok_or_else(not_found)?;
     Ok((
         ReadIndexes {
             applied_index: view.applied_index(),
@@ -1154,6 +1232,40 @@ async fn get_coordinators<P: ControlPlane>(
         },
         Json(response),
     ))
+}
+
+/// The latest published view, for resolving a write's entity references —
+/// eventual, like [`precheck`]'s: apply re-checks everything at the log
+/// position, so sharpening the lookup with a consensus round trip buys
+/// nothing.
+fn eventual() -> ReadOptions {
+    ReadOptions {
+        consistency: Consistency::Eventual,
+        min_index: None,
+    }
+}
+
+/// Resolve a write's entity reference to the id the command will carry
+/// (ADR 0045). An id passes through unchecked — whether it exists is apply's
+/// call, at the log position — while a path must name an entity in the
+/// latest view, and one that does not is the same `REJECTED` (409) an
+/// unknown id earns on a write, naming the path.
+async fn resolve_write_ref<P: ControlPlane>(
+    plane: &P,
+    entity: &QuotaEntityRef,
+) -> Result<QuotaEntityId, HttpError> {
+    if let QuotaEntityRef::Id(id) = entity {
+        return Ok(*id);
+    }
+    let view = plane.read_state(eventual()).await?;
+    view.state()
+        .resolve_quota_entity_ref(entity)
+        .ok_or_else(|| {
+            HttpError::new(
+                ErrorCode::Rejected,
+                format!("quota entity {entity} not found"),
+            )
+        })
 }
 
 fn bad_body(rejection: JsonRejection) -> HttpError {
@@ -1243,12 +1355,12 @@ mod tests {
         /// re-checks. A dropped actor passes every status assertion.
         actors: std::sync::Mutex<Vec<coppice_state::Actor>>,
         /// The last `PUT /api/v1/authorization` body the plane was handed.
-        authorization: std::sync::Mutex<Option<dto::UpdateAuthorizationRequest>>,
+        authorization: std::sync::Mutex<Option<dto::ResolvedUpdateAuthorizationRequest>>,
         /// The last `POST /api/v1/jobs` body the plane was handed. Recorded
         /// for the same reason `actors` is: a field the handler silently
         /// drops still answers 200, so the only way to prove `metadata`
         /// survives the edge is to look at what actually arrived.
-        submitted: std::sync::Mutex<Option<SubmitJobRequest>>,
+        submitted: std::sync::Mutex<Option<dto::ResolvedSubmitJobRequest>>,
         /// Every ADR 0042 metadata edit the plane was handed, in call order
         /// — the *domain* edit, so a test asserts which arm the handler
         /// built as well as the routing.
@@ -1293,7 +1405,7 @@ mod tests {
         }
 
         /// The single `SubmitJobRequest` a one-submit test drove.
-        fn only_submitted(&self) -> SubmitJobRequest {
+        fn only_submitted(&self) -> dto::ResolvedSubmitJobRequest {
             self.submitted
                 .lock()
                 .unwrap()
@@ -1387,7 +1499,7 @@ mod tests {
 
         async fn submit_job(
             &self,
-            req: SubmitJobRequest,
+            req: dto::ResolvedSubmitJobRequest,
             actor: coppice_state::Actor,
         ) -> Result<SubmitJobResponse, ApiError> {
             self.record(actor);
@@ -1470,19 +1582,29 @@ mod tests {
             ))
         }
 
+        /// Really applies, like the node writes, so the response's `path`
+        /// (read back from the view at the write's index, ADR 0045) and the
+        /// name rejections are the state machine's own.
         async fn configure_quota_entity(
             &self,
-            req: dto::ConfigureQuotaEntityRequest,
+            req: dto::ResolvedConfigureQuotaEntityRequest,
             actor: coppice_state::Actor,
-        ) -> Result<dto::ConfigureQuotaEntityResponse, ApiError> {
-            self.record(actor);
-            match self.fail_with {
-                Some(make) => Err(make()),
-                None => Ok(dto::ConfigureQuotaEntityResponse {
+        ) -> Result<crate::QuotaEntityConfigured, ApiError> {
+            self.record(actor.clone());
+            self.apply(coppice_state::Command::ConfigureQuotaEntity(
+                coppice_state::command::ConfigureQuotaEntity {
                     entity: req.entity,
-                    log_index: 7,
-                }),
-            }
+                    parent: req.parent,
+                    name: req.name,
+                    quota: coppice_core::quota::CostUnits(req.quota_ucu),
+                    actor: Some(actor),
+                    updated_at: Timestamp::now(),
+                },
+            ))?;
+            Ok(crate::QuotaEntityConfigured {
+                entity: req.entity,
+                log_index: 7,
+            })
         }
 
         /// Echoes an accepted replacement under one log index — the plane
@@ -1492,7 +1614,7 @@ mod tests {
         /// that the field reaches the plane at all.
         async fn update_authorization(
             &self,
-            req: dto::UpdateAuthorizationRequest,
+            req: dto::ResolvedUpdateAuthorizationRequest,
             actor: coppice_state::Actor,
         ) -> Result<dto::UpdateAuthorizationResponse, ApiError> {
             self.record(actor);
@@ -3389,7 +3511,8 @@ mod tests {
     async fn get_quota_entity_rejects_a_malformed_path_id() {
         let response = app(None)
             .oneshot(
-                Request::get("/api/v1/quota-entities/not-an-entity")
+                // Neither an id nor a well-formed path (an empty segment).
+                Request::get("/api/v1/quota-entities/acme%2F%2Feng")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6150,9 +6273,17 @@ mod tests {
         assert_eq!(
             body["bindings"],
             serde_json::json!([
-                { "role": "submitter", "scope": tree.team_a.to_string() },
-                { "role": "operator", "scope": null },
-                { "role": "admin", "scope": tree.squad.to_string() },
+                {
+                    "role": "submitter",
+                    "scope": tree.team_a.to_string(),
+                    "scope_path": "org/team-a",
+                },
+                { "role": "operator", "scope": null, "scope_path": null },
+                {
+                    "role": "admin",
+                    "scope": tree.squad.to_string(),
+                    "scope_path": "org/team-a/squad",
+                },
             ])
         );
         // A bearer holds no authority outside the list, however much of it
@@ -6177,5 +6308,286 @@ mod tests {
         assert_eq!(body["principal"], "anonymous");
         assert_eq!(body["implicit_admin"], true);
         assert_eq!(body["bindings"], serde_json::json!([]));
+    }
+
+    // ---- Quota entity paths (ADR 0045) -------------------------------------
+    //
+    // Every surface that names an entity takes a ref — an id or a path — and
+    // the handler resolves a path against its read view before anything is
+    // proposed. Driven against the `authz_fixture` tree
+    // (`org` → { `team-a` → `squad`, `team-b` }) in open mode.
+
+    fn path_tree() -> (coppice_state::StateMachine, Tree) {
+        authz_fixture(|_| Vec::new())
+    }
+
+    #[tokio::test]
+    async fn submit_resolves_a_path_to_the_id_the_plane_proposes() {
+        let (state, tree) = path_tree();
+        let plane = stub_plane(state);
+        let body = submit_body(tree.squad).replace(&tree.squad.to_string(), "org/team-a/squad");
+        let response = router(Arc::clone(&plane))
+            .oneshot(post_json("/api/v1/jobs", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(plane.only_submitted().quota_entity, tree.squad);
+    }
+
+    /// An unknown path on a write is the same 409 an unknown id earns there,
+    /// naming the path — and nothing reaches the plane.
+    #[tokio::test]
+    async fn submit_to_an_unknown_path_is_rejected_naming_the_path() {
+        let (state, tree) = path_tree();
+        let plane = stub_plane(state);
+        let body = submit_body(tree.squad).replace(&tree.squad.to_string(), "org/team-c");
+        let response = router(Arc::clone(&plane))
+            .oneshot(post_json("/api/v1/jobs", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "REJECTED");
+        assert!(body["message"].as_str().unwrap().contains("org/team-c"));
+        assert!(plane.actors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_entity_path() {
+        let (state, tree) = path_tree();
+        let app = app_with_state(None, state);
+        for (filter, expected) in [
+            (r#"{"entity":{"ref":"org"}}"#, vec![tree.job.to_string()]),
+            (
+                r#"{"entity":{"ref":"org/team-a","scope":"exact"}}"#,
+                vec![tree.job.to_string()],
+            ),
+            (r#"{"entity":{"ref":"org/team-b"}}"#, vec![]),
+        ] {
+            let uri = format!("/api/v1/jobs?filter={}", urlencoding_encode(filter));
+            let response = app
+                .clone()
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{filter}");
+            let body = body_json(response).await;
+            let ids: Vec<String> = body["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|j| j["id"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(ids, expected, "{filter}");
+            if !ids.is_empty() {
+                assert_eq!(body["jobs"][0]["quota_entity_path"], "org/team-a");
+            }
+        }
+    }
+
+    /// The filter asymmetry: an unknown id matches nothing (200, empty), an
+    /// unresolvable path is a typo (400).
+    #[tokio::test]
+    async fn list_jobs_refuses_an_unresolvable_path_but_not_an_unknown_id() {
+        let (state, _tree) = path_tree();
+        let app = app_with_state(None, state);
+        let typo = urlencoding_encode(r#"{"entity":{"ref":"org/team-z"}}"#);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/jobs?filter={typo}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(body["message"].as_str().unwrap().contains("org/team-z"));
+
+        let unknown = urlencoding_encode(&format!(
+            r#"{{"entity":{{"ref":"{}"}}}}"#,
+            QuotaEntityId::new()
+        ));
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/v1/jobs?filter={unknown}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["jobs"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn events_refuses_an_unresolvable_entity_path() {
+        let filter = serde_json::json!({"entity": {"ref": "nowhere/at-all"}});
+        let uri = format!("/api/v1/events?jobs={}", urlencode(&filter.to_string()));
+        let response = router(events_app(vec![]))
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(body["message"].as_str().unwrap().contains("nowhere/at-all"));
+    }
+
+    #[tokio::test]
+    async fn quota_entity_detail_answers_a_percent_encoded_path() {
+        let (state, tree) = path_tree();
+        let app = app_with_state(None, state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/quota-entities/org%2Fteam-a%2Fsquad")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["entity"]["id"], tree.squad.to_string());
+        assert_eq!(body["entity"]["name"], "squad");
+        assert_eq!(body["entity"]["path"], "org/team-a/squad");
+        let chain: Vec<&str> = body["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(chain, ["org", "org/team-a", "org/team-a/squad"]);
+
+        // An unknown path is the 404 an unknown id is.
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/quota-entities/org%2Fteam-q")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_json(response).await;
+        assert!(body["message"].as_str().unwrap().contains("org/team-q"));
+    }
+
+    /// `parent` by path resolves before the proposal, and the answer carries
+    /// the new entity's path read back at the write's index.
+    #[tokio::test]
+    async fn configure_resolves_a_parent_path_and_answers_with_the_path() {
+        let (state, tree) = path_tree();
+        let plane = stub_plane(state);
+        let entity = QuotaEntityId::new();
+        let body = format!(
+            r#"{{ "entity": "{entity}", "parent": "org/team-b", "name": "infra", "quota_ucu": 5 }}"#
+        );
+        let response = router(Arc::clone(&plane))
+            .oneshot(post_json("/api/v1/quota-entities", &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["entity"], entity.to_string());
+        assert_eq!(body["path"], "org/team-b/infra");
+        let state = plane.state.lock().unwrap();
+        assert_eq!(state.quota_entities[&entity].parent, Some(tree.team_b));
+    }
+
+    #[tokio::test]
+    async fn configure_refuses_a_bad_name_a_clash_and_an_unknown_parent_path() {
+        let (state, tree) = path_tree();
+        let plane = stub_plane(state);
+        let app = router(Arc::clone(&plane));
+        let post = |parent: &str, name: &str| {
+            post_json(
+                "/api/v1/quota-entities",
+                &format!(
+                    r#"{{ "entity": "{}", "parent": {parent}, "name": "{name}", "quota_ucu": 5 }}"#,
+                    QuotaEntityId::new()
+                ),
+            )
+        };
+
+        // Grammar: a 400 at the edge, before anything is proposed.
+        let response = app.clone().oneshot(post("null", "a/b")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(plane.actors().is_empty());
+
+        // A sibling clash is apply's 409, naming the holder.
+        let response = app
+            .clone()
+            .oneshot(post(r#""org""#, "team-a"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains(&tree.team_a.to_string()));
+
+        // An unknown parent path is the 409 an unknown parent id is.
+        let response = app.oneshot(post(r#""org/nope""#, "x")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(body_json(response).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("org/nope"));
+    }
+
+    /// A binding scope by path reaches the plane as the id; an unknown path
+    /// is the 400 an unknown scope id is on this endpoint; and reads carry
+    /// the scope's path alongside its id.
+    #[tokio::test]
+    async fn authorization_scopes_take_a_path_and_reads_carry_it() {
+        let (state, tree) = path_tree();
+        let plane = stub_plane(state);
+        let app = router(Arc::clone(&plane));
+        let body = r#"{ "bindings": [
+            { "group": "admins", "role": "admin" },
+            { "group": "squad", "role": "submitter", "scope": "org/team-a/squad" }
+        ] }"#;
+        let response = app
+            .clone()
+            .oneshot(put_json("/api/v1/authorization", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = plane.authorization.lock().unwrap().clone().unwrap();
+        assert_eq!(sent.bindings[1].scope, Some(tree.squad));
+
+        let typo = r#"{ "bindings": [
+            { "group": "admins", "role": "admin" },
+            { "group": "squad", "role": "submitter", "scope": "org/team-x" }
+        ] }"#;
+        let response = app
+            .clone()
+            .oneshot(put_json("/api/v1/authorization", typo))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(response).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("org/team-x"));
+
+        // The read side: `scope` stays the id, `scope_path` is added.
+        plane.state.lock().unwrap().bindings =
+            vec![group_binding("squad", Role::Submitter, Some(tree.squad))];
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/authorization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["bindings"][0]["scope"], tree.squad.to_string());
+        assert_eq!(body["bindings"][0]["scope_path"], "org/team-a/squad");
     }
 }

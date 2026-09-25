@@ -594,8 +594,8 @@ mod tests {
     use coppice_core::resource::Resources;
     use coppice_state::{AttemptRecord, JobRecord, NodeRecord, StateMachine};
 
-    use crate::http::dto::{AbortJobRequest, ConfigureQuotaEntityRequest, SubmitJobRequest};
-    use crate::http::dto::{ConfigureQuotaEntityResponse, SubmitJobResponse};
+    use crate::http::dto::AbortJobRequest;
+    use crate::http::dto::SubmitJobResponse;
     use crate::{
         ApiError, CoordinatorSummary, JobTimelineWindow, LogFetchError, LogFetchOutcome,
         LogFetchRequest, MetricSample, QueueWindow, ReadOptions, ReadView,
@@ -678,7 +678,7 @@ mod tests {
         }
         async fn submit_job(
             &self,
-            _req: SubmitJobRequest,
+            _req: crate::http::dto::ResolvedSubmitJobRequest,
             _actor: coppice_state::Actor,
         ) -> Result<SubmitJobResponse, ApiError> {
             unimplemented!("usage tests never submit")
@@ -713,16 +713,16 @@ mod tests {
         }
         async fn configure_quota_entity(
             &self,
-            _req: ConfigureQuotaEntityRequest,
+            _req: crate::http::dto::ResolvedConfigureQuotaEntityRequest,
             _actor: coppice_state::Actor,
-        ) -> Result<ConfigureQuotaEntityResponse, ApiError> {
+        ) -> Result<crate::QuotaEntityConfigured, ApiError> {
             unimplemented!("usage tests never configure")
         }
         // This fake exists for the metrics-fetch RPC-budget walk; it never
         // needs to serve authorization writes.
         async fn update_authorization(
             &self,
-            _req: crate::http::dto::UpdateAuthorizationRequest,
+            _req: crate::http::dto::ResolvedUpdateAuthorizationRequest,
             _actor: coppice_state::Actor,
         ) -> Result<crate::http::dto::UpdateAuthorizationResponse, ApiError> {
             unimplemented!("usage tests never update authorization")

@@ -26,15 +26,16 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use coppice_api::http::dto::{
-    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
-    SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
-    UpdateAuthorizationResponse, UpdateJobMetadataResponse,
+    AbortJobRequest, EvictNodeRequest, ResolvedConfigureQuotaEntityRequest,
+    ResolvedSubmitJobRequest, ResolvedUpdateAuthorizationRequest, SetNodeSchedulableRequest,
+    SubmitJobResponse, UpdateAuthorizationResponse, UpdateJobMetadataResponse,
 };
 use coppice_api::{
     ApiError, ClusterUsage, Consistency, ControlPlane, CoordinatorMemberSummary,
     CoordinatorSummary, JobTimelineWindow, LogFetchError, LogFetchOutcome, LogFetchRequest,
-    MetricsFetchError, MetricsFetchOutcome, MetricsFetchRequest, QueueWindow, ReadOptions,
-    ReadView, StampedEvent, UpdateJobMetadataCall, UsageSnapshot,
+    MetricsFetchError, MetricsFetchOutcome, MetricsFetchRequest, QueueWindow,
+    QuotaEntityConfigured, ReadOptions, ReadView, StampedEvent, UpdateJobMetadataCall,
+    UsageSnapshot,
 };
 use coppice_consensus::{
     Applied, Consensus, ConsensusError, CoordinatorId, NodeHandle, Role, StateView, StateViews,
@@ -80,7 +81,7 @@ pub trait LeaderWrites: Send + Sync + 'static {
     fn submit_job<'a>(
         &'a self,
         leader: CoordinatorId,
-        req: &'a SubmitJobRequest,
+        req: &'a ResolvedSubmitJobRequest,
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<SubmitJobResponse, ApiError>>;
 
@@ -95,14 +96,14 @@ pub trait LeaderWrites: Send + Sync + 'static {
     fn configure_quota_entity<'a>(
         &'a self,
         leader: CoordinatorId,
-        req: &'a ConfigureQuotaEntityRequest,
+        req: &'a ResolvedConfigureQuotaEntityRequest,
         actor: &'a Actor,
-    ) -> BoxFuture<'a, Result<ConfigureQuotaEntityResponse, ApiError>>;
+    ) -> BoxFuture<'a, Result<QuotaEntityConfigured, ApiError>>;
 
     fn update_authorization<'a>(
         &'a self,
         leader: CoordinatorId,
-        req: &'a UpdateAuthorizationRequest,
+        req: &'a ResolvedUpdateAuthorizationRequest,
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>>;
 
@@ -238,7 +239,7 @@ fn multiplier_for(view: &StateView, priority: i32) -> Option<PriorityMultiplier>
 pub(crate) async fn submit_job_here<C: Consensus>(
     consensus: &C,
     views: &StateViews,
-    req: &SubmitJobRequest,
+    req: &ResolvedSubmitJobRequest,
     actor: &Actor,
 ) -> Result<SubmitJobResponse, LocalWriteError> {
     // The client-minted job id is the submission's idempotency identity
@@ -508,9 +509,9 @@ pub(crate) async fn update_job_metadata_here<C: Consensus>(
 /// `PermissionDenied` — which the HTTP layer renders as a 403.
 pub(crate) async fn configure_quota_entity_here<C: Consensus>(
     consensus: &C,
-    req: &ConfigureQuotaEntityRequest,
+    req: &ResolvedConfigureQuotaEntityRequest,
     actor: &Actor,
-) -> Result<ConfigureQuotaEntityResponse, LocalWriteError> {
+) -> Result<QuotaEntityConfigured, LocalWriteError> {
     let entity = req.entity;
     let command = Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
         entity,
@@ -525,7 +526,7 @@ pub(crate) async fn configure_quota_entity_here<C: Consensus>(
         Ok(Applied {
             outcome: Ok(_),
             log_index,
-        }) => Ok(ConfigureQuotaEntityResponse { entity, log_index }),
+        }) => Ok(QuotaEntityConfigured { entity, log_index }),
         Ok(Applied {
             outcome: Err(rejection),
             ..
@@ -550,7 +551,7 @@ pub(crate) async fn configure_quota_entity_here<C: Consensus>(
 /// one the same way.
 pub(crate) async fn update_authorization_here<C: Consensus>(
     consensus: &C,
-    req: &UpdateAuthorizationRequest,
+    req: &ResolvedUpdateAuthorizationRequest,
     actor: &Actor,
 ) -> Result<UpdateAuthorizationResponse, LocalWriteError> {
     // The exactly-one-subject rule the DTO cannot express. The HTTP handler
@@ -874,7 +875,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
 
     async fn submit_job(
         &self,
-        req: SubmitJobRequest,
+        req: ResolvedSubmitJobRequest,
         actor: Actor,
     ) -> Result<SubmitJobResponse, ApiError> {
         // ADR 0023's revocation race, staged: the HTTP layer's authorization
@@ -956,9 +957,9 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
 
     async fn configure_quota_entity(
         &self,
-        req: ConfigureQuotaEntityRequest,
+        req: ResolvedConfigureQuotaEntityRequest,
         actor: Actor,
-    ) -> Result<ConfigureQuotaEntityResponse, ApiError> {
+    ) -> Result<QuotaEntityConfigured, ApiError> {
         match configure_quota_entity_here(&*self.consensus, &req, &actor).await {
             Ok(response) => Ok(response),
             Err(LocalWriteError::Api(e)) => Err(e),
@@ -998,7 +999,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
 
     async fn update_authorization(
         &self,
-        req: UpdateAuthorizationRequest,
+        req: ResolvedUpdateAuthorizationRequest,
         actor: Actor,
     ) -> Result<UpdateAuthorizationResponse, ApiError> {
         match update_authorization_here(&*self.consensus, &req, &actor).await {
@@ -1708,7 +1709,7 @@ mod tests {
         fn submit_job<'a>(
             &'a self,
             leader: CoordinatorId,
-            req: &'a SubmitJobRequest,
+            req: &'a ResolvedSubmitJobRequest,
             actor: &'a Actor,
         ) -> BoxFuture<'a, Result<SubmitJobResponse, ApiError>> {
             Box::pin(async move {
@@ -1736,12 +1737,12 @@ mod tests {
         fn configure_quota_entity<'a>(
             &'a self,
             leader: CoordinatorId,
-            req: &'a ConfigureQuotaEntityRequest,
+            req: &'a ResolvedConfigureQuotaEntityRequest,
             actor: &'a Actor,
-        ) -> BoxFuture<'a, Result<ConfigureQuotaEntityResponse, ApiError>> {
+        ) -> BoxFuture<'a, Result<QuotaEntityConfigured, ApiError>> {
             Box::pin(async move {
                 let log_index = self.record(leader, None, actor)?;
-                Ok(ConfigureQuotaEntityResponse {
+                Ok(QuotaEntityConfigured {
                     entity: req.entity,
                     log_index,
                 })
@@ -1751,7 +1752,7 @@ mod tests {
         fn update_authorization<'a>(
             &'a self,
             leader: CoordinatorId,
-            _req: &'a UpdateAuthorizationRequest,
+            _req: &'a ResolvedUpdateAuthorizationRequest,
             actor: &'a Actor,
         ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>> {
             Box::pin(async move {
@@ -1814,8 +1815,8 @@ mod tests {
         }
     }
 
-    fn submit_request(job: JobId) -> SubmitJobRequest {
-        SubmitJobRequest {
+    fn submit_request(job: JobId) -> ResolvedSubmitJobRequest {
+        ResolvedSubmitJobRequest {
             image: "busybox".to_string(),
             requests: dto::Resources {
                 cpu_millis: 1000,
@@ -2149,7 +2150,7 @@ mod tests {
     /// A submission at a priority the seeded policy has no multiplier for —
     /// the shape of a request a *lagging* replica cannot judge, because the
     /// class may have been added by a policy update it has not applied yet.
-    fn submit_at_an_unconfigured_priority() -> SubmitJobRequest {
+    fn submit_at_an_unconfigured_priority() -> ResolvedSubmitJobRequest {
         let mut req = submit_request(JobId::new());
         req.priority = 5;
         req
@@ -2336,8 +2337,10 @@ mod tests {
         assert!(cp.abort_job(req, test_actor()).await.is_ok());
     }
 
-    fn configure_request(entity: coppice_core::id::QuotaEntityId) -> ConfigureQuotaEntityRequest {
-        ConfigureQuotaEntityRequest {
+    fn configure_request(
+        entity: coppice_core::id::QuotaEntityId,
+    ) -> ResolvedConfigureQuotaEntityRequest {
+        ResolvedConfigureQuotaEntityRequest {
             entity,
             parent: None,
             name: "team".to_string(),
@@ -2619,7 +2622,7 @@ mod tests {
         .await
         .expect("accepted");
         cp.update_authorization(
-            dto::UpdateAuthorizationRequest {
+            dto::ResolvedUpdateAuthorizationRequest {
                 groups_claim: None,
                 bindings: Vec::new(),
             },
@@ -2676,8 +2679,10 @@ mod tests {
 
     // ---- UpdateAuthorization is one command (ADR 0023) -------------------
 
-    fn authorization_request(groups_claim: Option<&str>) -> dto::UpdateAuthorizationRequest {
-        dto::UpdateAuthorizationRequest {
+    fn authorization_request(
+        groups_claim: Option<&str>,
+    ) -> dto::ResolvedUpdateAuthorizationRequest {
+        dto::ResolvedUpdateAuthorizationRequest {
             groups_claim: groups_claim.map(str::to_string),
             bindings: vec![dto::BindingDto {
                 group: Some("platform".to_string()),
@@ -2802,7 +2807,7 @@ mod tests {
         .await
         .expect("forwarded");
         cp.update_authorization(
-            dto::UpdateAuthorizationRequest {
+            dto::ResolvedUpdateAuthorizationRequest {
                 groups_claim: None,
                 bindings: Vec::new(),
             },
@@ -2851,7 +2856,7 @@ mod tests {
         ));
         match cp
             .update_authorization(
-                dto::UpdateAuthorizationRequest {
+                dto::ResolvedUpdateAuthorizationRequest {
                     groups_claim: None,
                     bindings: Vec::new(),
                 },

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::entity_ref::QuotaEntityRef;
 use crate::id::QuotaEntityId;
 use crate::time::Timestamp;
 
@@ -86,6 +87,9 @@ pub struct QuotaEntityNode {
     pub id: QuotaEntityId,
     /// The entity's own stored name segment.
     pub name: String,
+    /// The entity's path: its ancestors' names, root first, joined by `/`
+    /// (ADR 0045). Derived at read time, never stored.
+    pub path: String,
     /// The parent entity; `null` roots the entity.
     pub parent: Option<QuotaEntityId>,
     /// How the entity came to exist.
@@ -127,6 +131,9 @@ pub struct QuotaEntityView {
     pub id: QuotaEntityId,
     /// The entity's own stored name segment.
     pub name: String,
+    /// The entity's path: its ancestors' names, root first, joined by `/`
+    /// (ADR 0045). Derived at read time, never stored.
+    pub path: String,
     /// The parent entity; `null` roots the entity.
     pub parent: Option<QuotaEntityId>,
     /// Soft quota as a stock in µCU.
@@ -218,11 +225,16 @@ pub struct ConfigureQuotaEntityRequest {
     /// Client-minted entity id — required. The upsert target: an existing
     /// id updates, a fresh one creates.
     pub entity: QuotaEntityId,
-    /// Parent in the quota tree; `null` roots the entity. A parent that does
-    /// not exist, or one that would form a cycle, is rejected by the server.
+    /// Parent in the quota tree, by id or path (ADR 0045); `null` roots the
+    /// entity. A parent that does not exist, or one that would form a
+    /// cycle, is rejected by the server. A path is resolved against the
+    /// serving replica's read view before proposing.
     #[serde(default)]
-    pub parent: Option<QuotaEntityId>,
-    /// The entity's name.
+    pub parent: Option<QuotaEntityRef>,
+    /// The entity's name — one path segment (ADR 0045): 1–63 characters
+    /// from `[A-Za-z0-9._-]`, the first alphanumeric, unique among its
+    /// siblings. [`crate::validate_segment`] pre-checks the grammar; the
+    /// sibling-uniqueness rule is enforced by the server at apply.
     pub name: String,
     /// Soft quota as a stock in µCU; the caller converts human rates.
     pub quota_ucu: u64,
@@ -242,9 +254,9 @@ impl ConfigureQuotaEntityRequest {
         }
     }
 
-    /// Place the entity under `parent` in the quota tree.
-    pub fn with_parent(mut self, parent: QuotaEntityId) -> Self {
-        self.parent = Some(parent);
+    /// Place the entity under `parent` (by id or path) in the quota tree.
+    pub fn with_parent(mut self, parent: impl Into<QuotaEntityRef>) -> Self {
+        self.parent = Some(parent.into());
         self
     }
 }
@@ -256,11 +268,13 @@ impl ConfigureQuotaEntityRequest {
 /// index, not a fresh projected view; pair the echoed id + `log_index` with
 /// a strong `GET /api/v1/quota-entities/{entity}?min_index=…` for
 /// read-your-writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ConfigureQuotaEntityResponse {
     /// Echo of the client-minted id from the request.
     pub entity: QuotaEntityId,
+    /// The entity's path as of this write's apply (ADR 0045).
+    pub path: String,
     /// Raft log index at which this upsert applied; pair with `?min_index=`
     /// on a subsequent read for read-your-writes.
     pub log_index: u64,
@@ -269,6 +283,7 @@ pub struct ConfigureQuotaEntityResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity_ref::QuotaEntityPath;
 
     fn ts(micros: i64) -> Timestamp {
         Timestamp::from_micros(micros).expect("fixture timestamps are in range")
@@ -285,6 +300,7 @@ mod tests {
         let node = QuotaEntityNode {
             id,
             name: "platform".to_string(),
+            path: "acme/platform".to_string(),
             parent: Some(parent),
             origin: QuotaEntityOrigin::Configured,
             principal: None,
@@ -303,6 +319,7 @@ mod tests {
             serde_json::json!({
                 "id": "quota-00000000-0000-0000-0000-000000000001",
                 "name": "platform",
+                "path": "acme/platform",
                 "parent": "quota-00000000-0000-0000-0000-000000000002",
                 "origin": "configured",
                 "principal": null,
@@ -326,6 +343,7 @@ mod tests {
         let view = QuotaEntityView {
             id,
             name: "root".to_string(),
+            path: "root".to_string(),
             parent: None,
             quota_ucu: 0,
             usage_ucu: 1,
@@ -346,6 +364,7 @@ mod tests {
         let node = QuotaEntityNode {
             id,
             name: "root".to_string(),
+            path: "root".to_string(),
             parent: None,
             origin: QuotaEntityOrigin::Configured,
             principal: None,
@@ -381,6 +400,7 @@ mod tests {
         let view: QuotaEntityView = serde_json::from_value(serde_json::json!({
             "id": id.to_string(),
             "name": "root",
+            "path": "root",
             "parent": null,
             "quota_ucu": 0,
             "usage_ucu": 1,
@@ -440,6 +460,7 @@ mod tests {
             .unwrap();
         let json = serde_json::to_value(ConfigureQuotaEntityResponse {
             entity,
+            path: "acme/team".to_string(),
             log_index: 7,
         })
         .unwrap();
@@ -447,6 +468,7 @@ mod tests {
             json,
             serde_json::json!({
                 "entity": "quota-00000000-0000-0000-0000-000000000001",
+                "path": "acme/team",
                 "log_index": 7,
             })
         );
@@ -458,8 +480,18 @@ mod tests {
         let parent = QuotaEntityId::new();
         let req = ConfigureQuotaEntityRequest::new(entity, "team", 1000).with_parent(parent);
         assert_eq!(req.entity, entity);
-        assert_eq!(req.parent, Some(parent));
+        assert_eq!(req.parent, Some(QuotaEntityRef::Id(parent)));
         assert_eq!(req.name, "team");
         assert_eq!(req.quota_ucu, 1000);
+    }
+
+    /// `with_parent` accepts a path as readily as an id (ADR 0045).
+    #[test]
+    fn with_parent_accepts_a_path_ref() {
+        let entity = QuotaEntityId::new();
+        let path: QuotaEntityPath = "acme/eng".parse().unwrap();
+        let req =
+            ConfigureQuotaEntityRequest::new(entity, "platform", 1000).with_parent(path.clone());
+        assert_eq!(req.parent, Some(QuotaEntityRef::Path(path)));
     }
 }

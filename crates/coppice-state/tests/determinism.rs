@@ -242,7 +242,9 @@ fn arb_global() -> impl Strategy<Value = Command> {
             Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
                 entity: qid(0xE0 + e),
                 parent: Some(ROOT),
-                name: "team".into(),
+                // Distinct per entity, so most of these land rather than
+                // tripping the ADR 0045 sibling-uniqueness rule.
+                name: format!("team-{e}"),
                 quota: CostUnits(1_000_000_000),
                 updated_at: ts,
                 actor: None,
