@@ -43,7 +43,10 @@ grouped by proposer:
   normalized observed facts, never raw agent reports.
 - **Node lifecycle** — `RegisterNode`, `DeclareNodeLost`, `SetNodeSchedulable`.
 - **Housekeeping** — `EvictTerminalJobs`.
-- **Admin / policy** — `ConfigureQuotaEntity`, `UpdatePolicy`,
+- **Admin / policy** — `ConfigureQuotaEntity` (names grammar-checked and
+  unique among siblings at apply; paths derived at read time by
+  `StateMachine::quota_entity_path`, resolved by `resolve_quota_entity_path`,
+  ADR 0045), `UpdatePolicy`,
   `BumpClusterVersion`.
 
 These domain types mirror the frozen `coppice.command.v1` protobuf schema field

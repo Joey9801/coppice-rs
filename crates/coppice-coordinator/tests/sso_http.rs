@@ -323,12 +323,14 @@ fn submit_body(job: JobId, entity: QuotaEntityId) -> Value {
     })
 }
 
-/// A quota-entity upsert body.
+/// A quota-entity upsert body. `name` may be a case label like
+/// `submitter/unscoped/principal`; its slashes become dots so it stays one
+/// ADR 0045 segment (and distinct labels stay distinct sibling names).
 fn entity_body(entity: QuotaEntityId, parent: Option<QuotaEntityId>, name: &str) -> Value {
     json!({
         "entity": entity.to_string(),
         "parent": parent.map(|p| p.to_string()),
-        "name": name,
+        "name": name.replace('/', "."),
         "quota_ucu": 1_000_000_000_000u64,
     })
 }

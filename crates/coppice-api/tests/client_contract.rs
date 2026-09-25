@@ -207,7 +207,7 @@ fn job_read_models_round_trip_through_the_client() {
         attempt: Some(atid(1)),
         image: "ubuntu:22.04".to_string(),
         quota_entity: qid(1),
-        quota_entity_name: "team-a".to_string(),
+        quota_entity_path: "acme/team-a".to_string(),
         priority: 5,
         submitted_at: ts(1_000_000),
         submitted_by: Some("alice@example.com".to_string()),
@@ -238,6 +238,7 @@ fn job_read_models_round_trip_through_the_client() {
         priority: 3,
         max_runtime_seconds: Some(3600),
         quota_entity: qid(1),
+        quota_entity_path: "acme/team-a".to_string(),
         retry,
         submitted_by: Some("alice@example.com".to_string()),
         env: coppice_core::env::JobEnv::from([
@@ -256,6 +257,7 @@ fn job_read_models_round_trip_through_the_client() {
     let penalty_link_finite = dto::PenaltyLink {
         entity: qid(2),
         name: "team-b".to_string(),
+        path: "acme/team-b".to_string(),
         usage_ucu: 100,
         quota_ucu: 200,
         over_quota_ratio: 0.5,
@@ -317,7 +319,8 @@ fn job_read_models_round_trip_through_the_client() {
         entity_chain: vec![
             dto::QuotaEntityView {
                 id: qid(0),
-                name: "root".to_string(),
+                name: "acme".to_string(),
+                path: "acme".to_string(),
                 parent: None,
                 quota_ucu: 1_000_000,
                 usage_ucu: 500_000,
@@ -327,6 +330,7 @@ fn job_read_models_round_trip_through_the_client() {
             dto::QuotaEntityView {
                 id: qid(1),
                 name: "team-a".to_string(),
+                path: "acme/team-a".to_string(),
                 parent: Some(qid(0)),
                 quota_ucu: 0,
                 usage_ucu: 1,
@@ -605,6 +609,7 @@ fn quota_read_models_round_trip_through_the_client() {
     let node = dto::QuotaEntityNode {
         id: qid(1),
         name: "team-a".to_string(),
+        path: "acme/team-a".to_string(),
         parent: Some(qid(0)),
         origin: dto::QuotaEntityOrigin::Configured,
         principal: Some("sub-123".to_string()),
@@ -647,7 +652,8 @@ fn quota_read_models_round_trip_through_the_client() {
 
     let view = dto::QuotaEntityView {
         id: qid(0),
-        name: "root".to_string(),
+        name: "acme".to_string(),
+        path: "acme".to_string(),
         parent: None,
         quota_ucu: 0,
         usage_ucu: 1,
@@ -668,6 +674,7 @@ fn quota_read_models_round_trip_through_the_client() {
     round_trip::<dto::ConfigureQuotaEntityResponse, client::ConfigureQuotaEntityResponse>(
         &dto::ConfigureQuotaEntityResponse {
             entity: qid(1),
+            path: "acme/team-a".to_string(),
             log_index: 7,
         },
     );
@@ -941,14 +948,17 @@ fn auth_read_models_round_trip_through_the_client() {
             dto::SessionBinding {
                 role: dto::BindingRole::Submitter,
                 scope: Some(qid(1)),
+                scope_path: Some("acme/team-a".to_string()),
             },
             dto::SessionBinding {
                 role: dto::BindingRole::Operator,
                 scope: None,
+                scope_path: None,
             },
             dto::SessionBinding {
                 role: dto::BindingRole::Admin,
                 scope: None,
+                scope_path: None,
             },
         ],
         implicit_admin: true,
@@ -956,17 +966,19 @@ fn auth_read_models_round_trip_through_the_client() {
     round_trip::<dto::GetSessionResponse, client::GetSessionResponse>(&session);
 
     let bindings = vec![
-        dto::BindingDto {
+        dto::BindingView {
             group: Some("platform-team".to_string()),
             principal: None,
             role: dto::BindingRole::Operator,
             scope: Some(qid(1)),
+            scope_path: Some("acme/team-a".to_string()),
         },
-        dto::BindingDto {
+        dto::BindingView {
             group: None,
             principal: Some("sub-456".to_string()),
             role: dto::BindingRole::Admin,
             scope: None,
+            scope_path: None,
         },
     ];
     round_trip::<dto::GetAuthorizationResponse, client::GetAuthorizationResponse>(
@@ -989,6 +1001,7 @@ fn infinite_quota_figures_round_trip_as_null_both_ways() {
     let node = dto::QuotaEntityNode {
         id: qid(1),
         name: "root".to_string(),
+        path: "root".to_string(),
         parent: None,
         origin: dto::QuotaEntityOrigin::Configured,
         principal: None,
@@ -1011,6 +1024,7 @@ fn infinite_quota_figures_round_trip_as_null_both_ways() {
     let view = dto::QuotaEntityView {
         id: qid(1),
         name: "root".to_string(),
+        path: "root".to_string(),
         parent: None,
         quota_ucu: 0,
         usage_ucu: 1,
@@ -1025,6 +1039,7 @@ fn infinite_quota_figures_round_trip_as_null_both_ways() {
     let link = dto::PenaltyLink {
         entity: qid(1),
         name: "root".to_string(),
+        path: "root".to_string(),
         usage_ucu: 1,
         quota_ucu: 0,
         over_quota_ratio: f64::INFINITY,
@@ -1102,6 +1117,19 @@ fn submit_job_request_decodes_into_the_server_type() {
     );
     assert!(minimal.validate().is_ok());
     request_round_trip::<client::SubmitJobRequest, dto::SubmitJobRequest>(&minimal);
+
+    // The quota entity may be named by path instead of id (ADR 0045); both
+    // shapes decode into the same server type and reserialize identically.
+    let by_path: client::QuotaEntityPath = "acme/eng/platform".parse().unwrap();
+    let path_addressed = client::SubmitJobRequest::new(
+        client::JobId::new(),
+        "alpine",
+        ["true"],
+        client::Resources::default(),
+        by_path,
+    );
+    assert!(path_addressed.validate().is_ok());
+    request_round_trip::<client::SubmitJobRequest, dto::SubmitJobRequest>(&path_addressed);
 }
 
 #[test]
@@ -1155,16 +1183,28 @@ fn configure_quota_entity_request_decodes_into_the_server_type() {
     request_round_trip::<client::ConfigureQuotaEntityRequest, dto::ConfigureQuotaEntityRequest>(
         &scoped,
     );
+
+    // The parent may be named by path instead of id (ADR 0045).
+    let parent_path: client::QuotaEntityPath = "acme/eng".parse().unwrap();
+    let path_scoped = client::ConfigureQuotaEntityRequest::new(entity, "platform", 1_000_000)
+        .with_parent(parent_path);
+    request_round_trip::<client::ConfigureQuotaEntityRequest, dto::ConfigureQuotaEntityRequest>(
+        &path_scoped,
+    );
 }
 
 #[test]
 fn update_authorization_request_decodes_into_the_server_type() {
     let scope = client::QuotaEntityId::new();
+    let scope_path: client::QuotaEntityPath = "acme/eng".parse().unwrap();
     let bindings = vec![
         client::Binding::for_group("platform-team", client::BindingRole::Submitter),
         client::Binding::for_group("sre", client::BindingRole::Operator).with_scope(scope),
         client::Binding::for_principal("sub-123", client::BindingRole::Admin),
         client::Binding::for_principal("sub-456", client::BindingRole::Submitter).with_scope(scope),
+        // The scope may be named by path instead of id (ADR 0045).
+        client::Binding::for_group("platform", client::BindingRole::Operator)
+            .with_scope(scope_path),
     ];
     for binding in &bindings {
         assert!(binding.validate().is_ok());
@@ -1224,11 +1264,15 @@ fn every_job_filter_leaf_matches_the_wire_contract() {
         ),
         (
             client::JobFilter::entity(entity),
-            json!({"entity": {"id": entity.to_string(), "scope": "subtree"}}),
+            json!({"entity": {"ref": entity.to_string(), "scope": "subtree"}}),
         ),
         (
             client::JobFilter::entity_exact(entity),
-            json!({"entity": {"id": entity.to_string(), "scope": "exact"}}),
+            json!({"entity": {"ref": entity.to_string(), "scope": "exact"}}),
+        ),
+        (
+            client::JobFilter::entity("acme/eng".parse::<client::QuotaEntityPath>().unwrap()),
+            json!({"entity": {"ref": "acme/eng", "scope": "subtree"}}),
         ),
         (
             client::JobFilter::node(node),
@@ -1302,6 +1346,166 @@ fn every_job_filter_leaf_matches_the_wire_contract() {
             server_filter.validate().is_ok(),
             "server validate failed for {client_json}"
         );
+    }
+}
+
+/// The `entity` leaf's pre-ADR-0045 key (`"id"`, in place of `"ref"`) is
+/// refused by both crates — the field was renamed, not aliased, so an old
+/// caller's request is a decode error rather than a silently-ignored key.
+#[test]
+fn the_old_entity_filter_id_key_is_refused_by_both_crates() {
+    let entity = client::QuotaEntityId::new();
+    let old_shape = json!({"entity": {"id": entity.to_string(), "scope": "subtree"}});
+
+    assert!(
+        serde_json::from_value::<client::JobFilter>(old_shape.clone()).is_err(),
+        "the client accepted the pre-ADR-0045 `id` key"
+    );
+    assert!(
+        parse_server_filter(old_shape).is_err(),
+        "the server accepted the pre-ADR-0045 `id` key"
+    );
+}
+
+/// The two crates' filter leaf agrees for an `entity` reference given as an
+/// id vs. a path, mirroring [`every_job_filter_leaf_matches_the_wire_contract`]
+/// but checked directly against `EntityFilter::id()`/`as_id()` rather than a
+/// hand-written JSON literal.
+#[test]
+fn the_entity_filter_leaf_agrees_on_an_id_and_a_path_ref() {
+    let entity = client::QuotaEntityId::new();
+    let path: client::QuotaEntityPath = "acme/eng".parse().unwrap();
+
+    for filter in [
+        client::JobFilter::entity(entity),
+        client::JobFilter::entity(path.clone()),
+        client::JobFilter::entity_exact(entity),
+        client::JobFilter::entity_exact(path),
+    ] {
+        let client_json = serde_json::to_value(&filter).unwrap();
+        let server_filter = parse_server_filter(client_json.clone())
+            .unwrap_or_else(|e| panic!("server failed to decode {client_json}: {e}"));
+        assert_eq!(filter.validate(), server_filter.validate());
+        if let dto::JobFilter::Entity(e) = &server_filter {
+            assert_eq!(e.id(), entity_from_json(&client_json));
+        } else {
+            panic!("expected an entity leaf, got {server_filter:?}");
+        }
+    }
+}
+
+/// The id this leaf's JSON carries, when it is an id ref (`None` for a
+/// path ref, matching [`dto::EntityFilter::id`]).
+fn entity_from_json(json: &serde_json::Value) -> Option<core_id::QuotaEntityId> {
+    json["entity"]["ref"].as_str()?.parse().ok()
+}
+
+/// The two crates' entity-name grammars ([`coppice_core::entity_ref`] and
+/// its `coppice_client` mirror) must accept and reject the identical set of
+/// inputs, with identical error text, for both a bare segment
+/// (`validate_segment`) and a full [`QuotaEntityRef`] (id vs. path vs.
+/// error).
+#[test]
+fn the_two_crates_entity_ref_grammars_agree() {
+    use coppice_core::entity_ref as server_entity_ref;
+
+    let id = core_id::QuotaEntityId::new();
+    let id_string = id.to_string();
+
+    let segments: Vec<String> = vec![
+        "acme".to_string(),
+        "Team-A".to_string(),
+        "eng.platform".to_string(),
+        "v1_2".to_string(),
+        "0day".to_string(),
+        "".to_string(),
+        "x".repeat(64),
+        "x".repeat(63),
+        "-lead".to_string(),
+        ".hidden".to_string(),
+        "_under".to_string(),
+        "a/b".to_string(),
+        "ünï".to_string(),
+        "a b".to_string(),
+        "quota-team".to_string(),
+        id_string.clone(),
+    ];
+
+    for segment in &segments {
+        let server_result = server_entity_ref::validate_segment(segment);
+        let client_result = client::validate_segment(segment);
+        assert_eq!(
+            server_result.is_ok(),
+            client_result.is_ok(),
+            "validate_segment agreement diverged for {segment:?}"
+        );
+        match (server_result, client_result) {
+            (Err(s), Err(c)) => {
+                assert_eq!(
+                    s.to_string(),
+                    c.to_string(),
+                    "validate_segment error text diverged for {segment:?}"
+                );
+            }
+            (Ok(()), Ok(())) => {}
+            _ => unreachable!("already asserted the two sides agree on ok/err"),
+        }
+    }
+
+    assert_eq!(server_entity_ref::MAX_SEGMENT_LEN, client::MAX_SEGMENT_LEN);
+
+    // `QuotaEntityRef` parsing: id vs. path vs. error, over a wider table
+    // that also exercises multi-segment paths and the malformed-path cases.
+    let refs: Vec<String> = vec![
+        id_string.clone(),
+        "acme".to_string(),
+        "acme/eng".to_string(),
+        "acme/eng/platform".to_string(),
+        "acme//eng".to_string(),
+        "/acme".to_string(),
+        "acme/".to_string(),
+        "".to_string(),
+        format!("acme/{id_string}"),
+        "quota-team".to_string(),
+    ];
+
+    #[derive(Debug, PartialEq)]
+    enum RefShape {
+        Id,
+        Path(String),
+        Err,
+    }
+
+    fn server_shape(input: &str) -> RefShape {
+        match input.parse::<server_entity_ref::QuotaEntityRef>() {
+            Ok(server_entity_ref::QuotaEntityRef::Id(_)) => RefShape::Id,
+            Ok(server_entity_ref::QuotaEntityRef::Path(p)) => RefShape::Path(p.to_string()),
+            Err(_) => RefShape::Err,
+        }
+    }
+    fn client_shape(input: &str) -> RefShape {
+        match input.parse::<client::QuotaEntityRef>() {
+            Ok(client::QuotaEntityRef::Id(_)) => RefShape::Id,
+            Ok(client::QuotaEntityRef::Path(p)) => RefShape::Path(p.to_string()),
+            Err(_) => RefShape::Err,
+        }
+    }
+
+    for input in &refs {
+        assert_eq!(
+            server_shape(input),
+            client_shape(input),
+            "QuotaEntityRef parse agreement diverged for {input:?}"
+        );
+    }
+
+    // Display round trip: parsing a rendered ref and re-rendering it gives
+    // back the original string, identically on both sides.
+    for input in [&id_string, &"acme/eng".to_string()] {
+        let server: server_entity_ref::QuotaEntityRef = input.parse().unwrap();
+        let client: client::QuotaEntityRef = input.parse().unwrap();
+        assert_eq!(server.to_string(), client.to_string());
+        assert_eq!(&server.to_string(), input);
     }
 }
 

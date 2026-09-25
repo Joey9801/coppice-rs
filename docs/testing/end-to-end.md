@@ -27,18 +27,22 @@ no logs or usage — any case asserting on real container output, job logs, or
 usage samples must say so and run `--executor docker` instead.
 
 `dev` prints a ready summary with the client-API port (7070 by default), the
-cluster id, the registered agent's node id, and a seeded quota entity
-(`quota-00000000-0000-0000-0000-000000000001`, priorities -2..=2). Export
-`API=http://localhost:<client-port>/api/v1` and reuse the same cluster for a
-whole run; cases that mutate state say so and are ordered accordingly.
+cluster id, the registered agent's node id, and a seeded quota entity at the
+fixed path `dev` (`quota-00000000-0000-0000-0000-000000000001`, priorities
+-2..=2). Export `API=http://localhost:<client-port>/api/v1` and reuse the same
+cluster for a whole run; cases that mutate state say so and are ordered
+accordingly.
 
-Jobs are submitted with a client-minted id (`job-<uuid>`, ADR 0026):
+Jobs are submitted with a client-minted id (`job-<uuid>`, ADR 0026). A quota
+entity reference (`quota_entity`, the `ListJobs`/subscription filter's
+`entity.ref`, an authorization binding's `scope`) accepts either the id or the
+path (ADR 0045); examples here use the path:
 
 ```
 curl -s -X POST $API/jobs -H 'content-type: application/json' -d '{
   "job":"job-<uuid>","image":"busybox","command":["sleep","600"],
   "requests":{"cpu_millis":2000,"memory_bytes":1073741824,"disk_bytes":0},
-  "quota_entity":"quota-00000000-0000-0000-0000-000000000001"}'
+  "quota_entity":"dev"}'
 ```
 
 ## Structure of a case

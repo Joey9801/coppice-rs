@@ -125,7 +125,7 @@ pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>
     Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
         entity,
         parent,
-        name: "entity".into(),
+        name: format!("e{}", entity.0.simple()),
         quota: CostUnits(1_000_000_000_000),
         updated_at: base_ts(),
         actor: None,

@@ -96,11 +96,17 @@ pub fn update_policy_cmd(policy: PolicyConfig) -> Command {
     })
 }
 
+/// A grammar-valid name unique to `entity` (ADR 0045), so fixtures that
+/// hang several entities off one parent never trip the sibling-clash rule.
+pub fn entity_name(entity: QuotaEntityId) -> String {
+    format!("e{}", entity.0.simple())
+}
+
 pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>) -> Command {
     Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
         entity,
         parent,
-        name: "entity".into(),
+        name: entity_name(entity),
         quota: CostUnits(1_000_000_000_000),
         updated_at: base_ts(),
         actor: None,

@@ -434,6 +434,11 @@ message ForwardWriteOutcome {
   // outcome, not a fault. `reason` is the leader's *rendered*
   // RejectionReason: the type has no proto encoding, and the client only
   // ever sees the rendered text anyway (ADR 0038).
+  //
+  // Also how the leader reports a quota-entity path (ADR 0045) it cannot
+  // resolve even at a read barrier — nothing is proposed then, but the client
+  // is owed the answer an unknown id earns from apply, so it travels as this
+  // arm with kind UNKNOWN_QUOTA_ENTITY.
   message Rejected {
     string reason = 1;
     // Which rejection this is, to the extent the HTTP status mapping cares
@@ -455,9 +460,10 @@ message ForwardWriteOutcome {
     REJECTION_KIND_UNSPECIFIED = 0;
     // Apply's ADR 0023 re-check refused the actor: 403, on every endpoint.
     REJECTION_KIND_PERMISSION_DENIED = 1;
-    // A binding scoped to a quota entity that does not exist. A 400 on
-    // PUT /api/v1/authorization only; still the documented 409 on submit
-    // and on the quota-entity upsert.
+    // A quota entity that does not exist — named by id at apply, or by a
+    // path the leader could not resolve. A 400 for a binding scope on
+    // PUT /api/v1/authorization; still the documented 409 on submit and on
+    // the quota-entity upsert's parent.
     REJECTION_KIND_UNKNOWN_QUOTA_ENTITY = 2;
     // A malformed bindings list (an empty subject).
     REJECTION_KIND_INVALID_AUTHORIZATION = 3;
@@ -466,6 +472,10 @@ message ForwardWriteOutcome {
     // The node a drain or undrain named does not exist at the command's log
     // position. A 404 on the ADR 0041 node-write routes only.
     REJECTION_KIND_UNKNOWN_NODE = 5;
+    // A quota entity name outside the ADR 0045 segment grammar: 400
+    // everywhere. The HTTP edge pre-checks the grammar, so this reaches a
+    // client only if that check was skipped.
+    REJECTION_KIND_INVALID_QUOTA_ENTITY_NAME = 6;
   }
   // The receiver is not the leader (the forwarder's view was stale, or
   // leadership moved under it). It never forwards again — the originating
@@ -508,7 +518,11 @@ message ForwardSubmitJobRequest {
   // range check belongs to the leader's validation, so the value it checks
   // must be the one the client wrote.
   optional int64 max_runtime_seconds = 14;
-  coppice.core.v1.QuotaEntityId quota_entity = 15;
+  // Was the resolved QuotaEntityId, back when the originating replica
+  // resolved a path before forwarding — a state read a follower must not
+  // make (ADR 0038, ADR 0045).
+  reserved 15;
+  reserved "quota_entity";
   // Absent = the platform default policy.
   coppice.core.v1.RetryPolicy retry = 16;
   // Who asked (ADR 0022/0023), as the *originating* replica's
@@ -532,6 +546,13 @@ message ForwardSubmitJobRequest {
   // The leader re-checks the same limits this replica already applied at
   // admission.
   repeated coppice.core.v1.EnvVar env = 19;
+  // The quota entity to charge, exactly as the client named it (ADR 0045):
+  // a `quota-<uuid>` id or a path. Unresolved, because resolving a path reads
+  // replicated state: the leader resolves it against *its own* view, inside
+  // the write path it runs for a direct request — the latest view first,
+  // and on a miss a view caught up to a read barrier — and answers an
+  // unresolvable path with the Rejected outcome (UNKNOWN_QUOTA_ENTITY).
+  string quota_entity_ref = 20;
 }
 
 message ForwardSubmitJobResponse {
@@ -558,35 +579,67 @@ message ForwardAbortJobResponse {
 message ForwardConfigureQuotaEntityRequest {
   bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   // Client-minted (ADR 0024/0026), and the upsert target: an existing id
-  // updates, a fresh one creates.
+  // updates its quota, a fresh one creates. An existing entity's name and
+  // parent are fixed (ADR 0045): an update must restate them.
   coppice.core.v1.QuotaEntityId entity = 8;
-  // Absent roots the entity. A missing or cycle-forming parent is rejected
-  // at apply, and comes back as the Rejected outcome above.
-  optional coppice.core.v1.QuotaEntityId parent = 9;
+  // Was the resolved parent id; see parent_ref.
+  reserved 9;
+  reserved "parent";
   string name = 10;
   uint64 quota_ucu = 11; // soft quota as a stock in µCU (ADR 0019).
   // As ForwardSubmitJobRequest.actor.
   coppice.core.v1.Actor actor = 12;
+  // The parent as the client named it — an id or a path (ADR 0045) —
+  // unresolved, like ForwardSubmitJobRequest.quota_entity_ref. Absent roots
+  // the entity. A parent the leader cannot find, even at a read barrier,
+  // comes back as the Rejected outcome above (UNKNOWN_QUOTA_ENTITY), as does
+  // apply's refusal of one differing from an existing entity's stored parent.
+  optional string parent_ref = 13;
 }
 
 message ForwardConfigureQuotaEntityResponse {
   ForwardWriteOutcome outcome = 1;
+  // The entity's path (ADR 0045), set with an Applied outcome: computed by
+  // the leader from the parent it resolved and the request's name, which is
+  // where the parent's path is known. The follower relays it to the client.
+  string path = 2;
 }
 
 // A follower's forwarding of `PUT /api/v1/authorization` (ADR 0023): the
 // full-replacement bindings list, and optionally a new groups_claim name.
 message ForwardUpdateAuthorizationRequest {
   bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
-  // The whole list, replacing whatever is there. An empty list is a
-  // meaningful request and is refused at apply by the lockout guard, not
-  // confused with "no bindings field".
-  repeated coppice.core.v1.Binding bindings = 8;
+  // Was the list as coppice.core.v1.Binding, whose scope is a resolved id;
+  // see requested_bindings.
+  reserved 8;
+  reserved "bindings";
   // Absent leaves PolicyConfig.groups_claim alone. Present, it rides the
   // single UpdateAuthorization command the leader proposes.
   optional string groups_claim = 9;
   // As ForwardSubmitJobRequest.actor. This verb takes an unscoped admin
   // binding, so the actor is the entire authorization input.
   coppice.core.v1.Actor actor = 10;
+  // The whole list, replacing whatever is there, with each scope as the
+  // client named it (ADR 0045). An empty list is a meaningful request and is
+  // refused at apply by the lockout guard, not confused with "no bindings
+  // field".
+  repeated ForwardBinding requested_bindings = 11;
+}
+
+// One binding of a forwarded authorization replacement: the
+// coppice.core.v1.Binding shape, but with the scope as the client's
+// QuotaEntityRef rather than a resolved id. The leader resolves any path
+// scope against its own view (ADR 0038, ADR 0045); a list with none is
+// proposed without reading state at all.
+message ForwardBinding {
+  // Unset names nobody, and the leader refuses it as a malformed request.
+  oneof subject {
+    coppice.core.v1.Binding.Group group = 1;
+    coppice.core.v1.Binding.Principal principal = 2;
+  }
+  coppice.core.v1.Role role = 3;
+  // A `quota-<uuid>` id or a path; absent is unscoped (cluster-wide).
+  optional string scope = 4;
 }
 
 message ForwardUpdateAuthorizationResponse {

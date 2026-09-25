@@ -308,8 +308,8 @@ fn drain_of_an_unknown_node_rejects_before_authorization() {
 }
 
 /// A subtree-scoped admin reshapes their subtree and only their subtree:
-/// creating under it works, creating under a sibling does not, and moving an
-/// entity out of it does not either.
+/// creating or reconfiguring under it works, anything under a sibling does
+/// not.
 #[test]
 fn scoped_admins_configure_only_inside_their_subtree() {
     let mut sm = tree_setup();
@@ -336,15 +336,40 @@ fn scoped_admins_configure_only_inside_their_subtree() {
         ))
         .expect_err("team-b is another subtree");
     assert!(denied(&reason), "{reason:?}");
-    // Moving squad out from under team-a carries authority with it.
+    // Reconfiguring inside the subtree works; outside it does not.
+    apply_ok(
+        &mut sm,
+        with_actor(
+            configure_entity_cmd(qid(SQUAD), Some(qid(TEAM_A))),
+            lead.clone(),
+        ),
+    );
+    let reason = sm
+        .apply(&with_actor(
+            configure_entity_cmd(qid(TEAM_B), Some(ROOT)),
+            lead.clone(),
+        ))
+        .expect_err("team-b is another subtree");
+    assert!(denied(&reason), "{reason:?}");
+    // A move is refused as immutable (ADR 0045) — after authorization, so
+    // an actor without rights over the entity is denied instead and learns
+    // nothing about where it lives.
     let reason = sm
         .apply(&with_actor(
             configure_entity_cmd(qid(SQUAD), Some(qid(TEAM_B))),
+            lead.clone(),
+        ))
+        .expect_err("entities do not move");
+    assert_eq!(reason, RejectionReason::QuotaEntityImmutable(qid(SQUAD)));
+    let reason = sm
+        .apply(&with_actor(
+            configure_entity_cmd(qid(TEAM_B), Some(qid(TEAM_A))),
             lead,
         ))
-        .expect_err("a cross-subtree move takes unscoped admin");
+        .expect_err("team-b is another subtree");
     assert!(denied(&reason), "{reason:?}");
     assert_eq!(sm.quota_entities[&qid(SQUAD)].parent, Some(qid(TEAM_A)));
+    assert_eq!(sm.quota_entities[&qid(TEAM_B)].parent, Some(ROOT));
 }
 
 /// Operator certificates are an implicit unscoped admin outside the bindings

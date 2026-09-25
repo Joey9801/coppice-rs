@@ -73,7 +73,7 @@ units), so a typo fail-stops naming the key:
 image = "busybox:1.36"
 command = ["sh", "-c", "echo hello"]
 # entrypoint = ["/bin/sh", "-c"]   # optional override; the image default when absent
-quota_entity = "quota-00000000-0000-0000-0000-000000000001"
+quota_entity = "acme/eng/platform"  # id or path (ADR 0045)
 priority = 0            # optional, default 0 (a multiplier index; dev seeds -2..=2)
 max_runtime = "1h"      # optional; whole seconds, positive
 
@@ -103,7 +103,7 @@ $ coppice dev
 Coppice dev is ready
   …
   API             http://localhost:7070/api/v1 (coppice job --api http://localhost:7070 …)
-  Quota entity    quota-00000000-0000-0000-0000-000000000001 ("dev", seeded; priorities -2..=2)
+  Quota entity    dev (quota-00000000-0000-0000-0000-000000000001, seeded; priorities -2..=2)
   …
 
 # In another shell (the spec above, saved as hello.toml):

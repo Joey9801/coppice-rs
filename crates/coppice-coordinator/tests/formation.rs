@@ -34,7 +34,7 @@ fn policy_seeding(entity: &str) -> String {
         r#"
 [[quota_entity]]
 id = "{entity}"
-name = "seeded-by-formation"
+path = "seeded-by-formation"
 quota = 1000000000
 "#
     )
@@ -994,32 +994,25 @@ async fn a_policy_that_parses_but_cannot_be_ordered_costs_no_data_directory() {
     daemon.start();
     daemon.await_phase("waiting").await;
 
-    // Valid TOML, valid ids, and an unsatisfiable quota hierarchy: two
-    // entities that are each other's parent. `parse_toml` accepts it; only the
-    // topological ordering rejects it. That rejection must land before the
+    // Valid TOML, valid paths, and an unsatisfiable quota hierarchy: a child
+    // whose parent path is declared nowhere. `parse_toml` accepts it; only
+    // resolving parents against the (empty) cluster state rejects it. That rejection must land before the
     // formation intent is stamped, or an operator typo has destroyed a data
     // directory that only a wipe can recover.
-    let (a, b) = (
-        coppice_core::id::QuotaEntityId::new(),
-        coppice_core::id::QuotaEntityId::new(),
-    );
     let reply = daemon
         .admin(AdminCall::Init {
-            policy: Some(format!(
+            policy: Some(
                 r#"
 [[quota_entity]]
-id = "{a}"
-parent = "{b}"
-name = "a"
+path = "acme/eng"
 quota = 1
 
 [[quota_entity]]
-id = "{b}"
-parent = "{a}"
-name = "b"
+path = "acme/eng/platform"
 quota = 1
 "#
-            )),
+                .to_string(),
+            ),
             operator_csr: None,
             operator_cn: None,
         })

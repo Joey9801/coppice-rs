@@ -446,6 +446,51 @@ pub enum ApiError {
     /// overload, or the seam shutting down. The caller may retry.
     #[error("unavailable: {0}")]
     Unavailable(String),
+
+    /// A quota-entity path (ADR 0045) that names nothing on the leader, even
+    /// on a view caught up to a read barrier — so nothing was proposed. The
+    /// text names the path.
+    ///
+    /// Not a [`Rejected`](Self::Rejected): no command carried the reference,
+    /// so apply never saw it. But the client is owed exactly the answer an
+    /// unknown *id* earns from apply on the same route, so it classifies as
+    /// [`RejectionKind::UnknownQuotaEntity`] — a 409 on submission and on the
+    /// configure `parent`, a 400 on an authorization binding's `scope` — and
+    /// crosses the ADR 0038 hop as that classified rejection. Built only by
+    /// [`unknown_quota_entity`](Self::unknown_quota_entity) and
+    /// [`unknown_binding_scope`](Self::unknown_binding_scope), so every
+    /// resolver words it alike.
+    #[error("{0}")]
+    UnresolvedQuotaEntity(String),
+}
+
+impl ApiError {
+    /// A submission's entity, or a configure `parent`, that names nothing.
+    pub fn unknown_quota_entity(reference: &coppice_core::entity_ref::QuotaEntityRef) -> Self {
+        ApiError::UnresolvedQuotaEntity(format!("quota entity {reference} not found"))
+    }
+
+    /// Binding `index`'s `scope` names nothing.
+    pub fn unknown_binding_scope(
+        index: usize,
+        reference: &coppice_core::entity_ref::QuotaEntityRef,
+    ) -> Self {
+        ApiError::UnresolvedQuotaEntity(format!(
+            "binding {index}: no quota entity at path \"{reference}\""
+        ))
+    }
+
+    /// The status-relevant classification of a refusal, for the error
+    /// mappings and the ADR 0038 hop: `Some` for the arms that answer like a
+    /// rejection, `None` for the rest.
+    pub fn rejection_kind(&self) -> Option<RejectionKind> {
+        match self {
+            ApiError::Rejected(r) => Some(RejectionKind::of(r)),
+            ApiError::ForwardedRejection { kind, .. } => Some(*kind),
+            ApiError::UnresolvedQuotaEntity(_) => Some(RejectionKind::UnknownQuotaEntity),
+            ApiError::NotLeader { .. } | ApiError::Invalid(_) | ApiError::Unavailable(_) => None,
+        }
+    }
 }
 
 /// The rejections whose *identity* changes the HTTP status a client sees, as
@@ -477,6 +522,10 @@ pub enum RejectionKind {
     /// The node a drain or undrain named is not in the state (ADR 0041 node-write
     /// routes only; a 404).
     UnknownNode,
+    /// A quota entity name outside the ADR 0045 segment grammar: a malformed
+    /// request (400) everywhere. The HTTP edge pre-checks the grammar, so
+    /// this is the backstop for a request that skipped that check.
+    InvalidQuotaEntityName,
 }
 
 impl RejectionKind {
@@ -490,6 +539,7 @@ impl RejectionKind {
             R::InvalidAuthorization(_) => RejectionKind::InvalidAuthorization,
             R::AuthorizationLockout => RejectionKind::AuthorizationLockout,
             R::UnknownNode(_) => RejectionKind::UnknownNode,
+            R::InvalidQuotaEntityName(_) => RejectionKind::InvalidQuotaEntityName,
             _ => RejectionKind::Other,
         }
     }
@@ -724,6 +774,14 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// 403 if it failed — the pre-check is the fast, friendly half, and this
     /// re-check is the authoritative one, which is what makes a revocation
     /// racing an in-flight write resolve in log order rather than by luck.
+    ///
+    /// `req.quota_entity` arrives as the client's [`QuotaEntityRef`]
+    /// (ADR 0045), unresolved: resolving a path reads replicated state, so it
+    /// is the leader's job, inside the write path it runs for direct and
+    /// forwarded requests alike (ADR 0038). A path naming nothing there is
+    /// [`ApiError::UnresolvedQuotaEntity`].
+    ///
+    /// [`QuotaEntityRef`]: coppice_core::entity_ref::QuotaEntityRef
     fn submit_job(
         &self,
         req: SubmitJobRequest,
@@ -787,14 +845,23 @@ pub trait ControlPlane: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
     /// Propose the `ConfigureQuotaEntity` upsert (ADR 0031's write class) on
-    /// behalf of `actor`. Resolves once committed and applied; a cycle or
-    /// unknown-parent refusal surfaces as [`ApiError::Rejected`] (a normal 409
-    /// race outcome), and an authorization refusal as
+    /// behalf of `actor`. Resolves once committed and applied, with the
+    /// apply's log index; an unknown-parent, name-clash, too-deep or
+    /// immutable-field refusal surfaces as [`ApiError::Rejected`] (a normal
+    /// 409 race outcome), and an authorization refusal as
     /// `RejectionReason::PermissionDenied` (403).
     ///
     /// Authorization follows the same arrangement as
     /// [`submit_job`](ControlPlane::submit_job): the API layer pre-checks
     /// against a read view and apply re-checks at the log position (ADR 0023).
+    ///
+    /// `req.parent` arrives unresolved, as [`submit_job`]'s entity does, and
+    /// the leader that resolves it also derives the response's `path` there:
+    /// name and parent are fixed at creation, so the parent's path and the
+    /// name are the entity's path for good (ADR 0045). A follower relays the
+    /// leader's answer, `path` included.
+    ///
+    /// [`submit_job`]: ControlPlane::submit_job
     fn configure_quota_entity(
         &self,
         req: ConfigureQuotaEntityRequest,
@@ -813,6 +880,12 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// admin group denies its own second half. `groups_claim` still lives in
     /// `PolicyConfig`, and `UpdatePolicy` still replaces it wholesale;
     /// concurrent editors resolve last-writer-wins in log order.
+    ///
+    /// Binding scopes arrive unresolved, as [`submit_job`]'s entity does;
+    /// the leader resolves any path among them, and a list naming none reads
+    /// no state at all.
+    ///
+    /// [`submit_job`]: ControlPlane::submit_job
     fn update_authorization(
         &self,
         req: UpdateAuthorizationRequest,
