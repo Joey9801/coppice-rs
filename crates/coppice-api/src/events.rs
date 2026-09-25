@@ -45,9 +45,6 @@ pub struct ForbiddenLeaf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSelector {
     root: Node,
-    /// See [`JobSelector::reads_entity_subtree`]. Computed once, at compile
-    /// time, because it is consulted per batch on the delivery path.
-    reads_entity_subtree: bool,
 }
 
 /// One node of a compiled selector. A private mirror of the allowed subset of
@@ -65,7 +62,10 @@ enum Node {
         equals: Option<String>,
     },
     Entity {
-        id: QuotaEntityId,
+        /// `None` for a path the handler never resolved against its view
+        /// (ADR 0045) — it matches nothing. The subscribe handler resolves
+        /// every path before compiling, so this is a guard, not a mode.
+        id: Option<QuotaEntityId>,
         /// `true` matches only the job's own entity; `false` matches anywhere
         /// along its ancestry.
         exact: bool,
@@ -82,42 +82,14 @@ impl JobSelector {
     /// rule that is specific to subscriptions — the restricted leaf set — and
     /// names the first leaf outside it.
     pub fn compile(filter: &dto::JobFilter) -> Result<JobSelector, ForbiddenLeaf> {
-        let root = compile_node(filter)?;
         Ok(JobSelector {
-            reads_entity_subtree: reads_entity_subtree(&root),
-            root,
+            root: compile_node(filter)?,
         })
     }
 
     /// Whether a job with these scope keys is in this selector's scope.
     pub fn matches(&self, job: JobId, scope: ScopeView<'_>) -> bool {
         eval(&self.root, job, scope)
-    }
-
-    /// Whether this selector's verdict can turn on a job's **ancestry** rather
-    /// than only on its own keys — true iff a subtree-scoped `entity` leaf
-    /// appears anywhere in the tree, under any combinator including `not`.
-    ///
-    /// Such a selector is the one kind that a `ConfigureQuotaEntity` reparent
-    /// can move jobs into and out of without naming any of them, so the fanout
-    /// owes it a gap when one goes by (ADR 0043). An exact-entity leaf reads
-    /// the chain's head, which a reparent of some ancestor never changes.
-    pub fn reads_entity_subtree(&self) -> bool {
-        self.reads_entity_subtree
-    }
-}
-
-/// Walk the compiled tree for a subtree-scoped `entity` leaf.
-///
-/// Negation is not special: `not(entity subtree = X)` admits precisely the
-/// complement of a subtree, and a reparent moves jobs across that boundary in
-/// the same way.
-fn reads_entity_subtree(node: &Node) -> bool {
-    match node {
-        Node::All(ns) | Node::Any(ns) => ns.iter().any(reads_entity_subtree),
-        Node::Not(n) => reads_entity_subtree(n),
-        Node::Entity { exact, .. } => !exact,
-        Node::Metadata { .. } | Node::Id(_) | Node::SubmittedBy(_) => false,
     }
 }
 
@@ -132,7 +104,7 @@ fn compile_node(filter: &dto::JobFilter) -> Result<Node, ForbiddenLeaf> {
             equals: m.equals.clone(),
         },
         F::Entity(e) => Node::Entity {
-            id: e.id,
+            id: e.id(),
             exact: e.scope == dto::EntityScope::Exact,
         },
         F::Id(i) => Node::Id(i.r#in.iter().copied().collect()),
@@ -166,7 +138,11 @@ fn eval(node: &Node, job: JobId, scope: ScopeView<'_>) -> bool {
         // The chain is entity-first, so `exact` is the head and `subtree` is
         // membership — the same two breadths `ListJobs` offers, decided here
         // without a tree walk because the walk already happened at apply.
-        Node::Entity { id, exact } => {
+        Node::Entity { id: None, .. } => false,
+        Node::Entity {
+            id: Some(id),
+            exact,
+        } => {
             if *exact {
                 scope.entity_chain.first() == Some(id)
             } else {
@@ -249,7 +225,10 @@ mod tests {
     }
 
     fn entity_leaf(id: QuotaEntityId, scope: dto::EntityScope) -> dto::JobFilter {
-        dto::JobFilter::Entity(dto::EntityFilter { id, scope })
+        dto::JobFilter::Entity(dto::EntityFilter {
+            entity: id.into(),
+            scope,
+        })
     }
 
     /// Every leaf outside the restricted set is refused by name, so the 400
@@ -354,53 +333,6 @@ mod tests {
             .expect("allowed leaf");
         assert!(selector.matches(job, scope(&[], None, &empty)));
         assert!(!selector.matches(JobId::new(), scope(&[], None, &empty)));
-    }
-
-    /// The flag that decides whether a quota-entity reparent owes this
-    /// subscriber a gap (ADR 0043). Only a *subtree* leaf reads a job's
-    /// ancestry; an exact one reads the chain's head, which a reparent above
-    /// the job never moves.
-    #[test]
-    fn reads_entity_subtree_is_true_only_for_a_subtree_leaf() {
-        let entity = QuotaEntityId::new();
-        let compile = |f| JobSelector::compile(&f).expect("allowed leaf");
-
-        assert!(compile(entity_leaf(entity, dto::EntityScope::Subtree)).reads_entity_subtree());
-        assert!(!compile(entity_leaf(entity, dto::EntityScope::Exact)).reads_entity_subtree());
-        assert!(!compile(metadata_leaf("team", None)).reads_entity_subtree());
-        assert!(!compile(dto::JobFilter::Id(dto::IdFilter {
-            r#in: vec![JobId::new()]
-        }))
-        .reads_entity_subtree());
-    }
-
-    /// The walk covers the whole tree, under every combinator — a subtree leaf
-    /// buried under `not` inside `any` still reads ancestry.
-    #[test]
-    fn reads_entity_subtree_finds_a_nested_leaf() {
-        let entity = QuotaEntityId::new();
-        let nested = dto::JobFilter::All(vec![
-            metadata_leaf("team", None),
-            dto::JobFilter::Any(vec![dto::JobFilter::Not(Box::new(entity_leaf(
-                entity,
-                dto::EntityScope::Subtree,
-            )))]),
-        ]);
-        assert!(JobSelector::compile(&nested)
-            .expect("allowed leaves")
-            .reads_entity_subtree());
-
-        // The same shape with an exact leaf reads no ancestry at all.
-        let exact = dto::JobFilter::All(vec![
-            metadata_leaf("team", None),
-            dto::JobFilter::Any(vec![dto::JobFilter::Not(Box::new(entity_leaf(
-                entity,
-                dto::EntityScope::Exact,
-            )))]),
-        ]);
-        assert!(!JobSelector::compile(&exact)
-            .expect("allowed leaves")
-            .reads_entity_subtree());
     }
 
     #[test]

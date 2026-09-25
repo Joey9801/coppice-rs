@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::entity_ref::QuotaEntityRef;
 use crate::id::QuotaEntityId;
 
 /// The authentication posture a deployment runs under (`GetAuthConfigResponse::mode`).
@@ -127,6 +128,9 @@ pub struct SessionBinding {
     pub role: BindingRole,
     /// Subtree root the role is scoped to; `null` means cluster-wide.
     pub scope: Option<QuotaEntityId>,
+    /// The scope entity's path (ADR 0045); `null` when unscoped, or when
+    /// the scoped entity is (impossibly) absent from the tree.
+    pub scope_path: Option<String>,
 }
 
 /// The mechanism that authenticated a request (`GetSessionResponse::auth_method`).
@@ -232,10 +236,11 @@ pub struct Binding {
     pub principal: Option<String>,
     /// The role this binding grants.
     pub role: BindingRole,
-    /// Subtree root the role is scoped to; absent means unscoped
-    /// (cluster-wide).
+    /// Subtree root the role is scoped to, by id or path (ADR 0045); absent
+    /// means unscoped (cluster-wide). A path is resolved against the
+    /// serving replica's read view before proposing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<QuotaEntityId>,
+    pub scope: Option<QuotaEntityRef>,
 }
 
 impl Binding {
@@ -259,9 +264,10 @@ impl Binding {
         }
     }
 
-    /// Scope this binding to a subtree, rather than leaving it cluster-wide.
-    pub fn with_scope(mut self, scope: QuotaEntityId) -> Binding {
-        self.scope = Some(scope);
+    /// Scope this binding to a subtree (by id or path), rather than leaving
+    /// it cluster-wide.
+    pub fn with_scope(mut self, scope: impl Into<QuotaEntityRef>) -> Binding {
+        self.scope = Some(scope.into());
         self
     }
 
@@ -302,7 +308,48 @@ pub struct GetAuthorizationResponse {
     /// The token claim group names are read from.
     pub groups_claim: String,
     /// Every binding, in stored order.
-    pub bindings: Vec<Binding>,
+    pub bindings: Vec<BindingView>,
+}
+
+/// One binding as read back on `GET /api/v1/authorization` — [`Binding`]
+/// plus the scope entity's path (ADR 0045).
+///
+/// A separate type from [`Binding`], which is what a `PUT` sends: a read
+/// carries `scope_path` alongside the id, and `impl From<&BindingView> for
+/// Binding` is the read-modify-write conversion back to the request shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BindingView {
+    /// Group-claim subject; exactly one of `group`/`principal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Principal (`sub`) subject; exactly one of `group`/`principal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// The role this binding grants.
+    pub role: BindingRole,
+    /// Subtree root the role is scoped to; absent means unscoped
+    /// (cluster-wide).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<QuotaEntityId>,
+    /// The scope entity's path (ADR 0045); absent when unscoped, or when
+    /// the scoped entity is (impossibly) absent from the tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_path: Option<String>,
+}
+
+impl From<&BindingView> for Binding {
+    /// The read-modify-write conversion: a binding read back is exactly
+    /// what a subsequent `PUT` sends, with `scope_path` dropped and `scope`
+    /// carried as an id ref.
+    fn from(view: &BindingView) -> Binding {
+        Binding {
+            group: view.group.clone(),
+            principal: view.principal.clone(),
+            role: view.role.clone(),
+            scope: view.scope.map(QuotaEntityRef::Id),
+        }
+    }
 }
 
 /// `PUT /api/v1/authorization` — a full-replacement update: `bindings`
@@ -475,6 +522,71 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&binding).unwrap(),
             serde_json::json!({ "principal": "sub-123", "role": "submitter" })
+        );
+    }
+
+    /// `with_scope` accepts a path as readily as an id (ADR 0045).
+    #[test]
+    fn with_scope_accepts_a_path_ref() {
+        let path: crate::entity_ref::QuotaEntityPath = "acme/eng".parse().unwrap();
+        let binding = Binding::for_group("sre", BindingRole::Operator).with_scope(path.clone());
+        assert_eq!(binding.scope, Some(QuotaEntityRef::Path(path)));
+        let json = serde_json::to_value(&binding).unwrap();
+        assert_eq!(json["scope"], serde_json::json!("acme/eng"));
+    }
+
+    /// A `BindingView` (a read) converts back into the `Binding` a
+    /// subsequent `PUT` sends, dropping `scope_path` and carrying `scope`
+    /// as an id ref.
+    #[test]
+    fn a_binding_view_converts_back_into_a_binding() {
+        let scope = QuotaEntityId::new();
+        let view = BindingView {
+            group: None,
+            principal: Some("sub-123".to_string()),
+            role: BindingRole::Operator,
+            scope: Some(scope),
+            scope_path: Some("acme/eng".to_string()),
+        };
+        let binding: Binding = (&view).into();
+        assert_eq!(
+            binding,
+            Binding {
+                group: None,
+                principal: Some("sub-123".to_string()),
+                role: BindingRole::Operator,
+                scope: Some(QuotaEntityRef::Id(scope)),
+            }
+        );
+    }
+
+    /// A `GetAuthorizationResponse` carries `BindingView`s, each with the
+    /// scope's path alongside its id.
+    #[test]
+    fn get_authorization_response_bindings_carry_scope_path() {
+        let scope = QuotaEntityId::new();
+        let response = GetAuthorizationResponse {
+            groups_claim: "groups".to_string(),
+            bindings: vec![BindingView {
+                group: Some("sre".to_string()),
+                principal: None,
+                role: BindingRole::Admin,
+                scope: Some(scope),
+                scope_path: Some("acme/eng".to_string()),
+            }],
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "groups_claim": "groups",
+                "bindings": [{
+                    "group": "sre",
+                    "role": "admin",
+                    "scope": scope.to_string(),
+                    "scope_path": "acme/eng",
+                }],
+            })
         );
     }
 }

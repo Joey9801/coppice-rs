@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass};
+use coppice_core::entity_ref;
 use coppice_core::env;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState};
@@ -1108,74 +1109,79 @@ impl StateMachine {
     // ---- Admin / policy ----
 
     fn configure_quota_entity(&mut self, c: &ConfigureQuotaEntity) -> ApplyResult {
-        if let Some(parent) = c.parent {
-            if parent == c.entity {
-                return Err(RejectionReason::QuotaEntityCycle(c.entity));
+        let verb = Verb::ConfigureQuotaEntity {
+            entity: &c.entity,
+            parent: c.parent.as_ref(),
+        };
+        if let Some(existing) = self.quota_entities.get(&c.entity) {
+            // An update. Name and parent are fixed at creation (ADR 0045), so
+            // a path that names an entity names it for good; only the quota
+            // changes. Checked after authorization, so a caller without
+            // rights over the entity learns nothing about its stored fields.
+            let (name, parent) = (existing.name.clone(), existing.parent);
+            self.authorize(c.actor.as_ref(), verb)?;
+            if name != c.name || parent != c.parent {
+                return Err(RejectionReason::QuotaEntityImmutable(c.entity));
             }
+            let e = self
+                .quota_entities
+                .get_mut(&c.entity)
+                .expect("present above, and authorization mutates nothing");
+            // Usage and `created_at` are preserved: reconfiguration is not an
+            // amnesty, and the creation instant never moves.
+            e.quota = c.quota;
+            e.updated_at = c.updated_at;
+            return Ok(Applied {
+                events: vec![Event::QuotaEntityConfigured { entity: c.entity }],
+            });
+        }
+        // A create. The name is one path segment (ADR 0045), a pure shape
+        // check.
+        entity_ref::validate_segment(&c.name)
+            .map_err(|e| RejectionReason::InvalidQuotaEntityName(e.to_string()))?;
+        // The parent must already exist, so the parent graph is acyclic by
+        // construction: nothing can be created under an entity that does not
+        // exist yet, and nothing ever moves. The new entity's depth, counting
+        // itself (a root is at depth 1), must be within the cap — every path
+        // is at most `QUOTA_TREE_DEPTH_CAP` names. Only creation is
+        // depth-checked; an existing subtree never changes shape.
+        if let Some(parent) = c.parent {
             if !self.quota_entities.contains_key(&parent) {
                 return Err(RejectionReason::UnknownQuotaEntity(parent));
             }
-            // Walk up from the parent: reaching the entity is a cycle,
-            // exhausting the cap is too deep either way.
-            let mut cur = Some(parent);
-            let mut rooted = false;
-            for _ in 0..QUOTA_TREE_DEPTH_CAP {
-                match cur {
-                    None => {
-                        rooted = true;
-                        break;
-                    }
-                    Some(id) if id == c.entity => break,
-                    Some(id) => cur = self.quota_entities.get(&id).and_then(|e| e.parent),
-                }
-            }
-            if !rooted {
-                return Err(RejectionReason::QuotaEntityCycle(c.entity));
+            if self.entity_chain(parent).len() as u32 >= QUOTA_TREE_DEPTH_CAP {
+                return Err(RejectionReason::QuotaEntityTooDeep(c.entity));
             }
         }
-        self.authorize(
-            c.actor.as_ref(),
-            Verb::ConfigureQuotaEntity {
-                entity: &c.entity,
-                new_parent: c.parent.as_ref(),
+        self.authorize(c.actor.as_ref(), verb)?;
+        // Unique among its siblings: every replica must agree that a path
+        // names at most one entity. After authorization, because the
+        // rejection names the holder's id. The check is a scan of the
+        // (bounded, ~1k) entity map — deliberately no index on the state
+        // machine.
+        if let Some((holder, _)) = self
+            .quota_entities
+            .iter()
+            .find(|(_, e)| e.parent == c.parent && e.name == c.name)
+        {
+            return Err(RejectionReason::QuotaEntityNameTaken {
+                name: c.name.clone(),
+                holder: *holder,
+            });
+        }
+        self.quota_entities.insert(
+            c.entity,
+            QuotaEntity {
+                parent: c.parent,
+                name: c.name.clone(),
+                quota: c.quota,
+                usage: UsageState::new(c.updated_at),
+                created_at: c.updated_at,
+                updated_at: c.updated_at,
             },
-        )?;
-        // Whether this command moves an existing entity under a different
-        // parent. Decided here, with the old and the new parent both in hand,
-        // because no later reader can tell the two apart — and a subtree
-        // subscription's membership just changed for every job below
-        // `c.entity` without any of them being named (ADR 0043).
-        let mut reparented = false;
-        match self.quota_entities.get_mut(&c.entity) {
-            // Usage and `created_at` are preserved on update: reconfiguration
-            // is not an amnesty, and the creation instant never moves.
-            Some(e) => {
-                reparented = e.parent != c.parent;
-                e.parent = c.parent;
-                e.name = c.name.clone();
-                e.quota = c.quota;
-                e.updated_at = c.updated_at;
-            }
-            // A fresh entity is not a reparent: nothing can be under it yet.
-            None => {
-                self.quota_entities.insert(
-                    c.entity,
-                    QuotaEntity {
-                        parent: c.parent,
-                        name: c.name.clone(),
-                        quota: c.quota,
-                        usage: UsageState::new(c.updated_at),
-                        created_at: c.updated_at,
-                        updated_at: c.updated_at,
-                    },
-                );
-            }
-        }
+        );
         Ok(Applied {
-            events: vec![Event::QuotaEntityConfigured {
-                entity: c.entity,
-                reparented,
-            }],
+            events: vec![Event::QuotaEntityConfigured { entity: c.entity }],
         })
     }
 

@@ -163,13 +163,14 @@ pub enum Verb<'a> {
     /// verb: unscoped `operator` or higher. One verb for all three because
     /// removal is the *end* of a drain, not a further authority.
     Drain,
-    /// Create or reconfigure a quota entity: `admin` covering the entity's
-    /// position, and — when the command actually reparents it — `admin`
-    /// covering the new parent too. A move to the root, or out of every
-    /// subtree the actor administers, therefore takes unscoped `admin`.
+    /// Create or reconfigure a quota entity. An existing entity takes
+    /// `admin` covering its own position (its name and parent are fixed at
+    /// creation, ADR 0045, so reconfiguring never moves authority); a new one
+    /// takes `admin` covering `parent`, the position it is created at — so a
+    /// new root takes unscoped `admin`.
     ConfigureQuotaEntity {
         entity: &'a QuotaEntityId,
-        new_parent: Option<&'a QuotaEntityId>,
+        parent: Option<&'a QuotaEntityId>,
     },
     /// Replace the replicated policy. A cluster verb: unscoped `admin`.
     UpdatePolicy,
@@ -190,7 +191,7 @@ impl fmt::Display for Verb<'_> {
                 "update the metadata of a job charging quota entity {entity}"
             ),
             Verb::Drain => f.write_str("drain, undrain, or remove nodes"),
-            Verb::ConfigureQuotaEntity { entity, new_parent } => match new_parent {
+            Verb::ConfigureQuotaEntity { entity, parent } => match parent {
                 Some(p) => write!(f, "configure quota entity {entity} under parent {p}"),
                 None => write!(f, "configure quota entity {entity} at the tree root"),
             },
@@ -322,57 +323,33 @@ pub fn evaluate(
             }
             Err(Denial::new(actor, &verb, "an unscoped admin binding"))
         }
-        Verb::ConfigureQuotaEntity { entity, new_parent } => {
+        Verb::ConfigureQuotaEntity { entity, parent } => {
             if holds_unscoped(Role::Admin) {
                 return Ok(());
             }
-            // Reparenting moves authority (ADR 0023), so a move must stay
-            // inside a subtree the actor administers: ONE scoped binding has
-            // to cover both the entity and its new parent. Two disjoint
-            // scoped grants must not compose into a cross-subtree move —
-            // that, like a move to the root (inside no subtree), is
-            // cluster-shaped and takes unscoped admin.
-            let holds_over_both = |a: &QuotaEntityId, b: &QuotaEntityId| {
-                bindings.iter().any(|bind| {
-                    bind.role >= Role::Admin
-                        && matches_subject(&bind.subject, actor)
-                        && covers(bind, a, entities)
-                        && covers(bind, b, entities)
-                })
-            };
-            match entities.get(entity) {
-                Some(current) if current.parent.as_ref() == new_parent => {
-                    // Not a move: the entity stays exactly where the actor
-                    // already administers it.
-                    if holds_over(Role::Admin, entity) {
-                        return Ok(());
-                    }
-                    Err(Denial::new(
-                        actor,
-                        &verb,
-                        "admin over that quota entity's current position",
-                    ))
+            if entities.contains_key(entity) {
+                // An update: name and parent are immutable (ADR 0045), so the
+                // entity stays exactly where the actor administers it, and
+                // the request's `parent` is apply's concern, not this one's.
+                if holds_over(Role::Admin, entity) {
+                    return Ok(());
                 }
-                Some(_) => match new_parent {
-                    Some(parent) if holds_over_both(entity, parent) => Ok(()),
-                    _ => Err(Denial::new(
-                        actor,
-                        &verb,
-                        "a single admin binding covering both the entity and its \
-                         new parent (a cross-subtree move, or a move to the tree \
-                         root, takes unscoped admin)",
-                    )),
-                },
-                // Creation: no current position, so the entity's position IS
-                // the new parent — one binding covering it covers both ends.
-                None => match new_parent {
-                    Some(parent) if holds_over(Role::Admin, parent) => Ok(()),
-                    _ => Err(Denial::new(
-                        actor,
-                        &verb,
-                        "admin over the new parent (a new root entity takes unscoped admin)",
-                    )),
-                },
+                return Err(Denial::new(
+                    actor,
+                    &verb,
+                    "admin over that quota entity's position",
+                ));
+            }
+            // Creation: the entity's position IS the parent it is created
+            // under. The tree root lies inside no subtree, so a new root
+            // takes unscoped admin.
+            match parent {
+                Some(parent) if holds_over(Role::Admin, parent) => Ok(()),
+                _ => Err(Denial::new(
+                    actor,
+                    &verb,
+                    "admin over the parent (a new root entity takes unscoped admin)",
+                )),
             }
         }
     }
@@ -482,7 +459,7 @@ mod tests {
     }
 
     /// Every verb, with the scope arm pointed at `team-a`.
-    fn every_verb<'a>(entity: &'a QuotaEntityId, new_parent: &'a QuotaEntityId) -> Vec<Verb<'a>> {
+    fn every_verb<'a>(entity: &'a QuotaEntityId, parent: &'a QuotaEntityId) -> Vec<Verb<'a>> {
         vec![
             Verb::Submit { entity },
             Verb::Abort {
@@ -492,7 +469,7 @@ mod tests {
             Verb::Drain,
             Verb::ConfigureQuotaEntity {
                 entity,
-                new_parent: Some(new_parent),
+                parent: Some(parent),
             },
             Verb::UpdatePolicy,
             Verb::UpdateAuthorization,
@@ -683,13 +660,13 @@ mod tests {
             for verb in every_verb(&team_a, &org) {
                 assert!(allowed(&[], who, verb), "{} on {verb:?}", who.principal);
             }
-            // Including a move to the root, which no scoped admin may do.
+            // Including creating a new root, which no scoped admin may do.
             assert!(allowed(
                 &[],
                 who,
                 Verb::ConfigureQuotaEntity {
-                    entity: &team_a,
-                    new_parent: None
+                    entity: &qid(0xF0),
+                    parent: None
                 }
             ));
         }
@@ -735,129 +712,61 @@ mod tests {
             &ana,
             Verb::ConfigureQuotaEntity {
                 entity: &team_a,
-                new_parent: Some(&qid(ORG))
+                parent: Some(&qid(ORG))
             }
         ));
     }
 
-    /// Reparenting moves authority, so a scoped admin must hold both ends.
-    /// Within their subtree they may move an entity; a move that would carry
-    /// it out of — or in from — another subtree is refused, and a move to
-    /// the root takes unscoped admin.
+    /// Reconfiguring an existing entity turns on its own position alone:
+    /// name and parent are fixed at creation (ADR 0045), so nothing moves
+    /// and the request's `parent` carries no authority either way — apply
+    /// refuses a differing one as immutable, after this check.
     #[test]
-    fn reparenting_needs_admin_over_both_ends() {
+    fn reconfiguring_an_existing_entity_turns_on_its_own_position() {
         let scoped = vec![bound(principal("ana"), Role::Admin, Some(TEAM_A))];
         let ana = actor("ana");
         let (team_a, team_b, squad, org) = (qid(TEAM_A), qid(TEAM_B), qid(SQUAD), qid(ORG));
 
-        // Inside the subtree: squad (currently under team-a) → team-a.
+        // Inside the subtree, including the entity the scope is rooted at,
+        // whose parent lies outside it.
+        for (entity, parent) in [(&squad, &team_a), (&team_a, &org)] {
+            assert!(allowed(
+                &scoped,
+                &ana,
+                Verb::ConfigureQuotaEntity {
+                    entity,
+                    parent: Some(parent)
+                }
+            ));
+        }
+        // Outside it, whatever parent the request names.
+        for parent in [Some(&org), Some(&team_a), None] {
+            assert!(!allowed(
+                &scoped,
+                &ana,
+                Verb::ConfigureQuotaEntity {
+                    entity: &team_b,
+                    parent
+                }
+            ));
+        }
+        // A request naming a parent outside the scope is not a cross-subtree
+        // grant to refuse here: authority follows the stored position.
         assert!(allowed(
             &scoped,
             &ana,
             Verb::ConfigureQuotaEntity {
                 entity: &squad,
-                new_parent: Some(&team_a)
-            }
-        ));
-        // Out of the subtree: squad → team-b, which ana does not administer.
-        assert!(!allowed(
-            &scoped,
-            &ana,
-            Verb::ConfigureQuotaEntity {
-                entity: &squad,
-                new_parent: Some(&team_b)
-            }
-        ));
-        // Into the subtree from outside: team-b → team-a. Ana administers
-        // the destination but not team-b's current position.
-        assert!(!allowed(
-            &scoped,
-            &ana,
-            Verb::ConfigureQuotaEntity {
-                entity: &team_b,
-                new_parent: Some(&team_a)
-            }
-        ));
-        // To the root: inside no subtree, so unscoped admin only.
-        assert!(!allowed(
-            &scoped,
-            &ana,
-            Verb::ConfigureQuotaEntity {
-                entity: &squad,
-                new_parent: None
-            }
-        ));
-        let unscoped = vec![bound(principal("ana"), Role::Admin, None)];
-        assert!(allowed(
-            &unscoped,
-            &ana,
-            Verb::ConfigureQuotaEntity {
-                entity: &squad,
-                new_parent: None
-            }
-        ));
-        // Re-asserting an entity's existing parent is not a move, so the
-        // new-parent check does not fire: a scoped admin may rename or
-        // requota the very entity their scope is rooted at.
-        assert!(allowed(
-            &scoped,
-            &ana,
-            Verb::ConfigureQuotaEntity {
-                entity: &team_a,
-                new_parent: Some(&org)
-            }
-        ));
-    }
-
-    /// Two disjoint scoped-admin grants must not compose into a
-    /// cross-subtree move: ONE binding has to cover both ends. Admin over
-    /// team-a plus admin over team-b still cannot move squad between them —
-    /// that is unscoped-admin territory (ADR 0023) — while a single binding
-    /// wide enough to contain both ends (at org) allows the same move.
-    #[test]
-    fn disjoint_scoped_admins_cannot_compose_a_cross_subtree_move() {
-        let disjoint = vec![
-            bound(principal("ana"), Role::Admin, Some(TEAM_A)),
-            bound(principal("ana"), Role::Admin, Some(TEAM_B)),
-        ];
-        let ana = actor("ana");
-        let (team_b, squad) = (qid(TEAM_B), qid(SQUAD));
-        // Each end is individually administered, and non-move configuration
-        // of either works...
-        assert!(allowed(
-            &disjoint,
-            &ana,
-            Verb::ConfigureQuotaEntity {
-                entity: &team_b,
-                new_parent: Some(&qid(ORG))
-            }
-        ));
-        // ...but the cross-subtree move squad (under team-a) → team-b is
-        // refused: no single binding covers both ends.
-        assert!(!allowed(
-            &disjoint,
-            &ana,
-            Verb::ConfigureQuotaEntity {
-                entity: &squad,
-                new_parent: Some(&team_b)
-            }
-        ));
-        // One binding containing both ends allows the identical move.
-        let org_admin = vec![bound(principal("ana"), Role::Admin, Some(ORG))];
-        assert!(allowed(
-            &org_admin,
-            &ana,
-            Verb::ConfigureQuotaEntity {
-                entity: &squad,
-                new_parent: Some(&team_b)
+                parent: None
             }
         ));
     }
 
     /// Creating an entity that does not exist yet has no current position to
-    /// check, so it turns entirely on admin over the new parent.
+    /// check, so it turns entirely on admin over the parent it is created
+    /// under.
     #[test]
-    fn creating_an_entity_turns_on_the_new_parent() {
+    fn creating_an_entity_turns_on_the_parent() {
         let scoped = vec![bound(principal("ana"), Role::Admin, Some(TEAM_A))];
         let ana = actor("ana");
         let fresh = qid(0xF0);
@@ -868,7 +777,7 @@ mod tests {
             &ana,
             Verb::ConfigureQuotaEntity {
                 entity: &fresh,
-                new_parent: Some(&team_a)
+                parent: Some(&team_a)
             }
         ));
         assert!(!allowed(
@@ -876,7 +785,7 @@ mod tests {
             &ana,
             Verb::ConfigureQuotaEntity {
                 entity: &fresh,
-                new_parent: Some(&team_b)
+                parent: Some(&team_b)
             }
         ));
         // A new root entity is a cluster-shaped act: unscoped admin only.
@@ -885,7 +794,7 @@ mod tests {
             &ana,
             Verb::ConfigureQuotaEntity {
                 entity: &fresh,
-                new_parent: None
+                parent: None
             }
         ));
     }

@@ -3,8 +3,9 @@
 //! bindings list plus the `groups_claim` token-claim name.
 //!
 //! The wire shapes are the published [`coppice_client`] crate's own types
-//! (`Binding`, `GetAuthorizationResponse`, `UpdateAuthorizationRequest`,
-//! `UpdateAuthorizationResponse`), as in every other verb. What this module
+//! (`Binding`, `BindingView`, `GetAuthorizationResponse`,
+//! `UpdateAuthorizationRequest`, `UpdateAuthorizationResponse`), as in every
+//! other verb. What this module
 //! owns outright is the *bindings file* — [`AuthzFile`] and its
 //! [`FileBinding`] tables, the TOML document from
 //! `notes/oidc_impl/SHARED.md` §6 that `policy authz get` prints and `policy
@@ -17,19 +18,19 @@
 //! [[bindings]]
 //! group = "batch-users"      # exactly one of group / principal
 //! role  = "submitter"
-//! scope = "quota-00000000-0000-0000-0000-000000000001"  # optional; absent = unscoped
+//! scope = "acme/team-a"      # optional id or path (ADR 0045); absent = unscoped
 //!
 //! [[bindings]]
 //! principal = "svc-ci"
 //! role = "admin"
 //! ```
 //!
-//! One deliberate divergence from the SHARED.md example: `scope` accepts a
-//! `quota-<uuid>` entity id, not a display path (`"org/team-a"`). The server
-//! stores no path for a quota entity — only the id and its parent pointer —
-//! so a path is not a thing this CLI could resolve or round-trip; an
-//! operator names the entity id directly, the same identity `quota show`
-//! already prints.
+//! `scope` takes an id or a path (ADR 0045) — a path is resolved against the
+//! server's read view before the write proposes. `policy authz get` prints
+//! the entity's **path** when the server could resolve one (`scope_path`),
+//! falling back to the bare id only when it could not (the scope names an
+//! entity absent from the tree). `policy authz set --file` round-trips
+//! either spelling back into a request.
 
 use std::path::{Path, PathBuf};
 
@@ -37,7 +38,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use coppice_client::{
-    paths, Binding, BindingRole, Client, GetAuthorizationResponse, QuotaEntityId,
+    paths, Binding, BindingRole, BindingView, Client, GetAuthorizationResponse, QuotaEntityRef,
     UpdateAuthorizationRequest, UpdateAuthorizationResponse,
 };
 
@@ -138,16 +139,27 @@ pub struct FileBinding {
     pub principal: Option<String>,
     pub role: BindingRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<QuotaEntityId>,
+    pub scope: Option<QuotaEntityRef>,
 }
 
-impl From<&Binding> for FileBinding {
-    fn from(binding: &Binding) -> FileBinding {
+/// The read-modify-write conversion `policy authz get` uses: a
+/// [`BindingView`]'s scope, preferring the resolved path (`scope_path`) —
+/// the whole point of printing a path rather than an id — and falling back
+/// to the bare id only when the server could not resolve one (the scope
+/// names an entity absent from the tree, which cannot happen for a live
+/// binding but is not ruled out on the wire).
+impl From<&BindingView> for FileBinding {
+    fn from(view: &BindingView) -> FileBinding {
+        let scope = match (&view.scope_path, view.scope) {
+            (Some(path), _) => path.parse::<QuotaEntityRef>().ok(),
+            (None, Some(id)) => Some(QuotaEntityRef::Id(id)),
+            (None, None) => None,
+        };
         FileBinding {
-            group: binding.group.clone(),
-            principal: binding.principal.clone(),
-            role: binding.role.clone(),
-            scope: binding.scope,
+            group: view.group.clone(),
+            principal: view.principal.clone(),
+            role: view.role.clone(),
+            scope,
         }
     }
 }
@@ -171,8 +183,8 @@ fn check_exactly_one_subject(index: usize, binding: &FileBinding) -> Result<Bind
         (Some(group), None) => Binding::for_group(group, binding.role.clone()),
         (None, Some(principal)) => Binding::for_principal(principal, binding.role.clone()),
     };
-    Ok(match binding.scope {
-        Some(scope) => wire.with_scope(scope),
+    Ok(match &binding.scope {
+        Some(scope) => wire.with_scope(scope.clone()),
         None => wire,
     })
 }
@@ -342,7 +354,7 @@ mod tests {
         assert_eq!(binding.group.as_deref(), Some("batch-users"));
         assert!(binding.principal.is_none());
         assert_eq!(binding.role, coppice_client::BindingRole::Submitter);
-        assert_eq!(binding.scope, Some(scope));
+        assert_eq!(binding.scope, Some(QuotaEntityRef::Id(scope)));
 
         let request = file.to_request().expect("converts to a request");
         assert_eq!(request.groups_claim.as_deref(), Some("groups"));
@@ -352,6 +364,24 @@ mod tests {
                 Binding::for_group("batch-users", coppice_client::BindingRole::Submitter)
                     .with_scope(scope)
             ]
+        );
+    }
+
+    /// A path scope is as valid as an id (ADR 0045).
+    #[test]
+    fn parses_a_group_binding_with_a_path_scope() {
+        let toml_body = "[[bindings]]\ngroup = \"batch-users\"\nrole = \"submitter\"\n\
+                          scope = \"acme/team-a\"\n";
+        let file: AuthzFile = toml::from_str(toml_body).expect("parses");
+        let binding = &file.bindings[0];
+        assert_eq!(
+            binding.scope,
+            Some(QuotaEntityRef::Path("acme/team-a".parse().unwrap()))
+        );
+        let request = file.to_request().expect("converts to a request");
+        assert_eq!(
+            request.bindings[0].scope,
+            Some(QuotaEntityRef::Path("acme/team-a".parse().unwrap()))
         );
     }
 
@@ -404,29 +434,43 @@ mod tests {
         let response: GetAuthorizationResponse = to_client(dto::GetAuthorizationResponse {
             groups_claim: "groups".to_string(),
             bindings: vec![
-                dto::BindingDto {
+                dto::BindingView {
                     group: Some("batch-users".to_string()),
                     principal: None,
                     role: dto::BindingRole::Submitter,
                     scope: Some(scope),
+                    scope_path: Some("acme/team-a".to_string()),
                 },
-                dto::BindingDto {
+                dto::BindingView {
                     group: None,
                     principal: Some("svc-ci".to_string()),
                     role: dto::BindingRole::Admin,
                     scope: None,
+                    scope_path: None,
                 },
             ],
         });
         let file = AuthzFile::from_response(&response);
+        // The path is what gets rendered, not the id — the whole point of
+        // preferring `scope_path` (ADR 0045).
         let rendered = toml::to_string_pretty(&file).expect("renders");
+        assert!(rendered.contains("acme/team-a"), "{rendered}");
+        assert!(!rendered.contains(&scope.to_string()), "{rendered}");
 
         // Re-parse the rendered TOML exactly as `set --file` would, and
-        // confirm the request it builds matches the response it came from.
+        // confirm the request it builds carries the same subjects/roles —
+        // the scope legitimately differs in spelling (a path in, an id out
+        // of `Binding::with_scope`'s echo), so compare that separately.
         let reparsed: AuthzFile = toml::from_str(&rendered).expect("re-parses");
         let request = reparsed.to_request().expect("converts");
         assert_eq!(request.groups_claim.as_deref(), Some("groups"));
-        assert_eq!(request.bindings, response.bindings);
+        assert_eq!(request.bindings.len(), response.bindings.len());
+        assert_eq!(
+            request.bindings[0].scope,
+            Some(coppice_client::QuotaEntityRef::Path(
+                "acme/team-a".parse().unwrap()
+            ))
+        );
     }
 
     // -----------------------------------------------------------------
@@ -438,11 +482,12 @@ mod tests {
         let scope = dto_quota_id(3);
         let response = dto::GetAuthorizationResponse {
             groups_claim: "groups".to_string(),
-            bindings: vec![dto::BindingDto {
+            bindings: vec![dto::BindingView {
                 group: Some("batch-users".to_string()),
                 principal: None,
                 role: dto::BindingRole::Operator,
                 scope: Some(scope),
+                scope_path: Some("acme/ops".to_string()),
             }],
         };
         let router = Router::new().route(
@@ -500,7 +545,10 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].groups_claim.as_deref(), Some("groups"));
         assert_eq!(received[0].bindings.len(), 2);
-        assert_eq!(received[0].bindings[1].scope, Some(scope));
+        assert_eq!(
+            received[0].bindings[1].scope,
+            Some(coppice_core::entity_ref::QuotaEntityRef::Id(scope))
+        );
     }
 
     #[tokio::test]

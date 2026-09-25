@@ -23,7 +23,7 @@ use tokio_stream::Stream;
 use coppice_core::time::Timestamp;
 
 use crate::events::{EventStreamItem, JobSelector};
-use crate::ControlPlane;
+use crate::{Consistency, ControlPlane, ReadOptions};
 
 use super::authn::RequestDeadline;
 use super::dto;
@@ -81,11 +81,25 @@ pub(super) async fn subscribe_events<P: ControlPlane>(
             "a `jobs` filter is required: an event subscription must say which jobs it wants",
         )
     })?;
-    let filter: dto::JobFilter = serde_json::from_str(raw)
+    let mut filter: dto::JobFilter = serde_json::from_str(raw)
         .map_err(|e| HttpError::invalid(format!("invalid jobs filter: {e}")))?;
     // The shape rules shared with ListJobs (depth, node and non-empty-list
     // caps) first, then the leaf restriction that is this endpoint's own.
     filter.validate().map_err(HttpError::invalid)?;
+    // Entity paths resolve once, here, against the latest view (ADR 0045):
+    // the selector matches the ids apply stamped, so a subscription binds to
+    // the entities its paths named when it opened, and a later rename does
+    // not move it. An unresolvable path is a 400, exactly as on `ListJobs`.
+    let view = plane
+        .read_state(ReadOptions {
+            consistency: Consistency::Eventual,
+            min_index: None,
+        })
+        .await?;
+    filter
+        .resolve_entity_refs(view.state())
+        .map_err(|e| HttpError::invalid(format!("invalid jobs filter: {e}")))?;
+    drop(view);
     let selector = JobSelector::compile(&filter).map_err(|e| HttpError::invalid(e.to_string()))?;
 
     let cursor = resume_cursor(&headers, params.cursor.as_deref())?;

@@ -1700,7 +1700,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         let outcome =
             api_server::configure_quota_entity_here(consensus.as_ref(), &dto, &actor).await;
         Ok(Response::new(pb::ForwardConfigureQuotaEntityResponse {
-            outcome: Some(forwarded_outcome(outcome.map(|r| r.log_index))?),
+            outcome: Some(forwarded_outcome(outcome)?),
         }))
     }
 

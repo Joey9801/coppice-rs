@@ -477,9 +477,9 @@ reachable through the API.
 | --- | --- |
 | Proposer | Admin API / `coppice-cli policy` (bootstrap tree included — ADR 0020: the node config file never seeds policy) |
 | Payload | `entity: QuotaEntityId`, `parent: optional QuotaEntityId`, `name: string`, `quota: CostUnits` (a *stock* in µCU; the CLI converts human rates, per ADR 0019), `actor: Actor`, `updated_at_us` |
-| Validation | Parent (if any) exists and is not the entity itself; the new parent chain is acyclic and within the depth cap (32); actor holds `admin` whose scope covers the entity's current position, and — when the command actually *moves* the entity — **one single binding** whose scope covers both the entity and its new parent, since reparenting carries authority with it and two disjoint scoped grants must not compose into a cross-subtree move. Re-asserting an entity's existing parent is not a move and needs only coverage of the current position. The tree root lies inside no subtree, so a move to it — like any cross-subtree move — takes unscoped `admin`, which covers everything (ADR 0023) |
-| Apply effects | Create (usage accumulator initialized zero at `updated_at_us`) or update (parent/name/quota replaced; **usage is preserved** — reconfiguring an entity is not an amnesty). No delete command in v1: entities with historical charges stay; removal is a future decision. |
-| Rejections | `UnknownQuotaEntity` (parent), `QuotaEntityCycle`, `PermissionDenied` |
+| Validation | **Update** (the id exists): actor holds `admin` whose scope covers the entity's position (ADR 0023); then `name` and `parent` must equal the stored ones — both are fixed at creation, so there is no rename and no move (ADR 0045). **Create** (a fresh id): `name` meets the path-segment grammar (1–63 characters from `[A-Za-z0-9._-]`, first alphanumeric, and not itself a `quota-<uuid>` id — ADR 0045); parent (if any) already exists, so the parent graph is acyclic by construction; the new entity sits within the depth cap (32 levels, counting itself); actor holds `admin` whose scope covers the parent — the tree root lies inside no subtree, so a new root takes unscoped `admin`; then no sibling under that parent (including another root, when the parent is `None`) already carries `name` |
+| Apply effects | Create (usage accumulator initialized zero at `updated_at_us`) or update (quota replaced; **usage and `created_at` are preserved** — reconfiguring an entity is not an amnesty). No delete command in v1: entities with historical charges stay; removal is a future decision. |
+| Rejections | `UnknownQuotaEntity` (parent), `QuotaEntityTooDeep`, `InvalidQuotaEntityName` (bad segment grammar), `QuotaEntityNameTaken` (naming the sibling that already holds the name), `QuotaEntityImmutable` (an update whose `name` or `parent` differs from the stored ones), `PermissionDenied` |
 
 #### `UpdatePolicy`
 
@@ -665,7 +665,10 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | `AccrualLimitExceeded` | Batch would leave more than K jobs accruing |
 | `PerNodeAccrualExceeded` | Batch would leave one node accruing for more than one job |
 | `UnsupportedPlacementShape` | Not one-allocation-singleton-group (v1 gate) |
-| `QuotaEntityCycle` | Parent edit would create a cycle or exceed the depth cap |
+| `QuotaEntityTooDeep` | Creating the entity under its parent would exceed the depth cap |
+| `QuotaEntityImmutable` | An update's `name` or `parent` differs from the stored ones (fixed at creation, ADR 0045) |
+| `InvalidQuotaEntityName` | `name` fails the path-segment grammar (ADR 0045) |
+| `QuotaEntityNameTaken` | A sibling — including another root — already carries `name`, naming the holder |
 | `InvalidPolicy` | Policy payload failed validation |
 | `PermissionDenied` | Actor lacks the role/scope (or ownership) the command requires (ADR 0023) |
 | `InvalidAuthorization` | Bindings payload failed validation (empty subject). An unknown *role* never reaches apply: `Role` is a closed proto enum, so an unknown value is a decode failure at the conversion boundary (a deterministic `InvalidCommand`) |

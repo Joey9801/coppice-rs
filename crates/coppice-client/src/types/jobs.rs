@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::entity_ref::QuotaEntityRef;
 use crate::env::JobEnv;
 use crate::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use crate::metadata::{JobMetadata, MetadataError};
@@ -55,9 +56,9 @@ pub struct JobSummary {
     pub image: String,
     /// The quota entity the job is charged to.
     pub quota_entity: QuotaEntityId,
-    /// `""` if the entity is (impossibly) absent from the tree, never a
-    /// fabricated name.
-    pub quota_entity_name: String,
+    /// The entity's path (ADR 0045), `""` if the entity is (impossibly)
+    /// absent from the tree, never a fabricated path.
+    pub quota_entity_path: String,
     /// Scheduling priority.
     pub priority: i32,
     /// When the job was submitted.
@@ -121,6 +122,9 @@ pub struct JobSpecView {
     pub max_runtime: Option<Duration>,
     /// The quota-entity leaf charged.
     pub quota_entity: QuotaEntityId,
+    /// The entity's path (ADR 0045), `""` if the entity is (impossibly)
+    /// absent from the tree, never a fabricated path.
+    pub quota_entity_path: String,
     /// The job's retry policy.
     pub retry: RetryPolicy,
     /// The principal that submitted the job, stamped from the command's
@@ -152,6 +156,8 @@ pub struct PenaltyLink {
     pub entity: QuotaEntityId,
     /// Its stored name.
     pub name: String,
+    /// Its path (ADR 0045).
+    pub path: String,
     /// Decayed usage as of read time.
     pub usage_ucu: u64,
     /// Its configured quota.
@@ -543,8 +549,10 @@ pub struct SubmitJobRequest {
     /// runtime. Must be positive when present.
     #[serde(rename = "max_runtime_seconds", with = "crate::time::seconds::option")]
     pub max_runtime: Option<Duration>,
-    /// The quota-entity leaf to charge.
-    pub quota_entity: QuotaEntityId,
+    /// The quota-entity leaf to charge, by id or path (ADR 0045). A path is
+    /// resolved against the serving replica's read view before proposing;
+    /// the proposed command carries the id it resolved to.
+    pub quota_entity: QuotaEntityRef,
     /// Absent = the platform default policy.
     pub retry: Option<RetryPolicy>,
     /// User-owned annotations (ADR 0042); absent is the empty map. Checked
@@ -567,7 +575,7 @@ impl SubmitJobRequest {
         image: impl Into<String>,
         command: impl IntoIterator<Item = impl Into<String>>,
         requests: Resources,
-        quota_entity: QuotaEntityId,
+        quota_entity: impl Into<QuotaEntityRef>,
     ) -> SubmitJobRequest {
         SubmitJobRequest {
             job,
@@ -577,7 +585,7 @@ impl SubmitJobRequest {
             requests,
             priority: 0,
             max_runtime: None,
-            quota_entity,
+            quota_entity: quota_entity.into(),
             retry: None,
             metadata: JobMetadata::new(),
             env: JobEnv::new(),
@@ -982,7 +990,7 @@ mod tests {
             attempt: None,
             image: "ubuntu:22.04".to_string(),
             quota_entity: entity,
-            quota_entity_name: "team-a".to_string(),
+            quota_entity_path: "acme/team-a".to_string(),
             priority: 0,
             submitted_at: Timestamp::UNIX_EPOCH,
             submitted_by: None,
@@ -1002,7 +1010,7 @@ mod tests {
                 "attempt": null,
                 "image": "ubuntu:22.04",
                 "quota_entity": entity.to_string(),
-                "quota_entity_name": "team-a",
+                "quota_entity_path": "acme/team-a",
                 "priority": 0,
                 "submitted_at": "1970-01-01T00:00:00.000000Z",
                 "submitted_by": null,
@@ -1066,6 +1074,25 @@ mod tests {
         let back: SubmitJobRequest = serde_json::from_value(json).unwrap();
         assert_eq!(back, request);
         assert!(request.validate().is_ok());
+    }
+
+    /// A path ref is as valid a `quota_entity` as an id (ADR 0045).
+    #[test]
+    fn submit_job_request_accepts_a_path_entity_ref() {
+        let path: crate::entity_ref::QuotaEntityPath = "acme/eng".parse().unwrap();
+        let request = SubmitJobRequest::new(
+            job(20),
+            "ubuntu",
+            ["echo", "hi"],
+            Resources::default(),
+            path.clone(),
+        );
+        assert_eq!(
+            request.quota_entity,
+            crate::entity_ref::QuotaEntityRef::Path(path)
+        );
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["quota_entity"], serde_json::json!("acme/eng"));
     }
 
     #[test]
@@ -1296,6 +1323,7 @@ mod tests {
         let json = serde_json::json!({
             "entity": quota(12).to_string(),
             "name": "team-a",
+            "path": "acme/team-a",
             "usage_ucu": 10,
             "quota_ucu": 0,
             "over_quota_ratio": null,

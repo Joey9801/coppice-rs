@@ -20,8 +20,8 @@
 # resident footprint, so `coppice job logs <job> --follow` can be read against
 # the usage table afterwards.
 #
-# `quota_entity` below is the entity `coppice dev` seeds out of the box; swap
-# it for a real one on any other cluster.
+# `quota_entity` below is the path `coppice dev` seeds out of the box; swap
+# it for a real one (an id or a path, ADR 0045) on any other cluster.
 
 image = "python:3.12-slim"
 command = [
@@ -123,7 +123,7 @@ print(
 ''',
 ]
 
-quota_entity = "quota-00000000-0000-0000-0000-000000000001"
+quota_entity = "dev"
 priority = 0
 max_runtime = "6m"
 
