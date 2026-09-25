@@ -23,9 +23,9 @@ use std::sync::Arc;
 use coppice_core::time::Timestamp;
 use coppice_state::ViewMemos;
 use http::dto::{
-    AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
-    SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
-    UpdateAuthorizationResponse, UpdateJobMetadataResponse,
+    AbortJobRequest, EvictNodeRequest, ResolvedConfigureQuotaEntityRequest,
+    ResolvedSubmitJobRequest, ResolvedUpdateAuthorizationRequest, SetNodeSchedulableRequest,
+    SubmitJobResponse, UpdateAuthorizationResponse, UpdateJobMetadataResponse,
 };
 
 /// The argument of [`ControlPlane::update_job_metadata`] (ADR 0042).
@@ -477,6 +477,10 @@ pub enum RejectionKind {
     /// The node a drain or undrain named is not in the state (ADR 0041 node-write
     /// routes only; a 404).
     UnknownNode,
+    /// A quota entity name outside the ADR 0045 segment grammar: a malformed
+    /// request (400) everywhere. The HTTP edge pre-checks the grammar, so
+    /// this is the backstop for a request that skipped that check.
+    InvalidQuotaEntityName,
 }
 
 impl RejectionKind {
@@ -490,6 +494,7 @@ impl RejectionKind {
             R::InvalidAuthorization(_) => RejectionKind::InvalidAuthorization,
             R::AuthorizationLockout => RejectionKind::AuthorizationLockout,
             R::UnknownNode(_) => RejectionKind::UnknownNode,
+            R::InvalidQuotaEntityName(_) => RejectionKind::InvalidQuotaEntityName,
             _ => RejectionKind::Other,
         }
     }
@@ -704,6 +709,16 @@ pub enum MetricsFetchError {
 /// an unknown outcome with the identical request and never create a second
 /// job — and carries the apply's `log_index` so a write can be paired with
 /// a strong read for read-your-writes (ADR 0007).
+/// What [`ControlPlane::configure_quota_entity`] reports for an applied
+/// upsert: the entity and the index it applied at. The HTTP handler turns it
+/// into a `ConfigureQuotaEntityResponse` by reading the entity's path from a
+/// view at `log_index` (ADR 0045).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaEntityConfigured {
+    pub entity: coppice_core::id::QuotaEntityId,
+    pub log_index: u64,
+}
+
 pub trait ControlPlane: Send + Sync + 'static {
     /// The cluster this replica belongs to (its node config, ADR 0020 — not
     /// replicated state, and constant for the process's lifetime).
@@ -724,9 +739,12 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// 403 if it failed — the pre-check is the fast, friendly half, and this
     /// re-check is the authoritative one, which is what makes a revocation
     /// racing an in-flight write resolve in log order rather than by luck.
+    ///
+    /// `req` arrives with its entity already resolved to an id by the handler
+    /// (ADR 0045).
     fn submit_job(
         &self,
-        req: SubmitJobRequest,
+        req: ResolvedSubmitJobRequest,
         actor: coppice_state::Actor,
     ) -> impl Future<Output = Result<SubmitJobResponse, ApiError>> + Send;
 
@@ -795,11 +813,16 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// Authorization follows the same arrangement as
     /// [`submit_job`](ControlPlane::submit_job): the API layer pre-checks
     /// against a read view and apply re-checks at the log position (ADR 0023).
+    ///
+    /// `req` arrives with its `parent` already resolved to an id by the
+    /// handler (ADR 0045). The answer is the entity and the apply's index;
+    /// the handler derives the HTTP response's `path` from a view at that
+    /// index.
     fn configure_quota_entity(
         &self,
-        req: ConfigureQuotaEntityRequest,
+        req: ResolvedConfigureQuotaEntityRequest,
         actor: coppice_state::Actor,
-    ) -> impl Future<Output = Result<ConfigureQuotaEntityResponse, ApiError>> + Send;
+    ) -> impl Future<Output = Result<QuotaEntityConfigured, ApiError>> + Send;
 
     /// Replace the replicated role bindings wholesale on behalf of `actor`
     /// (`PUT /api/v1/authorization`, ADR 0023) — an unscoped-admin verb.
@@ -813,9 +836,12 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// admin group denies its own second half. `groups_claim` still lives in
     /// `PolicyConfig`, and `UpdatePolicy` still replaces it wholesale;
     /// concurrent editors resolve last-writer-wins in log order.
+    ///
+    /// `req` arrives with every binding scope already resolved to an id by
+    /// the handler (ADR 0045).
     fn update_authorization(
         &self,
-        req: UpdateAuthorizationRequest,
+        req: ResolvedUpdateAuthorizationRequest,
         actor: coppice_state::Actor,
     ) -> impl Future<Output = Result<UpdateAuthorizationResponse, ApiError>> + Send;
 

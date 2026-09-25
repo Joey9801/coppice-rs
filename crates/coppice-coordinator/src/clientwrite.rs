@@ -30,10 +30,10 @@
 use std::sync::{Arc, Mutex};
 
 use coppice_api::http::dto::{
-    ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, SubmitJobRequest, SubmitJobResponse,
-    UpdateAuthorizationRequest, UpdateAuthorizationResponse,
+    ResolvedConfigureQuotaEntityRequest, ResolvedSubmitJobRequest,
+    ResolvedUpdateAuthorizationRequest, SubmitJobResponse, UpdateAuthorizationResponse,
 };
-use coppice_api::{ApiError, RejectionKind};
+use coppice_api::{ApiError, QuotaEntityConfigured, RejectionKind};
 use coppice_consensus::{CoordinatorId, NodeHandle};
 use coppice_core::id::{JobId, NodeId};
 use coppice_net::admin::Client;
@@ -392,6 +392,7 @@ pub(crate) fn rejection_kind_from_pb(raw: i32) -> RejectionKind {
         Ok(Pb::InvalidAuthorization) => RejectionKind::InvalidAuthorization,
         Ok(Pb::AuthorizationLockout) => RejectionKind::AuthorizationLockout,
         Ok(Pb::UnknownNode) => RejectionKind::UnknownNode,
+        Ok(Pb::InvalidQuotaEntityName) => RejectionKind::InvalidQuotaEntityName,
         Ok(Pb::Unspecified) | Err(_) => RejectionKind::Other,
     }
 }
@@ -409,6 +410,7 @@ pub(crate) fn rejection_kind_to_pb(
         RejectionKind::InvalidAuthorization => Pb::InvalidAuthorization,
         RejectionKind::AuthorizationLockout => Pb::AuthorizationLockout,
         RejectionKind::UnknownNode => Pb::UnknownNode,
+        RejectionKind::InvalidQuotaEntityName => Pb::InvalidQuotaEntityName,
     }
 }
 
@@ -416,7 +418,7 @@ impl LeaderWrites for AdminForwarder {
     fn submit_job<'a>(
         &'a self,
         leader: CoordinatorId,
-        req: &'a SubmitJobRequest,
+        req: &'a ResolvedSubmitJobRequest,
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<SubmitJobResponse, ApiError>> {
         Box::pin(async move {
@@ -457,9 +459,9 @@ impl LeaderWrites for AdminForwarder {
     fn configure_quota_entity<'a>(
         &'a self,
         leader: CoordinatorId,
-        req: &'a ConfigureQuotaEntityRequest,
+        req: &'a ResolvedConfigureQuotaEntityRequest,
         actor: &'a Actor,
-    ) -> BoxFuture<'a, Result<ConfigureQuotaEntityResponse, ApiError>> {
+    ) -> BoxFuture<'a, Result<QuotaEntityConfigured, ApiError>> {
         Box::pin(async move {
             let deadline = forward_deadline();
             let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
@@ -474,7 +476,7 @@ impl LeaderWrites for AdminForwarder {
             let response =
                 under_timeout(deadline, client.forward_configure_quota_entity(wire)).await?;
             let log_index = applied_index(response.outcome)?;
-            Ok(ConfigureQuotaEntityResponse {
+            Ok(QuotaEntityConfigured {
                 entity: req.entity,
                 log_index,
             })
@@ -489,7 +491,7 @@ impl LeaderWrites for AdminForwarder {
     fn update_authorization<'a>(
         &'a self,
         leader: CoordinatorId,
-        req: &'a UpdateAuthorizationRequest,
+        req: &'a ResolvedUpdateAuthorizationRequest,
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>> {
         Box::pin(async move {
@@ -792,7 +794,7 @@ fn actor_from_pb(
 /// (ADR 0042's two-place enforcement).
 pub(crate) fn submit_to_pb(
     history_id: [u8; 16],
-    req: &SubmitJobRequest,
+    req: &ResolvedSubmitJobRequest,
     actor: &Actor,
 ) -> pb::ForwardSubmitJobRequest {
     let requests: coppice_core::resource::Resources = req.requests.into();
@@ -827,7 +829,7 @@ pub(crate) fn submit_to_pb(
 /// leader's validation, not this conversion, decides what is required.
 pub(crate) fn submit_from_pb(
     req: pb::ForwardSubmitJobRequest,
-) -> Result<(SubmitJobRequest, Actor), ConvertError> {
+) -> Result<(ResolvedSubmitJobRequest, Actor), ConvertError> {
     let actor = actor_from_pb(req.actor, "ForwardSubmitJobRequest.actor")?;
     let requests: coppice_core::resource::Resources =
         required(req.requests, "ForwardSubmitJobRequest.requests")?.try_into()?;
@@ -839,7 +841,7 @@ pub(crate) fn submit_from_pb(
         Some(e) => Some(e.argv),
         None => None,
     };
-    // Absent is the empty map, the same reading `SubmitJobRequest`'s own
+    // Absent is the empty map, the same reading `ResolvedSubmitJobRequest`'s own
     // `#[serde(default)]` gives it — not a missing-field error, since an
     // empty metadata object is indistinguishable from one that was never
     // set once it has crossed the JSON boundary once already.
@@ -852,7 +854,7 @@ pub(crate) fn submit_from_pb(
     // preserve.
     let env = env_from_pb(req.env, "ForwardSubmitJobRequest.env")?;
     Ok((
-        SubmitJobRequest {
+        ResolvedSubmitJobRequest {
             job: required(req.job, "ForwardSubmitJobRequest.job")?.try_into()?,
             image: req.image,
             command: req.command,
@@ -880,10 +882,10 @@ pub(crate) fn submit_from_pb(
 /// actor the originating replica resolved.
 pub(crate) fn configure_from_pb(
     req: pb::ForwardConfigureQuotaEntityRequest,
-) -> Result<(ConfigureQuotaEntityRequest, Actor), ConvertError> {
+) -> Result<(ResolvedConfigureQuotaEntityRequest, Actor), ConvertError> {
     let actor = actor_from_pb(req.actor, "ForwardConfigureQuotaEntityRequest.actor")?;
     Ok((
-        ConfigureQuotaEntityRequest {
+        ResolvedConfigureQuotaEntityRequest {
             entity: required(req.entity, "ForwardConfigureQuotaEntityRequest.entity")?
                 .try_into()?,
             parent: req.parent.map(TryInto::try_into).transpose()?,
@@ -971,7 +973,7 @@ pub(crate) fn update_job_metadata_from_pb(
 /// would take a caller that bypassed the router.
 fn authorization_to_pb(
     history_id: [u8; 16],
-    req: &UpdateAuthorizationRequest,
+    req: &ResolvedUpdateAuthorizationRequest,
     actor: &Actor,
 ) -> Result<pb::ForwardUpdateAuthorizationRequest, ApiError> {
     let mut bindings = Vec::with_capacity(req.bindings.len());
@@ -997,11 +999,11 @@ fn authorization_to_pb(
 /// write and a direct one cannot be validated differently.
 pub(crate) fn authorization_from_pb(
     req: pb::ForwardUpdateAuthorizationRequest,
-) -> Result<(UpdateAuthorizationRequest, Actor), ConvertError> {
+) -> Result<(ResolvedUpdateAuthorizationRequest, Actor), ConvertError> {
     let actor = actor_from_pb(req.actor, "ForwardUpdateAuthorizationRequest.actor")?;
     let bindings = coppice_proto::convert::bindings_from_pb(req.bindings)?;
     Ok((
-        UpdateAuthorizationRequest {
+        ResolvedUpdateAuthorizationRequest {
             groups_claim: req.groups_claim,
             bindings: bindings.iter().map(Into::into).collect(),
         },
@@ -1029,8 +1031,8 @@ mod tests {
         }
     }
 
-    fn submit_request() -> SubmitJobRequest {
-        SubmitJobRequest {
+    fn submit_request() -> ResolvedSubmitJobRequest {
+        ResolvedSubmitJobRequest {
             job: JobId::new(),
             image: "busybox:latest".to_string(),
             command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
@@ -1164,7 +1166,7 @@ mod tests {
     #[test]
     fn an_authorization_replacement_survives_the_hop() {
         let scope = QuotaEntityId::new();
-        let original = UpdateAuthorizationRequest {
+        let original = ResolvedUpdateAuthorizationRequest {
             groups_claim: Some("entitlements".to_string()),
             bindings: vec![
                 dto::BindingDto {
@@ -1194,7 +1196,7 @@ mod tests {
     /// claim to nothing on the far side.
     #[test]
     fn an_absent_groups_claim_stays_absent_across_the_hop() {
-        let req = UpdateAuthorizationRequest {
+        let req = ResolvedUpdateAuthorizationRequest {
             groups_claim: None,
             bindings: Vec::new(),
         };
@@ -1210,7 +1212,7 @@ mod tests {
     /// to become, and the encoder says so rather than silently picking one.
     #[test]
     fn a_binding_with_two_subjects_is_invalid_before_it_reaches_the_wire() {
-        let req = UpdateAuthorizationRequest {
+        let req = ResolvedUpdateAuthorizationRequest {
             groups_claim: None,
             bindings: vec![dto::BindingDto {
                 group: Some("platform".to_string()),
@@ -1236,6 +1238,8 @@ mod tests {
             RejectionKind::UnknownQuotaEntity,
             RejectionKind::InvalidAuthorization,
             RejectionKind::AuthorizationLockout,
+            RejectionKind::UnknownNode,
+            RejectionKind::InvalidQuotaEntityName,
         ] {
             assert_eq!(
                 rejection_kind_from_pb(rejection_kind_to_pb(kind) as i32),
@@ -1250,7 +1254,7 @@ mod tests {
         let entity = QuotaEntityId::new();
         let parent = QuotaEntityId::new();
         for expected_parent in [None, Some(parent)] {
-            let req = ConfigureQuotaEntityRequest {
+            let req = ResolvedConfigureQuotaEntityRequest {
                 entity,
                 parent: expected_parent,
                 name: "platform".to_string(),

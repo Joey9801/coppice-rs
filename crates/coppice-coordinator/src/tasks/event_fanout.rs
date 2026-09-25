@@ -1481,7 +1481,12 @@ mod tests {
             scopes: vec![(job, scope(&[team, root], None, &[]))],
             ..batch_of(3, vec![job_event(job)])
         };
-        let entity = |id, s| selector(dto::JobFilter::Entity(dto::EntityFilter { id, scope: s }));
+        let entity = |id, s| {
+            selector(dto::JobFilter::Entity(dto::EntityFilter {
+                entity: coppice_core::id::QuotaEntityId::into(id),
+                scope: s,
+            }))
+        };
 
         assert!(filter_events(&entity(team, dto::EntityScope::Exact), &batch).is_some());
         assert!(filter_events(&entity(root, dto::EntityScope::Exact), &batch).is_none());
@@ -1561,14 +1566,14 @@ mod tests {
 
     fn subtree_selector(entity: QuotaEntityId) -> EventFilter {
         selector(dto::JobFilter::Entity(dto::EntityFilter {
-            id: entity,
+            entity: entity.into(),
             scope: dto::EntityScope::Subtree,
         }))
     }
 
     fn exact_selector(entity: QuotaEntityId) -> EventFilter {
         selector(dto::JobFilter::Entity(dto::EntityFilter {
-            id: entity,
+            entity: entity.into(),
             scope: dto::EntityScope::Exact,
         }))
     }

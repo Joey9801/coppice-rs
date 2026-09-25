@@ -68,6 +68,7 @@ import type {
 } from '../types'
 import { derivePhase, isTerminalJobState, jobAttemptId, JOB_PHASES } from '../types'
 import { validateMetadataKey, validateMetadataMap } from '../../lib/job-metadata'
+import { entitySegmentError, isQuotaEntityId } from '../../lib/quota-entity'
 import {
   GIB,
   hashSeed,
@@ -288,6 +289,7 @@ function computeRate(r: Resources): number {
 
 interface QEntity {
   id: string
+  /** One path segment (ADR 0045); the path is derived, never stored. */
   name: string
   parent: string | null
   quotaUcu: number
@@ -702,7 +704,7 @@ export class MockWorld {
     const divisionEntities = new Map<string, QEntity>()
     for (const division of Object.keys(TEAMS)) {
       const ent = this.newEntity({
-        name: `${ORG_NAME}/${division}`,
+        name: division,
         parent: root.id,
         quotaUcu: 0,
         usageUcu: 0,
@@ -719,7 +721,7 @@ export class MockWorld {
       const overQuota = overIdx.has(i)
       const ratio = overQuota ? this.rng.range(1.3, 2.4) : this.rng.range(0.2, 0.9)
       const leaf = this.newEntity({
-        name: `${ORG_NAME}/${spec.division}/${spec.team}`,
+        name: spec.team,
         parent: parent.id,
         quotaUcu,
         usageUcu: Math.round(quotaUcu * ratio),
@@ -775,7 +777,7 @@ export class MockWorld {
           const subQuota = this.rng.int(10, 25) * CU_UCU
           const subRatio = this.rng.range(0.2, 1.1)
           const sq = this.newEntity({
-            name: `${user.name}/${leaf}`,
+            name: leaf,
             parent: user.id,
             quotaUcu: subQuota,
             usageUcu: Math.round(subQuota * subRatio),
@@ -802,7 +804,7 @@ export class MockWorld {
   private mintUserEntity(sub: string, quotaUcu: number, usageUcu: number): QEntity {
     this.usedSubs.add(sub)
     return this.newEntity({
-      name: `${USERS_ROOT_NAME}/${sub}`,
+      name: userSegment(sub),
       parent: this.usersRootId,
       quotaUcu,
       usageUcu,
@@ -1865,6 +1867,7 @@ export class MockWorld {
     return usageUcu > 0 ? Number.POSITIVE_INFINITY : 0
   }
 
+  /** Leaf → root. Hot (scored per queued job per tick), so no paths here. */
   private penaltyChain(entityId: string): Array<{
     entity: string
     name: string
@@ -1905,8 +1908,50 @@ export class MockWorld {
     return n
   }
 
-  private entityName(id: string): string {
-    return this.entities.get(id)?.name ?? id
+  /**
+   * The entity's path (ADR 0045): ancestors' segments root first, joined by
+   * `/`. Derived on every read from the parent chain (depth-capped), never
+   * stored, so a rename or reparent is reflected everywhere at once.
+   */
+  private entityPath(id: string): string {
+    const segments: string[] = []
+    let cur: QEntity | undefined = this.entities.get(id)
+    while (cur && segments.length <= MAX_QUOTA_DEPTH) {
+      segments.push(cur.name)
+      cur = cur.parent ? this.entities.get(cur.parent) : undefined
+    }
+    return segments.reverse().join('/')
+  }
+
+  /**
+   * Resolve a `QuotaEntityRef` (ADR 0045) to an entity id: a string that
+   * parses as an id is an id (returned as-is, known or not — callers decide
+   * what an unknown id means); anything else is a path, walked segment by
+   * segment from the roots. Returns `null` for a path that does not resolve;
+   * throws `MockInvalid` for a path with a malformed segment.
+   */
+  private resolveEntityRef(ref: string): string | null {
+    if (isQuotaEntityId(ref)) return ref
+    const segments = ref.split('/')
+    for (const seg of segments) {
+      const reason = entitySegmentError(seg)
+      if (reason) throw new MockInvalid(`InvalidQuotaEntityRef: "${ref}": ${reason}`)
+    }
+    let parent: string | null = null
+    for (const seg of segments) {
+      const next = this.childNamed(parent, seg)
+      if (!next) return null
+      parent = next.id
+    }
+    return parent
+  }
+
+  /** The child of `parent` (or the root, for `null`) named `name`, if any. */
+  private childNamed(parent: string | null, name: string): QEntity | undefined {
+    for (const ent of this.entities.values()) {
+      if (ent.parent === parent && ent.name === name) return ent
+    }
+    return undefined
   }
 
   private childrenOf(id: string): QEntity[] {
@@ -2214,9 +2259,15 @@ export class MockWorld {
         break
       }
       case 'entity': {
-        const e = (filter as { entity: { id: string; scope?: string } }).entity
-        if (typeof e.id !== 'string' || e.id.length === 0) {
-          throw new MockInvalid('"entity.id" is required')
+        const e = (filter as { entity: { ref: string; scope?: string } }).entity
+        if (typeof e.ref !== 'string' || e.ref.length === 0) {
+          throw new MockInvalid('"entity.ref" is required')
+        }
+        // ADR 0045's deliberate asymmetry: an unknown *id* matches nothing
+        // (ids are client-minted and may not be visible yet), but a path is
+        // a human-typed lookup, so one that does not resolve is invalid.
+        if (this.resolveEntityRef(e.ref) === null) {
+          throw new MockInvalid(`UnknownQuotaEntity: no entity at path "${e.ref}"`)
         }
         if (e.scope !== undefined && e.scope !== 'subtree' && e.scope !== 'exact') {
           throw new MockInvalid('"entity.scope" must be "subtree" or "exact"')
@@ -2325,10 +2376,10 @@ export class MockWorld {
       return (job) => wanted.has(this.jobPhase(job))
     }
     if ('entity' in filter) {
+      // Validation already rejected an unresolvable path.
+      const id = this.resolveEntityRef(filter.entity.ref) ?? filter.entity.ref
       const ids =
-        (filter.entity.scope ?? 'subtree') === 'exact'
-          ? new Set([filter.entity.id])
-          : this.subtreeEntityIds(filter.entity.id)
+        (filter.entity.scope ?? 'subtree') === 'exact' ? new Set([id]) : this.subtreeEntityIds(id)
       return (job) => ids.has(job.spec.quotaEntity)
     }
     if ('node' in filter) {
@@ -2391,7 +2442,7 @@ export class MockWorld {
       state: job.state,
       image: job.spec.image,
       quotaEntity: job.spec.quotaEntity,
-      quotaEntityName: this.entityName(job.spec.quotaEntity),
+      quotaEntityPath: this.entityPath(job.spec.quotaEntity),
       priority: job.spec.priority,
       submittedAt: at(job.submittedAtUs),
       terminalAt: job.terminalAtUs === null ? null : at(job.terminalAtUs),
@@ -2432,6 +2483,7 @@ export class MockWorld {
         priority: job.spec.priority,
         maxRuntimeSeconds: job.spec.maxRuntimeUs === null ? null : secondsOf(job.spec.maxRuntimeUs),
         quotaEntity: job.spec.quotaEntity,
+        quotaEntityPath: this.entityPath(job.spec.quotaEntity),
         retry: { ...job.spec.retry },
       },
       submittedAt: at(job.submittedAtUs),
@@ -2499,6 +2551,7 @@ export class MockWorld {
     return {
       id: ent.id,
       name: ent.name,
+      path: this.entityPath(ent.id),
       parent: ent.parent,
       quotaUcu: ent.quotaUcu,
       usageUcu: Math.round(ent.usageUcu),
@@ -2574,7 +2627,7 @@ export class MockWorld {
     // with its own `w_age`/horizon knobs; see types.ts).
     return {
       multiplier,
-      penaltyChain: chain,
+      penaltyChain: chain.map((link) => ({ ...link, path: this.entityPath(link.entity) })),
       penaltyProduct,
       ageSeconds: secondsOf(ageUs),
     }
@@ -2741,6 +2794,7 @@ export class MockWorld {
     return {
       id: ent.id,
       name: ent.name,
+      path: this.entityPath(ent.id),
       parent: ent.parent,
       origin: ent.origin,
       principal: ent.principal,
@@ -2768,12 +2822,14 @@ export class MockWorld {
     const { queued, running } = this.subtreeJobCounts()
     return [...this.entities.values()]
       .map((e) => this.buildQuotaEntityNode(e, queued.get(e.id) ?? 0, running.get(e.id) ?? 0))
-      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   }
 
-  buildQuotaEntityDetail(id: string): QuotaEntityDetail {
-    const ent = this.entities.get(id)
-    if (!ent) throw new NotFound(`quota entity ${id}`)
+  /** `GET /quota-entities/{ref}`: the ref is an id or a path (ADR 0045). */
+  buildQuotaEntityDetail(ref: string): QuotaEntityDetail {
+    const id = this.resolveEntityRef(ref)
+    const ent = id === null ? undefined : this.entities.get(id)
+    if (!ent || id === null) throw new NotFound(`quota entity ${ref}`)
     const { queued, running } = this.subtreeJobCounts()
     const entity = this.buildQuotaEntityNode(ent, queued.get(id) ?? 0, running.get(id) ?? 0)
     const children = this.childrenOf(id)
@@ -2824,8 +2880,12 @@ export class MockWorld {
    * cycle/depth validation walks up from the proposed parent.
    */
   configureQuotaEntity(input: ConfigureQuotaEntityInput): QuotaEntityNode {
-    const name = input.name.trim()
-    if (name.length === 0) throw new MockInvalid('name must be non-empty')
+    // The segment grammar is pre-checked like the HTTP handler does (400,
+    // before anything is resolved); no trimming — the server takes the name
+    // byte for byte.
+    const name = input.name
+    const nameError = entitySegmentError(name)
+    if (nameError) throw new MockInvalid(`InvalidQuotaEntityName: ${nameError}`)
     if (
       !Number.isFinite(input.quotaUcu) ||
       !Number.isInteger(input.quotaUcu) ||
@@ -2833,9 +2893,11 @@ export class MockWorld {
     ) {
       throw new MockInvalid('quotaUcu must be a non-negative integer')
     }
-    const parentId = input.parent
-    if (parentId !== null && !this.entities.has(parentId)) {
-      throw new MockInvalid(`UnknownQuotaEntity: ${parentId}`)
+    // `parent` is a ref on the wire (id or path); either way, one that names
+    // nothing is a 409 `UnknownQuotaEntity`, naming what was sent.
+    const parentId = input.parent === null ? null : this.resolveEntityRef(input.parent)
+    if (input.parent !== null && (parentId === null || !this.entities.has(parentId))) {
+      throw new MockRejected(`UnknownQuotaEntity: ${input.parent}`)
     }
 
     if (input.entity !== null) {
@@ -2846,6 +2908,7 @@ export class MockWorld {
         throw new MockInvalid('an SSO identity owns its name and parent; only quota may change')
       }
       if (parentId !== ent.parent) this.assertReparentable(ent, parentId)
+      this.assertNameFree(parentId, name, ent.id)
       ent.name = name
       ent.parent = parentId
       ent.quotaUcu = input.quotaUcu
@@ -2861,6 +2924,7 @@ export class MockWorld {
     if (depth > MAX_QUOTA_DEPTH) {
       throw new MockInvalid(`quota entity depth exceeds cap ${MAX_QUOTA_DEPTH}`)
     }
+    this.assertNameFree(parentId, name, null)
     const ent = this.newEntity({
       name,
       parent: parentId,
@@ -2872,6 +2936,20 @@ export class MockWorld {
     this.seedEmptyQuotaHistory(ent)
     this.recomputeLeaves()
     return this.buildQuotaEntityNodeFor(ent.id)
+  }
+
+  /**
+   * Sibling uniqueness (ADR 0045): no two entities with the same parent —
+   * roots included — share a name, compared case-sensitively. `self` is the
+   * entity being updated, which may keep its own name.
+   */
+  private assertNameFree(parent: string | null, name: string, self: string | null): void {
+    const holder = this.childNamed(parent, name)
+    if (holder && holder.id !== self) {
+      throw new MockRejected(
+        `QuotaEntityNameTaken: "${this.entityPath(holder.id)}" is already held by ${holder.id}`,
+      )
+    }
   }
 
   /** Validate a reparent: no cycle, and the moved subtree fits the depth cap. */
@@ -3210,6 +3288,29 @@ class MockInvalid extends Error {
 
 export function isMockInvalid(e: unknown): boolean {
   return typeof e === 'object' && e !== null && 'invalid' in e
+}
+
+/** A well-formed request the state refused — the server's 409 `Rejected`. */
+class MockRejected extends Error {
+  readonly rejected = true
+  constructor(message: string) {
+    super(message)
+    this.name = 'MockRejected'
+  }
+}
+
+export function isMockRejected(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && 'rejected' in e
+}
+
+/**
+ * The entity segment for an SSO user (ADR 0045 grammar): the `sub`'s local
+ * part with anything outside `[A-Za-z0-9._-]` replaced by `-`. The full
+ * `sub` stays on the entity as its `principal`.
+ */
+function userSegment(sub: string): string {
+  const local = sub.split('@')[0] ?? sub
+  return local.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 63)
 }
 
 /**

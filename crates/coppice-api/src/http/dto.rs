@@ -32,6 +32,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use coppice_core::attempt;
 use coppice_core::bytes::ByteSize;
+use coppice_core::entity_ref::QuotaEntityRef;
 use coppice_core::env::JobEnv;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::metadata::{self, JobMetadata};
@@ -871,9 +872,9 @@ pub struct JobSummary {
     pub attempt: Option<AttemptId>,
     pub image: String,
     pub quota_entity: QuotaEntityId,
-    /// `""` if the entity is (impossibly) absent from the tree, never a
-    /// fabricated name.
-    pub quota_entity_name: String,
+    /// The entity's path (ADR 0045), derived at read time — `""` if the
+    /// entity is (impossibly) absent from the tree, never a fabricated path.
+    pub quota_entity_path: String,
     pub priority: i32,
     pub submitted_at: Timestamp,
     /// The principal that submitted the job (ADR 0023); `null` for a job
@@ -1005,13 +1006,27 @@ pub struct PhaseFilter {
     pub r#in: Vec<JobPhase>,
 }
 
-/// `{"entity": {"id": "quota-…", "scope": "subtree"}}`.
+/// `{"entity": {"ref": "acme/eng", "scope": "subtree"}}` — `ref` is a
+/// [`QuotaEntityRef`], an id or a path (ADR 0045).
+///
+/// A path is resolved against the read view before the filter runs
+/// ([`JobFilter::resolve_entity_refs`]); an unresolvable path is
+/// `INVALID_ARGUMENT`, while an unknown *id* matches nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntityFilter {
-    pub id: QuotaEntityId,
+    #[serde(rename = "ref")]
+    pub entity: QuotaEntityRef,
     #[serde(default)]
     pub scope: EntityScope,
+}
+
+impl EntityFilter {
+    /// The id this leaf matches — `None` only for a path the handler has not
+    /// resolved, which matches nothing.
+    pub fn id(&self) -> Option<QuotaEntityId> {
+        self.entity.as_id()
+    }
 }
 
 /// Entity match breadth. `Subtree` (the default) matches the entity and all
@@ -1081,6 +1096,46 @@ impl JobFilter {
     pub fn validate(&self) -> Result<(), String> {
         let mut nodes = 0usize;
         self.check(1, &mut nodes)
+    }
+
+    /// Rewrite every `entity` leaf's path to the id it names in `state`
+    /// (ADR 0045), so the filter runs over ids alone.
+    ///
+    /// An id is left as it is, known or not — ids are client-minted and may
+    /// name something not yet visible, so an unknown one matches nothing. An
+    /// unresolvable *path* is an error: a path is a human-typed lookup, and a
+    /// typo must not quietly return an empty result.
+    pub fn resolve_entity_refs(
+        &mut self,
+        state: &coppice_state::StateMachine,
+    ) -> Result<(), String> {
+        match self {
+            JobFilter::All(fs) | JobFilter::Any(fs) => {
+                for f in fs {
+                    f.resolve_entity_refs(state)?;
+                }
+                Ok(())
+            }
+            JobFilter::Not(f) => f.resolve_entity_refs(state),
+            JobFilter::Entity(e) => {
+                if let QuotaEntityRef::Path(path) = &e.entity {
+                    let id = state
+                        .resolve_quota_entity_path(path)
+                        .ok_or_else(|| format!("no quota entity at path \"{path}\""))?;
+                    e.entity = QuotaEntityRef::Id(id);
+                }
+                Ok(())
+            }
+            JobFilter::Phase(_)
+            | JobFilter::Node(_)
+            | JobFilter::Image(_)
+            | JobFilter::Id(_)
+            | JobFilter::Search(_)
+            | JobFilter::Submitted(_)
+            | JobFilter::SubmittedBy(_)
+            | JobFilter::Requests(_)
+            | JobFilter::Metadata(_) => Ok(()),
+        }
     }
 
     fn check(&self, depth: usize, nodes: &mut usize) -> Result<(), String> {
@@ -1215,14 +1270,17 @@ pub enum QuotaEntityOrigin {
 /// `origin`/`principal` are the ADR 0022 SSO provenance: replicated state
 /// records no auto-minted entities yet, so `origin` is uniformly
 /// `configured` and `principal` is `null` until that subsystem lands. `name`
-/// is the entity's own stored segment, not the slash-joined path `types.ts`
-/// sketches (no path is stored). `usage_ucu`, `over_quota_ratio`, and
+/// is the entity's own stored segment and `path` the slash-joined names from
+/// its root down to it (ADR 0045), derived at read time — no path is stored.
+/// `usage_ucu`, `over_quota_ratio`, and
 /// `penalty` are decayed to read time (the same lazy decay `score.rs`
 /// applies), so they are read-time figures, not the stored accumulator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaEntityNode {
     pub id: QuotaEntityId,
     pub name: String,
+    /// `acme/eng/platform` — derived at read time (ADR 0045).
+    pub path: String,
     pub parent: Option<QuotaEntityId>,
     pub origin: QuotaEntityOrigin,
     /// OIDC `sub` the entity was auto-minted for; only on `sso` entities.
@@ -1256,6 +1314,8 @@ pub struct QuotaEntityNode {
 pub struct QuotaEntityView {
     pub id: QuotaEntityId,
     pub name: String,
+    /// `acme/eng/platform` — derived at read time (ADR 0045).
+    pub path: String,
     pub parent: Option<QuotaEntityId>,
     pub quota_ucu: u64,
     /// Decayed usage as of the read's `now` (ADR 0019 integer decay).
@@ -1345,6 +1405,9 @@ pub struct JobSpecView {
     /// Enforced runtime bound in whole seconds; `null` when unbounded.
     pub max_runtime_seconds: Option<i64>,
     pub quota_entity: QuotaEntityId,
+    /// The entity's path as of the read (ADR 0045); `""` if the entity is
+    /// (impossibly) absent from the tree.
+    pub quota_entity_path: String,
     pub retry: RetryPolicy,
     /// The principal that submitted the job, stamped at apply from the
     /// command's verified actor (ADR 0023) — never client-supplied. `null`
@@ -1366,6 +1429,8 @@ pub struct AbortRequestedView {
 pub struct PenaltyLink {
     pub entity: QuotaEntityId,
     pub name: String,
+    /// The entity's path as of the read (ADR 0045).
+    pub path: String,
     pub usage_ucu: u64,
     pub quota_ucu: u64,
     /// `null` on the wire when infinite; see [`null_as_infinity`].
@@ -1557,9 +1622,15 @@ impl From<Resources> for coppice_core::resource::Resources {
 /// — a typo (`"max_runtme_seconds"`) or wrong casing
 /// (`"maxRuntimeSeconds"`) would otherwise silently drop its field to the
 /// default, turning e.g. a bounded job into a default-priced one.
+///
+/// Generic over the entity reference so one shape serves both sides of the
+/// ADR 0045 resolution: the wire form takes a [`QuotaEntityRef`] (the
+/// default), and the handler resolves it against its read view into a
+/// [`ResolvedSubmitJobRequest`] — the id-carrying form the control plane
+/// proposes and forwards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SubmitJobRequest {
+pub struct SubmitJobRequest<E = QuotaEntityRef> {
     /// Client-minted job identity (`job-<uuid>`, ADR 0024) — required.
     /// Mint a fresh id per logical submission; reuse it verbatim on every
     /// retry.
@@ -1589,8 +1660,8 @@ pub struct SubmitJobRequest {
     /// default runtime. Must be positive when present.
     #[serde(default)]
     pub max_runtime_seconds: Option<i64>,
-    /// The quota-entity leaf to charge.
-    pub quota_entity: QuotaEntityId,
+    /// The quota-entity leaf to charge: an id or a path (ADR 0045).
+    pub quota_entity: E,
     /// Absent = the platform default policy.
     #[serde(default)]
     pub retry: Option<RetryPolicy>,
@@ -1598,6 +1669,29 @@ pub struct SubmitJobRequest {
     /// against the ADR's limits at admission, and again at apply.
     #[serde(default)]
     pub metadata: JobMetadata,
+}
+
+/// A [`SubmitJobRequest`] whose entity the handler has resolved to an id.
+pub type ResolvedSubmitJobRequest = SubmitJobRequest<QuotaEntityId>;
+
+impl<E> SubmitJobRequest<E> {
+    /// The same request charged to `quota_entity` — the handler's resolved
+    /// id, in place of the wire reference.
+    pub fn with_entity<F>(self, quota_entity: F) -> SubmitJobRequest<F> {
+        SubmitJobRequest {
+            job: self.job,
+            image: self.image,
+            command: self.command,
+            entrypoint: self.entrypoint,
+            env: self.env,
+            requests: self.requests,
+            priority: self.priority,
+            max_runtime_seconds: self.max_runtime_seconds,
+            quota_entity,
+            retry: self.retry,
+            metadata: self.metadata,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1760,36 +1854,70 @@ pub struct RemoveNodeResponse {}
 /// command has no server-minting path — its `entity` is always required —
 /// and matching `SubmitJob` keeps id minting uniformly client-side.
 ///
+/// `entity` stays an id even under ADR 0045: it is the upsert's idempotency
+/// identity. `parent` is a [`QuotaEntityRef`] on the wire, resolved by the
+/// handler into a [`ResolvedConfigureQuotaEntityRequest`] as
+/// [`SubmitJobRequest`]'s entity is.
+///
 /// `deny_unknown_fields`: like every write body, a typo must be
 /// `INVALID_ARGUMENT`, not a silently defaulted field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ConfigureQuotaEntityRequest {
+pub struct ConfigureQuotaEntityRequest<P = QuotaEntityRef> {
     /// Client-minted entity id (`quota-<uuid>`, ADR 0024) — required. The
     /// upsert target: an existing id updates, a fresh one creates.
     pub entity: QuotaEntityId,
-    /// Parent in the quota tree; `null` roots the entity. A parent that does
-    /// not exist, or one that would form a cycle, is rejected at apply.
-    #[serde(default)]
-    pub parent: Option<QuotaEntityId>,
+    /// Parent in the quota tree, by id or path; `null` roots the entity. A
+    /// parent that does not exist, or one that would form a cycle, is
+    /// rejected.
+    #[serde(default = "no_parent")]
+    pub parent: Option<P>,
+    /// One path segment (ADR 0045): 1–63 of `[A-Za-z0-9._-]`, the first
+    /// alphanumeric, never an id — a violation is `INVALID_ARGUMENT` — and
+    /// unique among the entity's siblings, a clash being `REJECTED` (409).
     pub name: String,
     /// Soft quota as a stock in µCU (ADR 0019); the caller converts human
     /// rates.
     pub quota_ucu: u64,
 }
 
+fn no_parent<P>() -> Option<P> {
+    None
+}
+
+/// A [`ConfigureQuotaEntityRequest`] whose parent the handler has resolved.
+pub type ResolvedConfigureQuotaEntityRequest = ConfigureQuotaEntityRequest<QuotaEntityId>;
+
+impl<P> ConfigureQuotaEntityRequest<P> {
+    /// The same upsert under `parent` — the handler's resolved id, in place
+    /// of the wire reference.
+    pub fn with_parent<Q>(self, parent: Option<Q>) -> ConfigureQuotaEntityRequest<Q> {
+        ConfigureQuotaEntityRequest {
+            entity: self.entity,
+            parent,
+            name: self.name,
+            quota_ucu: self.quota_ucu,
+        }
+    }
+}
+
 /// `POST /api/v1/quota-entities` response — the echoed entity id plus the
-/// apply's `log_index`, shaped exactly like [`SubmitJobResponse`].
+/// apply's `log_index`, shaped like [`SubmitJobResponse`], plus the entity's
+/// `path` as of the write.
 ///
 /// `types.ts` sketches a full `QuotaEntityNode` here, but the write path
 /// (propose → committed decision) returns only the log index, not a fresh
 /// projected view; echoing the id + `log_index` lets the caller pair the
 /// write with a strong `GET /api/v1/quota-entities/{entity}?min_index=…`
 /// for read-your-writes (ADR 0007), the same pattern `SubmitJob` uses.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigureQuotaEntityResponse {
     /// Echo of the client-minted id from the request.
     pub entity: QuotaEntityId,
+    /// The entity's path as of the write's apply (ADR 0045) — read back from
+    /// this replica's view at the write's `log_index`, so a later rename is
+    /// not reflected.
+    pub path: String,
     /// Raft log index at which this upsert applied; pair with `?min_index=`
     /// on a subsequent read for read-your-writes (ADR 0007).
     pub log_index: u64,
@@ -2434,6 +2562,9 @@ pub struct SessionBinding {
     pub role: BindingRole,
     /// Subtree root the role is scoped to; `null` = cluster-wide.
     pub scope: Option<QuotaEntityId>,
+    /// The scope's path as of the read (ADR 0045); `null` when unscoped, or
+    /// when the scope names an entity absent from the tree.
+    pub scope_path: Option<String>,
 }
 
 /// The closed ADR 0023 role set, in wire form.
@@ -2455,9 +2586,13 @@ pub enum BindingRole {
 /// Flat subject: exactly one of `group` / `principal` must be present —
 /// serde cannot express "exactly one", so [`BindingDto::subject`] checks it
 /// and the handler surfaces a violation as `INVALID_ARGUMENT`.
+///
+/// The write form: `scope` is a [`QuotaEntityRef`] (ADR 0045), resolved by
+/// the handler into a `BindingDto<QuotaEntityId>`. Reads answer with
+/// [`BindingView`], which adds the scope's path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BindingDto {
+pub struct BindingDto<S = QuotaEntityRef> {
     /// Group-claim subject; exactly one of `group`/`principal`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -2465,9 +2600,64 @@ pub struct BindingDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
     pub role: BindingRole,
+    /// Subtree root the role is scoped to, by id or path; absent = unscoped
+    /// (cluster-wide).
+    #[serde(default = "no_scope", skip_serializing_if = "Option::is_none")]
+    pub scope: Option<S>,
+}
+
+fn no_scope<S>() -> Option<S> {
+    None
+}
+
+impl<S> BindingDto<S> {
+    /// The same binding scoped to `scope` — the handler's resolved id, in
+    /// place of the wire reference.
+    pub fn with_scope<T>(self, scope: Option<T>) -> BindingDto<T> {
+        BindingDto {
+            group: self.group,
+            principal: self.principal,
+            role: self.role,
+            scope,
+        }
+    }
+}
+
+/// One binding as `GET /api/v1/authorization` reports it: the stored id
+/// scope plus its path as of the read (ADR 0045).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    pub role: BindingRole,
     /// Subtree root the role is scoped to; absent = unscoped (cluster-wide).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<QuotaEntityId>,
+    /// `scope`'s path as of the read; absent when unscoped, or when the scope
+    /// names an entity absent from the tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_path: Option<String>,
+}
+
+impl BindingView {
+    /// Project a stored binding, deriving its scope's path from `state`.
+    pub fn of(b: &coppice_state::authz::Binding, state: &coppice_state::StateMachine) -> Self {
+        let BindingDto {
+            group,
+            principal,
+            role,
+            scope,
+        } = BindingDto::from(b);
+        BindingView {
+            group,
+            principal,
+            role,
+            scope,
+            scope_path: scope.and_then(|id| state.quota_entity_path(id)),
+        }
+    }
 }
 
 /// `GET /api/v1/authorization` — the current replicated authorization
@@ -2479,7 +2669,7 @@ pub struct GetAuthorizationResponse {
     /// The token claim group names are read from (replicated policy,
     /// ADR 0022).
     pub groups_claim: String,
-    pub bindings: Vec<BindingDto>,
+    pub bindings: Vec<BindingView>,
 }
 
 /// `PUT /api/v1/authorization` — the full-replacement `UpdateAuthorization`
@@ -2490,12 +2680,16 @@ pub struct GetAuthorizationResponse {
 /// edit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UpdateAuthorizationRequest {
+pub struct UpdateAuthorizationRequest<S = QuotaEntityRef> {
     /// Absent = leave the current groups-claim name unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups_claim: Option<String>,
-    pub bindings: Vec<BindingDto>,
+    pub bindings: Vec<BindingDto<S>>,
 }
+
+/// An [`UpdateAuthorizationRequest`] whose binding scopes the handler has
+/// resolved to ids.
+pub type ResolvedUpdateAuthorizationRequest = UpdateAuthorizationRequest<QuotaEntityId>;
 
 /// `PUT /api/v1/authorization` response.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -2529,7 +2723,7 @@ impl From<BindingRole> for coppice_state::authz::Role {
     }
 }
 
-impl From<&coppice_state::authz::Binding> for BindingDto {
+impl From<&coppice_state::authz::Binding> for BindingDto<QuotaEntityId> {
     fn from(b: &coppice_state::authz::Binding) -> Self {
         use coppice_state::authz::Subject;
         let (group, principal) = match &b.subject {
@@ -2545,14 +2739,14 @@ impl From<&coppice_state::authz::Binding> for BindingDto {
     }
 }
 
-impl TryFrom<&BindingDto> for coppice_state::authz::Binding {
+impl TryFrom<&BindingDto<QuotaEntityId>> for coppice_state::authz::Binding {
     type Error = String;
 
     /// Wire → domain, enforcing the exactly-one subject rule serde cannot.
     /// Empty subject strings pass through: apply owns that rejection
     /// (`InvalidAuthorization`), and pre-empting it here would fork the
     /// error vocabulary.
-    fn try_from(b: &BindingDto) -> Result<Self, String> {
+    fn try_from(b: &BindingDto<QuotaEntityId>) -> Result<Self, String> {
         use coppice_state::authz::{Binding, Subject};
         let subject = match (&b.group, &b.principal) {
             (Some(name), None) => Subject::Group(name.clone()),
@@ -2801,7 +2995,7 @@ mod tests {
         .expect("minimal request");
 
         assert_eq!(req.job, job);
-        assert_eq!(req.quota_entity, entity);
+        assert_eq!(req.quota_entity, QuotaEntityRef::Id(entity));
         assert_eq!(req.priority, 0);
         assert_eq!(req.max_runtime_seconds, None);
         assert!(req.entrypoint.is_none());
@@ -2899,8 +3093,9 @@ mod tests {
             {"any": [{"search": "x"}]},
             {"not": {"search": "x"}},
             {"phase": {"in": ["queued", "running"]}},
-            {"entity": {"id": entity, "scope": "subtree"}},
-            {"entity": {"id": entity}},
+            {"entity": {"ref": entity, "scope": "subtree"}},
+            {"entity": {"ref": entity}},
+            {"entity": {"ref": "acme/eng", "scope": "exact"}},
             {"node": node},
             {"image": {"contains": "alpine"}},
             {"image": {"equals": "alpine:3"}},
@@ -2918,11 +3113,78 @@ mod tests {
     #[test]
     fn entity_scope_defaults_to_subtree() {
         let entity = QuotaEntityId::new().to_string();
-        let filter = parse_filter(serde_json::json!({"entity": {"id": entity}})).unwrap();
+        let filter = parse_filter(serde_json::json!({"entity": {"ref": entity}})).unwrap();
         match filter {
             JobFilter::Entity(e) => assert_eq!(e.scope, EntityScope::Subtree),
             other => panic!("expected entity, got {other:?}"),
         }
+    }
+
+    /// ADR 0045: the leaf's key is `ref`, which takes an id or a path; the old
+    /// `id` key and a malformed path are both parse errors.
+    #[test]
+    fn the_entity_leaf_takes_a_ref_and_refuses_the_old_key() {
+        let id = QuotaEntityId::new();
+        let by_id = parse_filter(serde_json::json!({"entity": {"ref": id.to_string()}})).unwrap();
+        let JobFilter::Entity(by_id) = by_id else {
+            panic!("expected entity");
+        };
+        assert_eq!(by_id.id(), Some(id));
+        let by_path = parse_filter(serde_json::json!({"entity": {"ref": "acme/eng"}})).unwrap();
+        let JobFilter::Entity(by_path) = by_path else {
+            panic!("expected entity");
+        };
+        assert_eq!(by_path.entity.as_path().unwrap().as_str(), "acme/eng");
+        assert_eq!(by_path.id(), None);
+        assert!(parse_filter(serde_json::json!({"entity": {"id": id.to_string()}})).is_err());
+        assert!(parse_filter(serde_json::json!({"entity": {"ref": "acme//eng"}})).is_err());
+    }
+
+    /// Paths resolve against the view to ids; an unknown id is left alone
+    /// (it matches nothing), an unresolvable path is an error.
+    #[test]
+    fn resolving_entity_refs_rewrites_paths_and_refuses_unknown_ones() {
+        let mut state = coppice_state::StateMachine::default();
+        let (acme, eng) = (QuotaEntityId::new(), QuotaEntityId::new());
+        for (entity, parent, name) in [(acme, None, "acme"), (eng, Some(acme), "eng")] {
+            state
+                .apply(&coppice_state::Command::ConfigureQuotaEntity(
+                    coppice_state::command::ConfigureQuotaEntity {
+                        entity,
+                        parent,
+                        name: name.into(),
+                        quota: coppice_core::quota::CostUnits(1),
+                        actor: None,
+                        updated_at: ts(1),
+                    },
+                ))
+                .unwrap();
+        }
+        let unknown = QuotaEntityId::new();
+        let mut filter = parse_filter(serde_json::json!({"any": [
+            {"entity": {"ref": "acme/eng"}},
+            {"not": {"entity": {"ref": unknown.to_string(), "scope": "exact"}}},
+        ]}))
+        .unwrap();
+        filter.resolve_entity_refs(&state).unwrap();
+        let JobFilter::Any(leaves) = &filter else {
+            panic!("expected any");
+        };
+        let JobFilter::Entity(first) = &leaves[0] else {
+            panic!("expected entity");
+        };
+        assert_eq!(first.id(), Some(eng));
+        let JobFilter::Not(inner) = &leaves[1] else {
+            panic!("expected not");
+        };
+        let JobFilter::Entity(second) = inner.as_ref() else {
+            panic!("expected entity");
+        };
+        assert_eq!(second.id(), Some(unknown));
+
+        let mut typo = parse_filter(serde_json::json!({"entity": {"ref": "acme/eng/x"}})).unwrap();
+        let err = typo.resolve_entity_refs(&state).unwrap_err();
+        assert!(err.contains("acme/eng/x"), "{err}");
     }
 
     #[test]
@@ -3155,7 +3417,7 @@ mod tests {
             attempt: Some(attempt),
             image: "alpine:3".to_string(),
             quota_entity: entity,
-            quota_entity_name: "team-a".to_string(),
+            quota_entity_path: "acme/team-a".to_string(),
             priority: 1,
             submitted_at: ts(9_500_000),
             submitted_by: Some("user-42".to_string()),
@@ -3179,7 +3441,7 @@ mod tests {
                 "attempt": "attempt-00000000-0000-0000-0000-000000000002",
                 "image": "alpine:3",
                 "quota_entity": "quota-00000000-0000-0000-0000-000000000004",
-                "quota_entity_name": "team-a",
+                "quota_entity_path": "acme/team-a",
                 "priority": 1,
                 "submitted_at": "1970-01-01T00:00:09.500000Z",
                 "submitted_by": "user-42",
@@ -3219,6 +3481,7 @@ mod tests {
         let node = QuotaEntityNode {
             id,
             name: "platform".to_string(),
+            path: "acme/platform".to_string(),
             parent: Some(parent),
             origin: QuotaEntityOrigin::Configured,
             principal: None,
@@ -3237,6 +3500,7 @@ mod tests {
             serde_json::json!({
                 "id": "quota-00000000-0000-0000-0000-000000000001",
                 "name": "platform",
+                "path": "acme/platform",
                 "parent": "quota-00000000-0000-0000-0000-000000000002",
                 "origin": "configured",
                 "principal": null,
@@ -3262,6 +3526,7 @@ mod tests {
         let view = QuotaEntityView {
             id,
             name: "root".to_string(),
+            path: "root".to_string(),
             parent: None,
             quota_ucu: 0,
             usage_ucu: 1,
@@ -3285,6 +3550,7 @@ mod tests {
         let node = QuotaEntityNode {
             id,
             name: "root".to_string(),
+            path: "root".to_string(),
             parent: None,
             origin: QuotaEntityOrigin::Configured,
             principal: None,
@@ -3320,6 +3586,7 @@ mod tests {
         let view: QuotaEntityView = serde_json::from_value(serde_json::json!({
             "id": id.to_string(),
             "name": "root",
+            "path": "root",
             "parent": null,
             "quota_ucu": 0,
             "usage_ucu": 1,
@@ -3335,6 +3602,7 @@ mod tests {
             "penalty_chain": [{
                 "entity": id.to_string(),
                 "name": "root",
+                "path": "root",
                 "usage_ucu": 1,
                 "quota_ucu": 0,
                 "over_quota_ratio": null,
@@ -3387,6 +3655,19 @@ mod tests {
         assert!(req.parent.is_none());
         assert_eq!(req.quota_ucu, 1000);
 
+        // `parent` takes a ref: an id or a path (ADR 0045).
+        let under: ConfigureQuotaEntityRequest = serde_json::from_value(serde_json::json!({
+            "entity": entity.to_string(),
+            "parent": "acme/eng",
+            "name": "team",
+            "quota_ucu": 1000,
+        }))
+        .expect("parent by path");
+        assert_eq!(
+            under.parent.unwrap().as_path().unwrap().as_str(),
+            "acme/eng"
+        );
+
         // The client-minted id is required (ADR 0026 idempotency identity),
         // unlike `types.ts`'s nullable `entity`.
         let missing_entity: Result<ConfigureQuotaEntityRequest, _> =
@@ -3407,6 +3688,7 @@ mod tests {
             .unwrap();
         let json = serde_json::to_value(ConfigureQuotaEntityResponse {
             entity,
+            path: "acme/eng".to_string(),
             log_index: 7,
         })
         .unwrap();
@@ -3414,6 +3696,7 @@ mod tests {
             json,
             serde_json::json!({
                 "entity": "quota-00000000-0000-0000-0000-000000000001",
+                "path": "acme/eng",
                 "log_index": 7,
             })
         );

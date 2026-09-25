@@ -1852,7 +1852,7 @@ impl coppice_api::ControlPlane for NoopPlane {
 
     async fn submit_job(
         &self,
-        _req: coppice_api::http::dto::SubmitJobRequest,
+        _req: coppice_api::http::dto::ResolvedSubmitJobRequest,
         _actor: coppice_state::Actor,
     ) -> Result<coppice_api::http::dto::SubmitJobResponse, coppice_api::ApiError> {
         Err(unattached())
@@ -1884,9 +1884,9 @@ impl coppice_api::ControlPlane for NoopPlane {
 
     async fn configure_quota_entity(
         &self,
-        _req: coppice_api::http::dto::ConfigureQuotaEntityRequest,
+        _req: coppice_api::http::dto::ResolvedConfigureQuotaEntityRequest,
         _actor: coppice_state::Actor,
-    ) -> Result<coppice_api::http::dto::ConfigureQuotaEntityResponse, coppice_api::ApiError> {
+    ) -> Result<coppice_api::QuotaEntityConfigured, coppice_api::ApiError> {
         Err(unattached())
     }
 
@@ -1894,7 +1894,7 @@ impl coppice_api::ControlPlane for NoopPlane {
     // test; it has no cluster behind it, so authorization writes never land.
     async fn update_authorization(
         &self,
-        _req: coppice_api::http::dto::UpdateAuthorizationRequest,
+        _req: coppice_api::http::dto::ResolvedUpdateAuthorizationRequest,
         _actor: coppice_state::Actor,
     ) -> Result<coppice_api::http::dto::UpdateAuthorizationResponse, coppice_api::ApiError> {
         Err(unattached())

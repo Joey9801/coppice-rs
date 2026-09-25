@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass};
+use coppice_core::entity_ref;
 use coppice_core::env;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState};
@@ -1108,6 +1109,9 @@ impl StateMachine {
     // ---- Admin / policy ----
 
     fn configure_quota_entity(&mut self, c: &ConfigureQuotaEntity) -> ApplyResult {
+        // The entity's depth at its new position, counting itself: a root is
+        // at depth 1. Every path is at most `QUOTA_TREE_DEPTH_CAP` names.
+        let mut depth: u32 = 1;
         if let Some(parent) = c.parent {
             if parent == c.entity {
                 return Err(RejectionReason::QuotaEntityCycle(c.entity));
@@ -1115,24 +1119,50 @@ impl StateMachine {
             if !self.quota_entities.contains_key(&parent) {
                 return Err(RejectionReason::UnknownQuotaEntity(parent));
             }
-            // Walk up from the parent: reaching the entity is a cycle,
-            // exhausting the cap is too deep either way.
+            // Walk up from the parent: reaching the entity is a cycle, and
+            // an entity that would sit below depth `QUOTA_TREE_DEPTH_CAP` is
+            // too deep. Both reuse `QuotaEntityCycle`, whose message covers
+            // either case.
             let mut cur = Some(parent);
-            let mut rooted = false;
-            for _ in 0..QUOTA_TREE_DEPTH_CAP {
-                match cur {
-                    None => {
-                        rooted = true;
-                        break;
-                    }
-                    Some(id) if id == c.entity => break,
-                    Some(id) => cur = self.quota_entities.get(&id).and_then(|e| e.parent),
+            while let Some(id) = cur {
+                if id == c.entity {
+                    return Err(RejectionReason::QuotaEntityCycle(c.entity));
                 }
-            }
-            if !rooted {
-                return Err(RejectionReason::QuotaEntityCycle(c.entity));
+                depth += 1;
+                if depth > QUOTA_TREE_DEPTH_CAP {
+                    return Err(RejectionReason::QuotaEntityCycle(c.entity));
+                }
+                cur = self.quota_entities.get(&id).and_then(|e| e.parent);
             }
         }
+        // The entity's existing subtree moves with it: its deepest
+        // descendant must still be within the cap at the new position, or
+        // its path would be truncated and no longer resolve back to it.
+        // Level-by-level scans of the (bounded, ~1k) entity map — no index on
+        // the state machine. Bounded by the room left under the cap, so it
+        // terminates whatever the tree says.
+        let room = QUOTA_TREE_DEPTH_CAP - depth;
+        let mut frontier: BTreeSet<QuotaEntityId> = BTreeSet::from([c.entity]);
+        let mut below: u32 = 0;
+        loop {
+            let next: BTreeSet<QuotaEntityId> = self
+                .quota_entities
+                .iter()
+                .filter(|(_, e)| e.parent.is_some_and(|p| frontier.contains(&p)))
+                .map(|(id, _)| *id)
+                .collect();
+            if next.is_empty() {
+                break;
+            }
+            below += 1;
+            if below > room {
+                return Err(RejectionReason::QuotaEntityCycle(c.entity));
+            }
+            frontier = next;
+        }
+        // The name is one path segment (ADR 0045), a pure shape check.
+        entity_ref::validate_segment(&c.name)
+            .map_err(|e| RejectionReason::InvalidQuotaEntityName(e.to_string()))?;
         self.authorize(
             c.actor.as_ref(),
             Verb::ConfigureQuotaEntity {
@@ -1140,6 +1170,21 @@ impl StateMachine {
                 new_parent: c.parent.as_ref(),
             },
         )?;
+        // Unique among its siblings, checked for a create, a rename, and a
+        // reparent alike: every replica must agree that a path names at most
+        // one entity. After authorization, because the rejection names the
+        // holder's id. The check is a scan of the (bounded, ~1k) entity map —
+        // deliberately no index on the state machine.
+        if let Some((holder, _)) = self
+            .quota_entities
+            .iter()
+            .find(|(id, e)| **id != c.entity && e.parent == c.parent && e.name == c.name)
+        {
+            return Err(RejectionReason::QuotaEntityNameTaken {
+                name: c.name.clone(),
+                holder: *holder,
+            });
+        }
         // Whether this command moves an existing entity under a different
         // parent. Decided here, with the old and the new parent both in hand,
         // because no later reader can tell the two apart — and a subtree

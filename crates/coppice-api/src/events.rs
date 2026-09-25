@@ -65,7 +65,10 @@ enum Node {
         equals: Option<String>,
     },
     Entity {
-        id: QuotaEntityId,
+        /// `None` for a path the handler never resolved against its view
+        /// (ADR 0045) — it matches nothing. The subscribe handler resolves
+        /// every path before compiling, so this is a guard, not a mode.
+        id: Option<QuotaEntityId>,
         /// `true` matches only the job's own entity; `false` matches anywhere
         /// along its ancestry.
         exact: bool,
@@ -132,7 +135,7 @@ fn compile_node(filter: &dto::JobFilter) -> Result<Node, ForbiddenLeaf> {
             equals: m.equals.clone(),
         },
         F::Entity(e) => Node::Entity {
-            id: e.id,
+            id: e.id(),
             exact: e.scope == dto::EntityScope::Exact,
         },
         F::Id(i) => Node::Id(i.r#in.iter().copied().collect()),
@@ -166,7 +169,11 @@ fn eval(node: &Node, job: JobId, scope: ScopeView<'_>) -> bool {
         // The chain is entity-first, so `exact` is the head and `subtree` is
         // membership — the same two breadths `ListJobs` offers, decided here
         // without a tree walk because the walk already happened at apply.
-        Node::Entity { id, exact } => {
+        Node::Entity { id: None, .. } => false,
+        Node::Entity {
+            id: Some(id),
+            exact,
+        } => {
             if *exact {
                 scope.entity_chain.first() == Some(id)
             } else {
@@ -249,7 +256,10 @@ mod tests {
     }
 
     fn entity_leaf(id: QuotaEntityId, scope: dto::EntityScope) -> dto::JobFilter {
-        dto::JobFilter::Entity(dto::EntityFilter { id, scope })
+        dto::JobFilter::Entity(dto::EntityFilter {
+            entity: id.into(),
+            scope,
+        })
     }
 
     /// Every leaf outside the restricted set is refused by name, so the 400

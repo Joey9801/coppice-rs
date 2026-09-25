@@ -239,7 +239,8 @@ fn list_quota_entities_json() -> serde_json::Value {
 
 fn quota_entity_node_json(id: QuotaEntityId) -> serde_json::Value {
     serde_json::json!({
-        "id": id.to_string(), "name": "team", "parent": null, "origin": "configured",
+        "id": id.to_string(), "name": "team", "path": "acme/team", "parent": null,
+        "origin": "configured",
         "principal": null, "quota_ucu": 0, "usage_ucu": 0, "over_quota_ratio": 0.0,
         "penalty": 1.0, "created_at": "1970-01-01T00:00:00.000000Z",
         "updated_at": "1970-01-01T00:00:00.000000Z", "queued_count": 0, "running_count": 0
@@ -271,6 +272,7 @@ fn job_spec_json() -> serde_json::Value {
         "image": "alpine", "command": ["true"], "entrypoint": null,
         "requests": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 }, "priority": 0,
         "max_runtime_seconds": null, "quota_entity": quota_id().to_string(),
+        "quota_entity_path": "acme/team",
         "retry": { "max_retries": 0, "retry_user_errors": false }, "submitted_by": null
     })
 }
@@ -292,7 +294,7 @@ fn job_detail_json(job: &str, state: &str) -> serde_json::Value {
 fn job_summary_json(job: JobId) -> serde_json::Value {
     serde_json::json!({
         "id": job.to_string(), "state": "queued", "attempt": null, "image": "alpine",
-        "quota_entity": quota_id().to_string(), "quota_entity_name": "team", "priority": 0,
+        "quota_entity": quota_id().to_string(), "quota_entity_path": "acme/team", "priority": 0,
         "submitted_at": "1970-01-01T00:00:00.000000Z", "submitted_by": null, "terminal_at": null,
         "node": null, "attempt_state": null, "funding_fraction": null, "cost_ucu": 0,
         "outcome": null, "metadata": {}
@@ -658,7 +660,10 @@ async fn every_write_endpoint_hits_its_exact_path_method_and_body_shape() {
     let store = capture_store();
     let router = with_capture(
         Router::new()
-            .route("/api/v1/jobs", post(|| async { Json(job_write_response_json(JobId::new(), 1)) }))
+            .route(
+                "/api/v1/jobs",
+                post(|| async { Json(job_write_response_json(JobId::new(), 1)) }),
+            )
             .route(
                 "/api/v1/jobs/:job/abort",
                 post(|| async { Json(empty_object()) }),
@@ -682,7 +687,13 @@ async fn every_write_endpoint_hits_its_exact_path_method_and_body_shape() {
             )
             .route(
                 "/api/v1/quota-entities",
-                post(|| async { Json(serde_json::json!({ "entity": QuotaEntityId::new().to_string(), "log_index": 1 })) }),
+                post(|| async {
+                    Json(serde_json::json!({
+                        "entity": QuotaEntityId::new().to_string(),
+                        "path": "acme/team",
+                        "log_index": 1
+                    }))
+                }),
             ),
         store.clone(),
     );

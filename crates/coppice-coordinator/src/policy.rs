@@ -24,9 +24,13 @@
 //!   replicated weights are still all-zero (the booted "everything is free"
 //!   default); the `[retention]` windows ride it too, each seeded only while
 //!   the replicated field still holds its booted default;
-//! - each quota entity is created **only when absent** by id — an existing
-//!   entity is left untouched (reconfiguration is not an amnesty, and re-init
-//!   must not reset accumulated usage);
+//! - each quota entity is named by its **path** (ADR 0045) and created
+//!   **only when its path does not already resolve** in replicated state —
+//!   an existing entity is left untouched (reconfiguration is not an
+//!   amnesty, and re-init must not reset accumulated usage); entries may
+//!   appear in any order, parents before children or not, and a declared
+//!   `id` that collides with a *different* entity already holding that path
+//!   is a document error;
 //! - each `[[enroll_token]]` is minted **only when no live token carries its
 //!   label** (ADR 0037 §5), which is why labels are required and unique here;
 //! - the `[authorization]` role bindings are installed with one
@@ -44,11 +48,12 @@
 //! (rates, half-lives) are converted before proposal (ADR 0019). No float is
 //! ever replicated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use coppice_core::entity_ref::{QuotaEntityPath, QuotaEntityRef};
 use coppice_core::id::{EnrollTokenId, QuotaEntityId};
 use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier, MICRO_PER_COST_UNIT};
 use coppice_core::time::{Duration, Timestamp};
@@ -154,8 +159,12 @@ pub struct AuthorizationSpec {
 }
 
 impl AuthorizationSpec {
-    /// Every binding in document order, or the first entry that cannot be one.
-    fn bindings(&self) -> Result<Vec<Binding>> {
+    /// Every binding in document order, or the first entry that cannot be
+    /// parsed on its own. A binding's `scope` is left as an unresolved
+    /// [`QuotaEntityRef`] here — resolving it against seeded and existing
+    /// quota entities needs `state`, and is [`FormationPolicy::commands`]'s
+    /// job.
+    fn bindings(&self) -> Result<Vec<ParsedBinding>> {
         self.bindings
             .iter()
             .enumerate()
@@ -165,7 +174,8 @@ impl AuthorizationSpec {
 }
 
 /// One role binding: exactly one of `group`/`principal`, a role, and an
-/// optional quota-entity scope (absent = the whole tree).
+/// optional quota-entity scope (absent = the whole tree), named by
+/// [`QuotaEntityRef`] — an id or a path (ADR 0045).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindingSpec {
@@ -175,7 +185,15 @@ pub struct BindingSpec {
     pub principal: Option<String>,
     pub role: RoleSpec,
     #[serde(default)]
-    pub scope: Option<QuotaEntityId>,
+    pub scope: Option<QuotaEntityRef>,
+}
+
+/// One `[[authorization.binding]]`, parsed but with its `scope` (if any)
+/// still an unresolved [`QuotaEntityRef`].
+struct ParsedBinding {
+    subject: Subject,
+    role: Role,
+    scope: Option<QuotaEntityRef>,
 }
 
 /// The wire spelling of [`coppice_state::authz::Role`].
@@ -198,10 +216,11 @@ impl From<RoleSpec> for Role {
 }
 
 impl BindingSpec {
-    /// The replicated binding, or why this entry cannot be one. Mirrors the
+    /// The parsed binding, or why this entry cannot be one. Mirrors the
     /// API's wire → domain conversion and apply's own subject check so the
     /// document fails here, at the seeding edge, rather than mid-formation.
-    fn binding(&self, index: usize) -> Result<Binding> {
+    /// `scope` is left unresolved (see [`ParsedBinding`]).
+    fn binding(&self, index: usize) -> Result<ParsedBinding> {
         let subject = match (&self.group, &self.principal) {
             (Some(name), None) => Subject::Group(name.clone()),
             (None, Some(sub)) => Subject::Principal(sub.clone()),
@@ -220,10 +239,10 @@ impl BindingSpec {
                 index + 1
             );
         }
-        Ok(Binding {
+        Ok(ParsedBinding {
             subject,
             role: self.role.into(),
-            scope: self.scope,
+            scope: self.scope.clone(),
         })
     }
 }
@@ -477,19 +496,47 @@ impl CostWeightsSpec {
     }
 }
 
-/// One `[[quota_entity]]` entry: a quota leaf jobs charge against.
+/// One `[[quota_entity]]` entry: a quota leaf jobs charge against, named by
+/// its **path** (ADR 0045) — the parent is derived from the path, never
+/// stated separately.
+///
+/// Entries may appear in any document order: [`FormationPolicy::commands`]
+/// processes them in ascending path depth, so a listed parent is always
+/// resolved before its children regardless of where it sits in the file. A
+/// single-segment path is a root. Each entry's parent path (`path.parent()`)
+/// must be declared elsewhere in the same document or already exist in
+/// cluster state — otherwise seeding fails naming both paths, rather than
+/// leaving a half-built tree.
+///
+/// Idempotent re-apply, by path: an entry whose path already resolves in
+/// state is left untouched (reconfiguration is not an amnesty, and a re-run
+/// must not reset accumulated usage). If it also declares an `id` that
+/// differs from the entity actually holding that path, seeding fails naming
+/// the path, the holder, and the declared id — a document that thinks it is
+/// re-seeding an id-known entity but is aimed at the wrong path is a mistake,
+/// not a no-op. An entry whose declared `id` already exists in state under a
+/// *different* path (e.g. it was renamed or moved since a prior seeding run)
+/// is left untouched too, since the entity this document meant to create
+/// already exists. Its stale path does not resolve to anything for the rest
+/// of the document, though: a child entry beneath it, or an
+/// `[[authorization.binding]]` scope naming it, fails seeding with the
+/// entity's current path, rather than silently landing under (or binding to)
+/// wherever the entity lives now.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaEntitySpec {
-    /// The entity id (`quota-<uuid>`).
-    pub id: QuotaEntityId,
-    /// A human label recorded on the entity.
-    pub name: String,
+    /// The entity's path from a root, e.g. `acme/eng/platform`. Every
+    /// segment must meet the name grammar (ADR 0045); the last segment
+    /// becomes the created entity's `name`.
+    pub path: QuotaEntityPath,
     /// The quota stock in µCU (ADR 0019).
     pub quota: u64,
-    /// Optional parent entity for hierarchical accounting.
+    /// The entity id (`quota-<uuid>`) to create it with, when creation is
+    /// needed. Minted with `QuotaEntityId::new()` when absent. An explicit id
+    /// lets other parts of the document, or a later document, reference this
+    /// entity without waiting on path resolution.
     #[serde(default)]
-    pub parent: Option<QuotaEntityId>,
+    pub id: Option<QuotaEntityId>,
 }
 
 impl FormationPolicy {
@@ -528,10 +575,16 @@ impl FormationPolicy {
         if let Some(retention) = &self.retention {
             retention.validate()?;
         }
+        let mut seen_path = std::collections::BTreeSet::new();
         let mut seen_id = std::collections::BTreeSet::new();
         for qe in &self.quota_entities {
-            if !seen_id.insert(qe.id) {
-                bail!("duplicate quota entity {}", qe.id);
+            if !seen_path.insert(&qe.path) {
+                bail!("duplicate quota entity path {}", qe.path);
+            }
+            if let Some(id) = qe.id {
+                if !seen_id.insert(id) {
+                    bail!("duplicate quota entity id {id}");
+                }
             }
         }
         // Labels carry idempotency for token seeding, so they must be present
@@ -603,12 +656,13 @@ impl FormationPolicy {
     /// present — a re-run therefore proposes nothing and has no duplicate
     /// effect.
     ///
-    /// Quota entities are emitted **parent before child** regardless of their
-    /// document order: the state machine rejects a child whose parent does not
-    /// exist yet, so a valid hierarchy listed child-first must not fail midway
-    /// through seeding. A parent that is neither in the document nor already in
-    /// `state`, or a parent cycle within the document, is an error here — at
-    /// the seeding edge — rather than a mid-apply rejection.
+    /// Quota entities are resolved **in ascending path depth** regardless of
+    /// their document order (see [`resolve_entities`](Self::resolve_entities)):
+    /// a listed parent is always resolved before its children. A parent path
+    /// that is neither declared elsewhere in the document nor already in
+    /// `state` is an error here — at the seeding edge — rather than a
+    /// mid-apply rejection. Unlike the old id-parent scheme, a path can never
+    /// cycle: a path's parent is always a strictly shorter string.
     ///
     /// `kdf` is the cost the seeding node hashes `[[enroll_token]]` secrets
     /// at (`[token_kdf]` in its config); only the resulting PHC strings are
@@ -673,16 +727,18 @@ impl FormationPolicy {
             }));
         }
 
-        // Quota entities: create only those not already present, parent before
-        // child. An existing entity is left untouched — reconfiguration is not
-        // an amnesty, and a re-run must not reset accumulated usage.
-        for qe in self.ordered_entities(state)? {
-            if !state.quota_entities.contains_key(&qe.id) {
+        // Quota entities: create only those whose path does not already
+        // resolve, parent before child. An entity already at its path is left
+        // untouched — reconfiguration is not an amnesty, and a re-run must not
+        // reset accumulated usage.
+        let resolved_entities = self.resolve_entities(state)?;
+        for entity in &resolved_entities {
+            if entity.create {
                 commands.push(Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
-                    entity: qe.id,
-                    parent: qe.parent,
-                    name: qe.name.clone(),
-                    quota: CostUnits(qe.quota),
+                    entity: entity.id,
+                    parent: entity.parent,
+                    name: entity.spec.path.leaf().to_string(),
+                    quota: CostUnits(entity.spec.quota),
                     updated_at: now,
                     actor: None,
                 }));
@@ -726,24 +782,66 @@ impl FormationPolicy {
         // is still empty (the booted deny-everyone default). Once anything is
         // bound, the list belongs to `coppice policy authz set`, and a re-init
         // must not revert an operator's edits. A scoped binding may name an
-        // entity seeded above: those commands are ordered first, so the scope
-        // exists by the time this one applies.
+        // entity resolved above (by path or by id): `seeded_by_path` /
+        // `seeded_ids` cover both.
         if let Some(authz) = &self.authorization {
-            let bindings = authz.bindings()?;
+            let parsed = authz.bindings()?;
             // `validate` guaranteed at least one unscoped admin, so the list
             // is never empty here.
             if state.bindings.is_empty() {
-                let seeded: std::collections::BTreeSet<QuotaEntityId> =
-                    self.quota_entities.iter().map(|qe| qe.id).collect();
-                for binding in &bindings {
-                    if let Some(scope) = binding.scope {
-                        if !seeded.contains(&scope) && !state.quota_entities.contains_key(&scope) {
-                            bail!(
-                                "[[authorization.binding]] scope {scope} is neither seeded by this \
-                                 document nor an existing quota entity"
-                            );
+                let seeded_by_path: BTreeMap<&QuotaEntityPath, QuotaEntityId> = resolved_entities
+                    .iter()
+                    .filter(|e| !e.moved)
+                    .map(|e| (&e.spec.path, e.id))
+                    .collect();
+                // A moved entry's path names nothing any more; a scope naming
+                // it is refused below rather than bound to the entity's new
+                // location, which the document author may not intend.
+                let moved_by_path: BTreeMap<&QuotaEntityPath, QuotaEntityId> = resolved_entities
+                    .iter()
+                    .filter(|e| e.moved)
+                    .map(|e| (&e.spec.path, e.id))
+                    .collect();
+                let seeded_ids: BTreeSet<QuotaEntityId> =
+                    resolved_entities.iter().map(|e| e.id).collect();
+                let mut bindings = Vec::with_capacity(parsed.len());
+                for pb in &parsed {
+                    let scope = match &pb.scope {
+                        None => None,
+                        Some(scope_ref) => {
+                            let resolved = match scope_ref {
+                                QuotaEntityRef::Id(id) => (seeded_ids.contains(id)
+                                    || state.quota_entities.contains_key(id))
+                                .then_some(*id),
+                                QuotaEntityRef::Path(path) => {
+                                    if let Some(id) = moved_by_path.get(path) {
+                                        bail!(
+                                            "[[authorization.binding]] scope {path} names a \
+                                             [[quota_entity]] entry whose declared id {id} now \
+                                             lives at {}; update the document to the current path",
+                                            current_path(state, *id)
+                                        );
+                                    }
+                                    seeded_by_path
+                                        .get(path)
+                                        .copied()
+                                        .or_else(|| state.resolve_quota_entity_path(path))
+                                }
+                            };
+                            let Some(resolved) = resolved else {
+                                bail!(
+                                    "[[authorization.binding]] scope {scope_ref} is neither \
+                                     seeded by this document nor an existing quota entity"
+                                );
+                            };
+                            Some(resolved)
                         }
-                    }
+                    };
+                    bindings.push(Binding {
+                        subject: pb.subject.clone(),
+                        role: pb.role,
+                        scope,
+                    });
                 }
                 commands.push(Command::UpdateAuthorization(UpdateAuthorization {
                     bindings,
@@ -757,65 +855,141 @@ impl FormationPolicy {
         Ok(commands)
     }
 
-    /// The document's quota entities in parent-before-child order.
+    /// This document's quota entities resolved against `state`, in ascending
+    /// path depth — a listed parent is always resolved before its children,
+    /// whatever order the document lists them in. A path can never cycle (a
+    /// path's parent is always a strictly shorter string), so unlike an
+    /// id-parent scheme this cannot get stuck.
     ///
-    /// Kahn-style: an entity is ready once its parent is `None`, already in
-    /// `state`, or already emitted. A pass that emits nothing means every
-    /// remaining entity waits on a parent that can never appear — either a
-    /// reference to an entity that exists nowhere, or a cycle within the
-    /// document — and both are reported naming the entities involved.
-    fn ordered_entities(&self, state: &StateMachine) -> Result<Vec<&QuotaEntitySpec>> {
-        let in_doc: std::collections::BTreeSet<_> =
-            self.quota_entities.iter().map(|qe| qe.id).collect();
-        let mut emitted = std::collections::BTreeSet::new();
-        let mut remaining: Vec<&QuotaEntitySpec> = self.quota_entities.iter().collect();
-        let mut ordered = Vec::with_capacity(remaining.len());
+    /// For each entry:
+    /// - if its path already resolves in `state`, it is left untouched
+    ///   (`create: false`) — unless the entry also declares an `id` that
+    ///   disagrees with the entity actually holding that path, which is a
+    ///   document error naming the path, the holder, and the declared id;
+    /// - otherwise, if it declares an `id` that already exists in `state`
+    ///   (renamed or moved since a prior seeding run), it is left untouched
+    ///   too (`moved: true`) — the entity this entry meant to create already
+    ///   exists. Its stale path is *not* recorded as resolving to that id: a
+    ///   later child entry beneath it is a document error naming the
+    ///   entity's current path, rather than being silently created under the
+    ///   entity's new location;
+    /// - otherwise its parent path is resolved (against `state`, or against
+    ///   the id this same run chose for an earlier, shallower entry) and it
+    ///   is created (`create: true`) with the declared id or a freshly minted
+    ///   one.
+    ///
+    /// Every entry's resolved id — created or not — is returned, so a caller
+    /// can resolve a child's parent path or an `[[authorization.binding]]`
+    /// `scope` against exactly what this run seeds.
+    fn resolve_entities(&self, state: &StateMachine) -> Result<Vec<ResolvedEntity<'_>>> {
+        let mut specs: Vec<&QuotaEntitySpec> = self.quota_entities.iter().collect();
+        specs.sort_by_key(|qe| qe.path.depth());
 
-        while !remaining.is_empty() {
-            let emitted_before = ordered.len();
-            let mut stuck = Vec::with_capacity(remaining.len());
-            for qe in remaining {
-                let ready = match qe.parent {
-                    None => true,
-                    Some(parent) => {
-                        emitted.contains(&parent) || state.quota_entities.contains_key(&parent)
-                    }
-                };
-                if ready {
-                    emitted.insert(qe.id);
-                    ordered.push(qe);
-                } else {
-                    stuck.push(qe);
-                }
-            }
+        let mut resolved = Vec::with_capacity(specs.len());
+        let mut chosen: BTreeMap<&QuotaEntityPath, QuotaEntityId> = BTreeMap::new();
+        // Paths of entries whose declared id now lives elsewhere; a child
+        // under one of these must not resolve its parent at all.
+        let mut moved: BTreeMap<&QuotaEntityPath, QuotaEntityId> = BTreeMap::new();
 
-            // A pass that emitted nothing can never make progress: every stuck
-            // entity waits on a parent that will never appear. A parent outside
-            // the document (and absent from state) is a dangling reference;
-            // otherwise the stuck set forms a cycle within the document.
-            if ordered.len() == emitted_before {
-                for qe in &stuck {
-                    let parent = qe.parent.expect("unparented entities are never stuck");
-                    if !in_doc.contains(&parent) {
+        for spec in specs {
+            if let Some(existing) = state.resolve_quota_entity_path(&spec.path) {
+                if let Some(declared) = spec.id {
+                    if declared != existing {
                         bail!(
-                            "quota entity {} references parent {} which is neither in this \
-                             policy document nor already in cluster state",
-                            qe.id,
-                            parent
+                            "quota entity path {} is held by {existing}, but this document \
+                             declares id {declared} for it",
+                            spec.path
                         );
                     }
                 }
-                let ids: Vec<String> = stuck.iter().map(|qe| qe.id.to_string()).collect();
-                bail!(
-                    "quota entity parent cycle in policy document involving: {}",
-                    ids.join(", ")
-                );
+                chosen.insert(&spec.path, existing);
+                resolved.push(ResolvedEntity {
+                    spec,
+                    id: existing,
+                    parent: None,
+                    create: false,
+                    moved: false,
+                });
+                continue;
             }
-            remaining = stuck;
+
+            if let Some(declared) = spec.id {
+                if state.quota_entities.contains_key(&declared) {
+                    moved.insert(&spec.path, declared);
+                    resolved.push(ResolvedEntity {
+                        spec,
+                        id: declared,
+                        parent: None,
+                        create: false,
+                        moved: true,
+                    });
+                    continue;
+                }
+            }
+
+            let parent = match spec.path.parent() {
+                None => None,
+                Some(parent_path) => {
+                    if let Some(parent_id) = moved.get(&parent_path) {
+                        bail!(
+                            "quota entity {} has parent path {parent_path}, but that entry's \
+                             declared id {parent_id} now lives at {}; update the document to \
+                             the entity's current path",
+                            spec.path,
+                            current_path(state, *parent_id)
+                        );
+                    }
+                    let parent_id = state
+                        .resolve_quota_entity_path(&parent_path)
+                        .or_else(|| chosen.get(&parent_path).copied());
+                    let Some(parent_id) = parent_id else {
+                        bail!(
+                            "quota entity {} has parent path {parent_path}, which is neither \
+                             declared in this policy document nor already in cluster state",
+                            spec.path
+                        );
+                    };
+                    Some(parent_id)
+                }
+            };
+            let id = spec.id.unwrap_or_else(QuotaEntityId::new);
+            chosen.insert(&spec.path, id);
+            resolved.push(ResolvedEntity {
+                spec,
+                id,
+                parent,
+                create: true,
+                moved: false,
+            });
         }
 
-        Ok(ordered)
+        Ok(resolved)
     }
+}
+
+/// `id`'s current path in `state`, for error messages about an entry whose
+/// declared id has moved. The id is known to exist, so the fallback is only
+/// defensive.
+fn current_path(state: &StateMachine, id: QuotaEntityId) -> String {
+    state
+        .quota_entity_path(id)
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// One [`QuotaEntitySpec`] resolved against replicated state by
+/// [`FormationPolicy::resolve_entities`]: the id this run assigns to its
+/// path (whether newly minted or already the path's/id's holder), the
+/// resolved parent id, and whether a `ConfigureQuotaEntity` must be proposed
+/// to realize it.
+struct ResolvedEntity<'a> {
+    spec: &'a QuotaEntitySpec,
+    id: QuotaEntityId,
+    parent: Option<QuotaEntityId>,
+    create: bool,
+    /// The entry's declared id exists in state but no longer at the entry's
+    /// path (renamed or moved since a prior seeding). Its path must not
+    /// resolve to anything for a child entry or a binding scope.
+    moved: bool,
 }
 
 /// Propose every command in `commands`, riding out the leaderless window right
@@ -894,8 +1068,7 @@ index = 2
 multiplier = 4.0
 
 [[quota_entity]]
-id = "quota-00000000-0000-0000-0000-000000000001"
-name = "default"
+path = "default"
 quota = 1000000000000
 "#;
 
@@ -950,9 +1123,9 @@ quota = 1000000000000
         let policy = FormationPolicy::parse_toml(SAMPLE.as_bytes()).expect("sample parses");
         assert_eq!(policy.priority_multipliers.len(), 3);
         assert_eq!(policy.quota_entities.len(), 1);
-        assert_eq!(policy.quota_entities[0].name, "default");
+        assert_eq!(policy.quota_entities[0].path.as_str(), "default");
         assert_eq!(policy.quota_entities[0].quota, 1_000_000_000_000);
-        assert!(policy.quota_entities[0].parent.is_none());
+        assert!(policy.quota_entities[0].id.is_none());
     }
 
     /// The `[retention]` table parses as humantime spans and rejects a zero
@@ -1047,7 +1220,7 @@ quota = 1000000000000
 
     #[test]
     fn unknown_key_is_rejected() {
-        let bad = format!("{SAMPLE}\n[[quota_entity]]\nid = \"quota-00000000-0000-0000-0000-000000000002\"\nname = \"x\"\nquota = 1\nbogus = 3\n");
+        let bad = format!("{SAMPLE}\n[[quota_entity]]\npath = \"other\"\nquota = 1\nbogus = 3\n");
         assert!(FormationPolicy::parse_toml(bad.as_bytes()).is_err());
     }
 
@@ -1097,7 +1270,7 @@ quota = 1000000000000
         let now = Timestamp::now();
         let mut state = StateMachine::default();
         state.policy.priority_multipliers = policy.multiplier_table();
-        let id = policy.quota_entities[0].id;
+        let id = QuotaEntityId::new();
         state.quota_entities.insert(
             id,
             coppice_state::QuotaEntity {
@@ -1472,29 +1645,13 @@ ttl = "15m"
         assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
-    // ---- entity ordering (parent before child) ---------------------------
+    // ---- entity ordering and resolution (ADR 0045 paths) ------------------
 
-    const PARENT: &str = "quota-00000000-0000-0000-0000-00000000000a";
-    const CHILD: &str = "quota-00000000-0000-0000-0000-00000000000b";
-    const GRANDCHILD: &str = "quota-00000000-0000-0000-0000-00000000000c";
-
-    fn entity_toml(id: &str, parent: Option<&str>) -> String {
-        let parent_line = parent
-            .map(|p| format!("parent = \"{p}\"\n"))
-            .unwrap_or_default();
-        format!("[[quota_entity]]\nid = \"{id}\"\nname = \"x\"\nquota = 1\n{parent_line}\n")
-    }
-
-    /// The quota-entity id each `ConfigureQuotaEntity` command creates, in
-    /// emission order.
-    fn configured_ids(commands: &[Command]) -> Vec<QuotaEntityId> {
-        commands
-            .iter()
-            .map(|c| match c {
-                Command::ConfigureQuotaEntity(cfg) => cfg.entity,
-                other => panic!("expected ConfigureQuotaEntity, got {other:?}"),
-            })
-            .collect()
+    /// One `[[quota_entity]]` entry, at `path`, optionally with an explicit
+    /// `id`.
+    fn entity_toml(path: &str, id: Option<QuotaEntityId>) -> String {
+        let id_line = id.map(|id| format!("id = \"{id}\"\n")).unwrap_or_default();
+        format!("[[quota_entity]]\npath = \"{path}\"\nquota = 1\n{id_line}\n")
     }
 
     #[test]
@@ -1502,39 +1659,98 @@ ttl = "15m"
         // Grandchild, child, parent — reverse hierarchy order in the document.
         let toml = format!(
             "{}{}{}",
-            entity_toml(GRANDCHILD, Some(CHILD)),
-            entity_toml(CHILD, Some(PARENT)),
-            entity_toml(PARENT, None),
+            entity_toml("a/b/c", None),
+            entity_toml("a/b", None),
+            entity_toml("a", None),
         );
         let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
         let state = StateMachine::default();
         let commands = policy
             .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect("valid hierarchy");
+        // The state resolved after each command, so children are emitted
+        // exactly once their parent is present — regardless of document order.
+        assert_eq!(commands.len(), 3);
+        let mut applied = state.clone();
+        for command in &commands {
+            let Command::ConfigureQuotaEntity(cfg) = command else {
+                panic!("expected ConfigureQuotaEntity, got {command:?}")
+            };
+            if let Some(parent) = cfg.parent {
+                assert!(
+                    applied.quota_entities.contains_key(&parent),
+                    "parent must already exist when its child is proposed"
+                );
+            }
+            applied.quota_entities.insert(
+                cfg.entity,
+                coppice_state::QuotaEntity {
+                    parent: cfg.parent,
+                    name: cfg.name.clone(),
+                    quota: cfg.quota,
+                    usage: coppice_core::quota::UsageState::new(Timestamp::now()),
+                    created_at: Timestamp::now(),
+                    updated_at: Timestamp::now(),
+                },
+            );
+        }
         assert_eq!(
-            configured_ids(&commands),
-            vec![
-                PARENT.parse().unwrap(),
-                CHILD.parse().unwrap(),
-                GRANDCHILD.parse().unwrap(),
-            ],
-            "commands must run parent before child regardless of document order"
+            applied.quota_entity_path(commands_leaf_id(&commands, "c")),
+            Some("a/b/c".to_string())
         );
+    }
+
+    /// The id a `ConfigureQuotaEntity` command created whose `name` is `leaf`.
+    fn commands_leaf_id(commands: &[Command], leaf: &str) -> QuotaEntityId {
+        commands
+            .iter()
+            .find_map(|c| match c {
+                Command::ConfigureQuotaEntity(cfg) if cfg.name == leaf => Some(cfg.entity),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no ConfigureQuotaEntity named {leaf:?}"))
+    }
+
+    #[test]
+    fn entities_may_be_listed_in_any_order() {
+        // Every permutation of parent-before/after-child must resolve to the
+        // same tree.
+        for toml in [
+            format!(
+                "{}{}{}",
+                entity_toml("a", None),
+                entity_toml("a/b", None),
+                entity_toml("a/b/c", None),
+            ),
+            format!(
+                "{}{}{}",
+                entity_toml("a/b", None),
+                entity_toml("a/b/c", None),
+                entity_toml("a", None),
+            ),
+        ] {
+            let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+            let commands = policy
+                .commands(&StateMachine::default(), Timestamp::now(), CHEAP_KDF)
+                .expect("valid hierarchy, whatever the document order");
+            assert_eq!(commands.len(), 3);
+        }
     }
 
     #[test]
     fn child_of_a_parent_already_in_state_needs_no_document_parent() {
         // The parent exists only in replicated state (e.g. operator-created or
         // a prior seeding run); the document lists just the child.
-        let toml = entity_toml(CHILD, Some(PARENT));
+        let toml = entity_toml("a/b", None);
         let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
         let now = Timestamp::now();
         let mut state = StateMachine::default();
+        let parent_id = QuotaEntityId::new();
         state.quota_entities.insert(
-            PARENT.parse().unwrap(),
+            parent_id,
             coppice_state::QuotaEntity {
                 parent: None,
-                name: "parent".to_string(),
+                name: "a".to_string(),
                 quota: CostUnits(1),
                 usage: coppice_core::quota::UsageState::new(now),
                 created_at: now,
@@ -1544,50 +1760,196 @@ ttl = "15m"
         let commands = policy
             .commands(&state, now, CHEAP_KDF)
             .expect("parent found in state");
-        assert_eq!(configured_ids(&commands), vec![CHILD.parse().unwrap()]);
+        assert_eq!(commands.len(), 1);
+        let Command::ConfigureQuotaEntity(cfg) = &commands[0] else {
+            panic!("expected ConfigureQuotaEntity");
+        };
+        assert_eq!(cfg.parent, Some(parent_id));
+        assert_eq!(cfg.name, "b");
     }
 
     #[test]
     fn missing_parent_is_rejected_before_any_command_is_emitted() {
-        let toml = entity_toml(CHILD, Some(PARENT)); // PARENT nowhere
+        let toml = entity_toml("a/b", None); // "a" nowhere
         let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
         let state = StateMachine::default();
         let err = policy
             .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect_err("dangling parent must be rejected");
         let message = format!("{err:#}");
-        assert!(message.contains(CHILD), "{message}");
-        assert!(message.contains(PARENT), "{message}");
+        assert!(message.contains("a/b"), "{message}");
+        assert!(message.contains("parent path a"), "{message}");
         assert!(
-            message.contains("neither in this policy document nor already in cluster state"),
+            message
+                .contains("neither declared in this policy document nor already in cluster state"),
             "{message}"
         );
     }
 
     #[test]
-    fn parent_cycle_is_rejected() {
-        let toml = format!(
-            "{}{}",
-            entity_toml(PARENT, Some(CHILD)),
-            entity_toml(CHILD, Some(PARENT)),
+    fn duplicate_path_is_rejected() {
+        let toml = format!("{}{}", entity_toml("a", None), entity_toml("a", None));
+        let err = FormationPolicy::parse_toml(toml.as_bytes()).expect_err("duplicate path");
+        assert!(
+            format!("{err:#}").contains("duplicate quota entity path"),
+            "{err:#}"
         );
-        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
-        let state = StateMachine::default();
-        let err = policy
-            .commands(&state, Timestamp::now(), CHEAP_KDF)
-            .expect_err("parent cycle must be rejected");
-        assert!(format!("{err:#}").contains("cycle"), "{err:#}");
     }
 
     #[test]
-    fn self_parent_is_rejected_as_a_cycle() {
-        let toml = entity_toml(PARENT, Some(PARENT));
+    fn bad_segment_in_a_path_is_rejected_at_parse() {
+        let toml = entity_toml("acme/-eng", None);
+        let err = FormationPolicy::parse_toml(toml.as_bytes()).expect_err("bad segment");
+        assert!(format!("{err:#}").contains("acme/-eng"), "{err:#}");
+    }
+
+    #[test]
+    fn reapply_against_state_is_idempotent_even_with_minted_ids() {
+        // No explicit id: the first apply mints one. A second apply against
+        // the resulting state must find the path already resolved and emit
+        // nothing, without ever needing to know the minted id.
+        let toml = format!("{}{}", entity_toml("a", None), entity_toml("a/b", None));
         let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
-        let state = StateMachine::default();
+        let now = Timestamp::now();
+        let mut state = StateMachine::default();
+        for command in policy
+            .commands(&state, now, CHEAP_KDF)
+            .expect("first apply")
+        {
+            let Command::ConfigureQuotaEntity(cfg) = command else {
+                panic!("expected ConfigureQuotaEntity")
+            };
+            state.quota_entities.insert(
+                cfg.entity,
+                coppice_state::QuotaEntity {
+                    parent: cfg.parent,
+                    name: cfg.name,
+                    quota: cfg.quota,
+                    usage: coppice_core::quota::UsageState::new(now),
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+        assert!(policy
+            .commands(&state, now, CHEAP_KDF)
+            .expect("second apply")
+            .is_empty());
+    }
+
+    #[test]
+    fn declared_id_disagreeing_with_the_paths_holder_is_rejected() {
+        let holder = QuotaEntityId::new();
+        let declared = QuotaEntityId::new();
+        let now = Timestamp::now();
+        let mut state = StateMachine::default();
+        state.quota_entities.insert(
+            holder,
+            coppice_state::QuotaEntity {
+                parent: None,
+                name: "a".to_string(),
+                quota: CostUnits(1),
+                usage: coppice_core::quota::UsageState::new(now),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        let toml = entity_toml("a", Some(declared));
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+        let err = policy
+            .commands(&state, now, CHEAP_KDF)
+            .expect_err("mismatched declared id is rejected");
+        let message = format!("{err:#}");
+        assert!(message.contains("a"), "{message}");
+        assert!(message.contains(&holder.to_string()), "{message}");
+        assert!(message.contains(&declared.to_string()), "{message}");
+    }
+
+    #[test]
+    fn declared_id_already_existing_elsewhere_is_left_untouched() {
+        // The entity was renamed/moved since a prior seeding run: its id
+        // exists, but no longer at this document's path.
+        let id = QuotaEntityId::new();
+        let now = Timestamp::now();
+        let mut state = StateMachine::default();
+        state.quota_entities.insert(
+            id,
+            coppice_state::QuotaEntity {
+                parent: None,
+                name: "renamed".to_string(),
+                quota: CostUnits(1),
+                usage: coppice_core::quota::UsageState::new(now),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        let toml = entity_toml("a", Some(id));
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+        assert!(policy
+            .commands(&state, now, CHEAP_KDF)
+            .expect("left untouched, not an error")
+            .is_empty());
+    }
+
+    /// State with `other` (a root) and the declared entity moved beneath it
+    /// as `other/acme`, as if an operator reparented it after a first seeding
+    /// run of a document that still names it `acme`.
+    fn state_with_moved_entity(moved: QuotaEntityId) -> StateMachine {
+        let now = Timestamp::now();
+        let other = QuotaEntityId::new();
+        let mut state = StateMachine::default();
+        for (id, parent, name) in [(other, None, "other"), (moved, Some(other), "acme")] {
+            state.quota_entities.insert(
+                id,
+                coppice_state::QuotaEntity {
+                    parent,
+                    name: name.to_string(),
+                    quota: CostUnits(1),
+                    usage: coppice_core::quota::UsageState::new(now),
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn child_of_a_moved_entry_is_rejected_not_created_at_the_new_location() {
+        let moved = QuotaEntityId::new();
+        let state = state_with_moved_entity(moved);
+        let toml = format!(
+            "{}{}",
+            entity_toml("acme", Some(moved)),
+            entity_toml("acme/child", None)
+        );
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
         let err = policy
             .commands(&state, Timestamp::now(), CHEAP_KDF)
-            .expect_err("self-parent must be rejected");
-        assert!(format!("{err:#}").contains("cycle"), "{err:#}");
+            .expect_err("a child beneath a moved entry must not be created");
+        let message = format!("{err:#}");
+        assert!(message.contains("acme/child"), "{message}");
+        assert!(message.contains(&moved.to_string()), "{message}");
+        assert!(message.contains("now lives at other/acme"), "{message}");
+    }
+
+    #[test]
+    fn binding_scope_naming_a_moved_entrys_path_is_rejected() {
+        let moved = QuotaEntityId::new();
+        let state = state_with_moved_entity(moved);
+        let toml = format!(
+            "{}[authorization]\n\
+             [[authorization.binding]]\ngroup = \"admins\"\nrole = \"admin\"\n\
+             [[authorization.binding]]\ngroup = \"team\"\nrole = \"submitter\"\nscope = \"acme\"\n",
+            entity_toml("acme", Some(moved)),
+        );
+        let policy = FormationPolicy::parse_toml(toml.as_bytes()).expect("parses");
+        let err = policy
+            .commands(&state, Timestamp::now(), CHEAP_KDF)
+            .expect_err("a scope naming a stale path must not bind the moved entity");
+        let message = format!("{err:#}");
+        assert!(message.contains("scope acme"), "{message}");
+        assert!(message.contains("now lives at other/acme"), "{message}");
     }
 
     /// Formation seeding proposes **actorless** commands, and must keep
@@ -1621,8 +1983,7 @@ ttl = "15m"
 
     const AUTHZ_SAMPLE: &str = r#"
 [[quota_entity]]
-id = "quota-00000000-0000-0000-0000-000000000001"
-name = "default"
+path = "default"
 quota = 1000000000000
 
 [authorization]
@@ -1635,7 +1996,7 @@ role = "admin"
 [[authorization.binding]]
 principal = "user-42"
 role = "submitter"
-scope = "quota-00000000-0000-0000-0000-000000000001"
+scope = "default"
 "#;
 
     #[test]
@@ -1647,7 +2008,10 @@ scope = "quota-00000000-0000-0000-0000-000000000001"
         // The entity first (the scoped binding needs it to exist), then one
         // full-replacement UpdateAuthorization.
         assert_eq!(commands.len(), 2);
-        assert!(matches!(commands[0], Command::ConfigureQuotaEntity(_)));
+        let Command::ConfigureQuotaEntity(cfg) = &commands[0] else {
+            panic!("expected ConfigureQuotaEntity, got {:?}", commands[0]);
+        };
+        let entity_id = cfg.entity;
         let Command::UpdateAuthorization(update) = &commands[1] else {
             panic!("expected UpdateAuthorization, got {:?}", commands[1]);
         };
@@ -1665,7 +2029,33 @@ scope = "quota-00000000-0000-0000-0000-000000000001"
             Subject::Principal("user-42".to_string())
         );
         assert_eq!(update.bindings[1].role, Role::Submitter);
-        assert_eq!(update.bindings[1].scope, Some(policy.quota_entities[0].id));
+        // The path-scoped binding resolved to the id this same run just
+        // minted for it, before that id existed anywhere but this document.
+        assert_eq!(update.bindings[1].scope, Some(entity_id));
+    }
+
+    #[test]
+    fn authorization_scope_by_id_resolves_against_the_seeded_entity() {
+        // A scope may also be given as an id (ADR 0045 accepts either) —
+        // here, the explicit id this document declares for the entity.
+        let explicit_id = QuotaEntityId::new();
+        let doc = format!(
+            "[[quota_entity]]\npath = \"default\"\nquota = 1\nid = \"{explicit_id}\"\n\n\
+             [authorization]\n[[authorization.binding]]\ngroup = \"admins\"\nrole = \"admin\"\n\
+             [[authorization.binding]]\ngroup = \"team\"\nrole = \"submitter\"\nscope = \"{explicit_id}\"\n"
+        );
+        let policy = FormationPolicy::parse_toml(doc.as_bytes()).expect("parses");
+        let commands = policy
+            .commands(&StateMachine::default(), Timestamp::now(), CHEAP_KDF)
+            .expect("valid policy");
+        let Command::UpdateAuthorization(update) = commands
+            .iter()
+            .find(|c| matches!(c, Command::UpdateAuthorization(_)))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(update.bindings[1].scope, Some(explicit_id));
     }
 
     #[test]
@@ -1674,7 +2064,7 @@ scope = "quota-00000000-0000-0000-0000-000000000001"
         let now = Timestamp::now();
         let mut state = StateMachine::default();
         state.quota_entities.insert(
-            policy.quota_entities[0].id,
+            QuotaEntityId::new(),
             coppice_state::QuotaEntity {
                 parent: None,
                 name: "default".to_string(),
@@ -1778,5 +2168,31 @@ scope = "quota-00000000-0000-0000-0000-0000000000ee"
             format!("{err:#}").contains("neither seeded by this document nor an existing"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn authorization_scope_by_unknown_path_is_refused() {
+        let policy = FormationPolicy::parse_toml(
+            br#"
+[authorization]
+[[authorization.binding]]
+group = "admins"
+role = "admin"
+[[authorization.binding]]
+group = "team"
+role = "submitter"
+scope = "acme/eng"
+"# as &[u8],
+        )
+        .unwrap();
+        let err = policy
+            .commands(&StateMachine::default(), Timestamp::now(), CHEAP_KDF)
+            .expect_err("a path naming nothing is refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("neither seeded by this document nor an existing"),
+            "{message}"
+        );
+        assert!(message.contains("acme/eng"), "{message}");
     }
 }

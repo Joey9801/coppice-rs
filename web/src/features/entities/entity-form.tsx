@@ -1,18 +1,12 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import type { ConfigureQuotaEntityInput, QuotaEntityNode } from '@/api/types'
 import { useConfigureQuotaEntity } from '@/api/queries'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
+import { entitySegmentError, joinEntityPath } from '@/lib/quota-entity'
 import { cn } from '@/lib/utils'
-import {
-  buildEntityTree,
-  costUnitsToUcu,
-  descendantIds,
-  flattenTree,
-  lastSegment,
-  ucuToCostUnits,
-} from './lib'
+import { buildEntityTree, costUnitsToUcu, descendantIds, flattenTree, ucuToCostUnits } from './lib'
 
 type EntityFormProps = {
   /** Every entity, used to populate the parent picker. */
@@ -40,6 +34,8 @@ function errorMessage(error: unknown): string {
 export function EntityForm(props: EntityFormProps) {
   const { allEntities, onDone } = props
   const mutation = useConfigureQuotaEntity()
+  // Two forms can share a page (add-child and configure), so ids are per-form.
+  const uid = useId()
 
   const isEdit = props.mode === 'edit'
   const entity = props.mode === 'edit' ? props.entity : null
@@ -53,6 +49,14 @@ export function EntityForm(props: EntityFormProps) {
   const [parentId, setParentId] = useState<string | null>(
     props.mode === 'create' ? (fixedParent?.id ?? null) : (entity?.parent ?? null),
   )
+  // The parent id sent is the chosen/fixed id itself, never re-derived from the
+  // (possibly still loading) entity list — that must not silently reparent
+  // to the root.
+  const effectiveParentId = parentLocked
+    ? props.mode === 'create'
+      ? (fixedParent?.id ?? null)
+      : (entity?.parent ?? null)
+    : parentId
   const byId = new Map(allEntities.map((n) => [n.id, n]))
   const effectiveParent = parentLocked
     ? props.mode === 'create'
@@ -64,11 +68,9 @@ export function EntityForm(props: EntityFormProps) {
       ? (byId.get(parentId) ?? null)
       : null
 
-  // Create-under-a-parent types just the leaf segment (parent path is a fixed
-  // prefix); root create and edit type the full slash path.
-  const usesSegment = props.mode === 'create' && effectiveParent !== null
-  const [segment, setSegment] = useState('')
-  const [fullName, setFullName] = useState(entity?.name ?? '')
+  // Every mode types one segment (ADR 0045): the path is derived from the
+  // parent chain, never typed. An SSO identity's name is fixed.
+  const [segment, setSegment] = useState(entity?.name ?? '')
 
   const [quotaInput, setQuotaInput] = useState(
     entity ? String(ucuToCostUnits(entity.quotaUcu)) : '',
@@ -77,24 +79,37 @@ export function EntityForm(props: EntityFormProps) {
   const parentOptions = flattenTree(buildEntityTree(allEntities))
   const excluded = entity ? descendantIds(allEntities, entity.id) : new Set<string>()
 
-  const composedName = isSso
-    ? (entity?.name ?? '')
-    : usesSegment
-      ? `${effectiveParent?.name ?? ''}/${segment.trim()}`
-      : fullName.trim()
+  const name = isSso ? (entity?.name ?? '') : segment
+  const parentPath = effectiveParent?.path ?? null
+  const previewPath = joinEntityPath(parentPath, name)
+
+  // The server's own checks, mirrored so a bad name never round-trips: the
+  // segment grammar, then sibling uniqueness under the chosen parent.
+  const grammarError = isSso ? null : entitySegmentError(name)
+  const clash = isSso
+    ? undefined
+    : allEntities.find(
+        (n) => n.parent === effectiveParentId && n.name === name && n.id !== entity?.id,
+      )
+  const nameError =
+    grammarError ??
+    (clash
+      ? `${parentPath ? `"${parentPath}"` : 'The root level'} already has an entity named "${name}".`
+      : null)
+  // Don't shout "Name is required." at an untouched create form.
+  const showNameError = nameError !== null && name !== ''
 
   const quotaCu = Number(quotaInput)
   const quotaValid = quotaInput.trim() !== '' && Number.isFinite(quotaCu) && quotaCu >= 0
-  const nameValid = usesSegment ? segment.trim() !== '' : composedName !== ''
-  const canSubmit = nameValid && quotaValid && !mutation.isPending
+  const canSubmit = nameError === null && quotaValid && !mutation.isPending
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault()
     if (!canSubmit) return
     const input: ConfigureQuotaEntityInput = {
       entity: entity?.id ?? null,
-      parent: isSso ? (entity?.parent ?? null) : effectiveParent ? effectiveParent.id : null,
-      name: composedName,
+      parent: isSso ? (entity?.parent ?? null) : effectiveParentId,
+      name,
       quotaUcu: costUnitsToUcu(quotaCu),
     }
     mutation.mutate(input, { onSuccess: () => onDone() })
@@ -114,53 +129,68 @@ export function EntityForm(props: EntityFormProps) {
       ) : null}
 
       <div className="space-y-1.5">
-        <label className="block text-sm font-medium text-foreground" htmlFor="entity-name">
+        <label className="block text-sm font-medium text-foreground" htmlFor={`${uid}-name`}>
           Name
         </label>
         {isSso ? (
           <p className="font-mono text-sm text-muted-foreground">{entity?.name}</p>
-        ) : usesSegment ? (
-          <div className="flex items-center rounded-md border border-input bg-transparent pl-3 shadow-sm focus-within:ring-2 focus-within:ring-ring">
-            <span className="whitespace-nowrap font-mono text-sm text-muted-foreground">
-              {effectiveParent?.name}/
-            </span>
+        ) : (
+          <div
+            className={cn(
+              'flex items-center rounded-md border border-input bg-transparent pl-3 shadow-sm focus-within:ring-2 focus-within:ring-ring',
+              showNameError && 'border-destructive',
+            )}
+          >
+            {parentPath ? (
+              <span className="max-w-[60%] shrink-0 truncate whitespace-nowrap font-mono text-sm text-muted-foreground">
+                {parentPath}/
+              </span>
+            ) : null}
             <input
-              id="entity-name"
-              className="h-9 w-full bg-transparent pr-3 text-sm focus-visible:outline-none"
+              id={`${uid}-name`}
+              className="h-9 w-full bg-transparent pr-3 font-mono text-sm focus-visible:outline-none"
               placeholder="segment"
+              autoComplete="off"
+              spellCheck={false}
+              aria-invalid={showNameError}
+              aria-describedby={`${uid}-name-help`}
               value={segment}
               onChange={(e) => setSegment(e.target.value)}
             />
           </div>
-        ) : (
-          <Input
-            id="entity-name"
-            placeholder="Acme/Eng/Platform"
-            value={fullName}
-            onChange={(e) => setFullName(e.target.value)}
-          />
         )}
-        {!isSso && !usesSegment ? (
-          <p className="text-xs text-muted-foreground">
-            Full slash-separated path, e.g. <span className="font-mono">Acme/Eng/Platform</span>.
+        <div id={`${uid}-name-help`} className="space-y-0.5 text-xs">
+          {showNameError ? <p className="text-destructive">{nameError}</p> : null}
+          <p className="text-muted-foreground">
+            Full path:{' '}
+            <span className="font-mono text-foreground" data-testid="entity-path-preview">
+              {name ? previewPath : parentPath ? `${parentPath}/…` : '…'}
+            </span>
           </p>
-        ) : null}
+          {!isSso ? (
+            <p className="text-muted-foreground">
+              One segment: letters, digits, <span className="font-mono">.</span>{' '}
+              <span className="font-mono">_</span> <span className="font-mono">-</span>, starting
+              with a letter or digit, at most 63 characters.
+            </p>
+          ) : null}
+        </div>
       </div>
 
       {parentLocked ? (
         <div className="space-y-1.5">
           <span className="block text-sm font-medium text-foreground">Parent</span>
           <p className="font-mono text-sm text-muted-foreground">
-            {effectiveParent ? effectiveParent.name : '(root)'}
+            {effectiveParent ? effectiveParent.path : '(root)'}
           </p>
         </div>
       ) : (
         <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-foreground" htmlFor="entity-parent">
+          <label className="block text-sm font-medium text-foreground" htmlFor={`${uid}-parent`}>
             Parent
           </label>
           <Select
-            id="entity-parent"
+            id={`${uid}-parent`}
             className="w-full"
             value={parentId ?? ''}
             onChange={(e) => setParentId(e.target.value || null)}
@@ -170,8 +200,7 @@ export function EntityForm(props: EntityFormProps) {
               .filter((o) => !excluded.has(o.node.id))
               .map((o) => (
                 <option key={o.node.id} value={o.node.id}>
-                  {'— '.repeat(o.depth)}
-                  {lastSegment(o.node.name)}
+                  {o.node.path}
                 </option>
               ))}
           </Select>
@@ -179,11 +208,11 @@ export function EntityForm(props: EntityFormProps) {
       )}
 
       <div className="space-y-1.5">
-        <label className="block text-sm font-medium text-foreground" htmlFor="entity-quota">
+        <label className="block text-sm font-medium text-foreground" htmlFor={`${uid}-quota`}>
           Quota (CU)
         </label>
         <Input
-          id="entity-quota"
+          id={`${uid}-quota`}
           type="number"
           min={0}
           step="any"

@@ -383,7 +383,7 @@ mod tests {
     fn subtree_selector(entity: coppice_core::id::QuotaEntityId) -> Arc<JobSelector> {
         Arc::new(
             JobSelector::compile(&dto::JobFilter::Entity(dto::EntityFilter {
-                id: entity,
+                entity: entity.into(),
                 scope: dto::EntityScope::Subtree,
             }))
             .expect("allowed leaf"),

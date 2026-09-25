@@ -8,18 +8,6 @@ export function isNotFound(error: unknown): boolean {
   )
 }
 
-/** Last segment of a slash path ("Acme/Eng/Platform" → "Platform"). */
-export function lastSegment(name: string): string {
-  const i = name.lastIndexOf('/')
-  return i < 0 ? name : name.slice(i + 1)
-}
-
-/** The path up to and including the trailing slash ("Acme/Eng/" for "Acme/Eng/Platform"). */
-export function parentPrefix(name: string): string {
-  const i = name.lastIndexOf('/')
-  return i < 0 ? '' : name.slice(0, i + 1)
-}
-
 /** The reserved auto-populated user tree root (`users`, ADR 0022). */
 export function isUsersRoot(node: QuotaEntityNode): boolean {
   return node.parent === null && node.name === 'users'
@@ -77,8 +65,10 @@ export function flattenTree(tree: EntityTreeNode[]): EntityTreeNode[] {
 }
 
 /**
- * Ids that stay visible under a name/principal filter: every matching node
- * plus all of its ancestors, so the path to each match is preserved.
+ * Ids that stay visible under a filter: every node whose path, principal or
+ * id contains the query (case-insensitively), plus all of its ancestors, so
+ * the route to each match is preserved. Matching the path (not just the
+ * segment) lets `research/tr` narrow to one branch.
  */
 export function matchingIds(nodes: QuotaEntityNode[], query: string): Set<string> {
   const q = query.trim().toLowerCase()
@@ -86,7 +76,9 @@ export function matchingIds(nodes: QuotaEntityNode[], query: string): Set<string
   const visible = new Set<string>()
   for (const node of nodes) {
     const hit =
-      node.name.toLowerCase().includes(q) || (node.principal?.toLowerCase().includes(q) ?? false)
+      node.path.toLowerCase().includes(q) ||
+      node.id.toLowerCase().includes(q) ||
+      (node.principal?.toLowerCase().includes(q) ?? false)
     if (!hit) continue
     let cur: QuotaEntityNode | undefined = node
     while (cur && !visible.has(cur.id)) {

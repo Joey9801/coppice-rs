@@ -6,6 +6,14 @@ export { PageHeader, type PageHeaderProps } from './page-header'
 export { StatTile, type StatTileProps } from './stat-tile'
 export { StatePill, outcomePill, type StatePillProps, type PillState } from './state-pill'
 export { IdLink, type IdLinkProps } from './id-link'
+export {
+  EntityBreadcrumb,
+  EntityLabel,
+  EntitySegment,
+  type EntityBreadcrumbProps,
+  type EntityLabelProps,
+  type EntitySegmentProps,
+} from './entity-label'
 export { CopyButton, type CopyButtonProps } from './copy-button'
 export { TimeAgo, type TimeAgoProps } from './time-ago'
 export {

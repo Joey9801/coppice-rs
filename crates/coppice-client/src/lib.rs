@@ -259,6 +259,7 @@
 
 mod client;
 mod credential;
+mod entity_ref;
 mod env;
 mod error;
 pub mod events;
@@ -277,6 +278,10 @@ pub use client::{
     DEFAULT_RATE_LIMIT_RPS, DEFAULT_TIMEOUT, LAST_EVENT_ID_HEADER, LEADER_HEADER, STREAM_TIMEOUT,
 };
 pub use credential::{BearerToken, BoxError, TokenProvider};
+pub use entity_ref::{
+    validate_segment, InvalidSegment, ParsePathError, QuotaEntityPath, QuotaEntityRef,
+    MAX_SEGMENT_LEN, PATH_SEPARATOR,
+};
 pub use env::{
     EnvError, JobEnv, MAX_ENV_NAME_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, MAX_ENV_VARS,
 };

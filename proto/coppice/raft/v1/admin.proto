@@ -466,6 +466,10 @@ message ForwardWriteOutcome {
     // The node a drain or undrain named does not exist at the command's log
     // position. A 404 on the ADR 0041 node-write routes only.
     REJECTION_KIND_UNKNOWN_NODE = 5;
+    // A quota entity name outside the ADR 0045 segment grammar: 400
+    // everywhere. The HTTP edge pre-checks the grammar, so this reaches a
+    // client only if that check was skipped.
+    REJECTION_KIND_INVALID_QUOTA_ENTITY_NAME = 6;
   }
   // The receiver is not the leader (the forwarder's view was stale, or
   // leadership moved under it). It never forwards again — the originating
