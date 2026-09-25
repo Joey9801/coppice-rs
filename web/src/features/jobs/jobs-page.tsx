@@ -1,10 +1,19 @@
-import { useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useId, useState } from 'react'
 import { getRouteApi } from '@tanstack/react-router'
 import { ListTodo, Search, X } from 'lucide-react'
 import { derivePhase, JOB_PHASES, type JobPhase, type JobSummary } from '@/api/types'
-import { useJobs } from '@/api/queries'
+import { useJobs, useQuotaEntities } from '@/api/queries'
 import { formatPercent, formatUcu, shortId } from '@/lib/format'
-import { EmptyState, IdLink, outcomePill, PageHeader, StatePill, TimeAgo } from '@/components'
+import { isQuotaEntityId } from '@/lib/quota-entity'
+import {
+  EmptyState,
+  EntityLabel,
+  IdLink,
+  outcomePill,
+  PageHeader,
+  StatePill,
+  TimeAgo,
+} from '@/components'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -161,6 +170,12 @@ function FilterBar() {
         />
       </div>
 
+      <EntityFilterInput
+        onCommit={(ref) =>
+          void navigate({ search: (prev) => ({ ...prev, entity: ref || undefined }) })
+        }
+      />
+
       <div className="flex items-center gap-2">
         <Input
           className="w-40"
@@ -181,7 +196,7 @@ function FilterBar() {
       {search.entity ? (
         <FilterChip
           label="entity"
-          value={search.entity}
+          value={<EntityRefValue entityRef={search.entity} />}
           onClear={() => void navigate({ search: (prev) => ({ ...prev, entity: undefined }) })}
         />
       ) : null}
@@ -196,19 +211,85 @@ function FilterBar() {
   )
 }
 
+/**
+ * Pick an entity by path (ADR 0045): the datalist offers every known path,
+ * and picking one commits it straight away; Enter commits whatever was
+ * typed, so a path the list does not know yet still reaches the server —
+ * which rejects an unresolvable one rather than returning an empty list.
+ */
+function EntityFilterInput({ onCommit }: { onCommit: (ref: string) => void }) {
+  const { data: entities } = useQuotaEntities()
+  const listId = useId()
+  const [value, setValue] = useState('')
+  const paths = new Set((entities ?? []).map((e) => e.path))
+
+  const commit = (ref: string) => {
+    onCommit(ref.trim())
+    setValue('')
+  }
+
+  return (
+    <>
+      <Input
+        className="w-56"
+        aria-label="Filter by entity path"
+        placeholder="entity path…"
+        list={listId}
+        autoComplete="off"
+        spellCheck={false}
+        value={value}
+        onChange={(e) => {
+          const next = e.target.value
+          // Only a datalist pick commits on change: typing `acme` on the way
+          // to `acme/eng` must not fire early. A pick arrives as a
+          // replacement (Chromium) or as a plain, non-InputEvent change.
+          const inputType = (e.nativeEvent as Partial<InputEvent>).inputType
+          const picked = inputType === undefined || inputType === 'insertReplacementText'
+          if (picked && paths.has(next)) commit(next)
+          else setValue(next)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && value.trim()) {
+            e.preventDefault()
+            commit(value)
+          }
+        }}
+      />
+      <datalist id={listId}>
+        {[...paths].sort().map((p) => (
+          <option key={p} value={p} />
+        ))}
+      </datalist>
+    </>
+  )
+}
+
+/**
+ * The entity filter's value as a path: the URL may hold an id (links from an
+ * entity page) or a path (picked here); either resolves against the entity
+ * list for display. An unknown ref shows as typed.
+ */
+function EntityRefValue({ entityRef }: { entityRef: string }) {
+  const { data: entities } = useQuotaEntities()
+  const byId = isQuotaEntityId(entityRef)
+  const entity = entities?.find((e) => (byId ? e.id === entityRef : e.path === entityRef))
+  if (!entity) return <span className="font-mono">{entityRef}</span>
+  return <EntityLabel id={entity.id} path={entity.path} />
+}
+
 function FilterChip({
   label,
   value,
   onClear,
 }: {
   label: string
-  value: string
+  value: ReactNode
   onClear: () => void
 }) {
   return (
     <Badge variant="secondary" className="gap-1 py-1 pl-2 pr-1 font-normal">
       <span className="text-muted-foreground">{label}:</span>
-      <span className="font-mono">{value}</span>
+      {typeof value === 'string' ? <span className="font-mono">{value}</span> : value}
       <button
         type="button"
         aria-label={`Clear ${label} filter`}
@@ -263,7 +344,9 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
                   {job.image}
                 </span>
               </TableCell>
-              <TableCell className="whitespace-nowrap">{job.quotaEntityName}</TableCell>
+              <TableCell onClick={(e) => e.stopPropagation()} className="max-w-[16rem]">
+                <EntityLabel id={job.quotaEntity} path={job.quotaEntityPath} />
+              </TableCell>
               <TableCell className="text-right tabular-nums">{job.priority}</TableCell>
               <TableCell className="whitespace-nowrap text-muted-foreground">
                 <TimeAgo t={job.submittedAt} />

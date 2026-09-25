@@ -3,7 +3,7 @@ import type { JobFilter, ListJobsRequest, Resources } from '../types'
 import { isTerminalJobState, jobAttemptId, jobCurrentAttempt } from '../types'
 import { validateMetadataMap } from '../../lib/job-metadata'
 import { ORG_NAME } from './generate'
-import { isMockInvalid, isMockNotFound, MockWorld } from './world'
+import { isMockInvalid, isMockNotFound, isMockRejected, MockWorld } from './world'
 
 const NOW_US = 1_760_000_000_000_000 // pinned "now" so construction is reproducible
 
@@ -471,7 +471,9 @@ describe('MockWorld quota entities', () => {
     for (const user of users) {
       expect(user.origin).toBe('sso')
       expect(user.principal).not.toBeNull()
-      expect(user.name.startsWith('users/')).toBe(true)
+      expect(user.name.includes('/')).toBe(false)
+      expect(user.path.startsWith('users/')).toBe(true)
+      expect(user.path).toBe(`users/${user.name}`)
     }
 
     // At least one admin-configured sub-queue under an SSO user.
@@ -489,7 +491,7 @@ describe('MockWorld quota entities', () => {
 
     const check = (id: string) => {
       const node = entities.find((e) => e.id === id)!
-      const { jobs } = world.listJobs({ filter: { entity: { id } }, limit: 1000 })
+      const { jobs } = world.listJobs({ filter: { entity: { ref: id } }, limit: 1000 })
       const queued = jobs.filter((j) => j.state.kind === 'Queued').length
       const running = jobs.filter(
         (j) => j.state.kind === 'Attempting' && j.attemptState === 'Running',
@@ -545,7 +547,7 @@ describe('MockWorld quota entities', () => {
     expect(updated.createdAt).toEqual(created.createdAt)
   })
 
-  it('rejects invalid configure inputs (name, parent, sso rename, cycle)', () => {
+  it('rejects invalid configure inputs (name, quota, parent, immutable name/parent)', () => {
     const world = new MockWorld(NOW_US)
 
     expect(() =>
@@ -555,26 +557,27 @@ describe('MockWorld quota entities', () => {
       world.configureQuotaEntity({ entity: null, parent: null, name: 'ok', quotaUcu: -5 }),
     ).toThrow()
 
-    // Unknown parent → MockInvalid.
+    // Unknown parent → MockRejected (409: a well-formed ref naming nothing).
     try {
       world.configureQuotaEntity({ entity: null, parent: 'quota-nope', name: 'ok', quotaUcu: 1 })
       expect.unreachable('unknown parent should throw')
     } catch (e) {
-      expect(isMockInvalid(e)).toBe(true)
+      expect(isMockRejected(e)).toBe(true)
     }
 
-    // SSO identity rename → MockInvalid; quota-only change allowed.
+    // An SSO identity's rename → QuotaEntityImmutable; quota-only change allowed.
     const user = world.listQuotaEntities().find((e) => e.origin === 'sso' && e.principal !== null)!
     try {
       world.configureQuotaEntity({
         entity: user.id,
         parent: user.parent,
-        name: 'users/renamed@acme.dev',
+        name: 'renamed',
         quotaUcu: user.quotaUcu,
       })
       expect.unreachable('sso rename should throw')
     } catch (e) {
-      expect(isMockInvalid(e)).toBe(true)
+      expect(isMockRejected(e)).toBe(true)
+      expect((e as Error).message).toMatch(/^QuotaEntityImmutable/)
     }
     const bumped = world.configureQuotaEntity({
       entity: user.id,
@@ -583,16 +586,6 @@ describe('MockWorld quota entities', () => {
       quotaUcu: user.quotaUcu + 1_000_000,
     })
     expect(bumped.quotaUcu).toBe(user.quotaUcu + 1_000_000)
-
-    // Cycle: make A → B, then try to reparent A under B.
-    const a = world.configureQuotaEntity({ entity: null, parent: null, name: 'a', quotaUcu: 1 })
-    const b = world.configureQuotaEntity({ entity: null, parent: a.id, name: 'b', quotaUcu: 1 })
-    try {
-      world.configureQuotaEntity({ entity: a.id, parent: b.id, name: 'a', quotaUcu: 1 })
-      expect.unreachable('cycle should throw')
-    } catch (e) {
-      expect(isMockInvalid(e)).toBe(true)
-    }
   })
 
   it('throws a not-found marker for an unknown entity detail', () => {
@@ -787,9 +780,9 @@ describe('MockWorld listJobs semantics', () => {
     const entities = world.listQuotaEntities()
     const root = entities.find((e) => e.name === ORG_NAME)!
 
-    const subtree = world.listJobs({ filter: { entity: { id: root.id } }, limit: 1000 }).jobs
+    const subtree = world.listJobs({ filter: { entity: { ref: root.id } }, limit: 1000 }).jobs
     const exact = world.listJobs({
-      filter: { entity: { id: root.id, scope: 'exact' } },
+      filter: { entity: { ref: root.id, scope: 'exact' } },
       limit: 1000,
     }).jobs
     expect(subtree.length).toBeGreaterThan(0)
@@ -798,15 +791,19 @@ describe('MockWorld listJobs semantics', () => {
     // A job's own (leaf) entity: exact === subtree (a leaf has no descendants).
     const leafId = world.buildJobDetail(subtree[0]!.id).spec.quotaEntity
     const leafExact = world.listJobs({
-      filter: { entity: { id: leafId, scope: 'exact' } },
+      filter: { entity: { ref: leafId, scope: 'exact' } },
       limit: 1000,
     }).jobs
-    const leafSub = world.listJobs({ filter: { entity: { id: leafId } }, limit: 1000 }).jobs
+    const leafSub = world.listJobs({ filter: { entity: { ref: leafId } }, limit: 1000 }).jobs
     expect(leafExact.length).toBeGreaterThan(0)
     expect(leafExact.map((j) => j.id).sort()).toEqual(leafSub.map((j) => j.id).sort())
 
-    // An unknown entity id matches nothing (not an error).
-    expect(world.listJobs({ filter: { entity: { id: 'quota-nope' } } }).jobs).toEqual([])
+    // An unknown but well-formed entity id matches nothing (not an error).
+    const unknownId = 'quota-00000000-0000-0000-0000-000000000000'
+    expect(world.listJobs({ filter: { entity: { ref: unknownId } } }).jobs).toEqual([])
+
+    // An unresolvable path is invalid (a human-typed lookup, not a client id).
+    expect(() => world.listJobs({ filter: { entity: { ref: 'no/such/path' } } })).toThrow()
   })
 
   it('rejects invalid filters, cursors, and limits with InvalidArgument', () => {

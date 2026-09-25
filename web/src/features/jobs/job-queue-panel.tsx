@@ -1,6 +1,7 @@
 import type { QueuePositionExplainer } from '@/api/types'
 import { formatDuration, formatMultiplier, formatUcu } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { EntityLabel } from '@/components'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Table,
@@ -70,7 +71,7 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
               {overQuota.length === 0
                 ? 'Every entity on the path is within quota — no discount.'
                 : overQuota.length === 1 && overQuota[0]
-                  ? `${overQuota[0].name} is over quota, discounting the ranking.`
+                  ? `${overQuota[0].path} is over quota, discounting the ranking.`
                   : `${overQuota.length} entities are over quota, discounting the ranking.`}
             </p>
           </div>
@@ -106,7 +107,9 @@ export function JobQueuePanel({ queue }: { queue: QueuePositionExplainer }) {
               <TableBody>
                 {queue.penaltyChain.map((link) => (
                   <TableRow key={link.entity}>
-                    <TableCell className="whitespace-nowrap">{link.name}</TableCell>
+                    <TableCell className="max-w-[18rem]">
+                      <EntityLabel id={link.entity} path={link.path} />
+                    </TableCell>
                     <TableCell className="text-right tabular-nums">
                       {formatUcu(link.usageUcu)}
                     </TableCell>

@@ -1,7 +1,27 @@
+import type { ReactNode } from 'react'
 import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { QueuePositionExplainer } from '@/api/types'
 import { JobQueuePanel } from './job-queue-panel'
+
+// TanStack Router `Link` needs a router context we don't set up in unit
+// tests; render it as a plain anchor encoding `to`/`params` in the href.
+vi.mock('@tanstack/react-router', () => ({
+  Link: ({
+    to,
+    params,
+    children,
+    ...rest
+  }: {
+    to: string
+    params?: Record<string, string>
+    children?: ReactNode
+  }) => (
+    <a href={`${to}?${new URLSearchParams(params).toString()}`} {...rest}>
+      {children}
+    </a>
+  ),
+}))
 
 function explainer(overrides: Partial<QueuePositionExplainer> = {}): QueuePositionExplainer {
   return {
@@ -10,6 +30,7 @@ function explainer(overrides: Partial<QueuePositionExplainer> = {}): QueuePositi
       {
         entity: 'quota-00000000-0000-0000-0000-000000000001',
         name: 'team-a',
+        path: 'acme/division/team-a',
         usageUcu: 4_000_000_000_000,
         quotaUcu: 1_000_000_000_000,
         overQuotaRatio: 4,
@@ -18,6 +39,7 @@ function explainer(overrides: Partial<QueuePositionExplainer> = {}): QueuePositi
       {
         entity: 'quota-00000000-0000-0000-0000-000000000002',
         name: 'division',
+        path: 'acme/division',
         usageUcu: 500_000_000_000,
         quotaUcu: 1_000_000_000_000,
         overQuotaRatio: 0.5,
@@ -69,6 +91,7 @@ describe('JobQueuePanel', () => {
             {
               entity: 'quota-00000000-0000-0000-0000-000000000001',
               name: 'team-b',
+              path: 'acme/team-b',
               usageUcu: 100,
               quotaUcu: 1_000,
               overQuotaRatio: 0.1,
@@ -103,6 +126,7 @@ describe('JobQueuePanel', () => {
             {
               entity: 'quota-00000000-0000-0000-0000-000000000001',
               name: 'zero-quota-team',
+              path: 'acme/zero-quota-team',
               usageUcu: 10,
               quotaUcu: 0,
               overQuotaRatio: Number.POSITIVE_INFINITY,
