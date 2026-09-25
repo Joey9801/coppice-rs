@@ -6,7 +6,7 @@ import { useQuotaEntities } from '@/api/queries'
 import { canConfigureEntities, useSession } from '@/auth/session'
 import { formatMultiplier, formatUcu } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { EmptyState, PageHeader } from '@/components'
+import { CopyButton, EmptyState, EntitySegment, PageHeader } from '@/components'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -21,7 +21,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { EntityForm } from './entity-form'
-import { type EntityTreeNode, buildEntityTree, isUsersRoot, lastSegment, matchingIds } from './lib'
+import { type EntityTreeNode, buildEntityTree, isUsersRoot, matchingIds } from './lib'
 
 export function EntitiesPage() {
   const { data: entities, isPending, isError } = useQuotaEntities()
@@ -98,7 +98,7 @@ export function EntitiesPage() {
         <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
         <Input
           className="pl-8"
-          placeholder="Filter by name or principal…"
+          placeholder="Filter by path, principal or id…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
@@ -127,7 +127,7 @@ export function EntitiesPage() {
           <EmptyState
             icon={Search}
             title="No entities match this filter"
-            description="Try a different name or principal."
+            description="Try a different path, principal or id."
           />
         </Card>
       ) : (
@@ -209,7 +209,7 @@ function EntityRow({
   return (
     <TableRow
       onClick={() => navigate({ to: '/entities/$entityId', params: { entityId: node.id } })}
-      className="cursor-pointer"
+      className="group cursor-pointer"
     >
       <TableCell>
         <div className="flex items-center gap-1.5" style={{ paddingLeft: depth * 18 }}>
@@ -228,7 +228,7 @@ function EntityRow({
           ) : (
             <span className="inline-block size-5 shrink-0" />
           )}
-          <span className="font-medium text-foreground">{lastSegment(node.name)}</span>
+          <EntitySegment id={node.id} name={node.name} path={node.path} />
           {node.origin === 'sso' ? (
             <Badge variant="secondary" className="text-[10px]">
               SSO
@@ -239,6 +239,13 @@ function EntityRow({
               auto-populated
             </Badge>
           ) : null}
+          {/* The id is in the segment's tooltip; copying it must not open the row. */}
+          <span
+            className="opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <CopyButton value={node.id} ariaLabel="Copy entity id" />
+          </span>
         </div>
       </TableCell>
       <TableCell>

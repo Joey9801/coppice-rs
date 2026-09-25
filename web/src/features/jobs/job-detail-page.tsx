@@ -1,4 +1,4 @@
-import { Fragment, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, SearchX } from 'lucide-react'
 import {
@@ -23,6 +23,7 @@ import {
 import {
   CopyButton,
   EmptyState,
+  EntityBreadcrumb,
   LogViewer,
   PageHeader,
   StatePill,
@@ -295,30 +296,28 @@ function JobLogsCard({ jobId }: { jobId: JobId }) {
   )
 }
 
+/**
+ * The owning entity's path in the header, each segment linking to its entity
+ * (the leaf too — this is a job page); the leaf's id is subtext in the
+ * Specification card, and every segment's tooltip carries its path and id.
+ */
 function EntityChain({ chain }: { chain: QuotaEntityView[] }): ReactNode {
   if (chain.length === 0) return <span className="text-muted-foreground">no entity</span>
   return (
-    <span className="flex flex-wrap items-center gap-x-1 gap-y-1">
-      {chain.map((entity, i) => {
-        const leaf = i === chain.length - 1
-        return (
-          <Fragment key={entity.id}>
-            {i > 0 ? <span className="text-muted-foreground">›</span> : null}
-            <span className={leaf ? 'font-medium text-foreground' : 'text-muted-foreground'}>
-              {entity.name}
-            </span>
-            {entity.penalty > 1 ? (
-              <Badge
-                variant="outline"
-                className="border-amber-500/40 text-amber-600 dark:text-amber-400"
-              >
-                over quota {formatMultiplier(entity.penalty)}
-              </Badge>
-            ) : null}
-          </Fragment>
-        )
-      })}
-    </span>
+    <EntityBreadcrumb
+      chain={chain}
+      linkLeaf
+      renderSuffix={(entity) =>
+        entity.penalty > 1 ? (
+          <Badge
+            variant="outline"
+            className="border-amber-500/40 text-amber-600 dark:text-amber-400"
+          >
+            over quota {formatMultiplier(entity.penalty)}
+          </Badge>
+        ) : null
+      }
+    />
   )
 }
 
