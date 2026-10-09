@@ -32,8 +32,8 @@ concrete habits that keep the door open).
 | [FF-2](#ff-2-gang-failure-accounting) | Gang failure accounting | Outcome taxonomy, platform/user classification ([ADR 0033](../decisions/0033-aligned-limit-breach-outcomes.md)) |
 | [FF-3](#ff-3-custom-resource-types) | Custom resource types (GPUs, …) | `Resources` doc-flagged as placeholder for map-keyed dimensions |
 | [FF-4](#ff-4-topology-aware-scheduling) | Topology-aware scheduling | Label-filter seam in the scheduler; nothing else yet |
-| [FF-5](#ff-5-job-preemption) | Job preemption | Revocation machinery, strict backfill ([ADR 0006](../decisions/0006-reservations-and-strict-backfill.md), [ADR 0027](../decisions/0027-finite-projected-ready-accrual-protection.md)) |
-| [FF-6](#ff-6-checkpoint-awareness) | Checkpoint awareness | Attempt identity and lineage hooks; nothing else yet |
+| [FF-5](#ff-5-job-preemption) | Job preemption | **Being designed:** [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) (proposed); revocation machinery, strict backfill ([ADR 0006](../decisions/0006-reservations-and-strict-backfill.md), [ADR 0027](../decisions/0027-finite-projected-ready-accrual-protection.md)) |
+| [FF-6](#ff-6-checkpoint-awareness) | Checkpoint awareness | Resumption identity in [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) (proposed); checkpoint reporting not yet designed |
 | [FF-7](#ff-7-job-relationships) | Job relationships | Quota-entity tree as hierarchy precedent; client-minted job ids ([ADR 0026](../decisions/0026-client-minted-job-ids-idempotent-submission.md)) |
 | [FF-8](#ff-8-array-jobs-and-parameter-sweeps) | Array jobs / parameter sweeps | — |
 | [FF-9](#ff-9-deadline-aware-scheduling) | Deadline-aware scheduling | `max_runtime` declaration, `projected_ready` machinery |
@@ -49,7 +49,7 @@ concrete habits that keep the door open).
 | [FF-19](#ff-19-hard-quotas-and-admission-control) | Hard quotas & admission control | Cost-based soft quotas ([ADR 0005](../decisions/0005-cost-based-soft-quotas.md)) as substrate |
 | [FF-20](#ff-20-usage-accounting-and-chargeback) | Usage accounting & chargeback | Blocked on durable history (KOI-1) |
 | [FF-21](#ff-21-power-and-energy-aware-scheduling) | Power/energy-aware scheduling | — |
-| [FF-22](#ff-22-spot-capacity-and-autoscaling) | Spot capacity & autoscaling | OD-15(b), [deployment-story.md](deployment-story.md) |
+| [FF-22](#ff-22-spot-capacity-and-autoscaling) | Spot capacity & autoscaling | Spot half in [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) (proposed); [ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md) drain |
 | [FF-23](#ff-23-scheduling-simulator-and-capacity-planning) | Scheduling simulator & capacity planning | Pure deterministic scheduler passes |
 | [FF-24](#ff-24-federation) | Federation / multi-cluster | — |
 | [FF-25](#ff-25-external-integration-surface) | Webhooks, wider subscription selectors, SDKs | [ADR 0008](../decisions/0008-event-delivery-guarantees.md), [ADR 0043](../decisions/0043-filtered-job-event-subscriptions.md) |
@@ -167,6 +167,12 @@ term* among several, not the shape of the code.
 Evict a running attempt to make room for more important work, rather than only
 waiting for capacity.
 
+**Being designed.** [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)
+(proposed) fixes the opt-in and discount, the notice contract, the
+`Preempted` outcome, victim selection with churn guards, and preemption as a
+manufactured release event the incoming job accrues against. The entry below
+is kept as the record of what the design started from.
+
 **Already anticipated.** The mechanics mostly exist: `Revoked` is a first-class
 outcome that requeues without charging the job, and strict backfill
 ([ADR 0006](../decisions/0006-reservations-and-strict-backfill.md),
@@ -193,6 +199,12 @@ Keep `effective_score` computable for *running* work, not only queued work.
 The platform knows that a job has checkpoints: that a stopped attempt can
 resume from saved state rather than cold-starting. This transforms the
 economics of preemption (FF-5) and of spot/autoscaled capacity (FF-22).
+
+**Partly designed.** [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)
+(proposed) fixes the *resumption identity* half — the `COPPICE_*`
+environment block that tells an attempt who it is and what happened to its
+predecessor — and reserves `COPPICE_CHECKPOINT` for the reporting half,
+which is not yet designed.
 
 **Already anticipated.** Not concretely, but the state machines leave room:
 attempts have durable identity, so "attempt N+1 resumed from the checkpoint
@@ -380,6 +392,10 @@ material for GPU fleets where power is the binding constraint.
 ### Operations and scale
 
 #### FF-22: Spot capacity and autoscaling
+
+**Spot half being designed** in [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)
+(proposed): `preemptible_only` nodes, the agent's interruption poller, and
+deadline drain. Autoscaling itself remains unplanned.
 
 Zero-touch scale-up/scale-in is already planned
 ([deployment-story.md](deployment-story.md), OD-15(b) drain). The wishlist
