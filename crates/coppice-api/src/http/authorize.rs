@@ -62,7 +62,7 @@ pub(super) enum Intent<'a> {
     /// `POST /api/v1/quota-entities`.
     ConfigureQuotaEntity {
         entity: &'a QuotaEntityId,
-        new_parent: Option<&'a QuotaEntityId>,
+        parent: Option<&'a QuotaEntityId>,
     },
     /// `PUT /api/v1/authorization`.
     UpdateAuthorization,
@@ -129,8 +129,8 @@ pub(super) async fn precheck<P: ControlPlane>(
             None => return Ok(()),
         },
         Intent::Drain | Intent::RemoveNode => Verb::Drain,
-        Intent::ConfigureQuotaEntity { entity, new_parent } => {
-            Verb::ConfigureQuotaEntity { entity, new_parent }
+        Intent::ConfigureQuotaEntity { entity, parent } => {
+            Verb::ConfigureQuotaEntity { entity, parent }
         }
         Intent::UpdateAuthorization => Verb::UpdateAuthorization,
     };

@@ -32,10 +32,10 @@ index = 0
 multiplier = 1.0
 
 [[quota_entity]]
-# Created only when no entity carries this id — reconfiguration is not an
-# amnesty, so a re-init never resets accumulated usage. Jobs charge against it.
-id = "quota-00000000-0000-0000-0000-0000000000d1"
-name = "demo"
+# Named by its path (ADR 0045): created only when no entity already resolves
+# at "demo" — reconfiguration is not an amnesty, so a re-init never resets
+# accumulated usage. Jobs charge against it.
+path = "demo"
 # The quota stock in µCU (ADR 0019): 1e9 µCU = 1000 CU, which at the prices
 # above is 1000 core-hours — far more than a demo run consumes, so the
 # environment never has to think about quota.

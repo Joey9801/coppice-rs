@@ -863,7 +863,7 @@ fn dev_policy_toml() -> String {
     // above (a 1-core job would have to run for a million hours), far enough
     // from u64::MAX to stay clear of saturation.
     out.push_str(&format!(
-        "[[quota_entity]]\nid = \"{DEV_QUOTA_ENTITY}\"\nname = \"dev\"\nquota = 1000000000000\n\n"
+        "[[quota_entity]]\npath = \"dev\"\nid = \"{DEV_QUOTA_ENTITY}\"\nquota = 1000000000000\n\n"
     ));
     out.push_str(&format!(
         "[[enroll_token]]\nsecret = \"{DEV_ENROLL_TOKEN}\"\nrole = \"agent\"\n\
@@ -1221,7 +1221,7 @@ fn ready_summary(summary: &ReadySummary<'_>) -> String {
          \x20 Capacity        {cpu_millis} millicpu, {memory} memory, {disk} disk\n\
          \x20 Cluster         {cluster_id} (Raft node {coordinator_raft_id})\n\
          \x20 Agent           {agent_node} (enrolled, epoch {agent_epoch})\n\
-         \x20 Quota entity    {quota_entity} (\"dev\", seeded; priorities -2..=2)\n\
+         \x20 Quota entity    dev ({quota_entity}, seeded; priorities -2..=2)\n\
          \x20 Pricing         1 CU = {core_hours} core-hour, {memory_gib_hours} GiB-hours memory, or {disk_gib_hours} GiB-hours disk\n\
          \n\
          \x20 Local development only: authentication is effectively disabled.\n\
@@ -1307,7 +1307,7 @@ mod tests {
             "Agent           node-00000000-0000-0000-0000-000000000002 (enrolled, epoch 1)"
         ));
         assert!(summary.contains(&format!(
-            "Quota entity    {DEV_QUOTA_ENTITY} (\"dev\", seeded; priorities -2..=2)"
+            "Quota entity    dev ({DEV_QUOTA_ENTITY}, seeded; priorities -2..=2)"
         )));
         assert!(summary.contains("Capacity        16000 millicpu, 16 GiB memory, 1 TiB disk"));
         // The seeded prices are on the banner: a reader who is about to watch
@@ -1481,8 +1481,12 @@ mod tests {
         assert_eq!(zero.multiplier, 1.0);
 
         assert_eq!(policy.quota_entities.len(), 1);
+        assert_eq!(policy.quota_entities[0].path.as_str(), "dev");
         assert_eq!(
-            policy.quota_entities[0].id.to_string(),
+            policy.quota_entities[0]
+                .id
+                .expect("dev states an explicit id")
+                .to_string(),
             DEV_QUOTA_ENTITY,
             "submit examples name this entity verbatim"
         );

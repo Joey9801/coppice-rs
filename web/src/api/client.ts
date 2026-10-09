@@ -18,7 +18,7 @@ import type {
   NodeUtilization,
   QueueStats,
   QuotaEntityDetail,
-  QuotaEntityId,
+  QuotaEntityRef,
   QuotaEntityNode,
   Session,
   TimelineEvent,
@@ -92,7 +92,8 @@ export interface CoppiceApi {
 
   // Quota entities
   listQuotaEntities(): Promise<QuotaEntityNode[]>
-  getQuotaEntity(id: QuotaEntityId): Promise<QuotaEntityDetail>
+  /** By id or by path (a `QuotaEntityRef`, ADR 0045); the UI routes by id. */
+  getQuotaEntity(ref: QuotaEntityRef): Promise<QuotaEntityDetail>
   /**
    * Proposes `ConfigureQuotaEntity` (upsert; create when `input.entity` is
    * null). Requires an `admin` role binding covering the entity (ADR 0023) —
@@ -104,7 +105,7 @@ export interface CoppiceApi {
 /**
  * Error shape all clients throw; mirrors the server's closed `code`
  * vocabulary (`crates/coppice-api/src/http/error.rs::ErrorCode`) one for
- * one. The mock only ever throws `NotFound`/`InvalidArgument`; the real
+ * one. The mock only ever throws `NotFound`/`InvalidArgument`/`Rejected`; the real
  * client can throw any of these, translated from the wire `{ code, message }`
  * body.
  */

@@ -1464,7 +1464,7 @@ log_level = "warn"
             context(config, None),
             FormRequest {
                 policy: Some(
-                    format!("[[quota_entity]]\nid = \"{entity}\"\nname = \"seeded\"\nquota = 5\n")
+                    format!("[[quota_entity]]\npath = \"seeded\"\nid = \"{entity}\"\nquota = 5\n")
                         .into_bytes(),
                 ),
                 operator_csr: None,

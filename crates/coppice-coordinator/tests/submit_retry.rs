@@ -6,11 +6,21 @@
 //! the client retries the *identical* request through the next coordinator.
 //! Exactly one job may exist afterwards, and the retry must return the
 //! original client-minted id.
+//!
+//! The same contract holds for a submission that names its quota entity by
+//! **path** (ADR 0045): the path resolves before the proposal, and because an
+//! entity's name and parent are fixed at creation, a retry resolves to the
+//! same id and reaches the job-id dedup with an identical spec — even after
+//! an attempted rename, which is refused.
 
 mod common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use axum::body::{to_bytes, Body};
+use axum::http::{header, Request, StatusCode};
+use tower::ServiceExt;
 
 use coppice_api::http::dto;
 use coppice_api::{ApiError, ControlPlane};
@@ -61,8 +71,8 @@ async fn wait_for_leader(nodes: &[Node], candidates: &[usize], deadline: Duratio
 }
 
 /// The one logical submission, byte-identical on every send.
-fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequest {
-    dto::SubmitJobRequest {
+fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::ResolvedSubmitJobRequest {
+    dto::ResolvedSubmitJobRequest {
         image: "registry/img:latest".to_string(),
         requests: dto::Resources {
             cpu_millis: 1000,
@@ -248,4 +258,168 @@ async fn retried_submission_across_leader_change_creates_one_job() {
         // Explicit teardown keeps the tempdirs alive until the end.
         nodes[i].graceful_stop().await;
     }
+}
+
+/// POST `body` to `uri` through the real router, returning the status and
+/// the decoded JSON body.
+async fn post(router: &axum::Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("router response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// ADR 0045 + ADR 0026 through the real HTTP edge and a real single-node
+/// cluster: a submission by path, committed and then retried byte-for-byte,
+/// is the dedup success (one job, the original id) — and stays so after an
+/// attempted rename or move of the entity, because both are refused and the
+/// path keeps resolving to the same id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retried_submission_by_path_dedups_even_after_an_attempted_rename() {
+    let ca = Ca::new();
+    let cluster_id = ClusterId::new();
+    let mut nodes = vec![Node::new(1, cluster_id, &ca)];
+    nodes[0].boot().await;
+    wait_for_leader(&nodes, &[0], DEADLINE).await;
+
+    let mut policy = PolicyConfig::default();
+    policy
+        .priority_multipliers
+        .insert(0, PriorityMultiplier::ONE);
+    nodes[0]
+        .consensus()
+        .propose(Command::UpdatePolicy(UpdatePolicy {
+            policy,
+            updated_at: Timestamp::from_micros(1).expect("in range"),
+            actor: None,
+        }))
+        .await
+        .expect("update policy")
+        .outcome
+        .expect("policy accepted");
+
+    let router = coppice_api::http::router(
+        Arc::new(CoordinatorControlPlane::new(
+            nodes[0].consensus(),
+            nodes[0].views(),
+            cluster_id,
+        )),
+        coppice_api::http::MetricsEndpoint::detached_for_tests(),
+        coppice_api::http::ReadyzEndpoint::detached_for_tests(),
+        coppice_api::http::EnrollEndpoint::detached_for_tests(),
+        // Open mode: this is about path resolution and dedup, not authn.
+        Arc::new(coppice_authn::AuthnChain::open(coppice_authn::no_ca())),
+    );
+
+    // -- `acme/eng`, created by path through the configure route. ----------
+    let (acme, eng) = (QuotaEntityId::new(), QuotaEntityId::new());
+    let configure = |entity: QuotaEntityId, parent: &str, name: &str, quota: u64| {
+        format!(
+            r#"{{ "entity": "{entity}", "parent": {parent}, "name": "{name}", "quota_ucu": {quota} }}"#
+        )
+    };
+    let (status, body) = post(
+        &router,
+        "/api/v1/quota-entities",
+        &configure(acme, "null", "acme", 1_000_000),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["path"], "acme");
+    let (status, body) = post(
+        &router,
+        "/api/v1/quota-entities",
+        &configure(eng, r#""acme""#, "eng", 1_000_000),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["path"], "acme/eng");
+    // Path resolution reads this replica's view, which publishes the write
+    // shortly after the propose resolves: wait for it, as a client pairing
+    // the write's `log_index` with its next read would.
+    let views = nodes[0].views();
+    let min_index = body["log_index"].as_u64().expect("log_index");
+    poll(DEADLINE, "the view holds acme/eng", move || {
+        let views = views.clone();
+        async move { views.latest().applied_index() >= min_index }
+    })
+    .await;
+
+    // -- (a) Submit by path, then retry the identical bytes. ----------------
+    let job = JobId::new();
+    let submission = format!(
+        r#"{{
+            "image": "registry/img:latest",
+            "command": ["run"],
+            "requests": {{ "cpu_millis": 1000, "memory_bytes": 0, "disk_bytes": 0 }},
+            "max_runtime_seconds": 3600,
+            "job": "{job}",
+            "quota_entity": "acme/eng"
+        }}"#
+    );
+    let (status, first) = post(&router, "/api/v1/jobs", &submission).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["job"], job.to_string());
+    let (status, retried) = post(&router, "/api/v1/jobs", &submission).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the retry is the dedup success: {retried}"
+    );
+    assert_eq!(retried["job"], job.to_string());
+
+    // -- (b) An attempted rename, and an attempted move, are refused... -----
+    for (parent, name) in [(r#""acme""#, "platform"), ("null", "eng")] {
+        let (status, body) = post(
+            &router,
+            "/api/v1/quota-entities",
+            &configure(eng, parent, name, 1_000_000),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "REJECTED");
+    }
+    // ...while a quota-only update of the same entity is fine.
+    let (status, body) = post(
+        &router,
+        "/api/v1/quota-entities",
+        &configure(eng, r#""acme""#, "eng", 2_000_000),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["path"], "acme/eng");
+
+    // ...so the path still names the same entity, and the byte-identical
+    // retry still resolves to it and dedups.
+    let (status, again) = post(&router, "/api/v1/jobs", &submission).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["job"], job.to_string());
+
+    let views = nodes[0].views();
+    let min_index = again["log_index"].as_u64().expect("log_index");
+    poll(DEADLINE, "the view holds the retry", move || {
+        let views = views.clone();
+        async move { views.latest().applied_index() >= min_index }
+    })
+    .await;
+    let view = nodes[0].views().latest();
+    let state = view.state();
+    assert_eq!(state.jobs.len(), 1, "exactly one job must exist");
+    assert_eq!(state.jobs[&job].spec.quota_entity, eng);
+    assert_eq!(state.quota_entity_path(eng).as_deref(), Some("acme/eng"));
+    assert_eq!(state.quota_entities[&eng].quota, CostUnits(2_000_000));
+
+    nodes[0].graceful_stop().await;
 }

@@ -466,6 +466,10 @@ message ForwardWriteOutcome {
     // The node a drain or undrain named does not exist at the command's log
     // position. A 404 on the ADR 0041 node-write routes only.
     REJECTION_KIND_UNKNOWN_NODE = 5;
+    // A quota entity name outside the ADR 0045 segment grammar: 400
+    // everywhere. The HTTP edge pre-checks the grammar, so this reaches a
+    // client only if that check was skipped.
+    REJECTION_KIND_INVALID_QUOTA_ENTITY_NAME = 6;
   }
   // The receiver is not the leader (the forwarder's view was stale, or
   // leadership moved under it). It never forwards again — the originating
@@ -558,10 +562,12 @@ message ForwardAbortJobResponse {
 message ForwardConfigureQuotaEntityRequest {
   bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   // Client-minted (ADR 0024/0026), and the upsert target: an existing id
-  // updates, a fresh one creates.
+  // updates its quota, a fresh one creates. An existing entity's name and
+  // parent are fixed (ADR 0045): an update must restate them.
   coppice.core.v1.QuotaEntityId entity = 8;
-  // Absent roots the entity. A missing or cycle-forming parent is rejected
-  // at apply, and comes back as the Rejected outcome above.
+  // Absent roots the entity. A missing parent, or one differing from an
+  // existing entity's stored parent, is rejected at apply, and comes back as
+  // the Rejected outcome above.
   optional coppice.core.v1.QuotaEntityId parent = 9;
   string name = 10;
   uint64 quota_ucu = 11; // soft quota as a stock in µCU (ADR 0019).

@@ -1545,15 +1545,17 @@ fn reconcile_and_node_loss_stamp_the_terminal_timestamp() {
 }
 
 #[test]
-fn quota_entity_updates_preserve_usage_and_reject_cycles() {
+fn quota_entity_updates_preserve_usage_and_refuse_a_move() {
     let mut sm = setup();
     apply_ok(&mut sm, configure_entity_cmd(qid(2), Some(ROOT)));
     apply_ok(&mut sm, configure_entity_cmd(qid(3), Some(qid(2))));
-    // Re-parenting the root under its grandchild would cycle.
+    // Parents are fixed at creation (ADR 0045): the root cannot move, so it
+    // cannot be moved under its own grandchild either.
     let rejection = sm
         .apply(&configure_entity_cmd(ROOT, Some(qid(3))))
         .unwrap_err();
-    assert_eq!(rejection, RejectionReason::QuotaEntityCycle(ROOT));
+    assert_eq!(rejection, RejectionReason::QuotaEntityImmutable(ROOT));
+    assert_eq!(sm.quota_entities[&ROOT].parent, None);
 
     // Updates keep the accumulator: reconfiguration is not an amnesty.
     apply_ok(
@@ -1595,54 +1597,10 @@ fn quota_entity_timestamps_stamp_on_create_and_advance_only_updated() {
     assert_eq!(created.updated_at, create_at);
 
     // On update, updated_at advances to the new stamp; created_at is preserved.
-    apply_ok(&mut sm, configure(qid(7), Some(ROOT), "renamed", update_at));
+    apply_ok(&mut sm, configure(qid(7), Some(ROOT), "seven", update_at));
     let updated = &sm.quota_entities[&qid(7)];
-    assert_eq!(updated.name, "renamed");
     assert_eq!(updated.created_at, create_at);
     assert_eq!(updated.updated_at, update_at);
-}
-
-/// ADR 0043: only a command that moves an **existing** entity flags its event
-/// as a reparent. That flag is the whole of what the fanout has to go on —
-/// every job below the moved entity changes subtree membership without any
-/// event naming it — so a false positive costs subtree subscribers a resync
-/// and a false negative leaves them silently wrong.
-#[test]
-fn quota_entity_events_flag_only_a_reparent_of_an_existing_entity() {
-    let mut sm = setup();
-    let reparented = |applied: Applied| match applied.events.as_slice() {
-        [Event::QuotaEntityConfigured { reparented, .. }] => *reparented,
-        other => panic!("expected one QuotaEntityConfigured, got {other:?}"),
-    };
-
-    // Creation: nothing can be under it yet.
-    assert!(!reparented(apply_ok(
-        &mut sm,
-        configure_entity_cmd(qid(2), Some(ROOT))
-    )));
-    assert!(!reparented(apply_ok(
-        &mut sm,
-        configure_entity_cmd(qid(3), Some(ROOT))
-    )));
-    // Reconfiguration leaving the parent where it was.
-    assert!(!reparented(apply_ok(
-        &mut sm,
-        configure_entity_cmd(qid(3), Some(ROOT))
-    )));
-    // The move itself, in both directions: onto another parent, and up to
-    // the root's own parentless position.
-    assert!(reparented(apply_ok(
-        &mut sm,
-        configure_entity_cmd(qid(3), Some(qid(2)))
-    )));
-    assert!(reparented(apply_ok(
-        &mut sm,
-        configure_entity_cmd(qid(3), None)
-    )));
-    assert!(!reparented(apply_ok(
-        &mut sm,
-        configure_entity_cmd(qid(3), None)
-    )));
 }
 
 #[test]

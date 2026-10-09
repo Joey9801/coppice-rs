@@ -21,7 +21,7 @@
 //! image = "busybox:1.36"
 //! command = ["sh", "-c", "echo hello"]
 //! # entrypoint = ["/bin/sh", "-c"]   # optional; the image default when absent
-//! quota_entity = "quota-00000000-0000-0000-0000-000000000001"
+//! quota_entity = "acme/eng/platform"  # id or path (ADR 0045)
 //! priority = 0            # optional, default 0 (a multiplier index)
 //! max_runtime = "1h"      # optional humantime duration, whole seconds
 //!
@@ -53,7 +53,7 @@ use serde::Deserialize;
 use coppice_client::{
     paths, AbortJobRequest, AttemptId, Client, FollowOptions, JobCursor, JobDetail, JobEnv,
     JobFilter, JobId, JobMetadata, JobPhase, ListJobsParams, ListJobsResponse, LogAvailability,
-    LogEntry, LogOrder, LogSourceRecord, LogStreamName, LogsParams, NodeId, QuotaEntityId,
+    LogEntry, LogOrder, LogSourceRecord, LogStreamName, LogsParams, NodeId, QuotaEntityRef,
     ReplaceJobMetadataRequest, RequestsResource, Resources, RetryPolicy, SubmitJobRequest,
     TimelineEvent, TimelineEventBody, TimelineParams, Timestamp, UpdateJobMetadataRequest,
     UsageAvailability, UsageParams, UsagePoint, UsageSourceRecord,
@@ -83,8 +83,8 @@ pub struct JobSpec {
     /// present, must be non-empty.
     #[serde(default)]
     pub entrypoint: Option<Vec<String>>,
-    /// The quota-entity leaf to charge (`quota-<uuid>`).
-    pub quota_entity: QuotaEntityId,
+    /// The quota-entity leaf to charge, by id or path (ADR 0045).
+    pub quota_entity: QuotaEntityRef,
     /// Priority multiplier index; resolved through the replicated multiplier
     /// table (`coppice dev` seeds `-2..=2`). Default 0.
     #[serde(default)]
@@ -207,7 +207,7 @@ impl JobSpec {
                 self.resources.memory.as_u64(),
                 self.resources.disk.as_u64(),
             ),
-            self.quota_entity,
+            self.quota_entity.clone(),
         )
         .with_priority(self.priority)
         .with_metadata(JobMetadata::from(self.metadata.clone()))
@@ -357,9 +357,9 @@ pub struct JobFilterArgs {
     /// Match jobs in these display phases (repeatable).
     #[arg(long = "phase", value_enum)]
     pub phases: Vec<PhaseArg>,
-    /// Match jobs charged to this quota entity (`quota-<uuid>`).
+    /// Match jobs charged to this quota entity, by id or path (ADR 0045).
     #[arg(long)]
-    pub entity: Option<QuotaEntityId>,
+    pub entity: Option<QuotaEntityRef>,
     /// How broadly `--entity` matches; the server defaults to `subtree`.
     #[arg(long, value_enum, requires = "entity")]
     pub entity_scope: Option<ScopeArg>,
@@ -483,10 +483,10 @@ fn build_filter(args: &JobFilterArgs) -> Result<Option<JobFilter>> {
             args.phases.iter().map(|p| JobPhase::from(*p)),
         ));
     }
-    if let Some(entity) = args.entity {
+    if let Some(entity) = &args.entity {
         leaves.push(match args.entity_scope {
-            Some(ScopeArg::Exact) => JobFilter::entity_exact(entity),
-            Some(ScopeArg::Subtree) | None => JobFilter::entity(entity),
+            Some(ScopeArg::Exact) => JobFilter::entity_exact(entity.clone()),
+            Some(ScopeArg::Subtree) | None => JobFilter::entity(entity.clone()),
         });
     }
     if let Some(node) = args.node {
@@ -732,7 +732,7 @@ fn render_job_list(page: &ListJobsResponse) -> String {
                     metadata_name(&job.metadata),
                     state,
                     job.image.clone(),
-                    job.quota_entity.to_string(),
+                    format!("{} ({})", job.quota_entity_path, job.quota_entity),
                     job.node
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| "-".into()),
@@ -1357,7 +1357,10 @@ fn render_status(detail: &JobDetail) -> String {
     if let Some(entrypoint) = &spec.entrypoint {
         kv("entrypoint", &entrypoint.join(" "));
     }
-    kv("quota entity", &spec.quota_entity.to_string());
+    kv(
+        "quota entity",
+        &format!("{} ({})", spec.quota_entity_path, spec.quota_entity),
+    );
     kv("submitted by", spec.submitted_by.as_deref().unwrap_or("-"));
     kv("priority", &spec.priority.to_string());
     kv(
@@ -1539,6 +1542,7 @@ mod tests {
     use serde::Serialize;
 
     use coppice_api::http::dto;
+    use coppice_core::entity_ref::QuotaEntityRef as CoreQuotaEntityRef;
     use coppice_core::id::{AttemptId as CoreAttemptId, JobId as CoreJobId};
     use coppice_core::metadata::JobMetadata as CoreMetadata;
     use coppice_core::time::Timestamp as CoreTimestamp;
@@ -1637,6 +1641,51 @@ retry_user_errors = true
         let retry = spec.retry.expect("retry present");
         assert_eq!(retry.max_retries, 5);
         assert!(retry.retry_user_errors);
+    }
+
+    /// `quota_entity` accepts a path, not only an id (ADR 0045).
+    #[test]
+    fn quota_entity_accepts_a_path() {
+        let spec = MINIMAL_SPEC.replace(
+            r#"quota_entity = "quota-00000000-0000-0000-0000-000000000001""#,
+            r#"quota_entity = "acme/eng/platform""#,
+        );
+        let spec = parse(&spec).expect("a path quota_entity parses");
+        assert_eq!(
+            spec.quota_entity,
+            QuotaEntityRef::Path("acme/eng/platform".parse().unwrap())
+        );
+        let request = spec.request(JobId::new());
+        assert_eq!(request.quota_entity, spec.quota_entity);
+    }
+
+    /// `quota_entity` still accepts a bare id (ADR 0045: a ref is either).
+    #[test]
+    fn quota_entity_accepts_an_id() {
+        let spec = parse(MINIMAL_SPEC).expect("minimal spec parses");
+        assert_eq!(
+            spec.quota_entity,
+            QuotaEntityRef::Id(
+                "quota-00000000-0000-0000-0000-000000000001"
+                    .parse()
+                    .unwrap()
+            )
+        );
+    }
+
+    /// A malformed path (a doubled separator) is refused with a message
+    /// naming the problem, not a silent misparse.
+    #[test]
+    fn quota_entity_rejects_a_malformed_path() {
+        let spec = MINIMAL_SPEC.replace(
+            r#"quota_entity = "quota-00000000-0000-0000-0000-000000000001""#,
+            r#"quota_entity = "acme//eng""#,
+        );
+        let err = toml::from_str::<JobSpec>(&spec).expect_err("a malformed path is refused");
+        assert!(
+            format!("{err}").contains("invalid quota entity path"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1874,12 +1923,12 @@ EMPTY = ""
 
     #[test]
     fn several_leaves_are_anded_under_all() {
-        let entity: QuotaEntityId = "quota-00000000-0000-0000-0000-000000000001"
+        let entity: QuotaEntityRef = "quota-00000000-0000-0000-0000-000000000001"
             .parse()
             .unwrap();
         let node: NodeId = "node-00000000-0000-0000-0000-000000000002".parse().unwrap();
         let filter = round_trip(&JobFilterArgs {
-            entity: Some(entity),
+            entity: Some(entity.clone()),
             entity_scope: Some(ScopeArg::Exact),
             node: Some(node),
             image: Some("busybox".to_string()),
@@ -1894,13 +1943,33 @@ EMPTY = ""
             leaves,
             [
                 dto::JobFilter::Entity(dto::EntityFilter {
-                    id: dto_id(entity),
+                    entity: CoreQuotaEntityRef::Id(dto_id(entity.as_id().unwrap())),
                     scope: dto::EntityScope::Exact,
                 }),
                 dto::JobFilter::Node(dto_id(node)),
                 dto::JobFilter::Image(dto::ImageFilter::Contains("busybox".to_string())),
                 dto::JobFilter::Search("hello".to_string()),
             ]
+        );
+    }
+
+    /// A path ref is as valid an `--entity` filter as an id: it survives
+    /// the round trip through the server's own `JobFilter` and resolves to
+    /// the same [`EntityFilter`] shape.
+    #[test]
+    fn entity_filter_accepts_a_path_ref() {
+        let entity: QuotaEntityRef = "acme/eng".parse().unwrap();
+        let filter = round_trip(&JobFilterArgs {
+            entity: Some(entity.clone()),
+            ..JobFilterArgs::default()
+        })
+        .expect("a filter was built");
+        assert_eq!(
+            filter,
+            dto::JobFilter::Entity(dto::EntityFilter {
+                entity: CoreQuotaEntityRef::Path("acme/eng".parse().unwrap()),
+                scope: dto::EntityScope::Subtree,
+            })
         );
     }
 
@@ -2108,7 +2177,7 @@ EMPTY = ""
             quota_entity: "quota-00000000-0000-0000-0000-000000000001"
                 .parse()
                 .unwrap(),
-            quota_entity_name: "default".to_string(),
+            quota_entity_path: "acme/default".to_string(),
             priority: 0,
             submitted_at: CoreTimestamp::from_micros(1_000_000).unwrap(),
             submitted_by: None,
@@ -2241,6 +2310,11 @@ EMPTY = ""
         assert!(rendered.contains("busybox:1.36"), "{rendered}");
         assert!(rendered.contains("1234"), "{rendered}");
         assert!(rendered.contains("--cursor v1:job-000"), "{rendered}");
+        // The entity column shows the path first, the id alongside (ADR 0045).
+        assert!(
+            rendered.contains("acme/default (quota-00000000-0000-0000-0000-000000000001)"),
+            "{rendered}"
+        );
     }
 
     /// An empty page with a cursor is "more may exist", not "done" — the
@@ -2506,6 +2580,7 @@ EMPTY = ""
                 quota_entity: "quota-00000000-0000-0000-0000-000000000001"
                     .parse()
                     .unwrap(),
+                quota_entity_path: "acme/team-a".to_string(),
                 retry: dto::RetryPolicy {
                     max_retries: 3,
                     retry_user_errors: false,
@@ -2564,6 +2639,13 @@ EMPTY = ""
         );
         assert!(rendered.contains("cost (charged)  1234 uCU"), "{rendered}");
         assert!(rendered.contains("submitted by    -"), "{rendered}");
+        // The path is shown first, the id alongside (ADR 0045).
+        assert!(
+            rendered.contains(
+                "quota entity    acme/team-a (quota-00000000-0000-0000-0000-000000000001)"
+            ),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

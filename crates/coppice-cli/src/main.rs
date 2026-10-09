@@ -576,34 +576,46 @@ mod tests {
             "coppice",
             "quota",
             "configure",
+            "acme/team-a",
             "--entity",
             entity,
-            "--name",
-            "team-a",
             "--quota-ucu",
             "1000",
         ]);
-        assert!(matches!(
-            cli.command,
+        match cli.command {
             Command::Quota(quota::QuotaArgs {
-                command: quota::QuotaCommand::Configure { .. },
+                command:
+                    quota::QuotaCommand::Configure {
+                        path,
+                        entity: parsed_entity,
+                        quota_ucu,
+                        ..
+                    },
                 ..
-            })
-        ));
+            }) => {
+                assert_eq!(path.map(|p| p.to_string()), Some("acme/team-a".to_string()));
+                assert_eq!(
+                    parsed_entity.map(|e| e.to_string()),
+                    Some(entity.to_string())
+                );
+                assert_eq!(quota_ucu, Some(1000));
+            }
+            other => panic!("expected quota configure, got {other:?}"),
+        }
     }
 
     /// The two `quota configure` input modes are alternatives: a file and
-    /// flags describing different entities would have no defined winner.
+    /// `PATH`/flags describing different entities would have no defined
+    /// winner.
     #[test]
     fn quota_configure_refuses_a_file_and_flags_together() {
         assert!(Cli::try_parse_from([
             "coppice",
             "quota",
             "configure",
+            "acme/team-a",
             "--file",
             "e.toml",
-            "--name",
-            "team-a",
         ])
         .is_err());
     }
