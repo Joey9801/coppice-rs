@@ -133,6 +133,12 @@ where
     let discovery = coppice_discovery::build(&config.discovery)?;
 
     let mut drain = Drain::new(config.shutdown_grace);
+    // Pending max-runtime watchdog deadlines. Owned here, not by `serve_once`,
+    // so they survive a reconnect even when the new session's `observe()`
+    // fails and re-arms nothing (issue #166). Firing while no session is
+    // connected is not attempted: a deadline that passes in the gap fires on
+    // the first loop iteration of the next session.
+    let mut deadlines: BTreeMap<coppice_core::id::AllocationId, Instant> = BTreeMap::new();
     // The one clock of the shutdown path, raced at every await below. Nothing
     // on the deadline path flushes: the coordinator's liveness backstop covers
     // whatever the dropped stream did not carry.
@@ -188,6 +194,7 @@ where
                 &reap_tx,
                 &mut shutdown,
                 &mut drain,
+                &mut deadlines,
             ) => served,
             // The grace window closed with a session step still in flight —
             // dropping the future above is what cancels it.
@@ -413,6 +420,7 @@ async fn serve_once<F, E>(
     reap_tx: &mpsc::Sender<coppice_core::id::AllocationId>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     drain: &mut Drain,
+    deadlines: &mut BTreeMap<coppice_core::id::AllocationId, Instant>,
 ) -> anyhow::Result<Served>
 where
     F: Fs,
@@ -442,9 +450,6 @@ where
     let mut janitor = tokio::time::interval(janitor_cadence);
     janitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let reap_bound = coppice_core::time::Duration::from(reap_bound);
-    // A monotonic map of pending watchdog deadlines.
-    let mut deadlines: BTreeMap<coppice_core::id::AllocationId, Instant> = BTreeMap::new();
-
     // Leaf renewal (ADR 0037 §4) rides this channel, so its deadline is
     // recomputed here on every reconnect: a session that resumes near expiry
     // renews at once rather than waiting out a timer set before the break.
@@ -468,6 +473,25 @@ where
         // what `/readyz` reports as `running` (ADR 0041). Cheap, and the only
         // place that knows an event has finished being handled.
         session.refresh_health();
+
+        // Fold newly armed watchdogs into the deadline map — fresh starts and
+        // registration re-arms alike (issue #166). Done at the top of every
+        // iteration, not just after a command, so the re-arm that rides the
+        // `RegisterAccepted` handling is picked up before the next select.
+        // A re-arm keeps the earlier deadline: the retained one is monotonic,
+        // while a rebuilt one rests on the runtime's wall-clock reading and can
+        // drift later with a clock step, so it may tighten a deadline but
+        // never postpone one. Allocations
+        // with a journaled exit (e.g. stopped by `StopJob`) are dropped so the
+        // map holds no dead entries.
+        for w in session.take_armed_watchdogs() {
+            let at = w.measured_at + w.fires_after.to_std().unwrap_or(Duration::ZERO);
+            deadlines
+                .entry(w.allocation)
+                .and_modify(|d| *d = (*d).min(at))
+                .or_insert(at);
+        }
+        deadlines.retain(|alloc, _| !session.state().exits.contains_key(alloc));
 
         // The drain's two obligations, evaluated after every event the loop
         // handled (a command, an exit, a heartbeat tick) rather than on a poll
@@ -517,13 +541,6 @@ where
                     Ok(Some(cmd)) => {
                         let reports = session.handle_command(cmd).await?;
                         send_all(&tx, reports).await?;
-                        for w in session.take_armed_watchdogs() {
-                            deadlines.insert(
-                                w.allocation,
-                                Instant::now()
-                                    + w.max_runtime.to_std().unwrap_or(Duration::ZERO),
-                            );
-                        }
                     }
                     Ok(None) => return Ok(Served::Closed),
                     Err(status) => {
@@ -557,7 +574,7 @@ where
                 }
             }
             _ = watchdog => {
-                if let Some(alloc) = next_deadline.and_then(|_| due_allocation(&deadlines)) {
+                if let Some(alloc) = next_deadline.and_then(|_| due_allocation(deadlines)) {
                     deadlines.remove(&alloc);
                     let reports = session.trigger_max_runtime(alloc).await?;
                     send_all(&tx, reports).await?;

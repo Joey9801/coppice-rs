@@ -24,7 +24,10 @@ truth wins the race).
   runtime evidence wins. The Docker executor's job is to make `observe()`
   a faithful runtime half; **no new journal record types are needed** (§5).
 - **The session runner** — owns the heartbeat and max-runtime watchdog
-  timers and the exit-watcher task. Unchanged.
+  timers and the exit-watcher task. The watchdog deadlines outlive a single
+  connection: `Session::on_register_accepted` re-arms one per running
+  container from the journaled `StartIntent.max_runtime_us` minus the
+  `Running { runtime }` that `observe()` reports (`now - StartedAt`).
 
 ## 2. Module layout
 

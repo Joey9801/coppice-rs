@@ -1646,6 +1646,8 @@ async fn shutdown_while_reconnecting_lands_on_re_registration() {
     drop(agent_dir);
 }
 
+// ---- Issue #167 ----------------------------------------------------------
+
 /// An abort applied while the agent is disconnected is re-delivered when the
 /// agent reconnects: `StopJob` is routed once at `StopRequested`, the gateway
 /// drops it for a node with no session, and the reconnect `ObservedSet` diff
@@ -1710,3 +1712,267 @@ async fn abort_while_disconnected_is_stopped_on_reconnect() {
 }
 
 // ---- Issue #166 ----------------------------------------------------------
+
+/// A TCP forwarder between the agent and the coordinator's gateway. The mTLS
+/// session runs end to end through it untouched; [`SeverableProxy::sever`]
+/// drops every live connection while the listener keeps accepting, so the agent
+/// reconnects (and re-registers) exactly as after a network break or a leader
+/// change, without the coordinator or its state going anywhere.
+struct SeverableProxy {
+    port: u16,
+    /// Bumped by `sever`; each forwarded connection watches it.
+    generation: watch::Sender<u64>,
+    accept: JoinHandle<()>,
+}
+
+impl SeverableProxy {
+    async fn start(upstream: String) -> SeverableProxy {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let port = listener.local_addr().expect("proxy addr").port();
+        let (generation, rx) = watch::channel(0u64);
+        let accept = tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                let upstream = upstream.clone();
+                // A clone inherits the accept loop's stale view, so mark the
+                // current generation seen: only a *later* sever may fire.
+                let mut rx = rx.clone();
+                rx.mark_unchanged();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = rx.changed() => {}
+                    }
+                });
+            }
+        });
+        SeverableProxy {
+            port,
+            generation,
+            accept,
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("localhost:{}", self.port)
+    }
+
+    fn sever(&self) {
+        self.generation.send_modify(|g| *g += 1);
+    }
+}
+
+impl Drop for SeverableProxy {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+/// Boot a coordinator and an agent dialing it through `endpoint_via`, submit a
+/// job bounded by `max_runtime`, and drive it to `Running`.
+async fn run_bounded_to_running(max_runtime: coppice_core::time::Duration) -> BoundedWorld {
+    let ca = Ca::new();
+    let coord = RunningCoordinator::start(ClusterId::new(), &ca).await;
+    poll(DEADLINE, "coordinator leadership", || {
+        let coord = &coord;
+        async move { coord.is_leader() }
+    })
+    .await;
+    let gateway = coord
+        .agent_endpoint
+        .rsplit(':')
+        .next()
+        .expect("gateway port")
+        .to_string();
+    let proxy = SeverableProxy::start(format!("127.0.0.1:{gateway}")).await;
+
+    let node = NodeId::new();
+    let agent_dir = tempfile::tempdir().expect("agent tempdir");
+    let executor = FakeExecutor::new();
+    let config = agent_config(node, agent_dir.path().join("data"), &proxy.endpoint(), &ca);
+    let agent = spawn_agent(config, executor.clone()).await;
+    let views = coord.views();
+    poll(DEADLINE, "node registered", || {
+        let views = views.clone();
+        async move { node_epoch(&views, node).is_some_and(|e| e >= 1) }
+    })
+    .await;
+
+    let entity = QuotaEntityId::new();
+    seed_quota(&coord, entity).await;
+    let job = JobId::new();
+    let applied = coord
+        .consensus()
+        .propose(Command::SubmitJob(SubmitJob {
+            job: Job {
+                id: job,
+                image: "registry/img:latest".into(),
+                command: vec!["run".into()],
+                entrypoint: None,
+                env: Default::default(),
+                requests: requested(),
+                priority: 0,
+                max_runtime: Some(max_runtime),
+                quota_entity: entity,
+                retry: RetryPolicy {
+                    max_retries: 0,
+                    retry_user_errors: false,
+                },
+                abort_requested: None,
+                submitted_by: None,
+                metadata: Default::default(),
+            },
+            multiplier: PriorityMultiplier::ONE,
+            submitted_at: Timestamp::now(),
+            actor: None,
+        }))
+        .await
+        .expect("propose SubmitJob");
+    assert!(applied.outcome.is_ok(), "SubmitJob rejected");
+    poll(DEADLINE, "attempt Running", || {
+        let views = views.clone();
+        async move {
+            current_attempt_id(&views, job).and_then(|a| attempt_state(&views, a))
+                == Some(AttemptState::Running)
+        }
+    })
+    .await;
+    let attempt = current_attempt_id(&views, job).expect("current attempt");
+    let alloc = attempt_alloc(&views, attempt).expect("attempt allocation");
+    assert!(executor.is_running(alloc));
+
+    BoundedWorld {
+        coord,
+        ca,
+        proxy,
+        node,
+        attempt,
+        alloc,
+        executor,
+        agent,
+        agent_dir,
+    }
+}
+
+struct BoundedWorld {
+    coord: RunningCoordinator,
+    ca: Ca,
+    proxy: SeverableProxy,
+    node: NodeId,
+    attempt: AttemptId,
+    alloc: AllocationId,
+    executor: FakeExecutor,
+    agent: RunningAgent,
+    agent_dir: tempfile::TempDir,
+}
+
+/// The attempt resolves `RuntimeLimitExceeded` once the container has run its
+/// bound, and the container is actually stopped.
+async fn expect_runtime_limit(
+    coord: &RunningCoordinator,
+    attempt: AttemptId,
+    alloc: AllocationId,
+    executor: &FakeExecutor,
+    label: &str,
+) {
+    let views = coord.views();
+    poll(DEADLINE, label, || {
+        let views = views.clone();
+        async move {
+            attempt_state(&views, attempt)
+                == Some(AttemptState::Terminal(AttemptOutcome::RuntimeLimitExceeded))
+        }
+    })
+    .await;
+    assert!(!executor.is_running(alloc), "the container was stopped");
+}
+
+/// The watchdog survives a session reconnect: re-registration re-arms it from
+/// the journaled bound and the container's observed runtime.
+///
+/// The fake clock is advanced so 1s of the 3s budget remains at the break; with
+/// the pre-fix agent the deadline died with the connection and the attempt
+/// stayed `Running` forever.
+#[tokio::test]
+async fn max_runtime_watchdog_survives_a_session_reconnect() {
+    init_tracing();
+    let world = run_bounded_to_running(coppice_core::time::Duration::from_secs(3)).await;
+    let views = world.coord.views();
+    let epoch_before = node_epoch(&views, world.node).expect("epoch");
+
+    world
+        .executor
+        .advance(coppice_core::time::Duration::from_secs(2));
+    world.proxy.sever();
+    poll(DEADLINE, "re-registration after the break", || {
+        let views = views.clone();
+        let node = world.node;
+        async move { node_epoch(&views, node).is_some_and(|e| e > epoch_before) }
+    })
+    .await;
+
+    expect_runtime_limit(
+        &world.coord,
+        world.attempt,
+        world.alloc,
+        &world.executor,
+        "RuntimeLimitExceeded after reconnect",
+    )
+    .await;
+    assert_eq!(world.executor.start_count(world.alloc), 1);
+
+    stop_agent(world.agent).await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+/// The watchdog survives an agent restart: recovery re-arms it from the
+/// journaled `StartIntent.max_runtime_us` and the surviving container's runtime.
+#[tokio::test]
+async fn max_runtime_watchdog_survives_an_agent_restart() {
+    init_tracing();
+    let world = run_bounded_to_running(coppice_core::time::Duration::from_secs(3)).await;
+    let views = world.coord.views();
+    let epoch_before = node_epoch(&views, world.node).expect("epoch");
+
+    stop_agent(world.agent).await;
+    world
+        .executor
+        .advance(coppice_core::time::Duration::from_secs(2));
+
+    let executor2 = world.executor.fork();
+    let config2 = agent_config(
+        world.node,
+        world.agent_dir.path().join("data"),
+        &world.proxy.endpoint(),
+        &world.ca,
+    );
+    let agent2 = spawn_agent(config2, executor2.clone()).await;
+    poll(DEADLINE, "re-registration after the restart", || {
+        let views = views.clone();
+        let node = world.node;
+        async move { node_epoch(&views, node).is_some_and(|e| e > epoch_before) }
+    })
+    .await;
+
+    expect_runtime_limit(
+        &world.coord,
+        world.attempt,
+        world.alloc,
+        &executor2,
+        "RuntimeLimitExceeded after restart",
+    )
+    .await;
+    assert_eq!(executor2.start_count(world.alloc), 1);
+
+    stop_agent(agent2).await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}

@@ -43,18 +43,28 @@ enum Admit {
     Fresh,
 }
 
-/// A runtime watchdog armed by a successful start: the allocation to kill and
-/// the runtime bound it may not exceed.
+/// A runtime watchdog armed by a successful start or by a registration that
+/// found the container already running: the allocation to kill and how long
+/// from now it may keep running.
 ///
-/// `max_runtime` is the enforced bound copied from `StartJob.max_runtime_us`
-/// (ADR 0014), not a wall-clock deadline — the live loop converts it to a timer
-/// when it drains these via [`Session::take_armed_watchdogs`].
+/// `fires_after` is the *remaining* budget (ADR 0014's `max_runtime` minus the
+/// time the container has already run) measured from `measured_at`, a
+/// monotonic instant taken no later than the runtime reading it came from —
+/// not a wall-clock deadline. The live loop converts the pair to a timer when
+/// it drains these via [`Session::take_armed_watchdogs`], so time spent between
+/// the measurement and the drain (an `observe()`, sending the ObservedSet) is
+/// never granted again. A fresh start arms with the full bound; a registration
+/// re-arms with `max_runtime - observed runtime`, saturating at zero (fires at
+/// once). Re-arming an allocation that already has a timer keeps the earlier
+/// of the two deadlines, so repeated reconnects can never postpone it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArmedWatchdog {
     /// The allocation whose container the timer will stop.
     pub allocation: AllocationId,
-    /// The maximum runtime before the watchdog fires.
-    pub max_runtime: Duration,
+    /// How long after `measured_at` the watchdog fires.
+    pub fires_after: Duration,
+    /// When the budget was measured: the anchor `fires_after` counts from.
+    pub measured_at: tokio::time::Instant,
 }
 
 /// The transport-free session core. Generic over the filesystem seam (for the
@@ -357,6 +367,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
         if let Some(health) = &self.health {
             health.set_registered(true);
         }
+        // Taken before the observation, so a budget derived from its runtime
+        // readings is anchored no later than the reading itself.
+        let observed_at = tokio::time::Instant::now();
         let runtime = match self.executor.observe().await {
             Ok(runtime) => {
                 self.note_observation(true);
@@ -381,6 +394,35 @@ impl<F: Fs, E: Executor> Session<F, E> {
             {
                 self.pending_reaps.push(c.allocation);
             }
+        }
+
+        // Re-arm the max-runtime watchdog (issue #166) for every container that
+        // is running under a bounded intent with no journaled exit. Run on
+        // every session open, after a reconnect and after a restart alike, it
+        // re-derives each deadline from durable state (the journaled bound)
+        // plus runtime evidence (how long the container has run): a restart
+        // has no timers left at all. An overrun saturates to zero and fires at
+        // once.
+        for c in &runtime {
+            let ContainerState::Running { runtime: ran } = c.state else {
+                continue;
+            };
+            if self.state.exits.contains_key(&c.allocation) {
+                continue;
+            }
+            let Some(max) = self
+                .state
+                .intents
+                .get(&c.allocation)
+                .and_then(|i| i.max_runtime)
+            else {
+                continue;
+            };
+            self.armed_watchdogs.push(ArmedWatchdog {
+                allocation: c.allocation,
+                fires_after: max.saturating_sub(ran).max(Duration::ZERO),
+                measured_at: observed_at,
+            });
         }
 
         Ok(vec![self.report(pb::agent_report::Body::ObservedSet(
@@ -500,11 +542,12 @@ impl<F: Fs, E: Executor> Session<F, E> {
             attempt,
             job,
             node_epoch: self.epoch,
+            max_runtime: sj.max_runtime_us.map(runtime_bound),
         };
         self.journal.journal_intent(&intent)?;
         self.state.intents.insert(alloc, intent);
 
-        let max_runtime = sj.max_runtime_us.map(runtime_bound);
+        let max_runtime = intent.max_runtime;
         let spec = StartSpec {
             allocation: alloc,
             attempt,
@@ -524,7 +567,8 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 if let Some(max) = max_runtime {
                     self.armed_watchdogs.push(ArmedWatchdog {
                         allocation: alloc,
-                        max_runtime: max,
+                        fires_after: max,
+                        measured_at: tokio::time::Instant::now(),
                     });
                 }
                 Ok(vec![self.running_status(alloc, attempt, job)])

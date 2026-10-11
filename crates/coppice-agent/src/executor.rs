@@ -308,6 +308,10 @@ struct FakeInner {
     /// of ADR 0009 idempotency: a re-delivered or duplicate `StartJob` must
     /// never bump this past 1 for a given allocation.
     start_counts: std::collections::BTreeMap<AllocationId, u32>,
+    /// The fake clock reading at each running container's start, so `observe`
+    /// reports `Running { runtime: now - started }` like the Docker executor
+    /// (`now - StartedAt`) and [`FakeExecutor::advance`] ages containers.
+    started_at: std::collections::BTreeMap<AllocationId, Timestamp>,
     /// The fake's clock. Stamped onto stop-synthesized exits' `finished_at` and
     /// advanced by tests via [`FakeExecutor::set_now`]/[`FakeExecutor::advance`].
     /// Read from the real clock once at construction — the fake is an edge.
@@ -340,6 +344,7 @@ impl Default for FakeInner {
             exited: std::collections::BTreeMap::new(),
             fail_starts: std::collections::BTreeMap::new(),
             start_counts: std::collections::BTreeMap::new(),
+            started_at: std::collections::BTreeMap::new(),
             now: Timestamp::now(),
             stop_causes: std::collections::BTreeMap::new(),
             usage: None,
@@ -482,6 +487,8 @@ impl Executor for FakeExecutor {
             return Err(err);
         }
         *inner.start_counts.entry(spec.allocation).or_insert(0) += 1;
+        let now = inner.now;
+        inner.started_at.insert(spec.allocation, now);
         inner.running.insert(
             spec.allocation,
             ObservedContainer {
@@ -538,11 +545,21 @@ impl Executor for FakeExecutor {
         if let Some(message) = inner.fail_next_observe.take() {
             return Err(ExecutorError::Other(message));
         }
+        let now = inner.now;
+        let started_at = inner.started_at.clone();
         Ok(inner
             .running
             .values()
-            .chain(inner.exited.values())
-            .copied()
+            .map(|c| {
+                let mut c = *c;
+                if let (ContainerState::Running { runtime }, Some(at)) =
+                    (&mut c.state, started_at.get(&c.allocation))
+                {
+                    *runtime = now.duration_since(*at).max(Duration::ZERO);
+                }
+                c
+            })
+            .chain(inner.exited.values().copied())
             .collect())
     }
 

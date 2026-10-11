@@ -115,6 +115,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
             attempt: ids[i].attempt,
             job: ids[i].job,
             node_epoch: 1,
+            max_runtime: None,
         };
         journal.journal_intent(&intent)?;
         runtime.start(&ids[i]);
@@ -148,6 +149,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
         attempt: ids[2].attempt,
         job: ids[2].job,
         node_epoch: 2,
+        max_runtime: None,
     };
     journal.journal_intent(&intent2)?;
     runtime.start(&ids[2]);

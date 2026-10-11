@@ -137,9 +137,15 @@ filesystem seam with the storage engine's crash-safety discipline) holds:
 
 - `FencingUpdate { leader_term, node_epoch }` — the accepted-token
   watermark.
-- `StartIntent { allocation, attempt, job, node_epoch }` — journaled and
-  fsynced **before** the container starts, so a running container always
-  has durable intent behind it.
+- `StartIntent { allocation, attempt, job, node_epoch, max_runtime_us? }` —
+  journaled and fsynced **before** the container starts, so a running
+  container always has durable intent behind it. `max_runtime_us` is the
+  enforced bound copied from `StartJob`, journaled so the max-runtime
+  watchdog can be rebuilt: on every registration (reconnect or restart) the
+  agent re-arms it for each running, unexited container as `max_runtime`
+  minus the runtime the container reports (saturating at zero, which fires
+  at once). No launch wall-clock is journaled; elapsed time comes from the
+  runtime.
 - `AllocationTombstone { allocation }` — journaled before a stop is acted
   on, so a racing or re-delivered `StartJob` is refused even across a
   restart (ADR 0013).

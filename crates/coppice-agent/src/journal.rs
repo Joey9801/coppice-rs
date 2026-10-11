@@ -64,6 +64,9 @@ pub struct IntentRec {
     pub attempt: AttemptId,
     pub job: JobId,
     pub node_epoch: u64,
+    /// The enforced runtime bound from `StartJob`, so recovery can re-arm the
+    /// watchdog. `None` = unbounded.
+    pub max_runtime: Option<Duration>,
 }
 
 /// A journaled, classified exit (ADR 0013).
@@ -115,6 +118,9 @@ impl JournalState {
                         attempt,
                         job,
                         node_epoch: si.node_epoch,
+                        max_runtime: si
+                            .max_runtime_us
+                            .map(|us| Duration::from_micros(i64::try_from(us).unwrap_or(i64::MAX))),
                     },
                 );
             }
@@ -284,6 +290,9 @@ fn record_intent(intent: &IntentRec) -> pb::JournalRecord {
             attempt: Some(intent.attempt.into()),
             job: Some(intent.job.into()),
             node_epoch: intent.node_epoch,
+            max_runtime_us: intent
+                .max_runtime
+                .map(|d| u64::try_from(d.as_micros()).unwrap_or(0)),
         })),
     }
 }
@@ -415,6 +424,7 @@ mod tests {
                 attempt,
                 job,
                 node_epoch: 7,
+                max_runtime: Some(Duration::from_secs(30)),
             };
             journal.journal_intent(&intent).unwrap();
             state.intents.insert(alloc, intent);
@@ -459,6 +469,7 @@ mod tests {
                     attempt,
                     job,
                     node_epoch: 1,
+                    max_runtime: None,
                 })
                 .unwrap();
         }
@@ -482,6 +493,7 @@ mod tests {
                     attempt,
                     job,
                     node_epoch: 1,
+                    max_runtime: None,
                 })
                 .unwrap();
         }

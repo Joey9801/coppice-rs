@@ -236,6 +236,7 @@ mod tests {
                 attempt: at,
                 job: j,
                 node_epoch: 1,
+                max_runtime: None,
             },
         );
         let runtime = vec![ObservedContainer {
@@ -307,6 +308,7 @@ mod tests {
                 attempt: at,
                 job: j,
                 node_epoch: 1,
+                max_runtime: None,
             },
         );
         let set = build_observed_set(&state, &[]);
