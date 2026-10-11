@@ -168,22 +168,36 @@ async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &R
 
     let pending_aborts: Vec<(NodeId, AllocationId)> = view
         .state()
-        .jobs
+        .attempts
         .values()
-        .filter(|job| job.spec.abort_requested.is_some())
-        .filter_map(|job| job.current_attempt())
-        .filter_map(|attempt_id| view.state().attempts.get(&attempt_id))
-        .filter(|record| {
-            matches!(
-                record.attempt.state,
-                AttemptState::Dispatching | AttemptState::Running
-            )
-        })
+        .filter(|record| attempt_has_pending_abort(view.state(), record))
         .map(|record| (record.attempt.node, record.attempt.allocation))
         .collect();
     for (node, allocation) in pending_aborts {
         route_stop(router, views, node, allocation).await;
     }
+}
+
+/// Whether `record` is a live attempt whose agent must be told to stop it.
+///
+/// This is the "what should this agent have been told" rule for aborts,
+/// derived purely from replicated state: the attempt is the job's current one,
+/// is `Dispatching | Running` (a container exists or may exist), and the job
+/// carries a pending `abort_requested`. `StopJob` is only routed live once
+/// (`Event::StopRequested`), and the gateway drops commands for a node with no
+/// session, so the rule is re-evaluated by [`resync`] (leadership gain, event
+/// gap) and by the ingestion `ObservedSet` diff (every session open). Future
+/// re-derived commands (preempt, drain) belong beside it.
+pub(crate) fn attempt_has_pending_abort(
+    state: &coppice_state::StateMachine,
+    record: &AttemptRecord,
+) -> bool {
+    matches!(
+        record.attempt.state,
+        AttemptState::Dispatching | AttemptState::Running
+    ) && state.jobs.get(&record.attempt.job).is_some_and(|job| {
+        job.spec.abort_requested.is_some() && job.current_attempt() == Some(record.attempt.id)
+    })
 }
 
 /// Propose `DispatchAttempt`; only then route `StartJob` to the attempt's node.

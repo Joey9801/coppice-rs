@@ -44,7 +44,7 @@ use coppice_core::time::Timestamp;
 use coppice_discovery::SeedConfig;
 use coppice_net::session::{AgentService, Server as AgentServiceServer};
 use coppice_proto::pb::agent::v1 as pb;
-use coppice_state::command::{ConfigureQuotaEntity, DeclareNodeLost, SubmitJob};
+use coppice_state::command::{AbortJob, ConfigureQuotaEntity, DeclareNodeLost, SubmitJob};
 use coppice_state::Command;
 
 use common::{free_port, poll, Ca, RunningCoordinator};
@@ -1645,3 +1645,68 @@ async fn shutdown_while_reconnecting_lands_on_re_registration() {
     coord2.shutdown().await;
     drop(agent_dir);
 }
+
+/// An abort applied while the agent is disconnected is re-delivered when the
+/// agent reconnects: `StopJob` is routed once at `StopRequested`, the gateway
+/// drops it for a node with no session, and the reconnect `ObservedSet` diff
+/// must re-derive it from the job's `abort_requested` (no leader change).
+#[tokio::test]
+async fn abort_while_disconnected_is_stopped_on_reconnect() {
+    init_tracing();
+    let world = run_to_running().await;
+    let views = world.coord.views();
+    let (node, job, attempt, alloc) = (world.node, world.job, world.attempt, world.alloc);
+
+    // Take the session down; the container stays alive in the executor.
+    stop_agent(world.agent).await;
+    assert!(world.executor.is_running(alloc));
+
+    // Abort while nobody is listening. Nothing can have stopped the container.
+    let applied = world
+        .coord
+        .consensus()
+        .propose(Command::AbortJob(AbortJob {
+            job,
+            reason: Some("disconnected abort".into()),
+            actor: None,
+            requested_at: Timestamp::now(),
+        }))
+        .await
+        .expect("propose AbortJob");
+    assert!(
+        applied.outcome.is_ok(),
+        "AbortJob rejected: {:?}",
+        applied.outcome
+    );
+    assert!(world.executor.is_running(alloc), "no agent to stop it yet");
+    assert_eq!(job_state(&views, job), Some(JobState::Attempting(attempt)));
+
+    let epoch_before = node_epoch(&views, node).expect("epoch");
+    let executor2 = world.executor.fork();
+    let config2 = agent_config(
+        node,
+        world.agent_dir.path().join("data"),
+        &world.coord.agent_endpoint,
+        &world.ca,
+    );
+    let agent2 = spawn_agent(config2, executor2.clone()).await;
+
+    poll(DEADLINE, "re-registration", || {
+        let views = views.clone();
+        async move { node_epoch(&views, node).is_some_and(|e| e > epoch_before) }
+    })
+    .await;
+    poll(DEADLINE, "job Aborted after reconnect", || {
+        let views = views.clone();
+        async move { job_state(&views, job) == Some(JobState::Aborted) }
+    })
+    .await;
+    assert!(!executor2.is_running(alloc), "the container was stopped");
+    assert_eq!(executor2.start_count(alloc), 1, "never restarted");
+
+    stop_agent(agent2).await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+// ---- Issue #166 ----------------------------------------------------------
