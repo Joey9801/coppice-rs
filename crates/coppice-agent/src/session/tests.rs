@@ -609,11 +609,8 @@ async fn max_runtime_watchdog_classifies_exceeded() {
         .await
         .unwrap();
     assert_eq!(
-        session.take_armed_watchdogs(),
-        vec![ArmedWatchdog {
-            allocation: alloc,
-            max_runtime: Duration::from_micros(1_000)
-        }]
+        budgets(session.take_armed_watchdogs()),
+        vec![(alloc, Duration::from_micros(1_000))]
     );
 
     let reports = session.trigger_max_runtime(alloc).await.unwrap();
@@ -644,6 +641,133 @@ async fn max_runtime_after_natural_exit_is_a_noop() {
     // The container already exited: the watchdog must not fabricate an outcome.
     let reports = session.trigger_max_runtime(alloc).await.unwrap();
     assert!(reports.is_empty());
+}
+
+// ---- watchdog re-arm on registration (issue #166) ----
+
+/// A session over the same journal directory and the surviving containers —
+/// an agent restart.
+fn restarted(dir: &tempfile::TempDir, exec: &FakeExecutor) -> TestSession {
+    let (journal, state) = Journal::open(RealFs::new(dir.path())).unwrap();
+    Session::new(
+        NodeId::new(),
+        Resources::ZERO,
+        Vec::new(),
+        journal,
+        state,
+        exec.fork(),
+    )
+}
+
+async fn start_bounded(
+    session: &mut TestSession,
+    seq: u64,
+    max_runtime_us: Option<u64>,
+) -> AllocationId {
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    session
+        .handle_command(command(
+            1,
+            1,
+            seq,
+            start_job(alloc, attempt, job, max_runtime_us),
+        ))
+        .await
+        .unwrap();
+    session.take_armed_watchdogs();
+    alloc
+}
+
+#[tokio::test]
+async fn intent_max_runtime_survives_restart() {
+    let (dir, mut s1, exec) = session();
+    register(&mut s1, 1, 1, 1).await;
+    let bounded = start_bounded(&mut s1, 2, Some(30_000_000)).await;
+    let unbounded = start_bounded(&mut s1, 3, None).await;
+    drop(s1);
+
+    let s2 = restarted(&dir, &exec);
+    assert_eq!(
+        s2.state().intents[&bounded].max_runtime,
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(s2.state().intents[&unbounded].max_runtime, None);
+}
+
+#[tokio::test]
+async fn registration_rearms_with_remaining_budget() {
+    let (dir, mut s1, exec) = session();
+    register(&mut s1, 1, 1, 1).await;
+    let alloc = start_bounded(&mut s1, 2, Some(30_000_000)).await;
+    exec.advance(Duration::from_secs(12));
+
+    // Reconnect: same session object, registration redone.
+    s1.reset_session();
+    register(&mut s1, 1, 1, 1).await;
+    assert_eq!(
+        budgets(s1.take_armed_watchdogs()),
+        vec![(alloc, Duration::from_secs(18))]
+    );
+
+    // Restart: a new session over the same journal and containers.
+    drop(s1);
+    exec.advance(Duration::from_secs(3));
+    let mut s2 = restarted(&dir, &exec);
+    register(&mut s2, 1, 1, 1).await;
+    assert_eq!(
+        budgets(s2.take_armed_watchdogs()),
+        vec![(alloc, Duration::from_secs(15))]
+    );
+}
+
+#[tokio::test]
+async fn registration_rearm_saturates_to_zero_when_overrun() {
+    let (_dir, mut s1, exec) = session();
+    register(&mut s1, 1, 1, 1).await;
+    let alloc = start_bounded(&mut s1, 2, Some(30_000_000)).await;
+    exec.advance(Duration::from_secs(90));
+
+    s1.reset_session();
+    register(&mut s1, 1, 1, 1).await;
+    assert_eq!(
+        budgets(s1.take_armed_watchdogs()),
+        vec![(alloc, Duration::ZERO)]
+    );
+}
+
+#[tokio::test]
+async fn registration_does_not_rearm_unbounded_exited_or_unjournaled() {
+    let (_dir, mut s1, exec) = session();
+    register(&mut s1, 1, 1, 1).await;
+    let _unbounded = start_bounded(&mut s1, 2, None).await;
+    let exited = start_bounded(&mut s1, 3, Some(30_000_000)).await;
+    let exit = natural_exit(0, Duration::from_micros(5), exec.now());
+    exec.finish(exited, exit);
+    s1.handle_observed_exit(exited, exit).await.unwrap();
+    // A bounded stop: journaled exit, container still visible until reaped.
+    let stopped = start_bounded(&mut s1, 4, Some(30_000_000)).await;
+    s1.handle_command(command(1, 1, 5, stop_job(stopped)))
+        .await
+        .unwrap();
+    s1.take_armed_watchdogs();
+
+    s1.reset_session();
+    register(&mut s1, 1, 1, 1).await;
+    assert_eq!(s1.take_armed_watchdogs(), vec![]);
+}
+
+#[tokio::test]
+async fn registration_does_not_rearm_a_survivor_with_no_journaled_intent() {
+    let (_dir, mut s1, exec) = session();
+    register(&mut s1, 1, 1, 1).await;
+    start_bounded(&mut s1, 2, Some(30_000_000)).await;
+    drop(s1);
+
+    // Fresh journal over the surviving container: no intent to take a bound from.
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let mut s2 = restarted(&fresh_dir, &exec);
+    register(&mut s2, 1, 1, 1).await;
+    assert_eq!(s2.take_armed_watchdogs(), vec![]);
 }
 
 // ---- reaping (docker-executor.md §5) ----
@@ -1211,4 +1335,12 @@ fn draining_of(report: &pb::AgentReport) -> bool {
         pb::agent_report::Body::Heartbeat(h) => h.draining,
         other => panic!("not a report that carries draining: {other:?}"),
     }
+}
+
+/// The armed watchdogs' budgets, without their measurement instants.
+fn budgets(armed: Vec<ArmedWatchdog>) -> Vec<(AllocationId, Duration)> {
+    armed
+        .into_iter()
+        .map(|w| (w.allocation, w.fires_after))
+        .collect()
 }

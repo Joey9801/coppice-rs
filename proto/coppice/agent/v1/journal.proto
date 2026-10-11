@@ -45,6 +45,10 @@ message StartIntent {
   coppice.core.v1.JobId job = 3;
   // The node epoch the StartJob was accepted under.
   uint64 node_epoch = 4;
+  // The enforced runtime bound copied from StartJob.max_runtime_us (ADR 0014),
+  // journaled so recovery can rebuild the max-runtime watchdog: the remaining
+  // budget is this minus the runtime the container reports. Absent = unbounded.
+  optional uint64 max_runtime_us = 5;
 }
 
 // A StopJob was accepted for this allocation (ADR 0013): journaled before
