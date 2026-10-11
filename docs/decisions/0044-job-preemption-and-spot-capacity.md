@@ -1,6 +1,6 @@
 # 44. Job preemption, node draining, and spot capacity
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-24
 - **Builds on:** [ADR 0013](0013-job-attempt-allocation-state-machines.md)
   (attempt and allocation machines, `Revoked`, abort-as-a-flag, truth wins
@@ -118,7 +118,7 @@ running. This is for the production queue whose jobs look exactly like
 the pre-production runs beside them.
 
 **Pricing.** `preemptible_multiplier: PriorityMultiplier` is a replicated
-policy field (Q32.32, validated ≤ 1.0, default **0.5**). For an
+policy field (Q32.32, validated ≤ 1.0, default **0.75**). For an
 effectively preemptible job it is folded into the charge multiplier at
 `commit_placements` exactly as ADR 0029 folds the unbounded-runtime
 multiplier, `m' = ⌊m' × preemptible_multiplier / 2³²⌋`, multiplying with
@@ -640,7 +640,7 @@ documents is where that call belongs.
 | --- | --- | --- |
 | Job spec `[preemption]` | `preemptible`, `notice`, `notice_signal` | `false`, floor, `SIGUSR1` |
 | Quota entity | `preemptible` | `true` |
-| Replicated policy | `preemptible_multiplier` | 0.5 |
+| Replicated policy | `preemptible_multiplier` | 0.75 |
 | Replicated policy | `preemption_notice_floor`, `preemption_notice_cap` | 60 s, 5 min |
 | Replicated policy | `drain_cleanup_margin` | 30 s |
 | Scheduler config | `max_preempting_placements_per_cycle`, `preemption_cooldown`, `preemption_min_improvement` | 2, 5 min, 1 h |
